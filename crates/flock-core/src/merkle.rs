@@ -1727,6 +1727,7 @@ mod leaf_kernel_bench {
     // 8-wide NEON leaf kernel on L2-resident data. Run with:
     //   cargo test --profile challenge -p flock-core --lib \
     //     leaf_kernel_bench -- --ignored --nocapture
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     #[ignore]
     fn leaf_kernel_single_thread_ns_per_compression() {

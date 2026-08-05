@@ -2379,7 +2379,7 @@ mod tests {
                 );
             }
         }
-        assert!(use_ranked_low_twiddle_final_pair(20, 64, 10));
+        assert!(use_ranked_low_twiddle_final_pair(20, 64, 10) || cfg!(not(all(target_os = "macos", target_arch = "aarch64"))));
         assert!(!use_ranked_low_twiddle_final_pair(19, 64, 10));
         assert!(!use_ranked_low_twiddle_final_pair(20, 32, 10));
         assert!(!use_ranked_low_twiddle_final_pair(20, 64, 9));

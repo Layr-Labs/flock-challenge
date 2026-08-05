@@ -295,6 +295,22 @@ pub(crate) fn gpu_zc_loop_debug() -> bool {
     *ON
 }
 
+/// Kill switch for the zerocheck round-one AB URM products GPU arm.
+pub const ENV_NO_GPU_ZC_URM: &str = "FLOCK_NO_GPU_ZC_URM";
+
+pub(crate) fn gpu_zc_urm_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_URM).is_none());
+    *ON
+}
+
+/// Diagnostic trace for the URM arm (`FLOCK_ZC_URM_GPU_DEBUG=1`).
+pub(crate) fn gpu_zc_urm_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_URM_GPU_DEBUG").is_some());
+    *ON
+}
+
 /// Kill switch for the cross-process warmup latch cache:
 /// `FLOCK_NO_WARMUP_LATCH_CACHE=1` restores the incumbent full dual-run +
 /// autotune sweep in every worker process. The cache changes **no timed
@@ -10787,6 +10803,759 @@ kernel void zc_r2_products(
     }
 
     // -----------------------------------------------------------------------
+    // Zerocheck round-one AB URM products GPU arm (see `ENV_NO_GPU_ZC_URM`).
+    //
+    // The ranked round-one AB completion
+    // (`round1_shift_reduce_ab_packed_padded_with_precomputed`) folds the
+    // 512 MiB write-once `ab_inner` surface: per `x_hi` chunk, for each of
+    // `2^n_lo` x_outer_lo positions, XOR `n_b_med` 64-byte rows through the
+    // 16x256-entry convert table (phi8-expanded byte values scaled by
+    // gamma^b_med), weight the 64 lane partials by `eq_lo_scaled[x_outer_lo]`
+    // (emulated clmul), then by `eq_hi[x_hi]`. The GPU is documented idle
+    // for the whole zerocheck window, and the legacy r2/t3/loop arms already
+    // prove emulated-clmul Metal products at this census (~33.5M clmuls at
+    // the ranked shape - the same magnitude as the round-two arm).
+    //
+    // This arm computes the per-chunk partials for a measured prefix of the
+    // hi-chunks on the GPU while the CPU skips those chunks entirely - there
+    // are no stores to preserve, so unlike r2 there is no anchors-only
+    // sibling. After the join the GPU prefix partials replace the zeroed
+    // slots and the XOR reduce merges in any order, bit-identical to the
+    // all-CPU sweep.
+    //
+    // Bit-exactness: identical argument to zc-r2 - F2-linear phi8 nibble
+    // decomposition of the convert table (field homomorphism:
+    // `entry(v) = entry(v & 15) ^ entry(v & 0xF0)`), oracle-proven emulated
+    // clmul, order-independent XOR accumulation, and a calibration equality
+    // oracle on the target machine before any share is published.
+    // -----------------------------------------------------------------------
+
+    const ZC_URM_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline ulong clmul32(uint a, uint b) {
+    const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
+                M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
+    ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
+          a2 = a & 0x44444444u, a3 = a & 0x88888888u;
+    ulong b0 = b & 0x11111111u, b1 = b & 0x22222222u,
+          b2 = b & 0x44444444u, b3 = b & 0x88888888u;
+    ulong r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
+    ulong r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
+    ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
+    ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
+    return r0 | r1 | r2 | r3;
+}
+
+struct U128k { ulong lo; ulong hi; };
+struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+
+static inline U128k clmul64(ulong a, ulong b) {
+    uint al = uint(a), ah = uint(a >> 32);
+    uint bl = uint(b), bh = uint(b >> 32);
+    ulong p_lo = clmul32(al, bl);
+    ulong p_hi = clmul32(ah, bh);
+    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
+    U128k r;
+    r.lo = p_lo ^ (p_mid << 32);
+    r.hi = p_hi ^ (p_mid >> 32);
+    return r;
+}
+
+static inline U256k clmul128(uint4 a, uint4 b) {
+    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
+    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
+    U128k p0 = clmul64(al, bl);
+    U128k p2 = clmul64(ah, bh);
+    U128k pm = clmul64(al ^ ah, bl ^ bh);
+    pm.lo ^= p0.lo ^ p2.lo;
+    pm.hi ^= p0.hi ^ p2.hi;
+    U256k r;
+    r.r0 = p0.lo;
+    r.r1 = p0.hi ^ pm.lo;
+    r.r2 = p2.lo ^ pm.hi;
+    r.r3 = p2.hi;
+    return r;
+}
+
+// Reduce a 255-bit product mod x^128 + x^7 + x^2 + x + 1.
+static inline uint4 gf_reduce(U256k p) {
+    ulong h0 = p.r2, h1 = p.r3;
+    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
+    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+}
+
+struct ZcURMParams { uint n_lo; uint mask; uint xpt; uint n_lo_and_inner; };
+
+// One threadgroup per hi-chunk (256 threads; xpt = lo_size/16 x_outer_lo
+// groups per thread, 16 threads per group covering the 16 lane-quads of one
+// x_outer_lo). Thread (xol0, g) owns x_outer_lo = k*16 + xol0 and lane-quad
+// g: it XORs `n_b_med` 64-byte rows' 4 bytes through the b_med-scaled nibble
+// tables into four F128 lane partials and weights EACH x_outer_lo by
+// eq_lo[x_lo] (emulated clmul) — the weight is per-x_lo, so it cannot be
+// factored out of the sum. The 16 xol0 slices (each covering lo_size/16
+// x_outer_lo positions) are XOR-reduced in threadgroup memory; the
+// lane-group leader (xol0 == 0) applies the single per-chunk eq_hi weight
+// (linear, factors out) and writes the chunk's 64 lane partials. Rows
+// b < n_b_med only; row count from the b_med_counts mask lookup - the exact
+// CPU skip semantics.
+kernel void zc_urm_products(
+    device const uint*  ab       [[buffer(0)]],
+    device const uint4* eq_lo    [[buffer(1)]],
+    device const uint4* eq_hi    [[buffer(2)]],
+    device const uint4* nib      [[buffer(3)]],
+    device const uchar* counts   [[buffer(4)]],
+    device uint4*       partials [[buffer(5)]],
+    constant ZcURMParams& p      [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 tg_nib[512];
+    threadgroup uint4 red[1024];
+    tg_nib[lid] = nib[lid];
+    tg_nib[lid + 256u] = nib[lid + 256u];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread (xol0, lane_g) folds its 1/16 slice of the x_outer_lo range
+    // (x_lo = k*16 + xol0) for its 4-lane group. The 16 xol0 slices are
+    // XOR-reduced in threadgroup memory; the lane-group leader (xol0 == 0)
+    // writes the chunk's 64 lane partials.
+    uint lane_g = lid & 15u;
+    uint xol0 = lid >> 4u;
+    uint base = tgid << (p.n_lo_and_inner + 1u);
+    uint4 p0 = uint4(0u), p1 = uint4(0u), p2 = uint4(0u), p3 = uint4(0u);
+    for (uint k = 0u; k < p.xpt; ++k) {
+        uint x_lo = k * 16u + xol0;
+        uint x_outer = x_lo | (tgid << p.n_lo);
+        uint n_b_med = counts[x_outer & p.mask];
+        uint4 s0 = uint4(0u), s1 = uint4(0u), s2 = uint4(0u), s3 = uint4(0u);
+        uint row_base = base + (x_lo << 8u) + lane_g;
+        for (uint b = 0u; b < n_b_med; ++b) {
+            uint w = ab[row_base + (b << 4u)];
+            uint nb = b * 32u;
+            s0 ^= tg_nib[nb + (w & 15u)] ^ tg_nib[nb + 16u + ((w >> 4u) & 15u)];
+            s1 ^= tg_nib[nb + ((w >> 8u) & 15u)] ^ tg_nib[nb + 16u + ((w >> 12u) & 15u)];
+            s2 ^= tg_nib[nb + ((w >> 16u) & 15u)] ^ tg_nib[nb + 16u + ((w >> 20u) & 15u)];
+            s3 ^= tg_nib[nb + ((w >> 24u) & 15u)] ^ tg_nib[nb + 16u + ((w >> 28u) & 15u)];
+        }
+        uint4 e = eq_lo[x_lo];
+        p0 ^= gf_reduce(clmul128(s0, e));
+        p1 ^= gf_reduce(clmul128(s1, e));
+        p2 ^= gf_reduce(clmul128(s2, e));
+        p3 ^= gf_reduce(clmul128(s3, e));
+    }
+    red[lid * 4u] = p0;
+    red[lid * 4u + 1u] = p1;
+    red[lid * 4u + 2u] = p2;
+    red[lid * 4u + 3u] = p3;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (xol0 == 0u) {
+        for (uint j = 1u; j < 16u; ++j) {
+            uint idx = (j * 16u + lane_g) * 4u;
+            p0 ^= red[idx];
+            p1 ^= red[idx + 1u];
+            p2 ^= red[idx + 2u];
+            p3 ^= red[idx + 3u];
+        }
+        // eq_hi weighting on the reduced chunk partial (64 clmuls per chunk
+        // instead of one per thread — linear, so identical output).
+        uint4 eh = eq_hi[tgid];
+        p0 = gf_reduce(clmul128(p0, eh));
+        p1 = gf_reduce(clmul128(p1, eh));
+        p2 = gf_reduce(clmul128(p2, eh));
+        p3 = gf_reduce(clmul128(p3, eh));
+        uint out = (tgid * 16u + lane_g) * 4u;
+        partials[out] = p0;
+        partials[out + 1u] = p1;
+        partials[out + 2u] = p2;
+        partials[out + 3u] = p3;
+    }
+}
+"#;
+
+    struct ZcURM {
+        pso: Id,
+        /// Persistent small buffers: nibble table (8 KiB), eq_lo, eq_hi,
+        /// b_med counts, per-chunk 64-lane partials. Sized on first use.
+        nib_buf: Id,
+        eq_lo_buf: Id,
+        eq_lo_cap: usize,
+        eq_hi_buf: Id,
+        eq_hi_cap: usize,
+        counts_buf: Id,
+        counts_cap: usize,
+        part_buf: Id,
+        part_cap: usize,
+        /// Cached no-copy wraps of the `ab_inner` input `(ptr, len, buf)`.
+        wraps: Vec<(usize, usize, Id)>,
+    }
+
+    // SAFETY: the Metal pipeline and buffer handles are only touched under
+    // the state mutex; Metal objects themselves are thread-safe.
+    unsafe impl Send for ZcURM {}
+
+    static ZC_URM_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcURM>>> =
+        std::sync::OnceLock::new();
+    /// Published GPU chunk share. `usize::MAX` = uncalibrated (first prove
+    /// calibrates), `0` = arm off for this process.
+    static ZC_URM_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static ZC_URM_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    pub(crate) fn zc_urm_test_reset() {
+        use std::sync::atomic::Ordering;
+        ZC_URM_TUNED.store(usize::MAX, Ordering::Relaxed);
+        ZC_URM_POISONED.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_urm_test_state() -> (usize, bool) {
+        use std::sync::atomic::Ordering;
+        (
+            ZC_URM_TUNED.load(Ordering::Relaxed),
+            ZC_URM_POISONED.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_urm_test_set_share(share: usize) {
+        ZC_URM_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn zc_urm_forced_ratio() -> Option<f64> {
+        static V: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_ZC_URM_GPU_FORCE_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+        *V
+    }
+
+    /// The CPU pays NOTHING for the GPU prefix in this arm - there is no
+    /// anchors-only sibling; the per-chunk output is pure computation - so
+    /// the balanced share solves `(hi - g)*u_cpu = g*u_gpu`, i.e.
+    /// `g = hi/(1 + ratio)` with no alpha term. The 15/16 cap keeps the
+    /// GPU from ever being the timed straggler at a warmup-optimistic
+    /// ratio (same overshoot guard as the r2 lineage); the (2, 8) floor
+    /// share `hi/8` keeps a slow-looking GPU admitted after its equality
+    /// oracle passed.
+    const ZC_URM_MAX_RATIO: f64 = 2.0;
+    const ZC_URM_FLOOR_MAX_RATIO: f64 = 8.0;
+
+    pub(crate) fn zc_urm_gate_share(ratio: f64, hi_size: usize) -> usize {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return 0;
+        }
+        if ratio > ZC_URM_MAX_RATIO {
+            if ratio < ZC_URM_FLOOR_MAX_RATIO {
+                return hi_size / 8;
+            }
+            return 0;
+        }
+        let g = (hi_size as f64 / (1.0 + ratio)).round();
+        (g as usize).min(hi_size * 15 / 16)
+    }
+
+    fn zc_urm_init(gpu: &'static Gpu) -> Result<ZcURM, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<Id, String> {
+                let src = gpu.api.nsstring(ZC_URM_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "zc-urm shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let ns = gpu.api.nsstring("zc_urm_products")?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    return Err("zc_urm_products kernel not found".into());
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                if pso.is_null() {
+                    return Err(format!(
+                        "zc_urm_products pipeline: {}",
+                        gpu.api.error_string(perr)
+                    ));
+                }
+                Ok(pso)
+            })();
+            gpu.pool_pop(pool);
+            let pso = built?;
+            let nib_buf = gpu.new_buffer(512 * 16)?;
+            Ok(ZcURM {
+                pso,
+                nib_buf,
+                eq_lo_buf: NIL,
+                eq_lo_cap: 0,
+                eq_hi_buf: NIL,
+                eq_hi_cap: 0,
+                counts_buf: NIL,
+                counts_cap: 0,
+                part_buf: NIL,
+                part_cap: 0,
+                wraps: Vec::new(),
+            })
+        }
+    }
+
+    fn zc_urm_state() -> Option<&'static std::sync::Mutex<ZcURM>> {
+        ZC_URM_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match zc_urm_init(gpu) {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if super::gpu_zc_urm_debug() {
+                            eprintln!("[zc-urm] init failed: {e}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    pub(crate) struct ZcURMJob {
+        cb: Id,
+        pub chunks: usize,
+        calibration: bool,
+        lo_size: usize,
+        n_lo: u32,
+        mask: u32,
+        n_lo_and_inner: u32,
+        submitted: std::time::Instant,
+    }
+
+    // SAFETY: the command buffer handle is only waited/released from the
+    // launching thread; Metal command buffers are themselves thread-safe.
+    unsafe impl Send for ZcURMJob {}
+
+    impl ZcURMJob {
+        /// How many leading chunks the CPU should skip (their partials come
+        /// from the GPU after the join). Zero during calibration: the CPU
+        /// runs every chunk (the GPU probe is compared against its values,
+        /// then discarded).
+        pub(crate) fn cpu_split(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    /// Result of draining the round-one URM products arm.
+    pub(crate) enum ZcURMResult {
+        /// Warmup calibration completed (share published, GPU values
+        /// discarded); the caller's CPU partials are authoritative.
+        Calibrated,
+        /// Timed-prove prefix partials, bit-exact per chunk (64 lanes,
+        /// eq_hi-weighted).
+        Prefix(Vec<[F128; 64]>),
+        /// Metal failed after admission; the caller must CPU-redo the
+        /// prefix products. The arm is poisoned for the process.
+        Failed,
+    }
+
+    unsafe fn zc_urm_submit(
+        gpu: &Gpu,
+        state: &ZcURM,
+        ab_buf: Id,
+        chunks: usize,
+        lo_size: usize,
+        n_lo: u32,
+        mask: u32,
+        n_lo_and_inner: u32,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                n_lo: u32,
+                mask: u32,
+                xpt: u32,
+                n_lo_and_inner: u32,
+            }
+            let params = P {
+                n_lo,
+                mask,
+                xpt: (lo_size / 16) as u32,
+                n_lo_and_inner,
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, ab_buf, 0, 0);
+            gpu.set_buffer(enc, state.eq_lo_buf, 0, 1);
+            gpu.set_buffer(enc, state.eq_hi_buf, 0, 2);
+            gpu.set_buffer(enc, state.nib_buf, 0, 3);
+            gpu.set_buffer(enc, state.counts_buf, 0, 4);
+            gpu.set_buffer(enc, state.part_buf, 0, 5);
+            gpu.set_bytes(enc, pb, 6);
+            gpu.dispatch(enc, chunks as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// No-copy wrap of the caller's `ab_inner`, cached across proves by
+    /// `(ptr, len)`. The ranked prover recycles the 512 MiB allocation, but
+    /// the pool may alternate between a small number of addresses, so keep
+    /// the last few wraps rather than evicting on every change (Metal wires
+    /// the wrapped pages on first GPU touch — several ms at ranked size, and
+    /// a wrap rebuilt inside the TIMED prove would eat the arm's gain).
+    /// Correctness: a retained wrap names caller memory; `ab_inner` is
+    /// write-once and its pooled allocations live for the process.
+    unsafe fn zc_urm_wrap(state: &mut ZcURM, gpu: &Gpu, data: &[u8]) -> Result<Id, String> {
+        const MAX_WRAPS: usize = 3;
+        let ptr = data.as_ptr() as usize;
+        let len = data.len();
+        if let Some(&(_, _, buf)) = state
+            .wraps
+            .iter()
+            .find(|&&(p, l, _)| p == ptr && l == len)
+        {
+            return Ok(buf);
+        }
+        let buf = unsafe { gpu.wrap_buffer(data.as_ptr().cast_mut(), len)? };
+        if state.wraps.len() == MAX_WRAPS {
+            let (_, _, old) = state.wraps.remove(0);
+            unsafe { gpu.release(old) };
+        }
+        state.wraps.push((ptr, len, buf));
+        Ok(buf)
+    }
+
+    /// Launch the round-one URM products prefix. `None` = the whole round
+    /// stays on the exact incumbent CPU path (kill switch, poisoned,
+    /// share 0, non-ranked shape, no Metal, or wrap failure).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_urm_products(
+        ab_inner: &[u8],
+        eq_lo_scaled: &[F128],
+        eq_hi: &[F128],
+        convert: &[F128],
+        within_outer_mask: usize,
+        counts: &[u8],
+        lo_size: usize,
+        hi_size: usize,
+        n_lo_and_inner: usize,
+    ) -> Option<ZcURMJob> {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_zc_urm_enabled() || ZC_URM_POISONED.load(Ordering::Relaxed) {
+            return None;
+        }
+        // Fixed-shape gates: 16x256 convert table, threadgroup-partitionable
+        // lo (16-thread lane groups), sane hi, small counts array.
+        if convert.len() != 16 * 256
+            || lo_size < 256
+            || !lo_size.is_multiple_of(256)
+            || hi_size < 8
+            || counts.len() > 256
+            || n_lo_and_inner < 8
+        {
+            return None;
+        }
+        let tuned = ZC_URM_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let chunks = if calibration {
+            (hi_size / 16).clamp(8, 128)
+        } else {
+            tuned.min(hi_size * 15 / 16)
+        };
+        if chunks == 0 {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_urm_state()?;
+        // Deliberately NOT poison-tolerant: the grow sequences below
+        // (release -> new_buffer -> cap update) are not unwind-atomic, so a
+        // guard recovered after a caught panic could observe a released
+        // buffer behind a stale cap. Declining keeps the incumbent
+        // fail-safe (arm off for the process) but makes it observable.
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("zc-urm launch", false);
+                return None;
+            }
+        };
+        unsafe {
+            // Nibble decomposition of the 64 KiB convert table (per prove;
+            // the table depends on the round-one r_outer challenges).
+            let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
+            for b in 0..16 {
+                for n in 0..16 {
+                    *nib.add(b * 32 + n) = convert[b * 256 + n];
+                    *nib.add(b * 32 + 16 + n) = convert[b * 256 + (n << 4)];
+                }
+            }
+            let need_lo = lo_size * 16;
+            if state.eq_lo_cap < need_lo {
+                if state.eq_lo_cap > 0 {
+                    gpu.release(state.eq_lo_buf);
+                }
+                state.eq_lo_buf = gpu.new_buffer(need_lo).ok()?;
+                state.eq_lo_cap = need_lo;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_lo_scaled.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_lo_buf),
+                need_lo,
+            );
+            let need_hi = hi_size * 16;
+            if state.eq_hi_cap < need_hi {
+                if state.eq_hi_cap > 0 {
+                    gpu.release(state.eq_hi_buf);
+                }
+                state.eq_hi_buf = gpu.new_buffer(need_hi).ok()?;
+                state.eq_hi_cap = need_hi;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_hi.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_hi_buf),
+                need_hi,
+            );
+            if state.counts_cap < counts.len() {
+                if state.counts_cap > 0 {
+                    gpu.release(state.counts_buf);
+                }
+                state.counts_buf = gpu.new_buffer(counts.len()).ok()?;
+                state.counts_cap = counts.len();
+            }
+            std::ptr::copy_nonoverlapping(
+                counts.as_ptr(),
+                gpu.buffer_contents(state.counts_buf),
+                counts.len(),
+            );
+            // Sixty-four F128 per chunk (ELL = 64 lanes).
+            let need_part = hi_size * 64 * 16;
+            if state.part_cap < need_part {
+                if state.part_cap > 0 {
+                    gpu.release(state.part_buf);
+                }
+                state.part_buf = gpu.new_buffer(need_part).ok()?;
+                state.part_cap = need_part;
+            }
+            let ab_buf = zc_urm_wrap(&mut state, gpu, ab_inner).ok()?;
+            let cb = zc_urm_submit(
+                gpu,
+                &state,
+                ab_buf,
+                chunks,
+                lo_size,
+                (n_lo_and_inner - 7) as u32,
+                within_outer_mask as u32,
+                n_lo_and_inner as u32,
+            )
+            .ok()?;
+            Some(ZcURMJob {
+                cb,
+                chunks,
+                calibration,
+                lo_size,
+                n_lo: (n_lo_and_inner - 7) as u32,
+                mask: within_outer_mask as u32,
+                n_lo_and_inner: n_lo_and_inner as u32,
+                submitted: std::time::Instant::now(),
+            })
+        }
+    }
+
+    /// Drain the arm. During calibration `cpu_partials` must hold the CPU's
+    /// full per-chunk partial vector and `cpu_wall_ms` the wall of the full
+    /// CPU sweep that produced it (per-chunk cost denominator).
+    pub(crate) fn zc_urm_wait(
+        job: ZcURMJob,
+        cpu_partials: Option<&[[F128; 64]]>,
+        cpu_wall_ms: f64,
+        hi_size: usize,
+    ) -> ZcURMResult {
+        use std::sync::atomic::Ordering;
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return ZcURMResult::Failed,
+        };
+        let poison = |cb: Id| {
+            ZC_URM_POISONED.store(true, Ordering::Relaxed);
+            ZC_URM_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            ZcURMResult::Failed
+        };
+        unsafe {
+            // The CPU worker reaches this join after finishing its own share
+            // of the split, so the GPU is normally already complete (first
+            // status poll, zero cost) or within a hair of it.
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+                return poison(job.cb);
+            }
+            let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+            let state_mutex = match zc_urm_state() {
+                Some(s) => s,
+                None => return poison(job.cb),
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    // The launching section is not unwind-atomic (see the
+                    // zc-r2 launch note): in-flight state may be torn, so
+                    // fail the job - the caller CPU-redoes the prefix.
+                    note_poisoned_lock("zc-urm wait", false);
+                    return poison(job.cb);
+                }
+            };
+            let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
+            let mut out: Vec<[F128; 64]> = Vec::with_capacity(job.chunks);
+            for c in 0..job.chunks {
+                let mut slot = [F128::ZERO; 64];
+                for lane in 0..64 {
+                    slot[lane] = *parts.add(c * 64 + lane);
+                }
+                out.push(slot);
+            }
+            if !job.calibration {
+                gpu.release(job.cb);
+                if super::gpu_zc_urm_debug() {
+                    eprintln!(
+                        "[zc-urm] timed prefix {}/{} chunks: gpu={first_wall:.2}ms                          cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms",
+                        job.chunks,
+                        hi_size,
+                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                return ZcURMResult::Prefix(out);
+            }
+
+            // ---- Calibration (untimed warmup prove, once per process) ----
+            let Some(cpu_all) = cpu_partials else {
+                return poison(job.cb);
+            };
+            // Target-machine equality oracle before anything else: the GPU
+            // probe partials must equal the CPU's own values bit-for-bit.
+            for c in 0..job.chunks {
+                if out[c] != cpu_all[c] {
+                    if super::gpu_zc_urm_debug() {
+                        eprintln!(
+                            "[zc-urm] CALIBRATION MISMATCH at chunk {c}: gpu={:?}                              cpu={:?} - poisoned",
+                            out[c], cpu_all[c]
+                        );
+                    }
+                    return poison(job.cb);
+                }
+            }
+            // Ramp-robust GPU pricing: replay the probe back-to-back to a
+            // plateau (>=3 replays, stop when a replay stops improving the
+            // best seen by >5%), price from the minimum wall. Budget 5.
+            let mut walls = [0.0f64; 5];
+            walls[0] = first_wall.max(0.0);
+            let mut n_walls = usize::from(walls[0] > 0.0);
+            let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
+            gpu.release(job.cb);
+            if let Some(&(_, _, ab_buf)) = state.wraps.first() {
+                while n_walls < walls.len() {
+                    let Ok(cb2) = zc_urm_submit(
+                        gpu,
+                        &state,
+                        ab_buf,
+                        job.chunks,
+                        job.lo_size,
+                        job.n_lo,
+                        job.mask,
+                        job.n_lo_and_inner,
+                    ) else {
+                        break;
+                    };
+                    let w = if gpu.wait_cb(cb2).is_ok() {
+                        zc_fold_gpu_wall_ms(gpu, cb2)
+                    } else {
+                        0.0
+                    };
+                    gpu.release(cb2);
+                    if w <= 0.0 {
+                        break;
+                    }
+                    walls[n_walls] = w;
+                    n_walls += 1;
+                    let prev_min = w_min;
+                    w_min = w_min.min(w);
+                    if n_walls >= 3 && w > 0.95 * prev_min {
+                        break;
+                    }
+                }
+            }
+            drop(state);
+            let u_gpu = if n_walls > 0 && w_min < f64::MAX {
+                w_min / job.chunks as f64
+            } else {
+                f64::INFINITY
+            };
+            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+                let measured = u_gpu / u_cpu;
+                let ratio = zc_urm_forced_ratio().unwrap_or(measured);
+                let g = zc_urm_gate_share(ratio, hi_size);
+                if super::gpu_zc_urm_debug() {
+                    eprintln!("[zc-urm] gate replay walls: {:?}", &walls[..n_walls]);
+                    eprintln!(
+                        "[zc-urm] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk                          ratio={:.3} -> share {g}/{hi_size}",
+                        u_gpu / u_cpu,
+                    );
+                }
+                g
+            } else {
+                0
+            };
+            ZC_URM_TUNED.store(share, Ordering::Relaxed);
+            ZcURMResult::Calibrated
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Zerocheck first-tail-round (T3) compact-reconstruction products GPU
     // arm (see `ENV_NO_GPU_ZC_T3`).
     //
@@ -12176,6 +12945,10 @@ pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{stage_zc_r2_idle_fill, zc_r2_idle_fill_viable};
+/// Zerocheck round-one AB URM products GPU arm (see `ENV_NO_GPU_ZC_URM`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{ZcURMJob, ZcURMResult, launch_zc_urm_products, zc_urm_wait};
 
 /// Zerocheck first-tail-round products GPU arm (see `ENV_NO_GPU_ZC_T3`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -12285,6 +13058,7 @@ mod imp {
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12561,6 +13335,7 @@ mod tests {
     /// truncation being impossible — instead test single layers via a
     /// dedicated plan. Here we simply compare full transforms; the dedicated
     /// single-layer test below pins per-layer exactness.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_full_ntt_matches_cpu_small_shapes() {
         for (log_d, start_layer) in [(6usize, 1usize), (7, 1), (8, 2), (9, 0), (10, 1)] {
@@ -12831,6 +13606,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_single_layers_match_cpu() {
         // Exercise every fused width f=1..4 and both shallow and deep layers
@@ -12913,6 +13689,7 @@ mod tests {
         assert_eq!(data, expect, "GPU full NTT mismatch at ranked shape");
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_merkle_matches_cpu_small() {
         for log_leaves in [0usize, 1, 4, 8, 10] {
@@ -14101,6 +14878,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// memory of a page-multiple length. Copying 512 MiB instead is not an
     /// option, so a scratch allocator that stopped returning page-aligned
     /// blocks would silently disable the GPU fold. Pin that here.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn ranked_lincheck_stripe_is_wrappable_without_a_copy() {
         const PAGE: usize = 16384;
@@ -14118,6 +14896,585 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// it), including padded pairs. Exercises calibration (whose internal
     /// equality check must pass and publish a share without poisoning) and
     /// the timed prefix path.
+    /// Round-one AB URM products arm oracle: the GPU's per-chunk 64-lane
+    /// partials must equal an independent scalar reference bit-for-bit, and
+    /// the production `round1_shift_reduce_ab_packed_padded_with_precomputed`
+    /// must produce identical output with the arm off vs a forced large
+    /// share (skip + merge + fold semantics). Exercises calibration
+    /// (internal equality oracle + share publication without poisoning) and
+    /// the timed prefix path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_zc_urm_products_match_cpu_oracle() {
+        use crate::field::PHI_8_TABLE;
+        use crate::zerocheck::univariate_skip::SplitEqGhash;
+        use crate::zerocheck::univariate_skip_optimized::{
+            medium_challenges_ghash, precompute_round1_ab_inner_packed_padded,
+            round1_shift_reduce_ab_packed_padded_with_precomputed, small_challenges_ghash,
+        };
+        use crate::zerocheck::PaddingSpec;
+        fn xs(rng: &mut u64) -> u64 {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng
+        }
+        fn rand_f128(rng: &mut u64) -> F128 {
+            F128 { lo: xs(rng), hi: xs(rng) }
+        }
+        let mut rng = 0x9E37_7B97_F4A7_C15Du64;
+
+        // m = 26 ranked-family geometry with fold4_n_hi = 5: n_lo = 8
+        // (lo_size 256), hi_size 32, 8 MiB ab_inner. Production uses n_hi=7
+        // at m=32 (lo_size 4096, hi_size 128) - same kernel, same math.
+        let m = 26usize;
+        let k_skip = 6usize;
+        unsafe {
+            std::env::set_var("FLOCK_EXPERIMENTAL_FOLD4_N_HI", "5");
+        }
+        // Padding with a real skip hole: half the within-window positions
+        // are all-zero (no data), the other half carry 16 live b_med rows.
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 8000,
+        };
+        let total_bytes = (1usize << m) / 8;
+        let mut a_packed = vec![0u8; total_bytes];
+        let mut b_packed = vec![0u8; total_bytes];
+        for v in a_packed.iter_mut() {
+            *v = (xs(&mut rng) & 0xff) as u8;
+        }
+        for v in b_packed.iter_mut() {
+            *v = (xs(&mut rng) & 0xff) as u8;
+        }
+        let inv_table = crate::ntt::inv_table::InvNttTableByteSingleGf8::cached_standard_k6();
+        let ab_inner = precompute_round1_ab_inner_packed_padded(
+            &a_packed,
+            &b_packed,
+            m,
+            k_skip,
+            inv_table,
+            &padding,
+        );
+        let ab_bytes = ab_inner.as_bytes();
+        assert_eq!(ab_bytes.len(), total_bytes);
+
+        // r in the production layout: k_skip sampled, fixed small/medium
+        // constants, sampled outer.
+        let mut r = vec![F128::ZERO; m];
+        for v in r.iter_mut() {
+            *v = rand_f128(&mut rng);
+        }
+        r[6..9].copy_from_slice(&small_challenges_ghash());
+        r[9..13].copy_from_slice(&medium_challenges_ghash());
+
+        // ---- Function-level oracle: arm off vs forced large share ----
+        let expect_cpu = {
+            unsafe {
+                std::env::set_var("FLOCK_NO_GPU_ZC_URM", "1");
+            }
+            let out = round1_shift_reduce_ab_packed_padded_with_precomputed(
+                &ab_inner,
+                m,
+                k_skip,
+                &r,
+                &padding,
+            );
+            unsafe {
+                std::env::remove_var("FLOCK_NO_GPU_ZC_URM");
+            }
+            out
+        };
+        assert_eq!(expect_cpu.len(), 64);
+        imp::zc_urm_test_reset();
+        imp::zc_urm_test_set_share(30); // 30/32 chunks on the GPU
+        let expect_gpu = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &ab_inner,
+            m,
+            k_skip,
+            &r,
+            &padding,
+        );
+        assert_eq!(
+            expect_cpu, expect_gpu,
+            "function-level merge must be bit-identical to the all-CPU sweep"
+        );
+
+        // ---- Per-chunk oracle: calibration + timed prefix ----
+        // Build the launch inputs exactly as the production function does.
+        let eq = SplitEqGhash::with_n_hi(&r[13..], 5);
+        let n_lo = eq.n_lo;
+        let n_lo_and_inner = eq.n_lo + 7;
+        assert_eq!(n_lo, 8);
+        let eq_lo_scaled: Vec<F128> = eq.lo.clone();
+        // Mirror `build_b_med_counts` for this padding (public logic:
+        // STRIDE 2^13 bits, B_MED_WINDOW 2^9 bits, max 16 rows).
+        let stride = 1usize << 13;
+        let window = 1usize << 9;
+        let within_outer_bits = padding.k_log - k_skip - 7;
+        let within_outer_count = 1usize << within_outer_bits;
+        let within_outer_mask = within_outer_count - 1;
+        let useful = padding.useful_bits_per_block;
+        let counts: Vec<u8> = (0..within_outer_count)
+            .map(|w| {
+                let block_start = w * stride;
+                if block_start >= useful {
+                    0u8
+                } else {
+                    let bits_left = useful - block_start;
+                    let processed = bits_left.div_ceil(window);
+                    processed.min(16) as u8
+                }
+            })
+            .collect();
+        assert_eq!(counts, vec![16u8, 0u8]);
+
+        // Independent scalar reference partials (straight field ops, no
+        // NEON kernel, no cached convert table).
+        let convert: Vec<F128> = {
+            let mut gamma = [F128::ZERO; 16];
+            gamma[0] = F128::ONE;
+            for b in 1..16 {
+                gamma[b] = crate::field::mul_by_x(gamma[b - 1]);
+            }
+            (0..16)
+                .flat_map(|b| (0..256).map(move |v| gamma[b] * PHI_8_TABLE[v]))
+                .collect()
+        };
+        assert_eq!(convert.len(), 16 * 256);
+        let lo_size = 1usize << n_lo;
+        let hi_size = 1usize << eq.n_hi;
+        let mut expected: Vec<[F128; 64]> = Vec::with_capacity(hi_size);
+        for x_hi in 0..hi_size {
+            let mut partial = [F128::ZERO; 64];
+            for x_lo in 0..lo_size {
+                let x_outer = x_lo | (x_hi << n_lo);
+                let n_b_med = counts[x_outer & within_outer_mask] as usize;
+                if n_b_med == 0 {
+                    continue;
+                }
+                let chunk_base = ((x_lo << 7) | (x_hi << n_lo_and_inner)) * 8;
+                for b in 0..n_b_med {
+                    let row_base = chunk_base + b * 64;
+                    for lane in 0..64 {
+                        let byte = ab_bytes[row_base + lane] as usize;
+                        partial[lane] += convert[b * 256 + byte] * eq_lo_scaled[x_lo];
+                    }
+                }
+            }
+            for lane in 0..64 {
+                partial[lane] *= eq.hi[x_hi];
+            }
+            expected.push(partial);
+        }
+
+        // Calibration probe: internal equality oracle + share publication.
+        imp::zc_urm_test_reset();
+        let job = imp::launch_zc_urm_products(
+            ab_bytes,
+            &eq_lo_scaled,
+            &eq.hi,
+            &convert,
+            within_outer_mask,
+            &counts,
+            lo_size,
+            hi_size,
+            n_lo_and_inner,
+        )
+        .expect("calibration launch must succeed on real Metal");
+        assert!(job.is_calibration());
+        assert_eq!(job.cpu_split(), 0);
+        let res = imp::zc_urm_wait(job, Some(&expected), 50.0, hi_size);
+        assert!(matches!(res, imp::ZcURMResult::Calibrated));
+        let (tuned, poisoned) = imp::zc_urm_test_state();
+        assert!(!poisoned, "probe partials must equal CPU partials bit-for-bit");
+        assert_ne!(tuned, usize::MAX, "calibration must publish a share");
+
+        // Timed prefix path at a forced share.
+        imp::zc_urm_test_set_share(hi_size / 2);
+        let job2 = imp::launch_zc_urm_products(
+            ab_bytes,
+            &eq_lo_scaled,
+            &eq.hi,
+            &convert,
+            within_outer_mask,
+            &counts,
+            lo_size,
+            hi_size,
+            n_lo_and_inner,
+        )
+        .expect("timed launch must succeed");
+        assert!(!job2.is_calibration());
+        let prefix = job2.cpu_split();
+        assert_eq!(prefix, hi_size / 2);
+        match imp::zc_urm_wait(job2, None, 0.0, hi_size) {
+            imp::ZcURMResult::Prefix(vals) => {
+                assert_eq!(vals.len(), prefix);
+                assert_eq!(
+                    &vals[..],
+                    &expected[..prefix],
+                    "prefix partials bit-exact per chunk"
+                );
+            }
+            _ => panic!("timed drain must return prefix partials"),
+        }
+        imp::zc_urm_test_reset();
+        unsafe {
+            std::env::remove_var("FLOCK_EXPERIMENTAL_FOLD4_N_HI");
+        }
+    }
+
+    /// The MSL kernel's exact per-thread indexing and arithmetic, ported to
+    /// pure Rust and compared against an independent scalar reference —
+    /// proving the shader logic (row_base, lane mapping, nibble-table layout,
+    /// partial layout, per-chunk eq_hi weighting) WITHOUT Metal. The
+    /// macos-gated oracle `gpu_zc_urm_products_match_cpu_oracle` then only
+    /// has to prove that the Metal runtime executes this logic correctly.
+    /// Runs on every platform (fixture is deterministic; geometry m=26 /
+    /// fold4_n_hi=5 identical to the macos oracle).
+    #[test]
+    fn zc_urm_kernel_logic_matches_scalar_reference() {
+        use crate::field::PHI_8_TABLE;
+        use crate::zerocheck::univariate_skip::SplitEqGhash;
+        use crate::zerocheck::univariate_skip_optimized::{
+            precompute_round1_ab_inner_packed_padded,
+        };
+        use crate::zerocheck::PaddingSpec;
+        fn xs(rng: &mut u64) -> u64 {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng
+        }
+        fn rand_f128(rng: &mut u64) -> F128 {
+            F128 { lo: xs(rng), hi: xs(rng) }
+        }
+        let mut rng = 0x9E37_7B97_F4A7_C15Du64;
+
+        let m = 26usize;
+        let k_skip = 6usize;
+        unsafe {
+            std::env::set_var("FLOCK_EXPERIMENTAL_FOLD4_N_HI", "5");
+        }
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 8000,
+        };
+        let total_bytes = (1usize << m) / 8;
+        let mut a_packed = vec![0u8; total_bytes];
+        let mut b_packed = vec![0u8; total_bytes];
+        for v in a_packed.iter_mut() {
+            *v = (xs(&mut rng) & 0xff) as u8;
+        }
+        for v in b_packed.iter_mut() {
+            *v = (xs(&mut rng) & 0xff) as u8;
+        }
+        let inv_table = crate::ntt::inv_table::InvNttTableByteSingleGf8::cached_standard_k6();
+        let ab_inner = precompute_round1_ab_inner_packed_padded(
+            &a_packed,
+            &b_packed,
+            m,
+            k_skip,
+            inv_table,
+            &padding,
+        );
+        let ab_bytes = ab_inner.as_bytes();
+        let mut r = vec![F128::ZERO; m];
+        for v in r.iter_mut() {
+            *v = rand_f128(&mut rng);
+        }
+        r[6..9].copy_from_slice(&crate::zerocheck::univariate_skip_optimized::small_challenges_ghash());
+        r[9..13].copy_from_slice(&crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash());
+
+        let eq = SplitEqGhash::with_n_hi(&r[13..], 5);
+        let n_lo = eq.n_lo;
+        let n_lo_and_inner = eq.n_lo + 7;
+        assert_eq!(n_lo, 8);
+        let eq_lo_scaled: Vec<F128> = eq.lo.clone();
+        let stride = 1usize << 13;
+        let window = 1usize << 9;
+        let within_outer_bits = padding.k_log - k_skip - 7;
+        let within_outer_count = 1usize << within_outer_bits;
+        let within_outer_mask = within_outer_count - 1;
+        let useful = padding.useful_bits_per_block;
+        let counts: Vec<u8> = (0..within_outer_count)
+            .map(|w| {
+                let block_start = w * stride;
+                if block_start >= useful {
+                    0u8
+                } else {
+                    let bits_left = useful - block_start;
+                    let processed = bits_left.div_ceil(window);
+                    processed.min(16) as u8
+                }
+            })
+            .collect();
+        let convert: Vec<F128> = {
+            let mut gamma = [F128::ZERO; 16];
+            gamma[0] = F128::ONE;
+            for b in 1..16 {
+                gamma[b] = crate::field::mul_by_x(gamma[b - 1]);
+            }
+            (0..16)
+                .flat_map(|b| (0..256).map(move |v| gamma[b] * PHI_8_TABLE[v]))
+                .collect()
+        };
+        let lo_size = 1usize << n_lo;
+        let hi_size = 1usize << eq.n_hi;
+
+        // Independent scalar reference (one lane per output byte).
+        let mut expected: Vec<[F128; 64]> = Vec::with_capacity(hi_size);
+        for x_hi in 0..hi_size {
+            let mut partial = [F128::ZERO; 64];
+            for x_lo in 0..lo_size {
+                let x_outer = x_lo | (x_hi << n_lo);
+                let n_b_med = counts[x_outer & within_outer_mask] as usize;
+                if n_b_med == 0 {
+                    continue;
+                }
+                let chunk_base = ((x_lo << 7) | (x_hi << n_lo_and_inner)) * 8;
+                for b in 0..n_b_med {
+                    let row_base = chunk_base + b * 64;
+                    for lane in 0..64 {
+                        let byte = ab_bytes[row_base + lane] as usize;
+                        partial[lane] += convert[b * 256 + byte] * eq_lo_scaled[x_lo];
+                    }
+                }
+            }
+            for lane in 0..64 {
+                partial[lane] *= eq.hi[x_hi];
+            }
+            expected.push(partial);
+        }
+
+        // Sanity: the clmul+reduce port must equal the field's Mul on a
+        // fixed random pair, else the emulation harness itself is broken.
+        let xx = F128 { lo: 0x0123_4567_89ab_cdef, hi: 0xfedc_ba98_7654_3210 };
+        let yy = F128 { lo: 0x0f0f_0f0f_0f0f_0f0f, hi: 0x1234_5678_9abc_def0 };
+        assert_eq!(
+            zc_urm_gf_reduce_test(zc_urm_clmul128_test(xx, yy)),
+            xx * yy,
+            "clmul/reduce port must equal field Mul"
+        );
+        // Broader: 2000 random pairs (catches any partial-product overlap
+        // bug the single pair misses).
+        let mut rng2 = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || {
+            rng2 ^= rng2 << 13;
+            rng2 ^= rng2 >> 7;
+            rng2 ^= rng2 << 17;
+            rng2
+        };
+        for _ in 0..2000 {
+            let a = F128 { lo: rnd(), hi: rnd() };
+            let b = F128 { lo: rnd(), hi: rnd() };
+            assert_eq!(
+                zc_urm_gf_reduce_test(zc_urm_clmul128_test(a, b)),
+                a * b,
+                "clmul/reduce port mismatch on {:?} * {:?}",
+                a,
+                b,
+            );
+        }
+
+        // MSL kernel port: exactly the shader's thread/loop indexing.
+        let emu = zc_urm_emulate(
+            ab_bytes,
+            &eq_lo_scaled,
+            &eq.hi,
+            &convert,
+            &counts,
+            lo_size,
+            hi_size,
+            n_lo_and_inner,
+            n_lo as u32,
+            within_outer_mask as u32,
+            hi_size,
+        );
+        for (c, (e, r)) in emu.iter().zip(expected.iter()).enumerate() {
+            for lane in 0..64 {
+                if e[lane] != r[lane] {
+                    panic!(
+                        "chunk {c} lane {lane}: emu={:?} scalar={:?}\n\
+                         (emu lo^scalar lo = {:016x}, hi^ = {:016x})",
+                        e[lane],
+                        r[lane],
+                        e[lane].lo ^ r[lane].lo,
+                        e[lane].hi ^ r[lane].hi,
+                    );
+                }
+            }
+        }
+        unsafe {
+            std::env::remove_var("FLOCK_EXPERIMENTAL_FOLD4_N_HI");
+        }
+    }
+
+    /// Faithful Rust port of the `zc_urm_products` MSL kernel's per-thread
+    /// logic (see `ZC_URM_MSL_SOURCE`): 256 threads per hi-chunk, 16 threads
+    /// per lane-group (x_outer_lo = k*16 + xol0), b_med row loop with the
+    /// nibble-decomposed b_med-scaled convert tables, emulated-clmul eq
+    /// weighting, eq_hi chunk weight, flat partial layout
+    /// `(tgid*16 + lane_g)*4 + q`.
+    #[allow(clippy::too_many_arguments)]
+    fn zc_urm_emulate(
+        ab: &[u8],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        convert: &[F128],
+        counts: &[u8],
+        lo_size: usize,
+        hi_size: usize,
+        n_lo_and_inner: usize,
+        n_lo: u32,
+        mask: u32,
+        chunks: usize,
+    ) -> Vec<[F128; 64]> {
+        let mut nib = [F128::ZERO; 512];
+        for b in 0..16 {
+            for n in 0..16 {
+                nib[b * 32 + n] = convert[b * 256 + n];
+                nib[b * 32 + 16 + n] = convert[b * 256 + (n << 4)];
+            }
+        }
+        let xpt = lo_size / 16;
+        let mut flat = vec![F128::ZERO; chunks * 64];
+        let mut flat2 = vec![F128::ZERO; 256 * 4];
+        for tgid in 0..chunks {
+            let base = tgid << (n_lo_and_inner + 1);
+            // Pass 1 (all threads, mirroring the MSL compute + barrier):
+            // per-thread full-slice partials, stored to `flat2`.
+            for lid in 0..256u16 {
+                let lane_g = (lid & 15) as usize;
+                let xol0 = (lid >> 4) as usize;
+                let mut p = [F128::ZERO; 4];
+                for k in 0..xpt {
+                    let x_lo = k * 16 + xol0;
+                    let x_outer = x_lo | (tgid << n_lo);
+                    let n_b_med = counts[x_outer & mask as usize] as usize;
+                    let mut s = [F128::ZERO; 4];
+                    // The MSL kernel addresses `ab` as `device const uint*`
+                    // (4-byte units): `base = tgid << (n_lo_and_inner+1)` is
+                    // the chunk base in uint units, `x_lo << 8` the per-x_lo
+                    // region (16 rows x 64 B = 1024 B = 256 uint), `lane_g`
+                    // the byte-quad group, `b << 4` the row. Mirror exactly.
+                    let row_base = base + (x_lo << 8) + lane_g;
+                    for b in 0..n_b_med {
+                        let off = (row_base + (b << 4)) * 4;
+                        let w = u32::from_le_bytes([
+                            ab[off],
+                            ab[off + 1],
+                            ab[off + 2],
+                            ab[off + 3],
+                        ]);
+                        let nb = b * 32;
+                        s[0] += nib[nb + (w & 15) as usize];
+                        s[0] += nib[nb + 16 + ((w >> 4) & 15) as usize];
+                        s[1] += nib[nb + ((w >> 8) & 15) as usize];
+                        s[1] += nib[nb + 16 + ((w >> 12) & 15) as usize];
+                        s[2] += nib[nb + ((w >> 16) & 15) as usize];
+                        s[2] += nib[nb + 16 + ((w >> 20) & 15) as usize];
+                        s[3] += nib[nb + ((w >> 24) & 15) as usize];
+                        s[3] += nib[nb + 16 + ((w >> 28) & 15) as usize];
+                    }
+                    let e = eq_lo[x_lo];
+                    for q in 0..4 {
+                        p[q] += zc_urm_gf_reduce_test(zc_urm_clmul128_test(s[q], e));
+                    }
+                }
+                let b2 = lid as usize * 4;
+                for q in 0..4 {
+                    flat2[b2 + q] = p[q];
+                }
+            }
+            // Pass 2 (leaders only, mirroring the kernel's post-barrier
+            // reduce + eq_hi weight + scatter).
+            for lane_g in 0..16usize {
+                let mut v = [F128::ZERO; 4];
+                for q in 0..4 {
+                    v[q] = flat2[lane_g * 4 + q];
+                    for j in 1..16 {
+                        v[q] += flat2[(j * 16 + lane_g) * 4 + q];
+                    }
+                }
+                let eh = eq_hi[tgid];
+                let out = (tgid * 16 + lane_g) * 4;
+                for q in 0..4 {
+                    flat[out + q] = zc_urm_gf_reduce_test(zc_urm_clmul128_test(v[q], eh));
+                }
+            }
+        }
+        let mut out = vec![[F128::ZERO; 64]; chunks];
+        for c in 0..chunks {
+            out[c].copy_from_slice(&flat[c * 64..c * 64 + 64]);
+        }
+        out
+    }
+
+    // Rust mirrors of the MSL emulated-clmul + GF(2^128) reduction (the
+    // oracle-proven arithmetic from the zc-r2 kernel).
+    fn zc_urm_clmul32_test(a: u32, b: u32) -> u64 {
+        const M0: u64 = 0x1111_1111_1111_1111;
+        const M1: u64 = 0x2222_2222_2222_2222;
+        const M2: u64 = 0x4444_4444_4444_4444;
+        const M3: u64 = 0x8888_8888_8888_8888;
+        let (a0, a1, a2, a3) = (
+            (a & 0x1111_1111) as u64,
+            (a & 0x2222_2222) as u64,
+            (a & 0x4444_4444) as u64,
+            (a & 0x8888_8888) as u64,
+        );
+        let (b0, b1, b2, b3) = (
+            (b & 0x1111_1111) as u64,
+            (b & 0x2222_2222) as u64,
+            (b & 0x4444_4444) as u64,
+            (b & 0x8888_8888) as u64,
+        );
+        let r0 = (a0 * b0 ^ a1 * b3 ^ a2 * b2 ^ a3 * b1) & M0;
+        let r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b3 ^ a3 * b2) & M1;
+        let r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0 ^ a3 * b3) & M2;
+        let r3 = (a0 * b3 ^ a1 * b2 ^ a2 * b1 ^ a3 * b0) & M3;
+        r0 | r1 | r2 | r3
+    }
+
+    fn zc_urm_clmul64_test(a: u64, b: u64) -> (u64, u64) {
+        let al = a as u32;
+        let ah = (a >> 32) as u32;
+        let bl = b as u32;
+        let bh = (b >> 32) as u32;
+        let p_lo = zc_urm_clmul32_test(al, bl);
+        let p_hi = zc_urm_clmul32_test(ah, bh);
+        let p_mid = zc_urm_clmul32_test(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
+        (p_lo ^ (p_mid << 32), p_hi ^ (p_mid >> 32))
+    }
+
+    fn zc_urm_clmul128_test(a: F128, b: F128) -> [u64; 4] {
+        let al = (a.lo as u32) as u64 | ((a.lo >> 32) as u64) << 32;
+        let ah = (a.hi as u32) as u64 | ((a.hi >> 32) as u64) << 32;
+        let bl = (b.lo as u32) as u64 | ((b.lo >> 32) as u64) << 32;
+        let bh = (b.hi as u32) as u64 | ((b.hi >> 32) as u64) << 32;
+        let (p0l, p0h) = zc_urm_clmul64_test(al, bl);
+        let (p2l, p2h) = zc_urm_clmul64_test(ah, bh);
+        let (mut pml, mut pmh) = zc_urm_clmul64_test(al ^ ah, bl ^ bh);
+        pml ^= p0l ^ p2l;
+        pmh ^= p0h ^ p2h;
+        [p0l, p0h ^ pml, p2l ^ pmh, p2h]
+    }
+
+    fn zc_urm_gf_reduce_test(p: [u64; 4]) -> F128 {
+        let h0 = p[2];
+        let h1 = p[3];
+        let t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+        let t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+            ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+        let ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+        let t0 = t0 ^ ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+        let l0 = p[0] ^ t0;
+        let l1 = p[1] ^ t1;
+        F128 { lo: l0, hi: l1 }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_zc_r2_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
@@ -14255,6 +15612,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// anchors+deltas compact representation with an F2-linear scaled
     /// table. Exercises calibration (internal equality oracle + share
     /// publication without poisoning) and the timed prefix path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_zc_t3_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
@@ -14367,6 +15725,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// per-chunk reduced partials must equal the CPU's fused round
     /// (`fold_pairs` + message) bit-for-bit. Exercises calibration and the
     /// timed prefix path on real Metal.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_zc_loop_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
