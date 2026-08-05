@@ -29,3 +29,13 @@ pub mod seed_pipe;
 static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
 // dispersion-resample marker 172525636-o
+
+// welttowelt disclosed liger-cadence redraw 1 on tip ac86f16 (bar 1751855.93887911; prior: edaa3fee:1738715.27)
+
+// welttowelt disclosed liger-cadence redraw 2 on tip ac86f16 (bar 1751855.93887911; prior: edaa3fee:1738715.27, d1:1738715.26986406)
+
+// welttowelt disclosed liger-cadence redraw 3 on tip ac86f16 (bar 1751855.93887911; prior: edaa3fee:1738715.27, d1:1738715.26986406, d2:1739638.10352544)
+
+// welttowelt disclosed liger-cadence redraw 4 on tip ac86f16 (bar 1751855.93887911; prior: edaa3fee:1738715.27, d1:1738715.26986406, d2:1739638.10352544, d3:1741081.4077234)
+
+// welttowelt disclosed liger-cadence redraw 5 on tip ac86f16 (bar 1751855.93887911; prior: edaa3fee:1738715.27, d1:1738715.26986406, d2:1739638.10352544, d3:1741081.4077234, d4:1741081.4077234)
