@@ -12672,3 +12672,4 @@ mod tests {
 // RealAdii sample 7 on c52fba6.
 // RealAdii sample 8 on c52fba6.
 // RealAdii sample 9 on c52fba6.
+// welttowelt disclosed cadence resample 12 of the record tree on c6ca70d (previous draw: 1643870.58039645; zero-diff marker per board protocol).
