@@ -1195,6 +1195,8 @@ const RANKED_EXACT_TUNE_REQUESTED: u8 = 1;
 const RANKED_EXACT_TUNE_SATISFIED: u8 = 2;
 static RANKED_EXACT_TUNE_STATE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(RANKED_EXACT_TUNE_IDLE);
+static RANKED_EXACT_TUNE_WALL_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn request_ranked_exact_tune_in(state: &std::sync::atomic::AtomicU8) -> bool {
     state
@@ -1240,6 +1242,15 @@ pub fn ranked_exact_contention_tune_pending() -> bool {
     ranked_exact_tune_pending_in(&RANKED_EXACT_TUNE_STATE)
 }
 
+fn take_ranked_exact_contention_tune_wall_ms() -> f64 {
+    let bits = RANKED_EXACT_TUNE_WALL_BITS.swap(0, std::sync::atomic::Ordering::AcqRel);
+    if std::env::var_os("FLOCK_NO_ZC_FOLD_TUNE_HEAD_CORRECTION").is_some() {
+        0.0
+    } else {
+        f64::from_bits(bits)
+    }
+}
+
 fn satisfy_ranked_exact_contention_tune() {
     let _ = satisfy_ranked_exact_tune_in(&RANKED_EXACT_TUNE_STATE);
 }
@@ -1251,8 +1262,8 @@ fn claim_ranked_exact_contention_tune() -> bool {
 #[cfg(test)]
 mod ranked_exact_tune_lifecycle_tests {
     use super::{
-        RANKED_EXACT_TUNE_IDLE, ranked_exact_tune_pending_in, request_ranked_exact_tune_in,
-        satisfy_ranked_exact_tune_in,
+        RANKED_EXACT_TUNE_IDLE, correct_one_time_tune_head_ms, ranked_exact_tune_pending_in,
+        request_ranked_exact_tune_in, satisfy_ranked_exact_tune_in,
     };
     use std::sync::atomic::AtomicU8;
 
@@ -1275,6 +1286,16 @@ mod ranked_exact_tune_lifecycle_tests {
         assert!(!ranked_exact_tune_pending_in(&state));
         assert!(!satisfy_ranked_exact_tune_in(&state));
     }
+
+    #[test]
+    fn one_time_tune_wall_is_removed_and_clamped() {
+        assert_eq!(correct_one_time_tune_head_ms(30.0, 12.5), 17.5);
+        assert_eq!(correct_one_time_tune_head_ms(10.0, 12.5), 0.0);
+    }
+}
+
+fn correct_one_time_tune_head_ms(head_ms: f64, tune_wall_ms: f64) -> f64 {
+    (head_ms - tune_wall_ms).max(0.0)
 }
 
 /// Run the one requested broad exact-contention calibration while the
@@ -1286,11 +1307,18 @@ pub fn retune_ranked_hybrid_with_exact_contention(
     cpu_tree: &[crate::merkle::Hash],
     replay_ab: impl Fn() + Sync,
 ) {
+    let started = std::time::Instant::now();
     imp::retune_ranked_hybrid_with_exact_contention(
         params,
         cpu_codeword,
         cpu_tree,
         replay_ab,
+    );
+    // The staged C-fold launched before this untimed one-shot. Remove only
+    // this wall from its headroom sample; the normal commit-arm tail remains.
+    RANKED_EXACT_TUNE_WALL_BITS.store(
+        (started.elapsed().as_secs_f64() * 1e3).to_bits(),
+        std::sync::atomic::Ordering::Release,
     );
 }
 
@@ -8589,7 +8617,10 @@ LC_KERNEL(lc_fold_stripes, 4)
                 self.claim_lo,
                 self.n_claims,
                 sample_ms,
-                head_ms,
+                super::correct_one_time_tune_head_ms(
+                    head_ms,
+                    super::take_ranked_exact_contention_tune_wall_ms(),
+                ),
                 suffix_ms,
                 self.plan.byte_fold,
             );
