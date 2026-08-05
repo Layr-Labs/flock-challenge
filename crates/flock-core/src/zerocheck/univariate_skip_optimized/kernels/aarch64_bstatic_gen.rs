@@ -348,7 +348,7 @@ static BSTATIC_ARM_LIVE: [bool; 31] = [true, true, true, true, true, true, true,
 /// which case the caller must run the generic kernel.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_lines)]
-pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
+pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool, const TRUSTED: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -369,7 +369,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
         return false;
     }
     let partials = match context {
-        StaticBContext::Prepared { partials, .. } => partials,
+        StaticBContext::Prepared { partials } => partials,
         StaticBContext::LegacyPerCall => bstatic_partials(inv_table),
     };
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -438,7 +438,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                 let b_row = b_packed.as_ptr().add(off);
                 let (m, e) = BSTATIC_MASKS[blk][$k];
                 let b_word = u64::from_le(core::ptr::read_unaligned(b_row.cast::<u64>()));
-                if (b_word & m) == e {
+                if TRUSTED || (b_word & m) == e {
                     let pp = partials[blk * 8 + $k].as_ptr();
                     #[allow(unused_mut)]
                     let mut db0 = vld1q_u8(pp);

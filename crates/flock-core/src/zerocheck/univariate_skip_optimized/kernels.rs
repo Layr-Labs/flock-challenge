@@ -74,6 +74,7 @@ pub(super) fn fast_shift_reduce_enabled() -> bool {
 
 pub(super) const AB_FAST_POLICY_PROCESS: u8 = 0;
 pub(super) const AB_FAST_POLICY_FORCE_FAST: u8 = 1;
+pub(super) const AB_FAST_POLICY_TRUSTED_BLAKE3: u8 = 2;
 
 #[inline]
 pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {

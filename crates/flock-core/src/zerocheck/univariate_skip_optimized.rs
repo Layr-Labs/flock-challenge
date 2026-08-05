@@ -687,11 +687,51 @@ pub fn precompute_round1_ab_inner_packed_padded(
     )
 }
 
+/// Ranked streamed-BLAKE3 variant. Its private caller guarantees that B came
+/// from the circuit witness builder, so the generated static-B masks do not
+/// need to be revalidated in every row.
+pub fn precompute_round1_ab_inner_packed_padded_trusted_blake3(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_with_flavor_impl::<true>(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        ab_compact_store_enabled(),
+    )
+}
+
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
 /// choices, tests compare arms byte-for-byte in one process. `nt` selects the
 /// non-temporal drain vs the incumbent cached store; `compact` selects the
 /// QS3 tail-skip vs the incumbent zero-fill of the dead skipped-`b_med` rows.
 fn precompute_round1_ab_inner_packed_padded_with_flavor(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    nt: bool,
+    compact: bool,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_with_flavor_impl::<false>(
+        a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact,
+    )
+}
+
+fn precompute_round1_ab_inner_packed_padded_with_flavor_impl<
+    const TRUSTED_BLAKE3: bool,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     m: usize,
@@ -776,33 +816,71 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
             // per-chunk OnceLock probe, temporary buffer, or per-row bounce
             // branches; the kill-switch arm retains the exact old behavior.
             if nt && ab_pre_nt_direct_enabled() {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    within_outer_mask,
-                    &b_med_counts,
-                    blake3_static_layout,
-                    static_b_context,
-                    nt,
-                    compact,
-                    n_chunks,
-                    out_bytes,
-                );
+                if TRUSTED_BLAKE3 {
+                    precompute_ab_hetero::<
+                        { kernels::AB_FAST_POLICY_TRUSTED_BLAKE3 },
+                        true,
+                    >(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        within_outer_mask,
+                        &b_med_counts,
+                        blake3_static_layout,
+                        static_b_context,
+                        nt,
+                        compact,
+                        n_chunks,
+                        out_bytes,
+                    );
+                } else {
+                    precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        within_outer_mask,
+                        &b_med_counts,
+                        blake3_static_layout,
+                        static_b_context,
+                        nt,
+                        compact,
+                        n_chunks,
+                        out_bytes,
+                    );
+                }
             } else {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    within_outer_mask,
-                    &b_med_counts,
-                    blake3_static_layout,
-                    static_b_context,
-                    nt,
-                    compact,
-                    n_chunks,
-                    out_bytes,
-                );
+                if TRUSTED_BLAKE3 {
+                    precompute_ab_hetero::<
+                        { kernels::AB_FAST_POLICY_TRUSTED_BLAKE3 },
+                        false,
+                    >(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        within_outer_mask,
+                        &b_med_counts,
+                        blake3_static_layout,
+                        static_b_context,
+                        nt,
+                        compact,
+                        n_chunks,
+                        out_bytes,
+                    );
+                } else {
+                    precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        within_outer_mask,
+                        &b_med_counts,
+                        blake3_static_layout,
+                        static_b_context,
+                        nt,
+                        compact,
+                        n_chunks,
+                        out_bytes,
+                    );
+                }
             }
         } else {
             precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
@@ -4095,6 +4173,35 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn const_one_h4_matches_scalar() {
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xC057_0A11_0000_0004);
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
+        for trial in 0..128 {
+            let a: Vec<u8> = (0..64).map(|_| rng.next_u64() as u8).collect();
+            let b = [u8::MAX; 64];
+            let mut want = [0u8; 64];
+            shift_reduce_inner_ab_scalar(
+                &a,
+                &b,
+                &table,
+                0,
+                0,
+                &mut want,
+                &mut a_col,
+                &mut b_col,
+            );
+            let mut got = [0u8; 64];
+            kernels::aarch64::shift_reduce_inner_a_only_const_b_h4(
+                &a, &table, 0, &mut got, false,
+            );
+            assert_eq!(got, want, "const-one H4 mismatch on trial {trial}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn static_b_context_gate_respects_layout_and_legacy_policy() {
         let table = make_inv_table();
         assert!(
@@ -4186,8 +4293,29 @@ mod tests {
                     );
                     out
                 };
+                let run_trusted = |b: &[u8], context| {
+                    let mut out = [0u8; 64];
+                    kernels::aarch64::shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<
+                        { kernels::AB_FAST_POLICY_TRUSTED_BLAKE3 },
+                    >(
+                        &a_packed,
+                        b,
+                        &table,
+                        0,
+                        b_med,
+                        &mut out,
+                        false,
+                        false,
+                        0,
+                        w,
+                        Some(context),
+                        false,
+                    );
+                    out
+                };
 
                 assert_eq!(run_context(&b_packed, context), run_scalar(&b_packed));
+                assert_eq!(run_trusted(&b_packed, context), run_scalar(&b_packed));
                 assert_eq!(
                     run_context(&b_packed, legacy_context),
                     run_scalar(&b_packed)
@@ -4285,18 +4413,36 @@ mod tests {
                             );
                             let mut slow = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false>(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false, false>(
                                     &a_packed, &b, &table, 0, b_med, w, context, &mut slow, false,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );
                             let mut fast = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true>(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true, false>(
                                     &a_packed, &b, &table, 0, b_med, w, context, &mut fast, true,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );
+                            if variant == 1 {
+                                let mut trusted = [0u8; 64];
+                                assert!(
+                                    kernels::aarch64::shift_reduce_inner_ab_bstatic::<true, true>(
+                                        &a_packed,
+                                        &b,
+                                        &table,
+                                        0,
+                                        b_med,
+                                        w,
+                                        context,
+                                        &mut trusted,
+                                        true,
+                                    ),
+                                    "trusted arm (w={w}, b_med={b_med}) must be live"
+                                );
+                                assert_eq!(trusted, want, "trusted bstatic differs");
+                            }
                             assert_eq!(
                                 slow, want,
                                 "incumbent bstatic drift (w={w}, b_med={b_med}, variant={variant})"
@@ -4326,25 +4472,8 @@ mod tests {
         let b_bits = rng.bits(1 << m);
         let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
         let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
-        let prepared_context = kernels::aarch64::prepare_static_b_context_with_policy(
-            &table, true, false, false,
-        )
-        .expect("prepared static-b context");
 
-        for (mask, static_a_k1, prepared) in [
-            (0x03u8, false, false),
-            (0x03, true, false),
-            (0x03, true, true),
-            (0xf0, false, false),
-        ] {
-            let mut a_mixed = a_packed.clone();
-            if static_a_k1 {
-                let a_k0 = u64::from_le_bytes(a_mixed[..N_CHUNKS].try_into().unwrap())
-                    & !0xffff_fffe_0000_0000;
-                a_mixed[..N_CHUNKS].copy_from_slice(&a_k0.to_le_bytes());
-                a_mixed[N_CHUNKS..2 * N_CHUNKS]
-                    .copy_from_slice(&0x0000_0016_0000_0080u64.to_le_bytes());
-            }
+        for mask in [0x03u8, 0xf0] {
             let mut b_mixed = b_packed.clone();
             for k in 0..8 {
                 if mask & (1 << k) != 0 {
@@ -4356,10 +4485,10 @@ mod tests {
             let mut want = [0u8; 64];
             let mut got = [0u8; 64];
             shift_reduce_inner_ab_scalar(
-                &a_mixed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
+                &a_packed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
             );
             shift_reduce_inner_ab_fused_neon_checked(
-                &a_mixed,
+                &a_packed,
                 &b_mixed,
                 &table,
                 0,
@@ -4369,13 +4498,10 @@ mod tests {
                 false,
                 mask,
                 usize::MAX,
-                prepared.then_some(prepared_context),
+                None,
                 false,
             );
-            assert_eq!(
-                got, want,
-                "mixed const-one mask {mask:#04x}, static_a_k1={static_a_k1}, prepared={prepared}"
-            );
+            assert_eq!(got, want, "mixed const-one mask {mask:#04x}");
         }
     }
 

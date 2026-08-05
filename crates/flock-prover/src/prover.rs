@@ -809,16 +809,29 @@ fn commit_with_round1_ab_precompute(
     let k_skip = zerocheck::K_SKIP;
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
+    let trusted_blake3_b = matches!(&commit_codeword, CommitCodeword::StreamedFirstPass(..))
+        && std::env::var_os("FLOCK_NO_TRUSTED_BSTATIC").is_none();
 
     let precompute_ab = || {
-        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-            a_packed,
-            b_packed,
-            pcs_params.m,
-            k_skip,
-            inv_table,
-            padding,
-        )
+        if trusted_blake3_b {
+            zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_trusted_blake3(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+            )
+        } else {
+            zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+            )
+        }
     };
     // `Blake3Setup::prove_fast` issues this ticket before call-zero witness
     // generation. A valid cache hit may satisfy it inside the commit arm;
