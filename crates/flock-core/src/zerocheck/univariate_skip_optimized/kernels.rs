@@ -490,6 +490,42 @@ pub(super) fn accumulate_convert_ab(
     portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
 }
 
+/// [`accumulate_convert_ab`] with the eq_lo mul-drain deferred into the
+/// caller's per-band [`crate::field::F256Unreduced`] accumulators (see
+/// `FLOCK_NO_EQ_LO_SCHED`). The gather phase is shared with the incumbent;
+/// only the drain changes, and reduction commutes with XOR, so the reduced
+/// band totals are bit-identical.
+#[inline]
+pub(super) fn accumulate_convert_ab_unreduced(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    eq_lo_val: super::F128,
+    partial_ab: &mut [crate::field::F256Unreduced; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
+    // every table-selected load.
+    unsafe {
+        aarch64::accumulate_convert_ab_unreduced(
+            chunk_ab_bytes,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            partial_ab,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    portable::accumulate_convert_ab_unreduced(
+        chunk_ab_bytes,
+        n_b_med,
+        convert,
+        eq_lo_val,
+        partial_ab,
+    );
+}
+
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
 /// kernel is tested against.
 ///
