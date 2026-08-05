@@ -12771,3 +12771,5 @@ mod tests {
 // RealAdii next sample on 90b93d6 (marker 22229).
 
 // angel resample r463 of the current bar tree (629d733, JH-321 zerocheck) — measurement draw 2 (bar 1764890.73).
+
+// angel resample r464 of the bar tree (199141b, JH-321 zerocheck, promoted via ec4fb1d) — measurement draw 3 (bar 1765970.69).
