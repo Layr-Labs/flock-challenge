@@ -1,4 +1,6 @@
 //! Round-1 prover message — fully optimized (shift_reduce + extract_c, scalar).
+//! Resample 9 prep: distinct comment for next lane-warm slot.
+//! Resample 8: no code delta — comment-only re-measurement slot on frontier 6875d9e.
 //!
 //! Scalar Rust implementation (no NEON). Three layered optimizations on top of
 //! the [`super::round1_extract_c`] scaffold:
