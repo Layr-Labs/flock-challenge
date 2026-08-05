@@ -456,6 +456,23 @@ fn prove_packed_padded_inner<C: Challenger>(
                     padding.useful_bits_per_block,
                     &r,
                 );
+            // ZC-window GPU idle fill (`FLOCK_NO_ZC_IDLE_FILL=1` kills):
+            // with the C fold's GPU prefix in flight, stage round two's
+            // GPU-arm window setup behind it. Round two's eq split derives
+            // from `r[k_skip+1..]` — bound above, strictly before the fold
+            // submit — and a/b are the round-one operands, so every staged
+            // input is Fiat-Shamir-available here. (The LINCHECK window's
+            // eq table is NOT: its point is the mlv bind-challenge tail,
+            // sampled only after the round messages below are observed.)
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if c_prelude.gpu_in_flight()
+                && crate::gpu_commit::zc_idle_fill_enabled()
+                && crate::gpu_commit::zc_r2_idle_fill_viable()
+            {
+                crate::zerocheck::multilinear::stage_round2_gpu_window_from_r1_challenges(
+                    a_packed, b_packed, m, k_skip, &r, padding,
+                );
+            }
             let cpu_ab = crate::pcs::commit::commit_cpu_ms();
             let t_ab = std::time::Instant::now();
             let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(

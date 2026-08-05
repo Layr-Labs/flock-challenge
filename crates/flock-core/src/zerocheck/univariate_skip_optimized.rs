@@ -1660,6 +1660,21 @@ pub(crate) struct Round1CPrelude {
     submitted: std::time::Instant,
 }
 
+impl Round1CPrelude {
+    /// Whether a GPU C-fold prefix was actually submitted — i.e. there is a
+    /// measured GPU idle window behind it worth filling (see
+    /// `gpu_commit::ENV_NO_ZC_IDLE_FILL`).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn gpu_in_flight(&self) -> bool {
+        self.gpu.is_some()
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[allow(dead_code)] // the idle-fill call site is macOS/aarch64-only
+    pub(crate) fn gpu_in_flight(&self) -> bool {
+        false
+    }
+}
+
 /// The one production shape the GPU C-fold arm is tuned and gated for
 /// (`m = 32`, `k_log = 14`). Everything else takes the exact CPU path.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -216,6 +216,33 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
     *ON
 }
 
+/// Kill switch for the zerocheck C-fold-window GPU idle fill
+/// (`FLOCK_NO_ZC_IDLE_FILL=1`, exact): the ranked ZC byte-B4 fold drains in
+/// ~5.5 ms under a ~9.7 ms CPU AB head, leaving ~4 ms of GPU idle inside the
+/// window every prove. The fill stages the round-two products arm's fixed
+/// window setup — the a/b no-copy wraps (whose first GPU touch wires up to
+/// 2 × 512 MiB of pages), the eq_lo/eq_hi uploads, the persistent buffer
+/// grows, and a small fixed-size primer dispatch of the real kernel —
+/// behind the ZC fold dispatches in a second command buffer, so those costs
+/// execute in the measured idle instead of inside the round-two window.
+///
+/// Validity: every staged input is bound BEFORE the fold submit — a/b are
+/// the round-one operands and round two's eq tables derive from the
+/// zerocheck challenge tail `r[k_skip+1..]` sampled at step 1 (the round-2
+/// fold point `z` is NOT needed: the z-dependent nibble table upload stays
+/// in the window). The primer's output lands in the partials buffer and is
+/// never read (the real dispatch rewrites every lane the drain consumes),
+/// so the fill is byte-inert by construction. The fold's join is untouched
+/// (it waits its own command buffer only); the primer is drained where its
+/// buffers are next written — the round-two launch — which finds it long
+/// complete.
+pub const ENV_NO_ZC_IDLE_FILL: &str = "FLOCK_NO_ZC_IDLE_FILL";
+
+/// Read per prove (uncached) so same-process A/B tests can toggle it.
+pub(crate) fn zc_idle_fill_enabled() -> bool {
+    !std::env::var(ENV_NO_ZC_IDLE_FILL).is_ok_and(|v| v == "1")
+}
+
 /// Kill switch for the zerocheck first-tail-round (T3 compact reconstruction)
 /// products GPU arm.
 pub const ENV_NO_GPU_ZC_T3: &str = "FLOCK_NO_GPU_ZC_T3";
@@ -8266,6 +8293,11 @@ LC_KERNEL(lc_fold_stripes, 4)
                     self.claim_lo, self.n_claims,
                 );
             }
+            if self.arm == FoldArm::Zc {
+                // Pair the fold's GPU wall and window wall with the idle-fill
+                // primer's GPU wall at its later drain (see `[zc-idle-fill]`).
+                zc_idle_fill_note_fold(gpu_ms, wall_ms);
+            }
             if self.arm == FoldArm::Lincheck {
                 // WARMUP RATIO GATE (failed.md §24 — an idle-GPU split
                 // ratio is a TARGET-MACHINE fact): the first in-process
@@ -9751,6 +9783,11 @@ kernel void zc_r2_products(
         part_cap: usize,
         /// Cached no-copy wraps of the packed witness inputs `(ptr, len, buf)`.
         wraps: Vec<(usize, usize, Id)>,
+        /// In-flight ZC-idle-fill primer command buffer (see
+        /// [`super::ENV_NO_ZC_IDLE_FILL`]); `NIL` when none. Drained (wait +
+        /// release) before anything rewrites the buffers it binds — the next
+        /// round-two launch or the next prove's staging, whichever first.
+        prefetch_cb: Id,
     }
 
     // SAFETY: the Metal pipeline and buffer handles are only touched under
@@ -9915,6 +9952,7 @@ kernel void zc_r2_products(
                 part_buf: NIL,
                 part_cap: 0,
                 wraps: Vec::new(),
+                prefetch_cb: NIL,
             })
         }
     }
@@ -10037,6 +10075,194 @@ kernel void zc_r2_products(
         Ok(buf)
     }
 
+    // -------------------------------------------------------------------
+    // ZC-window idle fill (see `super::ENV_NO_ZC_IDLE_FILL`).
+    // -------------------------------------------------------------------
+
+    /// Primer dispatch size: the round-two calibration probe's clamp floor.
+    /// Fixed (no runtime self-decision); ~0.5 ms of steady-state GPU work,
+    /// small enough that even a late fill can never spill meaningfully past
+    /// the measured ~4 ms idle into the round-two window.
+    const ZC_IDLE_FILL_PRIMER_CHUNKS: usize = 8;
+
+    /// ZC C-fold stats captured at the fold's join (f64 bits; 0 = unset):
+    /// the fold command buffer's GPU wall and the submit→drain window wall.
+    /// Read by the primer drain to emit the `[zc-idle-fill]` line.
+    static ZC_IDLE_FILL_FOLD_GPU_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    static ZC_IDLE_FILL_WINDOW_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    fn zc_idle_fill_note_fold(gpu_ms: f64, window_ms: f64) {
+        use std::sync::atomic::Ordering;
+        ZC_IDLE_FILL_FOLD_GPU_MS.store(gpu_ms.to_bits(), Ordering::Relaxed);
+        ZC_IDLE_FILL_WINDOW_MS.store(window_ms.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Drain a stashed primer: wait (long complete in the steady state),
+    /// read its GPU wall, release. Under `FLOCK_PHASE_TIMING` this emits the
+    /// idle-fill timing line pairing the primer's GPU wall with the fold
+    /// stats captured at the ZC join.
+    unsafe fn zc_r2_drain_prefetch(gpu: &Gpu, state: &mut ZcR2) {
+        use std::sync::atomic::Ordering;
+        if state.prefetch_cb.is_null() {
+            return;
+        }
+        let cb = state.prefetch_cb;
+        state.prefetch_cb = NIL;
+        let ok = unsafe { gpu.wait_cb(cb) }.is_ok();
+        let filler_gpu_ms = if ok {
+            unsafe { zc_fold_gpu_wall_ms(gpu, cb) }
+        } else {
+            0.0
+        };
+        unsafe { gpu.release(cb) };
+        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            let fold_gpu =
+                f64::from_bits(ZC_IDLE_FILL_FOLD_GPU_MS.load(Ordering::Relaxed));
+            let window =
+                f64::from_bits(ZC_IDLE_FILL_WINDOW_MS.load(Ordering::Relaxed));
+            eprintln!(
+                "[zc-idle-fill] fold-gpu={fold_gpu:.2}ms filler-gpu={filler_gpu_ms:.2}ms \
+                 window-wall={window:.2}ms"
+            );
+        }
+    }
+
+    /// Cheap pre-gate so the caller can skip the eq build when the fill
+    /// cannot stage anyway (kill switches, poisoned/disabled arm, no Metal).
+    pub(crate) fn zc_r2_idle_fill_viable() -> bool {
+        use std::sync::atomic::Ordering;
+        super::zc_idle_fill_enabled()
+            && super::gpu_zc_r2_enabled()
+            && !ZC_R2_POISONED.load(Ordering::Relaxed)
+            && ZC_R2_TUNED.load(Ordering::Relaxed) != 0
+            && gpu().is_ok()
+    }
+
+    /// Stage the round-two products arm's fixed window setup behind an
+    /// in-flight ZC C-fold: grow the persistent buffers, upload the
+    /// challenge-derived eq tables (bytes identical to what the round-two
+    /// launch will copy again over them), create the a/b no-copy wraps, and
+    /// commit a fixed small primer dispatch of the real kernel in a second
+    /// command buffer. The queue executes it after the fold's dispatches —
+    /// i.e. in the measured GPU idle — wiring the wrapped pages and holding
+    /// the clock. Its output (leading partials lanes, computed against the
+    /// stale/uninitialized nibble table) is never read: the real dispatch
+    /// rewrites every lane its drain consumes.
+    ///
+    /// Shape gates mirror `launch_zc_r2_products` exactly, so this never
+    /// creates state on a shape the window's launch would decline. Every
+    /// failure is a silent no-op (the window then pays its incumbent setup).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_zc_r2_idle_fill(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+    ) {
+        if !zc_r2_idle_fill_viable() {
+            return;
+        }
+        if lo_size < 256
+            || !lo_size.is_multiple_of(256)
+            || hi_size < 8
+            || pair_in_block_mask > u32::MAX as usize
+            || useful_pairs_inclusive > u32::MAX as usize
+            || eq_lo.len() != lo_size
+            || eq_hi.len() != hi_size
+        {
+            return;
+        }
+        let Ok(gpu) = gpu() else { return };
+        let Some(state_mutex) = zc_r2_state() else {
+            return;
+        };
+        // Same poison discipline as the launch: the grow sequences are not
+        // unwind-atomic, so decline rather than recover.
+        let Ok(mut state) = state_mutex.lock() else {
+            note_poisoned_lock("zc-r2 idle-fill", false);
+            return;
+        };
+        unsafe {
+            // A stale primer (round-two window never ran, e.g. its arm was
+            // gated off mid-process) must complete before its buffers are
+            // rewritten below.
+            zc_r2_drain_prefetch(gpu, &mut state);
+            let ok = (|| -> Result<(), String> {
+                let need_lo = lo_size * 16;
+                if state.eq_lo_cap < need_lo {
+                    if state.eq_lo_cap > 0 {
+                        gpu.release(state.eq_lo_buf);
+                    }
+                    state.eq_lo_buf = gpu.new_buffer(need_lo)?;
+                    state.eq_lo_cap = need_lo;
+                }
+                std::ptr::copy_nonoverlapping(
+                    eq_lo.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(state.eq_lo_buf),
+                    need_lo,
+                );
+                let need_hi = hi_size * 16;
+                if state.eq_hi_cap < need_hi {
+                    if state.eq_hi_cap > 0 {
+                        gpu.release(state.eq_hi_buf);
+                    }
+                    state.eq_hi_buf = gpu.new_buffer(need_hi)?;
+                    state.eq_hi_cap = need_hi;
+                }
+                std::ptr::copy_nonoverlapping(
+                    eq_hi.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(state.eq_hi_buf),
+                    need_hi,
+                );
+                let need_part = hi_size * 64;
+                if state.part_cap < need_part {
+                    if state.part_cap > 0 {
+                        gpu.release(state.part_buf);
+                    }
+                    state.part_buf = gpu.new_buffer(need_part)?;
+                    state.part_cap = need_part;
+                }
+                let a_buf = zc_r2_wrap(&mut state, gpu, a_packed)?;
+                let b_buf = zc_r2_wrap(&mut state, gpu, b_packed)?;
+                let cb = zc_r2_submit(
+                    gpu,
+                    &state,
+                    a_buf,
+                    b_buf,
+                    ZC_IDLE_FILL_PRIMER_CHUNKS.min(hi_size),
+                    lo_size,
+                    pair_in_block_mask as u32,
+                    useful_pairs_inclusive as u32,
+                )?;
+                state.prefetch_cb = cb;
+                Ok(())
+            })();
+            match ok {
+                Ok(()) => {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[zc-idle-fill] staged: primer {} chunks, eq {}+{} lanes, a/b wraps warm",
+                            ZC_IDLE_FILL_PRIMER_CHUNKS.min(hi_size),
+                            lo_size,
+                            hi_size,
+                        );
+                    }
+                }
+                Err(e) => {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!("[zc-idle-fill] stage failed (window pays setup): {e}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Launch the round-two products prefix. `None` = whole round stays on
     /// the exact incumbent CPU path (kill switch, poisoned, share 0,
     /// non-ranked shape, no Metal, or wrap failure).
@@ -10101,6 +10327,11 @@ kernel void zc_r2_products(
             }
         };
         unsafe {
+            // An idle-fill primer staged in the ZC window binds the buffers
+            // rewritten below; drain it first (it completed during the ZC
+            // window's measured idle — this wait finds it done). Also emits
+            // the `[zc-idle-fill]` timing line.
+            zc_r2_drain_prefetch(gpu, &mut state);
             // Nibble decomposition of the 32 KiB byte table (per prove; the
             // table depends on the round challenge z).
             let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
@@ -11718,6 +11949,11 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+
+/// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{stage_zc_r2_idle_fill, zc_r2_idle_fill_viable};
 
 /// Zerocheck first-tail-round products GPU arm (see `ENV_NO_GPU_ZC_T3`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

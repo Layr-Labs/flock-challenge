@@ -4710,6 +4710,11 @@ mod tests {
         }
         .to_bytes();
         assert_eq!(proof_bytes.len(), EXPECTED_PROOF_BYTES);
+        // Cross-process gate A/B anchor: several gates are process-cached
+        // (OnceLock/LazyLock), so toggling them requires separate test
+        // processes. Each run prints this digest of the deterministic-input
+        // bundle; byte-identity across gate settings = identical digests.
+        eprintln!("[ranked-canary] bundle-blake3={}", blake3::hash(&proof_bytes).to_hex());
 
         let mut verifier = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
         let verified = setup
@@ -4743,19 +4748,24 @@ mod tests {
             eprintln!(
                 "[elide-canary] first_hits={first_hits:#05b} second_hits={second_hits:#05b}"
             );
-            // Hits are opportunistic by design: a later phase legitimately
-            // reusing a witness buffer's allocation retires its token
-            // (measured on M4 Max: `a`'s allocation is taken by an
-            // open-stage transient inside the first prove, so its bit is
-            // 0 — the per-buffer full-write fallback). z parks in the
-            // pinned slot and b's allocation stays untouched, so those two
-            // MUST hit on a warm second prove — anything less means the
-            // elision fast path silently died.
-            assert_eq!(
-                second_hits & 0b101,
-                0b101,
-                "second ranked prove should token-hit z (pinned) and b"
-            );
+            // Custody reservation (see `scratch::try_take_f128_inner`)
+            // keeps every witness token alive across the prove: z parks in
+            // the pinned slot, and a/b's tokened entries are invisible to
+            // non-matching takes (previously the open stage's small
+            // recursive-commit matrices grabbed a's 512 MiB entry via
+            // smallest-fit at a moment when nothing untokened fit,
+            // retiring its token every prove — measured 0b101 here). All
+            // three buffers MUST token-hit on a warm second prove —
+            // anything less means an elision fast path silently died.
+            // (Not applicable under the elision kill gate, where the mask
+            // is structurally zero — the gate A/B matrix runs the canary
+            // with FLOCK_NO_SCRATCH_CONST_ELIDE=1 for byte-identity only.)
+            if !std::env::var("FLOCK_NO_SCRATCH_CONST_ELIDE").is_ok_and(|v| v == "1") {
+                assert_eq!(
+                    second_hits, 0b111,
+                    "second ranked prove should token-hit z (pinned), a and b"
+                );
+            }
         }
     }
 

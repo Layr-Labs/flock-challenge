@@ -30,6 +30,9 @@ use std::sync::{
 /// byte regions its producer declared constant held those constants, and
 /// nothing has touched the buffer since" — every take path drops the token
 /// with the entry, so a token can only survive parked, untouched custody.
+/// A tokened entry is additionally RESERVED for its tagger: non-matching
+/// takes skip it (see [`try_take_f128_inner`]), so parked custody cannot be
+/// broken by an unrelated consumer that merely fits.
 struct PoolEntry {
     buf: Vec<F128>,
     token: Option<u64>,
@@ -392,9 +395,23 @@ pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
 
 /// Pool scan shared by the plain and tokened takes. When `want` is set, an
 /// exact token match (`token == want` AND parked length == `n`) is
-/// preferred over smallest-fit; otherwise smallest-fit, tie-broken toward
-/// untokened entries so an ordinary take does not needlessly retire a
-/// token another consumer staged.
+/// preferred over smallest-fit.
+///
+/// CUSTODY RESERVATION (constant-region elision, item B): an entry parked
+/// through a tagged release belongs to its tagger until that consumer takes
+/// it back — every non-matching take treats it as invisible and falls back
+/// to a fresh allocation when nothing else fits. Without this, smallest-fit
+/// deterministically retired the witgen a-buffer's token every prove: the
+/// PCS open's small recursive-commit matrices (2^17–2^19 F128) land at a
+/// moment when no untokened entry fits and grabbed the 512 MiB a-entry —
+/// the first equal-capacity tokened fit in scan order — killing a's elision
+/// on every subsequent prove (measured: elide-canary 0b101, the a-bit
+/// permanently 0). The reserved classes are exactly the per-prove witness
+/// buffers, so reservation adds no steady-state footprint: their tagger
+/// re-takes them every prove, and they stay evictable (give-side
+/// smallest-first) and released by [`clear`]. With elision killed
+/// (`FLOCK_NO_SCRATCH_CONST_ELIDE=1`) no tokens are ever staged and this
+/// policy is byte-for-byte the incumbent smallest-fit.
 fn try_take_f128_inner(n: usize, want: Option<u64>) -> Option<(Vec<F128>, Option<u64>)> {
     let mut pool = POOL.lock().unwrap();
     let mut best: Option<usize> = None;
@@ -410,6 +427,12 @@ fn try_take_f128_inner(n: usize, want: Option<u64>) -> Option<(Vec<F128>, Option
         for (i, e) in pool.iter().enumerate() {
             let cap = e.buf.capacity();
             if cap < n {
+                continue;
+            }
+            // Reserved for another consumer (see above). A same-tag entry
+            // whose parked length missed the exact-match loop is still fair
+            // game for its own tagger (the token is dropped at take).
+            if e.token.is_some_and(|t| Some(t) != want) {
                 continue;
             }
             let better = match best {
@@ -832,17 +855,40 @@ mod tests {
         let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
         const N: usize = 1536;
         const TAG: u64 = 0xF10C_C0DF;
+        const OTHER_TAG: u64 = 0xF10C_C0EE;
         clear();
-        // Foreign custody: any untagged take retires the token even if the
-        // buffer is returned untouched.
+        // Custody reservation: a plain take must NOT receive the tokened
+        // entry (it falls back to a fresh allocation), so the token
+        // survives for its tagger...
         let mut v = take_f128(N);
         v.fill(F128::ZERO);
         stage_f128_release_token(&v, TAG, Vec::new());
+        let ptr = v.as_ptr();
         give_f128(v);
         let foreign = take_f128(N);
+        assert_ne!(
+            foreign.as_ptr(),
+            ptr,
+            "plain take must not break tagged custody"
+        );
+        // ...and a differently-tagged take must not receive it either.
+        let (other, other_hit) = take_f128_with_token(N, OTHER_TAG);
+        assert!(!other_hit);
+        assert_ne!(
+            other.as_ptr(),
+            ptr,
+            "foreign-tagged take must not break tagged custody"
+        );
+        give_f128(other);
         give_f128(foreign);
         let (v2, hit) = take_f128_with_token(N, TAG);
-        assert!(!hit, "token must not survive foreign custody");
+        assert!(hit, "reserved token must survive non-matching takes");
+        assert_eq!(v2.as_ptr(), ptr);
+        // If the tagger itself re-takes and returns without staging, the
+        // next tagged take misses (token consumed exactly once).
+        give_f128(v2);
+        let (v2, hit) = take_f128_with_token(N, TAG);
+        assert!(!hit, "token is consumed by its tagger's take");
         // Failing probe: the give must refuse to attach the token.
         let mut v2 = v2;
         v2.fill(F128::ZERO);

@@ -111,6 +111,51 @@ fn zc_r2_odd_offload_enabled() -> bool {
     *ON
 }
 
+/// ZC-window GPU idle fill (see `gpu_commit::ENV_NO_ZC_IDLE_FILL`): stage
+/// round two's GPU-arm window setup while the ZC C-fold's GPU prefix is in
+/// flight. Everything staged derives from inputs bound BEFORE the fold
+/// submit — `a_packed`/`b_packed` are the round-one operands, and round
+/// two's eq split is built from the zerocheck challenge tail
+/// `r[k_skip+1..]` (`uni_skip_fold_and_round_pair*` receives it as
+/// `mlv_challenges[1..]` = exactly this slice, so the staged bytes are the
+/// bytes the window will upload). The round-2 fold point `z` is NOT
+/// required: the z-dependent nibble table stays a window-time upload.
+///
+/// The duplicate `SplitEqGhash` build costs microseconds against the
+/// ~10 ms AB head this call precedes; misses (shape, kill switches, Metal
+/// failures) are silent no-ops and the window pays its incumbent setup.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn stage_round2_gpu_window_from_r1_challenges(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    padding: &PaddingSpec,
+) {
+    if k_skip != 6 || m <= k_skip + 1 || r.len() != m {
+        return;
+    }
+    let n_pairs = (1usize << (m - k_skip)) / 2;
+    let eq = SplitEqGhash::with_n_hi(&r[k_skip + 1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    if lo_size * hi_size != n_pairs {
+        return;
+    }
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    crate::gpu_commit::stage_zc_r2_idle_fill(
+        a_packed,
+        b_packed,
+        &eq.lo,
+        &eq.hi,
+        lo_size,
+        hi_size,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+    );
+}
+
 fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);

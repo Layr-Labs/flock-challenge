@@ -825,6 +825,12 @@ mod tests {
             "FLOCK_NO_WITGEN_CONT_QUEUE",
             "FLOCK_NO_SCRATCH_CONST_ELIDE",
             "FLOCK_NO_GEN_BLOCK_SIMD",
+            // ZC-window GPU idle fill (byte-inert primer + staged uploads;
+            // read uncached, so in-process toggling is honored). At this
+            // small shape the fill is structurally inert — the gate proves
+            // the toggle stays inert everywhere; the ranked canary A/B
+            // covers the engaged arm.
+            "FLOCK_NO_ZC_IDLE_FILL",
         ];
         for gate in WITGEN_STACK_GATES {
             // SAFETY: single-threaded #[ignore]d test; no concurrent env
