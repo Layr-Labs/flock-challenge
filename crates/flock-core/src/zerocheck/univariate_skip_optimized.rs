@@ -759,14 +759,26 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         // but each chunk writes only its own disjoint 1 KiB, so the output
         // bytes are identical to the incumbent path.
         let n_chunks = total_bytes / OUTER_BYTES;
-        let n_jobs = n_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
+        // The arm completes when the last claimed job finishes. Keep the
+        // queue head coarse, but quarter the jobs near the drain so one late
+        // E-core claim cannot hold the commit window for a full 64 chunks.
+        let tail_chunks = AB_PRE_TAIL_CHUNKS.min(n_chunks);
+        let big_chunks = n_chunks - tail_chunks;
+        let n_big_jobs = big_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
+        let n_jobs = n_big_jobs + tail_chunks.div_ceil(AB_PRE_TAIL_CHUNKS_PER_JOB);
         let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
         crate::epool::run_hetero_chunks_stateful(
             n_jobs,
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
             |(a_col, b_col), job| {
-                let start = job * AB_PRE_CHUNKS_PER_JOB;
-                let end = (start + AB_PRE_CHUNKS_PER_JOB).min(n_chunks);
+                let (start, end) = if job < n_big_jobs {
+                    let start = job * AB_PRE_CHUNKS_PER_JOB;
+                    (start, (start + AB_PRE_CHUNKS_PER_JOB).min(big_chunks))
+                } else {
+                    let idx = job - n_big_jobs;
+                    let start = big_chunks + idx * AB_PRE_TAIL_CHUNKS_PER_JOB;
+                    (start, (start + AB_PRE_TAIL_CHUNKS_PER_JOB).min(n_chunks))
+                };
                 for x_outer in start..end {
                     // SAFETY: the queue hands out each job index exactly once
                     // and each `x_outer` maps to one disjoint 1 KiB chunk.
@@ -829,6 +841,12 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
 /// small enough that an E-core owns at most ~200 µs of tail when the main
 /// pool finishes — the same sizing logic as the deferred stripe's 64.
 const AB_PRE_CHUNKS_PER_JOB: usize = 64;
+
+/// Number and size of the fine-grained tail jobs in the heterogeneous drain.
+/// At the ranked shape this adds only 48 atomic claims while reducing the
+/// maximum late E-core straggler by roughly four times.
+const AB_PRE_TAIL_CHUNKS: usize = 1024;
+const AB_PRE_TAIL_CHUNKS_PER_JOB: usize = 16;
 
 /// Compile-time default for the QS5 hetero AB-precompute drain (the ranked
 /// decision must be a constant; ranked workers run with a cleared
@@ -4115,7 +4133,15 @@ mod tests {
         let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
         let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
 
-        for mask in [0x03u8, 0xf0] {
+        for (mask, static_a_k1) in [(0x03u8, false), (0x03, true), (0xf0, false)] {
+            let mut a_mixed = a_packed.clone();
+            if static_a_k1 {
+                let a_k0 = u64::from_le_bytes(a_mixed[..N_CHUNKS].try_into().unwrap())
+                    & !0xffff_fffe_0000_0000;
+                a_mixed[..N_CHUNKS].copy_from_slice(&a_k0.to_le_bytes());
+                a_mixed[N_CHUNKS..2 * N_CHUNKS]
+                    .copy_from_slice(&0x0000_0016_0000_0080u64.to_le_bytes());
+            }
             let mut b_mixed = b_packed.clone();
             for k in 0..8 {
                 if mask & (1 << k) != 0 {
@@ -4127,10 +4153,10 @@ mod tests {
             let mut want = [0u8; 64];
             let mut got = [0u8; 64];
             shift_reduce_inner_ab_scalar(
-                &a_packed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
+                &a_mixed, &b_mixed, &table, 0, 0, &mut want, &mut a_col, &mut b_col,
             );
             shift_reduce_inner_ab_fused_neon_checked(
-                &a_packed,
+                &a_mixed,
                 &b_mixed,
                 &table,
                 0,
@@ -4143,7 +4169,10 @@ mod tests {
                 None,
                 false,
             );
-            assert_eq!(got, want, "mixed const-one mask {mask:#04x}");
+            assert_eq!(
+                got, want,
+                "mixed const-one mask {mask:#04x}, static_a_k1={static_a_k1}"
+            );
         }
     }
 

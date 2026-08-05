@@ -1718,6 +1718,142 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
     }
 }
 
+/// Cached inverse transform for the ranked BLAKE3 `(window 0, b_med 2, K1)`
+/// A word. The dispatcher exact-matches the word before using this image, so
+/// arbitrary witnesses retain the generic table-lookup path.
+#[cfg(target_arch = "aarch64")]
+fn static_a_k1_partial(inv_table: &InvNttTableByteSingleGf8) -> &'static [u8; 64] {
+    use std::sync::OnceLock;
+
+    const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
+    static PARTIAL: OnceLock<[u8; 64]> = OnceLock::new();
+    PARTIAL.get_or_init(|| {
+        let mut transformed = [F8::ZERO; 64];
+        inv_table.apply(&STATIC_A_K1.to_le_bytes(), &mut transformed);
+        core::array::from_fn(|i| transformed[i].0)
+    })
+}
+
+/// Horner / scaled-table twin of [`shift_reduce_inner_mixed_const_b`]. Rows
+/// selected by `ONE_MASK` have B = 1 and therefore widen the transformed A
+/// bytes directly; all other rows form the same raw PMULL products as the h4
+/// generic kernel. `STATIC_A` additionally replaces the exact ranked K1 A
+/// transform's 32 table gathers with four contiguous vector loads and skips
+/// the three statically-zero high bytes of K0.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn shift_reduce_inner_mixed_const_b_h4<const ONE_MASK: u8, const STATIC_A: bool>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    a_k1_partial: Option<&[u8; 64]>,
+    out: &mut [u8; 64],
+    nt_store: bool,
+) {
+    use crate::field::gf2_8::neon::gf8_reduce_vec16;
+    use core::arch::aarch64::*;
+
+    let plain = inv_table.data_ptr();
+    let plain_sw = inv_table.half_swapped_data_ptr();
+    let scaled = inv_table.scaled_x4_data_ptr();
+    let scaled_sw = inv_table.scaled_x4_half_swapped_data_ptr();
+
+    #[inline(always)]
+    unsafe fn widen_lo(v: uint8x16_t) -> uint16x8_t {
+        unsafe { vmovl_u8(vget_low_u8(v)) }
+    }
+    #[inline(always)]
+    unsafe fn widen_hi(v: uint8x16_t) -> uint16x8_t {
+        unsafe { vmovl_u8(vget_high_u8(v)) }
+    }
+
+    unsafe {
+        let a_base = a_packed.as_ptr().add(byte_base_b);
+        let b_base = b_packed.as_ptr().add(byte_base_b);
+
+        macro_rules! products {
+            ($at:expr, $at_sw:expr, $k:literal) => {{
+                let (da0, da1, da2, da3) = if STATIC_A && $k == 1 {
+                    let p = a_k1_partial.unwrap_unchecked().as_ptr();
+                    (
+                        vld1q_u8(p),
+                        vld1q_u8(p.add(16)),
+                        vld1q_u8(p.add(32)),
+                        vld1q_u8(p.add(48)),
+                    )
+                } else if STATIC_A && $k == 0 {
+                    let aw = u64::from_le(core::ptr::read_unaligned(a_base.cast::<u64>()));
+                    apply_word_low5_into_4_regs($at, $at_sw, aw)
+                } else {
+                    let aw = u64::from_le(core::ptr::read_unaligned(
+                        a_base.add($k * N_CHUNKS).cast::<u64>(),
+                    ));
+                    apply_word_into_4_regs($at, $at_sw, aw)
+                };
+                if ONE_MASK & (1 << $k) != 0 {
+                    [
+                        widen_lo(da0),
+                        widen_hi(da0),
+                        widen_lo(da1),
+                        widen_hi(da1),
+                        widen_lo(da2),
+                        widen_hi(da2),
+                        widen_lo(da3),
+                        widen_hi(da3),
+                    ]
+                } else {
+                    let bw = u64::from_le(core::ptr::read_unaligned(
+                        b_base.add($k * N_CHUNKS).cast::<u64>(),
+                    ));
+                    let (db0, db1, db2, db3) = apply_word_into_4_regs(plain, plain_sw, bw);
+                    [
+                        pmull_lo_u16(da0, db0),
+                        pmull_hi_u16(da0, db0),
+                        pmull_lo_u16(da1, db1),
+                        pmull_hi_u16(da1, db1),
+                        pmull_lo_u16(da2, db2),
+                        pmull_hi_u16(da2, db2),
+                        pmull_lo_u16(da3, db3),
+                        pmull_hi_u16(da3, db3),
+                    ]
+                }
+            }};
+        }
+
+        let lo3 = products!(plain, plain_sw, 3);
+        let hi3 = products!(scaled, scaled_sw, 7);
+        let mut acc = [
+            veorq_u16(lo3[0], hi3[0]),
+            veorq_u16(lo3[1], hi3[1]),
+            veorq_u16(lo3[2], hi3[2]),
+            veorq_u16(lo3[3], hi3[3]),
+            veorq_u16(lo3[4], hi3[4]),
+            veorq_u16(lo3[5], hi3[5]),
+            veorq_u16(lo3[6], hi3[6]),
+            veorq_u16(lo3[7], hi3[7]),
+        ];
+
+        let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
+        let lo2 = products!(plain, plain_sw, 2);
+        let hi2 = products!(scaled, scaled_sw, 6);
+        horner_absorb(&mut acc, &lo2, &hi2, carry_not);
+        let lo1 = products!(plain, plain_sw, 1);
+        let hi1 = products!(scaled, scaled_sw, 5);
+        horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+        let lo0 = products!(plain, plain_sw, 0);
+        let hi0 = products!(scaled, scaled_sw, 4);
+        horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+
+        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
+        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
+        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[5]));
+        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
+
+        store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EXPERIMENT (seam-urm): checked static-structure fast paths.
 //
@@ -1869,6 +2005,52 @@ unsafe fn apply_word_into_4_regs(
             table_base,
             half_swapped_table_base,
             byte_from_word::<7>(word),
+            &mut d0,
+            &mut d1,
+            &mut d2,
+            &mut d3,
+        );
+        (d0, d1, d2, d3)
+    }
+}
+
+/// Apply a word whose bytes 5..7 are known to be zero. This is the ranked
+/// `(window 0, b_med 2, K0)` A shape; the caller checks the zero mask before
+/// selecting the monomorphized path.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_low5_into_4_regs(
+    table_base: *const u8,
+    half_swapped_table_base: *const u8,
+    word: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let r0 = table_base.add(byte_from_word::<0>(word) * 64);
+        let mut d0 = vld1q_u8(r0);
+        let mut d1 = vld1q_u8(r0.add(16));
+        let mut d2 = vld1q_u8(r0.add(32));
+        let mut d3 = vld1q_u8(r0.add(48));
+        xor_apply_byte_pair_into_4_regs::<0, true, 1, false>(
+            table_base,
+            half_swapped_table_base,
+            byte_from_word::<1>(word),
+            byte_from_word::<2>(word),
+            &mut d0,
+            &mut d1,
+            &mut d2,
+            &mut d3,
+        );
+        xor_apply_byte_pair_into_4_regs::<1, true, 2, false>(
+            table_base,
+            half_swapped_table_base,
+            byte_from_word::<3>(word),
+            byte_from_word::<4>(word),
             &mut d0,
             &mut d1,
             &mut d2,
@@ -2600,25 +2782,71 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     match const_one_mask {
         0 => {}
         0x03 if bw(0) & bw(1) == u64::MAX => {
-            shift_reduce_inner_mixed_const_b::<0x03>(
-                a_packed,
-                b_packed,
-                inv_table,
-                byte_base_b,
-                out,
-                nt_store,
-            );
+            if fast_shift_reduce_enabled() {
+                const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
+                const STATIC_A_K0_ZERO_MASK: u64 = 0xffff_fffe_0000_0000;
+                let a_k0 = u64::from_le(unsafe {
+                    core::ptr::read_unaligned(a_packed.as_ptr().add(byte_base_b).cast::<u64>())
+                });
+                let a_k1 = u64::from_le(unsafe {
+                    core::ptr::read_unaligned(
+                        a_packed.as_ptr().add(byte_base_b + N_CHUNKS).cast::<u64>(),
+                    )
+                });
+                if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_ZERO_MASK == 0 {
+                    shift_reduce_inner_mixed_const_b_h4::<0x03, true>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base_b,
+                        Some(static_a_k1_partial(inv_table)),
+                        out,
+                        nt_store,
+                    );
+                } else {
+                    shift_reduce_inner_mixed_const_b_h4::<0x03, false>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base_b,
+                        None,
+                        out,
+                        nt_store,
+                    );
+                }
+            } else {
+                shift_reduce_inner_mixed_const_b::<0x03>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            }
             return;
         }
         0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
-            shift_reduce_inner_mixed_const_b::<0xf0>(
-                a_packed,
-                b_packed,
-                inv_table,
-                byte_base_b,
-                out,
-                nt_store,
-            );
+            if fast_shift_reduce_enabled() {
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    byte_base_b,
+                    None,
+                    out,
+                    nt_store,
+                );
+            } else {
+                shift_reduce_inner_mixed_const_b::<0xf0>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            }
             return;
         }
         0x03 | 0xf0 => {}
