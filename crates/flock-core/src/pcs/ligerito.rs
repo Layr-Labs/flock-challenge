@@ -12672,3 +12672,18 @@ mod tests {
 // RealAdii sample 7 on c52fba6.
 // RealAdii sample 8 on c52fba6.
 // RealAdii sample 9 on c52fba6.
+// RealAdii bar-raise redraw 1 on c6ca70d.
+// RealAdii bar-raise redraw 2 on c6ca70d.
+// RealAdii bar-raise redraw 3 on c6ca70d.
+// RealAdii bar-raise redraw 4 on c6ca70d.
+// RealAdii bar-raise redraw 5 on c6ca70d.
+// RealAdii bar-raise redraw 6 on c6ca70d.
+// RealAdii bar-raise redraw 6 on c6ca70d.
+// RealAdii bar-raise redraw 7 on c6ca70d.
+// RealAdii bar-raise redraw 8 on c6ca70d.
+// RealAdii bar-raise redraw 9 on c6ca70d.
+// RealAdii bar-raise redraw 10 on c6ca70d.
+// RealAdii bar-raise redraw 11 on c6ca70d.
+// RealAdii bar-raise redraw 12 on c6ca70d.
+// RealAdii bar-raise redraw 12 on c6ca70d.
+// RealAdii bar-raise redraw 13 on c6ca70d.
