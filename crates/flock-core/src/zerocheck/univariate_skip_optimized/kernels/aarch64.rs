@@ -1443,6 +1443,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
     chunk_byte_base: usize,
     b_med: usize,
     out: &mut [u8; 64],
+    nt_store: bool,
 ) {
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
@@ -1497,11 +1498,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
         let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
         let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
 
-        let p = out.as_mut_ptr();
-        vst1q_u8(p, r0);
-        vst1q_u8(p.add(16), r1);
-        vst1q_u8(p.add(32), r2);
-        vst1q_u8(p.add(48), r3);
+        store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
     }
 }
 
@@ -1643,6 +1640,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
     chunk_byte_base: usize,
     b_med: usize,
     out: &mut [u8; 64],
+    nt_store: bool,
 ) {
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
@@ -1716,11 +1714,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
         let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[5]));
         let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
 
-        let p = out.as_mut_ptr();
-        vst1q_u8(p, r0);
-        vst1q_u8(p.add(16), r1);
-        vst1q_u8(p.add(32), r2);
-        vst1q_u8(p.add(48), r3);
+        store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
     }
 }
 
@@ -1888,6 +1882,44 @@ unsafe fn apply_word_into_4_regs(
 /// of the packed all-ones row is exactly the GF(2^8) multiplicative identity
 /// in all 64 lanes, so the baseline's final vector multiply is redundant.
 /// Caller has verified all eight B words are all-ones.
+/// Store one finished 64-byte AB row: plain cached `vst1q` quads, or
+/// non-temporal `stnp` pairs straight from the accumulator registers. The NT
+/// flavor lets `precompute_ab_one_chunk` drop its stack bounce — the row
+/// previously took four `vst1q` into a stack temporary plus an `ldp`/`stnp`
+/// copy (six memory ops and a store-to-load forward per row); storing from
+/// registers keeps only the two `stnp`. Bytes written are identical.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_row_64(
+    p: *mut u8,
+    nt: bool,
+    v0: core::arch::aarch64::uint8x16_t,
+    v1: core::arch::aarch64::uint8x16_t,
+    v2: core::arch::aarch64::uint8x16_t,
+    v3: core::arch::aarch64::uint8x16_t,
+) {
+    unsafe {
+        if nt {
+            core::arch::asm!(
+                "stnp {v0:q}, {v1:q}, [{p}]",
+                "stnp {v2:q}, {v3:q}, [{p}, #32]",
+                p = in(reg) p,
+                v0 = in(vreg) v0,
+                v1 = in(vreg) v1,
+                v2 = in(vreg) v2,
+                v3 = in(vreg) v3,
+                options(nostack, preserves_flags)
+            );
+        } else {
+            use core::arch::aarch64::vst1q_u8;
+            vst1q_u8(p, v0);
+            vst1q_u8(p.add(16), v1);
+            vst1q_u8(p.add(32), v2);
+            vst1q_u8(p.add(48), v3);
+        }
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn shift_reduce_inner_a_only_const_b(
@@ -1895,6 +1927,7 @@ fn shift_reduce_inner_a_only_const_b(
     inv_table: &InvNttTableByteSingleGf8,
     byte_base_b: usize,
     out: &mut [u8; 64],
+    nt_store: bool,
 ) {
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
@@ -1943,11 +1976,7 @@ fn shift_reduce_inner_a_only_const_b(
         let y2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
         let y3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
 
-        let p = out.as_mut_ptr();
-        vst1q_u8(p, y0);
-        vst1q_u8(p.add(16), y1);
-        vst1q_u8(p.add(32), y2);
-        vst1q_u8(p.add(48), y3);
+        store_row_64(out.as_mut_ptr(), nt_store, y0, y1, y2, y3);
     }
 }
 
@@ -1961,9 +1990,9 @@ fn shift_reduce_inner_single_k0(
     inv_table: &InvNttTableByteSingleGf8,
     byte_base_b: usize,
     out: &mut [u8; 64],
+    nt_store: bool,
 ) {
     use crate::field::gf2_8::neon::gf8_mul_vec16;
-    use core::arch::aarch64::*;
 
     let table_base = inv_table.data_ptr();
     let half_swapped_table_base = inv_table.half_swapped_data_ptr();
@@ -1980,11 +2009,44 @@ fn shift_reduce_inner_single_k0(
         let y1 = gf8_mul_vec16(a1, b1);
         let y2 = gf8_mul_vec16(a2, b2);
         let y3 = gf8_mul_vec16(a3, b3);
-        let p = out.as_mut_ptr();
-        vst1q_u8(p, y0);
-        vst1q_u8(p.add(16), y1);
-        vst1q_u8(p.add(32), y2);
-        vst1q_u8(p.add(48), y3);
+        store_row_64(out.as_mut_ptr(), nt_store, y0, y1, y2, y3);
+    }
+}
+
+/// Single-live-K fast path with a statically-known B word. At the ranked
+/// BLAKE3 shape the only single-K row is (w1, b_med 14) = blk 30, whose B
+/// word is the compile-time constant `0x0001ffffffffffff`
+/// (`BSTATIC_MASKS[30][0]` pins the full word). Its inverse transform is
+/// already materialized in `bstatic_partials()[240]`, so the row loads four
+/// registers instead of re-deriving the transform through eight table-row
+/// gathers. Caller has verified the exact B word; output is identical to
+/// [`shift_reduce_inner_single_k0`].
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn shift_reduce_inner_single_k0_static_b(
+    a_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    b_partial: &[u8; 64],
+    out: &mut [u8; 64],
+    nt_store: bool,
+) {
+    use crate::field::gf2_8::neon::gf8_mul_vec16;
+    use core::arch::aarch64::vld1q_u8;
+
+    let table_base = inv_table.data_ptr();
+    let half_swapped_table_base = inv_table.half_swapped_data_ptr();
+    unsafe {
+        let a_word = u64::from_le(core::ptr::read_unaligned(
+            a_packed.as_ptr().add(byte_base_b).cast::<u64>(),
+        ));
+        let (a0, a1, a2, a3) = apply_word_into_4_regs(table_base, half_swapped_table_base, a_word);
+        let p = b_partial.as_ptr();
+        let y0 = gf8_mul_vec16(a0, vld1q_u8(p));
+        let y1 = gf8_mul_vec16(a1, vld1q_u8(p.add(16)));
+        let y2 = gf8_mul_vec16(a2, vld1q_u8(p.add(32)));
+        let y3 = gf8_mul_vec16(a3, vld1q_u8(p.add(48)));
+        store_row_64(out.as_mut_ptr(), nt_store, y0, y1, y2, y3);
     }
 }
 
@@ -2000,6 +2062,7 @@ fn shift_reduce_inner_mixed_const_b<const ONE_MASK: u8>(
     inv_table: &InvNttTableByteSingleGf8,
     byte_base_b: usize,
     out: &mut [u8; 64],
+    nt_store: bool,
 ) {
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
@@ -2064,11 +2127,7 @@ fn shift_reduce_inner_mixed_const_b<const ONE_MASK: u8>(
         let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
         let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
         let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
-        let p = out.as_mut_ptr();
-        vst1q_u8(p, r0);
-        vst1q_u8(p.add(16), r1);
-        vst1q_u8(p.add(32), r2);
-        vst1q_u8(p.add(48), r3);
+        store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
     }
 }
 
@@ -2493,6 +2552,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     const_one_mask: u8,
     bstatic_w: usize,
     static_b_context: Option<StaticBContext>,
+    nt_store: bool,
 ) {
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let bw = |k: usize| -> u64 {
@@ -2503,14 +2563,37 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     if check_all_ones {
         let and_all = bw(0) & bw(1) & bw(2) & bw(3) & bw(4) & bw(5) & bw(6) & bw(7);
         if and_all == u64::MAX {
-            shift_reduce_inner_a_only_const_b(a_packed, inv_table, byte_base_b, out);
+            shift_reduce_inner_a_only_const_b(a_packed, inv_table, byte_base_b, out, nt_store);
             return;
         }
     }
     if check_single_k0 {
         let or_tail = bw(1) | bw(2) | bw(3) | bw(4) | bw(5) | bw(6) | bw(7);
         if or_tail == 0 {
-            shift_reduce_inner_single_k0(a_packed, b_packed, inv_table, byte_base_b, out);
+            // Ranked blk 30: the surviving K0 word is the static constant, so
+            // its transform comes from the precomputed partial instead of
+            // eight table-row gathers. Exact-match guard keeps the dispatch
+            // bit-identical for any witness.
+            if bstatic_w == 1
+                && b_med == 14
+                && bw(0) == 0x0001_ffff_ffff_ffff
+                && let Some(context) = static_b_context
+            {
+                let partials = match context {
+                    StaticBContext::Prepared { partials } => partials,
+                    StaticBContext::LegacyPerCall => bstatic_partials(inv_table),
+                };
+                shift_reduce_inner_single_k0_static_b(
+                    a_packed,
+                    inv_table,
+                    byte_base_b,
+                    &partials[30 * 8],
+                    out,
+                    nt_store,
+                );
+                return;
+            }
+            shift_reduce_inner_single_k0(a_packed, b_packed, inv_table, byte_base_b, out, nt_store);
             return;
         }
     }
@@ -2523,6 +2606,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
                 inv_table,
                 byte_base_b,
                 out,
+                nt_store,
             );
             return;
         }
@@ -2533,6 +2617,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
                 inv_table,
                 byte_base_b,
                 out,
+                nt_store,
             );
             return;
         }
@@ -2559,6 +2644,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
                     bstatic_w,
                     context,
                     out,
+                    nt_store,
                 )
             } else {
                 shift_reduce_inner_ab_bstatic::<false>(
@@ -2570,6 +2656,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
                     bstatic_w,
                     context,
                     out,
+                    nt_store,
                 )
             };
         if handled {
@@ -2584,6 +2671,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
             chunk_byte_base,
             b_med,
             out,
+            nt_store,
         );
     } else {
         shift_reduce_inner_ab_fused_neon(
@@ -2593,6 +2681,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
             chunk_byte_base,
             b_med,
             out,
+            nt_store,
         );
     }
 }

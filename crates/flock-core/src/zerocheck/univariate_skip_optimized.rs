@@ -601,6 +601,18 @@ fn ab_pre_nt_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_NT).is_none())
 }
 
+/// Kill switch for the register-direct `stnp` drain of the AB precompute
+/// rows: `FLOCK_NO_ZC_AB_PRE_NT_DIRECT=1` restores the incumbent stack-bounce
+/// flavor (kernel `vst1q` into a 64-byte temporary, then an `ldp`/`stnp`
+/// copy) as a same-binary control. Only meaningful while the NT drain itself
+/// is on; store flavor only — the bytes written are identical.
+pub const ENV_NO_ZC_AB_PRE_NT_DIRECT: &str = "FLOCK_NO_ZC_AB_PRE_NT_DIRECT";
+
+fn ab_pre_nt_direct_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_NT_DIRECT).is_none())
+}
+
 /// Kill switch for the QS3 compacted AB-precompute store. Default ON: the
 /// dead tail rows `[n_b_med, 16)` of each `x_outer` chunk are left untouched
 /// instead of being zero-filled, because no `ab_inner` consumer ever reads
@@ -859,13 +871,18 @@ fn precompute_ab_one_chunk(
     let n_b_med = b_med_counts[within_hash_outer] as usize;
     let chunk_byte_base = x_outer * OUTER_BYTES;
 
-    // NT arm: the kernel writes a stack temporary and the 64-byte
-    // block drains to the big buffer with `stnp` (write-once
-    // lines, consumer runs after the commit root). Control arm is
-    // the incumbent direct kernel write, byte-for-byte.
+    // NT arm: the kernel drains each 64-byte block to the big buffer with
+    // `stnp` (write-once lines, consumer runs after the commit root). By
+    // default the kernel stores non-temporally straight from its accumulator
+    // registers; `FLOCK_NO_ZC_AB_PRE_NT_DIRECT=1` restores the incumbent
+    // stack bounce (kernel `vst1q` into `tmp`, then an `ldp`/`stnp` copy —
+    // six extra memory ops and a store-to-load forward per row). Control arm
+    // (`FLOCK_NO_ZC_AB_PRE_NT=1`) is the incumbent cached kernel write.
+    // All three flavors are byte-identical.
+    let direct = nt && ab_pre_nt_direct_enabled();
     let mut tmp = [0u8; 64];
     for b_med in 0..n_b_med {
-        let dst: &mut [u8; 64] = if nt {
+        let dst: &mut [u8; 64] = if nt && !direct {
             &mut tmp
         } else {
             (&mut out_outer[b_med * 64..(b_med + 1) * 64])
@@ -899,8 +916,9 @@ fn precompute_ab_one_chunk(
                 usize::MAX
             },
             static_b_context,
+            direct,
         );
-        if nt {
+        if nt && !direct {
             // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
             // 64 destination bytes are in-bounds of `out_outer`.
             unsafe { store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64)) };
@@ -966,6 +984,7 @@ fn shift_reduce_inner_ab(
     const_one_mask: u8,
     bstatic_w: usize,
     static_b_context: Option<kernels::StaticBContext>,
+    nt_store: bool,
 ) {
     kernels::shift_reduce_inner_ab(
         a_packed,
@@ -981,6 +1000,7 @@ fn shift_reduce_inner_ab(
         const_one_mask,
         bstatic_w,
         static_b_context,
+        nt_store,
     );
 }
 
@@ -1115,6 +1135,7 @@ fn process_one_x_hi(
                     0,
                     usize::MAX,
                     None,
+                    false,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -1152,6 +1173,7 @@ fn process_one_x_hi(
                     0,
                     usize::MAX,
                     None,
+                    false,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -1324,6 +1346,7 @@ fn process_one_x_hi_with_s_hat_v(
                     0,
                     usize::MAX,
                     None,
+                    false,
                 );
             }
 
@@ -1353,6 +1376,7 @@ fn process_one_x_hi_with_s_hat_v(
                     0,
                     usize::MAX,
                     None,
+                    false,
                 );
             }
 
@@ -3652,7 +3676,20 @@ mod tests {
                 chunk_byte_base,
                 b_med,
                 &mut out_fused,
+                false,
             );
+            // The NT drain must be byte-identical to the cached store.
+            let mut out_fused_nt = [0u8; 64];
+            shift_reduce_inner_ab_fused_neon(
+                &a_packed,
+                &b_packed,
+                &table,
+                chunk_byte_base,
+                b_med,
+                &mut out_fused_nt,
+                true,
+            );
+            assert_eq!(out_fused, out_fused_nt, "nt store flavor must match");
             assert_eq!(
                 out_scalar, out_fused,
                 "fused-neon disagrees with scalar at (base={chunk_byte_base}, b_med={b_med})"
@@ -3761,6 +3798,7 @@ mod tests {
                     chunk_byte_base,
                     b_med,
                     &mut out_incumbent,
+                    false,
                 );
                 shift_reduce_inner_ab_fused_neon_h4(
                     &a_packed,
@@ -3769,6 +3807,7 @@ mod tests {
                     chunk_byte_base,
                     b_med,
                     &mut out_h4,
+                    false,
                 );
                 assert_eq!(
                     out_incumbent, out_scalar,
@@ -3888,6 +3927,7 @@ mod tests {
                         0,
                         w,
                         Some(context),
+                        false,
                     );
                     out
                 };
@@ -3991,14 +4031,14 @@ mod tests {
                             let mut slow = [0u8; 64];
                             assert!(
                                 kernels::aarch64::shift_reduce_inner_ab_bstatic::<false>(
-                                    &a_packed, &b, &table, 0, b_med, w, context, &mut slow,
+                                    &a_packed, &b, &table, 0, b_med, w, context, &mut slow, false,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );
                             let mut fast = [0u8; 64];
                             assert!(
                                 kernels::aarch64::shift_reduce_inner_ab_bstatic::<true>(
-                                    &a_packed, &b, &table, 0, b_med, w, context, &mut fast,
+                                    &a_packed, &b, &table, 0, b_med, w, context, &mut fast, true,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );
@@ -4058,8 +4098,60 @@ mod tests {
                 mask,
                 usize::MAX,
                 None,
+                false,
             );
             assert_eq!(got, want, "mixed const-one mask {mask:#04x}");
+        }
+    }
+
+    /// The blk-30 static-B single-K0 fast path (precomputed partial instead
+    /// of the eight B table-row gathers) must be byte-identical to the
+    /// generic dispatch, and the guard must fall back for any other B word.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn single_k0_static_b_matches_generic() {
+        let mut rng = Rng::new(0x51C0_B30);
+        let table = make_inv_table();
+        let context = kernels::aarch64::prepare_static_b_context_with_policy(
+            &table, true, false, false,
+        )
+        .expect("prepared static-b context");
+        let b_med = 14usize;
+        let byte_base_b = b_med * N_CHUNKS * 8;
+        let len = byte_base_b + 8 * N_CHUNKS;
+        for trial in 0..64 {
+            let a_packed: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
+            let mut b_packed = vec![0u8; len];
+            // K0 = the blk-30 static constant, K1..7 = zero; one arm perturbs
+            // K0 so the guard must route to the generic single-K0 kernel.
+            let mut k0 = 0x0001_ffff_ffff_ffffu64;
+            if trial % 2 == 1 {
+                k0 ^= 1 << (trial % 49);
+            }
+            b_packed[byte_base_b..byte_base_b + 8].copy_from_slice(&k0.to_le_bytes());
+            let run = |ctx: Option<kernels::StaticBContext>| {
+                let mut out = [0u8; 64];
+                kernels::aarch64::shift_reduce_inner_ab_fused_neon_checked(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    0,
+                    b_med,
+                    &mut out,
+                    false,
+                    true,
+                    0,
+                    1,
+                    ctx,
+                    false,
+                );
+                out
+            };
+            assert_eq!(
+                run(Some(context)),
+                run(None),
+                "static-b K0 word {k0:#018x} must match the generic kernel"
+            );
         }
     }
 

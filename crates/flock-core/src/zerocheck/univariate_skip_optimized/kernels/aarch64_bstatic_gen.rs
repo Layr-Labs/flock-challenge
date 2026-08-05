@@ -357,6 +357,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
     w: usize,
     context: StaticBContext,
     out: &mut [u8; 64],
+    nt_store: bool,
 ) -> bool {
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
@@ -832,11 +833,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
         let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc1_lo), vreinterpretq_u8_u16(acc1_hi));
         let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc2_lo), vreinterpretq_u8_u16(acc2_hi));
         let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc3_lo), vreinterpretq_u8_u16(acc3_hi));
-        let p = out.as_mut_ptr();
-        vst1q_u8(p, r0);
-        vst1q_u8(p.add(16), r1);
-        vst1q_u8(p.add(32), r2);
-        vst1q_u8(p.add(48), r3);
+        store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
     }
     true
 }

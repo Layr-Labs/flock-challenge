@@ -91,7 +91,10 @@ pub(super) fn shift_reduce_inner_ab(
     const_one_mask: u8,
     bstatic_w: usize,
     static_b_context: Option<StaticBContext>,
+    nt_store: bool,
 ) {
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = nt_store;
     #[cfg(target_arch = "aarch64")]
     {
         let _ = (a_col, b_col);
@@ -107,6 +110,7 @@ pub(super) fn shift_reduce_inner_ab(
             const_one_mask,
             bstatic_w,
             static_b_context,
+            nt_store,
         );
     }
 
