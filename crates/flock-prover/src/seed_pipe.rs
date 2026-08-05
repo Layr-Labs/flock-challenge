@@ -524,7 +524,7 @@ fn write_all_fd(fd: i32, mut buf: &[u8]) -> bool {
 
 /// True only for the protected ranked worker: `flock-benchmark-worker LOG2
 /// READY PROOF`. Keeps every test, bench and example on the ordinary path.
-fn is_ranked_worker() -> bool {
+pub(crate) fn is_ranked_worker() -> bool {
     let mut args = std::env::args_os();
     let Some(exe) = args.next() else {
         return false;
@@ -676,6 +676,12 @@ fn speculative_main(
     let mut scratch = scratch;
 
     let line = read_line_fd(real_stdin);
+
+    // The seed's first byte has arrived: this thread is about to forward it and
+    // start the speculative prove. Halt the CPU keep-alive immediately, before
+    // any of that timed work, so the P-cores it was warming across the idle gap
+    // are handed straight to the prover instead of shared with a spin thread.
+    flock_core::cpu_keepalive::keepalive_stop();
 
     // Forward first and unconditionally. Everything after this point can fail
     // without ever leaving the worker blocked on stdin.
