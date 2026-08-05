@@ -32,6 +32,10 @@
 use crate::field::F128;
 use crate::ntt::AdditiveNttF128;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "gpu_from_z_radix256_tables.rs"]
+mod gpu_from_z_radix256_tables;
+
 /// Env var that disables the GPU commit path entirely.
 pub const ENV_NO_GPU_COMMIT: &str = "FLOCK_NO_GPU_COMMIT";
 
@@ -586,6 +590,89 @@ pub(crate) fn gpu_blake3_pow_scan(
 /// restoring the incumbent kernel selection as the same-binary control.
 pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 
+/// Set to `1` to disable the ranked from-`z` radix-256 prefix. It applies
+/// layers 0..7 directly from the message, removing the separate
+/// layer-4 pass. Four field lanes share each 64-thread group; sixteen values
+/// per thread remain register-resident and cross-thread butterflies use SIMD
+/// lane exchange.
+pub const ENV_NO_GPU_FROM_Z_RADIX256: &str = "FLOCK_NO_GPU_FROM_Z_RADIX256";
+
+fn gpu_from_z_radix256_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_from_z_radix256_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_from_z_radix256_value_enabled(std::env::var_os(ENV_NO_GPU_FROM_Z_RADIX256).as_deref())
+    })
+}
+
+fn select_gpu_from_z_radix256(
+    log_d: usize,
+    num_ntts: usize,
+    pass_tune: bool,
+    enabled: bool,
+) -> bool {
+    enabled && pass_tune && log_d == 20 && num_ntts == 64
+}
+
+#[inline]
+fn gpu_from_z_radix256_selected(log_d: usize) -> bool {
+    select_gpu_from_z_radix256(
+        log_d,
+        64,
+        pass_tune_enabled(),
+        gpu_from_z_radix256_enabled(),
+    ) && !gpu_from_z_radix256_degraded()
+}
+
+/// Permanent in-process radix256 degrade, set when the untimed warmup's
+/// streamed-geometry verification (poison-reveal emulation) observes any
+/// mismatch on THIS host's GPU. Ranked workers run with a cleared
+/// environment, so this code-level latch — not an env kill switch — is the
+/// only reachable rollback to the incumbent layered from-z path there.
+static RADIX256_DEGRADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn gpu_from_z_radix256_degraded() -> bool {
+    RADIX256_DEGRADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn degrade_gpu_from_z_radix256(reason: &str) {
+    RADIX256_DEGRADED.store(true, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "[gpu-commit] radix256 DEGRADED for this process ({reason}); \
+         from-z passes fall back to the incumbent layered path"
+    );
+}
+
+#[cfg(test)]
+mod from_z_radix256_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn disable_value_and_ranked_shape_only() {
+        assert!(!super::gpu_from_z_radix256_value_enabled(Some(OsStr::new(
+            "1"
+        ))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_from_z_radix256_value_enabled(
+                value.map(OsStr::new)
+            ));
+        }
+        assert!(super::select_gpu_from_z_radix256(20, 64, true, true));
+        assert!(!super::select_gpu_from_z_radix256(20, 64, false, true));
+        assert!(!super::select_gpu_from_z_radix256(20, 64, true, false));
+        assert!(!super::select_gpu_from_z_radix256(19, 64, true, true));
+        assert!(!super::select_gpu_from_z_radix256(20, 32, true, true));
+    }
+}
+
 /// Exact-`1` rollback for the ranked from-`z` compact zero-root kernel. The
 /// candidate constructs only the eleven nonzero l=0/B=0 twiddle tables in
 /// each threadgroup and spells the seven zero-root butterflies as XORs.
@@ -1030,6 +1117,22 @@ pub struct FromZFirstPassStream {
     inner: imp::FromZFirstPassStream,
 }
 
+/// Streamed-first-pass engagement instrumentation: (streams begun, ranges
+/// successfully encoded+committed) in this process. Test/diagnostic only —
+/// local verification MUST be able to prove the streamed path actually
+/// executed instead of silently missing it (warmup-only runs never stream).
+static STREAMS_BEGUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STREAM_RANGES_SUBMITTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[doc(hidden)]
+pub fn streamed_first_pass_stats() -> (u64, u64) {
+    (
+        STREAMS_BEGUN.load(std::sync::atomic::Ordering::Relaxed),
+        STREAM_RANGES_SUBMITTED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Reserve the latched ranked GPU staging buffer before `z` is initialized.
 /// Returns `None` during warmup, on unsupported targets/shapes, or whenever
 /// the ordinary CPU/GPU fallback machinery should remain in control.
@@ -1049,11 +1152,38 @@ pub unsafe fn begin_from_z_first_pass_stream(
 }
 
 impl FromZFirstPassStream {
-    /// Publish `r_start..r_start+r_count` (in position tiles). Ranges must be
-    /// contiguous, ordered, and multiples of four for the tuned g4 kernel.
+    /// `true` when this stream's first pass is the fused radix-256 prefix,
+    /// which consumes `z` in the f=8 r-space (position low-12-bits). The
+    /// witness driver MUST then schedule production so that every published
+    /// prefix covers ALL 128 sp-stripes of its r8 range, and publish through
+    /// [`Self::submit_ready_r8_range`]. When `false`, the incumbent f=4
+    /// r4-prefix contract applies and publication goes through
+    /// [`Self::submit_ready_range`]. The mode is fixed at stream creation;
+    /// publishing through the wrong entry point fails the stream (safe CPU
+    /// fallback) rather than corrupting the codeword.
+    #[doc(hidden)]
+    pub fn r8_publication(&self) -> bool {
+        self.inner.r8_publication()
+    }
+
+    /// Publish `r_start..r_start+r_count` (f=4 position tiles: position
+    /// low-16-bits). Ranges must be contiguous, ordered, and multiples of
+    /// four for the tuned g4 kernel. Valid only when `!r8_publication()`:
+    /// an r4-prefix guarantees nothing about the strided r8 reads of the
+    /// radix-256 kernel.
     #[doc(hidden)]
     pub fn submit_ready_range(&mut self, r_start: usize, r_count: usize) {
         self.inner.submit_ready_range(r_start, r_count);
+    }
+
+    /// Publish `r8_start..r8_start+r8_count` in the f=8 r-space (position
+    /// low-12-bits, 4096 total at the ranked shape): every z position `p`
+    /// with `p & 0xfff` in the range — across ALL 128 sp-stripes — must be
+    /// fully initialized. Ranges must be contiguous, in order, and multiples
+    /// of 16 (one witness group column). Valid only when `r8_publication()`.
+    #[doc(hidden)]
+    pub fn submit_ready_r8_range(&mut self, r8_start: usize, r8_count: usize) {
+        self.inner.submit_ready_r8_range(r8_start, r8_count);
     }
 }
 
@@ -2847,6 +2977,9 @@ kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
 }
 "#;
 
+    /// Source-only ranked radix-256 prefix.
+    const FROM_Z_RADIX256_MSL_SOURCE: &str = include_str!("gpu_from_z_radix256.metal");
+
     /// Source-only ranked from-z specialization. This deliberately does not
     /// reuse the rejected device-table preload design: every group constructs
     /// its own compact 11-table image directly from the existing raw twiddle
@@ -3243,6 +3376,10 @@ kernel void blake3_pow_scan(
         /// `NIL` outside `cfg(test)`.
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) pso_export_from_z_zero_root_tabs: Id,
+        /// Register/SIMD-distributed radix-256 from-z prefix and its compact
+        /// 255 x 256 F128 multiplication image.
+        pub(crate) pso_from_z_radix256: Id,
+        pub(crate) from_z_radix256_tabs: Id,
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_ntt5mix: Id,
         pub(crate) pso_leaf: Id,
@@ -3400,67 +3537,293 @@ kernel void blake3_pow_scan(
                 // Keep the embedded incumbent metallib byte-for-byte intact.
                 // The exact rollback skips this supplemental compile and
                 // selects the incumbent pso_ntt4zg4 below.
-                let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) =
-                    if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
-                        let src = api.nsstring(FROM_Z_ZERO_ROOT_MSL_SOURCE)?;
-                        let mut err: Id = NIL;
-                        let library: Id = send!(
+                //
+                // Built whenever zero-root is selected, INCLUDING when
+                // radix256 is also selected: it is the code-level auto-degrade
+                // target if radix256 setup fails on the ranked GPU (see the
+                // radix256 block below). When radix256 succeeds this pipeline
+                // is simply left unused; the extra init-time compile is
+                // untimed.
+                let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) = if cfg!(test)
+                    || super::gpu_from_z_zero_root_selected(20)
+                {
+                    let src = api.nsstring(FROM_Z_ZERO_ROOT_MSL_SOURCE)?;
+                    let mut err: Id = NIL;
+                    let library: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                        device,
+                        c"newLibraryWithSource:options:error:",
+                        src,
+                        NIL,
+                        &mut err
+                    );
+                    if library.is_null() {
+                        return Err(format!(
+                            "from-z zero-root shader compile failed: {}",
+                            api.error_string(err)
+                        ));
+                    }
+                    let build = |name: &str| -> Result<Id, String> {
+                        let ns = api.nsstring(name)?;
+                        let f: Id = send!(
                             api,
-                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                            device,
-                            c"newLibraryWithSource:options:error:",
-                            src,
-                            NIL,
-                            &mut err
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            library,
+                            c"newFunctionWithName:",
+                            ns
                         );
-                        if library.is_null() {
-                            return Err(format!(
-                                "from-z zero-root shader compile failed: {}",
-                                api.error_string(err)
-                            ));
+                        if f.is_null() {
+                            return Err(format!("from-z zero-root kernel {name} not found"));
                         }
-                        let build = |name: &str| -> Result<Id, String> {
-                            let ns = api.nsstring(name)?;
-                            let f: Id = send!(
-                                api,
-                                unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                                library,
-                                c"newFunctionWithName:",
-                                ns
-                            );
-                            if f.is_null() {
-                                return Err(format!("from-z zero-root kernel {name} not found"));
-                            }
-                            let mut pso_err: Id = NIL;
-                            let pso: Id = send!(
-                                api,
-                                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                                device,
-                                c"newComputePipelineStateWithFunction:error:",
-                                f,
-                                &mut pso_err
-                            );
-                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-                            if pso.is_null() {
-                                Err(format!(
-                                    "from-z zero-root pipeline {name}: {}",
-                                    api.error_string(pso_err)
-                                ))
-                            } else {
-                                Ok(pso)
-                            }
-                        };
-                        let candidate = build("ntt_fused_reg4_from_zg4_zero_root")?;
-                        let export = if cfg!(test) {
-                            build("export_from_z_zero_root_tabs")?
+                        let mut pso_err: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            f,
+                            &mut pso_err
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                        if pso.is_null() {
+                            Err(format!(
+                                "from-z zero-root pipeline {name}: {}",
+                                api.error_string(pso_err)
+                            ))
                         } else {
-                            NIL
-                        };
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                        (candidate, export)
-                    } else {
-                        (NIL, NIL)
+                            Ok(pso)
+                        }
                     };
+                    let candidate = build("ntt_fused_reg4_from_zg4_zero_root")?;
+                    let export = if cfg!(test) {
+                        build("export_from_z_zero_root_tabs")?
+                    } else {
+                        NIL
+                    };
+                    send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
+                    (candidate, export)
+                } else {
+                    (NIL, NIL)
+                };
+
+                // Supplemental radix-256 prefix. Its byte multiplication
+                // image is immutable and process-persistent; construction and
+                // upload happen during the untimed GPU initialization.
+                let (pso_from_z_radix256, from_z_radix256_tabs) = if cfg!(test)
+                    || super::gpu_from_z_radix256_selected(20)
+                {
+                    // Ranked workers run with a CLEARED environment, so the
+                    // `FLOCK_NO_GPU_FROM_Z_RADIX256` kill switch cannot reach
+                    // them — radix256 is pinned on. Any radix256-specific setup
+                    // failure (a Metal library/pipeline the ranked GPU rejects,
+                    // a function-lookup miss, or a table-buffer allocation
+                    // failure) MUST therefore degrade in code rather than
+                    // return `Err`: returning `Err` here fails `Gpu`
+                    // construction and disables ALL GPU commit (a catastrophic
+                    // ~38%-of-wall regression with no env escape on ranked). On
+                    // failure both slots stay NIL, so `FromZFirstPassPlan`
+                    // selects the incumbent layered zero-root from-z path
+                    // (built above) and every other GPU stage is untouched.
+                    match (|| -> Result<(Id, Id), String> {
+                    let src = api.nsstring(FROM_Z_RADIX256_MSL_SOURCE)?;
+                    let mut err: Id = NIL;
+                    let library: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                        device,
+                        c"newLibraryWithSource:options:error:",
+                        src,
+                        NIL,
+                        &mut err
+                    );
+                    if library.is_null() {
+                        return Err(format!(
+                            "from-z radix256 shader compile failed: {}",
+                            api.error_string(err)
+                        ));
+                    }
+                    let ns = api.nsstring("ntt_from_z_radix256_register_simd")?;
+                    let function: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if function.is_null() {
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
+                        return Err("from-z radix256 kernel not found".into());
+                    }
+                    let mut pso_err: Id = NIL;
+                    let pso: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        function,
+                        &mut pso_err
+                    );
+                    send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        function,
+                        c"release"
+                    );
+                    send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
+                    if pso.is_null() {
+                        return Err(format!(
+                            "from-z radix256 pipeline: {}",
+                            api.error_string(pso_err)
+                        ));
+                    }
+
+                    let table = &super::gpu_from_z_radix256_tables::TAB8;
+                    let table_bytes = core::mem::size_of_val(table);
+                    let upload_buf: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, u64, u64) -> Id,
+                        device,
+                        c"newBufferWithLength:options:",
+                        table_bytes as u64,
+                        0u64
+                    );
+                    if upload_buf.is_null() {
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                        return Err(format!(
+                            "from-z radix256 table buffer allocation ({table_bytes} bytes) failed"
+                        ));
+                    }
+                    let dst: *mut u8 = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel) -> *mut u8,
+                        upload_buf,
+                        c"contents"
+                    );
+                    std::ptr::copy_nonoverlapping(table.as_ptr().cast::<u8>(), dst, table_bytes);
+
+                    // Keep the immutable lookup image in GPU-private storage.
+                    // The one-time upload completes before initialization
+                    // returns; if private allocation or blitting is
+                    // unavailable, the populated shared buffer remains valid.
+                    const STORAGE_MODE_PRIVATE: u64 = 2 << 4;
+                    let private_buf: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, u64, u64) -> Id,
+                        device,
+                        c"newBufferWithLength:options:",
+                        table_bytes as u64,
+                        STORAGE_MODE_PRIVATE
+                    );
+                    let table_buf = if private_buf.is_null() {
+                        upload_buf
+                    } else {
+                        let cb: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            queue,
+                            c"commandBuffer"
+                        );
+                        let blit: Id = if cb.is_null() {
+                            NIL
+                        } else {
+                            send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                cb,
+                                c"blitCommandEncoder"
+                            )
+                        };
+                        if blit.is_null() {
+                            send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                private_buf,
+                                c"release"
+                            );
+                            upload_buf
+                        } else {
+                            send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, u64, Id, u64, u64) -> Id,
+                                blit,
+                                c"copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:",
+                                upload_buf,
+                                0u64,
+                                private_buf,
+                                0u64,
+                                table_bytes as u64
+                            );
+                            send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                blit,
+                                c"endEncoding"
+                            );
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"commit");
+                            send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                cb,
+                                c"waitUntilCompleted"
+                            );
+                            let status: u64 = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> u64,
+                                cb,
+                                c"status"
+                            );
+                            if status == 4 {
+                                send!(
+                                    api,
+                                    unsafe extern "C" fn(Id, Sel) -> Id,
+                                    upload_buf,
+                                    c"release"
+                                );
+                                private_buf
+                            } else {
+                                send!(
+                                    api,
+                                    unsafe extern "C" fn(Id, Sel) -> Id,
+                                    private_buf,
+                                    c"release"
+                                );
+                                upload_buf
+                            }
+                        }
+                    };
+                    Ok((pso, table_buf))
+                    })() {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            // Auto-degrade to the incumbent from-z path.
+                            if debug_enabled() {
+                                eprintln!(
+                                    "[gpu-commit] radix256 setup failed ({e}); \
+                                     degrading to incumbent from-z path (GPU commit unaffected)"
+                                );
+                            }
+                            (NIL, NIL)
+                        }
+                    }
+                } else {
+                    (NIL, NIL)
+                };
 
                 // Supplemental leaf+parent3 fuse. Failure → NIL → exact
                 // incumbent leaf + parent3 path. Compile only when the ranked
@@ -3700,6 +4063,8 @@ kernel void blake3_pow_scan(
                     pso_ntt4zg4,
                     pso_ntt4zg4_zero_root,
                     pso_export_from_z_zero_root_tabs,
+                    pso_from_z_radix256,
+                    from_z_radix256_tabs,
                     pso_ntt4h8,
                     pso_ntt5mix,
                     pso_leaf,
@@ -4134,14 +4499,36 @@ kernel void blake3_pow_scan(
     struct FromZFirstPassPlan {
         grouped: bool,
         zero_root: bool,
+        radix256: bool,
     }
 
     impl FromZFirstPassPlan {
-        fn new(log_d: usize) -> Self {
+        fn new(gpu: &Gpu, log_d: usize) -> Self {
             let grouped = super::pass_tune_enabled();
+            let radix256 = grouped
+                && super::gpu_from_z_radix256_selected(log_d)
+                && !gpu.pso_from_z_radix256.is_null()
+                && !gpu.from_z_radix256_tabs.is_null();
             Self {
                 grouped,
-                zero_root: grouped && super::gpu_from_z_zero_root_selected(log_d),
+                zero_root: grouped && !radix256 && super::gpu_from_z_zero_root_selected(log_d),
+                radix256,
+            }
+        }
+
+        #[inline]
+        fn next_layer(self) -> usize {
+            if self.radix256 { 8 } else { 4 }
+        }
+
+        #[inline]
+        fn published_r_granularity(self) -> usize {
+            if self.radix256 {
+                16
+            } else if self.grouped {
+                4
+            } else {
+                1
             }
         }
 
@@ -4157,8 +4544,30 @@ kernel void blake3_pow_scan(
             r_count: usize,
         ) {
             debug_assert!(!self.zero_root || self.grouped);
-            debug_assert!(!self.grouped || r_count.is_multiple_of(4));
+            debug_assert!(r_count.is_multiple_of(self.published_r_granularity()));
             unsafe {
+                if self.radix256 {
+                    debug_assert_eq!(log_d, 20);
+                    debug_assert!(byte_offset.is_multiple_of(16 * 64 * 16));
+                    gpu.set_pipeline(enc, gpu.pso_from_z_radix256);
+                    // The radix-256 kernel's r index is the position's LOW
+                    // 12 bits (f=8 r-space); its z reads for one r8 tile
+                    // stride ALL 128 sp-slices (`sp<<12 | r8`). A published
+                    // unit range here therefore encodes an r8 range scaled
+                    // by 16 — sixteen units per r8 value — and the caller
+                    // MUST have published in the r8 space (streamed:
+                    // `submit_ready_r8_range` + r8-band witness scheduling;
+                    // full-range: the whole message). An r4-prefix caller
+                    // would hand the kernel unwritten z: r8 = r4 & 0xfff,
+                    // NOT r4 >> 4, so r4 prefixes are not r8 prefixes.
+                    let radix256_byte_offset = byte_offset >> 4;
+                    let radix256_r_count = r_count >> 4;
+                    gpu.set_buffer(enc, staging, radix256_byte_offset, 0);
+                    gpu.set_buffer(enc, gpu.from_z_radix256_tabs, 0, 1);
+                    gpu.set_buffer(enc, z_buf, radix256_byte_offset, 3);
+                    gpu.dispatch(enc, (radix256_r_count * 16) as u64, 64);
+                    return;
+                }
                 let pso = if self.zero_root {
                     debug_assert!(!gpu.pso_ntt4zg4_zero_root.is_null());
                     gpu.pso_ntt4zg4_zero_root
@@ -4206,6 +4615,7 @@ kernel void blake3_pow_scan(
             FromZFirstPassPlan {
                 grouped: true,
                 zero_root: true,
+                radix256: false,
             }
             .encode_range(
                 gpu,
@@ -4772,6 +5182,11 @@ kernel void blake3_pow_scan(
         tree_buf: Id,
         log_d: usize,
         n_leaves: usize,
+        /// First-pass selection captured ONCE at stream creation. Every
+        /// streamed encode and the publication-space contract (r4 vs r8)
+        /// derive from this copy so the mode cannot drift between the
+        /// witness driver's schedule and the dispatched kernel.
+        plan: FromZFirstPassPlan,
         next_r: usize,
         pending: Vec<Id>,
         failed: Option<String>,
@@ -4793,16 +5208,53 @@ kernel void blake3_pow_scan(
     unsafe impl Send for FromZFirstPassStream {}
 
     impl FromZFirstPassStream {
+        pub(crate) fn r8_publication(&self) -> bool {
+            self.plan.radix256
+        }
+
+        /// Incumbent r4-prefix publication (position low-16-bits tiles).
+        /// Rejecting this on an r8-mode stream is the safety net that turns
+        /// a driver/kernel publication-space mismatch into a clean CPU
+        /// fallback instead of a corrupted codeword.
         pub(crate) fn submit_ready_range(&mut self, r_start: usize, r_count: usize) {
+            if self.failed.is_none() && self.plan.radix256 {
+                self.failed = Some(
+                    "r4-space publication on an r8-mode (radix256) stream".into(),
+                );
+                return;
+            }
+            self.submit_ready_units(r_start, r_count);
+        }
+
+        /// r8-prefix publication (position low-12-bits, radix256 mode only):
+        /// the caller guarantees every z position whose low 12 bits fall in
+        /// the range is initialized across ALL 128 sp-stripes. Internally one
+        /// r8 unit is 16 published units (the shared unit space in which the
+        /// radix-256 arm of `encode_range` divides by 16 again), so the byte
+        /// offsets below stay mode-independent: consecutive units are
+        /// consecutive 1 KiB position rows in both spaces.
+        pub(crate) fn submit_ready_r8_range(&mut self, r8_start: usize, r8_count: usize) {
+            if self.failed.is_none() && !self.plan.radix256 {
+                self.failed = Some(
+                    "r8-space publication on an r4-mode (incumbent) stream".into(),
+                );
+                return;
+            }
+            self.submit_ready_units(r8_start * 16, r8_count * 16);
+        }
+
+        fn submit_ready_units(&mut self, r_start: usize, r_count: usize) {
             if self.failed.is_some() {
                 return;
             }
+            let plan = self.plan;
+            let granularity = plan.published_r_granularity();
             let total_r = 1usize << (self.log_d - 4);
             if r_start != self.next_r
                 || r_count == 0
                 || r_start + r_count > total_r
-                || !r_start.is_multiple_of(4)
-                || !r_count.is_multiple_of(4)
+                || !r_start.is_multiple_of(granularity)
+                || !r_count.is_multiple_of(granularity)
             {
                 self.failed = Some(format!(
                     "invalid streamed range start={r_start} count={r_count} next={} total={total_r}",
@@ -4821,7 +5273,7 @@ kernel void blake3_pow_scan(
                 let result = (|| -> Result<Id, String> {
                     let cb = self.gpu.command_buffer()?;
                     let enc = self.gpu.compute_encoder(cb)?;
-                    FromZFirstPassPlan::new(self.log_d).encode_range(
+                    plan.encode_range(
                         self.gpu,
                         enc,
                         self.staging,
@@ -4846,6 +5298,8 @@ kernel void blake3_pow_scan(
                 Ok(cb) => {
                     self.pending.push(cb);
                     self.next_r += r_count;
+                    super::STREAM_RANGES_SUBMITTED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(e) => self.failed = Some(e),
             }
@@ -5037,6 +5491,14 @@ kernel void blake3_pow_scan(
                 _ => 0,
             }
         };
+        super::STREAMS_BEGUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let plan = FromZFirstPassPlan::new(gpu, params.k_code());
+        if debug_enabled() {
+            eprintln!(
+                "[gpu-commit] streamed from-z first pass engaged (mode={})",
+                if plan.radix256 { "r8/radix256" } else { "r4/incumbent" }
+            );
+        }
         Some(FromZFirstPassStream {
             gpu,
             z_buf,
@@ -5045,6 +5507,7 @@ kernel void blake3_pow_scan(
             tree_buf: state.tree_buf,
             log_d: params.k_code(),
             n_leaves: params.n_leaves(),
+            plan,
             next_r: 0,
             pending: Vec::with_capacity(8),
             failed: None,
@@ -5299,11 +5762,8 @@ kernel void blake3_pow_scan(
             let r = (|| {
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                // Pass 1: layers 0..3 from z.
-                // From-z tiles all live in block B = 0 (l = 0), so the g4
-                // table-reuse idiom applies; the tuned kernel also skips the
-                // zero-region sub-layer (a pure copy).
-                FromZFirstPassPlan::new(log_d).encode_range(
+                let first_pass = FromZFirstPassPlan::new(gpu, log_d);
+                first_pass.encode_range(
                     gpu,
                     enc,
                     staging,
@@ -5313,8 +5773,7 @@ kernel void blake3_pow_scan(
                     0,
                     1usize << (log_d - 4),
                 );
-                // Passes 2..: layers 4..log_d in place over staging.
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
+                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, first_pass.next_layer());
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb)
@@ -5339,7 +5798,8 @@ kernel void blake3_pow_scan(
             let r = (|| {
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
+                let next_layer = FromZFirstPassPlan::new(gpu, log_d).next_layer();
+                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, next_layer);
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb)
@@ -5375,10 +5835,7 @@ kernel void blake3_pow_scan(
         unsafe {
             let cb1 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb1)?;
-            // From-z tiles all live in block B = 0 (l = 0), so the g4
-            // table-reuse idiom applies; the tuned kernel also skips
-            // the zero-region sub-layer (a pure copy).
-            FromZFirstPassPlan::new(log_d).encode_range(
+            FromZFirstPassPlan::new(gpu, log_d).encode_range(
                 gpu,
                 enc,
                 staging,
@@ -5425,7 +5882,8 @@ kernel void blake3_pow_scan(
             let prefix16 = (16 - k_cpu16) as u64;
             let cb2 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb2)?;
-            encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
+            let next_layer = FromZFirstPassPlan::new(gpu, log_d).next_layer();
+            encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, next_layer, prefix16);
             // Greedy aligned power-of-two subtree decomposition of the
             // leaf prefix.
             let sixteenth = n_leaves / 16;
@@ -5486,6 +5944,10 @@ kernel void blake3_pow_scan(
                 // The twiddle table is deterministic per log_d; built once per
                 // process (the autotune sweep prebuilds it untimed).
                 let ntt = hybrid_suffix_ntt(log_d);
+                let next_layer = FromZFirstPassPlan::new(gpu, log_d).next_layer();
+                let block_scale = 1usize << (next_layer - 4);
+                let suffix_block_start = (16 - k_cpu16) * block_scale;
+                let suffix_block_end = 16 * block_scale;
                 let data: &mut [F128] = core::slice::from_raw_parts_mut(
                     gpu.buffer_contents(staging).cast::<F128>(),
                     n_leaves * 64,
@@ -5537,10 +5999,10 @@ kernel void blake3_pow_scan(
                     ntt.forward_transform_interleaved_ranked_block_range_and_then(
                         data,
                         64,
-                        4,
+                        next_layer,
                         log_d,
-                        16 - k_cpu16,
-                        16,
+                        suffix_block_start,
+                        suffix_block_end,
                         finish_chunk,
                     );
                 } else {
@@ -5549,10 +6011,10 @@ kernel void blake3_pow_scan(
                     ntt.forward_transform_interleaved_block_range(
                         data,
                         64,
-                        4,
+                        next_layer,
                         log_d,
-                        16 - k_cpu16,
-                        16,
+                        suffix_block_start,
+                        suffix_block_end,
                         crate::ntt::additive_ntt_f128::ranked_zero_odd_tail_lanes(log_d, 64),
                     );
                     let suffix_bytes: &[u8] = core::slice::from_raw_parts(
@@ -6513,7 +6975,7 @@ kernel void blake3_pow_scan(
     /// Cache key component tying entries to both the exact GPU source and
     /// selected from-z mode. Candidate and exact-rollback processes must not
     /// consume each other's latch or tuned split.
-    fn warmup_cache_msl_fnv_for(zero_root: bool, leaf_vec4: bool) -> u64 {
+    fn warmup_cache_msl_fnv_for(zero_root: bool, radix256: bool, leaf_vec4: bool) -> u64 {
         let mut key = fnv1a64(MSL_SOURCE);
         if zero_root {
             key ^= fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
@@ -6522,12 +6984,17 @@ kernel void blake3_pow_scan(
         if leaf_vec4 {
             key ^= fnv1a64(LEAF_VEC4_MSL_SOURCE).rotate_left(2) ^ 0x4C45_4146_5F56_3431; // "LEAF_V41"
         }
+        if radix256 {
+            key ^= fnv1a64(FROM_Z_RADIX256_MSL_SOURCE).rotate_left(3) ^ 0x5232_3536_5F52_4547; // "R256_REG"
+        }
         key
     }
 
     fn warmup_cache_msl_fnv() -> u64 {
+        let radix256 = super::gpu_from_z_radix256_selected(20);
         warmup_cache_msl_fnv_for(
-            super::gpu_from_z_zero_root_selected(20),
+            super::gpu_from_z_zero_root_selected(20) && !radix256,
+            radix256,
             super::gpu_leaf_vec4_enabled(),
         )
     }
@@ -6536,8 +7003,8 @@ kernel void blake3_pow_scan(
     mod zero_root_cache_key_tests {
         #[test]
         fn supplemental_source_and_mode_have_a_distinct_fingerprint() {
-            let incumbent = super::warmup_cache_msl_fnv_for(false, false);
-            let candidate = super::warmup_cache_msl_fnv_for(true, false);
+            let incumbent = super::warmup_cache_msl_fnv_for(false, false, false);
+            let candidate = super::warmup_cache_msl_fnv_for(true, false, false);
             assert_eq!(incumbent, super::fnv1a64(super::MSL_SOURCE));
             assert_ne!(candidate, incumbent);
             assert_eq!(
@@ -6548,14 +7015,25 @@ kernel void blake3_pow_scan(
             );
             // The leaf-vec4 dimension is independent and non-degenerate:
             // candidate and exact-rollback processes never share a latch.
-            let vec4 = super::warmup_cache_msl_fnv_for(false, true);
+            let vec4 = super::warmup_cache_msl_fnv_for(false, false, true);
             assert_ne!(vec4, incumbent);
-            assert_ne!(super::warmup_cache_msl_fnv_for(true, true), candidate);
+            assert_ne!(
+                super::warmup_cache_msl_fnv_for(true, false, true),
+                candidate
+            );
             assert_eq!(
                 vec4,
                 incumbent
                     ^ super::fnv1a64(super::LEAF_VEC4_MSL_SOURCE).rotate_left(2)
                     ^ 0x4C45_4146_5F56_3431
+            );
+            let radix256 = super::warmup_cache_msl_fnv_for(false, true, false);
+            assert_ne!(radix256, incumbent);
+            assert_eq!(
+                radix256,
+                incumbent
+                    ^ super::fnv1a64(super::FROM_Z_RADIX256_MSL_SOURCE).rotate_left(3)
+                    ^ 0x5232_3536_5F52_4547
             );
         }
 
@@ -6685,6 +7163,202 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// Untimed warmup backstop for the STREAMED radix-256 first pass: a
+    /// poison-reveal emulation of exactly the geometry the timed prove will
+    /// run and the ordinary full-range warmup byte-compare can never cover.
+    ///
+    /// The streamed contract is "a published dispatch reads only z that was
+    /// published before it" — the property whose violation corrupted the
+    /// ranked codeword while every full-z compare stayed bit-exact. The
+    /// emulation makes any violation deterministic instead of
+    /// scheduling-dependent: a scratch z image is filled with poison, bands
+    /// are revealed (copied in) one at a time in publication order, and the
+    /// band's dispatch runs to completion BEFORE the next band is revealed.
+    /// A dispatch touching any byte beyond its published prefix reads
+    /// poison and changes the Merkle fingerprint of the first-pass output,
+    /// which is compared against the same fingerprint computed from one
+    /// full-range dispatch over complete z. Three reps with three band
+    /// decompositions (tapered, uniform, finest 16-r8 columns) bound the
+    /// boundary coverage.
+    ///
+    /// Any mismatch or Metal failure permanently degrades radix256 for this
+    /// process (`degrade_gpu_from_z_radix256`) — the incumbent layered
+    /// from-z path takes over before the wiring run, the latch decision, or
+    /// any timed prove can consume radix256 output.
+    unsafe fn verify_streamed_radix256_geometry(
+        gpu: &Gpu,
+        z_packed: &[F128],
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+    ) -> Result<(), String> {
+        // a-unit = 16 r8 positions = one witness group column across all 128
+        // sp-stripes; 256 a-units cover the r8 space. Schedules mirror the
+        // production tapered/uniform bands plus the finest publishable
+        // decomposition.
+        const GUARD_SCHEDULES: [&[usize]; 3] = [
+            &[32, 32, 32, 32, 32, 32, 32, 28, 4],
+            &[32; 8],
+            &[16; 16],
+        ];
+        const POISON: [u8; 3] = [0xA5, 0x5A, 0xC3];
+        // RANKED DEFAULT: ONE rep, on the PRODUCTION schedule only. The
+        // defect class this guards is deterministic geometry (an r4-space
+        // prefix consumed as an r8-space prefix), so one rep on the schedule
+        // the ranked worker actually publishes detects it; reps 1-2 are
+        // alternative decompositions ranked never runs, kept for local
+        // diagnostics behind `FLOCK_R256_GUARD_REPS` (ranked workers run
+        // env-cleared, so ranked always takes the cheap default). Rationale:
+        // at ~1 s x ~120 workers a 3-rep guard spends minutes of the
+        // 10-minute job-wall cap — the budget that has already taken
+        // competitor submissions to n/a. `0` (local only) skips the guard
+        // and is how its marginal wall is measured.
+        let reps = std::env::var("FLOCK_R256_GUARD_REPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(1, |n| n.min(GUARD_SCHEDULES.len()));
+        if reps == 0 {
+            return Ok(());
+        }
+        let total_r_units = 1usize << (log_d - 4);
+        let plan = FromZFirstPassPlan::new(gpu, log_d);
+        debug_assert!(plan.radix256);
+        let z_bytes = core::mem::size_of_val(z_packed);
+        let root_index = 2 * n_leaves - 2;
+        unsafe {
+            let pool = gpu.pool_push();
+            let mut z_emul: Id = NIL;
+            let dbg = debug_enabled();
+            let t_ref = std::time::Instant::now();
+            let mut t_poison_ms = 0.0f64;
+            let mut t_reveal_ms = 0.0f64;
+            let mut t_dispatch_ms = 0.0f64;
+            let r = (|| -> Result<(), String> {
+                // Reference fingerprint: full-range first pass over the real
+                // (complete) z, then the Merkle tree of the layer-8 state.
+                {
+                    let cb = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb)?;
+                    plan.encode_range(
+                        gpu, enc, staging, tw_buf, z_buf, log_d, 0, total_r_units,
+                    );
+                    encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb)?;
+                }
+                let ref_root = *gpu
+                    .buffer_contents(tree_buf)
+                    .cast::<Hash>()
+                    .add(root_index);
+                let ref_ms = t_ref.elapsed().as_secs_f64() * 1e3;
+
+                z_emul = gpu.new_buffer(z_bytes)?;
+                let emul: *mut u8 = gpu.buffer_contents(z_emul);
+                for (rep, schedule) in GUARD_SCHEDULES.iter().take(reps).enumerate() {
+                    debug_assert_eq!(schedule.iter().sum::<usize>(), 256);
+                    // Fresh poison every rep: the previous rep ends with the
+                    // full (correct) z revealed, which would mask stray reads.
+                    let t = std::time::Instant::now();
+                    std::ptr::write_bytes(emul, POISON[rep], z_bytes);
+                    t_poison_ms += t.elapsed().as_secs_f64() * 1e3;
+                    // Which bands to actually probe. The comparison stays
+                    // EXACT for any subset: the reference pass above left
+                    // reference bytes in every staging position, so a band we
+                    // do not dispatch contributes identical bytes to both
+                    // sides of the fingerprint, while a band we do dispatch
+                    // overwrites its own output — with reference bytes if it
+                    // read only its published region, with poison-derived
+                    // bytes otherwise. Each band's dispatch reads ONLY its own
+                    // r8 range (the kernel indexes z relative to the bound
+                    // offset), so probing the FIRST and LAST bands covers both
+                    // the zero-offset case and the maximum-offset case, where
+                    // any r4-vs-r8 or offset-scaling geometry error is
+                    // largest. The diagnostic reps sweep every band.
+                    let probe_first_last = rep == 0;
+                    let mut a0 = 0usize;
+                    for (band, &aps) in schedule.iter().enumerate() {
+                        if probe_first_last && band != 0 && band != schedule.len() - 1 {
+                            a0 += aps;
+                            continue;
+                        }
+                        // Reveal exactly this band's published region: for
+                        // each of the 128 sp-stripes, positions sp<<12 | r8
+                        // with r8 in [16*a0, 16*(a0+aps)). Everything else
+                        // stays poisoned, which is STRICTER than production
+                        // (there, earlier bands are already published).
+                        let t = std::time::Instant::now();
+                        let run_f128 = 16 * aps * 64;
+                        for sp in 0..128usize {
+                            let start = ((sp << 12) + 16 * a0) * 64;
+                            std::ptr::copy_nonoverlapping(
+                                z_packed.as_ptr().add(start).cast::<u8>(),
+                                emul.add(start * core::mem::size_of::<F128>()),
+                                run_f128 * core::mem::size_of::<F128>(),
+                            );
+                        }
+                        t_reveal_ms += t.elapsed().as_secs_f64() * 1e3;
+                        // The band's dispatch, exactly as the stream encodes
+                        // it, completed BEFORE the next band is revealed.
+                        let t = std::time::Instant::now();
+                        let cb = gpu.command_buffer()?;
+                        let enc = gpu.compute_encoder(cb)?;
+                        // One published unit = one 1 KiB position row; an
+                        // a-unit is 256 units (16 r8 x 16 units/r8), matching
+                        // `submit_ready_units`'s byte-offset convention.
+                        plan.encode_range(
+                            gpu,
+                            enc,
+                            staging,
+                            tw_buf,
+                            z_emul,
+                            log_d,
+                            a0 * 256 * 64 * core::mem::size_of::<F128>(),
+                            aps * 256,
+                        );
+                        gpu.end_encoding(enc);
+                        gpu.commit_and_wait(cb)?;
+                        t_dispatch_ms += t.elapsed().as_secs_f64() * 1e3;
+                        a0 += aps;
+                    }
+                    let t = std::time::Instant::now();
+                    let cb = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb)?;
+                    encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb)?;
+                    let rep_root = *gpu
+                        .buffer_contents(tree_buf)
+                        .cast::<Hash>()
+                        .add(root_index);
+                    t_dispatch_ms += t.elapsed().as_secs_f64() * 1e3;
+                    if rep_root != ref_root {
+                        return Err(format!(
+                            "streamed-geometry rep {rep} fingerprint mismatch \
+                             (schedule {schedule:?}, probe={})",
+                            if probe_first_last { "first+last" } else { "all bands" }
+                        ));
+                    }
+                }
+                if dbg {
+                    eprintln!(
+                        "[gpu-commit] r256 guard phases: ref {ref_ms:.0} ms, \
+                         poison {t_poison_ms:.0} ms, reveal {t_reveal_ms:.0} ms, \
+                         emul-dispatch+fingerprint {t_dispatch_ms:.0} ms"
+                    );
+                }
+                Ok(())
+            })();
+            if !z_emul.is_null() {
+                gpu.release(z_emul);
+            }
+            gpu.pool_pop(pool);
+            r
+        }
+    }
+
     /// GPU half of the warmup dual-run: create the persistent state (twiddle
     /// upload, staging codeword home, tree buffer, read-only z wrap), run
     /// the full from-z graph once untimed (page-wires every buffer exactly
@@ -6732,6 +7406,38 @@ kernel void blake3_pow_scan(
                 let z_buf =
                     gpu.wrap_buffer(z_packed.as_ptr().cast_mut().cast::<u8>(), z_bytes)?;
                 created.push(z_buf);
+
+                // Runtime backstop, still untimed: prove the streamed
+                // radix-256 geometry on THIS host's GPU before anything can
+                // latch it. Any anomaly permanently degrades radix256 (the
+                // wiring run below and every later encode then re-plan onto
+                // the incumbent layered path), so a host where the streamed
+                // decomposition misbehaves ships incumbent bytes instead of
+                // a corrupt codeword.
+                // Once per process: the verdict (pass or permanent degrade)
+                // is process-wide, and warmup_gpu_run itself can run twice
+                // when the static latch rejects into the full dual-run.
+                static R256_GUARD_DONE: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if FromZFirstPassPlan::new(gpu, log_d).radix256
+                    && !R256_GUARD_DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    let t = std::time::Instant::now();
+                    match verify_streamed_radix256_geometry(
+                        gpu, z_packed, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves,
+                    ) {
+                        Ok(()) => {
+                            if debug_enabled() {
+                                eprintln!(
+                                    "[gpu-commit] streamed radix256 geometry verified \
+                                     ({:.1} ms untimed)",
+                                    t.elapsed().as_secs_f64() * 1e3
+                                );
+                            }
+                        }
+                        Err(e) => super::degrade_gpu_from_z_radix256(&e),
+                    }
+                }
 
                 // Untimed wiring run, then the identical timed run.
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
@@ -12201,7 +12907,11 @@ mod imp {
     pub(crate) struct FromZFirstPassStream;
 
     impl FromZFirstPassStream {
+        pub(crate) fn r8_publication(&self) -> bool {
+            false
+        }
         pub(crate) fn submit_ready_range(&mut self, _r_start: usize, _r_count: usize) {}
+        pub(crate) fn submit_ready_r8_range(&mut self, _r8_start: usize, _r8_count: usize) {}
     }
 
     pub(crate) unsafe fn begin_from_z_first_pass_stream(

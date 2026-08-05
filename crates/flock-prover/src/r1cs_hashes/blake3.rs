@@ -2514,30 +2514,71 @@ pub(crate) mod witgen_simd {
             const SEGMENTS: usize = 8;
             let groups_per_segment = n_groups / SEGMENTS;
             debug_assert_eq!(groups_per_segment, 4096);
-            // Band schedule in groups-per-segment units (each unit maps to 16
-            // streamed r tiles across all 8 segments). The GPU consumes the
-            // first NTT pass at witness-production pace with zero inter-band
-            // gaps, so the window's head segment ends at (last submit) +
-            // (final band's GPU slice). Tapering the trailing bands shrinks
-            // that final slice from 1/8 of the pass to 1/256 of it, pulling
-            // the whole downstream GPU chain earlier by the difference. The
-            // uniform 8-band control remains selectable for exact same-binary
-            // A/B (`FLOCK_NO_STREAM_TAPER=1`).
-            // Tail band of 64 gps keeps 8 hetero slabs (WITGEN_HETERO_SLAB =
-            // 64 jobs) so its drain still parallelizes across the pool.
+            // Publication geometry depends on the stream's first-pass kernel.
+            //
+            // r4 mode (incumbent f=4 kernel): the kernel reads z positions
+            // `p4<<16 | r4` with r4 inside the published range, so a band is
+            // an r4-prefix: `gps` group columns across the 8 SEGMENTS
+            // (position bits 18..16).
+            //
+            // r8 mode (radix256, layers 0..7 fused): the kernel reads
+            // `sp<<12 | r8` — its r-tile is the position's LOW 12 bits and
+            // one tile strides ALL 128 sp-slices (position bits 18..12). A
+            // band must therefore be an r8-prefix: `aps` a-columns across
+            // ALL SEGMENTS*16 (seg, j) stripes, where group
+            // `g = seg*4096 + j*256 + a` covers r8 [16a, 16a+16) of stripe
+            // sp = seg*16 + j. Publishing r4 bands to a radix256 stream is
+            // exactly the read-before-write race that corrupted the ranked
+            // codeword (streamed dispatches consumed z the CPU had not
+            // produced yet), so the two modes must never mix — the stream
+            // rejects a wrong-space publication into a clean CPU fallback.
+            const J_STRIPES: usize = 16;
+            const A_PER_STRIPE: usize = 256;
+            debug_assert_eq!(J_STRIPES * A_PER_STRIPE, groups_per_segment);
+            let r8_mode = stream.r8_publication();
+            // Band schedules. r4 units: groups-per-segment (each unit maps
+            // to 16 streamed r4 tiles across all 8 segments). r8 units:
+            // a-columns-per-stripe (each unit maps to 16 streamed r8 tiles
+            // across all 128 stripes). The r8 schedules are the r4 schedules
+            // divided by 16, so band boundaries land at the same witness
+            // fractions and the GPU consumes the first pass at the same
+            // production pace in both modes. The taper rationale is
+            // unchanged: shrinking the final band shrinks the final GPU
+            // slice appended after the last submit. The uniform control
+            // remains selectable for exact same-binary A/B
+            // (`FLOCK_NO_STREAM_TAPER=1`).
             const UNIFORM_SCHEDULE: &[usize] = &[512; 8];
             const TAPERED_SCHEDULE: &[usize] = &[512, 512, 512, 512, 512, 512, 512, 448, 64];
+            const UNIFORM_SCHEDULE_R8: &[usize] = &[32; 8];
+            const TAPERED_SCHEDULE_R8: &[usize] = &[32, 32, 32, 32, 32, 32, 32, 28, 4];
             // A/B-CONTROL: set to `false` for the official-harness control
             // build. The env kill switch exists for same-binary diagnostics.
             const STREAM_TAPER_DEFAULT: bool = true;
             let tapered = STREAM_TAPER_DEFAULT
                 && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
-            let schedule = if tapered {
-                TAPERED_SCHEDULE
-            } else {
-                UNIFORM_SCHEDULE
+            let schedule = match (r8_mode, tapered) {
+                (false, true) => TAPERED_SCHEDULE,
+                (false, false) => UNIFORM_SCHEDULE,
+                (true, true) => TAPERED_SCHEDULE_R8,
+                (true, false) => UNIFORM_SCHEDULE_R8,
             };
-            debug_assert_eq!(schedule.iter().sum::<usize>(), groups_per_segment);
+            debug_assert_eq!(
+                schedule.iter().sum::<usize>(),
+                if r8_mode { A_PER_STRIPE } else { groups_per_segment }
+            );
+            // Stripes a band spans: every (seg, j) pair in r8 mode, every
+            // segment in r4 mode. Per-band group totals are identical across
+            // modes (128 * aps == 8 * gps for aps == gps/16).
+            let stripes = if r8_mode { SEGMENTS * J_STRIPES } else { SEGMENTS };
+            let stripe_stride = if r8_mode { A_PER_STRIPE } else { groups_per_segment };
+            let stripe_g0 = |stripe: usize| {
+                if r8_mode {
+                    (stripe / J_STRIPES) * groups_per_segment + (stripe % J_STRIPES) * A_PER_STRIPE
+                } else {
+                    stripe * groups_per_segment
+                }
+            };
+            debug_assert_eq!(stripes * stripe_stride, n_groups);
             // Item A (continuous claim queue): replace the 8–9 per-band full
             // join barriers with ONE queue over all slabs in band order plus
             // per-band atomic remaining-counters. Whoever zeroes a band's
@@ -2564,27 +2605,38 @@ pub(crate) mod witgen_simd {
                         Some(cur)
                     })
                     .collect();
-                // Slab table in band-major order (band, then segment, then
+                // Slab table in band-major order (band, then stripe, then
                 // local) — the incumbent's claim order, minus its joins. A
-                // slab never straddles a segment or a band: every schedule
-                // entry is a multiple of the 64-group slab.
-                let mut slab_band: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
-                let mut slab_g0: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
-                for (i, &gps) in schedule.iter().enumerate() {
-                    debug_assert!(gps.is_multiple_of(SLAB));
-                    for seg in 0..SEGMENTS {
-                        for l in (0..gps).step_by(SLAB) {
+                // slab is a run of CONSECUTIVE groups (long ascending store
+                // runs preserved in both modes) and never straddles a stripe
+                // or a band. In r4 mode every schedule entry is a multiple
+                // of the 64-group slab, reproducing the incumbent table
+                // exactly; in r8 mode a stripe holds at most 32 band-local
+                // columns, so slabs are the per-band column runs (32/28/4
+                // groups) and the per-slab length rides along.
+                let mut slab_band: Vec<u32> = Vec::new();
+                let mut slab_g0: Vec<u32> = Vec::new();
+                let mut slab_len: Vec<u32> = Vec::new();
+                let mut band_slab_count = vec![0usize; n_bands];
+                for (i, &per_stripe) in schedule.iter().enumerate() {
+                    debug_assert!(r8_mode || per_stripe.is_multiple_of(SLAB));
+                    for stripe in 0..stripes {
+                        for l in (0..per_stripe).step_by(SLAB) {
+                            let len = SLAB.min(per_stripe - l);
                             slab_band.push(i as u32);
-                            slab_g0.push(
-                                (seg * groups_per_segment + band_offset[i] + l) as u32,
-                            );
+                            slab_g0.push((stripe_g0(stripe) + band_offset[i] + l) as u32);
+                            slab_len.push(len as u32);
+                            band_slab_count[i] += 1;
                         }
                     }
                 }
-                debug_assert_eq!(slab_band.len(), n_groups / SLAB);
-                let remaining: Vec<AtomicUsize> = schedule
+                debug_assert_eq!(
+                    slab_len.iter().map(|&l| l as usize).sum::<usize>(),
+                    n_groups
+                );
+                let remaining: Vec<AtomicUsize> = band_slab_count
                     .iter()
-                    .map(|&gps| AtomicUsize::new(SEGMENTS * gps / SLAB))
+                    .map(|&c| AtomicUsize::new(c))
                     .collect();
                 let done: Vec<AtomicBool> =
                     (0..n_bands).map(|_| AtomicBool::new(false)).collect();
@@ -2601,7 +2653,7 @@ pub(crate) mod witgen_simd {
                 let seq = std::sync::Mutex::new(SubmitSeq { next: 0, stream });
                 let slab_fn = |s: usize| {
                     let g0 = slab_g0[s] as usize;
-                    for g in g0..g0 + SLAB {
+                    for g in g0..g0 + slab_len[s] as usize {
                         process_group(g);
                     }
                     let band = slab_band[s] as usize;
@@ -2624,7 +2676,13 @@ pub(crate) mod witgen_simd {
                             // publish all CPU writes of band b before the
                             // command buffer that reads them is committed.
                             std::sync::atomic::fence(Ordering::Release);
-                            seq.stream.submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
+                            if r8_mode {
+                                seq.stream
+                                    .submit_ready_r8_range(band_offset[b] * 16, schedule[b] * 16);
+                            } else {
+                                seq.stream
+                                    .submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
+                            }
                             seq.next += 1;
                             if timing {
                                 submit_ns[b].store(
@@ -2646,7 +2704,13 @@ pub(crate) mod witgen_simd {
                 while seq.next < n_bands {
                     let b = seq.next;
                     std::sync::atomic::fence(Ordering::Release);
-                    seq.stream.submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
+                    if r8_mode {
+                        seq.stream
+                            .submit_ready_r8_range(band_offset[b] * 16, schedule[b] * 16);
+                    } else {
+                        seq.stream
+                            .submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
+                    }
                     seq.next += 1;
                 }
                 if timing {
@@ -2672,11 +2736,12 @@ pub(crate) mod witgen_simd {
             let t_bands = std::time::Instant::now();
             let mut offset = 0usize;
             for (band_i, &band_gps) in schedule.iter().enumerate() {
-                let n_jobs = SEGMENTS * band_gps;
+                let n_jobs = stripes * band_gps;
                 let claimed = std::sync::atomic::AtomicUsize::new(0);
                 let last_claim_ns = std::sync::atomic::AtomicU64::new(0);
                 // W-H1: the band's jobs drain through the same slab shim as
-                // the generic driver (a slab never straddles a segment).
+                // the generic driver (a slab never straddles a stripe's
+                // band-local run; consecutive jobs stay consecutive groups).
                 let band_job = |job: usize| {
                     if band_timing {
                         let i = claimed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -2687,19 +2752,23 @@ pub(crate) mod witgen_simd {
                             );
                         }
                     }
-                    let segment = job / band_gps;
+                    let stripe = job / band_gps;
                     let local = job % band_gps;
-                    let g = segment * groups_per_segment + offset + local;
+                    let g = stripe_g0(stripe) + offset + local;
                     process_group(g);
                 };
-                super::super::common::drain_group_jobs(SEGMENTS * band_gps, &band_job);
+                super::super::common::drain_group_jobs(n_jobs, &band_job);
                 let t_join_ns = band_timing.then(|| t_bands.elapsed().as_nanos() as u64);
                 // The queue/Rayon join above publishes every CPU write in
                 // this band; command-buffer submission then makes those
                 // shared-memory pages visible to Metal before it starts the
                 // range.
                 std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                stream.submit_ready_range(offset * 16, band_gps * 16);
+                if r8_mode {
+                    stream.submit_ready_r8_range(offset * 16, band_gps * 16);
+                } else {
+                    stream.submit_ready_range(offset * 16, band_gps * 16);
+                }
                 if band_timing {
                     let t_submit_ns = t_bands.elapsed().as_nanos() as u64;
                     let last_claim = last_claim_ns.load(std::sync::atomic::Ordering::Relaxed);
@@ -5053,6 +5122,125 @@ mod chain_e2e_tests {
             setup
                 .verify_chain(&comm, &proof, &cv0, &cv_last, &mut chv)
                 .is_err()
+        );
+    }
+}
+
+/// Ranked streamed-GPU end-to-end verification (local M2/M3 hardware only).
+///
+/// Mirrors the benchmark worker's exact per-trial flow: one warmup prove on
+/// the fixed warmup seed (latching the GPU), then timed proves whose L0
+/// commit runs the LATCHED, STREAMED from-z first pass — the only
+/// configuration the ranked runner ever times and the one the ordinary
+/// warmup byte-compare never covers. Each timed commitment is checked
+/// against a trusted recommit of the same witness (the ranked verifier's
+/// "proof commitment does not match the trusted BLAKE3 witness" gate) and
+/// full proof verification, and the test FAILS unless the streamed path is
+/// proven to have engaged (no silent path-miss).
+///
+/// Run with the GPU latch forced so the M2-vs-CPU wall cannot leave the
+/// latch off:
+/// ```text
+/// RUST_MIN_STACK=67108864 FLOCK_GPU_COMMIT_FORCE=1 \
+///   cargo test --release -p flock-prover \
+///   ranked_streamed_timed_prove_matches_trusted_witness -- --ignored --nocapture
+/// ```
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod ranked_streamed_gpu_tests {
+    use super::{Blake3Setup, Compression};
+    use flock_core::challenger::FsChallenger;
+    use flock_core::merkle::HashKind;
+
+    /// Local copy of the benchmark harness's deterministic compression
+    /// generator (`benchmark-tools/common`): same splitmix-style stream so
+    /// local witnesses match the shape the ranked runner draws.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            (z ^ (z >> 31)) as u32
+        }
+    }
+
+    fn generate_compressions(log2_size: u32, seed: u64) -> Vec<Compression> {
+        let mut rng = Rng(seed ^ u64::from(log2_size).rotate_left(29));
+        (0..1usize << log2_size)
+            .map(|_| {
+                let cv = std::array::from_fn(|_| rng.next_u32());
+                let message = std::array::from_fn(|_| rng.next_u32());
+                let counter = u64::from(rng.next_u32());
+                (cv, message, counter, 64, 11)
+            })
+            .collect()
+    }
+
+    const DOMAIN: &[u8] = b"flock-bench-v0";
+    const WARMUP_SEED: u64 = 0x00C0_FFEE_BEEF_D15C;
+
+    #[test]
+    #[ignore] // ranked shape: needs Apple-silicon GPU, ~6 GiB, minutes.
+    fn ranked_streamed_timed_prove_matches_trusted_witness() {
+        assert!(
+            std::env::var_os("FLOCK_GPU_COMMIT_FORCE").is_some(),
+            "run with FLOCK_GPU_COMMIT_FORCE=1 so the latch decision cannot \
+             silently leave the GPU (and therefore the streamed path) off"
+        );
+        let log2_size = 18u32;
+        let mut setup = Blake3Setup::new(1usize << log2_size);
+        setup.pcs_params.merkle_hash = HashKind::Blake3;
+
+        // Worker warmup prove: different witness from every timed prove, so
+        // recycled scratch cannot mask reads of not-yet-published z.
+        {
+            let blocks = generate_compressions(log2_size, WARMUP_SEED);
+            let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+            let _ = setup.prove_fast(&blocks, &mut ch);
+        }
+        let (streams_after_warmup, _) = flock_core::gpu_commit::streamed_first_pass_stats();
+
+        // Timed proves (the streamed path runs in each). Default is two —
+        // one more than the production envelope (the ranked worker proves
+        // exactly warmup + 1 per process); more can be requested via
+        // FLOCK_TEST_TIMED_SEEDS=comma-separated-u64 for stress runs.
+        let seeds: Vec<u64> = match std::env::var("FLOCK_TEST_TIMED_SEEDS") {
+            Ok(s) => s
+                .split(',')
+                .map(|t| t.trim().parse().expect("FLOCK_TEST_TIMED_SEEDS: bad u64"))
+                .collect(),
+            Err(_) => vec![42, 0xDEAD_BEEF],
+        };
+        for seed in seeds {
+            let blocks = generate_compressions(log2_size, seed);
+            let mut ch = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+            let (proof, commitment, _) = setup.prove_fast(&blocks, &mut ch);
+
+            // Trusted-witness recommit (the ranked verifier's gate). z is
+            // fully materialized before this commit, so it takes the
+            // full-range (non-streamed) path regardless of latch state.
+            let witness = setup.generate_witness_packed(&blocks);
+            let (expected, _) = flock_core::pcs::commit(&witness, &setup.pcs_params);
+            assert_eq!(
+                commitment.root, expected.root,
+                "seed {seed:#x}: streamed commitment does not match the \
+                 trusted BLAKE3 witness"
+            );
+
+            let mut chv = FsChallenger::with_hash(DOMAIN, HashKind::Blake3);
+            setup
+                .verify(&commitment, &proof, &mut chv)
+                .unwrap_or_else(|e| panic!("seed {seed:#x}: verify rejected: {e:?}"));
+        }
+
+        // Engagement proof: the timed proves must actually have streamed.
+        let (streams, ranges) = flock_core::gpu_commit::streamed_first_pass_stats();
+        assert!(
+            streams > streams_after_warmup && ranges > 0,
+            "streamed first pass never engaged (streams={streams}, \
+             ranges={ranges}) — the test proved nothing; check the latch \
+             and stream gating"
         );
     }
 }

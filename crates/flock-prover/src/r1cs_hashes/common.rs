@@ -718,27 +718,67 @@ where
         let r_per_band = r_total / BANDS;
         debug_assert_eq!(groups_per_segment, 4096);
         debug_assert_eq!(groups_per_band, 512);
-        for band in 0..BANDS {
-            // W-H1: the band's jobs drain through the same slab shim. A slab
-            // never straddles a segment (512 % 64 == 0), so consecutive jobs
-            // stay consecutive groups and the long ascending store runs are
-            // preserved. The queue join below still bounds the band before
-            // submission, exactly like the incumbent Rayon join.
-            let band_job = |job: usize| {
-                let g = ranked_stream_group_index(
-                    job,
-                    band,
-                    groups_per_segment,
-                    groups_per_band,
-                );
-                process_group(g);
-            };
-            drain_group_jobs(SEGMENTS * groups_per_band, &band_job);
-            // The queue/Rayon join above publishes every CPU write in this
-            // band; command-buffer submission then makes those shared-memory
-            // pages visible to Metal before it starts the range.
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            stream.submit_ready_range(band * r_per_band, r_per_band);
+        if stream.r8_publication() {
+            // radix256 first pass: its r-tile is the position's LOW 12 bits
+            // and one tile reads ALL 128 sp-stripes (`sp<<12 | r8`), so a
+            // published band must be an r8-prefix completed across every
+            // (segment, j) stripe — group `g = seg*4096 + j*256 + a` covers
+            // r8 [16a, 16a+16) of stripe sp = seg*16 + j. Publishing the
+            // incumbent r4 bands here is the read-before-write race that
+            // corrupted the ranked codeword.
+            const J_STRIPES: usize = 16;
+            let a_per_stripe = groups_per_segment / J_STRIPES;
+            let a_per_band = a_per_stripe / BANDS;
+            let stripes = SEGMENTS * J_STRIPES;
+            debug_assert_eq!(a_per_stripe, 256);
+            debug_assert_eq!(a_per_band, 32);
+            let r8_total = 1usize << 12;
+            let r8_per_band = r8_total / BANDS;
+            for band in 0..BANDS {
+                // W-H1: same slab shim; consecutive jobs stay consecutive
+                // groups inside one stripe's band-local 32-column run.
+                let band_job = |job: usize| {
+                    let stripe = job / a_per_band;
+                    let local = job % a_per_band;
+                    let seg = stripe / J_STRIPES;
+                    let j = stripe % J_STRIPES;
+                    let g = seg * groups_per_segment
+                        + j * a_per_stripe
+                        + band * a_per_band
+                        + local;
+                    process_group(g);
+                };
+                drain_group_jobs(stripes * a_per_band, &band_job);
+                // The queue/Rayon join above publishes every CPU write in
+                // this band before the command buffer that reads it commits.
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                stream.submit_ready_r8_range(band * r8_per_band, r8_per_band);
+            }
+        } else {
+            for band in 0..BANDS {
+                // W-H1: the band's jobs drain through the same slab shim. A
+                // slab never straddles a segment (512 % 64 == 0), so
+                // consecutive jobs stay consecutive groups and the long
+                // ascending store runs are preserved. The queue join below
+                // still bounds the band before submission, exactly like the
+                // incumbent Rayon join.
+                let band_job = |job: usize| {
+                    let g = ranked_stream_group_index(
+                        job,
+                        band,
+                        groups_per_segment,
+                        groups_per_band,
+                    );
+                    process_group(g);
+                };
+                drain_group_jobs(SEGMENTS * groups_per_band, &band_job);
+                // The queue/Rayon join above publishes every CPU write in
+                // this band; command-buffer submission then makes those
+                // shared-memory pages visible to Metal before it starts the
+                // range.
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                stream.submit_ready_range(band * r_per_band, r_per_band);
+            }
         }
     } else {
         drain_group_jobs(n_groups, &process_group);
