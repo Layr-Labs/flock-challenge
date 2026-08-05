@@ -12672,3 +12672,7 @@ mod tests {
 // RealAdii sample 7 on c52fba6.
 // RealAdii sample 8 on c52fba6.
 // RealAdii sample 9 on c52fba6.
+
+// angel-cockpit frontier resample on cc1d811 (board 1,682,849.58 after
+// georgwiese's +6.56% real delta — hetero-drained AB precompute + E4 stripe).
+// No code delta: comment-only tree; promotion barrier remains a noise draw.
