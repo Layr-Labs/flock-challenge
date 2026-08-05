@@ -728,101 +728,216 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
+    if zc_ab_pre_hetero_enabled() {
+        // QS5 hetero drain: feed the precompute through the shared two-pool
+        // chunk queue instead of a main-pool-only `par_chunks_mut`. The
+        // E-side of this queue is a broadcast on the SAME helper pool that is
+        // draining the deferred lincheck stripe, and rayon broadcasts on one
+        // pool run in submission order — so the four E-workers pick up
+        // precompute jobs at the exact moment the stripe releases them,
+        // with no new synchronization. Rationale (measured 2026-08-05, this
+        // hardware class): post-byte16 the commit window is BOUND by this
+        // precompute arm (arm 58.2 ms ≈ window 58.3 ms; the GPU graph
+        // finishes at 41–53 ms with 0.00 ms host wait), while the stripe
+        // releases the E-cluster at ~52 ms (E3) or ~40 ms (E4). Every
+        // E-core-second spent on the tail of THIS queue therefore shortens
+        // the window one-for-one — the inverse of the regime in which the
+        // hetero AB drain was measured dead (GPU-bound join, E-traffic
+        // raising the dominant arm). Chunk-claim order is nondeterministic
+        // but each chunk writes only its own disjoint 1 KiB, so the output
+        // bytes are identical to the incumbent path.
+        let n_chunks = total_bytes / OUTER_BYTES;
+        let n_jobs = n_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
+        let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+        crate::epool::run_hetero_chunks_stateful(
+            n_jobs,
+            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+            |(a_col, b_col), job| {
+                let start = job * AB_PRE_CHUNKS_PER_JOB;
+                let end = (start + AB_PRE_CHUNKS_PER_JOB).min(n_chunks);
+                for x_outer in start..end {
+                    // SAFETY: the queue hands out each job index exactly once
+                    // and each `x_outer` maps to one disjoint 1 KiB chunk.
+                    let out_outer = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            out_base.ptr().add(x_outer * OUTER_BYTES),
+                            OUTER_BYTES,
+                        )
+                    };
+                    precompute_ab_one_chunk(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        within_outer_mask,
+                        &b_med_counts,
+                        blake3_static_layout,
+                        static_b_context,
+                        nt,
+                        compact,
+                        x_outer,
+                        out_outer,
+                        a_col,
+                        b_col,
+                    );
+                }
+            },
+        );
+        return Round1AbInner { storage };
+    }
+
     out_bytes
         .par_chunks_mut(OUTER_BYTES)
         .enumerate()
         .for_each_init(
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
             |(a_col, b_col), (x_outer, out_outer)| {
-                let within_hash_outer = x_outer & within_outer_mask;
-                let n_b_med = b_med_counts[within_hash_outer] as usize;
-                let chunk_byte_base = x_outer * OUTER_BYTES;
-
-                // NT arm: the kernel writes a stack temporary and the 64-byte
-                // block drains to the big buffer with `stnp` (write-once
-                // lines, consumer runs after the commit root). Control arm is
-                // the incumbent direct kernel write, byte-for-byte.
-                let mut tmp = [0u8; 64];
-                for b_med in 0..n_b_med {
-                    let dst: &mut [u8; 64] = if nt {
-                        &mut tmp
-                    } else {
-                        (&mut out_outer[b_med * 64..(b_med + 1) * 64])
-                            .try_into()
-                            .expect("one transformed b_med block")
-                    };
-                    shift_reduce_inner_ab(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        chunk_byte_base,
-                        b_med,
-                        dst,
-                        a_col,
-                        b_col,
-                        !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
-                        !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-                        if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
-                            0x03
-                        } else if blake3_static_layout
-                            && within_hash_outer == 1
-                            && b_med + 2 == n_b_med
-                        {
-                            0xf0
-                        } else {
-                            0
-                        },
-                        if blake3_static_layout {
-                            within_hash_outer
-                        } else {
-                            usize::MAX
-                        },
-                        static_b_context,
-                    );
-                    if nt {
-                        // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
-                        // 64 destination bytes are in-bounds of `out_outer`.
-                        unsafe {
-                            store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64))
-                        };
-                    }
-                }
-                // QS3 compacted store. The tail rows `[n_b_med, 16)` of this
-                // chunk are dead: every `ab_inner` consumer iterates exactly
-                // `0..n_b_med` — the AB completion (`accumulate_convert_ab`),
-                // the fused/split `accumulate_convert_with_s_hat_v` AB half,
-                // and the Fold4 AB arm all bound their per-`b_med` reads by the
-                // same `n_b_med`; C reads the packed witness, not `ab_inner`;
-                // and round two overwrites the whole donated buffer
-                // (`into_scratch_bytes` → compact `deltas`) before reading it.
-                // So zeroing the tail is pure write traffic. At the ranked
-                // BLAKE3 shape (k_log=14, useful=15_409) window 1 has
-                // `n_b_med = 15`, i.e. one dead 64-byte row per window-1 chunk:
-                // 2^18 chunks × 64 B = 16 MiB, ~3% of the 512 MiB precompute
-                // write surface. The AB precompute runs concurrently with the
-                // streamed GPU commit, which saturates the same memory system,
-                // so dropping these stores pays as CONTENTION RELIEF on the
-                // commit arm rather than on the precompute's own wall (which
-                // already finishes ~24 ms early). The kill switch restores the
-                // incumbent zero-fill for a same-binary A/B; both leave the
-                // live region byte-identical, so the proof is unchanged.
-                if !compact {
-                    if nt {
-                        let tail = &mut out_outer[n_b_med * 64..];
-                        debug_assert_eq!(tail.len() % 64, 0);
-                        let zero = [0u8; 64];
-                        for i in 0..tail.len() / 64 {
-                            // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
-                            unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
-                        }
-                    } else {
-                        out_outer[n_b_med * 64..].fill(0);
-                    }
-                }
+                precompute_ab_one_chunk(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    within_outer_mask,
+                    &b_med_counts,
+                    blake3_static_layout,
+                    static_b_context,
+                    nt,
+                    compact,
+                    x_outer,
+                    out_outer,
+                    a_col,
+                    b_col,
+                );
             },
         );
 
     Round1AbInner { storage }
+}
+
+/// Jobs of this many 1 KiB chunks feed the QS5 hetero precompute queue: big
+/// enough that the atomic claim amortizes (a job is ~60 µs on a P-core),
+/// small enough that an E-core owns at most ~200 µs of tail when the main
+/// pool finishes — the same sizing logic as the deferred stripe's 64.
+const AB_PRE_CHUNKS_PER_JOB: usize = 64;
+
+/// Compile-time default for the QS5 hetero AB-precompute drain (the ranked
+/// decision must be a constant; ranked workers run with a cleared
+/// environment). A/B-CONTROL: set exactly `FLOCK_NO_ZC_AB_PRE_HETERO=1` for
+/// the incumbent main-pool-only drain, same binary, byte-identical output.
+pub const ZC_AB_PRE_HETERO_DEFAULT: bool = true;
+pub const ENV_NO_ZC_AB_PRE_HETERO: &str = "FLOCK_NO_ZC_AB_PRE_HETERO";
+
+fn zc_ab_pre_hetero_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        ZC_AB_PRE_HETERO_DEFAULT
+            && std::env::var_os(ENV_NO_ZC_AB_PRE_HETERO).as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// One `x_outer`'s worth of the challenge-independent AB transform — the
+/// exact loop body both precompute drains share, factored out so the QS5
+/// hetero queue and the incumbent `par_chunks_mut` cannot diverge.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn precompute_ab_one_chunk(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    blake3_static_layout: bool,
+    static_b_context: Option<kernels::StaticBContext>,
+    nt: bool,
+    compact: bool,
+    x_outer: usize,
+    out_outer: &mut [u8],
+    a_col: &mut [F8; ELL],
+    b_col: &mut [F8; ELL],
+) {
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    let within_hash_outer = x_outer & within_outer_mask;
+    let n_b_med = b_med_counts[within_hash_outer] as usize;
+    let chunk_byte_base = x_outer * OUTER_BYTES;
+
+    // NT arm: the kernel writes a stack temporary and the 64-byte
+    // block drains to the big buffer with `stnp` (write-once
+    // lines, consumer runs after the commit root). Control arm is
+    // the incumbent direct kernel write, byte-for-byte.
+    let mut tmp = [0u8; 64];
+    for b_med in 0..n_b_med {
+        let dst: &mut [u8; 64] = if nt {
+            &mut tmp
+        } else {
+            (&mut out_outer[b_med * 64..(b_med + 1) * 64])
+                .try_into()
+                .expect("one transformed b_med block")
+        };
+        shift_reduce_inner_ab(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            dst,
+            a_col,
+            b_col,
+            !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
+            !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
+            if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
+                0x03
+            } else if blake3_static_layout
+                && within_hash_outer == 1
+                && b_med + 2 == n_b_med
+            {
+                0xf0
+            } else {
+                0
+            },
+            if blake3_static_layout {
+                within_hash_outer
+            } else {
+                usize::MAX
+            },
+            static_b_context,
+        );
+        if nt {
+            // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
+            // 64 destination bytes are in-bounds of `out_outer`.
+            unsafe { store_nt_64(tmp.as_ptr(), out_outer.as_mut_ptr().add(b_med * 64)) };
+        }
+    }
+    // QS3 compacted store. The tail rows `[n_b_med, 16)` of this
+    // chunk are dead: every `ab_inner` consumer iterates exactly
+    // `0..n_b_med` — the AB completion (`accumulate_convert_ab`),
+    // the fused/split `accumulate_convert_with_s_hat_v` AB half,
+    // and the Fold4 AB arm all bound their per-`b_med` reads by the
+    // same `n_b_med`; C reads the packed witness, not `ab_inner`;
+    // and round two overwrites the whole donated buffer
+    // (`into_scratch_bytes` → compact `deltas`) before reading it.
+    // So zeroing the tail is pure write traffic. At the ranked
+    // BLAKE3 shape (k_log=14, useful=15_409) window 1 has
+    // `n_b_med = 15`, i.e. one dead 64-byte row per window-1 chunk:
+    // 2^18 chunks × 64 B = 16 MiB, ~3% of the 512 MiB precompute
+    // write surface. The AB precompute runs concurrently with the
+    // streamed GPU commit, which saturates the same memory system,
+    // so dropping these stores pays as CONTENTION RELIEF on the
+    // commit arm rather than on the precompute's own wall. The kill
+    // switch restores the incumbent zero-fill for a same-binary A/B;
+    // both leave the live region byte-identical, so the proof is
+    // unchanged.
+    if !compact {
+        if nt {
+            let tail = &mut out_outer[n_b_med * 64..];
+            debug_assert_eq!(tail.len() % 64, 0);
+            let zero = [0u8; 64];
+            for i in 0..tail.len() / 64 {
+                // SAFETY: chunk `i` is 64 in-bounds bytes of `tail`.
+                unsafe { store_nt_64(zero.as_ptr(), tail.as_mut_ptr().add(i * 64)) };
+            }
+        } else {
+            out_outer[n_b_med * 64..].fill(0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

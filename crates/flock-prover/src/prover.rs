@@ -939,20 +939,24 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             assert_eq!(r1cs.useful_bits, 15_409);
             let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
             let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
-            // E3, not E2, is the ranked contention optimum. The E2 default came
-            // from a local 5-P-core reading; on the ranked 10-P-core M3 Max the
-            // stripe fill has more E-side slack than that reading implied.
-            // Credit: welttowelt's public candidate `4e30884` (submission
-            // `6cd24839`) measured E3 at 1,467,688.35 cps on the ranked runner,
-            // +0.95% over the `c8aba2a` bar, and gnuchev's `6ad9781` reproduced
-            // the direction; both scored positive and then lost the run to the
-            // 10-minute job cap rather than to the mechanism. E4 still steals
-            // bandwidth from commit and E1 lets the stripe spill into zerocheck,
-            // so the 1..=4 override stays for controlled same-binary diagnostics.
+            // E4 (all four E-workers), revisited 2026-08-05. The E3 default
+            // was tuned in the GPU-bound-window regime (welttowelt `4e30884`
+            // +0.95% ranked over E2; "E4 steals bandwidth from commit" was
+            // measured when the commit GRAPH bound the join). Post-byte16 the
+            // window is bound by the AB precompute ARM (arm 58.2 ms ≈ window
+            // 58.3 ms; GPU graph 41–53 ms, 0.00 ms host wait), and the QS5
+            // hetero precompute queue lets E-workers continue onto arm chunks
+            // the moment the stripe broadcast returns. A wider stripe both
+            // finishes the fill earlier (~40 ms vs ~52 ms) and releases the
+            // E-cluster to the arm-bound queue sooner; the bandwidth-theft
+            // argument no longer applies to a CPU-compute-bound binder. The
+            // 1..=4 override stays for controlled same-binary diagnostics
+            // (E3 = the prior shipped behavior).
+            const DEFER_STRIPE_EPOOL_THREADS_DEFAULT: usize = 4;
             let epool_workers = std::env::var_os("FLOCK_DEFER_STRIPE_EPOOL_THREADS")
                 .and_then(|value| value.to_str()?.parse::<usize>().ok())
                 .filter(|workers| (1..=4).contains(workers))
-                .unwrap_or(3);
+                .unwrap_or(DEFER_STRIPE_EPOOL_THREADS_DEFAULT);
             let pre = std::thread::scope(|scope| {
                 let stripe_job = scope.spawn(|| {
                     let started = std::time::Instant::now();
