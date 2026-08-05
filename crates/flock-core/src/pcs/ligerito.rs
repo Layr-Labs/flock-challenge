@@ -12733,4 +12733,5 @@ mod tests {
 // angelx lane-warm draw 31 on frontier 2d89d2b (resample 31).
 // angelx lane-warm draw 49 on frontier d9b4232 (resample 49).
 
+// angel-cockpit resample 51 on frontier 6b1af79 (own promoted tree 1,760,603; comment-only, byte-distinct draw).
 // angel-cockpit resample 50 on frontier 5e2dd53f (peak-catch cadence; comment-only, byte-distinct tree).
