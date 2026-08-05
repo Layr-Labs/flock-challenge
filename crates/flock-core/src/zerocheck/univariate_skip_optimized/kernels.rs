@@ -1,4 +1,4 @@
-use super::{C_MASK_TABLE_STRIDE, InvNttTableByteSingleGf8, F8};
+use super::{C_MASK_TABLE_STRIDE, InvNttPairTableGf8, InvNttTableByteSingleGf8, F8};
 
 mod portable;
 
@@ -91,6 +91,7 @@ pub(super) fn shift_reduce_inner_ab(
     const_one_mask: u8,
     bstatic_w: usize,
     static_b_context: Option<StaticBContext>,
+    pair_tables: Option<&InvNttPairTableGf8>,
 ) {
     #[cfg(target_arch = "aarch64")]
     {
@@ -107,6 +108,7 @@ pub(super) fn shift_reduce_inner_ab(
             const_one_mask,
             bstatic_w,
             static_b_context,
+            pair_tables,
         );
     }
 
@@ -125,6 +127,7 @@ pub(super) fn shift_reduce_inner_ab(
             const_one_mask,
             bstatic_w,
             static_b_context,
+            pair_tables,
         );
         // SAFETY: all required target features are enabled at compile time.
         unsafe {
@@ -152,6 +155,7 @@ pub(super) fn shift_reduce_inner_ab(
             const_one_mask,
             bstatic_w,
             static_b_context,
+            pair_tables,
         );
         x86_64::shift_reduce_inner_ab_x86_sse(
             a_packed,
@@ -176,6 +180,7 @@ pub(super) fn shift_reduce_inner_ab(
             const_one_mask,
             bstatic_w,
             static_b_context,
+            pair_tables,
         );
         portable::shift_reduce_inner_ab_scalar(
             a_packed,

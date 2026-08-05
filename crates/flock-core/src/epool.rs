@@ -235,6 +235,21 @@ where
     run_chunks_with_helper_stateful(n_chunks, &init, &f, epool());
 }
 
+/// Pool-tagged sibling of [`run_hetero_chunks_stateful`]: `init` receives
+/// `true` on efficiency-core helper-pool workers and `false` on main-pool
+/// workers (including the inline single-threaded drain), so a caller can vary
+/// worker-private state by pool — e.g. pick table images sized for the P-core
+/// vs the E-cluster cache hierarchy. Chunk ownership, output disjointness and
+/// claim-order nondeterminism are identical to the untagged queue; the tag
+/// must never change which bytes a chunk writes, only how fast.
+pub(crate) fn run_hetero_chunks_stateful_tagged<S, I, F>(n_chunks: usize, init: I, f: F)
+where
+    I: Fn(bool) -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
+    run_chunks_with_helper_stateful_tagged(n_chunks, &init, &f, epool());
+}
+
 /// [`run_hetero_chunks`] with an explicit helper pool, so tests can exercise
 /// the two-pool queue on hosts without efficiency cores.
 pub fn run_chunks_with_helper<F>(n_chunks: usize, f: &F, helper: Option<&rayon::ThreadPool>)
@@ -304,12 +319,27 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
     I: Fn() -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
 {
+    run_chunks_with_helper_stateful_tagged(n_chunks, &|_is_helper| init(), f, helper);
+}
+
+/// [`run_hetero_chunks_stateful_tagged`] with an explicit helper pool: the
+/// single implementation behind both stateful queues. `init(false)` on main
+/// pool / inline workers, `init(true)` on helper-pool broadcast workers.
+pub(crate) fn run_chunks_with_helper_stateful_tagged<S, I, F>(
+    n_chunks: usize,
+    init: &I,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+) where
+    I: Fn(bool) -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
     if n_chunks == 0 {
         return;
     }
     let main_threads = rayon::current_num_threads();
     if main_threads <= 1 {
-        let mut state = init();
+        let mut state = init(false);
         for i in 0..n_chunks {
             f(&mut state, i);
         }
@@ -317,7 +347,7 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
     }
     let next = AtomicUsize::new(0);
     let worker = || {
-        let mut state = init();
+        let mut state = init(false);
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n_chunks {
@@ -336,7 +366,7 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
         Some(ep) => std::thread::scope(|s| {
             s.spawn(|| {
                 ep.broadcast(|_| {
-                    let mut state = init();
+                    let mut state = init(true);
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= n_chunks {
@@ -519,6 +549,36 @@ mod tests {
             uses[state.load(Ordering::Relaxed)] += 1;
         }
         assert!(uses.into_iter().any(|n_uses| n_uses > 1));
+    }
+
+    /// The pool tag handed to `init` must identify the executing pool: `true`
+    /// exactly on helper-pool workers, `false` on main-pool workers — while
+    /// every chunk still runs exactly once.
+    #[test]
+    fn tagged_stateful_queue_reports_pool_identity() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("tag-test-helper-{i}"))
+            .build()
+            .unwrap();
+        let n = 1000;
+        let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        run_chunks_with_helper_stateful_tagged(
+            n,
+            &|is_helper| is_helper,
+            &|is_helper, i| {
+                counts[i].fetch_add(1, Ordering::Relaxed);
+                let on_helper_thread = std::thread::current()
+                    .name()
+                    .is_some_and(|name| name.starts_with("tag-test-helper-"));
+                assert_eq!(
+                    *is_helper, on_helper_thread,
+                    "pool tag must match the executing pool"
+                );
+            },
+            Some(&helper),
+        );
+        assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
     }
 
     /// The stateful single-thread path preserves strict chunk order and owns

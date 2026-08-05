@@ -33,7 +33,7 @@
 use std::sync::OnceLock;
 
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
-use crate::ntt::InvNttTableByteSingleGf8;
+use crate::ntt::{InvNttPairTableGf8, InvNttTableByteSingleGf8};
 
 use super::PaddingSpec;
 use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, pack_bits};
@@ -672,13 +672,18 @@ pub fn precompute_round1_ab_inner_packed_padded(
         padding,
         ab_pre_nt_enabled(),
         ab_compact_store_enabled(),
+        resolve_ab_pair_tables(inv_table),
     )
 }
 
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
 /// choices, tests compare arms byte-for-byte in one process. `nt` selects the
 /// non-temporal drain vs the incumbent cached store; `compact` selects the
-/// QS3 tail-skip vs the incumbent zero-fill of the dead skipped-`b_med` rows.
+/// QS3 tail-skip vs the incumbent zero-fill of the dead skipped-`b_med` rows;
+/// `pair_tables` selects the QS6 paired-byte gather images for MAIN-POOL
+/// workers (E-broadcast workers always keep the byte tables — the tag only
+/// changes which table computes the same bytes, never the bytes themselves).
+#[allow(clippy::too_many_arguments)]
 fn precompute_round1_ab_inner_packed_padded_with_flavor(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -688,6 +693,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     padding: &PaddingSpec,
     nt: bool,
     compact: bool,
+    pair_tables: Option<&InvNttPairTableGf8>,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -749,10 +755,21 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         let n_chunks = total_bytes / OUTER_BYTES;
         let n_jobs = n_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
         let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
-        crate::epool::run_hetero_chunks_stateful(
+        // QS6 pool gating: only MAIN-POOL (P-core) workers carry the 8 MiB
+        // pair images in their state; the E-broadcast workers keep the
+        // incumbent 64 KiB byte tables, which fit the E-cluster's small
+        // shared L2. Both table families compute identical bytes per chunk,
+        // so chunk-claim nondeterminism cannot change the output.
+        crate::epool::run_hetero_chunks_stateful_tagged(
             n_jobs,
-            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), job| {
+            |is_helper| {
+                (
+                    [F8::ZERO; ELL],
+                    [F8::ZERO; ELL],
+                    if is_helper { None } else { pair_tables },
+                )
+            },
+            |(a_col, b_col, worker_pair), job| {
                 let start = job * AB_PRE_CHUNKS_PER_JOB;
                 let end = (start + AB_PRE_CHUNKS_PER_JOB).min(n_chunks);
                 for x_outer in start..end {
@@ -774,6 +791,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                         static_b_context,
                         nt,
                         compact,
+                        *worker_pair,
                         x_outer,
                         out_outer,
                         a_col,
@@ -801,6 +819,8 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
+                    // Main-pool-only drain: every worker is a P-core worker.
+                    pair_tables,
                     x_outer,
                     out_outer,
                     a_col,
@@ -834,6 +854,56 @@ fn zc_ab_pre_hetero_enabled() -> bool {
     })
 }
 
+/// Compile-time default for the QS6 paired-byte (16-bit) inverse-NTT gather
+/// table on the AB-precompute MAIN-POOL (P-core) workers (the ranked decision
+/// must be a constant; ranked workers run with a cleared environment).
+/// A/B-CONTROL: set exactly `FLOCK_NO_ZC_AB_PAIR_TABLE=1` for the incumbent
+/// byte-table gathers, same binary, byte-identical output.
+///
+/// Mechanism: the two-byte collapse `U[w16][i'] = T_0[lo][i'] ⊕ T_0[hi][i'⊕8]`
+/// (see [`InvNttPairTableGf8`]) halves the table loads of every operand-word
+/// transform in the binding AB-precompute arm — 16 `vld1q` instead of 32 per
+/// word. The images cost 8 MiB, so they are P-core-only: the E-broadcast
+/// workers of the QS5 hetero drain keep the L1-resident 64 KiB byte images
+/// (the E-cluster's small shared L2 is exactly where an 8 MiB working set
+/// turns a load win into a miss loss).
+pub const ZC_AB_PAIR_TABLE_DEFAULT: bool = true;
+pub const ENV_NO_ZC_AB_PAIR_TABLE: &str = "FLOCK_NO_ZC_AB_PAIR_TABLE";
+
+/// Exact-`"1"` kill semantics, factored out for the gate tests.
+fn ab_pair_table_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn zc_ab_pair_table_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        ZC_AB_PAIR_TABLE_DEFAULT
+            && ab_pair_table_value_enabled(std::env::var_os(ENV_NO_ZC_AB_PAIR_TABLE).as_deref())
+    })
+}
+
+/// Resolve the QS6 pair images for one AB precompute: gated on the kill
+/// switch, on aarch64 (the only arch with pair kernels), and on `inv_table`
+/// being **exactly** the process-cached standard k=6 table — an identity
+/// check, so a caller holding any other table (tests, future shapes) keeps
+/// the incumbent byte-table path instead of a mismatched pair image. The
+/// ranked prover always passes the cached table.
+fn resolve_ab_pair_tables(
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Option<&'static InvNttPairTableGf8> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if zc_ab_pair_table_enabled()
+            && core::ptr::eq(inv_table, InvNttTableByteSingleGf8::cached_standard_k6())
+        {
+            return Some(InvNttPairTableGf8::cached_standard_k6());
+        }
+    }
+    let _ = inv_table;
+    None
+}
+
 /// One `x_outer`'s worth of the challenge-independent AB transform — the
 /// exact loop body both precompute drains share, factored out so the QS5
 /// hetero queue and the incumbent `par_chunks_mut` cannot diverge.
@@ -849,6 +919,7 @@ fn precompute_ab_one_chunk(
     static_b_context: Option<kernels::StaticBContext>,
     nt: bool,
     compact: bool,
+    pair_tables: Option<&InvNttPairTableGf8>,
     x_outer: usize,
     out_outer: &mut [u8],
     a_col: &mut [F8; ELL],
@@ -899,6 +970,7 @@ fn precompute_ab_one_chunk(
                 usize::MAX
             },
             static_b_context,
+            pair_tables,
         );
         if nt {
             // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
@@ -952,6 +1024,7 @@ fn precompute_ab_one_chunk(
 // Output `out[lane]` is the F_8 representative of Σ_K x^K · y_K[lane] mod p.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn shift_reduce_inner_ab(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -966,6 +1039,7 @@ fn shift_reduce_inner_ab(
     const_one_mask: u8,
     bstatic_w: usize,
     static_b_context: Option<kernels::StaticBContext>,
+    pair_tables: Option<&InvNttPairTableGf8>,
 ) {
     kernels::shift_reduce_inner_ab(
         a_packed,
@@ -981,6 +1055,7 @@ fn shift_reduce_inner_ab(
         const_one_mask,
         bstatic_w,
         static_b_context,
+        pair_tables,
     );
 }
 
@@ -1115,6 +1190,7 @@ fn process_one_x_hi(
                     0,
                     usize::MAX,
                     None,
+                    None,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
                 let c_in: &[u8; 64] = (&c_packed[byte_base_b..byte_base_b + 64])
@@ -1151,6 +1227,7 @@ fn process_one_x_hi(
                     true,
                     0,
                     usize::MAX,
+                    None,
                     None,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -1324,6 +1401,7 @@ fn process_one_x_hi_with_s_hat_v(
                     0,
                     usize::MAX,
                     None,
+                    None,
                 );
             }
 
@@ -1352,6 +1430,7 @@ fn process_one_x_hi_with_s_hat_v(
                     true,
                     0,
                     usize::MAX,
+                    None,
                     None,
                 );
             }
@@ -3453,10 +3532,10 @@ mod tests {
             // both flavors with `compact = false` so the dead tail is zeroed
             // deterministically and the full-buffer comparison stays valid.
             let plain = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, false, false,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, false, false, None,
             );
             let nt = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, true, false,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, true, false, None,
             );
             assert_eq!(
                 plain.as_bytes(),
@@ -3465,6 +3544,110 @@ mod tests {
                 padded.is_some()
             );
         }
+    }
+
+    /// QS6 pair-table flavor: the whole AB-precompute surface must be
+    /// byte-identical with the paired-byte gather images enabled vs the
+    /// incumbent byte tables, across the dense and BLAKE3-padded shapes.
+    /// This drives the pair kernels through the real two-pool hetero drain
+    /// (mixed pair/byte workers when this host has an E-cluster) and through
+    /// every checked-dispatcher arm the ranked shape exercises.
+    #[test]
+    fn ab_precompute_pair_table_flavor_is_byte_identical() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+        let table = make_inv_table();
+        let pair = InvNttPairTableGf8::new(&table);
+        let cases: [(usize, Option<(usize, usize)>); 3] = [
+            (13, None),
+            (14, Some((14, 15_409))), // BLAKE3 block shape
+            (17, Some((14, 15_409))),
+        ];
+        for (m, padded) in cases {
+            let mut rng = Rng::new(0x5041_49F1_u64 ^ (m as u64));
+            let total_bits = 1usize << m;
+            let mut a = rng.bits(total_bits);
+            let mut b = rng.bits(total_bits);
+            let padding = match padded {
+                None => PaddingSpec::dense(m),
+                Some((k_log, useful_bits)) => {
+                    let block_size = 1usize << k_log;
+                    for blk in 0..(total_bits / block_size) {
+                        for j in useful_bits..block_size {
+                            let idx = blk * block_size + j;
+                            a[idx] = false;
+                            b[idx] = false;
+                        }
+                    }
+                    PaddingSpec {
+                        k_log,
+                        useful_bits_per_block: useful_bits,
+                    }
+                }
+            };
+            let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
+            // `compact = false` so the whole buffer (tail rows included) is
+            // deterministic and the full comparison stays valid.
+            let byte_flavor = precompute_round1_ab_inner_packed_padded_with_flavor(
+                &a_p, &b_p, m, K_SKIP, &table, &padding, false, false, None,
+            );
+            let pair_flavor = precompute_round1_ab_inner_packed_padded_with_flavor(
+                &a_p, &b_p, m, K_SKIP, &table, &padding, false, false, Some(&pair),
+            );
+            assert_eq!(
+                byte_flavor.as_bytes(),
+                pair_flavor.as_bytes(),
+                "pair-table flavor changed bytes at m={m}, padded={}",
+                padded.is_some()
+            );
+        }
+    }
+
+    /// FLOCK_NO_ZC_AB_PAIR_TABLE follows the codebase's exact-"1" kill
+    /// semantics, and the ranked (compile-time) default is ON.
+    #[test]
+    fn ab_pair_table_kill_switch_semantics() {
+        use std::ffi::OsStr;
+        assert!(super::ab_pair_table_value_enabled(None));
+        assert!(!super::ab_pair_table_value_enabled(Some(OsStr::new("1"))));
+        for value in ["0", "true", "yes", "", " 1", "11"] {
+            assert!(
+                super::ab_pair_table_value_enabled(Some(OsStr::new(value))),
+                "only exactly \"1\" may disable the pair tables (got {value:?})"
+            );
+        }
+        assert!(
+            super::ZC_AB_PAIR_TABLE_DEFAULT,
+            "ranked default must be ON (ranked workers run with a cleared environment)"
+        );
+    }
+
+    /// The pair-table resolver must hand out images ONLY for the exact
+    /// process-cached standard table — any other byte table (even one with
+    /// identical contents) keeps the incumbent path, because pair images are
+    /// only ever built from the cached table.
+    #[test]
+    fn pair_table_resolver_requires_cached_table_identity() {
+        let fresh = make_inv_table();
+        assert!(
+            super::resolve_ab_pair_tables(&fresh).is_none(),
+            "a non-cached table must not resolve pair images"
+        );
+        let cached = InvNttTableByteSingleGf8::cached_standard_k6();
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Env-dependent only through the latched kill switch; under the
+            // default (no FLOCK_NO_ZC_AB_PAIR_TABLE in the test environment)
+            // the cached table resolves the cached pair images.
+            if super::zc_ab_pair_table_enabled() {
+                assert!(
+                    super::resolve_ab_pair_tables(cached)
+                        .is_some_and(|p| core::ptr::eq(p, InvNttPairTableGf8::cached_standard_k6())),
+                    "the cached standard table must resolve the cached pair images"
+                );
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        assert!(super::resolve_ab_pair_tables(cached).is_none());
     }
 
     /// QS3 compacted store: skipping the dead skipped-`b_med` tail rows must
@@ -3508,10 +3691,10 @@ mod tests {
             let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
             for nt in [false, true] {
                 let filled = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, false,
+                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, false, None,
                 );
                 let compact = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
+                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true, None,
                 );
                 let filled = filled.as_bytes();
                 let compact = compact.as_bytes();
@@ -3563,14 +3746,14 @@ mod tests {
         // exercises the shipped QS3 path (dead tail rows never stored).
         for nt in [false, true] {
             let _ = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true, None,
             );
         }
         for rep in 0..4 {
             for nt in [rep % 2 == 1, rep % 2 == 0] {
                 let t0 = std::time::Instant::now();
                 let out = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
+                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true, None,
                 );
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
                 println!("rep={rep} nt={nt}: {ms:.2} ms");
@@ -3784,6 +3967,193 @@ mod tests {
         assert!(cases > 600, "oracle coverage too thin: {cases} cases");
     }
 
+    /// Byte-exact oracle for the QS6 pair-table Horner kernel against the
+    /// scalar reference AND the byte-table Horner kernel it substitutes for,
+    /// over random witnesses, every 64-byte-block byte alignment, every
+    /// `b_med` slot, and the same planted degenerate rows as the byte-kernel
+    /// oracle (all-zero, all-ones, top-bit-only — the rows that drive the
+    /// Horner carry fold on every step).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_h4_pair_shift_reduce_is_bit_exact_with_incumbent() {
+        use kernels::aarch64::{
+            shift_reduce_inner_ab_fused_neon_h4, shift_reduce_inner_ab_fused_neon_h4_pair,
+        };
+
+        let table = make_inv_table();
+        let pair = InvNttPairTableGf8::new(&table);
+        let mut rng = Rng::new(0x5041_4952_5F51_5336);
+
+        const N: usize = 8192;
+        let mut a_packed = vec![0u8; N];
+        let mut b_packed = vec![0u8; N];
+        for i in 0..N {
+            a_packed[i] = (rng.next_u64() & 0xff) as u8;
+            b_packed[i] = (rng.next_u64() >> 13 & 0xff) as u8;
+        }
+        a_packed[0..64].fill(0x00);
+        b_packed[0..64].fill(0xff);
+        a_packed[64..128].fill(0xff);
+        b_packed[64..128].fill(0x00);
+        a_packed[128..192].fill(0xff);
+        b_packed[128..192].fill(0xff);
+        a_packed[192..256].fill(0x80);
+        b_packed[192..256].fill(0x01);
+
+        let mut a_col = vec![F8::ZERO; ELL];
+        let mut b_col = vec![F8::ZERO; ELL];
+        let mut cases = 0usize;
+
+        let check =
+            |chunk_byte_base: usize, b_med: usize, a_col: &mut Vec<F8>, b_col: &mut Vec<F8>| {
+                let base = chunk_byte_base + b_med * N_CHUNKS * 8;
+                if base + 8 * N_CHUNKS > N {
+                    return false;
+                }
+                let mut out_scalar = [0u8; 64];
+                let mut out_byte = [0u8; 64];
+                let mut out_pair = [0u8; 64];
+                shift_reduce_inner_ab_scalar(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_scalar,
+                    a_col,
+                    b_col,
+                );
+                shift_reduce_inner_ab_fused_neon_h4(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_byte,
+                );
+                shift_reduce_inner_ab_fused_neon_h4_pair(
+                    &a_packed,
+                    &b_packed,
+                    &pair,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_pair,
+                );
+                assert_eq!(
+                    out_byte, out_scalar,
+                    "byte-h4 oracle drift at (base={chunk_byte_base}, b_med={b_med})"
+                );
+                assert_eq!(
+                    out_pair, out_byte,
+                    "pair-h4 kernel differs from byte-h4 at \
+                     (base={chunk_byte_base}, b_med={b_med})"
+                );
+                true
+            };
+
+        // Every byte alignment of the 64-byte K-block start.
+        for chunk_byte_base in 0..64usize {
+            for b_med in 0..8usize {
+                if check(chunk_byte_base, b_med, &mut a_col, &mut b_col) {
+                    cases += 1;
+                }
+            }
+        }
+        // Every `b_med` slot across the whole buffer, at production alignment.
+        for b_med in 0.. {
+            if !check(0, b_med, &mut a_col, &mut b_col) {
+                break;
+            }
+            cases += 1;
+        }
+        assert!(cases > 600, "oracle coverage too thin: {cases} cases");
+    }
+
+    /// The checked dispatcher must be byte-exact with `pair_tables` Some vs
+    /// None across every routing arm it owns: the sniffed all-ones /
+    /// single-K0 / mixed const-one blocks (which keep byte tables by design),
+    /// the static-B arms, and the generic Horner tail.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn checked_dispatcher_pair_tables_are_byte_identical() {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                let table = make_inv_table();
+                let pair = InvNttPairTableGf8::new(&table);
+                let context = kernels::aarch64::prepare_static_b_context_with_policy(
+                    &table, true, false, false,
+                )
+                .expect("enabled static-B context");
+                let mut rng = Rng::new(0xD15_9A7C_4E5F);
+
+                const N: usize = 4096;
+                let a_packed: Vec<u8> = (0..N).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+                let mut b_packed: Vec<u8> = (0..N)
+                    .map(|_| (rng.next_u64() >> 9 & 0xff) as u8)
+                    .collect();
+                // Plant sniffable structures: an all-ones-B block at b_med 0,
+                // a single-K0 block at b_med 1 (K=1..7 rows zero), and the
+                // mixed const-one shapes at b_med 2 (K0..1) / b_med 3 (K4..7).
+                b_packed[0..64].fill(0xff);
+                b_packed[64 + 8..128].fill(0x00);
+                b_packed[128..128 + 16].fill(0xff);
+                b_packed[192 + 32..256].fill(0xff);
+
+                let mut a_col = vec![F8::ZERO; ELL];
+                let mut b_col = vec![F8::ZERO; ELL];
+
+                let cases: &[(usize, bool, bool, u8, usize)] = &[
+                    (0, true, false, 0, usize::MAX),  // all-ones sniff hit
+                    (0, false, false, 0, usize::MAX), // same block, sniff off
+                    (1, false, true, 0, usize::MAX),  // single-K0 sniff hit
+                    (2, false, false, 0x03, usize::MAX), // mixed K0..1
+                    (3, false, false, 0xf0, usize::MAX), // mixed K4..7
+                    (4, false, false, 0, 0),          // static-B arm, window 0
+                    (5, false, false, 0, 1),          // static-B arm, window 1
+                    (6, true, true, 0, usize::MAX),   // generic tail (sniffs miss)
+                    (7, false, false, 0, usize::MAX), // generic tail (no sniffs)
+                ];
+                for &(b_med, all_ones, single_k0, mask, w) in cases {
+                    let mut want = [0u8; 64];
+                    shift_reduce_inner_ab_scalar(
+                        &a_packed, &b_packed, &table, 0, b_med, &mut want, &mut a_col, &mut b_col,
+                    );
+                    let mut run = |pair_tables: Option<&InvNttPairTableGf8>| {
+                        let mut out = [0u8; 64];
+                        shift_reduce_inner_ab_fused_neon_checked(
+                            &a_packed,
+                            &b_packed,
+                            &table,
+                            0,
+                            b_med,
+                            &mut out,
+                            all_ones,
+                            single_k0,
+                            mask,
+                            w,
+                            (w <= 1).then_some(context),
+                            pair_tables,
+                        );
+                        out
+                    };
+                    let got_byte = run(None);
+                    let got_pair = run(Some(&pair));
+                    assert_eq!(
+                        got_byte, want,
+                        "byte dispatcher drift at (b_med={b_med}, w={w})"
+                    );
+                    assert_eq!(
+                        got_pair, want,
+                        "pair dispatcher differs at (b_med={b_med}, w={w})"
+                    );
+                }
+            })
+            .expect("spawn checked-dispatcher oracle")
+            .join()
+            .expect("checked-dispatcher oracle thread");
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn static_b_context_gate_respects_layout_and_legacy_policy() {
@@ -3873,6 +4243,7 @@ mod tests {
                         0,
                         w,
                         Some(context),
+                        None,
                     );
                     out
                 };
@@ -3935,6 +4306,7 @@ mod tests {
                     &table, true, false, false,
                 )
                 .expect("enabled static-B context");
+                let pair = InvNttPairTableGf8::new(&table);
 
                 const N: usize = 4096;
                 let a_packed: Vec<u8> = (0..N).map(|_| (rng.next_u64() & 0xff) as u8).collect();
@@ -3975,15 +4347,32 @@ mod tests {
                             );
                             let mut slow = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false>(
-                                    &a_packed, &b, &table, 0, b_med, w, context, &mut slow,
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false, false>(
+                                    &a_packed, &b, &table, 0, b_med, w, context, None, &mut slow,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );
                             let mut fast = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true>(
-                                    &a_packed, &b, &table, 0, b_med, w, context, &mut fast,
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true, false>(
+                                    &a_packed, &b, &table, 0, b_med, w, context, None, &mut fast,
+                                ),
+                                "arm (w={w}, b_med={b_med}) must be live"
+                            );
+                            // QS6 pair-table arm: same static plan, same
+                            // guards, word transforms out of the pair images.
+                            let mut fast_pair = [0u8; 64];
+                            assert!(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true, true>(
+                                    &a_packed,
+                                    &b,
+                                    &table,
+                                    0,
+                                    b_med,
+                                    w,
+                                    context,
+                                    Some(&pair),
+                                    &mut fast_pair,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );
@@ -3994,6 +4383,10 @@ mod tests {
                             assert_eq!(
                                 fast, slow,
                                 "fast bstatic differs (w={w}, b_med={b_med}, variant={variant})"
+                            );
+                            assert_eq!(
+                                fast_pair, slow,
+                                "pair bstatic differs (w={w}, b_med={b_med}, variant={variant})"
                             );
                         }
                         arms += 1;
@@ -4042,6 +4435,7 @@ mod tests {
                 false,
                 mask,
                 usize::MAX,
+                None,
                 None,
             );
             assert_eq!(got, want, "mixed const-one mask {mask:#04x}");

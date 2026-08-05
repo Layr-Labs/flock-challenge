@@ -346,9 +346,16 @@ static BSTATIC_ARM_LIVE: [bool; 31] = [true, true, true, true, true, true, true,
 /// Guarded static-b variant of [`shift_reduce_inner_ab_fused_neon`].
 /// Returns `false` when this (w, b_med) position has no static plan, in
 /// which case the caller must run the generic kernel.
+///
+/// `PAIR` (QS6, hand-edit on top of the generated body — regenerate with
+/// care) selects the paired-byte (16-bit) gather images for the FAST word
+/// transforms; requires `FAST` and `pair_tables.is_some()`. The static-B
+/// partials, the vary patches and the guard masks are untouched — only the
+/// full-word A/B transforms swap their table.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_lines)]
-pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool, const PAIR: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -356,8 +363,12 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
     b_med: usize,
     w: usize,
     context: StaticBContext,
+    pair_tables: Option<&InvNttPairTableGf8>,
     out: &mut [u8; 64],
 ) -> bool {
+    const {
+        assert!(FAST || !PAIR, "PAIR requires the FAST kernel family");
+    }
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
     if w > 1 || (w == 1 && b_med >= 15) {
@@ -379,6 +390,15 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
     // `x^4` part of the `x^K` weight costs no instructions.
     let scaled_base = inv_table.scaled_x4_data_ptr();
     let scaled_half_swapped_base = inv_table.scaled_x4_half_swapped_data_ptr();
+    // QS6 pair images; only read when `PAIR` (const, so the byte-table
+    // monomorphizations carry no trace of them).
+    let (pair_base, pair_scaled_base) = match pair_tables {
+        Some(pair) if PAIR => (pair.data_ptr(), pair.scaled_x4_data_ptr()),
+        _ => {
+            debug_assert!(!PAIR, "PAIR kernels require pair tables");
+            (core::ptr::null(), core::ptr::null())
+        }
+    };
     unsafe {
         let mut acc0_lo = vdupq_n_u16(0);
         let mut acc0_hi = vdupq_n_u16(0);
@@ -391,7 +411,22 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
         macro_rules! k_generic {
             ($k:literal) => {{
                 let off = byte_base_b + $k * N_CHUNKS;
-                if FAST {
+                if FAST && PAIR {
+                    fused_apply_one_k_fast_pair::<{ $k & 1 }, { $k & 2 != 0 }>(
+                        if $k & 4 != 0 { pair_scaled_base } else { pair_base },
+                        pair_base,
+                        a_packed.as_ptr().add(off),
+                        b_packed.as_ptr().add(off),
+                        &mut acc0_lo,
+                        &mut acc0_hi,
+                        &mut acc1_lo,
+                        &mut acc1_hi,
+                        &mut acc2_lo,
+                        &mut acc2_hi,
+                        &mut acc3_lo,
+                        &mut acc3_hi,
+                    );
+                } else if FAST {
                     fused_apply_one_k_fast::<{ $k & 1 }, { $k & 2 != 0 }>(
                         if $k & 4 != 0 { scaled_base } else { table_base },
                         if $k & 4 != 0 {
@@ -469,7 +504,24 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                             &mut db3,
                         );
                     )*
-                    if FAST {
+                    if FAST && PAIR {
+                        fused_apply_one_k_with_b_fast_pair::<{ $k & 1 }, { $k & 2 != 0 }>(
+                            if $k & 4 != 0 { pair_scaled_base } else { pair_base },
+                            a_row,
+                            db0,
+                            db1,
+                            db2,
+                            db3,
+                            &mut acc0_lo,
+                            &mut acc0_hi,
+                            &mut acc1_lo,
+                            &mut acc1_hi,
+                            &mut acc2_lo,
+                            &mut acc2_hi,
+                            &mut acc3_lo,
+                            &mut acc3_hi,
+                        );
+                    } else if FAST {
                         fused_apply_one_k_with_b_fast::<{ $k & 1 }, { $k & 2 != 0 }>(
                             if $k & 4 != 0 { scaled_base } else { table_base },
                             if $k & 4 != 0 {

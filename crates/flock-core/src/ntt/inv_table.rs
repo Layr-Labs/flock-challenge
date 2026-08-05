@@ -452,6 +452,146 @@ impl InvNttTableByteSingleGf8 {
     }
 }
 
+/// QS6 paired-byte (16-bit) collapse of [`InvNttTableByteSingleGf8`],
+/// specialized to the production `k_skip = 6` (`ell = 64`, `n_chunks = 8`)
+/// shape.
+///
+/// The byte collapse gives `M[i', 8b + t] = T_0[byte_b][i' ⊕ 8b]` (see the
+/// module doc). Group the eight byte positions into four pairs `h ∈ 0..4`
+/// (bytes `2h` and `2h + 1`) and define
+///
+///   `U[w16][j] = T_0[lo(w16)][j] ⊕ T_0[hi(w16)][j ⊕ 8]`
+///
+/// with `w16 = lo | (hi << 8)`. Pair `h` of a packed word `w` (16-bit group
+/// `w16_h = (w >> 16h) & 0xffff`, i.e. `lo = byte_{2h}`, `hi = byte_{2h+1}`)
+/// then contributes exactly
+///
+///   `U[w16_h][i' ⊕ 16h]`
+///
+/// because `i' ⊕ 8(2h) = i' ⊕ 16h` and `i' ⊕ 8(2h+1) = (i' ⊕ 16h) ⊕ 8`: the
+/// intra-pair XOR-8 half-swap is baked into `U`, and the residual `⊕ 16h`
+/// moves whole 16-byte chunks — a register reindex for the NEON kernels
+/// (output chunk `c` reads row chunk `c ⊕ h`), never a byte shuffle. One
+/// operand word costs 4 row lookups instead of 8.
+///
+/// Two images: plain `U` and the `x^4`-scaled `U4 = x^4 · U`. `U` is built
+/// from GF(2)-linear combinations of `T_0` rows and multiplication by the
+/// constant `x^4` is GF(2)-linear, so applying the collapse out of `U4`
+/// yields `x^4 · T(w)` — the same argument that justifies the byte table's
+/// scaled twin. Storage: `65536 × 64` B per image, 8 MiB total, built once
+/// per process behind [`Self::cached_standard_k6`] (the benchmark's untimed
+/// warm proof initializes the slot before the measured request arrives).
+pub struct InvNttPairTableGf8 {
+    /// Backing allocation: two images plus at most 63 bytes of alignment
+    /// padding. The logical table starts at `data_offset`.
+    data: Vec<u8>,
+    data_offset: usize,
+}
+
+/// `ell` of the pair-collapse shape (fixed: the pair kernels are the
+/// four-register `ell = 64` family).
+const PAIR_ELL: usize = 64;
+/// Bytes per pair-table image: 65536 rows × 64 B.
+const PAIR_IMAGE_LEN: usize = 65536 * PAIR_ELL;
+
+impl InvNttPairTableGf8 {
+    /// Build both pair images from an already-built byte table. Panics unless
+    /// `byte_table.ell == 64` — the pair collapse is only defined for the
+    /// production shape.
+    pub fn new(byte_table: &InvNttTableByteSingleGf8) -> Self {
+        assert_eq!(
+            byte_table.ell, PAIR_ELL,
+            "pair table is specialized to k_skip = 6 (ell = 64)"
+        );
+        const TABLE_ALIGNMENT: usize = 64;
+        let mut data = vec![0u8; 2 * PAIR_IMAGE_LEN + TABLE_ALIGNMENT - 1];
+        let data_offset = (TABLE_ALIGNMENT - (data.as_ptr() as usize & (TABLE_ALIGNMENT - 1)))
+            & (TABLE_ALIGNMENT - 1);
+
+        let t0 = byte_table.table();
+        {
+            // Plain image: U[w16] = T_0[lo] ⊕ (T_0[hi] with each 16-byte
+            // chunk's 8-byte halves exchanged) — `j ⊕ 8` is exactly that
+            // half-swap, so build each row from two half-slices per chunk.
+            let plain = &mut data[data_offset..data_offset + PAIR_IMAGE_LEN];
+            for (w16, row) in plain.chunks_exact_mut(PAIR_ELL).enumerate() {
+                let lo = &t0[(w16 & 0xff) * PAIR_ELL..(w16 & 0xff) * PAIR_ELL + PAIR_ELL];
+                let hi = &t0[(w16 >> 8) * PAIR_ELL..(w16 >> 8) * PAIR_ELL + PAIR_ELL];
+                for c in 0..PAIR_ELL / 16 {
+                    for r in 0..8 {
+                        row[16 * c + r] = (lo[16 * c + r] + hi[16 * c + 8 + r]).0;
+                        row[16 * c + 8 + r] = (lo[16 * c + 8 + r] + hi[16 * c + r]).0;
+                    }
+                }
+            }
+        }
+        {
+            // Scaled image: elementwise `x^4 ·` of the plain image, exactly
+            // like the byte table's images 2/3.
+            const X4: F8 = F8(1u8 << 4);
+            let scaled_start = data_offset + PAIR_IMAGE_LEN;
+            let (plain_storage, scaled_storage) = data.split_at_mut(scaled_start);
+            let source = &plain_storage[data_offset..data_offset + PAIR_IMAGE_LEN];
+            let scaled = &mut scaled_storage[..PAIR_IMAGE_LEN];
+            for (src, dst) in source.iter().zip(scaled.iter_mut()) {
+                *dst = (F8(*src) * X4).0;
+            }
+        }
+
+        Self { data, data_offset }
+    }
+
+    /// The process-cached pair twin of
+    /// [`InvNttTableByteSingleGf8::cached_standard_k6`]: no witness,
+    /// transcript, or thread dependence, initialized during the untimed warm
+    /// proof.
+    #[inline]
+    pub fn cached_standard_k6() -> &'static Self {
+        static TABLE: OnceLock<InvNttPairTableGf8> = OnceLock::new();
+        TABLE.get_or_init(|| Self::new(InvNttTableByteSingleGf8::cached_standard_k6()))
+    }
+
+    /// Raw pointer to the plain pair image (`65536 × 64` bytes, row-major,
+    /// 64-byte-aligned rows).
+    #[inline]
+    pub fn data_ptr(&self) -> *const u8 {
+        // SAFETY: `data_offset` selects a position within the over-allocated
+        // buffer and the allocation cannot move while borrowed through self.
+        unsafe { self.data.as_ptr().add(self.data_offset) }
+    }
+
+    /// Raw pointer to the `x^4`-scaled pair image. Applying the pair collapse
+    /// out of this image returns `x^4 · T(w)`.
+    #[inline]
+    pub fn scaled_x4_data_ptr(&self) -> *const u8 {
+        // SAFETY: construction appends two complete logical images.
+        unsafe { self.data.as_ptr().add(self.data_offset + PAIR_IMAGE_LEN) }
+    }
+
+    #[inline]
+    fn image(&self, scaled: bool) -> &[u8] {
+        let start = self.data_offset + if scaled { PAIR_IMAGE_LEN } else { 0 };
+        &self.data[start..start + PAIR_IMAGE_LEN]
+    }
+
+    /// Scalar reference for the whole pair-collapse transform: apply the
+    /// four-group lookup `out[i] = ⊕_h U[w16_h][i ⊕ 16h]` to one packed
+    /// eight-byte row. Kept public(crate)-visible through tests as the oracle
+    /// the NEON pair kernel is differentially tested against.
+    pub fn apply_scalar(&self, bytes: &[u8; 8], out: &mut [u8; 64]) {
+        let word = u64::from_le_bytes(*bytes);
+        let table = self.image(false);
+        out.fill(0);
+        for h in 0..4 {
+            let w16 = ((word >> (16 * h)) & 0xffff) as usize;
+            let row = &table[w16 * PAIR_ELL..w16 * PAIR_ELL + PAIR_ELL];
+            for (i, o) in out.iter_mut().enumerate() {
+                *o ^= row[i ^ (16 * h)];
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,6 +801,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn make_standard_k6() -> InvNttTableByteSingleGf8 {
+        let ntt_s = AdditiveNttGf8::new(6, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(6, F8(1u8 << 6));
+        InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
+    }
+
+    /// EMPIRICAL GATE for the QS6 two-byte collapse: before any kernel uses
+    /// the pair table, verify against real table lookups that
+    /// (a) the documented byte relation composes as claimed, i.e. the pair of
+    ///     byte positions (2h, 2h+1) contributes
+    ///     `T_0[b_lo][i ⊕ 16h] ⊕ T_0[b_hi][i ⊕ 16h ⊕ 8]`, and
+    /// (b) the stored row `U[w16]` equals `T_0[lo][j] ⊕ T_0[hi][j ⊕ 8]` for
+    ///     every j — exhaustively over all 65536 rows.
+    #[test]
+    fn pair_table_rows_match_documented_byte_relation() {
+        let table = make_standard_k6();
+        let pair = InvNttPairTableGf8::new(&table);
+        let t0 = table.table();
+        let plain = pair.image(false);
+        for w16 in 0..65536usize {
+            let lo = w16 & 0xff;
+            let hi = w16 >> 8;
+            let row = &plain[w16 * 64..w16 * 64 + 64];
+            for j in 0..64 {
+                let want = t0[lo * 64 + j] + t0[hi * 64 + (j ^ 8)];
+                assert_eq!(
+                    row[j], want.0,
+                    "pair row mismatch at w16={w16:#06x}, j={j}"
+                );
+            }
+        }
+    }
+
+    /// Whole-transform oracle: the four-group pair collapse must reproduce
+    /// the byte table's `apply_scalar` (and hence the naive inv-NTT/fwd-NTT
+    /// composition it is tested against) on random packed rows.
+    #[test]
+    fn pair_apply_matches_byte_apply_scalar() {
+        let table = make_standard_k6();
+        let pair = InvNttPairTableGf8::new(&table);
+        let mut rng = Rng::new(0x9A16_7AB1);
+        for case in 0..256 {
+            let mut bytes = [0u8; 8];
+            for b in bytes.iter_mut() {
+                *b = (rng.next_u64() & 0xff) as u8;
+            }
+            // Planted degenerate rows alongside the random ones.
+            match case {
+                0 => bytes = [0u8; 8],
+                1 => bytes = [0xff; 8],
+                2 => bytes = [0x80; 8],
+                3 => bytes = [0x01; 8],
+                _ => {}
+            }
+            let mut out_byte = vec![F8::ZERO; 64];
+            table.apply_scalar(&bytes, &mut out_byte);
+            let mut out_pair = [0u8; 64];
+            pair.apply_scalar(&bytes, &mut out_pair);
+            let out_byte: Vec<u8> = out_byte.iter().map(|f| f.0).collect();
+            assert_eq!(
+                out_byte,
+                out_pair.to_vec(),
+                "pair collapse disagrees with byte collapse for bytes={bytes:02x?}"
+            );
+        }
+    }
+
+    /// The scaled pair image must be exactly `x^4 ·` the plain pair image —
+    /// the identity that makes `x^4 · T(w)` a pure table swap for the pair
+    /// kernels too.
+    #[test]
+    fn pair_scaled_image_is_x4_times_plain() {
+        let table = make_standard_k6();
+        let pair = InvNttPairTableGf8::new(&table);
+        let x4 = F8(1u8 << 4);
+        for (i, (&p, &s)) in pair
+            .image(false)
+            .iter()
+            .zip(pair.image(true).iter())
+            .enumerate()
+        {
+            assert_eq!(F8(p) * x4, F8(s), "scaled pair image mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn pair_table_storage_is_cache_line_aligned() {
+        let table = make_standard_k6();
+        let pair = InvNttPairTableGf8::new(&table);
+        assert_eq!(pair.data_ptr() as usize % 64, 0);
+        assert_eq!(pair.scaled_x4_data_ptr() as usize % 64, 0);
+    }
+
+    #[test]
+    fn cached_standard_k6_pair_matches_fresh() {
+        let fresh = InvNttPairTableGf8::new(InvNttTableByteSingleGf8::cached_standard_k6());
+        let cached = InvNttPairTableGf8::cached_standard_k6();
+        assert_eq!(cached.image(false), fresh.image(false));
+        assert_eq!(cached.image(true), fresh.image(true));
+        assert!(core::ptr::eq(cached, InvNttPairTableGf8::cached_standard_k6()));
     }
 
     #[test]

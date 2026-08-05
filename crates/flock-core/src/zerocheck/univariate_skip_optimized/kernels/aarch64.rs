@@ -1,4 +1,4 @@
-use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
+use super::super::{F8, F128, InvNttPairTableGf8, InvNttTableByteSingleGf8, N_CHUNKS};
 
 /// Four-lane convert-table fold.
 ///
@@ -1724,6 +1724,99 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
     }
 }
 
+/// QS6 pair-table twin of [`shift_reduce_inner_ab_fused_neon_h4`]: identical
+/// Horner structure and weights, but every operand-word transform runs
+/// through [`apply_word_into_4_regs_pair`] — 16 table loads per word instead
+/// of 32. `A` takes the `x^4`-scaled pair image for K ≥ 4 exactly as the byte
+/// kernel takes the scaled byte image; `B` always takes the plain pair image.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+pub(crate) fn shift_reduce_inner_ab_fused_neon_h4_pair(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    pair_table: &InvNttPairTableGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+) {
+    use crate::field::gf2_8::neon::gf8_reduce_vec16;
+    use core::arch::aarch64::*;
+
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    let plain = pair_table.data_ptr();
+    let scaled = pair_table.scaled_x4_data_ptr();
+
+    unsafe {
+        let a_base = a_packed.as_ptr().add(byte_base_b);
+        let b_base = b_packed.as_ptr().add(byte_base_b);
+
+        // Raw 15-bit products of one K row. `A` comes out of `$at`, which is
+        // the plain pair image for K < 4 and the `x^4`-scaled pair image for
+        // K ≥ 4; `B` always comes out of the plain pair image.
+        macro_rules! products {
+            ($at:expr, $k:literal) => {{
+                let aw = u64::from_le(core::ptr::read_unaligned(
+                    a_base.add($k * N_CHUNKS).cast::<u64>(),
+                ));
+                let bw = u64::from_le(core::ptr::read_unaligned(
+                    b_base.add($k * N_CHUNKS).cast::<u64>(),
+                ));
+                let (da0, da1, da2, da3) = apply_word_into_4_regs_pair($at, aw);
+                let (db0, db1, db2, db3) = apply_word_into_4_regs_pair(plain, bw);
+                [
+                    pmull_lo_u16(da0, db0),
+                    pmull_hi_u16(da0, db0),
+                    pmull_lo_u16(da1, db1),
+                    pmull_hi_u16(da1, db1),
+                    pmull_lo_u16(da2, db2),
+                    pmull_hi_u16(da2, db2),
+                    pmull_lo_u16(da3, db3),
+                    pmull_hi_u16(da3, db3),
+                ]
+            }};
+        }
+
+        // d_3 seeds the Horner chain; no shift is due before the first row.
+        let lo3 = products!(plain, 3);
+        let hi3 = products!(scaled, 7);
+        let mut acc = [
+            veorq_u16(lo3[0], hi3[0]),
+            veorq_u16(lo3[1], hi3[1]),
+            veorq_u16(lo3[2], hi3[2]),
+            veorq_u16(lo3[3], hi3[3]),
+            veorq_u16(lo3[4], hi3[4]),
+            veorq_u16(lo3[5], hi3[5]),
+            veorq_u16(lo3[6], hi3[6]),
+            veorq_u16(lo3[7], hi3[7]),
+        ];
+
+        let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
+
+        let lo2 = products!(plain, 2);
+        let hi2 = products!(scaled, 6);
+        horner_absorb(&mut acc, &lo2, &hi2, carry_not);
+
+        let lo1 = products!(plain, 1);
+        let hi1 = products!(scaled, 5);
+        horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+
+        let lo0 = products!(plain, 0);
+        let hi0 = products!(scaled, 4);
+        horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+
+        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
+        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
+        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[5]));
+        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
+
+        let p = out.as_mut_ptr();
+        vst1q_u8(p, r0);
+        vst1q_u8(p.add(16), r1);
+        vst1q_u8(p.add(32), r2);
+        vst1q_u8(p.add(48), r3);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EXPERIMENT (seam-urm): checked static-structure fast paths.
 //
@@ -1879,6 +1972,52 @@ unsafe fn apply_word_into_4_regs(
             &mut d1,
             &mut d2,
             &mut d3,
+        );
+        (d0, d1, d2, d3)
+    }
+}
+
+/// QS6 pair-table twin of [`apply_word_into_4_regs`]: four 16-bit group
+/// lookups instead of eight byte lookups — 16 table loads instead of 32.
+///
+/// Row `U[w16_h]` (`w16_h = (word >> 16h) & 0xffff`) carries the XOR-8
+/// half-swap of the odd byte baked in (see `InvNttPairTableGf8`), so the
+/// residual `π(i') = i' ⊕ 16h` permutation is pure register reindexing in the
+/// existing BH style: output chunk `c` reads row chunk `c ⊕ h`, and no
+/// half-swapped image is needed at all.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_into_4_regs_pair(
+    pair_table_base: *const u8,
+    word: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let r0 = pair_table_base.add((word & 0xffff) as usize * 64);
+        let r1 = pair_table_base.add(((word >> 16) & 0xffff) as usize * 64);
+        let r2 = pair_table_base.add(((word >> 32) & 0xffff) as usize * 64);
+        let r3 = pair_table_base.add(((word >> 48) & 0xffff) as usize * 64);
+        // d_c = ⊕_h U[w16_h][chunk c ⊕ h].
+        let d0 = veorq_u8(
+            xor3_u8(vld1q_u8(r0), vld1q_u8(r1.add(16)), vld1q_u8(r2.add(32))),
+            vld1q_u8(r3.add(48)),
+        );
+        let d1 = veorq_u8(
+            xor3_u8(vld1q_u8(r0.add(16)), vld1q_u8(r1), vld1q_u8(r2.add(48))),
+            vld1q_u8(r3.add(32)),
+        );
+        let d2 = veorq_u8(
+            xor3_u8(vld1q_u8(r0.add(32)), vld1q_u8(r1.add(48)), vld1q_u8(r2)),
+            vld1q_u8(r3.add(16)),
+        );
+        let d3 = veorq_u8(
+            xor3_u8(vld1q_u8(r0.add(48)), vld1q_u8(r1.add(32)), vld1q_u8(r2.add(16))),
+            vld1q_u8(r3),
         );
         (d0, d1, d2, d3)
     }
@@ -2412,6 +2551,70 @@ unsafe fn fused_apply_one_k_with_b_fast<const R: i32, const MUL_X2: bool>(
     }
 }
 
+/// QS6 pair-table twin of [`fused_apply_one_k_fast`]. `a_pair_table` selects
+/// the plain or the `x^4`-scaled pair image; `b_pair_table` is always the
+/// plain pair image.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fused_apply_one_k_fast_pair<const R: i32, const MUL_X2: bool>(
+    a_pair_table: *const u8,
+    b_pair_table: *const u8,
+    a_row: *const u8,
+    b_row: *const u8,
+    acc0_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc0_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc1_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc1_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc2_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc2_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc3_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc3_hi: &mut core::arch::aarch64::uint16x8_t,
+) {
+    unsafe {
+        let a_word = u64::from_le(core::ptr::read_unaligned(a_row.cast::<u64>()));
+        let b_word = u64::from_le(core::ptr::read_unaligned(b_row.cast::<u64>()));
+        let (da0, da1, da2, da3) = apply_word_into_4_regs_pair(a_pair_table, a_word);
+        let (db0, db1, db2, db3) = apply_word_into_4_regs_pair(b_pair_table, b_word);
+        accumulate_raw_one_k::<R, MUL_X2>(
+            da0, da1, da2, da3, db0, db1, db2, db3, acc0_lo, acc0_hi, acc1_lo, acc1_hi, acc2_lo,
+            acc2_hi, acc3_lo, acc3_hi,
+        );
+    }
+}
+
+/// QS6 pair-table twin of [`fused_apply_one_k_with_b_fast`]: only the A-side
+/// word transform changes — the B registers arrive precomputed (static-B
+/// partials plus byte-table vary patches) exactly as in the byte kernel.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fused_apply_one_k_with_b_fast_pair<const R: i32, const MUL_X2: bool>(
+    a_pair_table: *const u8,
+    a_row: *const u8,
+    db0: core::arch::aarch64::uint8x16_t,
+    db1: core::arch::aarch64::uint8x16_t,
+    db2: core::arch::aarch64::uint8x16_t,
+    db3: core::arch::aarch64::uint8x16_t,
+    acc0_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc0_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc1_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc1_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc2_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc2_hi: &mut core::arch::aarch64::uint16x8_t,
+    acc3_lo: &mut core::arch::aarch64::uint16x8_t,
+    acc3_hi: &mut core::arch::aarch64::uint16x8_t,
+) {
+    unsafe {
+        let a_word = u64::from_le(core::ptr::read_unaligned(a_row.cast::<u64>()));
+        let (da0, da1, da2, da3) = apply_word_into_4_regs_pair(a_pair_table, a_word);
+        accumulate_raw_one_k::<R, MUL_X2>(
+            da0, da1, da2, da3, db0, db1, db2, db3, acc0_lo, acc0_hi, acc1_lo, acc1_hi, acc2_lo,
+            acc2_hi, acc3_lo, acc3_hi,
+        );
+    }
+}
+
 /// Pre-resolved state shared by every static-B kernel call in one AB
 /// precompute. The reference is process-stable because the partials live in a
 /// `OnceLock`; carrying it here removes the lock's hot-path acquire from each
@@ -2479,8 +2682,16 @@ pub(crate) fn prepare_static_b_context_with_policy(
 ///
 /// `bstatic_w` is the BLAKE3 outer-window index (0 or 1) for the byte-level
 /// static-B path, or `usize::MAX` to disable it. Block-level sniffs run first.
+///
+/// `pair_tables` is the QS6 paired-byte (16-bit) gather image set: when
+/// `Some`, the FAST-kernel word transforms (the generic Horner kernel and the
+/// static-B rows) run out of it — 16 table loads per operand word instead of
+/// 32. The rare sniffed arms (all-ones B, single-K0, mixed const-one) keep
+/// the incumbent byte tables; every arm computes the same bytes, so `None`
+/// (E-cluster workers, kill switch, non-standard tables) is always safe.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -2493,6 +2704,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     const_one_mask: u8,
     bstatic_w: usize,
     static_b_context: Option<StaticBContext>,
+    pair_tables: Option<&InvNttPairTableGf8>,
 ) {
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let bw = |k: usize| -> u64 {
@@ -2544,13 +2756,14 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     {
         let enabled =
             !matches!(context, StaticBContext::LegacyPerCall) || !bstatic_legacy_enabled();
-        // `FAST` is a const generic so the per-K table choice, the `x^2`
-        // constant multiply and the residual shift all fold away at
-        // monomorphization; the kill switch picks a whole kernel, never a
-        // branch inside one.
+        // `FAST` and `PAIR` are const generics so the per-K table choice, the
+        // `x^2` constant multiply and the residual shift all fold away at
+        // monomorphization; the kill switches pick a whole kernel, never a
+        // branch inside one. `PAIR` rides the FAST family only: the legacy
+        // control kernel stays byte-exact incumbent.
         let handled = enabled
-            && if fast_shift_reduce_enabled() {
-                shift_reduce_inner_ab_bstatic::<true>(
+            && match (fast_shift_reduce_enabled(), pair_tables) {
+                (true, Some(_)) => shift_reduce_inner_ab_bstatic::<true, true>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -2558,10 +2771,10 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
                     b_med,
                     bstatic_w,
                     context,
+                    pair_tables,
                     out,
-                )
-            } else {
-                shift_reduce_inner_ab_bstatic::<false>(
+                ),
+                (true, None) => shift_reduce_inner_ab_bstatic::<true, false>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -2569,30 +2782,49 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
                     b_med,
                     bstatic_w,
                     context,
+                    None,
                     out,
-                )
+                ),
+                (false, _) => shift_reduce_inner_ab_bstatic::<false, false>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    bstatic_w,
+                    context,
+                    None,
+                    out,
+                ),
             };
         if handled {
             return;
         }
     }
-    if fast_shift_reduce_enabled() {
-        shift_reduce_inner_ab_fused_neon_h4(
+    match (fast_shift_reduce_enabled(), pair_tables) {
+        (true, Some(pair)) => shift_reduce_inner_ab_fused_neon_h4_pair(
+            a_packed,
+            b_packed,
+            pair,
+            chunk_byte_base,
+            b_med,
+            out,
+        ),
+        (true, None) => shift_reduce_inner_ab_fused_neon_h4(
             a_packed,
             b_packed,
             inv_table,
             chunk_byte_base,
             b_med,
             out,
-        );
-    } else {
-        shift_reduce_inner_ab_fused_neon(
+        ),
+        (false, _) => shift_reduce_inner_ab_fused_neon(
             a_packed,
             b_packed,
             inv_table,
             chunk_byte_base,
             b_med,
             out,
-        );
+        ),
     }
 }
