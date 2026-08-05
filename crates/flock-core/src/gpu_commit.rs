@@ -413,8 +413,29 @@ pub const ENV_NO_GPU_KEEPWARM: &str = "FLOCK_NO_GPU_KEEPWARM";
 /// or submission failure falls back to the untouched CPU builder.
 pub const ENV_NO_GPU_RECURSIVE_MERKLE: &str = "FLOCK_NO_GPU_RECURSIVE_MERKLE";
 
+/// Exact rollback for the warmup-calibrated bounded status spin at the
+/// recursive L1 Merkle command-buffer drain.  The first (untimed) ranked call
+/// keeps the incumbent blocking wait and records its submit-to-completion
+/// wall; later calls spin only for that measured wall plus a small margin,
+/// capped so an anomalous warmup cannot monopolize the caller indefinitely.
+pub const ENV_NO_GPU_RECURSIVE_MERKLE_SPIN: &str =
+    "FLOCK_NO_GPU_RECURSIVE_MERKLE_SPIN";
+
 fn gpu_recursive_merkle_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_recursive_merkle_spin_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_recursive_merkle_spin_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_recursive_merkle_spin_value_enabled(
+            std::env::var_os(ENV_NO_GPU_RECURSIVE_MERKLE_SPIN).as_deref(),
+        )
+    })
 }
 
 pub(crate) fn gpu_recursive_merkle_enabled() -> bool {
@@ -428,6 +449,23 @@ pub(crate) fn gpu_recursive_merkle_enabled() -> bool {
                 std::env::var_os(ENV_NO_GPU_RECURSIVE_MERKLE).as_deref(),
             )
     })
+}
+
+#[cfg(test)]
+mod recursive_merkle_spin_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_recursive_merkle_spin_kill_value() {
+        assert!(!super::gpu_recursive_merkle_spin_value_enabled(Some(
+            OsStr::new("1")
+        )));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_recursive_merkle_spin_value_enabled(
+                value.map(OsStr::new)
+            ));
+        }
+    }
 }
 
 /// GPU BLAKE3 Merkle tree for the recursive Ligerito 128-byte-leaf shapes
@@ -9181,6 +9219,10 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         wraps: Vec<(usize, usize, Id)>,
         hits: usize,
         misses: usize,
+        /// Zero until the first real (untimed warmup) call completes.  That
+        /// call uses the incumbent blocking wait and publishes a conservative
+        /// budget for subsequent bounded status polls.
+        spin_budget_ms: f64,
     }
     // SAFETY: Metal objects are thread-safe; every access is serialized by
     // the REC_MERKLE mutex.
@@ -9233,6 +9275,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     wraps: Vec::new(),
                     hits: 0,
                     misses: 0,
+                    spin_budget_ms: 0.0,
                 };
                 // Pin one exact-fit L1 matrix allocation into the scratch
                 // pool's dedicated second slot, then wrap and wire it here
@@ -9377,6 +9420,9 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             .expect("shape checked above");
 
         let total_nodes = 2 * num_leaves - 1;
+        let spin_enabled = super::gpu_recursive_merkle_spin_enabled();
+        let spin_budget_ms = state.spin_budget_ms;
+        let mut submit_wall_ms = 0.0;
         let run = unsafe {
             let pool = gpu.pool_push();
             let run = (|| -> Result<(), String> {
@@ -9401,7 +9447,14 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     read_len = n_out;
                 }
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                let wait_started = std::time::Instant::now();
+                let result = if spin_enabled && spin_budget_ms > 0.0 {
+                    gpu.commit_and_spin(cb, spin_budget_ms)
+                } else {
+                    gpu.commit_and_wait(cb)
+                };
+                submit_wall_ms = wait_started.elapsed().as_secs_f64() * 1e3;
+                result
             })();
             gpu.pool_pop(pool);
             run
@@ -9415,6 +9468,19 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             }
             *guard = Some(Err(msg));
             return None;
+        }
+        if spin_enabled && state.spin_budget_ms == 0.0 && submit_wall_ms > 0.0 {
+            // One-sided scheduling noise can only inflate the blocking wall.
+            // A 25% margin absorbs ordinary warmup-to-timed drift; the cap
+            // bounds the worst-case busy wait before `commit_and_spin`
+            // degrades to the exact incumbent wait.
+            state.spin_budget_ms = (submit_wall_ms * 1.25).clamp(0.25, 8.0);
+            if rec_merkle_debug() {
+                eprintln!(
+                    "[gpu-recmerkle] calibrated spin budget {:.2} ms from {:.2} ms warm wait",
+                    state.spin_budget_ms, submit_wall_ms,
+                );
+            }
         }
 
         let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
