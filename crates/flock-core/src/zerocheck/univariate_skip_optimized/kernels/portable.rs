@@ -101,3 +101,23 @@ pub(super) fn accumulate_convert_ab(
         partial_ab[lane] += converted_ab * eq_lo_val;
     }
 }
+
+/// [`accumulate_convert_ab`] with the eq_lo mul deferred: same gathers, the
+/// per-lane product by the shared chunk constant is accumulated UNREDUCED
+/// (see the aarch64 sibling for the reduction-commutes-with-XOR argument).
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn accumulate_convert_ab_unreduced(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [crate::field::F256Unreduced; 64],
+) {
+    for lane in 0..64 {
+        let mut converted_ab = F128::ZERO;
+        for b_med in 0..n_b_med {
+            converted_ab += convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
+        }
+        partial_ab[lane] ^= converted_ab.mul_unreduced(eq_lo_val);
+    }
+}
