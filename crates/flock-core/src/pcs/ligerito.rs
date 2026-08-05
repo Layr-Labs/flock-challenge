@@ -12731,3 +12731,4 @@ mod tests {
 // welttowelt disclosed cadence resample 4 of the record tree on f027957 (previous draw: 1703434.61020512; zero-diff marker per board protocol).
 // RealAdii sample 1 on 368da6d.
 // angelx lane-warm draw 31 on frontier 2d89d2b (resample 31).
+// angelx lane-warm draw 32 on frontier 44a6631 (resample 32, MY promoted tree).
