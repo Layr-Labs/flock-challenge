@@ -233,6 +233,102 @@ pub(crate) unsafe fn accumulate_convert_ab(
     }
 }
 
+/// [`accumulate_convert_ab`] with the eq_lo mul-drain deferred: the gather
+/// phase is the incumbent kernel verbatim; the drain multiplies each lane by
+/// the shared per-chunk constant `eq_lo_val` UNREDUCED (4 PMULL, no mod-p
+/// fold) and XORs the 256-bit product into the caller's per-band
+/// [`F256Unreduced`] accumulators. The incumbent drain pays the 2-PMULL
+/// GHASH reduction on all 64 lanes of every chunk; deferring it leaves one
+/// reduction per lane per BAND (the caller reduces once after its
+/// `x_outer_lo` sweep). Bit-exact: reduction commutes with XOR
+/// (`Σ (aᵢ·b) mod p = (Σ aᵢ·b) mod p`), so the reduced band accumulator is
+/// the same field element — hence the same bytes — as the incumbent's.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_unreduced(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [crate::field::F256Unreduced; 64],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
+    // Table offsets are `u8` indices scaled by the 16-byte row size, bounded
+    // by the debug-asserted table length: `b_med < 16` selects one of 16
+    // convert blocks.
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        let n_pairs = n_b_med / 2;
+        for lane in (0..64).step_by(4) {
+            let mut ab0 = vdupq_n_u8(0);
+            let mut ab1 = vdupq_n_u8(0);
+            let mut ab2 = vdupq_n_u8(0);
+            let mut ab3 = vdupq_n_u8(0);
+
+            for p in 0..n_pairs {
+                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let t_even = convert_ptr.add(b_even * 256 * 16);
+                let t_odd = convert_ptr.add(b_odd * 256 * 16);
+
+                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                ab0 = xor3_u8(
+                    ab0,
+                    vld1q_u8(t_even.add((we & 0xff) * 16)),
+                    vld1q_u8(t_odd.add((wo & 0xff) * 16)),
+                );
+                ab1 = xor3_u8(
+                    ab1,
+                    vld1q_u8(t_even.add(((we >> 8) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 8) & 0xff) * 16)),
+                );
+                ab2 = xor3_u8(
+                    ab2,
+                    vld1q_u8(t_even.add(((we >> 16) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 16) & 0xff) * 16)),
+                );
+                ab3 = xor3_u8(
+                    ab3,
+                    vld1q_u8(t_even.add((we >> 24) * 16)),
+                    vld1q_u8(t_odd.add((wo >> 24) * 16)),
+                );
+            }
+
+            if n_b_med & 1 == 1 {
+                let b_med = n_b_med - 1;
+                let table = convert_ptr.add(b_med * 256 * 16);
+                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
+                    as usize;
+                ab0 = veorq_u8(ab0, vld1q_u8(table.add((wa & 0xff) * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(table.add(((wa >> 8) & 0xff) * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(table.add(((wa >> 16) & 0xff) * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(table.add((wa >> 24) * 16)));
+            }
+
+            macro_rules! drain_lane {
+                ($offset:literal, $ab:ident) => {{
+                    let ab = vreinterpretq_u64_u8($ab);
+                    partial_ab[lane + $offset] ^= F128 {
+                        lo: vgetq_lane_u64::<0>(ab),
+                        hi: vgetq_lane_u64::<1>(ab),
+                    }
+                    .mul_unreduced(eq_lo_val);
+                }};
+            }
+            drain_lane!(0, ab0);
+            drain_lane!(1, ab1);
+            drain_lane!(2, ab2);
+            drain_lane!(3, ab3);
+        }
+    }
+}
+
 /// Eight α-free single-bit-`K` C banks, NEON — straight off the packed witness.
 ///
 /// Three phases, no multiplies, no convert-table gathers, and **no per-`b_med`
