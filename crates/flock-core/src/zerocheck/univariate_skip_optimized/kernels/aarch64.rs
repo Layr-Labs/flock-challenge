@@ -2494,6 +2494,18 @@ fn bstatic_legacy_enabled() -> bool {
 }
 
 #[inline]
+pub(crate) fn mixed_const_bstatic_position(w: usize, b_med: usize) -> bool {
+    matches!((w, b_med), (0, 2) | (1, 13))
+}
+
+fn mixed_const_bstatic_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_MIXED_CONST_BSTATIC").is_none()
+    });
+    *ON
+}
+
+#[inline]
 pub(crate) fn prepare_static_b_context(
     inv_table: &InvNttTableByteSingleGf8,
     blake3_static_layout: bool,
@@ -2597,9 +2609,12 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
             return;
         }
     }
+    let prefer_bstatic = static_b_context.is_some()
+        && mixed_const_bstatic_enabled()
+        && mixed_const_bstatic_position(bstatic_w, b_med);
     match const_one_mask {
         0 => {}
-        0x03 if bw(0) & bw(1) == u64::MAX => {
+        0x03 if !prefer_bstatic && bw(0) & bw(1) == u64::MAX => {
             shift_reduce_inner_mixed_const_b::<0x03>(
                 a_packed,
                 b_packed,
@@ -2610,7 +2625,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
             );
             return;
         }
-        0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
+        0xf0 if !prefer_bstatic && bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
             shift_reduce_inner_mixed_const_b::<0xf0>(
                 a_packed,
                 b_packed,

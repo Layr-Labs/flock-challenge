@@ -3913,6 +3913,16 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn mixed_const_bstatic_targets_only_profitable_blocks() {
+        let selected = kernels::aarch64::mixed_const_bstatic_position;
+        assert!(selected(0, 2));
+        assert!(selected(1, 13));
+        assert!(!selected(0, 3));
+        assert!(!selected(1, 12));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn prepared_static_b_context_matches_scalar_and_guard_fallback() {
         // The generated debug kernel keeps every match arm's SIMD locals in
         // the frame; give this direct-kernel oracle more than libtest's small
