@@ -46,6 +46,36 @@ pub(super) fn prepare_static_b_context(
 }
 
 #[inline]
+pub(super) fn static_b_context_is_prepared(context: Option<StaticBContext>) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        matches!(context, Some(StaticBContext::Prepared { .. }))
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = context;
+        false
+    }
+}
+
+#[inline]
+pub(super) fn fast_shift_reduce_enabled() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::fast_shift_reduce_enabled()
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+pub(super) const AB_FAST_POLICY_PROCESS: u8 = 0;
+pub(super) const AB_FAST_POLICY_FORCE_FAST: u8 = 1;
+
+#[inline]
 pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON.
@@ -77,7 +107,7 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn shift_reduce_inner_ab(
+pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -98,7 +128,7 @@ pub(super) fn shift_reduce_inner_ab(
     #[cfg(target_arch = "aarch64")]
     {
         let _ = (a_col, b_col);
-        aarch64::shift_reduce_inner_ab_fused_neon_checked(
+        aarch64::shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<FAST_POLICY>(
             a_packed,
             b_packed,
             inv_table,

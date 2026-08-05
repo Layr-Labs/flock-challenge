@@ -914,6 +914,28 @@ mod grind_worker {
     }
 }
 
+/// Run the CPU next-block window after the persistent GPU worker has already
+/// delivered its result. A successful GPU hit is in the earlier nonce block,
+/// so the caller will return it without consulting the CPU result. When the
+/// existing abort policy is armed, skip constructing and dispatching that
+/// provably-dead CPU window altogether.
+///
+/// Keep this helper parameterized rather than reading process-global state so
+/// the exact policy boundary can be tested without mutating the environment.
+#[inline]
+fn run_cpu_window_after_persistent_gpu(
+    gpu_result: &Result<Option<u64>, String>,
+    abort_enabled: bool,
+    skip_dead_cpu_enabled: bool,
+    cpu_window: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    if abort_enabled && skip_dead_cpu_enabled && matches!(gpu_result, Ok(Some(_))) {
+        None
+    } else {
+        cpu_window()
+    }
+}
+
 fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, String> {
     debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
     let block_len = 1u32 << bits.min(24);
@@ -954,12 +976,27 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                 abort,
             ) {
                 Some(gpu) => {
-                    let cpu = cpu_blake3_pow_window_inner(
-                        state_digest,
-                        next_start,
-                        block_len,
-                        bits,
-                        abort.then_some(stop.as_ref()),
+                    // `dispatch` has already waited for this persistent-worker
+                    // result. On a hit the following CPU block is later in
+                    // nonce order and its result is unconditionally discarded
+                    // below, while the pre-set stop flag makes every worker
+                    // exit immediately. Avoid the otherwise-dead allocation,
+                    // Rayon drain, and E-pool broadcast. Misses, errors,
+                    // abort-disabled diagnostics, and the scope-spawn fallback
+                    // retain the incumbent behavior exactly.
+                    let cpu = run_cpu_window_after_persistent_gpu(
+                        &gpu,
+                        abort,
+                        grind_skip_dead_cpu_enabled(),
+                        || {
+                            cpu_blake3_pow_window_inner(
+                                state_digest,
+                                next_start,
+                                block_len,
+                                bits,
+                                abort.then_some(stop.as_ref()),
+                            )
+                        },
                     );
                     (gpu, cpu)
                 }
@@ -1023,6 +1060,14 @@ fn grind_hybrid_enabled() -> bool {
 fn grind_hybrid_abort_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_HYBRID_ABORT").is_none())
+}
+
+/// Skip the CPU next-block scaffold when the serialized persistent GPU worker
+/// has already returned a hit. `FLOCK_NO_GRIND_SKIP_DEAD_CPU=1` restores the
+/// previous behavior for exact same-binary comparison.
+fn grind_skip_dead_cpu_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_SKIP_DEAD_CPU").is_none())
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,6 +1264,58 @@ mod tests {
         assert_eq!(GPU_GRIND_CALIBRATION_BITS, 19);
         let exact_geometric = 1.0 / (1.0 - (-1.0f64).exp());
         assert!((GPU_GRIND_BLOCK_OVERDRAW - exact_geometric).abs() < 1e-12);
+    }
+
+    /// A completed persistent-worker hit owns the earlier nonce block, so an
+    /// armed candidate must not even invoke the later CPU-window closure.
+    /// Turning off either the existing abort policy or the new feature input
+    /// restores the incumbent invocation without touching process-global env.
+    #[test]
+    fn persistent_gpu_hit_skips_dead_cpu_window_only_when_armed() {
+        use std::cell::Cell;
+
+        let hit: Result<Option<u64>, String> = Ok(Some(7));
+        let calls = Cell::new(0);
+        let got = run_cpu_window_after_persistent_gpu(&hit, true, true, || {
+            calls.set(calls.get() + 1);
+            Some(99)
+        });
+        assert_eq!(got, None);
+        assert_eq!(calls.get(), 0, "armed GPU hit must not dispatch CPU work");
+
+        for (abort_enabled, feature_enabled) in [(false, true), (true, false), (false, false)] {
+            let calls = Cell::new(0);
+            let got = run_cpu_window_after_persistent_gpu(
+                &hit,
+                abort_enabled,
+                feature_enabled,
+                || {
+                    calls.set(calls.get() + 1);
+                    Some(99)
+                },
+            );
+            assert_eq!(got, Some(99));
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    /// Miss and error results must retain the existing CPU-window behavior;
+    /// only `Ok(Some(_))` is a proof that the later block is dead.
+    #[test]
+    fn persistent_gpu_miss_and_error_keep_cpu_window() {
+        use std::cell::Cell;
+
+        let cases: [Result<Option<u64>, String>; 2] =
+            [Ok(None), Err("synthetic GPU failure".to_string())];
+        for gpu_result in &cases {
+            let calls = Cell::new(0);
+            let got = run_cpu_window_after_persistent_gpu(gpu_result, true, true, || {
+                calls.set(calls.get() + 1);
+                Some(123)
+            });
+            assert_eq!(got, Some(123));
+            assert_eq!(calls.get(), 1);
+        }
     }
 
     /// Every FsChallenger property must hold under both transcript hashes:

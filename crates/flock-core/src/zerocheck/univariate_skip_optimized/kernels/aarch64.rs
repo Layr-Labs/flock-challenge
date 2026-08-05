@@ -2538,9 +2538,55 @@ pub(crate) fn prepare_static_b_context_with_policy(
 ///
 /// `bstatic_w` is the BLAKE3 outer-window index (0 or 1) for the byte-level
 /// static-B path, or `usize::MAX` to disable it. Block-level sniffs run first.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(test, target_arch = "aarch64"))]
 #[inline(always)]
 pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    check_all_ones: bool,
+    check_single_k0: bool,
+    const_one_mask: u8,
+    bstatic_w: usize,
+    static_b_context: Option<StaticBContext>,
+    nt_store: bool,
+) {
+    shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<
+        { super::AB_FAST_POLICY_PROCESS },
+    >(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        b_med,
+        out,
+        check_all_ones,
+        check_single_k0,
+        const_one_mask,
+        bstatic_w,
+        static_b_context,
+        nt_store,
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fast_shift_reduce_with_policy<const FAST_POLICY: u8>() -> bool {
+    match FAST_POLICY {
+        super::AB_FAST_POLICY_PROCESS => fast_shift_reduce_enabled(),
+        super::AB_FAST_POLICY_FORCE_FAST => true,
+        _ => unreachable!("unsupported AB fast-policy mode"),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
+    const FAST_POLICY: u8,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -2634,7 +2680,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
         // monomorphization; the kill switch picks a whole kernel, never a
         // branch inside one.
         let handled = enabled
-            && if fast_shift_reduce_enabled() {
+            && if fast_shift_reduce_with_policy::<FAST_POLICY>() {
                 shift_reduce_inner_ab_bstatic::<true>(
                     a_packed,
                     b_packed,
@@ -2663,7 +2709,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
             return;
         }
     }
-    if fast_shift_reduce_enabled() {
+    if fast_shift_reduce_with_policy::<FAST_POLICY>() {
         shift_reduce_inner_ab_fused_neon_h4(
             a_packed,
             b_packed,
