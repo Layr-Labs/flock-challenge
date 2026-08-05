@@ -59,7 +59,7 @@
 
 use crate::bits::{transpose_8_u64s_to_64_bytes, transpose_8x8_bits};
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, mul_by_x};
 use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use crate::zerocheck::univariate_skip::build_eq;
@@ -1924,6 +1924,15 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
 /// Total length of a fold byte table (`build_fold_byte_table` output).
 pub(crate) const FOLD_TABLE_LEN: usize = FOLD_N_BYTES * FOLD_TABLE_SIZE;
 
+/// Default-on exact generator ladder for composed fold tables. The rollback is
+/// intentionally cached: a ranked proof builds hundreds of these tables, so
+/// the environment is resolved only on the first call in each worker.
+#[inline]
+fn compose_x_ladder_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_COMPOSE_X_LADDER").is_none())
+}
+
 /// Compose the fold byte table with a fixed field multiplier: fills `out`
 /// (length [`FOLD_TABLE_LEN`]) with a table `C` such that
 ///
@@ -1940,23 +1949,47 @@ pub(crate) const FOLD_TABLE_LEN: usize = FOLD_N_BYTES * FOLD_TABLE_SIZE;
 /// XOR combination of exact field products, so the result is bit-identical to
 /// the slot-multiply path — same XOR multiset, order-independent.
 ///
-/// Cost: 128 field muls (the `x^b·e_hi` ladder) + 128 `fold_one_slot` + 16·255
-/// adds ≈ a few µs — amortized over one 2^(n_lo)-slot block in pcs's fused
-/// combine, where it deletes one field mul per slot.
+/// Cost: 127 shift-and-fold `mul_by_x` steps + 128 `fold_one_slot` + 16·255
+/// adds. Advancing the monomial product with `mul_by_x` is exactly the same
+/// field operation as multiplying by `x`, but avoids a full field multiply for
+/// every generator. The table build is amortized over one 2^(n_lo)-slot block
+/// in pcs's fused combine, where it deletes one field mul per slot.
 pub(crate) fn compose_fold_byte_table_into(e_hi: F128, base: &[F128], out: &mut [F128]) {
+    compose_fold_byte_table_into_mode(e_hi, base, out, compose_x_ladder_enabled());
+}
+
+fn compose_fold_byte_table_into_mode(
+    e_hi: F128,
+    base: &[F128],
+    out: &mut [F128],
+    x_ladder: bool,
+) {
     debug_assert_eq!(base.len(), FOLD_TABLE_LEN);
     debug_assert_eq!(out.len(), FOLD_TABLE_LEN);
-    // Generators g_b = L(e_b · e_hi) over the single-bit basis elements e_b
-    // (bit b of the lo:hi u128 = polynomial-basis coordinate b, matching
-    // fold_one_slot's byte decomposition). Direct products — exact field muls.
     let mut g = [F128::ZERO; 128];
-    for (b, gb) in g.iter_mut().enumerate() {
-        let e_b = if b < 64 {
-            F128::new(1u64 << b, 0)
-        } else {
-            F128::new(0, 1u64 << (b - 64))
-        };
-        *gb = fold_one_slot(e_b * e_hi, base);
+    if x_ladder {
+        // Generators g_b = L(x^b · e_hi) over the single-bit basis elements
+        // x^b (bit b of the lo:hi u128 = polynomial-basis coordinate b,
+        // matching fold_one_slot's byte decomposition). Each next product is
+        // obtained by multiplying the previous one by x via one exact
+        // shift-and-fold.
+        let mut basis_product = e_hi;
+        g[0] = fold_one_slot(basis_product, base);
+        for gb in &mut g[1..] {
+            basis_product = mul_by_x(basis_product);
+            *gb = fold_one_slot(basis_product, base);
+        }
+    } else {
+        // Strict benchmark rollback: construct every monomial independently,
+        // matching the incumbent implementation byte for byte.
+        for (b, gb) in g.iter_mut().enumerate() {
+            let e_b = if b < 64 {
+                F128::new(1u64 << b, 0)
+            } else {
+                F128::new(0, 1u64 << (b - 64))
+            };
+            *gb = fold_one_slot(e_b * e_hi, base);
+        }
     }
     // Per byte position: subset-sum doubling over that byte's 8 generators.
     // Every entry is written exactly once (t[0] = 0, then each doubling round
@@ -3583,6 +3616,24 @@ mod tests {
                     "trial={trial} lo={lo:?} e_hi={e_hi:?}"
                 );
             }
+        }
+    }
+
+    /// The shift ladder is exactly the incumbent independent-monomial table
+    /// construction for every entry, including products that cross the field
+    /// polynomial's reduction boundary.
+    #[test]
+    fn compose_fold_x_ladder_matches_independent_products() {
+        let mut rng = Rng::new(0xC011_1ADD_E2);
+        for _ in 0..8 {
+            let eq_r_dprime: Vec<F128> = (0..(1 << LOG_PACKING)).map(|_| rng.f128()).collect();
+            let base = build_fold_byte_table(&eq_r_dprime);
+            let e_hi = rng.f128();
+            let mut ladder = vec![F128::ZERO; FOLD_TABLE_LEN];
+            let mut incumbent = vec![F128::ZERO; FOLD_TABLE_LEN];
+            compose_fold_byte_table_into_mode(e_hi, &base, &mut ladder, true);
+            compose_fold_byte_table_into_mode(e_hi, &base, &mut incumbent, false);
+            assert_eq!(ladder, incumbent);
         }
     }
 
