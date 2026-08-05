@@ -262,6 +262,143 @@ pub fn commit_tail_fill_enabled() -> bool {
     !std::env::var(ENV_NO_COMMIT_TAIL_FILL).is_ok_and(|v| v == "1")
 }
 
+/// Kill switch for the zerocheck round-one AB-head GPU completion arm
+/// (`FLOCK_NO_AB_HEAD_GPU=1`, exact): the ranked ZC round-one window's GPU
+/// goes idle once the commit-tail-staged C fold drains, while the CPU walks
+/// the ~9.7 ms AB head (challenge-weighted reduction over the 512 MiB
+/// `ab_inner`). This arm offloads a fixed prefix of the 128 `x_hi` bands:
+/// per chunk the kernel replays the exact convert-table XOR gathers (the
+/// 64 KiB γ^b·φ₈ table nibble-decomposed into 8 KiB of threadgroup memory —
+/// F₂-linearity of φ₈ makes the split exact), multiplies by the shared
+/// per-chunk `eq_lo` weight with the oracle-proven emulated carry-less
+/// multiply, and XOR-accumulates unreduced; per-band partials are
+/// eq_hi-weighted, reduced, and XOR-joined on the CPU. Warmup calibration
+/// refuses to admit the arm until the GPU's band partials compare EQUAL to
+/// the CPU's own values on the target machine; there is no runtime share
+/// decision beyond the env-fixed band count plus that pass/fail.
+pub const ENV_NO_AB_HEAD_GPU: &str = "FLOCK_NO_AB_HEAD_GPU";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn ab_head_gpu_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn ab_head_gpu_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        ab_head_gpu_value_enabled(std::env::var_os(ENV_NO_AB_HEAD_GPU).as_deref())
+    })
+}
+
+/// Fixed GPU band count for the AB-head arm (`FLOCK_AB_HEAD_GPU_BANDS=<n>`,
+/// `0` = arm off). Default from the measured 2.8:1 LUT-throughput law at the
+/// ranked 11-P-equivalent pool: with the GPU's per-band wall ≈ 2.8× the full
+/// CPU pool's per-band wall, the balanced split solves
+/// `2.8·G = hi_size − G` ⇒ `G = hi_size/3.8` — 33 of the ranked 128 bands,
+/// floored so a noisy calibration can never make the GPU the timed
+/// straggler (at 33 the GPU wall is 92.4 band-units against the CPU
+/// suffix's 95).
+pub const ENV_AB_HEAD_GPU_BANDS: &str = "FLOCK_AB_HEAD_GPU_BANDS";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn ab_head_gpu_bands_from_value(value: Option<&std::ffi::OsStr>, hi_size: usize) -> usize {
+    let configured = value
+        .and_then(|v| v.to_str())
+        .and_then(|v| v.parse::<usize>().ok());
+    match configured {
+        Some(n) => n.min(hi_size),
+        // Default OFF: the local (M4 Max) interleaved ABBA screened the GPU
+        // arm at −0.89% median — its head is partially bandwidth-bound and
+        // the window GPU is shared, so the 2.8:1-law split does not pay
+        // there. The arm stays available for machines with a compute-bound
+        // head and an empty window (set FLOCK_AB_HEAD_GPU_BANDS=33 per the
+        // balanced-split arithmetic above), but a default must ship at its
+        // screened-positive setting, and the screened-positive setting on
+        // the reference box is off.
+        None => 0,
+    }
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn ab_head_gpu_bands(hi_size: usize) -> usize {
+    // Tests exercise the arm regardless of the shipped default.
+    #[cfg(test)]
+    if crate::zerocheck::univariate_skip_optimized::AB_HEAD_TEST_DRIVER_FORCE
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return hi_size * 10 / 38;
+    }
+    static RAW: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    let raw = RAW.get_or_init(|| std::env::var_os(ENV_AB_HEAD_GPU_BANDS));
+    ab_head_gpu_bands_from_value(raw.as_deref(), hi_size)
+}
+
+/// Diagnostic trace for the AB-head arm (`FLOCK_AB_HEAD_GPU_DEBUG=1`).
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn ab_head_gpu_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_AB_HEAD_GPU_DEBUG").is_some());
+    *ON
+}
+
+#[cfg(test)]
+mod ab_head_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_ab_head_kill_value() {
+        assert!(!super::ab_head_gpu_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::ab_head_gpu_value_enabled(value.map(OsStr::new)));
+        }
+    }
+
+    #[test]
+    fn ab_head_band_default_is_the_balanced_2_8_split() {
+        // Default ships OFF (local screen −0.89%); the balanced 2.8:1 split
+        // (2.8·G = 128 − G ⇒ 33) is opt-in via the env.
+        assert_eq!(super::ab_head_gpu_bands_from_value(None, 128), 0);
+        assert_eq!(
+            super::ab_head_gpu_bands_from_value(Some(std::ffi::OsStr::new("33")), 128),
+            33
+        );
+        // Explicit values win and clamp to the band count; 0 = off.
+        assert_eq!(
+            super::ab_head_gpu_bands_from_value(Some(OsStr::new("48")), 128),
+            48
+        );
+        assert_eq!(
+            super::ab_head_gpu_bands_from_value(Some(OsStr::new("999")), 128),
+            128
+        );
+        assert_eq!(
+            super::ab_head_gpu_bands_from_value(Some(OsStr::new("0")), 128),
+            0
+        );
+        // Unparsable values fall back to the shipped default (off).
+        assert_eq!(
+            super::ab_head_gpu_bands_from_value(Some(OsStr::new("lots")), 128),
+            0
+        );
+    }
+}
+
 /// Kill switch for the zerocheck first-tail-round (T3 compact reconstruction)
 /// products GPU arm.
 pub const ENV_NO_GPU_ZC_T3: &str = "FLOCK_NO_GPU_ZC_T3";
@@ -10787,6 +10924,845 @@ kernel void zc_r2_products(
     }
 
     // -----------------------------------------------------------------------
+    // Zerocheck round-one AB-head GPU completion arm (see
+    // `ENV_NO_AB_HEAD_GPU`).
+    //
+    // The round-one AB completion sweeps `hi_size` (ranked: 128) `x_hi`
+    // bands of the 512 MiB challenge-independent `ab_inner` transform: per
+    // 1 KiB chunk, 16 convert-table XOR gathers per lane over 64 lanes, one
+    // GHASH multiply per lane by the shared per-chunk `eq_lo_scaled` weight,
+    // and an eq_hi weighting per band. The commit-tail-staged C fold leaves
+    // the window's GPU idle under this CPU wall, so the arm computes a FIXED
+    // env-selected prefix of the bands on the GPU while the CPU walks the
+    // suffix; band partials combine by XOR (GF(2^128) add), so the join is
+    // exact.
+    //
+    // Bit-exactness: the convert table is `γ^b · φ₈(byte)` and φ₈ is a field
+    // embedding, hence F₂-linear in the byte — the kernel's 8 KiB nibble
+    // decomposition (`T_b[v] = T_b[v & 15] ^ T_b[v & 0xF0]`, pinned by
+    // `convert_table_is_nibble_decomposable`) gathers exactly the incumbent
+    // rows. Products use the emulated carry-less multiply already
+    // oracle-proven bit-exact on this board (zc_r2/T3/loop arms), unreduced
+    // 256-bit accumulation is order-independent XOR, and every reduction is
+    // the same mod-p fold the CPU applies, so per-band values are identical
+    // field elements — identical bytes. Calibration additionally refuses to
+    // admit the arm until a warmup probe over the exact prefix the timed
+    // dispatch will read compares EQUAL to the CPU's own band partials on
+    // the target machine; any mismatch or Metal failure poisons the arm and
+    // every prove runs the exact incumbent.
+    //
+    // Dispatch timing: the window setup (eq/nib/counts uploads) can be
+    // staged at commit-graph completion from the fork-hook challenges and is
+    // parked under an exact challenge-vector fingerprint, adopted at
+    // zerocheck entry, abandoned (overwritten, byte-inert) on any mismatch —
+    // the ZcFoldStaged adoption discipline. The DISPATCH itself is not
+    // staged there: at commit-graph completion the AB precompute arm is
+    // typically still writing `ab_inner`, so a parked dispatch would read
+    // torn bytes, and a page-wiring primer would steal memory bandwidth from
+    // the very CPU arm that binds the commit window. The submit therefore
+    // happens at zerocheck entry — a single >3 ms dispatch, comfortably
+    // clearing the measured Metal fixed-overhead law — and the 512 MiB
+    // no-copy wrap is cached across proves by `(ptr, len)` so its wiring
+    // cost lands in the warmup calibration dispatch, which touches exactly
+    // the pages the timed prefix reads.
+    // -----------------------------------------------------------------------
+
+    const AB_HEAD_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// 32x32 -> 64 carry-less multiply via 4-bit-spaced masked integer multiplies.
+static inline ulong clmul32(uint a, uint b) {
+    const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
+                M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
+    ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
+          a2 = a & 0x44444444u, a3 = a & 0x88888888u;
+    ulong b0 = b & 0x11111111u, b1 = b & 0x22222222u,
+          b2 = b & 0x44444444u, b3 = b & 0x88888888u;
+    ulong r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
+    ulong r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
+    ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
+    ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
+    return r0 | r1 | r2 | r3;
+}
+
+struct U128k { ulong lo; ulong hi; };
+struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+
+static inline U128k clmul64(ulong a, ulong b) {
+    uint al = uint(a), ah = uint(a >> 32);
+    uint bl = uint(b), bh = uint(b >> 32);
+    ulong p_lo = clmul32(al, bl);
+    ulong p_hi = clmul32(ah, bh);
+    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
+    U128k r;
+    r.lo = p_lo ^ (p_mid << 32);
+    r.hi = p_hi ^ (p_mid >> 32);
+    return r;
+}
+
+static inline U256k clmul128(uint4 a, uint4 b) {
+    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
+    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
+    U128k p0 = clmul64(al, bl);
+    U128k p2 = clmul64(ah, bh);
+    U128k pm = clmul64(al ^ ah, bl ^ bh);
+    pm.lo ^= p0.lo ^ p2.lo;
+    pm.hi ^= p0.hi ^ p2.hi;
+    U256k r;
+    r.r0 = p0.lo;
+    r.r1 = p0.hi ^ pm.lo;
+    r.r2 = p2.lo ^ pm.hi;
+    r.r3 = p2.hi;
+    return r;
+}
+
+// Reduce a 255-bit product mod x^128 + x^7 + x^2 + x + 1.
+static inline uint4 gf_reduce(U256k p) {
+    ulong h0 = p.r2, h1 = p.r3;
+    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
+    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+}
+
+struct AbHeadParams {
+    uint big_lo;     // chunks per band
+    uint n_lo;       // log2(big_lo): x_outer = x_lo | (band << n_lo)
+    uint mask;       // within_outer_mask for the counts lookup
+    uint segs;       // threadgroups per band
+    uint seg_chunks; // chunk span per threadgroup
+};
+
+// One threadgroup per (band, seg): 256 threads = 64 lanes x 4 chunk strides.
+// Per chunk: the incumbent 16 convert-table gathers per lane, via the 8 KiB
+// threadgroup-staged nibble split of the 64 KiB table (the 32 KiB threadgroup
+// limit rules out the full byte table; F2-linearity of gamma^b*phi8 makes two
+// 16-row gathers per byte exact), then one emulated clmul by eq_lo[x_lo],
+// accumulated unreduced. Threadgroup XOR-reduce over the 4 strides (XOR of
+// unreduced products commutes with reduction), then lanes 0..64 reduce,
+// weight by eq_hi[band], reduce again, and store one uint4 per lane. The
+// CPU XOR-joins the per-seg outputs; distributivity of the eq_hi product
+// over XOR makes the joined band partial the identical field element the
+// CPU band worker produces.
+kernel void ab_head_partials(
+    device const uchar* ab       [[buffer(0)]],
+    device const uint4* eq_lo    [[buffer(1)]],
+    device const uint4* eq_hi    [[buffer(2)]],
+    device const uint4* nib_dev  [[buffer(3)]],
+    device const uchar* counts   [[buffer(4)]],
+    device uint4*       partials [[buffer(5)]],
+    constant AbHeadParams& p     [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 nib[512];
+    threadgroup ulong4 red[256];
+    nib[lid] = nib_dev[lid];
+    nib[256u + lid] = nib_dev[256u + lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint band = tgid / p.segs;
+    uint seg = tgid % p.segs;
+    uint lane = lid & 63u;
+    uint sub = lid >> 6u;
+
+    ulong4 acc = ulong4(0ul);
+    uint k_end = min((seg + 1u) * p.seg_chunks, p.big_lo);
+    for (uint k = seg * p.seg_chunks + sub; k < k_end; k += 4u) {
+        uint n_b = uint(counts[(k | (band << p.n_lo)) & p.mask]);
+        if (n_b == 0u) { continue; }
+        ulong base = (ulong(band) * p.big_lo + k) * 1024ul;
+        uint4 g = uint4(0u);
+        for (uint b = 0u; b < n_b; b++) {
+            uint v = uint(ab[base + ulong(b) * 64ul + lane]);
+            g ^= nib[b * 32u + (v & 15u)] ^ nib[b * 32u + 16u + (v >> 4u)];
+        }
+        U256k m = clmul128(eq_lo[k], g);
+        acc ^= ulong4(m.r0, m.r1, m.r2, m.r3);
+    }
+
+    // XOR-reduce the 4 chunk strides per lane (steps 128 and 64 pair equal
+    // lane indices only; the lane-mixing steps below 64 never run).
+    red[lid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 128u) { red[lid] ^= red[lid + 128u]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 64u) { red[lid] ^= red[lid + 64u]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 64u) {
+        ulong4 t = red[lid];
+        U256k u; u.r0 = t.x; u.r1 = t.y; u.r2 = t.z; u.r3 = t.w;
+        uint4 v = gf_reduce(u);
+        partials[tgid * 64u + lid] = gf_reduce(clmul128(eq_hi[band], v));
+    }
+}
+"#;
+
+    /// Process-lifetime Metal state for the AB-head completion arm.
+    struct AbHead {
+        pso: Id,
+        /// Persistent small buffers: nibble-split convert table (8 KiB),
+        /// eq_lo_scaled, eq_hi, b_med counts, per-(band,seg) partials.
+        nib_buf: Id,
+        eq_lo_buf: Id,
+        eq_lo_cap: usize,
+        eq_hi_buf: Id,
+        eq_hi_cap: usize,
+        counts_buf: Id,
+        counts_cap: usize,
+        part_buf: Id,
+        part_cap: usize,
+        /// Cached no-copy wraps of `ab_inner` surfaces `(ptr, len, buf)`.
+        wraps: Vec<(usize, usize, Id)>,
+        /// Commit-tail-staged window setup (see `stage_ab_head_window`):
+        /// uploads already performed from the fork-hook challenges, parked
+        /// under an exact fingerprint for adoption at zerocheck entry.
+        staged: Option<AbHeadStaged>,
+    }
+
+    /// Fingerprint of a commit-tail-staged AB-head window setup. No command
+    /// buffer is parked (see the section comment: `ab_inner` is mid-write at
+    /// staging time), so abandoning is dropping the fingerprint — the launch
+    /// then redoes the uploads over the same buffers, byte-inert either way.
+    struct AbHeadStaged {
+        /// Exact challenge vector the staged eq tables derive from.
+        r: Vec<F128>,
+        big_lo: usize,
+        hi_size: usize,
+        mask: usize,
+        n_lo: usize,
+    }
+
+    // SAFETY: the Metal pipeline and buffer handles are only touched under
+    // the state mutex; Metal objects themselves are thread-safe.
+    unsafe impl Send for AbHead {}
+
+    static AB_HEAD_STATE: std::sync::OnceLock<Option<std::sync::Mutex<AbHead>>> =
+        std::sync::OnceLock::new();
+    /// Admission state. `usize::MAX` = uncalibrated (first prove runs the
+    /// compare-equal probe), `0` = arm off for this process, otherwise the
+    /// admitted env-fixed band count. Unlike the round-two arm there is NO
+    /// measured share decision: calibration only proves bit-exactness on
+    /// the target machine (and wires the prefix pages); the share itself is
+    /// `ab_head_gpu_bands` verbatim.
+    static AB_HEAD_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static AB_HEAD_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Serializes every test that touches the arm's process-global
+    /// admission state (the flock-core test binary is multithreaded).
+    #[cfg(test)]
+    pub(crate) fn ab_head_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ab_head_test_reset() {
+        use std::sync::atomic::Ordering;
+        AB_HEAD_TUNED.store(usize::MAX, Ordering::Relaxed);
+        AB_HEAD_POISONED.store(false, Ordering::Relaxed);
+        // The shipped default is bands=0; tests exercise the arm via the
+        // driver-force flag, which ab_head_gpu_bands honors under cfg(test).
+        crate::zerocheck::univariate_skip_optimized::AB_HEAD_TEST_DRIVER_FORCE
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ab_head_test_state() -> (usize, bool) {
+        use std::sync::atomic::Ordering;
+        (
+            AB_HEAD_TUNED.load(Ordering::Relaxed),
+            AB_HEAD_POISONED.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ab_head_test_set_bands(bands: usize) {
+        AB_HEAD_TUNED.store(bands, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn ab_head_init(gpu: &'static Gpu) -> Result<AbHead, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<Id, String> {
+                let src = gpu.api.nsstring(AB_HEAD_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "ab-head shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let ns = gpu.api.nsstring("ab_head_partials")?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    return Err("ab_head_partials kernel not found".into());
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                if pso.is_null() {
+                    return Err(format!(
+                        "ab_head_partials pipeline: {}",
+                        gpu.api.error_string(perr)
+                    ));
+                }
+                Ok(pso)
+            })();
+            gpu.pool_pop(pool);
+            let pso = built?;
+            let nib_buf = gpu.new_buffer(512 * 16)?;
+            Ok(AbHead {
+                pso,
+                nib_buf,
+                eq_lo_buf: NIL,
+                eq_lo_cap: 0,
+                eq_hi_buf: NIL,
+                eq_hi_cap: 0,
+                counts_buf: NIL,
+                counts_cap: 0,
+                part_buf: NIL,
+                part_cap: 0,
+                wraps: Vec::new(),
+                staged: None,
+            })
+        }
+    }
+
+    fn ab_head_state() -> Option<&'static std::sync::Mutex<AbHead>> {
+        AB_HEAD_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match ab_head_init(gpu) {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if super::ab_head_gpu_debug() {
+                            eprintln!("[ab-head] init failed: {e}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Threadgroups per band: enough sub-partitions of the ranked 4096-chunk
+    /// band for occupancy, degrading gracefully for the small test shapes.
+    fn ab_head_segs(big_lo: usize) -> usize {
+        if big_lo >= 64 { 8 } else { 1 }
+    }
+
+    /// Upload the AB-head window setup (nibble table, eq tables, counts)
+    /// into the arm's persistent buffers. Caller holds the state lock.
+    unsafe fn ab_head_upload(
+        gpu: &Gpu,
+        state: &mut AbHead,
+        convert: &[F128],
+        eq_lo_scaled: &[F128],
+        eq_hi: &[F128],
+        b_med_counts: &[u8],
+        bands: usize,
+    ) -> Result<(), String> {
+        unsafe {
+            // Nibble split: nib[b*32 + n] = T_b[n], nib[b*32 + 16 + n] =
+            // T_b[n << 4]; the kernel composes T_b[v] by F2-linearity.
+            let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
+            for b in 0..16 {
+                for n in 0..16 {
+                    *nib.add(b * 32 + n) = convert[b * 256 + n];
+                    *nib.add(b * 32 + 16 + n) = convert[b * 256 + (n << 4)];
+                }
+            }
+            let need_lo = eq_lo_scaled.len() * 16;
+            if state.eq_lo_cap < need_lo {
+                if state.eq_lo_cap > 0 {
+                    gpu.release(state.eq_lo_buf);
+                }
+                state.eq_lo_buf = gpu.new_buffer(need_lo)?;
+                state.eq_lo_cap = need_lo;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_lo_scaled.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_lo_buf),
+                need_lo,
+            );
+            let need_hi = eq_hi.len() * 16;
+            if state.eq_hi_cap < need_hi {
+                if state.eq_hi_cap > 0 {
+                    gpu.release(state.eq_hi_buf);
+                }
+                state.eq_hi_buf = gpu.new_buffer(need_hi)?;
+                state.eq_hi_cap = need_hi;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_hi.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_hi_buf),
+                need_hi,
+            );
+            let need_counts = b_med_counts.len();
+            if state.counts_cap < need_counts {
+                if state.counts_cap > 0 {
+                    gpu.release(state.counts_buf);
+                }
+                state.counts_buf = gpu.new_buffer(need_counts)?;
+                state.counts_cap = need_counts;
+            }
+            std::ptr::copy_nonoverlapping(
+                b_med_counts.as_ptr(),
+                gpu.buffer_contents(state.counts_buf),
+                need_counts,
+            );
+            let need_part = bands * ab_head_segs(eq_lo_scaled.len()) * 64 * 16;
+            if state.part_cap < need_part {
+                if state.part_cap > 0 {
+                    gpu.release(state.part_buf);
+                }
+                state.part_buf = gpu.new_buffer(need_part)?;
+                state.part_cap = need_part;
+            }
+            Ok(())
+        }
+    }
+
+    /// Cheap viability pre-gate for the commit-tail staging road.
+    pub(crate) fn ab_head_gpu_viable() -> bool {
+        use std::sync::atomic::Ordering;
+        super::ab_head_gpu_enabled()
+            && !AB_HEAD_POISONED.load(Ordering::Relaxed)
+            && AB_HEAD_TUNED.load(Ordering::Relaxed) != 0
+            && gpu().is_ok()
+    }
+
+    /// Commit-tail staging half: perform the window-setup uploads from the
+    /// fork-hook challenge vector and park the fingerprint for adoption at
+    /// zerocheck entry. Never touches `ab_inner` (still being written by the
+    /// precompute arm at commit-graph completion). Every failure is a silent
+    /// no-op — the launch then pays its incumbent setup.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_ab_head_window(
+        convert: &[F128],
+        eq_lo_scaled: &[F128],
+        eq_hi: &[F128],
+        b_med_counts: &[u8],
+        within_outer_mask: usize,
+        n_lo: usize,
+        r: &[F128],
+    ) -> bool {
+        if !ab_head_gpu_viable() || convert.len() != 16 * 256 {
+            return false;
+        }
+        let bands = {
+            use std::sync::atomic::Ordering;
+            let tuned = AB_HEAD_TUNED.load(Ordering::Relaxed);
+            let configured = super::ab_head_gpu_bands(eq_hi.len());
+            if tuned == usize::MAX { configured } else { tuned }
+        };
+        if bands == 0 {
+            return false;
+        }
+        let Ok(gpu) = gpu() else { return false };
+        let Some(state_mutex) = ab_head_state() else {
+            return false;
+        };
+        let Ok(mut state) = state_mutex.lock() else {
+            note_poisoned_lock("ab-head stage", false);
+            return false;
+        };
+        // The grow sequences are not unwind-atomic; decline on any failure.
+        let ok = unsafe {
+            ab_head_upload(
+                gpu,
+                &mut state,
+                convert,
+                eq_lo_scaled,
+                eq_hi,
+                b_med_counts,
+                bands,
+            )
+        };
+        match ok {
+            Ok(()) => {
+                state.staged = Some(AbHeadStaged {
+                    r: r.to_vec(),
+                    big_lo: eq_lo_scaled.len(),
+                    hi_size: eq_hi.len(),
+                    mask: within_outer_mask,
+                    n_lo,
+                });
+                true
+            }
+            Err(e) => {
+                state.staged = None;
+                if super::ab_head_gpu_debug() {
+                    eprintln!("[ab-head] stage failed (window pays setup): {e}");
+                }
+                false
+            }
+        }
+    }
+
+    pub(crate) struct AbHeadJob {
+        cb: Id,
+        pub bands: usize,
+        segs: usize,
+        calibration: bool,
+        submitted: std::time::Instant,
+    }
+
+    // SAFETY: the command buffer handle is only waited/released from the
+    // draining thread; Metal command buffers are themselves thread-safe.
+    unsafe impl Send for AbHeadJob {}
+
+    impl AbHeadJob {
+        /// First band the CPU should compute. Zero during calibration: the
+        /// CPU runs every band and the probe is compared, then discarded.
+        pub(crate) fn cpu_split(&self) -> usize {
+            if self.calibration { 0 } else { self.bands }
+        }
+
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    /// Result of draining the AB-head arm.
+    pub(crate) enum AbHeadResult {
+        /// Warmup calibration completed (equality proven, band count
+        /// published, GPU values discarded); the caller's CPU partials are
+        /// authoritative. The GPU wall of the probe is attached for the
+        /// timing line.
+        Calibrated(f64),
+        /// Timed-prove prefix: per-band eq_hi-weighted partial lanes,
+        /// bit-exact, plus the dispatch's GPU wall in ms.
+        Prefix(Vec<[F128; 64]>, f64),
+        /// Metal failed after admission; the caller must CPU-redo the
+        /// prefix bands. The arm is poisoned for the process.
+        Failed,
+    }
+
+    unsafe fn ab_head_submit(
+        gpu: &Gpu,
+        state: &AbHead,
+        ab_buf: Id,
+        bands: usize,
+        big_lo: usize,
+        n_lo: usize,
+        mask: usize,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                big_lo: u32,
+                n_lo: u32,
+                mask: u32,
+                segs: u32,
+                seg_chunks: u32,
+            }
+            let segs = ab_head_segs(big_lo);
+            let params = P {
+                big_lo: big_lo as u32,
+                n_lo: n_lo as u32,
+                mask: mask as u32,
+                segs: segs as u32,
+                seg_chunks: big_lo.div_ceil(segs) as u32,
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, ab_buf, 0, 0);
+            gpu.set_buffer(enc, state.eq_lo_buf, 0, 1);
+            gpu.set_buffer(enc, state.eq_hi_buf, 0, 2);
+            gpu.set_buffer(enc, state.nib_buf, 0, 3);
+            gpu.set_buffer(enc, state.counts_buf, 0, 4);
+            gpu.set_buffer(enc, state.part_buf, 0, 5);
+            gpu.set_bytes(enc, pb, 6);
+            gpu.dispatch(enc, (bands * segs) as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// Launch the AB-head prefix at zerocheck entry. `None` = the whole head
+    /// stays on the exact incumbent CPU path (kill switch, poisoned, band
+    /// count 0, shape gate, no Metal, or wrap failure — e.g. an `ab_inner`
+    /// allocation that is not page-aligned).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_ab_head_partials(
+        ab_inner: &[u8],
+        convert: &[F128],
+        eq_lo_scaled: &[F128],
+        eq_hi: &[F128],
+        b_med_counts: &[u8],
+        within_outer_mask: usize,
+        n_lo: usize,
+        r: &[F128],
+    ) -> Option<AbHeadJob> {
+        use std::sync::atomic::Ordering;
+        if !super::ab_head_gpu_enabled() || AB_HEAD_POISONED.load(Ordering::Relaxed) {
+            return None;
+        }
+        let big_lo = eq_lo_scaled.len();
+        let hi_size = eq_hi.len();
+        // Fixed-shape gates: the 16x256 convert table, the band/chunk/byte
+        // layout contract, u32-addressable params.
+        if convert.len() != 16 * 256
+            || big_lo == 0
+            || hi_size == 0
+            || big_lo != 1usize << n_lo
+            || ab_inner.len() != hi_size * big_lo * 1024
+            || b_med_counts.len() != within_outer_mask + 1
+            || within_outer_mask > u32::MAX as usize
+            || big_lo > u32::MAX as usize
+        {
+            return None;
+        }
+        let tuned = AB_HEAD_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let configured = super::ab_head_gpu_bands(hi_size);
+        if configured == 0 {
+            // Env-fixed off: publish and decline without a probe.
+            AB_HEAD_TUNED.store(0, Ordering::Relaxed);
+            return None;
+        }
+        // Calibration probes the EXACT prefix the timed dispatch will read,
+        // so the compare covers every admitted band and the wrap's page
+        // wiring lands on the pages the timed path touches.
+        let bands = if calibration { configured } else { tuned.min(hi_size) };
+        let gpu = gpu().ok()?;
+        let state_mutex = ab_head_state()?;
+        // Not poison-tolerant: the grow sequences are not unwind-atomic
+        // (same discipline as the round-two arm).
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("ab-head launch", false);
+                return None;
+            }
+        };
+        unsafe {
+            // Adopt a commit-tail-staged window setup on an exact
+            // fingerprint match; otherwise (re)do the uploads. Either way
+            // the parked fingerprint is consumed.
+            let adopted = state.staged.take().is_some_and(|s| {
+                s.r.as_slice() == r
+                    && s.big_lo == big_lo
+                    && s.hi_size == hi_size
+                    && s.mask == within_outer_mask
+                    && s.n_lo == n_lo
+            });
+            // Even an adopted stage may have sized the partials buffer for a
+            // different band count; `ab_head_upload` is cheap and grow-only,
+            // so redo it unless everything matches.
+            if !adopted {
+                ab_head_upload(
+                    gpu,
+                    &mut state,
+                    convert,
+                    eq_lo_scaled,
+                    eq_hi,
+                    b_med_counts,
+                    bands,
+                )
+                .ok()?;
+            } else if state.part_cap < bands * ab_head_segs(big_lo) * 64 * 16 {
+                ab_head_upload(
+                    gpu,
+                    &mut state,
+                    convert,
+                    eq_lo_scaled,
+                    eq_hi,
+                    b_med_counts,
+                    bands,
+                )
+                .ok()?;
+            } else if super::ab_head_gpu_debug() {
+                eprintln!("[ab-head] staged window setup adopted");
+            }
+            // No-copy wrap of the 512 MiB surface, cached across proves.
+            let ptr = ab_inner.as_ptr() as usize;
+            let len = ab_inner.len();
+            let ab_buf = match state
+                .wraps
+                .iter()
+                .find(|&&(p, l, _)| p == ptr && l == len)
+            {
+                Some(&(_, _, buf)) => buf,
+                None => {
+                    const MAX_WRAPS: usize = 3;
+                    let buf = gpu.wrap_buffer(ab_inner.as_ptr().cast_mut(), len).ok()?;
+                    if state.wraps.len() == MAX_WRAPS {
+                        let (_, _, old) = state.wraps.remove(0);
+                        gpu.release(old);
+                    }
+                    state.wraps.push((ptr, len, buf));
+                    buf
+                }
+            };
+            let cb = ab_head_submit(
+                gpu,
+                &state,
+                ab_buf,
+                bands,
+                big_lo,
+                n_lo,
+                within_outer_mask,
+            )
+            .ok()?;
+            Some(AbHeadJob {
+                cb,
+                bands,
+                segs: ab_head_segs(big_lo),
+                calibration,
+                submitted: std::time::Instant::now(),
+            })
+        }
+    }
+
+    /// Drain the AB-head arm. During calibration `cpu_partials` must hold
+    /// the CPU's eq_hi-weighted band partials for at least the probe's
+    /// bands; the probe must compare EQUAL lane-for-lane or the arm is
+    /// poisoned.
+    pub(crate) fn ab_head_wait(
+        job: AbHeadJob,
+        cpu_partials: Option<&[[F128; 64]]>,
+    ) -> AbHeadResult {
+        use std::sync::atomic::Ordering;
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return AbHeadResult::Failed,
+        };
+        let poison = |cb: Id| {
+            AB_HEAD_POISONED.store(true, Ordering::Relaxed);
+            AB_HEAD_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            AbHeadResult::Failed
+        };
+        unsafe {
+            // The CPU suffix normally outlasts the dispatch, so the first
+            // status poll finds it complete; the bounded spin dodges the
+            // waitUntilCompleted park on the timed spine.
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+                return poison(job.cb);
+            }
+            let gpu_ms = zc_fold_gpu_wall_ms(gpu, job.cb);
+            let state_mutex = match ab_head_state() {
+                Some(s) => s,
+                None => return poison(job.cb),
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    note_poisoned_lock("ab-head wait", false);
+                    return poison(job.cb);
+                }
+            };
+            let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
+            let mut out: Vec<[F128; 64]> = Vec::with_capacity(job.bands);
+            for band in 0..job.bands {
+                let mut joined = [F128::ZERO; 64];
+                for seg in 0..job.segs {
+                    let base = (band * job.segs + seg) * 64;
+                    for (lane, value) in joined.iter_mut().enumerate() {
+                        *value += *parts.add(base + lane);
+                    }
+                }
+                out.push(joined);
+            }
+            drop(state);
+            gpu.release(job.cb);
+            if !job.calibration {
+                if super::ab_head_gpu_debug() {
+                    eprintln!(
+                        "[ab-head] timed prefix {} bands: gpu={gpu_ms:.2}ms \
+                         submit-to-drain={:.2}ms",
+                        job.bands,
+                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                return AbHeadResult::Prefix(out, gpu_ms);
+            }
+
+            // ---- Calibration (untimed warmup prove, once per process) ----
+            let Some(cpu_all) = cpu_partials else {
+                AB_HEAD_POISONED.store(true, Ordering::Relaxed);
+                AB_HEAD_TUNED.store(0, Ordering::Relaxed);
+                return AbHeadResult::Failed;
+            };
+            if cpu_all.len() < job.bands {
+                AB_HEAD_POISONED.store(true, Ordering::Relaxed);
+                AB_HEAD_TUNED.store(0, Ordering::Relaxed);
+                return AbHeadResult::Failed;
+            }
+            for band in 0..job.bands {
+                if out[band] != cpu_all[band] {
+                    if super::ab_head_gpu_debug() {
+                        let lane = out[band]
+                            .iter()
+                            .zip(cpu_all[band].iter())
+                            .position(|(g, c)| g != c)
+                            .unwrap_or(0);
+                        eprintln!(
+                            "[ab-head] CALIBRATION MISMATCH at band {band} lane {lane}: \
+                             gpu={:?} cpu={:?} — poisoned",
+                            out[band][lane], cpu_all[band][lane],
+                        );
+                    }
+                    AB_HEAD_POISONED.store(true, Ordering::Relaxed);
+                    AB_HEAD_TUNED.store(0, Ordering::Relaxed);
+                    return AbHeadResult::Failed;
+                }
+            }
+            if super::ab_head_gpu_debug() {
+                eprintln!(
+                    "[ab-head] calibration EQUAL over {} bands: gpu={gpu_ms:.2}ms — admitted",
+                    job.bands,
+                );
+            }
+            AB_HEAD_TUNED.store(job.bands, Ordering::Relaxed);
+            AbHeadResult::Calibrated(gpu_ms)
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Zerocheck first-tail-round (T3) compact-reconstruction products GPU
     // arm (see `ENV_NO_GPU_ZC_T3`).
     //
@@ -12176,6 +13152,19 @@ pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{stage_zc_r2_idle_fill, zc_r2_idle_fill_viable};
+
+/// Zerocheck round-one AB-head GPU completion arm (see `ENV_NO_AB_HEAD_GPU`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{
+    AbHeadJob, AbHeadResult, ab_head_gpu_viable, ab_head_wait, launch_ab_head_partials,
+    stage_ab_head_window,
+};
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{
+    ab_head_test_guard, ab_head_test_reset, ab_head_test_set_bands, ab_head_test_state,
+};
 
 /// Zerocheck first-tail-round products GPU arm (see `ENV_NO_GPU_ZC_T3`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -14248,6 +15237,148 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             _ => panic!("timed drain must return prefix partials"),
         }
         imp::zc_r2_test_reset();
+    }
+
+    /// AB-head completion arm oracle: the GPU's per-band eq_hi-weighted
+    /// partial lanes must equal the CPU's bit-for-bit on an F2-linear
+    /// convert table (the real γ^b·φ₈ table is F2-linear by construction —
+    /// pinned by `convert_table_is_nibble_decomposable` next to the table),
+    /// including 15-row padded and dead (0-row) chunks. Exercises
+    /// calibration (internal compare-equal + band-count publication without
+    /// poisoning), the timed prefix path, and the commit-tail staged-window
+    /// adoption.
+    #[test]
+    fn gpu_ab_head_partials_match_cpu_oracle() {
+        let _guard = imp::ab_head_test_guard();
+        fn xs(rng: &mut u64) -> u64 {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng
+        }
+        fn rand_f128(rng: &mut u64) -> F128 {
+            F128 { lo: xs(rng), hi: xs(rng) }
+        }
+        let mut rng = 0xAB44EADu64 | 1;
+
+        // F2-linear 16-bank convert table from random byte bases.
+        let mut convert = vec![F128::ZERO; 16 * 256];
+        for bank in 0..16 {
+            let basis: Vec<F128> = (0..8).map(|_| rand_f128(&mut rng)).collect();
+            for v in 1usize..256 {
+                let mut acc = F128::ZERO;
+                for bit in 0..8 {
+                    if v & (1 << bit) != 0 {
+                        acc += basis[bit];
+                    }
+                }
+                convert[bank * 256 + v] = acc;
+            }
+        }
+
+        let n_lo = 6usize;
+        let big_lo = 1usize << n_lo;
+        let hi_size = 16usize;
+        // Mixed row counts: full, the ranked padded window, dead, odd.
+        let mask = 3usize;
+        let counts = [16u8, 15, 0, 7];
+
+        let ab = leak_page_aligned(hi_size * big_lo * 1024);
+        for byte in ab.iter_mut() {
+            *byte = xs(&mut rng) as u8;
+        }
+        let eq_lo: Vec<F128> = (0..big_lo).map(|_| rand_f128(&mut rng)).collect();
+        let eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
+        let r_fp: Vec<F128> = (0..8).map(|_| rand_f128(&mut rng)).collect();
+
+        // CPU reference band partials, the exact band-worker computation.
+        let mut cpu: Vec<[F128; 64]> = Vec::with_capacity(hi_size);
+        for band in 0..hi_size {
+            let mut partial = [F128::ZERO; 64];
+            for k in 0..big_lo {
+                let n_b = counts[(k | (band << n_lo)) & mask] as usize;
+                if n_b == 0 {
+                    continue;
+                }
+                let base = (band * big_lo + k) * 1024;
+                for (lane, value) in partial.iter_mut().enumerate() {
+                    let mut g = F128::ZERO;
+                    for b in 0..n_b {
+                        g += convert[b * 256 + ab[base + b * 64 + lane] as usize];
+                    }
+                    *value += g * eq_lo[k];
+                }
+            }
+            for value in partial.iter_mut() {
+                *value *= eq_hi[band];
+            }
+            cpu.push(partial);
+        }
+
+        // Calibration probe: internal compare-equal + band publication.
+        imp::ab_head_test_reset();
+        let job = imp::launch_ab_head_partials(
+            ab, &convert, &eq_lo, &eq_hi, &counts, mask, n_lo, &r_fp,
+        )
+        .expect("calibration launch must succeed on real Metal");
+        assert!(job.is_calibration());
+        assert_eq!(job.cpu_split(), 0);
+        match imp::ab_head_wait(job, Some(&cpu)) {
+            imp::AbHeadResult::Calibrated(_) => {}
+            imp::AbHeadResult::Prefix(..) => panic!("calibration drain must not return a prefix"),
+            imp::AbHeadResult::Failed => panic!("calibration must compare EQUAL"),
+        }
+        let (tuned, poisoned) = imp::ab_head_test_state();
+        assert!(!poisoned, "probe partials must equal CPU partials bit-for-bit");
+        assert!(tuned != usize::MAX && tuned > 0, "calibration must admit the arm");
+
+        // Timed prefix path at a forced band count.
+        imp::ab_head_test_set_bands(hi_size / 2);
+        let job2 = imp::launch_ab_head_partials(
+            ab, &convert, &eq_lo, &eq_hi, &counts, mask, n_lo, &r_fp,
+        )
+        .expect("timed launch must succeed");
+        assert!(!job2.is_calibration());
+        assert_eq!(job2.cpu_split(), hi_size / 2);
+        match imp::ab_head_wait(job2, None) {
+            imp::AbHeadResult::Prefix(vals, _) => {
+                assert_eq!(vals.len(), hi_size / 2);
+                assert_eq!(&vals[..], &cpu[..hi_size / 2], "prefix bands bit-exact");
+            }
+            _ => panic!("timed drain must return prefix bands"),
+        }
+
+        // Commit-tail staged-window adoption: same fingerprint, same bytes.
+        assert!(imp::stage_ab_head_window(
+            &convert, &eq_lo, &eq_hi, &counts, mask, n_lo, &r_fp,
+        ));
+        let job3 = imp::launch_ab_head_partials(
+            ab, &convert, &eq_lo, &eq_hi, &counts, mask, n_lo, &r_fp,
+        )
+        .expect("staged-adoption launch must succeed");
+        match imp::ab_head_wait(job3, None) {
+            imp::AbHeadResult::Prefix(vals, _) => {
+                assert_eq!(&vals[..], &cpu[..hi_size / 2], "adopted-stage bands bit-exact");
+            }
+            _ => panic!("staged-adoption drain must return prefix bands"),
+        }
+        // Fingerprint mismatch must be byte-inert: stage against a DIFFERENT
+        // challenge vector, then launch with the real one — the launch must
+        // rebuild the uploads and stay bit-exact.
+        assert!(imp::stage_ab_head_window(
+            &convert, &eq_lo, &eq_hi, &counts, mask, n_lo, &r_fp[..4],
+        ));
+        let job4 = imp::launch_ab_head_partials(
+            ab, &convert, &eq_lo, &eq_hi, &counts, mask, n_lo, &r_fp,
+        )
+        .expect("mismatched-stage launch must succeed");
+        match imp::ab_head_wait(job4, None) {
+            imp::AbHeadResult::Prefix(vals, _) => {
+                assert_eq!(&vals[..], &cpu[..hi_size / 2], "mismatched stage stays byte-inert");
+            }
+            _ => panic!("mismatched-stage drain must return prefix bands"),
+        }
+        imp::ab_head_test_reset();
     }
 
     /// T3 products arm oracle: the GPU's per-chunk reduced partials must
