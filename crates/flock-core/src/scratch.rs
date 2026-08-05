@@ -24,7 +24,98 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-static POOL: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
+/// An evictable pooled buffer plus its optional provenance token.
+///
+/// A token asserts "when this exact allocation entered pool custody, the
+/// byte regions its producer declared constant held those constants, and
+/// nothing has touched the buffer since" — every take path drops the token
+/// with the entry, so a token can only survive parked, untouched custody.
+struct PoolEntry {
+    buf: Vec<F128>,
+    token: Option<u64>,
+}
+
+static POOL: Mutex<Vec<PoolEntry>> = Mutex::new(Vec::new());
+
+/// One sampled constant-byte range a staged release token must satisfy at
+/// give time (belt-and-braces against a stale stage matching a recycled
+/// address): `len` bytes at `byte_off` must all equal `value`.
+pub struct ReleaseProbe {
+    pub byte_off: usize,
+    pub len: usize,
+    pub value: u8,
+}
+
+/// A release token staged by the buffer's owner while the buffer is still
+/// alive (pointer identity guaranteed), consumed by the `give_f128` of that
+/// exact allocation. `addr`+`len` must match the given vector exactly and
+/// every probe must verify, or the give attaches no token (fail-safe).
+struct StagedRelease {
+    addr: usize,
+    len: usize,
+    tag: u64,
+    probes: Vec<ReleaseProbe>,
+}
+
+static STAGED: Mutex<Vec<StagedRelease>> = Mutex::new(Vec::new());
+
+/// Stage a provenance token for `buf`'s eventual return through
+/// [`give_f128`]. Call while owning `buf` (so the address cannot be
+/// recycled between stage and give of the same allocation). Replaces any
+/// previously staged entry with the same `tag` — a stale stage from a
+/// prove that never released (abnormal termination) is thereby retired at
+/// the next prove's stage; [`take_f128_with_token`] additionally purges
+/// same-tag stages before taking. `probes` are verified against the given
+/// buffer's bytes at give time; any mismatch drops the token silently.
+pub fn stage_f128_release_token(buf: &[F128], tag: u64, probes: Vec<ReleaseProbe>) {
+    if buf.is_empty() {
+        return;
+    }
+    let mut staged = STAGED.lock().unwrap();
+    staged.retain(|s| s.tag != tag);
+    staged.push(StagedRelease {
+        addr: buf.as_ptr() as usize,
+        len: buf.len(),
+        tag,
+        probes,
+    });
+}
+
+/// Retire any staged token naming `addr` — called whenever a take hands out
+/// (or freshly allocates) a buffer at that address, so a stale stage can
+/// never be matched by a later give of a *different* allocation that
+/// happens to reuse the address.
+fn purge_staged_addr(addr: usize) {
+    let mut staged = STAGED.lock().unwrap();
+    staged.retain(|s| s.addr != addr);
+}
+
+/// Consume the staged token matching this exact give (`addr` + `len`), if
+/// any, verifying its probes against the buffer contents. `None` (no stage,
+/// or any probe mismatch) means the buffer parks untokened.
+fn consume_staged_token(v: &[F128]) -> Option<u64> {
+    let addr = v.as_ptr() as usize;
+    let entry = {
+        let mut staged = STAGED.lock().unwrap();
+        let i = staged
+            .iter()
+            .position(|s| s.addr == addr && s.len == v.len())?;
+        staged.swap_remove(i)
+    };
+    // SAFETY: F128 is plain bytes; the view covers the initialized slice.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v))
+    };
+    for p in &entry.probes {
+        let Some(range) = bytes.get(p.byte_off..p.byte_off + p.len) else {
+            return None;
+        };
+        if !range.iter().all(|&b| b == p.value) {
+            return None;
+        }
+    }
+    Some(entry.tag)
+}
 
 /// One process-lifetime allocation whose address is consumed by a retained
 /// external no-copy view. Unlike [`POOL`], this slot is deliberately immune
@@ -36,6 +127,9 @@ struct PinnedF128 {
     addr: usize,
     len: usize,
     buffer: Option<Vec<F128>>,
+    /// Provenance token attached when the allocation was last parked (same
+    /// semantics as [`PoolEntry::token`]); cleared by every take.
+    token: Option<u64>,
 }
 
 static PINNED_F128: Mutex<Option<PinnedF128>> = Mutex::new(None);
@@ -77,16 +171,48 @@ const MAX_POOLED: usize = 48;
 /// data from a previous use. Caller MUST write every slot before reading it
 /// (same contract as [`crate::alloc_uninit_vec`]).
 pub fn take_f128(n: usize) -> Vec<F128> {
-    if let Some(v) = try_take_pinned_f128(n) {
-        return v;
+    take_f128_with_token_inner(n, None).0
+}
+
+/// [`take_f128`] variant carrying a provenance-token request: returns the
+/// buffer plus whether the exact allocation handed out was parked through a
+/// tagged release ([`stage_f128_release_token`] + `give_f128` of that same
+/// live allocation) with this `tag` and length `n`, and untouched since.
+/// On `true` the buffer's producer-declared constant regions are still the
+/// bytes that producer wrote. On `false` the ordinary uninitialized
+/// write-before-read contract applies to every slot.
+///
+/// Preference order matches [`take_f128`] (pinned slots first); within the
+/// evictable pool an exact token match is preferred over smallest-fit.
+pub fn take_f128_with_token(n: usize, tag: u64) -> (Vec<F128>, bool) {
+    take_f128_with_token_inner(n, Some(tag))
+}
+
+fn take_f128_with_token_inner(n: usize, tag: Option<u64>) -> (Vec<F128>, bool) {
+    if let Some(want) = tag {
+        // Retire any stale stage with this tag (a prove that never
+        // released) before it could match a future give at a recycled
+        // address.
+        STAGED.lock().unwrap().retain(|s| s.tag != want);
     }
-    if let Some(v) = try_take_pinned2_f128(n) {
-        return v;
+    if let Some((v, token)) = try_take_pinned_f128(n) {
+        purge_staged_addr(v.as_ptr() as usize);
+        let hit = tag.is_some() && token == tag;
+        return (v, hit);
     }
-    if let Some(v) = try_take_f128(n) {
-        return v;
+    if let Some((v, token)) = try_take_pinned2_f128(n) {
+        purge_staged_addr(v.as_ptr() as usize);
+        let hit = tag.is_some() && token == tag;
+        return (v, hit);
     }
-    crate::alloc_uninit_vec(n)
+    if let Some((v, token)) = try_take_f128_inner(n, tag) {
+        purge_staged_addr(v.as_ptr() as usize);
+        let hit = tag.is_some() && token == tag;
+        return (v, hit);
+    }
+    let v = crate::alloc_uninit_vec(n);
+    purge_staged_addr(v.as_ptr() as usize);
+    (v, false)
 }
 
 /// [`take_f128`] variant that never returns a pinned allocation. The pinned
@@ -102,7 +228,9 @@ pub(crate) fn take_f128_unpinned(n: usize) -> Vec<F128> {
         // parks those in their dedicated slots), so this cannot alias.
         return v;
     }
-    crate::alloc_uninit_vec(n)
+    let v = crate::alloc_uninit_vec(n);
+    purge_staged_addr(v.as_ptr() as usize);
+    v
 }
 
 /// Whether `[addr, addr + len_bytes)` overlaps either pinned registration's
@@ -132,7 +260,7 @@ pub(crate) fn f128_range_overlaps_pin(addr: usize, len_bytes: usize) -> bool {
     false
 }
 
-fn try_take_pinned_f128(n: usize) -> Option<Vec<F128>> {
+fn try_take_pinned_f128(n: usize) -> Option<(Vec<F128>, Option<u64>)> {
     if PINNED_F128_LEN.load(Ordering::Acquire) != n {
         return None;
     }
@@ -142,16 +270,17 @@ fn try_take_pinned_f128(n: usize) -> Option<Vec<F128>> {
         return None;
     }
     let mut v = pinned.buffer.take()?;
+    let token = pinned.token.take();
     debug_assert_eq!(v.as_ptr() as usize, pinned.addr);
     debug_assert!(v.capacity() >= n);
     v.clear();
     // SAFETY: the registered allocation has capacity >= n and F128 is Copy;
     // callers retain the ordinary write-before-read contract of take_f128.
     unsafe { v.set_len(n) };
-    Some(v)
+    Some((v, token))
 }
 
-fn try_take_pinned2_f128(n: usize) -> Option<Vec<F128>> {
+fn try_take_pinned2_f128(n: usize) -> Option<(Vec<F128>, Option<u64>)> {
     if PINNED2_F128_LEN.load(Ordering::Acquire) != n {
         return None;
     }
@@ -161,13 +290,14 @@ fn try_take_pinned2_f128(n: usize) -> Option<Vec<F128>> {
         return None;
     }
     let mut v = pinned.buffer.take()?;
+    let token = pinned.token.take();
     debug_assert_eq!(v.as_ptr() as usize, pinned.addr);
     debug_assert!(v.capacity() >= n);
     v.clear();
     // SAFETY: the registered allocation has capacity >= n and F128 is Copy;
     // callers retain the ordinary write-before-read contract of take_f128.
     unsafe { v.set_len(n) };
-    Some(v)
+    Some((v, token))
 }
 
 /// [`pin_f128_allocation`] for the second slot. Registered once per process
@@ -187,6 +317,7 @@ pub(crate) fn pin2_f128_allocation(buffer: &[F128]) -> bool {
                 addr,
                 len,
                 buffer: None,
+                token: None,
             });
             PINNED2_F128_ADDR.store(addr, Ordering::Release);
             PINNED2_F128_LEN.store(len, Ordering::Release);
@@ -216,6 +347,7 @@ pub(crate) fn pin_f128_allocation(buffer: &[F128]) -> bool {
                 addr,
                 len,
                 buffer: None,
+                token: None,
             });
             PINNED_F128_ADDR.store(addr, Ordering::Release);
             PINNED_F128_LEN.store(len, Ordering::Release);
@@ -253,22 +385,61 @@ pub(crate) fn unpin_f128_allocation(addr: usize, len: usize) -> bool {
 /// the commit prefault skips its page-touch thread when the pool can
 /// supply an already-resident buffer).
 pub(crate) fn try_take_f128(n: usize) -> Option<Vec<F128>> {
+    let v = try_take_f128_inner(n, None)?.0;
+    purge_staged_addr(v.as_ptr() as usize);
+    Some(v)
+}
+
+/// Pool scan shared by the plain and tokened takes. When `want` is set, an
+/// exact token match (`token == want` AND parked length == `n`) is
+/// preferred over smallest-fit; otherwise smallest-fit, tie-broken toward
+/// untokened entries so an ordinary take does not needlessly retire a
+/// token another consumer staged.
+fn try_take_f128_inner(n: usize, want: Option<u64>) -> Option<(Vec<F128>, Option<u64>)> {
     let mut pool = POOL.lock().unwrap();
     let mut best: Option<usize> = None;
-    for (i, v) in pool.iter().enumerate() {
-        if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
-            best = Some(i);
+    if let Some(want) = want {
+        for (i, e) in pool.iter().enumerate() {
+            if e.token == Some(want) && e.buf.len() == n {
+                best = Some(i);
+                break;
+            }
+        }
+    }
+    if best.is_none() {
+        for (i, e) in pool.iter().enumerate() {
+            let cap = e.buf.capacity();
+            if cap < n {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some(b) => {
+                    cap < pool[b].buf.capacity()
+                        || (cap == pool[b].buf.capacity()
+                            && e.token.is_none()
+                            && pool[b].token.is_some())
+                }
+            };
+            if better {
+                best = Some(i);
+            }
         }
     }
     if let Some(i) = best {
-        let mut v = pool.swap_remove(i);
+        let entry = pool.swap_remove(i);
         drop(pool);
+        let mut v = entry.buf;
+        // A token is only valid for the exact parked length (a resize
+        // through set_len below would expose slots the tagged release
+        // never vouched for).
+        let token = entry.token.filter(|_| v.len() == n);
         v.clear();
         // SAFETY: capacity ≥ n was checked above; F128: Copy (no Drop), so
         // exposing uninit/stale elements is sound to *hold* — the caller
         // upholds write-before-read per this function's contract.
         unsafe { v.set_len(n) };
-        return Some(v);
+        return Some((v, token));
     }
     None
 }
@@ -282,6 +453,11 @@ pub fn give_f128(v: Vec<F128>) {
         return;
     }
     let addr = v.as_ptr() as usize;
+    // Attach the staged provenance token (if the owner staged one for this
+    // exact allocation+length and its constant-region probes verify). The
+    // owner held the Vec from stage to this give, so pointer identity here
+    // is the same allocation, not a recycled address.
+    let token = consume_staged_token(&v);
     if PINNED_F128_ADDR.load(Ordering::Acquire) == addr {
         let mut slot = PINNED_F128.lock().unwrap();
         if let Some(pinned) = slot.as_mut()
@@ -290,6 +466,7 @@ pub fn give_f128(v: Vec<F128>) {
             && pinned.buffer.is_none()
         {
             pinned.buffer = Some(v);
+            pinned.token = token;
             return;
         }
     }
@@ -301,16 +478,17 @@ pub fn give_f128(v: Vec<F128>) {
             && pinned.buffer.is_none()
         {
             pinned.buffer = Some(v);
+            pinned.token = token;
             return;
         }
     }
     let mut pool = POOL.lock().unwrap();
-    pool.push(v);
+    pool.push(PoolEntry { buf: v, token });
     if pool.len() > MAX_POOLED {
         let smallest = pool
             .iter()
             .enumerate()
-            .min_by_key(|(_, v)| v.capacity())
+            .min_by_key(|(_, e)| e.buf.capacity())
             .map(|(i, _)| i)
             .expect("pool non-empty");
         pool.swap_remove(smallest);
@@ -383,6 +561,7 @@ pub fn prewarm_prover(m: usize) {
 pub fn clear() {
     POOL.lock().unwrap().clear();
     POOL_U8.lock().unwrap().clear();
+    STAGED.lock().unwrap().clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +793,79 @@ mod tests {
         assert_eq!(reused.as_ptr(), ptr);
         give_f128(reused);
         assert!(unpin_f128_allocation(ptr as usize, N));
+        clear();
+    }
+
+    #[test]
+    fn release_token_round_trip_then_consumed() {
+        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
+        const N: usize = 1024;
+        const TAG: u64 = 0xF10C_C0DE;
+        clear();
+        let mut v = take_f128(N);
+        v.fill(F128::ZERO);
+        stage_f128_release_token(
+            &v,
+            TAG,
+            vec![ReleaseProbe {
+                byte_off: 0,
+                len: 64,
+                value: 0,
+            }],
+        );
+        let ptr = v.as_ptr();
+        give_f128(v);
+        // The tagged take returns the exact allocation with a hit...
+        let (v2, hit) = take_f128_with_token(N, TAG);
+        assert!(hit);
+        assert_eq!(v2.as_ptr(), ptr);
+        // ...and consumes the token: an un-staged re-release misses.
+        give_f128(v2);
+        let (v3, hit) = take_f128_with_token(N, TAG);
+        assert!(!hit);
+        give_f128(v3);
+        clear();
+    }
+
+    #[test]
+    fn release_token_dropped_by_foreign_custody_and_failed_probe() {
+        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
+        const N: usize = 1536;
+        const TAG: u64 = 0xF10C_C0DF;
+        clear();
+        // Foreign custody: any untagged take retires the token even if the
+        // buffer is returned untouched.
+        let mut v = take_f128(N);
+        v.fill(F128::ZERO);
+        stage_f128_release_token(&v, TAG, Vec::new());
+        give_f128(v);
+        let foreign = take_f128(N);
+        give_f128(foreign);
+        let (v2, hit) = take_f128_with_token(N, TAG);
+        assert!(!hit, "token must not survive foreign custody");
+        // Failing probe: the give must refuse to attach the token.
+        let mut v2 = v2;
+        v2.fill(F128::ZERO);
+        stage_f128_release_token(
+            &v2,
+            TAG,
+            vec![ReleaseProbe {
+                byte_off: 0,
+                len: 16,
+                value: 0xFF, // buffer holds zeros — probe must fail
+            }],
+        );
+        give_f128(v2);
+        let (v3, hit) = take_f128_with_token(N, TAG);
+        assert!(!hit, "failed probe must drop the token");
+        // Wrong length: token is only valid for the exact staged length.
+        let mut v3 = v3;
+        v3.fill(F128::ZERO);
+        stage_f128_release_token(&v3, TAG, Vec::new());
+        give_f128(v3);
+        let (v4, hit) = take_f128_with_token(N / 2, TAG);
+        assert!(!hit, "length mismatch must miss");
+        give_f128(v4);
         clear();
     }
 

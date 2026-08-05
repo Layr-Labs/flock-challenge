@@ -1710,8 +1710,40 @@ fn next_s(s: F128, s_at_root: F128) -> F128 {
 }
 
 /// `sks_vks[k] = s_k(v_k)` for `k = 0..=log_n`. Length `log_n + 1`.
-/// Only depends on `log_n`, so callers cache.
+/// Only depends on `log_n` (standard basis `v_i = 2^i` is fixed), so the
+/// values are circuit-determined — no challenge or witness dependence.
+///
+/// Micro-stack memoization: despite the "callers cache" intent, the ranked
+/// prover recomputes this at dims 19/16/13/10/7 on EVERY prove (L0 induce at
+/// `n1` plus the recursion loop's `n_next` levels). Same memo pattern as
+/// [`prover_config_for`]; the cached value is the pure function output, so
+/// the memo is bit-exact by construction (`eval_sk_at_vks_memo_matches_direct`
+/// checks it anyway). `FLOCK_NO_MICRO_STACK=1` bypasses the cache and always
+/// recomputes — the incumbent behavior.
 pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
+    use std::sync::{Mutex, OnceLock};
+    if !crate::micro_stack_enabled() {
+        return eval_sk_at_vks_uncached(log_n);
+    }
+    static MEMO: OnceLock<Mutex<Vec<(usize, Vec<F128>)>>> = OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(g) = memo.lock() {
+        for (k, v) in g.iter() {
+            if *k == log_n {
+                return v.clone();
+            }
+        }
+    }
+    let out = eval_sk_at_vks_uncached(log_n);
+    if let Ok(mut g) = memo.lock() {
+        if !g.iter().any(|(k, _)| *k == log_n) {
+            g.push((log_n, out.clone()));
+        }
+    }
+    out
+}
+
+fn eval_sk_at_vks_uncached(log_n: usize) -> Vec<F128> {
     let mut sks_vks = vec![F128::ZERO; log_n + 1];
     sks_vks[0] = F128::ONE;
     if log_n == 0 {
@@ -6270,7 +6302,16 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let _t = std::time::Instant::now();
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
-                let eq_z = build_eq_table(&z);
+                // Micro-stack: the PMULL two-lane kernel builder is an exact
+                // drop-in for the generic one (byte-equality proven by
+                // `lincheck::tests::optimized_eq_table_matches_generic_bytes`,
+                // which covers these dims — ranked n_next = 16/13/10/7).
+                // FLOCK_NO_MICRO_STACK=1 restores the generic builder.
+                let eq_z = if crate::micro_stack_enabled() {
+                    crate::lincheck::build_eq_table_optimized(&z)
+                } else {
+                    build_eq_table(&z)
+                };
                 let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
                 challenger.observe_f128(y);
                 ood_values.push(y);
@@ -9921,6 +9962,18 @@ mod tests {
             .map(|(&m, &b)| m * b)
             .fold(F128::ZERO, |a, v| a + v);
         assert_eq!(inner, enforced_sum, "msg · basis_poly != enforced_sum");
+    }
+
+    /// The micro-stack memo for `eval_sk_at_vks` must return exactly the
+    /// direct computation at every dim the provers use (and then some),
+    /// including on repeated (cache-hit) calls.
+    #[test]
+    fn eval_sk_at_vks_memo_matches_direct() {
+        for log_n in 0..=20usize {
+            let direct = eval_sk_at_vks_uncached(log_n);
+            assert_eq!(eval_sk_at_vks(log_n), direct, "first call, log_n={log_n}");
+            assert_eq!(eval_sk_at_vks(log_n), direct, "cached call, log_n={log_n}");
+        }
     }
 
     /// `induce_sumcheck_poly_via_ntt` must be byte-identical to dense across

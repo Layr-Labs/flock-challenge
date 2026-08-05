@@ -1564,6 +1564,150 @@ pub(crate) mod witgen_simd {
 
     const U32_PER_BLOCK: usize = K / 32; // 512
     const F128_PER_BLOCK: usize = K / 128;
+    /// [`dump`] drains a block in 64 chunks of 8 u32 words (32 bytes).
+    const DUMP_CHUNKS: usize = U32_PER_BLOCK / 8; // 64
+
+    // -----------------------------------------------------------------------
+    // Recycled-scratch constant-region elision (witgen-stack item B).
+    //
+    // z/a/b come from the recycling scratch pool. At this fixed layout the
+    // builder rewrites the same per-block constants every prove: the zero
+    // fill (u32 words 482..512 of every block, all three buffers) and b's
+    // MAX prefix (words 0..36). When the pool proves — via a provenance
+    // token attached at the previous release and dropped by any other
+    // custody event — that the handed-out allocation still holds exactly a
+    // previous prove's output of this same layout, those regions already
+    // contain the right bytes and their dump chunks are skipped. Skips are
+    // dump-chunk (32 B/block) granular and stay strictly INSIDE the
+    // constant regions: the zero tail skips words 488..512 (chunk 60 still
+    // carries data words 480/481 and is always written), b's prefix skips
+    // words 0..32 (chunk 4 carries data words 36..39 and the residual
+    // constant words 32..35, always written).
+    //
+    // The constants are content-independent — every completed witgen of
+    // this layout writes identical bytes there (padding blocks included) —
+    // so a token hit only ever elides rewriting bytes with themselves.
+    // `FLOCK_NO_SCRATCH_CONST_ELIDE=1` (exact) restores plain takes and
+    // full incumbent writes; any token miss independently falls back to
+    // full writes for that buffer.
+    // -----------------------------------------------------------------------
+
+    /// First skippable chunk of the zero tail: words 488..512.
+    const ELIDE_ZERO_CHUNK: usize = 61;
+    /// Leading skippable chunks of b's MAX prefix: words 0..32.
+    const ELIDE_B_PREFIX_CHUNKS: usize = 4;
+    const BLOCK_BYTES: usize = U32_PER_BLOCK * 4; // 2048
+    const ZERO_TAIL_BYTE: usize = ELIDE_ZERO_CHUNK * 32; // 1952
+    const B_PREFIX_BYTES: usize = ELIDE_B_PREFIX_CHUNKS * 32; // 128
+    const _ELIDE_GEOMETRY: () = {
+        // Skipped zero-tail words start at or after the zero fill's first
+        // word (USEFUL_BITS.div_ceil(32) = 482)...
+        assert!(8 * ELIDE_ZERO_CHUNK >= USEFUL_BITS.div_ceil(32));
+        assert!(8 * ELIDE_ZERO_CHUNK < U32_PER_BLOCK);
+        // ...and skipped b-prefix words end at or before the MAX prefix's
+        // last word (36).
+        assert!(8 * ELIDE_B_PREFIX_CHUNKS <= 36);
+    };
+
+    /// Provenance-tag layout version: bump on ANY change to the witness
+    /// block layout or to the elision geometry above.
+    const WITGEN_SCRATCH_LAYOUT_V: u64 = 1;
+    pub(crate) const ROLE_Z: u64 = 1;
+    pub(crate) const ROLE_A: u64 = 2;
+    pub(crate) const ROLE_B: u64 = 3;
+
+    /// Scratch provenance tag: magic | role | layout version | K_LOG |
+    /// USEFUL_BITS | n_blocks_log. Combined with the pool's exact-length
+    /// check this uniquely names "witness buffer `role` of the ranked
+    /// BLAKE3 witgen layout at this size".
+    pub(crate) fn witgen_scratch_tag(role: u64, n_blocks_log: usize) -> u64 {
+        (0x57u64 << 56)
+            | (role << 48)
+            | (WITGEN_SCRATCH_LAYOUT_V << 40)
+            | ((super::K_LOG as u64) << 32)
+            | ((USEFUL_BITS as u64) << 16)
+            | (n_blocks_log as u64)
+    }
+
+    /// Exact-`1` kill switch for the constant-region elision (item B).
+    /// Read per witgen call (uncached) so same-process A/B tests can
+    /// toggle it.
+    fn const_elide_killed() -> bool {
+        std::env::var("FLOCK_NO_SCRATCH_CONST_ELIDE").is_ok_and(|v| v == "1")
+    }
+
+    /// Bitmask of token hits (bit0 z, bit1 a, bit2 b) of the most recent
+    /// `generate_impl` call — release-canary probe.
+    static WITGEN_ELIDE_HITS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    #[cfg(test)]
+    pub(crate) fn last_elide_hits() -> u8 {
+        WITGEN_ELIDE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Constant-region probe set for a staged release: sampled blocks'
+    /// zero tails (and, for b, MAX prefixes) that `give_f128` re-verifies
+    /// before attaching the token.
+    fn elide_probes(n_total: usize, b_flavor: bool) -> Vec<flock_core::scratch::ReleaseProbe> {
+        use flock_core::scratch::ReleaseProbe;
+        let mut blocks = [0, 1, n_total / 2, n_total - 2, n_total - 1];
+        blocks.sort_unstable();
+        let mut probes = Vec::with_capacity(2 * blocks.len());
+        let mut last = usize::MAX;
+        for &blk in &blocks {
+            if blk == last {
+                continue;
+            }
+            last = blk;
+            probes.push(ReleaseProbe {
+                byte_off: blk * BLOCK_BYTES + ZERO_TAIL_BYTE,
+                len: BLOCK_BYTES - ZERO_TAIL_BYTE,
+                value: 0x00,
+            });
+            if b_flavor {
+                probes.push(ReleaseProbe {
+                    byte_off: blk * BLOCK_BYTES,
+                    len: B_PREFIX_BYTES,
+                    value: 0xFF,
+                });
+            }
+        }
+        probes
+    }
+
+    /// Debug-build gate (i): before a group's dump runs with elision, its
+    /// destination ranges that will be SKIPPED must already hold the
+    /// constants the builder would have written. A failure here means the
+    /// provenance token vouched for bytes that are not there — a
+    /// silently-wrong witness in release — so this asserts, not warns.
+    #[cfg(debug_assertions)]
+    fn debug_verify_elided_group(z: &[F128], a: &[F128], b: &[F128], elide: [bool; 3]) {
+        let bytes = |v: &[F128]| unsafe {
+            core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v))
+        };
+        for blk in 0..8 {
+            let tail = blk * BLOCK_BYTES + ZERO_TAIL_BYTE..(blk + 1) * BLOCK_BYTES;
+            for (i, (buf, on)) in [(z, elide[0]), (a, elide[1]), (b, elide[2])]
+                .into_iter()
+                .enumerate()
+            {
+                if !on {
+                    continue;
+                }
+                assert!(
+                    bytes(buf)[tail.clone()].iter().all(|&x| x == 0),
+                    "elide zero-tail mismatch buf={i} blk={blk}"
+                );
+            }
+            if elide[2] {
+                let prefix = blk * BLOCK_BYTES..blk * BLOCK_BYTES + B_PREFIX_BYTES;
+                assert!(
+                    bytes(b)[prefix].iter().all(|&x| x == 0xFF),
+                    "elide b-prefix mismatch blk={blk}"
+                );
+            }
+        }
+    }
 
     pub(crate) fn enabled() -> bool {
         static ON: LazyLock<bool> =
@@ -1747,11 +1891,16 @@ pub(crate) mod witgen_simd {
     /// per-block 16-B runs (the register transpose the batch-major layout
     /// dodged), so each block's 2 KiB drains as ONE long ascending burst:
     /// stnp pairs for the §14-passing buffers (a/b), plain stores for z
-    /// (§16 in-closure stripe re-read).
+    /// (§16 in-closure stripe re-read). Drains dump-chunk range `g0..g1`
+    /// only (a dump chunk `g` covers u32 words `8g..8g+8` of every block in
+    /// the quad — 32 bytes per block; the full block is `0..DUMP_CHUNKS`).
+    /// The recycled-scratch constant-region elision narrows the range to
+    /// skip chunks whose destination bytes are token-verified to already
+    /// hold the per-block constants the builder would rewrite.
     #[inline(always)]
-    unsafe fn dump<const NT: bool>(stage: *const V4, dst: *mut u32) {
+    unsafe fn dump_range<const NT: bool>(stage: *const V4, dst: *mut u32, g0: usize, g1: usize) {
         unsafe {
-            for g in 0..64 {
+            for g in g0..g1 {
                 let w = 8 * g;
                 let x = vld4q_u32(stage.add(w) as *const u32);
                 let y = vld4q_u32(stage.add(w + 4) as *const u32);
@@ -1833,6 +1982,7 @@ pub(crate) mod witgen_simd {
     /// `z_nt` and `ab_nt` independently select non-temporal drain stores for
     /// z and for the a/b pair, respectively.
     /// Bit-exact with [`super::build_block_witness_ab_stream_into`] x4.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) unsafe fn build_quad_witness_ab_stream_neon(
         inputs: [&Compression; 4],
         z: *mut u32,
@@ -1840,6 +1990,50 @@ pub(crate) mod witgen_simd {
         b: *mut u32,
         z_nt: bool,
         ab_nt: bool,
+    ) {
+        unsafe {
+            build_quad_witness_ab_stream_neon_elide(
+                inputs,
+                z,
+                a,
+                b,
+                z_nt,
+                ab_nt,
+                [false; 3],
+            )
+        }
+    }
+
+    /// [`dump`] with the constant-region skips applied: `elide_tail` drops
+    /// the zero-tail chunks, `elide_prefix` drops b's MAX-prefix chunks.
+    /// Callers may only pass `true` for destinations whose skipped bytes
+    /// are token-verified to already hold those constants.
+    #[inline(always)]
+    unsafe fn dump_elide<const NT: bool>(
+        stage: *const V4,
+        dst: *mut u32,
+        elide_tail: bool,
+        elide_prefix: bool,
+    ) {
+        let g0 = if elide_prefix { ELIDE_B_PREFIX_CHUNKS } else { 0 };
+        let g1 = if elide_tail { ELIDE_ZERO_CHUNK } else { DUMP_CHUNKS };
+        unsafe { dump_range::<NT>(stage, dst, g0, g1) }
+    }
+
+    /// [`build_quad_witness_ab_stream_neon`] with per-buffer constant-region
+    /// elision flags `[z, a, b]` (item B). With all flags false this is the
+    /// incumbent full write; with a flag true the corresponding buffer's
+    /// token-verified constant chunks are not re-stored (b's flag covers
+    /// both its MAX prefix and its zero tail).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn build_quad_witness_ab_stream_neon_elide(
+        inputs: [&Compression; 4],
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        z_nt: bool,
+        ab_nt: bool,
+        elide: [bool; 3],
     ) {
         unsafe {
             // ---- gather: SoA block-lane vectors via 4x4 transposes ----
@@ -2084,16 +2278,16 @@ pub(crate) mod witgen_simd {
 
             // ---- drain stages: per-block 2 KiB ascending bursts ----
             if z_nt {
-                dump::<true>(zs, z);
+                dump_elide::<true>(zs, z, elide[0], false);
             } else {
-                dump::<false>(zs, z);
+                dump_elide::<false>(zs, z, elide[0], false);
             }
             if ab_nt {
-                dump::<true>(ast, a);
-                dump::<true>(bs, b);
+                dump_elide::<true>(ast, a, elide[1], false);
+                dump_elide::<true>(bs, b, elide[2], elide[2]);
             } else {
-                dump::<false>(ast, a);
-                dump::<false>(bs, b);
+                dump_elide::<false>(ast, a, elide[1], false);
+                dump_elide::<false>(bs, b, elide[2], elide[2]);
             }
         }
     }
@@ -2129,6 +2323,9 @@ pub(crate) mod witgen_simd {
         // eager fill would have written to `blocks[idx]` (both are the one
         // `crate::seed_pipe::gen_block` closed form).
         let spec_init = crate::seed_pipe::spec_gen_init(blocks);
+        // Item C: resolve the gen_block ILP/scalar choice once per witgen
+        // (the quad synth below calls it per block).
+        let gen_ilp = !crate::seed_pipe::gen_block_ilp_killed();
         assert!(
             n_total >= 8 && n_total.is_multiple_of(8),
             "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
@@ -2140,9 +2337,31 @@ pub(crate) mod witgen_simd {
         };
         let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
         let total_f128 = n_total * F128_PER_BLOCK;
-        let mut z = flock_core::scratch::take_f128(total_f128);
-        let mut a = flock_core::scratch::take_f128(total_f128);
-        let mut b = flock_core::scratch::take_f128(total_f128);
+        // Item B: tokened takes. A hit certifies the exact allocation still
+        // holds a previous prove's output of this same layout+size, so the
+        // per-block constant regions are already the bytes the builder
+        // would rewrite; that buffer's constant dump chunks are skipped.
+        // Any miss (cold pool, other consumer touched the buffer, layout
+        // change, kill switch) falls back to the incumbent full write.
+        let elide_off = const_elide_killed();
+        let take = |role: u64| -> (Vec<F128>, bool) {
+            if elide_off {
+                (flock_core::scratch::take_f128(total_f128), false)
+            } else {
+                flock_core::scratch::take_f128_with_token(
+                    total_f128,
+                    witgen_scratch_tag(role, n_blocks_log),
+                )
+            }
+        };
+        let (mut z, elide_z) = take(ROLE_Z);
+        let (mut a, elide_a) = take(ROLE_A);
+        let (mut b, elide_b) = take(ROLE_B);
+        let elide = [elide_z, elide_a, elide_b];
+        WITGEN_ELIDE_HITS.store(
+            u8::from(elide_z) | (u8::from(elide_a) << 1) | (u8::from(elide_b) << 2),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let mut stream = stream_params.and_then(|params| {
             // SAFETY: z's allocation/address stays fixed until the returned
@@ -2204,6 +2423,12 @@ pub(crate) mod witgen_simd {
                     std::slice::from_raw_parts_mut(b_base.get().add(g * group_f128), group_f128),
                 )
             };
+            // Gate (i): in debug builds, prove the about-to-be-skipped
+            // destination ranges already hold the expected constants BEFORE
+            // the builder runs (they are exactly the bytes elision leaves
+            // untouched).
+            #[cfg(debug_assertions)]
+            debug_verify_elided_group(z_grp, a_grp, b_grp, elide);
             for half in 0..2 {
                 // Owned synth storage for the lazy path; unread when
                 // `spec_init` is `None`, so it costs nothing on the ordinary
@@ -2214,7 +2439,7 @@ pub(crate) mod witgen_simd {
                     synth = std::array::from_fn(|j| {
                         let idx = 8 * g + 4 * half + j;
                         if idx < n_blocks {
-                            crate::seed_pipe::gen_block(init, idx)
+                            crate::seed_pipe::gen_block_with(init, idx, gen_ilp)
                         } else {
                             padding
                         }
@@ -2234,13 +2459,14 @@ pub(crate) mod witgen_simd {
                 // SAFETY: each quad fully owns its four block slots in every
                 // buffer; groups are disjoint across workers.
                 unsafe {
-                    build_quad_witness_ab_stream_neon(
+                    build_quad_witness_ab_stream_neon_elide(
                         quad,
                         z_grp[base..].as_mut_ptr() as *mut u32,
                         a_grp[base..].as_mut_ptr() as *mut u32,
                         b_grp[base..].as_mut_ptr() as *mut u32,
                         z_nt,
                         nt,
+                        elide,
                     );
                 }
             }
@@ -2312,24 +2538,182 @@ pub(crate) mod witgen_simd {
                 UNIFORM_SCHEDULE
             };
             debug_assert_eq!(schedule.iter().sum::<usize>(), groups_per_segment);
+            // Item A (continuous claim queue): replace the 8–9 per-band full
+            // join barriers with ONE queue over all slabs in band order plus
+            // per-band atomic remaining-counters. Whoever zeroes a band's
+            // counter publishes it and drains the in-order submit sequencer,
+            // so a band's Metal submit happens the instant its last slab
+            // lands while every other worker keeps claiming later bands'
+            // slabs — no cross-band idle bubble. Submits stay strictly in
+            // band order (`submit_ready_range` requires r_start == next_r);
+            // `submit_ready_range` manages its own autorelease pool, so
+            // worker-thread submission needs no extra pool handling.
+            // `FLOCK_NO_WITGEN_CONT_QUEUE=1` restores the incumbent band
+            // loop exactly.
+            let cont_queue = !std::env::var("FLOCK_NO_WITGEN_CONT_QUEUE")
+                .is_ok_and(|v| v == "1");
+            if cont_queue {
+                use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+                const SLAB: usize = super::super::common::WITGEN_HETERO_SLAB;
+                let n_bands = schedule.len();
+                let band_offset: Vec<usize> = schedule
+                    .iter()
+                    .scan(0usize, |o, &gps| {
+                        let cur = *o;
+                        *o += gps;
+                        Some(cur)
+                    })
+                    .collect();
+                // Slab table in band-major order (band, then segment, then
+                // local) — the incumbent's claim order, minus its joins. A
+                // slab never straddles a segment or a band: every schedule
+                // entry is a multiple of the 64-group slab.
+                let mut slab_band: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
+                let mut slab_g0: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
+                for (i, &gps) in schedule.iter().enumerate() {
+                    debug_assert!(gps.is_multiple_of(SLAB));
+                    for seg in 0..SEGMENTS {
+                        for l in (0..gps).step_by(SLAB) {
+                            slab_band.push(i as u32);
+                            slab_g0.push(
+                                (seg * groups_per_segment + band_offset[i] + l) as u32,
+                            );
+                        }
+                    }
+                }
+                debug_assert_eq!(slab_band.len(), n_groups / SLAB);
+                let remaining: Vec<AtomicUsize> = schedule
+                    .iter()
+                    .map(|&gps| AtomicUsize::new(SEGMENTS * gps / SLAB))
+                    .collect();
+                let done: Vec<AtomicBool> =
+                    (0..n_bands).map(|_| AtomicBool::new(false)).collect();
+                let timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+                let t0 = std::time::Instant::now();
+                let done_ns: Vec<AtomicU64> =
+                    (0..n_bands).map(|_| AtomicU64::new(0)).collect();
+                let submit_ns: Vec<AtomicU64> =
+                    (0..n_bands).map(|_| AtomicU64::new(0)).collect();
+                struct SubmitSeq<'a> {
+                    next: usize,
+                    stream: &'a mut flock_core::gpu_commit::FromZFirstPassStream,
+                }
+                let seq = std::sync::Mutex::new(SubmitSeq { next: 0, stream });
+                let slab_fn = |s: usize| {
+                    let g0 = slab_g0[s] as usize;
+                    for g in g0..g0 + SLAB {
+                        process_group(g);
+                    }
+                    let band = slab_band[s] as usize;
+                    // AcqRel: the zero-observer acquires every worker's
+                    // stores for this band before publishing/submitting it.
+                    if remaining[band].fetch_sub(1, Ordering::AcqRel) == 1 {
+                        if timing {
+                            done_ns[band]
+                                .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        }
+                        done[band].store(true, Ordering::Release);
+                        // Blocking lock (never try_lock): the current holder
+                        // may already have passed this band's `done` check,
+                        // so completion of the drain below is what guarantees
+                        // every published band gets submitted.
+                        let mut seq = seq.lock().unwrap();
+                        while seq.next < n_bands && done[seq.next].load(Ordering::Acquire) {
+                            let b = seq.next;
+                            // Same visibility boundary as the incumbent path:
+                            // publish all CPU writes of band b before the
+                            // command buffer that reads them is committed.
+                            std::sync::atomic::fence(Ordering::Release);
+                            seq.stream.submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
+                            seq.next += 1;
+                            if timing {
+                                submit_ns[b].store(
+                                    t0.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        }
+                    }
+                };
+                super::super::common::drain_witgen_slabs(slab_band.len(), &slab_fn);
+                // The full-drain join above proves every band completed and
+                // every zeroing worker drained the sequencer, so all bands
+                // are submitted. Belt for release builds: after the join any
+                // still-unsubmitted suffix (impossible by construction) may
+                // be submitted safely — every write is already published.
+                let mut seq = seq.into_inner().unwrap();
+                debug_assert_eq!(seq.next, n_bands, "continuous-queue band left unsubmitted");
+                while seq.next < n_bands {
+                    let b = seq.next;
+                    std::sync::atomic::fence(Ordering::Release);
+                    seq.stream.submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
+                    seq.next += 1;
+                }
+                if timing {
+                    for b in 0..n_bands {
+                        eprintln!(
+                            "[witgen-cont] band={b} gps={} done=+{:.3}ms submit=+{:.3}ms",
+                            schedule[b],
+                            done_ns[b].load(Ordering::Relaxed) as f64 / 1e6,
+                            submit_ns[b].load(Ordering::Relaxed) as f64 / 1e6,
+                        );
+                    }
+                }
+            } else {
+            // Band-bubble instrumentation (diagnostics-only, off unless
+            // FLOCK_PHASE_TIMING is set): per band, the moment the LAST group
+            // job was claimed from the drain queue, the moment the band's
+            // full join returned, and the moment its Metal submit returned —
+            // all relative to the start of the streamed drain. `tail` =
+            // join − last_claim is the per-band join-barrier bubble (the
+            // stretch where at most one worker is still finishing its final
+            // slab while every other core waits at the band join).
+            let band_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+            let t_bands = std::time::Instant::now();
             let mut offset = 0usize;
-            for &band_gps in schedule {
+            for (band_i, &band_gps) in schedule.iter().enumerate() {
+                let n_jobs = SEGMENTS * band_gps;
+                let claimed = std::sync::atomic::AtomicUsize::new(0);
+                let last_claim_ns = std::sync::atomic::AtomicU64::new(0);
                 // W-H1: the band's jobs drain through the same slab shim as
                 // the generic driver (a slab never straddles a segment).
                 let band_job = |job: usize| {
+                    if band_timing {
+                        let i = claimed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if i == n_jobs {
+                            last_claim_ns.store(
+                                t_bands.elapsed().as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                    }
                     let segment = job / band_gps;
                     let local = job % band_gps;
                     let g = segment * groups_per_segment + offset + local;
                     process_group(g);
                 };
                 super::super::common::drain_group_jobs(SEGMENTS * band_gps, &band_job);
+                let t_join_ns = band_timing.then(|| t_bands.elapsed().as_nanos() as u64);
                 // The queue/Rayon join above publishes every CPU write in
                 // this band; command-buffer submission then makes those
                 // shared-memory pages visible to Metal before it starts the
                 // range.
                 std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
                 stream.submit_ready_range(offset * 16, band_gps * 16);
+                if band_timing {
+                    let t_submit_ns = t_bands.elapsed().as_nanos() as u64;
+                    let last_claim = last_claim_ns.load(std::sync::atomic::Ordering::Relaxed);
+                    let join = t_join_ns.unwrap_or(t_submit_ns);
+                    eprintln!(
+                        "[witgen-band] band={band_i} gps={band_gps} last_claim=+{:.3}ms join=+{:.3}ms submit=+{:.3}ms tail={:.3}ms",
+                        last_claim as f64 / 1e6,
+                        join as f64 / 1e6,
+                        t_submit_ns as f64 / 1e6,
+                        (join - last_claim) as f64 / 1e6,
+                    );
+                }
                 offset += band_gps;
+            }
             }
         } else {
             super::super::common::drain_group_jobs(n_groups, &process_group);
@@ -2338,6 +2722,30 @@ pub(crate) mod witgen_simd {
             eprintln!(
                 "[witgen-hetero] groups={n_groups} helper-claims={}",
                 flock_core::epool::helper_chunks_claimed() - before
+            );
+        }
+
+        // Item B: the buffers now hold a complete witgen output of this
+        // layout — stage their provenance tokens for the eventual
+        // `give_f128` of these exact live allocations (pointer identity is
+        // guaranteed because the owner holds the Vec from here to the
+        // give). The give re-verifies sampled constant regions before
+        // attaching; any intermediate custody event drops the token.
+        if !elide_off {
+            flock_core::scratch::stage_f128_release_token(
+                &z,
+                witgen_scratch_tag(ROLE_Z, n_blocks_log),
+                elide_probes(n_total, false),
+            );
+            flock_core::scratch::stage_f128_release_token(
+                &a,
+                witgen_scratch_tag(ROLE_A, n_blocks_log),
+                elide_probes(n_total, false),
+            );
+            flock_core::scratch::stage_f128_release_token(
+                &b,
+                witgen_scratch_tag(ROLE_B, n_blocks_log),
+                elide_probes(n_total, true),
             );
         }
 
@@ -3997,6 +4405,46 @@ mod tests {
                         }
                     }
                 }
+                // Item B: the elided kernel over destinations pre-seeded
+                // with ONLY the per-block constant regions (garbage
+                // everywhere else) must reproduce the full write
+                // byte-for-byte — pins that the skipped chunks are exactly
+                // (a subset of) the constant regions on all three buffers.
+                let seed_consts = |dst: &mut [u64; 4 * WORDS], b_flavor: bool| {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            dst.as_mut_ptr().cast::<u8>(),
+                            core::mem::size_of_val(dst),
+                        )
+                    };
+                    const BLOCK_BYTES: usize = K / 8; // 2048
+                    for blk in 0..4 {
+                        bytes[blk * BLOCK_BYTES + 1952..(blk + 1) * BLOCK_BYTES].fill(0x00);
+                        if b_flavor {
+                            bytes[blk * BLOCK_BYTES..blk * BLOCK_BYTES + 128].fill(0xFF);
+                        }
+                    }
+                };
+                let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
+                let mut ae = ze;
+                let mut be = ze;
+                seed_consts(&mut ze, false);
+                seed_consts(&mut ae, false);
+                seed_consts(&mut be, true);
+                unsafe {
+                    witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                        [&inputs[0], &inputs[1], &inputs[2], &inputs[3]],
+                        ze.as_mut_ptr() as *mut u32,
+                        ae.as_mut_ptr() as *mut u32,
+                        be.as_mut_ptr() as *mut u32,
+                        z_nt,
+                        ab_nt,
+                        [true; 3],
+                    );
+                }
+                assert_eq!(ze, zq, "elided z diverged z_nt={z_nt} ab_nt={ab_nt}");
+                assert_eq!(ae, aq, "elided a diverged z_nt={z_nt} ab_nt={ab_nt}");
+                assert_eq!(be, bq, "elided b diverged z_nt={z_nt} ab_nt={ab_nt}");
             }
         }
         // Driver equality incl. padding slots and the stripe.
@@ -4268,6 +4716,47 @@ mod tests {
             .verify(&commitment, &proof, &mut verifier)
             .expect("ranked preinitialized-codeword proof must verify");
         assert_eq!(verified, claim);
+
+        // --- Item B (constant-region elision) release-mode canary A/B ---
+        // A second identical prove takes the witness allocations back
+        // through their provenance tokens (warm pool), so its witgen runs
+        // with the constant-region skips active. It must produce
+        // byte-identical proof bytes and verify. The hit mask proves the
+        // elision path was actually exercised (bit0 z, bit1 a, bit2 b).
+        #[cfg(target_arch = "aarch64")]
+        let first_hits = witgen_simd::last_elide_hits();
+        let mut prover2 = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+        let (proof2, commitment2, claim2) = setup.prove_fast(&blocks, &mut prover2);
+        let proof2_bytes = crate::proof_io::R1csProofBundleLigerito {
+            commitment: commitment2,
+            proof: proof2,
+        }
+        .to_bytes();
+        assert_eq!(claim2, claim);
+        assert_eq!(
+            proof_bytes, proof2_bytes,
+            "second (token-hit) ranked prove diverged from the first"
+        );
+        #[cfg(target_arch = "aarch64")]
+        {
+            let second_hits = witgen_simd::last_elide_hits();
+            eprintln!(
+                "[elide-canary] first_hits={first_hits:#05b} second_hits={second_hits:#05b}"
+            );
+            // Hits are opportunistic by design: a later phase legitimately
+            // reusing a witness buffer's allocation retires its token
+            // (measured on M4 Max: `a`'s allocation is taken by an
+            // open-stage transient inside the first prove, so its bit is
+            // 0 — the per-buffer full-write fallback). z parks in the
+            // pinned slot and b's allocation stays untouched, so those two
+            // MUST hit on a warm second prove — anything less means the
+            // elision fast path silently died.
+            assert_eq!(
+                second_hits & 0b101,
+                0b101,
+                "second ranked prove should token-hit z (pinned) and b"
+            );
+        }
     }
 
     /// Full prove→verify round-trip through the Ligerito PCS for EACH named

@@ -40,6 +40,23 @@ pub mod scratch;
 pub mod verifier;
 pub mod zerocheck;
 
+/// Shared kill switch for the micro-stack batch of small prover cuts
+/// (`eval_sk_at_vks` memoization, recursion-OOD optimized eq-table builder,
+/// fast `pcs_open` bundle encoder). Set exactly `FLOCK_NO_MICRO_STACK=1` to
+/// restore every incumbent path as a same-binary A/B control; any other value
+/// (or unset) keeps the micro-stack paths. All gated paths are byte-identical
+/// to the incumbents (each has its own equivalence test), so the switch exists
+/// purely for screening/rollback — mirrors `FLOCK_NO_AB_COMPACT_STORE`.
+pub const ENV_NO_MICRO_STACK: &str = "FLOCK_NO_MICRO_STACK";
+
+/// Unlike `ab_compact_store_enabled` this does **not** latch the first read
+/// in a `OnceLock`: every gated call site runs O(10) times per prove, so the
+/// per-call `var_os` read is noise, and re-reading keeps same-process A/B
+/// tests (set var → prove → unset → prove) possible.
+pub fn micro_stack_enabled() -> bool {
+    std::env::var_os(ENV_NO_MICRO_STACK).as_deref() != Some(std::ffi::OsStr::new("1"))
+}
+
 /// Configure rayon's global thread pool to use only performance cores on
 /// Apple silicon (excluding efficiency cores).
 ///

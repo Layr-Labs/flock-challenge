@@ -167,8 +167,7 @@ impl R1csProofBundleLigerito {
         // last field reproduces the single-shot encode byte-for-byte; the
         // fingerprint gate below guarantees the stash is for THIS bundle.
         if let Some(mut out) = take_matching_pre_encoded(self) {
-            bincode::serialize_into(&mut out, &self.proof.pcs_open)
-                .expect("bincode serialize pcs_open");
+            encode_pcs_open_into(&mut out, &self.proof.pcs_open);
             return out;
         }
         // Ranked bundles serialize to ~437–440 kB; the old 1 KiB hint forced
@@ -177,7 +176,24 @@ impl R1csProofBundleLigerito {
         // 500 kB cap while degrading gracefully (Vec growth) if exceeded.
         let mut out = Vec::with_capacity(HEADER_LEN + 450_000);
         write_header(&mut out, FLAVOR_R1CS_LIGERITO);
-        bincode::serialize_into(&mut out, self).expect("bincode serialize R1csProofBundleLigerito");
+        if fast_pcs_open_encode_enabled() {
+            // Same untagged-field-concatenation identity as the fast path
+            // above: `enc(bundle) = enc(commitment) ‖ enc(zerocheck) ‖
+            // enc(lincheck) ‖ enc(pcs_open)`, so encoding the first three
+            // sections with bincode and the dominant `pcs_open` (~99% of the
+            // bytes) with the flat encoder reproduces the single-shot encode
+            // byte-for-byte.
+            bincode::serialize_into(&mut out, &self.commitment)
+                .expect("bincode serialize Commitment");
+            bincode::serialize_into(&mut out, &self.proof.zerocheck)
+                .expect("bincode serialize ZerocheckProof");
+            bincode::serialize_into(&mut out, &self.proof.lincheck)
+                .expect("bincode serialize LincheckProof");
+            encode_pcs_open_into(&mut out, &self.proof.pcs_open);
+        } else {
+            bincode::serialize_into(&mut out, self)
+                .expect("bincode serialize R1csProofBundleLigerito");
+        }
         out
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
@@ -295,6 +311,151 @@ fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>
     }
     let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
     (stash.bytes.len() == want).then_some(stash.bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Flat bincode-compatible `pcs_open` encoder (micro-stack item 5)
+// ---------------------------------------------------------------------------
+//
+// `bincode::serialize_into` (fixint, little-endian — the bincode 1.x
+// free-function config) drives the ~433 kB `pcs_open` section through serde
+// element-at-a-time: every F128 costs two `write_u64` calls and every Merkle
+// hash 32 single-byte writes, all inside the measured publish tail. The
+// encoder below emits the *identical bytes* with bulk `extend_from_slice`
+// copies instead:
+//
+//   - struct        → field concatenation in declaration order (no framing)
+//   - Vec<T>        → u64 LE length ‖ elements
+//   - u64           → 8 LE bytes
+//   - F128 {lo,hi}  → lo LE ‖ hi LE = its in-memory bytes on a little-endian
+//                     target (`repr(C, align(16))`, two u64s, no padding) —
+//                     whole slices are memcpy'd
+//   - Hash [u8;32]  → 32 raw bytes (serde fixed arrays carry no length) —
+//                     whole slices are memcpy'd via `as_flattened`
+//
+// Every struct is destructured exhaustively (no `..`), so adding/removing/
+// reordering a field breaks compilation here instead of silently changing
+// the encoding; `flat_pcs_open_encoder_matches_bincode` byte-checks the
+// result against `bincode::serialize` on nonuniform random proofs.
+//
+// `FLOCK_NO_MICRO_STACK=1` (shared micro-stack kill switch) restores the
+// incumbent serde encode; big-endian targets always fall back.
+
+use flock_core::field::F128;
+use flock_core::merkle::Hash as MerkleHash;
+use flock_core::pcs::BatchOpeningProofLigerito;
+use flock_core::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage};
+use flock_core::pcs::ring_switch::RingSwitchProof;
+
+fn fast_pcs_open_encode_enabled() -> bool {
+    cfg!(target_endian = "little") && flock_core::micro_stack_enabled()
+}
+
+/// Append the bincode-fixint encoding of `p` to `out`. Byte-identical to
+/// `bincode::serialize_into(out, p)` (falls back to exactly that when the
+/// fast path is disabled).
+fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
+    if !fast_pcs_open_encode_enabled() {
+        bincode::serialize_into(&mut *out, p).expect("bincode serialize pcs_open");
+        return;
+    }
+    let BatchOpeningProofLigerito {
+        ring_switches,
+        ligerito,
+    } = p;
+    put_u64(out, ring_switches.len() as u64);
+    for rs in ring_switches {
+        let RingSwitchProof { s_hat_v } = rs;
+        put_f128_vec(out, s_hat_v);
+    }
+    let LigeritoProof {
+        initial_root,
+        initial_proof,
+        recursive_roots,
+        recursive_proofs,
+        final_proof,
+        sumcheck_transcript,
+        grinding_nonces,
+        ood_values,
+        fold_grinding_nonces,
+    } = ligerito;
+    out.extend_from_slice(initial_root);
+    put_recursive_proof(out, initial_proof);
+    put_hash_vec(out, recursive_roots);
+    put_u64(out, recursive_proofs.len() as u64);
+    for rp in recursive_proofs {
+        put_recursive_proof(out, rp);
+    }
+    let FinalProof {
+        yr,
+        opened_rows,
+        merkle_proof,
+    } = final_proof;
+    put_f128_vec(out, yr);
+    put_rows(out, opened_rows);
+    put_hash_vec(out, merkle_proof);
+    put_u64(out, sumcheck_transcript.len() as u64);
+    for m in sumcheck_transcript {
+        let SumcheckMessage { u_0, u_2 } = m;
+        put_f128(out, *u_0);
+        put_f128(out, *u_2);
+    }
+    put_u64_vec(out, grinding_nonces);
+    put_f128_vec(out, ood_values);
+    put_u64_vec(out, fold_grinding_nonces);
+}
+
+fn put_recursive_proof(out: &mut Vec<u8>, rp: &RecursiveProof) {
+    let RecursiveProof {
+        opened_rows,
+        merkle_proof,
+    } = rp;
+    put_rows(out, opened_rows);
+    put_hash_vec(out, merkle_proof);
+}
+
+#[inline]
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+#[inline]
+fn put_f128(out: &mut Vec<u8>, v: F128) {
+    put_u64(out, v.lo);
+    put_u64(out, v.hi);
+}
+
+#[inline]
+fn put_f128_vec(out: &mut Vec<u8>, v: &[F128]) {
+    put_u64(out, v.len() as u64);
+    // SAFETY: `F128` is `repr(C, align(16))` with exactly two `u64` fields
+    // (size 16, no padding), so on a little-endian target the in-memory bytes
+    // of a slice are precisely the bincode-fixint encoding of its elements.
+    // The fast path is compile-time gated to little-endian above.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) };
+    out.extend_from_slice(bytes);
+}
+
+#[inline]
+fn put_hash_vec(out: &mut Vec<u8>, v: &[MerkleHash]) {
+    put_u64(out, v.len() as u64);
+    out.extend_from_slice(v.as_flattened());
+}
+
+#[inline]
+fn put_u64_vec(out: &mut Vec<u8>, v: &[u64]) {
+    put_u64(out, v.len() as u64);
+    for &x in v {
+        put_u64(out, x);
+    }
+}
+
+fn put_rows(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
+    put_u64(out, rows.len() as u64);
+    for row in rows {
+        put_f128_vec(out, row);
+    }
 }
 
 impl ChainProofBundleLigerito {
@@ -543,6 +704,161 @@ mod tests {
                 &mut chv,
             )
             .expect("verify round-tripped chain proof");
+    }
+
+    /// The flat `pcs_open` encoder must reproduce `bincode::serialize`
+    /// byte-for-byte on nonuniform random proofs (empty vecs, ragged rows,
+    /// zero and max scalars included).
+    #[test]
+    fn flat_pcs_open_encoder_matches_bincode() {
+        use flock_core::pcs::BatchOpeningProofLigerito;
+        use flock_core::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage};
+        use flock_core::pcs::ring_switch::RingSwitchProof;
+
+        let mut rng = Rng::new(0x515E_D0_F128);
+        let f128 = |rng: &mut Rng| F128::new(rng.nx(), rng.nx());
+        let f128_vec =
+            |rng: &mut Rng, n: usize| -> Vec<F128> { (0..n).map(|_| F128::new(rng.nx(), rng.nx())).collect() };
+        let hash_vec = |rng: &mut Rng, n: usize| -> Vec<MerkleHash> {
+            (0..n)
+                .map(|_| std::array::from_fn(|_| rng.nx() as u8))
+                .collect()
+        };
+        let rows = |rng: &mut Rng, n: usize, w: usize| -> Vec<Vec<F128>> {
+            (0..n)
+                .map(|i| (0..(w + i % 3)).map(|_| F128::new(rng.nx(), rng.nx())).collect())
+                .collect()
+        };
+
+        for (n_rs, n_rec, n_rows, n_msgs) in
+            [(0usize, 0usize, 0usize, 0usize), (1, 1, 3, 2), (3, 4, 17, 55)]
+        {
+            let recursive_proof = |rng: &mut Rng| RecursiveProof {
+                opened_rows: rows(rng, n_rows, 4),
+                merkle_proof: hash_vec(rng, n_rows * 2 + 1),
+            };
+            let proof = BatchOpeningProofLigerito {
+                ring_switches: (0..n_rs)
+                    .map(|i| RingSwitchProof {
+                        s_hat_v: f128_vec(&mut rng, i * 7),
+                    })
+                    .collect(),
+                ligerito: LigeritoProof {
+                    initial_root: std::array::from_fn(|_| rng.nx() as u8),
+                    initial_proof: recursive_proof(&mut rng),
+                    recursive_roots: hash_vec(&mut rng, n_rec),
+                    recursive_proofs: (0..n_rec).map(|_| recursive_proof(&mut rng)).collect(),
+                    final_proof: FinalProof {
+                        yr: f128_vec(&mut rng, n_msgs * 3),
+                        opened_rows: rows(&mut rng, n_rows, 2),
+                        merkle_proof: hash_vec(&mut rng, n_rows),
+                    },
+                    sumcheck_transcript: (0..n_msgs)
+                        .map(|_| SumcheckMessage {
+                            u_0: f128(&mut rng),
+                            u_2: f128(&mut rng),
+                        })
+                        .collect(),
+                    grinding_nonces: (0..n_rec).map(|_| rng.nx()).collect(),
+                    ood_values: {
+                        let mut v = f128_vec(&mut rng, n_rec);
+                        if let Some(first) = v.first_mut() {
+                            *first = F128::ZERO;
+                        }
+                        if let Some(last) = v.last_mut() {
+                            *last = F128::new(u64::MAX, u64::MAX);
+                        }
+                        v
+                    },
+                    fold_grinding_nonces: (0..n_msgs).map(|_| rng.nx()).collect(),
+                },
+            };
+            let incumbent = bincode::serialize(&proof).expect("bincode serialize");
+            let mut flat = Vec::new();
+            encode_pcs_open_into(&mut flat, &proof);
+            assert_eq!(
+                flat, incumbent,
+                "flat encoder diverged at shape (n_rs={n_rs}, n_rec={n_rec}, n_rows={n_rows}, n_msgs={n_msgs})"
+            );
+        }
+    }
+
+    /// End-to-end micro-stack byte-identity gate: the same prove published
+    /// with the micro-stack on vs `FLOCK_NO_MICRO_STACK=1` must yield an
+    /// identical commit root and identical full bundle bytes. Covers all
+    /// three shipped items (eval_sk_at_vks memo, recursion-OOD optimized eq
+    /// tables, flat pcs_open encoder) on the real prover path.
+    ///
+    /// Env-mutating — run explicitly, single-threaded:
+    /// `cargo test micro_stack_bundle_bytes_identical -- --ignored --test-threads=1`
+    #[test]
+    #[ignore] // Heavier + env-mutating; see doc comment.
+    fn micro_stack_bundle_bytes_identical() {
+        let setup = Blake3Setup::new(256);
+        let (blocks, _, _) = honest_chain(256, 0x0Ff1_CE_57AC);
+
+        let prove_bytes = || {
+            let mut ch = FsChallenger::new(b"flock-micro-stack-ab");
+            let (proof, commitment, _claim) = setup.prove_fast(&blocks, &mut ch);
+            let root = commitment.root;
+            let bundle = R1csProofBundleLigerito { commitment, proof };
+            (root, bundle.to_bytes())
+        };
+
+        let (root_on, bytes_on) = prove_bytes();
+        // SAFETY: single-threaded #[ignore]d test; no concurrent env access.
+        unsafe { std::env::set_var(flock_core::ENV_NO_MICRO_STACK, "1") };
+        let (root_off, bytes_off) = prove_bytes();
+        unsafe { std::env::remove_var(flock_core::ENV_NO_MICRO_STACK) };
+
+        assert_eq!(root_on, root_off, "commit root changed under micro-stack");
+        assert_eq!(bytes_on, bytes_off, "bundle bytes changed under micro-stack");
+
+        // Witgen-stack gates: each item's kill switch (and all of them at
+        // once) must leave the bundle byte-identical. The elision item is
+        // additionally exercised on its HIT path by the repeated proves
+        // here (warm scratch pool + tokens), so on/off covers both
+        // fast-path and incumbent writes. (The continuous-queue gate only
+        // changes behavior on the streamed ranked shape — the ranked
+        // canary covers that arm — but it must stay inert here too.)
+        const WITGEN_STACK_GATES: &[&str] = &[
+            "FLOCK_NO_WITGEN_CONT_QUEUE",
+            "FLOCK_NO_SCRATCH_CONST_ELIDE",
+            "FLOCK_NO_GEN_BLOCK_SIMD",
+        ];
+        for gate in WITGEN_STACK_GATES {
+            // SAFETY: single-threaded #[ignore]d test; no concurrent env
+            // access.
+            unsafe { std::env::set_var(gate, "1") };
+            let (root, bytes) = prove_bytes();
+            unsafe { std::env::remove_var(gate) };
+            assert_eq!(root, root_on, "commit root changed under {gate}=1");
+            assert_eq!(bytes, bytes_on, "bundle bytes changed under {gate}=1");
+        }
+        for gate in WITGEN_STACK_GATES {
+            // SAFETY: as above.
+            unsafe { std::env::set_var(gate, "1") };
+        }
+        let (root_all_off, bytes_all_off) = prove_bytes();
+        for gate in WITGEN_STACK_GATES {
+            // SAFETY: as above.
+            unsafe { std::env::remove_var(gate) };
+        }
+        assert_eq!(
+            root_all_off, root_on,
+            "commit root changed with the whole witgen stack off"
+        );
+        assert_eq!(
+            bytes_all_off, bytes_on,
+            "bundle bytes changed with the whole witgen stack off"
+        );
+        // And one more prove with everything back on: the scratch pool now
+        // holds tokened witness buffers from the earlier on-proves, so this
+        // is the strongest same-process elision-hit identity check at this
+        // shape.
+        let (root_on2, bytes_on2) = prove_bytes();
+        assert_eq!(root_on2, root_on, "commit root changed on warm token-hit prove");
+        assert_eq!(bytes_on2, bytes_on, "bundle bytes changed on warm token-hit prove");
     }
 
     #[test]

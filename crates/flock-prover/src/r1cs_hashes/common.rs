@@ -396,7 +396,7 @@ fn witgen_hetero_main_only() -> bool {
 /// EPOOL_MIN_CHUNKS. (Measured on b844d53: single-group claims interleave 14
 /// writers' store streams and cost +2.5 ms of pure scheduling damage;
 /// 64-group slabs recover it and the E-cores convert −1.3 ms.)
-const WITGEN_HETERO_SLAB: usize = 64;
+pub(crate) const WITGEN_HETERO_SLAB: usize = 64;
 
 /// Oracle arm: `FLOCK_WITGEN_HETERO_SINGLE=1` drains single groups per claim
 /// (the naive `run_hetero_chunks` shape) instead of 64-group slabs.
@@ -437,6 +437,26 @@ where
                 f(g);
             }
         });
+    }
+}
+
+/// Slab-granular sibling of [`drain_group_jobs`] for the continuous-queue
+/// streamed drain (blake3 witgen item A): `f` receives SLAB indices — the
+/// caller owns the slab→groups mapping and any per-slab completion
+/// accounting (band counters + in-order Metal submits) — claimed one at a
+/// time from a single shared queue in ascending order. Same pool selection
+/// as [`drain_group_jobs`]: hetero P+E queue by default,
+/// `FLOCK_WITGEN_HETERO_MAIN_ONLY=1` for the queue-without-E-cores oracle,
+/// `FLOCK_NO_WITGEN_HETERO=1` for a main-pool-only claim loop (still
+/// single-queue so the caller's completion accounting stays exact).
+pub(crate) fn drain_witgen_slabs<F>(n_slabs: usize, f: &F)
+where
+    F: Fn(usize) + Sync,
+{
+    if !witgen_hetero_enabled() || witgen_hetero_main_only() {
+        flock_core::epool::run_chunks_with_helper(n_slabs, f, None);
+    } else {
+        flock_core::epool::run_hetero_chunks(n_slabs, f);
     }
 }
 
