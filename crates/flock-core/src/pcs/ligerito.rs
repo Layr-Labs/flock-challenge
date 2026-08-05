@@ -12732,3 +12732,9 @@ mod tests {
 // RealAdii sample 1 on 368da6d.
 // angelx lane-warm draw 31 on frontier 2d89d2b (resample 31).
 // angelx lane-warm draw 49 on frontier d9b4232 (resample 49).
+// RealAdii sample 1 on ac86f16.
+// RealAdii sample 2 on ac86f16.
+// RealAdii sample 3 on ac86f16.
+// RealAdii sample 4 on ac86f16.
+// RealAdii sample 5 on ac86f16.
+// RealAdii sample 6 on ac86f16.
