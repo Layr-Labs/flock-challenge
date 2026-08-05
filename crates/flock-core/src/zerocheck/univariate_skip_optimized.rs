@@ -834,6 +834,35 @@ fn zc_ab_pre_hetero_enabled() -> bool {
     })
 }
 
+/// Exact-`1` control restoring the 0x03/0xf0 mixed const-one sniff arms on
+/// static-B blocks (see the mask expression in `precompute_ab_one_chunk`).
+/// Default-off: with a static-B context those arms shadow the bstatic FAST
+/// path, which handles their const-one rows byte-identically and runs the
+/// generic rows through the raw-PMULL epilogue.
+pub const ENV_ZC_KEEP_MIXED_ARMS: &str = "FLOCK_ZC_KEEP_MIXED_ARMS";
+
+fn keep_mixed_arms_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn keep_mixed_arms() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| keep_mixed_arms_value(std::env::var_os(ENV_ZC_KEEP_MIXED_ARMS).as_deref()))
+}
+
+#[cfg(test)]
+mod keep_mixed_arms_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_keep_mixed_value() {
+        assert!(super::keep_mixed_arms_value(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(!super::keep_mixed_arms_value(value.map(OsStr::new)));
+        }
+    }
+}
+
 /// One `x_outer`'s worth of the challenge-independent AB transform — the
 /// exact loop body both precompute drains share, factored out so the QS5
 /// hetero queue and the incumbent `par_chunks_mut` cannot diverge.
@@ -883,7 +912,24 @@ fn precompute_ab_one_chunk(
             b_col,
             !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
             !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-            if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
+            // Mixed-arm retirement (kill: FLOCK_ZC_KEEP_MIXED_ARMS=1): when
+            // the static-B context exists, the 0x03/0xf0 mixed sniff arms
+            // are strictly dominated — `shift_reduce_inner_mixed_const_b`
+            // runs its non-const K-rows through the INCUMBENT epilogue with
+            // no `fast_shift_reduce_enabled()` gate and no static-B byte
+            // exploitation, while the bstatic FAST path both applies the
+            // raw-PMULL epilogue to those rows and activates the generated
+            // static plans these arms shadow (blk2/K5's 7-static-byte
+            // gather, blk29/K0's static pair). Passing 0 here routes the
+            // block to bstatic; const-one rows fold to k_static([],[]) rows
+            // there, byte-identically. The a-only and single-K0 sniffs are
+            // untouched — those ARE optimal.
+            if blake3_static_layout
+                && static_b_context.is_some()
+                && !keep_mixed_arms()
+            {
+                0
+            } else if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
                 0x03
             } else if blake3_static_layout
                 && within_hash_outer == 1
