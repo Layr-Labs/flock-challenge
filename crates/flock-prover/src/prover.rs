@@ -1,3 +1,4 @@
+//! Resample 10 prep: distinct comment for next lane-warm slot (prover.rs).
 //! Top-level R1CS prover: composes zerocheck + lincheck for block-diagonal
 //! circuit R1CS instances. Outputs **two** z-claims at different quirky
 //! points that the PCS layer (when it lands) will verify against `z`'s
