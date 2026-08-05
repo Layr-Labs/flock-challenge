@@ -86,19 +86,6 @@ pub trait Challenger: Send {
     fn verify_pow(&mut self, _nonce: u64, _bits: u32) -> bool {
         true
     }
-
-    /// Fork this challenger into an independent copy with identical
-    /// transcript state, for speculative pre-derivation of challenges whose
-    /// inputs are already fully bound (commit-tail fill). The fork must be
-    /// deterministic: absorbing the same messages into the fork and into
-    /// `self` must yield identical samples. `None` (the default) disables
-    /// every speculative consumer, which is always sound.
-    fn fork(&self) -> Option<Self>
-    where
-        Self: Sized,
-    {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -136,10 +123,6 @@ impl Challenger for RandomChallenger {
         let lo = splitmix64(&mut self.state);
         let hi = splitmix64(&mut self.state);
         F128 { lo, hi }
-    }
-
-    fn fork(&self) -> Option<Self> {
-        Some(self.clone())
     }
 }
 
@@ -342,10 +325,6 @@ impl Challenger for FsChallenger {
         self.absorb(&[OP_LABEL]);
         self.absorb(&(label.len() as u64).to_le_bytes());
         self.absorb(label);
-    }
-
-    fn fork(&self) -> Option<Self> {
-        Some(self.clone())
     }
 
     fn observe_f128(&mut self, value: F128) {
