@@ -754,6 +754,70 @@ mod hybrid_cb2_spin_gate_tests {
     }
 }
 
+/// Strict kill switch for queueing the pure-GPU continuation at finish entry,
+/// after the already-submitted streamed from-z tiles. Only exact value `1`
+/// restores the incumbent post-drain encode/commit path. The queued
+/// command buffer contains the same layers 4+ and Merkle work and executes in
+/// the same serial Metal queue.
+pub const ENV_NO_EARLY_PURE_GPU_CONTINUATION: &str =
+    "FLOCK_NO_EARLY_PURE_GPU_CONTINUATION";
+
+fn early_pure_gpu_continuation_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn early_pure_gpu_continuation_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        early_pure_gpu_continuation_value_enabled(
+            std::env::var_os(ENV_NO_EARLY_PURE_GPU_CONTINUATION).as_deref(),
+        )
+    })
+}
+
+fn select_early_gpu_continuation_k(
+    k: usize,
+    hybrid_disabled: bool,
+    pure_gpu_enabled: bool,
+) -> Option<usize> {
+    match k {
+        0 if pure_gpu_enabled => Some(0),
+        1..=15 if !hybrid_disabled => Some(k),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod early_pure_gpu_continuation_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_pure_gpu_continuation_kill_value() {
+        assert_eq!(
+            super::ENV_NO_EARLY_PURE_GPU_CONTINUATION,
+            "FLOCK_NO_EARLY_PURE_GPU_CONTINUATION"
+        );
+        assert!(!super::early_pure_gpu_continuation_value_enabled(Some(
+            OsStr::new("1")
+        )));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::early_pure_gpu_continuation_value_enabled(
+                value.map(OsStr::new)
+            ));
+        }
+    }
+
+    #[test]
+    fn selector_keeps_pure_gpu_and_hybrid_rollbacks_independent() {
+        assert_eq!(super::select_early_gpu_continuation_k(0, false, true), Some(0));
+        assert_eq!(super::select_early_gpu_continuation_k(0, false, false), None);
+        assert_eq!(super::select_early_gpu_continuation_k(7, false, false), Some(7));
+        assert_eq!(super::select_early_gpu_continuation_k(7, true, true), None);
+        assert_eq!(super::select_early_gpu_continuation_k(16, false, true), None);
+    }
+}
+
 /// Strict kill switch for the third ranked-tree pool slot: only exact
 /// value `1` restores the incumbent two-slot cap (see `give_tree`). The
 /// pool is reuse plumbing for the 64 MiB L0 tree allocation — cap choice
@@ -4669,13 +4733,14 @@ kernel void blake3_pow_scan(
         failed: Option<String>,
         owns_lease: bool,
         started: std::time::Instant,
-        /// Hybrid CPU share captured at stream creation; 0 disables the
-        /// early-prefix commit (kill switch, non-hybrid split, or pure-GPU).
-        early_k: usize,
-        /// GPU-prefix command buffer (retained) committed directly behind the
-        /// final streamed tile, with the split it was encoded for. Queue
-        /// order makes it start the moment the first pass completes, deleting
-        /// the host wait/encode bubble; `finish` consumes (or drains) it.
+        /// Selected continuation captured at stream creation: `Some(0)` is
+        /// pure GPU, `Some(1..=15)` is hybrid, and `None` disables early commit.
+        early_k: Option<usize>,
+        /// Continuation command buffer (retained) committed behind the final
+        /// streamed tile, with the split it was encoded for. Hybrid work is
+        /// queued by the final callback; pure-GPU work is queued at finish
+        /// entry so it does not run ahead of post-witness stripe/AB startup.
+        /// `finish` consumes (or drains) the retained buffer.
         early_cb2: Option<(Id, usize)>,
     }
 
@@ -4742,20 +4807,20 @@ kernel void blake3_pow_scan(
                 Err(e) => self.failed = Some(e),
             }
 
-            // Final tile queued: encode the hybrid GPU prefix now and commit
-            // it directly behind that tile on the same (serial) queue. The
-            // GPU then flows from the last first-pass tile straight into the
-            // prefix passes with no host round-trip, and `finish` skips the
-            // encode on the CPU-suffix critical path. Bit-identical: the
-            // encoded work is exactly what `finish` would have encoded.
+            // Final tile queued: preserve the promoted hybrid behavior by
+            // encoding and committing its prefix directly behind that tile.
+            // Pure-GPU continuation is deliberately deferred to finish entry:
+            // queueing it from this callback advances a large unified-memory
+            // consumer ahead of post-witness deferred-stripe and A/B startup.
             // (Redraw marker: first draw of this tree scored 1,199,897.47 —
             // 0.12% below the 1,201,360 bar — on 2026-08-01; content change
             // required for a per-account resubmission.)
             if self.failed.is_none()
-                && self.early_k > 0
+                && matches!(self.early_k, Some(1..=15))
                 && self.early_cb2.is_none()
                 && self.next_r == total_r
             {
+                let early_k = self.early_k.expect("checked Some above");
                 let result = unsafe {
                     let pool = self.gpu.pool_push();
                     let result = (|| -> Result<Id, String> {
@@ -4766,7 +4831,7 @@ kernel void blake3_pow_scan(
                             self.tree_buf,
                             self.log_d,
                             self.n_leaves,
-                            self.early_k,
+                            early_k,
                         )?;
                         // Retain across the pool: completion is consumed by
                         // `finish` (same idiom as the streamed tiles above).
@@ -4779,12 +4844,9 @@ kernel void blake3_pow_scan(
                 };
                 match result {
                     Ok(cb2) => {
-                        self.early_cb2 = Some((cb2, self.early_k));
+                        self.early_cb2 = Some((cb2, early_k));
                         if debug_enabled() {
-                            eprintln!(
-                                "[gpu-commit] early hybrid prefix committed behind final tile (k={})",
-                                self.early_k
-                            );
+                            eprintln!("[gpu-commit] early hybrid prefix committed (k={early_k})");
                         }
                     }
                     // Encode failure is not a stream failure: `finish` simply
@@ -4793,6 +4855,56 @@ kernel void blake3_pow_scan(
                         if debug_enabled() {
                             eprintln!("[gpu-commit] early hybrid prefix encode failed ({e})");
                         }
+                    }
+                }
+            }
+        }
+
+        /// Queue the pure-GPU continuation as soon as the post-witness commit
+        /// arm enters, but before it drains the retained first-pass buffers.
+        /// This preserves post-witness branch startup order and is early enough
+        /// for serial queue order to overlap the host drain: if the last tile
+        /// is still in flight, the handoff can be gapless; if it has completed,
+        /// only finish-entry encode remains before the continuation is queued.
+        fn queue_finish_entry_pure_continuation(&mut self) {
+            let total_r = 1usize << (self.log_d - 4);
+            if self.failed.is_some()
+                || self.early_k != Some(0)
+                || self.early_cb2.is_some()
+                || self.next_r != total_r
+            {
+                return;
+            }
+            let result = unsafe {
+                let pool = self.gpu.pool_push();
+                let result = (|| -> Result<Id, String> {
+                    let cb2 = encode_commit_graph_after_from_z_cb(
+                        self.gpu,
+                        self.staging,
+                        self.tw_buf,
+                        self.tree_buf,
+                        self.log_d,
+                        self.n_leaves,
+                    )?;
+                    let cb2 = self.gpu.retain(cb2);
+                    self.gpu.commit_async(cb2);
+                    Ok(cb2)
+                })();
+                self.gpu.pool_pop(pool);
+                result
+            };
+            match result {
+                Ok(cb2) => {
+                    self.early_cb2 = Some((cb2, 0));
+                    if debug_enabled() {
+                        eprintln!("[gpu-commit] pure continuation queued at finish entry");
+                    }
+                }
+                // Encode failure is not a stream failure: after draining the
+                // first pass, finish takes the ordinary encode/commit path.
+                Err(e) => {
+                    if debug_enabled() {
+                        eprintln!("[gpu-commit] finish-entry continuation encode failed ({e})");
                     }
                 }
             }
@@ -4917,18 +5029,16 @@ kernel void blake3_pow_scan(
                 }
             },
         };
-        // Capture the hybrid split for the early-prefix commit at creation:
-        // the sweep publishes before any timed prove, so this matches the
-        // value `finish` will read; `finish` still re-checks and recovers if
-        // it changed (possible only around warmup).
-        let early_k = if std::env::var_os("FLOCK_NO_EARLY_GPU_PREFIX").is_some() {
-            0
-        } else {
-            match hybrid_cpu_sixteenths() {
-                k @ 1..=15 => k,
-                _ => 0,
-            }
-        };
+        // Capture the selected continuation at creation: the sweep publishes
+        // before any timed prove, so this matches the value `finish` will
+        // read; `finish` still re-checks and recovers if it changed (possible
+        // only around warmup). The legacy hybrid and strict pure-GPU rollback
+        // switches remain independent.
+        let early_k = super::select_early_gpu_continuation_k(
+            hybrid_cpu_sixteenths(),
+            std::env::var_os("FLOCK_NO_EARLY_GPU_PREFIX").is_some(),
+            super::early_pure_gpu_continuation_enabled(),
+        );
         Some(FromZFirstPassStream {
             gpu,
             z_buf,
@@ -5216,6 +5326,28 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// Encode the pure-GPU continuation when layers 0..3 have already been
+    /// written into `staging`. The caller controls commit timing so streamed
+    /// production can place this command buffer directly behind the last
+    /// first-pass tile on the serial queue.
+    pub(crate) unsafe fn encode_commit_graph_after_from_z_cb(
+        gpu: &Gpu,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+    ) -> Result<Id, String> {
+        unsafe {
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
+            encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+            gpu.end_encoding(enc);
+            Ok(cb)
+        }
+    }
+
     /// Finish the pure-GPU graph when layers 0..3 have already been written
     /// into `staging` by the witness-overlapped stream.
     unsafe fn run_commit_graph_after_from_z(
@@ -5228,14 +5360,10 @@ kernel void blake3_pow_scan(
     ) -> Result<(), String> {
         unsafe {
             let pool = gpu.pool_push();
-            let r = (|| {
-                let cb = gpu.command_buffer()?;
-                let enc = gpu.compute_encoder(cb)?;
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
-                encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
-                gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
-            })();
+            let r = encode_commit_graph_after_from_z_cb(
+                gpu, staging, tw_buf, tree_buf, log_d, n_leaves,
+            )
+            .and_then(|cb| gpu.commit_and_wait(cb));
             gpu.pool_pop(pool);
             r
         }
@@ -7109,6 +7237,7 @@ kernel void blake3_pow_scan(
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         use std::sync::atomic::Ordering;
 
+        stream.queue_finish_entry_pure_continuation();
         let total_r = 1usize << (stream.log_d - 4);
         let first_pass = stream.wait_pending().and_then(|()| {
             if stream.next_r == total_r {
@@ -7129,7 +7258,7 @@ kernel void blake3_pow_scan(
                     && state.tw_buf == stream.tw_buf
                     && state.tree_buf == stream.tree_buf
         );
-        // Consume any early-committed GPU prefix before choosing a path: it
+        // Consume any early-committed GPU continuation before choosing a path: it
         // was queued directly behind the final streamed tile and may already
         // be executing against the latched buffers, so every exit from this
         // function must have waited on it (or handed it to the graph, which
@@ -7156,18 +7285,22 @@ kernel void blake3_pow_scan(
             unsafe {
                 match early {
                     Some((cb2, k_early)) if k_early == k_cpu16 => {
-                        let r = run_commit_graph_from_z_hybrid_impl(
-                            stream.gpu,
-                            stream.z_buf,
-                            stream.staging,
-                            stream.tw_buf,
-                            stream.tree_buf,
-                            stream.log_d,
-                            stream.n_leaves,
-                            k_cpu16,
-                            true,
-                            Some(cb2),
-                        );
+                        let r = if k_cpu16 == 0 {
+                            stream.gpu.wait_cb(cb2)
+                        } else {
+                            run_commit_graph_from_z_hybrid_impl(
+                                stream.gpu,
+                                stream.z_buf,
+                                stream.staging,
+                                stream.tw_buf,
+                                stream.tree_buf,
+                                stream.log_d,
+                                stream.n_leaves,
+                                k_cpu16,
+                                true,
+                                Some(cb2),
+                            )
+                        };
                         stream.gpu.release(cb2);
                         r
                     }
@@ -12193,6 +12326,113 @@ mod tests {
             gpu.release(z_buf);
             gpu.release(table_buf);
             gpu.release(tree_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    /// Scaled ordering oracle for the streamed pure-GPU handoff: queue the
+    /// production first pass and its factored continuation back-to-back with
+    /// no host wait, then verify that serial Metal queue order supplies the
+    /// dependency for the complete codeword and Merkle tree.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn queued_pure_gpu_continuation_observes_first_pass_writes_scaled() {
+        use super::imp;
+
+        let log_d = 8usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0xEA21_C011_71A8_0008);
+        let z = rng.vec(64 << (log_d - 1));
+        let mut expect = vec![F128::ZERO; 64 << log_d];
+        crate::pcs::commit::replicate_message_fill(&mut expect, &z);
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut expect, 64, 1);
+        let expect_bytes = unsafe {
+            core::slice::from_raw_parts(
+                expect.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(expect.as_slice()),
+            )
+        };
+        let expect_tree = crate::merkle::merkle_tree(
+            expect_bytes,
+            n_leaves,
+            crate::merkle::HashKind::Blake3,
+        );
+
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = core::mem::size_of_val(expect.as_slice());
+            let tree_bytes = (2 * n_leaves - 1) * core::mem::size_of::<crate::merkle::Hash>();
+            let staging = gpu.new_buffer(data_bytes).unwrap();
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            let z_buf = gpu
+                .new_buffer(core::mem::size_of_val(z.as_slice()))
+                .unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            std::ptr::copy_nonoverlapping(
+                z.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(z_buf),
+                core::mem::size_of_val(z.as_slice()),
+            );
+            std::ptr::write_bytes(gpu.buffer_contents(staging), 0xA5, data_bytes);
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0x3C, tree_bytes);
+
+            let cb1 = gpu.command_buffer().unwrap();
+            let enc1 = gpu.compute_encoder(cb1).unwrap();
+            gpu.set_pipeline(enc1, gpu.pso_ntt4zg4);
+            gpu.set_buffer(enc1, staging, 0, 0);
+            gpu.set_buffer(enc1, tw_buf, 0, 1);
+            let p = imp::NttParams {
+                log_d: log_d as u32,
+                l: 0,
+                f: 4,
+                s: (log_d - 4) as u32,
+            };
+            let p_bytes = core::slice::from_raw_parts(
+                (&p as *const imp::NttParams).cast::<u8>(),
+                core::mem::size_of::<imp::NttParams>(),
+            );
+            gpu.set_bytes(enc1, p_bytes, 2);
+            gpu.set_buffer(enc1, z_buf, 0, 3);
+            gpu.dispatch(enc1, 1u64 << (log_d - 6), 64);
+            gpu.end_encoding(enc1);
+            gpu.commit_async(cb1);
+
+            let cb2 = imp::encode_commit_graph_after_from_z_cb(
+                gpu, staging, tw_buf, tree_buf, log_d, n_leaves,
+            )
+            .unwrap();
+            gpu.commit_async(cb2);
+
+            gpu.wait_cb(cb1).unwrap();
+            gpu.wait_cb(cb2).unwrap();
+            let got = core::slice::from_raw_parts(
+                gpu.buffer_contents(staging).cast::<F128>(),
+                expect.len(),
+            );
+            let got_tree = core::slice::from_raw_parts(
+                gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                expect_tree.len(),
+            );
+            assert_eq!(got, expect.as_slice(), "queued continuation codeword mismatch");
+            assert_eq!(got_tree, expect_tree.as_slice(), "queued continuation tree mismatch");
+
+            gpu.release(staging);
+            gpu.release(tree_buf);
+            gpu.release(tw_buf);
+            gpu.release(z_buf);
             gpu.pool_pop(pool);
         }
     }
