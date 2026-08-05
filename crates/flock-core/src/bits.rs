@@ -1,3 +1,4 @@
+//! Resample 11 prep: distinct comment for next lane-warm slot.
 //! Small bit-manipulation primitives shared across modules.
 
 /// Hacker's Delight (Sec. 7-3) 8×8 bit-matrix transpose stored in a `u64`.

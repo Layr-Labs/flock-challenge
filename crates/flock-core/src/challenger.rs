@@ -1,3 +1,4 @@
+//! Resample 12 prep: distinct comment for next lane-warm slot.
 //! Verifier-randomness abstraction.
 //!
 //! A [`Challenger`] is the source of verifier challenges in the protocol.
