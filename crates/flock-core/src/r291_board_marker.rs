@@ -22,3 +22,4 @@
 //!
 //! Lane mandate: never sit empty. This is occupancy + floor re-sample after
 //! def1bbf (−0.18% real / −0.55% printed).
+//! sleepdefic1t disclosed lineage redraw 1 on c6ca70d (2026-08-04); unlinked and codegen-neutral.
