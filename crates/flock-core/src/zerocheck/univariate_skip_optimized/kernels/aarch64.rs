@@ -2094,62 +2094,6 @@ unsafe fn apply_word_low5_into_4_regs(
     }
 }
 
-/// Apply a word whose top byte is known to be zero. The final live BLAKE3
-/// medium row has this A shape; the checked static-B path guards the byte
-/// before selecting this helper, saving the last four table loads and XORs.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn apply_word_low7_into_4_regs(
-    table_base: *const u8,
-    half_swapped_table_base: *const u8,
-    word: u64,
-) -> (
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let r0 = table_base.add(byte_from_word::<0>(word) * 64);
-        let mut d0 = vld1q_u8(r0);
-        let mut d1 = vld1q_u8(r0.add(16));
-        let mut d2 = vld1q_u8(r0.add(32));
-        let mut d3 = vld1q_u8(r0.add(48));
-        xor_apply_byte_pair_into_4_regs::<0, true, 1, false>(
-            table_base,
-            half_swapped_table_base,
-            byte_from_word::<1>(word),
-            byte_from_word::<2>(word),
-            &mut d0,
-            &mut d1,
-            &mut d2,
-            &mut d3,
-        );
-        xor_apply_byte_pair_into_4_regs::<1, true, 2, false>(
-            table_base,
-            half_swapped_table_base,
-            byte_from_word::<3>(word),
-            byte_from_word::<4>(word),
-            &mut d0,
-            &mut d1,
-            &mut d2,
-            &mut d3,
-        );
-        xor_apply_byte_pair_into_4_regs::<2, true, 3, false>(
-            table_base,
-            half_swapped_table_base,
-            byte_from_word::<5>(word),
-            byte_from_word::<6>(word),
-            &mut d0,
-            &mut d1,
-            &mut d2,
-            &mut d3,
-        );
-        (d0, d1, d2, d3)
-    }
-}
-
 /// Const-ones-B fast path: `out = red(sum_K x^K ntt_a[K])`. The transform
 /// of the packed all-ones row is exactly the GF(2^8) multiplicative identity
 /// in all 64 lanes, so the baseline's final vector multiply is redundant.
@@ -2291,14 +2235,14 @@ fn shift_reduce_inner_single_k0(
 /// (`BSTATIC_MASKS[30][0]` pins the full word). Its inverse transform is
 /// already materialized in `bstatic_partials()[240]`, so the row loads four
 /// registers instead of re-deriving the transform through eight table-row
-/// gathers. Caller has verified the exact B word and selects `A_TOP_ZERO`
-/// only after checking A's top byte. Output is identical to
+/// gathers. Caller has verified the exact B word; output is identical to
 /// [`shift_reduce_inner_single_k0`].
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn shift_reduce_inner_single_k0_static_b<const A_TOP_ZERO: bool>(
-    a_word: u64,
+fn shift_reduce_inner_single_k0_static_b(
+    a_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
     b_partial: &[u8; 64],
     out: &mut [u8; 64],
     nt_store: bool,
@@ -2309,11 +2253,10 @@ fn shift_reduce_inner_single_k0_static_b<const A_TOP_ZERO: bool>(
     let table_base = inv_table.data_ptr();
     let half_swapped_table_base = inv_table.half_swapped_data_ptr();
     unsafe {
-        let (a0, a1, a2, a3) = if A_TOP_ZERO {
-            apply_word_low7_into_4_regs(table_base, half_swapped_table_base, a_word)
-        } else {
-            apply_word_into_4_regs(table_base, half_swapped_table_base, a_word)
-        };
+        let a_word = u64::from_le(core::ptr::read_unaligned(
+            a_packed.as_ptr().add(byte_base_b).cast::<u64>(),
+        ));
+        let (a0, a1, a2, a3) = apply_word_into_4_regs(table_base, half_swapped_table_base, a_word);
         let p = b_partial.as_ptr();
         let y0 = gf8_mul_vec16(a0, vld1q_u8(p));
         let y1 = gf8_mul_vec16(a1, vld1q_u8(p.add(16)));
@@ -2904,26 +2847,14 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
                     StaticBContext::Prepared { partials, .. } => partials,
                     StaticBContext::LegacyPerCall => bstatic_partials(inv_table),
                 };
-                let a_word = u64::from_le(unsafe {
-                    core::ptr::read_unaligned(a_packed.as_ptr().add(byte_base_b).cast::<u64>())
-                });
-                if a_word & 0xff00_0000_0000_0000 == 0 {
-                    shift_reduce_inner_single_k0_static_b::<true>(
-                        a_word,
-                        inv_table,
-                        &partials[30 * 8],
-                        out,
-                        nt_store,
-                    );
-                } else {
-                    shift_reduce_inner_single_k0_static_b::<false>(
-                        a_word,
-                        inv_table,
-                        &partials[30 * 8],
-                        out,
-                        nt_store,
-                    );
-                }
+                shift_reduce_inner_single_k0_static_b(
+                    a_packed,
+                    inv_table,
+                    byte_base_b,
+                    &partials[30 * 8],
+                    out,
+                    nt_store,
+                );
                 return;
             }
             shift_reduce_inner_single_k0(a_packed, b_packed, inv_table, byte_base_b, out, nt_store);
