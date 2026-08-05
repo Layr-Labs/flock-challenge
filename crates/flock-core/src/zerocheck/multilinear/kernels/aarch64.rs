@@ -557,7 +557,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
 /// Returns the four folded rows plus whether the b≡1 shortcut was taken.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn r2_pair_fold_and_store(
+unsafe fn r2_pair_fold_and_store<const STORE: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -592,8 +592,10 @@ unsafe fn r2_pair_fold_and_store(
     unsafe {
         let zero = vdupq_n_u64(0);
         if padded {
-            store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            if STORE {
+                store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            }
             return (zero, zero, zero, zero, false);
         }
 
@@ -614,20 +616,25 @@ unsafe fn r2_pair_fold_and_store(
 
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
-            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            if STORE {
+                store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
+                let delta_pair =
+                    core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            }
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
-        store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-        let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
-            a0_code ^ a1_code,
-            b0_code ^ b1_code,
-        ]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        if STORE {
+            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
+            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
+                a0_code ^ a1_code,
+                b0_code ^ b1_code,
+            ]);
+            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        }
         (a0, a1, b0, b1, false)
     }
 }
@@ -675,6 +682,7 @@ unsafe fn r2_pair_fold_and_store(
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const FULL: bool,
     const ODD_ON_GPU: bool,
+    const STORE: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -725,12 +733,14 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 
         macro_rules! zero_group {
             ($u:expr) => {{
-                let x_lo0 = 2 * $u;
-                let x_lo1 = x_lo0 + 1;
-                store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
-                store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                if STORE {
+                    let x_lo0 = 2 * $u;
+                    let x_lo1 = x_lo0 + 1;
+                    store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
+                    vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
+                    store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
+                    vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                }
             }};
         }
 
@@ -741,10 +751,10 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let pad0 = $pad0;
                 let pad1 = $pad1;
 
-                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
+                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store::<STORE>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
                 );
-                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
+                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store::<STORE>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
                 );
 
@@ -1134,6 +1144,216 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
                     wide_xor(&mut w0, mul_unreduced_q(w, av[2]));
                     continue;
                 }
+            }
+
+            // Weight-sharing reshape: four reduced row scalings, then every
+            // product below is one unreduced multiply.
+            let a0w = mul_q(w, av[0]);
+            let a1w = mul_q(w, av[1]);
+            let a2w = mul_q(w, av[2]);
+            let a3w = mul_q(w, av[3]);
+
+            // ---- round-four products, split by round-4-pair parity ----
+            wide_xor(&mut p1_even, mul_unreduced_q(a1w, bv[1]));
+            wide_xor(
+                &mut pinf_even,
+                mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(bv[0], bv[1])),
+            );
+            wide_xor(&mut p1_odd, mul_unreduced_q(a3w, bv[3]));
+            wide_xor(
+                &mut pinf_odd,
+                mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(bv[2], bv[3])),
+            );
+
+            // ---- deferred round-five aggregates (no extra loads) ----
+            wide_xor(&mut w0, mul_unreduced_q(a2w, bv[2]));
+            let e_aw = veorq_u64(a0w, a2w);
+            let o_aw = veorq_u64(a1w, a3w);
+            let e_b = veorq_u64(bv[0], bv[2]);
+            let o_b = veorq_u64(bv[1], bv[3]);
+            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+            wide_xor(
+                &mut w5,
+                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+            );
+        }
+
+        *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));
+        *out.add(1) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_even));
+        *out.add(2) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_odd));
+        *out.add(3) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_odd));
+        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w0));
+        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w3));
+        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w4));
+        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w5));
+    }
+}
+
+/// Cascade K pass sourced directly from the round-two packed byte state
+/// ("K-packed"): value-identical to [`fold2_compact_and_round45_chunk_neon_8`]
+/// but the anchors and deltas are re-derived in registers from
+/// `a_packed`/`b_packed` through four tensor-scaled tables, so the compact
+/// intermediate is never materialized in memory.
+///
+/// Value identity per output lane (see the compact kernel's doc): with
+/// `anc0 = T(r00)`, `anc1 = T(r10)`, `T(δ)` linear in the code bits and
+/// `δ0 = r00 ⊕ r01`, `δ1 = r10 ⊕ r11`,
+///
+/// ```text
+/// out = anc0 + ρ₂(anc0+anc1) + T_λ1(δ0) + T_λ3(δ1)
+///     = T_μ00(r00) + T_μ01(r01) + T_μ10(r10) + T_μ11(r11)
+/// μ00 = (1+ρ₁)(1+ρ₂)   μ01 = ρ₁(1+ρ₂)   μ10 = (1+ρ₁)ρ₂   μ11 = ρ₁ρ₂
+/// ```
+///
+/// where `(r00, r01)` / `(r10, r11)` are the two row codes of the group's
+/// even / odd source pair. Padded source pairs contribute zero: their codes
+/// are replaced by 0 and every scaled table maps code 0 to 0 (linearity),
+/// matching the zeroed anchors/deltas of the compact route bit-for-bit.
+///
+/// The b≡1 product fast path survives as a value check on the four folded
+/// b outputs (today's kernel reaches it through the delta-zero pre-gate; the
+/// simplification itself is exact algebra on the values, so gating it
+/// differently cannot change any output).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold2_packed_and_round45_chunk_neon_8(
+    table_m00: *const u8,
+    table_m01: *const u8,
+    table_m10: *const u8,
+    table_m11: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    out_pairs: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    out: *mut F128,
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+        let mut p1_even = WideNeon { lo: zero, hi: zero };
+        let mut pinf_even = WideNeon { lo: zero, hi: zero };
+        let mut p1_odd = WideNeon { lo: zero, hi: zero };
+        let mut pinf_odd = WideNeon { lo: zero, hi: zero };
+        let mut w0 = WideNeon { lo: zero, hi: zero };
+        let mut w3 = WideNeon { lo: zero, hi: zero };
+        let mut w4 = WideNeon { lo: zero, hi: zero };
+        let mut w5 = WideNeon { lo: zero, hi: zero };
+
+        debug_assert!(out_pairs >= 2 && out_pairs.is_multiple_of(2));
+        let n5 = out_pairs / 2;
+        for t in 0..n5 {
+            let mut av = [zero; 4];
+            let mut bv = [zero; 4];
+            for lane in 0..4usize {
+                let g = 4 * t + lane;
+                // The group's two source pairs and their four packed rows.
+                let p0 = 2 * g;
+                let p1 = p0 + 1;
+                let pad0 =
+                    ((pair_idx_base + p0) & pair_in_block_mask) >= useful_pairs_inclusive;
+                let pad1 =
+                    ((pair_idx_base + p1) & pair_in_block_mask) >= useful_pairs_inclusive;
+
+                let (ra00, ra01, rb00, rb01) = if pad0 {
+                    (0u64, 0u64, 0u64, 0u64)
+                } else {
+                    (
+                        u64::from_le(core::ptr::read_unaligned(
+                            a_packed.add(2 * p0 * 8).cast::<u64>(),
+                        )),
+                        u64::from_le(core::ptr::read_unaligned(
+                            a_packed.add((2 * p0 + 1) * 8).cast::<u64>(),
+                        )),
+                        u64::from_le(core::ptr::read_unaligned(
+                            b_packed.add(2 * p0 * 8).cast::<u64>(),
+                        )),
+                        u64::from_le(core::ptr::read_unaligned(
+                            b_packed.add((2 * p0 + 1) * 8).cast::<u64>(),
+                        )),
+                    )
+                };
+                let (ra10, ra11, rb10, rb11) = if pad1 {
+                    (0u64, 0u64, 0u64, 0u64)
+                } else {
+                    (
+                        u64::from_le(core::ptr::read_unaligned(
+                            a_packed.add(2 * p1 * 8).cast::<u64>(),
+                        )),
+                        u64::from_le(core::ptr::read_unaligned(
+                            a_packed.add((2 * p1 + 1) * 8).cast::<u64>(),
+                        )),
+                        u64::from_le(core::ptr::read_unaligned(
+                            b_packed.add(2 * p1 * 8).cast::<u64>(),
+                        )),
+                        u64::from_le(core::ptr::read_unaligned(
+                            b_packed.add((2 * p1 + 1) * 8).cast::<u64>(),
+                        )),
+                    )
+                };
+
+                av[lane] = veorq_u64(
+                    veorq_u64(
+                        lookup_lanes_q::<8>(table_m00, ra00, 0),
+                        lookup_lanes_q::<8>(table_m01, ra01, 0),
+                    ),
+                    veorq_u64(
+                        lookup_lanes_q::<8>(table_m10, ra10, 0),
+                        lookup_lanes_q::<8>(table_m11, ra11, 0),
+                    ),
+                );
+                bv[lane] = veorq_u64(
+                    veorq_u64(
+                        lookup_lanes_q::<8>(table_m00, rb00, 0),
+                        lookup_lanes_q::<8>(table_m01, rb01, 0),
+                    ),
+                    veorq_u64(
+                        lookup_lanes_q::<8>(table_m10, rb10, 0),
+                        lookup_lanes_q::<8>(table_m11, rb11, 0),
+                    ),
+                );
+            }
+
+            store_pair_nt(a_out.add(4 * t), av[0], av[1]);
+            store_pair_nt(a_out.add(4 * t + 2), av[2], av[3]);
+            store_pair_nt(b_out.add(4 * t), bv[0], bv[1]);
+            store_pair_nt(b_out.add(4 * t + 2), bv[2], bv[3]);
+
+            // The odd round-4 pair's weight drives the whole group; see the
+            // compact kernel's doc.
+            let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
+
+            // b≡1 fast path, gated directly on the folded values.
+            let ones_miss = vorrq_u64(
+                vorrq_u64(veorq_u64(bv[0], one_q), veorq_u64(bv[1], one_q)),
+                vorrq_u64(veorq_u64(bv[2], one_q), veorq_u64(bv[3], one_q)),
+            );
+            if is_zero_q(ones_miss) {
+                wide_xor(&mut p1_even, mul_unreduced_q(w, av[1]));
+                wide_xor(&mut p1_odd, mul_unreduced_q(w, av[3]));
+                wide_xor(&mut w0, mul_unreduced_q(w, av[2]));
+                continue;
             }
 
             // Weight-sharing reshape: four reduced row scalings, then every
@@ -2166,7 +2386,7 @@ mod tests {
             let mut deltas = vec![0xa5u8; 2 * LO_SIZE * N_CHUNKS];
             let mut out = [poison; 8];
             unsafe {
-                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                fold_round2_compact_chunk_neon_lookahead_8::<true, false, true>(
                     table.as_ptr().cast::<u8>(),
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),

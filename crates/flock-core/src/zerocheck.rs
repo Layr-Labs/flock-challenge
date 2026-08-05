@@ -28,11 +28,13 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold2_compact_and_round4_into,
-    fold2_compact_and_round45_into, fold2_plain_and_round6_into, fold2_plain_and_round67_into,
-    fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair, fold_in_place_pair,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    fold2_compact_and_round45_into, fold2_packed_and_round45_into, fold2_plain_and_round6_into,
+    fold2_plain_and_round67_into, fold_and_compute_round_pair_into,
+    fold_compact_and_compute_round_pair, fold_in_place_pair, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_lookahead,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
+    uni_skip_fold_and_round_pair_lookahead_elided,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -100,6 +102,33 @@ fn cascade3_off() -> bool {
     }
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE3").is_some_and(|v| v == *"1"))
+}
+
+/// Test-only forced-off latch for the K-packed cascade source, mirroring
+/// [`ZC_CASCADE2_FORCED_OFF`]: the transcript-identity test flips this
+/// instead of mutating the process environment.
+#[cfg(test)]
+pub(crate) static ZC_K_PACKED_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Kill switch for the K-packed cascade source: `FLOCK_NO_ZC_K_PACKED=1`
+/// (exact '1') restores the compact anchors/deltas intermediate — round two
+/// stores it, the K pass reads it — within the same binary. Bit-identical
+/// either way: the K-packed route re-derives the identical F128 values
+/// through tensor-scaled tables (table linearity; see
+/// `fold2_packed_and_round45_into`), which is what the transcript-identity
+/// test asserts. AArch64-only: the portable kernels keep the compact route.
+#[inline]
+fn k_packed_off() -> bool {
+    if !cfg!(target_arch = "aarch64") {
+        return true;
+    }
+    #[cfg(test)]
+    if ZC_K_PACKED_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_PACKED").is_some_and(|v| v == *"1"))
 }
 
 /// Number of variables folded in round 1 via the additive-NTT univariate skip.
@@ -741,7 +770,30 @@ fn prove_packed_padded_inner<C: Challenger>(
     let use_lookahead =
         (m == 32 || cfg!(test)) && n_mlv >= 6 && r[k_skip + 1] != F128::ZERO && !lookahead_off();
 
-    let (compact_mlv, msg_1, msg_inf, lookahead) = if use_lookahead {
+    // Hoisted cascade gates (every input is a round-1 challenge slot or a
+    // shape constant, all known before the round-two sweep runs): with the
+    // K-packed source active, round two skips materializing the compact
+    // anchors/deltas intermediate entirely, because the cascade K pass will
+    // re-derive both from the packed byte state. `use_k_packed ⊆ use_cascade`
+    // keeps every non-cascade consumer of the compact state on the storing
+    // route.
+    let use_cascade =
+        use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
+    let use_k_packed = use_cascade && !k_packed_off();
+
+    let (mut compact_mlv, msg_1, msg_inf, lookahead) = if use_k_packed {
+        let (m1, mi, la) = uni_skip_fold_and_round_pair_lookahead_elided(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+            compact_deltas,
+        );
+        (None, m1, mi, Some(la))
+    } else if use_lookahead {
         let (compact, m1, mi, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
             a_packed,
             b_packed,
@@ -752,7 +804,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             padding,
             compact_deltas,
         );
-        (compact, m1, mi, Some(la))
+        (Some(compact), m1, mi, Some(la))
     } else {
         let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             a_packed,
@@ -764,7 +816,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             padding,
             compact_deltas,
         );
-        (compact, m1, mi, None)
+        (Some(compact), m1, mi, None)
     };
 
     if zc_timing {
@@ -814,9 +866,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // for a sampled slot it is probability 2⁻¹²⁸); that case falls back to
     // the incumbent route, which stays in the tree as the oracle anyway.
     // n_mlv ≥ 7 keeps every eq split at lo_size ≥ 2 and the composed input
-    // ≥ 32. Kill switch: FLOCK_NO_ZC_CASCADE2=1 (exact '1').
-    let use_cascade =
-        use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
+    // ≥ 32. Kill switch: FLOCK_NO_ZC_CASCADE2=1 (exact '1'). (`use_cascade`
+    // itself is hoisted above the round-two sweep so the K-packed source can
+    // elide the compact stores.)
 
     // Cascade one level deeper still (rounds 7+8, see
     // `fold2_plain_and_round67_into`): the composed 5+6 pass materializes each
@@ -850,9 +902,12 @@ fn prove_packed_padded_inner<C: Challenger>(
         mlv_rhos.push(challenger.sample_f128());
 
         // Rounds three and four now fold together in one pass over the compact
-        // state, replacing the T3 reconstruction *and* tail iteration i = 1.
+        // state (or straight from the packed byte state on the K-packed
+        // route), replacing the T3 reconstruction *and* tail iteration i = 1.
         let t_k = std::time::Instant::now();
-        let n_groups = compact_mlv.len() / 2;
+        // = compact len / 2; computed from the shape so the K-packed route
+        // (which materializes no compact state) sizes identically.
+        let n_groups = 1usize << (m - k_skip - 2);
         let mut r_next4 = vec![F128::ONE; n_mlv - 2];
         r_next4[1..].copy_from_slice(&r[k_skip + 3..]);
         // Unpinned: these become the loop-round arm's no-copy wrap targets
@@ -861,22 +916,42 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut a_out = crate::scratch::take_f128_unpinned(n_groups);
         let mut b_out = crate::scratch::take_f128_unpinned(n_groups);
         if use_cascade {
-            let (m4_1, m4_inf, la5) = fold2_compact_and_round45_into(
-                &compact_mlv,
-                &fold_table,
-                mlv_rhos[0],
-                mlv_rhos[1],
-                &r_next4,
-                &mut a_out,
-                &mut b_out,
-            );
+            let (m4_1, m4_inf, la5) = if use_k_packed {
+                fold2_packed_and_round45_into(
+                    a_packed,
+                    b_packed,
+                    &fold_table,
+                    mlv_rhos[0],
+                    mlv_rhos[1],
+                    &r_next4,
+                    padding,
+                    k_skip,
+                    &mut a_out,
+                    &mut b_out,
+                )
+            } else {
+                fold2_compact_and_round45_into(
+                    compact_mlv
+                        .as_ref()
+                        .expect("compact state present on the storing route"),
+                    &fold_table,
+                    mlv_rhos[0],
+                    mlv_rhos[1],
+                    &r_next4,
+                    &mut a_out,
+                    &mut b_out,
+                )
+            };
             if tail_round_timing {
                 eprintln!(
-                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}): {:.2} ms",
+                    "[zc-tail-rounds] K double fold + round4 (cascade{} +W', out n={n_groups}): {:.2} ms",
+                    if use_k_packed { "/packed" } else { "" },
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
             }
-            compact_mlv.recycle();
+            if let Some(compact) = compact_mlv.take() {
+                compact.recycle();
+            }
             multilinear_msgs.push((m4_1, m4_inf));
             challenger.observe_f128(m4_1);
             challenger.observe_f128(m4_inf);
@@ -992,7 +1067,9 @@ fn prove_packed_padded_inner<C: Challenger>(
             }
         } else {
             let (m4_1, m4_inf) = fold2_compact_and_round4_into(
-                &compact_mlv,
+                compact_mlv
+                    .as_ref()
+                    .expect("compact state present on the non-cascade route"),
                 &fold_table,
                 mlv_rhos[0],
                 mlv_rhos[1],
@@ -1006,7 +1083,9 @@ fn prove_packed_padded_inner<C: Challenger>(
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
             }
-            compact_mlv.recycle();
+            if let Some(compact) = compact_mlv.take() {
+                compact.recycle();
+            }
             multilinear_msgs.push((m4_1, m4_inf));
             challenger.observe_f128(m4_1);
             challenger.observe_f128(m4_inf);
@@ -1018,7 +1097,9 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut first_r_next = vec![F128::ONE; n_mlv - 1];
         first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
         let (a_mlv, b_mlv, first_m1, first_mi) = fold_compact_and_compute_round_pair(
-            &compact_mlv,
+            compact_mlv
+                .as_ref()
+                .expect("compact state present on the T3 route"),
             &fold_table,
             mlv_rhos[0],
             &first_r_next,
@@ -1030,7 +1111,9 @@ fn prove_packed_padded_inner<C: Challenger>(
                 t_t3.elapsed().as_secs_f64() * 1e3
             );
         }
-        compact_mlv.recycle();
+        if let Some(compact) = compact_mlv.take() {
+            compact.recycle();
+        }
         multilinear_msgs.push((first_m1, first_mi));
         challenger.observe_f128(first_m1);
         challenger.observe_f128(first_mi);

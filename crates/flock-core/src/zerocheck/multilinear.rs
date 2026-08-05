@@ -52,7 +52,7 @@ use kernels::aarch64::fold_one_row_neon_unchecked_8;
 use kernels::aarch64::{
     fold2_and_message_aarch64, fold2_and_message_lookahead_aarch64,
     fold2_compact_and_round4_chunk_neon_8, fold2_compact_and_round45_chunk_neon_8,
-    fold_and_message_aarch64,
+    fold2_packed_and_round45_chunk_neon_8, fold_and_message_aarch64,
     fold_compact_chunk_neon_unchecked_8, fold_compact_stream_chunk_neon,
     fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_lookahead_8,
     fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
@@ -1373,6 +1373,69 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     padding: &PaddingSpec,
     deltas_backing: Option<ScratchBytes>,
 ) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
+    let (compact, m1, mi, la) = uni_skip_fold_and_round_pair_lookahead_impl(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        padding,
+        deltas_backing,
+        false,
+    );
+    (
+        compact.expect("compact state requested but not produced"),
+        m1,
+        mi,
+        la,
+    )
+}
+
+/// Store-eliding twin of
+/// [`uni_skip_fold_and_round_pair_compact_padded_lookahead`]: identical
+/// round-two message and lookahead, but the compact anchors/deltas
+/// intermediate (~48 B per pair) is never materialized — the K-packed cascade
+/// ([`fold2_packed_and_round45_into`]) re-derives both from the packed byte
+/// state through tensor-scaled tables. Kill switch: `FLOCK_NO_ZC_K_PACKED=1`
+/// (checked by the caller).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn uni_skip_fold_and_round_pair_lookahead_elided(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    deltas_backing: Option<ScratchBytes>,
+) -> (F128, F128, Round3Lookahead) {
+    let (_, m1, mi, la) = uni_skip_fold_and_round_pair_lookahead_impl(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        padding,
+        deltas_backing,
+        true,
+    );
+    (m1, mi, la)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn uni_skip_fold_and_round_pair_lookahead_impl(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    deltas_backing: Option<ScratchBytes>,
+    elide_compact: bool,
+) -> (Option<UniSkipCompactFold>, F128, F128, Round3Lookahead) {
     assert_eq!(k_skip, 6, "lookahead compact round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
     let n_chunks = table.n_chunks;
@@ -1385,15 +1448,24 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
 
     let deltas_len = 2 * n_pairs * n_chunks;
-    let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take(deltas_len));
-    assert_eq!(
-        deltas.len(),
-        deltas_len,
-        "donated compact delta backing has the wrong byte length"
-    );
-    let mut compact = UniSkipCompactFold {
-        anchors: crate::scratch::take_f128(2 * n_pairs),
-        deltas,
+    let mut compact = if elide_compact {
+        // The donated backing is dead weight on this route; hand it straight
+        // back to the pool so the next taker reuses the allocation.
+        if let Some(backing) = deltas_backing {
+            backing.recycle();
+        }
+        None
+    } else {
+        let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take(deltas_len));
+        assert_eq!(
+            deltas.len(),
+            deltas_len,
+            "donated compact delta backing has the wrong byte length"
+        );
+        Some(UniSkipCompactFold {
+            anchors: crate::scratch::take_f128(2 * n_pairs),
+            deltas,
+        })
     };
 
     let n_vars = mlv_challenges.len() - 1;
@@ -1449,18 +1521,28 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     // [p1_odd, pinf_odd, W0, W3, W4, W5], eq_hi-weighted, one slot per chunk.
     let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
-    let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
-    let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
+    let (anchors_root, deltas_root) = match compact.as_mut() {
+        Some(c) => (c.anchors.as_mut_ptr(), c.deltas.as_mut_ptr()),
+        None => (core::ptr::null_mut(), core::ptr::null_mut()),
+    };
+    let anchors_base = crate::epool::SyncPtr(anchors_root);
+    let deltas_base = crate::epool::SyncPtr(deltas_root);
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and both partial slots.
-        let (anchors, deltas) = unsafe {
-            (
-                anchors_base.ptr().add(x_hi * anchor_chunk_size),
-                deltas_base.ptr().add(x_hi * delta_chunk_size),
-            )
+        // On the eliding route the pointers stay null and the STORE=false
+        // kernels never form an address from them.
+        let (anchors, deltas) = if elide_compact {
+            (core::ptr::null_mut::<F128>(), core::ptr::null_mut::<u8>())
+        } else {
+            unsafe {
+                (
+                    anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                    deltas_base.ptr().add(x_hi * delta_chunk_size),
+                )
+            }
         };
         let pair_idx_base = x_hi * lo_size;
         let row_base = pair_idx_base * 2;
@@ -1476,63 +1558,71 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                 let t = table.data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
+                macro_rules! r2_la_kernel {
+                    ($full:literal, $odd:literal) => {
+                        if elide_compact {
+                            fold_round2_compact_chunk_neon_lookahead_8::<$full, $odd, false>(
+                                t,
+                                ap,
+                                bp,
+                                anchors,
+                                deltas,
+                                eq_lo.as_ptr(),
+                                lo_size,
+                                pair_idx_base,
+                                pair_in_block_mask,
+                                useful_pairs_inclusive,
+                                degen,
+                                periodic_padding,
+                                out.as_mut_ptr(),
+                            )
+                        } else {
+                            fold_round2_compact_chunk_neon_lookahead_8::<$full, $odd, true>(
+                                t,
+                                ap,
+                                bp,
+                                anchors,
+                                deltas,
+                                eq_lo.as_ptr(),
+                                lo_size,
+                                pair_idx_base,
+                                pair_in_block_mask,
+                                useful_pairs_inclusive,
+                                degen,
+                                periodic_padding,
+                                out.as_mut_ptr(),
+                            )
+                        }
+                    };
+                }
                 if full {
-                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        out.as_mut_ptr(),
-                    );
+                    r2_la_kernel!(true, false);
                 } else if odd_on_gpu {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        out.as_mut_ptr(),
-                    );
+                    r2_la_kernel!(false, true);
                 } else {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        out.as_mut_ptr(),
-                    );
+                    r2_la_kernel!(false, false);
                 }
             }
         }
 
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let anchors =
-                unsafe { std::slice::from_raw_parts_mut(anchors, anchor_chunk_size) };
-            let deltas = unsafe { std::slice::from_raw_parts_mut(deltas, delta_chunk_size) };
+            // Portable route: the eliding caller is aarch64-gated, but stay
+            // correct anyway with per-chunk throwaway stores.
+            let mut throw_anchors;
+            let mut throw_deltas;
+            let (anchors, deltas) = if elide_compact {
+                throw_anchors = vec![F128::ZERO; anchor_chunk_size];
+                throw_deltas = vec![0u8; delta_chunk_size];
+                (&mut throw_anchors[..], &mut throw_deltas[..])
+            } else {
+                unsafe {
+                    (
+                        std::slice::from_raw_parts_mut(anchors, anchor_chunk_size),
+                        std::slice::from_raw_parts_mut(deltas, delta_chunk_size),
+                    )
+                }
+            };
             out = round2_lookahead_chunk_scalar(
                 a_packed,
                 b_packed,
@@ -1608,7 +1698,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
                     unsafe {
-                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false, true>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
@@ -2065,6 +2155,272 @@ pub(crate) fn fold2_compact_and_round45_into(
     };
 
     (r_next4[0] * sum1, sum_inf, la5)
+}
+
+/// Cascade K pass sourced directly from the round-two packed byte state
+/// ("K-packed"): value-identical to [`fold2_compact_and_round45_into`], but
+/// the anchors/deltas intermediate is never read — or, on the eliding round
+/// two route, never written. Each output lane re-derives its four source
+/// rows through four tensor-scaled tables (`μ = ((1+ρ₁)(1+ρ₂), ρ₁(1+ρ₂),
+/// (1+ρ₁)ρ₂, ρ₁ρ₂)`); table linearity makes this the exact expression the
+/// compact kernel evaluates (see the NEON kernel's doc). DRAM accounting per
+/// group vs the compact route: −96 B intermediate stores (round two) and
+/// −96 B intermediate loads (this pass) against +64 B packed re-reads and
+/// +32 L1 table gathers.
+///
+/// Requires the same `r_next4[1] ≠ 0` guard as the compact cascade (the
+/// caller's `use_cascade` gate already enforces it).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold2_packed_and_round45_into(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    rho1: F128,
+    rho2: F128,
+    r_next4: &[F128],
+    padding: &PaddingSpec,
+    k_skip: usize,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+) -> (F128, F128, Round3Lookahead) {
+    assert_eq!(k_skip, 6, "K-packed cascade is k_skip=6 only");
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = a_packed.len() / n_chunks;
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    let n_pairs = n_out / 2;
+    let n_groups = n_pairs / 2;
+    assert!(n_groups >= 4 && n_groups.is_power_of_two());
+    assert_eq!(a_out.len(), n_groups);
+    assert_eq!(b_out.len(), n_groups);
+    assert_eq!(r_next4.len(), n_groups.trailing_zeros() as usize);
+    let r_par = r_next4[1];
+    assert_ne!(r_par, F128::ZERO, "cascade requires a non-zero r_next4[1]");
+
+    // Tensor λ composition over (ρ₁, ρ₂): anchors and deltas collapse into
+    // one scaled-table fold per source row.
+    let one_p_rho2 = F128::ONE + rho2;
+    let table_m00 = table.scaled_linear((F128::ONE + rho1) * one_p_rho2);
+    let table_m01 = table.scaled_linear(rho1 * one_p_rho2);
+    let table_m10 = table.scaled_linear((F128::ONE + rho1) * rho2);
+    let table_m11 = table.scaled_linear(rho1 * rho2);
+
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+
+    let n_vars = r_next4.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&r_next4[1..], cascade_k_pass_n_hi(n_vars));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size * 2, n_groups);
+    assert!(lo_size >= 2, "cascade sweep pairs two round-4 pairs per group");
+    let kappa = (F128::ONE + r_par) * r_par.inv();
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let out_chunk = 2 * lo_size;
+
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    // [p1_odd, pinf_odd, W0', W3', W4', W5'], eq_hi-weighted, one per chunk.
+    let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
+    let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+    let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: exclusive per-chunk ownership; the queue join publishes the
+        // writes before the reduction below reads them.
+        let (a_ptr, b_ptr) = unsafe {
+            (
+                a_base.ptr().add(x_hi * out_chunk),
+                b_base.ptr().add(x_hi * out_chunk),
+            )
+        };
+        // Each output chunk covers `out_chunk` groups = 2·out_chunk source
+        // pairs = 4·out_chunk packed rows.
+        let pair_base = 2 * x_hi * out_chunk;
+        let mut outv = [F128::ZERO; 8];
+
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            fold2_packed_and_round45_chunk_neon_8(
+                table_m00.as_ptr().cast::<u8>(),
+                table_m01.as_ptr().cast::<u8>(),
+                table_m10.as_ptr().cast::<u8>(),
+                table_m11.as_ptr().cast::<u8>(),
+                a_packed.as_ptr().add(2 * pair_base * n_chunks),
+                b_packed.as_ptr().add(2 * pair_base * n_chunks),
+                a_ptr,
+                b_ptr,
+                eq_lo.as_ptr(),
+                lo_size,
+                pair_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                outv.as_mut_ptr(),
+            );
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let a_out = unsafe { std::slice::from_raw_parts_mut(a_ptr, out_chunk) };
+            let b_out = unsafe { std::slice::from_raw_parts_mut(b_ptr, out_chunk) };
+            outv = fold2_packed_round45_chunk_scalar(
+                a_packed,
+                b_packed,
+                n_chunks,
+                &table_m00,
+                &table_m01,
+                &table_m10,
+                &table_m11,
+                a_out,
+                b_out,
+                eq_lo,
+                lo_size,
+                pair_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+            );
+        }
+
+        let eq_h = eq_hi[x_hi];
+        // `outv[0..2]` carry the even round-4 pairs on the odd lane's weight;
+        // κ restores `eq₄(2y')` exactly (field arithmetic, no rounding).
+        let p1 = kappa * outv[0] + outv[2];
+        let pinf = kappa * outv[1] + outv[3];
+        // SAFETY: exclusive owner of both partial slots (see above).
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            *la_base.ptr().add(x_hi) = [
+                eq_h * outv[2],
+                eq_h * outv[3],
+                eq_h * outv[4],
+                eq_h * outv[5],
+                eq_h * outv[6],
+                eq_h * outv[7],
+            ];
+        }
+    });
+
+    let (sum1, sum_inf) = partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+            (s1 + c1, sinf + cinf)
+        });
+    let mut agg = [F128::ZERO; 6];
+    for slot in &la_partials {
+        for (a, v) in agg.iter_mut().zip(slot.iter()) {
+            *a += *v;
+        }
+    }
+    // Every aggregate was accumulated on the odd lane's weight `r'·eq₅`, so a
+    // single `r'⁻¹` puts all six back on `eq₅`.
+    let r_inv = r_par.inv();
+    let w1 = r_inv * agg[0];
+    let w2 = r_inv * agg[1];
+    let w0 = r_inv * agg[2];
+    let w3 = r_inv * agg[3];
+    let w4 = r_inv * agg[4];
+    let w5 = r_inv * agg[5];
+    let la5 = Round3Lookahead {
+        c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
+    };
+
+    (r_next4[0] * sum1, sum_inf, la5)
+}
+
+/// Portable reference for one K-packed chunk. Same slot order as the NEON
+/// kernel: `[p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5']`.
+/// Also the oracle body for the aarch64 unit test.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+fn fold2_packed_round45_chunk_scalar(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    n_chunks: usize,
+    table_m00: &[F128],
+    table_m01: &[F128],
+    table_m10: &[F128],
+    table_m11: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    eq_lo: &[F128],
+    lo_size: usize,
+    pair_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> [F128; 8] {
+    let nc = n_chunks;
+    let out_chunk = a_out.len();
+    let mut p1_even = F256Unreduced::ZERO;
+    let mut pinf_even = F256Unreduced::ZERO;
+    let mut p1_odd = F256Unreduced::ZERO;
+    let mut pinf_odd = F256Unreduced::ZERO;
+    let mut w = [F256Unreduced::ZERO; 4];
+
+    let fold_row = |tbl: &[F128], packed: &[u8], row: usize| -> F128 {
+        let bytes = &packed[row * nc..(row + 1) * nc];
+        let mut acc = F128::ZERO;
+        for (j, &b) in bytes.iter().enumerate() {
+            acc += tbl[j * 256 + b as usize];
+        }
+        acc
+    };
+
+    // Materialize the chunk's composed outputs first (exactly the compact
+    // kernel's expressions, re-derived through the tensor tables)…
+    for g_local in 0..out_chunk {
+        let p0 = pair_base + 2 * g_local;
+        let p1 = p0 + 1;
+        let pad0 = (p0 & pair_in_block_mask) >= useful_pairs_inclusive;
+        let pad1 = (p1 & pair_in_block_mask) >= useful_pairs_inclusive;
+        let mut a = F128::ZERO;
+        let mut b = F128::ZERO;
+        if !pad0 {
+            let (r0, r1) = (2 * p0, 2 * p0 + 1);
+            a += fold_row(table_m00, a_packed, r0) + fold_row(table_m01, a_packed, r1);
+            b += fold_row(table_m00, b_packed, r0) + fold_row(table_m01, b_packed, r1);
+        }
+        if !pad1 {
+            let (r0, r1) = (2 * p1, 2 * p1 + 1);
+            a += fold_row(table_m10, a_packed, r0) + fold_row(table_m11, a_packed, r1);
+            b += fold_row(table_m10, b_packed, r0) + fold_row(table_m11, b_packed, r1);
+        }
+        a_out[g_local] = a;
+        b_out[g_local] = b;
+    }
+    // …then sweep round-five groups with the shared odd-lane weight.
+    for t in 0..lo_size / 2 {
+        let o = 4 * t;
+        let (a0, a1, a2, a3) = (a_out[o], a_out[o + 1], a_out[o + 2], a_out[o + 3]);
+        let (b0, b1, b2, b3) = (b_out[o], b_out[o + 1], b_out[o + 2], b_out[o + 3]);
+        let eq = eq_lo[2 * t + 1];
+        let a0w = eq * a0;
+        let a1w = eq * a1;
+        let a2w = eq * a2;
+        let a3w = eq * a3;
+        p1_even ^= a1w.mul_unreduced(b1);
+        pinf_even ^= (a0w + a1w).mul_unreduced(b0 + b1);
+        p1_odd ^= a3w.mul_unreduced(b3);
+        pinf_odd ^= (a2w + a3w).mul_unreduced(b2 + b3);
+        w[0] ^= a2w.mul_unreduced(b2);
+        let e_aw = a0w + a2w;
+        let o_aw = a1w + a3w;
+        let e_b = b0 + b2;
+        let o_b = b1 + b3;
+        w[1] ^= e_aw.mul_unreduced(e_b);
+        w[2] ^= o_aw.mul_unreduced(o_b);
+        w[3] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+    }
+    [
+        p1_even.reduce(),
+        pinf_even.reduce(),
+        p1_odd.reduce(),
+        pinf_odd.reduce(),
+        w[0].reduce(),
+        w[1].reduce(),
+        w[2].reduce(),
+        w[3].reduce(),
+    ]
 }
 
 /// Portable reference for one cascade K chunk (non-AArch64 builds). Same
@@ -4610,6 +4966,93 @@ mod tests {
             rng.f128(),
             &r_next6,
         );
+    }
+
+    /// K-packed oracle: the store-eliding round-two sweep and the
+    /// packed-source cascade K pass reproduce the compact route bit-for-bit —
+    /// round-two message, round-three lookahead, K outputs, round-four
+    /// message, and round-five lookahead — across padding shapes, the degen /
+    /// periodic kernel settings, and a ρ grid that includes both zeros
+    /// (degenerate λ tables) and the all-ones pattern.
+    #[test]
+    fn k_packed_cascade_matches_compact_route() {
+        for (m, ranked) in [(16usize, true), (13, false), (20, true)] {
+            let f = la_fixture(m, 0x4B9A_C4ED ^ (m as u64), ranked);
+            let mut rng = Rng::new(0x4B9A_0002 ^ (m as u64));
+            let n_pairs = (1usize << (m - 6)) / 2;
+            let n_groups = n_pairs / 2;
+            let mut r_next4 = vec![F128::ONE; m - 8];
+            for slot in r_next4[1..].iter_mut() {
+                *slot = rng.f128();
+            }
+            assert_ne!(r_next4[1], F128::ZERO);
+            with_round2_settings(|| {
+                crate::scratch::clear();
+                // Storing route (oracle).
+                let (compact, m1_c, mi_c, la_c) =
+                    uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                        &f.a_packed,
+                        &f.b_packed,
+                        f.m,
+                        6,
+                        &f.table,
+                        &f.mlv,
+                        &f.padding,
+                        None,
+                    );
+                // Eliding route: identical message and lookahead.
+                let (m1_e, mi_e, la_e) = uni_skip_fold_and_round_pair_lookahead_elided(
+                    &f.a_packed,
+                    &f.b_packed,
+                    f.m,
+                    6,
+                    &f.table,
+                    &f.mlv,
+                    &f.padding,
+                    None,
+                );
+                assert_eq!((m1_e, mi_e), (m1_c, mi_c), "round-two message, m={m}");
+                assert_eq!(la_e.c, la_c.c, "round-three lookahead, m={m}");
+
+                // K pass equivalence over the ρ grid (zeros included: they
+                // degenerate two of the four tensor tables to all-zero).
+                for &rho1 in &f.rho_grid {
+                    for &rho2 in &f.rho_grid[1..] {
+                        let mut a_c = vec![F128::ZERO; n_groups];
+                        let mut b_c = vec![F128::ZERO; n_groups];
+                        let (m4_c, mi4_c, la5_c) = fold2_compact_and_round45_into(
+                            &compact, &f.table, rho1, rho2, &r_next4, &mut a_c, &mut b_c,
+                        );
+                        let mut a_p = vec![LA_POISON; n_groups];
+                        let mut b_p = vec![LA_POISON; n_groups];
+                        let (m4_p, mi4_p, la5_p) = fold2_packed_and_round45_into(
+                            &f.a_packed,
+                            &f.b_packed,
+                            &f.table,
+                            rho1,
+                            rho2,
+                            &r_next4,
+                            &f.padding,
+                            6,
+                            &mut a_p,
+                            &mut b_p,
+                        );
+                        assert_eq!(a_p, a_c, "K outputs A, m={m} rho1={rho1:?} rho2={rho2:?}");
+                        assert_eq!(b_p, b_c, "K outputs B, m={m} rho1={rho1:?} rho2={rho2:?}");
+                        assert_eq!(
+                            (m4_p, mi4_p),
+                            (m4_c, mi4_c),
+                            "round-four message, m={m} rho1={rho1:?} rho2={rho2:?}"
+                        );
+                        assert_eq!(
+                            la5_p.c, la5_c.c,
+                            "round-five lookahead, m={m} rho1={rho1:?} rho2={rho2:?}"
+                        );
+                    }
+                }
+                compact.recycle();
+            });
+        }
     }
 
     /// Parallel `uni_skip_fold_and_round_pair_optimized_packed` produces
