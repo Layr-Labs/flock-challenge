@@ -19,7 +19,6 @@
 
 pub mod bits;
 pub mod challenger;
-pub mod cpu_keepalive;
 // Public but hidden: flock-prover's witness driver drains its groups through
 // the hetero queue (W-H1). Not a stable API surface.
 #[doc(hidden)]
@@ -99,6 +98,14 @@ pub fn init_perf_thread_pool() -> Option<usize> {
         Err(_) => None, // pool already built
     }
 }
+
+/// Start the benchmark worker's pool keepalive nudger; see
+/// [`epool::keepalive_start`]. Intended to be called once, right before the
+/// worker signals readiness for the timed seed. Disabled by
+/// `FLOCK_NO_EPOOL_KEEPALIVE=1`.
+
+/// Flip the keepalive nudger to proving mode (helper pool only); see
+/// [`epool::keepalive_proving`]. Call as soon as the timed seed arrives.
 
 /// Apply the prover's QoS class to the calling thread.
 ///
