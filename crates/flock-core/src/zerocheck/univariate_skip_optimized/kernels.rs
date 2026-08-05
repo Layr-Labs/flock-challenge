@@ -46,36 +46,6 @@ pub(super) fn prepare_static_b_context(
 }
 
 #[inline]
-pub(super) fn static_b_context_is_prepared(context: Option<StaticBContext>) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        matches!(context, Some(StaticBContext::Prepared { .. }))
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = context;
-        false
-    }
-}
-
-#[inline]
-pub(super) fn fast_shift_reduce_enabled() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        aarch64::fast_shift_reduce_enabled()
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        false
-    }
-}
-
-pub(super) const AB_FAST_POLICY_PROCESS: u8 = 0;
-pub(super) const AB_FAST_POLICY_FORCE_FAST: u8 = 1;
-
-#[inline]
 pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON.
@@ -107,7 +77,7 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
+pub(super) fn shift_reduce_inner_ab(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -128,7 +98,7 @@ pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
     #[cfg(target_arch = "aarch64")]
     {
         let _ = (a_col, b_col);
-        aarch64::shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<FAST_POLICY>(
+        aarch64::shift_reduce_inner_ab_fused_neon_checked(
             a_packed,
             b_packed,
             inv_table,
@@ -222,6 +192,39 @@ pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
             b_col,
         );
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(super) fn shift_reduce_inner_ab_trusted_blake3(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    check_all_ones: bool,
+    check_single_k0: bool,
+    const_one_mask: u8,
+    bstatic_w: usize,
+    static_b_context: Option<StaticBContext>,
+    nt_store: bool,
+) {
+    aarch64::shift_reduce_inner_ab_fused_neon_trusted_blake3(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        b_med,
+        out,
+        check_all_ones,
+        check_single_k0,
+        const_one_mask,
+        bstatic_w,
+        static_b_context,
+        nt_store,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

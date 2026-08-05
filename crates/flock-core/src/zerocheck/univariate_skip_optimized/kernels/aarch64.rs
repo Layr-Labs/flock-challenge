@@ -1980,6 +1980,83 @@ fn shift_reduce_inner_a_only_const_b(
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn gf8_mul_x_vec16(
+    a: core::arch::aarch64::uint8x16_t,
+) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        let carry = vreinterpretq_u8_s8(vshrq_n_s8::<7>(vreinterpretq_s8_u8(a)));
+        veorq_u8(
+            vshlq_n_u8::<1>(a),
+            vandq_u8(carry, vdupq_n_u8(0x1b)),
+        )
+    }
+}
+
+/// Const-ones-B twin using the existing x^4-scaled inverse-NTT image. Pair
+/// K and K+4, then evaluate the remaining cubic in GF(2^8) with Horner.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+pub(crate) fn shift_reduce_inner_a_only_const_b_h4(
+    a_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    out: &mut [u8; 64],
+    nt_store: bool,
+) {
+    use core::arch::aarch64::*;
+
+    let plain = inv_table.data_ptr();
+    let plain_sw = inv_table.half_swapped_data_ptr();
+    let scaled = inv_table.scaled_x4_data_ptr();
+    let scaled_sw = inv_table.scaled_x4_half_swapped_data_ptr();
+    unsafe {
+        macro_rules! row {
+            ($table:expr, $table_sw:expr, $k:literal) => {{
+                let word = u64::from_le(core::ptr::read_unaligned(
+                    a_packed
+                        .as_ptr()
+                        .add(byte_base_b + $k * N_CHUNKS)
+                        .cast::<u64>(),
+                ));
+                apply_word_into_4_regs($table, $table_sw, word)
+            }};
+        }
+        macro_rules! absorb {
+            ($acc:ident, $lo:expr, $hi:expr) => {{
+                let lo = $lo;
+                let hi = $hi;
+                $acc.0 = xor3_u8(gf8_mul_x_vec16($acc.0), lo.0, hi.0);
+                $acc.1 = xor3_u8(gf8_mul_x_vec16($acc.1), lo.1, hi.1);
+                $acc.2 = xor3_u8(gf8_mul_x_vec16($acc.2), lo.2, hi.2);
+                $acc.3 = xor3_u8(gf8_mul_x_vec16($acc.3), lo.3, hi.3);
+            }};
+        }
+
+        let lo = row!(plain, plain_sw, 3);
+        let hi = row!(scaled, scaled_sw, 7);
+        let mut acc = (
+            veorq_u8(lo.0, hi.0),
+            veorq_u8(lo.1, hi.1),
+            veorq_u8(lo.2, hi.2),
+            veorq_u8(lo.3, hi.3),
+        );
+        absorb!(acc, row!(plain, plain_sw, 2), row!(scaled, scaled_sw, 6));
+        absorb!(acc, row!(plain, plain_sw, 1), row!(scaled, scaled_sw, 5));
+        absorb!(acc, row!(plain, plain_sw, 0), row!(scaled, scaled_sw, 4));
+        store_row_64(out.as_mut_ptr(), nt_store, acc.0, acc.1, acc.2, acc.3);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn a_only_h4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_A_ONLY_H4").is_none());
+    *ON
+}
+
 /// Single-live-K fast path: b rows K=1..7 are zero, so only K=0 contributes
 /// and `out = ntt_a[0] . ntt_b[0]` (x^0, already reduced).
 #[cfg(target_arch = "aarch64")]
@@ -2538,55 +2615,9 @@ pub(crate) fn prepare_static_b_context_with_policy(
 ///
 /// `bstatic_w` is the BLAKE3 outer-window index (0 or 1) for the byte-level
 /// static-B path, or `usize::MAX` to disable it. Block-level sniffs run first.
-#[cfg(all(test, target_arch = "aarch64"))]
-#[inline(always)]
-pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    chunk_byte_base: usize,
-    b_med: usize,
-    out: &mut [u8; 64],
-    check_all_ones: bool,
-    check_single_k0: bool,
-    const_one_mask: u8,
-    bstatic_w: usize,
-    static_b_context: Option<StaticBContext>,
-    nt_store: bool,
-) {
-    shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<
-        { super::AB_FAST_POLICY_PROCESS },
-    >(
-        a_packed,
-        b_packed,
-        inv_table,
-        chunk_byte_base,
-        b_med,
-        out,
-        check_all_ones,
-        check_single_k0,
-        const_one_mask,
-        bstatic_w,
-        static_b_context,
-        nt_store,
-    );
-}
-
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn fast_shift_reduce_with_policy<const FAST_POLICY: u8>() -> bool {
-    match FAST_POLICY {
-        super::AB_FAST_POLICY_PROCESS => fast_shift_reduce_enabled(),
-        super::AB_FAST_POLICY_FORCE_FAST => true,
-        _ => unreachable!("unsupported AB fast-policy mode"),
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
-    const FAST_POLICY: u8,
->(
+fn shift_reduce_inner_ab_fused_neon_checked_impl<const TRUSTED: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -2608,8 +2639,24 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
     };
     if check_all_ones {
         let and_all = bw(0) & bw(1) & bw(2) & bw(3) & bw(4) & bw(5) & bw(6) & bw(7);
-        if and_all == u64::MAX {
-            shift_reduce_inner_a_only_const_b(a_packed, inv_table, byte_base_b, out, nt_store);
+        if TRUSTED || and_all == u64::MAX {
+            if a_only_h4_enabled() {
+                shift_reduce_inner_a_only_const_b_h4(
+                    a_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            } else {
+                shift_reduce_inner_a_only_const_b(
+                    a_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            }
             return;
         }
     }
@@ -2622,7 +2669,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
             // bit-identical for any witness.
             if bstatic_w == 1
                 && b_med == 14
-                && bw(0) == 0x0001_ffff_ffff_ffff
+                && (TRUSTED || bw(0) == 0x0001_ffff_ffff_ffff)
                 && let Some(context) = static_b_context
             {
                 let partials = match context {
@@ -2645,7 +2692,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
     }
     match const_one_mask {
         0 => {}
-        0x03 if bw(0) & bw(1) == u64::MAX => {
+        0x03 if TRUSTED || bw(0) & bw(1) == u64::MAX => {
             shift_reduce_inner_mixed_const_b::<0x03>(
                 a_packed,
                 b_packed,
@@ -2656,7 +2703,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
             );
             return;
         }
-        0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
+        0xf0 if TRUSTED || bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
             shift_reduce_inner_mixed_const_b::<0xf0>(
                 a_packed,
                 b_packed,
@@ -2680,8 +2727,8 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
         // monomorphization; the kill switch picks a whole kernel, never a
         // branch inside one.
         let handled = enabled
-            && if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                shift_reduce_inner_ab_bstatic::<true>(
+            && if fast_shift_reduce_enabled() {
+                shift_reduce_inner_ab_bstatic::<true, TRUSTED>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -2693,7 +2740,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
                     nt_store,
                 )
             } else {
-                shift_reduce_inner_ab_bstatic::<false>(
+                shift_reduce_inner_ab_bstatic::<false, TRUSTED>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -2709,7 +2756,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
             return;
         }
     }
-    if fast_shift_reduce_with_policy::<FAST_POLICY>() {
+    if fast_shift_reduce_enabled() {
         shift_reduce_inner_ab_fused_neon_h4(
             a_packed,
             b_packed,
@@ -2730,4 +2777,68 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
             nt_store,
         );
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    check_all_ones: bool,
+    check_single_k0: bool,
+    const_one_mask: u8,
+    bstatic_w: usize,
+    static_b_context: Option<StaticBContext>,
+    nt_store: bool,
+) {
+    shift_reduce_inner_ab_fused_neon_checked_impl::<false>(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        b_med,
+        out,
+        check_all_ones,
+        check_single_k0,
+        const_one_mask,
+        bstatic_w,
+        static_b_context,
+        nt_store,
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn shift_reduce_inner_ab_fused_neon_trusted_blake3(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    check_all_ones: bool,
+    check_single_k0: bool,
+    const_one_mask: u8,
+    bstatic_w: usize,
+    static_b_context: Option<StaticBContext>,
+    nt_store: bool,
+) {
+    shift_reduce_inner_ab_fused_neon_checked_impl::<true>(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        b_med,
+        out,
+        check_all_ones,
+        check_single_k0,
+        const_one_mask,
+        bstatic_w,
+        static_b_context,
+        nt_store,
+    );
 }
