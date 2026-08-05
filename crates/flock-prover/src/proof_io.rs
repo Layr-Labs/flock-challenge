@@ -831,10 +831,6 @@ mod tests {
             // the toggle stays inert everywhere; the ranked canary A/B
             // covers the engaged arm.
             "FLOCK_NO_ZC_IDLE_FILL",
-            // Commit-tail fill (staged round-one C fold at graph
-            // completion; consumed only on exact challenge identity, so
-            // toggling it can never change bytes).
-            "FLOCK_NO_COMMIT_TAIL_FILL",
         ];
         for gate in WITGEN_STACK_GATES {
             // SAFETY: single-threaded #[ignore]d test; no concurrent env
