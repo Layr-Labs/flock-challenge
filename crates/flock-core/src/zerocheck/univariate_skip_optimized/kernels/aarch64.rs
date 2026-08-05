@@ -1718,6 +1718,124 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
     }
 }
 
+/// Horner / scaled-table twin of [`shift_reduce_inner_mixed_const_b`]: K rows
+/// selected by `ONE_MASK` have B ≡ 1 in every lane, so their raw "product" is
+/// just the A transform itself (zero-extended to the 16-bit unreduced lanes);
+/// all other rows form the same PMULL products as
+/// [`shift_reduce_inner_ab_fused_neon_h4`]. The Horner chain, carry fold and
+/// final reduction are identical to the h4 kernel, so the output is
+/// bit-identical to the incumbent mixed kernel for any witness while the
+/// generic rows drop from the accumulate-and-reduce block (two reductions) to
+/// the raw-product Horner block.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn shift_reduce_inner_mixed_const_b_h4<const ONE_MASK: u8>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    out: &mut [u8; 64],
+    nt_store: bool,
+) {
+    use crate::field::gf2_8::neon::gf8_reduce_vec16;
+    use core::arch::aarch64::*;
+
+    let plain = inv_table.data_ptr();
+    let plain_sw = inv_table.half_swapped_data_ptr();
+    let scaled = inv_table.scaled_x4_data_ptr();
+    let scaled_sw = inv_table.scaled_x4_half_swapped_data_ptr();
+
+    #[inline(always)]
+    unsafe fn widen_lo(v: core::arch::aarch64::uint8x16_t) -> core::arch::aarch64::uint16x8_t {
+        unsafe { core::arch::aarch64::vmovl_u8(core::arch::aarch64::vget_low_u8(v)) }
+    }
+    #[inline(always)]
+    unsafe fn widen_hi(v: core::arch::aarch64::uint8x16_t) -> core::arch::aarch64::uint16x8_t {
+        unsafe { core::arch::aarch64::vmovl_u8(core::arch::aarch64::vget_high_u8(v)) }
+    }
+
+    unsafe {
+        let a_base = a_packed.as_ptr().add(byte_base_b);
+        let b_base = b_packed.as_ptr().add(byte_base_b);
+
+        // Raw 15-bit "products" of one K row. Const-one rows (per `ONE_MASK`)
+        // skip the B word read and its 32 table loads entirely: `A · 1` is the
+        // A transform, zero-extended into the unreduced 16-bit lanes. The
+        // `$at` image is plain for K < 4 and `x^4`-scaled for K ≥ 4 exactly as
+        // in the h4 kernel, so the Horner weights line up unchanged.
+        macro_rules! products {
+            ($at:expr, $at_sw:expr, $k:literal) => {{
+                let aw = u64::from_le(core::ptr::read_unaligned(
+                    a_base.add($k * N_CHUNKS).cast::<u64>(),
+                ));
+                let (da0, da1, da2, da3) = apply_word_into_4_regs($at, $at_sw, aw);
+                if ONE_MASK & (1 << $k) != 0 {
+                    [
+                        widen_lo(da0),
+                        widen_hi(da0),
+                        widen_lo(da1),
+                        widen_hi(da1),
+                        widen_lo(da2),
+                        widen_hi(da2),
+                        widen_lo(da3),
+                        widen_hi(da3),
+                    ]
+                } else {
+                    let bw = u64::from_le(core::ptr::read_unaligned(
+                        b_base.add($k * N_CHUNKS).cast::<u64>(),
+                    ));
+                    let (db0, db1, db2, db3) = apply_word_into_4_regs(plain, plain_sw, bw);
+                    [
+                        pmull_lo_u16(da0, db0),
+                        pmull_hi_u16(da0, db0),
+                        pmull_lo_u16(da1, db1),
+                        pmull_hi_u16(da1, db1),
+                        pmull_lo_u16(da2, db2),
+                        pmull_hi_u16(da2, db2),
+                        pmull_lo_u16(da3, db3),
+                        pmull_hi_u16(da3, db3),
+                    ]
+                }
+            }};
+        }
+
+        // d_3 seeds the Horner chain; no shift is due before the first row.
+        let lo3 = products!(plain, plain_sw, 3);
+        let hi3 = products!(scaled, scaled_sw, 7);
+        let mut acc = [
+            veorq_u16(lo3[0], hi3[0]),
+            veorq_u16(lo3[1], hi3[1]),
+            veorq_u16(lo3[2], hi3[2]),
+            veorq_u16(lo3[3], hi3[3]),
+            veorq_u16(lo3[4], hi3[4]),
+            veorq_u16(lo3[5], hi3[5]),
+            veorq_u16(lo3[6], hi3[6]),
+            veorq_u16(lo3[7], hi3[7]),
+        ];
+
+        let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
+
+        let lo2 = products!(plain, plain_sw, 2);
+        let hi2 = products!(scaled, scaled_sw, 6);
+        horner_absorb(&mut acc, &lo2, &hi2, carry_not);
+
+        let lo1 = products!(plain, plain_sw, 1);
+        let hi1 = products!(scaled, scaled_sw, 5);
+        horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+
+        let lo0 = products!(plain, plain_sw, 0);
+        let hi0 = products!(scaled, scaled_sw, 4);
+        horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+
+        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
+        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
+        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[5]));
+        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
+
+        store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EXPERIMENT (seam-urm): checked static-structure fast paths.
 //
@@ -2600,25 +2718,47 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     match const_one_mask {
         0 => {}
         0x03 if bw(0) & bw(1) == u64::MAX => {
-            shift_reduce_inner_mixed_const_b::<0x03>(
-                a_packed,
-                b_packed,
-                inv_table,
-                byte_base_b,
-                out,
-                nt_store,
-            );
+            if fast_shift_reduce_enabled() {
+                shift_reduce_inner_mixed_const_b_h4::<0x03>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            } else {
+                shift_reduce_inner_mixed_const_b::<0x03>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            }
             return;
         }
         0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
-            shift_reduce_inner_mixed_const_b::<0xf0>(
-                a_packed,
-                b_packed,
-                inv_table,
-                byte_base_b,
-                out,
-                nt_store,
-            );
+            if fast_shift_reduce_enabled() {
+                shift_reduce_inner_mixed_const_b_h4::<0xf0>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            } else {
+                shift_reduce_inner_mixed_const_b::<0xf0>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            }
             return;
         }
         0x03 | 0xf0 => {}

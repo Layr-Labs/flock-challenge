@@ -759,14 +759,32 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         // but each chunk writes only its own disjoint 1 KiB, so the output
         // bytes are identical to the incumbent path.
         let n_chunks = total_bytes / OUTER_BYTES;
-        let n_jobs = n_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
+        // Queue-tail taper: the arm ends when the LAST claimed job finishes,
+        // so a full-size (64-chunk) job claimed late by an E-core can hold
+        // the arm-bound commit window for the whole job's E-duration. Keep
+        // the head of the queue at 64 chunks per claim (amortizes the atomic)
+        // but split the final `AB_PRE_TAIL_CHUNKS` chunks into quarter-size
+        // jobs so the worst-case tail shrinks ~4x. Job → chunk-range mapping
+        // stays a pure function of the job index; chunk coverage is exactly
+        // `0..n_chunks` with each chunk owned once, so output bytes are
+        // identical to the untapered schedule.
+        let tail_chunks = AB_PRE_TAIL_CHUNKS.min(n_chunks);
+        let big_chunks = n_chunks - tail_chunks;
+        let n_big_jobs = big_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
+        let n_jobs = n_big_jobs + tail_chunks.div_ceil(AB_PRE_TAIL_CHUNKS_PER_JOB);
         let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
         crate::epool::run_hetero_chunks_stateful(
             n_jobs,
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
             |(a_col, b_col), job| {
-                let start = job * AB_PRE_CHUNKS_PER_JOB;
-                let end = (start + AB_PRE_CHUNKS_PER_JOB).min(n_chunks);
+                let (start, end) = if job < n_big_jobs {
+                    let start = job * AB_PRE_CHUNKS_PER_JOB;
+                    (start, (start + AB_PRE_CHUNKS_PER_JOB).min(big_chunks))
+                } else {
+                    let idx = job - n_big_jobs;
+                    let start = big_chunks + idx * AB_PRE_TAIL_CHUNKS_PER_JOB;
+                    (start, (start + AB_PRE_TAIL_CHUNKS_PER_JOB).min(n_chunks))
+                };
                 for x_outer in start..end {
                     // SAFETY: the queue hands out each job index exactly once
                     // and each `x_outer` maps to one disjoint 1 KiB chunk.
@@ -829,6 +847,16 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
 /// small enough that an E-core owns at most ~200 µs of tail when the main
 /// pool finishes — the same sizing logic as the deferred stripe's 64.
 const AB_PRE_CHUNKS_PER_JOB: usize = 64;
+
+/// Queue-tail taper for the QS5 hetero AB-precompute drain: the final
+/// `AB_PRE_TAIL_CHUNKS` chunks are handed out in quarter-size jobs so the
+/// worst-case straggler (one late-claimed job on an E-core) holds the
+/// arm-bound commit window for ~¼ the incumbent duration. 1024 tail chunks ≈
+/// two full-size claims per worker on a 10P+4E box — enough runway that the
+/// taper engages before the queue drains, small enough that the added atomic
+/// claims (48 extra) are noise against the 8k-job head.
+const AB_PRE_TAIL_CHUNKS: usize = 1024;
+const AB_PRE_TAIL_CHUNKS_PER_JOB: usize = 16;
 
 /// Compile-time default for the QS5 hetero AB-precompute drain (the ranked
 /// decision must be a constant; ranked workers run with a cleared
