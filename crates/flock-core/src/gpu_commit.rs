@@ -70,56 +70,6 @@ pub(crate) fn gpu_zerocheck_enabled() -> bool {
     *ON
 }
 
-/// Exact same-binary rollback for reusing the lincheck arm's byte-table B4
-/// pipeline in the zerocheck C-fold window. `FLOCK_NO_ZC_BYTE_FOLD=1`
-/// restores the shipped nibble-table pipeline, its 8-stripe block size, and
-/// its conservative 7/8 split cap; every other value leaves the byte-table
-/// route enabled. The decision is cached because both the warmup and timed
-/// proof launch this arm.
-pub const ENV_NO_ZC_BYTE_FOLD: &str = "FLOCK_NO_ZC_BYTE_FOLD";
-
-fn zc_byte_fold_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("1"))
-}
-
-#[cfg_attr(
-    not(all(target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)]
-pub(crate) fn zc_byte_fold_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        zc_byte_fold_value_enabled(std::env::var_os(ENV_NO_ZC_BYTE_FOLD).as_deref())
-    })
-}
-
-#[cfg(test)]
-mod zc_byte_fold_gate_tests {
-    use std::ffi::OsStr;
-
-    #[test]
-    fn exact_one_is_the_only_zc_byte_fold_rollback_value() {
-        assert!(!super::zc_byte_fold_value_enabled(Some(OsStr::new("1"))));
-        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
-            assert!(super::zc_byte_fold_value_enabled(value.map(OsStr::new)));
-        }
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn byte_route_may_tune_full_gpu_while_nibble_keeps_legacy_cap() {
-        // Candidate warmup sample from the ranked M4 Max auto run. Use the
-        // identical clocks for both policies so this test isolates the cap:
-        // byte-B4 may consume all 64 claims, while exact rollback remains at
-        // the incumbent 7/8 = 56 ceiling.
-        let tune = |byte_fold| {
-            super::imp::zc_fold_balanced_share(24, 64, 2.21, 8.02, 8.88, 1.0, byte_fold)
-        };
-        assert_eq!(tune(true), Some(64));
-        assert_eq!(tune(false), Some(56));
-    }
-}
-
 /// Diagnostic trace for the zerocheck fold arm (`FLOCK_ZC_GPU_DEBUG=1`).
 pub(crate) fn gpu_zerocheck_debug() -> bool {
     static ON: std::sync::LazyLock<bool> =
@@ -7773,9 +7723,9 @@ LC_KERNEL(lc_fold_stripes, 4)
         gpu: &'static Gpu,
         pso_fold: Id,
         pso_reduce: Id,
-        /// Shared byte-table B4 fold kernel (`NIL` when the LC source failed
-        /// to compile). Lincheck then falls back to its incumbent CPU fold;
-        /// zerocheck falls back to its shipped nibble-table pipeline.
+        /// Lincheck-arm byte-table fold kernel (`NIL` when the LC source
+        /// failed to compile — the lincheck arm alone falls back to the
+        /// incumbent CPU fold; the zerocheck arm is unaffected).
         pso_lc_fold: Id,
         /// eq_outer upload (n_outer x 16 B).
         eq_buf: Id,
@@ -8483,7 +8433,6 @@ LC_KERNEL(lc_fold_stripes, 4)
                 sample_ms,
                 head_ms,
                 suffix_ms,
-                self.plan.byte_fold,
             );
             Ok(())
         }
@@ -8660,39 +8609,31 @@ LC_KERNEL(lc_fold_stripes, 4)
         gpu_ms: f64,
         head_ms: f64,
         suffix_ms: f64,
-        byte_fold: bool,
     ) {
         if arm.claim_override().is_some() || claim_lo == 0 || claim_lo >= n_claims {
             return;
         }
+        let u_gpu = gpu_ms / claim_lo as f64;
+        let u_cpu = suffix_ms / (n_claims - claim_lo) as f64;
+        if !(u_gpu.is_finite() && u_cpu.is_finite()) || u_gpu <= 0.0 || u_cpu <= 0.0 {
+            return;
+        }
         // Balanced finish-time split. A previous 0.9 CPU-ward bias systematically
         // left GPU claim capacity idle after warmup clock-ramp (wayfinder F3);
-        // overshoot risk is bounded by the measured formula and the cap below.
-        //
-        // The shipped nibble rollback retains its exact 7n/8 cap. The byte-B4
-        // route may use the complete range: a ranked M4 Max sweep measured
-        // 5.53 ms for 64/64 byte claims under a 9.67 ms AB head, while every
-        // non-empty CPU suffix (one through eight claims) retained 1.6--2.3 ms
-        // of fixed queue cost. This is still target-calibrated rather than a
-        // forced full-GPU policy: the formula chooses less than n whenever the
-        // measured byte kernel and head do not support n.
-        // `FLOCK_ZC_FOLD_CPU_BIAS=1` restores the 0.9 factor.
+        // overshoot risk is already bounded by the clamp below and by the fact
+        // that the next timed prove remeasures under steady state. Cap at
+        // 7n/8 so an optimistic warmup sample cannot make the GPU the timed
+        // straggler. `FLOCK_ZC_FOLD_CPU_BIAS=1` restores the 0.9 factor.
         let bias = if std::env::var_os("FLOCK_ZC_FOLD_CPU_BIAS").is_some() {
             0.9
         } else {
             1.0
         };
-        let Some(g) = zc_fold_balanced_share(
-            claim_lo,
-            n_claims,
-            gpu_ms,
-            head_ms,
-            suffix_ms,
-            bias,
-            byte_fold,
-        ) else {
-            return;
-        };
+        let balanced =
+            bias * (head_ms.max(0.0) + n_claims as f64 * u_cpu) / (u_gpu + u_cpu);
+        let hi = (n_claims as i64 - 1).max(1);
+        let cap = (n_claims as i64 * 7 / 8).clamp(1, hi);
+        let g = (balanced.round() as i64).clamp(1, cap) as usize;
         arm.tuned()
             .store(g, std::sync::atomic::Ordering::Relaxed);
         if arm.debug() {
@@ -8702,42 +8643,6 @@ LC_KERNEL(lc_fold_stripes, 4)
                 arm.tag(),
             );
         }
-    }
-
-    /// Pure zerocheck split policy used by the warmup tuner. Keeping the
-    /// measured arithmetic separate pins the byte-route full-GPU admission
-    /// and the nibble rollback's legacy cap without touching process statics.
-    pub(crate) fn zc_fold_balanced_share(
-        claim_lo: usize,
-        n_claims: usize,
-        gpu_ms: f64,
-        head_ms: f64,
-        suffix_ms: f64,
-        bias: f64,
-        byte_fold: bool,
-    ) -> Option<usize> {
-        if claim_lo == 0 || claim_lo >= n_claims || !bias.is_finite() || bias <= 0.0 {
-            return None;
-        }
-        let u_gpu = gpu_ms / claim_lo as f64;
-        let u_cpu = suffix_ms / (n_claims - claim_lo) as f64;
-        if !(u_gpu.is_finite() && u_cpu.is_finite()) || u_gpu <= 0.0 || u_cpu <= 0.0 {
-            return None;
-        }
-        let balanced =
-            bias * (head_ms.max(0.0) + n_claims as f64 * u_cpu) / (u_gpu + u_cpu);
-        let hi = if byte_fold {
-            n_claims as i64
-        } else {
-            (n_claims as i64 - 1).max(1)
-        };
-        let cap = if byte_fold {
-            hi
-        } else {
-            (n_claims as i64 * 7 / 8).clamp(1, hi)
-        };
-        let g = (balanced.round() as i64).clamp(1, cap) as usize;
-        Some(g)
     }
 
     /// Successful GPU prefix submissions this process. Lets a test assert the
@@ -8767,10 +8672,6 @@ LC_KERNEL(lc_fold_stripes, 4)
         /// Fold pipeline for this dispatch — the zerocheck arm's nibble
         /// kernel or one of the lincheck arm's byte-table kernels.
         pso_fold: Id,
-        /// This dispatch selected the byte-table B4 kernel. The zerocheck
-        /// split tuner uses the measured headroom to admit a complete-GPU
-        /// fold only for this faster route; rollback preserves the old cap.
-        byte_fold: bool,
         k: usize,
         useful: usize,
         stripe_hi: usize,
@@ -8921,28 +8822,20 @@ LC_KERNEL(lc_fold_stripes, 4)
             let state = guard.as_mut()?.as_mut().ok()?;
             let n_outer = 1usize << (m - k_log);
             let useful = (useful_bits.div_ceil(8) * 8).min(k);
-            // Fold pipeline + stripe-block size for this arm. Zerocheck
-            // normally reuses the already-compiled byte-table B4 pipeline;
-            // its exact rollback (and a byte-pipeline compile failure) keeps
-            // the shipped nibble B8 route. Lincheck keeps its existing B4
-            // route and stays CPU-only when that pipeline is unavailable.
-            let (pso_fold, block, kernel, byte_fold) = match arm {
-                FoldArm::Zc
-                    if super::zc_byte_fold_enabled() && !state.pso_lc_fold.is_null() =>
-                {
-                    (state.pso_lc_fold, 4, "byte-b4", true)
-                }
-                FoldArm::Zc => (state.pso_fold, 8, "nibble-b8", false),
-                FoldArm::Lincheck => (state.pso_lc_fold, 4, "byte-b4", true),
+            // Fold pipeline + stripe-block size for this arm. The zerocheck
+            // arm always runs its shipped nibble kernel (8-stripe blocks);
+            // the lincheck arm runs its byte-table kernel (4-stripe
+            // blocks). A NIL pipeline (compile failure) keeps the whole
+            // fold on the incumbent CPU path.
+            let (pso_fold, block) = match arm {
+                FoldArm::Zc => (state.pso_fold, 8),
+                FoldArm::Lincheck => (state.pso_lc_fold, 4),
             };
             if pso_fold.is_null() {
                 if arm.debug() {
                     eprintln!("{} fold pipeline unavailable, CPU-only fold", arm.tag());
                 }
                 return None;
-            }
-            if arm.debug() {
-                eprintln!("{} fold pipeline: {kernel}", arm.tag());
             }
             unsafe {
                 let pool = gpu.pool_push();
@@ -8978,7 +8871,6 @@ LC_KERNEL(lc_fold_stripes, 4)
                     let plan = ZcFoldPlan {
                         z_buf,
                         pso_fold,
-                        byte_fold,
                         k,
                         useful,
                         stripe_hi,
