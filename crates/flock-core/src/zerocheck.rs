@@ -423,9 +423,15 @@ pub fn stage_commit_tail_fill<C: Challenger>(
             padding.useful_bits_per_block,
             &r,
         );
+        // AB-head GPU arm window setup (see `gpu_commit::ENV_NO_AB_HEAD_GPU`):
+        // uploads only, parked under the same challenge fingerprint. The
+        // dispatch stays at zerocheck entry — `ab_inner` is still being
+        // written by the precompute arm here.
+        let ab_staged = univariate_skip_optimized::stage_ab_head_for_tail_fill(m, &r, padding);
         if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
             eprintln!(
-                "[commit-tail-fill] stage at graph completion: staged={staged} {:.2} ms",
+                "[commit-tail-fill] stage at graph completion: staged={staged} \
+                 ab-head-staged={ab_staged} {:.2} ms",
                 t_stage.elapsed().as_secs_f64() * 1e3
             );
         }
