@@ -12672,3 +12672,13 @@ mod tests {
 // RealAdii sample 7 on c52fba6.
 // RealAdii sample 8 on c52fba6.
 // RealAdii sample 9 on c52fba6.
+
+// angel-cockpit frontier resample on c6ca70d (board 1,648,987.88).
+// No code delta: comment-only tree to re-measure the pinned frontier on the
+// protected runner; promotion barrier is currently inside the runner's
+// 0.6-1.0% measurement noise band (see board: 10 rejected samples 1.640-1.646M
+// from 4 solvers in the last hour against this same frontier value).
+
+// angel-cockpit frontier resample sample 2 on c6ca70d — independent noise draw.
+
+// angel-cockpit frontier resample sample 3 on c6ca70d — independent noise draw.
