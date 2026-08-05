@@ -3,7 +3,8 @@ mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
-    partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
+    partial_fold_packed_z_neon_oblock16_padded, partial_fold_packed_z_neon_single,
+    partial_fold_packed_z_neon_single_padded,
 };
 #[cfg(target_arch = "aarch64")]
 pub(crate) use aarch64::{

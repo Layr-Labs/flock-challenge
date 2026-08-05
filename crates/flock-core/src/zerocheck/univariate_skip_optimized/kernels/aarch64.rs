@@ -141,7 +141,9 @@ pub(crate) unsafe fn accumulate_convert(
 /// tables. It is gone — the eight α-free single-bit-`K` banks are pure u16 bit
 /// masks over the 16 `b_med` C bytes and need no table at all
 /// (see [`super::accumulate_c_banks`]). What remains here is the incumbent AB
-/// arm verbatim: 4 lanes per group, two adjacent `b_med` folded into one EOR3.
+/// arm widened to 8 lanes per group, with two adjacent `b_med` folded into one
+/// EOR3. Eight independent gather chains fit now that the removed C side no
+/// longer shares the register file.
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab(
     chunk_ab_bytes: &[[u8; 64]; 16],
@@ -162,25 +164,29 @@ pub(crate) unsafe fn accumulate_convert_ab(
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
         let n_pairs = n_b_med / 2;
-        for lane in (0..64).step_by(4) {
-            // 4 live accumulator q-registers (4 lanes × 1 bank); the paired
-            // loop adds only address temporaries, so nothing spills.
+        for lane in (0..64).step_by(8) {
+            // 8 live accumulator q-registers (8 lanes × 1 bank); the removed
+            // C side leaves room for the gather temporaries.
             let mut ab0 = vdupq_n_u8(0);
             let mut ab1 = vdupq_n_u8(0);
             let mut ab2 = vdupq_n_u8(0);
             let mut ab3 = vdupq_n_u8(0);
+            let mut ab4 = vdupq_n_u8(0);
+            let mut ab5 = vdupq_n_u8(0);
+            let mut ab6 = vdupq_n_u8(0);
+            let mut ab7 = vdupq_n_u8(0);
 
             for p in 0..n_pairs {
                 let (b_even, b_odd) = (2 * p, 2 * p + 1);
                 let t_even = convert_ptr.add(b_even * 256 * 16);
                 let t_odd = convert_ptr.add(b_odd * 256 * 16);
 
-                // One u32 load per b_med covers the 4 adjacent lanes; each
+                // One u64 load per b_med covers the 8 adjacent lanes; each
                 // extracted byte addresses the same table row as the original
                 // byte-load form.
-                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32).read_unaligned()
+                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u64).read_unaligned()
                     as usize;
-                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32).read_unaligned()
+                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u64).read_unaligned()
                     as usize;
                 ab0 = xor3_u8(
                     ab0,
@@ -199,8 +205,28 @@ pub(crate) unsafe fn accumulate_convert_ab(
                 );
                 ab3 = xor3_u8(
                     ab3,
-                    vld1q_u8(t_even.add((we >> 24) * 16)),
-                    vld1q_u8(t_odd.add((wo >> 24) * 16)),
+                    vld1q_u8(t_even.add(((we >> 24) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 24) & 0xff) * 16)),
+                );
+                ab4 = xor3_u8(
+                    ab4,
+                    vld1q_u8(t_even.add(((we >> 32) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 32) & 0xff) * 16)),
+                );
+                ab5 = xor3_u8(
+                    ab5,
+                    vld1q_u8(t_even.add(((we >> 40) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 40) & 0xff) * 16)),
+                );
+                ab6 = xor3_u8(
+                    ab6,
+                    vld1q_u8(t_even.add(((we >> 48) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 48) & 0xff) * 16)),
+                );
+                ab7 = xor3_u8(
+                    ab7,
+                    vld1q_u8(t_even.add((we >> 56) * 16)),
+                    vld1q_u8(t_odd.add((wo >> 56) * 16)),
                 );
             }
 
@@ -208,12 +234,16 @@ pub(crate) unsafe fn accumulate_convert_ab(
             if n_b_med & 1 == 1 {
                 let b_med = n_b_med - 1;
                 let table = convert_ptr.add(b_med * 256 * 16);
-                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
+                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u64).read_unaligned()
                     as usize;
                 ab0 = veorq_u8(ab0, vld1q_u8(table.add((wa & 0xff) * 16)));
                 ab1 = veorq_u8(ab1, vld1q_u8(table.add(((wa >> 8) & 0xff) * 16)));
                 ab2 = veorq_u8(ab2, vld1q_u8(table.add(((wa >> 16) & 0xff) * 16)));
-                ab3 = veorq_u8(ab3, vld1q_u8(table.add((wa >> 24) * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(table.add(((wa >> 24) & 0xff) * 16)));
+                ab4 = veorq_u8(ab4, vld1q_u8(table.add(((wa >> 32) & 0xff) * 16)));
+                ab5 = veorq_u8(ab5, vld1q_u8(table.add(((wa >> 40) & 0xff) * 16)));
+                ab6 = veorq_u8(ab6, vld1q_u8(table.add(((wa >> 48) & 0xff) * 16)));
+                ab7 = veorq_u8(ab7, vld1q_u8(table.add((wa >> 56) * 16)));
             }
 
             macro_rules! drain_lane {
@@ -229,6 +259,10 @@ pub(crate) unsafe fn accumulate_convert_ab(
             drain_lane!(1, ab1);
             drain_lane!(2, ab2);
             drain_lane!(3, ab3);
+            drain_lane!(4, ab4);
+            drain_lane!(5, ab5);
+            drain_lane!(6, ab6);
+            drain_lane!(7, ab7);
         }
     }
 }

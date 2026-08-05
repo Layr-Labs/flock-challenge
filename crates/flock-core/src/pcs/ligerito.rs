@@ -4542,6 +4542,12 @@ fn materialize_direct_fold8(
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
     let deferred_reduce = super::use_fold_deferred_reduce();
+    // On Apple AArch64, adjacent slots share the same 64 fold weights. Keep
+    // their product sums independent while loading each weight only once.
+    // The rollback retains the incumbent two single-slot calls for A/B.
+    let pair_fold64 = deferred_reduce
+        && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
+        && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none();
 
     // One shared per-block body for both drains below, so the scheduling
     // choice cannot drift from the value computation. For block `i` it fully
@@ -4583,7 +4589,36 @@ fn materialize_direct_fold8(
             first_table,
             scratch,
         );
-        for slot in 0..block_len {
+        let mut slot = 0usize;
+        if pair_fold64 {
+            while slot + 1 < block_len {
+                let base = 64 * slot;
+                let folded_f = crate::field::f128_slice::fold_banked_slots2::<64>(
+                    &fold_weight,
+                    &f_in[base..base + 128],
+                );
+                f_out[slot] = folded_f[0];
+                f_out[slot + 1] = folded_f[1];
+
+                let direct0 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                let direct1 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
+                if has_ordinary {
+                    let folded_b = crate::field::f128_slice::fold_banked_slots2::<64>(
+                        &fold_weight,
+                        &b_in[base..base + 128],
+                    );
+                    b_out[slot] = direct0 + folded_b[0];
+                    b_out[slot + 1] = direct1 + folded_b[1];
+                } else {
+                    b_out[slot] = direct0;
+                    b_out[slot + 1] = direct1;
+                }
+                slot += 2;
+            }
+        }
+        while slot < block_len {
             f_out[slot] = fold64(f_in, slot);
             let direct = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
             b_out[slot] = if has_ordinary {
@@ -4591,6 +4626,7 @@ fn materialize_direct_fold8(
             } else {
                 direct
             };
+            slot += 1;
         }
         for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
             super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
@@ -12732,5 +12768,3 @@ mod tests {
 // RealAdii sample 1 on 368da6d.
 // angelx lane-warm draw 31 on frontier 2d89d2b (resample 31).
 // angelx lane-warm draw 49 on frontier d9b4232 (resample 49).
-
-// angel-cockpit resample 50 on frontier 5e2dd53f (peak-catch cadence; comment-only, byte-distinct tree).

@@ -258,6 +258,185 @@ unsafe fn process_block_neon_single<const TILE_T: usize>(
     vst1q_u8(o.add(112), a7);
 }
 
+/// SHA3/EOR3 specialization that fuses two adjacent BLOCK_K=8 drains into one
+/// stripe/table traversal. The fixed register assignment avoids callee-saved
+/// vector registers and uses scaled table loads fed directly by UBFX.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(never)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn process_block16_neon_single_sha3(
+    row_ptr: *const u8,
+    row_stride: usize,
+    bs: usize,
+    tables_ptr: *const u8,
+    out_ptr: *mut F128,
+) {
+    use std::arch::asm;
+
+    asm!(
+        "ldp q0, q1, [{dst}]",
+        "ldp q2, q3, [{dst}, #32]",
+        "ldp q4, q5, [{dst}, #64]",
+        "ldp q6, q7, [{dst}, #96]",
+        "ldp q16, q17, [{dst}, #128]",
+        "ldp q18, q19, [{dst}, #160]",
+        "ldp q20, q21, [{dst}, #192]",
+        "ldp q22, q23, [{dst}, #224]",
+        "add x8, {row}, {block_start}",
+        "lsl x9, {stride}, #1",
+        "mov x10, #4",
+        "2:",
+        "ldp x11, x12, [x8]",
+        "add x15, x8, {stride}",
+        "ldp x13, x14, [x15]",
+        "add x15, {table}, #4096",
+
+        "and x16, x11, #0xff",
+        "and x17, x13, #0xff",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v0, v0, v24, v25",
+
+        "ubfx x16, x11, #8, #8",
+        "ubfx x17, x13, #8, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v1, v1, v24, v25",
+
+        "ubfx x16, x11, #16, #8",
+        "ubfx x17, x13, #16, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v2, v2, v24, v25",
+
+        "ubfx x16, x11, #24, #8",
+        "ubfx x17, x13, #24, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v3, v3, v24, v25",
+
+        "ubfx x16, x11, #32, #8",
+        "ubfx x17, x13, #32, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v4, v4, v24, v25",
+
+        "ubfx x16, x11, #40, #8",
+        "ubfx x17, x13, #40, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v5, v5, v24, v25",
+
+        "ubfx x16, x11, #48, #8",
+        "ubfx x17, x13, #48, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v6, v6, v24, v25",
+
+        "lsr x16, x11, #56",
+        "lsr x17, x13, #56",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v7, v7, v24, v25",
+
+        "and x16, x12, #0xff",
+        "and x17, x14, #0xff",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v16, v16, v24, v25",
+
+        "ubfx x16, x12, #8, #8",
+        "ubfx x17, x14, #8, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v17, v17, v24, v25",
+
+        "ubfx x16, x12, #16, #8",
+        "ubfx x17, x14, #16, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v18, v18, v24, v25",
+
+        "ubfx x16, x12, #24, #8",
+        "ubfx x17, x14, #24, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v19, v19, v24, v25",
+
+        "ubfx x16, x12, #32, #8",
+        "ubfx x17, x14, #32, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v20, v20, v24, v25",
+
+        "ubfx x16, x12, #40, #8",
+        "ubfx x17, x14, #40, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v21, v21, v24, v25",
+
+        "ubfx x16, x12, #48, #8",
+        "ubfx x17, x14, #48, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v22, v22, v24, v25",
+
+        "lsr x16, x12, #56",
+        "lsr x17, x14, #56",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v23, v23, v24, v25",
+
+        "add x8, x8, x9",
+        "add {table}, {table}, #8192",
+        "subs x10, x10, #1",
+        "b.ne 2b",
+
+        "stp q0, q1, [{dst}]",
+        "stp q2, q3, [{dst}, #32]",
+        "stp q4, q5, [{dst}, #64]",
+        "stp q6, q7, [{dst}, #96]",
+        "stp q16, q17, [{dst}, #128]",
+        "stp q18, q19, [{dst}, #160]",
+        "stp q20, q21, [{dst}, #192]",
+        "stp q22, q23, [{dst}, #224]",
+        row = in(reg) row_ptr,
+        stride = in(reg) row_stride,
+        block_start = in(reg) bs,
+        table = inout(reg) tables_ptr => _,
+        dst = in(reg) out_ptr,
+        out("x8") _,
+        out("x9") _,
+        out("x10") _,
+        out("x11") _,
+        out("x12") _,
+        out("x13") _,
+        out("x14") _,
+        out("x15") _,
+        out("x16") _,
+        out("x17") _,
+        out("v0") _,
+        out("v1") _,
+        out("v2") _,
+        out("v3") _,
+        out("v4") _,
+        out("v5") _,
+        out("v6") _,
+        out("v7") _,
+        out("v16") _,
+        out("v17") _,
+        out("v18") _,
+        out("v19") _,
+        out("v20") _,
+        out("v21") _,
+        out("v22") _,
+        out("v23") _,
+        out("v24") _,
+        out("v25") _,
+        options(nostack),
+    );
+}
+
 /// **i_inner-partitioned** NEON partial fold. Same result as
 /// [`partial_fold_packed_z_neon_single_padded`] but parallelizes over the
 /// **output** (`i_inner`) instead of over z stripes.
@@ -400,6 +579,10 @@ fn iblock_padded_tiled<const TILE_T: usize>(
 /// grows with the outer dim (the redundant-table cost it removes is ∝ `n_stripes`).
 ///
 /// # Safety / preconditions: identical to the iblock kernel.
+///
+/// Ranked BLAKE3 additionally fuses adjacent Block8 drains into the
+/// fixed-register SHA3 Block16 helper. `FLOCK_NO_LINCHECK_BLOCK16=1` restores
+/// the incumbent two-call schedule for same-binary proof/performance A/B.
 #[cfg(target_arch = "aarch64")]
 pub fn partial_fold_packed_z_neon_oblock_padded(
     z_packed: &[u8],
@@ -409,6 +592,29 @@ pub fn partial_fold_packed_z_neon_oblock_padded(
     eq_outer: &[F128],
 ) -> Vec<F128> {
     oblock_padded_tiled::<NEON_TILE_T>(z_packed, m, k_log, useful_bits, eq_outer, 0, usize::MAX)
+}
+
+/// Correctness-oracle entry point that forces the Block16 schedule whenever
+/// the binary supports SHA3/EOR3. Production callers use the ranked-shape gate
+/// inside [`oblock_padded_tiled`] instead.
+#[cfg(target_arch = "aarch64")]
+pub fn partial_fold_packed_z_neon_oblock16_padded(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    oblock_padded_tiled_impl::<NEON_TILE_T>(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        eq_outer,
+        0,
+        usize::MAX,
+        true,
+    )
 }
 
 /// Tile claims per queue chunk in the oblock fold. Exposed so a co-processor
@@ -478,6 +684,34 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
     eq_outer: &[F128],
     claim_lo: usize,
     claim_hi: usize,
+) -> Vec<F128> {
+    let block16 = TILE_T == 8
+        && m == 32
+        && k_log == 14
+        && useful_bits == 15_409
+        && std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none();
+    oblock_padded_tiled_impl::<TILE_T>(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        eq_outer,
+        claim_lo,
+        claim_hi,
+        block16,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+fn oblock_padded_tiled_impl<const TILE_T: usize>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+    claim_lo: usize,
+    claim_hi: usize,
+    block16: bool,
 ) -> Vec<F128> {
     use rayon::prelude::*;
 
@@ -555,6 +789,23 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
             let tables_ptr = tables.as_ptr() as *const u8;
             let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
             let mut bs = 0usize;
+            #[cfg(target_feature = "sha3")]
+            if block16 {
+                while bs + 16 <= useful {
+                    unsafe {
+                        process_block16_neon_single_sha3(
+                            z_base,
+                            k,
+                            bs,
+                            tables_ptr,
+                            partial.as_mut_ptr().add(bs),
+                        );
+                    }
+                    bs += 16;
+                }
+            }
+            #[cfg(not(target_feature = "sha3"))]
+            let _ = block16;
             while bs < useful {
                 unsafe {
                     process_block_neon_single::<TILE_T>(
