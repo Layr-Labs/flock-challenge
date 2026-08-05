@@ -12672,6 +12672,9 @@ mod tests {
 // RealAdii sample 7 on c52fba6.
 // RealAdii sample 8 on c52fba6.
 // RealAdii sample 9 on c52fba6.
-// RealAdii fresh-tree pull 1 on cc1d811.
-// RealAdii frontier pull 2 on cc1d811.
-// RealAdii frontier pull 3 on cc1d811.
+// RealAdii sample 1 on cc1d811.
+// RealAdii sample 2 on cc1d811.
+// RealAdii sample 3 on cc1d811.
+// RealAdii sample 4 on cc1d811.
+// RealAdii sample 5 on cc1d811.
+// RealAdii sample 6 on cc1d811.
