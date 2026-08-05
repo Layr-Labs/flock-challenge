@@ -192,34 +192,6 @@ fn generator_init(log2_size: u32, seed: u64) -> u64 {
 /// transcription of the reference.
 #[inline(always)]
 pub(crate) fn gen_block(init: u64, block: usize) -> Compression {
-    gen_block_with(init, block, !gen_block_ilp_killed())
-}
-
-/// Exact-`1` kill for the ILP-unrolled [`gen_block`]; anything else leaves
-/// it on. Deliberately UNCACHED (one getenv per call) so same-process A/B
-/// tests can toggle it: the hot paths (the lazy witgen quad synth and the
-/// eager parallel fill) resolve it once per prove/fill and pass the bool
-/// down via [`gen_block_with`]; only cold callers pay the per-call read.
-pub(crate) fn gen_block_ilp_killed() -> bool {
-    std::env::var("FLOCK_NO_GEN_BLOCK_SIMD").is_ok_and(|v| v == "1")
-}
-
-/// [`gen_block`] with the ILP/scalar choice resolved by the caller (hot
-/// paths hoist the env read out of their per-block loops).
-#[inline(always)]
-pub(crate) fn gen_block_with(init: u64, block: usize, ilp: bool) -> Compression {
-    if ilp {
-        gen_block_ilp(init, block)
-    } else {
-        gen_block_scalar(init, block)
-    }
-}
-
-/// Incumbent scalar body: one running state, 25 sequential `+= GOLDEN`
-/// steps. Kept verbatim as the `FLOCK_NO_GEN_BLOCK_SIMD=1` control and the
-/// equality oracle for [`gen_block_ilp`].
-#[inline(always)]
-pub(crate) fn gen_block_scalar(init: u64, block: usize) -> Compression {
     let mut s = init.wrapping_add(((DRAWS_PER_BLOCK * block) as u64).wrapping_mul(GOLDEN));
     let mut cv = [0u32; 8];
     for word in cv.iter_mut() {
@@ -235,57 +207,12 @@ pub(crate) fn gen_block_scalar(init: u64, block: usize) -> Compression {
     (cv, message, u64::from(mix(s)), 64, 11)
 }
 
-/// ILP form of [`gen_block_scalar`] (witgen-stack item C): the state before
-/// draw `d` is the closed form `base + (d+1)·GOLDEN` (the recurrence is a
-/// pure counter — the mix is not fed back), so all 25 draws are
-/// independent. Computing states by closed-form multiply in a 4-wide
-/// unroll removes the serial add chain and lets the core run four
-/// independent `mix` pipelines (2 multiplies each) abreast instead of
-/// issuing them behind a 25-deep dependency-ordered loop.
-/// `wrapping_mul`/`wrapping_add` reassociation is exact: everything is
-/// mod-2^64 ring arithmetic, so `(init + 25·b·G) + (d+1)·G` equals the
-/// scalar's stepped state bit-for-bit.
-#[inline(always)]
-pub(crate) fn gen_block_ilp(init: u64, block: usize) -> Compression {
-    let base = init.wrapping_add(((DRAWS_PER_BLOCK * block) as u64).wrapping_mul(GOLDEN));
-    #[inline(always)]
-    fn draw(base: u64, d: usize) -> u32 {
-        mix(base.wrapping_add(((d + 1) as u64).wrapping_mul(GOLDEN)))
-    }
-    let mut out = [0u32; DRAWS_PER_BLOCK];
-    let mut d = 0usize;
-    while d + 4 <= DRAWS_PER_BLOCK {
-        // Four fully independent state computations + mixes per step.
-        let (o0, o1, o2, o3) = (
-            draw(base, d),
-            draw(base, d + 1),
-            draw(base, d + 2),
-            draw(base, d + 3),
-        );
-        out[d] = o0;
-        out[d + 1] = o1;
-        out[d + 2] = o2;
-        out[d + 3] = o3;
-        d += 4;
-    }
-    while d < DRAWS_PER_BLOCK {
-        out[d] = draw(base, d);
-        d += 1;
-    }
-    let cv: [u32; 8] = out[0..8].try_into().expect("draw layout");
-    let message: [u32; 16] = out[8..24].try_into().expect("draw layout");
-    (cv, message, u64::from(out[24]), 64, 11)
-}
-
 /// Fill `out` with the blocks the protected generator would produce.
 fn fill_compressions_par(out: &mut [Compression], log2_size: u32, seed: u64) {
     fill_compressions_from_init(out, generator_init(log2_size, seed));
 }
 
 fn fill_compressions_from_init(out: &mut [Compression], init: u64) {
-    // Resolve the ILP/scalar choice once for the whole fill (getenv is far
-    // too slow for the per-block loop).
-    let ilp = !gen_block_ilp_killed();
     // 4096 blocks ≈ 448 KiB per task: large enough that the RNG chain
     // dominates task overhead, small enough to keep all workers fed.
     out.par_chunks_mut(4096)
@@ -293,7 +220,7 @@ fn fill_compressions_from_init(out: &mut [Compression], init: u64) {
         .for_each(|(chunk_index, dst)| {
             let base = chunk_index * 4096;
             for (offset, slot) in dst.iter_mut().enumerate() {
-                *slot = gen_block_with(init, base + offset, ilp);
+                *slot = gen_block(init, base + offset);
             }
         });
 }
@@ -964,33 +891,9 @@ mod tests {
         let all = generate_compressions_par(log2, seed);
         let init = generator_init(log2, seed);
         // Cross a 4096-block task boundary (the eager fill's chunk size) and
-        // both endpoints — for the dispatching entry AND both explicit
-        // variants (item C: the ILP form must be draw-exact with the scalar
-        // stepped form everywhere).
+        // both endpoints.
         for &i in &[0usize, 1, 7, 8, 4095, 4096, all.len() - 2, all.len() - 1] {
             assert_eq!(gen_block(init, i), all[i], "block {i}");
-            assert_eq!(gen_block_scalar(init, i), all[i], "scalar block {i}");
-            assert_eq!(gen_block_ilp(init, i), all[i], "ilp block {i}");
-        }
-        // Dense scalar-vs-ILP sweep across many seeds and every index class
-        // mod the 4-wide unroll, plus large indices (closed-form multiply
-        // overflow territory).
-        for &(lg, sd) in &[
-            (10u32, 0u64),
-            (13, 0xDEAD_BEEF_1234_5678),
-            (18, u64::MAX),
-            (18, 0x0123_4567_89AB_CDEF),
-            (32, 0x9E37_79B9_7F4A_7C15),
-        ] {
-            let init = generator_init(lg, sd);
-            let n = 1usize << lg.min(18);
-            for i in (0..64).chain([n / 2 - 1, n / 2, n - 3, n - 2, n - 1]) {
-                assert_eq!(
-                    gen_block_scalar(init, i),
-                    gen_block_ilp(init, i),
-                    "scalar/ilp divergence lg={lg} sd={sd:#x} block {i}"
-                );
-            }
         }
     }
 

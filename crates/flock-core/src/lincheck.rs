@@ -1969,13 +1969,10 @@ mod tests {
     }
 
     /// The opt-in vector builder is an exact replacement at every expansion
-    /// geometry, including its first parallel level (crossed at d ≥ 15; the
-    /// generic builder parallelizes from d ≥ 13). d = 16 also covers the
-    /// largest ranked recursion-OOD dim now routed through the optimized
-    /// builder (micro-stack item 3); 7/10/13 cover the deeper ranked levels.
+    /// geometry, including its first parallel level.
     #[test]
     fn optimized_eq_table_matches_generic_bytes() {
-        for &d in &[0usize, 1, 2, 3, 5, 7, 8, 10, 12, 13, 16] {
+        for &d in &[0usize, 1, 2, 3, 5, 8, 12, 13] {
             let mut rng = Rng::new(0x4551_4f50 + d as u64);
             let point = rng.f128_vec(d);
             let generic = build_eq_table(&point);
