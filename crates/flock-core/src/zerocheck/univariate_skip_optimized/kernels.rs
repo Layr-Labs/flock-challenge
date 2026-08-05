@@ -319,6 +319,44 @@ pub(super) fn accumulate_c_banks_with_policy(
     }
 }
 
+/// Paired C-bank drain: two `x_outer_lo` blocks folded into one pass over
+/// `partial_c` (see `aarch64::accumulate_c_banks2`). Bit-exact with two
+/// sequential single-block drains; the portable fallback is exactly that.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn accumulate_c_banks_pair_with_policy(
+    c_block_a: &[u8; 16 * 64],
+    n_b_med_a: usize,
+    mask_tables_a: &[super::F128],
+    c_block_b: &[u8; 16 * 64],
+    n_b_med_b: usize,
+    mask_tables_b: &[super::F128],
+    partial_c: &mut [[super::F128; 64]; 8],
+    drain4: bool,
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: same contracts as the single-block dispatcher, per block.
+    unsafe {
+        aarch64::accumulate_c_banks2(
+            c_block_a,
+            n_b_med_a,
+            mask_tables_a,
+            c_block_b,
+            n_b_med_b,
+            mask_tables_b,
+            partial_c,
+            drain4,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = drain4;
+        accumulate_c_banks_scalar(c_block_a, n_b_med_a, mask_tables_a, partial_c);
+        accumulate_c_banks_scalar(c_block_b, n_b_med_b, mask_tables_b, partial_c);
+    }
+}
+
 /// Thirty-two-bank C drain for the experimental direct-fold4 capture.
 /// `q = b_med & 3` is retained alongside the incumbent eight small-bit banks;
 /// the 16-entry table folds only `h = b_med >> 2`.

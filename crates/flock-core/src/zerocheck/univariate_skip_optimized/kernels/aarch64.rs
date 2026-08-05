@@ -318,6 +318,80 @@ pub(crate) unsafe fn accumulate_c_banks(
     // fixed-size arrays; table indices are `u8` scaled by the 16-byte row size,
     // bounded by the debug-asserted 256-row halves.
     unsafe {
+        let mut m_lo = [[0u8; 64]; 8];
+        let mut m_hi = [[0u8; 64]; 8];
+        build_c_bank_masks(c_block, n_b_med, &mut m_lo, &mut m_hi);
+
+        let t_lo = mask_tables.as_ptr() as *const u8;
+        let t_hi = t_lo.add(256 * 16);
+        if drain4 {
+            // Four independent lanes expose eight random table loads at once,
+            // matching the latency-hiding shape of the AB convert kernel.
+            // The old scalar drain kept only the low/high pair for one lane in
+            // flight, leaving the dependent L1 gather latency on the critical
+            // chain even though the register file has ample headroom.
+            for s in 0..8 {
+                let bank = partial_c[s].as_mut_ptr() as *mut u8;
+                for lane in (0..64).step_by(4) {
+                    let lo = (m_lo[s].as_ptr().add(lane) as *const u32).read_unaligned();
+                    let hi = (m_hi[s].as_ptr().add(lane) as *const u32).read_unaligned();
+
+                    let l0 = vld1q_u8(t_lo.add(usize::from((lo & 0xff) as u8) * 16));
+                    let l1 = vld1q_u8(t_lo.add(usize::from(((lo >> 8) & 0xff) as u8) * 16));
+                    let l2 = vld1q_u8(t_lo.add(usize::from(((lo >> 16) & 0xff) as u8) * 16));
+                    let l3 = vld1q_u8(t_lo.add(usize::from((lo >> 24) as u8) * 16));
+                    let h0 = vld1q_u8(t_hi.add(usize::from((hi & 0xff) as u8) * 16));
+                    let h1 = vld1q_u8(t_hi.add(usize::from(((hi >> 8) & 0xff) as u8) * 16));
+                    let h2 = vld1q_u8(t_hi.add(usize::from(((hi >> 16) & 0xff) as u8) * 16));
+                    let h3 = vld1q_u8(t_hi.add(usize::from((hi >> 24) as u8) * 16));
+
+                    let p0 = bank.add(lane * 16);
+                    let p1 = p0.add(16);
+                    let p2 = p1.add(16);
+                    let p3 = p2.add(16);
+                    vst1q_u8(p0, xor3_u8(vld1q_u8(p0), l0, h0));
+                    vst1q_u8(p1, xor3_u8(vld1q_u8(p1), l1, h1));
+                    vst1q_u8(p2, xor3_u8(vld1q_u8(p2), l2, h2));
+                    vst1q_u8(p3, xor3_u8(vld1q_u8(p3), l3, h3));
+                }
+            }
+        } else {
+            for s in 0..8 {
+                let bank = partial_c[s].as_mut_ptr() as *mut u8;
+                for lane in 0..64 {
+                    let slot = bank.add(lane * 16);
+                    vst1q_u8(
+                        slot,
+                        xor3_u8(
+                            vld1q_u8(slot),
+                            vld1q_u8(t_lo.add(usize::from(m_lo[s][lane]) * 16)),
+                            vld1q_u8(t_hi.add(usize::from(m_hi[s][lane]) * 16)),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Phases 1–2 of [`accumulate_c_banks`] (cross-`b_med` bit transpose +
+/// interleaved store), extracted so the paired drain below can build two
+/// blocks' masks before one fused pass over `partial_c`. Layout contract is
+/// identical to the incumbent in-line version.
+#[inline(always)]
+unsafe fn build_c_bank_masks(
+    c_block: &[u8; 16 * 64],
+    n_b_med: usize,
+    m_lo: &mut [[u8; 64]; 8],
+    m_hi: &mut [[u8; 64]; 8],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med <= 16);
+
+    // SAFETY: every load/store below is a fixed offset into the caller's
+    // fixed-size arrays.
+    unsafe {
         // `x[b] bit s` -> `out[s] bit b`, vectorized over the 16 byte columns.
         macro_rules! transpose8 {
             ($x:expr, $m33:expr, $m55:expr) => {{
@@ -376,10 +450,8 @@ pub(crate) unsafe fn accumulate_c_banks(
         let m55 = vdupq_n_u8(0x55);
 
         // Bit `b` of `m_lo[s][lane]` is bit `s` of the transposed C byte for
-        // `b_med = b` (`m_hi` covers `b_med` 8..16). 1 KiB of stack, dead at
-        // return; phase 2 writes it in exactly this layout.
-        let mut m_lo = [[0u8; 64]; 8];
-        let mut m_hi = [[0u8; 64]; 8];
+        // `b_med = b` (`m_hi` covers `b_med` 8..16); phase 2 writes the
+        // caller's buffers in exactly this layout.
         let src = c_block.as_ptr();
 
         // `n_b_med` is fixed for the whole call, so the padded boundary window
@@ -430,38 +502,86 @@ pub(crate) unsafe fn accumulate_c_banks(
                 vdupq_n_u8(0)
             });
         }
+    }
+}
 
-        let t_lo = mask_tables.as_ptr() as *const u8;
-        let t_hi = t_lo.add(256 * 16);
+/// Paired twin of [`accumulate_c_banks`]: drains the C banks of two
+/// `x_outer_lo` blocks in one pass over `partial_c`. The banks are α-free
+/// (`eq_lo` folds in later at `finish_c_banks`) and accumulation is
+/// characteristic-2 XOR, so folding both blocks into one read-modify-write is
+/// bit-exact while halving the accumulator load/store traffic and loop
+/// control, and doubling the number of independent table gathers in flight.
+///
+/// `#[inline(never)]`: the four 512-byte mask buffers below must live in this
+/// function's own frame, not be folded into the (already large) caller frame
+/// — the same worker-stack guard as `shift_reduce_inner_ab_fused_neon_h4`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn accumulate_c_banks2(
+    c_block_a: &[u8; 16 * 64],
+    n_b_med_a: usize,
+    mask_tables_a: &[F128],
+    c_block_b: &[u8; 16 * 64],
+    n_b_med_b: usize,
+    mask_tables_b: &[F128],
+    partial_c: &mut [[F128; 64]; 8],
+    drain4: bool,
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert_eq!(mask_tables_a.len(), 512);
+    debug_assert_eq!(mask_tables_b.len(), 512);
+
+    // SAFETY: same contracts as `accumulate_c_banks`, applied to each block.
+    unsafe {
+        let mut ma_lo = [[0u8; 64]; 8];
+        let mut ma_hi = [[0u8; 64]; 8];
+        let mut mb_lo = [[0u8; 64]; 8];
+        let mut mb_hi = [[0u8; 64]; 8];
+        build_c_bank_masks(c_block_a, n_b_med_a, &mut ma_lo, &mut ma_hi);
+        build_c_bank_masks(c_block_b, n_b_med_b, &mut mb_lo, &mut mb_hi);
+
+        let ta_lo = mask_tables_a.as_ptr() as *const u8;
+        let ta_hi = ta_lo.add(256 * 16);
+        let tb_lo = mask_tables_b.as_ptr() as *const u8;
+        let tb_hi = tb_lo.add(256 * 16);
         if drain4 {
-            // Four independent lanes expose eight random table loads at once,
-            // matching the latency-hiding shape of the AB convert kernel.
-            // The old scalar drain kept only the low/high pair for one lane in
-            // flight, leaving the dependent L1 gather latency on the critical
-            // chain even though the register file has ample headroom.
+            // Sixteen independent table loads in flight per 4-lane step —
+            // twice the single-block drain — against one shared accumulator
+            // read-modify-write instead of two.
             for s in 0..8 {
                 let bank = partial_c[s].as_mut_ptr() as *mut u8;
                 for lane in (0..64).step_by(4) {
-                    let lo = (m_lo[s].as_ptr().add(lane) as *const u32).read_unaligned();
-                    let hi = (m_hi[s].as_ptr().add(lane) as *const u32).read_unaligned();
+                    let alo = (ma_lo[s].as_ptr().add(lane) as *const u32).read_unaligned();
+                    let ahi = (ma_hi[s].as_ptr().add(lane) as *const u32).read_unaligned();
+                    let blo = (mb_lo[s].as_ptr().add(lane) as *const u32).read_unaligned();
+                    let bhi = (mb_hi[s].as_ptr().add(lane) as *const u32).read_unaligned();
 
-                    let l0 = vld1q_u8(t_lo.add(usize::from((lo & 0xff) as u8) * 16));
-                    let l1 = vld1q_u8(t_lo.add(usize::from(((lo >> 8) & 0xff) as u8) * 16));
-                    let l2 = vld1q_u8(t_lo.add(usize::from(((lo >> 16) & 0xff) as u8) * 16));
-                    let l3 = vld1q_u8(t_lo.add(usize::from((lo >> 24) as u8) * 16));
-                    let h0 = vld1q_u8(t_hi.add(usize::from((hi & 0xff) as u8) * 16));
-                    let h1 = vld1q_u8(t_hi.add(usize::from(((hi >> 8) & 0xff) as u8) * 16));
-                    let h2 = vld1q_u8(t_hi.add(usize::from(((hi >> 16) & 0xff) as u8) * 16));
-                    let h3 = vld1q_u8(t_hi.add(usize::from((hi >> 24) as u8) * 16));
+                    let al0 = vld1q_u8(ta_lo.add(usize::from((alo & 0xff) as u8) * 16));
+                    let al1 = vld1q_u8(ta_lo.add(usize::from(((alo >> 8) & 0xff) as u8) * 16));
+                    let al2 = vld1q_u8(ta_lo.add(usize::from(((alo >> 16) & 0xff) as u8) * 16));
+                    let al3 = vld1q_u8(ta_lo.add(usize::from((alo >> 24) as u8) * 16));
+                    let ah0 = vld1q_u8(ta_hi.add(usize::from((ahi & 0xff) as u8) * 16));
+                    let ah1 = vld1q_u8(ta_hi.add(usize::from(((ahi >> 8) & 0xff) as u8) * 16));
+                    let ah2 = vld1q_u8(ta_hi.add(usize::from(((ahi >> 16) & 0xff) as u8) * 16));
+                    let ah3 = vld1q_u8(ta_hi.add(usize::from((ahi >> 24) as u8) * 16));
+                    let bl0 = vld1q_u8(tb_lo.add(usize::from((blo & 0xff) as u8) * 16));
+                    let bl1 = vld1q_u8(tb_lo.add(usize::from(((blo >> 8) & 0xff) as u8) * 16));
+                    let bl2 = vld1q_u8(tb_lo.add(usize::from(((blo >> 16) & 0xff) as u8) * 16));
+                    let bl3 = vld1q_u8(tb_lo.add(usize::from((blo >> 24) as u8) * 16));
+                    let bh0 = vld1q_u8(tb_hi.add(usize::from((bhi & 0xff) as u8) * 16));
+                    let bh1 = vld1q_u8(tb_hi.add(usize::from(((bhi >> 8) & 0xff) as u8) * 16));
+                    let bh2 = vld1q_u8(tb_hi.add(usize::from(((bhi >> 16) & 0xff) as u8) * 16));
+                    let bh3 = vld1q_u8(tb_hi.add(usize::from((bhi >> 24) as u8) * 16));
 
                     let p0 = bank.add(lane * 16);
                     let p1 = p0.add(16);
                     let p2 = p1.add(16);
                     let p3 = p2.add(16);
-                    vst1q_u8(p0, xor3_u8(vld1q_u8(p0), l0, h0));
-                    vst1q_u8(p1, xor3_u8(vld1q_u8(p1), l1, h1));
-                    vst1q_u8(p2, xor3_u8(vld1q_u8(p2), l2, h2));
-                    vst1q_u8(p3, xor3_u8(vld1q_u8(p3), l3, h3));
+                    vst1q_u8(p0, xor3_u8(xor3_u8(vld1q_u8(p0), al0, ah0), bl0, bh0));
+                    vst1q_u8(p1, xor3_u8(xor3_u8(vld1q_u8(p1), al1, ah1), bl1, bh1));
+                    vst1q_u8(p2, xor3_u8(xor3_u8(vld1q_u8(p2), al2, ah2), bl2, bh2));
+                    vst1q_u8(p3, xor3_u8(xor3_u8(vld1q_u8(p3), al3, ah3), bl3, bh3));
                 }
             }
         } else {
@@ -472,9 +592,13 @@ pub(crate) unsafe fn accumulate_c_banks(
                     vst1q_u8(
                         slot,
                         xor3_u8(
-                            vld1q_u8(slot),
-                            vld1q_u8(t_lo.add(usize::from(m_lo[s][lane]) * 16)),
-                            vld1q_u8(t_hi.add(usize::from(m_hi[s][lane]) * 16)),
+                            xor3_u8(
+                                vld1q_u8(slot),
+                                vld1q_u8(ta_lo.add(usize::from(ma_lo[s][lane]) * 16)),
+                                vld1q_u8(ta_hi.add(usize::from(ma_hi[s][lane]) * 16)),
+                            ),
+                            vld1q_u8(tb_lo.add(usize::from(mb_lo[s][lane]) * 16)),
+                            vld1q_u8(tb_hi.add(usize::from(mb_hi[s][lane]) * 16)),
                         ),
                     );
                 }

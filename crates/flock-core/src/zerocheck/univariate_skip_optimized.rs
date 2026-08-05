@@ -632,6 +632,19 @@ fn ab_compact_store_enabled() -> bool {
     })
 }
 
+/// Kill switch for the paired C-bank drain: `FLOCK_NO_C_BANKS_PAIR=1`
+/// restores one `accumulate_c_banks` call per live `x_outer_lo` as a
+/// same-binary control. The banks are α-free XOR accumulators, so pairing
+/// two blocks into one `partial_c` pass is bit-exact (the split-path comment
+/// on AB/C reordering already relies on the same property); the switch
+/// exists purely for screening the accumulator-traffic win.
+pub const ENV_NO_C_BANKS_PAIR: &str = "FLOCK_NO_C_BANKS_PAIR";
+
+fn c_banks_pair_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_C_BANKS_PAIR).is_none())
+}
+
 /// Non-temporal 64-byte store (L1 stack bounce → `stnp` pair burst), the same
 /// best-effort cache-bypass idiom as the witness stripe drain. The precompute
 /// output is a 512 MiB write-once surface whose consumer runs tens of
@@ -1445,6 +1458,24 @@ fn process_one_x_hi_with_s_hat_v(
 
     let n_lo = n_lo_and_inner - N_INNER;
 
+    // The C side reads the packed witness directly: the fused mask kernel
+    // subsumes the per-`b_med` `bit_transpose_64bytes` this path used to run.
+    let c_rows_tables = |x_outer_lo: usize| {
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
+            [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
+            .try_into()
+            .expect("sixteen 64-byte c rows per x_outer_lo");
+        let c_tables =
+            &mask_tables[x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
+        (c_rows, c_tables)
+    };
+    let pair_c = c_banks_pair_enabled();
+    // Deferred first block of a C-drain pair: `(x_outer_lo, n_b_med)`. The
+    // banks are α-free XOR accumulators, so draining block A alongside block
+    // B is bit-exact regardless of the AB work in between.
+    let mut pending_c: Option<(usize, usize)> = None;
+
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
@@ -1455,14 +1486,6 @@ fn process_one_x_hi_with_s_hat_v(
 
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
         let eq_lo_val = eq_lo_scaled[x_outer_lo];
-        let c_tables =
-            &mask_tables[x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
-        // The C side reads the packed witness directly: the fused mask kernel
-        // subsumes the per-`b_med` `bit_transpose_64bytes` this path used to run.
-        let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
-            [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
-            .try_into()
-            .expect("sixteen 64-byte c rows per x_outer_lo");
 
         if n_b_med == (1 << N_MEDIUM) {
             for b_med in 0..(1 << N_MEDIUM) {
@@ -1484,15 +1507,12 @@ fn process_one_x_hi_with_s_hat_v(
                 );
             }
 
-            kernels::accumulate_convert_with_s_hat_v(
+            kernels::accumulate_convert_ab(
                 &state.chunk_ab_bytes,
-                c_rows,
                 1 << N_MEDIUM,
                 convert,
                 eq_lo_val,
-                c_tables,
                 &mut state.partial_ab,
-                &mut state.partial_c,
             );
         } else {
             for b_med in 0..n_b_med {
@@ -1514,17 +1534,41 @@ fn process_one_x_hi_with_s_hat_v(
                 );
             }
 
-            kernels::accumulate_convert_with_s_hat_v(
+            kernels::accumulate_convert_ab(
                 &state.chunk_ab_bytes,
-                c_rows,
                 n_b_med,
                 convert,
                 eq_lo_val,
-                c_tables,
                 &mut state.partial_ab,
-                &mut state.partial_c,
             );
         }
+
+        if !pair_c {
+            let (c_rows, c_tables) = c_rows_tables(x_outer_lo);
+            kernels::accumulate_c_banks(c_rows, n_b_med, c_tables, &mut state.partial_c);
+        } else {
+            match pending_c.take() {
+                None => pending_c = Some((x_outer_lo, n_b_med)),
+                Some((lo_a, n_a)) => {
+                    let (rows_a, tables_a) = c_rows_tables(lo_a);
+                    let (rows_b, tables_b) = c_rows_tables(x_outer_lo);
+                    kernels::accumulate_c_banks_pair_with_policy(
+                        rows_a,
+                        n_a,
+                        tables_a,
+                        rows_b,
+                        n_b_med,
+                        tables_b,
+                        &mut state.partial_c,
+                        true,
+                    );
+                }
+            }
+        }
+    }
+    if let Some((lo_a, n_a)) = pending_c {
+        let (rows_a, tables_a) = c_rows_tables(lo_a);
+        kernels::accumulate_c_banks(rows_a, n_a, tables_a, &mut state.partial_c);
     }
 
     // Outer fold by eq_hi (per bank).
@@ -1603,6 +1647,19 @@ fn process_one_x_hi_with_precomputed_ab(
             );
         }
 
+        let c_rows_tables = |x_outer_lo: usize| {
+            let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+            let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
+                [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
+                .try_into()
+                .expect("sixteen 64-byte c rows per x_outer_lo");
+            let c_tables = &mask_tables
+                [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
+            (c_rows, c_tables)
+        };
+        let pair_c = c_banks_pair_enabled();
+        // Deferred first block of a C-drain pair: `(x_outer_lo, n_b_med)`.
+        let mut pending_c: Option<(usize, usize)> = None;
         for x_outer_lo in 0..big_lo_size {
             let x_outer = x_outer_lo | (x_hi << n_lo);
             let within_hash_outer = x_outer & within_outer_mask;
@@ -1611,17 +1668,41 @@ fn process_one_x_hi_with_precomputed_ab(
                 continue;
             }
 
-            let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-            let c_rows: &[u8; (1 << N_MEDIUM) * 64] = (&c_packed
-                [chunk_byte_base..chunk_byte_base + (1 << N_MEDIUM) * 64])
-                .try_into()
-                .expect("sixteen 64-byte c rows per x_outer_lo");
-            let c_tables = &mask_tables
-                [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
+            if !pair_c {
+                let (c_rows, c_tables) = c_rows_tables(x_outer_lo);
+                kernels::accumulate_c_banks_with_policy(
+                    c_rows,
+                    n_b_med,
+                    c_tables,
+                    &mut state.partial_c,
+                    c_drain4,
+                );
+                continue;
+            }
+            match pending_c.take() {
+                None => pending_c = Some((x_outer_lo, n_b_med)),
+                Some((lo_a, n_a)) => {
+                    let (rows_a, tables_a) = c_rows_tables(lo_a);
+                    let (rows_b, tables_b) = c_rows_tables(x_outer_lo);
+                    kernels::accumulate_c_banks_pair_with_policy(
+                        rows_a,
+                        n_a,
+                        tables_a,
+                        rows_b,
+                        n_b_med,
+                        tables_b,
+                        &mut state.partial_c,
+                        c_drain4,
+                    );
+                }
+            }
+        }
+        if let Some((lo_a, n_a)) = pending_c {
+            let (rows_a, tables_a) = c_rows_tables(lo_a);
             kernels::accumulate_c_banks_with_policy(
-                c_rows,
-                n_b_med,
-                c_tables,
+                rows_a,
+                n_a,
+                tables_a,
                 &mut state.partial_c,
                 c_drain4,
             );
@@ -5000,6 +5081,66 @@ mod tests {
 
             assert_eq!(got_ab, want_ab, "partial_ab mismatch at n_b_med={n_b_med}");
             assert_eq!(got_c, want_c, "partial_c mismatch at n_b_med={n_b_med}");
+        }
+    }
+
+    /// Paired C-bank drain oracle: `accumulate_c_banks_pair_with_policy` must
+    /// be bit-identical to two sequential single-block drains, for every
+    /// `(n_b_med_a, n_b_med_b)` combination (1..=16 each, covering full and
+    /// padded boundary windows on both sides), over random blocks and
+    /// distinct random tables, from non-zero partials, in both drain flavors.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn paired_c_banks_match_two_singles() {
+        let mut rng = Rng::new(0xC2_BA1B_ED);
+        let random_block = |rng: &mut Rng| {
+            let mut block = [0u8; 16 * 64];
+            for byte in block.iter_mut() {
+                *byte = (rng.next_u64() & 0xff) as u8;
+            }
+            block
+        };
+        let random_tables = |rng: &mut Rng| {
+            (0..C_MASK_TABLE_STRIDE)
+                .map(|_| F128 {
+                    lo: rng.next_u64(),
+                    hi: rng.next_u64(),
+                })
+                .collect::<Vec<_>>()
+        };
+        for drain4 in [false, true] {
+            let block_a = random_block(&mut rng);
+            let block_b = random_block(&mut rng);
+            let tables_a = random_tables(&mut rng);
+            let tables_b = random_tables(&mut rng);
+            let mut seed = [[F128::ZERO; ELL]; N_C_BANKS];
+            for bank in seed.iter_mut() {
+                for slot in bank.iter_mut() {
+                    *slot = F128 {
+                        lo: rng.next_u64(),
+                        hi: rng.next_u64(),
+                    };
+                }
+            }
+            for n_a in 1..=16usize {
+                for n_b in 1..=16usize {
+                    let mut want = seed;
+                    kernels::accumulate_c_banks_with_policy(
+                        &block_a, n_a, &tables_a, &mut want, drain4,
+                    );
+                    kernels::accumulate_c_banks_with_policy(
+                        &block_b, n_b, &tables_b, &mut want, drain4,
+                    );
+                    let mut got = seed;
+                    kernels::accumulate_c_banks_pair_with_policy(
+                        &block_a, n_a, &tables_a, &block_b, n_b, &tables_b, &mut got, drain4,
+                    );
+                    assert_eq!(
+                        want, got,
+                        "paired drain drift (n_a={n_a}, n_b={n_b}, drain4={drain4})"
+                    );
+                }
+            }
         }
     }
 
