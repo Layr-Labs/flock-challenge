@@ -8737,12 +8737,48 @@ LC_KERNEL(lc_fold_stripes, 4)
         share.clamp(0.0, (n_claims / 2) as f64) as usize
     }
 
+    /// `FLOCK_NO_LINCHECK_FULL_SHARE=1` (exact) restores the 5n/8 clamp.
+    fn lincheck_full_share_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_LINCHECK_FULL_SHARE").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+        })
+    }
+
     pub(crate) fn lincheck_gate_share_balanced(ratio: f64, n_claims: usize) -> usize {
+        lincheck_gate_share_balanced_with_cap(ratio, n_claims, lincheck_full_share_enabled())
+    }
+
+    /// Cap policy as a parameter so both arms are unit-testable in one process
+    /// (the env selector is latched in a `OnceLock`).
+    pub(crate) fn lincheck_gate_share_balanced_with_cap(
+        ratio: f64,
+        n_claims: usize,
+        full_range: bool,
+    ) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 || ratio > LINCHECK_FOLD_MAX_GPU_RATIO {
             return 0;
         }
         let share = (n_claims as f64 / (1.0 + ratio)).round();
-        share.clamp(0.0, (n_claims * 5 / 8) as f64) as usize
+        // The balanced value is already target-calibrated from the arm's own
+        // measured `ratio = u_gpu/u_cpu`, so a fixed fractional clamp can only
+        // truncate it. At the ranked shape the measured ratio 0.477 balances at
+        // 43 of 64 claims while the 5n/8 clamp caps the arm at 40, leaving the
+        // split CPU-bound (measured: gpu 2.93 ms vs cpu suffix 4.28 ms).
+        //
+        // This arm runs the byte-B4 fold kernel, the same route whose full claim
+        // range the zerocheck arm already admits (`zc_fold_balanced_share` keeps
+        // its 7n/8 cap only for the shipped nibble rollback). Admit the full
+        // range here too: the formula still chooses less than `n` whenever the
+        // measured kernel does not support more, and `ratio >
+        // LINCHECK_FOLD_MAX_GPU_RATIO` still disables the arm entirely.
+        let cap = if full_range {
+            n_claims as f64
+        } else {
+            (n_claims * 5 / 8) as f64
+        };
+        share.clamp(0.0, cap) as usize
     }
 
     pub(crate) fn lincheck_gate_share(ratio: f64, n_claims: usize) -> usize {
@@ -13929,7 +13965,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn lincheck_gate_share_formula_and_disable() {
-        use imp::{lincheck_gate_share_balanced, lincheck_gate_share_legacy};
+        use imp::{
+            lincheck_gate_share_balanced, lincheck_gate_share_balanced_with_cap,
+            lincheck_gate_share_legacy,
+        };
         // Balanced default: round(64 / 2) = 32.
         assert_eq!(lincheck_gate_share_balanced(1.0, 64), 32);
         // v1's measured local ratio: round(64 / 2.52) = 25.
@@ -13942,10 +13981,17 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // Above it the arm is OFF (0 = exact incumbent).
         assert_eq!(lincheck_gate_share_balanced(2.01, 64), 0);
         assert_eq!(lincheck_gate_share_balanced(3.0, 64), 0);
-        // Fast GPU: capped at five eighths (overshoot makes the GPU the
-        // timed straggler).
-        assert_eq!(lincheck_gate_share_balanced(0.5, 64), 40);
-        assert_eq!(lincheck_gate_share_balanced(0.1, 64), 40);
+        // Fast GPU: the byte-B4 route admits the full claim range, so the
+        // measured balance is no longer truncated — round(64/1.5) = 43.
+        // `FLOCK_NO_LINCHECK_FULL_SHARE=1` restores the old five-eighths clamp,
+        // which capped exactly this case at 40.
+        assert_eq!(lincheck_gate_share_balanced_with_cap(0.5, 64, true), 43);
+        assert_eq!(lincheck_gate_share_balanced_with_cap(0.5, 64, false), 40);
+        assert_eq!(lincheck_gate_share_balanced_with_cap(0.1, 64, true), 58);
+        assert_eq!(lincheck_gate_share_balanced_with_cap(0.1, 64, false), 40);
+        // The measured ranked ratio: balanced at 43, previously clamped to 40.
+        assert_eq!(lincheck_gate_share_balanced_with_cap(0.477, 64, true), 43);
+        assert_eq!(lincheck_gate_share_balanced_with_cap(0.477, 64, false), 40);
         // Unusable samples disable rather than guess.
         assert_eq!(lincheck_gate_share_balanced(f64::NAN, 64), 0);
         assert_eq!(lincheck_gate_share_balanced(f64::INFINITY, 64), 0);
