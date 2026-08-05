@@ -243,6 +243,25 @@ pub(crate) fn zc_idle_fill_enabled() -> bool {
     !std::env::var(ENV_NO_ZC_IDLE_FILL).is_ok_and(|v| v == "1")
 }
 
+/// Kill switch for the commit-tail fill (`FLOCK_NO_COMMIT_TAIL_FILL=1`,
+/// exact): on the ranked shape the commit window is bound by the CPU AB
+/// precompute arm while the GPU graph lands earlier, leaving the GPU idle
+/// for the arm's tail. The Merkle root — the only commit-derived transcript
+/// input — exists at graph completion, so the zerocheck challenges are
+/// derivable there on a forked challenger and the round-one C-fold's GPU
+/// prefix can be submitted inside that idle tail instead of at zerocheck
+/// entry. The staged dispatch is the incumbent dispatch, merely earlier;
+/// its inputs (the deferred lincheck stripe, guarded by an explicit
+/// completion flag, and `eq_outer` from the forked challenges) are bound
+/// before the submit, and the stash is consumed at zerocheck entry only
+/// after the real challenger reproduces byte-identical challenges.
+pub const ENV_NO_COMMIT_TAIL_FILL: &str = "FLOCK_NO_COMMIT_TAIL_FILL";
+
+/// Read per prove (uncached) so same-process A/B tests can toggle it.
+pub fn commit_tail_fill_enabled() -> bool {
+    !std::env::var(ENV_NO_COMMIT_TAIL_FILL).is_ok_and(|v| v == "1")
+}
+
 /// Kill switch for the zerocheck first-tail-round (T3 compact reconstruction)
 /// products GPU arm.
 pub const ENV_NO_GPU_ZC_T3: &str = "FLOCK_NO_GPU_ZC_T3";
@@ -2582,12 +2601,24 @@ kernel void leaf_parent3(device const uint* codeword [[buffer(0)]],
 
     {
         const uint id = tgid * 256u + lid;
-        device const uint* leaf = codeword + id * 256u;
+        // uint4 leaf fetch: the leaf pass re-reads the full codeword and is
+        // request-count-bound, not bandwidth-bound (see the leaf-pass note on
+        // the main MSL source). Each 1 KiB leaf is 16-byte aligned (buffer
+        // offset 0, id * 1024), so the same 256 words arrive as 64 vector
+        // requests instead of 256 scalar ones. Word order into `block` is
+        // unchanged — output bytes are bit-identical.
+        device const uint4* leaf4 = (device const uint4*)(codeword + id * 256u);
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
         for (uint b = 0u; b < 16u; b++) {
             uint block[16];
-            for (uint i = 0u; i < 16u; i++) block[i] = leaf[b * 16u + i];
+            for (uint q = 0u; q < 4u; q++) {
+                const uint4 w = leaf4[b * 4u + q];
+                block[q * 4u + 0u] = w.x;
+                block[q * 4u + 1u] = w.y;
+                block[q * 4u + 2u] = w.z;
+                block[q * 4u + 3u] = w.w;
+            }
             uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
             b3_compress(cv, block, 64u, flags);
         }
@@ -7815,6 +7846,46 @@ LC_KERNEL(lc_fold_stripes, 4)
         out_cap: usize,
         /// Cached no-copy wraps of caller stripes: `(ptr, len, buffer)`.
         z_wraps: Vec<(usize, usize, Id)>,
+        /// Commit-tail-fill parked prefix (see `ENV_NO_COMMIT_TAIL_FILL`):
+        /// a ZC fold dispatch submitted at commit-graph completion, waiting
+        /// for the same prove's zerocheck entry to adopt it under an exact
+        /// fingerprint. Every other ZC_FOLD operation abandons it before
+        /// touching the shared buffer set it reads.
+        staged: Option<ZcFoldStaged>,
+    }
+
+    /// See [`ZcFold::staged`]. Parked WITHOUT the guard so any thread can
+    /// adopt or abandon it — the staging thread (a rayon pool worker inside
+    /// the commit join) is not the thread that runs zerocheck.
+    struct ZcFoldStaged {
+        cb: Id,
+        plan: ZcFoldPlan,
+        k: usize,
+        claim_lo: usize,
+        n_claims: usize,
+        submitted: std::time::Instant,
+        /// Exact challenge vector the staged eq/plan derives from.
+        r: Vec<F128>,
+        /// Stripe identity the staged dispatch reads.
+        z_ptr: usize,
+        z_len: usize,
+        /// eq lane count (for reconstructing a staged-table view).
+        eq_len: usize,
+        /// Owned eq table when the build could not stage into `eq_buf`;
+        /// `None` = the table lives in `eq_buf`.
+        eq_owned: Option<Vec<F128>>,
+    }
+
+    /// Abandon a parked commit-tail-fill prefix: wait out its command
+    /// buffer and release it. The staged output is byte-inert (never read
+    /// on this path). Caller holds the ZC_FOLD guard.
+    unsafe fn abandon_staged_prefix(state: &mut ZcFold) {
+        if let Some(staged) = state.staged.take() {
+            unsafe {
+                let _ = state.gpu.wait_cb(staged.cb);
+                state.gpu.release(staged.cb);
+            }
+        }
     }
     // SAFETY: Metal objects are thread-safe; every access is serialized by
     // the ZC_FOLD mutex, and the one prove in flight owns the lease.
@@ -7970,6 +8041,7 @@ LC_KERNEL(lc_fold_stripes, 4)
                 out_buf: NIL,
                 out_cap: 0,
                 z_wraps: Vec::new(),
+                staged: None,
             })
         }
     }
@@ -8096,6 +8168,9 @@ LC_KERNEL(lc_fold_stripes, 4)
         }
         let state = guard.as_mut()?.as_mut().ok()?;
         unsafe {
+            // A parked commit-tail-fill prefix reads eq_buf; retire it
+            // before this build can overwrite its input.
+            abandon_staged_prefix(state);
             let (mut eq_buf, mut eq_cap) = (state.eq_buf, state.eq_cap);
             state.ensure(&mut eq_buf, &mut eq_cap, n_outer * 16).ok()?;
             state.eq_buf = eq_buf;
@@ -8234,6 +8309,7 @@ LC_KERNEL(lc_fold_stripes, 4)
         pub(crate) fn claim_lo(&self) -> usize {
             self.claim_lo
         }
+
 
         /// Wait for the prefix and XOR it into `dst` (length `k`). `head_ms`
         /// is the wall between submission and the start of the CPU suffix,
@@ -8868,6 +8944,142 @@ LC_KERNEL(lc_fold_stripes, 4)
         launch_fold_prefix(FoldArm::Zc, z_packed, m, k_log, useful_bits, eq_outer)
     }
 
+    /// Commit-tail fill, GPU half (see `ENV_NO_COMMIT_TAIL_FILL`): build the
+    /// eq table, submit the round-one C fold's Zc prefix exactly as
+    /// [`launch_zerocheck_c_fold`] would at zerocheck entry, then PARK the
+    /// job in the fold state (guard released) instead of returning it — the
+    /// staging thread is a rayon pool worker inside the commit join, not the
+    /// thread that runs zerocheck. Returns whether a prefix was parked.
+    pub(crate) fn stage_zerocheck_c_fold_prefix(
+        z_packed: &[u8],
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+        r: &[F128],
+    ) -> bool {
+        if !super::gpu_zerocheck_enabled() {
+            return false;
+        }
+        let eq_outer = zc_fold_eq_table(&r[k_log..]);
+        let Some(job) = launch_fold_prefix(
+            FoldArm::Zc,
+            z_packed,
+            m,
+            k_log,
+            useful_bits,
+            eq_outer.as_slice(),
+        ) else {
+            return false;
+        };
+        // `ZcFoldJob` implements `Drop` (releases `cb`), so it cannot be
+        // destructured. Wrap it and read the fields out exactly once — the
+        // wrapper is never dropped, so ownership transfers without running
+        // the drop glue that would release the cb we are parking.
+        let job = std::mem::ManuallyDrop::new(job);
+        let (mut guard, cb, plan, k, claim_lo, n_claims, submitted) = unsafe {
+            (
+                std::ptr::read(&job.guard),
+                job.cb,
+                std::ptr::read(&job.plan),
+                job.k,
+                job.claim_lo,
+                job.n_claims,
+                job.submitted,
+            )
+        };
+        let eq_len = 1usize << (m - k_log);
+        let eq_owned = match eq_outer {
+            FoldEqTable::Owned(v) => Some(v),
+            FoldEqTable::Staged(_) => None,
+        };
+        match guard.as_mut().and_then(|r| r.as_mut().ok()) {
+            Some(state) => {
+                state.staged = Some(ZcFoldStaged {
+                    cb,
+                    plan,
+                    k,
+                    claim_lo,
+                    n_claims,
+                    submitted,
+                    r: r.to_vec(),
+                    z_ptr: z_packed.as_ptr() as usize,
+                    z_len: z_packed.len(),
+                    eq_len,
+                    eq_owned,
+                });
+                true
+            }
+            None => {
+                // State vanished under the live guard (init error path);
+                // retire the orphan dispatch.
+                if let Ok(gpu) = gpu() {
+                    unsafe {
+                        let _ = gpu.wait_cb(cb);
+                        gpu.release(cb);
+                    }
+                }
+                false
+            }
+        }
+        // `guard` drops here: the lock is released with the prefix parked.
+    }
+
+    /// Commit-tail fill, adoption half: if a parked prefix matches this
+    /// exact challenge vector and stripe, hand it back as the live fold job
+    /// (plus its eq table and original submit instant, so the split tuner
+    /// prices the true head). On any mismatch the parked prefix is retired
+    /// and the caller proceeds with the incumbent launch.
+    pub(crate) fn adopt_staged_zc_fold(
+        z_packed: &[u8],
+        r: &[F128],
+    ) -> Option<(FoldEqTable, ZcFoldJob, std::time::Instant)> {
+        if !super::gpu_zerocheck_enabled() {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let _ = gpu;
+        let mut guard = match ZC_FOLD.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                ZC_FOLD.clear_poison();
+                note_poisoned_lock("zc-fold", true);
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
+        let state = guard.as_mut()?.as_mut().ok()?;
+        let matches = state.staged.as_ref().is_some_and(|s| {
+            s.z_ptr == z_packed.as_ptr() as usize
+                && s.z_len == z_packed.len()
+                && s.r.as_slice() == r
+        });
+        if !matches {
+            unsafe { abandon_staged_prefix(state) };
+            return None;
+        }
+        let staged = state.staged.take()?;
+        let eq = match staged.eq_owned {
+            Some(v) => FoldEqTable::Owned(v),
+            None => FoldEqTable::Staged(FoldEqStage {
+                ptr: unsafe { state.gpu.buffer_contents(state.eq_buf).cast::<F128>() },
+                len: staged.eq_len,
+            }),
+        };
+        let submitted = staged.submitted;
+        let job = ZcFoldJob {
+            guard,
+            cb: staged.cb,
+            plan: staged.plan,
+            k: staged.k,
+            claim_lo: staged.claim_lo,
+            n_claims: staged.n_claims,
+            submitted,
+            arm: FoldArm::Zc,
+        };
+        Some((eq, job, submitted))
+    }
+
     /// Submit the GPU prefix of the LINCHECK window's witness-stripe fold —
     /// the same gather+XOR kernel over the same no-copy wrapped stripe and
     /// the same oblock claim partition as the round-one C fold, gated by
@@ -8951,6 +9163,10 @@ LC_KERNEL(lc_fold_stripes, 4)
         let submitted = std::time::Instant::now();
         let (cb, plan) = {
             let state = guard.as_mut()?.as_mut().ok()?;
+            // Any parked commit-tail-fill prefix that was not adopted by
+            // now is stale (mismatched fingerprint or a non-adopting
+            // window); retire it before reusing the buffers it reads.
+            unsafe { abandon_staged_prefix(state) };
             let n_outer = 1usize << (m - k_log);
             let useful = (useful_bits.div_ceil(8) * 8).min(k);
             // Fold pipeline + stripe-block size for this arm. Zerocheck
@@ -11937,6 +12153,12 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcFoldJob, launch_lincheck_fold, launch_zerocheck_c_fold, zerocheck_gpu_submits};
+
+/// Commit-tail fill: staged/adopted round-one C-fold prefix (see
+/// `ENV_NO_COMMIT_TAIL_FILL`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix};
 
 /// eq-direct staging for the two fold arms (see `ENV_NO_EQ_DIRECT`): the
 /// producers build eq_outer straight into the arms' persistent upload

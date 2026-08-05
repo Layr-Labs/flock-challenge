@@ -1699,6 +1699,32 @@ impl Round1CPrelude {
     }
 }
 
+/// Commit-tail fill, staging wrapper (see
+/// `gpu_commit::ENV_NO_COMMIT_TAIL_FILL`): submit the round-one C fold's
+/// GPU prefix now — at commit-graph completion, from a forked challenger's
+/// challenge vector — and park it in the fold state for adoption by
+/// [`round1_c_prelude`] at zerocheck entry. No-op off the ranked arm shape.
+pub(crate) fn stage_c_prelude_for_tail_fill(
+    c_lincheck: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    r: &[F128],
+) -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if !ranked_c_fold_shape(m, k_log) {
+            return false;
+        }
+        crate::gpu_commit::stage_zerocheck_c_fold_prefix(c_lincheck, m, k_log, useful_bits, r)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (c_lincheck, m, k_log, useful_bits, r);
+        false
+    }
+}
+
 /// The one production shape the GPU C-fold arm is tuned and gated for
 /// (`m = 32`, `k_log = 14`). Everything else takes the exact CPU path.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1719,6 +1745,23 @@ pub(crate) fn round1_c_prelude(
 ) -> Round1CPrelude {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
+        // Commit-tail fill adoption: an identical dispatch parked at
+        // commit-graph completion (exact challenge-vector + stripe match)
+        // short-circuits the build-and-launch below.
+        if ranked_c_fold_shape(m, k_log) {
+            if let Some((eq_outer, job, submitted)) =
+                crate::gpu_commit::adopt_staged_zc_fold(c_lincheck, r)
+            {
+                if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+                    eprintln!("[commit-tail-fill] staged C prelude adopted");
+                }
+                return Round1CPrelude {
+                    eq_outer,
+                    gpu: Some(job),
+                    submitted,
+                };
+            }
+        }
         // Off the arm's shape no launch will consume a staged table, so keep
         // the incumbent owned build there (same gate as the launch below).
         let eq_outer = if ranked_c_fold_shape(m, k_log) {

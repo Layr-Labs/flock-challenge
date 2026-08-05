@@ -740,6 +740,55 @@ mod deferred_stripe_tests {
 /// Build the witness commitment and the challenge-independent half of
 /// zerocheck round 1 on the same fixed Rayon pool. A/B are only borrowed:
 /// their original packed values remain live for zerocheck round 2.
+/// Commit-tail fill hook: runs in the commit arm's closure immediately after
+/// the GPU graph completes (arm A of the `rayon::join` executes on the
+/// calling thread, and the Merkle root is final the instant `pcs::commit*`
+/// returns), while the AB precompute arm is typically still running. See
+/// `zerocheck::stage_commit_tail_fill`.
+type CommitTailFillHook<'a> = Box<dyn FnOnce(&Commitment) + Send + 'a>;
+
+/// Build the commit-tail-fill hook for one prove: `None` when the fill is
+/// killed (`FLOCK_NO_COMMIT_TAIL_FILL=1`), off the ranked lincheck-C-reuse
+/// shape, or the challenger cannot fork. The hook — run at commit-graph
+/// completion inside the commit arm — acquires `stripe_ready`, reconstructs
+/// the stripe view, and stages the round-one C fold's GPU prefix (see
+/// `zerocheck::stage_commit_tail_fill`).
+fn make_commit_tail_fill_hook<'a, Ch: Challenger>(
+    challenger: &Ch,
+    r1cs: &'a BlockR1cs,
+    padding: &'a zerocheck::PaddingSpec,
+    stripe_ready: &'a std::sync::atomic::AtomicBool,
+    stripe_ptr: usize,
+    stripe_len: usize,
+) -> Option<CommitTailFillHook<'a>>
+where
+    Ch: 'a,
+{
+    if !flock_core::gpu_commit::commit_tail_fill_enabled()
+        || !ranked_lincheck_c_reuse_enabled(r1cs)
+    {
+        return None;
+    }
+    let forked = challenger.fork()?;
+    Some(Box::new(move |commitment: &Commitment| {
+        if !stripe_ready.load(std::sync::atomic::Ordering::Acquire) {
+            // The stripe fill lost the race to the graph; staging would
+            // read torn bytes. Skip — the incumbent zerocheck-entry
+            // submit runs.
+            if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+                eprintln!("[commit-tail-fill] skipped: stripe not ready");
+            }
+            return;
+        }
+        // SAFETY: the acquire above pairs with the fill worker's
+        // release-store, which follows its last stripe write; the buffer
+        // is not written again until after zerocheck consumed the stash.
+        let stripe: &[u8] =
+            unsafe { std::slice::from_raw_parts(stripe_ptr as *const u8, stripe_len) };
+        flock_core::zerocheck::stage_commit_tail_fill(forked, r1cs, commitment, stripe, padding);
+    }))
+}
+
 fn commit_with_round1_ab_precompute(
     z_packed: &[F128],
     a_packed_f128: &[F128],
@@ -747,6 +796,7 @@ fn commit_with_round1_ab_precompute(
     pcs_params: &PcsParams,
     padding: &zerocheck::PaddingSpec,
     commit_codeword: CommitCodeword,
+    tail_fill: Option<CommitTailFillHook<'_>>,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -792,15 +842,26 @@ fn commit_with_round1_ab_precompute(
     );
 
     let result = rayon::join(
-        || match commit_codeword {
-            CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
-            CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
-            CommitCodeword::Preinitialized(buf) => {
-                pcs::commit_preinitialized(z_packed, buf, pcs_params)
+        || {
+            let pre = match commit_codeword {
+                CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
+                CommitCodeword::NeedsReplication(buf) => {
+                    pcs::commit_into(z_packed, pcs_params, buf)
+                }
+                CommitCodeword::Preinitialized(buf) => {
+                    pcs::commit_preinitialized(z_packed, buf, pcs_params)
+                }
+                CommitCodeword::StreamedFirstPass(buf, stream) => {
+                    pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
+                }
+            };
+            // Graph complete, root final — the AB arm is (typically) still
+            // running. Fire the tail-fill hook here so its staged GPU work
+            // executes in the arm-tail idle.
+            if let Some(hook) = tail_fill {
+                hook(&pre.0);
             }
-            CommitCodeword::StreamedFirstPass(buf, stream) => {
-                pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
-            }
+            pre
         },
         || {
             let t = std::time::Instant::now();
@@ -904,7 +965,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
-    let run_commit = || {
+    let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>| {
         let cpu0 = phase_timing.then(process_cpu_ms);
         let t_commit = std::time::Instant::now();
         let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
@@ -914,6 +975,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             pcs_params,
             &padding,
             commit_codeword,
+            tail_fill,
         );
         if phase_timing {
             let wall = t_commit.elapsed().as_secs_f64() * 1e3;
@@ -932,7 +994,22 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // this join earlier adds no measured tail while eliminating C's 32-bank
     // row-major drain.
     let (pre_zerocheck, z_packed_lincheck) = match z_packed_lincheck {
-        LincheckStripeInput::Ready(stripe) => (run_commit(), stripe),
+        LincheckStripeInput::Ready(stripe) => {
+            // The stripe is fully materialized, so the tail fill can stage
+            // unconditionally at graph completion. Engaging here keeps the
+            // warmup prove's split calibration representative of the timed
+            // prove's earlier-submit head timing.
+            let stripe_ready = std::sync::atomic::AtomicBool::new(true);
+            let hook = make_commit_tail_fill_hook(
+                &*challenger,
+                r1cs,
+                &padding,
+                &stripe_ready,
+                stripe.as_ptr() as usize,
+                stripe.len(),
+            );
+            (run_commit(hook), stripe)
+        }
         LincheckStripeInput::DeferredRanked => {
             assert_eq!(r1cs.m, 32);
             assert_eq!(r1cs.k_log, 14);
@@ -957,7 +1034,22 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 .and_then(|value| value.to_str()?.parse::<usize>().ok())
                 .filter(|workers| (1..=4).contains(workers))
                 .unwrap_or(DEFER_STRIPE_EPOOL_THREADS_DEFAULT);
+            // Commit-tail fill (`FLOCK_NO_COMMIT_TAIL_FILL=1` kills): the
+            // hook stages only after acquiring `stripe_ready`, whose paired
+            // release follows the fill worker's last stripe write.
+            let stripe_ready = std::sync::atomic::AtomicBool::new(false);
+            let stripe_ptr = stripe.as_ptr() as usize;
+            let stripe_len = stripe.len();
+            let tail_fill_hook = make_commit_tail_fill_hook(
+                &*challenger,
+                r1cs,
+                &padding,
+                &stripe_ready,
+                stripe_ptr,
+                stripe_len,
+            );
             let pre = std::thread::scope(|scope| {
+                let stripe_ready = &stripe_ready;
                 let stripe_job = scope.spawn(|| {
                     let started = std::time::Instant::now();
                     let filled_on_epool = fill_deferred_lincheck_stripe_with_dispatch(
@@ -979,6 +1071,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                             useful_bits,
                         );
                     }
+                    // Last stripe write is above; the release-store publishes
+                    // the bytes to the commit arm's tail-fill hook (acquire).
+                    stripe_ready.store(true, std::sync::atomic::Ordering::Release);
                     if phase_timing {
                         eprintln!(
                             "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={}",
@@ -992,7 +1087,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                         );
                     }
                 });
-                let pre = run_commit();
+                let pre = run_commit(tail_fill_hook);
                 let join_started = std::time::Instant::now();
                 // Spin-family completion, prover side: this is the last timed
                 // production join in the prove path (the gpu_commit.rs joins
@@ -1281,6 +1376,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
+        None,
     );
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
