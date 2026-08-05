@@ -12675,3 +12675,4 @@ mod tests {
 // RealAdii fresh-tree pull 1 on cc1d811.
 // RealAdii frontier pull 2 on cc1d811.
 // RealAdii frontier pull 3 on cc1d811.
+// welttowelt disclosed cadence resample 4 of the record tree on 6875d9e (previous draw: 1671801.41149186; zero-diff marker per board protocol).
