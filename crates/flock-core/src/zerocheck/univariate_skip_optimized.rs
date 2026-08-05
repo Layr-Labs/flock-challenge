@@ -4395,7 +4395,14 @@ mod tests {
         let byte_base_b = b_med * N_CHUNKS * 8;
         let len = byte_base_b + 8 * N_CHUNKS;
         for trial in 0..64 {
-            let a_packed: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
+            let mut a_packed: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
+            // Exact B plus trial mod 4 = 0 exercises the ranked top-byte-zero
+            // A transform; mod 4 = 2 forces its checked full-word fallback.
+            if trial % 4 == 0 {
+                a_packed[byte_base_b + 7] = 0;
+            } else if trial % 4 == 2 {
+                a_packed[byte_base_b + 7] |= 1;
+            }
             let mut b_packed = vec![0u8; len];
             // K0 = the blk-30 static constant, K1..7 = zero; one arm perturbs
             // K0 so the guard must route to the generic single-K0 kernel.
