@@ -235,6 +235,66 @@ where
     run_chunks_with_helper_stateful(n_chunks, &init, &f, epool());
 }
 
+/// [`run_hetero_chunks_stateful`] whose `init` receives the worker's pool:
+/// `true` for an efficiency-core helper worker, `false` for a main-pool
+/// worker (and for the single-threaded inline path). Lets a call site pick a
+/// per-pool kernel variant while keeping the shared claim queue; the flag is
+/// fixed per worker, so carrying it in the state costs nothing per chunk.
+pub(crate) fn run_hetero_chunks_stateful_tagged<S, I, F>(n_chunks: usize, init: I, f: F)
+where
+    I: Fn(bool) -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
+    let helper = epool();
+    if n_chunks == 0 {
+        return;
+    }
+    let main_threads = rayon::current_num_threads();
+    if main_threads <= 1 {
+        let mut state = init(false);
+        for i in 0..n_chunks {
+            f(&mut state, i);
+        }
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    let worker = || {
+        let mut state = init(false);
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n_chunks {
+                break;
+            }
+            f(&mut state, i);
+        }
+    };
+    let drain_main = || {
+        (0..main_threads)
+            .into_par_iter()
+            .with_max_len(1)
+            .for_each(|_| worker());
+    };
+    match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
+        Some(ep) => std::thread::scope(|s| {
+            s.spawn(|| {
+                ep.broadcast(|_| {
+                    let mut state = init(true);
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n_chunks {
+                            break;
+                        }
+                        EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+                        f(&mut state, i);
+                    }
+                })
+            });
+            drain_main();
+        }),
+        None => drain_main(),
+    }
+}
+
 /// [`run_hetero_chunks`] with an explicit helper pool, so tests can exercise
 /// the two-pool queue on hosts without efficiency cores.
 pub fn run_chunks_with_helper<F>(n_chunks: usize, f: &F, helper: Option<&rayon::ThreadPool>)

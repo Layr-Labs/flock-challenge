@@ -759,66 +759,69 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         // but each chunk writes only its own disjoint 1 KiB, so the output
         // bytes are identical to the incumbent path.
         let n_chunks = total_bytes / OUTER_BYTES;
-        let ranked_fast_policy = ranked_ab_pre_fast_policy_hoist_shape(
-            m,
-            k_skip,
-            n_chunks,
-            padding.k_log,
-            padding.useful_bits_per_block,
-            rayon::current_num_threads(),
-            crate::epool::helper_pool().map_or(0, rayon::ThreadPool::current_num_threads),
-            kernels::static_b_context_is_prepared(static_b_context),
-            zc_ab_pre_fast_policy_hoist_enabled(),
-        ) && kernels::fast_shift_reduce_enabled();
-        if ranked_fast_policy {
-            // Resolve the process-wide direct-store switch once before the
-            // queue starts. The ranked/default arm is compiled without the
-            // per-chunk OnceLock probe, temporary buffer, or per-row bounce
-            // branches; the kill-switch arm retains the exact old behavior.
-            if nt && ab_pre_nt_direct_enabled() {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    within_outer_mask,
-                    &b_med_counts,
-                    blake3_static_layout,
-                    static_b_context,
-                    nt,
-                    compact,
-                    n_chunks,
-                    out_bytes,
-                );
-            } else {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    within_outer_mask,
-                    &b_med_counts,
-                    blake3_static_layout,
-                    static_b_context,
-                    nt,
-                    compact,
-                    n_chunks,
-                    out_bytes,
-                );
-            }
+        // Tail taper: hand out the final ~5% of the chunk index space in
+        // narrow jobs so the last claim a ~3× slower efficiency-core worker
+        // can own shrinks from 64 chunks (~200 µs of join tail) to 8
+        // (~25 µs). The head keeps the wide jobs, so the atomic-claim
+        // amortization is unchanged for 95% of the surface, and claim order
+        // stays monotonic. Chunk→job mapping only — every chunk is still
+        // claimed exactly once and writes its own disjoint 1 KiB, so the
+        // output bytes are identical. A/B-CONTROL:
+        // `FLOCK_NO_ZC_AB_PRE_TAPER=1` restores the flat 64-chunk jobs.
+        let taper = ab_pre_taper_enabled() && n_chunks >= 64 * AB_PRE_CHUNKS_PER_JOB;
+        let head_chunks = if taper {
+            n_chunks - (n_chunks / 20).next_multiple_of(AB_PRE_TAIL_CHUNKS_PER_JOB)
         } else {
-            precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
-                a_packed,
-                b_packed,
-                inv_table,
-                within_outer_mask,
-                &b_med_counts,
-                blake3_static_layout,
-                static_b_context,
-                nt,
-                compact,
-                n_chunks,
-                out_bytes,
-            );
-        }
+            n_chunks
+        };
+        let n_wide = head_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
+        let n_jobs = n_wide + (n_chunks - head_chunks).div_ceil(AB_PRE_TAIL_CHUNKS_PER_JOB);
+        let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+        crate::epool::run_hetero_chunks_stateful_tagged(
+            n_jobs,
+            |is_helper| ([F8::ZERO; ELL], [F8::ZERO; ELL], is_helper),
+            |(a_col, b_col, is_helper), job| {
+                // D6: helper (efficiency-core) workers take the non-FAST
+                // kernel — its two table images are 32 KiB, half the E-core
+                // L1D, where the FAST path's four images are exactly 64 KiB.
+                // Kernels are bit-identical either way (the
+                // FLOCK_NO_FAST_SHIFT_REDUCE contract).
+                let force_nonfast = *is_helper && epool_nonfast_enabled();
+                let (start, end) = if job < n_wide {
+                    let s = job * AB_PRE_CHUNKS_PER_JOB;
+                    (s, (s + AB_PRE_CHUNKS_PER_JOB).min(head_chunks))
+                } else {
+                    let s = head_chunks + (job - n_wide) * AB_PRE_TAIL_CHUNKS_PER_JOB;
+                    (s, (s + AB_PRE_TAIL_CHUNKS_PER_JOB).min(n_chunks))
+                };
+                for x_outer in start..end {
+                    // SAFETY: the queue hands out each job index exactly once
+                    // and each `x_outer` maps to one disjoint 1 KiB chunk.
+                    let out_outer = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            out_base.ptr().add(x_outer * OUTER_BYTES),
+                            OUTER_BYTES,
+                        )
+                    };
+                    precompute_ab_one_chunk(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        within_outer_mask,
+                        &b_med_counts,
+                        blake3_static_layout,
+                        static_b_context,
+                        nt,
+                        compact,
+                        force_nonfast,
+                        x_outer,
+                        out_outer,
+                        a_col,
+                        b_col,
+                    );
+                }
+            },
+        );
         return Round1AbInner { storage };
     }
 
@@ -828,7 +831,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         .for_each_init(
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
             |(a_col, b_col), (x_outer, out_outer)| {
-                precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+                precompute_ab_one_chunk(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -838,6 +841,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
+                    false,
                     x_outer,
                     out_outer,
                     a_col,
@@ -855,41 +859,29 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
 /// pool finishes — the same sizing logic as the deferred stripe's 64.
 const AB_PRE_CHUNKS_PER_JOB: usize = 64;
 
-/// Ranked-shape selector for resolving the process-wide Horner policy once
-/// before the AB queue starts. Every other shape retains the incumbent
-/// per-row policy lookup so this codegen specialization cannot perturb
-/// library callers or differently provisioned workers.
-#[allow(clippy::too_many_arguments)]
-fn ranked_ab_pre_fast_policy_hoist_shape(
-    m: usize,
-    k_skip: usize,
-    n_chunks: usize,
-    k_log: usize,
-    useful_bits_per_block: usize,
-    main_threads: usize,
-    helper_threads: usize,
-    prepared_static_b: bool,
-    enabled: bool,
-) -> bool {
-    cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && enabled
-        && m == 32
-        && k_skip == K_SKIP
-        && n_chunks == (1 << 19)
-        && k_log == 14
-        && useful_bits_per_block == 15_409
-        && main_threads == 10
-        && helper_threads == 4
-        && prepared_static_b
+/// Narrow job size for the taper over the final ~5% of the QS5 queue's chunk
+/// index space (see the mapping at the `run_hetero_chunks_stateful` call).
+const AB_PRE_TAIL_CHUNKS_PER_JOB: usize = 8;
+
+/// Kill switch for the QS5 tail taper: `FLOCK_NO_ZC_AB_PRE_TAPER=1` restores
+/// the flat 64-chunk job mapping as a same-binary control. Mapping only —
+/// the bytes written are identical.
+pub const ENV_NO_ZC_AB_PRE_TAPER: &str = "FLOCK_NO_ZC_AB_PRE_TAPER";
+
+fn ab_pre_taper_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_TAPER).is_none())
 }
 
-/// Exact same-binary rollback for the ranked AB policy specialization.
-pub const ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST: &str =
-    "FLOCK_NO_ZC_AB_PRE_FAST_POLICY_HOIST";
+/// Kill switch for the per-pool kernel split in the QS5 drain:
+/// `FLOCK_NO_ZC_EPOOL_NONFAST=1` keeps efficiency-core helper workers on the
+/// process-wide FAST selection as a same-binary control. Kernel-route choice
+/// only — outputs are byte-identical.
+pub const ENV_NO_ZC_EPOOL_NONFAST: &str = "FLOCK_NO_ZC_EPOOL_NONFAST";
 
-fn zc_ab_pre_fast_policy_hoist_enabled() -> bool {
-    std::env::var_os(ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST).as_deref()
-        != Some(std::ffi::OsStr::new("1"))
+fn epool_nonfast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_EPOOL_NONFAST).is_none())
 }
 
 /// Compile-time default for the QS5 hetero AB-precompute drain (the ranked
@@ -908,80 +900,12 @@ fn zc_ab_pre_hetero_enabled() -> bool {
     })
 }
 
-/// Drain the ranked AB precompute through both core clusters. The const policy
-/// lets the ranked arm fold away the process-wide Horner flag inside the hot
-/// row dispatcher. `FORCE_DIRECT` additionally folds away the direct-store
-/// OnceLock lookup and stack-bounce alternative after the caller has checked
-/// both `nt` and the process-wide direct-store kill switch.
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    within_outer_mask: usize,
-    b_med_counts: &[u8],
-    blake3_static_layout: bool,
-    static_b_context: Option<kernels::StaticBContext>,
-    nt: bool,
-    compact: bool,
-    n_chunks: usize,
-    out_bytes: &mut [u8],
-) {
-    // This is a private specialization contract, but keep it checked in
-    // release builds so a future caller cannot accidentally select
-    // non-temporal direct stores while requesting the cached-store mode.
-    if FORCE_DIRECT {
-        assert!(
-            nt,
-            "FORCE_DIRECT requires the non-temporal AB-precompute mode"
-        );
-    }
-
-    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-    let n_jobs = n_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
-    let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
-    crate::epool::run_hetero_chunks_stateful(
-        n_jobs,
-        || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-        |(a_col, b_col), job| {
-            let start = job * AB_PRE_CHUNKS_PER_JOB;
-            let end = (start + AB_PRE_CHUNKS_PER_JOB).min(n_chunks);
-            for x_outer in start..end {
-                // SAFETY: the queue hands out each job index exactly once and
-                // each `x_outer` maps to one disjoint 1 KiB chunk.
-                let out_outer = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        out_base.ptr().add(x_outer * OUTER_BYTES),
-                        OUTER_BYTES,
-                    )
-                };
-                precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    within_outer_mask,
-                    b_med_counts,
-                    blake3_static_layout,
-                    static_b_context,
-                    nt,
-                    compact,
-                    x_outer,
-                    out_outer,
-                    a_col,
-                    b_col,
-                );
-            }
-        },
-    );
-}
-
 /// One `x_outer`'s worth of the challenge-independent AB transform — the
 /// exact loop body both precompute drains share, factored out so the QS5
 /// hetero queue and the incumbent `par_chunks_mut` cannot diverge.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
+fn precompute_ab_one_chunk(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -991,6 +915,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     static_b_context: Option<kernels::StaticBContext>,
     nt: bool,
     compact: bool,
+    force_nonfast: bool,
     x_outer: usize,
     out_outer: &mut [u8],
     a_col: &mut [F8; ELL],
@@ -1009,11 +934,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // six extra memory ops and a store-to-load forward per row). Control arm
     // (`FLOCK_NO_ZC_AB_PRE_NT=1`) is the incumbent cached kernel write.
     // All three flavors are byte-identical.
-    let direct = if FORCE_DIRECT {
-        true
-    } else {
-        nt && ab_pre_nt_direct_enabled()
-    };
+    let direct = nt && ab_pre_nt_direct_enabled();
     let mut tmp = [0u8; 64];
     for b_med in 0..n_b_med {
         let dst: &mut [u8; 64] = if nt && !direct {
@@ -1023,7 +944,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 .try_into()
                 .expect("one transformed b_med block")
         };
-        shift_reduce_inner_ab::<FAST_POLICY>(
+        shift_reduce_inner_ab(
             a_packed,
             b_packed,
             inv_table,
@@ -1051,6 +972,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             },
             static_b_context,
             direct,
+            force_nonfast,
         );
         if nt && !direct {
             // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
@@ -1104,7 +1026,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
 // Output `out[lane]` is the F_8 representative of Σ_K x^K · y_K[lane] mod p.
 // ---------------------------------------------------------------------------
 
-fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
+fn shift_reduce_inner_ab(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -1119,8 +1041,9 @@ fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
     bstatic_w: usize,
     static_b_context: Option<kernels::StaticBContext>,
     nt_store: bool,
+    force_nonfast: bool,
 ) {
-    kernels::shift_reduce_inner_ab::<FAST_POLICY>(
+    kernels::shift_reduce_inner_ab(
         a_packed,
         b_packed,
         inv_table,
@@ -1135,6 +1058,7 @@ fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
         bstatic_w,
         static_b_context,
         nt_store,
+        force_nonfast,
     );
 }
 
@@ -1255,7 +1179,7 @@ fn process_one_x_hi(
         // n_b_med < 16.
         if n_b_med == (1 << N_MEDIUM) {
             for b_med in 0..(1 << N_MEDIUM) {
-                shift_reduce_inner_ab::<{ kernels::AB_FAST_POLICY_PROCESS }>(
+                shift_reduce_inner_ab(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1269,6 +1193,7 @@ fn process_one_x_hi(
                     0,
                     usize::MAX,
                     None,
+                    false,
                     false,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -1293,7 +1218,7 @@ fn process_one_x_hi(
             // window straddling the useful/padding boundary), so the tighter
             // loop wins despite losing the SIMD chain unroll.
             for b_med in 0..n_b_med {
-                shift_reduce_inner_ab::<{ kernels::AB_FAST_POLICY_PROCESS }>(
+                shift_reduce_inner_ab(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1307,6 +1232,7 @@ fn process_one_x_hi(
                     0,
                     usize::MAX,
                     None,
+                    false,
                     false,
                 );
                 let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
@@ -1466,7 +1392,7 @@ fn process_one_x_hi_with_s_hat_v(
 
         if n_b_med == (1 << N_MEDIUM) {
             for b_med in 0..(1 << N_MEDIUM) {
-                shift_reduce_inner_ab::<{ kernels::AB_FAST_POLICY_PROCESS }>(
+                shift_reduce_inner_ab(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1480,6 +1406,7 @@ fn process_one_x_hi_with_s_hat_v(
                     0,
                     usize::MAX,
                     None,
+                    false,
                     false,
                 );
             }
@@ -1496,7 +1423,7 @@ fn process_one_x_hi_with_s_hat_v(
             );
         } else {
             for b_med in 0..n_b_med {
-                shift_reduce_inner_ab::<{ kernels::AB_FAST_POLICY_PROCESS }>(
+                shift_reduce_inner_ab(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1510,6 +1437,7 @@ fn process_one_x_hi_with_s_hat_v(
                     0,
                     usize::MAX,
                     None,
+                    false,
                     false,
                 );
             }
@@ -3329,84 +3257,6 @@ mod tests {
         InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn ranked_ab_pre_fast_policy_hoist_selector_is_exact() {
-        let selected = |m, k_skip, n_chunks, k_log, useful, main, helper, prepared, enabled| {
-            ranked_ab_pre_fast_policy_hoist_shape(
-                m, k_skip, n_chunks, k_log, useful, main, helper, prepared, enabled,
-            )
-        };
-        let ranked = (32, K_SKIP, 1 << 19, 14, 15_409, 10, 4, true, true);
-        assert!(selected(
-            ranked.0, ranked.1, ranked.2, ranked.3, ranked.4, ranked.5, ranked.6, ranked.7,
-            ranked.8,
-        ));
-
-        assert!(!selected(31, K_SKIP, 1 << 19, 14, 15_409, 10, 4, true, true));
-        assert!(!selected(32, K_SKIP + 1, 1 << 19, 14, 15_409, 10, 4, true, true));
-        assert!(!selected(32, K_SKIP, (1 << 19) - 1, 14, 15_409, 10, 4, true, true));
-        assert!(!selected(32, K_SKIP, 1 << 19, 15, 15_409, 10, 4, true, true));
-        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_408, 10, 4, true, true));
-        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 9, 4, true, true));
-        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 10, 3, true, true));
-        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 10, 4, false, true));
-        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 10, 4, true, false));
-    }
-
-    #[test]
-    fn force_direct_one_chunk_matches_cached_store() {
-        use crate::zerocheck::univariate_skip::pack_bits;
-
-        const M: usize = 13;
-        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-        let mut rng = Rng::new(0xF0CE_D1EC7);
-        let a_packed = pack_bits(&rng.bits(1 << M));
-        let b_packed = pack_bits(&rng.bits(1 << M));
-        let inv_table = make_inv_table();
-        let (within_outer_mask, b_med_counts) = build_b_med_counts(&PaddingSpec::dense(M));
-
-        let mut cached = [0u8; OUTER_BYTES];
-        let mut cached_a_col = [F8::ZERO; ELL];
-        let mut cached_b_col = [F8::ZERO; ELL];
-        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
-            &a_packed,
-            &b_packed,
-            &inv_table,
-            within_outer_mask,
-            &b_med_counts,
-            false,
-            None,
-            false,
-            false,
-            0,
-            &mut cached,
-            &mut cached_a_col,
-            &mut cached_b_col,
-        );
-
-        let mut direct = [0u8; OUTER_BYTES];
-        let mut direct_a_col = [F8::ZERO; ELL];
-        let mut direct_b_col = [F8::ZERO; ELL];
-        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
-            &a_packed,
-            &b_packed,
-            &inv_table,
-            within_outer_mask,
-            &b_med_counts,
-            false,
-            None,
-            true,
-            false,
-            0,
-            &mut direct,
-            &mut direct_a_col,
-            &mut direct_b_col,
-        );
-
-        assert_eq!(direct, cached);
-    }
-
     #[test]
     fn output_shape() {
         let m = 14;
@@ -4183,6 +4033,7 @@ mod tests {
                         w,
                         Some(context),
                         false,
+                    false,
                     );
                     out
                 };
@@ -4354,6 +4205,7 @@ mod tests {
                 usize::MAX,
                 None,
                 false,
+                    false,
             );
             assert_eq!(got, want, "mixed const-one mask {mask:#04x}");
         }
@@ -4398,6 +4250,7 @@ mod tests {
                     0,
                     1,
                     ctx,
+                    false,
                     false,
                 );
                 out
