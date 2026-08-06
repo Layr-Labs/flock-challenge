@@ -848,11 +848,12 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     Round1AbInner { storage }
 }
 
-/// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
-/// shape exposes roughly sixty-four scheduling waves on the ten-thread worker.
+/// Assign ranked AB work with one queue job per existing 128-chunk block. This
+/// keeps the slab geometry fixed while removing the second band from the common
+/// ranked shape, so each claim owns one disjoint sequential block.
 #[inline]
-fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
-    n_chunks.div_ceil(640).max(1)
+fn ab_pre_job_boundary(job: usize, _n_jobs: usize, _n_chunks: usize) -> usize {
+    job
 }
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
@@ -938,22 +939,24 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     }
 
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-    // Process each queue-owned slab monotonically. This removes permutation
-    // generation and maximizes spatial locality; queue-level heterogeneity still
-    // distributes independent slabs dynamically.
-    let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
-    let n_jobs = n_chunks.div_ceil(chunks_per_job);
+    // Use one queue claim per 128-chunk slab. This keeps the slab geometry
+    // unchanged but gives the two pools finer-grained ownership and lets the
+    // atomic queue balance the final partial slab without a band permutation.
+    const BLOCK_CHUNKS: usize = 128;
+    let n_blocks = n_chunks.div_ceil(BLOCK_CHUNKS);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
-        n_jobs,
+        n_blocks,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-        |(a_col, b_col), job| {
-            let chunk_start = job * chunks_per_job;
-            let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
-            let slab_len = chunk_end - chunk_start;
-            for offset in 0..slab_len {
-                let x_outer = chunk_start + offset;
-                // SAFETY: offset is within this queue job's disjoint output slab.
+        |(a_col, b_col), block| {
+            let block_start = block * BLOCK_CHUNKS;
+            for offset in 0..BLOCK_CHUNKS {
+                let x_outer = block_start + offset;
+                if x_outer >= n_chunks {
+                    continue;
+                }
+                // SAFETY: the atomic queue hands out each slab index once;
+                // every chunk in this slab maps to a disjoint output range.
                 let out_outer = unsafe {
                     core::slice::from_raw_parts_mut(
                         out_base.ptr().add(x_outer * OUTER_BYTES),
