@@ -12862,3 +12862,5 @@ mod tests {
 // r552 cadence nonce: poll-after-queue experiment
 
 // r554 cadence nonce: 20260806T034654Z; semantics unchanged.
+
+// Akashneelesh R2-carrying dispersion sample of promoted tree c1467d3 (marker d1, 2026-08-06).

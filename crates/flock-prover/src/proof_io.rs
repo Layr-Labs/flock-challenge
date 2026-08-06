@@ -835,6 +835,10 @@ mod tests {
             // completion; consumed only on exact challenge identity, so
             // toggling it can never change bytes).
             "FLOCK_NO_COMMIT_TAIL_FILL",
+            // Enlarged staged C-fold prefix (full claim range at tail-fill
+            // staging; any claim partition XORs to the identical fold, so
+            // toggling it can never change bytes).
+            "FLOCK_NO_ZC_PREFIX_ENLARGE",
         ];
         for gate in WITGEN_STACK_GATES {
             // SAFETY: single-threaded #[ignore]d test; no concurrent env
