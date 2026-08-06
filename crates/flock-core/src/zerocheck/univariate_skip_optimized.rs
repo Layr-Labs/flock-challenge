@@ -848,11 +848,13 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     Round1AbInner { storage }
 }
 
-/// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
-/// shape exposes roughly sixty-four scheduling waves on the ten-thread worker.
+/// Assign ranked AB work as 1,024 Gray-coded four-band queues. Each job
+/// drains one 128-chunk block from every input quartile; Gray coding makes
+/// consecutive queue claims change one index bit while retaining a bijection
+/// and sequential runs inside every owned block.
 #[inline]
-fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
-    n_chunks.div_ceil(640).max(1)
+fn ab_pre_job_boundary(job: usize, _n_jobs: usize, _n_chunks: usize) -> usize {
+    job
 }
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
@@ -938,43 +940,64 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     }
 
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-    // Process each queue-owned slab monotonically. This removes permutation
-    // generation and maximizes spatial locality; queue-level heterogeneity still
-    // distributes independent slabs dynamically.
-    let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
-    let n_jobs = n_chunks.div_ceil(chunks_per_job);
+      // Use 976 queue claims: remove one and a half 32-claim hardware groups
+      // from 1,024, opening a scheduler geometry not covered by the previous
+      // 960-, 992-, or 1,008-claim tapers. The multiplier 3 is coprime to 976,
+      // so every complete positional band remains bijectively assigned.
+      const RANKED_TAPERED_JOBS: usize = 976;
+    let n_jobs = RANKED_TAPERED_JOBS.min(n_chunks);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
-            let chunk_start = job * chunks_per_job;
-            let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
-            let slab_len = chunk_end - chunk_start;
-            for offset in 0..slab_len {
-                let x_outer = chunk_start + offset;
-                // SAFETY: offset is within this queue job's disjoint output slab.
-                let out_outer = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        out_base.ptr().add(x_outer * OUTER_BYTES),
-                        OUTER_BYTES,
-                    )
-                };
-                precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    within_outer_mask,
-                    b_med_counts,
-                    blake3_static_layout,
-                    static_b_context,
-                    nt,
-                    compact,
-                    x_outer,
-                    out_outer,
-                    a_col,
-                    b_col,
-                );
+              // Preserve sixteen-chunk phased traversal with affine ownership
+              // specialized for the 976-claim geometry.
+            const BLOCK_CHUNKS: usize = 128;
+            const BURST_CHUNKS: usize = 16;
+            const N_BURSTS: usize = BLOCK_CHUNKS / BURST_CHUNKS;
+            let n_blocks = n_chunks.div_ceil(BLOCK_CHUNKS);
+            let band_blocks = n_blocks.div_ceil(n_jobs);
+            for burst_step in 0..N_BURSTS {
+                  let burst_start = (burst_step * BURST_CHUNKS + job * 3) % BLOCK_CHUNKS;
+                for band_step in 0..band_blocks {
+                    let band = (band_step + job) % band_blocks;
+                    let band_base = band * n_jobs;
+                      let owner = (job * 3 + band * 257) % n_jobs;
+                    let block = band_base + owner;
+                    if block >= n_blocks {
+                        continue;
+                    }
+                    for burst_inner in 0..BURST_CHUNKS {
+                        let offset = (burst_start + burst_inner) % BLOCK_CHUNKS;
+                        let x_outer = block * BLOCK_CHUNKS + offset;
+                        if x_outer >= n_chunks {
+                            continue;
+                        }
+                        // SAFETY: this queue job exclusively owns `block`.
+                        let out_outer = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                out_base.ptr().add(x_outer * OUTER_BYTES),
+                                OUTER_BYTES,
+                            )
+                        };
+                        precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            within_outer_mask,
+                            b_med_counts,
+                            blake3_static_layout,
+                            static_b_context,
+                            nt,
+                            compact,
+                            x_outer,
+                            out_outer,
+                            a_col,
+                            b_col,
+                        );
+                    }
+                }
             }
         },
     );
