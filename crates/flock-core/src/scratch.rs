@@ -106,9 +106,8 @@ fn consume_staged_token(v: &[F128]) -> Option<u64> {
         staged.swap_remove(i)
     };
     // SAFETY: F128 is plain bytes; the view covers the initialized slice.
-    let bytes = unsafe {
-        core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v))
-    };
+    let bytes =
+        unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v)) };
     for p in &entry.probes {
         let Some(range) = bytes.get(p.byte_off..p.byte_off + p.len) else {
             return None;

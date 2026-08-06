@@ -576,11 +576,7 @@ pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compre
 /// `run` receives `setup_addr` back and is responsible for reconstituting the
 /// `Blake3Setup` reference; keeping that unsafety at the call site lets this
 /// module stay free of prover types.
-pub(crate) fn arm(
-    log2_size: u32,
-    setup_addr: usize,
-    run: fn(usize, &[Compression]) -> ProveOut,
-) {
+pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compression]) -> ProveOut) {
     if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() || !is_ranked_worker() {
         return;
     }
@@ -624,9 +620,7 @@ pub(crate) fn arm(
         // the process and costs the trial. Reservation is lazily committed, so
         // the untouched pages cost nothing.
         .stack_size(32 << 20)
-        .spawn(move || {
-            speculative_main(real_stdin, writer, log2_size, setup_addr, run, scratch)
-        });
+        .spawn(move || speculative_main(real_stdin, writer, log2_size, setup_addr, run, scratch));
 
     if spawned.is_err() {
         // Nobody will ever forward the seed, so hand the real stdin straight
@@ -793,10 +787,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     // Phase 1: wait for the speculative blocks, then verify them. This runs
     // while the speculative proof continues, so the comparison is free.
     while state.blocks.is_none() && !state.dead {
-        state = shared
-            .signal
-            .wait(state)
-            .unwrap_or_else(|e| e.into_inner());
+        state = shared.signal.wait(state).unwrap_or_else(|e| e.into_inner());
     }
     if state.dead {
         return None;
@@ -857,10 +848,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     // proofs would race for the process-global scratch pools.
     let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
     while state.result.is_none() && !state.dead {
-        state = shared
-            .signal
-            .wait(state)
-            .unwrap_or_else(|e| e.into_inner());
+        state = shared.signal.wait(state).unwrap_or_else(|e| e.into_inner());
     }
     let result = state.result.take();
     if state.dead || !matched {

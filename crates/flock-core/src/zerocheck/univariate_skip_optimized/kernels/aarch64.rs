@@ -1776,7 +1776,11 @@ fn static_a_k1_partial(inv_table: &InvNttTableByteSingleGf8) -> &'static [u8; 64
 /// the three statically-zero high bytes of K0.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn shift_reduce_inner_mixed_const_b_h4<const ONE_MASK: u8, const STATIC_A: bool, const A_LOW5_K: u8>(
+fn shift_reduce_inner_mixed_const_b_h4<
+    const ONE_MASK: u8,
+    const STATIC_A: bool,
+    const A_LOW5_K: u8,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -2845,9 +2849,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     static_b_context: Option<StaticBContext>,
     nt_store: bool,
 ) {
-    shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<
-        { super::AB_FAST_POLICY_PROCESS },
-    >(
+    shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<{ super::AB_FAST_POLICY_PROCESS }>(
         a_packed,
         b_packed,
         inv_table,
@@ -2875,9 +2877,7 @@ fn fast_shift_reduce_with_policy<const FAST_POLICY: u8>() -> bool {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
-    const FAST_POLICY: u8,
->(
+pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FAST_POLICY: u8>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
