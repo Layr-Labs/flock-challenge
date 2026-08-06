@@ -5065,3 +5065,11 @@ mod tests {
         assert_eq!(g_via_poly, g_via_sum);
     }
 }
+
+// r567 archive marker: submission cadence variant.
+
+// r577 cadence marker: candidate identity only; no runtime effect.
+
+// r581: source-distinct cadence marker; no semantic effect.
+
+// r584: source-distinct cadence marker

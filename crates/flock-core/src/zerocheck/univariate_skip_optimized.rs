@@ -849,11 +849,12 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     Round1AbInner { storage }
 }
 
-/// Jobs of this many 1 KiB chunks feed the QS5 hetero precompute queue: big
-/// enough that the atomic claim amortizes (a job is ~60 µs on a P-core),
-/// small enough that an E-core owns at most ~200 µs of tail when the main
-/// pool finishes — the same sizing logic as the deferred stripe's 64.
-const AB_PRE_CHUNKS_PER_JOB: usize = 64;
+/// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
+/// shape exposes roughly fifty scheduling waves on the ten-thread worker.
+#[inline]
+fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
+    n_chunks.div_ceil(512).max(1)
+}
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
 /// before the AB queue starts. Every other shape retains the incumbent
@@ -939,17 +940,25 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     }
 
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-    let n_jobs = n_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
-    let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
-    crate::epool::run_hetero_chunks_stateful(
-        n_jobs,
-        || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-        |(a_col, b_col), job| {
-            let start = job * AB_PRE_CHUNKS_PER_JOB;
-            let end = (start + AB_PRE_CHUNKS_PER_JOB).min(n_chunks);
-            for x_outer in start..end {
+      // Keep dynamic claims sequential, but split each contiguous slab into four
+      // unit-stride residue streams. Rotate the first residue by job so adjacent
+      // workers expose different slab quarters early while retaining exact
+      // disjoint coverage and forward-only accesses within each stream.
+      let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
+      let n_jobs = n_chunks.div_ceil(chunks_per_job);
+      let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+      crate::epool::run_hetero_chunks_stateful(
+          n_jobs,
+          || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+          |(a_col, b_col), job| {
+              let chunk_start = job * chunks_per_job;
+              let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
+              let residue_phase = job & 3;
+              for stream in 0..4 {
+                  let residue = (residue_phase + stream) & 3;
+                  for x_outer in (chunk_start + residue..chunk_end).step_by(4) {
                 // SAFETY: the queue hands out each job index exactly once and
-                // each `x_outer` maps to one disjoint 1 KiB chunk.
+                // each contiguous slab is disjoint.
                 let out_outer = unsafe {
                     core::slice::from_raw_parts_mut(
                         out_base.ptr().add(x_outer * OUTER_BYTES),
@@ -971,6 +980,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     a_col,
                     b_col,
                 );
+                  }
             }
         },
     );
@@ -5724,3 +5734,13 @@ mod tests {
 // chewy-cadence: r557 1785988378687326387
 
 // chewy-cadence: r558 1785988571742870116
+
+// chewy-cadence: r560 20260806T040229Z
+
+// r561 archive-distinct hot-line marker: 20260806T040426Z
+
+// r562 archive-distinct hot-line marker: 20260806T040635Z
+
+// chewy-cadence: r578 20260806T044834Z
+
+// chewy-cadence: r582 20260806T045819Z
