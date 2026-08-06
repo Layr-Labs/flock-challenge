@@ -3884,6 +3884,112 @@ pub fn generate_witness_batch_major(
 mod tests {
     use super::*;
 
+    /// Census tool for the round-1 AB word structure (run manually with
+    /// `FLOCK_AB_CENSUS=1 cargo test -p flock-prover --release
+    /// ab_word_structure_census -- --nocapture --ignored`).
+    ///
+    /// Generates blocks under the EXACT ranked-harness input policy
+    /// (`benchmark-tools/common::generate_compressions`: cv/message random
+    /// u32s, `counter = u64::from(next_u32())` — high half always zero —
+    /// `block_len = 64`, `flags = 11`), packs the round-1 `a = A·z`,
+    /// `b = B·z` vectors, and reports per (window, b_med, K) 64-bit row
+    /// word: the AND/OR accumulators over every real block and a distinct
+    /// count. Bytes where AND == OR are structurally static on the scored
+    /// distribution; static-zero bytes cost a skippable table gather, and
+    /// fully-static words admit precomputed inverse transforms. The B-side
+    /// output must reproduce `BSTATIC_MASKS` in
+    /// `univariate_skip_optimized/kernels/aarch64_bstatic_gen.rs` — that
+    /// cross-check validates the offset mapping and input policy.
+    #[test]
+    #[ignore = "manual census tool; run with FLOCK_AB_CENSUS=1 -- --ignored"]
+    fn ab_word_structure_census() {
+        if std::env::var_os("FLOCK_AB_CENSUS").is_none() {
+            return;
+        }
+        const N_LOG: usize = 9; // 512 blocks per seed round
+        const N: usize = 1 << N_LOG;
+        const BYTES_PER_BLOCK: usize = 2048; // 2^14 bits
+        let mut and_a = [[u64::MAX; 8]; 32];
+        let mut or_a = [[0u64; 8]; 32];
+        let mut and_b = [[u64::MAX; 8]; 32];
+        let mut or_b = [[0u64; 8]; 32];
+        let mut distinct_a: Vec<Vec<std::collections::HashSet<u64>>> =
+            vec![vec![std::collections::HashSet::new(); 8]; 32];
+
+        for seed_round in 0..4u64 {
+            let mut rng = Rng::new(0xC0FFEE ^ (seed_round.wrapping_mul(0x9E37_79B9)));
+            let mut r32 = || rng.next_u32();
+            let blocks: Vec<Compression> = (0..N)
+                .map(|_| {
+                    let cv = core::array::from_fn(|_| r32());
+                    let message = core::array::from_fn(|_| r32());
+                    let counter = u64::from(r32());
+                    (cv, message, counter, 64u32, 11u32)
+                })
+                .collect();
+            let (_z, a, b) = generate_witness_with_ab_packed(&blocks, N_LOG);
+            let cast = |v: &[flock_core::field::F128]| -> &[u8] {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        v.as_ptr() as *const u8,
+                        std::mem::size_of_val(v),
+                    )
+                }
+            };
+            let (a_bytes, b_bytes) = (cast(&a), cast(&b));
+            for i in 0..N {
+                for w in 0..2usize {
+                    for b_med in 0..16usize {
+                        let blk = w * 16 + b_med;
+                        for k in 0..8usize {
+                            let off = i * BYTES_PER_BLOCK + w * 1024 + b_med * 64 + k * 8;
+                            let wa =
+                                u64::from_le_bytes(a_bytes[off..off + 8].try_into().unwrap());
+                            let wb =
+                                u64::from_le_bytes(b_bytes[off..off + 8].try_into().unwrap());
+                            and_a[blk][k] &= wa;
+                            or_a[blk][k] |= wa;
+                            and_b[blk][k] &= wb;
+                            or_b[blk][k] |= wb;
+                            let set = &mut distinct_a[blk][k];
+                            if set.len() <= 16 {
+                                set.insert(wa);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for blk in 0..32usize {
+            for k in 0..8usize {
+                let (aa, oa) = (and_a[blk][k], or_a[blk][k]);
+                let (ab, ob) = (and_b[blk][k], or_b[blk][k]);
+                // Static bytes: AND == OR at that byte.
+                let static_mask = |and: u64, or: u64| -> u64 {
+                    let mut m = 0u64;
+                    for j in 0..8 {
+                        let sh = j * 8;
+                        if (and >> sh) & 0xff == (or >> sh) & 0xff {
+                            m |= 0xffu64 << sh;
+                        }
+                    }
+                    m
+                };
+                let (ma, mb) = (static_mask(aa, oa), static_mask(ab, ob));
+                let d = distinct_a[blk][k].len();
+                let dtxt = if d > 16 { ">16".to_string() } else { d.to_string() };
+                println!(
+                    "blk {blk:2} (w{} b{:2}) k{k}: A mask={ma:016x} val={:016x} distinct={dtxt:>3} | B mask={mb:016x} val={:016x}",
+                    blk / 16,
+                    blk % 16,
+                    aa & ma,
+                    ab & mb,
+                );
+            }
+        }
+    }
+
     /// SplitMix64.
     struct Rng(u64);
     impl Rng {
