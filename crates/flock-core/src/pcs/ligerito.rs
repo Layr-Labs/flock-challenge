@@ -12862,3 +12862,5 @@ mod tests {
 // r552 cadence nonce: poll-after-queue experiment
 
 // r554 cadence nonce: 20260806T034654Z; semantics unchanged.
+
+// Akashneelesh static-A-first dispatch, re-rolled on promoted 3a3f088 (2026-08-06, roll 2).
