@@ -849,11 +849,12 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     Round1AbInner { storage }
 }
 
-/// Jobs of this many 1 KiB chunks feed the QS5 hetero precompute queue: big
-/// enough that the atomic claim amortizes (a job is ~60 µs on a P-core),
-/// small enough that an E-core owns at most ~200 µs of tail when the main
-/// pool finishes — the same sizing logic as the deferred stripe's 64.
-const AB_PRE_CHUNKS_PER_JOB: usize = 64;
+/// Keep roughly one hundred queue claims available: ten scheduling waves on the
+/// official ten-thread worker, leaving enough late work for straggler stealing.
+#[inline]
+fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
+    n_chunks.div_ceil(100).max(1)
+}
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
 /// before the AB queue starts. Every other shape retains the incumbent
@@ -939,14 +940,31 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     }
 
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-    let n_jobs = n_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
+    let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
+    let n_jobs = n_chunks.div_ceil(chunks_per_job);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
-            let start = job * AB_PRE_CHUNKS_PER_JOB;
-            let end = (start + AB_PRE_CHUNKS_PER_JOB).min(n_chunks);
+            // Enumerate a bounded binary-reflected Gray-code order. Consecutive
+            // queue claims move by one bit in the enclosing power-of-two space;
+            // filtering values outside `0..n_jobs` preserves a bijection.
+            let width = n_jobs.next_power_of_two();
+            let mut valid_rank = 0;
+            let mut mapped_job = 0;
+            for rank in 0..width {
+                let gray = rank ^ (rank >> 1);
+                if gray < n_jobs {
+                    if valid_rank == job {
+                        mapped_job = gray;
+                        break;
+                    }
+                    valid_rank += 1;
+                }
+            }
+            let start = mapped_job * chunks_per_job;
+            let end = (start + chunks_per_job).min(n_chunks);
             for x_outer in start..end {
                 // SAFETY: the queue hands out each job index exactly once and
                 // each `x_outer` maps to one disjoint 1 KiB chunk.
@@ -5724,3 +5742,13 @@ mod tests {
 // chewy-cadence: r557 1785988378687326387
 
 // chewy-cadence: r558 1785988571742870116
+
+// chewy-cadence: r560 20260806T040229Z
+
+// r561 archive-distinct hot-line marker: 20260806T040426Z
+
+// r562 archive-distinct hot-line marker: 20260806T040635Z
+
+// chewy-cadence: r578 20260806T044834Z
+
+// chewy-cadence: r582 20260806T045819Z
