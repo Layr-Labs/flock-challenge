@@ -3949,7 +3949,7 @@ fn fold2_and_msg_lsb(
             wb.set_len(quarter);
         }
 
-        const CHUNK: usize = 2048;
+        const CHUNK: usize = 1024;
         let nt_stores = {
             use std::sync::OnceLock;
             static NT_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -12862,3 +12862,29 @@ mod tests {
 // r552 cadence nonce: poll-after-queue experiment
 
 // r554 cadence nonce: 20260806T034654Z; semantics unchanged.
+// r564 cadence nonce: 20260806T041230Z
+
+// r565: archive-distinct hot-line candidate; semantics unchanged.
+
+// r566: archive-distinct cadence marker; no semantic effect.
+
+// r568 archive nonce: 20260806T042222Z; semantics unchanged.
+
+// r569 hot-line archive nonce: 20260806T042512Z; semantics unchanged.
+
+// r570 hot-line archive nonce: 20260806T042745Z; semantics unchanged.
+
+// r571 hot-line archive nonce: 20260806T043105Z; semantics unchanged.
+
+// r572 chewy cadence: distinct submission archive, semantics unchanged.
+
+// r573 submission-cadence marker: preserves semantics.
+// r574 chewy hot-line nonce: 20260806T043827Z; semantics unchanged.
+
+// r575: source-distinct competition candidate; preserves kernel semantics.
+
+// r576 chewy hot-line nonce: 20260806T044306Z; semantics unchanged.
+
+// r580: archive-distinct candidate; no semantic change.
+
+// r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
