@@ -12862,3 +12862,12 @@ mod tests {
 // r552 cadence nonce: poll-after-queue experiment
 
 // r554 cadence nonce: 20260806T034654Z; semantics unchanged.
+// r564 cadence nonce: 20260806T041230Z
+
+// r565: archive-distinct hot-line candidate; semantics unchanged.
+
+// r566: archive-distinct cadence marker; no semantic effect.
+
+// r568 archive nonce: 20260806T042222Z; semantics unchanged.
+
+// r569 hot-line archive nonce: 20260806T042512Z; semantics unchanged.
