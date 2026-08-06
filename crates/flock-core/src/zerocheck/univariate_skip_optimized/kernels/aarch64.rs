@@ -2769,6 +2769,7 @@ pub(crate) enum StaticBContext {
     Prepared {
         partials: &'static [[u8; 64]; 248],
         static_a_k1: &'static [u8; 64],
+        compact: bool,
     },
     /// Exact same-binary control: retain both historical per-call OnceLock
     /// queries while leaving the generated static-B kernel enabled.
@@ -2776,6 +2777,383 @@ pub(crate) enum StaticBContext {
 }
 
 include!("aarch64_bstatic_gen.rs");
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_bstatic_word_four_chunks<const BLK: usize, const K: usize>(
+    table: *const u8,
+    swapped: *const u8,
+    word: u64,
+    partials: &'static [[u8; 64]; 248],
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let mask = BSTATIC_MASKS[BLK][K].0;
+        if mask == 0 {
+            return apply_word_into_4_regs(table, swapped, word);
+        }
+        let partial = partials[BLK * 8 + K].as_ptr();
+        let mut out0 = vld1q_u8(partial);
+        let mut out1 = vld1q_u8(partial.add(16));
+        let mut out2 = vld1q_u8(partial.add(32));
+        let mut out3 = vld1q_u8(partial.add(48));
+        macro_rules! varying_pair {
+            ($j0:literal, $j1:literal) => {{
+                let fixed0 = ((mask >> (8 * $j0)) & 0xff) == 0xff;
+                let fixed1 = ((mask >> (8 * $j1)) & 0xff) == 0xff;
+                if !fixed0 && !fixed1 {
+                    xor_vary_pair::<$j0, $j1>(
+                        table,
+                        swapped,
+                        word,
+                        &mut out0,
+                        &mut out1,
+                        &mut out2,
+                        &mut out3,
+                    );
+                } else {
+                    if !fixed0 {
+                        xor_vary_single::<$j0>(
+                            table,
+                            swapped,
+                            word,
+                            &mut out0,
+                            &mut out1,
+                            &mut out2,
+                            &mut out3,
+                        );
+                    }
+                    if !fixed1 {
+                        xor_vary_single::<$j1>(
+                            table,
+                            swapped,
+                            word,
+                            &mut out0,
+                            &mut out1,
+                            &mut out2,
+                            &mut out3,
+                        );
+                    }
+                }
+            }};
+        }
+        varying_pair!(0, 1);
+        varying_pair!(2, 3);
+        varying_pair!(4, 5);
+        varying_pair!(6, 7);
+        (out0, out1, out2, out3)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn shift_reduce_inner_ab_bstatic_compact_block<const BLK: usize>(
+    a_words: &[u64; 8],
+    b_words: &[u64; 8],
+    partials: &'static [[u8; 64]; 248],
+    plain: *const u8,
+    plain_swapped: *const u8,
+    scaled: *const u8,
+    scaled_swapped: *const u8,
+    out: &mut [u8; 64],
+    nt_store: bool,
+) {
+    use crate::field::gf2_8::neon::gf8_reduce_vec16;
+    use core::arch::aarch64::*;
+
+    unsafe {
+        macro_rules! products {
+            ($k:literal) => {{
+                let (a_table, a_swapped) = if $k < 4 {
+                    (plain, plain_swapped)
+                } else {
+                    (scaled, scaled_swapped)
+                };
+                let (da0, da1, da2, da3) =
+                    apply_word_into_4_regs(a_table, a_swapped, a_words[$k]);
+                let (db0, db1, db2, db3) =
+                    apply_bstatic_word_four_chunks::<BLK, $k>(
+                        plain,
+                        plain_swapped,
+                        b_words[$k],
+                        partials,
+                    );
+                [
+                    pmull_lo_u16(da0, db0),
+                    pmull_hi_u16(da0, db0),
+                    pmull_lo_u16(da1, db1),
+                    pmull_hi_u16(da1, db1),
+                    pmull_lo_u16(da2, db2),
+                    pmull_hi_u16(da2, db2),
+                    pmull_lo_u16(da3, db3),
+                    pmull_hi_u16(da3, db3),
+                ]
+            }};
+        }
+
+        let lo3 = products!(3);
+        let hi3 = products!(7);
+        let mut acc = core::array::from_fn(|i| veorq_u16(lo3[i], hi3[i]));
+        let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
+
+        let lo2 = products!(2);
+        let hi2 = products!(6);
+        horner_absorb(&mut acc, &lo2, &hi2, carry_not);
+        let lo1 = products!(1);
+        let hi1 = products!(5);
+        horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+        let lo0 = products!(0);
+        let hi0 = products!(4);
+        horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+
+        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
+        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
+        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[5]));
+        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
+        store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+pub(crate) fn shift_reduce_inner_ab_bstatic_compact(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    w: usize,
+    context: StaticBContext,
+    out: &mut [u8; 64],
+    nt_store: bool,
+) -> bool {
+    if w > 1 || (w == 1 && b_med >= 15) {
+        return false;
+    }
+    let blk = w * 16 + b_med;
+    let plans = &BSTATIC_MASKS[blk];
+    let partials = match context {
+        StaticBContext::Prepared { partials, .. } => partials,
+        StaticBContext::LegacyPerCall => bstatic_partials(inv_table),
+    };
+    let byte_base = chunk_byte_base + b_med * N_CHUNKS * 8;
+    let a_words = core::array::from_fn(|k| unsafe {
+        u64::from_le(core::ptr::read_unaligned(
+            a_packed.as_ptr().add(byte_base + k * 8).cast::<u64>(),
+        ))
+    });
+    let b_words = core::array::from_fn(|k| unsafe {
+        u64::from_le(core::ptr::read_unaligned(
+            b_packed.as_ptr().add(byte_base + k * 8).cast::<u64>(),
+        ))
+    });
+    if (0..8).any(|k| (b_words[k] & plans[k].0) != plans[k].1) {
+        return false;
+    }
+
+    let plain = inv_table.data_ptr();
+    let plain_swapped = inv_table.half_swapped_data_ptr();
+    let scaled = inv_table.scaled_x4_data_ptr();
+    let scaled_swapped = inv_table.scaled_x4_half_swapped_data_ptr();
+    macro_rules! run_block {
+        ($block:literal) => {{
+            unsafe {
+                shift_reduce_inner_ab_bstatic_compact_block::<$block>(
+                    &a_words,
+                    &b_words,
+                    partials,
+                    plain,
+                    plain_swapped,
+                    scaled,
+                    scaled_swapped,
+                    out,
+                    nt_store,
+                );
+            }
+            true
+        }};
+    }
+    match blk {
+        0 => run_block!(0),
+        1 => run_block!(1),
+        2 => run_block!(2),
+        3 => run_block!(3),
+        4 => run_block!(4),
+        5 => run_block!(5),
+        6 => run_block!(6),
+        7 => run_block!(7),
+        8 => run_block!(8),
+        9 => run_block!(9),
+        10 => run_block!(10),
+        11 => run_block!(11),
+        12 => run_block!(12),
+        13 => run_block!(13),
+        14 => run_block!(14),
+        15 => run_block!(15),
+        16 => run_block!(16),
+        17 => run_block!(17),
+        18 => run_block!(18),
+        19 => run_block!(19),
+        20 => run_block!(20),
+        21 => run_block!(21),
+        22 => run_block!(22),
+        23 => run_block!(23),
+        24 => run_block!(24),
+        25 => run_block!(25),
+        26 => run_block!(26),
+        27 => run_block!(27),
+        28 => run_block!(28),
+        29 => run_block!(29),
+        30 => run_block!(30),
+        _ => false,
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn validate_bstatic_compact(
+    inv_table: &InvNttTableByteSingleGf8,
+    partials: &'static [[u8; 64]; 248],
+    static_a_k1: &'static [u8; 64],
+) -> bool {
+    const SAMPLES_PER_BLOCK: usize = 64;
+    const PACKED_BYTES: usize = 16 * N_CHUNKS * 8;
+
+    #[inline(always)]
+    fn next_word(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    let context = StaticBContext::Prepared {
+        partials,
+        static_a_k1,
+        compact: false,
+    };
+    let mut a_packed = [0u8; PACKED_BYTES];
+    let mut b_packed = [0u8; PACKED_BYTES];
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+
+    for blk in 0..31 {
+        let w = blk / 16;
+        let b_med = blk % 16;
+        let byte_base = b_med * N_CHUNKS * 8;
+        let plans = &BSTATIC_MASKS[blk];
+
+        for _ in 0..SAMPLES_PER_BLOCK {
+            for k in 0..8 {
+                let a_word = next_word(&mut state);
+                let mask = plans[k].0;
+                let expected = plans[k].1;
+                if expected & !mask != 0 {
+                    return false;
+                }
+                let b_word = (next_word(&mut state) & !mask) | expected;
+                let off = byte_base + k * N_CHUNKS;
+                a_packed[off..off + N_CHUNKS].copy_from_slice(&a_word.to_le_bytes());
+                b_packed[off..off + N_CHUNKS].copy_from_slice(&b_word.to_le_bytes());
+            }
+
+            let mut compact_out = [0u8; 64];
+            let mut incumbent_out = [0u8; 64];
+            if !shift_reduce_inner_ab_bstatic_compact(
+                &a_packed,
+                &b_packed,
+                inv_table,
+                0,
+                b_med,
+                w,
+                context,
+                &mut compact_out,
+                false,
+            ) || !shift_reduce_inner_ab_bstatic::<true>(
+                &a_packed,
+                &b_packed,
+                inv_table,
+                0,
+                b_med,
+                w,
+                context,
+                &mut incumbent_out,
+                false,
+            ) || compact_out != incumbent_out
+            {
+                return false;
+            }
+        }
+
+        // Each fixed-word guard must reject before either kernel writes output.
+        for k in 0..8 {
+            let mask = plans[k].0;
+            if mask == 0 {
+                continue;
+            }
+            let off = byte_base + k * N_CHUNKS;
+            let mut word = u64::from_le_bytes([
+                b_packed[off],
+                b_packed[off + 1],
+                b_packed[off + 2],
+                b_packed[off + 3],
+                b_packed[off + 4],
+                b_packed[off + 5],
+                b_packed[off + 6],
+                b_packed[off + 7],
+            ]);
+            word ^= 1u64 << mask.trailing_zeros();
+            b_packed[off..off + N_CHUNKS].copy_from_slice(&word.to_le_bytes());
+            let mut out = [0u8; 64];
+            let compact_handled = shift_reduce_inner_ab_bstatic_compact(
+                &a_packed,
+                &b_packed,
+                inv_table,
+                0,
+                b_med,
+                w,
+                context,
+                &mut out,
+                false,
+            );
+            let incumbent_handled = shift_reduce_inner_ab_bstatic::<true>(
+                &a_packed,
+                &b_packed,
+                inv_table,
+                0,
+                b_med,
+                w,
+                context,
+                &mut out,
+                false,
+            );
+            word ^= 1u64 << mask.trailing_zeros();
+            b_packed[off..off + N_CHUNKS].copy_from_slice(&word.to_le_bytes());
+            if compact_handled || incumbent_handled {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(target_arch = "aarch64")]
+fn bstatic_compact_enabled(
+    inv_table: &InvNttTableByteSingleGf8,
+    partials: &'static [[u8; 64]; 248],
+    static_a_k1: &'static [u8; 64],
+) -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_ZC_BSTATIC_COMPACT").is_none()
+            && validate_bstatic_compact(inv_table, partials, static_a_k1)
+    })
+}
 
 fn bstatic_legacy_enabled() -> bool {
     use std::sync::OnceLock;
@@ -2815,9 +3193,12 @@ pub(crate) fn prepare_static_b_context_with_policy(
     } else if legacy_enabled {
         None
     } else {
+        let partials = bstatic_partials(inv_table);
+        let static_a_k1 = static_a_k1_partial(inv_table);
         Some(StaticBContext::Prepared {
-            partials: bstatic_partials(inv_table),
-            static_a_k1: static_a_k1_partial(inv_table),
+            partials,
+            static_a_k1,
+            compact: bstatic_compact_enabled(inv_table, partials, static_a_k1),
         })
     }
 }
@@ -3050,12 +3431,29 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
     {
         let enabled =
             !matches!(context, StaticBContext::LegacyPerCall) || !bstatic_legacy_enabled();
+        let compact = matches!(
+            context,
+            StaticBContext::Prepared { compact: true, .. }
+        );
+        let fast = fast_shift_reduce_with_policy::<FAST_POLICY>();
         // `FAST` is a const generic so the per-K table choice, the `x^2`
         // constant multiply and the residual shift all fold away at
         // monomorphization; the kill switch picks a whole kernel, never a
         // branch inside one.
         let handled = enabled
-            && if fast_shift_reduce_with_policy::<FAST_POLICY>() {
+            && if fast && compact {
+                shift_reduce_inner_ab_bstatic_compact(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    bstatic_w,
+                    context,
+                    out,
+                    nt_store,
+                )
+            } else if fast {
                 shift_reduce_inner_ab_bstatic::<true>(
                     a_packed,
                     b_packed,

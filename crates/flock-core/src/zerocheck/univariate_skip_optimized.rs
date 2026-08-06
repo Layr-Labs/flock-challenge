@@ -4305,6 +4305,32 @@ mod tests {
                                 fast, slow,
                                 "fast bstatic differs (w={w}, b_med={b_med}, variant={variant})"
                             );
+                            let mut compact = [0u8; 64];
+                            if !kernels::aarch64::shift_reduce_inner_ab_bstatic_compact(
+                                &a_packed,
+                                &b,
+                                &table,
+                                0,
+                                b_med,
+                                w,
+                                context,
+                                &mut compact,
+                                true,
+                            ) {
+                                kernels::aarch64::shift_reduce_inner_ab_fused_neon_h4(
+                                    &a_packed,
+                                    &b,
+                                    &table,
+                                    0,
+                                    b_med,
+                                    &mut compact,
+                                    true,
+                                );
+                            }
+                            assert_eq!(
+                                compact, slow,
+                                "compact bstatic differs (w={w}, b_med={b_med}, variant={variant})"
+                            );
                         }
                         arms += 1;
                     }

@@ -664,6 +664,40 @@ mod tests {
     }
 
     #[test]
+    fn static_byte_split_matches_apply() {
+        let ntt_s = AdditiveNttGf8::new(6, F8::ZERO);
+        let ntt_l = AdditiveNttGf8::new(6, F8(1 << 6));
+        let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+        let mut rng = Rng::new(0x5ca1_ab1e_600d_f00d);
+
+        for _ in 0..256 {
+            let word = rng.next_u64();
+            let fixed_bytes = (rng.next_u64() & 0xff) as u8;
+            let fixed_mask = u64::from_le_bytes(core::array::from_fn(|j| {
+                if fixed_bytes & (1 << j) != 0 { 0xff } else { 0 }
+            }));
+            let expected = rng.next_u64() & fixed_mask;
+            let actual = (word & !fixed_mask) | expected;
+            let mut split = [F8::ZERO; 64];
+            table.apply_scalar(&expected.to_le_bytes(), &mut split);
+            for j in 0..8 {
+                if fixed_mask.to_le_bytes()[j] != 0xff {
+                    let mut one = [0u8; 8];
+                    one[j] = actual.to_le_bytes()[j];
+                    let mut contribution = [F8::ZERO; 64];
+                    table.apply_scalar(&one, &mut contribution);
+                    for lane in 0..64 {
+                        split[lane] += contribution[lane];
+                    }
+                }
+            }
+            let mut actual_apply = [F8::ZERO; 64];
+            table.apply_scalar(&actual.to_le_bytes(), &mut actual_apply);
+            assert_eq!(split, actual_apply);
+        }
+    }
+
+    #[test]
     fn apply_triple_matches_three_singles() {
         let ntt_s = AdditiveNttGf8::new(5, F8::ZERO);
         let ntt_l = AdditiveNttGf8::new(5, F8(1 << 5));
