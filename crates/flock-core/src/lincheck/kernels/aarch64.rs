@@ -671,13 +671,7 @@ pub(crate) fn partial_fold_packed_z_neon_oblock_padded_range(
     claim_hi: usize,
 ) -> Vec<F128> {
     oblock_padded_tiled::<NEON_TILE_T>(
-        z_packed,
-        m,
-        k_log,
-        useful_bits,
-        eq_outer,
-        claim_lo,
-        claim_hi,
+        z_packed, m, k_log, useful_bits, eq_outer, claim_lo, claim_hi,
     )
 }
 

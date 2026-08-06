@@ -278,7 +278,7 @@ fn pow_fixed(state_digest: &[u8; 32]) -> PowFixed {
     let mut s = [
         IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7], // h
         IV[0], IV[1], IV[2], IV[3], // iv
-        0, 0,  // counter (always 0: single chunk)
+        0, 0, // counter (always 0: single chunk)
         64, // block length
         POW_FLAGS,
     ];
@@ -466,12 +466,7 @@ unsafe fn g3s_c_only(
 /// leading zero bits, or `None` — the register-resident specialization of
 /// `blake3_pow_scan` for `1 <= bits <= 32`. Byte-exact against `blake3::hash`
 /// of the 64-byte pre-image for every nonce.
-pub(crate) fn pow_scan_reg(
-    state_digest: &[u8; 32],
-    start: u64,
-    len: u64,
-    bits: u32,
-) -> Option<u64> {
+pub(crate) fn pow_scan_reg(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
     if len == 0 {
         return None;
     }

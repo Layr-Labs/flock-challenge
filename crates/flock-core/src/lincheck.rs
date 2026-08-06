@@ -128,16 +128,16 @@ mod kernels;
 #[cfg(target_arch = "x86_64")]
 pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
-pub(crate) use kernels::{
-    oblock_claim_count, oblock_claim_stripe_base, partial_fold_packed_z_neon_oblock_padded_range,
-    partial_fold_packed_z_neon_oblock_padded_suffix,
-};
-#[cfg(target_arch = "aarch64")]
 pub use kernels::{
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
     partial_fold_packed_z_neon_oblock16_padded, partial_fold_packed_z_neon_single,
     partial_fold_packed_z_neon_single_padded,
+};
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
+pub(crate) use kernels::{
+    oblock_claim_count, oblock_claim_stripe_base, partial_fold_packed_z_neon_oblock_padded_range,
+    partial_fold_packed_z_neon_oblock_padded_suffix,
 };
 
 /// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
@@ -853,11 +853,7 @@ fn ranked_lincheck_fold_gpu_shape(m: usize, k_log: usize) -> bool {
 /// owned build + copy); every other shape keeps the incumbent Vec. Bytes and
 /// lane order are identical either way — only the table's location changes.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn build_z_fold_eq_table(
-    m: usize,
-    k_log: usize,
-    x_outer: &[F128],
-) -> crate::gpu_commit::FoldEqTable {
+fn build_z_fold_eq_table(m: usize, k_log: usize, x_outer: &[F128]) -> crate::gpu_commit::FoldEqTable {
     if ranked_lincheck_fold_gpu_shape(m, k_log) {
         crate::gpu_commit::lincheck_fold_eq_table(x_outer)
     } else {
@@ -888,7 +884,9 @@ fn partial_fold_packed_z_best_gpu_split(
     eq_outer: &[F128],
 ) -> Vec<F128> {
     let gpu = ranked_lincheck_fold_gpu_shape(m, k_log)
-        .then(|| crate::gpu_commit::launch_lincheck_fold(z_packed, m, k_log, useful_bits, eq_outer))
+        .then(|| {
+            crate::gpu_commit::launch_lincheck_fold(z_packed, m, k_log, useful_bits, eq_outer)
+        })
         .flatten();
     if let Some(job) = gpu {
         let claim_lo = job.claim_lo();
@@ -2115,10 +2113,20 @@ mod tests {
             }
             let z_packed = pack_z_lincheck(&z, m, k_log);
             let eq = build_eq_table(&rng.f128_vec(n_log));
-            let block8 =
-                partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
-            let block16 =
-                partial_fold_packed_z_neon_oblock16_padded(&z_packed, m, k_log, useful_bits, &eq);
+            let block8 = partial_fold_packed_z_neon_oblock_padded(
+                &z_packed,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+            );
+            let block16 = partial_fold_packed_z_neon_oblock16_padded(
+                &z_packed,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+            );
             assert_eq!(
                 block8, block16,
                 "m={m}, k_log={k_log}, useful={useful_bits}"

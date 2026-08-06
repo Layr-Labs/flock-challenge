@@ -234,7 +234,17 @@ pub(crate) fn fold_two_and_msg_with_scaled_basis_addend(
     r: F128,
     scale: F128,
 ) -> (F128, F128) {
-    fold_two_and_msg_with_scaled_basis_addend_at(f, b, basis_addend, base, base, nf, nb, r, scale)
+    fold_two_and_msg_with_scaled_basis_addend_at(
+        f,
+        b,
+        basis_addend,
+        base,
+        base,
+        nf,
+        nb,
+        r,
+        scale,
+    )
 }
 
 /// Fold-and-message variant whose addend is a chunk-local table. Source pair
@@ -255,7 +265,17 @@ pub(crate) fn fold_two_and_msg_with_scaled_local_basis_addend(
     r: F128,
     scale: F128,
 ) -> (F128, F128) {
-    fold_two_and_msg_with_scaled_basis_addend_at(f, b, basis_addend, base, 0, nf, nb, r, scale)
+    fold_two_and_msg_with_scaled_basis_addend_at(
+        f,
+        b,
+        basis_addend,
+        base,
+        0,
+        nf,
+        nb,
+        r,
+        scale,
+    )
 }
 
 /// Fold an incumbent witness/basis pair while consuming two deferred basis
@@ -381,7 +401,8 @@ fn fold_two_and_msg_with_scaled_basis_addend_at(
         "fold source must contain both elements for every destination pair"
     );
     assert!(
-        addend_base <= basis_addend.len() && nf.len() <= basis_addend.len() - addend_base,
+        addend_base <= basis_addend.len()
+            && nf.len() <= basis_addend.len() - addend_base,
         "scaled basis addend must cover every destination slot"
     );
     let basis_addend = &basis_addend[addend_base..addend_base + nf.len()];
@@ -756,7 +777,8 @@ mod tests {
             let b: Vec<F128> = (0..input_len).map(|_| F128::new(next(), next())).collect();
             let deferred_basis: Vec<F128> =
                 (0..input_len).map(|_| F128::new(next(), next())).collect();
-            let local_addend: Vec<F128> = (0..n_out).map(|_| F128::new(next(), next())).collect();
+            let local_addend: Vec<F128> =
+                (0..n_out).map(|_| F128::new(next(), next())).collect();
             let challenges = [
                 (F128::ZERO, F128::ZERO, F128::ZERO),
                 (F128::ZERO, F128::ONE, F128::ONE),
@@ -812,46 +834,29 @@ mod tests {
                         alpha_r,
                         gamma,
                     );
-                assert_eq!(
-                    portable_f, expected_f,
-                    "portable f base={base} n={n_out} case={case}"
-                );
-                assert_eq!(
-                    portable_b, expected_b,
-                    "portable b base={base} n={n_out} case={case}"
-                );
-                assert_eq!(
-                    portable_msg, expected_msg,
-                    "portable msg base={base} n={n_out} case={case}"
-                );
+                assert_eq!(portable_f, expected_f, "portable f base={base} n={n_out} case={case}");
+                assert_eq!(portable_b, expected_b, "portable b base={base} n={n_out} case={case}");
+                assert_eq!(portable_msg, expected_msg, "portable msg base={base} n={n_out} case={case}");
 
                 let mut actual_f = vec![sentinel; n_out];
                 let mut actual_b = vec![sentinel; n_out];
-                let actual_msg = fold_two_and_msg_with_deferred_basis_and_scaled_local_addend(
-                    &f,
-                    &b,
-                    &deferred_basis,
-                    &local_addend,
-                    base,
-                    &mut actual_f,
-                    &mut actual_b,
-                    r,
-                    alpha,
-                    alpha_r,
-                    gamma,
-                );
-                assert_eq!(
-                    actual_f, expected_f,
-                    "selected f base={base} n={n_out} case={case}"
-                );
-                assert_eq!(
-                    actual_b, expected_b,
-                    "selected b base={base} n={n_out} case={case}"
-                );
-                assert_eq!(
-                    actual_msg, expected_msg,
-                    "selected msg base={base} n={n_out} case={case}"
-                );
+                let actual_msg =
+                    fold_two_and_msg_with_deferred_basis_and_scaled_local_addend(
+                        &f,
+                        &b,
+                        &deferred_basis,
+                        &local_addend,
+                        base,
+                        &mut actual_f,
+                        &mut actual_b,
+                        r,
+                        alpha,
+                        alpha_r,
+                        gamma,
+                    );
+                assert_eq!(actual_f, expected_f, "selected f base={base} n={n_out} case={case}");
+                assert_eq!(actual_b, expected_b, "selected b base={base} n={n_out} case={case}");
+                assert_eq!(actual_msg, expected_msg, "selected msg base={base} n={n_out} case={case}");
             }
         }
     }

@@ -27,9 +27,9 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into,
-    fold_compact_and_compute_round_pair, fold_in_place_pair, fold2_compact_and_round4_into,
+    UniSkipFoldTable, eval_round3_lookahead, fold2_compact_and_round4_into,
     fold2_compact_and_round45_into, fold2_plain_and_round6_into, fold2_plain_and_round67_into,
+    fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair, fold_in_place_pair,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_lookahead,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
@@ -514,13 +514,14 @@ fn prove_packed_padded_inner<C: Challenger>(
             // transcript only advances after the round-one messages), so the
             // prefix runs concurrently with the AB completion AND with the
             // CPU's own share of the C fold.
-            let c_prelude = crate::zerocheck::univariate_skip_optimized::round1_c_prelude(
-                c_lincheck,
-                m,
-                padding.k_log,
-                padding.useful_bits_per_block,
-                &r,
-            );
+            let c_prelude =
+                crate::zerocheck::univariate_skip_optimized::round1_c_prelude(
+                    c_lincheck,
+                    m,
+                    padding.k_log,
+                    padding.useful_bits_per_block,
+                    &r,
+                );
             // ZC-window GPU idle fill (`FLOCK_NO_ZC_IDLE_FILL=1` kills):
             // with the C fold's GPU prefix in flight, stage round two's
             // GPU-arm window setup behind it. Round two's eq split derives
@@ -814,7 +815,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     // the incumbent route, which stays in the tree as the oracle anyway.
     // n_mlv ≥ 7 keeps every eq split at lo_size ≥ 2 and the composed input
     // ≥ 32. Kill switch: FLOCK_NO_ZC_CASCADE2=1 (exact '1').
-    let use_cascade = use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
+    let use_cascade =
+        use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
 
     // Cascade one level deeper still (rounds 7+8, see
     // `fold2_plain_and_round67_into`): the composed 5+6 pass materializes each
@@ -833,7 +835,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     // anyway. n_mlv ≥ 8 keeps the composed-7/8 input ≥ 16 (its own floor) and
     // every eq split at lo_size ≥ 2. Kill switch: FLOCK_NO_ZC_CASCADE3=1
     // (exact '1').
-    let use_cascade3 = use_cascade && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
+    let use_cascade3 =
+        use_cascade && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
 
     // `loop_start` is the first tail iteration this route has not already
     // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
@@ -1054,6 +1057,14 @@ fn prove_packed_padded_inner<C: Challenger>(
     // H2 engagement evidence: E-core chunks claimed across the loop rounds
     // (T3's hetero drain is already behind us, so the delta is loop-only).
     let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
+
+    // Correctness-preserving kill switch for the fused serial tail rounds.
+    fn zc_tail_fused_serial_enabled() -> bool {
+        use std::sync::LazyLock;
+        static ENABLED: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_FUSED_SERIAL").is_none());
+        *ENABLED
+    }
     let hetero_claimed_before = crate::epool::helper_chunks_claimed();
     for i in loop_start..(n_mlv - 1) {
         let t_round_i = std::time::Instant::now();
@@ -1086,8 +1097,31 @@ fn prove_packed_padded_inner<C: Challenger>(
             b_mlv.truncate(half);
             (m1, mi)
         } else {
-            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-            round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            let half = a_mlv.len() / 2;
+            // Fused single-traversal serial tail: same fused implementation
+            // as the ≥2^15 rounds, one chunk (`n_hi = 0`) — deletes the
+            // separate fold pass (and its intermediate re-read) from each of
+            // the ~12 FS-serial tail rounds. Bit-identical messages (exact
+            // field; unit-tested against the two-pass form).
+            // `FLOCK_NO_ZC_TAIL_FUSED_SERIAL=1` restores the two-pass tail.
+            if log_n_before >= 3 && a_nxt.len() >= half && zc_tail_fused_serial_enabled() {
+                let (m1, mi) = crate::zerocheck::multilinear::fold_and_compute_round_pair_serial(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..half],
+                    &mut b_nxt[..half],
+                    rho_prev,
+                    &r_next,
+                );
+                std::mem::swap(&mut a_mlv, &mut a_nxt);
+                std::mem::swap(&mut b_mlv, &mut b_nxt);
+                a_mlv.truncate(half);
+                b_mlv.truncate(half);
+                (m1, mi)
+            } else {
+                fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+                round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            }
         };
 
         multilinear_msgs.push((m1, mi));
@@ -1546,15 +1580,7 @@ mod tests {
             );
             let mut old_ch = FsChallenger::new(b"flock-c-stripe-gpu-v0");
             let (old_proof, old_claim, old_capture) = prove_packed_padded_inner(
-                &a_p,
-                &b_p,
-                &c_p,
-                M,
-                &padding,
-                true,
-                Some(old_ab),
-                None,
-                &mut old_ch,
+                &a_p, &b_p, &c_p, M, &padding, true, Some(old_ab), None, &mut old_ch,
             );
 
             let c_words: Vec<F128> = c_p
@@ -1976,18 +2002,9 @@ mod tests {
                 proof_on.multilinear_rounds, proof_off.multilinear_rounds,
                 "multilinear_rounds m={m}"
             );
-            assert_eq!(
-                proof_on.final_a_eval, proof_off.final_a_eval,
-                "a_eval m={m}"
-            );
-            assert_eq!(
-                proof_on.final_b_eval, proof_off.final_b_eval,
-                "b_eval m={m}"
-            );
-            assert_eq!(
-                proof_on.final_c_eval, proof_off.final_c_eval,
-                "c_eval m={m}"
-            );
+            assert_eq!(proof_on.final_a_eval, proof_off.final_a_eval, "a_eval m={m}");
+            assert_eq!(proof_on.final_b_eval, proof_off.final_b_eval, "b_eval m={m}");
+            assert_eq!(proof_on.final_c_eval, proof_off.final_c_eval, "c_eval m={m}");
             assert_eq!(claim_on.z, claim_off.z, "z m={m}");
             assert_eq!(
                 claim_on.mlv_challenges, claim_off.mlv_challenges,
@@ -2026,18 +2043,9 @@ mod tests {
                 proof_on.multilinear_rounds, proof_off.multilinear_rounds,
                 "multilinear_rounds m={m}"
             );
-            assert_eq!(
-                proof_on.final_a_eval, proof_off.final_a_eval,
-                "a_eval m={m}"
-            );
-            assert_eq!(
-                proof_on.final_b_eval, proof_off.final_b_eval,
-                "b_eval m={m}"
-            );
-            assert_eq!(
-                proof_on.final_c_eval, proof_off.final_c_eval,
-                "c_eval m={m}"
-            );
+            assert_eq!(proof_on.final_a_eval, proof_off.final_a_eval, "a_eval m={m}");
+            assert_eq!(proof_on.final_b_eval, proof_off.final_b_eval, "b_eval m={m}");
+            assert_eq!(proof_on.final_c_eval, proof_off.final_c_eval, "c_eval m={m}");
             assert_eq!(claim_on.z, claim_off.z, "z m={m}");
             assert_eq!(
                 claim_on.mlv_challenges, claim_off.mlv_challenges,
@@ -2077,18 +2085,9 @@ mod tests {
                 proof_on.multilinear_rounds, proof_off.multilinear_rounds,
                 "multilinear_rounds m={m}"
             );
-            assert_eq!(
-                proof_on.final_a_eval, proof_off.final_a_eval,
-                "a_eval m={m}"
-            );
-            assert_eq!(
-                proof_on.final_b_eval, proof_off.final_b_eval,
-                "b_eval m={m}"
-            );
-            assert_eq!(
-                proof_on.final_c_eval, proof_off.final_c_eval,
-                "c_eval m={m}"
-            );
+            assert_eq!(proof_on.final_a_eval, proof_off.final_a_eval, "a_eval m={m}");
+            assert_eq!(proof_on.final_b_eval, proof_off.final_b_eval, "b_eval m={m}");
+            assert_eq!(proof_on.final_c_eval, proof_off.final_c_eval, "c_eval m={m}");
             assert_eq!(claim_on.z, claim_off.z, "z m={m}");
             assert_eq!(
                 claim_on.mlv_challenges, claim_off.mlv_challenges,

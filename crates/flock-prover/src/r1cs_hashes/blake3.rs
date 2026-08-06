@@ -716,7 +716,11 @@ impl<'a> ReverseTranspose<'a> {
 
     #[inline]
     fn xor_rot(&mut self, x: usize, y: usize, rotation: usize) -> usize {
-        self.push(ReverseWordOp::XorRot { x, y, rotation })
+        self.push(ReverseWordOp::XorRot {
+            x,
+            y,
+            rotation,
+        })
     }
 
     /// Register one carry-only addition and all 31 nonlinear rows that define
@@ -794,6 +798,8 @@ impl<'a> ReverseTranspose<'a> {
     }
 }
 
+
+
 pub struct Blake3LincheckCircuit;
 
 impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
@@ -853,15 +859,27 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
                 let [mx_idx, my_idx] = PER_ROUND_MSG_IDX[r][g_in_round];
                 let [a, b, c, d] = [state[la], state[lb], state[lc], state[ld]];
 
-                let tmp_0 = reverse.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
-                let a_1 = reverse.add(tmp_0, messages[mx_idx], g_add_carry_bit(g, ADD_A1, 0));
+                let tmp_0 =
+                    reverse.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
+                let a_1 = reverse.add(
+                    tmp_0,
+                    messages[mx_idx],
+                    g_add_carry_bit(g, ADD_A1, 0),
+                );
                 let d_1 = reverse.xor_rot(d, a_1, 16);
-                let c_1 = reverse.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
+                let c_1 =
+                    reverse.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
                 let b_1 = reverse.xor_rot(b, c_1, 12);
-                let tmp_1 = reverse.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
-                let a_2 = reverse.add(tmp_1, messages[my_idx], g_add_carry_bit(g, ADD_A2, 0));
+                let tmp_1 =
+                    reverse.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
+                let a_2 = reverse.add(
+                    tmp_1,
+                    messages[my_idx],
+                    g_add_carry_bit(g, ADD_A2, 0),
+                );
                 let d_2 = reverse.xor_rot(d_1, a_2, 8);
-                let c_2 = reverse.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
+                let c_2 =
+                    reverse.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
 
                 let b_new = reverse.xor_rot(b_1, c_2, 7);
                 for i in 0..WORD_BITS {
@@ -1375,8 +1393,8 @@ fn build_block_witness_ab_stream_into(
         std::ptr::write_bytes(b_ptr.add(4), 0, 4);
 
         let values = [
-            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13],
-            m[14], m[15], counter_lo, counter_hi, block_len, flags,
+            m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
+            m[12], m[13], m[14], m[15], counter_lo, counter_hi, block_len, flags,
         ];
         for i in 0..10 {
             let low = if i == 0 {
@@ -1384,7 +1402,9 @@ fn build_block_witness_ab_stream_into(
             } else {
                 (values[2 * i - 1] >> 31) as u64
             };
-            let value = low | ((values[2 * i] as u64) << 1) | ((values[2 * i + 1] as u64) << 33);
+            let value = low
+                | ((values[2 * i] as u64) << 1)
+                | ((values[2 * i + 1] as u64) << 33);
             z_ptr.add(8 + i).write(value);
             a_ptr.add(8 + i).write(value);
             b_ptr.add(8 + i).write(u64::MAX);
@@ -1534,7 +1554,7 @@ fn build_block_witness_ab_stream_into(
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod witgen_simd {
     use super::{
-        BLAKE3_IV, Compression, G_STRIDE, GS_BASE, K, OUT_HI_BASE, REC_C0, REC_C1, REC_C2, REC_C3,
+        BLAKE3_IV, Compression, GS_BASE, G_STRIDE, K, OUT_HI_BASE, REC_C0, REC_C1, REC_C2, REC_C3,
         REC_C4, REC_C5, REC_LIN0, REC_LIN1, USEFUL_BITS,
     };
     use core::arch::aarch64::*;
@@ -1914,10 +1934,15 @@ pub(crate) mod witgen_simd {
     /// completed word's absolute index.
     macro_rules! pushf {
         ($w:ident, $pos:expr, $width:literal, $v:expr) => {{
-            $w.push::<{ ($pos % 32) as i32 }, $width, {
-                let u = ($pos % 32) as i32;
-                if u == 0 { 1 } else { 32 - u }
-            }, { $pos / 32 }>($v);
+            $w.push::<
+                { ($pos % 32) as i32 },
+                $width,
+                {
+                    let u = ($pos % 32) as i32;
+                    if u == 0 { 1 } else { 32 - u }
+                },
+                { $pos / 32 },
+            >($v);
         }};
     }
 
@@ -1966,7 +1991,17 @@ pub(crate) mod witgen_simd {
         z_nt: bool,
         ab_nt: bool,
     ) {
-        unsafe { build_quad_witness_ab_stream_neon_elide(inputs, z, a, b, z_nt, ab_nt, [false; 3]) }
+        unsafe {
+            build_quad_witness_ab_stream_neon_elide(
+                inputs,
+                z,
+                a,
+                b,
+                z_nt,
+                ab_nt,
+                [false; 3],
+            )
+        }
     }
 
     /// [`dump`] with the constant-region skips applied: `elide_tail` drops
@@ -1980,16 +2015,8 @@ pub(crate) mod witgen_simd {
         elide_tail: bool,
         elide_prefix: bool,
     ) {
-        let g0 = if elide_prefix {
-            ELIDE_B_PREFIX_CHUNKS
-        } else {
-            0
-        };
-        let g1 = if elide_tail {
-            ELIDE_ZERO_CHUNK
-        } else {
-            DUMP_CHUNKS
-        };
+        let g0 = if elide_prefix { ELIDE_B_PREFIX_CHUNKS } else { 0 };
+        let g1 = if elide_tail { ELIDE_ZERO_CHUNK } else { DUMP_CHUNKS };
         unsafe { dump_range::<NT>(stage, dst, g0, g1) }
     }
 
@@ -2121,7 +2148,10 @@ pub(crate) mod witgen_simd {
                 vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
             );
             for k in 1..20usize {
-                let w = vorrq_u32(vshrq_n_u32::<31>(chain[k - 1]), vshlq_n_u32::<1>(chain[k]));
+                let w = vorrq_u32(
+                    vshrq_n_u32::<31>(chain[k - 1]),
+                    vshlq_n_u32::<1>(chain[k]),
+                );
                 vst1q_u32(zs.add(16 + k) as *mut u32, w);
             }
             // a's message region equals z's.
@@ -2500,8 +2530,8 @@ pub(crate) mod witgen_simd {
             // A/B-CONTROL: set to `false` for the official-harness control
             // build. The env kill switch exists for same-binary diagnostics.
             const STREAM_TAPER_DEFAULT: bool = true;
-            let tapered =
-                STREAM_TAPER_DEFAULT && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
+            let tapered = STREAM_TAPER_DEFAULT
+                && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
             let schedule = if tapered {
                 TAPERED_SCHEDULE
             } else {
@@ -2520,7 +2550,8 @@ pub(crate) mod witgen_simd {
             // worker-thread submission needs no extra pool handling.
             // `FLOCK_NO_WITGEN_CONT_QUEUE=1` restores the incumbent band
             // loop exactly.
-            let cont_queue = !std::env::var("FLOCK_NO_WITGEN_CONT_QUEUE").is_ok_and(|v| v == "1");
+            let cont_queue = !std::env::var("FLOCK_NO_WITGEN_CONT_QUEUE")
+                .is_ok_and(|v| v == "1");
             if cont_queue {
                 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
                 const SLAB: usize = super::super::common::WITGEN_HETERO_SLAB;
@@ -2544,7 +2575,9 @@ pub(crate) mod witgen_simd {
                     for seg in 0..SEGMENTS {
                         for l in (0..gps).step_by(SLAB) {
                             slab_band.push(i as u32);
-                            slab_g0.push((seg * groups_per_segment + band_offset[i] + l) as u32);
+                            slab_g0.push(
+                                (seg * groups_per_segment + band_offset[i] + l) as u32,
+                            );
                         }
                     }
                 }
@@ -2553,11 +2586,14 @@ pub(crate) mod witgen_simd {
                     .iter()
                     .map(|&gps| AtomicUsize::new(SEGMENTS * gps / SLAB))
                     .collect();
-                let done: Vec<AtomicBool> = (0..n_bands).map(|_| AtomicBool::new(false)).collect();
+                let done: Vec<AtomicBool> =
+                    (0..n_bands).map(|_| AtomicBool::new(false)).collect();
                 let timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
                 let t0 = std::time::Instant::now();
-                let done_ns: Vec<AtomicU64> = (0..n_bands).map(|_| AtomicU64::new(0)).collect();
-                let submit_ns: Vec<AtomicU64> = (0..n_bands).map(|_| AtomicU64::new(0)).collect();
+                let done_ns: Vec<AtomicU64> =
+                    (0..n_bands).map(|_| AtomicU64::new(0)).collect();
+                let submit_ns: Vec<AtomicU64> =
+                    (0..n_bands).map(|_| AtomicU64::new(0)).collect();
                 struct SubmitSeq<'a> {
                     next: usize,
                     stream: &'a mut flock_core::gpu_commit::FromZFirstPassStream,
@@ -2573,7 +2609,8 @@ pub(crate) mod witgen_simd {
                     // stores for this band before publishing/submitting it.
                     if remaining[band].fetch_sub(1, Ordering::AcqRel) == 1 {
                         if timing {
-                            done_ns[band].store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            done_ns[band]
+                                .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }
                         done[band].store(true, Ordering::Release);
                         // Blocking lock (never try_lock): the current holder
@@ -2587,12 +2624,13 @@ pub(crate) mod witgen_simd {
                             // publish all CPU writes of band b before the
                             // command buffer that reads them is committed.
                             std::sync::atomic::fence(Ordering::Release);
-                            seq.stream
-                                .submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
+                            seq.stream.submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
                             seq.next += 1;
                             if timing {
-                                submit_ns[b]
-                                    .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                submit_ns[b].store(
+                                    t0.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
                             }
                         }
                     }
@@ -2608,8 +2646,7 @@ pub(crate) mod witgen_simd {
                 while seq.next < n_bands {
                     let b = seq.next;
                     std::sync::atomic::fence(Ordering::Release);
-                    seq.stream
-                        .submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
+                    seq.stream.submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
                     seq.next += 1;
                 }
                 if timing {
@@ -2623,60 +2660,60 @@ pub(crate) mod witgen_simd {
                     }
                 }
             } else {
-                // Band-bubble instrumentation (diagnostics-only, off unless
-                // FLOCK_PHASE_TIMING is set): per band, the moment the LAST group
-                // job was claimed from the drain queue, the moment the band's
-                // full join returned, and the moment its Metal submit returned —
-                // all relative to the start of the streamed drain. `tail` =
-                // join − last_claim is the per-band join-barrier bubble (the
-                // stretch where at most one worker is still finishing its final
-                // slab while every other core waits at the band join).
-                let band_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
-                let t_bands = std::time::Instant::now();
-                let mut offset = 0usize;
-                for (band_i, &band_gps) in schedule.iter().enumerate() {
-                    let n_jobs = SEGMENTS * band_gps;
-                    let claimed = std::sync::atomic::AtomicUsize::new(0);
-                    let last_claim_ns = std::sync::atomic::AtomicU64::new(0);
-                    // W-H1: the band's jobs drain through the same slab shim as
-                    // the generic driver (a slab never straddles a segment).
-                    let band_job = |job: usize| {
-                        if band_timing {
-                            let i = claimed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                            if i == n_jobs {
-                                last_claim_ns.store(
-                                    t_bands.elapsed().as_nanos() as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
-                        }
-                        let segment = job / band_gps;
-                        let local = job % band_gps;
-                        let g = segment * groups_per_segment + offset + local;
-                        process_group(g);
-                    };
-                    super::super::common::drain_group_jobs(SEGMENTS * band_gps, &band_job);
-                    let t_join_ns = band_timing.then(|| t_bands.elapsed().as_nanos() as u64);
-                    // The queue/Rayon join above publishes every CPU write in
-                    // this band; command-buffer submission then makes those
-                    // shared-memory pages visible to Metal before it starts the
-                    // range.
-                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                    stream.submit_ready_range(offset * 16, band_gps * 16);
+            // Band-bubble instrumentation (diagnostics-only, off unless
+            // FLOCK_PHASE_TIMING is set): per band, the moment the LAST group
+            // job was claimed from the drain queue, the moment the band's
+            // full join returned, and the moment its Metal submit returned —
+            // all relative to the start of the streamed drain. `tail` =
+            // join − last_claim is the per-band join-barrier bubble (the
+            // stretch where at most one worker is still finishing its final
+            // slab while every other core waits at the band join).
+            let band_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+            let t_bands = std::time::Instant::now();
+            let mut offset = 0usize;
+            for (band_i, &band_gps) in schedule.iter().enumerate() {
+                let n_jobs = SEGMENTS * band_gps;
+                let claimed = std::sync::atomic::AtomicUsize::new(0);
+                let last_claim_ns = std::sync::atomic::AtomicU64::new(0);
+                // W-H1: the band's jobs drain through the same slab shim as
+                // the generic driver (a slab never straddles a segment).
+                let band_job = |job: usize| {
                     if band_timing {
-                        let t_submit_ns = t_bands.elapsed().as_nanos() as u64;
-                        let last_claim = last_claim_ns.load(std::sync::atomic::Ordering::Relaxed);
-                        let join = t_join_ns.unwrap_or(t_submit_ns);
-                        eprintln!(
-                            "[witgen-band] band={band_i} gps={band_gps} last_claim=+{:.3}ms join=+{:.3}ms submit=+{:.3}ms tail={:.3}ms",
-                            last_claim as f64 / 1e6,
-                            join as f64 / 1e6,
-                            t_submit_ns as f64 / 1e6,
-                            (join - last_claim) as f64 / 1e6,
-                        );
+                        let i = claimed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if i == n_jobs {
+                            last_claim_ns.store(
+                                t_bands.elapsed().as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                     }
-                    offset += band_gps;
+                    let segment = job / band_gps;
+                    let local = job % band_gps;
+                    let g = segment * groups_per_segment + offset + local;
+                    process_group(g);
+                };
+                super::super::common::drain_group_jobs(SEGMENTS * band_gps, &band_job);
+                let t_join_ns = band_timing.then(|| t_bands.elapsed().as_nanos() as u64);
+                // The queue/Rayon join above publishes every CPU write in
+                // this band; command-buffer submission then makes those
+                // shared-memory pages visible to Metal before it starts the
+                // range.
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                stream.submit_ready_range(offset * 16, band_gps * 16);
+                if band_timing {
+                    let t_submit_ns = t_bands.elapsed().as_nanos() as u64;
+                    let last_claim = last_claim_ns.load(std::sync::atomic::Ordering::Relaxed);
+                    let join = t_join_ns.unwrap_or(t_submit_ns);
+                    eprintln!(
+                        "[witgen-band] band={band_i} gps={band_gps} last_claim=+{:.3}ms join=+{:.3}ms submit=+{:.3}ms tail={:.3}ms",
+                        last_claim as f64 / 1e6,
+                        join as f64 / 1e6,
+                        t_submit_ns as f64 / 1e6,
+                        (join - last_claim) as f64 / 1e6,
+                    );
                 }
+                offset += band_gps;
+            }
             }
         } else {
             super::super::common::drain_group_jobs(n_groups, &process_group);
@@ -3089,7 +3126,8 @@ impl Blake3Setup {
             && self.r1cs.b_0.num_cols == K
             && self.pcs_params.log_inv_rate == 1
             && self.pcs_params.log_batch_size == 6
-            && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
+            && self.pcs_params.profile
+                == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
     }
 
@@ -3322,10 +3360,7 @@ impl Blake3Setup {
     /// Body of a speculative proof: identical to the timed call the wrapper
     /// would have made, including a challenger built from the benchmark domain
     /// and hash, so the emitted proof bytes are the same ones.
-    fn run_speculative_prove(
-        setup_addr: usize,
-        blocks: &[Compression],
-    ) -> crate::seed_pipe::ProveOut {
+    fn run_speculative_prove(setup_addr: usize, blocks: &[Compression]) -> crate::seed_pipe::ProveOut {
         // SAFETY: `setup_addr` is the address of the `Blake3Setup` the ranked
         // worker builds in `main` and holds until the process exits, so it
         // outlives this thread. Only shared reads happen through it — the same
@@ -3849,6 +3884,112 @@ pub fn generate_witness_batch_major(
 mod tests {
     use super::*;
 
+    /// Census tool for the round-1 AB word structure (run manually with
+    /// `FLOCK_AB_CENSUS=1 cargo test -p flock-prover --release
+    /// ab_word_structure_census -- --nocapture --ignored`).
+    ///
+    /// Generates blocks under the EXACT ranked-harness input policy
+    /// (`benchmark-tools/common::generate_compressions`: cv/message random
+    /// u32s, `counter = u64::from(next_u32())` — high half always zero —
+    /// `block_len = 64`, `flags = 11`), packs the round-1 `a = A·z`,
+    /// `b = B·z` vectors, and reports per (window, b_med, K) 64-bit row
+    /// word: the AND/OR accumulators over every real block and a distinct
+    /// count. Bytes where AND == OR are structurally static on the scored
+    /// distribution; static-zero bytes cost a skippable table gather, and
+    /// fully-static words admit precomputed inverse transforms. The B-side
+    /// output must reproduce `BSTATIC_MASKS` in
+    /// `univariate_skip_optimized/kernels/aarch64_bstatic_gen.rs` — that
+    /// cross-check validates the offset mapping and input policy.
+    #[test]
+    #[ignore = "manual census tool; run with FLOCK_AB_CENSUS=1 -- --ignored"]
+    fn ab_word_structure_census() {
+        if std::env::var_os("FLOCK_AB_CENSUS").is_none() {
+            return;
+        }
+        const N_LOG: usize = 9; // 512 blocks per seed round
+        const N: usize = 1 << N_LOG;
+        const BYTES_PER_BLOCK: usize = 2048; // 2^14 bits
+        let mut and_a = [[u64::MAX; 8]; 32];
+        let mut or_a = [[0u64; 8]; 32];
+        let mut and_b = [[u64::MAX; 8]; 32];
+        let mut or_b = [[0u64; 8]; 32];
+        let mut distinct_a: Vec<Vec<std::collections::HashSet<u64>>> =
+            vec![vec![std::collections::HashSet::new(); 8]; 32];
+
+        for seed_round in 0..4u64 {
+            let mut rng = Rng::new(0xC0FFEE ^ (seed_round.wrapping_mul(0x9E37_79B9)));
+            let mut r32 = || rng.next_u32();
+            let blocks: Vec<Compression> = (0..N)
+                .map(|_| {
+                    let cv = core::array::from_fn(|_| r32());
+                    let message = core::array::from_fn(|_| r32());
+                    let counter = u64::from(r32());
+                    (cv, message, counter, 64u32, 11u32)
+                })
+                .collect();
+            let (_z, a, b) = generate_witness_with_ab_packed(&blocks, N_LOG);
+            let cast = |v: &[flock_core::field::F128]| -> &[u8] {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        v.as_ptr() as *const u8,
+                        std::mem::size_of_val(v),
+                    )
+                }
+            };
+            let (a_bytes, b_bytes) = (cast(&a), cast(&b));
+            for i in 0..N {
+                for w in 0..2usize {
+                    for b_med in 0..16usize {
+                        let blk = w * 16 + b_med;
+                        for k in 0..8usize {
+                            let off = i * BYTES_PER_BLOCK + w * 1024 + b_med * 64 + k * 8;
+                            let wa =
+                                u64::from_le_bytes(a_bytes[off..off + 8].try_into().unwrap());
+                            let wb =
+                                u64::from_le_bytes(b_bytes[off..off + 8].try_into().unwrap());
+                            and_a[blk][k] &= wa;
+                            or_a[blk][k] |= wa;
+                            and_b[blk][k] &= wb;
+                            or_b[blk][k] |= wb;
+                            let set = &mut distinct_a[blk][k];
+                            if set.len() <= 16 {
+                                set.insert(wa);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for blk in 0..32usize {
+            for k in 0..8usize {
+                let (aa, oa) = (and_a[blk][k], or_a[blk][k]);
+                let (ab, ob) = (and_b[blk][k], or_b[blk][k]);
+                // Static bytes: AND == OR at that byte.
+                let static_mask = |and: u64, or: u64| -> u64 {
+                    let mut m = 0u64;
+                    for j in 0..8 {
+                        let sh = j * 8;
+                        if (and >> sh) & 0xff == (or >> sh) & 0xff {
+                            m |= 0xffu64 << sh;
+                        }
+                    }
+                    m
+                };
+                let (ma, mb) = (static_mask(aa, oa), static_mask(ab, ob));
+                let d = distinct_a[blk][k].len();
+                let dtxt = if d > 16 { ">16".to_string() } else { d.to_string() };
+                println!(
+                    "blk {blk:2} (w{} b{:2}) k{k}: A mask={ma:016x} val={:016x} distinct={dtxt:>3} | B mask={mb:016x} val={:016x}",
+                    blk / 16,
+                    blk % 16,
+                    aa & ma,
+                    ab & mb,
+                );
+            }
+        }
+    }
+
     /// SplitMix64.
     struct Rng(u64);
     impl Rng {
@@ -3887,13 +4028,7 @@ mod tests {
                 let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
                 let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
                 let t = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
-                (
-                    cv,
-                    m,
-                    t,
-                    rng.next_u32() & 0xFF,
-                    CHUNK_START | CHUNK_END | ROOT,
-                )
+                (cv, m, t, rng.next_u32() & 0xFF, CHUNK_START | CHUNK_END | ROOT)
             })
             .collect();
         let setup = Blake3Setup::new(n_blocks);
@@ -3954,13 +4089,7 @@ mod tests {
                 let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
                 let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
                 let t = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
-                (
-                    cv,
-                    m,
-                    t,
-                    rng.next_u32() & 0xFF,
-                    CHUNK_START | CHUNK_END | ROOT,
-                )
+                (cv, m, t, rng.next_u32() & 0xFF, CHUNK_START | CHUNK_END | ROOT)
             })
             .collect();
         let setup = Blake3Setup::new(n_blocks);
@@ -3972,10 +4101,7 @@ mod tests {
             padding.k_log,
             padding.useful_bits_per_block,
         );
-        assert_eq!(
-            lanes, 7,
-            "ranked BLAKE3 padding must expose seven zero lanes"
-        );
+        assert_eq!(lanes, 7, "ranked BLAKE3 padding must expose seven zero lanes");
 
         let mut z_packed = setup.generate_witness_packed(&blocks);
         // Digest instead of retaining two 1 GiB codewords + two trees.
@@ -3998,14 +4124,8 @@ mod tests {
 
         let dense = commit_with(&z_packed, 0);
         let skipped = commit_with(&z_packed, lanes);
-        assert_eq!(
-            dense.0, skipped.0,
-            "Merkle root changed under the zero-lane skip"
-        );
-        assert_eq!(
-            dense.1, skipped.1,
-            "codeword changed under the zero-lane skip"
-        );
+        assert_eq!(dense.0, skipped.0, "Merkle root changed under the zero-lane skip");
+        assert_eq!(dense.1, skipped.1, "codeword changed under the zero-lane skip");
         assert_eq!(dense.2, skipped.2, "Merkle tree length changed");
 
         // Negative control: prove the skip really engaged at this geometry.
@@ -4078,7 +4198,11 @@ mod tests {
             for defer_ranked_stripe in [false, true] {
                 for z_nt_enabled in [false, true] {
                     assert_eq!(
-                        witgen_simd::select_z_nt(nt_enabled, defer_ranked_stripe, z_nt_enabled,),
+                        witgen_simd::select_z_nt(
+                            nt_enabled,
+                            defer_ranked_stripe,
+                            z_nt_enabled,
+                        ),
                         nt_enabled && defer_ranked_stripe && z_nt_enabled,
                     );
                 }
@@ -4455,15 +4579,9 @@ mod tests {
                     let (cv, m, t, bl, fl) = block;
                     build_block_witness_ab_stream_into(cv, m, *t, *bl, *fl, z_u64, a_u64, b_u64);
                 };
-            let (zr, ar, br, sr) =
-                super::super::common::drive_witness_packed_and_lincheck_full_write(
-                    &blocks,
-                    &padding,
-                    n_log,
-                    K_LOG,
-                    USEFUL_BITS,
-                    per_block,
-                );
+            let (zr, ar, br, sr) = super::super::common::drive_witness_packed_and_lincheck_full_write(
+                &blocks, &padding, n_log, K_LOG, USEFUL_BITS, per_block,
+            );
             assert_eq!(zs, zr, "z mismatch n_blocks={n_blocks}");
             assert_eq!(a_s, ar, "a mismatch n_blocks={n_blocks}");
             assert_eq!(bs, br, "b mismatch n_blocks={n_blocks}");
@@ -4717,10 +4835,7 @@ mod tests {
         // (OnceLock/LazyLock), so toggling them requires separate test
         // processes. Each run prints this digest of the deterministic-input
         // bundle; byte-identity across gate settings = identical digests.
-        eprintln!(
-            "[ranked-canary] bundle-blake3={}",
-            blake3::hash(&proof_bytes).to_hex()
-        );
+        eprintln!("[ranked-canary] bundle-blake3={}", blake3::hash(&proof_bytes).to_hex());
 
         let mut verifier = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
         let verified = setup
@@ -4751,7 +4866,9 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         {
             let second_hits = witgen_simd::last_elide_hits();
-            eprintln!("[elide-canary] first_hits={first_hits:#05b} second_hits={second_hits:#05b}");
+            eprintln!(
+                "[elide-canary] first_hits={first_hits:#05b} second_hits={second_hits:#05b}"
+            );
             // Custody reservation (see `scratch::try_take_f128_inner`)
             // keeps every witness token alive across the prove: z parks in
             // the pinned slot, and a/b's tokened entries are invisible to

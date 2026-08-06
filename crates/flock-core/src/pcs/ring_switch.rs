@@ -1323,7 +1323,10 @@ pub fn s_hat_v_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F12
 /// The two least-significant packed-polynomial index variables are retained
 /// instead of being folded at `x_inner_rest_tail[..2]`. Collapsing the banks
 /// with `eq(x_inner_rest_tail[..2], ·)` recovers [`s_hat_v_from_z_vec`].
-pub fn s_hat_v_quad_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F128> {
+pub fn s_hat_v_quad_from_z_vec(
+    z_vec: &[F128],
+    x_inner_rest_tail: &[F128],
+) -> Vec<F128> {
     use rayon::prelude::*;
 
     assert!(
@@ -1375,7 +1378,10 @@ pub fn s_hat_v_quad_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Ve
 /// Banks are stored contiguously in little-endian coordinate order:
 /// `bank = e_small + 4 * q`, followed by the 128 packed-prefix entries. This
 /// is also the intake layout used by the retained-coordinate C producer.
-pub fn s_hat_v_fold4_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F128> {
+pub fn s_hat_v_fold4_from_z_vec(
+    z_vec: &[F128],
+    x_inner_rest_tail: &[F128],
+) -> Vec<F128> {
     use rayon::prelude::*;
 
     assert!(
@@ -1401,7 +1407,8 @@ pub fn s_hat_v_fold4_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
             |mut acc, (k, &weight)| {
                 let base = 16 * k * n_packed;
                 for bank in 0..16 {
-                    let block = &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
+                    let block =
+                        &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
                     for packed in 0..n_packed {
                         acc[bank * n_packed + packed] += weight * block[packed];
                     }
@@ -1440,7 +1447,10 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
 
 /// Collapse the sixteen-bank direct-fold4 intake under the first four suffix
 /// coordinates, recovering the canonical transcript-visible 128-vector.
-pub(crate) fn collapse_s_hat_v_fold4(s_hat_v_fold4: &[F128], low_point: &[F128]) -> Vec<F128> {
+pub(crate) fn collapse_s_hat_v_fold4(
+    s_hat_v_fold4: &[F128],
+    low_point: &[F128],
+) -> Vec<F128> {
     debug_assert_eq!(s_hat_v_fold4.len(), 16 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 4);
     let n_packed = 1usize << LOG_PACKING;
@@ -1462,7 +1472,10 @@ pub(crate) fn collapse_s_hat_v_fold4(s_hat_v_fold4: &[F128], low_point: &[F128])
 /// `bank = e_small + 4 * q_med + 16 * q_high`, followed by the 128
 /// packed-prefix entries. Same intake layout as the fold4 statistic, one
 /// level wider; every `z_vec` element is touched exactly once.
-pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F128> {
+pub fn s_hat_v_fold8_from_z_vec(
+    z_vec: &[F128],
+    x_inner_rest_tail: &[F128],
+) -> Vec<F128> {
     use rayon::prelude::*;
 
     assert!(
@@ -1488,7 +1501,8 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
             |mut acc, (k, &weight)| {
                 let base = 64 * k * n_packed;
                 for bank in 0..64 {
-                    let block = &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
+                    let block =
+                        &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
                     for packed in 0..n_packed {
                         acc[bank * n_packed + packed] += weight * block[packed];
                     }
@@ -1512,7 +1526,10 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
 /// 128-vector. Bitwise identical to `collapse_s_hat_v_fold4` of the 16-bank
 /// statistic: both are the same F2-linear fold regrouped, and GF(2^128)
 /// addition is XOR.
-pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128]) -> Vec<F128> {
+pub(crate) fn collapse_s_hat_v_fold8(
+    s_hat_v_fold8: &[F128],
+    low_point: &[F128],
+) -> Vec<F128> {
     debug_assert_eq!(s_hat_v_fold8.len(), 64 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 6);
     let n_packed = 1usize << LOG_PACKING;
@@ -1941,7 +1958,12 @@ pub(crate) fn compose_fold_byte_table_into(e_hi: F128, base: &[F128], out: &mut 
     compose_fold_byte_table_into_mode(e_hi, base, out, compose_x_ladder_enabled());
 }
 
-fn compose_fold_byte_table_into_mode(e_hi: F128, base: &[F128], out: &mut [F128], x_ladder: bool) {
+fn compose_fold_byte_table_into_mode(
+    e_hi: F128,
+    base: &[F128],
+    out: &mut [F128],
+    x_ladder: bool,
+) {
     debug_assert_eq!(base.len(), FOLD_TABLE_LEN);
     debug_assert_eq!(out.len(), FOLD_TABLE_LEN);
     let mut g = [F128::ZERO; 128];
@@ -2006,7 +2028,10 @@ fn build_direct_fold_table<const N: usize>(
     for byte in 0..FOLD_N_BYTES {
         let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
         table[0] = F128::ZERO;
-        for (bit, &generator) in generators[byte * 8..byte * 8 + 8].iter().enumerate() {
+        for (bit, &generator) in generators[byte * 8..byte * 8 + 8]
+            .iter()
+            .enumerate()
+        {
             let half = 1usize << bit;
             for value in 0..half {
                 table[value + half] = table[value] + generator;
@@ -3067,182 +3092,183 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             .zip(gammas_rs.par_iter())
             .enumerate()
             .map(|(i, (w, &g))| {
-                let scaled_eq_r_dprime: Vec<F128> =
-                    w.eq_r_dprime.iter().map(|value| g * *value).collect();
-                let table = build_fold_byte_table(&scaled_eq_r_dprime);
-                let direct_fold2 = match (kinds[i], w.s_hat_v_quad.as_deref()) {
-                    (Kind::Dense(d), Some(quad)) if use_split && dense_suffixes[d].len() >= 2 => {
-                        let suffix = dense_suffixes[d];
-                        let low_eq: [F128; 4] = build_eq(&suffix[..2])
-                            .try_into()
-                            .expect("two-coordinate eq has four entries");
-                        let mut products = [F128::ZERO; 16];
-                        let mut scaled_bank = vec![F128::ZERO; n_packed];
-                        for e in 0..4 {
-                            let bank = &quad[e * n_packed..(e + 1) * n_packed];
-                            for d_low in 0..4 {
-                                for p in 0..n_packed {
-                                    scaled_bank[p] = low_eq[d_low] * bank[p];
-                                }
-                                let transposed = tensor_algebra_transpose(&scaled_bank);
-                                products[e * 4 + d_low] =
-                                    inner_product(&transposed, &scaled_eq_r_dprime);
+            let scaled_eq_r_dprime: Vec<F128> =
+                w.eq_r_dprime.iter().map(|value| g * *value).collect();
+            let table = build_fold_byte_table(&scaled_eq_r_dprime);
+            let direct_fold2 = match (kinds[i], w.s_hat_v_quad.as_deref()) {
+                (Kind::Dense(d), Some(quad)) if use_split && dense_suffixes[d].len() >= 2 => {
+                    let suffix = dense_suffixes[d];
+                    let low_eq: [F128; 4] = build_eq(&suffix[..2])
+                        .try_into()
+                        .expect("two-coordinate eq has four entries");
+                    let mut products = [F128::ZERO; 16];
+                    let mut scaled_bank = vec![F128::ZERO; n_packed];
+                    for e in 0..4 {
+                        let bank = &quad[e * n_packed..(e + 1) * n_packed];
+                        for d_low in 0..4 {
+                            for p in 0..n_packed {
+                                scaled_bank[p] = low_eq[d_low] * bank[p];
                             }
-                        }
-                        let tail = &suffix[2..];
-                        let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                        Some(DirectFold2Factors {
-                            eq_lo,
-                            eq_hi,
-                            low_eq,
-                            table: table.clone(),
-                            products,
-                        })
-                    }
-                    _ => None,
-                };
-                let direct_fold4 = match (kinds[i], w.s_hat_v_fold4.as_deref()) {
-                    (Kind::Dense(d), Some(fold4)) if use_split && dense_suffixes[d].len() >= 4 => {
-                        let suffix = dense_suffixes[d];
-                        let low_eq: [F128; 16] = build_eq(&suffix[..4])
-                            .try_into()
-                            .expect("four-coordinate eq has sixteen entries");
-                        let mut products = [F128::ZERO; 256];
-                        let mut scaled_bank = vec![F128::ZERO; n_packed];
-                        for e in 0..16 {
-                            let bank = &fold4[e * n_packed..(e + 1) * n_packed];
-                            for d_low in 0..16 {
-                                for packed in 0..n_packed {
-                                    scaled_bank[packed] = low_eq[d_low] * bank[packed];
-                                }
-                                let transposed = tensor_algebra_transpose(&scaled_bank);
-                                products[e * 16 + d_low] =
-                                    inner_product(&transposed, &scaled_eq_r_dprime);
-                            }
-                        }
-                        let tail = &suffix[4..];
-                        let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                        Some(DirectFold4Factors {
-                            eq_lo,
-                            eq_hi,
-                            low_eq,
-                            table: table.clone(),
-                            products,
-                        })
-                    }
-                    _ => None,
-                };
-                let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.as_deref()) {
-                    (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
-                        let suffix = dense_suffixes[d];
-                        let low_eq: [F128; 64] = build_eq(&suffix[..6])
-                            .try_into()
-                            .expect("six-coordinate eq has sixty-four entries");
-                        // products[e][d] = ⟨transpose(low_eq[d]·bank_e), w⟩ with
-                        // w = scaled_eq_r_dprime. Mul-by-low_eq[d] and the
-                        // transpose are both F2-linear, so with
-                        // w'_d[k] = φ_w(low_eq[d]·e_k) = fold_one_slot(low_eq[d]·e_k, table)
-                        // the product equals ⟨transpose(bank_e), w'_d⟩ — bitwise
-                        // identical (char 2), 64 transposes per claim instead of
-                        // 4,096.
-                        let mut w_prime = vec![F128::ZERO; 64 * n_packed];
-                        for (d_low, w_prime_d) in w_prime.chunks_mut(n_packed).enumerate() {
-                            let scale = low_eq[d_low];
-                            for (bit, out) in w_prime_d.iter_mut().enumerate() {
-                                let basis = if bit < 64 {
-                                    F128::new(1u64 << bit, 0)
-                                } else {
-                                    F128::new(0, 1u64 << (bit - 64))
-                                };
-                                *out = fold_one_slot(scale * basis, &table);
-                            }
-                        }
-                        let mut products = [F128::ZERO; 4096];
-                        products
-                            .par_chunks_mut(64)
-                            .enumerate()
-                            .for_each(|(e, chunk)| {
-                                let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-                                let transposed = tensor_algebra_transpose(bank);
-                                for (d_low, out) in chunk.iter_mut().enumerate() {
-                                    *out = inner_product(
-                                        &transposed,
-                                        &w_prime[d_low * n_packed..(d_low + 1) * n_packed],
-                                    );
-                                }
-                            });
-                        let tail = &suffix[6..];
-                        let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                        Some(DirectFold8Factors {
-                            eq_lo,
-                            eq_hi,
-                            low_eq,
-                            table: table.clone(),
-                            products,
-                        })
-                    }
-                    _ => None,
-                };
-                // Mirrors the AB bundle above minus `products` (zeroed): C's
-                // message contribution flows through pcs's combine sweep.
-                let deferred_c_fold2 = match kinds[i] {
-                    Kind::Dense(d)
-                        if deferred_c_enabled && i == 1 && dense_suffixes[d].len() >= 2 =>
-                    {
-                        let suffix = dense_suffixes[d];
-                        let low_eq: [F128; 4] = build_eq(&suffix[..2])
-                            .try_into()
-                            .expect("two-coordinate eq has four entries");
-                        let tail = &suffix[2..];
-                        let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
-                        Some(DirectFold2Factors {
-                            eq_lo,
-                            eq_hi,
-                            low_eq,
-                            table: table.clone(),
-                            products: [F128::ZERO; 16],
-                        })
-                    }
-                    _ => None,
-                };
-                let rs_eq_ind = match kinds[i] {
-                    Kind::Dense(d) => {
-                        if use_split {
-                            // Defer the fold: carry split factors + the γ-baked byte
-                            // table so pcs's combine folds each slot on the fly into
-                            // `b_combined` (no 2^(m-7) materialize + readback).
-                            //
-                            // The factors are re-split COARSE (blocks of 2^(n-8),
-                            // see `deferred_split_n_lo`) rather than reusing the
-                            // balanced `dense_splits[d]`: the combine composes a
-                            // per-block byte table (`compose_fold_byte_table_into`)
-                            // whose build must amortize over the block. Bit-exact:
-                            // the deferred value at index j is
-                            // `fold_one_slot(build_eq(suffix)[j], table)` under
-                            // either split — `eq_lo[j&(B-1)]·eq_hi[j>>log2 B]` is
-                            // the same field element (exact tensor factoring, see
-                            // `build_eq_split`), and field elements have a unique
-                            // bit representation.
-                            let suffix = dense_suffixes[d];
-                            let (eq_lo, eq_hi) =
-                                build_eq_split(suffix, deferred_split_n_lo(suffix.len()));
-                            RsEqInd::DeferredDense {
-                                eq_lo,
-                                eq_hi,
-                                table,
-                            }
-                        } else {
-                            RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
+                            let transposed = tensor_algebra_transpose(&scaled_bank);
+                            products[e * 4 + d_low] =
+                                inner_product(&transposed, &scaled_eq_r_dprime);
                         }
                     }
-                    Kind::Sparse(s) => RsEqInd::Sparse {
-                        len: l,
-                        entries: fold_b128_elems_sparse_pairs(
-                            &sparse_supports[s],
-                            &scaled_eq_r_dprime,
-                        ),
-                    },
-                };
+                    let tail = &suffix[2..];
+                    let (eq_lo, eq_hi) =
+                        build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                    Some(DirectFold2Factors {
+                        eq_lo,
+                        eq_hi,
+                        low_eq,
+                        table: table.clone(),
+                        products,
+                    })
+                }
+                _ => None,
+            };
+            let direct_fold4 = match (kinds[i], w.s_hat_v_fold4.as_deref()) {
+                (Kind::Dense(d), Some(fold4)) if use_split && dense_suffixes[d].len() >= 4 => {
+                    let suffix = dense_suffixes[d];
+                    let low_eq: [F128; 16] = build_eq(&suffix[..4])
+                        .try_into()
+                        .expect("four-coordinate eq has sixteen entries");
+                    let mut products = [F128::ZERO; 256];
+                    let mut scaled_bank = vec![F128::ZERO; n_packed];
+                    for e in 0..16 {
+                        let bank = &fold4[e * n_packed..(e + 1) * n_packed];
+                        for d_low in 0..16 {
+                            for packed in 0..n_packed {
+                                scaled_bank[packed] = low_eq[d_low] * bank[packed];
+                            }
+                            let transposed = tensor_algebra_transpose(&scaled_bank);
+                            products[e * 16 + d_low] =
+                                inner_product(&transposed, &scaled_eq_r_dprime);
+                        }
+                    }
+                    let tail = &suffix[4..];
+                    let (eq_lo, eq_hi) =
+                        build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                    Some(DirectFold4Factors {
+                        eq_lo,
+                        eq_hi,
+                        low_eq,
+                        table: table.clone(),
+                        products,
+                    })
+                }
+                _ => None,
+            };
+            let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.as_deref()) {
+                (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
+                    let suffix = dense_suffixes[d];
+                    let low_eq: [F128; 64] = build_eq(&suffix[..6])
+                        .try_into()
+                        .expect("six-coordinate eq has sixty-four entries");
+                    // products[e][d] = ⟨transpose(low_eq[d]·bank_e), w⟩ with
+                    // w = scaled_eq_r_dprime. Mul-by-low_eq[d] and the
+                    // transpose are both F2-linear, so with
+                    // w'_d[k] = φ_w(low_eq[d]·e_k) = fold_one_slot(low_eq[d]·e_k, table)
+                    // the product equals ⟨transpose(bank_e), w'_d⟩ — bitwise
+                    // identical (char 2), 64 transposes per claim instead of
+                    // 4,096.
+                    let mut w_prime = vec![F128::ZERO; 64 * n_packed];
+                    for (d_low, w_prime_d) in w_prime.chunks_mut(n_packed).enumerate() {
+                        let scale = low_eq[d_low];
+                        for (bit, out) in w_prime_d.iter_mut().enumerate() {
+                            let basis = if bit < 64 {
+                                F128::new(1u64 << bit, 0)
+                            } else {
+                                F128::new(0, 1u64 << (bit - 64))
+                            };
+                            *out = fold_one_slot(scale * basis, &table);
+                        }
+                    }
+                    let mut products = [F128::ZERO; 4096];
+                    products
+                        .par_chunks_mut(64)
+                        .enumerate()
+                        .for_each(|(e, chunk)| {
+                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
+                            let transposed = tensor_algebra_transpose(bank);
+                            for (d_low, out) in chunk.iter_mut().enumerate() {
+                                *out = inner_product(
+                                    &transposed,
+                                    &w_prime[d_low * n_packed..(d_low + 1) * n_packed],
+                                );
+                            }
+                        });
+                    let tail = &suffix[6..];
+                    let (eq_lo, eq_hi) =
+                        build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                    Some(DirectFold8Factors {
+                        eq_lo,
+                        eq_hi,
+                        low_eq,
+                        table: table.clone(),
+                        products,
+                    })
+                }
+                _ => None,
+            };
+            // Mirrors the AB bundle above minus `products` (zeroed): C's
+            // message contribution flows through pcs's combine sweep.
+            let deferred_c_fold2 = match kinds[i] {
+                Kind::Dense(d)
+                    if deferred_c_enabled && i == 1 && dense_suffixes[d].len() >= 2 =>
+                {
+                    let suffix = dense_suffixes[d];
+                    let low_eq: [F128; 4] = build_eq(&suffix[..2])
+                        .try_into()
+                        .expect("two-coordinate eq has four entries");
+                    let tail = &suffix[2..];
+                    let (eq_lo, eq_hi) =
+                        build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                    Some(DirectFold2Factors {
+                        eq_lo,
+                        eq_hi,
+                        low_eq,
+                        table: table.clone(),
+                        products: [F128::ZERO; 16],
+                    })
+                }
+                _ => None,
+            };
+            let rs_eq_ind = match kinds[i] {
+                Kind::Dense(d) => {
+                    if use_split {
+                        // Defer the fold: carry split factors + the γ-baked byte
+                        // table so pcs's combine folds each slot on the fly into
+                        // `b_combined` (no 2^(m-7) materialize + readback).
+                        //
+                        // The factors are re-split COARSE (blocks of 2^(n-8),
+                        // see `deferred_split_n_lo`) rather than reusing the
+                        // balanced `dense_splits[d]`: the combine composes a
+                        // per-block byte table (`compose_fold_byte_table_into`)
+                        // whose build must amortize over the block. Bit-exact:
+                        // the deferred value at index j is
+                        // `fold_one_slot(build_eq(suffix)[j], table)` under
+                        // either split — `eq_lo[j&(B-1)]·eq_hi[j>>log2 B]` is
+                        // the same field element (exact tensor factoring, see
+                        // `build_eq_split`), and field elements have a unique
+                        // bit representation.
+                        let suffix = dense_suffixes[d];
+                        let (eq_lo, eq_hi) =
+                            build_eq_split(suffix, deferred_split_n_lo(suffix.len()));
+                        RsEqInd::DeferredDense {
+                            eq_lo,
+                            eq_hi,
+                            table,
+                        }
+                    } else {
+                        RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
+                    }
+                }
+                Kind::Sparse(s) => RsEqInd::Sparse {
+                    len: l,
+                    entries: fold_b128_elems_sparse_pairs(&sparse_supports[s], &scaled_eq_r_dprime),
+                },
+            };
                 (
                     RingSwitchProof { s_hat_v: w.s_hat_v },
                     RingSwitchBatchOutput {
@@ -4208,7 +4234,8 @@ mod tests {
         for high in 0..packed.len() / 16 {
             for e in 0..16 {
                 for d in 0..16 {
-                    product_oracle[16 * e + d] += packed[16 * high + e] * basis[16 * high + d];
+                    product_oracle[16 * e + d] +=
+                        packed[16 * high + e] * basis[16 * high + d];
                 }
             }
         }
@@ -4296,7 +4323,8 @@ mod tests {
         for high in 0..packed.len() / 64 {
             for e in 0..64 {
                 for d in 0..64 {
-                    product_oracle[64 * e + d] += packed[64 * high + e] * basis[64 * high + d];
+                    product_oracle[64 * e + d] +=
+                        packed[64 * high + e] * basis[64 * high + d];
                 }
             }
         }
@@ -4321,7 +4349,12 @@ mod tests {
         ab_point.extend_from_slice(&outer);
         let mut c_point: Vec<F128> = (0..ab_point.len()).map(|_| rng.f128()).collect();
         c_point[1..4].fill(F128::ZERO);
-        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
+        let z_vec = partial_fold_packed_z(
+            &z_packed_lincheck,
+            M,
+            K_LOG,
+            &build_eq(&outer),
+        );
         let quad = s_hat_v_quad_from_z_vec(&z_vec, &inner_rest[1..]);
         let padding = PaddingSpec::dense(M);
 
@@ -4359,7 +4392,8 @@ mod tests {
         for high in 0..(packed.len() / 4) {
             for e in 0..4 {
                 for d in 0..4 {
-                    product_oracle[4 * e + d] += packed[4 * high + e] * ab_basis[4 * high + d];
+                    product_oracle[4 * e + d] +=
+                        packed[4 * high + e] * ab_basis[4 * high + d];
                 }
             }
         }
@@ -4449,7 +4483,8 @@ mod tests {
         for claim in 0..2 {
             assert_eq!(direct[claim].0, baseline[claim].0, "s_hat_v claim {claim}");
             assert_eq!(
-                direct[claim].1.sumcheck_claim, baseline[claim].1.sumcheck_claim,
+                direct[claim].1.sumcheck_claim,
+                baseline[claim].1.sumcheck_claim,
                 "sumcheck_claim claim {claim}"
             );
             assert_eq!(

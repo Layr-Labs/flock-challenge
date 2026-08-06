@@ -26,10 +26,7 @@ use crate::field::F128;
 
 /// Carry-less multiply of two 64-bit lanes, result in a q register.
 #[inline(always)]
-unsafe fn pmull_ll(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
+unsafe fn pmull_ll(a: core::arch::aarch64::uint64x2_t, b: core::arch::aarch64::uint64x2_t) -> core::arch::aarch64::uint64x2_t {
     use core::arch::aarch64::*;
     unsafe {
         core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
@@ -493,7 +490,9 @@ pub(super) unsafe fn butterfly_fused_3layer_from_src_row(
     twiddles: &[F128; 7],
 ) {
     unsafe {
-        butterfly_fused_3layer_from_src_row_impl::<false>(src, dst, eighth, num_ntts, r, twiddles);
+        butterfly_fused_3layer_from_src_row_impl::<false>(
+            src, dst, eighth, num_ntts, r, twiddles,
+        );
     }
 }
 
@@ -507,7 +506,9 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
     twiddles: &[F128; 7],
 ) {
     unsafe {
-        butterfly_fused_3layer_from_src_row_impl::<true>(src, dst, eighth, num_ntts, r, twiddles);
+        butterfly_fused_3layer_from_src_row_impl::<true>(
+            src, dst, eighth, num_ntts, r, twiddles,
+        );
     }
 }
 

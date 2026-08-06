@@ -712,16 +712,13 @@ mod tests {
     #[test]
     fn flat_pcs_open_encoder_matches_bincode() {
         use flock_core::pcs::BatchOpeningProofLigerito;
-        use flock_core::pcs::ligerito::{
-            FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage,
-        };
+        use flock_core::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage};
         use flock_core::pcs::ring_switch::RingSwitchProof;
 
         let mut rng = Rng::new(0x515E_D0_F128);
         let f128 = |rng: &mut Rng| F128::new(rng.nx(), rng.nx());
-        let f128_vec = |rng: &mut Rng, n: usize| -> Vec<F128> {
-            (0..n).map(|_| F128::new(rng.nx(), rng.nx())).collect()
-        };
+        let f128_vec =
+            |rng: &mut Rng, n: usize| -> Vec<F128> { (0..n).map(|_| F128::new(rng.nx(), rng.nx())).collect() };
         let hash_vec = |rng: &mut Rng, n: usize| -> Vec<MerkleHash> {
             (0..n)
                 .map(|_| std::array::from_fn(|_| rng.nx() as u8))
@@ -729,19 +726,13 @@ mod tests {
         };
         let rows = |rng: &mut Rng, n: usize, w: usize| -> Vec<Vec<F128>> {
             (0..n)
-                .map(|i| {
-                    (0..(w + i % 3))
-                        .map(|_| F128::new(rng.nx(), rng.nx()))
-                        .collect()
-                })
+                .map(|i| (0..(w + i % 3)).map(|_| F128::new(rng.nx(), rng.nx())).collect())
                 .collect()
         };
 
-        for (n_rs, n_rec, n_rows, n_msgs) in [
-            (0usize, 0usize, 0usize, 0usize),
-            (1, 1, 3, 2),
-            (3, 4, 17, 55),
-        ] {
+        for (n_rs, n_rec, n_rows, n_msgs) in
+            [(0usize, 0usize, 0usize, 0usize), (1, 1, 3, 2), (3, 4, 17, 55)]
+        {
             let recursive_proof = |rng: &mut Rng| RecursiveProof {
                 opened_rows: rows(rng, n_rows, 4),
                 merkle_proof: hash_vec(rng, n_rows * 2 + 1),
@@ -821,10 +812,7 @@ mod tests {
         unsafe { std::env::remove_var(flock_core::ENV_NO_MICRO_STACK) };
 
         assert_eq!(root_on, root_off, "commit root changed under micro-stack");
-        assert_eq!(
-            bytes_on, bytes_off,
-            "bundle bytes changed under micro-stack"
-        );
+        assert_eq!(bytes_on, bytes_off, "bundle bytes changed under micro-stack");
 
         // Witgen-stack gates: each item's kill switch (and all of them at
         // once) must leave the bundle byte-identical. The elision item is
@@ -879,14 +867,8 @@ mod tests {
         // is the strongest same-process elision-hit identity check at this
         // shape.
         let (root_on2, bytes_on2) = prove_bytes();
-        assert_eq!(
-            root_on2, root_on,
-            "commit root changed on warm token-hit prove"
-        );
-        assert_eq!(
-            bytes_on2, bytes_on,
-            "bundle bytes changed on warm token-hit prove"
-        );
+        assert_eq!(root_on2, root_on, "commit root changed on warm token-hit prove");
+        assert_eq!(bytes_on2, bytes_on, "bundle bytes changed on warm token-hit prove");
     }
 
     #[test]

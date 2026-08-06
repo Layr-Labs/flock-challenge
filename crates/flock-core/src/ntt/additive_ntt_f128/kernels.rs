@@ -101,7 +101,9 @@ pub(super) fn butterfly_fused_2layer_low_twiddles(
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     // SAFETY: the cfg gate guarantees PMULL through the aes feature.
     unsafe {
-        aarch64::butterfly_fused_2layer_low_twiddles(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+        aarch64::butterfly_fused_2layer_low_twiddles(
+            a, b, c, d, t_outer, t_inner_a, t_inner_b,
+        );
     }
 
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
@@ -269,14 +271,18 @@ pub(super) unsafe fn butterfly_fused_3layer_from_src_row(
     // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
     unsafe {
         if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_from_src_row(src, dst, eighth, num_ntts, r, twiddles);
+            aarch64::butterfly_fused_3layer_from_src_row(
+                src, dst, eighth, num_ntts, r, twiddles,
+            );
             return;
         }
     }
 
     // SAFETY: forwarded caller contract.
     unsafe {
-        portable::butterfly_fused_3layer_from_src_row(src, dst, eighth, num_ntts, r, twiddles);
+        portable::butterfly_fused_3layer_from_src_row(
+            src, dst, eighth, num_ntts, r, twiddles,
+        );
     }
 }
 
@@ -552,8 +558,9 @@ mod aarch64_row_tests {
         let mut state = 0x4645_5350_4149_5232;
         for &width in &[1usize, 2, 5, 16, 64, 96] {
             for _ in 0..4 {
-                let mut mk =
-                    |n: usize| -> Vec<F128> { (0..n).map(|_| rand_f128(&mut state)).collect() };
+                let mut mk = |n: usize| -> Vec<F128> {
+                    (0..n).map(|_| rand_f128(&mut state)).collect()
+                };
                 let (a0, b0, c0, d0) = (mk(width), mk(width), mk(width), mk(width));
                 let t_outer = rand_f128(&mut state);
                 let t_inner_a = rand_f128(&mut state);

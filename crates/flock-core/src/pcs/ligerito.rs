@@ -2288,10 +2288,20 @@ fn transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
             *value = unsafe { *ptr.add(row + i * eighth) };
         }
         for pair in 0..4 {
-            butterfly(&mut values, 2 * pair, 2 * pair + 1, layer_2_twiddles[pair]);
+            butterfly(
+                &mut values,
+                2 * pair,
+                2 * pair + 1,
+                layer_2_twiddles[pair],
+            );
         }
         for half in 0..2 {
-            butterfly(&mut values, 4 * half, 4 * half + 2, layer_1_twiddles[half]);
+            butterfly(
+                &mut values,
+                4 * half,
+                4 * half + 2,
+                layer_1_twiddles[half],
+            );
             butterfly(
                 &mut values,
                 4 * half + 1,
@@ -2333,9 +2343,20 @@ fn transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
             // rows and the eight retained outputs at those same row offsets.
             unsafe {
                 let ptr = data_ptr as *mut F128;
-                let even =
-                    retained_row(ptr, even_row, eighth, &layer_1_twiddles, &layer_2_twiddles);
-                let odd = retained_row(ptr, odd_row, eighth, &layer_1_twiddles, &layer_2_twiddles);
+                let even = retained_row(
+                    ptr,
+                    even_row,
+                    eighth,
+                    &layer_1_twiddles,
+                    &layer_2_twiddles,
+                );
+                let odd = retained_row(
+                    ptr,
+                    odd_row,
+                    eighth,
+                    &layer_1_twiddles,
+                    &layer_2_twiddles,
+                );
                 for segment in 0..4 {
                     let even_index = segment * eighth + even_row;
                     *ptr.add(even_index) = even[segment];
@@ -2590,9 +2611,7 @@ fn induce_sumcheck_poly_via_ntt_impl(
             .map(query_term)
             .reduce(|| F128::ZERO, |a, b| a + b)
     } else {
-        (0..n_queries)
-            .map(query_term)
-            .fold(F128::ZERO, |a, b| a + b)
+        (0..n_queries).map(query_term).fold(F128::ZERO, |a, b| a + b)
     };
 
     let (mut coeffs, intro_msg) = if log_block == 0 {
@@ -3093,6 +3112,11 @@ fn transpose_forward_ntt_sparse_hashmap_impl(
 pub(crate) struct LigeroWitness {
     pub mat: Vec<F128>,
     pub tree: Vec<Hash>,
+    /// Zero-copy borrow of the persistent GPU rec-Merkle buffer (ranked L1
+    /// commit). When present, `tree` is empty and every reader goes through
+    /// [`Self::tree_slice`]; dropping/clearing it releases the process-wide
+    /// borrow flag so the next prove's dispatch may rewrite the buffer.
+    pub gpu_tree: Option<crate::gpu_commit::GpuRecTree>,
     pub block_len: usize,
     pub num_interleaved: usize,
 }
@@ -3124,9 +3148,27 @@ impl LigeroWitness {
         &self.mat[start..start + self.num_interleaved]
     }
 
+    /// The flat tree nodes, wherever they live (owned Vec or the zero-copy
+    /// GPU borrow). Identical bytes either way.
+    #[inline]
+    pub fn tree_slice(&self) -> &[Hash] {
+        if let Some(g) = &self.gpu_tree {
+            return g;
+        }
+        &self.tree
+    }
+
+    /// Recycle the tree storage: pool an owned Vec, release a GPU borrow.
+    #[inline]
+    pub fn recycle_tree(&mut self) {
+        self.gpu_tree = None;
+        crate::gpu_commit::give_rec_tree(std::mem::take(&mut self.tree));
+    }
+
     #[inline]
     pub fn root(&self) -> Hash {
-        self.tree[self.tree.len() - 1]
+        let t = self.tree_slice();
+        t[t.len() - 1]
     }
 }
 
@@ -3220,7 +3262,11 @@ fn ligero_commit_impl(
         super::commit::replicate_message_fill(&mut mat, poly);
         fill_elapsed = fill_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
         // RS-encode every lane in one call (each lane is one independent NTT).
-        ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
+        ntt.forward_transform_interleaved_from_layer(
+            &mut mat,
+            num_interleaved,
+            log_inv_rate,
+        );
     }
     let ntt_elapsed = ntt_start
         .map_or(std::time::Duration::ZERO, |t| t.elapsed())
@@ -3241,14 +3287,30 @@ fn ligero_commit_impl(
     // returns the bit-identical flat tree or `None` for the exact CPU path
     // (kill switch `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, non-Blake3 hashes,
     // other shapes, and every GPU failure).
-    let gpu_tree = if matches!(kind, HashKind::Blake3) && leaf_size_bytes == 128 {
-        crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
+    let is_gpu_shape = matches!(kind, HashKind::Blake3) && leaf_size_bytes == 128;
+    // Zero-copy first: borrow the persistent GPU tree buffer instead of
+    // copying 16 MiB out (the L0 `GpuMerkleTree` pattern). Falls back to the
+    // copy-out variant, then the CPU builder — identical bytes either way.
+    let gpu_view = if is_gpu_shape {
+        crate::gpu_commit::gpu_recursive_merkle_blake3_view(data_bytes, block_len)
     } else {
         None
     };
-    let tree = match gpu_tree {
-        Some(tree) => tree,
-        None => merkle::merkle_tree(data_bytes, block_len, kind),
+    let (tree, gpu_view) = if gpu_view.is_some() {
+        (Vec::new(), gpu_view)
+    } else {
+        let gpu_tree = if is_gpu_shape {
+            crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
+        } else {
+            None
+        };
+        (
+            match gpu_tree {
+                Some(tree) => tree,
+                None => merkle::merkle_tree(data_bytes, block_len, kind),
+            },
+            None,
+        )
     };
     let merkle_elapsed = merkle_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
 
@@ -3274,6 +3336,7 @@ fn ligero_commit_impl(
     LigeroWitness {
         mat,
         tree,
+        gpu_tree: gpu_view,
         block_len,
         num_interleaved,
     }
@@ -3491,7 +3554,8 @@ fn round_msg_and_eval_lsb_factorized_eq_split(
         .par_chunks(2 * eq_lo.len())
         .zip(eq_hi.par_iter())
         .map(|(f_chunk, &hi_weight)| {
-            let (a_chunk, s_chunk) = crate::field::f128_slice::round0_factorized_eq(f_chunk, eq_lo);
+            let (a_chunk, s_chunk) =
+                crate::field::f128_slice::round0_factorized_eq(f_chunk, eq_lo);
             (a_chunk * hi_weight, s_chunk * hi_weight)
         })
         .reduce(
@@ -3793,7 +3857,8 @@ fn fold2_and_msgs_lsb(
         use std::sync::OnceLock;
         static NT_ENABLED: OnceLock<bool> = OnceLock::new();
         quarter >= (1usize << 21)
-            && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_LIG_NT_LEGACY").is_none())
+            && *NT_ENABLED
+                .get_or_init(|| std::env::var_os("FLOCK_LIG_NT_LEGACY").is_none())
     };
     let acc = wf
         .par_chunks_mut(CHUNK)
@@ -3924,7 +3989,7 @@ fn fold2_and_msg_lsb(
             wb.set_len(quarter);
         }
 
-        const CHUNK: usize = 1024;
+        const CHUNK: usize = 2048;
         let nt_stores = {
             use std::sync::OnceLock;
             static NT_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -4109,7 +4174,14 @@ fn materialize_direct_ab_fold2(
     )
     .then(crate::epool::epool)
     .flatten();
-    materialize_direct_ab_fold2_with_helper(packed_witness, ordinary_basis, claims, r0, r1, helper)
+    materialize_direct_ab_fold2_with_helper(
+        packed_witness,
+        ordinary_basis,
+        claims,
+        r0,
+        r1,
+        helper,
+    )
 }
 
 fn materialize_direct_ab_fold2_with_helper(
@@ -4134,7 +4206,11 @@ fn materialize_direct_ab_fold2_with_helper(
     let direct_tables: Vec<Vec<F128>> = claims
         .iter()
         .map(|claim| {
-            super::ring_switch::build_direct_fold2_table(&claim.low_eq, &fold_weight, &claim.table)
+            super::ring_switch::build_direct_fold2_table(
+                &claim.low_eq,
+                &fold_weight,
+                &claim.table,
+            )
         })
         .collect();
 
@@ -4158,7 +4234,10 @@ fn materialize_direct_ab_fold2_with_helper(
     fn empty_stats() -> FoldStats {
         ((F128::ZERO, F128::ZERO), [F128::ZERO; 6])
     }
-    fn merge_stats(((x0, x2), mut xc): FoldStats, ((y0, y2), yc): FoldStats) -> FoldStats {
+    fn merge_stats(
+        ((x0, x2), mut xc): FoldStats,
+        ((y0, y2), yc): FoldStats,
+    ) -> FoldStats {
         for (x, y) in xc.iter_mut().zip(yc) {
             *x += y;
         }
@@ -4166,87 +4245,102 @@ fn materialize_direct_ab_fold2_with_helper(
     }
     let fold_block =
         |scratch: &mut Vec<F128>, block: usize, b_out: &mut [F128], f_out: &mut [F128]| {
-            let start = 4 * block * block_len;
-            let f_in = &packed_witness[start..start + 4 * block_len];
-            let b_in: &[F128] = if has_ordinary {
-                &ordinary_basis[start..start + 4 * block_len]
-            } else {
-                &[]
-            };
-            let fold4 = |input: &[F128], slot: usize| {
-                let a0 = input[4 * slot];
-                let a1 = input[4 * slot + 1];
-                let a2 = input[4 * slot + 2];
-                let a3 = input[4 * slot + 3];
-                let low = a0 + r0 * (a0 + a1);
-                let high = a2 + r0 * (a2 + a3);
-                low + r1 * (low + high)
-            };
+                let start = 4 * block * block_len;
+                let f_in = &packed_witness[start..start + 4 * block_len];
+                let b_in: &[F128] = if has_ordinary {
+                    &ordinary_basis[start..start + 4 * block_len]
+                } else {
+                    &[]
+                };
+                let fold4 = |input: &[F128], slot: usize| {
+                    let a0 = input[4 * slot];
+                    let a1 = input[4 * slot + 1];
+                    let a2 = input[4 * slot + 2];
+                    let a3 = input[4 * slot + 3];
+                    let low = a0 + r0 * (a0 + a1);
+                    let high = a2 + r0 * (a2 + a3);
+                    low + r1 * (low + high)
+                };
 
-            if fuse_init {
-                // First direct claim initializes; remaining claims add.
-                // Fuse claim-0 with ordinary-basis fold4 so each b_out
-                // slot is written once when there is a single claim
-                // (the ranked AB-only shape).
-                let (first_claim, rest_claims) = claims.split_first().expect("nonempty claims");
-                let (first_table, rest_tables) =
-                    direct_tables.split_first().expect("nonempty tables");
-                super::ring_switch::compose_fold_byte_table_into(
-                    first_claim.eq_hi[block],
-                    first_table,
-                    scratch,
-                );
-                if has_ordinary {
-                    for slot in 0..block_len {
-                        let direct =
-                            super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                        f_out[slot] = fold4(f_in, slot);
-                        b_out[slot] = direct + fold4(b_in, slot);
-                    }
-                } else {
-                    for slot in 0..block_len {
-                        f_out[slot] = fold4(f_in, slot);
-                        b_out[slot] =
-                            super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                    }
-                }
-                for (claim, direct_table) in rest_claims.iter().zip(rest_tables.iter()) {
+                if fuse_init {
+                    // First direct claim initializes; remaining claims add.
+                    // Fuse claim-0 with ordinary-basis fold4 so each b_out
+                    // slot is written once when there is a single claim
+                    // (the ranked AB-only shape).
+                    let (first_claim, rest_claims) =
+                        claims.split_first().expect("nonempty claims");
+                    let (first_table, rest_tables) =
+                        direct_tables.split_first().expect("nonempty tables");
                     super::ring_switch::compose_fold_byte_table_into(
-                        claim.eq_hi[block],
-                        direct_table,
+                        first_claim.eq_hi[block],
+                        first_table,
                         scratch,
                     );
-                    for (slot, out) in b_out.iter_mut().enumerate() {
-                        *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                    if has_ordinary {
+                        for slot in 0..block_len {
+                            let direct = super::ring_switch::fold_one_slot(
+                                first_claim.eq_lo[slot],
+                                scratch,
+                            );
+                            f_out[slot] = fold4(f_in, slot);
+                            b_out[slot] = direct + fold4(b_in, slot);
+                        }
+                    } else {
+                        for slot in 0..block_len {
+                            f_out[slot] = fold4(f_in, slot);
+                            b_out[slot] = super::ring_switch::fold_one_slot(
+                                first_claim.eq_lo[slot],
+                                scratch,
+                            );
+                        }
                     }
-                }
-            } else {
-                // Frontier control: zero-fill, sum all direct claims, then
-                // add ordinary-basis fold4.
-                b_out.fill(F128::ZERO);
-                for (claim, direct_table) in claims.iter().zip(direct_tables.iter()) {
-                    super::ring_switch::compose_fold_byte_table_into(
-                        claim.eq_hi[block],
-                        direct_table,
-                        scratch,
-                    );
-                    for (slot, out) in b_out.iter_mut().enumerate() {
-                        *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-                    }
-                }
-                if has_ordinary {
-                    for slot in 0..block_len {
-                        f_out[slot] = fold4(f_in, slot);
-                        b_out[slot] += fold4(b_in, slot);
+                    for (claim, direct_table) in rest_claims.iter().zip(rest_tables.iter()) {
+                        super::ring_switch::compose_fold_byte_table_into(
+                            claim.eq_hi[block],
+                            direct_table,
+                            scratch,
+                        );
+                        for (slot, out) in b_out.iter_mut().enumerate() {
+                            *out += super::ring_switch::fold_one_slot(
+                                claim.eq_lo[slot],
+                                scratch,
+                            );
+                        }
                     }
                 } else {
-                    for slot in 0..block_len {
-                        f_out[slot] = fold4(f_in, slot);
+                    // Frontier control: zero-fill, sum all direct claims, then
+                    // add ordinary-basis fold4.
+                    b_out.fill(F128::ZERO);
+                    for (claim, direct_table) in claims.iter().zip(direct_tables.iter()) {
+                        super::ring_switch::compose_fold_byte_table_into(
+                            claim.eq_hi[block],
+                            direct_table,
+                            scratch,
+                        );
+                        for (slot, out) in b_out.iter_mut().enumerate() {
+                            *out += super::ring_switch::fold_one_slot(
+                                claim.eq_lo[slot],
+                                scratch,
+                            );
+                        }
+                    }
+                    if has_ordinary {
+                        for slot in 0..block_len {
+                            f_out[slot] = fold4(f_in, slot);
+                            b_out[slot] += fold4(b_in, slot);
+                        }
+                    } else {
+                        for slot in 0..block_len {
+                            f_out[slot] = fold4(f_in, slot);
+                        }
                     }
                 }
-            }
-            super::round0_and_round1_lookahead_ranked(f_out, b_out, ranked_lookahead_neon)
-        };
+                super::round0_and_round1_lookahead_ranked(
+                    f_out,
+                    b_out,
+                    ranked_lookahead_neon,
+                )
+            };
     let stats = if let Some(helper) = helper {
         let n_blocks = out_len / block_len;
         let mut partials = vec![empty_stats(); n_blocks];
@@ -4287,7 +4381,9 @@ fn materialize_direct_ab_fold2_with_helper(
             .enumerate()
             .map_init(
                 || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
-                |scratch, (block, (b_out, f_out))| fold_block(scratch, block, b_out, f_out),
+                |scratch, (block, (b_out, f_out))| {
+                    fold_block(scratch, block, b_out, f_out)
+                },
             )
             .reduce(empty_stats, merge_stats)
     };
@@ -4336,7 +4432,11 @@ fn materialize_direct_fold4(
     let direct_tables: Vec<Vec<F128>> = claims
         .iter()
         .map(|claim| {
-            super::ring_switch::build_direct_fold4_table(&claim.low_eq, &fold_weight, &claim.table)
+            super::ring_switch::build_direct_fold4_table(
+                &claim.low_eq,
+                &fold_weight,
+                &claim.table,
+            )
         })
         .collect();
 
@@ -4467,7 +4567,11 @@ fn materialize_direct_fold8(
     let direct_tables: Vec<Vec<F128>> = claims
         .iter()
         .map(|claim| {
-            super::ring_switch::build_direct_fold8_table(&claim.low_eq, &fold_weight, &claim.table)
+            super::ring_switch::build_direct_fold8_table(
+                &claim.low_eq,
+                &fold_weight,
+                &claim.table,
+            )
         })
         .collect();
 
@@ -4537,7 +4641,8 @@ fn materialize_direct_fold8(
                 f_out[slot] = folded_f[0];
                 f_out[slot + 1] = folded_f[1];
 
-                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                let direct0 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
                 let direct1 =
                     super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
                 if has_ordinary {
@@ -4950,10 +5055,7 @@ impl SumcheckProver {
             self.pending_fold_basis.is_none(),
             "fold2 across deferred ordinary glue"
         );
-        debug_assert!(
-            self.pending_ood_eq.is_none(),
-            "fold2 across pending OOD equality"
-        );
+        debug_assert!(self.pending_ood_eq.is_none(), "fold2 across pending OOD equality");
         let (msg, coeffs) = fold2_and_msgs_lsb(
             &self.f,
             &self.combined_basis,
@@ -4976,10 +5078,7 @@ impl SumcheckProver {
             self.pending_fold_basis.is_none(),
             "fold2 across deferred ordinary glue"
         );
-        debug_assert!(
-            self.pending_ood_eq.is_none(),
-            "fold2 across pending OOD equality"
-        );
+        debug_assert!(self.pending_ood_eq.is_none(), "fold2 across pending OOD equality");
         let msg = fold2_and_msg_lsb(
             &self.f,
             &self.combined_basis,
@@ -4998,10 +5097,7 @@ impl SumcheckProver {
     /// (u_0, u_2) for `Σ_x f(x) · b_new(x)` at the current dim.
     pub fn introduce_new(&mut self, b_new: Vec<F128>, h_new: F128) -> SumcheckMessage {
         assert_eq!(b_new.len(), self.f.len());
-        assert!(
-            self.pending_glue.is_none(),
-            "ordinary introduction already pending"
-        );
+        assert!(self.pending_glue.is_none(), "ordinary introduction already pending");
         assert!(
             self.pending_fold_basis.is_none(),
             "ordinary introduction across deferred glue"
@@ -5022,10 +5118,7 @@ impl SumcheckProver {
         msg: SumcheckMessage,
     ) -> SumcheckMessage {
         assert_eq!(b_new.len(), self.f.len());
-        assert!(
-            self.pending_glue.is_none(),
-            "ordinary introduction already pending"
-        );
+        assert!(self.pending_glue.is_none(), "ordinary introduction already pending");
         assert!(
             self.pending_fold_basis.is_none(),
             "ordinary introduction across deferred glue"
@@ -5043,10 +5136,7 @@ impl SumcheckProver {
     /// `h_new` then `(u_0, u_2)`, exactly as the unfused path does.
     pub fn introduce_new_with_eval(&mut self, b_new: Vec<F128>) -> (SumcheckMessage, F128) {
         assert_eq!(b_new.len(), self.f.len());
-        assert!(
-            self.pending_glue.is_none(),
-            "ordinary introduction already pending"
-        );
+        assert!(self.pending_glue.is_none(), "ordinary introduction already pending");
         assert!(
             self.pending_fold_basis.is_none(),
             "ordinary introduction across deferred glue"
@@ -5062,7 +5152,10 @@ impl SumcheckProver {
     /// or any outstanding introduction. A caller may use the full-table path
     /// after `None` only when no ordinary introduction is pending; the ranked
     /// production caller's exact gate guarantees both pending slots are empty.
-    fn introduce_new_ood_factorized(&mut self, z: &[F128]) -> Option<(SumcheckMessage, F128)> {
+    fn introduce_new_ood_factorized(
+        &mut self,
+        z: &[F128],
+    ) -> Option<(SumcheckMessage, F128)> {
         let expected_len = z
             .len()
             .try_into()
@@ -5083,7 +5176,8 @@ impl SumcheckProver {
         let eq_lo = crate::lincheck::build_eq_table_optimized(&tail[..split_low_log]);
         let eq_hi = crate::lincheck::build_eq_table_optimized(&tail[split_low_log..]);
         let z_0 = z[0];
-        let (msg, h_new) = round_msg_and_eval_lsb_factorized_eq_split(&self.f, &eq_lo, &eq_hi, z_0);
+        let (msg, h_new) =
+            round_msg_and_eval_lsb_factorized_eq_split(&self.f, &eq_lo, &eq_hi, z_0);
         self.transcript.push(msg);
         self.pending_ood_eq = Some(PendingOodEq::Introduced {
             eq_lo,
@@ -5360,6 +5454,7 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
     let wtns_0 = LigeroWitness {
         mat: l0_codeword,
         tree: l0_tree,
+        gpu_tree: None,
         block_len,
         num_interleaved,
     };
@@ -5516,10 +5611,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
     round3_lookahead: super::Fold4Lookahead3,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    assert_eq!(
-        config.initial_k, 6,
-        "direct-fold4 scaffold requires initial_k=6"
-    );
+    assert_eq!(config.initial_k, 6, "direct-fold4 scaffold requires initial_k=6");
     recursive_prover_with_basis_impl(
         config,
         packed_witness,
@@ -5564,10 +5656,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
     round5_lookahead: super::Fold8Lookahead5,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    assert_eq!(
-        config.initial_k, 6,
-        "direct-fold8 scaffold requires initial_k=6"
-    );
+    assert_eq!(config.initial_k, 6, "direct-fold8 scaffold requires initial_k=6");
     recursive_prover_with_basis_impl(
         config,
         packed_witness,
@@ -5630,10 +5719,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 && b_initial.is_empty())
     );
     if direct_fold4.is_some() || direct_fold8.is_some() {
-        assert_eq!(
-            initial_k, 6,
-            "direct-fold4/fold8 scaffold requires initial_k=6"
-        );
+        assert_eq!(initial_k, 6, "direct-fold4/fold8 scaffold requires initial_k=6");
     }
     assert_eq!(config.recursive_ks.len(), r);
     assert_eq!(config.log_inv_rates.len(), r + 1);
@@ -6001,10 +6087,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         deferred_challenge.is_none(),
         "ranked initial_k must be even"
     );
-    debug_assert!(
-        fold4_challenges.is_empty(),
-        "direct-fold4/fold8 must materialize"
-    );
+    debug_assert!(fold4_challenges.is_empty(), "direct-fold4/fold8 must materialize");
     let mut sc_prover = sc_prover.expect("initial direct mode must materialize");
     if trace {
         t_init_sumcheck += _t.elapsed();
@@ -6117,15 +6200,15 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let _t = std::time::Instant::now();
     let (basis_0_induced, enforced_sum_0, induced_intro_msg_0) =
         induce_sumcheck_poly_auto_with_ranked_msg(
-            n1,
-            log_inv_rate_0,
-            &sks_vks_n1,
-            &opened_rows_0,
-            &r_lane_fold,
-            &queries_0,
-            &alpha_0,
-            sc_prover.f(),
-        );
+        n1,
+        log_inv_rate_0,
+        &sks_vks_n1,
+        &opened_rows_0,
+        &r_lane_fold,
+        &queries_0,
+        &alpha_0,
+        sc_prover.f(),
+    );
     if trace {
         t_induce += _t.elapsed();
     }
@@ -6141,7 +6224,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // Introduce + glue basis_0.
     let _t = std::time::Instant::now();
     let intro_msg_0 = if let Some(msg) = induced_intro_msg_0 {
-        sc_prover.introduce_new_with_precomputed_msg(basis_0_induced, enforced_sum_0, msg)
+        sc_prover.introduce_new_with_precomputed_msg(
+            basis_0_induced,
+            enforced_sum_0,
+            msg,
+        )
     } else {
         sc_prover.introduce_new(basis_0_induced, enforced_sum_0)
     };
@@ -6205,14 +6292,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     .collect()
             };
             let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+                merkle_multi_proof_for(wtns_prev.tree_slice(), wtns_prev.block_len, &queries_last);
             if trace {
                 t_opens += _t.elapsed();
             }
             // Final open complete — recycle last recursive codeword/tree before
             // proof-object assembly (transcript copy etc.).
             crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-            wtns_prev.tree = Vec::new();
+            wtns_prev.recycle_tree();
             if trace {
                 let total = t_total.elapsed();
                 eprintln!("[lig-prove] total = {:.2} ms", total.as_secs_f64() * 1e3);
@@ -6332,7 +6419,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 .collect()
         };
         let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+            merkle_multi_proof_for(wtns_prev.tree_slice(), wtns_prev.block_len, &queries_i);
         if trace {
             t_opens += _t.elapsed();
         }
@@ -6341,7 +6428,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // so they do not stack under wtns_next (already committed) + induce temps.
         // Bit-identical: no further reads of wtns_prev.mat/tree this iteration.
         crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-        wtns_prev.tree = Vec::new();
+        wtns_prev.recycle_tree();
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
         let (basis_i_induced, enforced_sum_i) =
@@ -7458,18 +7545,15 @@ fn recursive_prover_inner<Ch: Challenger>(
     let opened_rows_0: Vec<Vec<F128>> = {
         use rayon::prelude::*;
         // Order-preserving parallel collect — bit-identical (see above).
-        queries_0
-            .par_iter()
-            .map(|&q| wtns_0.row(q).to_vec())
-            .collect()
+        queries_0.par_iter().map(|&q| wtns_0.row(q).to_vec()).collect()
     };
-    let merkle_proof_0 = merkle_multi_proof_for(&wtns_0.tree, wtns_0.block_len, &queries_0);
+    let merkle_proof_0 = merkle_multi_proof_for(wtns_0.tree_slice(), wtns_0.block_len, &queries_0);
     t_opens += t.elapsed();
     // L0 mat/tree dead after open copies; recycle before induce.
     {
         let mut wtns_0 = wtns_0;
         crate::scratch::give_f128(std::mem::take(&mut wtns_0.mat));
-        wtns_0.tree = Vec::new();
+        wtns_0.recycle_tree();
     }
 
     // ---- Induce basis from wtns_0 opens ----
@@ -7551,9 +7635,9 @@ fn recursive_prover_inner<Ch: Challenger>(
                     .collect()
             };
             let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+                merkle_multi_proof_for(wtns_prev.tree_slice(), wtns_prev.block_len, &queries_last);
             crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-            wtns_prev.tree = Vec::new();
+            wtns_prev.recycle_tree();
             return LigeritoProof {
                 initial_root,
                 initial_proof,
@@ -7614,11 +7698,11 @@ fn recursive_prover_inner<Ch: Challenger>(
                 .collect()
         };
         let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+            merkle_multi_proof_for(wtns_prev.tree_slice(), wtns_prev.block_len, &queries_i);
         t_opens += t.elapsed();
         // Prior-level mat/tree dead after the open; recycle before induce.
         crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-        wtns_prev.tree = Vec::new();
+        wtns_prev.recycle_tree();
 
         // Induce fresh basis from these opens.
         let sks_vks_i = eval_sk_at_vks(n_next);
@@ -8067,8 +8151,10 @@ mod tests {
         .into_iter()
         .map(|value| gamma * value)
         .collect();
-        let direct_full =
-            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix), &scaled_rdp);
+        let direct_full = super::super::ring_switch::fold_b128_elems(
+            &build_eq_table(&suffix),
+            &scaled_rdp,
+        );
         let combined_full: Vec<F128> = ordinary_c
             .iter()
             .zip(direct_full)
@@ -8085,20 +8171,27 @@ mod tests {
 
         let mut want_f = Vec::with_capacity(n / 4);
         let mut want_b = Vec::with_capacity(n / 4);
-        let (want_msg, want_coeffs) =
-            super::fold2_and_msgs_lsb(&f, &combined_full, r0, r1, &mut want_f, &mut want_b);
+        let (want_msg, want_coeffs) = super::fold2_and_msgs_lsb(
+            &f,
+            &combined_full,
+            r0,
+            r1,
+            &mut want_f,
+            &mut want_b,
+        );
         let helper = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
             .build()
             .unwrap();
-        let (got_f, got_b, got_msg, got_coeffs) = super::materialize_direct_ab_fold2_with_helper(
-            f,
-            ordinary_c,
-            &direct,
-            r0,
-            r1,
-            Some(&helper),
-        );
+        let (got_f, got_b, got_msg, got_coeffs) =
+            super::materialize_direct_ab_fold2_with_helper(
+                f,
+                ordinary_c,
+                &direct,
+                r0,
+                r1,
+                Some(&helper),
+            );
         assert_eq!(got_f, want_f);
         assert_eq!(got_b, want_b);
         assert_eq!(got_msg, want_msg);
@@ -8140,7 +8233,14 @@ mod tests {
                 true,
             );
             assert_eq!(fused.mat, ordinary.mat, "encoded matrix changed");
-            assert_eq!(fused.tree, ordinary.tree, "flat Merkle tree changed");
+            // `tree_slice` covers both storages (owned Vec or the zero-copy
+            // GPU borrow) — when the GPU engages for one arm this also
+            // cross-checks the GPU tree against the CPU builder's bytes.
+            assert_eq!(
+                fused.tree_slice(),
+                ordinary.tree_slice(),
+                "flat Merkle tree changed"
+            );
             assert_eq!(fused.root(), ordinary.root(), "Merkle root changed");
         }
     }
@@ -8641,8 +8741,8 @@ mod tests {
     /// return to the incumbent materialized equality path.
     #[test]
     fn factorized_ood_ranked_gate_is_exact() {
-        let mut config =
-            prover_config_for(25, 6, LigeritoProfile::Fast).expect("embedded M32 Fast config");
+        let mut config = prover_config_for(25, 6, LigeritoProfile::Fast)
+            .expect("embedded M32 Fast config");
         config.merkle_hash = HashKind::Blake3;
         let selected = |cfg: &ProverConfig,
                         log_n: usize,
@@ -8652,7 +8752,9 @@ mod tests {
                         direct8: bool,
                         platform: bool,
                         disabled: bool| {
-            ranked_l1_lazy_ood_eq_selected(cfg, log_n, n_1, count, len, direct8, platform, disabled)
+            ranked_l1_lazy_ood_eq_selected(
+                cfg, log_n, n_1, count, len, direct8, platform, disabled,
+            )
         };
         assert!(selected(&config, 25, 19, 1, 1 << 19, true, true, false));
         assert!(!selected(&config, 24, 19, 1, 1 << 19, true, true, false));
@@ -8665,40 +8767,13 @@ mod tests {
 
         let mut wrong_hash = config.clone();
         wrong_hash.merkle_hash = HashKind::Sha256;
-        assert!(!selected(
-            &wrong_hash,
-            25,
-            19,
-            1,
-            1 << 19,
-            true,
-            true,
-            false
-        ));
+        assert!(!selected(&wrong_hash, 25, 19, 1, 1 << 19, true, true, false));
         let mut wrong_rate = config.clone();
         wrong_rate.log_inv_rates[1] += 1;
-        assert!(!selected(
-            &wrong_rate,
-            25,
-            19,
-            1,
-            1 << 19,
-            true,
-            true,
-            false
-        ));
+        assert!(!selected(&wrong_rate, 25, 19, 1, 1 << 19, true, true, false));
         let mut wrong_query = config;
         wrong_query.queries[1] += 1;
-        assert!(!selected(
-            &wrong_query,
-            25,
-            19,
-            1,
-            1 << 19,
-            true,
-            true,
-            false
-        ));
+        assert!(!selected(&wrong_query, 25, 19, 1, 1 << 19, true, true, false));
     }
 
     /// The ranked lazy OOD representation must be a protocol-transparent
@@ -8757,17 +8832,15 @@ mod tests {
                 assert_eq!(lazy_first, full_first);
                 assert_eq!(deferred_first, full_first);
 
-                let (full_intro, full_y) = full.introduce_new_with_eval(build_eq_table(&z));
+                let (full_intro, full_y) =
+                    full.introduce_new_with_eval(build_eq_table(&z));
                 let (lazy_intro, lazy_y) = lazy
                     .introduce_new_ood_factorized(&z)
                     .expect("supported factorized geometry");
                 let (deferred_intro, deferred_y) = deferred
                     .introduce_new_ood_factorized(&z)
                     .expect("supported deferred factorized geometry");
-                assert_eq!(
-                    lazy_y, full_y,
-                    "OOD value differs, log_n={log_n}, case={case}"
-                );
+                assert_eq!(lazy_y, full_y, "OOD value differs, log_n={log_n}, case={case}");
                 assert_eq!(
                     lazy_intro, full_intro,
                     "OOD intro differs, log_n={log_n}, case={case}"
@@ -8783,9 +8856,12 @@ mod tests {
 
                 // This is the ranked ordering: the OOD term remains lazy while
                 // the ordinary opening-induced basis is introduced and glued.
-                let full_ordinary = full.introduce_new(ordinary_basis.clone(), h_ordinary);
-                let lazy_ordinary = lazy.introduce_new(ordinary_basis.clone(), h_ordinary);
-                let deferred_ordinary = deferred.introduce_new(ordinary_basis, h_ordinary);
+                let full_ordinary =
+                    full.introduce_new(ordinary_basis.clone(), h_ordinary);
+                let lazy_ordinary =
+                    lazy.introduce_new(ordinary_basis.clone(), h_ordinary);
+                let deferred_ordinary =
+                    deferred.introduce_new(ordinary_basis, h_ordinary);
                 assert_eq!(lazy_ordinary, full_ordinary);
                 assert_eq!(deferred_ordinary, full_ordinary);
                 full.glue(alpha);
@@ -8805,18 +8881,12 @@ mod tests {
                 let full_next = full.fold(r);
                 let lazy_next = lazy.fold(r);
                 let deferred_next = deferred.fold(r);
-                assert_eq!(
-                    lazy_next, full_next,
-                    "fold msg differs, log_n={log_n}, case={case}"
-                );
+                assert_eq!(lazy_next, full_next, "fold msg differs, log_n={log_n}, case={case}");
                 assert_eq!(
                     deferred_next, full_next,
                     "deferred fold msg differs, log_n={log_n}, case={case}"
                 );
-                assert_eq!(
-                    lazy.f, full.f,
-                    "folded f differs, log_n={log_n}, case={case}"
-                );
+                assert_eq!(lazy.f, full.f, "folded f differs, log_n={log_n}, case={case}");
                 assert_eq!(deferred.f, full.f, "deferred folded f differs");
                 assert_eq!(
                     lazy.combined_basis, full.combined_basis,
@@ -8895,7 +8965,8 @@ mod tests {
             SumcheckProver::new_with_first_msg(f, initial_basis, h_initial, first_msg);
         assert_eq!(lazy_first, full_first);
 
-        let (full_intro, full_y) = full.introduce_new_with_eval(build_eq_table(&z));
+        let (full_intro, full_y) =
+            full.introduce_new_with_eval(build_eq_table(&z));
         let (lazy_intro, lazy_y) = lazy
             .introduce_new_ood_factorized(&z)
             .expect("ranked OOD geometry must use the split path");
@@ -8919,7 +8990,8 @@ mod tests {
         assert_eq!(lazy.t_r, full.t_r);
         assert_eq!(lazy.transcript(), full.transcript());
 
-        let full_ordinary = full.introduce_new(ordinary_basis.clone(), h_ordinary);
+        let full_ordinary =
+            full.introduce_new(ordinary_basis.clone(), h_ordinary);
         let lazy_ordinary = lazy.introduce_new(ordinary_basis, h_ordinary);
         assert_eq!(lazy_ordinary, full_ordinary);
         full.glue(alpha);
@@ -8979,7 +9051,8 @@ mod tests {
         );
         assert_eq!(hybrid.transcript().len(), transcript_len);
 
-        let (full_intro_1, full_y_1) = full.introduce_new_with_eval(build_eq_table(&z_1));
+        let (full_intro_1, full_y_1) =
+            full.introduce_new_with_eval(build_eq_table(&z_1));
         let (hybrid_intro_1, hybrid_y_1) = hybrid
             .introduce_new_ood_factorized(&z_1)
             .expect("first OOD should factorize");
@@ -8993,8 +9066,10 @@ mod tests {
             "multiple lazy OOD terms must fall back"
         );
         assert_eq!(hybrid.transcript().len(), before_second);
-        let (full_intro_2, full_y_2) = full.introduce_new_with_eval(build_eq_table(&z_2));
-        let (hybrid_intro_2, hybrid_y_2) = hybrid.introduce_new_with_eval(build_eq_table(&z_2));
+        let (full_intro_2, full_y_2) =
+            full.introduce_new_with_eval(build_eq_table(&z_2));
+        let (hybrid_intro_2, hybrid_y_2) =
+            hybrid.introduce_new_with_eval(build_eq_table(&z_2));
         assert_eq!((hybrid_intro_2, hybrid_y_2), (full_intro_2, full_y_2));
         full.glue(beta_2);
         hybrid.glue(beta_2);
@@ -9217,9 +9292,9 @@ mod tests {
         let ordinary_glue_started = Instant::now();
         match arm {
             LazyOodTimingArm::Control => slot.prover.glue(ordinary_beta),
-            LazyOodTimingArm::Candidate => {
-                slot.prover.glue_deferred_into_lazy_ood_fold(ordinary_beta)
-            }
+            LazyOodTimingArm::Candidate => slot
+                .prover
+                .glue_deferred_into_lazy_ood_fold(ordinary_beta),
         }
         let ordinary_glue_ms = ordinary_glue_started.elapsed().as_secs_f64() * 1e3;
         assert!(slot.prover.pending_glue.is_none());
@@ -10069,7 +10144,8 @@ mod tests {
                     dense[p] += v;
                 }
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
-                let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
+                let sparse =
+                    transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
         }
@@ -10103,9 +10179,15 @@ mod tests {
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
 
                 let legacy = transpose_forward_ntt_sparse_hashmap(
-                    &ntt, &positions, &values, log_d, 8, false,
+                    &ntt,
+                    &positions,
+                    &values,
+                    log_d,
+                    8,
+                    false,
                 );
-                let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
+                let linear =
+                    transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
                 assert_eq!(
                     linear, legacy,
                     "linear != hashmap at log_d={log_d}, nq={n_queries}"
@@ -10261,14 +10343,19 @@ mod tests {
                 let mut actual = before.clone();
                 let ntt = AdditiveNttF128::standard(log_d);
 
-                transpose_forward_ntt_fused_final_3layer_low_half(&ntt, &mut expected, log_d);
-                let expected_msg = round_msg_lsb(&f, &expected[..n >> 1]);
-                let actual_msg = transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
+                transpose_forward_ntt_fused_final_3layer_low_half(
                     &ntt,
-                    &mut actual,
+                    &mut expected,
                     log_d,
-                    &f,
                 );
+                let expected_msg = round_msg_lsb(&f, &expected[..n >> 1]);
+                let actual_msg =
+                    transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
+                        &ntt,
+                        &mut actual,
+                        log_d,
+                        &f,
+                    );
 
                 assert_eq!(actual_msg, expected_msg, "log_d={log_d}, case={case}");
                 assert_eq!(
@@ -10433,7 +10520,8 @@ mod tests {
             let mut expected =
                 transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
             expected.truncate(n >> 1);
-            let actual = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, true);
+            let actual =
+                transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, true);
             assert_eq!(actual, expected, "log_d={log_d}");
         }
     }
@@ -11315,7 +11403,9 @@ mod tests {
         // unique-decoding query count.
         let log_inv_rate = 3;
         let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_AB02);
-        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let poly: Vec<F128> = (0..(1usize << log_n))
+            .map(|_| rng.sample_f128())
+            .collect();
         let ordinary_c: Vec<F128> = (0..poly.len()).map(|_| rng.sample_f128()).collect();
         let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let scaled_rdp: Vec<F128> = build_eq_table(
@@ -11323,8 +11413,10 @@ mod tests {
                 .map(|_| rng.sample_f128())
                 .collect::<Vec<_>>(),
         );
-        let direct_full =
-            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix), &scaled_rdp);
+        let direct_full = super::super::ring_switch::fold_b128_elems(
+            &build_eq_table(&suffix),
+            &scaled_rdp,
+        );
         let combined_basis: Vec<F128> = ordinary_c
             .iter()
             .zip(direct_full)
@@ -11335,7 +11427,8 @@ mod tests {
             .zip(combined_basis.iter())
             .map(|(&f, &b)| f * b)
             .fold(F128::ZERO, |acc, value| acc + value);
-        let (round0, lookahead) = super::super::round0_and_round1_lookahead(&poly, &combined_basis);
+        let (round0, lookahead) =
+            super::super::round0_and_round1_lookahead(&poly, &combined_basis);
 
         let (eq_lo, eq_hi) =
             super::super::ring_switch::build_eq_split(&suffix[2..], (log_n - 2) / 2);
@@ -11356,16 +11449,14 @@ mod tests {
             initial_k,
             recursive_log_msg_cols: vec![log_n - initial_k - k_0],
             recursive_ks: vec![k_0],
-            queries: log_inv_rates
-                .iter()
-                .map(|&rate| udr_queries(rate))
-                .collect(),
+            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
         };
-        let ntt_0 = AdditiveNttF128::standard(log_n - initial_k + log_inv_rate);
+        let ntt_0 =
+            AdditiveNttF128::standard(log_n - initial_k + log_inv_rate);
         let wtns_0 = ligero_commit(
             &poly,
             log_n - initial_k,
@@ -11418,10 +11509,7 @@ mod tests {
             initial_k,
             recursive_log_msg_cols: vec![log_n - initial_k - k_0],
             recursive_ks: vec![k_0],
-            queries: log_inv_rates
-                .iter()
-                .map(|&rate| udr_queries(rate))
-                .collect(),
+            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
@@ -11448,15 +11536,19 @@ mod tests {
         let k_0 = 2;
         let log_inv_rate = 3;
         let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_F004);
-        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let poly: Vec<F128> = (0..(1usize << log_n))
+            .map(|_| rng.sample_f128())
+            .collect();
         let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let scaled_rdp: Vec<F128> = build_eq_table(
             &(0..crate::pcs::LOG_PACKING)
                 .map(|_| rng.sample_f128())
                 .collect::<Vec<_>>(),
         );
-        let combined_basis =
-            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix), &scaled_rdp);
+        let combined_basis = super::super::ring_switch::fold_b128_elems(
+            &build_eq_table(&suffix),
+            &scaled_rdp,
+        );
         let target = poly
             .iter()
             .zip(combined_basis.iter())
@@ -11467,7 +11559,8 @@ mod tests {
         for high in 0..poly.len() / 16 {
             for e in 0..16 {
                 for d in 0..16 {
-                    products[16 * e + d] += poly[16 * high + e] * combined_basis[16 * high + d];
+                    products[16 * e + d] +=
+                        poly[16 * high + e] * combined_basis[16 * high + d];
                 }
             }
         }
@@ -11492,10 +11585,7 @@ mod tests {
             initial_k,
             recursive_log_msg_cols: vec![log_n - initial_k - k_0],
             recursive_ks: vec![k_0],
-            queries: log_inv_rates
-                .iter()
-                .map(|&rate| udr_queries(rate))
-                .collect(),
+            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
@@ -11555,10 +11645,7 @@ mod tests {
             initial_k,
             recursive_log_msg_cols: vec![log_n - initial_k - k_0],
             recursive_ks: vec![k_0],
-            queries: log_inv_rates
-                .iter()
-                .map(|&rate| udr_queries(rate))
-                .collect(),
+            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
@@ -11585,15 +11672,19 @@ mod tests {
         let k_0 = 2;
         let log_inv_rate = 3;
         let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_F008);
-        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let poly: Vec<F128> = (0..(1usize << log_n))
+            .map(|_| rng.sample_f128())
+            .collect();
         let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let scaled_rdp: Vec<F128> = build_eq_table(
             &(0..crate::pcs::LOG_PACKING)
                 .map(|_| rng.sample_f128())
                 .collect::<Vec<_>>(),
         );
-        let combined_basis =
-            super::super::ring_switch::fold_b128_elems(&build_eq_table(&suffix), &scaled_rdp);
+        let combined_basis = super::super::ring_switch::fold_b128_elems(
+            &build_eq_table(&suffix),
+            &scaled_rdp,
+        );
         let target = poly
             .iter()
             .zip(combined_basis.iter())
@@ -11604,7 +11695,8 @@ mod tests {
         for high in 0..poly.len() / 64 {
             for e in 0..64 {
                 for d in 0..64 {
-                    products[64 * e + d] += poly[64 * high + e] * combined_basis[64 * high + d];
+                    products[64 * e + d] +=
+                        poly[64 * high + e] * combined_basis[64 * high + d];
                 }
             }
         }
@@ -11629,10 +11721,7 @@ mod tests {
             initial_k,
             recursive_log_msg_cols: vec![log_n - initial_k - k_0],
             recursive_ks: vec![k_0],
-            queries: log_inv_rates
-                .iter()
-                .map(|&rate| udr_queries(rate))
-                .collect(),
+            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
@@ -11694,10 +11783,7 @@ mod tests {
             initial_k,
             recursive_log_msg_cols: vec![log_n - initial_k - k_0],
             recursive_ks: vec![k_0],
-            queries: log_inv_rates
-                .iter()
-                .map(|&rate| udr_queries(rate))
-                .collect(),
+            queries: log_inv_rates.iter().map(|&rate| udr_queries(rate)).collect(),
             grinding_bits: vec![0; log_inv_rates.len()],
             fold_grinding_bits: vec![0; 2],
             ood_samples: vec![0; 2],
@@ -12824,29 +12910,3 @@ mod tests {
 // r552 cadence nonce: poll-after-queue experiment
 
 // r554 cadence nonce: 20260806T034654Z; semantics unchanged.
-// r564 cadence nonce: 20260806T041230Z
-
-// r565: archive-distinct hot-line candidate; semantics unchanged.
-
-// r566: archive-distinct cadence marker; no semantic effect.
-
-// r568 archive nonce: 20260806T042222Z; semantics unchanged.
-
-// r569 hot-line archive nonce: 20260806T042512Z; semantics unchanged.
-
-// r570 hot-line archive nonce: 20260806T042745Z; semantics unchanged.
-
-// r571 hot-line archive nonce: 20260806T043105Z; semantics unchanged.
-
-// r572 chewy cadence: distinct submission archive, semantics unchanged.
-
-// r573 submission-cadence marker: preserves semantics.
-// r574 chewy hot-line nonce: 20260806T043827Z; semantics unchanged.
-
-// r575: source-distinct competition candidate; preserves kernel semantics.
-
-// r576 chewy hot-line nonce: 20260806T044306Z; semantics unchanged.
-
-// r580: archive-distinct candidate; no semantic change.
-
-// r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.

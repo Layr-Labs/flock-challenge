@@ -182,22 +182,16 @@ impl core::ops::Deref for MerkleTreeBuf {
 
 impl core::fmt::Debug for MerkleTreeBuf {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("MerkleTreeBuf")
-            .field("len", &self.len())
-            .finish()
+        f.debug_struct("MerkleTreeBuf").field("len", &self.len()).finish()
     }
 }
 
 impl PartialEq<Vec<Hash>> for MerkleTreeBuf {
-    fn eq(&self, other: &Vec<Hash>) -> bool {
-        &**self == other.as_slice()
-    }
+    fn eq(&self, other: &Vec<Hash>) -> bool { &**self == other.as_slice() }
 }
 
 impl PartialEq<MerkleTreeBuf> for Vec<Hash> {
-    fn eq(&self, other: &MerkleTreeBuf) -> bool {
-        self.as_slice() == &**other
-    }
+    fn eq(&self, other: &MerkleTreeBuf) -> bool { self.as_slice() == &**other }
 }
 
 impl core::ops::Deref for CodewordBuf {
@@ -344,7 +338,11 @@ fn ranked_from_message_supported_len(
     use_ranked_from_message_commit(params) && codeword_len == 2 * z_packed.len()
 }
 
-fn ranked_from_message_supported(params: &PcsParams, codeword: &[F128], z_packed: &[F128]) -> bool {
+fn ranked_from_message_supported(
+    params: &PcsParams,
+    codeword: &[F128],
+    z_packed: &[F128],
+) -> bool {
     ranked_from_message_supported_len(params, codeword.len(), z_packed)
 }
 

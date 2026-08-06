@@ -491,11 +491,7 @@ fn tensor_quadratic_coefficients(values: &mut [F128], variables: usize) {
         let period = 3 * stride;
         for block in (0..values.len()).step_by(period) {
             for offset in 0..stride {
-                let indices = [
-                    block + offset,
-                    block + stride + offset,
-                    block + 2 * stride + offset,
-                ];
+                let indices = [block + offset, block + stride + offset, block + 2 * stride + offset];
                 let coefficients = quadratic_coefficients([
                     values[indices[0]],
                     values[indices[1]],
@@ -514,7 +510,10 @@ fn tensor_quadratic_coefficients(values: &mut [F128], variables: usize) {
 /// zero endpoint, 1 the one endpoint, and 2 the quadratic leading term (the
 /// sum of both endpoint banks). The current-coordinate `u_2` grid similarly
 /// selects both halves. Higher coordinates are summed independently.
-fn direct_fold4_message_coefficients(h: &[F128; 256], round: usize) -> (Vec<F128>, Vec<F128>) {
+fn direct_fold4_message_coefficients(
+    h: &[F128; 256],
+    round: usize,
+) -> (Vec<F128>, Vec<F128>) {
     debug_assert!(round < 4);
     let grid_len = 3usize.pow(round as u32);
     let mut endpoints = vec![F128::ZERO; 2 * grid_len];
@@ -574,7 +573,12 @@ fn direct_fold4_message_coefficients(h: &[F128; 256], round: usize) -> (Vec<F128
 /// quadratics in the already-sampled challenges.
 pub(crate) fn messages_from_direct_products_fold4(
     factors: &[ring_switch::DirectFold4Factors],
-) -> ((F128, F128), [F128; 6], Fold4Lookahead2, Fold4Lookahead3) {
+) -> (
+    (F128, F128),
+    [F128; 6],
+    Fold4Lookahead2,
+    Fold4Lookahead3,
+) {
     let mut h = [F128::ZERO; 256];
     for claim in factors {
         for (out, value) in h.iter_mut().zip(claim.products) {
@@ -608,7 +612,10 @@ pub(crate) fn messages_from_direct_products_fold4(
 /// Selected banks always form a subcube, so the product sum iterates set
 /// mask bits only (Σ_r 2·3^r·2^(5−r) configs × E|selected|² = 2^(r+1) ≈ 47K
 /// F128 adds total — scalar-negligible).
-fn direct_fold8_message_coefficients(h: &[F128; 4096], round: usize) -> (Vec<F128>, Vec<F128>) {
+fn direct_fold8_message_coefficients(
+    h: &[F128; 4096],
+    round: usize,
+) -> (Vec<F128>, Vec<F128>) {
     debug_assert!(round < 6);
     let grid_len = 3usize.pow(round as u32);
     let mut endpoints = vec![F128::ZERO; 2 * grid_len];
@@ -764,7 +771,10 @@ fn is_ranked_open_mat_hetero_shape(
     claim_count: usize,
     has_ordinary: bool,
 ) -> bool {
-    packed_len == (1usize << 25) && block_len == (1usize << 11) && claim_count == 2 && !has_ordinary
+    packed_len == (1usize << 25)
+        && block_len == (1usize << 11)
+        && claim_count == 2
+        && !has_ordinary
 }
 
 /// Heterogeneous (P+E) drain for the direct-fold8 materializer — the single
@@ -1181,14 +1191,16 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     } else {
         None
     };
-    let direct_count = direct_fold8.as_ref().map_or_else(
-        || {
-            direct_fold4
-                .as_ref()
-                .map_or_else(|| direct_fold2.as_ref().map_or(0, Vec::len), Vec::len)
-        },
-        Vec::len,
-    );
+    let direct_count = direct_fold8
+        .as_ref()
+        .map_or_else(
+            || {
+                direct_fold4
+                    .as_ref()
+                    .map_or_else(|| direct_fold2.as_ref().map_or(0, Vec::len), Vec::len)
+            },
+            Vec::len,
+        );
     // Deferred-C candidate: taken here, before `rs_baked`/`rs_deferred`
     // borrow `rs_results`; confirmed below once the ranked sweep shape is
     // known (dropped — incumbent path — otherwise). Mutually exclusive with
@@ -1290,12 +1302,11 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
     //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
     let t_alloc = std::time::Instant::now();
-    let mut b_combined: Vec<F128> =
-        if use_deferred_c || use_direct_all || use_direct_fold4 || use_direct_fold8 {
-            Vec::new()
-        } else {
-            crate::scratch::take_f128(l)
-        };
+    let mut b_combined: Vec<F128> = if use_deferred_c || use_direct_all || use_direct_fold4 || use_direct_fold8 {
+        Vec::new()
+    } else {
+        crate::scratch::take_f128(l)
+    };
     let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
     let t_fold = std::time::Instant::now();
     let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_direct_fold8 || use_direct_fold4 {
@@ -1375,8 +1386,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
             }
             (u0, u2)
         };
-        let ranked_lookahead_neon =
-            enable_fold2 && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd);
+        let ranked_lookahead_neon = enable_fold2
+            && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd);
         let fold_lookahead_block = |ctable: &mut Vec<F128>, hi: usize, out_block: &mut [F128]| {
             fill_block(ctable, hi, out_block);
             let base = hi * b;
@@ -1399,12 +1410,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         let ranked_hetero = use_ranked_hetero_open_combine(l, b, n_rs, n_pd);
         if want_round1_lookahead {
             let fast = if deferred_c.is_some() {
-                run_hetero_open_combine_scratch_lookahead(
-                    l / b,
-                    b,
-                    init_ctable,
-                    |ctable, hi, out_block| fold_lookahead_block(ctable, hi, out_block),
-                )
+                run_hetero_open_combine_scratch_lookahead(l / b, b, init_ctable, |ctable, hi, out_block| {
+                    fold_lookahead_block(ctable, hi, out_block)
+                })
             } else if ranked_hetero {
                 run_hetero_open_combine_blocks_lookahead(
                     &mut b_combined,
@@ -1507,14 +1515,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let mut round4_lookahead = None;
     let mut round5_lookahead = None;
     if let Some(direct) = direct_fold8.as_ref() {
-        let (
-            direct_round0,
-            direct_round1,
-            direct_round2,
-            direct_round3,
-            direct_round4,
-            direct_round5,
-        ) = messages_from_direct_products_fold8(direct);
+        let (direct_round0, direct_round1, direct_round2, direct_round3, direct_round4, direct_round5) =
+            messages_from_direct_products_fold8(direct);
         round0_u0 += direct_round0.0;
         round0_u2 += direct_round0.1;
         let combined_round1 = round1_lookahead
@@ -2098,7 +2100,10 @@ mod tests {
             let witness: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
             let basis: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
             let expected = round0_and_round1_lookahead_scalar(&witness, &basis);
-            let actual = crate::field::f128_slice::round0_and_round1_lookahead(&witness, &basis);
+            let actual = crate::field::f128_slice::round0_and_round1_lookahead(
+                &witness,
+                &basis,
+            );
             assert_eq!(actual, expected, "deferred reduction at log_n={log_n}");
         }
     }
