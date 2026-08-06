@@ -3086,6 +3086,30 @@ pub fn fold_and_compute_round_pair_into(
     fold_and_compute_round_pair_into_with_n_hi(a, b, a_out, b_out, r_fold, r_next, n_hi)
 }
 
+/// Serial single-chunk fused fold+message for the sub-2^15 tail rounds.
+///
+/// The incumbent tail (below the fused threshold) made two traversals per
+/// round — `fold_in_place_pair` (read 2n, write n) then `round_pair_naive`
+/// (read n again, with fully-reduced per-pair message muls) — because the
+/// parallel fused path's fixed `n_hi` would shatter a small round into
+/// hundreds of rayon chunks. Calling the identical fused implementation with
+/// `n_hi = 0` (one chunk, eq_hi = [1]) keeps it serial while deleting the
+/// second traversal and routing the message accumulation through the fused
+/// kernel's deferred-reduction form. Values are bit-identical to the
+/// two-pass: the fold outputs are the same field elements, and GF(2^128)
+/// arithmetic is exact, so the message sums agree bit-for-bit
+/// (`serial_fused_tail_matches_two_pass` proves it against the naive pair).
+pub fn fold_and_compute_round_pair_serial(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    r_fold: F128,
+    r_next: &[F128],
+) -> (F128, F128) {
+    fold_and_compute_round_pair_into_with_n_hi(a, b, a_out, b_out, r_fold, r_next, 0)
+}
+
 /// Split-explicit implementation used by the public policy wrapper and by the
 /// exact n_hi=9 versus n_hi=11 regression test.
 fn fold_and_compute_round_pair_into_with_n_hi(
@@ -3602,6 +3626,38 @@ mod tests {
                 let sum: F128 = weights.iter().copied().fold(F128::ZERO, |a, b| a + b);
                 assert_eq!(sum, F128::ONE, "Σ L_i ≠ 1 at k_skip={k_skip}");
             }
+        }
+    }
+
+    /// The fused serial tail round (one-chunk `fold_and_compute_round_pair`)
+    /// must reproduce the two-pass tail (`fold_in_place_pair` +
+    /// `round_pair_naive`) bit-for-bit: same folded state, same wire message.
+    #[test]
+    fn serial_fused_tail_matches_two_pass() {
+        let mut rng = Rng::new(0xF05E);
+        for log_n in [3usize, 4, 5, 8, 11, 14] {
+            let n = 1usize << log_n;
+            let a = rng.f128_vec(n);
+            let b = rng.f128_vec(n);
+            let r_fold = rng.f128();
+            let mut r_next = vec![F128::ONE; log_n - 1];
+            for v in r_next[1..].iter_mut() {
+                *v = rng.f128();
+            }
+
+            let (mut a_ref, mut b_ref) = (a.clone(), b.clone());
+            fold_in_place_pair(&mut a_ref, &mut b_ref, r_fold);
+            let want = round_pair_naive(&a_ref, &b_ref, &r_next);
+
+            let mut a_out = vec![F128::ZERO; n / 2];
+            let mut b_out = vec![F128::ZERO; n / 2];
+            let got = fold_and_compute_round_pair_serial(
+                &a, &b, &mut a_out, &mut b_out, r_fold, &r_next,
+            );
+
+            assert_eq!(got, want, "message mismatch at log_n={log_n}");
+            assert_eq!(a_out, a_ref, "folded a mismatch at log_n={log_n}");
+            assert_eq!(b_out, b_ref, "folded b mismatch at log_n={log_n}");
         }
     }
 

@@ -6258,7 +6258,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // Final open complete — recycle last recursive codeword/tree before
             // proof-object assembly (transcript copy etc.).
             crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-            wtns_prev.tree = Vec::new();
+            crate::gpu_commit::give_rec_tree(std::mem::take(&mut wtns_prev.tree));
             if trace {
                 let total = t_total.elapsed();
                 eprintln!("[lig-prove] total = {:.2} ms", total.as_secs_f64() * 1e3);
@@ -6387,7 +6387,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // so they do not stack under wtns_next (already committed) + induce temps.
         // Bit-identical: no further reads of wtns_prev.mat/tree this iteration.
         crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-        wtns_prev.tree = Vec::new();
+        crate::gpu_commit::give_rec_tree(std::mem::take(&mut wtns_prev.tree));
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
         let (basis_i_induced, enforced_sum_i) =
@@ -7512,7 +7512,7 @@ fn recursive_prover_inner<Ch: Challenger>(
     {
         let mut wtns_0 = wtns_0;
         crate::scratch::give_f128(std::mem::take(&mut wtns_0.mat));
-        wtns_0.tree = Vec::new();
+        crate::gpu_commit::give_rec_tree(std::mem::take(&mut wtns_0.tree));
     }
 
     // ---- Induce basis from wtns_0 opens ----
@@ -7596,7 +7596,7 @@ fn recursive_prover_inner<Ch: Challenger>(
             let merkle_proof_last =
                 merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-            wtns_prev.tree = Vec::new();
+            crate::gpu_commit::give_rec_tree(std::mem::take(&mut wtns_prev.tree));
             return LigeritoProof {
                 initial_root,
                 initial_proof,
@@ -7661,7 +7661,7 @@ fn recursive_prover_inner<Ch: Challenger>(
         t_opens += t.elapsed();
         // Prior-level mat/tree dead after the open; recycle before induce.
         crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-        wtns_prev.tree = Vec::new();
+        crate::gpu_commit::give_rec_tree(std::mem::take(&mut wtns_prev.tree));
 
         // Induce fresh basis from these opens.
         let sks_vks_i = eval_sk_at_vks(n_next);

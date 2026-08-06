@@ -538,6 +538,17 @@ pub fn gpu_recursive_merkle_blake3(
     imp::gpu_recursive_merkle_blake3(data, num_leaves)
 }
 
+/// Recycle a recursive-level Merkle tree allocation (2^19−1 nodes = 16 MiB
+/// for the ranked L1, smaller for deeper levels). These were allocated fresh
+/// and munmapped every prove — the existing tree pool only accepts the
+/// ranked L0 size (2^21−1 nodes). Pooled entries are handed back by
+/// [`gpu_recursive_merkle_blake3`]'s copy-out (or dropped at process exit).
+/// `FLOCK_NO_REC_TREE_POOL=1` restores the drop. Bit-exact: pooling only
+/// changes WHERE the bytes live; every node byte is rewritten before use.
+pub fn give_rec_tree(tree: Vec<crate::merkle::Hash>) {
+    imp::give_rec_tree(tree);
+}
+
 /// Exact rollback for the PCS Fiat--Shamir BLAKE3 grind scanner.  The first
 /// untimed ranked grind still has to prove that Metal returns the same
 /// globally-smallest nonce and clears the target-side timing gate before the
@@ -9549,6 +9560,78 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         *ON.get_or_init(|| std::env::var_os("FLOCK_GPU_RECMERKLE_DEBUG").is_some())
     }
 
+    /// Pool for recursive-level Merkle tree Vecs (see the public
+    /// `give_rec_tree`). Sized entries between 2^13 nodes (256 KiB) and the
+    /// ranked-L0 node count (exclusive — those belong to the existing tree
+    /// pool). Cap 6: L1 (2^19−1 nodes, 16 MiB) + the deeper levels ≈ 22 MiB
+    /// retained per process, returned at exit outside the scored window.
+    static REC_TREE_POOL: Mutex<Vec<Vec<Hash>>> = Mutex::new(Vec::new());
+    const REC_TREE_POOL_CAP: usize = 6;
+    const REC_TREE_MIN_NODES: usize = (1 << 13) - 1;
+
+    fn rec_tree_pool_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_REC_TREE_POOL").is_none())
+    }
+
+    /// Correctness-preserving kill switch for the rec-Merkle spin-wait:
+    /// `FLOCK_NO_REC_MERKLE_SPIN=1` restores the thread-parking
+    /// `waitUntilCompleted`.
+    fn rec_merkle_spin_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_REC_MERKLE_SPIN").is_none())
+    }
+
+    fn rec_tree_pool_lock() -> std::sync::MutexGuard<'static, Vec<Vec<Hash>>> {
+        REC_TREE_POOL.lock().unwrap_or_else(|e| {
+            REC_TREE_POOL.clear_poison();
+            note_poisoned_lock("rec-tree-pool", true);
+            e.into_inner()
+        })
+    }
+
+    pub(crate) fn give_rec_tree(tree: Vec<Hash>) {
+        if !rec_tree_pool_enabled()
+            || tree.capacity() < REC_TREE_MIN_NODES
+            || tree.capacity() >= RANKED_TREE_NODES
+        {
+            return;
+        }
+        let mut pool = rec_tree_pool_lock();
+        if pool.len() < REC_TREE_POOL_CAP {
+            pool.push(tree);
+            return;
+        }
+        drop(pool);
+        // `tree` drops (munmaps) here, outside the pool lock.
+    }
+
+    /// Best-fit reuse of a pooled recursive tree allocation, or a fresh
+    /// uninit Vec. Every node byte is rewritten by the caller before any
+    /// read, so recycled contents are irrelevant.
+    #[allow(clippy::uninit_vec)]
+    fn take_rec_tree(n: usize) -> Vec<Hash> {
+        if rec_tree_pool_enabled() {
+            let mut pool = rec_tree_pool_lock();
+            let mut best: Option<usize> = None;
+            for (i, t) in pool.iter().enumerate() {
+                if t.capacity() >= n
+                    && best.is_none_or(|b| t.capacity() < pool[b].capacity())
+                {
+                    best = Some(i);
+                }
+            }
+            if let Some(i) = best {
+                let mut tree = pool.swap_remove(i);
+                // SAFETY: capacity ≥ n was just checked; `Hash` is `Copy`
+                // plain bytes and the caller overwrites all `n` nodes.
+                unsafe { tree.set_len(n) };
+                return tree;
+            }
+        }
+        crate::alloc_uninit_vec(n)
+    }
+
     fn rec_merkle_init(gpu: &'static Gpu) -> Result<RecMerkle, String> {
         unsafe {
             let pool = gpu.pool_push();
@@ -9757,7 +9840,16 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     read_len = n_out;
                 }
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                // The warm dispatch completes in ~1-2 ms: a bounded status
+                // spin skips the thread park + completion-handler wake that
+                // `waitUntilCompleted` pays on the open spine (same rationale
+                // as the commit graph's `commit_and_spin` call sites); the
+                // budget expiry falls back to the exact blocking wait.
+                if rec_merkle_spin_enabled() {
+                    gpu.commit_and_spin(cb, 4.0)
+                } else {
+                    gpu.commit_and_wait(cb)
+                }
             })();
             gpu.pool_pop(pool);
             run
@@ -9773,7 +9865,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             return None;
         }
 
-        let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
+        let mut tree: Vec<Hash> = take_rec_tree(total_nodes);
         unsafe {
             let dst = core::slice::from_raw_parts_mut(
                 tree.as_mut_ptr().cast::<u8>(),
@@ -12196,6 +12288,10 @@ mod imp {
         _num_leaves: usize,
     ) -> Option<Vec<crate::merkle::Hash>> {
         None
+    }
+
+    pub(crate) fn give_rec_tree(tree: Vec<crate::merkle::Hash>) {
+        drop(tree);
     }
 
     pub(crate) struct FromZFirstPassStream;
