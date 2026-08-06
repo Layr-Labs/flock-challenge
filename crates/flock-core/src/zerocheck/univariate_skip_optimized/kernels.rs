@@ -520,6 +520,62 @@ pub(super) fn accumulate_convert_ab(
     portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
 }
 
+/// Deferred-reduction sibling used by the ranked AB-completion band.
+#[inline]
+pub(super) fn accumulate_convert_ab_unreduced(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    eq_lo_val: super::F128,
+    partial_ab: &mut [crate::field::F256Unreduced; 64],
+) {
+    for lane in 0..64 {
+        let mut converted_ab = super::F128::ZERO;
+        for b_med in 0..n_b_med {
+            converted_ab += convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
+        }
+        partial_ab[lane] ^= converted_ab.mul_unreduced(eq_lo_val);
+    }
+}
+
+/// Eight consecutive outer rows with the unreduced lane accumulator retained
+/// across the tile. This removes seven of every eight accumulator round trips
+/// while preserving the incumbent's sequential 8 KiB input footprint.
+#[inline]
+pub(super) fn accumulate_convert_ab_unreduced_tile8(
+    chunk_ab_bytes: &[[[u8; 64]; 16]; 8],
+    n_b_med: &[usize; 8],
+    convert: &[super::F128],
+    eq_lo_val: &[super::F128; 8],
+    partial_ab: &mut [crate::field::F256Unreduced; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        aarch64::accumulate_convert_ab_unreduced_tile8(
+            chunk_ab_bytes,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            partial_ab,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    for lane in 0..64 {
+        let mut acc = partial_ab[lane];
+        for outer in 0..8 {
+            let mut converted_ab = super::F128::ZERO;
+            for b_med in 0..n_b_med[outer] {
+                converted_ab += convert[
+                    b_med * 256 + chunk_ab_bytes[outer][b_med][lane] as usize
+                ];
+            }
+            acc ^= converted_ab.mul_unreduced(eq_lo_val[outer]);
+        }
+        partial_ab[lane] = acc;
+    }
+}
+
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
 /// kernel is tested against.
 ///

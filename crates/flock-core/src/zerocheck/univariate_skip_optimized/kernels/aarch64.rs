@@ -1,4 +1,5 @@
 use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
+use crate::field::F256Unreduced;
 
 /// Four-lane convert-table fold.
 ///
@@ -263,6 +264,140 @@ pub(crate) unsafe fn accumulate_convert_ab(
             drain_lane!(5, ab5);
             drain_lane!(6, ab6);
             drain_lane!(7, ab7);
+        }
+    }
+}
+
+/// Eight-row deferred-reduction AB kernel. Four lanes are kept as eight NEON
+/// wide-product registers across the complete tile, so the hot loop performs
+/// one accumulator load/store per eight outer rows.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn accumulate_convert_ab_unreduced_tile8(
+    chunk_ab_bytes: &[[[u8; 64]; 16]; 8],
+    n_b_med: &[usize; 8],
+    convert: &[F128],
+    eq_lo_val: &[F128; 8],
+    partial_ab: &mut [F256Unreduced; 64],
+) {
+    use core::arch::aarch64::*;
+    use core::mem::transmute;
+
+    debug_assert!(n_b_med.iter().all(|&n| n <= 16));
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        let zero = vdupq_n_u64(0);
+        for lane in (0..64).step_by(4) {
+            macro_rules! load_wide {
+                ($offset:literal) => {{
+                    let value = partial_ab[lane + $offset];
+                    (
+                        transmute::<[u64; 2], uint64x2_t>([value.r0, value.r1]),
+                        transmute::<[u64; 2], uint64x2_t>([value.r2, value.r3]),
+                    )
+                }};
+            }
+            let (mut w0_lo, mut w0_hi) = load_wide!(0);
+            let (mut w1_lo, mut w1_hi) = load_wide!(1);
+            let (mut w2_lo, mut w2_hi) = load_wide!(2);
+            let (mut w3_lo, mut w3_hi) = load_wide!(3);
+
+            for outer in 0..8 {
+                let chunk = &chunk_ab_bytes[outer];
+                let rows = n_b_med[outer];
+                let mut ab0 = vdupq_n_u8(0);
+                let mut ab1 = vdupq_n_u8(0);
+                let mut ab2 = vdupq_n_u8(0);
+                let mut ab3 = vdupq_n_u8(0);
+                for pair in 0..rows / 2 {
+                    let b0 = 2 * pair;
+                    let b1 = b0 + 1;
+                    let table0 = convert_ptr.add(b0 * 256 * 16);
+                    let table1 = convert_ptr.add(b1 * 256 * 16);
+                    let word0 = (chunk[b0].as_ptr().add(lane) as *const u32)
+                        .read_unaligned() as usize;
+                    let word1 = (chunk[b1].as_ptr().add(lane) as *const u32)
+                        .read_unaligned() as usize;
+                    ab0 = xor3_u8(
+                        ab0,
+                        vld1q_u8(table0.add((word0 & 0xff) * 16)),
+                        vld1q_u8(table1.add((word1 & 0xff) * 16)),
+                    );
+                    ab1 = xor3_u8(
+                        ab1,
+                        vld1q_u8(table0.add(((word0 >> 8) & 0xff) * 16)),
+                        vld1q_u8(table1.add(((word1 >> 8) & 0xff) * 16)),
+                    );
+                    ab2 = xor3_u8(
+                        ab2,
+                        vld1q_u8(table0.add(((word0 >> 16) & 0xff) * 16)),
+                        vld1q_u8(table1.add(((word1 >> 16) & 0xff) * 16)),
+                    );
+                    ab3 = xor3_u8(
+                        ab3,
+                        vld1q_u8(table0.add((word0 >> 24) * 16)),
+                        vld1q_u8(table1.add((word1 >> 24) * 16)),
+                    );
+                }
+                if rows & 1 == 1 {
+                    let b_med = rows - 1;
+                    let table = convert_ptr.add(b_med * 256 * 16);
+                    let word = (chunk[b_med].as_ptr().add(lane) as *const u32)
+                        .read_unaligned() as usize;
+                    ab0 = veorq_u8(ab0, vld1q_u8(table.add((word & 0xff) * 16)));
+                    ab1 = veorq_u8(ab1, vld1q_u8(table.add(((word >> 8) & 0xff) * 16)));
+                    ab2 = veorq_u8(ab2, vld1q_u8(table.add(((word >> 16) & 0xff) * 16)));
+                    ab3 = veorq_u8(ab3, vld1q_u8(table.add((word >> 24) * 16)));
+                }
+
+                let a0 = vreinterpretq_u64_u8(ab0);
+                let a1 = vreinterpretq_u64_u8(ab1);
+                let a2 = vreinterpretq_u64_u8(ab2);
+                let a3 = vreinterpretq_u64_u8(ab3);
+                let weight = eq_lo_val[outer];
+                let weight_mid = weight.lo ^ weight.hi;
+
+                macro_rules! product_parts {
+                    ($value:ident) => {{
+                        let lo = vgetq_lane_u64::<0>($value);
+                        let hi = vgetq_lane_u64::<1>($value);
+                        let ll = transmute::<u128, uint64x2_t>(vmull_p64(lo, weight.lo));
+                        let hh = transmute::<u128, uint64x2_t>(vmull_p64(hi, weight.hi));
+                        let mm = transmute::<u128, uint64x2_t>(vmull_p64(lo ^ hi, weight_mid));
+                        (ll, hh, mm)
+                    }};
+                }
+                let (ll0, hh0, mm0) = product_parts!(a0);
+                let (ll1, hh1, mm1) = product_parts!(a1);
+                let (ll2, hh2, mm2) = product_parts!(a2);
+                let (ll3, hh3, mm3) = product_parts!(a3);
+
+                macro_rules! accumulate_product {
+                    ($w_lo:ident, $w_hi:ident, $ll:ident, $hh:ident, $mm:ident) => {{
+                        let cross = xor3_u64($mm, $ll, $hh);
+                        $w_lo = xor3_u64($w_lo, $ll, vextq_u64::<1>(zero, cross));
+                        $w_hi = xor3_u64($w_hi, $hh, vextq_u64::<1>(cross, zero));
+                    }};
+                }
+                accumulate_product!(w0_lo, w0_hi, ll0, hh0, mm0);
+                accumulate_product!(w1_lo, w1_hi, ll1, hh1, mm1);
+                accumulate_product!(w2_lo, w2_hi, ll2, hh2, mm2);
+                accumulate_product!(w3_lo, w3_hi, ll3, hh3, mm3);
+            }
+
+            macro_rules! store_wide {
+                ($offset:literal, $lo:ident, $hi:ident) => {{
+                    let [r0, r1] = transmute::<uint64x2_t, [u64; 2]>($lo);
+                    let [r2, r3] = transmute::<uint64x2_t, [u64; 2]>($hi);
+                    partial_ab[lane + $offset] = F256Unreduced { r0, r1, r2, r3 };
+                }};
+            }
+            store_wide!(0, w0_lo, w0_hi);
+            store_wide!(1, w1_lo, w1_hi);
+            store_wide!(2, w2_lo, w2_hi);
+            store_wide!(3, w3_lo, w3_hi);
         }
     }
 }

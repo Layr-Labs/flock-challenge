@@ -32,7 +32,7 @@
 
 use std::sync::OnceLock;
 
-use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
+use crate::field::{F8, F128, F256Unreduced, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
 use super::PaddingSpec;
@@ -1402,6 +1402,18 @@ fn precomputed_ab_rows(ab_inner: &[u8], byte_base: usize) -> &[[u8; 64]; 1 << N_
     unsafe { &*bytes.as_ptr().cast::<[[u8; 64]; 1 << N_MEDIUM]>() }
 }
 
+#[inline]
+fn precomputed_ab_rows_tile8(
+    ab_inner: &[u8],
+    byte_base: usize,
+) -> &[[[u8; 64]; 1 << N_MEDIUM]; 8] {
+    const TILE_BYTES: usize = 8 * (1 << N_MEDIUM) * ELL;
+    let bytes = &ab_inner[byte_base..byte_base + TILE_BYTES];
+    // SAFETY: the source and target are byte-aligned, the slice proves the
+    // full 8 KiB extent, and all nested arrays are padding-free.
+    unsafe { &*bytes.as_ptr().cast::<[[[u8; 64]; 1 << N_MEDIUM]; 8]>() }
+}
+
 impl WorkerStateWithSHatV {
     fn new() -> Self {
         Self {
@@ -1737,6 +1749,68 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
     }
 }
 
+/// Ranked AB completion with one reduction per `(x_hi, lane)` rather than one
+/// per `(x_hi, x_lo, lane)`. GHASH reduction is F2-linear, so XORing the full
+/// 256-bit products and reducing once is byte-identical to the incumbent sum.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn process_one_x_hi_with_precomputed_ab_deferred(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    eq_lo_scaled: &[F128],
+    eq_hi_val: F128,
+    convert: &[F128],
+    partial_ab: &mut [F128; ELL],
+) {
+    let mut wide = [F256Unreduced::ZERO; ELL];
+    let n_lo = n_lo_and_inner - N_INNER;
+    let mut x_outer_lo = 0;
+    while x_outer_lo + 8 <= big_lo_size {
+        let n_b_med = std::array::from_fn(|offset| {
+            let x_outer = (x_outer_lo + offset) | (x_hi << n_lo);
+            b_med_counts[x_outer & within_outer_mask] as usize
+        });
+        let eq_lo_val = std::array::from_fn(|offset| eq_lo_scaled[x_outer_lo + offset]);
+        let chunk_byte_base =
+            ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        kernels::accumulate_convert_ab_unreduced_tile8(
+            precomputed_ab_rows_tile8(ab_inner, chunk_byte_base),
+            &n_b_med,
+            convert,
+            &eq_lo_val,
+            &mut wide,
+        );
+        x_outer_lo += 8;
+    }
+    while x_outer_lo < big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        if n_b_med != 0 {
+            let chunk_byte_base =
+                ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+            kernels::accumulate_convert_ab_unreduced(
+                precomputed_ab_rows(ab_inner, chunk_byte_base),
+                n_b_med,
+                convert,
+                eq_lo_scaled[x_outer_lo],
+                &mut wide,
+            );
+        }
+        x_outer_lo += 1;
+    }
+    for lane in 0..ELL {
+        partial_ab[lane] = wide[lane].reduce() * eq_hi_val;
+    }
+}
+
+// 0 = unchecked, 2 = deferred reduction verified against the incumbent.
+static RANKED_AB_DEFERRED_PATH: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
 /// Challenge-weighted AB completion for the retained-coordinate ranked path,
 /// without the independent C drain.  The legacy wire AB message is unchanged;
 /// callers that can derive C from another honest representation use this to
@@ -1763,27 +1837,61 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
 
+    use std::sync::atomic::Ordering;
+    let forced_incumbent = std::env::var_os("FLOCK_NO_ZC_AB_DEFERRED").is_some();
+    let selected = RANKED_AB_DEFERRED_PATH.load(Ordering::Relaxed);
+    let checking = !forced_incumbent && selected == 0;
+    let use_deferred = !forced_incumbent && (selected == 2 || checking);
+
+    let run_variant = |deferred: bool, output: &mut [[F128; ELL]]| {
+        let output_base = crate::epool::SyncPtr(output.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            let mut partial = [F128::ZERO; ELL];
+            if deferred {
+                process_one_x_hi_with_precomputed_ab_deferred(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts,
+                    ab_inner_bytes,
+                    &eq_lo_scaled,
+                    eq.hi[x_hi],
+                    convert,
+                    &mut partial,
+                );
+            } else {
+                process_one_x_hi_with_precomputed_ab_fold4_ab(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts,
+                    ab_inner_bytes,
+                    &eq_lo_scaled,
+                    eq.hi[x_hi],
+                    convert,
+                    None,
+                    &mut partial,
+                );
+            }
+            // SAFETY: each queue index owns one disjoint output slot and the
+            // synchronous queue join publishes all writes before reduction.
+            unsafe { *output_base.ptr().add(x_hi) = partial };
+        });
+    };
+
     let mut partials = vec![[F128::ZERO; ELL]; hi_size];
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        let mut partial = [F128::ZERO; ELL];
-        process_one_x_hi_with_precomputed_ab_fold4_ab(
-            x_hi,
-            big_lo_size,
-            n_lo_and_inner,
-            within_outer_mask,
-            &b_med_counts,
-            ab_inner_bytes,
-            &eq_lo_scaled,
-            eq.hi[x_hi],
-            convert,
-            None,
-            &mut partial,
-        );
-        // SAFETY: each queue index owns one disjoint output slot and the
-        // synchronous queue join publishes all writes before reduction.
-        unsafe { *partials_base.ptr().add(x_hi) = partial };
-    });
+    run_variant(use_deferred, &mut partials);
+
+    if checking {
+        let mut incumbent = vec![[F128::ZERO; ELL]; hi_size];
+        run_variant(false, &mut incumbent);
+        if partials != incumbent {
+            panic!("deferred ranked AB mismatch");
+        }
+        RANKED_AB_DEFERRED_PATH.store(2, Ordering::Relaxed);
+    }
 
     partials
         .into_iter()
