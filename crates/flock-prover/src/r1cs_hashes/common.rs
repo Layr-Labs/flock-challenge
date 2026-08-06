@@ -449,11 +449,16 @@ where
 /// `FLOCK_WITGEN_HETERO_MAIN_ONLY=1` for the queue-without-E-cores oracle,
 /// `FLOCK_NO_WITGEN_HETERO=1` for a main-pool-only claim loop (still
 /// single-queue so the caller's completion accounting stays exact).
-pub(crate) fn drain_witgen_slabs<F>(n_slabs: usize, f: &F)
+/// `use_epool = false` keeps the drain on the main pool only — the AB
+/// head start owns the E-cluster for the witgen window, and issuing a
+/// second broadcast on the helper pool while the head start's broadcast is
+/// live would queue this drain's join behind it (deadlock by ordering:
+/// the head start only exits when this drain completes).
+pub(crate) fn drain_witgen_slabs<F>(n_slabs: usize, f: &F, use_epool: bool)
 where
     F: Fn(usize) + Sync,
 {
-    if !witgen_hetero_enabled() || witgen_hetero_main_only() {
+    if !use_epool || !witgen_hetero_enabled() || witgen_hetero_main_only() {
         flock_core::epool::run_chunks_with_helper(n_slabs, f, None);
     } else {
         flock_core::epool::run_hetero_chunks(n_slabs, f);

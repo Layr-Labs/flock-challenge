@@ -715,6 +715,16 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     assert_eq!(inv_table.k, k_skip);
     assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
 
+    // AB head start (see `ENV_NO_AB_HEADSTART`): a stash staged by the
+    // streamed witgen already holds part of this exact transform; finish it
+    // instead of recomputing. Any mismatch retires the stash and falls
+    // through to the incumbent full compute below.
+    if let Some(done) =
+        try_finish_ab_headstart(a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact)
+    {
+        return done;
+    }
+
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Besides
     // the full all-ones B rows at b_med 0/1 and the single-K0 tail, two mixed
@@ -906,6 +916,539 @@ fn zc_ab_pre_hetero_enabled() -> bool {
             && std::env::var_os(ENV_NO_ZC_AB_PRE_HETERO).as_deref()
                 != Some(std::ffi::OsStr::new("1"))
     })
+}
+
+// ---------------------------------------------------------------------------
+// AB-precompute head start inside the witgen window
+// ---------------------------------------------------------------------------
+
+/// Kill switch for the AB-precompute head start (`FLOCK_NO_AB_HEADSTART=1`,
+/// exact): the QS5 AB precompute has zero Fiat–Shamir dependency — its
+/// inputs are `a_packed`/`b_packed` only, and the streamed ranked witgen
+/// produces those band-wise with release/acquire completion accounting for
+/// its Metal submits. The head start reuses that watermark to run AB
+/// precompute jobs on the efficiency-core cluster WHILE witgen is still
+/// filling later bands (measured: the E-cluster converts only ~4% of the
+/// witgen slab drain, while E-core-seconds on the AB queue shorten the
+/// commit window's binding arm one-for-one). The commit-window AB arm then
+/// drains only the remaining jobs. Same jobs, same kernels, disjoint
+/// outputs — the transform bytes are identical regardless of which pool or
+/// window ran a job, so the switch can never change proof bytes.
+pub const ENV_NO_AB_HEADSTART: &str = "FLOCK_NO_AB_HEADSTART";
+
+/// Read per prove (uncached) so same-process A/B tests can toggle it.
+fn ab_headstart_enabled() -> bool {
+    !std::env::var(ENV_NO_AB_HEADSTART).is_ok_and(|v| v == "1")
+}
+
+/// Kernel flavor latched at stage time — the exact branch the commit-window
+/// entry would select for the same shape and process env. All flavors are
+/// byte-identical on the live bytes; latching one keeps every job of one
+/// prove on one compiled path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AbPreFlavor {
+    FastDirect,
+    Fast,
+    Process,
+}
+
+/// Shared state of one prove's head start. Addresses are raw (`usize`)
+/// because witgen still owns `&mut` ranges of a/b while completed bands are
+/// read here; every read is bounded by the band watermark, whose release
+/// store follows the producing slabs' writes (same visibility chain that
+/// guards the Metal band submits).
+struct AbHeadstartInner {
+    a_addr: usize,
+    b_addr: usize,
+    total_bytes: usize,
+    out_addr: usize,
+    /// The output allocation, handed to [`Round1AbInner`] at finish.
+    storage: std::sync::Mutex<Option<Vec<F128>>>,
+    inv_table: &'static InvNttTableByteSingleGf8,
+    m: usize,
+    k_log: usize,
+    useful_bits_per_block: usize,
+    within_outer_mask: usize,
+    b_med_counts: Vec<u8>,
+    blake3_static_layout: bool,
+    static_b_context: Option<kernels::StaticBContext>,
+    nt: bool,
+    compact: bool,
+    flavor: AbPreFlavor,
+    n_chunks: usize,
+    n_jobs: usize,
+    /// Job ids in band-major (availability) order.
+    order: Vec<u32>,
+    /// `band_jobs_prefix[w]` = jobs claimable once `w` bands are complete.
+    band_jobs_prefix: Vec<usize>,
+    /// Bands complete, in band order (release store by the witgen submit
+    /// sequencer; acquire load here publishes those bands' a/b bytes).
+    bands_done: std::sync::atomic::AtomicUsize,
+    /// Claim cursor over `order` (shared by E workers and the finish drain).
+    next_pos: std::sync::atomic::AtomicUsize,
+    jobs_done: std::sync::atomic::AtomicUsize,
+    /// Witgen over (or the prove abandoned): E workers exit, freeing the
+    /// helper pool for the commit window's deferred stripe fill.
+    over: std::sync::atomic::AtomicBool,
+    driver_panicked: std::sync::atomic::AtomicBool,
+}
+
+/// Producer-side control handle held by the streamed witgen driver.
+pub struct AbHeadstartCtl {
+    inner: std::sync::Arc<AbHeadstartInner>,
+}
+
+impl AbHeadstartCtl {
+    /// Publish that bands `0..bands_done` are complete (called from the
+    /// witgen in-order submit sequencer, after the band's writes are
+    /// published). Monotone; release pairs with the workers' acquire.
+    pub fn publish_bands(&self, bands_done: usize) {
+        self.inner
+            .bands_done
+            .store(bands_done, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Witgen drain joined: every band is complete. Publishes the full
+    /// watermark and releases the E-cluster (remaining jobs drain inside
+    /// the commit-window AB arm).
+    pub fn witgen_done(&self) {
+        self.inner.bands_done.store(
+            self.inner.band_jobs_prefix.len() - 1,
+            std::sync::atomic::Ordering::Release,
+        );
+        self.inner
+            .over
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for AbHeadstartCtl {
+    fn drop(&mut self) {
+        // Belt for unwind paths: stop the E workers WITHOUT publishing any
+        // further bands (an early drop means witgen did not complete, so
+        // unclaimed jobs must never read the unfinished buffers).
+        self.inner
+            .over
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// One staged head start per process at a time (the single-prove-in-flight
+/// contract of the ranked worker; concurrent test proves are disambiguated
+/// by the adopt fingerprint, exactly like the commit-tail-fill stash).
+static AB_HEADSTART_SLOT: std::sync::Mutex<Option<std::sync::Arc<AbHeadstartInner>>> =
+    std::sync::Mutex::new(None);
+
+/// Run one head-start job (`AB_PRE_CHUNKS_PER_JOB` chunks) with the staged
+/// kernel flavor. `#[inline(never)]`: worker stacks are marginal — keep this
+/// frame (and the kernel frames below it) out of every caller.
+#[inline(never)]
+fn ab_headstart_run_job(
+    inner: &AbHeadstartInner,
+    job: usize,
+    a_col: &mut [F8; ELL],
+    b_col: &mut [F8; ELL],
+) {
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    // SAFETY: the claim protocol only hands out `job` once its covering
+    // bands' watermark was acquired, so every a/b byte this job reads is
+    // published and never written again; each chunk owns a disjoint output
+    // range of the staged storage.
+    let a_packed =
+        unsafe { core::slice::from_raw_parts(inner.a_addr as *const u8, inner.total_bytes) };
+    let b_packed =
+        unsafe { core::slice::from_raw_parts(inner.b_addr as *const u8, inner.total_bytes) };
+    let start = job * AB_PRE_CHUNKS_PER_JOB;
+    let end = (start + AB_PRE_CHUNKS_PER_JOB).min(inner.n_chunks);
+    for x_outer in start..end {
+        let out_outer = unsafe {
+            core::slice::from_raw_parts_mut(
+                (inner.out_addr as *mut u8).add(x_outer * OUTER_BYTES),
+                OUTER_BYTES,
+            )
+        };
+        match inner.flavor {
+            AbPreFlavor::FastDirect => {
+                precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
+                    a_packed,
+                    b_packed,
+                    inner.inv_table,
+                    inner.within_outer_mask,
+                    &inner.b_med_counts,
+                    inner.blake3_static_layout,
+                    inner.static_b_context,
+                    inner.nt,
+                    inner.compact,
+                    x_outer,
+                    out_outer,
+                    a_col,
+                    b_col,
+                );
+            }
+            AbPreFlavor::Fast => {
+                precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
+                    a_packed,
+                    b_packed,
+                    inner.inv_table,
+                    inner.within_outer_mask,
+                    &inner.b_med_counts,
+                    inner.blake3_static_layout,
+                    inner.static_b_context,
+                    inner.nt,
+                    inner.compact,
+                    x_outer,
+                    out_outer,
+                    a_col,
+                    b_col,
+                );
+            }
+            AbPreFlavor::Process => {
+                precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+                    a_packed,
+                    b_packed,
+                    inner.inv_table,
+                    inner.within_outer_mask,
+                    &inner.b_med_counts,
+                    inner.blake3_static_layout,
+                    inner.static_b_context,
+                    inner.nt,
+                    inner.compact,
+                    x_outer,
+                    out_outer,
+                    a_col,
+                    b_col,
+                );
+            }
+        }
+    }
+}
+
+/// Claim the next available job under the current watermark, or `None`.
+fn ab_headstart_claim(inner: &AbHeadstartInner) -> Option<usize> {
+    use std::sync::atomic::Ordering;
+    let w = inner
+        .bands_done
+        .load(Ordering::Acquire)
+        .min(inner.band_jobs_prefix.len() - 1);
+    let avail = inner.band_jobs_prefix[w];
+    inner
+        .next_pos
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |p| {
+            (p < avail).then_some(p + 1)
+        })
+        .ok()
+        .map(|p| inner.order[p] as usize)
+}
+
+/// E-worker loop: claim watermark-released jobs until witgen ends (`over`),
+/// then exit so the helper pool is free for the commit window's own users
+/// (deferred stripe fill, then the incumbent QS5 broadcast).
+fn ab_headstart_worker(inner: &AbHeadstartInner) {
+    use std::sync::atomic::Ordering;
+    let mut a_col = [F8::ZERO; ELL];
+    let mut b_col = [F8::ZERO; ELL];
+    loop {
+        match ab_headstart_claim(inner) {
+            Some(job) => {
+                ab_headstart_run_job(inner, job, &mut a_col, &mut b_col);
+                inner.jobs_done.fetch_add(1, Ordering::Release);
+            }
+            None => {
+                if inner.over.load(Ordering::Acquire)
+                    || inner.next_pos.load(Ordering::Relaxed) >= inner.n_jobs
+                {
+                    break;
+                }
+                for _ in 0..64 {
+                    core::hint::spin_loop();
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+/// Stage an AB-precompute head start for the streamed ranked witgen (kill:
+/// [`ENV_NO_AB_HEADSTART`], exact). `schedule` is the witgen band schedule in
+/// groups-per-segment units; bands are published via
+/// [`AbHeadstartCtl::publish_bands`] in band order. Returns `None` (exact
+/// incumbent) whenever any precondition is off: kill switch, no helper pool,
+/// hetero drain disabled, or a geometry the job partition cannot tile.
+#[allow(clippy::too_many_arguments)]
+pub fn stage_ab_headstart(
+    a_packed: *const u8,
+    b_packed: *const u8,
+    total_bytes: usize,
+    m: usize,
+    k_log: usize,
+    useful_bits_per_block: usize,
+    schedule: &[usize],
+    groups_per_segment: usize,
+    n_segments: usize,
+) -> Option<AbHeadstartCtl> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        if !ab_headstart_enabled() || !zc_ab_pre_hetero_enabled() {
+            return None;
+        }
+        crate::epool::helper_pool()?;
+        if m < K_SKIP + N_INNER || total_bytes != (1usize << m) / 8 {
+            return None;
+        }
+        let n_groups = n_segments.checked_mul(groups_per_segment)?;
+        if n_groups == 0
+            || !total_bytes.is_multiple_of(n_groups)
+            || schedule.iter().sum::<usize>() != groups_per_segment
+        {
+            return None;
+        }
+        let group_bytes = total_bytes / n_groups;
+        // One job = AB_PRE_CHUNKS_PER_JOB 1 KiB chunks; require whole groups
+        // per job and whole jobs per (band, segment) span so a job never
+        // straddles a completion boundary.
+        if group_bytes == 0 || !(AB_PRE_CHUNKS_PER_JOB * OUTER_BYTES).is_multiple_of(group_bytes) {
+            return None;
+        }
+        let groups_per_job = AB_PRE_CHUNKS_PER_JOB * OUTER_BYTES / group_bytes;
+        if schedule
+            .iter()
+            .any(|&gps| !gps.is_multiple_of(groups_per_job))
+        {
+            return None;
+        }
+        let n_chunks = total_bytes / OUTER_BYTES;
+        let n_jobs = n_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
+        debug_assert_eq!(n_jobs * groups_per_job, n_groups);
+
+        // Latch the exact kernel flavor the commit-window entry would pick.
+        let inv_table = crate::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
+        if inv_table.k != K_SKIP {
+            return None;
+        }
+        let padding = PaddingSpec {
+            k_log,
+            useful_bits_per_block,
+        };
+        let nt = ab_pre_nt_enabled();
+        let compact = ab_compact_store_enabled();
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+        let blake3_static_layout = k_log == 14 && useful_bits_per_block == 15_409;
+        let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
+        let hoist = ranked_ab_pre_fast_policy_hoist_shape(
+            m,
+            K_SKIP,
+            n_chunks,
+            k_log,
+            useful_bits_per_block,
+            rayon::current_num_threads(),
+            crate::epool::helper_pool().map_or(0, rayon::ThreadPool::current_num_threads),
+            kernels::static_b_context_is_prepared(static_b_context),
+            zc_ab_pre_fast_policy_hoist_enabled(),
+        ) && kernels::fast_shift_reduce_enabled();
+        let flavor = if hoist {
+            if nt && ab_pre_nt_direct_enabled() {
+                AbPreFlavor::FastDirect
+            } else {
+                AbPreFlavor::Fast
+            }
+        } else {
+            AbPreFlavor::Process
+        };
+
+        // Band-major job order + availability prefix.
+        let mut order: Vec<u32> = Vec::with_capacity(n_jobs);
+        let mut band_jobs_prefix: Vec<usize> = Vec::with_capacity(schedule.len() + 1);
+        band_jobs_prefix.push(0);
+        let mut offset = 0usize;
+        for &gps in schedule {
+            for seg in 0..n_segments {
+                let g0 = seg * groups_per_segment + offset;
+                for t in 0..gps / groups_per_job {
+                    order.push((g0 / groups_per_job + t) as u32);
+                }
+            }
+            offset += gps;
+            band_jobs_prefix.push(order.len());
+        }
+        debug_assert_eq!(order.len(), n_jobs);
+
+        let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
+        let out_addr = storage.as_mut_ptr() as usize;
+        let inner = std::sync::Arc::new(AbHeadstartInner {
+            a_addr: a_packed as usize,
+            b_addr: b_packed as usize,
+            total_bytes,
+            out_addr,
+            storage: std::sync::Mutex::new(Some(storage)),
+            inv_table,
+            m,
+            k_log,
+            useful_bits_per_block,
+            within_outer_mask,
+            b_med_counts,
+            blake3_static_layout,
+            static_b_context,
+            nt,
+            compact,
+            flavor,
+            n_chunks,
+            n_jobs,
+            order,
+            band_jobs_prefix,
+            bands_done: AtomicUsize::new(0),
+            next_pos: AtomicUsize::new(0),
+            jobs_done: AtomicUsize::new(0),
+            over: AtomicBool::new(false),
+            driver_panicked: AtomicBool::new(false),
+        });
+
+        // Driver: a plain OS thread (never a rayon join arm — see the
+        // WITGEN_STACK_GATES trap record) parks in the helper-pool broadcast
+        // while the E workers drain, and exits when they do.
+        let driver = std::sync::Arc::clone(&inner);
+        if std::thread::Builder::new()
+            .name("flock-ab-headstart".into())
+            .spawn(move || {
+                let Some(ep) = crate::epool::helper_pool() else {
+                    driver
+                        .over
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return;
+                };
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ep.broadcast(|_| ab_headstart_worker(&driver));
+                }));
+                if res.is_err() {
+                    driver
+                        .driver_panicked
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            })
+            .is_err()
+        {
+            // No driver: nothing will ever claim, so do not stage.
+            return None;
+        }
+
+        // Park for adoption; any previously staged head start is stale.
+        let mut slot = AB_HEADSTART_SLOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(old) = slot.replace(std::sync::Arc::clone(&inner)) {
+            old.over.store(true, std::sync::atomic::Ordering::Release);
+        }
+        drop(slot);
+        Some(AbHeadstartCtl { inner })
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (
+            a_packed,
+            b_packed,
+            total_bytes,
+            m,
+            k_log,
+            useful_bits_per_block,
+            schedule,
+            groups_per_segment,
+            n_segments,
+        );
+        None
+    }
+}
+
+/// Adoption half: if a staged head start matches this exact precompute call
+/// (operand identity, shape, kernel latches), drain its remaining jobs on
+/// the incumbent two-pool queue, wait out any in-flight worker, and return
+/// the completed transform. Any mismatch retires the stash and the caller
+/// proceeds with the incumbent full compute (the head start's partial
+/// writes land in a buffer nothing else reads).
+#[allow(clippy::too_many_arguments)]
+fn try_finish_ab_headstart(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    nt: bool,
+    compact: bool,
+) -> Option<Round1AbInner> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        use std::sync::atomic::Ordering;
+        let mut slot = AB_HEADSTART_SLOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let matches = slot.as_ref().is_some_and(|hs| {
+            hs.a_addr == a_packed.as_ptr() as usize
+                && hs.b_addr == b_packed.as_ptr() as usize
+                && hs.total_bytes == a_packed.len()
+                && hs.total_bytes == b_packed.len()
+                && hs.m == m
+                && k_skip == K_SKIP
+                && hs.k_log == padding.k_log
+                && hs.useful_bits_per_block == padding.useful_bits_per_block
+                && std::ptr::eq(hs.inv_table, inv_table)
+                && hs.nt == nt
+                && hs.compact == compact
+                // The producer must have published every band (witgen_done);
+                // anything else means the stash is from a torn prove.
+                && hs.over.load(Ordering::Acquire)
+                && hs.bands_done.load(Ordering::Acquire) == hs.band_jobs_prefix.len() - 1
+        });
+        if !matches {
+            if let Some(old) = slot.take() {
+                old.over.store(true, Ordering::Release);
+            }
+            return None;
+        }
+        let hs = slot.take()?;
+        drop(slot);
+        if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+            eprintln!(
+                "[ab-headstart] adopt: {}/{} jobs done at commit-window entry",
+                hs.jobs_done.load(Ordering::Acquire),
+                hs.n_jobs,
+            );
+        }
+        // Drain the remaining jobs through the incumbent two-pool queue
+        // (every band is complete, so no claim can block). Queue indices
+        // exceed remaining jobs; surplus invocations claim nothing.
+        crate::epool::run_hetero_chunks_stateful(
+            hs.n_jobs,
+            || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+            |(a_col, b_col), _i| {
+                if let Some(job) = ab_headstart_claim(&hs) {
+                    ab_headstart_run_job(&hs, job, a_col, b_col);
+                    hs.jobs_done.fetch_add(1, Ordering::Release);
+                }
+            },
+        );
+        // In-flight E stragglers finish their one claimed job each.
+        while hs.jobs_done.load(Ordering::Acquire) < hs.n_jobs {
+            assert!(
+                !hs.driver_panicked.load(Ordering::Acquire),
+                "AB head-start worker panicked"
+            );
+            std::thread::yield_now();
+        }
+        let storage = hs
+            .storage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()?;
+        Some(Round1AbInner { storage })
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (
+            a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact,
+        );
+        None
+    }
 }
 
 /// Drain the ranked AB precompute through both core clusters. The const policy

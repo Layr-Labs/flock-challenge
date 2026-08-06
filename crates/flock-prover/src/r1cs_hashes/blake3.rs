@@ -2582,6 +2582,26 @@ pub(crate) mod witgen_simd {
                     }
                 }
                 debug_assert_eq!(slab_band.len(), n_groups / SLAB);
+                // AB head start (kill: FLOCK_NO_AB_HEADSTART): give the
+                // E-cluster band-gated AB-precompute jobs for the witgen
+                // window instead of witgen slabs (it converts only ~4% of
+                // this drain), using the submit sequencer's in-order band
+                // watermark as the release/acquire completion boundary.
+                // While staged, the slab drain below stays main-pool-only
+                // (a second epool broadcast would queue this drain's join
+                // behind the head start's — see `drain_witgen_slabs`).
+                let headstart =
+                    flock_core::zerocheck::univariate_skip_optimized::stage_ab_headstart(
+                        a_base.get() as *const u8,
+                        b_base.get() as *const u8,
+                        total_f128 * core::mem::size_of::<F128>(),
+                        super::K_LOG + n_blocks_log,
+                        super::K_LOG,
+                        USEFUL_BITS,
+                        schedule,
+                        groups_per_segment,
+                        SEGMENTS,
+                    );
                 let remaining: Vec<AtomicUsize> = schedule
                     .iter()
                     .map(|&gps| AtomicUsize::new(SEGMENTS * gps / SLAB))
@@ -2626,6 +2646,12 @@ pub(crate) mod witgen_simd {
                             std::sync::atomic::fence(Ordering::Release);
                             seq.stream.submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
                             seq.next += 1;
+                            // Same visibility chain as the Metal submit: the
+                            // sequencer only advances past fully published
+                            // bands, so the head start may now read them.
+                            if let Some(hs) = &headstart {
+                                hs.publish_bands(seq.next);
+                            }
                             if timing {
                                 submit_ns[b].store(
                                     t0.elapsed().as_nanos() as u64,
@@ -2635,7 +2661,11 @@ pub(crate) mod witgen_simd {
                         }
                     }
                 };
-                super::super::common::drain_witgen_slabs(slab_band.len(), &slab_fn);
+                super::super::common::drain_witgen_slabs(
+                    slab_band.len(),
+                    &slab_fn,
+                    headstart.is_none(),
+                );
                 // The full-drain join above proves every band completed and
                 // every zeroing worker drained the sequencer, so all bands
                 // are submitted. Belt for release builds: after the join any
@@ -2648,6 +2678,12 @@ pub(crate) mod witgen_simd {
                     std::sync::atomic::fence(Ordering::Release);
                     seq.stream.submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
                     seq.next += 1;
+                }
+                // Every band is complete and published: release the
+                // E-cluster; the commit-window AB arm adopts the stash and
+                // drains whatever jobs remain.
+                if let Some(hs) = &headstart {
+                    hs.witgen_done();
                 }
                 if timing {
                     for b in 0..n_bands {
