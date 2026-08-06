@@ -853,7 +853,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
 /// enough that the atomic claim amortizes (a job is ~60 µs on a P-core),
 /// small enough that an E-core owns at most ~200 µs of tail when the main
 /// pool finishes — the same sizing logic as the deferred stripe's 64.
-const AB_PRE_CHUNKS_PER_JOB: usize = 64;
+const AB_PRE_CHUNKS_PER_JOB: usize = 48;
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
 /// before the AB queue starts. Every other shape retains the incumbent
@@ -5724,3 +5724,9 @@ mod tests {
 // chewy-cadence: r557 1785988378687326387
 
 // chewy-cadence: r558 1785988571742870116
+
+// chewy-cadence: r560 20260806T040229Z
+
+// r561 archive-distinct hot-line marker: 20260806T040426Z
+
+// r562 archive-distinct hot-line marker: 20260806T040635Z
