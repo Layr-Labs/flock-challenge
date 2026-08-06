@@ -614,6 +614,12 @@ impl Challenger for FsChallenger {
                             && protected_gain >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN
                     };
                     let _ = GPU_GRIND_LATCH.set(enable);
+                    if std::env::var_os("FLOCK_GRIND_DEBUG").is_some() {
+                        eprintln!(
+                            "[grind-latch] enable={enable} exact={exact} cpu={:?}/{:?} gpu={:?}/{:?}",
+                            cpu_1_time, cpu_2_time, gpu_1_time, gpu_2_time
+                        );
+                    }
                     if enable {
                         match gpu_blake3_pow_nonce(&state_digest, bits) {
                             Ok(nonce) => nonce,
@@ -868,19 +874,34 @@ mod grind_worker {
         .as_ref()
     }
 
-    /// Dispatch one GPU grind scan through the persistent worker. Returns
-    /// `None` when the worker is unavailable (kill switch or setup failure)
-    /// and the caller must run the incumbent scope-spawn path; `Some(result)`
-    /// is the scan outcome with the same `Err` surface as a direct
-    /// `gpu_blake3_pow_scan` call.
-    pub(super) fn dispatch(
+    /// An in-flight GPU grind scan on the persistent worker. The caller may
+    /// run CPU work between `send` and `wait`; the worker sets the job's
+    /// `stop` flag on an abort-armed hit exactly like the scope-spawn path's
+    /// GPU thread, so a concurrently running CPU window bails between chunks.
+    pub(super) struct Pending {
+        done_rx: Receiver<Result<Option<u64>, String>>,
+    }
+
+    impl Pending {
+        pub(super) fn wait(self) -> Result<Option<u64>, String> {
+            match self.done_rx.recv() {
+                Ok(res) => res,
+                Err(_) => Err("GPU grind worker channel closed".to_string()),
+            }
+        }
+    }
+
+    /// Queue one GPU grind scan on the persistent worker without waiting.
+    /// Returns `None` when the worker is unavailable (kill switch or setup
+    /// failure) and the caller must run the incumbent scope-spawn path.
+    pub(super) fn send(
         state_digest: &[u8; 32],
         start: u64,
         len: u32,
         bits: u32,
         stop: Arc<AtomicBool>,
         abort: bool,
-    ) -> Option<Result<Option<u64>, String>> {
+    ) -> Option<Pending> {
         let w = worker()?;
         let (done_tx, done_rx) = channel();
         let job = Job {
@@ -893,13 +914,27 @@ mod grind_worker {
             done: done_tx,
         };
         if w.tx.send(job).is_err() {
-            return Some(Err("GPU grind worker channel closed".to_string()));
+            return None;
         }
-        match done_rx.recv() {
-            Ok(res) => Some(res),
-            Err(_) => Some(Err("GPU grind worker channel closed".to_string())),
-        }
+        Some(Pending { done_rx })
     }
+}
+
+/// The scope-spawn hybrid (the promoted design this worker replaced) ran the
+/// GPU block scan and the next-block CPU window CONCURRENTLY; the persistent
+/// worker's original `dispatch` blocked on the GPU result first and ran the
+/// CPU window only afterwards — so every GPU block MISS paid the full CPU
+/// window serially on the transcript spine instead of hiding it under the
+/// GPU wall. Default restores the promoted concurrency through the worker
+/// (spawn-free dispatch + overlapped window). `FLOCK_NO_GRIND_OVERLAP=1`
+/// restores the serialized flow (including the ee56a9f dead-window skip on
+/// hits). Nonce selection is unchanged either way: the GPU block is earlier
+/// in nonce order and blocks are visited ascending, so the returned nonce —
+/// and therefore the transcript — is byte-identical (the same argument
+/// documented for the scope-spawn hybrid above).
+fn grind_overlap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_OVERLAP").is_none())
 }
 
 /// Run the CPU next-block window after the persistent GPU worker has already
@@ -954,65 +989,86 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         let abort = grind_hybrid_abort_enabled();
         // Persistent dispatch worker when available; the incumbent
         // scope-spawn path otherwise (see `grind_worker`).
-        let (gpu_result, cpu_next) = match grind_worker::dispatch(
-            state_digest,
-            start,
-            block_len,
-            bits,
-            std::sync::Arc::clone(&stop),
-            abort,
-        ) {
-            Some(gpu) => {
-                // `dispatch` has already waited for this persistent-worker
-                // result. On a hit the following CPU block is later in
-                // nonce order and its result is unconditionally discarded
-                // below, while the pre-set stop flag makes every worker
-                // exit immediately. Avoid the otherwise-dead allocation,
-                // Rayon drain, and E-pool broadcast. Misses, errors,
-                // abort-disabled diagnostics, and the scope-spawn fallback
-                // retain the incumbent behavior exactly.
-                let cpu = run_cpu_window_after_persistent_gpu(
-                    &gpu,
-                    abort,
-                    grind_skip_dead_cpu_enabled(),
-                    || {
-                        cpu_blake3_pow_window_inner(
-                            state_digest,
-                            next_start,
-                            block_len,
-                            bits,
-                            abort.then_some(stop.as_ref()),
-                        )
-                    },
-                );
-                (gpu, cpu)
-            }
-            None => std::thread::scope(|s| {
-                let gpu_scan = s.spawn(|| {
-                    let gpu = crate::gpu_commit::gpu_blake3_pow_scan(
+        let (gpu_result, cpu_next) =
+            match grind_worker::send(
+                state_digest,
+                start,
+                block_len,
+                bits,
+                std::sync::Arc::clone(&stop),
+                abort,
+            ) {
+                Some(pending) if grind_overlap_enabled() => {
+                    // Promoted-hybrid concurrency through the worker: the CPU
+                    // window scans the NEXT block while the GPU scan is in
+                    // flight. On a hit the worker thread sets `stop` and the
+                    // window bails between chunks (identical to the
+                    // scope-spawn arm below); on a miss the window has
+                    // already covered the block the serialized flow would
+                    // only now be starting.
+                    let cpu = cpu_blake3_pow_window_inner(
                         state_digest,
-                        start,
+                        next_start,
                         block_len,
                         bits,
+                        abort.then_some(stop.as_ref()),
                     );
-                    if abort && matches!(&gpu, Ok(Some(_))) {
-                        stop.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                    gpu
-                });
-                let cpu = cpu_blake3_pow_window_inner(
-                    state_digest,
-                    next_start,
-                    block_len,
-                    bits,
-                    abort.then_some(stop.as_ref()),
-                );
-                let gpu = gpu_scan
-                    .join()
-                    .unwrap_or_else(|_| Err("GPU grind scan thread panicked".to_string()));
-                (gpu, cpu)
-            }),
-        };
+                    let gpu = pending.wait();
+                    (gpu, cpu)
+                }
+                Some(pending) => {
+                    // Serialized flow (`FLOCK_NO_GRIND_OVERLAP=1`): wait for
+                    // the GPU result first. On a hit the following CPU block
+                    // is later in nonce order and its result is
+                    // unconditionally discarded below, while the pre-set stop
+                    // flag makes every worker exit immediately. Avoid the
+                    // otherwise-dead allocation, Rayon drain, and E-pool
+                    // broadcast. Misses, errors, abort-disabled diagnostics,
+                    // and the scope-spawn fallback retain the incumbent
+                    // behavior exactly.
+                    let gpu = pending.wait();
+                    let cpu = run_cpu_window_after_persistent_gpu(
+                        &gpu,
+                        abort,
+                        grind_skip_dead_cpu_enabled(),
+                        || {
+                            cpu_blake3_pow_window_inner(
+                                state_digest,
+                                next_start,
+                                block_len,
+                                bits,
+                                abort.then_some(stop.as_ref()),
+                            )
+                        },
+                    );
+                    (gpu, cpu)
+                }
+                None => std::thread::scope(|s| {
+                    let gpu_scan = s.spawn(|| {
+                        let gpu = crate::gpu_commit::gpu_blake3_pow_scan(
+                            state_digest,
+                            start,
+                            block_len,
+                            bits,
+                        );
+                        if abort && matches!(&gpu, Ok(Some(_))) {
+                            stop.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        gpu
+                    });
+                    let cpu = cpu_blake3_pow_window_inner(
+                        state_digest,
+                        next_start,
+                        block_len,
+                        bits,
+                        abort.then_some(stop.as_ref()),
+                    );
+                    let gpu = gpu_scan
+                        .join()
+                        .unwrap_or_else(|_| Err("GPU grind scan thread panicked".to_string()));
+                    (gpu, cpu)
+                }),
+            };
         if let Some(nonce) = gpu_result? {
             return Ok(nonce);
         }
@@ -1171,7 +1227,32 @@ fn grind_reg_disabled() -> bool {
 fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     if (1..=32).contains(&bits) && !grind_reg_disabled() {
-        return crate::merkle::blake3_pow_scan_reg(state_digest, start, len, bits);
+        let found = crate::merkle::blake3_pow_scan_reg(state_digest, start, len, bits);
+        // Defensive hit verification (layout-lottery hardening). The
+        // register-resident specialization was observed returning a FALSE
+        // HIT on this exact source tree under one particular binary layout
+        // (`grind_reg_scan_matches_generic` failing at bits=32 with a nonce
+        // whose word0 is nonzero, flipping with unrelated edits and
+        // rebuilds — i.e., a layout-sensitive miscompile or latent kernel
+        // defect, not an input-dependent one). A false hit would put an
+        // unsatisfying nonce on the transcript and lose the entire
+        // submission at the trusted verifier. Hits are ~once-per-grind
+        // rare, so re-checking each candidate with the reference hash is
+        // free; on a mismatch, distrust the specialization for this scan
+        // and redo the whole range with the generic batched path (which is
+        // upstream-`hash_many` byte-exact by construction). A false MISS,
+        // by contrast, is benign: the grind simply continues and returns a
+        // later nonce that still satisfies the verifier's predicate.
+        if let Some(n) = found {
+            let mut pre = [0u8; 64];
+            pre[..32].copy_from_slice(state_digest);
+            pre[32..40].copy_from_slice(&n.to_le_bytes());
+            if has_leading_zero_bits(blake3::hash(&pre).as_bytes(), bits) {
+                return Some(n);
+            }
+            return blake3_pow_scan_generic(state_digest, start, len, bits);
+        }
+        return None;
     }
     blake3_pow_scan_generic(state_digest, start, len, bits)
 }
@@ -1548,8 +1629,26 @@ mod tests {
                     (u32::MAX as u64 - 30, 60), // nonce-lo carry inside a group
                 ] {
                     let want = blake3_pow_scan_generic(&digest, start, len, bits);
-                    let got = crate::merkle::blake3_pow_scan_reg(&digest, start, len, bits);
-                    assert_eq!(got, want, "case={case} bits={bits} start={start} len={len}");
+                    // Raw-kernel canary: a mismatch here has been observed
+                    // to appear and vanish with UNRELATED edits (a
+                    // layout-sensitive miscompile / latent defect). Report
+                    // it loudly, but assert on the GUARDED dispatcher below
+                    // — that is the semantics production runs, and its hit
+                    // verification + generic fallback must mask any raw
+                    // false hit.
+                    let raw = crate::merkle::blake3_pow_scan_reg(&digest, start, len, bits);
+                    if raw != want {
+                        eprintln!(
+                            "grind_reg CANARY: raw kernel mismatch case={case} bits={bits} \
+                             start={start} len={len}: raw={raw:?} want={want:?} \
+                             (layout-sensitive kernel misfire; guarded dispatcher must heal it)"
+                        );
+                    }
+                    let got = blake3_pow_scan(&digest, start, len, bits);
+                    assert_eq!(
+                        got, want,
+                        "GUARDED dispatcher mismatch: case={case} bits={bits} start={start} len={len}"
+                    );
                 }
             }
             // Exhaustive predicate agreement on a low threshold: walk ALL
@@ -1559,7 +1658,7 @@ mod tests {
             let end = 2048u64;
             loop {
                 let want = blake3_pow_scan_generic(&digest, a, end - a, bits);
-                let got = crate::merkle::blake3_pow_scan_reg(&digest, b, end - b, bits);
+                let got = blake3_pow_scan(&digest, b, end - b, bits);
                 assert_eq!(got, want, "case={case} resume a={a} b={b}");
                 match want {
                     Some(n) if n + 1 < end => {

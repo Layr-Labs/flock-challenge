@@ -1054,6 +1054,14 @@ fn prove_packed_padded_inner<C: Challenger>(
     // H2 engagement evidence: E-core chunks claimed across the loop rounds
     // (T3's hetero drain is already behind us, so the delta is loop-only).
     let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
+
+    // Correctness-preserving kill switch for the fused serial tail rounds.
+    fn zc_tail_fused_serial_enabled() -> bool {
+        use std::sync::LazyLock;
+        static ENABLED: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_FUSED_SERIAL").is_none());
+        *ENABLED
+    }
     let hetero_claimed_before = crate::epool::helper_chunks_claimed();
     for i in loop_start..(n_mlv - 1) {
         let t_round_i = std::time::Instant::now();
@@ -1086,8 +1094,31 @@ fn prove_packed_padded_inner<C: Challenger>(
             b_mlv.truncate(half);
             (m1, mi)
         } else {
-            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-            round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            let half = a_mlv.len() / 2;
+            // Fused single-traversal serial tail: same fused implementation
+            // as the ≥2^15 rounds, one chunk (`n_hi = 0`) — deletes the
+            // separate fold pass (and its intermediate re-read) from each of
+            // the ~12 FS-serial tail rounds. Bit-identical messages (exact
+            // field; unit-tested against the two-pass form).
+            // `FLOCK_NO_ZC_TAIL_FUSED_SERIAL=1` restores the two-pass tail.
+            if log_n_before >= 3 && a_nxt.len() >= half && zc_tail_fused_serial_enabled() {
+                let (m1, mi) = crate::zerocheck::multilinear::fold_and_compute_round_pair_serial(
+                    &a_mlv,
+                    &b_mlv,
+                    &mut a_nxt[..half],
+                    &mut b_nxt[..half],
+                    rho_prev,
+                    &r_next,
+                );
+                std::mem::swap(&mut a_mlv, &mut a_nxt);
+                std::mem::swap(&mut b_mlv, &mut b_nxt);
+                a_mlv.truncate(half);
+                b_mlv.truncate(half);
+                (m1, mi)
+            } else {
+                fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+                round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            }
         };
 
         multilinear_msgs.push((m1, mi));
