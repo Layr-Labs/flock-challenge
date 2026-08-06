@@ -383,9 +383,8 @@ pub(crate) fn witgen_hetero_trace() -> bool {
 /// through the shared atomic queue but WITHOUT the efficiency-core pool —
 /// isolates queue-vs-slab scheduling from the E-core addition.
 fn witgen_hetero_main_only() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_WITGEN_HETERO_MAIN_ONLY").is_some()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_WITGEN_HETERO_MAIN_ONLY").is_some());
     *ON
 }
 
@@ -401,9 +400,8 @@ pub(crate) const WITGEN_HETERO_SLAB: usize = 64;
 /// Oracle arm: `FLOCK_WITGEN_HETERO_SINGLE=1` drains single groups per claim
 /// (the naive `run_hetero_chunks` shape) instead of 64-group slabs.
 fn witgen_hetero_single() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_WITGEN_HETERO_SINGLE").is_some()
-    });
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_WITGEN_HETERO_SINGLE").is_some());
     *ON
 }
 
@@ -418,10 +416,7 @@ where
 {
     use rayon::prelude::*;
     if !witgen_hetero_enabled() {
-        (0..n_jobs)
-            .into_par_iter()
-            .with_max_len(256)
-            .for_each(f);
+        (0..n_jobs).into_par_iter().with_max_len(256).for_each(f);
         return;
     }
     if witgen_hetero_main_only() {
@@ -534,11 +529,7 @@ where
         // is consumed by commit. No range is submitted until all eight source
         // segments for it have been fully initialized below.
         unsafe {
-            flock_core::gpu_commit::begin_from_z_first_pass_stream(
-                z.as_mut_ptr(),
-                z.len(),
-                params,
-            )
+            flock_core::gpu_commit::begin_from_z_first_pass_stream(z.as_mut_ptr(), z.len(), params)
         }
     });
     // The range-to-witness mapping below is the ranked BLAKE3 geometry:
@@ -574,135 +565,112 @@ where
     let stripe_base = U8WritePtr(z_lincheck.as_mut_ptr());
 
     let process_group = |g: usize| {
-            // SAFETY: each scheduled group index occurs exactly once. Every
-            // group owns disjoint z/a/b ranges and one disjoint stripe.
-            let (z_grp, a_grp, b_grp, stripe) = unsafe {
-                (
-                    std::slice::from_raw_parts_mut(
-                        z_base.get().add(g * group_f128),
-                        group_f128,
-                    ),
-                    std::slice::from_raw_parts_mut(
-                        a_base.get().add(g * group_f128),
-                        group_f128,
-                    ),
-                    std::slice::from_raw_parts_mut(
-                        b_base.get().add(g * group_f128),
-                        group_f128,
-                    ),
-                    std::slice::from_raw_parts_mut(stripe_base.get().add(g * k), k),
-                )
-            };
-            // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
-            // slot left unbuilt (no padding block) stays zero, which the
-            // lincheck transpose below reads correctly. Full-write builders
-            // skip this pass and must initialize every word themselves.
-            // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
-            // the valid `F128::ZERO`, so a byte memset is a correct init.
-            if !PER_BLOCK_FULLY_WRITES {
-                unsafe {
-                    std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
-                    std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
-                    std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
-                }
-            }
-            for k_in in 0..8 {
-                let global_idx = 8 * g + k_in;
-                let init: &S = if global_idx < n_blocks {
-                    &initial_states[global_idx]
-                } else if let Some(p) = padding {
-                    // Fill the padding slot with a real block so its constant
-                    // wire is set (see `padding` docs above).
-                    p
-                } else {
-                    // No padding block — leave this slot zero.
-                    continue;
-                };
-                let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
-                // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields in
-                // LE order — same byte layout as a u64 pair.
-                let z_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        z_chunk.as_mut_ptr() as *mut u64,
-                        z_chunk.len() * 2,
-                    )
-                };
-                let a_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        a_chunk.as_mut_ptr() as *mut u64,
-                        a_chunk.len() * 2,
-                    )
-                };
-                let b_u64: &mut [u64] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        b_chunk.as_mut_ptr() as *mut u64,
-                        b_chunk.len() * 2,
-                    )
-                };
-                per_block(init, z_u64, a_u64, b_u64);
-            }
-
-            // Bit-transpose 8 z chunks into the lincheck stripe.
-            let z_u64_all: &[u64] = unsafe {
-                std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
-            };
-            // Padded lincheck fold reads only stripe[..useful_bits]
-            // (`partial_fold_packed_z_fast_padded`). Ranked Blake3 defaults
-            // useful_bits=USEFUL_BITS (15409) with k=16384, so the tail past
-            // useful_words*64 is never observed on the timed path.
-            //
-            // `take_u8` is write-before-read / stale-pool (scratch.rs): skipping
-            // the tail memset leaves pool garbage in stripe[useful_words*64..].
-            // Production fold never loads that range; unit oracles that compare
-            // full-k stripes still need an honest zero pad. Gate the memset on
-            // `cfg(test)` so release/ranked proves elide ~960 B/stripe × n_stripes
-            // while `cargo test` keeps the full-stripe contract.
-            let useful_words = stripe_useful_bits.div_ceil(64);
-            for i in 0..useful_words {
-                let lanes: [u64; 8] = [
-                    z_u64_all[0 * u64_per_block + i],
-                    z_u64_all[u64_per_block + i],
-                    z_u64_all[2 * u64_per_block + i],
-                    z_u64_all[3 * u64_per_block + i],
-                    z_u64_all[4 * u64_per_block + i],
-                    z_u64_all[5 * u64_per_block + i],
-                    z_u64_all[6 * u64_per_block + i],
-                    z_u64_all[7 * u64_per_block + i],
-                ];
-                transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
-            }
-            #[cfg(test)]
-            {
-                stripe[useful_words * 64..].fill(0);
-            }
-
-            if EMIT_RATE2_CODEWORD {
-                let codeword =
-                    rate2_codeword.expect("rate-1/2 driver specialization requires a codeword");
-                let elem_offset = g * z_grp.len();
-                // SAFETY: group `g` owns `z[elem_offset..elem_offset+len]`.
-                // The same group exclusively owns those offsets in each of the
-                // two codeword replicas. Groups are disjoint, cover all of z,
-                // and the parallel iterator joins before `codeword` is used
-                // again. Both source and destinations are in bounds and do not
-                // overlap.
-                unsafe {
-                    let dst = codeword.get();
-                    std::ptr::copy_nonoverlapping(
-                        z_grp.as_ptr(),
-                        dst.add(elem_offset),
-                        z_grp.len(),
-                    );
-                    std::ptr::copy_nonoverlapping(
-                        z_grp.as_ptr(),
-                        dst.add(total_f128 + elem_offset),
-                        z_grp.len(),
-                    );
-                }
-            }
+        // SAFETY: each scheduled group index occurs exactly once. Every
+        // group owns disjoint z/a/b ranges and one disjoint stripe.
+        let (z_grp, a_grp, b_grp, stripe) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(z_base.get().add(g * group_f128), group_f128),
+                std::slice::from_raw_parts_mut(a_base.get().add(g * group_f128), group_f128),
+                std::slice::from_raw_parts_mut(b_base.get().add(g * group_f128), group_f128),
+                std::slice::from_raw_parts_mut(stripe_base.get().add(g * k), k),
+            )
         };
+        // Ordinary per-block builders OR 1-bits into pre-zeroed words; any
+        // slot left unbuilt (no padding block) stays zero, which the
+        // lincheck transpose below reads correctly. Full-write builders
+        // skip this pass and must initialize every word themselves.
+        // SAFETY: F128 is `Copy` (no Drop) and the all-zero bit pattern is
+        // the valid `F128::ZERO`, so a byte memset is a correct init.
+        if !PER_BLOCK_FULLY_WRITES {
+            unsafe {
+                std::ptr::write_bytes(z_grp.as_mut_ptr(), 0, z_grp.len());
+                std::ptr::write_bytes(a_grp.as_mut_ptr(), 0, a_grp.len());
+                std::ptr::write_bytes(b_grp.as_mut_ptr(), 0, b_grp.len());
+            }
+        }
+        for k_in in 0..8 {
+            let global_idx = 8 * g + k_in;
+            let init: &S = if global_idx < n_blocks {
+                &initial_states[global_idx]
+            } else if let Some(p) = padding {
+                // Fill the padding slot with a real block so its constant
+                // wire is set (see `padding` docs above).
+                p
+            } else {
+                // No padding block — leave this slot zero.
+                continue;
+            };
+            let z_chunk = &mut z_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+            let a_chunk = &mut a_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+            let b_chunk = &mut b_grp[k_in * f128_per_block..(k_in + 1) * f128_per_block];
+            // SAFETY: F128 is `repr(C, align(16))` with two `u64` fields in
+            // LE order — same byte layout as a u64 pair.
+            let z_u64: &mut [u64] = unsafe {
+                std::slice::from_raw_parts_mut(z_chunk.as_mut_ptr() as *mut u64, z_chunk.len() * 2)
+            };
+            let a_u64: &mut [u64] = unsafe {
+                std::slice::from_raw_parts_mut(a_chunk.as_mut_ptr() as *mut u64, a_chunk.len() * 2)
+            };
+            let b_u64: &mut [u64] = unsafe {
+                std::slice::from_raw_parts_mut(b_chunk.as_mut_ptr() as *mut u64, b_chunk.len() * 2)
+            };
+            per_block(init, z_u64, a_u64, b_u64);
+        }
+
+        // Bit-transpose 8 z chunks into the lincheck stripe.
+        let z_u64_all: &[u64] =
+            unsafe { std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2) };
+        // Padded lincheck fold reads only stripe[..useful_bits]
+        // (`partial_fold_packed_z_fast_padded`). Ranked Blake3 defaults
+        // useful_bits=USEFUL_BITS (15409) with k=16384, so the tail past
+        // useful_words*64 is never observed on the timed path.
+        //
+        // `take_u8` is write-before-read / stale-pool (scratch.rs): skipping
+        // the tail memset leaves pool garbage in stripe[useful_words*64..].
+        // Production fold never loads that range; unit oracles that compare
+        // full-k stripes still need an honest zero pad. Gate the memset on
+        // `cfg(test)` so release/ranked proves elide ~960 B/stripe × n_stripes
+        // while `cargo test` keeps the full-stripe contract.
+        let useful_words = stripe_useful_bits.div_ceil(64);
+        for i in 0..useful_words {
+            let lanes: [u64; 8] = [
+                z_u64_all[0 * u64_per_block + i],
+                z_u64_all[u64_per_block + i],
+                z_u64_all[2 * u64_per_block + i],
+                z_u64_all[3 * u64_per_block + i],
+                z_u64_all[4 * u64_per_block + i],
+                z_u64_all[5 * u64_per_block + i],
+                z_u64_all[6 * u64_per_block + i],
+                z_u64_all[7 * u64_per_block + i],
+            ];
+            transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+        }
+        #[cfg(test)]
+        {
+            stripe[useful_words * 64..].fill(0);
+        }
+
+        if EMIT_RATE2_CODEWORD {
+            let codeword =
+                rate2_codeword.expect("rate-1/2 driver specialization requires a codeword");
+            let elem_offset = g * z_grp.len();
+            // SAFETY: group `g` owns `z[elem_offset..elem_offset+len]`.
+            // The same group exclusively owns those offsets in each of the
+            // two codeword replicas. Groups are disjoint, cover all of z,
+            // and the parallel iterator joins before `codeword` is used
+            // again. Both source and destinations are in bounds and do not
+            // overlap.
+            unsafe {
+                let dst = codeword.get();
+                std::ptr::copy_nonoverlapping(z_grp.as_ptr(), dst.add(elem_offset), z_grp.len());
+                std::ptr::copy_nonoverlapping(
+                    z_grp.as_ptr(),
+                    dst.add(total_f128 + elem_offset),
+                    z_grp.len(),
+                );
+            }
+        }
+    };
 
     let n_groups = n_total / 8;
     // W-H1 engagement evidence: E-core slab claims across the whole witness
@@ -725,12 +693,7 @@ where
             // preserved. The queue join below still bounds the band before
             // submission, exactly like the incumbent Rayon join.
             let band_job = |job: usize| {
-                let g = ranked_stream_group_index(
-                    job,
-                    band,
-                    groups_per_segment,
-                    groups_per_band,
-                );
+                let g = ranked_stream_group_index(job, band, groups_per_segment, groups_per_band);
                 process_group(g);
             };
             drain_group_jobs(SEGMENTS * groups_per_band, &band_job);
@@ -768,13 +731,11 @@ mod streamed_first_pass_tests {
 
         for band in 0..BANDS {
             for job in 0..SEGMENTS * GROUPS_PER_BAND {
-                let g = ranked_stream_group_index(
-                    job,
-                    band,
-                    GROUPS_PER_SEGMENT,
-                    GROUPS_PER_BAND,
+                let g = ranked_stream_group_index(job, band, GROUPS_PER_SEGMENT, GROUPS_PER_BAND);
+                assert!(
+                    !std::mem::replace(&mut seen[g], true),
+                    "duplicate group {g}"
                 );
-                assert!(!std::mem::replace(&mut seen[g], true), "duplicate group {g}");
             }
 
             // One witness group is eight compressions = sixteen NTT
