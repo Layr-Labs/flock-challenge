@@ -88,9 +88,7 @@ fn zc_byte_fold_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 )]
 pub(crate) fn zc_byte_fold_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        zc_byte_fold_value_enabled(std::env::var_os(ENV_NO_ZC_BYTE_FOLD).as_deref())
-    })
+    *ON.get_or_init(|| zc_byte_fold_value_enabled(std::env::var_os(ENV_NO_ZC_BYTE_FOLD).as_deref()))
 }
 
 #[cfg(test)]
@@ -405,10 +403,8 @@ pub(crate) fn cache_dir_candidates(args: &[String]) -> Vec<std::path::PathBuf> {
 mod cache_dir_fallback_tests {
     #[test]
     fn temp_dir_is_first_candidate_and_argv_parents_follow() {
-        let scratch = std::env::temp_dir().join(format!(
-            "flock-cache-dir-test-{}",
-            std::process::id()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("flock-cache-dir-test-{}", std::process::id()));
         let trial = scratch.join("trial-0");
         std::fs::create_dir_all(&trial).unwrap();
         let args = vec![
@@ -429,10 +425,7 @@ mod cache_dir_fallback_tests {
 
     #[test]
     fn numeric_and_relative_args_produce_no_candidates() {
-        let cands = super::cache_dir_candidates(&[
-            "18".to_string(),
-            "proof.bin".to_string(),
-        ]);
+        let cands = super::cache_dir_candidates(&["18".to_string(), "proof.bin".to_string()]);
         assert_eq!(cands.len(), 1); // temp_dir only
     }
 
@@ -480,7 +473,9 @@ pub(crate) fn shared_cache_dir() -> &'static std::path::Path {
                     }
                     top = parent.to_path_buf();
                 }
-                if best.as_ref().is_none_or(|b| top.components().count() < b.components().count())
+                if best
+                    .as_ref()
+                    .is_none_or(|b| top.components().count() < b.components().count())
                 {
                     best = Some(top);
                 }
@@ -599,9 +594,7 @@ fn gpu_from_z_zero_root_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 fn gpu_from_z_zero_root_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        gpu_from_z_zero_root_value_enabled(
-            std::env::var_os(ENV_NO_GPU_FROM_Z_ZERO_ROOT).as_deref(),
-        )
+        gpu_from_z_zero_root_value_enabled(std::env::var_os(ENV_NO_GPU_FROM_Z_ZERO_ROOT).as_deref())
     })
 }
 
@@ -634,17 +627,33 @@ mod from_z_zero_root_gate_tests {
 
     #[test]
     fn exact_one_rollback_and_ranked_shape_only() {
-        assert!(!super::gpu_from_z_zero_root_value_enabled(Some(OsStr::new("1"))));
+        assert!(!super::gpu_from_z_zero_root_value_enabled(Some(
+            OsStr::new("1")
+        )));
         for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
-            assert!(super::gpu_from_z_zero_root_value_enabled(value.map(OsStr::new)));
+            assert!(super::gpu_from_z_zero_root_value_enabled(
+                value.map(OsStr::new)
+            ));
         }
         assert!(super::select_gpu_from_z_zero_root(20, 64, 0, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 0, 4, false, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 0, 4, true, false));
-        assert!(!super::select_gpu_from_z_zero_root(19, 64, 0, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 32, 0, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 1, 4, true, true));
-        assert!(!super::select_gpu_from_z_zero_root(20, 64, 0, 3, true, true));
+        assert!(!super::select_gpu_from_z_zero_root(
+            20, 64, 0, 4, false, true
+        ));
+        assert!(!super::select_gpu_from_z_zero_root(
+            20, 64, 0, 4, true, false
+        ));
+        assert!(!super::select_gpu_from_z_zero_root(
+            19, 64, 0, 4, true, true
+        ));
+        assert!(!super::select_gpu_from_z_zero_root(
+            20, 32, 0, 4, true, true
+        ));
+        assert!(!super::select_gpu_from_z_zero_root(
+            20, 64, 1, 4, true, true
+        ));
+        assert!(!super::select_gpu_from_z_zero_root(
+            20, 64, 0, 3, true, true
+        ));
     }
 
     #[test]
@@ -666,7 +675,10 @@ mod from_z_zero_root_gate_tests {
         const COMPACT_BUILD_MULX: usize = 11 * (0 + 4 + 8 + 12) + 11 * 64 * 4;
         assert_eq!(INCUMBENT_BUILD_MULX, 4_200);
         assert_eq!(COMPACT_BUILD_MULX, 3_080);
-        assert_eq!((INCUMBENT_BUILD_MULX - COMPACT_BUILD_MULX) * GROUPS, 18_350_080);
+        assert_eq!(
+            (INCUMBENT_BUILD_MULX - COMPACT_BUILD_MULX) * GROUPS,
+            18_350_080
+        );
 
         // Layer zero is already a copy. In layers 1..3 the zero root occurs
         // 4+2+1 times per tile and lane; four tiles and 64 lanes share each
@@ -713,9 +725,7 @@ fn gpu_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 
 fn gpu_parent3_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        gpu_parent3_value_enabled(std::env::var_os(ENV_NO_GPU_PARENT3).as_deref())
-    })
+    *ON.get_or_init(|| gpu_parent3_value_enabled(std::env::var_os(ENV_NO_GPU_PARENT3).as_deref()))
 }
 
 fn select_gpu_parent3(n_leaves_total: usize, enabled: bool) -> bool {
@@ -782,9 +792,7 @@ fn gpu_leaf_vec4_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 
 pub(crate) fn gpu_leaf_vec4_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        gpu_leaf_vec4_value_enabled(std::env::var_os(ENV_LEAF_VEC4).as_deref())
-    })
+    *ON.get_or_init(|| gpu_leaf_vec4_value_enabled(std::env::var_os(ENV_LEAF_VEC4).as_deref()))
 }
 
 #[cfg(test)]
@@ -828,7 +836,10 @@ fn hybrid_cb2_spin_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
 
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 fn hybrid_cb2_spin_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -856,9 +867,16 @@ mod hybrid_cb2_spin_gate_tests {
 /// changes only when pages are returned to the OS, never proof bytes.
 pub const ENV_NO_TREE_POOL3: &str = "FLOCK_NO_TREE_POOL3";
 
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 fn tree_pool_cap_for(value: Option<&std::ffi::OsStr>) -> usize {
-    if value == Some(std::ffi::OsStr::new("1")) { 2 } else { 3 }
+    if value == Some(std::ffi::OsStr::new("1")) {
+        2
+    } else {
+        3
+    }
 }
 
 #[cfg(test)]
@@ -894,12 +912,18 @@ mod tree_pool3_gate_tests {
 /// under `FLOCK_GPU_COMMIT_DEBUG`.
 pub const ENV_TUNER_ARM_TIMING: &str = "FLOCK_TUNER_ARM_TIMING";
 
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 fn tuner_arm_timing_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value == Some(std::ffi::OsStr::new("1"))
 }
 
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 fn tuner_arm_timing_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -916,7 +940,9 @@ mod tuner_arm_timing_gate_tests {
         assert_eq!(super::ENV_TUNER_ARM_TIMING, "FLOCK_TUNER_ARM_TIMING");
         assert!(super::tuner_arm_timing_value_enabled(Some(OsStr::new("1"))));
         for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
-            assert!(!super::tuner_arm_timing_value_enabled(value.map(OsStr::new)));
+            assert!(!super::tuner_arm_timing_value_enabled(
+                value.map(OsStr::new)
+            ));
         }
     }
 }
@@ -977,9 +1003,13 @@ mod latch_measure_fix_gate_tests {
 
     #[test]
     fn exact_one_is_the_only_latch_measure_kill_value() {
-        assert!(!super::latch_measure_fix_value_enabled(Some(OsStr::new("1"))));
+        assert!(!super::latch_measure_fix_value_enabled(Some(OsStr::new(
+            "1"
+        ))));
         for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
-            assert!(super::latch_measure_fix_value_enabled(value.map(OsStr::new)));
+            assert!(super::latch_measure_fix_value_enabled(
+                value.map(OsStr::new)
+            ));
         }
     }
 }
@@ -1014,7 +1044,10 @@ pub(crate) fn commit_l0_or_fallback(
     codeword: Vec<F128>,
     params: &crate::pcs::commit::PcsParams,
     cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+) -> (
+    crate::pcs::commit::CodewordBuf,
+    crate::pcs::commit::MerkleTreeBuf,
+) {
     imp::commit_l0_or_fallback(z_packed, codeword, params, cpu)
 }
 
@@ -1066,7 +1099,10 @@ pub(crate) fn finish_from_z_first_pass_or_fallback(
     codeword: Vec<F128>,
     params: &crate::pcs::commit::PcsParams,
     cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+) -> (
+    crate::pcs::commit::CodewordBuf,
+    crate::pcs::commit::MerkleTreeBuf,
+) {
     imp::finish_from_z_first_pass_or_fallback(stream.inner, z_packed, codeword, params, cpu)
 }
 
@@ -1158,8 +1194,7 @@ static PRECOMPUTE_BRANCH_WALL_MS: std::sync::atomic::AtomicU64 =
 /// every scored prove and prevents the sweep from silently substituting its
 /// 100 ms fallback when the commit arm reaches tuning just before the sibling
 /// `rayon::join` arm publishes its measurement.
-const PRECOMPUTE_WALL_HANDOFF_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(2);
+const PRECOMPUTE_WALL_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn wait_for_nonzero_wall_ms(
     wall_bits: &std::sync::atomic::AtomicU64,
@@ -1286,12 +1321,7 @@ pub fn retune_ranked_hybrid_with_exact_contention(
     cpu_tree: &[crate::merkle::Hash],
     replay_ab: impl Fn() + Sync,
 ) {
-    imp::retune_ranked_hybrid_with_exact_contention(
-        params,
-        cpu_codeword,
-        cpu_tree,
-        replay_ab,
-    );
+    imp::retune_ranked_hybrid_with_exact_contention(params, cpu_codeword, cpu_tree, replay_ab);
 }
 
 #[cfg_attr(
@@ -1299,10 +1329,7 @@ pub fn retune_ranked_hybrid_with_exact_contention(
     allow(dead_code)
 )]
 fn wait_for_precompute_branch_wall_ms() -> f64 {
-    wait_for_nonzero_wall_ms(
-        &PRECOMPUTE_BRANCH_WALL_MS,
-        PRECOMPUTE_WALL_HANDOFF_TIMEOUT,
-    )
+    wait_for_nonzero_wall_ms(&PRECOMPUTE_BRANCH_WALL_MS, PRECOMPUTE_WALL_HANDOFF_TIMEOUT)
 }
 
 /// Returns true when the GPU commit machinery is allowed to initialize.
@@ -1496,7 +1523,11 @@ mod imp {
                 // fast path.
                 let libsystem = dlopen(c"/usr/lib/libSystem.B.dylib".as_ptr().cast(), RTLD_NOW);
                 let opt_sym = |h: *mut c_void, name: &core::ffi::CStr| -> *mut c_void {
-                    if h.is_null() { std::ptr::null_mut() } else { dlsym(h, name.as_ptr()) }
+                    if h.is_null() {
+                        std::ptr::null_mut()
+                    } else {
+                        dlsym(h, name.as_ptr())
+                    }
                 };
                 let ddc = opt_sym(libsystem, c"dispatch_data_create");
                 let drel = opt_sym(libsystem, c"dispatch_release");
@@ -1510,10 +1541,7 @@ mod imp {
                         metal,
                         c"MTLCreateSystemDefaultDevice",
                     )?),
-                    copy_all_devices: core::mem::transmute(sym(
-                        metal,
-                        c"MTLCopyAllDevices",
-                    )?),
+                    copy_all_devices: core::mem::transmute(sym(metal, c"MTLCopyAllDevices")?),
                     dispatch_data_create: if ddc.is_null() {
                         None
                     } else {
@@ -3368,34 +3396,55 @@ kernel void blake3_pow_scan(
                     if let Ok(p) = build_psos(prebuilt) {
                         psos = Some(p);
                     }
-                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, prebuilt, c"release");
+                    send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        prebuilt,
+                        c"release"
+                    );
                 }
-                let [pso_ntt, pso_ntt4g4, pso_ntt4, pso_ntt3, pso_ntt4z, pso_ntt4zg4, pso_ntt4h8, pso_ntt5mix, pso_leaf, pso_parent, pso_parent3] =
-                    match psos {
-                        Some(p) => p,
-                        None => {
-                            let src = api.nsstring(MSL_SOURCE)?;
-                            let mut err: Id = NIL;
-                            let library: Id = send!(
-                                api,
-                                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                                device,
-                                c"newLibraryWithSource:options:error:",
-                                src,
-                                NIL,
-                                &mut err
-                            );
-                            if library.is_null() {
-                                return Err(format!(
-                                    "shader compile failed: {}",
-                                    api.error_string(err)
-                                ));
-                            }
-                            let p = build_psos(library)?;
-                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
-                            p
+                let [
+                    pso_ntt,
+                    pso_ntt4g4,
+                    pso_ntt4,
+                    pso_ntt3,
+                    pso_ntt4z,
+                    pso_ntt4zg4,
+                    pso_ntt4h8,
+                    pso_ntt5mix,
+                    pso_leaf,
+                    pso_parent,
+                    pso_parent3,
+                ] = match psos {
+                    Some(p) => p,
+                    None => {
+                        let src = api.nsstring(MSL_SOURCE)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "shader compile failed: {}",
+                                api.error_string(err)
+                            ));
                         }
-                    };
+                        let p = build_psos(library)?;
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
+                        p
+                    }
+                };
 
                 // Keep the embedded incumbent metallib byte-for-byte intact.
                 // The exact rollback skips this supplemental compile and
@@ -3456,7 +3505,12 @@ kernel void blake3_pow_scan(
                         } else {
                             NIL
                         };
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
                         (candidate, export)
                     } else {
                         (NIL, NIL)
@@ -3493,7 +3547,12 @@ kernel void blake3_pow_scan(
                             ns
                         );
                         if function.is_null() {
-                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                library,
+                                c"release"
+                            );
                             return Err("leaf_parent3 kernel not found".into());
                         }
                         let mut pso_err: Id = NIL;
@@ -3505,8 +3564,18 @@ kernel void blake3_pow_scan(
                             function,
                             &mut pso_err
                         );
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, function, c"release");
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            function,
+                            c"release"
+                        );
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
                         if pso.is_null() {
                             return Err(format!(
                                 "leaf_parent3 pipeline: {}",
@@ -3580,7 +3649,12 @@ kernel void blake3_pow_scan(
                         let leaf = match build("leaf_hash_v4") {
                             Ok(l) => l,
                             Err(e) => {
-                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                                send!(
+                                    api,
+                                    unsafe extern "C" fn(Id, Sel) -> Id,
+                                    library,
+                                    c"release"
+                                );
                                 return Err(e);
                             }
                         };
@@ -3588,11 +3662,21 @@ kernel void blake3_pow_scan(
                             Ok(p) => p,
                             Err(e) => {
                                 send!(api, unsafe extern "C" fn(Id, Sel) -> Id, leaf, c"release");
-                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                                send!(
+                                    api,
+                                    unsafe extern "C" fn(Id, Sel) -> Id,
+                                    library,
+                                    c"release"
+                                );
                                 return Err(e);
                             }
                         };
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
                         Ok((leaf, parent3))
                     })();
                     match built {
@@ -3650,7 +3734,12 @@ kernel void blake3_pow_scan(
                             ns
                         );
                         if function.is_null() {
-                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                library,
+                                c"release"
+                            );
                             return Err("PCS grind kernel blake3_pow_scan not found".into());
                         }
                         let mut pso_err: Id = NIL;
@@ -3662,8 +3751,18 @@ kernel void blake3_pow_scan(
                             function,
                             &mut pso_err
                         );
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, function, c"release");
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            function,
+                            c"release"
+                        );
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
                         if pso.is_null() {
                             return Err(format!(
                                 "PCS grind pipeline blake3_pow_scan: {}",
@@ -3793,7 +3892,12 @@ kernel void blake3_pow_scan(
         pub(crate) unsafe fn release(&self, obj: Id) {
             if !obj.is_null() {
                 unsafe {
-                    send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, obj, c"release");
+                    send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        obj,
+                        c"release"
+                    );
                 }
             }
         }
@@ -3802,7 +3906,14 @@ kernel void blake3_pow_scan(
         /// autorelease pool is popped. Paired with [`Self::release`] after the
         /// stream waits for completion.
         pub(crate) unsafe fn retain(&self, obj: Id) -> Id {
-            unsafe { send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, obj, c"retain") }
+            unsafe {
+                send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    obj,
+                    c"retain"
+                )
+            }
         }
 
         pub(crate) unsafe fn command_buffer(&self) -> Result<Id, String> {
@@ -3884,8 +3995,16 @@ kernel void blake3_pow_scan(
                     unsafe extern "C" fn(Id, Sel, MtlSize, MtlSize),
                     enc,
                     c"dispatchThreadgroups:threadsPerThreadgroup:",
-                    MtlSize { width: groups, height: 1, depth: 1 },
-                    MtlSize { width: threads_per_group, height: 1, depth: 1 }
+                    MtlSize {
+                        width: groups,
+                        height: 1,
+                        depth: 1
+                    },
+                    MtlSize {
+                        width: threads_per_group,
+                        height: 1,
+                        depth: 1
+                    }
                 );
             }
         }
@@ -3959,11 +4078,7 @@ kernel void blake3_pow_scan(
         /// thread skips both. Bounded: past `budget_ms` of spinning it falls
         /// back to the blocking wait, so a long or hung dispatch costs one
         /// spin budget and then behaves exactly like [`commit_and_wait`].
-        pub(crate) unsafe fn commit_and_spin(
-            &self,
-            cb: Id,
-            budget_ms: f64,
-        ) -> Result<(), String> {
+        pub(crate) unsafe fn commit_and_spin(&self, cb: Id, budget_ms: f64) -> Result<(), String> {
             unsafe {
                 send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
                 let start = std::time::Instant::now();
@@ -3978,12 +4093,8 @@ kernel void blake3_pow_scan(
                         if status == 4 {
                             return Ok(());
                         }
-                        let err: Id = send!(
-                            self.api,
-                            unsafe extern "C" fn(Id, Sel) -> Id,
-                            cb,
-                            c"error"
-                        );
+                        let err: Id =
+                            send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
                         return Err(format!(
                             "command buffer status {status}: {}",
                             self.api.error_string(err)
@@ -4017,12 +4128,8 @@ kernel void blake3_pow_scan(
                         if status == 4 {
                             return Ok(());
                         }
-                        let err: Id = send!(
-                            self.api,
-                            unsafe extern "C" fn(Id, Sel) -> Id,
-                            cb,
-                            c"error"
-                        );
+                        let err: Id =
+                            send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
                         return Err(format!(
                             "command buffer status {status}: {}",
                             self.api.error_string(err)
@@ -4063,12 +4170,8 @@ kernel void blake3_pow_scan(
                         if status == 4 {
                             return Ok(());
                         }
-                        let err: Id = send!(
-                            self.api,
-                            unsafe extern "C" fn(Id, Sel) -> Id,
-                            cb,
-                            c"error"
-                        );
+                        let err: Id =
+                            send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
                         return Err(format!(
                             "command buffer status {status}: {}",
                             self.api.error_string(err)
@@ -4100,12 +4203,8 @@ kernel void blake3_pow_scan(
                 if status == 4 {
                     Ok(())
                 } else {
-                    let err: Id = send!(
-                        self.api,
-                        unsafe extern "C" fn(Id, Sel) -> Id,
-                        cb,
-                        c"error"
-                    );
+                    let err: Id =
+                        send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
                     Err(format!(
                         "command buffer status {status}: {}",
                         self.api.error_string(err)
@@ -4264,11 +4363,9 @@ kernel void blake3_pow_scan(
                 // loses badly because each lane keeps 16 F128s live.
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
-                    4 if share_log > 0 && s >= share_log => (
-                        gpu.pso_ntt4g4,
-                        64u64,
-                        1u64 << (log_d - f - share_log),
-                    ),
+                    4 if share_log > 0 && s >= share_log => {
+                        (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
+                    }
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
@@ -4278,9 +4375,7 @@ kernel void blake3_pow_scan(
                     // share, so spend the same occupancy currency the other
                     // way — halve the per-tile table footprint (byte-Horner
                     // 32-entry tables) so twice the tiles fit a core.
-                    4 if super::pass_tune_enabled() => {
-                        (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f))
-                    }
+                    4 if super::pass_tune_enabled() => (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f)),
                     4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
@@ -4329,11 +4424,9 @@ kernel void blake3_pow_scan(
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
-                    4 if share_log > 0 && s >= share_log => (
-                        gpu.pso_ntt4g4,
-                        64u64,
-                        1u64 << (log_d - f - share_log),
-                    ),
+                    4 if share_log > 0 && s >= share_log => {
+                        (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
+                    }
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
@@ -4343,9 +4436,7 @@ kernel void blake3_pow_scan(
                     // share, so spend the same occupancy currency the other
                     // way — halve the per-tile table footprint (byte-Horner
                     // 32-entry tables) so twice the tiles fit a core.
-                    4 if super::pass_tune_enabled() => {
-                        (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f))
-                    }
+                    4 if super::pass_tune_enabled() => (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f)),
                     4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
@@ -4411,10 +4502,16 @@ kernel void blake3_pow_scan(
             // bytes; NIL (kill switch / compile failure) keeps the incumbent.
             // Dispatch itself happens below — either fused (leaf_parent3) or
             // via the incumbent-shaped leaf pass using the swapped pipeline.
-            let pso_leaf =
-                if gpu.pso_leaf_v4.is_null() { gpu.pso_leaf } else { gpu.pso_leaf_v4 };
-            let pso_parent3 =
-                if gpu.pso_parent3_v4.is_null() { gpu.pso_parent3 } else { gpu.pso_parent3_v4 };
+            let pso_leaf = if gpu.pso_leaf_v4.is_null() {
+                gpu.pso_leaf
+            } else {
+                gpu.pso_leaf_v4
+            };
+            let pso_parent3 = if gpu.pso_parent3_v4.is_null() {
+                gpu.pso_parent3
+            } else {
+                gpu.pso_parent3_v4
+            };
             let mut level_start = 0usize; // global node index of level base
             let mut level_len = n_leaves_total;
             let mut local_start = leaf_start;
@@ -4494,12 +4591,7 @@ kernel void blake3_pow_scan(
                 let write_level_start = level_start + level_len;
                 let n_out = local_len / 2;
                 gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
-                gpu.set_buffer(
-                    enc,
-                    tree_buf,
-                    (write_level_start + local_start / 2) * 32,
-                    1,
-                );
+                gpu.set_buffer(enc, tree_buf, (write_level_start + local_start / 2) * 32, 1);
                 let tpg = 256u64.min(n_out as u64);
                 gpu.dispatch(enc, n_out as u64 / tpg, tpg);
                 level_start = write_level_start;
@@ -4544,10 +4636,16 @@ kernel void blake3_pow_scan(
             // bytes; NIL (kill switch / compile failure) keeps the incumbent.
             // Dispatch itself happens below — either fused (leaf_parent3) or
             // via the incumbent-shaped leaf pass using the swapped pipeline.
-            let pso_leaf =
-                if gpu.pso_leaf_v4.is_null() { gpu.pso_leaf } else { gpu.pso_leaf_v4 };
-            let pso_parent3 =
-                if gpu.pso_parent3_v4.is_null() { gpu.pso_parent3 } else { gpu.pso_parent3_v4 };
+            let pso_leaf = if gpu.pso_leaf_v4.is_null() {
+                gpu.pso_leaf
+            } else {
+                gpu.pso_leaf_v4
+            };
+            let pso_parent3 = if gpu.pso_parent3_v4.is_null() {
+                gpu.pso_parent3
+            } else {
+                gpu.pso_parent3_v4
+            };
             let mut read_start = 0usize; // node index
             let mut read_len = n_leaves;
 
@@ -5158,7 +5256,11 @@ kernel void blake3_pow_scan(
         if std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some() {
             eprintln!(
                 "[gpu-commit] {tag}: poisoned lock {}",
-                if recovered { "recovered" } else { "left disabled" }
+                if recovered {
+                    "recovered"
+                } else {
+                    "left disabled"
+                }
             );
         }
     }
@@ -5195,17 +5297,19 @@ kernel void blake3_pow_scan(
     fn copy_bytes_parallel(src: *const u8, dst: &mut [u8]) {
         use rayon::prelude::*;
         let src_addr = src as usize;
-        dst.par_chunks_mut(1 << 22).enumerate().for_each(|(i, chunk)| {
-            // SAFETY: caller guarantees `src` points at least `dst.len()`
-            // bytes; chunks are disjoint.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (src_addr as *const u8).add(i << 22),
-                    chunk.as_mut_ptr(),
-                    chunk.len(),
-                );
-            }
-        });
+        dst.par_chunks_mut(1 << 22)
+            .enumerate()
+            .for_each(|(i, chunk)| {
+                // SAFETY: caller guarantees `src` points at least `dst.len()`
+                // bytes; chunks are disjoint.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        (src_addr as *const u8).add(i << 22),
+                        chunk.as_mut_ptr(),
+                        chunk.len(),
+                    );
+                }
+            });
     }
 
     /// Parent levels built by each finalized 1,024-leaf CPU-suffix chunk.
@@ -5594,8 +5698,10 @@ kernel void blake3_pow_scan(
                     }
                     while local_len > 1 {
                         let write_level_start = level_start + level_len;
-                        let (r0, w0) =
-                            (level_start + local_start, write_level_start + local_start / 2);
+                        let (r0, w0) = (
+                            level_start + local_start,
+                            write_level_start + local_start / 2,
+                        );
                         let n_out = local_len / 2;
                         // ≤1024-output jobs (the parent kernel's contract),
                         // parallel across the level.
@@ -5610,10 +5716,8 @@ kernel void blake3_pow_scan(
                                 tree_base.ptr().add(r0 + 2 * o),
                                 2 * len,
                             );
-                            let write = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(w0 + o),
-                                len,
-                            );
+                            let write =
+                                core::slice::from_raw_parts_mut(tree_base.ptr().add(w0 + o), len);
                             crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
                         });
                         level_start = write_level_start;
@@ -5898,7 +6002,13 @@ kernel void blake3_pow_scan(
         // so the sweep's `rayon::join` arm is `Send`.
         unsafe impl Send for GraphCtx<'_> {}
         unsafe impl Sync for GraphCtx<'_> {}
-        let ctx = GraphCtx { gpu, z_buf, staging, tw_buf, tree_buf };
+        let ctx = GraphCtx {
+            gpu,
+            z_buf,
+            staging,
+            tw_buf,
+            tree_buf,
+        };
         let run_graph = |k: usize| -> Result<(), String> {
             let c = &ctx;
             unsafe {
@@ -6009,8 +6119,8 @@ kernel void blake3_pow_scan(
         // once, repeatedly transformed stale staging, and subtracted a
         // first-pass wall from an interval that did not contain that pass.
         // Keep an exact same-binary rollback for paired measurements.
-        let canonical_reprime = streamed_probe
-            && std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_none();
+        let canonical_reprime =
+            streamed_probe && std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_none();
         let first_pass_ms = if streamed_probe && !canonical_reprime {
             let c = &ctx;
             let t0 = std::time::Instant::now();
@@ -6057,7 +6167,11 @@ kernel void blake3_pow_scan(
                      graph-arm {arm_ms:.1} ms join {join_ms:.1} ms"
                 );
             }
-            let scored = if super::tuner_arm_timing_enabled() { arm_ms } else { join_ms };
+            let scored = if super::tuner_arm_timing_enabled() {
+                arm_ms
+            } else {
+                join_ms
+            };
             Ok((scored - first_pass_ms).max(0.0))
         };
         const CANDIDATES: [usize; 8] = [0, 2, 3, 4, 5, 6, 7, 8];
@@ -6166,9 +6280,7 @@ kernel void blake3_pow_scan(
     ) {
         use std::sync::atomic::Ordering;
 
-        if !ranked_exact_tune_applicable(params)
-            || !super::claim_ranked_exact_contention_tune()
-        {
+        if !ranked_exact_tune_applicable(params) || !super::claim_ranked_exact_contention_tune() {
             return;
         }
 
@@ -6264,13 +6376,7 @@ kernel void blake3_pow_scan(
             })
         };
         let reprime = || unsafe {
-            run_from_z_first_pass(
-                ctx.gpu,
-                ctx.z_buf,
-                ctx.staging,
-                ctx.tw_buf,
-                params.k_code(),
-            )
+            run_from_z_first_pass(ctx.gpu, ctx.z_buf, ctx.staging, ctx.tw_buf, params.k_code())
         };
         let samples = match collect_ranked_exact_samples(reprime, sample) {
             Ok(samples) => samples,
@@ -6288,11 +6394,8 @@ kernel void blake3_pow_scan(
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
-        let Some(chosen) = choose_hybrid_k(
-            &RANKED_EXACT_TUNE_CANDIDATES,
-            &means,
-            DEFAULT_HYBRID_K,
-        ) else {
+        let Some(chosen) = choose_hybrid_k(&RANKED_EXACT_TUNE_CANDIDATES, &means, DEFAULT_HYBRID_K)
+        else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
@@ -6360,11 +6463,7 @@ kernel void blake3_pow_scan(
                 if verified { chosen } else { 0 },
             );
         }
-        finish_ranked_exact_contention_tune(
-            params,
-            cpu_tree,
-            if verified { chosen } else { 0 },
-        );
+        finish_ranked_exact_contention_tune(params, cpu_tree, if verified { chosen } else { 0 });
     }
 
     /// Use the ranked cache-local deep-pair CPU suffix and hash each finalized
@@ -6424,9 +6523,10 @@ kernel void blake3_pow_scan(
             // in flight when a prove pauses the bridge (its drain hides under
             // the prove's CPU-side witness start), large enough to hold DVFS.
             const KW_LEAVES: usize = 16_384;
-            let (Ok(data), Ok(tree)) =
-                (gpu.new_buffer(KW_LEAVES * 1024), gpu.new_buffer(KW_LEAVES * 32))
-            else {
+            let (Ok(data), Ok(tree)) = (
+                gpu.new_buffer(KW_LEAVES * 1024),
+                gpu.new_buffer(KW_LEAVES * 32),
+            ) else {
                 gpu.pool_pop(pool);
                 return;
             };
@@ -6516,8 +6616,7 @@ kernel void blake3_pow_scan(
     fn warmup_cache_msl_fnv_for(zero_root: bool, leaf_vec4: bool) -> u64 {
         let mut key = fnv1a64(MSL_SOURCE);
         if zero_root {
-            key ^= fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
-                ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
+            key ^= fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1) ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
         }
         if leaf_vec4 {
             key ^= fnv1a64(LEAF_VEC4_MSL_SOURCE).rotate_left(2) ^ 0x4C45_4146_5F56_3431; // "LEAF_V41"
@@ -6585,7 +6684,11 @@ kernel void blake3_pow_scan(
     }
 
     fn warmup_cache_path() -> std::path::PathBuf {
-        let version = if hybrid_tune_canonical_reprime_enabled() { 3 } else { 2 };
+        let version = if hybrid_tune_canonical_reprime_enabled() {
+            3
+        } else {
+            2
+        };
         super::shared_cache_dir().join(format!("flock-warmup-latch-v{version}.bin"))
     }
 
@@ -6618,7 +6721,12 @@ kernel void blake3_pow_scan(
         }
         let mut cpu_root: Hash = [0u8; 32];
         cpu_root.copy_from_slice(root_bytes);
-        Some(WarmupCache { latch_on, tuned_k, cpu_wall_ms, cpu_root })
+        Some(WarmupCache {
+            latch_on,
+            tuned_k,
+            cpu_wall_ms,
+            cpu_root,
+        })
     }
 
     fn write_warmup_cache(
@@ -6729,8 +6837,7 @@ kernel void blake3_pow_scan(
                 // Read-only no-copy wrap of the caller's z buffer. The GPU
                 // never writes it; the pooled allocation is page-aligned.
                 let z_bytes = core::mem::size_of_val(z_packed);
-                let z_buf =
-                    gpu.wrap_buffer(z_packed.as_ptr().cast_mut().cast::<u8>(), z_bytes)?;
+                let z_buf = gpu.wrap_buffer(z_packed.as_ptr().cast_mut().cast::<u8>(), z_bytes)?;
                 created.push(z_buf);
 
                 // Untimed wiring run, then the identical timed run.
@@ -6814,7 +6921,10 @@ kernel void blake3_pow_scan(
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         let dbg = debug_enabled();
 
@@ -6837,13 +6947,10 @@ kernel void blake3_pow_scan(
                     *latch = LatchState::Off;
                     return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(cpu_tree));
                 }
-                if let Ok(run) =
-                    warmup_gpu_run(z_packed, params.k_code(), params.n_leaves())
-                {
+                if let Ok(run) = warmup_gpu_run(z_packed, params.k_code(), params.n_leaves()) {
                     let tree_ok = run.gpu_tree.last() == Some(&cache.cpu_root);
                     let force = std::env::var_os(super::ENV_GPU_COMMIT_FORCE).is_some();
-                    let fast =
-                        run.gpu_wall_ms * super::LATCH_MARGIN <= cache.cpu_wall_ms;
+                    let fast = run.gpu_wall_ms * super::LATCH_MARGIN <= cache.cpu_wall_ms;
                     // Mirror the incumbent latch contract: latching ON also
                     // pins the warmup z allocation to its retained no-copy
                     // Metal view (the promoted z-pin mechanism). On pin
@@ -6859,8 +6966,7 @@ kernel void blake3_pow_scan(
                                 run.gpu_wall_ms, cache.cpu_wall_ms, cache.tuned_k
                             );
                         }
-                        TUNED_HYBRID_K
-                            .store(cache.tuned_k, std::sync::atomic::Ordering::Relaxed);
+                        TUNED_HYBRID_K.store(cache.tuned_k, std::sync::atomic::Ordering::Relaxed);
                         // The publishing worker already completed the exact
                         // replay; keep cache-hit workers out of calibration.
                         super::satisfy_ranked_exact_contention_tune();
@@ -6915,8 +7021,8 @@ kernel void blake3_pow_scan(
                 const STATIC_LATCH_MAX_GPU_MS: f64 = 500.0;
                 let deterministic = run.gpu_tree.last() == Some(&run.wiring_root);
                 let sane = run.gpu_wall_ms > 0.0 && run.gpu_wall_ms <= STATIC_LATCH_MAX_GPU_MS;
-                let z_pinned = !super::gpu_z_pin_enabled()
-                    || crate::scratch::pin_f128_allocation(z_packed);
+                let z_pinned =
+                    !super::gpu_z_pin_enabled() || crate::scratch::pin_f128_allocation(z_packed);
                 if deterministic && sane && z_pinned {
                     if dbg {
                         eprintln!(
@@ -7099,7 +7205,10 @@ kernel void blake3_pow_scan(
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         use std::sync::atomic::Ordering;
         let log_d = params.k_code();
@@ -7213,7 +7322,10 @@ kernel void blake3_pow_scan(
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         use std::sync::atomic::Ordering;
 
@@ -7408,7 +7520,10 @@ kernel void blake3_pow_scan(
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         if !super::gpu_commit_enabled()
             || !super::is_ranked_gpu_shape(params)
@@ -7426,9 +7541,7 @@ kernel void blake3_pow_scan(
                 let tree = cpu(&mut codeword);
                 (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree))
             }
-            LatchState::Undecided => {
-                warmup_and_decide(&mut latch, z_packed, codeword, params, cpu)
-            }
+            LatchState::Undecided => warmup_and_decide(&mut latch, z_packed, codeword, params, cpu),
             LatchState::On(_) => run_latched(&mut latch, z_packed, codeword, params, cpu),
         }
     }
@@ -7526,8 +7639,7 @@ kernel void blake3_pow_scan(
                     encode_merkle(gpu, enc, data_buf, tree_buf, n_leaves);
                     gpu.end_encoding(enc);
                     gpu.commit_and_wait(cb)?;
-                    let mut tree: Vec<crate::merkle::Hash> =
-                        crate::alloc_uninit_vec(total_nodes);
+                    let mut tree: Vec<crate::merkle::Hash> = crate::alloc_uninit_vec(total_nodes);
                     std::ptr::copy_nonoverlapping(
                         gpu.buffer_contents(tree_buf),
                         tree.as_mut_ptr().cast::<u8>(),
@@ -7950,11 +8062,21 @@ LC_KERNEL(lc_fold_stripes, 4)
                     Ok(r) => r,
                     Err(e) => {
                         gpu.release(fold);
-                        send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        send!(
+                            gpu.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
                         return Err(e);
                     }
                 };
-                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    library,
+                    c"release"
+                );
                 Ok((fold, reduce))
             })();
             gpu.pool_pop(pool);
@@ -8015,7 +8137,12 @@ LC_KERNEL(lc_fold_stripes, 4)
                         }
                     };
                     let out = build("lc_fold_stripes");
-                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
                     out
                 })();
                 gpu.pool_pop(pool);
@@ -8079,10 +8206,7 @@ LC_KERNEL(lc_fold_stripes, 4)
             const MAX_WRAPS: usize = 3;
             let ptr = z.as_ptr() as usize;
             let len = z.len();
-            if let Some(&(_, _, buf)) = self
-                .z_wraps
-                .iter()
-                .find(|(p, l, _)| *p == ptr && *l == len)
+            if let Some(&(_, _, buf)) = self.z_wraps.iter().find(|(p, l, _)| *p == ptr && *l == len)
             {
                 return Ok(buf);
             }
@@ -8310,7 +8434,6 @@ LC_KERNEL(lc_fold_stripes, 4)
             self.claim_lo
         }
 
-
         /// Wait for the prefix and XOR it into `dst` (length `k`). `head_ms`
         /// is the wall between submission and the start of the CPU suffix,
         /// `suffix_ms` the CPU suffix wall; both feed the split autotune.
@@ -8366,7 +8489,8 @@ LC_KERNEL(lc_fold_stripes, 4)
                     "{} prefix {}/{} claims: gpu={gpu_ms:.2}ms submit-to-drain={wall_ms:.2}ms \
                      head={head_ms:.2}ms cpu-suffix={suffix_ms:.2}ms",
                     self.arm.tag(),
-                    self.claim_lo, self.n_claims,
+                    self.claim_lo,
+                    self.n_claims,
                 );
             }
             if self.arm == FoldArm::Zc {
@@ -8393,8 +8517,7 @@ LC_KERNEL(lc_fold_stripes, 4)
                 // and price u_gpu from the converged wall. Once per
                 // process, untimed warmup prove only.
                 if self.arm.claim_override().is_none()
-                    && self.arm.tuned().load(std::sync::atomic::Ordering::Relaxed)
-                        == usize::MAX
+                    && self.arm.tuned().load(std::sync::atomic::Ordering::Relaxed) == usize::MAX
                     && self.claim_lo > 0
                     && self.claim_lo < self.n_claims
                 {
@@ -8409,13 +8532,10 @@ LC_KERNEL(lc_fold_stripes, 4)
                         .calibrated()
                         .swap(true, std::sync::atomic::Ordering::Relaxed)
                     {
-                        let full_hi =
-                            crate::lincheck::oblock_claim_stripe_base(self.n_claims);
+                        let full_hi = crate::lincheck::oblock_claim_stripe_base(self.n_claims);
                         let replay = ZcFoldPlan {
                             stripe_hi: full_hi,
-                            stripes_per_chunk: full_hi
-                                .div_ceil(ZC_FOLD_CHUNKS)
-                                .next_multiple_of(4),
+                            stripes_per_chunk: full_hi.div_ceil(ZC_FOLD_CHUNKS).next_multiple_of(4),
                             ..self.plan
                         };
                         // SAFETY: the probe dispatch completed and its
@@ -8479,8 +8599,7 @@ LC_KERNEL(lc_fold_stripes, 4)
                             gpu.pool_pop(pool);
                         }
                     }
-                    if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() && u_gpu > 0.0
-                    {
+                    if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() && u_gpu > 0.0 {
                         let measured = u_gpu / u_cpu;
                         let ratio = lincheck_fold_forced_ratio().unwrap_or(measured);
                         let g = lincheck_gate_share(ratio, self.n_claims);
@@ -8628,7 +8747,11 @@ LC_KERNEL(lc_fold_stripes, 4)
                 cb,
                 c"GPUEndTime"
             );
-            if end > start { (end - start) * 1e3 } else { 0.0 }
+            if end > start {
+                (end - start) * 1e3
+            } else {
+                0.0
+            }
         }
     }
 
@@ -8674,9 +8797,8 @@ LC_KERNEL(lc_fold_stripes, 4)
     /// (exact rollback lever for the min-over-replays host-wall measurement
     /// correction in [`ZcFoldJob::finish_xor_into`]).
     fn zc_fold_measure_fix_enabled() -> bool {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_NO_ZC_FOLD_MEASURE_FIX").is_none()
-        });
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_FOLD_MEASURE_FIX").is_none());
         *ON
     }
 
@@ -8791,18 +8913,11 @@ LC_KERNEL(lc_fold_stripes, 4)
             1.0
         };
         let Some(g) = zc_fold_balanced_share(
-            claim_lo,
-            n_claims,
-            gpu_ms,
-            head_ms,
-            suffix_ms,
-            bias,
-            byte_fold,
+            claim_lo, n_claims, gpu_ms, head_ms, suffix_ms, bias, byte_fold,
         ) else {
             return;
         };
-        arm.tuned()
-            .store(g, std::sync::atomic::Ordering::Relaxed);
+        arm.tuned().store(g, std::sync::atomic::Ordering::Relaxed);
         if arm.debug() {
             eprintln!(
                 "{} split {claim_lo}/{n_claims} gpu={gpu_ms:.2}ms head={head_ms:.2}ms \
@@ -8832,8 +8947,7 @@ LC_KERNEL(lc_fold_stripes, 4)
         if !(u_gpu.is_finite() && u_cpu.is_finite()) || u_gpu <= 0.0 || u_cpu <= 0.0 {
             return None;
         }
-        let balanced =
-            bias * (head_ms.max(0.0) + n_claims as f64 * u_cpu) / (u_gpu + u_cpu);
+        let balanced = bias * (head_ms.max(0.0) + n_claims as f64 * u_cpu) / (u_gpu + u_cpu);
         let hi = if byte_fold {
             n_claims as i64
         } else {
@@ -8851,8 +8965,7 @@ LC_KERNEL(lc_fold_stripes, 4)
     /// Successful GPU prefix submissions this process. Lets a test assert the
     /// arm actually ran instead of silently falling back to the CPU, and lets
     /// an in-process A/B confirm which arm produced a prove.
-    static ZC_FOLD_SUBMITS: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static ZC_FOLD_SUBMITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     /// Same for the lincheck arm.
     static LINCHECK_FOLD_SUBMITS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
@@ -9098,14 +9211,7 @@ LC_KERNEL(lc_fold_stripes, 4)
         if !super::gpu_lincheck_enabled() {
             return None;
         }
-        launch_fold_prefix(
-            FoldArm::Lincheck,
-            z_packed,
-            m,
-            k_log,
-            useful_bits,
-            eq_outer,
-        )
+        launch_fold_prefix(FoldArm::Lincheck, z_packed, m, k_log, useful_bits, eq_outer)
     }
 
     fn launch_fold_prefix(
@@ -9175,9 +9281,7 @@ LC_KERNEL(lc_fold_stripes, 4)
             // the shipped nibble B8 route. Lincheck keeps its existing B4
             // route and stays CPU-only when that pipeline is unavailable.
             let (pso_fold, block, kernel, byte_fold) = match arm {
-                FoldArm::Zc
-                    if super::zc_byte_fold_enabled() && !state.pso_lc_fold.is_null() =>
-                {
+                FoldArm::Zc if super::zc_byte_fold_enabled() && !state.pso_lc_fold.is_null() => {
                     (state.pso_lc_fold, 4, "byte-b4", true)
                 }
                 FoldArm::Zc => (state.pso_fold, 8, "nibble-b8", false),
@@ -9404,7 +9508,12 @@ LC_KERNEL(lc_fold_stripes, 4)
                 ns
             );
             if f.is_null() {
-                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    library,
+                    c"release"
+                );
                 return Err(format!("supplemental kernel {name} not found"));
             }
             let mut perr: Id = NIL;
@@ -9417,7 +9526,12 @@ LC_KERNEL(lc_fold_stripes, 4)
                 &mut perr
             );
             send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-            send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+            send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> Id,
+                library,
+                c"release"
+            );
             if pso.is_null() {
                 Err(format!(
                     "supplemental pipeline {name}: {}",
@@ -9611,8 +9725,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                         .for_each(|chunk| chunk.fill(F128::ZERO));
                 }
                 if crate::scratch::pin2_f128_allocation(&seed) {
-                    match gpu.wrap_buffer(seed.as_ptr().cast_mut().cast::<u8>(), seed_bytes)
-                    {
+                    match gpu.wrap_buffer(seed.as_ptr().cast_mut().cast::<u8>(), seed_bytes) {
                         Ok(buf) => {
                             // Wire the pages with one throwaway leaf pass
                             // into the persistent tree buffer (overwritten by
@@ -9634,9 +9747,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                             {
                                 eprintln!("[gpu-recmerkle] seed wiring failed ({e})");
                             }
-                            state
-                                .wraps
-                                .push((seed.as_ptr() as usize, seed_bytes, buf));
+                            state.wraps.push((seed.as_ptr() as usize, seed_bytes, buf));
                         }
                         Err(e) => {
                             if rec_merkle_debug() {
@@ -9655,10 +9766,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
-    pub(crate) fn gpu_recursive_merkle_blake3(
-        data: &[u8],
-        num_leaves: usize,
-    ) -> Option<Vec<Hash>> {
+    pub(crate) fn gpu_recursive_merkle_blake3(data: &[u8], num_leaves: usize) -> Option<Vec<Hash>> {
         if !super::gpu_recursive_merkle_enabled()
             || !REC_MERKLE_SHAPES.contains(&num_leaves)
             || data.len() != num_leaves * 128
@@ -9698,7 +9806,10 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 
         let data_addr = data.as_ptr() as usize;
         if rec_merkle_debug() {
-            eprintln!("[gpu-recmerkle] call: mat at {data_addr:#x} len {} MiB", data.len() >> 20);
+            eprintln!(
+                "[gpu-recmerkle] call: mat at {data_addr:#x} len {} MiB",
+                data.len() >> 20
+            );
         }
         let cached = state
             .wraps
@@ -9775,10 +9886,8 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 
         let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
         unsafe {
-            let dst = core::slice::from_raw_parts_mut(
-                tree.as_mut_ptr().cast::<u8>(),
-                total_nodes * 32,
-            );
+            let dst =
+                core::slice::from_raw_parts_mut(tree.as_mut_ptr().cast::<u8>(), total_nodes * 32);
             copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
         }
         if let Some(t) = started {
@@ -10133,7 +10242,12 @@ kernel void zc_r2_products(
                     ns
                 );
                 if f.is_null() {
-                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
                     return Err("zc_r2_products kernel not found".into());
                 }
                 let mut perr: Id = NIL;
@@ -10146,7 +10260,12 @@ kernel void zc_r2_products(
                     &mut perr
                 );
                 send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    library,
+                    c"release"
+                );
                 if pso.is_null() {
                     return Err(format!(
                         "zc_r2_products pipeline: {}",
@@ -10279,11 +10398,7 @@ kernel void zc_r2_products(
     unsafe fn zc_r2_wrap(state: &mut ZcR2, gpu: &Gpu, data: &[u8]) -> Result<Id, String> {
         let ptr = data.as_ptr() as usize;
         let len = data.len();
-        if let Some(&(_, _, buf)) = state
-            .wraps
-            .iter()
-            .find(|&&(p, l, _)| p == ptr && l == len)
-        {
+        if let Some(&(_, _, buf)) = state.wraps.iter().find(|&&(p, l, _)| p == ptr && l == len) {
             return Ok(buf);
         }
         let buf = unsafe { gpu.wrap_buffer(data.as_ptr().cast_mut(), len)? };
@@ -10334,10 +10449,8 @@ kernel void zc_r2_products(
         };
         unsafe { gpu.release(cb) };
         if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
-            let fold_gpu =
-                f64::from_bits(ZC_IDLE_FILL_FOLD_GPU_MS.load(Ordering::Relaxed));
-            let window =
-                f64::from_bits(ZC_IDLE_FILL_WINDOW_MS.load(Ordering::Relaxed));
+            let fold_gpu = f64::from_bits(ZC_IDLE_FILL_FOLD_GPU_MS.load(Ordering::Relaxed));
+            let window = f64::from_bits(ZC_IDLE_FILL_WINDOW_MS.load(Ordering::Relaxed));
             eprintln!(
                 "[zc-idle-fill] fold-gpu={fold_gpu:.2}ms filler-gpu={filler_gpu_ms:.2}ms \
                  window-wall={window:.2}ms"
@@ -10703,9 +10816,8 @@ kernel void zc_r2_products(
             // cannot be admitted.
             for c in 0..job.chunks {
                 let summed = (out[c][0] + out[c][2], out[c][1] + out[c][3]);
-                let split_ok = cpu_la.is_none_or(|la| {
-                    la[c][0] == out[c][2] && la[c][1] == out[c][3]
-                });
+                let split_ok =
+                    cpu_la.is_none_or(|la| la[c][0] == out[c][2] && la[c][1] == out[c][3]);
                 if summed != cpu_all[c] || !split_ok {
                     if super::gpu_zc_r2_debug() {
                         eprintln!(
@@ -10734,7 +10846,14 @@ kernel void zc_r2_products(
             {
                 while n_walls < walls.len() {
                     let Ok(cb2) = zc_r2_submit(
-                        gpu, &state, a_buf, b_buf, job.chunks, job.lo_size, job.mask, job.useful,
+                        gpu,
+                        &state,
+                        a_buf,
+                        b_buf,
+                        job.chunks,
+                        job.lo_size,
+                        job.mask,
+                        job.useful,
                     ) else {
                         break;
                     };
@@ -10768,9 +10887,7 @@ kernel void zc_r2_products(
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
                 let g = zc_r2_gate_share(ratio, hi_size);
                 if super::gpu_zc_r2_debug() {
-                    eprintln!(
-                        "[zc-r2] gate replay walls: {:?}", &walls[..n_walls]
-                    );
+                    eprintln!("[zc-r2] gate replay walls: {:?}", &walls[..n_walls]);
                     eprintln!(
                         "[zc-r2] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
                          ratio={:.3} -> share {g}/{hi_size}",
@@ -11069,7 +11186,12 @@ kernel void zc_t3_products(
                     ns
                 );
                 if f.is_null() {
-                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
                     return Err("zc_t3_products kernel not found".into());
                 }
                 let mut perr: Id = NIL;
@@ -11082,7 +11204,12 @@ kernel void zc_t3_products(
                     &mut perr
                 );
                 send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    library,
+                    c"release"
+                );
                 if pso.is_null() {
                     return Err(format!(
                         "zc_t3_products pipeline: {}",
@@ -11195,13 +11322,14 @@ kernel void zc_t3_products(
         }
     }
 
-    unsafe fn zc_t3_wrap(state: &mut ZcT3, gpu: &Gpu, ptr: *const u8, len: usize) -> Result<Id, String> {
+    unsafe fn zc_t3_wrap(
+        state: &mut ZcT3,
+        gpu: &Gpu,
+        ptr: *const u8,
+        len: usize,
+    ) -> Result<Id, String> {
         let addr = ptr as usize;
-        if let Some(&(_, _, buf)) = state
-            .wraps
-            .iter()
-            .find(|&&(p, l, _)| p == addr && l == len)
-        {
+        if let Some(&(_, _, buf)) = state.wraps.iter().find(|&&(p, l, _)| p == addr && l == len) {
             return Ok(buf);
         }
         // Never create a second no-copy view over a pinned (already
@@ -11310,9 +11438,13 @@ kernel void zc_t3_products(
                 state.part_buf = gpu.new_buffer(need_part).ok()?;
                 state.part_cap = need_part;
             }
-            let anchors_buf =
-                zc_t3_wrap(&mut state, gpu, anchors.as_ptr().cast::<u8>(), anchors.len() * 16)
-                    .ok()?;
+            let anchors_buf = zc_t3_wrap(
+                &mut state,
+                gpu,
+                anchors.as_ptr().cast::<u8>(),
+                anchors.len() * 16,
+            )
+            .ok()?;
             let deltas_buf = zc_t3_wrap(&mut state, gpu, deltas.as_ptr(), deltas.len()).ok()?;
             let cb = zc_t3_submit(gpu, &state, anchors_buf, deltas_buf, chunks, lo_size).ok()?;
             Some(ZcT3Job {
@@ -11737,7 +11869,12 @@ kernel void zc_loop_products(
                     ns
                 );
                 if f.is_null() {
-                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
                     return Err("zc_loop_products kernel not found".into());
                 }
                 let mut perr: Id = NIL;
@@ -11750,7 +11887,12 @@ kernel void zc_loop_products(
                     &mut perr
                 );
                 send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    library,
+                    c"release"
+                );
                 if pso.is_null() {
                     return Err(format!(
                         "zc_loop_products pipeline: {}",
@@ -11868,11 +12010,7 @@ kernel void zc_loop_products(
         len: usize,
     ) -> Result<Id, String> {
         let addr = ptr as usize;
-        if let Some(&(_, _, buf)) = state
-            .wraps
-            .iter()
-            .find(|&&(p, l, _)| p == addr && l == len)
-        {
+        if let Some(&(_, _, buf)) = state.wraps.iter().find(|&&(p, l, _)| p == addr && l == len) {
             return Ok(buf);
         }
         // Never create a second no-copy view over a pinned (already
@@ -12152,7 +12290,9 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 /// lincheck gather-fold GPU arm (see `ENV_NO_GPU_LINCHECK`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{ZcFoldJob, launch_lincheck_fold, launch_zerocheck_c_fold, zerocheck_gpu_submits};
+pub(crate) use imp::{
+    ZcFoldJob, launch_lincheck_fold, launch_zerocheck_c_fold, zerocheck_gpu_submits,
+};
 
 /// Commit-tail fill: staged/adopted round-one C-fold prefix (see
 /// `ENV_NO_COMMIT_TAIL_FILL`).
@@ -12218,7 +12358,10 @@ mod imp {
         mut codeword: Vec<F128>,
         _params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         let tree = cpu(&mut codeword);
         (
             crate::pcs::commit::CodewordBuf::Cpu(codeword),
@@ -12260,7 +12403,10 @@ mod imp {
         mut codeword: Vec<F128>,
         _params: &crate::pcs::commit::PcsParams,
         cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
-    ) -> (crate::pcs::commit::CodewordBuf, crate::pcs::commit::MerkleTreeBuf) {
+    ) -> (
+        crate::pcs::commit::CodewordBuf,
+        crate::pcs::commit::MerkleTreeBuf,
+    ) {
         let tree = cpu(&mut codeword);
         (
             crate::pcs::commit::CodewordBuf::Cpu(codeword),
@@ -12300,7 +12446,10 @@ mod tests {
         let n_leaves = 1usize << 20;
         let gpu = match imp::gpu() {
             Ok(g) => g,
-            Err(e) => { eprintln!("no GPU: {e}"); return; }
+            Err(e) => {
+                eprintln!("no GPU: {e}");
+                return;
+            }
         };
         let ntt = crate::ntt::AdditiveNttF128::standard(log_d);
         let twiddles = flat_twiddle_table(&ntt, log_d);
@@ -12310,7 +12459,11 @@ mod tests {
             let tree_buf = gpu.new_buffer((2 * n_leaves - 1) * 32).unwrap();
             let tw_bytes = core::mem::size_of_val(twiddles.as_slice());
             let tw_buf = gpu.new_buffer(tw_bytes).unwrap();
-            std::ptr::copy_nonoverlapping(twiddles.as_ptr().cast::<u8>(), gpu.buffer_contents(tw_buf), tw_bytes);
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                tw_bytes,
+            );
             let base = gpu.buffer_contents(staging);
             for i in (0..n_leaves * 1024).step_by(4096) {
                 *base.add(i) = (i as u8).wrapping_mul(31) | 1;
@@ -12349,20 +12502,31 @@ mod tests {
                 n
             };
             for (rep, idle_ms, warm) in [
-                (0u32, 0u64, false), (1, 2000, false), (2, 0, false),
-                (3, 2000, true), (4, 0, false), (5, 2000, false),
-                (6, 2000, true), (7, 0, false),
+                (0u32, 0u64, false),
+                (1, 2000, false),
+                (2, 0, false),
+                (3, 2000, true),
+                (4, 0, false),
+                (5, 2000, false),
+                (6, 2000, true),
+                (7, 0, false),
             ] {
                 let mut n = 0;
                 if idle_ms > 0 {
-                    if warm { n = warm_idle(idle_ms); }
-                    else { std::thread::sleep(std::time::Duration::from_millis(idle_ms)); }
+                    if warm {
+                        n = warm_idle(idle_ms);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(idle_ms));
+                    }
                 }
                 let ms = run_full();
                 println!("rep={rep} idle={idle_ms}ms warm={warm} dispatches={n} full={ms:.2}ms");
             }
-            gpu.release(kw_data); gpu.release(kw_tree);
-            gpu.release(staging); gpu.release(tree_buf); gpu.release(tw_buf);
+            gpu.release(kw_data);
+            gpu.release(kw_tree);
+            gpu.release(staging);
+            gpu.release(tree_buf);
+            gpu.release(tw_buf);
             gpu.pool_pop(pool);
         }
     }
@@ -12415,9 +12579,7 @@ mod tests {
         match r {
             Ok(v) => Some(v),
             Err(e)
-                if e.contains("disabled")
-                    || e.contains("dlopen")
-                    || e.contains("returned nil") =>
+                if e.contains("disabled") || e.contains("dlopen") || e.contains("returned nil") =>
             {
                 eprintln!("skipping GPU test: {e}");
                 None
@@ -12616,11 +12778,8 @@ mod tests {
                 core::mem::size_of_val(expect_full.as_slice()),
             )
         };
-        let expect_tree = crate::merkle::merkle_tree(
-            expect_bytes,
-            n_leaves,
-            crate::merkle::HashKind::Blake3,
-        );
+        let expect_tree =
+            crate::merkle::merkle_tree(expect_bytes, n_leaves, crate::merkle::HashKind::Blake3);
 
         let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
             Some(g) => unsafe { &*g },
@@ -12685,9 +12844,7 @@ mod tests {
             // shared verbatim with its production PSO.
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_from_z_zero_root_for_test(
-                gpu, enc, candidate, tw_buf, z_buf, log_d,
-            );
+            imp::encode_from_z_zero_root_for_test(gpu, enc, candidate, tw_buf, z_buf, log_d);
             imp::encode_zero_root_table_export_for_test(gpu, enc, tw_buf, table_buf);
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
@@ -12727,8 +12884,16 @@ mod tests {
                 expect_first.len(),
             );
             assert_eq!(got_table, expect_table.as_slice(), "compact table mismatch");
-            assert_eq!(candidate_first, expect_first.as_slice(), "candidate first pass mismatch");
-            assert_eq!(incumbent_first, expect_first.as_slice(), "incumbent first pass mismatch");
+            assert_eq!(
+                candidate_first,
+                expect_first.as_slice(),
+                "candidate first pass mismatch"
+            );
+            assert_eq!(
+                incumbent_first,
+                expect_first.as_slice(),
+                "incumbent first pass mismatch"
+            );
             assert_eq!(candidate_first, incumbent_first);
             assert_eq!(
                 gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root).0,
@@ -12750,7 +12915,11 @@ mod tests {
                 gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
                 expect_tree.len(),
             );
-            assert_eq!(candidate_full, expect_full.as_slice(), "full codeword mismatch");
+            assert_eq!(
+                candidate_full,
+                expect_full.as_slice(),
+                "full codeword mismatch"
+            );
             assert_eq!(got_tree, expect_tree.as_slice(), "full tree mismatch");
 
             gpu.release(candidate);
@@ -12806,15 +12975,7 @@ mod tests {
 
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_ntt_passes_prefix(
-                gpu,
-                enc,
-                data_buf,
-                tw_buf,
-                log_d,
-                start_layer,
-                prefix16,
-            );
+            imp::encode_ntt_passes_prefix(gpu, enc, data_buf, tw_buf, log_d, start_layer, prefix16);
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
 
@@ -13052,9 +13213,7 @@ mod tests {
                 let sb = time_small(gpu.pso_leaf_v4);
                 sa_min = sa_min.min(sa);
                 sb_min = sb_min.min(sb);
-                println!(
-                    "rep={rep} cache-resident leaf x32: scalar {sa:.3} ms vs vec4 {sb:.3} ms"
-                );
+                println!("rep={rep} cache-resident leaf x32: scalar {sa:.3} ms vs vec4 {sb:.3} ms");
             }
             println!(
                 "min-of-5 cache-resident leaf x32: scalar {sa_min:.3} ms vs vec4 {sb_min:.3} ms"
@@ -13078,8 +13237,7 @@ mod tests {
         let data: Vec<u8> = (0..n_leaves * 1024)
             .map(|_| (rng.next_u64() & 0xff) as u8)
             .collect();
-        let expect =
-            crate::merkle::merkle_tree(&data, n_leaves, crate::merkle::HashKind::Blake3);
+        let expect = crate::merkle::merkle_tree(&data, n_leaves, crate::merkle::HashKind::Blake3);
         let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
             Some(g) => unsafe { &*g },
             None => return,
@@ -13090,11 +13248,7 @@ mod tests {
             let data_buf = gpu.new_buffer(data.len()).unwrap();
             let tree_bytes = expect.len() * core::mem::size_of::<crate::merkle::Hash>();
             let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                gpu.buffer_contents(data_buf),
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), gpu.buffer_contents(data_buf), data.len());
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
             imp::encode_merkle_impl(gpu, enc, data_buf, tree_buf, n_leaves, true);
@@ -13127,8 +13281,7 @@ mod tests {
         let data: Vec<u8> = (0..N_LEAVES * 1024)
             .map(|_| (rng.next_u64() & 0xff) as u8)
             .collect();
-        let expect =
-            crate::merkle::merkle_tree(&data, N_LEAVES, crate::merkle::HashKind::Blake3);
+        let expect = crate::merkle::merkle_tree(&data, N_LEAVES, crate::merkle::HashKind::Blake3);
         let mut initial = vec![SENTINEL; expect.len()];
         let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
             Some(g) => unsafe { &*g },
@@ -13140,11 +13293,7 @@ mod tests {
             let data_buf = gpu.new_buffer(data.len()).unwrap();
             let tree_bytes = core::mem::size_of_val(initial.as_slice());
             let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                gpu.buffer_contents(data_buf),
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), gpu.buffer_contents(data_buf), data.len());
             std::ptr::copy_nonoverlapping(
                 initial.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(tree_buf),
@@ -13270,9 +13419,7 @@ mod tests {
         let t_cpu = std::time::Instant::now();
         let expect = crate::merkle::merkle_tree(&data, n_leaves, crate::merkle::HashKind::Blake3);
         let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
-        eprintln!(
-            "ranked-shape Merkle: gpu {gpu_ms:.1} ms (incl. copies) vs cpu {cpu_ms:.1} ms"
-        );
+        eprintln!("ranked-shape Merkle: gpu {gpu_ms:.1} ms (incl. copies) vs cpu {cpu_ms:.1} ms");
         assert_eq!(got, expect, "GPU Merkle mismatch at ranked shape");
     }
 
@@ -13384,7 +13531,10 @@ mod tests {
             let cpu_tree =
                 crate::merkle::merkle_tree(data, n_leaves, crate::merkle::HashKind::Blake3);
             assert_eq!(gpu_tree.len(), cpu_tree.len());
-            assert!(gpu_tree == cpu_tree, "GPU tree diverges at 2^{log_leaves} leaves");
+            assert!(
+                gpu_tree == cpu_tree,
+                "GPU tree diverges at 2^{log_leaves} leaves"
+            );
             // Second call on the same allocation: cached wrap, same bytes.
             let again = super::gpu_recursive_merkle_blake3(data, n_leaves)
                 .expect("second call must succeed");
@@ -13693,11 +13843,8 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 expect.as_ptr().cast::<u8>(),
                 core::mem::size_of_val(expect.as_slice()),
             );
-            let expect_tree = crate::merkle::merkle_tree(
-                expect_bytes,
-                n_leaves,
-                crate::merkle::HashKind::Blake3,
-            );
+            let expect_tree =
+                crate::merkle::merkle_tree(expect_bytes, n_leaves, crate::merkle::HashKind::Blake3);
             let got_tree = core::slice::from_raw_parts(
                 gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
                 2 * n_leaves - 1,
@@ -13708,7 +13855,9 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             gpu.release(tree_buf);
             gpu.pool_pop(pool);
             let best = walls.iter().skip(1).cloned().fold(f64::MAX, f64::min);
-            eprintln!("warm commit graph best: {best:.2} ms (NTT layers 1..20 + leaves + parents, 1 GiB)");
+            eprintln!(
+                "warm commit graph best: {best:.2} ms (NTT layers 1..20 + leaves + parents, 1 GiB)"
+            );
         }
     }
 
@@ -13762,10 +13911,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             oracle[..] == pd2.codeword[..],
             "codeword differs from CPU oracle"
         );
-        assert_eq!(
-            oracle_tree, pd2.merkle_tree,
-            "tree differs from CPU oracle"
-        );
+        assert_eq!(oracle_tree, pd2.merkle_tree, "tree differs from CPU oracle");
     }
 
     #[test]
@@ -13783,7 +13929,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 assert_eq!(l, log_d);
             }
         }
-        assert_eq!(plan_passes(20, 1), vec![(1, 4), (5, 4), (9, 4), (13, 4), (17, 3)]);
+        assert_eq!(
+            plan_passes(20, 1),
+            vec![(1, 4), (5, 4), (9, 4), (13, 4), (17, 3)]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -13858,12 +14007,19 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         );
         assert_eq!(got, want, "GPU prefix must be bit-exact");
         assert!(
-            got[useful_bits.div_ceil(8) * 8..].iter().all(|v| *v == F128::ZERO),
+            got[useful_bits.div_ceil(8) * 8..]
+                .iter()
+                .all(|v| *v == F128::ZERO),
             "padded columns must stay zero"
         );
 
         let suffix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
-            z, m, k_log, useful_bits, &eq, claim_lo,
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+            claim_lo,
         );
         for (a, b) in got.iter_mut().zip(suffix) {
             *a += b;
@@ -13891,7 +14047,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         let claim_lo = job.claim_lo();
         let mut hybrid = vec![F128::ZERO; 1usize << k_log];
         let suffix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
-            z, m, k_log, useful_bits, &eq, claim_lo,
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+            claim_lo,
         );
         job.finish_xor_into(&mut hybrid, 0.0, 0.0).unwrap();
         for (a, b) in hybrid.iter_mut().zip(suffix) {
@@ -13910,7 +14071,13 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         let mut again = vec![F128::ZERO; 1usize << k_log];
         job.finish_xor_into(&mut again, 0.0, 0.0).unwrap();
         let want = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_range(
-            z, m, k_log, useful_bits, &eq, 0, claim_lo2,
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+            0,
+            claim_lo2,
         );
         assert_eq!(again, want, "resubmitted prefix must stay bit-exact");
     }
@@ -14039,7 +14206,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         );
 
         let suffix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
-            z, m, k_log, useful_bits, &eq, claim_lo,
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+            claim_lo,
         );
         for (a, b) in got.iter_mut().zip(suffix) {
             *a += b;
@@ -14068,7 +14240,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         let claim_lo = job.claim_lo();
         let mut hybrid = vec![F128::ZERO; 1usize << k_log];
         let suffix = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
-            z, m, k_log, useful_bits, &eq, claim_lo,
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+            claim_lo,
         );
         job.finish_xor_into(&mut hybrid, 0.0, 0.0).unwrap();
         for (a, b) in hybrid.iter_mut().zip(suffix) {
@@ -14108,7 +14285,11 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         let (ptr, len) = (stripe.as_ptr() as usize, stripe.len());
         crate::scratch::give_u8(stripe);
         assert_eq!(ptr % PAGE, 0, "ranked stripe base must be page-aligned");
-        assert_eq!(len % PAGE, 0, "ranked stripe length must be a page multiple");
+        assert_eq!(
+            len % PAGE,
+            0,
+            "ranked stripe length must be a page multiple"
+        );
     }
 
     /// Round-two products arm oracle: the GPU's per-chunk reduced partials
@@ -14128,7 +14309,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             *rng
         }
         fn rand_f128(rng: &mut u64) -> F128 {
-            F128 { lo: xs(rng), hi: xs(rng) }
+            F128 {
+                lo: xs(rng),
+                hi: xs(rng),
+            }
         }
         let mut rng = 0x9E3779B97F4A7C15u64;
 
@@ -14212,7 +14396,15 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // Calibration probe: internal equality oracle + share publication.
         imp::zc_r2_test_reset();
         let job = imp::launch_zc_r2_products(
-            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            &a_packed,
+            &b_packed,
+            &table_data,
+            &eq_lo,
+            &eq_hi,
+            lo_size,
+            hi_size,
+            mask,
+            useful,
         )
         .expect("calibration launch must succeed on real Metal");
         assert!(job.is_calibration());
@@ -14220,13 +14412,24 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         let res = imp::zc_r2_wait(job, Some(&cpu_partials), Some(&cpu_la), 50.0, hi_size);
         assert!(matches!(res, imp::ZcR2Result::Calibrated));
         let (tuned, poisoned) = imp::zc_r2_test_state();
-        assert!(!poisoned, "probe partials must equal CPU partials bit-for-bit");
+        assert!(
+            !poisoned,
+            "probe partials must equal CPU partials bit-for-bit"
+        );
         assert_ne!(tuned, usize::MAX, "calibration must publish a share");
 
         // Timed prefix path at a forced share.
         imp::zc_r2_test_set_share(hi_size / 2);
         let job2 = imp::launch_zc_r2_products(
-            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            &a_packed,
+            &b_packed,
+            &table_data,
+            &eq_lo,
+            &eq_hi,
+            lo_size,
+            hi_size,
+            mask,
+            useful,
         )
         .expect("timed launch must succeed");
         assert!(!job2.is_calibration());
@@ -14265,7 +14468,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             *rng
         }
         fn rand_f128(rng: &mut u64) -> F128 {
-            F128 { lo: xs(rng), hi: xs(rng) }
+            F128 {
+                lo: xs(rng),
+                hi: xs(rng),
+            }
         }
         let mut rng = 0xC3A5C85C97CB3127u64;
 
@@ -14333,7 +14539,13 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // Calibration probe: internal equality oracle + share publication.
         imp::zc_t3_test_reset();
         let job = imp::launch_zc_t3_products(
-            &anchors, &deltas, &table_data, &eq_lo, &eq_hi, lo_size, hi_size,
+            &anchors,
+            &deltas,
+            &table_data,
+            &eq_lo,
+            &eq_hi,
+            lo_size,
+            hi_size,
         )
         .expect("calibration launch must succeed on real Metal");
         assert!(job.is_calibration());
@@ -14341,13 +14553,22 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         let res = imp::zc_t3_wait(job, Some(&cpu_partials), 50.0, hi_size);
         assert!(matches!(res, imp::ZcT3Result::Calibrated));
         let (tuned, poisoned) = imp::zc_t3_test_state();
-        assert!(!poisoned, "probe partials must equal CPU partials bit-for-bit");
+        assert!(
+            !poisoned,
+            "probe partials must equal CPU partials bit-for-bit"
+        );
         assert_ne!(tuned, usize::MAX, "calibration must publish a share");
 
         // Timed prefix path at a forced share.
         imp::zc_t3_test_set_share(hi_size / 2);
         let job2 = imp::launch_zc_t3_products(
-            &anchors, &deltas, &table_data, &eq_lo, &eq_hi, lo_size, hi_size,
+            &anchors,
+            &deltas,
+            &table_data,
+            &eq_lo,
+            &eq_hi,
+            lo_size,
+            hi_size,
         )
         .expect("timed launch must succeed");
         assert!(!job2.is_calibration());
@@ -14356,7 +14577,11 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         match imp::zc_t3_wait(job2, None, 0.0, hi_size) {
             imp::ZcT3Result::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);
-                assert_eq!(&vals[..], &cpu_partials[..prefix], "prefix partials bit-exact");
+                assert_eq!(
+                    &vals[..],
+                    &cpu_partials[..prefix],
+                    "prefix partials bit-exact"
+                );
             }
             _ => panic!("timed drain must return prefix partials"),
         }
@@ -14377,7 +14602,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             *rng
         }
         fn rand_f128(rng: &mut u64) -> F128 {
-            F128 { lo: xs(rng), hi: xs(rng) }
+            F128 {
+                lo: xs(rng),
+                hi: xs(rng),
+            }
         }
         let mut rng = 0xA24BAED4963EE407u64;
 
@@ -14411,31 +14639,34 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
 
         // Calibration probe: internal equality oracle + share publication.
         imp::zc_loop_test_reset();
-        let job = imp::launch_zc_loop_products(
-            &a, &b, r_fold, &eq_lo, &eq_hi, lo_size, hi_size,
-        )
-        .expect("calibration launch must succeed on real Metal");
+        let job = imp::launch_zc_loop_products(&a, &b, r_fold, &eq_lo, &eq_hi, lo_size, hi_size)
+            .expect("calibration launch must succeed on real Metal");
         assert!(job.is_calibration());
         assert_eq!(job.cpu_split(), 0);
         let res = imp::zc_loop_wait(job, Some(&cpu_partials), 50.0, hi_size);
         assert!(matches!(res, imp::ZcLoopResult::Calibrated));
         let (tuned, poisoned) = imp::zc_loop_test_state();
-        assert!(!poisoned, "probe partials must equal CPU partials bit-for-bit");
+        assert!(
+            !poisoned,
+            "probe partials must equal CPU partials bit-for-bit"
+        );
         assert_ne!(tuned, usize::MAX, "calibration must publish a share");
 
         // Timed prefix path at a forced share.
         imp::zc_loop_test_set_share(hi_size / 2);
-        let job2 = imp::launch_zc_loop_products(
-            &a, &b, r_fold, &eq_lo, &eq_hi, lo_size, hi_size,
-        )
-        .expect("timed launch must succeed");
+        let job2 = imp::launch_zc_loop_products(&a, &b, r_fold, &eq_lo, &eq_hi, lo_size, hi_size)
+            .expect("timed launch must succeed");
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
         match imp::zc_loop_wait(job2, None, 0.0, hi_size) {
             imp::ZcLoopResult::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);
-                assert_eq!(&vals[..], &cpu_partials[..prefix], "prefix partials bit-exact");
+                assert_eq!(
+                    &vals[..],
+                    &cpu_partials[..prefix],
+                    "prefix partials bit-exact"
+                );
             }
             _ => panic!("timed drain must return prefix partials"),
         }

@@ -202,22 +202,12 @@ unsafe fn xor_karatsuba_const_pair(
         let weight_p = vreinterpretq_p64_u64(weight);
 
         // Keep all six independent PMULLs visible before consuming results.
-        let even_ll = pmull(
-            vgetq_lane_u64::<0>(even),
-            vgetq_lane_u64::<0>(weight),
-        );
-        let odd_ll = pmull(
-            vgetq_lane_u64::<0>(odd),
-            vgetq_lane_u64::<0>(weight),
-        );
-        let even_hh = transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(even),
-            weight_p,
-        ));
-        let odd_hh = transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(odd),
-            weight_p,
-        ));
+        let even_ll = pmull(vgetq_lane_u64::<0>(even), vgetq_lane_u64::<0>(weight));
+        let odd_ll = pmull(vgetq_lane_u64::<0>(odd), vgetq_lane_u64::<0>(weight));
+        let even_hh =
+            transmute::<u128, uint64x2_t>(vmull_high_p64(vreinterpretq_p64_u64(even), weight_p));
+        let odd_hh =
+            transmute::<u128, uint64x2_t>(vmull_high_p64(vreinterpretq_p64_u64(odd), weight_p));
         let even_mm = pmull(
             vgetq_lane_u64::<0>(even_mid),
             vgetq_lane_u64::<0>(weight_mid),
@@ -884,10 +874,8 @@ pub(super) unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_adden
             let b_odd0 = vld1q_u64(b.as_ptr().add(source + 1).cast::<u64>());
             let b_even1 = vld1q_u64(b.as_ptr().add(source + 2).cast::<u64>());
             let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
-            let deferred_even0 =
-                vld1q_u64(deferred_basis.as_ptr().add(source).cast::<u64>());
-            let deferred_even1 =
-                vld1q_u64(deferred_basis.as_ptr().add(source + 2).cast::<u64>());
+            let deferred_even0 = vld1q_u64(deferred_basis.as_ptr().add(source).cast::<u64>());
+            let deferred_even1 = vld1q_u64(deferred_basis.as_ptr().add(source + 2).cast::<u64>());
             let incumbent_and_deferred_even = mul_two_const_sum_vec2(
                 r_q,
                 veorq_u64(b_even0, b_odd0),
@@ -902,14 +890,10 @@ pub(super) unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_adden
             // Reload the deferred evens after the first product-sum helper. This
             // keeps their odd partners and the two partial outputs from being
             // simultaneously live across the helper's PMULL fan-out.
-            let deferred_even0 =
-                vld1q_u64(deferred_basis.as_ptr().add(source).cast::<u64>());
-            let deferred_odd0 =
-                vld1q_u64(deferred_basis.as_ptr().add(source + 1).cast::<u64>());
-            let deferred_even1 =
-                vld1q_u64(deferred_basis.as_ptr().add(source + 2).cast::<u64>());
-            let deferred_odd1 =
-                vld1q_u64(deferred_basis.as_ptr().add(source + 3).cast::<u64>());
+            let deferred_even0 = vld1q_u64(deferred_basis.as_ptr().add(source).cast::<u64>());
+            let deferred_odd0 = vld1q_u64(deferred_basis.as_ptr().add(source + 1).cast::<u64>());
+            let deferred_even1 = vld1q_u64(deferred_basis.as_ptr().add(source + 2).cast::<u64>());
+            let deferred_odd1 = vld1q_u64(deferred_basis.as_ptr().add(source + 3).cast::<u64>());
             let addend0 = vld1q_u64(local_addend.as_ptr().add(t).cast::<u64>());
             let addend1 = vld1q_u64(local_addend.as_ptr().add(t + 1).cast::<u64>());
             let deferred_delta_and_addend = mul_two_const_sum_vec2(

@@ -278,13 +278,15 @@ where
             // drain; it costs no main-pool worker. The scope join bounds the
             // tail wait at one chunk on one efficiency core.
             s.spawn(|| {
-                ep.broadcast(|_| loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n_chunks {
-                        break;
+                ep.broadcast(|_| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n_chunks {
+                            break;
+                        }
+                        EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+                        f(i);
                     }
-                    EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
-                    f(i);
                 })
             });
             drain_main();
@@ -472,9 +474,11 @@ mod tests {
             },
             Some(&helper),
         ));
-        assert!(counts
-            .iter()
-            .all(|count| count.load(Ordering::Relaxed) == 1));
+        assert!(
+            counts
+                .iter()
+                .all(|count| count.load(Ordering::Relaxed) == 1)
+        );
         assert_eq!(worker_mask.load(Ordering::Relaxed) & !0b11, 0);
 
         let untouched = AtomicUsize::new(0);
