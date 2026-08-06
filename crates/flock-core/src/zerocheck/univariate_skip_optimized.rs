@@ -848,11 +848,12 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     Round1AbInner { storage }
 }
 
-/// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
-/// shape exposes roughly sixty-four scheduling waves on the ten-thread worker.
+/// Keep the 1024-job depth, but rotate slab claims by half the queue. This
+/// exposes the middle-to-high region first while preserving sequential claim
+/// order and monotone, contiguous access inside every queue-owned slab.
 #[inline]
 fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
-    n_chunks.div_ceil(640).max(1)
+    n_chunks.div_ceil(1024).max(1)
 }
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
@@ -948,7 +949,12 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
-            let chunk_start = job * chunks_per_job;
+            let physical_job = if n_jobs == 1024 {
+                (job + 512) & 1023
+            } else {
+                job
+            };
+            let chunk_start = physical_job * chunks_per_job;
             let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
             let slab_len = chunk_end - chunk_start;
             for offset in 0..slab_len {
