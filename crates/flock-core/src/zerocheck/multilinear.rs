@@ -58,8 +58,6 @@ use kernels::aarch64::{
     fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use kernels::aarch64::fold_compact_chunk_neon_reconstruct_only_8;
 #[cfg(all(
     target_arch = "x86_64",
@@ -95,20 +93,6 @@ fn r2_degen_enabled() -> bool {
 #[cfg(target_arch = "aarch64")]
 fn r2_periodic_padding_enabled() -> bool {
     std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
-}
-
-/// Kill switch for adopting the round-two GPU arm's odd-parity products as the
-/// round-three lookahead's `W1`/`W2`: `FLOCK_NO_ZC_R2_ODD_OFFLOAD=1` makes the
-/// CPU recompute the odd pair on offloaded chunks, which is the incumbent
-/// division of labour. Output is bit-identical either way — the GPU's
-/// odd-parity half is the same sum the CPU would form, and the calibration
-/// oracle verifies that on the target before the arm is ever admitted.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn zc_r2_odd_offload_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_R2_ODD_OFFLOAD").is_none_or(|v| v != *"1")
-    });
-    *ON
 }
 
 /// ZC-window GPU idle fill (see `gpu_commit::ENV_NO_ZC_IDLE_FILL`): stage
@@ -835,27 +819,39 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
 
-    // GPU round-two products arm (see `ENV_NO_GPU_ZC_R2`): a measured
-    // prefix of the hi-chunks gets its message products computed on the
-    // otherwise-idle GPU while the CPU writes those chunks' anchors and
-    // deltas through the anchors-only sibling kernel (byte-identical
-    // stores). Partials for prefix chunks are merged after the join; the
-    // XOR reduce below is order-independent, so the output is bit-identical
-    // to the all-CPU sweep. `None` = the exact incumbent path.
+    // A measured prefix is owned entirely by Metal: compact outputs and
+    // message products. Adjacent equality weights differ by the first low
+    // challenge, so the kernel scales its even-parity products before they
+    // are merged. A zero odd weight cannot be recovered by scaling and keeps
+    // the exact CPU path.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
-        a_packed,
-        b_packed,
-        &table.data,
-        eq_lo,
-        eq_hi,
-        lo_size,
-        hi_size,
-        pair_in_block_mask,
-        useful_pairs_inclusive,
-    );
+    let gpu_job = {
+        let r1 = mlv_challenges[1];
+        if r1 == F128::ZERO {
+            None
+        } else {
+            crate::gpu_commit::launch_zc_r2_products(
+                a_packed,
+                b_packed,
+                &mut compact.anchors,
+                compact.deltas.as_mut(),
+                &table.data,
+                eq_lo,
+                eq_hi,
+                (F128::ONE + r1) * r1.inv(),
+                lo_size,
+                hi_size,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+            )
+        }
+    };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cpu_start = gpu_prefix;
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let cpu_start = 0;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -868,7 +864,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
     let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    crate::epool::run_hetero_chunks(hi_size - cpu_start, |cpu_chunk| {
+        let x_hi = cpu_start + cpu_chunk;
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and partials[x_hi]. The
         // queue's completion join publishes the writes before the reduction
@@ -888,27 +885,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         {
             let pair_idx_base = x_hi * lo_size;
             let row_base = pair_idx_base * 2;
-
-            // GPU-covered prefix chunk: write the identical anchors and
-            // deltas, skip the products (the GPU partial replaces this
-            // chunk's slot after the join).
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            if x_hi < gpu_prefix {
-                unsafe {
-                    fold_round2_compact_chunk_neon_anchors_only_8(
-                        table.data.as_ptr().cast::<u8>(),
-                        a_packed.as_ptr().add(row_base * n_chunks),
-                        b_packed.as_ptr().add(row_base * n_chunks),
-                        anchors.as_mut_ptr(),
-                        deltas.as_mut_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                    );
-                }
-                return;
-            }
 
             #[cfg(target_arch = "aarch64")]
             let (p1, pinf) = unsafe {
@@ -969,9 +945,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             }
         }
     });
-    // Drain the GPU products arm: merge prefix partials (timed proves),
-    // finish calibration (untimed warmup), or CPU-redo the skipped prefix
-    // products on any post-admission Metal failure.
+    // Drain Metal: merge prefix partials, finish warmup calibration, or
+    // CPU-redo every skipped prefix output after a command failure.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(job) = gpu_job {
         let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
@@ -996,11 +971,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                 }
             }
             crate::gpu_commit::ZcR2Result::Failed => {
-                // Redo exactly the skipped prefix products — slower, still
-                // exact. Throwaway anchor/delta scratch: the real ranges
-                // were already written by the anchors-only pass.
-                let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
-                let mut scr_deltas = vec![0u8; delta_chunk_size];
+                // Redo every skipped prefix chunk, including its compact
+                // outputs. A failed Metal command is complete before this
+                // branch, so the CPU owns these ranges again.
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
@@ -1009,8 +982,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
-                            scr_anchors.as_mut_ptr(),
-                            scr_deltas.as_mut_ptr(),
+                            compact.anchors.as_mut_ptr().add(x_hi * anchor_chunk_size),
+                            compact.deltas.as_mut_ptr().add(x_hi * delta_chunk_size),
                             eq_lo.as_ptr(),
                             lo_size,
                             pair_idx_base,
@@ -1577,18 +1550,19 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     #[cfg(target_arch = "aarch64")]
     let periodic_padding = r2_periodic_padding_enabled();
 
-    // Same GPU round-two products arm as the incumbent sweep: it still
-    // receives byte-identical anchors/deltas for every chunk and still owns
-    // the *summed* `(p1, pinf)` for its prefix. The CPU keeps producing the
-    // odd-parity halves on those chunks (the GPU's sums are not parity-split),
-    // which is what makes `W1`/`W2` recoverable everywhere.
+    // Metal owns every output for its prefix. Its first four aggregates are
+    // the correctly weighted parity split of the round-two message; the last
+    // four complete the deferred round-three state.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_job = crate::gpu_commit::launch_zc_r2_products(
         a_packed,
         b_packed,
+        &mut compact.anchors,
+        compact.deltas.as_mut(),
         &table.data,
         eq_lo,
         eq_hi,
+        kappa,
         lo_size,
         hi_size,
         pair_in_block_mask,
@@ -1596,14 +1570,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
-    // The GPU arm now returns its round-two products parity-split, so on an
-    // offloaded chunk the CPU can skip the odd-parity pair as well as the even
-    // one instead of recomputing the odd half for `W1`/`W2`. The kill switch
-    // restores the incumbent division of labour within the same binary.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
+    let cpu_start = gpu_prefix;
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let odd_on_gpu = false;
+    let cpu_start = 0;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -1614,7 +1584,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    crate::epool::run_hetero_chunks(hi_size - cpu_start, |cpu_chunk| {
+        let x_hi = cpu_start + cpu_chunk;
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and both partial slots.
         let (anchors, deltas) = unsafe {
@@ -1629,63 +1600,25 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
 
         #[cfg(target_arch = "aarch64")]
         {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let full = x_hi >= gpu_prefix;
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let full = true;
             unsafe {
                 let t = table.data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
-                if full {
-                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        out.as_mut_ptr(),
-                    );
-                } else if odd_on_gpu {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        out.as_mut_ptr(),
-                    );
-                } else {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        out.as_mut_ptr(),
-                    );
-                }
+                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                    t,
+                    ap,
+                    bp,
+                    anchors,
+                    deltas,
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    degen,
+                    periodic_padding,
+                    out.as_mut_ptr(),
+                );
             }
         }
 
@@ -1728,11 +1661,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         }
     });
 
-    // Drain the GPU products arm. The arm returns `[p1_even, pinf_even,
-    // p1_odd, pinf_odd]`; XORing the parities back together reproduces the
-    // summed pair the incumbent contract delivered, and the odd half is
-    // adopted as the lookahead's `W1`/`W2` state exactly when the CPU was told
-    // to skip it.
+    // Drain Metal's eight per-chunk aggregates. The first four reconstruct
+    // the round-two pair; the remaining values complete the six-slot
+    // deferred round-three state for every skipped prefix chunk.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(job) = gpu_job {
         let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
@@ -1750,20 +1681,12 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
             crate::gpu_commit::ZcR2Result::Prefix(vals) => {
                 for (x_hi, v) in vals.iter().enumerate() {
                     partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
-                    if odd_on_gpu {
-                        la_partials[x_hi][0] = v[2];
-                        la_partials[x_hi][1] = v[3];
-                    }
+                    la_partials[x_hi] = [v[2], v[3], v[4], v[5], v[6], v[7]];
                 }
             }
             crate::gpu_commit::ZcR2Result::Failed => {
-                // Redo exactly the skipped prefix products — slower, still
-                // exact. Throwaway anchor/delta scratch: the real ranges were
-                // already written by the lookahead pass. The full-lookahead
-                // monomorphization is used so the odd-parity slots are
-                // recovered too when the CPU sweep skipped them.
-                let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
-                let mut scr_deltas = vec![0u8; delta_chunk_size];
+                // Redo the skipped prefix in full, including compact outputs
+                // and every deferred-lookahead aggregate.
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
@@ -1773,8 +1696,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
-                            scr_anchors.as_mut_ptr(),
-                            scr_deltas.as_mut_ptr(),
+                            compact.anchors.as_mut_ptr().add(x_hi * anchor_chunk_size),
+                            compact.deltas.as_mut_ptr().add(x_hi * delta_chunk_size),
                             eq_lo.as_ptr(),
                             lo_size,
                             pair_idx_base,
@@ -1790,10 +1713,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         eq_h * (kappa * out[0] + out[2]),
                         eq_h * (kappa * out[1] + out[3]),
                     );
-                    if odd_on_gpu {
-                        la_partials[x_hi][0] = eq_h * out[2];
-                        la_partials[x_hi][1] = eq_h * out[3];
-                    }
+                    la_partials[x_hi] = [
+                        eq_h * out[2],
+                        eq_h * out[3],
+                        eq_h * out[4],
+                        eq_h * out[5],
+                        eq_h * out[6],
+                        eq_h * out[7],
+                    ];
                 }
             }
         }
