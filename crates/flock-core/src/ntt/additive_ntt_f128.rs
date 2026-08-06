@@ -908,10 +908,11 @@ impl AdditiveNttF128 {
     /// Complete a ranked hybrid suffix with the same cache-local schedule as
     /// the tuned full-CPU transform, then publish each finalized 1 MiB chunk.
     ///
-    /// The shared GPU pass has already completed layers 0..4.  This routine
-    /// runs the two remaining top radix-8 groups (layers 4..10) over the
-    /// requested absolute layer-4 blocks, then finishes layers 10..20 as five
-    /// fused pairs inside independent layer-10 sub-NTTs.  `finish_chunk`
+    /// The shared GPU prefix has already completed either layers 0..3 or
+    /// layers 0..7. This routine completes the remaining layers through 10
+    /// over the requested absolute start-layer blocks, then finishes layers
+    /// 10..20 as five fused pairs inside independent layer-10 sub-NTTs.
+    /// `finish_chunk`
     /// receives an absolute element offset, so a concurrent GPU prefix and
     /// this CPU suffix can write disjoint Merkle leaf ranges without rebasing
     /// indices.  It runs immediately after the last pair while the 1 MiB
@@ -935,7 +936,10 @@ impl AdditiveNttF128 {
         let log_d = log2_pow2(data.len() / num_ntts);
         assert_eq!(log_d, 20, "ranked hybrid suffix requires log_d=20");
         assert_eq!(num_ntts, 64, "ranked hybrid suffix requires 64 lanes");
-        assert_eq!(start_layer, 4, "ranked hybrid suffix starts at layer 4");
+        assert!(
+            matches!(start_layer, 4 | 8),
+            "ranked hybrid suffix starts at layer 4 or 8"
+        );
         assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
         assert!(b_start < b_end && b_end <= (1usize << start_layer));
 
@@ -944,8 +948,8 @@ impl AdditiveNttF128 {
         // explicit tail.
         let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
 
-        // Two fused radix-8 passes.  Unlike the old all-layer range driver,
-        // this is the last streaming traversal of the complete suffix.
+        // Complete the top range through layer 10. Unlike the old all-layer
+        // range driver, this is the last streaming traversal of the suffix.
         self.forward_transform_interleaved_block_range(
             data,
             num_ntts,
@@ -956,9 +960,8 @@ impl AdditiveNttF128 {
             odd_tail,
         );
 
-        // Every layer-4 block contains 2^(10-4) independent layer-10
-        // sub-NTTs.  Preserve their absolute indices so all deeper twiddles
-        // match the unsplit transform exactly.
+        // Preserve absolute layer-10 indices so all deeper twiddles match the
+        // unsplit transform exactly.
         let sub_start = b_start << (DEEP_LAYER - start_layer);
         let sub_end = b_end << (DEEP_LAYER - start_layer);
         self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
