@@ -627,8 +627,7 @@ pub const ENV_NO_AB_COMPACT_STORE: &str = "FLOCK_NO_AB_COMPACT_STORE";
 fn ab_compact_store_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os(ENV_NO_AB_COMPACT_STORE).as_deref()
-            != Some(std::ffi::OsStr::new("1"))
+        std::env::var_os(ENV_NO_AB_COMPACT_STORE).as_deref() != Some(std::ffi::OsStr::new("1"))
     })
 }
 
@@ -849,11 +848,12 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     Round1AbInner { storage }
 }
 
-/// Jobs of this many 1 KiB chunks feed the QS5 hetero precompute queue: big
-/// enough that the atomic claim amortizes (a job is ~60 µs on a P-core),
-/// small enough that an E-core owns at most ~200 µs of tail when the main
-/// pool finishes — the same sizing logic as the deferred stripe's 64.
-const AB_PRE_CHUNKS_PER_JOB: usize = 64;
+/// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
+/// shape exposes roughly fifty scheduling waves on the ten-thread worker.
+#[inline]
+fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
+    n_chunks.div_ceil(512).max(1)
+}
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
 /// before the AB queue starts. Every other shape retains the incumbent
@@ -884,8 +884,7 @@ fn ranked_ab_pre_fast_policy_hoist_shape(
 }
 
 /// Exact same-binary rollback for the ranked AB policy specialization.
-pub const ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST: &str =
-    "FLOCK_NO_ZC_AB_PRE_FAST_POLICY_HOIST";
+pub const ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST: &str = "FLOCK_NO_ZC_AB_PRE_FAST_POLICY_HOIST";
 
 fn zc_ab_pre_fast_policy_hoist_enabled() -> bool {
     std::env::var_os(ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST).as_deref()
@@ -939,17 +938,34 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     }
 
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-    let n_jobs = n_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
+    // Traverse complete 75-chunk groups as fifteen contiguous five-chunk blocks,
+    // visiting block indices by the coprime stride seven. This exposes recurring
+    // medium-scale positional bands while retaining sequential access in blocks;
+    // incomplete tails remain sequential.
+    const GROUP_CHUNKS: usize = 75;
+    let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
+    let n_jobs = n_chunks.div_ceil(chunks_per_job);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
-            let start = job * AB_PRE_CHUNKS_PER_JOB;
-            let end = (start + AB_PRE_CHUNKS_PER_JOB).min(n_chunks);
-            for x_outer in start..end {
-                // SAFETY: the queue hands out each job index exactly once and
-                // each `x_outer` maps to one disjoint 1 KiB chunk.
+            let chunk_start = job * chunks_per_job;
+            let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
+            let slab_len = chunk_end - chunk_start;
+            for visit in 0..slab_len {
+                let group_base = (visit / GROUP_CHUNKS) * GROUP_CHUNKS;
+                let group_visit = visit % GROUP_CHUNKS;
+                let offset = if group_base + GROUP_CHUNKS <= slab_len {
+                    let block = group_visit / 5;
+                    let lane = group_visit % 5;
+                    group_base + ((block * 7) % 15) * 5 + lane
+                } else {
+                    visit
+                };
+                let x_outer = chunk_start + offset;
+                // SAFETY: each queue job is unique; multiplication by seven
+                // permutes the fifteen blocks, and each five-chunk lane is unique.
                 let out_outer = unsafe {
                     core::slice::from_raw_parts_mut(
                         out_base.ptr().add(x_outer * OUTER_BYTES),
@@ -1036,10 +1052,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
             if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
                 0x03
-            } else if blake3_static_layout
-                && within_hash_outer == 1
-                && b_med + 2 == n_b_med
-            {
+            } else if blake3_static_layout && within_hash_outer == 1 && b_med + 2 == n_b_med {
                 0xf0
             } else {
                 0
@@ -1983,7 +1996,13 @@ fn round1_c_inner_fold(
             }
         }
     }
-    crate::lincheck::partial_fold_packed_z_best(c_lincheck, m, k_log, useful_bits, eq_outer.as_slice())
+    crate::lincheck::partial_fold_packed_z_best(
+        c_lincheck,
+        m,
+        k_log,
+        useful_bits,
+        eq_outer.as_slice(),
+    )
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -3343,15 +3362,95 @@ mod tests {
             ranked.8,
         ));
 
-        assert!(!selected(31, K_SKIP, 1 << 19, 14, 15_409, 10, 4, true, true));
-        assert!(!selected(32, K_SKIP + 1, 1 << 19, 14, 15_409, 10, 4, true, true));
-        assert!(!selected(32, K_SKIP, (1 << 19) - 1, 14, 15_409, 10, 4, true, true));
-        assert!(!selected(32, K_SKIP, 1 << 19, 15, 15_409, 10, 4, true, true));
-        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_408, 10, 4, true, true));
+        assert!(!selected(
+            31,
+            K_SKIP,
+            1 << 19,
+            14,
+            15_409,
+            10,
+            4,
+            true,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP + 1,
+            1 << 19,
+            14,
+            15_409,
+            10,
+            4,
+            true,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            (1 << 19) - 1,
+            14,
+            15_409,
+            10,
+            4,
+            true,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            1 << 19,
+            15,
+            15_409,
+            10,
+            4,
+            true,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            1 << 19,
+            14,
+            15_408,
+            10,
+            4,
+            true,
+            true
+        ));
         assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 9, 4, true, true));
-        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 10, 3, true, true));
-        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 10, 4, false, true));
-        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 10, 4, true, false));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            1 << 19,
+            14,
+            15_409,
+            10,
+            3,
+            true,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            1 << 19,
+            14,
+            15_409,
+            10,
+            4,
+            false,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            1 << 19,
+            14,
+            15_409,
+            10,
+            4,
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -4326,10 +4425,9 @@ mod tests {
         let b_bits = rng.bits(1 << m);
         let a_packed = super::super::univariate_skip::pack_bits(&a_bits);
         let b_packed = super::super::univariate_skip::pack_bits(&b_bits);
-        let prepared_context = kernels::aarch64::prepare_static_b_context_with_policy(
-            &table, true, false, false,
-        )
-        .expect("prepared static-b context");
+        let prepared_context =
+            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+                .expect("prepared static-b context");
 
         for (mask, static_a_k1, prepared) in [
             (0x03u8, false, false),
@@ -4415,7 +4513,10 @@ mod tests {
                 Some(prepared_context),
                 false,
             );
-            assert_eq!(got, want, "A_LOW5_K=0x03 h4 arm (trial {trial}) must be bit-identical");
+            assert_eq!(
+                got, want,
+                "A_LOW5_K=0x03 h4 arm (trial {trial}) must be bit-identical"
+            );
         }
     }
 
@@ -4427,10 +4528,9 @@ mod tests {
     fn single_k0_static_b_matches_generic() {
         let mut rng = Rng::new(0x51C0_B30);
         let table = make_inv_table();
-        let context = kernels::aarch64::prepare_static_b_context_with_policy(
-            &table, true, false, false,
-        )
-        .expect("prepared static-b context");
+        let context =
+            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+                .expect("prepared static-b context");
         let b_med = 14usize;
         let byte_base_b = b_med * N_CHUNKS * 8;
         let len = byte_base_b + 8 * N_CHUNKS;
@@ -4454,18 +4554,7 @@ mod tests {
             let run = |ctx: Option<kernels::StaticBContext>| {
                 let mut out = [0u8; 64];
                 kernels::aarch64::shift_reduce_inner_ab_fused_neon_checked(
-                    &a_packed,
-                    &b_packed,
-                    &table,
-                    0,
-                    b_med,
-                    &mut out,
-                    false,
-                    true,
-                    0,
-                    1,
-                    ctx,
-                    false,
+                    &a_packed, &b_packed, &table, 0, b_med, &mut out, false, true, 0, 1, ctx, false,
                 );
                 out
             };
@@ -5724,3 +5813,13 @@ mod tests {
 // chewy-cadence: r557 1785988378687326387
 
 // chewy-cadence: r558 1785988571742870116
+
+// chewy-cadence: r560 20260806T040229Z
+
+// r561 archive-distinct hot-line marker: 20260806T040426Z
+
+// r562 archive-distinct hot-line marker: 20260806T040635Z
+
+// chewy-cadence: r578 20260806T044834Z
+
+// chewy-cadence: r582 20260806T045819Z
