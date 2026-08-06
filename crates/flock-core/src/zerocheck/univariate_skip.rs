@@ -29,13 +29,22 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
+    build_eq_seeded(r, F128::ONE)
+}
+
+/// `build_eq` with the tensor seed pre-multiplied: returns
+/// `seed · eq(r, x)` for every `x`. Bit-identical to scaling the finished
+/// table (GF(2^128) multiplication is exactly associative, so pushing the
+/// scalar through the doubling expansion cannot change any bit) while
+/// deleting the separate `2^n`-multiply scaling pass and its allocation.
+pub fn build_eq_seeded(r: &[F128], seed: F128) -> Vec<F128> {
     use rayon::prelude::*;
 
     let n = r.len();
     // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
     // every slot in t[0..2^n] is written exactly once before any read.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
-    t[0] = F128::ONE;
+    t[0] = seed;
     const PAR_THRESHOLD: usize = 1 << 12;
     for i in 0..n {
         let r_i = r[i];
@@ -227,6 +236,65 @@ impl SplitEqGhash {
 /// φ_8 commutes with that linearity, which is what makes the bit-by-bit
 /// decomposition equal to the direct F_8-valued NTT extension.
 pub fn ntt_extend_f128_vec_ghash(in_s: &[F128], inv_table: &InvNttTableByteSingleGf8) -> Vec<F128> {
+    // Horner-by-γ (default): iterating the bit-planes in DESCENDING order
+    // turns the accumulation `out[λ] = Σ_b γ^b·φ8(v_b[λ])` into
+    // `out[λ] = γ·out[λ] + φ8(v_b[λ])`, where multiplication by γ is
+    // `mul_by_x` — a shift plus conditional XOR, no PMULL — deleting all
+    // 128·ell reduced field multiplies (and the γ-power table build) from
+    // this round-one serial-path helper. Value-identical by exactness of
+    // GF(2^128) arithmetic (`mul_by_x` equals multiplication by γ —
+    // `mul_by_x_matches_mul_by_gen` — and Horner is a re-association of the
+    // same exact sum); `ntt_extend_horner_matches_reference` checks
+    // bit-equality. `FLOCK_NO_NTT_EXTEND_HORNER=1` restores the power-sum.
+    fn horner_enabled() -> bool {
+        use std::sync::LazyLock;
+        static ENABLED: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_EXTEND_HORNER").is_none());
+        *ENABLED
+    }
+    if horner_enabled() {
+        let ell = inv_table.ell;
+        assert_eq!(in_s.len(), ell);
+        assert_eq!(ell, 1usize << inv_table.k);
+
+        let mut out = vec![F128::ZERO; ell];
+        let n_chunks = inv_table.n_chunks;
+        let mut input_bits = vec![0u8; n_chunks];
+        let mut out_bytes = vec![F8::ZERO; ell];
+
+        for b in (0..128).rev() {
+            // Pack bit b of each in_s[z] into z-indexed LSB-first byte form.
+            input_bits.iter_mut().for_each(|x| *x = 0);
+            for z in 0..ell {
+                let bit = if b < 64 {
+                    (in_s[z].lo >> b) & 1
+                } else {
+                    (in_s[z].hi >> (b - 64)) & 1
+                };
+                if bit != 0 {
+                    input_bits[z / 8] |= 1u8 << (z % 8);
+                }
+            }
+
+            // Bit-input NTT.
+            inv_table.apply(&input_bits, &mut out_bytes);
+
+            for lambda in 0..ell {
+                out[lambda] = mul_by_x(out[lambda]) + phi8(out_bytes[lambda]);
+            }
+        }
+
+        return out;
+    }
+    ntt_extend_f128_vec_ghash_reference(in_s, inv_table)
+}
+
+/// Reference power-sum form of [`ntt_extend_f128_vec_ghash`] (kill-switch
+/// path and test oracle).
+pub fn ntt_extend_f128_vec_ghash_reference(
+    in_s: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
     let ell = inv_table.ell;
     assert_eq!(in_s.len(), ell);
     assert_eq!(ell, 1usize << inv_table.k);
@@ -981,6 +1049,38 @@ mod tests {
             let x_lo = x & ((1 << eq.n_lo) - 1);
             let x_hi = x >> eq.n_lo;
             assert_eq!(eq.lo[x_lo] * eq.hi[x_hi], full[x]);
+        }
+    }
+
+    /// The Horner-by-γ accumulation is bit-identical to the reference
+    /// power-sum form for random inputs at the ranked table shape.
+    #[test]
+    fn ntt_extend_horner_matches_reference() {
+        for k_skip in [3usize, 6] {
+            let table = make_inv_table(k_skip);
+            let mut rng = Rng::new(0x408E * (k_skip as u64 + 1));
+            for _ in 0..4 {
+                let in_s = rng.f128_vec(1 << k_skip);
+                assert_eq!(
+                    ntt_extend_f128_vec_ghash(&in_s, &table),
+                    ntt_extend_f128_vec_ghash_reference(&in_s, &table),
+                    "Horner mismatch at k_skip={k_skip}"
+                );
+            }
+        }
+    }
+
+    /// Seeding the tensor build is bit-identical to scaling the finished
+    /// table entry-by-entry.
+    #[test]
+    fn build_eq_seeded_matches_post_scale() {
+        let mut rng = Rng::new(0x5EED);
+        for n in [0usize, 1, 4, 9, 12] {
+            let r = rng.f128_vec(n);
+            let seed = rng.f128();
+            let seeded = build_eq_seeded(&r, seed);
+            let scaled: Vec<F128> = build_eq(&r).iter().map(|v| *v * seed).collect();
+            assert_eq!(seeded, scaled, "seeded build mismatch at n={n}");
         }
     }
 

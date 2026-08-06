@@ -538,6 +538,54 @@ pub fn gpu_recursive_merkle_blake3(
     imp::gpu_recursive_merkle_blake3(data, num_leaves)
 }
 
+/// Recycle a recursive-level Merkle tree allocation (2^19−1 nodes = 16 MiB
+/// for the ranked L1, smaller for deeper levels). These were allocated fresh
+/// and munmapped every prove — the existing tree pool only accepts the
+/// ranked L0 size (2^21−1 nodes). Pooled entries are handed back by
+/// [`gpu_recursive_merkle_blake3`]'s copy-out (or dropped at process exit).
+/// `FLOCK_NO_REC_TREE_POOL=1` restores the drop. Bit-exact: pooling only
+/// changes WHERE the bytes live; every node byte is rewritten before use.
+pub fn give_rec_tree(tree: Vec<crate::merkle::Hash>) {
+    imp::give_rec_tree(tree);
+}
+
+/// Read-only view of the recursive-level (2^18-leaf L1) Merkle tree in the
+/// persistent Metal buffer — the zero-copy counterpart of the L0
+/// [`GpuMerkleTree`] borrow. While a view is alive, a process-wide borrow
+/// flag makes every subsequent GPU rec-Merkle call fall back (copy-out or
+/// CPU build), so the buffer can never be re-dispatched under a live
+/// reader; dropping the view releases the flag (RAII, unwind-safe).
+pub struct GpuRecTree {
+    ptr: *const crate::merkle::Hash,
+    len: usize,
+}
+// SAFETY: plain host-visible shared memory owned by a process-lifetime Metal
+// buffer; the GPU only rewrites it after the borrow flag is released.
+unsafe impl Send for GpuRecTree {}
+unsafe impl Sync for GpuRecTree {}
+impl core::ops::Deref for GpuRecTree {
+    type Target = [crate::merkle::Hash];
+    fn deref(&self) -> &[crate::merkle::Hash] {
+        // SAFETY: contract of construction in `gpu_recursive_merkle_blake3_view`.
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+impl Drop for GpuRecTree {
+    fn drop(&mut self) {
+        imp::release_rec_tree_borrow();
+    }
+}
+
+/// Zero-copy variant of [`gpu_recursive_merkle_blake3`]: builds the tree in
+/// the persistent Metal buffer and returns a borrow of it instead of copying
+/// 16 MiB out. `None` whenever the copy-out variant would return `None`, when
+/// a previous borrow is still alive, or when `FLOCK_NO_REC_MERKLE_BORROW=1` —
+/// callers then fall back to the copy-out variant or the CPU builder, whose
+/// bytes are identical.
+pub fn gpu_recursive_merkle_blake3_view(data: &[u8], num_leaves: usize) -> Option<GpuRecTree> {
+    imp::gpu_recursive_merkle_blake3_view(data, num_leaves)
+}
+
 /// Exact rollback for the PCS Fiat--Shamir BLAKE3 grind scanner.  The first
 /// untimed ranked grind still has to prove that Metal returns the same
 /// globally-smallest nonce and clears the target-side timing gate before the
@@ -9549,6 +9597,78 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         *ON.get_or_init(|| std::env::var_os("FLOCK_GPU_RECMERKLE_DEBUG").is_some())
     }
 
+    /// Pool for recursive-level Merkle tree Vecs (see the public
+    /// `give_rec_tree`). Sized entries between 2^13 nodes (256 KiB) and the
+    /// ranked-L0 node count (exclusive — those belong to the existing tree
+    /// pool). Cap 6: L1 (2^19−1 nodes, 16 MiB) + the deeper levels ≈ 22 MiB
+    /// retained per process, returned at exit outside the scored window.
+    static REC_TREE_POOL: Mutex<Vec<Vec<Hash>>> = Mutex::new(Vec::new());
+    const REC_TREE_POOL_CAP: usize = 6;
+    const REC_TREE_MIN_NODES: usize = (1 << 13) - 1;
+
+    fn rec_tree_pool_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_REC_TREE_POOL").is_none())
+    }
+
+    /// Correctness-preserving kill switch for the rec-Merkle spin-wait:
+    /// `FLOCK_NO_REC_MERKLE_SPIN=1` restores the thread-parking
+    /// `waitUntilCompleted`.
+    fn rec_merkle_spin_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_REC_MERKLE_SPIN").is_none())
+    }
+
+    fn rec_tree_pool_lock() -> std::sync::MutexGuard<'static, Vec<Vec<Hash>>> {
+        REC_TREE_POOL.lock().unwrap_or_else(|e| {
+            REC_TREE_POOL.clear_poison();
+            note_poisoned_lock("rec-tree-pool", true);
+            e.into_inner()
+        })
+    }
+
+    pub(crate) fn give_rec_tree(tree: Vec<Hash>) {
+        if !rec_tree_pool_enabled()
+            || tree.capacity() < REC_TREE_MIN_NODES
+            || tree.capacity() >= RANKED_TREE_NODES
+        {
+            return;
+        }
+        let mut pool = rec_tree_pool_lock();
+        if pool.len() < REC_TREE_POOL_CAP {
+            pool.push(tree);
+            return;
+        }
+        drop(pool);
+        // `tree` drops (munmaps) here, outside the pool lock.
+    }
+
+    /// Best-fit reuse of a pooled recursive tree allocation, or a fresh
+    /// uninit Vec. Every node byte is rewritten by the caller before any
+    /// read, so recycled contents are irrelevant.
+    #[allow(clippy::uninit_vec)]
+    fn take_rec_tree(n: usize) -> Vec<Hash> {
+        if rec_tree_pool_enabled() {
+            let mut pool = rec_tree_pool_lock();
+            let mut best: Option<usize> = None;
+            for (i, t) in pool.iter().enumerate() {
+                if t.capacity() >= n
+                    && best.is_none_or(|b| t.capacity() < pool[b].capacity())
+                {
+                    best = Some(i);
+                }
+            }
+            if let Some(i) = best {
+                let mut tree = pool.swap_remove(i);
+                // SAFETY: capacity ≥ n was just checked; `Hash` is `Copy`
+                // plain bytes and the caller overwrites all `n` nodes.
+                unsafe { tree.set_len(n) };
+                return tree;
+            }
+        }
+        crate::alloc_uninit_vec(n)
+    }
+
     fn rec_merkle_init(gpu: &'static Gpu) -> Result<RecMerkle, String> {
         unsafe {
             let pool = gpu.pool_push();
@@ -9655,6 +9775,62 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
+    /// Process-wide borrow flag for the zero-copy tree view: while set, no
+    /// GPU rec-Merkle dispatch may touch the persistent tree buffer (a live
+    /// [`super::GpuRecTree`] is reading it), so both entry points fall back.
+    static REC_TREE_BORROWED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    pub(crate) fn release_rec_tree_borrow() {
+        REC_TREE_BORROWED.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Correctness-preserving kill switch for the zero-copy tree borrow:
+    /// `FLOCK_NO_REC_MERKLE_BORROW=1` restores the copy-out path.
+    fn rec_merkle_borrow_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_REC_MERKLE_BORROW").is_none())
+    }
+
+    pub(crate) fn gpu_recursive_merkle_blake3_view(
+        data: &[u8],
+        num_leaves: usize,
+    ) -> Option<super::GpuRecTree> {
+        if !rec_merkle_borrow_enabled()
+            || !super::gpu_recursive_merkle_enabled()
+            || !REC_MERKLE_SHAPES.contains(&num_leaves)
+            || data.len() != num_leaves * 128
+        {
+            return None;
+        }
+        // Acquire the borrow before dispatching; a live previous view means
+        // the buffer must not be rewritten — fall back (copy-out will also
+        // refuse; the CPU builder takes over, bit-identically).
+        if REC_TREE_BORROWED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return None;
+        }
+        let started = rec_merkle_debug().then(std::time::Instant::now);
+        match rec_merkle_build_in_buffer(data, num_leaves) {
+            Some((gpu, tree_buf, total_nodes, hits, misses)) => {
+                let ptr = unsafe { gpu.buffer_contents(tree_buf) } as *const Hash;
+                if let Some(t) = started {
+                    eprintln!(
+                        "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms BORROWED (wrap hits {} misses {})",
+                        num_leaves.trailing_zeros(),
+                        t.elapsed().as_secs_f64() * 1e3,
+                        hits,
+                        misses,
+                    );
+                }
+                Some(super::GpuRecTree { ptr, len: total_nodes })
+            }
+            None => {
+                REC_TREE_BORROWED.store(false, std::sync::atomic::Ordering::Release);
+                None
+            }
+        }
+    }
+
     pub(crate) fn gpu_recursive_merkle_blake3(
         data: &[u8],
         num_leaves: usize,
@@ -9662,11 +9838,43 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         if !super::gpu_recursive_merkle_enabled()
             || !REC_MERKLE_SHAPES.contains(&num_leaves)
             || data.len() != num_leaves * 128
+            // A live borrow is reading the persistent buffer — do not
+            // dispatch over it; the CPU builder produces identical bytes.
+            || REC_TREE_BORROWED.load(std::sync::atomic::Ordering::Acquire)
         {
             return None;
         }
-        let gpu = gpu().ok()?;
         let started = rec_merkle_debug().then(std::time::Instant::now);
+        let (gpu, tree_buf, total_nodes, hits, misses) =
+            rec_merkle_build_in_buffer(data, num_leaves)?;
+        let mut tree: Vec<Hash> = take_rec_tree(total_nodes);
+        unsafe {
+            let dst = core::slice::from_raw_parts_mut(
+                tree.as_mut_ptr().cast::<u8>(),
+                total_nodes * 32,
+            );
+            copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
+        }
+        if let Some(t) = started {
+            eprintln!(
+                "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms (wrap hits {} misses {})",
+                num_leaves.trailing_zeros(),
+                t.elapsed().as_secs_f64() * 1e3,
+                hits,
+                misses,
+            );
+        }
+        Some(tree)
+    }
+
+    /// Shared guarded dispatch for both rec-Merkle entry points: builds the
+    /// flat tree in the persistent Metal buffer and returns the handles plus
+    /// wrap-cache counters for the callers' debug lines.
+    fn rec_merkle_build_in_buffer(
+        data: &[u8],
+        num_leaves: usize,
+    ) -> Option<(&'static Gpu, Id, usize, usize, usize)> {
+        let gpu = gpu().ok()?;
         // Poison-tolerant for the same reason as `ZC_FOLD`: discard torn
         // state and re-init rather than silently disabling the arm for the
         // rest of the process.
@@ -9757,7 +9965,16 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     read_len = n_out;
                 }
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                // The warm dispatch completes in ~1-2 ms: a bounded status
+                // spin skips the thread park + completion-handler wake that
+                // `waitUntilCompleted` pays on the open spine (same rationale
+                // as the commit graph's `commit_and_spin` call sites); the
+                // budget expiry falls back to the exact blocking wait.
+                if rec_merkle_spin_enabled() {
+                    gpu.commit_and_spin(cb, 4.0)
+                } else {
+                    gpu.commit_and_wait(cb)
+                }
             })();
             gpu.pool_pop(pool);
             run
@@ -9773,24 +9990,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             return None;
         }
 
-        let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
-        unsafe {
-            let dst = core::slice::from_raw_parts_mut(
-                tree.as_mut_ptr().cast::<u8>(),
-                total_nodes * 32,
-            );
-            copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
-        }
-        if let Some(t) = started {
-            eprintln!(
-                "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms (wrap hits {} misses {})",
-                num_leaves.trailing_zeros(),
-                t.elapsed().as_secs_f64() * 1e3,
-                state.hits,
-                state.misses,
-            );
-        }
-        Some(tree)
+        Some((gpu, tree_buf, total_nodes, state.hits, state.misses))
     }
 
     // -----------------------------------------------------------------------
@@ -12197,6 +12397,19 @@ mod imp {
     ) -> Option<Vec<crate::merkle::Hash>> {
         None
     }
+
+    pub(crate) fn give_rec_tree(tree: Vec<crate::merkle::Hash>) {
+        drop(tree);
+    }
+
+    pub(crate) fn gpu_recursive_merkle_blake3_view(
+        _data: &[u8],
+        _num_leaves: usize,
+    ) -> Option<super::GpuRecTree> {
+        None
+    }
+
+    pub(crate) fn release_rec_tree_borrow() {}
 
     pub(crate) struct FromZFirstPassStream;
 

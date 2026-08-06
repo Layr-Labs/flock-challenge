@@ -1754,11 +1754,19 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     assert_eq!(r.len(), m);
 
     let fold4_n_hi = fold4_n_hi_from_env();
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], fold4_n_hi);
-    let big_lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    let n_lo_and_inner = eq.n_lo + N_INNER;
-    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
+    // Seed `d_inv` into the lo tensor build instead of a separate serial
+    // 2^n_lo-multiply rescale pass (bit-identical: exact-field associativity
+    // pushes the scalar through the doubling expansion). The hi half is
+    // unscaled, exactly as before.
+    let full_r = &r[k_skip + N_INNER..];
+    let n_hi_eff = fold4_n_hi.min(full_r.len());
+    let n_lo_eff = full_r.len() - n_hi_eff;
+    let eq_lo_scaled: Vec<F128> =
+        crate::zerocheck::univariate_skip::build_eq_seeded(&full_r[..n_lo_eff], d_inv());
+    let eq_hi: Vec<F128> = crate::zerocheck::univariate_skip::build_eq(&full_r[n_lo_eff..]);
+    let big_lo_size = 1usize << n_lo_eff;
+    let hi_size = 1usize << n_hi_eff;
+    let n_lo_and_inner = n_lo_eff + N_INNER;
     let convert = convert_table();
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
@@ -1775,7 +1783,7 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
             &b_med_counts,
             ab_inner_bytes,
             &eq_lo_scaled,
-            eq.hi[x_hi],
+            eq_hi[x_hi],
             convert,
             None,
             &mut partial,
