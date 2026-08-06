@@ -207,6 +207,16 @@ impl InvNttTableByteSingleGf8 {
         &self.data[self.data_offset..self.data_offset + 256 * self.ell]
     }
 
+    /// Raw bytes of the plain (unswapped) 256×ell table — the GPU AB
+    /// precompute arm uploads this once and performs the `i ^ 8b` chunk
+    /// rotation with explicit indexing (`apply_scalar`'s exact semantics).
+    pub fn table_bytes(&self) -> &[u8] {
+        let t = self.table();
+        // SAFETY: `F8` is a transparent u8 wrapper; the slice covers
+        // exactly the logical table.
+        unsafe { core::slice::from_raw_parts(t.as_ptr() as *const u8, t.len()) }
+    }
+
     /// Apply M to a single byte-packed row, in place.
     /// `bytes` is `n_chunks` bytes (the LCH-coefficient bits of the row);
     /// `out` will be filled with the `ell` evaluations on Λ.

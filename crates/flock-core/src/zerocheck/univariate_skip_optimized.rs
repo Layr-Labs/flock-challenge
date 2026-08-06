@@ -758,6 +758,36 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         // but each chunk writes only its own disjoint 1 KiB, so the output
         // bytes are identical to the incumbent path.
         let n_chunks = total_bytes / OUTER_BYTES;
+        // GPU AB share (R1): a calibrated prefix of this chunk queue runs on
+        // the GPU, which is otherwise idle for the window's tail while this
+        // arm binds it. The share is 0 unless the warmup admission oracle
+        // proved the GPU rows byte-exact on this machine AND the warmup's
+        // arm wall exceeded the commit branch's (a positive idle gap) — so
+        // GPU-bound hosts (like the local gate box) keep the incumbent path
+        // automatically. Kill: FLOCK_NO_GPU_AB_PRE.
+        let mut gpu_job = None;
+        let mut cpu_base = 0usize;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if blake3_static_layout {
+            let share = crate::gpu_commit::gpu_ab_pre_decide_share(n_chunks);
+            if share > 0 {
+                let out_ptr = out_bytes.as_mut_ptr();
+                let out_len = out_bytes.len();
+                gpu_job = crate::gpu_commit::gpu_ab_pre_launch(
+                    a_packed,
+                    b_packed,
+                    inv_table.table_bytes(),
+                    &b_med_counts,
+                    within_outer_mask as u32,
+                    share,
+                    out_ptr,
+                    out_len,
+                );
+                if gpu_job.is_some() {
+                    cpu_base = share;
+                }
+            }
+        }
         let ranked_fast_policy = ranked_ab_pre_fast_policy_hoist_shape(
             m,
             k_skip,
@@ -785,6 +815,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
+                    cpu_base,
                     n_chunks,
                     out_bytes,
                 );
@@ -799,6 +830,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
+                    cpu_base,
                     n_chunks,
                     out_bytes,
                 );
@@ -814,6 +846,50 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 static_b_context,
                 nt,
                 compact,
+                cpu_base,
+                n_chunks,
+                out_bytes,
+            );
+        }
+        // GPU prefix join: on any failure, recompute the prefix on the CPU
+        // (generic policy — correctness path, never the hot one).
+        if let Some(job) = gpu_job {
+            let t_join = std::time::Instant::now();
+            let ok = job.wait();
+            if !ok {
+                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    within_outer_mask,
+                    &b_med_counts,
+                    blake3_static_layout,
+                    static_b_context,
+                    nt,
+                    compact,
+                    0,
+                    cpu_base,
+                    out_bytes,
+                );
+            }
+            if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+                eprintln!(
+                    "[zc-timing] gpu-ab-pre join: ok={ok} share={cpu_base} wait {:.2} ms",
+                    t_join.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
+        // Warmup admission calibration (once per process): probe the GPU on
+        // a prefix into a scratch slab, byte-compare against this arm's own
+        // freshly computed rows, and price u_gpu from the min replay wall.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if blake3_static_layout && crate::gpu_commit::gpu_ab_pre_calibration_pending() {
+            gpu_ab_pre_calibrate(
+                a_packed,
+                b_packed,
+                inv_table,
+                &b_med_counts,
+                within_outer_mask,
                 n_chunks,
                 out_bytes,
             );
@@ -853,6 +929,85 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
 #[inline]
 fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
     n_chunks.div_ceil(640).max(1)
+}
+
+/// Warmup admission calibration for the GPU AB-precompute share: run the GPU
+/// kernel on a probe prefix into a scratch slab, byte-compare every LIVE row
+/// against the CPU arm's freshly written `reference` bytes, and price
+/// `u_gpu` from the minimum of three replay walls (the Metal clock may ramp
+/// across them). Publishes via `gpu_ab_pre_note_calibration`; a mismatch or
+/// any GPU failure publishes `oracle_ok = false`, which pins the share to 0
+/// for the process lifetime. Untimed (warmup prove only), ~2 ms of GPU work.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn gpu_ab_pre_calibrate(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    b_med_counts: &[u8],
+    within_outer_mask: usize,
+    n_chunks: usize,
+    reference: &[u8],
+) {
+    const PROBE: usize = 4096;
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    let probe = PROBE.min(n_chunks);
+    if probe == 0 {
+        crate::gpu_commit::gpu_ab_pre_note_calibration(f64::INFINITY, false);
+        return;
+    }
+    let len = probe * OUTER_BYTES;
+    let mut slab = crate::scratch::take_f128(len / core::mem::size_of::<F128>());
+    let ptr = slab.as_mut_ptr() as *mut u8;
+    let mut best = f64::INFINITY;
+    let mut ran = true;
+    for _ in 0..3 {
+        match crate::gpu_commit::gpu_ab_pre_rows(
+            a_packed,
+            b_packed,
+            inv_table.table_bytes(),
+            b_med_counts,
+            within_outer_mask as u32,
+            0,
+            probe,
+            ptr,
+            len,
+        ) {
+            Some(w) if w > 0.0 => best = best.min(w),
+            _ => {
+                ran = false;
+                break;
+            }
+        }
+    }
+    let mut exact = ran && best.is_finite();
+    if exact {
+        // SAFETY: the slab covers `len` bytes and the GPU dispatch completed.
+        let out = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+        for c in 0..probe {
+            let n_b = b_med_counts[c & within_outer_mask] as usize;
+            let off = c * OUTER_BYTES;
+            let live = n_b * 64;
+            if out[off..off + live] != reference[off..off + live] {
+                exact = false;
+                break;
+            }
+        }
+    }
+    let u_gpu_us = if exact {
+        best * 1000.0 / probe as f64
+    } else {
+        f64::INFINITY
+    };
+    crate::gpu_commit::gpu_ab_pre_note_calibration(u_gpu_us, exact);
+    if std::env::var_os("FLOCK_ZC_TIMING").is_some()
+        || std::env::var_os("FLOCK_GPU_AB_PRE_DEBUG").is_some()
+    {
+        eprintln!(
+            "[gpu-ab-pre] calibration: exact={exact} u_gpu={u_gpu_us:.3} us/chunk \
+             (probe {probe} chunks, best wall {best:.3} ms)"
+        );
+    }
+    crate::scratch::give_f128(slab);
 }
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
@@ -924,6 +1079,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     static_b_context: Option<kernels::StaticBContext>,
     nt: bool,
     compact: bool,
+    chunk_base: usize,
     n_chunks: usize,
     out_bytes: &mut [u8],
 ) {
@@ -940,15 +1096,21 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     // Process each queue-owned slab monotonically. This removes permutation
     // generation and maximizes spatial locality; queue-level heterogeneity still
-    // distributes independent slabs dynamically.
-    let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
-    let n_jobs = n_chunks.div_ceil(chunks_per_job);
+    // distributes independent slabs dynamically. `chunk_base` skips a prefix
+    // owned by the GPU AB arm (0 when the arm is off).
+    debug_assert!(chunk_base <= n_chunks);
+    let span = n_chunks - chunk_base;
+    if span == 0 {
+        return;
+    }
+    let chunks_per_job = ab_pre_chunks_per_job(span);
+    let n_jobs = span.div_ceil(chunks_per_job);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
-            let chunk_start = job * chunks_per_job;
+            let chunk_start = chunk_base + job * chunks_per_job;
             let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
             let slab_len = chunk_end - chunk_start;
             for offset in 0..slab_len {
@@ -1754,19 +1916,30 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     assert_eq!(ab_inner.len_bytes(), total_bytes);
     assert_eq!(r.len(), m);
 
-    let fold4_n_hi = fold4_n_hi_from_env();
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], fold4_n_hi);
-    let big_lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    let n_lo_and_inner = eq.n_lo + N_INNER;
-    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
+    let fold4_n_hi = ab_completion_n_hi_from_env();
+    // Seed `d_inv` into the lo tensor build instead of a separate serial
+    // 2^n_lo-multiply rescale pass (bit-identical: exact-field associativity
+    // pushes the scalar through the doubling expansion). The hi half is
+    // unscaled, exactly as before.
+    let full_r = &r[k_skip + N_INNER..];
+    let n_hi_eff = fold4_n_hi.min(full_r.len());
+    let n_lo_eff = full_r.len() - n_hi_eff;
+    let eq_lo_scaled: Vec<F128> =
+        crate::zerocheck::univariate_skip::build_eq_seeded(&full_r[..n_lo_eff], d_inv());
+    let eq_hi: Vec<F128> = crate::zerocheck::univariate_skip::build_eq(&full_r[n_lo_eff..]);
+    let big_lo_size = 1usize << n_lo_eff;
+    let hi_size = 1usize << n_hi_eff;
+    let n_lo_and_inner = n_lo_eff + N_INNER;
     let convert = convert_table();
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
 
     let mut partials = vec![[F128::ZERO; ELL]; hi_size];
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    // Phase-seam cache handoff: the AB precompute filled ab_inner ascending
+    // during the commit window, so its tail is SLC-warm when this completion
+    // starts — claim descending.
+    crate::epool::run_hetero_chunks_rev(hi_size, |x_hi| {
         let mut partial = [F128::ZERO; ELL];
         process_one_x_hi_with_precomputed_ab_fold4_ab(
             x_hi,
@@ -1776,7 +1949,7 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
             &b_med_counts,
             ab_inner_bytes,
             &eq_lo_scaled,
-            eq.hi[x_hi],
+            eq_hi[x_hi],
             convert,
             None,
             &mut partial,
@@ -2839,6 +3012,35 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
 
 /// Resolve the Fold4-only lo/hi split tuning seam. Invalid values fail loudly:
 /// silently accepting a typo would make component profiles incomparable.
+/// Chunk-granularity split for the AB-only round-1 completion (separate
+/// from the C-side fold4's n_hi, whose 32-bank high-scaling cost scales
+/// with 2^n_hi and is deliberately pinned at 7). Default 8 = 256 chunks:
+/// ~18 claims per worker on the ranked 10P+4E heterogeneous queue instead
+/// of ~9 — halving the join's straggler tail (an efficiency-core holding a
+/// final coarse chunk straggles the whole round-1 join) — and a 32 KiB
+/// eq_lo table that coexists with the 64 KiB convert table in L1 instead
+/// of competing with it at 64 KiB. Outputs are bit-identical at any value:
+/// the lo/hi split is an exact tensor factorisation of the same eq table
+/// (the in-tree MAX_N_HI note makes the same argument), and the per-chunk
+/// partial regrouping is XOR-exact. `FLOCK_AB_COMPLETION_N_HI` (5..=10)
+/// overrides for A/B; the extra per-chunk cost is 64 eq_hi multiplies and
+/// one 1 KiB partial slot per additional chunk — trivial against the tail.
+fn ab_completion_n_hi_from_env() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        match std::env::var("FLOCK_AB_COMPLETION_N_HI") {
+            Ok(s) => match s.parse::<usize>() {
+                Ok(n) if (5..=10).contains(&n) => n,
+                _ => panic!("FLOCK_AB_COMPLETION_N_HI must be an integer in 5..=10"),
+            },
+            // Default restored to the incumbent 7 pending runner evidence
+            // (the one ranked draw carrying 8 landed well below its base;
+            // local medians favored 8 by only ~0.2 ms). Override for A/B.
+            Err(_) => 7,
+        }
+    })
+}
+
 fn fold4_n_hi_from_env() -> usize {
     match std::env::var_os("FLOCK_EXPERIMENTAL_FOLD4_N_HI") {
         None => 7,
@@ -5060,6 +5262,168 @@ mod tests {
                 bank[lane] += (cf_c[s] * alpha_inv_pow[s]) * eq_lo_val;
             }
         }
+    }
+
+    /// The GPU AB-precompute arm must reproduce the scalar row kernel
+    /// byte-for-byte on every live row, for both a no-padding shape and the
+    /// ranked BLAKE3 padding pattern (b_med skips). This is the admission
+    /// oracle's contract; a mismatch here means the arm must never be
+    /// enabled.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_ab_pre_rows_match_scalar() {
+        let inv_table = make_inv_table();
+        let mut rng = Rng::new(0xAB_9E0);
+        let paddings = [
+            crate::zerocheck::PaddingSpec {
+                k_log: 12,
+                useful_bits_per_block: 1 << 12,
+            },
+            crate::zerocheck::PaddingSpec {
+                k_log: 14,
+                useful_bits_per_block: 15_409,
+            },
+        ];
+        for padding in paddings {
+            let m = 19usize; // 2^19 bits = 64 KiB per operand, 512 chunks
+            let total_bytes = (1usize << m) / 8;
+            let n_chunks = total_bytes / 1024;
+            // Page-aligned slabs (wrap_buffer requirement) via the pool.
+            let mut a_v = crate::scratch::take_f128(total_bytes / 16);
+            let mut b_v = crate::scratch::take_f128(total_bytes / 16);
+            let mut out_v = crate::scratch::take_f128(total_bytes / 16);
+            {
+                let a_bytes: &mut [u8] = unsafe {
+                    core::slice::from_raw_parts_mut(a_v.as_mut_ptr() as *mut u8, total_bytes)
+                };
+                let b_bytes: &mut [u8] = unsafe {
+                    core::slice::from_raw_parts_mut(b_v.as_mut_ptr() as *mut u8, total_bytes)
+                };
+                for x in a_bytes.iter_mut() {
+                    *x = (rng.next_u64() & 0xff) as u8;
+                }
+                for x in b_bytes.iter_mut() {
+                    *x = (rng.next_u64() & 0xff) as u8;
+                }
+            }
+            let a: &[u8] =
+                unsafe { core::slice::from_raw_parts(a_v.as_ptr() as *const u8, total_bytes) };
+            let b: &[u8] =
+                unsafe { core::slice::from_raw_parts(b_v.as_ptr() as *const u8, total_bytes) };
+            let (mask, counts) = build_b_med_counts(&padding);
+
+            let Some(gpu_wall) = crate::gpu_commit::gpu_ab_pre_rows(
+                a,
+                b,
+                inv_table.table_bytes(),
+                &counts,
+                mask as u32,
+                0,
+                n_chunks,
+                out_v.as_mut_ptr() as *mut u8,
+                total_bytes,
+            ) else {
+                eprintln!("[gpu-ab-pre oracle] GPU unavailable — skipping");
+                return;
+            };
+            eprintln!(
+                "[gpu-ab-pre oracle] k_log={} {} chunks GPU wall {gpu_wall:.3} ms",
+                padding.k_log, n_chunks
+            );
+
+            let out: &[u8] =
+                unsafe { core::slice::from_raw_parts(out_v.as_ptr() as *const u8, total_bytes) };
+            let mut expected = [0u8; 64];
+            let mut a_col = [F8::ZERO; ELL];
+            let mut b_col = [F8::ZERO; ELL];
+            for chunk in 0..n_chunks {
+                let n_b_med = counts[chunk & mask] as usize;
+                for b_med in 0..n_b_med {
+                    shift_reduce_inner_ab_scalar(
+                        a,
+                        b,
+                        &inv_table,
+                        chunk * 1024,
+                        b_med,
+                        &mut expected,
+                        &mut a_col,
+                        &mut b_col,
+                    );
+                    let off = chunk * 1024 + b_med * 64;
+                    assert_eq!(
+                        &out[off..off + 64],
+                        &expected[..],
+                        "GPU row mismatch at chunk={chunk} b_med={b_med} k_log={}",
+                        padding.k_log
+                    );
+                }
+            }
+            crate::scratch::give_f128(a_v);
+            crate::scratch::give_f128(b_v);
+            crate::scratch::give_f128(out_v);
+        }
+    }
+
+    /// Manual throughput probe for the GPU AB-precompute arm (amortizes the
+    /// dispatch overhead over a large chunk count):
+    /// `cargo test -p flock-core --release gpu_ab_pre_throughput -- --ignored --nocapture`
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "manual throughput probe"]
+    fn gpu_ab_pre_throughput() {
+        let inv_table = make_inv_table();
+        let mut rng = Rng::new(0xAB_79);
+        let padding = crate::zerocheck::PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let m = 27usize; // 16 MiB slabs, 16384 chunks
+        let total_bytes = (1usize << m) / 8;
+        let n_chunks = total_bytes / 1024;
+        let mut a_v = crate::scratch::take_f128(total_bytes / 16);
+        let mut b_v = crate::scratch::take_f128(total_bytes / 16);
+        let mut out_v = crate::scratch::take_f128(total_bytes / 16);
+        unsafe {
+            let ab = core::slice::from_raw_parts_mut(a_v.as_mut_ptr() as *mut u8, total_bytes);
+            let bb = core::slice::from_raw_parts_mut(b_v.as_mut_ptr() as *mut u8, total_bytes);
+            for x in ab.iter_mut() {
+                *x = (rng.next_u64() & 0xff) as u8;
+            }
+            for x in bb.iter_mut() {
+                *x = (rng.next_u64() & 0xff) as u8;
+            }
+        }
+        let a: &[u8] =
+            unsafe { core::slice::from_raw_parts(a_v.as_ptr() as *const u8, total_bytes) };
+        let b: &[u8] =
+            unsafe { core::slice::from_raw_parts(b_v.as_ptr() as *const u8, total_bytes) };
+        let (mask, counts) = build_b_med_counts(&padding);
+        for round in 0..4 {
+            let wall = crate::gpu_commit::gpu_ab_pre_rows(
+                a,
+                b,
+                inv_table.table_bytes(),
+                &counts,
+                mask as u32,
+                0,
+                n_chunks,
+                out_v.as_mut_ptr() as *mut u8,
+                total_bytes,
+            );
+            if let Some(w) = wall {
+                eprintln!(
+                    "[gpu-ab-pre throughput] round {round}: {n_chunks} chunks in {w:.3} ms = {:.3} us/chunk (ranked 2^19 chunks => {:.1} ms)",
+                    w * 1000.0 / n_chunks as f64,
+                    w * (1u64 << 19) as f64 / n_chunks as f64
+                );
+            } else {
+                eprintln!("[gpu-ab-pre throughput] GPU unavailable");
+                return;
+            }
+        }
+        crate::scratch::give_f128(a_v);
+        crate::scratch::give_f128(b_v);
+        crate::scratch::give_f128(out_v);
     }
 
     /// The 4-lane-wide NEON convert fold must be **bit-identical** to the

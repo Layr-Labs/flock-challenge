@@ -533,6 +533,118 @@ pub fn gpu_recursive_merkle_blake3(
     imp::gpu_recursive_merkle_blake3(data, num_leaves)
 }
 
+/// Recycle a recursive-level Merkle tree allocation (2^19−1 nodes = 16 MiB
+/// for the ranked L1, smaller for deeper levels). These were allocated fresh
+/// and munmapped every prove — the existing tree pool only accepts the
+/// ranked L0 size (2^21−1 nodes). Pooled entries are handed back by
+/// [`gpu_recursive_merkle_blake3`]'s copy-out (or dropped at process exit).
+/// `FLOCK_NO_REC_TREE_POOL=1` restores the drop. Bit-exact: pooling only
+/// changes WHERE the bytes live; every node byte is rewritten before use.
+pub fn give_rec_tree(tree: Vec<crate::merkle::Hash>) {
+    imp::give_rec_tree(tree);
+}
+
+/// Read-only view of the recursive-level (2^18-leaf L1) Merkle tree in the
+/// persistent Metal buffer — the zero-copy counterpart of the L0
+/// [`GpuMerkleTree`] borrow. While a view is alive, a process-wide borrow
+/// flag makes every subsequent GPU rec-Merkle call fall back (copy-out or
+/// CPU build), so the buffer can never be re-dispatched under a live
+/// reader; dropping the view releases the flag (RAII, unwind-safe).
+pub struct GpuRecTree {
+    ptr: *const crate::merkle::Hash,
+    len: usize,
+}
+// SAFETY: plain host-visible shared memory owned by a process-lifetime Metal
+// buffer; the GPU only rewrites it after the borrow flag is released.
+unsafe impl Send for GpuRecTree {}
+unsafe impl Sync for GpuRecTree {}
+impl core::ops::Deref for GpuRecTree {
+    type Target = [crate::merkle::Hash];
+    fn deref(&self) -> &[crate::merkle::Hash] {
+        // SAFETY: contract of construction in `gpu_recursive_merkle_blake3_view`.
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+impl Drop for GpuRecTree {
+    fn drop(&mut self) {
+        imp::release_rec_tree_borrow();
+    }
+}
+
+/// Zero-copy variant of [`gpu_recursive_merkle_blake3`]: builds the tree in
+/// the persistent Metal buffer and returns a borrow of it instead of copying
+/// 16 MiB out. `None` whenever the copy-out variant would return `None`, when
+/// a previous borrow is still alive, or when `FLOCK_NO_REC_MERKLE_BORROW=1` —
+/// callers then fall back to the copy-out variant or the CPU builder, whose
+/// bytes are identical.
+pub fn gpu_recursive_merkle_blake3_view(data: &[u8], num_leaves: usize) -> Option<GpuRecTree> {
+    imp::gpu_recursive_merkle_blake3_view(data, num_leaves)
+}
+
+/// Synchronous GPU computation of round-1 AB-precompute rows
+/// `[chunk_base, chunk_base + n_chunks)` directly into the (page-aligned)
+/// `ab_inner` slab. Byte-identical to
+/// `kernels/portable.rs::shift_reduce_inner_ab_scalar` for every live row
+/// (rows ≥ the chunk's `b_med_count` are left unwritten — the compact-store
+/// contract). Returns the dispatch's GPU wall in milliseconds, or `None` on
+/// any failure/unavailability (callers keep the CPU path).
+/// Kill switch: `FLOCK_NO_GPU_AB_PRE=1`.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_ab_pre_rows(
+    a: &[u8],
+    b: &[u8],
+    table_bytes: &[u8],
+    counts: &[u8],
+    mask: u32,
+    chunk_base: usize,
+    n_chunks: usize,
+    out_ptr: *mut u8,
+    out_len: usize,
+) -> Option<f64> {
+    imp::gpu_ab_pre_rows(
+        a, b, table_bytes, counts, mask, chunk_base, n_chunks, out_ptr, out_len,
+    )
+}
+
+/// Stamp the warmup phase's commit-branch wall (the counterpart of
+/// [`note_precompute_branch_wall_ms`]) — the AB-precompute GPU share is
+/// admitted only when the arm's wall exceeded this (a positive idle gap).
+pub fn note_commit_branch_wall_ms(ms: f64) {
+    imp::note_commit_branch_wall_ms(ms);
+}
+
+/// Record the warmup calibration outcome for the AB-precompute GPU arm.
+pub fn gpu_ab_pre_note_calibration(u_gpu_us: f64, oracle_ok: bool) {
+    imp::ab_pre_note_calibration(u_gpu_us, oracle_ok);
+}
+
+/// The timed prove's GPU chunk share for the AB precompute (0 = arm off).
+pub fn gpu_ab_pre_decide_share(n_chunks: usize) -> usize {
+    imp::ab_pre_decide_share(n_chunks)
+}
+
+/// True until the once-per-process AB-precompute admission calibration runs.
+pub fn gpu_ab_pre_calibration_pending() -> bool {
+    imp::ab_pre_calibration_pending()
+}
+
+pub(crate) use imp::AbPreJob as GpuAbPreJob;
+
+/// Asynchronously launch the AB-precompute GPU prefix `[0, n_chunks)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_ab_pre_launch(
+    a: &[u8],
+    b: &[u8],
+    table_bytes: &[u8],
+    counts: &[u8],
+    mask: u32,
+    n_chunks: usize,
+    out_ptr: *mut u8,
+    out_len: usize,
+) -> Option<GpuAbPreJob> {
+    imp::gpu_ab_pre_launch(a, b, table_bytes, counts, mask, n_chunks, out_ptr, out_len)
+}
+
 /// Exact rollback for the PCS Fiat--Shamir BLAKE3 grind scanner.  The first
 /// untimed ranked grind still has to prove that Metal returns the same
 /// globally-smallest nonce and clears the target-side timing gate before the
@@ -9663,6 +9775,78 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         *ON.get_or_init(|| std::env::var_os("FLOCK_GPU_RECMERKLE_DEBUG").is_some())
     }
 
+    /// Pool for recursive-level Merkle tree Vecs (see the public
+    /// `give_rec_tree`). Sized entries between 2^13 nodes (256 KiB) and the
+    /// ranked-L0 node count (exclusive — those belong to the existing tree
+    /// pool). Cap 6: L1 (2^19−1 nodes, 16 MiB) + the deeper levels ≈ 22 MiB
+    /// retained per process, returned at exit outside the scored window.
+    static REC_TREE_POOL: Mutex<Vec<Vec<Hash>>> = Mutex::new(Vec::new());
+    const REC_TREE_POOL_CAP: usize = 6;
+    const REC_TREE_MIN_NODES: usize = (1 << 13) - 1;
+
+    fn rec_tree_pool_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_REC_TREE_POOL").is_none())
+    }
+
+    /// Correctness-preserving kill switch for the rec-Merkle spin-wait:
+    /// `FLOCK_NO_REC_MERKLE_SPIN=1` restores the thread-parking
+    /// `waitUntilCompleted`.
+    fn rec_merkle_spin_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_REC_MERKLE_SPIN").is_none())
+    }
+
+    fn rec_tree_pool_lock() -> std::sync::MutexGuard<'static, Vec<Vec<Hash>>> {
+        REC_TREE_POOL.lock().unwrap_or_else(|e| {
+            REC_TREE_POOL.clear_poison();
+            note_poisoned_lock("rec-tree-pool", true);
+            e.into_inner()
+        })
+    }
+
+    pub(crate) fn give_rec_tree(tree: Vec<Hash>) {
+        if !rec_tree_pool_enabled()
+            || tree.capacity() < REC_TREE_MIN_NODES
+            || tree.capacity() >= RANKED_TREE_NODES
+        {
+            return;
+        }
+        let mut pool = rec_tree_pool_lock();
+        if pool.len() < REC_TREE_POOL_CAP {
+            pool.push(tree);
+            return;
+        }
+        drop(pool);
+        // `tree` drops (munmaps) here, outside the pool lock.
+    }
+
+    /// Best-fit reuse of a pooled recursive tree allocation, or a fresh
+    /// uninit Vec. Every node byte is rewritten by the caller before any
+    /// read, so recycled contents are irrelevant.
+    #[allow(clippy::uninit_vec)]
+    fn take_rec_tree(n: usize) -> Vec<Hash> {
+        if rec_tree_pool_enabled() {
+            let mut pool = rec_tree_pool_lock();
+            let mut best: Option<usize> = None;
+            for (i, t) in pool.iter().enumerate() {
+                if t.capacity() >= n
+                    && best.is_none_or(|b| t.capacity() < pool[b].capacity())
+                {
+                    best = Some(i);
+                }
+            }
+            if let Some(i) = best {
+                let mut tree = pool.swap_remove(i);
+                // SAFETY: capacity ≥ n was just checked; `Hash` is `Copy`
+                // plain bytes and the caller overwrites all `n` nodes.
+                unsafe { tree.set_len(n) };
+                return tree;
+            }
+        }
+        crate::alloc_uninit_vec(n)
+    }
+
     fn rec_merkle_init(gpu: &'static Gpu) -> Result<RecMerkle, String> {
         unsafe {
             let pool = gpu.pool_push();
@@ -9766,15 +9950,106 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
-    pub(crate) fn gpu_recursive_merkle_blake3(data: &[u8], num_leaves: usize) -> Option<Vec<Hash>> {
-        if !super::gpu_recursive_merkle_enabled()
+    /// Process-wide borrow flag for the zero-copy tree view: while set, no
+    /// GPU rec-Merkle dispatch may touch the persistent tree buffer (a live
+    /// [`super::GpuRecTree`] is reading it), so both entry points fall back.
+    static REC_TREE_BORROWED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    pub(crate) fn release_rec_tree_borrow() {
+        REC_TREE_BORROWED.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Correctness-preserving kill switch for the zero-copy tree borrow:
+    /// `FLOCK_NO_REC_MERKLE_BORROW=1` restores the copy-out path.
+    fn rec_merkle_borrow_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_REC_MERKLE_BORROW").is_none())
+    }
+
+    pub(crate) fn gpu_recursive_merkle_blake3_view(
+        data: &[u8],
+        num_leaves: usize,
+    ) -> Option<super::GpuRecTree> {
+        if !rec_merkle_borrow_enabled()
+            || !super::gpu_recursive_merkle_enabled()
             || !REC_MERKLE_SHAPES.contains(&num_leaves)
             || data.len() != num_leaves * 128
         {
             return None;
         }
-        let gpu = gpu().ok()?;
+        // Acquire the borrow before dispatching; a live previous view means
+        // the buffer must not be rewritten — fall back (copy-out will also
+        // refuse; the CPU builder takes over, bit-identically).
+        if REC_TREE_BORROWED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return None;
+        }
         let started = rec_merkle_debug().then(std::time::Instant::now);
+        match rec_merkle_build_in_buffer(data, num_leaves) {
+            Some((gpu, tree_buf, total_nodes, hits, misses)) => {
+                let ptr = unsafe { gpu.buffer_contents(tree_buf) } as *const Hash;
+                if let Some(t) = started {
+                    eprintln!(
+                        "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms BORROWED (wrap hits {} misses {})",
+                        num_leaves.trailing_zeros(),
+                        t.elapsed().as_secs_f64() * 1e3,
+                        hits,
+                        misses,
+                    );
+                }
+                Some(super::GpuRecTree { ptr, len: total_nodes })
+            }
+            None => {
+                REC_TREE_BORROWED.store(false, std::sync::atomic::Ordering::Release);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn gpu_recursive_merkle_blake3(
+        data: &[u8],
+        num_leaves: usize,
+    ) -> Option<Vec<Hash>> {
+        if !super::gpu_recursive_merkle_enabled()
+            || !REC_MERKLE_SHAPES.contains(&num_leaves)
+            || data.len() != num_leaves * 128
+            // A live borrow is reading the persistent buffer — do not
+            // dispatch over it; the CPU builder produces identical bytes.
+            || REC_TREE_BORROWED.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        let started = rec_merkle_debug().then(std::time::Instant::now);
+        let (gpu, tree_buf, total_nodes, hits, misses) =
+            rec_merkle_build_in_buffer(data, num_leaves)?;
+        let mut tree: Vec<Hash> = take_rec_tree(total_nodes);
+        unsafe {
+            let dst = core::slice::from_raw_parts_mut(
+                tree.as_mut_ptr().cast::<u8>(),
+                total_nodes * 32,
+            );
+            copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
+        }
+        if let Some(t) = started {
+            eprintln!(
+                "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms (wrap hits {} misses {})",
+                num_leaves.trailing_zeros(),
+                t.elapsed().as_secs_f64() * 1e3,
+                hits,
+                misses,
+            );
+        }
+        Some(tree)
+    }
+
+    /// Shared guarded dispatch for both rec-Merkle entry points: builds the
+    /// flat tree in the persistent Metal buffer and returns the handles plus
+    /// wrap-cache counters for the callers' debug lines.
+    fn rec_merkle_build_in_buffer(
+        data: &[u8],
+        num_leaves: usize,
+    ) -> Option<(&'static Gpu, Id, usize, usize, usize)> {
+        let gpu = gpu().ok()?;
         // Poison-tolerant for the same reason as `ZC_FOLD`: discard torn
         // state and re-init rather than silently disabling the arm for the
         // rest of the process.
@@ -9868,7 +10143,16 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     read_len = n_out;
                 }
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                // The warm dispatch completes in ~1-2 ms: a bounded status
+                // spin skips the thread park + completion-handler wake that
+                // `waitUntilCompleted` pays on the open spine (same rationale
+                // as the commit graph's `commit_and_spin` call sites); the
+                // budget expiry falls back to the exact blocking wait.
+                if rec_merkle_spin_enabled() {
+                    gpu.commit_and_spin(cb, 4.0)
+                } else {
+                    gpu.commit_and_wait(cb)
+                }
             })();
             gpu.pool_pop(pool);
             run
@@ -9884,22 +10168,466 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             return None;
         }
 
-        let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
-        unsafe {
-            let dst =
-                core::slice::from_raw_parts_mut(tree.as_mut_ptr().cast::<u8>(), total_nodes * 32);
-            copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
+        Some((gpu, tree_buf, total_nodes, state.hits, state.misses))
+    }
+
+    // -----------------------------------------------------------------------
+    // GPU share of the round-1 AB PRECOMPUTE (the commit-window binder).
+    //
+    // The commit window is bound by the CPU AB-precompute arm (ranked: arm
+    // ~58 ms ≈ window, GPU graph 41-53 ms with zero host wait), so GPU
+    // seconds spent on a prefix of its chunk queue shorten the window
+    // one-for-one once the graph has drained. The kernel is the exact
+    // scalar row spec (`kernels/portable.rs::shift_reduce_inner_ab_scalar`):
+    // per (x_outer, b_med < n_b_med): for k in 0..8, apply the 16 KiB
+    // compressed LDE table to the 8 a-bytes and 8 b-bytes
+    // (`out[i] ^= T[byte][i ^ 8b]`, `apply_scalar` semantics), lane-multiply
+    // in GF(2^8) (reduced, poly x^8+x^4+x^3+x+1), accumulate `<< k`, and
+    // final-reduce — byte-identical to the CPU by construction and enforced
+    // by the warmup equality oracle before any share is admitted.
+    // -----------------------------------------------------------------------
+
+    const AB_PRE_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// 8x8 -> <=15-bit carry-less multiply via 4-bit-spaced masked multiplies
+// (the clmul32 trick restricted to byte operands).
+static inline uint clpoly8(uint a, uint b) {
+    const uint M0 = 0x11111111u, M1 = 0x22222222u,
+               M2 = 0x44444444u, M3 = 0x88888888u;
+    uint a0 = a & 0x11u, a1 = a & 0x22u, a2 = a & 0x44u, a3 = a & 0x88u;
+    uint b0 = b & 0x11u, b1 = b & 0x22u, b2 = b & 0x44u, b3 = b & 0x88u;
+    uint r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
+    uint r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
+    uint r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
+    uint r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
+    return r0 | r1 | r2 | r3;
+}
+
+// GF(2^8) reduce mod x^8+x^4+x^3+x+1 — byte-for-byte the CPU's gf8_reduce.
+static inline uint gf8_reduce15(uint p) {
+    uint h = p >> 8;
+    uint t = (p & 0xFFu) ^ h ^ (h << 1) ^ (h << 3) ^ (h << 4);
+    uint h2 = t >> 8;
+    return (t & 0xFFu) ^ h2 ^ (h2 << 1) ^ (h2 << 3) ^ (h2 << 4);
+}
+
+// Wide reduce for the deferred accumulator (<=21-bit input): each fold
+// shaves ~4 bits above 8 (the h<<4 term dominates), so four folds fully
+// reduce 21 bits. F2-linearity makes the single deferred reduce equal to
+// the scalar's per-k reduce chain.
+static inline uint gf8_reduce_wide(uint p) {
+    for (uint r = 0; r < 4u; ++r) {
+        uint h = p >> 8;
+        p = (p & 0xFFu) ^ h ^ (h << 1) ^ (h << 3) ^ (h << 4);
+    }
+    return p;
+}
+
+struct AbPreParams {
+    uint chunk_base;   // first x_outer this dispatch owns
+    uint mask;         // within_outer_mask
+};
+
+// One threadgroup (256 threads) per x_outer chunk: 16 b_med rows x 16
+// four-lane thread slots. Threads on rows >= n_b_med exit (compact-store
+// contract: dead rows are never read).
+kernel void ab_pre_rows(
+    device const uchar* a        [[buffer(0)]],
+    device const uchar* b        [[buffer(1)]],
+    constant uint*      table    [[buffer(2)]],   // 256 x 64 bytes, plain
+    device const uchar* counts   [[buffer(3)]],   // b_med_counts
+    device uchar*       out      [[buffer(4)]],
+    constant AbPreParams& P      [[buffer(5)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    // v3: the 16 KiB LDE table lives in the CONSTANT address space (cached,
+    // broadcast-friendly) instead of threadgroup memory — zero threadgroup
+    // bytes means maximum occupancy, and the byte-indexed row gathers hit
+    // the constant cache. (v2's threadgroup staging of the 2 KiB row inputs
+    // measured 5% SLOWER: the kernel is not input-load-bound and the extra
+    // threadgroup bytes halved occupancy.)
+    uint x = P.chunk_base + tg;
+    uint n_b_med = counts[x & P.mask];
+    uint row  = tid >> 4;   // b_med 0..15
+    uint quad = tid & 15u;  // four-lane slot 0..15
+    if (row >= n_b_med) { return; }
+    ulong base = ulong(x) * 1024ul + ulong(row) * 64ul;
+
+    // v4: deferred reduction. The GF(2^8) reduction is F2-linear, so the
+    // raw <=14-bit products can be XOR-accumulated shifted by k (<=21 bits)
+    // and reduced ONCE per lane — deleting the per-(lane,k) reduce (32 calls
+    // per thread) that v1-v3 performed to mirror the CPU scalar literally.
+    // The final gf8_reduce_wide folds four times (each fold shaves ~4 bits
+    // above 8), fully reducing the <=21-bit accumulator (oracle-verified).
+    uint acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0; // per-lane <=21-bit accs
+    for (uint k = 0; k < 8u; ++k) {
+        device const uchar* ap = a + base + ulong(k) * 8ul;
+        device const uchar* bp = b + base + ulong(k) * 8ul;
+        uint acol = 0, bcol = 0; // 4 lanes packed LE
+        for (uint j = 0; j < 8u; ++j) {
+            uint idx4 = ((quad * 4u) ^ (8u * j)) >> 2;
+            acol ^= table[uint(ap[j]) * 16u + idx4];
+            bcol ^= table[uint(bp[j]) * 16u + idx4];
         }
-        if let Some(t) = started {
+        acc0 ^= clpoly8(acol & 0xFFu,         bcol & 0xFFu)         << k;
+        acc1 ^= clpoly8((acol >> 8) & 0xFFu,  (bcol >> 8) & 0xFFu)  << k;
+        acc2 ^= clpoly8((acol >> 16) & 0xFFu, (bcol >> 16) & 0xFFu) << k;
+        acc3 ^= clpoly8(acol >> 24,           bcol >> 24)           << k;
+    }
+    uint outw = gf8_reduce_wide(acc0)
+              | (gf8_reduce_wide(acc1) << 8)
+              | (gf8_reduce_wide(acc2) << 16)
+              | (gf8_reduce_wide(acc3) << 24);
+    ((device uint*)(out + base))[quad] = outw;
+}
+"#;
+
+    struct AbPre {
+        pso: Id,
+        /// 16 KiB plain inv table, uploaded once (keyed by source pointer).
+        table_buf: Id,
+        table_key: usize,
+        /// b_med_counts upload (tiny; re-uploaded when its bytes change).
+        counts_buf: Id,
+        counts_cap: usize,
+        counts_key: u64,
+        /// Cached zero-copy wraps `(ptr, len, buf)` for a/b/out slabs.
+        wraps: Vec<(usize, usize, Id)>,
+    }
+    // SAFETY: handles only touched under the state mutex; Metal objects are
+    // thread-safe.
+    unsafe impl Send for AbPre {}
+
+    static AB_PRE_STATE: std::sync::OnceLock<Option<std::sync::Mutex<AbPre>>> =
+        std::sync::OnceLock::new();
+
+    fn ab_pre_gpu_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_AB_PRE").is_none())
+    }
+
+    fn ab_pre_init(gpu: &'static Gpu) -> Result<AbPre, String> {
+        // SAFETY: one-time pipeline compilation against the process Metal
+        // device; same contract as every other supplemental pipeline here.
+        let pso =
+            unsafe { compile_supplemental_pipeline(gpu, AB_PRE_MSL_SOURCE, "ab_pre_rows")? };
+        Ok(AbPre {
+            pso,
+            table_buf: NIL,
+            table_key: 0,
+            counts_buf: NIL,
+            counts_cap: 0,
+            counts_key: 0,
+            wraps: Vec::new(),
+        })
+    }
+
+    fn ab_pre_state() -> Option<&'static std::sync::Mutex<AbPre>> {
+        AB_PRE_STATE
+            .get_or_init(|| {
+                if !ab_pre_gpu_enabled() {
+                    return None;
+                }
+                let gpu = gpu().ok()?;
+                match ab_pre_init(gpu) {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if debug_enabled() {
+                            eprintln!("[gpu-ab-pre] init failed ({e})");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Upload/refresh the small constant inputs and wrap the big slabs.
+    /// Returns the four buffer handles.
+    unsafe fn ab_pre_bind(
+        gpu: &Gpu,
+        state: &mut AbPre,
+        a: &[u8],
+        b: &[u8],
+        table_bytes: &[u8],
+        counts: &[u8],
+        out_ptr: *mut u8,
+        out_len: usize,
+    ) -> Result<(Id, Id, Id), String> {
+        unsafe {
+            if state.table_key != table_bytes.as_ptr() as usize {
+                if state.table_buf != NIL {
+                    gpu.release(state.table_buf);
+                }
+                state.table_buf = gpu.new_buffer(table_bytes.len())?;
+                std::ptr::copy_nonoverlapping(
+                    table_bytes.as_ptr(),
+                    gpu.buffer_contents(state.table_buf),
+                    table_bytes.len(),
+                );
+                state.table_key = table_bytes.as_ptr() as usize;
+            }
+            let counts_key = {
+                // Tiny table: fingerprint by content so shape changes re-upload.
+                let mut h = 0xcbf2_9ce4_8422_2325u64;
+                for &c in counts {
+                    h = (h ^ c as u64).wrapping_mul(0x1000_0000_01b3);
+                }
+                h ^ (counts.len() as u64)
+            };
+            if state.counts_key != counts_key || state.counts_cap < counts.len() {
+                if state.counts_buf != NIL && state.counts_cap < counts.len() {
+                    gpu.release(state.counts_buf);
+                    state.counts_buf = NIL;
+                }
+                if state.counts_buf == NIL {
+                    state.counts_buf = gpu.new_buffer(counts.len().max(64))?;
+                    state.counts_cap = counts.len().max(64);
+                }
+                std::ptr::copy_nonoverlapping(
+                    counts.as_ptr(),
+                    gpu.buffer_contents(state.counts_buf),
+                    counts.len(),
+                );
+                state.counts_key = counts_key;
+            }
+            let wrap = |state: &mut AbPre, ptr: *mut u8, len: usize| -> Result<Id, String> {
+                let key = ptr as usize;
+                if let Some(&(_, _, buf)) =
+                    state.wraps.iter().find(|&&(p, l, _)| p == key && l == len)
+                {
+                    return Ok(buf);
+                }
+                let buf = gpu.wrap_buffer(ptr, len)?;
+                state.wraps.push((key, len, buf));
+                Ok(buf)
+            };
+            let a_buf = wrap(state, a.as_ptr().cast_mut(), a.len())?;
+            let b_buf = wrap(state, b.as_ptr().cast_mut(), b.len())?;
+            let out_buf = wrap(state, out_ptr, out_len)?;
+            Ok((a_buf, b_buf, out_buf))
+        }
+    }
+
+    unsafe fn ab_pre_submit(
+        gpu: &Gpu,
+        state: &AbPre,
+        a_buf: Id,
+        b_buf: Id,
+        out_buf: Id,
+        chunk_base: usize,
+        n_chunks: usize,
+        mask: u32,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                chunk_base: u32,
+                mask: u32,
+            }
+            let params = P {
+                chunk_base: chunk_base as u32,
+                mask,
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, a_buf, 0, 0);
+            gpu.set_buffer(enc, b_buf, 0, 1);
+            gpu.set_buffer(enc, state.table_buf, 0, 2);
+            gpu.set_buffer(enc, state.counts_buf, 0, 3);
+            gpu.set_buffer(enc, out_buf, 0, 4);
+            gpu.set_bytes(enc, pb, 5);
+            gpu.dispatch(enc, n_chunks as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// Warmup-measured GPU cost per chunk (f64 bits; 0 = unmeasured) and the
+    /// admission oracle outcome for the AB-precompute arm.
+    static AB_PRE_U_GPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static AB_PRE_ORACLE_OK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    /// Warmup commit-branch wall (f64 ms bits; 0 = unset), stamped by the
+    /// prover's phase join — the counterpart of `note_precompute_branch_wall_ms`.
+    static COMMIT_BRANCH_WALL_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    pub(crate) fn note_commit_branch_wall_ms(ms: f64) {
+        COMMIT_BRANCH_WALL_MS.store(ms.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    static AB_PRE_CAL_DONE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    pub(crate) fn ab_pre_note_calibration(u_gpu_us: f64, oracle_ok: bool) {
+        AB_PRE_U_GPU_US.store(u_gpu_us.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        AB_PRE_ORACLE_OK.store(oracle_ok, std::sync::atomic::Ordering::Relaxed);
+        AB_PRE_CAL_DONE.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn ab_pre_calibration_pending() -> bool {
+        ab_pre_gpu_enabled()
+            && !AB_PRE_CAL_DONE.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Decide the timed prove's GPU chunk share from warmup measurements:
+    /// probe-priced `u_gpu`, the arm's own wall (`note_precompute_branch_wall_ms`),
+    /// and the commit branch's wall. Share > 0 only when the arm BOUND the
+    /// warmup window (positive idle gap) and the oracle proved bit-exactness
+    /// on this machine; the share is sized so the GPU's tail lands at the
+    /// shrunken arm's end: `g = gap / (u_gpu + u_cpu)`, capped at n/4.
+    /// `FLOCK_GPU_AB_PRE_FORCE_SHARE=<chunks>` overrides sizing (oracle
+    /// still required); `FLOCK_NO_GPU_AB_PRE=1` disables.
+    pub(crate) fn ab_pre_decide_share(n_chunks: usize) -> usize {
+        use std::sync::atomic::Ordering;
+        if !ab_pre_gpu_enabled() || !AB_PRE_ORACLE_OK.load(Ordering::Relaxed) {
+            return 0;
+        }
+        if let Ok(s) = std::env::var("FLOCK_GPU_AB_PRE_FORCE_SHARE") {
+            if let Ok(g) = s.parse::<usize>() {
+                return g.min(n_chunks);
+            }
+        }
+        let u_gpu = f64::from_bits(AB_PRE_U_GPU_US.load(Ordering::Relaxed));
+        let arm_ms = f64::from_bits(super::PRECOMPUTE_BRANCH_WALL_MS.load(Ordering::Relaxed));
+        let commit_ms = f64::from_bits(COMMIT_BRANCH_WALL_MS.load(Ordering::Relaxed));
+        if !(u_gpu.is_finite() && u_gpu > 0.0) || arm_ms <= 0.0 || commit_ms <= 0.0 {
+            return 0;
+        }
+        let gap_ms = arm_ms - commit_ms;
+        if gap_ms < 2.0 {
+            return 0; // arm not binding (or within noise) — no free GPU tail.
+        }
+        let u_cpu = arm_ms * 1000.0 / n_chunks as f64; // µs per chunk, whole pool
+        let g = (gap_ms * 1000.0 / (u_gpu + u_cpu)) as usize;
+        let g = g.min(n_chunks / 4);
+        if debug_enabled() {
             eprintln!(
-                "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms (wrap hits {} misses {})",
-                num_leaves.trailing_zeros(),
-                t.elapsed().as_secs_f64() * 1e3,
-                state.hits,
-                state.misses,
+                "[gpu-ab-pre] share decision: gap={gap_ms:.2}ms u_gpu={u_gpu:.3}us \
+                 u_cpu={u_cpu:.3}us -> {g}/{n_chunks} chunks"
             );
         }
-        Some(tree)
+        g
+    }
+
+    /// In-flight AB-precompute prefix dispatch.
+    pub(crate) struct AbPreJob {
+        cb: Id,
+    }
+    // SAFETY: command-buffer handle; Metal objects are thread-safe, and the
+    // job is waited exactly once.
+    unsafe impl Send for AbPreJob {}
+    impl AbPreJob {
+        /// Wait for completion. `true` = the prefix rows are in the slab.
+        pub(crate) fn wait(self) -> bool {
+            let Ok(gpu) = gpu() else { return false };
+            // SAFETY: cb was retained at submit; released exactly once here.
+            unsafe {
+                let ok = gpu.wait_cb(self.cb).is_ok();
+                gpu.release(self.cb);
+                ok
+            }
+        }
+    }
+
+    /// Asynchronously launch the AB-precompute prefix `[0, n_chunks)` into
+    /// the slab. Returns `None` on any setup failure (caller computes the
+    /// prefix on the CPU instead).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gpu_ab_pre_launch(
+        a: &[u8],
+        b: &[u8],
+        table_bytes: &[u8],
+        counts: &[u8],
+        mask: u32,
+        n_chunks: usize,
+        out_ptr: *mut u8,
+        out_len: usize,
+    ) -> Option<AbPreJob> {
+        if n_chunks == 0 {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = ab_pre_state()?;
+        let mut state = state_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let pool = gpu.pool_push();
+            let run = (|| -> Result<Id, String> {
+                let (a_buf, b_buf, out_buf) =
+                    ab_pre_bind(gpu, &mut state, a, b, table_bytes, counts, out_ptr, out_len)?;
+                ab_pre_submit(gpu, &state, a_buf, b_buf, out_buf, 0, n_chunks, mask)
+            })();
+            gpu.pool_pop(pool);
+            match run {
+                Ok(cb) => Some(AbPreJob { cb }),
+                Err(e) => {
+                    if debug_enabled() {
+                        eprintln!("[gpu-ab-pre] launch failed ({e})");
+                    }
+                    None
+                }
+            }
+        }
+    }
+
+    /// Synchronous GPU computation of AB-precompute rows
+    /// `[chunk_base, chunk_base + n_chunks)` into `out` (the ab_inner slab).
+    /// Returns the dispatch's GPU wall in ms, or `None` on any failure
+    /// (caller keeps the CPU path; never poisons other arms).
+    pub(crate) fn gpu_ab_pre_rows(
+        a: &[u8],
+        b: &[u8],
+        table_bytes: &[u8],
+        counts: &[u8],
+        mask: u32,
+        chunk_base: usize,
+        n_chunks: usize,
+        out_ptr: *mut u8,
+        out_len: usize,
+    ) -> Option<f64> {
+        if n_chunks == 0 {
+            return Some(0.0);
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = ab_pre_state()?;
+        let mut state = state_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let pool = gpu.pool_push();
+            let run = (|| -> Result<f64, String> {
+                let (a_buf, b_buf, out_buf) = ab_pre_bind(
+                    gpu, &mut state, a, b, table_bytes, counts, out_ptr, out_len,
+                )?;
+                let cb = ab_pre_submit(
+                    gpu, &state, a_buf, b_buf, out_buf, chunk_base, n_chunks, mask,
+                )?;
+                let res = gpu.wait_cb(cb);
+                let wall = zc_fold_gpu_wall_ms(gpu, cb);
+                gpu.release(cb);
+                res?;
+                Ok(wall)
+            })();
+            gpu.pool_pop(pool);
+            match run {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    if debug_enabled() {
+                        eprintln!("[gpu-ab-pre] failed ({e})");
+                    }
+                    None
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -10147,6 +10875,13 @@ kernel void zc_r2_products(
     #[cfg(test)]
     pub(crate) fn zc_r2_test_set_share(share: usize) {
         ZC_R2_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Correctness-preserving kill switch for the calibration ramp rescue:
+    /// `FLOCK_NO_ZC_R2_RAMP_RESCUE=1` restores the 5-replay-only pricing.
+    fn zc_r2_ramp_rescue_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_R2_RAMP_RESCUE").is_none())
     }
 
     /// Ratio-gate override (`FLOCK_ZC_R2_GPU_FORCE_RATIO=<f64>`).
@@ -10875,13 +11610,94 @@ kernel void zc_r2_products(
                     }
                 }
             }
-            drop(state);
-            let u_gpu = if n_walls > 0 && w_min < f64::MAX {
+            let mut u_gpu = if n_walls > 0 && w_min < f64::MAX {
                 w_min / job.chunks as f64
             } else {
                 f64::INFINITY
             };
             let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            // Ramp rescue (kill: FLOCK_NO_ZC_R2_RAMP_RESCUE). On strong GPUs
+            // the hi/16 probe replays are so short (~1 ms each) that all of
+            // them can finish before the Metal clock governor ramps, so the
+            // min-of-replays still prices an un-ramped clock — the suspected
+            // cause of the gate publishing floor/zero shares on a majority
+            // of ranked worker processes while every admitted process posts
+            // record p10s (see the gate-share history above; true ratios
+            // measured across every instrumented host are 0.33-0.83, so a
+            // priced ratio > 2 is either mispricing or a genuinely marginal
+            // GPU). When the priced ratio lands outside the healthy band,
+            // force the governor up with one 4x-size keep-warm dispatch
+            // (discarded), then re-probe to a strict plateau (up to 8
+            // replays; stop after 3 consecutive replays that fail to improve
+            // the running minimum by >2%) and re-price from the overall
+            // minimum. On machines where the slow ratio is genuine (the M2
+            // Pro gate box: replay walls already flat at ~32 ms) the
+            // re-probes confirm the plateau and the published share is
+            // unchanged; on a ramp-glitched process the re-priced ratio
+            // falls back into the healthy band and the full balanced share
+            // is restored. Warmup-only cost on glitch-band processes; the
+            // timed prove's bytes are identical at any share by the arm's
+            // bit-exactness design.
+            if zc_r2_ramp_rescue_enabled()
+                && u_cpu.is_finite()
+                && u_cpu > 0.0
+                && u_gpu.is_finite()
+                && u_gpu / u_cpu > ZC_R2_MAX_RATIO
+            {
+                if let (Some(&(_, _, a_buf)), Some(&(_, _, b_buf))) =
+                    (state.wraps.first(), state.wraps.get(1))
+                {
+                    let warm_chunks = (job.chunks * 4).min(hi_size);
+                    if let Ok(cbw) = zc_r2_submit(
+                        gpu, &state, a_buf, b_buf, warm_chunks, job.lo_size, job.mask, job.useful,
+                    ) {
+                        let _ = gpu.wait_cb(cbw);
+                        gpu.release(cbw);
+                    }
+                    let mut stale = 0usize;
+                    let mut re_walls: Vec<f64> = Vec::new();
+                    for _ in 0..8 {
+                        let Ok(cb2) = zc_r2_submit(
+                            gpu,
+                            &state,
+                            a_buf,
+                            b_buf,
+                            job.chunks,
+                            job.lo_size,
+                            job.mask,
+                            job.useful,
+                        ) else {
+                            break;
+                        };
+                        let w = if gpu.wait_cb(cb2).is_ok() {
+                            zc_fold_gpu_wall_ms(gpu, cb2)
+                        } else {
+                            0.0
+                        };
+                        gpu.release(cb2);
+                        if w <= 0.0 {
+                            break;
+                        }
+                        re_walls.push(w);
+                        let new_u = w / job.chunks as f64;
+                        if new_u < u_gpu * 0.98 {
+                            u_gpu = new_u;
+                            stale = 0;
+                        } else {
+                            stale += 1;
+                            if stale >= 3 {
+                                break;
+                            }
+                        }
+                    }
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[zc-r2] ramp-rescue re-probe walls: {re_walls:?} -> u_gpu={u_gpu:.4}ms/chunk"
+                        );
+                    }
+                }
+            }
+            drop(state);
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
@@ -12335,6 +13151,67 @@ mod imp {
         _data: &[u8],
         _num_leaves: usize,
     ) -> Option<Vec<crate::merkle::Hash>> {
+        None
+    }
+
+    pub(crate) fn give_rec_tree(tree: Vec<crate::merkle::Hash>) {
+        drop(tree);
+    }
+
+    pub(crate) fn gpu_recursive_merkle_blake3_view(
+        _data: &[u8],
+        _num_leaves: usize,
+    ) -> Option<super::GpuRecTree> {
+        None
+    }
+
+    pub(crate) fn release_rec_tree_borrow() {}
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gpu_ab_pre_rows(
+        _a: &[u8],
+        _b: &[u8],
+        _table_bytes: &[u8],
+        _counts: &[u8],
+        _mask: u32,
+        _chunk_base: usize,
+        _n_chunks: usize,
+        _out_ptr: *mut u8,
+        _out_len: usize,
+    ) -> Option<f64> {
+        None
+    }
+
+    pub(crate) fn note_commit_branch_wall_ms(_ms: f64) {}
+
+    pub(crate) fn ab_pre_note_calibration(_u_gpu_us: f64, _oracle_ok: bool) {}
+
+    pub(crate) fn ab_pre_decide_share(_n_chunks: usize) -> usize {
+        0
+    }
+
+    pub(crate) fn ab_pre_calibration_pending() -> bool {
+        false
+    }
+
+    pub(crate) struct AbPreJob {}
+    impl AbPreJob {
+        pub(crate) fn wait(self) -> bool {
+            false
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gpu_ab_pre_launch(
+        _a: &[u8],
+        _b: &[u8],
+        _table_bytes: &[u8],
+        _counts: &[u8],
+        _mask: u32,
+        _n_chunks: usize,
+        _out_ptr: *mut u8,
+        _out_len: usize,
+    ) -> Option<AbPreJob> {
         None
     }
 

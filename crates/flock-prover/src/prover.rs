@@ -834,6 +834,7 @@ fn commit_with_round1_ab_precompute(
 
     let result = rayon::join(
         || {
+            let t = std::time::Instant::now();
             let pre = match commit_codeword {
                 CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
                 CommitCodeword::NeedsReplication(buf) => {
@@ -851,6 +852,14 @@ fn commit_with_round1_ab_precompute(
             // executes in the arm-tail idle.
             if let Some(hook) = tail_fill {
                 hook(&pre.0);
+            }
+            // Stamp this branch's wall: the GPU AB-precompute share is
+            // admitted only when the arm's wall exceeds this (the branches
+            // start together at the join, so the walls are comparable).
+            let wall_ms = t.elapsed().as_secs_f64() * 1e3;
+            flock_core::gpu_commit::note_commit_branch_wall_ms(wall_ms);
+            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+                eprintln!("[phase-timing] commit branch wall: {wall_ms:.2} ms");
             }
             pre
         },

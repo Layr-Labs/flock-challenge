@@ -435,6 +435,17 @@ static GENERATOR_VERIFIED: AtomicBool = AtomicBool::new(false);
 
 static PIPE: OnceLock<Pipe> = OnceLock::new();
 static ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Set by [`try_adopt`] the moment its adoption gate verifies that the
+/// worker's blocks are byte-identical to the speculative ones (~5 ms into
+/// the timed window, long before the prove completes). Once set, adoption
+/// is unconditional — the worker WILL publish exactly the speculative
+/// bundle — which is what makes the early publisher below sound.
+static GATE_PASSED: AtomicBool = AtomicBool::new(false);
+
+/// The ranked worker's proof output path (its third argv), captured at
+/// [`arm`] time for the early publisher.
+static PROOF_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 /// Set when [`arm`] parked the wrapper's main thread on the E-cluster, so
 /// [`try_adopt`] knows to keep the comparison off the proving pool and to hand
 /// the thread back before the publication tail.
@@ -476,7 +487,18 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
     fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
 }
+
+/// `fcntl` command / flag values (ABI-stable; `libc` is not a dependency of
+/// this crate). `F_GETFL`/`F_SETFL` are 3/4 on every supported platform;
+/// `O_NONBLOCK` differs (Darwin 0x4, Linux 0o4000).
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x0004;
+#[cfg(not(target_os = "macos"))]
+const O_NONBLOCK: i32 = 0o4000;
 
 /// Blocking read of one newline-terminated line. Returns `None` on EOF or a
 /// hard error.
@@ -484,8 +506,60 @@ unsafe extern "C" {
 /// whole `"<seed>\n"` in one go, so this is a single syscall on the critical
 /// path instead of ~21 of them.
 fn read_line_fd(fd: i32) -> Option<Vec<u8>> {
+    // Spin-poll the seed's arrival (kill: FLOCK_NO_SEED_SPIN). The timed
+    // window opens the instant the harness writes the seed, so the latency
+    // between that write and this thread resuming is pure measured dead
+    // time: a blocking `read` pays a kernel wake (~tens of µs, worse under
+    // load). The harness sends the seed within a few hundred µs of the
+    // ready file (its poll interval is 100 µs), so a bounded non-blocking
+    // spin catches it at ~µs latency. The spin burns one core across a gap
+    // the CPU keep-alive was deliberately warming anyway, and falls back to
+    // the blocking read at budget expiry (late seeds, tests, EOF) — same
+    // semantics, byte-for-byte.
+    // DEFAULT OFF pending runner evidence (see early_publish).
+    let spin = std::env::var_os("FLOCK_SEED_SPIN").is_some();
     let mut line = Vec::with_capacity(64);
     let mut chunk = [0u8; 64];
+    if spin {
+        // SAFETY: fcntl on a descriptor this thread owns.
+        let flags = unsafe { fcntl(fd, F_GETFL, 0) };
+        if flags >= 0
+            && unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } >= 0
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+            loop {
+                // SAFETY: `fd` is a live descriptor owned by this thread and
+                // `chunk` is a valid writable buffer of the stated length.
+                let n = unsafe { read(fd, chunk.as_mut_ptr(), chunk.len()) };
+                if n > 0 {
+                    line.extend_from_slice(&chunk[..n as usize]);
+                    if line.contains(&b'\n') || line.len() >= 256 {
+                        // Restore blocking semantics for any later reader.
+                        unsafe { fcntl(fd, F_SETFL, flags) };
+                        return Some(line);
+                    }
+                    continue;
+                }
+                if n == 0 {
+                    unsafe { fcntl(fd, F_SETFL, flags) };
+                    return (!line.is_empty()).then_some(line);
+                }
+                // n < 0: EAGAIN = nothing yet (spin on); anything else is a
+                // real error unless we time out into the blocking fallback.
+                if std::io::Error::last_os_error().kind()
+                    != std::io::ErrorKind::WouldBlock
+                {
+                    unsafe { fcntl(fd, F_SETFL, flags) };
+                    return None;
+                }
+                if std::time::Instant::now() >= deadline {
+                    unsafe { fcntl(fd, F_SETFL, flags) };
+                    break; // fall through to the blocking loop below
+                }
+                std::hint::spin_loop();
+            }
+        }
+    }
     loop {
         // SAFETY: `fd` is a live descriptor owned by this thread and `chunk`
         // is a valid writable buffer of the stated length.
@@ -582,6 +656,10 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     }
     if ARMED.swap(true, Ordering::SeqCst) {
         return;
+    }
+    // The ranked argv shape was just verified: [exe, LOG2, READY, PROOF].
+    if let Some(p) = std::env::args_os().nth(3) {
+        let _ = PROOF_PATH.set(std::path::PathBuf::from(p));
     }
 
     // SAFETY: plain descriptor manipulation on this process's own stdin. Each
@@ -748,17 +826,151 @@ fn speculative_main(
             state.blocks = Some(Arc::clone(&blocks));
             shared().signal.notify_all();
         }
+        // Race the prove with the publish-target pre-warm (E-cluster, ~1 ms
+        // of file work against a ~150 ms prove).
+        spawn_publish_prewarm();
         run(setup_addr, &blocks)
     }));
 
     match outcome {
         Ok(out) => {
+            // Early publish (kill: FLOCK_NO_EARLY_PUBLISH). The measured
+            // window ends when the harness observes the proof FILE — but the
+            // incumbent tail routes the finished proof through a condvar
+            // wake, the worker main thread's scheduling, `to_bytes`,
+            // `fs::write` and a rename before that can happen. This thread
+            // already holds the finished proof, and once the adoption gate
+            // has verified the blocks (~5 ms into the window, ~140 ms before
+            // this point) the worker is GUARANTEED to publish exactly these
+            // bytes — so serialize and atomically publish them right here,
+            // ending the window several hundred microseconds earlier. The
+            // worker's own publish still runs afterwards and atomically
+            // renames identical bytes over identical bytes (readers of the
+            // old inode finish their read untorn — POSIX rename semantics),
+            // so every capture the harness can make is a complete, valid
+            // proof. Panic-safety: any unwind here marks the pipe dead and
+            // the worker falls back to its ordinary prove (same seed → same
+            // deterministic bytes), which only re-publishes the same file.
+            let out = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                early_publish(out)
+            })) {
+                Ok(out) => out,
+                Err(_) => {
+                    mark_dead();
+                    return;
+                }
+            };
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
             state.result = Some(out);
             shared().signal.notify_all();
         }
         Err(_) => mark_dead(),
     }
+}
+
+/// Pre-warmed publish target: the temp file is created, extended to the
+/// maximum observed bundle size, and page-warmed by an efficiency-core
+/// helper WHILE the prove runs, so the completion-time publish is a
+/// `write` into hot page cache + `set_len` + atomic rename instead of a
+/// cold create/extend/fault sequence inside the measured window.
+static PREWARMED_PUBLISH: Mutex<Option<(std::path::PathBuf, std::fs::File)>> = Mutex::new(None);
+
+/// Upper bound on ranked bundle bytes (verifier caps proofs at 500 kB).
+const PUBLISH_PREWARM_LEN: u64 = 460_000;
+
+fn publish_prewarm_enabled() -> bool {
+    // DEFAULT OFF pending runner evidence (see early_publish).
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_PUBLISH_PREWARM").is_some())
+}
+
+/// Spawned (detached, E-cluster QoS) at speculative-prove start; races the
+/// ~150 ms prove with ~1 ms of file work. Failure paths simply leave the
+/// slot empty and the publisher falls back to a plain `fs::write`.
+fn spawn_publish_prewarm() {
+    if !publish_prewarm_enabled() || std::env::var_os("FLOCK_EARLY_PUBLISH").is_none() {
+        return;
+    }
+    let Some(path) = PROOF_PATH.get() else {
+        return;
+    };
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".early");
+    let tmp = std::path::PathBuf::from(tmp);
+    let _ = std::thread::Builder::new()
+        .name("flock-publish-prewarm".into())
+        .spawn(move || {
+            flock_core::set_calling_thread_shadow_qos();
+            use std::io::{Seek, Write};
+            let Ok(mut f) = std::fs::File::create(&tmp) else {
+                return;
+            };
+            // Extend and physically touch every page so the publish-time
+            // write lands in resident, already-allocated cache pages.
+            let zeros = vec![0u8; PUBLISH_PREWARM_LEN as usize];
+            if f.write_all(&zeros).is_err() {
+                return;
+            }
+            if f.seek(std::io::SeekFrom::Start(0)).is_err() {
+                return;
+            }
+            if let Ok(mut slot) = PREWARMED_PUBLISH.lock() {
+                *slot = Some((tmp, f));
+            }
+        });
+}
+
+/// Serialize and atomically publish the finished speculative bundle to the
+/// ranked worker's proof path, iff the adoption gate has already verified
+/// the blocks. Consumes and returns the `ProveOut` unchanged (the bundle is
+/// destructured back — no clone of the ~438 KB proof). Every failure path
+/// simply skips the early publish; the worker's ordinary tail publishes the
+/// identical bytes moments later.
+fn early_publish(out: ProveOut) -> ProveOut {
+    // DEFAULT OFF pending runner evidence: the two ranked draws carrying
+    // this arm landed 0.14-0.19% below their tree family's prior draws
+    // (window-edge mechanics are sound locally, but the runner disagrees
+    // or the draws were unlucky — either way the EV-maximizing default is
+    // the incumbent tail). `FLOCK_EARLY_PUBLISH=1` re-arms for A/B.
+    if std::env::var_os("FLOCK_EARLY_PUBLISH").is_none()
+        || !GATE_PASSED.load(Ordering::SeqCst)
+    {
+        return out;
+    }
+    let Some(path) = PROOF_PATH.get() else {
+        return out;
+    };
+    let (proof, commitment, claim) = out;
+    let bundle = crate::proof_io::R1csProofBundleLigerito { commitment, proof };
+    let bytes = bundle.to_bytes();
+    // Publish through the pre-warmed handle when available (write into hot
+    // pages + truncate to the exact length), else a plain temp write.
+    let prewarmed = PREWARMED_PUBLISH
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    match prewarmed {
+        Some((tmp, mut f)) => {
+            use std::io::Write;
+            if f.write_all(&bytes).is_ok()
+                && f.set_len(bytes.len() as u64).is_ok()
+                && f.flush().is_ok()
+            {
+                drop(f);
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+        None => {
+            let mut tmp = path.as_os_str().to_owned();
+            tmp.push(".early");
+            let tmp = std::path::PathBuf::from(tmp);
+            if std::fs::write(&tmp, &bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+    let crate::proof_io::R1csProofBundleLigerito { commitment, proof } = bundle;
+    (proof, commitment, claim)
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +1036,14 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     } else {
         blocks_eq(&speculative, blocks)
     };
+
+    // Publish the gate outcome for the early publisher: once the blocks are
+    // verified identical, the worker is guaranteed to adopt and publish
+    // exactly the speculative bundle, so the speculative thread may publish
+    // it the moment it exists.
+    if matched {
+        GATE_PASSED.store(true, Ordering::SeqCst);
+    }
 
     // Hand the thread back now: the condvar wake below, `to_bytes`, the proof
     // file write and the rename are all on the measured critical path.

@@ -163,6 +163,38 @@ where
     run_chunks_with_helper(n_chunks, &f, epool());
 }
 
+/// Correctness-preserving kill switch for the phase-seam claim reversal:
+/// `FLOCK_NO_SEAM_REV=1` restores ascending claim order everywhere.
+fn seam_rev_enabled() -> bool {
+    // DEFAULT OFF pending runner evidence: the one ranked draw carrying
+    // the reversal landed ~4 sigma below its base tree. Local component
+    // evidence was mildly positive (-0.65 ms on the DRAM-bound K pass),
+    // so keep the machinery for A/B via `FLOCK_SEAM_REV=1`.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_SEAM_REV").is_some())
+}
+
+/// Reversed-index variant of [`run_hetero_chunks`] for phase-seam cache
+/// handoff. The producer phase filled the consumed buffer in ascending
+/// order, so its TAIL is the freshest region — still resident in the
+/// system-level cache when the consumer starts — while index 0 is the
+/// coldest. Claiming chunks in descending index order starts the consumer
+/// on warm lines and defers the coldest reads to when the prefetchers are
+/// streaming anyway. Chunk ownership and per-chunk output ranges are
+/// unchanged — only the claim→index mapping differs — so outputs are
+/// bit-identical (each chunk's work is independent and the queue join
+/// publishes all writes before any reduction reads them).
+pub fn run_hetero_chunks_rev<F>(n_chunks: usize, f: F)
+where
+    F: Fn(usize) + Sync,
+{
+    if seam_rev_enabled() && n_chunks > 0 {
+        run_chunks_with_helper(n_chunks, &|i| f(n_chunks - 1 - i), epool());
+    } else {
+        run_chunks_with_helper(n_chunks, &f, epool());
+    }
+}
+
 /// Try to process chunks exclusively on the efficiency-core helper pool.
 ///
 /// Unlike [`run_hetero_chunks`], the calling thread and the main Rayon pool do
