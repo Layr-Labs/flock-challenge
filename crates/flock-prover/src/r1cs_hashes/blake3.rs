@@ -2532,7 +2532,10 @@ pub(crate) mod witgen_simd {
             const STREAM_TAPER_DEFAULT: bool = true;
             let tapered = STREAM_TAPER_DEFAULT
                 && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
-            let schedule = if tapered {
+            let radix256 = stream.uses_radix256_layout();
+            let schedule = if radix256 {
+                super::super::common::radix256_ready_schedule()
+            } else if tapered {
                 TAPERED_SCHEDULE
             } else {
                 UNIFORM_SCHEDULE
@@ -2575,9 +2578,12 @@ pub(crate) mod witgen_simd {
                     for seg in 0..SEGMENTS {
                         for l in (0..gps).step_by(SLAB) {
                             slab_band.push(i as u32);
-                            slab_g0.push(
-                                (seg * groups_per_segment + band_offset[i] + l) as u32,
-                            );
+                            let g0 = if radix256 {
+                                seg * gps + l
+                            } else {
+                                seg * groups_per_segment + band_offset[i] + l
+                            };
+                            slab_g0.push(g0 as u32);
                         }
                     }
                 }
@@ -2600,11 +2606,23 @@ pub(crate) mod witgen_simd {
                 }
                 let seq = std::sync::Mutex::new(SubmitSeq { next: 0, stream });
                 let slab_fn = |s: usize| {
-                    let g0 = slab_g0[s] as usize;
-                    for g in g0..g0 + SLAB {
-                        process_group(g);
-                    }
                     let band = slab_band[s] as usize;
+                    let job0 = slab_g0[s] as usize;
+                    if radix256 {
+                        for job in job0..job0 + SLAB {
+                            let g = super::super::common::ranked_radix256_stream_group_index(
+                                job,
+                                band_offset[band],
+                                schedule[band],
+                                groups_per_segment,
+                            );
+                            process_group(g);
+                        }
+                    } else {
+                        for g in job0..job0 + SLAB {
+                            process_group(g);
+                        }
+                    }
                     // AcqRel: the zero-observer acquires every worker's
                     // stores for this band before publishing/submitting it.
                     if remaining[band].fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -2687,9 +2705,18 @@ pub(crate) mod witgen_simd {
                             );
                         }
                     }
-                    let segment = job / band_gps;
-                    let local = job % band_gps;
-                    let g = segment * groups_per_segment + offset + local;
+                    let g = if radix256 {
+                        super::super::common::ranked_radix256_stream_group_index(
+                            job,
+                            offset,
+                            band_gps,
+                            groups_per_segment,
+                        )
+                    } else {
+                        let segment = job / band_gps;
+                        let local = job % band_gps;
+                        segment * groups_per_segment + offset + local
+                    };
                     process_group(g);
                 };
                 super::super::common::drain_group_jobs(SEGMENTS * band_gps, &band_job);

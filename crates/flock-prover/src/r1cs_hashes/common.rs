@@ -327,6 +327,47 @@ fn ranked_stream_group_index(
     segment * groups_per_segment + band * groups_per_band + local
 }
 
+/// Map one logical witness-band job to the source group needed by a fused
+/// radix-256 first pass. A radix-256 `r8` tile spans sixteen radix-16 stripes:
+/// `r4 = q * 4096 + r8`, `q = 0..15`. A band is publishable only after every
+/// one of those source stripes has been produced for all eight segments.
+#[inline(always)]
+pub(super) fn ranked_radix256_stream_group_index(
+    job: usize,
+    r8_start: usize,
+    r8_count: usize,
+    groups_per_segment: usize,
+) -> usize {
+    debug_assert!(r8_start.is_multiple_of(16));
+    debug_assert!(r8_count.is_multiple_of(16));
+    debug_assert_eq!(groups_per_segment, 4096);
+    let segment = job / r8_count;
+    let within_segment = job % r8_count;
+    let x_groups = r8_count / 16;
+    let q = within_segment / x_groups;
+    let x_group = within_segment % x_groups;
+    segment * groups_per_segment
+        + q * (groups_per_segment / 16)
+        + r8_start / 16
+        + x_group
+}
+
+/// Race-free ranked radix-256 publication schedule, in `r8` positions per
+/// band. The environment selector exists only for same-binary diagnostics;
+/// the ranked harness clears it and therefore uses the two-band default.
+pub(super) fn radix256_ready_schedule() -> &'static [usize] {
+    const B512: &[usize] = &[512; 8];
+    const B1024: &[usize] = &[1024; 4];
+    const B2048: &[usize] = &[2048; 2];
+    const B4096: &[usize] = &[4096; 1];
+    match std::env::var("FLOCK_RADIX256_READY_BAND").as_deref() {
+        Ok("512") => B512,
+        Ok("1024") => B1024,
+        Ok("4096") => B4096,
+        _ => B2048,
+    }
+}
+
 /// Full-write row-major witness driver that also emits the exact rate-1/2
 /// pre-NTT codeword `[z, z]`. Each worker copies its completed `z` group into
 /// the two disjoint replica ranges while that group is still cache-resident.
@@ -711,26 +752,36 @@ where
     let claimed_before = witgen_hetero_trace().then(flock_core::epool::helper_chunks_claimed);
     if let Some(stream) = &mut stream {
         const SEGMENTS: usize = 8;
-        const BANDS: usize = 8;
         let groups_per_segment = n_groups / SEGMENTS;
-        let groups_per_band = groups_per_segment / BANDS;
-        let r_total = 1usize << 16;
-        let r_per_band = r_total / BANDS;
         debug_assert_eq!(groups_per_segment, 4096);
-        debug_assert_eq!(groups_per_band, 512);
-        for band in 0..BANDS {
+        let radix256 = stream.uses_radix256_layout();
+        const UNIFORM_SCHEDULE: &[usize] = &[512; 8];
+        let schedule = if radix256 {
+            radix256_ready_schedule()
+        } else {
+            UNIFORM_SCHEDULE
+        };
+        debug_assert_eq!(schedule.iter().sum::<usize>(), groups_per_segment);
+        let mut offset = 0usize;
+        for &groups_per_band in schedule {
             // W-H1: the band's jobs drain through the same slab shim. A slab
-            // never straddles a segment (512 % 64 == 0), so consecutive jobs
-            // stay consecutive groups and the long ascending store runs are
-            // preserved. The queue join below still bounds the band before
-            // submission, exactly like the incumbent Rayon join.
+            // never straddles a segment (every band is a multiple of 64), so
+            // consecutive jobs stay consecutive groups and the long ascending
+            // store runs are preserved. The queue join below still bounds the
+            // band before submission, exactly like the incumbent Rayon join.
             let band_job = |job: usize| {
-                let g = ranked_stream_group_index(
-                    job,
-                    band,
-                    groups_per_segment,
-                    groups_per_band,
-                );
+                let g = if radix256 {
+                    ranked_radix256_stream_group_index(
+                        job,
+                        offset,
+                        groups_per_band,
+                        groups_per_segment,
+                    )
+                } else {
+                    let segment = job / groups_per_band;
+                    let local = job % groups_per_band;
+                    segment * groups_per_segment + offset + local
+                };
                 process_group(g);
             };
             drain_group_jobs(SEGMENTS * groups_per_band, &band_job);
@@ -738,8 +789,10 @@ where
             // band; command-buffer submission then makes those shared-memory
             // pages visible to Metal before it starts the range.
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            stream.submit_ready_range(band * r_per_band, r_per_band);
+            stream.submit_ready_range(offset * 16, groups_per_band * 16);
+            offset += groups_per_band;
         }
+        debug_assert_eq!(offset, groups_per_segment);
     } else {
         drain_group_jobs(n_groups, &process_group);
     }
@@ -755,7 +808,7 @@ where
 
 #[cfg(test)]
 mod streamed_first_pass_tests {
-    use super::ranked_stream_group_index;
+    use super::{ranked_radix256_stream_group_index, ranked_stream_group_index};
 
     #[test]
     fn ranked_bands_cover_each_group_and_every_published_tile_is_ready() {
@@ -799,6 +852,62 @@ mod streamed_first_pass_tests {
             }
         }
         assert!(seen.into_iter().all(|done| done));
+    }
+
+    #[test]
+    fn radix256_bands_cover_each_group_and_every_wide_tile_is_ready() {
+        const SEGMENTS: usize = 8;
+        const GROUPS_PER_SEGMENT: usize = 4096;
+        const TAPERED: &[usize] = &[512, 512, 512, 512, 512, 512, 512, 448, 64];
+        const B512: &[usize] = &[512; 8];
+        const B1024: &[usize] = &[1024; 4];
+        const B2048: &[usize] = &[2048; 2];
+        const B4096: &[usize] = &[4096; 1];
+
+        for schedule in [TAPERED, B512, B1024, B2048, B4096] {
+            let mut seen = vec![false; SEGMENTS * GROUPS_PER_SEGMENT];
+            let mut r8_start = 0usize;
+
+            for &r8_count in schedule {
+                for job in 0..SEGMENTS * r8_count {
+                    let g = ranked_radix256_stream_group_index(
+                        job,
+                        r8_start,
+                        r8_count,
+                        GROUPS_PER_SEGMENT,
+                    );
+                    assert!(
+                        !std::mem::replace(&mut seen[g], true),
+                        "duplicate group {g} in schedule {schedule:?}"
+                    );
+                }
+
+                for r8 in r8_start..r8_start + r8_count {
+                    for segment in 0..SEGMENTS {
+                        for q in 0..16 {
+                            let g = segment * GROUPS_PER_SEGMENT + q * 256 + r8 / 16;
+                            assert!(
+                                seen[g],
+                                "schedule {schedule:?} r8 band at {r8_start} published unreadied source group {g}"
+                            );
+                        }
+
+                        // The stream passes synthetic radix-16 coordinates
+                        // `(r8_start*16, r8_count*16)`. The kernel divides the
+                        // byte binding by sixteen, so local r8 maps globally.
+                        let local_r8 = r8 - r8_start;
+                        let binding_position_offset = r8_start;
+                        let local = (segment * 16 * 4096 + local_r8) * 64;
+                        let global = (segment * 16 * 4096 + r8) * 64;
+                        assert_eq!(binding_position_offset * 64 + local, global);
+                    }
+                }
+                r8_start += r8_count;
+            }
+
+            assert_eq!(r8_start, 4096);
+            assert!(seen.into_iter().all(|done| done));
+        }
     }
 }
 
