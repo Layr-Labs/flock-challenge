@@ -262,6 +262,24 @@ pub fn commit_tail_fill_enabled() -> bool {
     !std::env::var(ENV_NO_COMMIT_TAIL_FILL).is_ok_and(|v| v == "1")
 }
 
+/// Kill switch for the commit-tail fill's ENLARGED GPU prefix
+/// (`FLOCK_NO_ZC_PREFIX_ENLARGE=1`, exact): the split tuner sizes the
+/// round-one C-fold GPU prefix for a launch at zerocheck entry, where the
+/// GPU only owns the AB-completion head. A prefix staged at commit-graph
+/// completion instead owns the commit window's arm tail PLUS the AB
+/// completion before the CPU C share starts, so the staged dispatch takes
+/// the FULL claim range (empty CPU suffix) — legally pulling the serial
+/// stripe-C CPU share out of zerocheck. The split is not transcript-visible
+/// (any claim partition XORs to the identical fold result) and the staged
+/// job remains adopt-or-abandon exactly as before; this switch restores the
+/// incumbent tuned sizing for the staged dispatch only.
+pub const ENV_NO_ZC_PREFIX_ENLARGE: &str = "FLOCK_NO_ZC_PREFIX_ENLARGE";
+
+/// Read per prove (uncached) so same-process A/B tests can toggle it.
+pub(crate) fn zc_prefix_enlarge_enabled() -> bool {
+    !std::env::var(ENV_NO_ZC_PREFIX_ENLARGE).is_ok_and(|v| v == "1")
+}
+
 /// Kill switch for the zerocheck first-tail-round (T3 compact reconstruction)
 /// products GPU arm.
 pub const ENV_NO_GPU_ZC_T3: &str = "FLOCK_NO_GPU_ZC_T3";
@@ -8941,7 +8959,37 @@ LC_KERNEL(lc_fold_stripes, 4)
         if !super::gpu_zerocheck_enabled() {
             return None;
         }
-        launch_fold_prefix(FoldArm::Zc, z_packed, m, k_log, useful_bits, eq_outer)
+        launch_fold_prefix(FoldArm::Zc, z_packed, m, k_log, useful_bits, eq_outer, None)
+    }
+
+    /// Enlarged prefix sizing for a commit-tail-fill staged dispatch (kill:
+    /// `super::ENV_NO_ZC_PREFIX_ENLARGE`, exact). The tuned split balances
+    /// GPU-prefix and CPU-suffix finish times for a launch at ZEROCHECK
+    /// entry, whose GPU head is only the AB completion. Staged at
+    /// commit-graph completion the GPU instead owns the commit window's
+    /// arm tail plus the whole AB completion before the CPU C share can
+    /// start, so the staged dispatch takes the FULL claim range: the
+    /// ranked full-range byte fold (~5.5 ms) lands well inside that head,
+    /// the CPU suffix (and its measured 1.6–2.3 ms fixed queue cost)
+    /// disappears, and the serial stripe-C CPU share leaves zerocheck.
+    /// Any claim partition XORs to the identical fold result, so the
+    /// resize is transcript-invisible; a full-range job also skips the
+    /// split tuner's note (`claim_lo >= n_claims`), so the published
+    /// window split is never polluted by the staged head.
+    ///
+    /// `None` = keep the incumbent tuned sizing: kill switch set, an exact
+    /// `FLOCK_ZC_GPU_CLAIMS` override pinned (controlled A/Bs keep their
+    /// requested share), or the split not yet tuned — the untimed warmup
+    /// prove stages at the incumbent split so the tuner still publishes
+    /// its steady-state sample for every non-staged window launch.
+    fn tail_fill_staged_claims(m: usize, k_log: usize) -> Option<usize> {
+        if !super::zc_prefix_enlarge_enabled() || zc_fold_claim_override().is_some() {
+            return None;
+        }
+        if ZC_FOLD_TUNED_CLAIMS.load(std::sync::atomic::Ordering::Relaxed) == usize::MAX {
+            return None;
+        }
+        Some(crate::lincheck::oblock_claim_count(m, k_log))
     }
 
     /// Commit-tail fill, GPU half (see `ENV_NO_COMMIT_TAIL_FILL`): build the
@@ -8968,6 +9016,7 @@ LC_KERNEL(lc_fold_stripes, 4)
             k_log,
             useful_bits,
             eq_outer.as_slice(),
+            tail_fill_staged_claims(m, k_log),
         ) else {
             return false;
         };
@@ -9105,6 +9154,7 @@ LC_KERNEL(lc_fold_stripes, 4)
             k_log,
             useful_bits,
             eq_outer,
+            None,
         )
     }
 
@@ -9115,13 +9165,19 @@ LC_KERNEL(lc_fold_stripes, 4)
         k_log: usize,
         useful_bits: usize,
         eq_outer: &[F128],
+        staged_claims: Option<usize>,
     ) -> Option<ZcFoldJob> {
         let k = 1usize << k_log;
         if !k.is_multiple_of(ZC_FOLD_COLS_PER_TG) || m <= k_log + 3 {
             return None;
         }
         let n_claims = crate::lincheck::oblock_claim_count(m, k_log);
-        let claim_lo = arm.claims_for(n_claims);
+        // Commit-tail-fill staging may size its own (enlarged) prefix — see
+        // `tail_fill_staged_claims`; every window launch keeps the tuned
+        // incumbent split.
+        let claim_lo = staged_claims
+            .map(|c| c.min(n_claims))
+            .unwrap_or_else(|| arm.claims_for(n_claims));
         if claim_lo == 0 || claim_lo > n_claims {
             return None;
         }
