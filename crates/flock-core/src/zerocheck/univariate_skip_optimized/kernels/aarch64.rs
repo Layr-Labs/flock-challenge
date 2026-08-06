@@ -439,6 +439,9 @@ pub(crate) unsafe fn accumulate_c_banks(
             // The old scalar drain kept only the low/high pair for one lane in
             // flight, leaving the dependent L1 gather latency on the critical
             // chain even though the register file has ample headroom.
+            // Bank-major order keeps each partial bank's read/modify/write
+            // stream contiguous before advancing to the next bank, while
+            // four lanes still expose independent table loads per iteration.
             for s in 0..8 {
                 let bank = partial_c[s].as_mut_ptr() as *mut u8;
                 for lane in (0..64).step_by(4) {
@@ -1776,11 +1779,7 @@ fn static_a_k1_partial(inv_table: &InvNttTableByteSingleGf8) -> &'static [u8; 64
 /// the three statically-zero high bytes of K0.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn shift_reduce_inner_mixed_const_b_h4<
-    const ONE_MASK: u8,
-    const STATIC_A: bool,
-    const A_LOW5_K: u8,
->(
+fn shift_reduce_inner_mixed_const_b_h4<const ONE_MASK: u8, const STATIC_A: bool, const A_LOW5_K: u8>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -2849,7 +2848,9 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     static_b_context: Option<StaticBContext>,
     nt_store: bool,
 ) {
-    shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<{ super::AB_FAST_POLICY_PROCESS }>(
+    shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<
+        { super::AB_FAST_POLICY_PROCESS },
+    >(
         a_packed,
         b_packed,
         inv_table,
@@ -2877,7 +2878,9 @@ fn fast_shift_reduce_with_policy<const FAST_POLICY: u8>() -> bool {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FAST_POLICY: u8>(
+pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
+    const FAST_POLICY: u8,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -2978,8 +2981,8 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     );
                 } else {
                     const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
-                    const STATIC_A_K0_TOP3_MASK: u64 = 0xffff_ff00_0000_0000;
-                    if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_TOP3_MASK == 0 {
+                    const STATIC_A_K0_ZERO_MASK: u64 = 0xffff_fffe_0000_0000;
+                    if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_ZERO_MASK == 0 {
                         let static_a_k1 = match static_b_context {
                             Some(StaticBContext::Prepared { static_a_k1, .. }) => static_a_k1,
                             Some(StaticBContext::LegacyPerCall) | None => {
