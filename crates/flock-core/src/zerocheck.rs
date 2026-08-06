@@ -27,9 +27,9 @@ pub mod univariate_skip_deg4_optimized;
 pub mod univariate_skip_optimized;
 
 use multilinear::{
-    UniSkipFoldTable, eval_round3_lookahead, fold2_compact_and_round4_into,
+    UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into,
+    fold_compact_and_compute_round_pair, fold_in_place_pair, fold2_compact_and_round4_into,
     fold2_compact_and_round45_into, fold2_plain_and_round6_into, fold2_plain_and_round67_into,
-    fold_and_compute_round_pair_into, fold_compact_and_compute_round_pair, fold_in_place_pair,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_lookahead,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
@@ -514,14 +514,13 @@ fn prove_packed_padded_inner<C: Challenger>(
             // transcript only advances after the round-one messages), so the
             // prefix runs concurrently with the AB completion AND with the
             // CPU's own share of the C fold.
-            let c_prelude =
-                crate::zerocheck::univariate_skip_optimized::round1_c_prelude(
-                    c_lincheck,
-                    m,
-                    padding.k_log,
-                    padding.useful_bits_per_block,
-                    &r,
-                );
+            let c_prelude = crate::zerocheck::univariate_skip_optimized::round1_c_prelude(
+                c_lincheck,
+                m,
+                padding.k_log,
+                padding.useful_bits_per_block,
+                &r,
+            );
             // ZC-window GPU idle fill (`FLOCK_NO_ZC_IDLE_FILL=1` kills):
             // with the C fold's GPU prefix in flight, stage round two's
             // GPU-arm window setup behind it. Round two's eq split derives
@@ -815,8 +814,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // the incumbent route, which stays in the tree as the oracle anyway.
     // n_mlv ≥ 7 keeps every eq split at lo_size ≥ 2 and the composed input
     // ≥ 32. Kill switch: FLOCK_NO_ZC_CASCADE2=1 (exact '1').
-    let use_cascade =
-        use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
+    let use_cascade = use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
 
     // Cascade one level deeper still (rounds 7+8, see
     // `fold2_plain_and_round67_into`): the composed 5+6 pass materializes each
@@ -835,8 +833,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // anyway. n_mlv ≥ 8 keeps the composed-7/8 input ≥ 16 (its own floor) and
     // every eq split at lo_size ≥ 2. Kill switch: FLOCK_NO_ZC_CASCADE3=1
     // (exact '1').
-    let use_cascade3 =
-        use_cascade && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
+    let use_cascade3 = use_cascade && n_mlv >= 8 && r[k_skip + 5] != F128::ZERO && !cascade3_off();
 
     // `loop_start` is the first tail iteration this route has not already
     // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
@@ -1549,7 +1546,15 @@ mod tests {
             );
             let mut old_ch = FsChallenger::new(b"flock-c-stripe-gpu-v0");
             let (old_proof, old_claim, old_capture) = prove_packed_padded_inner(
-                &a_p, &b_p, &c_p, M, &padding, true, Some(old_ab), None, &mut old_ch,
+                &a_p,
+                &b_p,
+                &c_p,
+                M,
+                &padding,
+                true,
+                Some(old_ab),
+                None,
+                &mut old_ch,
             );
 
             let c_words: Vec<F128> = c_p
@@ -1971,9 +1976,18 @@ mod tests {
                 proof_on.multilinear_rounds, proof_off.multilinear_rounds,
                 "multilinear_rounds m={m}"
             );
-            assert_eq!(proof_on.final_a_eval, proof_off.final_a_eval, "a_eval m={m}");
-            assert_eq!(proof_on.final_b_eval, proof_off.final_b_eval, "b_eval m={m}");
-            assert_eq!(proof_on.final_c_eval, proof_off.final_c_eval, "c_eval m={m}");
+            assert_eq!(
+                proof_on.final_a_eval, proof_off.final_a_eval,
+                "a_eval m={m}"
+            );
+            assert_eq!(
+                proof_on.final_b_eval, proof_off.final_b_eval,
+                "b_eval m={m}"
+            );
+            assert_eq!(
+                proof_on.final_c_eval, proof_off.final_c_eval,
+                "c_eval m={m}"
+            );
             assert_eq!(claim_on.z, claim_off.z, "z m={m}");
             assert_eq!(
                 claim_on.mlv_challenges, claim_off.mlv_challenges,
@@ -2012,9 +2026,18 @@ mod tests {
                 proof_on.multilinear_rounds, proof_off.multilinear_rounds,
                 "multilinear_rounds m={m}"
             );
-            assert_eq!(proof_on.final_a_eval, proof_off.final_a_eval, "a_eval m={m}");
-            assert_eq!(proof_on.final_b_eval, proof_off.final_b_eval, "b_eval m={m}");
-            assert_eq!(proof_on.final_c_eval, proof_off.final_c_eval, "c_eval m={m}");
+            assert_eq!(
+                proof_on.final_a_eval, proof_off.final_a_eval,
+                "a_eval m={m}"
+            );
+            assert_eq!(
+                proof_on.final_b_eval, proof_off.final_b_eval,
+                "b_eval m={m}"
+            );
+            assert_eq!(
+                proof_on.final_c_eval, proof_off.final_c_eval,
+                "c_eval m={m}"
+            );
             assert_eq!(claim_on.z, claim_off.z, "z m={m}");
             assert_eq!(
                 claim_on.mlv_challenges, claim_off.mlv_challenges,
@@ -2054,9 +2077,18 @@ mod tests {
                 proof_on.multilinear_rounds, proof_off.multilinear_rounds,
                 "multilinear_rounds m={m}"
             );
-            assert_eq!(proof_on.final_a_eval, proof_off.final_a_eval, "a_eval m={m}");
-            assert_eq!(proof_on.final_b_eval, proof_off.final_b_eval, "b_eval m={m}");
-            assert_eq!(proof_on.final_c_eval, proof_off.final_c_eval, "c_eval m={m}");
+            assert_eq!(
+                proof_on.final_a_eval, proof_off.final_a_eval,
+                "a_eval m={m}"
+            );
+            assert_eq!(
+                proof_on.final_b_eval, proof_off.final_b_eval,
+                "b_eval m={m}"
+            );
+            assert_eq!(
+                proof_on.final_c_eval, proof_off.final_c_eval,
+                "c_eval m={m}"
+            );
             assert_eq!(claim_on.z, claim_off.z, "z m={m}");
             assert_eq!(
                 claim_on.mlv_challenges, claim_off.mlv_challenges,
