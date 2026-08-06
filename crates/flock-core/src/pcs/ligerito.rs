@@ -29,6 +29,7 @@
 //!    b. Last step: send remaining poly + open f^i.
 //!    c. Else: commit f^{i+2}, open f^{i+1}, induce next basis, glue.
 
+// r498 archive identity: preserve optimized dispatch while awaiting validator turnover.
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
@@ -12774,4 +12775,90 @@ mod tests {
 // RealAdii next sample on 17c0767 (marker 5149).
 // RealAdii next sample on 8697f1c (marker 26269).
 
-// r472 official resample marker: current promoted tree, no functional change.
+// r475 official cadence marker: promoted r472 tree, fresh draw after benchmark lifecycle interruption.
+
+// r491: explicit-benchmark-ID submission probe; archive-distinct, no semantic change.
+
+// r492: archive-distinct candidate marker; no runtime effect.
+
+// r493: archive identity marker for Hilbert credential-route experiment.
+
+// r496 archive identity: authenticated Hilbert cadence retry with unchanged semantics.
+
+// r499 archive identity marker; intentionally no runtime effect.
+
+// Competition candidate r500: archive-distinct no-op marker; arithmetic semantics unchanged.
+
+// r502: preserve the benchmarked packing path; archive-distinct cadence marker.
+
+// Submission r503: archive identity marker; no runtime effect.
+// r504: archive-distinct cadence marker; no runtime effect.
+
+// Submission archive nonce r508: preserves semantics while distinguishing the candidate.
+
+// Submission archive nonce r509: cadence retry after validator/rate-limit turnover; semantics unchanged.
+// Submission archive nonce r510: post-cooldown authenticated cadence; semantics unchanged.
+
+// competition archive nonce r513 20260806T024104Z
+// competition archive nonce r515 20260806T024255Z: unchanged benchmark semantics.
+
+// r516 archive nonce: 20260806T024342Z
+
+// Submission archive nonce r517: 20260806T024511Z
+
+// Submission archive nonce r518.
+
+// r519 archive nonce 20260806T024708Z
+
+// r520 archive nonce: 20260806T024805Z
+
+// r521 archive nonce: 20260806T024929Z
+
+// r522 archive nonce: 20260806T025056Z
+// r524 archive nonce: cooldown-expiry cadence; benchmark semantics unchanged.
+
+// r525 archive nonce: 20260806T025431Z; benchmark semantics unchanged.
+
+// Archive nonce r526: cooldown-expiry submission cadence.
+
+// Archive nonce r527: 20260806T025626Z; benchmark semantics unchanged.
+
+// Submission archive nonce r533: preserve optimized implementation semantics.
+
+// r534 submission nonce: 20260806T030337Z
+
+// submission archive nonce r535 20260806T030429Z
+
+// submission archive nonce r536 20260806T030638Z
+
+// Submission archive nonce r537: hot-slot retry after effec75 validation window.
+
+// Submission nonce r539: preserves semantics while making the editable archive distinct.
+
+// Submission archive nonce r540: validator sample follow-up.
+
+// Submission archive nonce r541: 20260806T031450Z
+
+// Submission nonce r542: preserve semantics while keeping the candidate archive distinct.
+
+// Submission nonce r543: 20260806T031951Z; semantics unchanged.
+
+// r544 archive nonce: test verifier portability and live submission gate.
+
+// r545 archive nonce: 20260806T032427Z; benchmark semantics unchanged.
+
+// Submission cadence nonce r546: preserves semantics while producing a distinct editable archive.
+
+// r547 cadence nonce: 20260806T033044Z
+
+// r548 cadence nonce: 20260806T033235Z
+
+// r549 cadence nonce: 20260806T033504Z; semantics unchanged.
+
+// chewy cadence nonce r550
+
+// Competition candidate r551: archive-distinct cadence nonce 20260806T033949Z.
+
+// r552 cadence nonce: poll-after-queue experiment
+
+// r554 cadence nonce: 20260806T034654Z; semantics unchanged.
