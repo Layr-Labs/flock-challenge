@@ -2966,7 +2966,35 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
                         a_packed.as_ptr().add(byte_base_b + N_CHUNKS).cast::<u64>(),
                     )
                 });
-                if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
+                // Census on the ranked worker distribution (generate_compressions:
+                // random cv/message, counter = u64::from(next_u32), block_len 64,
+                // flags 11; 9 × 262,144 blocks, two seeds): a_k1 ==
+                // 0x0000_0016_0000_0080 on every scored block (distinct = 1) and
+                // a_k0's OR-mask is 0x0000_0001_ffff_ffff, so the exact static-A
+                // guard fires 100% and is dispatched FIRST. Its K1 transform is
+                // four contiguous vector loads from the precomputed partial
+                // instead of five low5 byte gathers. The low5 arm remains the
+                // witness-safe fallback for any block failing the exact guard,
+                // and the generic whole-word arm backstops both.
+                const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
+                const STATIC_A_K0_ZERO_MASK: u64 = 0xffff_fffe_0000_0000;
+                if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_ZERO_MASK == 0 {
+                    let static_a_k1 = match static_b_context {
+                        Some(StaticBContext::Prepared { static_a_k1, .. }) => static_a_k1,
+                        Some(StaticBContext::LegacyPerCall) | None => {
+                            static_a_k1_partial(inv_table)
+                        }
+                    };
+                    shift_reduce_inner_mixed_const_b_h4::<0x03, true, 0>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base_b,
+                        Some(static_a_k1),
+                        out,
+                        nt_store,
+                    );
+                } else if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
                     shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03>(
                         a_packed,
                         b_packed,
@@ -2977,35 +3005,15 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
                         nt_store,
                     );
                 } else {
-                    const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
-                    const STATIC_A_K0_TOP3_MASK: u64 = 0xffff_ff00_0000_0000;
-                    if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_TOP3_MASK == 0 {
-                        let static_a_k1 = match static_b_context {
-                            Some(StaticBContext::Prepared { static_a_k1, .. }) => static_a_k1,
-                            Some(StaticBContext::LegacyPerCall) | None => {
-                                static_a_k1_partial(inv_table)
-                            }
-                        };
-                        shift_reduce_inner_mixed_const_b_h4::<0x03, true, 0>(
-                            a_packed,
-                            b_packed,
-                            inv_table,
-                            byte_base_b,
-                            Some(static_a_k1),
-                            out,
-                            nt_store,
-                        );
-                    } else {
-                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0>(
-                            a_packed,
-                            b_packed,
-                            inv_table,
-                            byte_base_b,
-                            None,
-                            out,
-                            nt_store,
-                        );
-                    }
+                    shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base_b,
+                        None,
+                        out,
+                        nt_store,
+                    );
                 }
             } else {
                 shift_reduce_inner_mixed_const_b::<0x03>(
