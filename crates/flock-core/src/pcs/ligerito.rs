@@ -12774,4 +12774,4 @@ mod tests {
 // RealAdii next sample on 17c0767 (marker 5149).
 // RealAdii next sample on 8697f1c (marker 26269).
 
-// r472 official resample marker: current promoted tree, no functional change.
+// r474 official resample marker: promoted r472 tree, second fresh post-promotion draw.
