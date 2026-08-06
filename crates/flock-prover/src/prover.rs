@@ -53,8 +53,7 @@ fn ranked_direct_c_precompute_enabled(r1cs: &BlockR1cs) -> bool {
 
 #[inline]
 fn ranked_direct_fold4_precompute_enabled(r1cs: &BlockR1cs) -> bool {
-    ranked_direct_ab_precompute_enabled(r1cs)
-        && pcs::ranked_direct_fold4_enabled()
+    ranked_direct_ab_precompute_enabled(r1cs) && pcs::ranked_direct_fold4_enabled()
 }
 
 /// Direct-fold8 capture/consumer predicate: the fold4 chain plus the shared
@@ -106,10 +105,7 @@ fn precompute_ab_s_hat_v(
             inner_rest_tail,
         ))
     } else if r1cs.k_log >= pcs::LOG_PACKING {
-        Some(pcs::ring_switch::s_hat_v_from_z_vec(
-            z_vec,
-            inner_rest_tail,
-        ))
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(z_vec, inner_rest_tail))
     } else {
         None
     }
@@ -122,20 +118,18 @@ fn precompute_ab_s_hat_v(
 /// narrower captures by presence, so a producer shape miss (e.g. no lincheck
 /// stripe) degrades to a still-correct route instead of panicking.
 #[inline]
-fn pre_c_slot<'a>(
-    r1cs: &BlockR1cs,
-    captured: &'a zerocheck::CapturedSHatVC,
-) -> Option<&'a [F128]> {
+fn pre_c_slot<'a>(r1cs: &BlockR1cs, captured: &'a zerocheck::CapturedSHatVC) -> Option<&'a [F128]> {
     Some(
         if ranked_direct_fold8_precompute_enabled(r1cs) && captured.fold8.is_some() {
             captured.fold8.as_deref().unwrap()
         } else if ranked_direct_fold4_precompute_enabled(r1cs) && captured.fold4.is_some() {
             captured.fold4.as_deref().unwrap()
         } else if ranked_direct_c_precompute_enabled(r1cs) {
-        captured.quad.as_slice()
-    } else {
-        captured.s_hat_v_c.as_slice()
-    })
+            captured.quad.as_slice()
+        } else {
+            captured.s_hat_v_c.as_slice()
+        },
+    )
 }
 
 /// Construct a multilinear `x_outer_full` of length `m − k_skip` from a
@@ -269,10 +263,9 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
-    let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-        // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-        flock_core::scratch::give_f128(z_vec_pre);
+    let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+    // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
+    flock_core::scratch::give_f128(z_vec_pre);
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(
@@ -764,8 +757,7 @@ fn make_commit_tail_fill_hook<'a, Ch: Challenger>(
 where
     Ch: 'a,
 {
-    if !flock_core::gpu_commit::commit_tail_fill_enabled()
-        || !ranked_lincheck_c_reuse_enabled(r1cs)
+    if !flock_core::gpu_commit::commit_tail_fill_enabled() || !ranked_lincheck_c_reuse_enabled(r1cs)
     {
         return None;
     }
@@ -824,8 +816,7 @@ fn commit_with_round1_ab_precompute(
     // generation. A valid cache hit may satisfy it inside the commit arm;
     // otherwise the post-join callback claims it and replays this exact A/B
     // closure beside the broad split sweep.
-    let run_ranked_exact_tune =
-        flock_core::gpu_commit::ranked_exact_contention_tune_pending();
+    let run_ranked_exact_tune = flock_core::gpu_commit::ranked_exact_contention_tune_pending();
 
     // The BLAKE3 padding rows force every block's tail words to zero, which
     // in the SoA codeword is a static all-zero pattern on the top lanes of
@@ -1213,10 +1204,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // (everything past prefix0). Byte-identical to `fold_1b_rows` on the AB
     // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
     // (only test setups; real R1CS has k_log >= 16).
-    let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-        // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-        flock_core::scratch::give_f128(z_vec_pre);
+    let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+    // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
+    flock_core::scratch::give_f128(z_vec_pre);
     if phase_timing {
         let wall = t_lc.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_lc0.unwrap_or(0.0);
@@ -1433,10 +1423,9 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
-    let s_hat_v_ab =
-        precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-        // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-        flock_core::scratch::give_f128(z_vec_pre);
+    let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+    // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
+    flock_core::scratch::give_f128(z_vec_pre);
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---
