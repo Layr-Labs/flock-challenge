@@ -12775,3 +12775,5 @@ mod tests {
 // RealAdii next sample on 8697f1c (marker 26269).
 
 // r472 official resample marker: current promoted tree, no functional change.
+
+// Akashneelesh dispersion sample of promoted tree 7c355b6 (marker a1, 2026-08-06). No functional change.
