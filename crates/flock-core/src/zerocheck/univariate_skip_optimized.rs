@@ -5676,6 +5676,7 @@ mod tests {
                 incumbent.2,
                 "fold8 suffix[..6] collapse mismatch in case {case}"
             );
+            // Candidate r494: preserve the fold8-to-fold4 equivalence check.
             // Folding retained coordinates 4 and 5 must reproduce the
             // incumbent 16-bank fold4 tensor exactly.
             let hi_eq = build_eq(&inner_tail[4..6]);
@@ -5697,3 +5698,8 @@ mod tests {
         }
     }
 }
+// r495 archive identity: preserve scalar fallback semantics while forcing a distinct candidate archive.
+
+// Competition candidate r497-20260806T021939Z: preserve kernel semantics while forcing a distinct editable archive.
+
+// Competition candidate r501: terminal-slot-release archive identity; preserve scalar fallback semantics.

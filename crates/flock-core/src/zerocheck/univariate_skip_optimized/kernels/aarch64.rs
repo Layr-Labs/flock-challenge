@@ -2978,8 +2978,8 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
                     );
                 } else {
                     const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
-                    const STATIC_A_K0_ZERO_MASK: u64 = 0xffff_fffe_0000_0000;
-                    if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_ZERO_MASK == 0 {
+                    const STATIC_A_K0_TOP3_MASK: u64 = 0xffff_ff00_0000_0000;
+                    if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_TOP3_MASK == 0 {
                         let static_a_k1 = match static_b_context {
                             Some(StaticBContext::Prepared { static_a_k1, .. }) => static_a_k1,
                             Some(StaticBContext::LegacyPerCall) | None => {
