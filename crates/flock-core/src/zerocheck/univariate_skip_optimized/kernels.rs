@@ -1,4 +1,4 @@
-use super::{C_MASK_TABLE_STRIDE, InvNttTableByteSingleGf8, F8};
+use super::{C_MASK_TABLE_STRIDE, F8, InvNttTableByteSingleGf8};
 
 mod portable;
 
@@ -483,13 +483,7 @@ pub(super) fn accumulate_convert_ab(
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
     // every table-selected load.
     unsafe {
-        aarch64::accumulate_convert_ab(
-            chunk_ab_bytes,
-            n_b_med,
-            convert,
-            eq_lo_val,
-            partial_ab,
-        );
+        aarch64::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
     }
 
     #[cfg(all(
