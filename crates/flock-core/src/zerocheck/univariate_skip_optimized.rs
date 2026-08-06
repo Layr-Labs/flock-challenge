@@ -1754,19 +1754,30 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     assert_eq!(ab_inner.len_bytes(), total_bytes);
     assert_eq!(r.len(), m);
 
-    let fold4_n_hi = fold4_n_hi_from_env();
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], fold4_n_hi);
-    let big_lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    let n_lo_and_inner = eq.n_lo + N_INNER;
-    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
+    let fold4_n_hi = ab_completion_n_hi_from_env();
+    // Seed `d_inv` into the lo tensor build instead of a separate serial
+    // 2^n_lo-multiply rescale pass (bit-identical: exact-field associativity
+    // pushes the scalar through the doubling expansion). The hi half is
+    // unscaled, exactly as before.
+    let full_r = &r[k_skip + N_INNER..];
+    let n_hi_eff = fold4_n_hi.min(full_r.len());
+    let n_lo_eff = full_r.len() - n_hi_eff;
+    let eq_lo_scaled: Vec<F128> =
+        crate::zerocheck::univariate_skip::build_eq_seeded(&full_r[..n_lo_eff], d_inv());
+    let eq_hi: Vec<F128> = crate::zerocheck::univariate_skip::build_eq(&full_r[n_lo_eff..]);
+    let big_lo_size = 1usize << n_lo_eff;
+    let hi_size = 1usize << n_hi_eff;
+    let n_lo_and_inner = n_lo_eff + N_INNER;
     let convert = convert_table();
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
 
     let mut partials = vec![[F128::ZERO; ELL]; hi_size];
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    // Phase-seam cache handoff: the AB precompute filled ab_inner ascending
+    // during the commit window, so its tail is SLC-warm when this completion
+    // starts — claim descending.
+    crate::epool::run_hetero_chunks_rev(hi_size, |x_hi| {
         let mut partial = [F128::ZERO; ELL];
         process_one_x_hi_with_precomputed_ab_fold4_ab(
             x_hi,
@@ -1776,7 +1787,7 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
             &b_med_counts,
             ab_inner_bytes,
             &eq_lo_scaled,
-            eq.hi[x_hi],
+            eq_hi[x_hi],
             convert,
             None,
             &mut partial,
@@ -2839,6 +2850,32 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
 
 /// Resolve the Fold4-only lo/hi split tuning seam. Invalid values fail loudly:
 /// silently accepting a typo would make component profiles incomparable.
+/// Chunk-granularity split for the AB-only round-1 completion (separate
+/// from the C-side fold4's n_hi, whose 32-bank high-scaling cost scales
+/// with 2^n_hi and is deliberately pinned at 7). Default 8 = 256 chunks:
+/// ~18 claims per worker on the ranked 10P+4E heterogeneous queue instead
+/// of ~9 — halving the join's straggler tail (an efficiency-core holding a
+/// final coarse chunk straggles the whole round-1 join) — and a 32 KiB
+/// eq_lo table that coexists with the 64 KiB convert table in L1 instead
+/// of competing with it at 64 KiB. Outputs are bit-identical at any value:
+/// the lo/hi split is an exact tensor factorisation of the same eq table
+/// (the in-tree MAX_N_HI note makes the same argument), and the per-chunk
+/// partial regrouping is XOR-exact. `FLOCK_AB_COMPLETION_N_HI` (5..=10)
+/// overrides for A/B; the extra per-chunk cost is 64 eq_hi multiplies and
+/// one 1 KiB partial slot per additional chunk — trivial against the tail.
+fn ab_completion_n_hi_from_env() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        match std::env::var("FLOCK_AB_COMPLETION_N_HI") {
+            Ok(s) => match s.parse::<usize>() {
+                Ok(n) if (5..=10).contains(&n) => n,
+                _ => panic!("FLOCK_AB_COMPLETION_N_HI must be an integer in 5..=10"),
+            },
+            Err(_) => 8,
+        }
+    })
+}
+
 fn fold4_n_hi_from_env() -> usize {
     match std::env::var_os("FLOCK_EXPERIMENTAL_FOLD4_N_HI") {
         None => 7,
