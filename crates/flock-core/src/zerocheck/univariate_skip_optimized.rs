@@ -849,11 +849,12 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     Round1AbInner { storage }
 }
 
-/// Jobs of this many 1 KiB chunks feed the QS5 hetero precompute queue: big
-/// enough that the atomic claim amortizes (a job is ~60 µs on a P-core),
-/// small enough that an E-core owns at most ~200 µs of tail when the main
-/// pool finishes — the same sizing logic as the deferred stripe's 64.
-const AB_PRE_CHUNKS_PER_JOB: usize = 64;
+/// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
+/// shape exposes roughly fifty scheduling waves on the ten-thread worker.
+#[inline]
+fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
+    n_chunks.div_ceil(512).max(1)
+}
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
 /// before the AB queue starts. Every other shape retains the incumbent
@@ -939,17 +940,28 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     }
 
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-    let n_jobs = n_chunks.div_ceil(AB_PRE_CHUNKS_PER_JOB);
+    // Rotate each complete three-chunk group left by one visit. This exposes
+    // two later neighbors before the group head while retaining short runs.
+    let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
+    let n_jobs = n_chunks.div_ceil(chunks_per_job);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
-            let start = job * AB_PRE_CHUNKS_PER_JOB;
-            let end = (start + AB_PRE_CHUNKS_PER_JOB).min(n_chunks);
-            for x_outer in start..end {
-                // SAFETY: the queue hands out each job index exactly once and
-                // each `x_outer` maps to one disjoint 1 KiB chunk.
+            let chunk_start = job * chunks_per_job;
+            let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
+            let slab_len = chunk_end - chunk_start;
+            for visit in 0..slab_len {
+                let group_base = (visit / 3) * 3;
+                let offset = if group_base + 2 < slab_len {
+                    group_base + ((visit % 3 + 1) % 3)
+                } else {
+                    visit
+                };
+                let x_outer = chunk_start + offset;
+                // SAFETY: each queue job is unique; complete triples rotate
+                // bijectively within the slab, and a one/two-item tail is fixed.
                 let out_outer = unsafe {
                     core::slice::from_raw_parts_mut(
                         out_base.ptr().add(x_outer * OUTER_BYTES),
@@ -5724,3 +5736,13 @@ mod tests {
 // chewy-cadence: r557 1785988378687326387
 
 // chewy-cadence: r558 1785988571742870116
+
+// chewy-cadence: r560 20260806T040229Z
+
+// r561 archive-distinct hot-line marker: 20260806T040426Z
+
+// r562 archive-distinct hot-line marker: 20260806T040635Z
+
+// chewy-cadence: r578 20260806T044834Z
+
+// chewy-cadence: r582 20260806T045819Z
