@@ -12862,3 +12862,4 @@ mod tests {
 // r552 cadence nonce: poll-after-queue experiment
 
 // r554 cadence nonce: 20260806T034654Z; semantics unchanged.
+// RealAdii next sample on c1467d3 (marker 24085).
