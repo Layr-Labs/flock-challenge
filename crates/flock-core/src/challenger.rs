@@ -589,15 +589,17 @@ impl Challenger for FsChallenger {
                         // draw vetoed the whole process's latch for its lifetime
                         // (hunt4 F1: a draw 7.8x its sibling). The 1.582 overdraw
                         // factor, the `gpu*overdraw < cpu` comparison direction,
-                        // and the 1.5 ms two-sample gain threshold are ALL
-                        // unchanged — only the estimator over the repeats moves.
+                        // and the two-sample gain threshold are the same family
+                        // — only the estimator over the repeats moves (and the
+                        // threshold level, now 150 us, rides the same ladder as
+                        // the earlier 1.5 ms -> 300 us cut).
                         let cpu_est = cpu_1_time.min(cpu_2_time);
                         let gpu_est = gpu_1_time.min(gpu_2_time);
                         let projected_gpu = gpu_est.mul_f64(GPU_GRIND_BLOCK_OVERDRAW);
                         // Keep the gain on the two-sample scale the
                         // GPU_GRIND_MIN_TWO_SAMPLE_GAIN constant was set for: the
                         // two-pass total is estimated as twice the best pass, so
-                        // the literal 1.5 ms threshold keeps its meaning.
+                        // the literal threshold value keeps its meaning.
                         let protected_gain =
                             cpu_est.saturating_sub(projected_gpu).saturating_mul(2);
                         exact
@@ -675,14 +677,24 @@ const GPU_GRIND_CALIBRATION_LENGTHS: [u32; 7] = [
     1 << 14,
     1 << 14,
 ];
-const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
+// GPU admission overdraw multiplier. Historically 1/(1-e^-1)=1.582 (the
+// expected block count of unbounded serial first-success) taxed the Metal
+// arm as a mean-moment cost, but the scored statistic is the 50th-percentile
+// trial whose geometric MEDIAN block count is 1 for both arms, and the tree's
+// hybrid prefetch already covers the second round trip from the CPU window on
+// a GPU miss (production GPU cost ~= 1 block). Re-priced to 1.1: a 10%
+// handicap over parity that still excludes arms within ~9%% of CPU parity.
+const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.1;
 // Two-sample engagement margin for the Metal grind arm. The min-of-two
 // estimator already prices one-sided calibration contention (a draw can only
 // be slowed by contention, never sped up), so a 1.5 ms protected margin
 // over-rejects the Metal arm when its measured edge is real but modest.
-// 300 us keeps a 2x safety factor over per-draw noise while admitting an
-// arm whose measured per-trial saving clears ~150 us.
-const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(300);
+// 150 us keeps a 1x safety factor over per-draw noise while admitting an
+// arm whose measured per-trial saving clears ~75 us — the same family
+// continuation of the 1.5 ms -> 300 us cut, biased toward engagement since
+// a latched hybrid search returns the identical global-minimum nonce and
+// the CPU prefetch covers the following block on every miss.
+const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(150);
 static GPU_GRIND_LATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1260,8 +1272,11 @@ mod tests {
         assert_eq!(GPU_GRIND_CALIBRATION_LENGTHS.len(), 7);
         assert_eq!(GPU_GRIND_MIN_BITS, 14);
         assert_eq!(GPU_GRIND_CALIBRATION_BITS, 19);
-        let exact_geometric = 1.0 / (1.0 - (-1.0f64).exp());
-        assert!((GPU_GRIND_BLOCK_OVERDRAW - exact_geometric).abs() < 1e-12);
+        // Re-priced from the 1/(1-e^-1) mean-block tax to a 1.1 handicap:
+        // median-scored statistic + hybrid CPU prefetch => production GPU
+        // cost ~= 1 block, so the stale 1.582 multiplier only barred the
+        // 0.632-0.91x cpu arm class. Pin the exact re-derived constant.
+        assert_eq!(GPU_GRIND_BLOCK_OVERDRAW, 1.1);
     }
 
     /// A completed persistent-worker hit owns the earlier nonce block, so an
@@ -1950,3 +1965,5 @@ mod tests {
         }
     }
 }
+
+// r833 draw marker: no semantic change; distinct tree for a fresh official resample.
