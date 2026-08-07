@@ -35,6 +35,20 @@ use crate::ntt::AdditiveNttF128;
 /// Env var that disables the GPU commit path entirely.
 pub const ENV_NO_GPU_COMMIT: &str = "FLOCK_NO_GPU_COMMIT";
 
+/// Exact rollback for the ranked round-one AB tail split. The derived AB
+/// transform is never part of the committed witness; the warmup proof still
+/// requires a byte-for-byte GPU/CPU equality check before any timed suffix is
+/// assigned to Metal.
+pub const ENV_NO_GPU_AB_TAIL: &str = "FLOCK_NO_GPU_AB_TAIL";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn gpu_ab_tail_enabled() -> bool {
+    !std::env::var(ENV_NO_GPU_AB_TAIL).is_ok_and(|value| value == "1")
+}
+
 /// Same-binary control that preserves the CPU codeword allocation/prefault
 /// even after the ranked GPU commit has latched on.
 pub const ENV_NO_LAZY_GPU_CODEWORD: &str = "FLOCK_NO_LAZY_GPU_CODEWORD";
@@ -9903,6 +9917,467 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     }
 
     // -----------------------------------------------------------------------
+    // Ranked round-one AB tail split.
+    // -----------------------------------------------------------------------
+
+    const ROUND1_AB_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct Round1AbParams { uint start_chunk; uint chunk_count; };
+
+static inline uchar ab_reduce15(ushort p) {
+    ushort h = p >> 8;
+    ushort t = (p & 0xffu) ^ h ^ (h << 1) ^ (h << 3) ^ (h << 4);
+    ushort h2 = t >> 8;
+    return uchar((t & 0xffu) ^ h2 ^ (h2 << 1) ^ (h2 << 3) ^ (h2 << 4));
+}
+
+static inline uchar ab_mul(uchar aa, uchar bb) {
+    ushort a = aa;
+    ushort b = bb;
+    ushort p = 0;
+    #pragma unroll
+    for (uint i = 0; i < 8; i++) {
+        p ^= ushort(-int((a >> i) & 1u)) & ushort(b << i);
+    }
+    return ab_reduce15(p);
+}
+
+kernel void round1_ab_tail(
+    device const uchar* a [[buffer(0)]],
+    device const uchar* b [[buffer(1)]],
+    device uchar* out [[buffer(2)]],
+    constant uchar* table [[buffer(3)]],
+    constant Round1AbParams& p [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    uint local_chunk = tgid >> 1;
+    uint row_group = tgid & 1u;
+    if (local_chunk >= p.chunk_count) return;
+    uint chunk = p.start_chunk + local_chunk;
+    uint row = row_group * 8u + lid / 64u;
+    uint lane = lid & 63u;
+    uint rows = (chunk & 1u) == 0u ? 16u : 15u;
+    uint input_base = chunk * 1024u + row * 64u;
+    threadgroup uchar ar[512];
+    threadgroup uchar br[512];
+    if (row < rows) {
+        ar[lid] = a[input_base + lane];
+        br[lid] = b[input_base + lane];
+    } else {
+        ar[lid] = 0;
+        br[lid] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= rows) return;
+    uint row_offset = (lid / 64u) * 64u;
+    ushort acc = 0;
+    #pragma unroll
+    for (uint k = 0; k < 8; k++) {
+        uchar da = 0;
+        uchar db = 0;
+        #pragma unroll
+        for (uint j = 0; j < 8; j++) {
+            uint target = lane ^ (j * 8u);
+            da ^= table[uint(ar[row_offset + k * 8u + j]) * 64u + target];
+            db ^= table[uint(br[row_offset + k * 8u + j]) * 64u + target];
+        }
+        acc ^= ushort(ab_mul(da, db)) << k;
+    }
+    uint output_base = local_chunk * 1024u + row * 64u;
+    out[output_base + lane] = ab_reduce15(acc);
+}
+"#;
+
+    const ROUND1_AB_RANKED_CHUNKS: usize = 1 << 19;
+    const ROUND1_AB_CHUNK_BYTES: usize = 1024;
+    const ROUND1_AB_PROBE_CHUNKS: usize = ROUND1_AB_RANKED_CHUNKS / 16;
+    const ROUND1_AB_MIN_TAIL_CHUNKS: usize = 4096;
+    const ROUND1_AB_SPLIT_GRANULARITY: usize = 256;
+
+    struct Round1AbGpu {
+        pso: Id,
+        table_buf: Id,
+        probe_buf: Id,
+    }
+
+    unsafe impl Send for Round1AbGpu {}
+
+    static ROUND1_AB_STATE: std::sync::OnceLock<Option<std::sync::Mutex<Round1AbGpu>>> =
+        std::sync::OnceLock::new();
+    static ROUND1_AB_TUNED_TAIL: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static ROUND1_AB_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn round1_ab_debug() -> bool {
+        std::env::var_os("FLOCK_AB_GPU_DEBUG").is_some()
+    }
+
+    fn round1_ab_init(gpu: &'static Gpu) -> Result<Round1AbGpu, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<Round1AbGpu, String> {
+                let pso =
+                    compile_supplemental_pipeline(gpu, ROUND1_AB_MSL_SOURCE, "round1_ab_tail")?;
+                let table_buf = match gpu.new_buffer(256 * 64) {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        gpu.release(pso);
+                        return Err(error);
+                    }
+                };
+                let table = crate::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
+                std::ptr::copy_nonoverlapping(
+                    table.data_ptr(),
+                    gpu.buffer_contents(table_buf),
+                    256 * 64,
+                );
+                let probe_buf = match gpu.new_buffer(ROUND1_AB_PROBE_CHUNKS * ROUND1_AB_CHUNK_BYTES)
+                {
+                    Ok(buf) => buf,
+                    Err(error) => {
+                        gpu.release(table_buf);
+                        gpu.release(pso);
+                        return Err(error);
+                    }
+                };
+                Ok(Round1AbGpu {
+                    pso,
+                    table_buf,
+                    probe_buf,
+                })
+            })();
+            gpu.pool_pop(pool);
+            built
+        }
+    }
+
+    fn round1_ab_state() -> Option<&'static std::sync::Mutex<Round1AbGpu>> {
+        ROUND1_AB_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match round1_ab_init(gpu) {
+                    Ok(state) => Some(std::sync::Mutex::new(state)),
+                    Err(error) => {
+                        if round1_ab_debug() {
+                            eprintln!("[round1-ab-gpu] init failed: {error}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    pub struct Round1AbTailJob {
+        cb: Id,
+        calibration: bool,
+        start_chunk: usize,
+        chunk_count: usize,
+        total_chunks: usize,
+        launch_delay_ms: f64,
+        submitted_host_s: f64,
+    }
+
+    unsafe impl Send for Round1AbTailJob {}
+
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+    }
+
+    fn round1_ab_host_seconds() -> f64 {
+        static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        let scale = *SCALE.get_or_init(|| {
+            let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+            let status = unsafe { mach_timebase_info(&mut info) };
+            if status == 0 && info.denom != 0 {
+                f64::from(info.numer) / f64::from(info.denom) * 1e-9
+            } else {
+                1e-9
+            }
+        });
+        unsafe { mach_absolute_time() as f64 * scale }
+    }
+
+    unsafe fn round1_ab_submit(
+        gpu: &Gpu,
+        state: &Round1AbGpu,
+        a_buf: Id,
+        b_buf: Id,
+        out_buf: Id,
+        out_offset: usize,
+        start_chunk: usize,
+        chunk_count: usize,
+    ) -> Result<Id, String> {
+        #[repr(C)]
+        struct Params {
+            start_chunk: u32,
+            chunk_count: u32,
+        }
+        let params = Params {
+            start_chunk: start_chunk as u32,
+            chunk_count: chunk_count as u32,
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<Params>(),
+            )
+        };
+        unsafe {
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, a_buf, 0, 0);
+            gpu.set_buffer(enc, b_buf, 0, 1);
+            gpu.set_buffer(enc, out_buf, out_offset, 2);
+            gpu.set_buffer(enc, state.table_buf, 0, 3);
+            gpu.set_bytes(enc, bytes, 4);
+            gpu.dispatch(enc, (chunk_count * 2) as u64, 512);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn prepare_round1_ab_tail(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        out_ptr: *mut u8,
+        out_len: usize,
+        total_chunks: usize,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_ab_tail_enabled()
+            || ROUND1_AB_POISONED.load(Ordering::Relaxed)
+            || ROUND1_AB_TUNED_TAIL.load(Ordering::Relaxed) == 0
+            || total_chunks != ROUND1_AB_RANKED_CHUNKS
+            || a_packed.len() != total_chunks * ROUND1_AB_CHUNK_BYTES
+            || b_packed.len() != a_packed.len()
+            || out_len != a_packed.len()
+            || out_ptr.is_null()
+        {
+            return false;
+        }
+        let Ok(gpu) = gpu() else { return false };
+        let Some(ab_state) = round1_ab_state() else {
+            return false;
+        };
+        if ab_state.lock().is_err() {
+            return false;
+        }
+        let Some(r2_state) = zc_r2_state() else {
+            return false;
+        };
+        let Ok(mut r2) = r2_state.lock() else {
+            return false;
+        };
+        if unsafe { zc_r2_wrap(&mut r2, gpu, a_packed) }.is_err()
+            || unsafe { zc_r2_wrap(&mut r2, gpu, b_packed) }.is_err()
+        {
+            return false;
+        }
+        drop(r2);
+        let Some(t3_state) = zc_t3_state() else {
+            return false;
+        };
+        let Ok(mut t3) = t3_state.lock() else {
+            return false;
+        };
+        unsafe { zc_t3_wrap(&mut t3, gpu, out_ptr.cast_const(), out_len) }.is_ok()
+    }
+
+    pub fn round1_ab_cpu_chunks(total_chunks: usize, prepared: bool) -> usize {
+        use std::sync::atomic::Ordering;
+        if !prepared {
+            return total_chunks;
+        }
+        let tail = ROUND1_AB_TUNED_TAIL.load(Ordering::Relaxed);
+        if tail == usize::MAX || tail == 0 || tail >= total_chunks {
+            total_chunks
+        } else {
+            total_chunks - tail
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_round1_ab_tail(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        out_ptr: *mut u8,
+        out_len: usize,
+        total_chunks: usize,
+        cpu_chunks: usize,
+        launch_delay_ms: f64,
+    ) -> Option<Round1AbTailJob> {
+        use std::sync::atomic::Ordering;
+        if ROUND1_AB_POISONED.load(Ordering::Relaxed) || cpu_chunks > total_chunks {
+            return None;
+        }
+        let tuned = ROUND1_AB_TUNED_TAIL.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let (start_chunk, chunk_count) = if calibration {
+            (
+                total_chunks - ROUND1_AB_PROBE_CHUNKS,
+                ROUND1_AB_PROBE_CHUNKS,
+            )
+        } else {
+            (cpu_chunks, total_chunks - cpu_chunks)
+        };
+        if chunk_count == 0 {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = round1_ab_state()?;
+        let state = state_mutex.lock().ok()?;
+        let r2_state = zc_r2_state()?;
+        let mut r2 = r2_state.lock().ok()?;
+        let a_buf = unsafe { zc_r2_wrap(&mut r2, gpu, a_packed) }.ok()?;
+        let b_buf = unsafe { zc_r2_wrap(&mut r2, gpu, b_packed) }.ok()?;
+        drop(r2);
+        let (out_buf, out_offset) = if calibration {
+            (state.probe_buf, 0)
+        } else {
+            let t3_state = zc_t3_state()?;
+            let mut t3 = t3_state.lock().ok()?;
+            let buf = unsafe { zc_t3_wrap(&mut t3, gpu, out_ptr.cast_const(), out_len) }.ok()?;
+            (buf, start_chunk * ROUND1_AB_CHUNK_BYTES)
+        };
+        let submitted_host_s = round1_ab_host_seconds();
+        let cb = unsafe {
+            round1_ab_submit(
+                gpu,
+                &state,
+                a_buf,
+                b_buf,
+                out_buf,
+                out_offset,
+                start_chunk,
+                chunk_count,
+            )
+        }
+        .ok()?;
+        Some(Round1AbTailJob {
+            cb,
+            calibration,
+            start_chunk,
+            chunk_count,
+            total_chunks,
+            launch_delay_ms,
+            submitted_host_s,
+        })
+    }
+
+    pub fn finish_round1_ab_tail(
+        job: Round1AbTailJob,
+        cpu_output: &[u8],
+        cpu_wall_ms: f64,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        let Ok(gpu) = gpu() else { return false };
+        let fail = |cb: Id| {
+            ROUND1_AB_POISONED.store(true, Ordering::Relaxed);
+            ROUND1_AB_TUNED_TAIL.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            false
+        };
+        unsafe {
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+                return fail(job.cb);
+            }
+            if !job.calibration {
+                gpu.release(job.cb);
+                return true;
+            }
+            let gpu_ms = zc_fold_gpu_wall_ms(gpu, job.cb);
+            let gpu_start_s: f64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> f64,
+                job.cb,
+                c"GPUStartTime"
+            );
+            let Some(state_mutex) = round1_ab_state() else {
+                return fail(job.cb);
+            };
+            let Ok(state) = state_mutex.lock() else {
+                return fail(job.cb);
+            };
+            let probe = core::slice::from_raw_parts(
+                gpu.buffer_contents(state.probe_buf).cast_const(),
+                job.chunk_count * ROUND1_AB_CHUNK_BYTES,
+            );
+            for local in 0..job.chunk_count {
+                let global = job.start_chunk + local;
+                let live = if global & 1 == 0 { 1024 } else { 15 * 64 };
+                let got = &probe[local * 1024..local * 1024 + live];
+                let want = &cpu_output[global * 1024..global * 1024 + live];
+                if got != want {
+                    if round1_ab_debug() {
+                        let byte = got.iter().zip(want).position(|(a, b)| a != b).unwrap_or(0);
+                        eprintln!(
+                            "[round1-ab-gpu] mismatch at chunk {global} byte {byte}; disabled"
+                        );
+                    }
+                    drop(state);
+                    return fail(job.cb);
+                }
+            }
+            drop(state);
+
+            let raw_queue_ms = (gpu_start_s - job.submitted_host_s) * 1e3;
+            let queue_ms = if raw_queue_ms.is_finite() && (-1.0..=100.0).contains(&raw_queue_ms) {
+                raw_queue_ms.max(0.0)
+            } else {
+                6.0
+            };
+            let ready_ms = job.launch_delay_ms + queue_ms;
+            let gpu_full_ms = gpu_ms * job.total_chunks as f64 / job.chunk_count as f64;
+            let available_ms = cpu_wall_ms - ready_ms;
+            let balanced = if gpu_ms > 0.0
+                && cpu_wall_ms.is_finite()
+                && cpu_wall_ms > 0.0
+                && gpu_full_ms.is_finite()
+                && available_ms > 1.0
+            {
+                job.total_chunks as f64 * available_ms / (cpu_wall_ms + gpu_full_ms)
+            } else {
+                0.0
+            };
+            let mut tail = (balanced * 0.875) as usize;
+            tail = tail.min(job.total_chunks / 8);
+            tail -= tail % ROUND1_AB_SPLIT_GRANULARITY;
+            if tail < ROUND1_AB_MIN_TAIL_CHUNKS {
+                tail = 0;
+            }
+            ROUND1_AB_TUNED_TAIL.store(tail, Ordering::Relaxed);
+            if round1_ab_debug() {
+                eprintln!(
+                    "[round1-ab-gpu] exact probe {}/{} gpu={gpu_ms:.2}ms ready={ready_ms:.2}ms \
+                     cpu={cpu_wall_ms:.2}ms gpu-full={gpu_full_ms:.2}ms -> tail {tail}",
+                    job.chunk_count, job.total_chunks,
+                );
+            }
+            gpu.release(job.cb);
+            false
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Zerocheck round-two PRODUCTS GPU arm (see `ENV_NO_GPU_ZC_R2`).
     //
     // The round-two fused fold sweeps 2^25 packed row pairs: per pair, four
@@ -11256,6 +11731,8 @@ kernel void zc_t3_products(
         cb: Id,
         pub chunks: usize,
         calibration: bool,
+        anchors_buf: Id,
+        deltas_buf: Id,
         submitted: std::time::Instant,
     }
 
@@ -11451,6 +11928,8 @@ kernel void zc_t3_products(
                 cb,
                 chunks,
                 calibration,
+                anchors_buf,
+                deltas_buf,
                 submitted: std::time::Instant::now(),
             })
         }
@@ -11536,32 +12015,33 @@ kernel void zc_t3_products(
             let mut n_walls = usize::from(walls[0] > 0.0);
             let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
             gpu.release(job.cb);
-            if let (Some(&(_, _, anchors_buf)), Some(&(_, _, deltas_buf))) =
-                (state.wraps.first(), state.wraps.get(1))
-            {
-                let lo_size = state.eq_lo_cap / 16;
-                while n_walls < walls.len() {
-                    let Ok(cb2) =
-                        zc_t3_submit(gpu, &state, anchors_buf, deltas_buf, job.chunks, lo_size)
-                    else {
-                        break;
-                    };
-                    let w = if gpu.wait_cb(cb2).is_ok() {
-                        zc_fold_gpu_wall_ms(gpu, cb2)
-                    } else {
-                        0.0
-                    };
-                    gpu.release(cb2);
-                    if w <= 0.0 {
-                        break;
-                    }
-                    walls[n_walls] = w;
-                    n_walls += 1;
-                    let prev_min = w_min;
-                    w_min = w_min.min(w);
-                    if n_walls >= 2 && w > 0.95 * prev_min {
-                        break;
-                    }
+            let lo_size = state.eq_lo_cap / 16;
+            while n_walls < walls.len() {
+                let Ok(cb2) = zc_t3_submit(
+                    gpu,
+                    &state,
+                    job.anchors_buf,
+                    job.deltas_buf,
+                    job.chunks,
+                    lo_size,
+                ) else {
+                    break;
+                };
+                let w = if gpu.wait_cb(cb2).is_ok() {
+                    zc_fold_gpu_wall_ms(gpu, cb2)
+                } else {
+                    0.0
+                };
+                gpu.release(cb2);
+                if w <= 0.0 {
+                    break;
+                }
+                walls[n_walls] = w;
+                n_walls += 1;
+                let prev_min = w_min;
+                w_min = w_min.min(w);
+                if n_walls >= 2 && w > 0.95 * prev_min {
+                    break;
                 }
             }
             drop(state);
@@ -12286,6 +12766,15 @@ kernel void zc_loop_products(
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 
+/// Ranked round-one AB split: Metal consumes a calibrated suffix after the
+/// commit graph while the CPU produces the disjoint prefix.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[doc(hidden)]
+pub use imp::{
+    Round1AbTailJob, finish_round1_ab_tail, launch_round1_ab_tail, prepare_round1_ab_tail,
+    round1_ab_cpu_chunks,
+};
+
 /// Zerocheck round-one C-fold GPU arm (see `ENV_NO_GPU_ZEROCHECK`) and the
 /// lincheck gather-fold GPU arm (see `ENV_NO_GPU_LINCHECK`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -12330,6 +12819,42 @@ pub(crate) use imp::{ZcLoopJob, ZcLoopResult, launch_zc_loop_products, zc_loop_w
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
     use super::*;
+
+    pub struct Round1AbTailJob;
+
+    pub unsafe fn prepare_round1_ab_tail(
+        _a_packed: &[u8],
+        _b_packed: &[u8],
+        _out_ptr: *mut u8,
+        _out_len: usize,
+        _total_chunks: usize,
+    ) -> bool {
+        false
+    }
+
+    pub fn round1_ab_cpu_chunks(total_chunks: usize, _prepared: bool) -> usize {
+        total_chunks
+    }
+
+    pub unsafe fn launch_round1_ab_tail(
+        _a_packed: &[u8],
+        _b_packed: &[u8],
+        _out_ptr: *mut u8,
+        _out_len: usize,
+        _total_chunks: usize,
+        _cpu_chunks: usize,
+        _launch_delay_ms: f64,
+    ) -> Option<Round1AbTailJob> {
+        None
+    }
+
+    pub fn finish_round1_ab_tail(
+        _job: Round1AbTailJob,
+        _cpu_output: &[u8],
+        _cpu_wall_ms: f64,
+    ) -> bool {
+        false
+    }
 
     pub(crate) fn gpu_recursive_merkle_blake3(
         _data: &[u8],
@@ -12430,6 +12955,13 @@ mod imp {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[doc(hidden)]
+pub use imp::{
+    Round1AbTailJob, finish_round1_ab_tail, launch_round1_ab_tail, prepare_round1_ab_tail,
+    round1_ab_cpu_chunks,
+};
 
 #[cfg(test)]
 mod tests {

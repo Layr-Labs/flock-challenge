@@ -832,7 +832,28 @@ fn commit_with_round1_ab_precompute(
         ),
     );
 
-    let result = rayon::join(
+    const AB_CHUNK_BYTES: usize = 1024;
+    let total_bytes = a_packed.len();
+    assert_eq!(total_bytes, b_packed.len());
+    assert_eq!(total_bytes % AB_CHUNK_BYTES, 0);
+    let total_chunks = total_bytes / AB_CHUNK_BYTES;
+    let mut ab_work = zerocheck::univariate_skip_optimized::Round1AbWork::new(total_bytes);
+    let ab_output_addr = ab_work.as_mut_ptr() as usize;
+    let ab_output_len = ab_work.len_bytes();
+    let gpu_prepared = unsafe {
+        flock_core::gpu_commit::prepare_round1_ab_tail(
+            a_packed,
+            b_packed,
+            ab_output_addr as *mut u8,
+            ab_output_len,
+            total_chunks,
+        )
+    };
+    let cpu_chunks = flock_core::gpu_commit::round1_ab_cpu_chunks(total_chunks, gpu_prepared);
+    let cpu_output = ab_work.chunk_range_mut(0, cpu_chunks);
+    let split_started = std::time::Instant::now();
+
+    let ((pre, gpu_tail), cpu_wall_ms) = rayon::join(
         || {
             let pre = match commit_codeword {
                 CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
@@ -846,17 +867,41 @@ fn commit_with_round1_ab_precompute(
                     pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
                 }
             };
-            // Graph complete, root final — the AB arm is (typically) still
-            // running. Fire the tail-fill hook here so its staged GPU work
-            // executes in the arm-tail idle.
+            // The root is final, so Metal's commit graph has drained. Queue
+            // the challenge-independent AB suffix first: its completion is
+            // on the commit/AB join's critical path. The root-dependent C
+            // fold is queued immediately behind it and remains hidden under
+            // the longer challenge-weighted AB completion after this join.
+            let launch_delay_ms = split_started.elapsed().as_secs_f64() * 1e3;
+            let gpu_tail = unsafe {
+                flock_core::gpu_commit::launch_round1_ab_tail(
+                    a_packed,
+                    b_packed,
+                    ab_output_addr as *mut u8,
+                    ab_output_len,
+                    total_chunks,
+                    cpu_chunks,
+                    launch_delay_ms,
+                )
+            };
             if let Some(hook) = tail_fill {
                 hook(&pre.0);
             }
-            pre
+            (pre, gpu_tail)
         },
         || {
             let t = std::time::Instant::now();
-            let r = precompute_ab();
+            zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_range(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+                0,
+                cpu_chunks,
+                cpu_output,
+            );
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
             // The hybrid-commit warmup sweep sizes its contention emulation
             // from this arm's measured wall (an Instant read is free; the
@@ -865,9 +910,29 @@ fn commit_with_round1_ab_precompute(
             if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
-            r
+            wall_ms
         },
     );
+
+    let gpu_complete = gpu_tail
+        .map(|job| {
+            flock_core::gpu_commit::finish_round1_ab_tail(job, ab_work.as_bytes(), cpu_wall_ms)
+        })
+        .unwrap_or(false);
+    if cpu_chunks < total_chunks && !gpu_complete {
+        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_range(
+            a_packed,
+            b_packed,
+            pcs_params.m,
+            k_skip,
+            inv_table,
+            padding,
+            cpu_chunks,
+            total_chunks - cpu_chunks,
+            ab_work.chunk_range_mut(cpu_chunks, total_chunks - cpu_chunks),
+        );
+    }
+    let result = (pre, ab_work.finish());
 
     if run_ranked_exact_tune {
         flock_core::gpu_commit::retune_ranked_hybrid_with_exact_contention(

@@ -590,6 +590,66 @@ impl Drop for Round1AbInner {
     }
 }
 
+/// Split-capable owner for the challenge-independent AB transform.
+///
+/// The allocation is created before the commit/AB join so the CPU can fill a
+/// prefix while an independent engine fills the disjoint suffix. Only live
+/// rows may be read before [`Self::finish`]; compact padding rows deliberately
+/// retain the ordinary write-before-read contract.
+#[doc(hidden)]
+pub struct Round1AbWork {
+    storage: Vec<F128>,
+}
+
+impl Round1AbWork {
+    #[doc(hidden)]
+    pub fn new(total_bytes: usize) -> Self {
+        assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
+        Self {
+            storage: crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn len_bytes(&self) -> usize {
+        self.storage.len() * core::mem::size_of::<F128>()
+    }
+
+    #[doc(hidden)]
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.storage.as_mut_ptr().cast::<u8>()
+    }
+
+    #[doc(hidden)]
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.storage.as_ptr().cast::<u8>(), self.len_bytes()) }
+    }
+
+    #[doc(hidden)]
+    pub fn chunk_range_mut(&mut self, start: usize, count: usize) -> &mut [u8] {
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        let lo = start.checked_mul(OUTER_BYTES).expect("AB range overflow");
+        let hi = lo
+            .checked_add(count.checked_mul(OUTER_BYTES).expect("AB range overflow"))
+            .expect("AB range overflow");
+        assert!(hi <= self.len_bytes(), "AB range out of bounds");
+        unsafe { core::slice::from_raw_parts_mut(self.as_mut_ptr().add(lo), hi - lo) }
+    }
+
+    #[doc(hidden)]
+    pub fn finish(mut self) -> Round1AbInner {
+        Round1AbInner {
+            storage: core::mem::take(&mut self.storage),
+        }
+    }
+}
+
+impl Drop for Round1AbWork {
+    fn drop(&mut self) {
+        crate::scratch::give_f128(core::mem::take(&mut self.storage));
+    }
+}
+
 /// Kill switch for the non-temporal store flavor of the deferred AB
 /// precompute output: `FLOCK_NO_ZC_AB_PRE_NT=1` restores the incumbent plain
 /// cached stores as a same-binary control. Store flavor only — the bytes
@@ -700,6 +760,71 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     nt: bool,
     compact: bool,
 ) -> Round1AbInner {
+    let total_bytes = (1usize << m) / 8;
+    let mut work = Round1AbWork::new(total_bytes);
+    let total_chunks = total_bytes / ((1 << N_MEDIUM) * 64);
+    precompute_round1_ab_inner_packed_padded_range_with_flavor(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        0,
+        total_chunks,
+        work.chunk_range_mut(0, total_chunks),
+        nt,
+        compact,
+    );
+    work.finish()
+}
+
+/// Fill a contiguous range of the challenge-independent AB transform.
+/// `out` is range-local: chunk zero in `out` corresponds to `chunk_start` in
+/// the packed A/B inputs. This is the disjoint-write seam used by the ranked
+/// CPU/GPU split; the full public precompute above remains its exact oracle.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn precompute_round1_ab_inner_packed_padded_range(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    chunk_start: usize,
+    chunk_count: usize,
+    out: &mut [u8],
+) {
+    precompute_round1_ab_inner_packed_padded_range_with_flavor(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        chunk_start,
+        chunk_count,
+        out,
+        ab_pre_nt_enabled(),
+        ab_compact_store_enabled(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn precompute_round1_ab_inner_packed_padded_range_with_flavor(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    chunk_start: usize,
+    chunk_count: usize,
+    out_bytes: &mut [u8],
+    nt: bool,
+    compact: bool,
+) {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -724,20 +849,10 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
-
-    // Reuse an A-sized resident F128 allocation from the prover scratch pool.
-    // Treating it as bytes is valid under the read contract every consumer
-    // honors: each LIVE byte — rows `[0, n_b_med)` of every `x_outer` chunk —
-    // is written below before it is read. With the QS3 compacted store the
-    // dead tail rows `[n_b_med, 16)` are left recycled/uninitialized; this is
-    // sound because NO consumer ever reads them (all bound their per-`b_med`
-    // reads by the same `n_b_med`, derived from the same `padding`), and round
-    // two rewrites the whole donated buffer before use. The kill switch
-    // `FLOCK_NO_AB_COMPACT_STORE=1` restores the historical invariant "every
-    // byte written below (explicit zero fills for the skipped-b_med holes)".
-    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
-    let out_bytes: &mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
+    let total_chunks = total_bytes / OUTER_BYTES;
+    assert!(chunk_start <= total_chunks);
+    assert!(chunk_count <= total_chunks - chunk_start);
+    assert_eq!(out_bytes.len(), chunk_count * OUTER_BYTES);
 
     if zc_ab_pre_hetero_enabled() {
         // QS5 hetero drain: feed the precompute through the shared two-pool
@@ -757,11 +872,10 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         // raising the dominant arm). Chunk-claim order is nondeterministic
         // but each chunk writes only its own disjoint 1 KiB, so the output
         // bytes are identical to the incumbent path.
-        let n_chunks = total_bytes / OUTER_BYTES;
         let ranked_fast_policy = ranked_ab_pre_fast_policy_hoist_shape(
             m,
             k_skip,
-            n_chunks,
+            total_chunks,
             padding.k_log,
             padding.useful_bits_per_block,
             rayon::current_num_threads(),
@@ -785,7 +899,8 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
-                    n_chunks,
+                    chunk_start,
+                    chunk_count,
                     out_bytes,
                 );
             } else {
@@ -799,7 +914,8 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
-                    n_chunks,
+                    chunk_start,
+                    chunk_count,
                     out_bytes,
                 );
             }
@@ -814,11 +930,12 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 static_b_context,
                 nt,
                 compact,
-                n_chunks,
+                chunk_start,
+                chunk_count,
                 out_bytes,
             );
         }
-        return Round1AbInner { storage };
+        return;
     }
 
     out_bytes
@@ -826,7 +943,8 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         .enumerate()
         .for_each_init(
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
-            |(a_col, b_col), (x_outer, out_outer)| {
+            |(a_col, b_col), (local_chunk, out_outer)| {
+                let x_outer = chunk_start + local_chunk;
                 precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
                     a_packed,
                     b_packed,
@@ -844,8 +962,6 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 );
             },
         );
-
-    Round1AbInner { storage }
 }
 
 /// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
@@ -924,7 +1040,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     static_b_context: Option<kernels::StaticBContext>,
     nt: bool,
     compact: bool,
-    n_chunks: usize,
+    chunk_start: usize,
+    chunk_count: usize,
     out_bytes: &mut [u8],
 ) {
     // This is a private specialization contract, but keep it checked in
@@ -941,22 +1058,23 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // Process each queue-owned slab monotonically. This removes permutation
     // generation and maximizes spatial locality; queue-level heterogeneity still
     // distributes independent slabs dynamically.
-    let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
-    let n_jobs = n_chunks.div_ceil(chunks_per_job);
+    let chunks_per_job = ab_pre_chunks_per_job(chunk_count);
+    let n_jobs = chunk_count.div_ceil(chunks_per_job);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
-            let chunk_start = job * chunks_per_job;
-            let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
-            let slab_len = chunk_end - chunk_start;
+            let local_start = job * chunks_per_job;
+            let local_end = (local_start + chunks_per_job).min(chunk_count);
+            let slab_len = local_end - local_start;
             for offset in 0..slab_len {
-                let x_outer = chunk_start + offset;
+                let local_chunk = local_start + offset;
+                let x_outer = chunk_start + local_chunk;
                 // SAFETY: offset is within this queue job's disjoint output slab.
                 let out_outer = unsafe {
                     core::slice::from_raw_parts_mut(
-                        out_base.ptr().add(x_outer * OUTER_BYTES),
+                        out_base.ptr().add(local_chunk * OUTER_BYTES),
                         OUTER_BYTES,
                     )
                 };
@@ -3844,6 +3962,65 @@ mod tests {
                 nt.as_bytes(),
                 "store flavor changed bytes at m={m}, padded={}",
                 padded.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn ab_precompute_disjoint_ranges_match_full_oracle() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        let m = 17usize;
+        for padded in [false, true] {
+            let mut rng = Rng::new(0xA8_5E_A11C_u64 ^ u64::from(padded));
+            let total_bits = 1usize << m;
+            let mut a = rng.bits(total_bits);
+            let mut b = rng.bits(total_bits);
+            let padding = if padded {
+                let spec = PaddingSpec {
+                    k_log: 14,
+                    useful_bits_per_block: 15_409,
+                };
+                let block_size = 1usize << spec.k_log;
+                for block in 0..total_bits / block_size {
+                    for bit in spec.useful_bits_per_block..block_size {
+                        let index = block * block_size + bit;
+                        a[index] = false;
+                        b[index] = false;
+                    }
+                }
+                spec
+            } else {
+                PaddingSpec::dense(m)
+            };
+            let (a_packed, b_packed) = (pack_bits(&a), pack_bits(&b));
+            let table = make_inv_table();
+            let oracle = precompute_round1_ab_inner_packed_padded_with_flavor(
+                &a_packed, &b_packed, m, K_SKIP, &table, &padding, false, false,
+            );
+            let total_bytes = a_packed.len();
+            let total_chunks = total_bytes / OUTER_BYTES;
+            assert_eq!(total_chunks, 16);
+            let mut split = Round1AbWork::new(total_bytes);
+            for (start, count) in [(7, 9), (0, 3), (3, 4)] {
+                precompute_round1_ab_inner_packed_padded_range_with_flavor(
+                    &a_packed,
+                    &b_packed,
+                    m,
+                    K_SKIP,
+                    &table,
+                    &padding,
+                    start,
+                    count,
+                    split.chunk_range_mut(start, count),
+                    false,
+                    false,
+                );
+            }
+            assert_eq!(
+                oracle.as_bytes(),
+                split.as_bytes(),
+                "range partition changed AB bytes (padded={padded})"
             );
         }
     }
