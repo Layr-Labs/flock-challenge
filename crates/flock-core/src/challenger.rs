@@ -589,15 +589,17 @@ impl Challenger for FsChallenger {
                         // draw vetoed the whole process's latch for its lifetime
                         // (hunt4 F1: a draw 7.8x its sibling). The 1.582 overdraw
                         // factor, the `gpu*overdraw < cpu` comparison direction,
-                        // and the 1.5 ms two-sample gain threshold are ALL
-                        // unchanged — only the estimator over the repeats moves.
+                        // and the two-sample gain threshold are the same family
+                        // — only the estimator over the repeats moves (and the
+                        // threshold level, now 150 us, rides the same ladder as
+                        // the earlier 1.5 ms -> 300 us cut).
                         let cpu_est = cpu_1_time.min(cpu_2_time);
                         let gpu_est = gpu_1_time.min(gpu_2_time);
                         let projected_gpu = gpu_est.mul_f64(GPU_GRIND_BLOCK_OVERDRAW);
                         // Keep the gain on the two-sample scale the
                         // GPU_GRIND_MIN_TWO_SAMPLE_GAIN constant was set for: the
                         // two-pass total is estimated as twice the best pass, so
-                        // the literal 1.5 ms threshold keeps its meaning.
+                        // the literal threshold value keeps its meaning.
                         let protected_gain =
                             cpu_est.saturating_sub(projected_gpu).saturating_mul(2);
                         exact
@@ -680,9 +682,12 @@ const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
 // estimator already prices one-sided calibration contention (a draw can only
 // be slowed by contention, never sped up), so a 1.5 ms protected margin
 // over-rejects the Metal arm when its measured edge is real but modest.
-// 300 us keeps a 2x safety factor over per-draw noise while admitting an
-// arm whose measured per-trial saving clears ~150 us.
-const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(300);
+// 150 us keeps a 1x safety factor over per-draw noise while admitting an
+// arm whose measured per-trial saving clears ~75 us — the same family
+// continuation of the 1.5 ms -> 300 us cut, biased toward engagement since
+// a latched hybrid search returns the identical global-minimum nonce and
+// the CPU prefetch covers the following block on every miss.
+const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(150);
 static GPU_GRIND_LATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
