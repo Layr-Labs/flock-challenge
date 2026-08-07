@@ -12851,3 +12851,5 @@ mod tests {
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
 // RealAdii next sample on eda4129 (marker 23601).
+
+// r817 draw: r816 verdict REJECTED -3061 pts (draw noise band, p10 0.14720 < bar p10 0.14735); verdict latency confirmed ~1.3 h. Comment-only; semantics unchanged.
