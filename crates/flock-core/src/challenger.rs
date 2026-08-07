@@ -450,14 +450,13 @@ impl Challenger for FsChallenger {
                 // grind sits on the opening's critical path while the helper pool
                 // is otherwise parked.
                 //
-                // Determinism: the emitted nonce is re-derived after the join as
-                // the match in the lowest-indexed chunk that has one. The counter
+                // Determinism: every match atomically lowers `best`. The counter
                 // hands out indices in ascending order, a worker never abandons a
-                // chunk it has claimed, and a chunk below the final bound with a
-                // match would have lowered the bound below itself — contradiction.
-                // So every chunk below the winning one was fully scanned with no
-                // match, and the result is exactly the globally smallest nonce,
-                // byte-identical to the sequential search.
+                // chunk it has claimed, and all claimed chunks join before `best`
+                // is read. Once chunk c matches, no later chunk can improve its
+                // nonce; every earlier claimed chunk still finishes and can lower
+                // `best`. Thus the result is the globally smallest nonce without
+                // allocating and reducing one result atomic per chunk.
                 //
                 // Block ≈ 2× the expected attempts: large enough that the match
                 // usually falls inside one block (so all threads do useful
@@ -465,18 +464,16 @@ impl Challenger for FsChallenger {
                 // `+2` block caused (which left ~¾ of threads doing cancelled work).
                 use rayon::prelude::*;
                 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-                const PENDING: u64 = u64::MAX;
-                const NO_MATCH: u64 = u64::MAX - 1;
+                const NO_MATCH: u64 = u64::MAX;
                 let block: u64 = 1 << (bits.min(24) + 1);
                 let n_chunks = usize::try_from(block.div_ceil(GRIND_CHUNK)).expect("chunk count");
                 let mut start: u64 = 0;
                 'blocks: loop {
-                    let results: Vec<AtomicU64> =
-                        (0..n_chunks).map(|_| AtomicU64::new(PENDING)).collect();
+                    let best = AtomicU64::new(NO_MATCH);
                     let next = AtomicUsize::new(0);
                     // Lowest chunk index known to hold a match. Chunks at or past
                     // it cannot supply the answer; Relaxed is enough because the
-                    // bound only prunes work — correctness comes from `results`
+                    // bound only prunes work — correctness comes from `best`
                     // plus the joins below.
                     let bound = AtomicUsize::new(n_chunks);
                     let worker = || {
@@ -485,18 +482,22 @@ impl Challenger for FsChallenger {
                             if c >= n_chunks || c >= bound.load(Ordering::Relaxed) {
                                 break;
                             }
-                            match pow_scan(
+                            let chunk_offset = c as u64 * GRIND_CHUNK;
+                            // The power-of-two search block is not generally a
+                            // multiple of the 960-nonce SIMD-aligned chunk. Cap
+                            // its final chunk at the block boundary so a miss
+                            // never hashes (and then re-hashes) the prefix of the
+                            // following block.
+                            let chunk_len = GRIND_CHUNK.min(block - chunk_offset);
+                            if let Some(n) = pow_scan(
                                 &state_digest,
-                                start.saturating_add(c as u64 * GRIND_CHUNK),
-                                GRIND_CHUNK,
+                                start.saturating_add(chunk_offset),
+                                chunk_len,
                                 bits,
                                 kind,
                             ) {
-                                Some(n) => {
-                                    results[c].store(n, Ordering::Release);
-                                    bound.fetch_min(c, Ordering::Relaxed);
-                                }
-                                None => results[c].store(NO_MATCH, Ordering::Release),
+                                best.fetch_min(n, Ordering::Release);
+                                bound.fetch_min(c, Ordering::Relaxed);
                             }
                         }
                     };
@@ -522,13 +523,11 @@ impl Challenger for FsChallenger {
                         }),
                         None => drain_main(),
                     }
-                    // Both pools joined (Release stores in `results` are
-                    // synchronized by the joins). Take the lowest-chunk match.
-                    for r in &results {
-                        match r.load(Ordering::Acquire) {
-                            PENDING | NO_MATCH => continue,
-                            n => break 'blocks n,
-                        }
+                    // Both pools joined; every claimed earlier chunk has had a
+                    // chance to lower the sparse global minimum.
+                    let nonce = best.load(Ordering::Acquire);
+                    if nonce != NO_MATCH {
+                        break 'blocks nonce;
                     }
                     start = start.saturating_add(block);
                 }
@@ -680,9 +679,9 @@ const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
 // estimator already prices one-sided calibration contention (a draw can only
 // be slowed by contention, never sped up), so a 1.5 ms protected margin
 // over-rejects the Metal arm when its measured edge is real but modest.
-// 300 us keeps a 2x safety factor over per-draw noise while admitting an
-// arm whose measured per-trial saving clears ~150 us.
-const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(300);
+// 600 us keeps a meaningful guard over per-draw noise while admitting an
+// arm whose measured per-trial saving clears ~300 us.
+const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(600);
 static GPU_GRIND_LATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -691,23 +690,25 @@ static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// independent of the first matching nonce while retaining the same P+E-core
 /// hash kernel and queue shape.
 fn cpu_blake3_pow_window(state_digest: &[u8; 32], start: u64, len: u32, bits: u32) -> Option<u64> {
-    cpu_blake3_pow_window_inner(state_digest, start, len, bits, None)
+    cpu_blake3_pow_window_inner(state_digest, start, len, bits, None, false)
 }
 
-/// Same drain-everything window as [`cpu_blake3_pow_window`], plus an
-/// optional cooperative stop flag. The hybrid prefetch sets the flag from
-/// the GPU-spin thread the moment the GPU block reports a hit — at that
-/// point the prefetch window's result is discarded unconditionally (the
-/// GPU nonce is the global minimum), so bailing out early cannot change
-/// any returned nonce; it only stops burning cores on a dead scan. The
-/// calibration oracles pass `None`: their runtime must stay independent
-/// of first-hit distance.
+/// Same fixed-window scanner as [`cpu_blake3_pow_window`], plus production-only
+/// controls. The hybrid prefetch sets `stop` when the earlier GPU block hits;
+/// its result is then discarded, so bailing out cannot change the returned
+/// nonce. With `prune_on_match`, workers stop claiming chunks at or above the
+/// first chunk known to contain a match. Chunk indices are handed out in order,
+/// so every lower chunk was already claimed and is joined before reduction;
+/// this preserves the global minimum while avoiding the dead tail of a
+/// successful CPU prefetch. Calibration disables both controls so its runtime
+/// remains independent of first-hit distance.
 fn cpu_blake3_pow_window_inner(
     state_digest: &[u8; 32],
     start: u64,
     len: u32,
     bits: u32,
     stop: Option<&std::sync::atomic::AtomicBool>,
+    prune_on_match: bool,
 ) -> Option<u64> {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -715,14 +716,19 @@ fn cpu_blake3_pow_window_inner(
     const CHUNK: u64 = 960;
     const NO_MATCH: u64 = u64::MAX;
     let n_chunks = usize::try_from(u64::from(len).div_ceil(CHUNK)).expect("chunk count");
-    let results: Vec<AtomicU64> = (0..n_chunks).map(|_| AtomicU64::new(NO_MATCH)).collect();
+    // Every worker only lowers this value, so one atomic minimum preserves the
+    // exact lowest nonce without allocating and rereading one atomic per chunk.
+    let best = AtomicU64::new(NO_MATCH);
     let next = AtomicUsize::new(0);
+    let bound = AtomicUsize::new(n_chunks);
     let worker = || loop {
         if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             break;
         }
         let chunk = next.fetch_add(1, Ordering::Relaxed);
-        if chunk >= n_chunks {
+        if chunk >= n_chunks
+            || (prune_on_match && chunk >= bound.load(Ordering::Relaxed))
+        {
             break;
         }
         let offset = chunk as u64 * CHUNK;
@@ -730,7 +736,10 @@ fn cpu_blake3_pow_window_inner(
         if let Some(nonce) =
             blake3_pow_scan(state_digest, start.saturating_add(offset), chunk_len, bits)
         {
-            results[chunk].store(nonce, Ordering::Release);
+            best.fetch_min(nonce, Ordering::Release);
+            if prune_on_match {
+                bound.fetch_min(chunk, Ordering::Relaxed);
+            }
         }
     };
     let main_threads = rayon::current_num_threads();
@@ -747,11 +756,10 @@ fn cpu_blake3_pow_window_inner(
         }),
         None => drain_main(),
     }
-    results
-        .iter()
-        .map(|result| result.load(Ordering::Acquire))
-        .filter(|&nonce| nonce != NO_MATCH)
-        .min()
+    match best.load(Ordering::Relaxed) {
+        NO_MATCH => None,
+        nonce => Some(nonce),
+    }
 }
 
 fn cpu_gpu_grind_calibration(state_digest: &[u8; 32]) -> Vec<Option<u64>> {
@@ -874,11 +882,10 @@ mod grind_worker {
         .as_ref()
     }
 
-    /// Dispatch one GPU grind scan through the persistent worker. Returns
-    /// `None` when the worker is unavailable (kill switch or setup failure)
-    /// and the caller must run the incumbent scope-spawn path; `Some(result)`
-    /// is the scan outcome with the same `Err` surface as a direct
-    /// `gpu_blake3_pow_scan` call.
+    /// Queue one GPU grind scan on the persistent worker. The returned receiver
+    /// is deliberately not waited here: the caller scans the following CPU
+    /// block concurrently, then joins the GPU result. Returns `None` when the
+    /// worker is unavailable and the caller must use the scope-spawn fallback.
     pub(super) fn dispatch(
         state_digest: &[u8; 32],
         start: u64,
@@ -886,7 +893,7 @@ mod grind_worker {
         bits: u32,
         stop: Arc<AtomicBool>,
         abort: bool,
-    ) -> Option<Result<Option<u64>, String>> {
+    ) -> Option<Result<Receiver<Result<Option<u64>, String>>, String>> {
         let w = worker()?;
         let (done_tx, done_rx) = channel();
         let job = Job {
@@ -901,32 +908,7 @@ mod grind_worker {
         if w.tx.send(job).is_err() {
             return Some(Err("GPU grind worker channel closed".to_string()));
         }
-        match done_rx.recv() {
-            Ok(res) => Some(res),
-            Err(_) => Some(Err("GPU grind worker channel closed".to_string())),
-        }
-    }
-}
-
-/// Run the CPU next-block window after the persistent GPU worker has already
-/// delivered its result. A successful GPU hit is in the earlier nonce block,
-/// so the caller will return it without consulting the CPU result. When the
-/// existing abort policy is armed, skip constructing and dispatching that
-/// provably-dead CPU window altogether.
-///
-/// Keep this helper parameterized rather than reading process-global state so
-/// the exact policy boundary can be tested without mutating the environment.
-#[inline]
-fn run_cpu_window_after_persistent_gpu(
-    gpu_result: &Result<Option<u64>, String>,
-    abort_enabled: bool,
-    skip_dead_cpu_enabled: bool,
-    cpu_window: impl FnOnce() -> Option<u64>,
-) -> Option<u64> {
-    if abort_enabled && skip_dead_cpu_enabled && matches!(gpu_result, Ok(Some(_))) {
-        None
-    } else {
-        cpu_window()
+        Some(Ok(done_rx))
     }
 }
 
@@ -934,6 +916,12 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
     debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
     let block_len = 1u32 << bits.min(24);
     let hybrid = grind_hybrid_enabled() && rayon::current_num_threads() > 1;
+    // The hybrid loop is serial: both scans are joined before the next block
+    // pair starts. Reuse its stop word across iterations instead of allocating
+    // and freeing one Arc on every GPU block dispatch.
+    let hybrid_stop = hybrid.then(|| {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+    });
     let mut start = 0u64;
     loop {
         if !hybrid {
@@ -956,7 +944,8 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         // is already dead. On a GPU miss the flag is never set and the window
         // drains fully — byte-identical to the unflagged search either way
         // (`FLOCK_NO_GRIND_HYBRID_ABORT` restores the unconditional drain).
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = hybrid_stop.as_ref().expect("hybrid stop flag");
+        stop.store(false, std::sync::atomic::Ordering::Relaxed);
         let abort = grind_hybrid_abort_enabled();
         // Persistent dispatch worker when available; the incumbent
         // scope-spawn path otherwise (see `grind_worker`).
@@ -965,34 +954,29 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             start,
             block_len,
             bits,
-            std::sync::Arc::clone(&stop),
+            std::sync::Arc::clone(stop),
             abort,
         ) {
-            Some(gpu) => {
-                // `dispatch` has already waited for this persistent-worker
-                // result. On a hit the following CPU block is later in
-                // nonce order and its result is unconditionally discarded
-                // below, while the pre-set stop flag makes every worker
-                // exit immediately. Avoid the otherwise-dead allocation,
-                // Rayon drain, and E-pool broadcast. Misses, errors,
-                // abort-disabled diagnostics, and the scope-spawn fallback
-                // retain the incumbent behavior exactly.
-                let cpu = run_cpu_window_after_persistent_gpu(
-                    &gpu,
-                    abort,
-                    grind_skip_dead_cpu_enabled(),
-                    || {
-                        cpu_blake3_pow_window_inner(
-                            state_digest,
-                            next_start,
-                            block_len,
-                            bits,
-                            abort.then_some(stop.as_ref()),
-                        )
-                    },
+            Some(Ok(done)) => {
+                // Queueing does not wait: hash the following nonce block on
+                // both CPU pools while Metal scans the earlier block. A GPU
+                // hit raises `stop`, so CPU workers abandon their now-dead
+                // later block between chunks; a GPU miss leaves the complete
+                // CPU minimum ready for immediate use.
+                let cpu = cpu_blake3_pow_window_inner(
+                    state_digest,
+                    next_start,
+                    block_len,
+                    bits,
+                    abort.then_some(stop.as_ref()),
+                    true,
                 );
+                let gpu = done
+                    .recv()
+                    .unwrap_or_else(|_| Err("GPU grind worker channel closed".to_string()));
                 (gpu, cpu)
             }
+            Some(Err(error)) => (Err(error), None),
             None => std::thread::scope(|s| {
                 let gpu_scan = s.spawn(|| {
                     let gpu = crate::gpu_commit::gpu_blake3_pow_scan(
@@ -1012,6 +996,7 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                     block_len,
                     bits,
                     abort.then_some(stop.as_ref()),
+                    true,
                 );
                 let gpu = gpu_scan
                     .join()
@@ -1053,14 +1038,6 @@ fn grind_hybrid_enabled() -> bool {
 fn grind_hybrid_abort_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_HYBRID_ABORT").is_none())
-}
-
-/// Skip the CPU next-block scaffold when the serialized persistent GPU worker
-/// has already returned a hit. `FLOCK_NO_GRIND_SKIP_DEAD_CPU=1` restores the
-/// previous behavior for exact same-binary comparison.
-fn grind_skip_dead_cpu_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_SKIP_DEAD_CPU").is_none())
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,54 +1239,6 @@ mod tests {
         assert_eq!(GPU_GRIND_CALIBRATION_BITS, 19);
         let exact_geometric = 1.0 / (1.0 - (-1.0f64).exp());
         assert!((GPU_GRIND_BLOCK_OVERDRAW - exact_geometric).abs() < 1e-12);
-    }
-
-    /// A completed persistent-worker hit owns the earlier nonce block, so an
-    /// armed candidate must not even invoke the later CPU-window closure.
-    /// Turning off either the existing abort policy or the new feature input
-    /// restores the incumbent invocation without touching process-global env.
-    #[test]
-    fn persistent_gpu_hit_skips_dead_cpu_window_only_when_armed() {
-        use std::cell::Cell;
-
-        let hit: Result<Option<u64>, String> = Ok(Some(7));
-        let calls = Cell::new(0);
-        let got = run_cpu_window_after_persistent_gpu(&hit, true, true, || {
-            calls.set(calls.get() + 1);
-            Some(99)
-        });
-        assert_eq!(got, None);
-        assert_eq!(calls.get(), 0, "armed GPU hit must not dispatch CPU work");
-
-        for (abort_enabled, feature_enabled) in [(false, true), (true, false), (false, false)] {
-            let calls = Cell::new(0);
-            let got =
-                run_cpu_window_after_persistent_gpu(&hit, abort_enabled, feature_enabled, || {
-                    calls.set(calls.get() + 1);
-                    Some(99)
-                });
-            assert_eq!(got, Some(99));
-            assert_eq!(calls.get(), 1);
-        }
-    }
-
-    /// Miss and error results must retain the existing CPU-window behavior;
-    /// only `Ok(Some(_))` is a proof that the later block is dead.
-    #[test]
-    fn persistent_gpu_miss_and_error_keep_cpu_window() {
-        use std::cell::Cell;
-
-        let cases: [Result<Option<u64>, String>; 2] =
-            [Ok(None), Err("synthetic GPU failure".to_string())];
-        for gpu_result in &cases {
-            let calls = Cell::new(0);
-            let got = run_cpu_window_after_persistent_gpu(gpu_result, true, true, || {
-                calls.set(calls.get() + 1);
-                Some(123)
-            });
-            assert_eq!(got, Some(123));
-            assert_eq!(calls.get(), 1);
-        }
     }
 
     /// Every FsChallenger property must hold under both transcript hashes:
@@ -1618,12 +1547,12 @@ mod tests {
         assert!(plain.is_some(), "2^14 window at 10 bits must contain a hit");
         let unstopped = AtomicBool::new(false);
         assert_eq!(
-            cpu_blake3_pow_window_inner(&digest, 0, len, bits, Some(&unstopped)),
+            cpu_blake3_pow_window_inner(&digest, 0, len, bits, Some(&unstopped), false),
             plain,
         );
         let stopped = AtomicBool::new(true);
         assert_eq!(
-            cpu_blake3_pow_window_inner(&digest, 0, len, bits, Some(&stopped)),
+            cpu_blake3_pow_window_inner(&digest, 0, len, bits, Some(&stopped), false),
             None,
         );
     }
