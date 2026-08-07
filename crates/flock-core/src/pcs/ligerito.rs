@@ -12851,3 +12851,7 @@ mod tests {
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
 // RealAdii next sample on eda4129 (marker 23601).
+
+// r807 draw: operator-directed lane reopen on 4cea641 (origin/main re-fetched
+// 2026-08-07; no other solver promoted since r805). Comment-only; semantics
+// unchanged.
