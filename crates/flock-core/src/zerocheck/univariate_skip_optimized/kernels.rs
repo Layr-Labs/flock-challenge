@@ -514,6 +514,38 @@ pub(super) fn accumulate_convert_ab(
     portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
 }
 
+/// Ranked first-window AB completion after the two all-linear medium rows
+/// have been removed from preprocessing. The incumbent entry point above is
+/// kept unchanged for every ordinary row and shape.
+#[inline]
+pub(super) fn accumulate_convert_ab_skip_first_pair(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[super::F128],
+    eq_lo_val: super::F128,
+    partial_ab: &mut [super::F128; 64],
+) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        aarch64::accumulate_convert_ab_skip_first_pair(
+            chunk_ab_bytes,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            partial_ab,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    portable::accumulate_convert_ab_skip_first_pair(
+        chunk_ab_bytes,
+        n_b_med,
+        convert,
+        eq_lo_val,
+        partial_ab,
+    );
+}
+
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
 /// kernel is tested against.
 ///

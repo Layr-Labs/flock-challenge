@@ -559,6 +559,7 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 /// original A and B tables after the round-1 transcript challenge is sampled.
 pub struct Round1AbInner {
     storage: Vec<F128>,
+    linear_rows_elided: bool,
 }
 
 impl Round1AbInner {
@@ -575,6 +576,11 @@ impl Round1AbInner {
     /// Resident scratch bytes retained until the challenge-weighted finish.
     pub fn len_bytes(&self) -> usize {
         self.storage.len() * core::mem::size_of::<F128>()
+    }
+
+    #[inline]
+    pub(crate) fn linear_rows_elided(&self) -> bool {
+        self.linear_rows_elided
     }
 
     /// Donate the now-dead transform to a byte-oriented scratch consumer
@@ -686,11 +692,55 @@ pub fn precompute_round1_ab_inner_packed_padded(
     )
 }
 
+/// Ranked BLAKE3 specialization for the two complete medium rows whose B
+/// polynomial is identically one. Their exact AB contribution is recovered
+/// from the existing outer-folded identity-C table.
+pub fn precompute_round1_ab_inner_packed_padded_elide_linear(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Round1AbInner {
+    assert_eq!(m, 32, "linear-row elision is ranked-only");
+    assert_eq!(padding.k_log, 14);
+    assert_eq!(padding.useful_bits_per_block, 15_409);
+    precompute_round1_ab_inner_packed_padded_with_flavor_impl::<true>(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        ab_compact_store_enabled(),
+    )
+}
+
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
 /// choices, tests compare arms byte-for-byte in one process. `nt` selects the
 /// non-temporal drain vs the incumbent cached store; `compact` selects the
 /// QS3 tail-skip vs the incumbent zero-fill of the dead skipped-`b_med` rows.
 fn precompute_round1_ab_inner_packed_padded_with_flavor(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    nt: bool,
+    compact: bool,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_with_flavor_impl::<false>(
+        a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn precompute_round1_ab_inner_packed_padded_with_flavor_impl<
+    const ELIDE_LINEAR: bool,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     m: usize,
@@ -775,7 +825,11 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
             // per-chunk OnceLock probe, temporary buffer, or per-row bounce
             // branches; the kill-switch arm retains the exact old behavior.
             if nt && ab_pre_nt_direct_enabled() {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
+                precompute_ab_hetero::<
+                    { kernels::AB_FAST_POLICY_FORCE_FAST },
+                    true,
+                    ELIDE_LINEAR,
+                >(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -789,7 +843,11 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     out_bytes,
                 );
             } else {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
+                precompute_ab_hetero::<
+                    { kernels::AB_FAST_POLICY_FORCE_FAST },
+                    false,
+                    ELIDE_LINEAR,
+                >(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -804,7 +862,11 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 );
             }
         } else {
-            precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+            precompute_ab_hetero::<
+                { kernels::AB_FAST_POLICY_PROCESS },
+                false,
+                ELIDE_LINEAR,
+            >(
                 a_packed,
                 b_packed,
                 inv_table,
@@ -818,7 +880,10 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 out_bytes,
             );
         }
-        return Round1AbInner { storage };
+        return Round1AbInner {
+            storage,
+            linear_rows_elided: ELIDE_LINEAR,
+        };
     }
 
     out_bytes
@@ -827,7 +892,11 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         .for_each_init(
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
             |(a_col, b_col), (x_outer, out_outer)| {
-                precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+                precompute_ab_one_chunk::<
+                    { kernels::AB_FAST_POLICY_PROCESS },
+                    false,
+                    ELIDE_LINEAR,
+                >(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -845,7 +914,10 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
             },
         );
 
-    Round1AbInner { storage }
+    Round1AbInner {
+        storage,
+        linear_rows_elided: ELIDE_LINEAR,
+    }
 }
 
 /// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
@@ -914,7 +986,11 @@ fn zc_ab_pre_hetero_enabled() -> bool {
 /// both `nt` and the process-wide direct-store kill switch.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
+fn precompute_ab_hetero<
+    const FAST_POLICY: u8,
+    const FORCE_DIRECT: bool,
+    const ELIDE_LINEAR: bool,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -960,7 +1036,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                         OUTER_BYTES,
                     )
                 };
-                precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT>(
+                precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT, ELIDE_LINEAR>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -985,7 +1061,11 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
 /// hetero queue and the incumbent `par_chunks_mut` cannot diverge.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
+fn precompute_ab_one_chunk<
+    const FAST_POLICY: u8,
+    const FORCE_DIRECT: bool,
+    const ELIDE_LINEAR: bool,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -1020,6 +1100,9 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     };
     let mut tmp = [0u8; 64];
     for b_med in 0..n_b_med {
+        if ELIDE_LINEAR && within_hash_outer == 0 && b_med < 2 {
+            continue;
+        }
         let dst: &mut [u8; 64] = if nt && !direct {
             &mut tmp
         } else {
@@ -1685,7 +1768,7 @@ fn process_one_x_hi_with_precomputed_ab(
 /// `x_hi`; splitting C into four q-local jobs must not multiply AB traffic.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn process_one_x_hi_with_precomputed_ab_fold4_ab(
+fn process_one_x_hi_with_precomputed_ab_fold4_ab<const ELIDE_LINEAR: bool>(
     x_hi: usize,
     big_lo_size: usize,
     n_lo_and_inner: usize,
@@ -1706,18 +1789,30 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
     let t_ab = timing_cpu_ns.map(|_| std::time::Instant::now());
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
-        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
         if n_b_med == 0 {
             continue;
         }
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        kernels::accumulate_convert_ab(
-            precomputed_ab_rows(ab_inner, chunk_byte_base),
-            n_b_med,
-            convert,
-            eq_lo_scaled[x_outer_lo],
-            partial_ab,
-        );
+        let rows = precomputed_ab_rows(ab_inner, chunk_byte_base);
+        if ELIDE_LINEAR && within_hash_outer == 0 {
+            kernels::accumulate_convert_ab_skip_first_pair(
+                rows,
+                n_b_med,
+                convert,
+                eq_lo_scaled[x_outer_lo],
+                partial_ab,
+            );
+        } else {
+            kernels::accumulate_convert_ab(
+                rows,
+                n_b_med,
+                convert,
+                eq_lo_scaled[x_outer_lo],
+                partial_ab,
+            );
+        }
     }
     if let (Some(totals), Some(start)) = (timing_cpu_ns, t_ab) {
         totals[0].fetch_add(
@@ -1766,25 +1861,43 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
 
     let mut partials = vec![[F128::ZERO; ELL]; hi_size];
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        let mut partial = [F128::ZERO; ELL];
-        process_one_x_hi_with_precomputed_ab_fold4_ab(
-            x_hi,
-            big_lo_size,
-            n_lo_and_inner,
-            within_outer_mask,
-            &b_med_counts,
-            ab_inner_bytes,
-            &eq_lo_scaled,
-            eq.hi[x_hi],
-            convert,
-            None,
-            &mut partial,
-        );
-        // SAFETY: each queue index owns one disjoint output slot and the
-        // synchronous queue join publishes all writes before reduction.
-        unsafe { *partials_base.ptr().add(x_hi) = partial };
-    });
+    if ab_inner.linear_rows_elided() {
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            let mut partial = [F128::ZERO; ELL];
+            process_one_x_hi_with_precomputed_ab_fold4_ab::<true>(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                ab_inner_bytes,
+                &eq_lo_scaled,
+                eq.hi[x_hi],
+                convert,
+                None,
+                &mut partial,
+            );
+            unsafe { *partials_base.ptr().add(x_hi) = partial };
+        });
+    } else {
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            let mut partial = [F128::ZERO; ELL];
+            process_one_x_hi_with_precomputed_ab_fold4_ab::<false>(
+                x_hi,
+                big_lo_size,
+                n_lo_and_inner,
+                within_outer_mask,
+                &b_med_counts,
+                ab_inner_bytes,
+                &eq_lo_scaled,
+                eq.hi[x_hi],
+                convert,
+                None,
+                &mut partial,
+            );
+            unsafe { *partials_base.ptr().add(x_hi) = partial };
+        });
+    }
 
     partials
         .into_iter()
@@ -2010,6 +2123,31 @@ fn round1_c_inner_fold(
     )
 }
 
+/// Exact optimized AB message for the two complete medium rows where the
+/// ranked BLAKE3 circuit has `B == 1` and therefore `A * B == C`.
+fn full_linear_rows_from_c_inner(
+    c_inner: &[F128],
+    k_log: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
+    assert_eq!(k_log, 14);
+    assert_eq!(k_skip, K_SKIP);
+    assert_eq!(c_inner.len(), 1usize << k_log);
+
+    let eq_inner = build_eq(&r[k_skip..k_log]);
+    let c_s_inv = c_s_f128().inv();
+    let mut res_s = [F128::ZERO; ELL];
+    for q in 0..16 {
+        let weight = c_s_inv * eq_inner[q];
+        for lane in 0..ELL {
+            res_s[lane] += weight * c_inner[q * ELL + lane];
+        }
+    }
+    ntt_extend_f128_vec_ghash(&res_s, inv_table)
+}
+
 /// Derive the exact legacy C round-one message and its existing RingSwitch
 /// helper tensors from the lincheck stripe.  The stripe represents identity C
 /// (`Cz = z`) in an outer-fold-friendly layout.  Folding it at the original
@@ -2026,7 +2164,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
     prelude: Round1CPrelude,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     assert_eq!(k_skip, K_SKIP);
     assert!(
         k_log >= k_skip + 5,
@@ -2036,6 +2174,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
+    let linear_ab = full_linear_rows_from_c_inner(&c_inner, k_log, k_skip, r, inv_table);
     let inner_tail = &r[k_skip + 1..k_log];
     let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold4(&fold4, &inner_tail[..4]);
@@ -2067,7 +2206,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
         res_c_s[lane] = c_s_inv * naive;
     }
     let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (round1_c_opt, s_hat_v_c, quad, fold4)
+    (round1_c_opt, s_hat_v_c, quad, fold4, linear_ab)
 }
 
 /// Fold8 sibling of [`round1_c_fold4_from_lincheck_stripe`]: same single
@@ -2086,7 +2225,7 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
     prelude: Round1CPrelude,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     assert_eq!(k_skip, K_SKIP);
     assert!(
         k_log >= k_skip + 7,
@@ -2096,6 +2235,7 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
+    let linear_ab = full_linear_rows_from_c_inner(&c_inner, k_log, k_skip, r, inv_table);
     let inner_tail = &r[k_skip + 1..k_log];
     let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &inner_tail[..6]);
@@ -2127,7 +2267,7 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
         res_c_s[lane] = c_s_inv * naive;
     }
     let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (round1_c_opt, s_hat_v_c, quad, fold8)
+    (round1_c_opt, s_hat_v_c, quad, fold8, linear_ab)
 }
 
 /// Pair-fused C job with the original 32-bank accumulator and one job per
@@ -2988,7 +3128,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
             if job < hi_size {
                 let x_hi = job;
                 let mut partial_ab = [F128::ZERO; ELL];
-                process_one_x_hi_with_precomputed_ab_fold4_ab(
+                process_one_x_hi_with_precomputed_ab_fold4_ab::<false>(
                     x_hi,
                     big_lo_size,
                     n_lo_and_inner,
@@ -3062,7 +3202,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
         let t_queue = std::time::Instant::now();
         crate::epool::run_hetero_chunks(hi_size, |x_hi| {
             let mut partial_ab = [F128::ZERO; ELL];
-            process_one_x_hi_with_precomputed_ab_fold4_ab(
+            process_one_x_hi_with_precomputed_ab_fold4_ab::<false>(
                 x_hi,
                 big_lo_size,
                 n_lo_and_inner,
@@ -3456,7 +3596,7 @@ mod tests {
         let mut cached = [0u8; OUTER_BYTES];
         let mut cached_a_col = [F8::ZERO; ELL];
         let mut cached_b_col = [F8::ZERO; ELL];
-        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false, false>(
             &a_packed,
             &b_packed,
             &inv_table,
@@ -3475,7 +3615,7 @@ mod tests {
         let mut direct = [0u8; OUTER_BYTES];
         let mut direct_a_col = [F8::ZERO; ELL];
         let mut direct_b_col = [F8::ZERO; ELL];
-        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
+        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true, false>(
             &a_packed,
             &b_packed,
             &inv_table,

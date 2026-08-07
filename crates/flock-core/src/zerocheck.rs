@@ -540,7 +540,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             }
             let cpu_ab = crate::pcs::commit::commit_cpu_ms();
             let t_ab = std::time::Instant::now();
-            let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+            let recover_linear_ab = ab_inner.linear_rows_elided();
+            let mut ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
                 ab_inner,
                 m,
                 k_skip,
@@ -557,7 +558,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             let cpu_c = crate::pcs::commit::commit_cpu_ms();
             let t_c = std::time::Instant::now();
             if crate::pcs::ranked_direct_fold8_enabled() {
-                let (c, s_hat_v_c, quad, fold8) =
+                let (c, s_hat_v_c, quad, fold8, linear_ab) =
                     crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
                         c_lincheck,
                         m,
@@ -568,6 +569,11 @@ fn prove_packed_padded_inner<C: Challenger>(
                         inv_table,
                         c_prelude,
                     );
+                if recover_linear_ab {
+                    for (dst, src) in ab.iter_mut().zip(linear_ab) {
+                        *dst += src;
+                    }
+                }
                 if zc_timing {
                     eprintln!(
                         "[zc-timing] round1 lincheck-stripe C (fold8): {:.2} ms cpu={:.1}",
@@ -586,7 +592,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     }),
                 )
             } else {
-                let (c, s_hat_v_c, quad, fold4) =
+                let (c, s_hat_v_c, quad, fold4, linear_ab) =
                     crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
                         c_lincheck,
                         m,
@@ -597,6 +603,11 @@ fn prove_packed_padded_inner<C: Challenger>(
                         inv_table,
                         c_prelude,
                     );
+                if recover_linear_ab {
+                    for (dst, src) in ab.iter_mut().zip(linear_ab) {
+                        *dst += src;
+                    }
+                }
                 if zc_timing {
                     eprintln!(
                         "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",

@@ -267,6 +267,106 @@ pub(crate) unsafe fn accumulate_convert_ab(
     }
 }
 
+/// Ranked first-window sibling of [`accumulate_convert_ab`]. The first table
+/// pair is absent because both medium rows have `B == 1` and are recovered
+/// from identity C. Keeping this as a separate symbol leaves the incumbent
+/// completion kernel unchanged for the second window and all fallback paths.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_skip_first_pair(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert_eq!(n_b_med, 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        for lane in (0..64).step_by(8) {
+            let mut ab0 = vdupq_n_u8(0);
+            let mut ab1 = vdupq_n_u8(0);
+            let mut ab2 = vdupq_n_u8(0);
+            let mut ab3 = vdupq_n_u8(0);
+            let mut ab4 = vdupq_n_u8(0);
+            let mut ab5 = vdupq_n_u8(0);
+            let mut ab6 = vdupq_n_u8(0);
+            let mut ab7 = vdupq_n_u8(0);
+
+            for p in 1..8 {
+                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let t_even = convert_ptr.add(b_even * 256 * 16);
+                let t_odd = convert_ptr.add(b_odd * 256 * 16);
+                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u64)
+                    .read_unaligned() as usize;
+                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u64)
+                    .read_unaligned() as usize;
+                ab0 = xor3_u8(
+                    ab0,
+                    vld1q_u8(t_even.add((we & 0xff) * 16)),
+                    vld1q_u8(t_odd.add((wo & 0xff) * 16)),
+                );
+                ab1 = xor3_u8(
+                    ab1,
+                    vld1q_u8(t_even.add(((we >> 8) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 8) & 0xff) * 16)),
+                );
+                ab2 = xor3_u8(
+                    ab2,
+                    vld1q_u8(t_even.add(((we >> 16) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 16) & 0xff) * 16)),
+                );
+                ab3 = xor3_u8(
+                    ab3,
+                    vld1q_u8(t_even.add(((we >> 24) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 24) & 0xff) * 16)),
+                );
+                ab4 = xor3_u8(
+                    ab4,
+                    vld1q_u8(t_even.add(((we >> 32) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 32) & 0xff) * 16)),
+                );
+                ab5 = xor3_u8(
+                    ab5,
+                    vld1q_u8(t_even.add(((we >> 40) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 40) & 0xff) * 16)),
+                );
+                ab6 = xor3_u8(
+                    ab6,
+                    vld1q_u8(t_even.add(((we >> 48) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 48) & 0xff) * 16)),
+                );
+                ab7 = xor3_u8(
+                    ab7,
+                    vld1q_u8(t_even.add((we >> 56) * 16)),
+                    vld1q_u8(t_odd.add((wo >> 56) * 16)),
+                );
+            }
+
+            macro_rules! drain_lane {
+                ($offset:literal, $ab:ident) => {{
+                    let ab = vreinterpretq_u64_u8($ab);
+                    partial_ab[lane + $offset] += F128 {
+                        lo: vgetq_lane_u64::<0>(ab),
+                        hi: vgetq_lane_u64::<1>(ab),
+                    } * eq_lo_val;
+                }};
+            }
+            drain_lane!(0, ab0);
+            drain_lane!(1, ab1);
+            drain_lane!(2, ab2);
+            drain_lane!(3, ab3);
+            drain_lane!(4, ab4);
+            drain_lane!(5, ab5);
+            drain_lane!(6, ab6);
+            drain_lane!(7, ab7);
+        }
+    }
+}
+
 /// Eight α-free single-bit-`K` C banks, NEON — straight off the packed witness.
 ///
 /// Three phases, no multiplies, no convert-table gathers, and **no per-`b_med`

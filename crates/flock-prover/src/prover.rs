@@ -84,6 +84,12 @@ fn ranked_lincheck_c_reuse_enabled(r1cs: &BlockR1cs) -> bool {
         && std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none()
 }
 
+#[inline]
+fn ranked_linear_ab_elision_enabled(r1cs: &BlockR1cs) -> bool {
+    ranked_lincheck_c_reuse_enabled(r1cs)
+        && std::env::var_os("FLOCK_NO_LINEAR_AB_ELISION").is_none()
+}
+
 fn precompute_ab_s_hat_v(
     r1cs: &BlockR1cs,
     z_vec: &[F128],
@@ -788,6 +794,7 @@ fn commit_with_round1_ab_precompute(
     pcs_params: &PcsParams,
     padding: &zerocheck::PaddingSpec,
     commit_codeword: CommitCodeword,
+    elide_linear_ab: bool,
     tail_fill: Option<CommitTailFillHook<'_>>,
 ) -> (
     (Commitment, pcs::ProverData),
@@ -803,14 +810,25 @@ fn commit_with_round1_ab_precompute(
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
 
     let precompute_ab = || {
-        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-            a_packed,
-            b_packed,
-            pcs_params.m,
-            k_skip,
-            inv_table,
-            padding,
-        )
+        if elide_linear_ab {
+            zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_elide_linear(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+            )
+        } else {
+            zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+            )
+        }
     };
     // `Blake3Setup::prove_fast` issues this ticket before call-zero witness
     // generation. A valid cache hit may satisfy it inside the commit arm;
@@ -966,6 +984,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             pcs_params,
             &padding,
             commit_codeword,
+            ranked_linear_ab_elision_enabled(r1cs),
             tail_fill,
         );
         if phase_timing {
@@ -1366,6 +1385,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
+        false,
         None,
     );
     t.commit_s = t0.elapsed().as_secs_f64();
