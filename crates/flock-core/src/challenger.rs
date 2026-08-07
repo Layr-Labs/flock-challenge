@@ -680,9 +680,9 @@ const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
 // estimator already prices one-sided calibration contention (a draw can only
 // be slowed by contention, never sped up), so a 1.5 ms protected margin
 // over-rejects the Metal arm when its measured edge is real but modest.
-// 300 us keeps a 2x safety factor over per-draw noise while admitting an
-// arm whose measured per-trial saving clears ~150 us.
-const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(300);
+// 600 us keeps a meaningful guard over per-draw noise while admitting an
+// arm whose measured per-trial saving clears ~300 us.
+const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(600);
 static GPU_GRIND_LATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -715,7 +715,9 @@ fn cpu_blake3_pow_window_inner(
     const CHUNK: u64 = 960;
     const NO_MATCH: u64 = u64::MAX;
     let n_chunks = usize::try_from(u64::from(len).div_ceil(CHUNK)).expect("chunk count");
-    let results: Vec<AtomicU64> = (0..n_chunks).map(|_| AtomicU64::new(NO_MATCH)).collect();
+    // Every worker only lowers this value, so one atomic minimum preserves the
+    // exact lowest nonce without allocating and rereading one atomic per chunk.
+    let best = AtomicU64::new(NO_MATCH);
     let next = AtomicUsize::new(0);
     let worker = || loop {
         if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -730,7 +732,7 @@ fn cpu_blake3_pow_window_inner(
         if let Some(nonce) =
             blake3_pow_scan(state_digest, start.saturating_add(offset), chunk_len, bits)
         {
-            results[chunk].store(nonce, Ordering::Release);
+            best.fetch_min(nonce, Ordering::Release);
         }
     };
     let main_threads = rayon::current_num_threads();
@@ -747,11 +749,10 @@ fn cpu_blake3_pow_window_inner(
         }),
         None => drain_main(),
     }
-    results
-        .iter()
-        .map(|result| result.load(Ordering::Acquire))
-        .filter(|&nonce| nonce != NO_MATCH)
-        .min()
+    match best.load(Ordering::Relaxed) {
+        NO_MATCH => None,
+        nonce => Some(nonce),
+    }
 }
 
 fn cpu_gpu_grind_calibration(state_digest: &[u8; 32]) -> Vec<Option<u64>> {
@@ -874,11 +875,10 @@ mod grind_worker {
         .as_ref()
     }
 
-    /// Dispatch one GPU grind scan through the persistent worker. Returns
-    /// `None` when the worker is unavailable (kill switch or setup failure)
-    /// and the caller must run the incumbent scope-spawn path; `Some(result)`
-    /// is the scan outcome with the same `Err` surface as a direct
-    /// `gpu_blake3_pow_scan` call.
+    /// Queue one GPU grind scan on the persistent worker. The returned receiver
+    /// is deliberately not waited here: the caller scans the following CPU
+    /// block concurrently, then joins the GPU result. Returns `None` when the
+    /// worker is unavailable and the caller must use the scope-spawn fallback.
     pub(super) fn dispatch(
         state_digest: &[u8; 32],
         start: u64,
@@ -886,7 +886,7 @@ mod grind_worker {
         bits: u32,
         stop: Arc<AtomicBool>,
         abort: bool,
-    ) -> Option<Result<Option<u64>, String>> {
+    ) -> Option<Result<Receiver<Result<Option<u64>, String>>, String>> {
         let w = worker()?;
         let (done_tx, done_rx) = channel();
         let job = Job {
@@ -901,32 +901,7 @@ mod grind_worker {
         if w.tx.send(job).is_err() {
             return Some(Err("GPU grind worker channel closed".to_string()));
         }
-        match done_rx.recv() {
-            Ok(res) => Some(res),
-            Err(_) => Some(Err("GPU grind worker channel closed".to_string())),
-        }
-    }
-}
-
-/// Run the CPU next-block window after the persistent GPU worker has already
-/// delivered its result. A successful GPU hit is in the earlier nonce block,
-/// so the caller will return it without consulting the CPU result. When the
-/// existing abort policy is armed, skip constructing and dispatching that
-/// provably-dead CPU window altogether.
-///
-/// Keep this helper parameterized rather than reading process-global state so
-/// the exact policy boundary can be tested without mutating the environment.
-#[inline]
-fn run_cpu_window_after_persistent_gpu(
-    gpu_result: &Result<Option<u64>, String>,
-    abort_enabled: bool,
-    skip_dead_cpu_enabled: bool,
-    cpu_window: impl FnOnce() -> Option<u64>,
-) -> Option<u64> {
-    if abort_enabled && skip_dead_cpu_enabled && matches!(gpu_result, Ok(Some(_))) {
-        None
-    } else {
-        cpu_window()
+        Some(Ok(done_rx))
     }
 }
 
@@ -968,31 +943,25 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             std::sync::Arc::clone(&stop),
             abort,
         ) {
-            Some(gpu) => {
-                // `dispatch` has already waited for this persistent-worker
-                // result. On a hit the following CPU block is later in
-                // nonce order and its result is unconditionally discarded
-                // below, while the pre-set stop flag makes every worker
-                // exit immediately. Avoid the otherwise-dead allocation,
-                // Rayon drain, and E-pool broadcast. Misses, errors,
-                // abort-disabled diagnostics, and the scope-spawn fallback
-                // retain the incumbent behavior exactly.
-                let cpu = run_cpu_window_after_persistent_gpu(
-                    &gpu,
-                    abort,
-                    grind_skip_dead_cpu_enabled(),
-                    || {
-                        cpu_blake3_pow_window_inner(
-                            state_digest,
-                            next_start,
-                            block_len,
-                            bits,
-                            abort.then_some(stop.as_ref()),
-                        )
-                    },
+            Some(Ok(done)) => {
+                // Queueing does not wait: hash the following nonce block on
+                // both CPU pools while Metal scans the earlier block. A GPU
+                // hit raises `stop`, so CPU workers abandon their now-dead
+                // later block between chunks; a GPU miss leaves the complete
+                // CPU minimum ready for immediate use.
+                let cpu = cpu_blake3_pow_window_inner(
+                    state_digest,
+                    next_start,
+                    block_len,
+                    bits,
+                    abort.then_some(stop.as_ref()),
                 );
+                let gpu = done
+                    .recv()
+                    .unwrap_or_else(|_| Err("GPU grind worker channel closed".to_string()));
                 (gpu, cpu)
             }
+            Some(Err(error)) => (Err(error), None),
             None => std::thread::scope(|s| {
                 let gpu_scan = s.spawn(|| {
                     let gpu = crate::gpu_commit::gpu_blake3_pow_scan(
@@ -1053,14 +1022,6 @@ fn grind_hybrid_enabled() -> bool {
 fn grind_hybrid_abort_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_HYBRID_ABORT").is_none())
-}
-
-/// Skip the CPU next-block scaffold when the serialized persistent GPU worker
-/// has already returned a hit. `FLOCK_NO_GRIND_SKIP_DEAD_CPU=1` restores the
-/// previous behavior for exact same-binary comparison.
-fn grind_skip_dead_cpu_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_SKIP_DEAD_CPU").is_none())
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,54 +1223,6 @@ mod tests {
         assert_eq!(GPU_GRIND_CALIBRATION_BITS, 19);
         let exact_geometric = 1.0 / (1.0 - (-1.0f64).exp());
         assert!((GPU_GRIND_BLOCK_OVERDRAW - exact_geometric).abs() < 1e-12);
-    }
-
-    /// A completed persistent-worker hit owns the earlier nonce block, so an
-    /// armed candidate must not even invoke the later CPU-window closure.
-    /// Turning off either the existing abort policy or the new feature input
-    /// restores the incumbent invocation without touching process-global env.
-    #[test]
-    fn persistent_gpu_hit_skips_dead_cpu_window_only_when_armed() {
-        use std::cell::Cell;
-
-        let hit: Result<Option<u64>, String> = Ok(Some(7));
-        let calls = Cell::new(0);
-        let got = run_cpu_window_after_persistent_gpu(&hit, true, true, || {
-            calls.set(calls.get() + 1);
-            Some(99)
-        });
-        assert_eq!(got, None);
-        assert_eq!(calls.get(), 0, "armed GPU hit must not dispatch CPU work");
-
-        for (abort_enabled, feature_enabled) in [(false, true), (true, false), (false, false)] {
-            let calls = Cell::new(0);
-            let got =
-                run_cpu_window_after_persistent_gpu(&hit, abort_enabled, feature_enabled, || {
-                    calls.set(calls.get() + 1);
-                    Some(99)
-                });
-            assert_eq!(got, Some(99));
-            assert_eq!(calls.get(), 1);
-        }
-    }
-
-    /// Miss and error results must retain the existing CPU-window behavior;
-    /// only `Ok(Some(_))` is a proof that the later block is dead.
-    #[test]
-    fn persistent_gpu_miss_and_error_keep_cpu_window() {
-        use std::cell::Cell;
-
-        let cases: [Result<Option<u64>, String>; 2] =
-            [Ok(None), Err("synthetic GPU failure".to_string())];
-        for gpu_result in &cases {
-            let calls = Cell::new(0);
-            let got = run_cpu_window_after_persistent_gpu(gpu_result, true, true, || {
-                calls.set(calls.get() + 1);
-                Some(123)
-            });
-            assert_eq!(got, Some(123));
-            assert_eq!(calls.get(), 1);
-        }
     }
 
     /// Every FsChallenger property must hold under both transcript hashes:
