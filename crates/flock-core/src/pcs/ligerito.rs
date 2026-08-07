@@ -12851,3 +12851,5 @@ mod tests {
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
 // RealAdii next sample on eda4129 (marker 23601).
+
+// r800 candidate resample marker.
