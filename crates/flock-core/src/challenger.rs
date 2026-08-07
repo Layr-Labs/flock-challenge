@@ -613,7 +613,19 @@ impl Challenger for FsChallenger {
                             && gpu_2_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW) < cpu_2_time
                             && protected_gain >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN
                     };
-                    let _ = GPU_GRIND_LATCH.set(enable);
+                    // CPU-always (r834): two clean same-epoch A/Bs show every
+                    // marginal Metal engagement shifts the WHOLE 100-trial
+                    // distribution right — r832 (overdraw 1.582->1.1) p10
+                    // 0.147739 vs 0.147086 sibling, r833 (300->150 us rung)
+                    // p10 0.147863 vs 0.147163 sibling — a per-trial constant
+                    // penalty, not an upper-order-stat artifact. The 1.582
+                    // overdraw model under-charges real GPU misses, so the arm
+                    // only ever engages at a loss; calibrate (untimed) for
+                    // science but never admit the Metal arm.
+                    // r834: the calibrated `enable` verdict is recorded for
+                    // science but never admitted — every measured Metal
+                    // engagement shifts the whole trial distribution right.
+                    let _ = GPU_GRIND_LATCH.set(false);
                     if enable {
                         match gpu_blake3_pow_nonce(&state_digest, bits) {
                             Ok(nonce) => nonce,
