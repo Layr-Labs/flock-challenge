@@ -676,7 +676,13 @@ const GPU_GRIND_CALIBRATION_LENGTHS: [u32; 7] = [
     1 << 14,
 ];
 const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
-const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(1_500);
+// Two-sample engagement margin for the Metal grind arm. The min-of-two
+// estimator already prices one-sided calibration contention (a draw can only
+// be slowed by contention, never sped up), so a 1.5 ms protected margin
+// over-rejects the Metal arm when its measured edge is real but modest.
+// 300 us keeps a 2x safety factor over per-draw noise while admitting an
+// arm whose measured per-trial saving clears ~150 us.
+const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(300);
 static GPU_GRIND_LATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
