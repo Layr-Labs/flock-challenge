@@ -848,11 +848,19 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     Round1AbInner { storage }
 }
 
-/// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
-/// shape exposes roughly sixty-four scheduling waves on the ten-thread worker.
+/// Ranked AB precompute: 2,048 block-cyclic queues over 128-chunk blocks.
+/// Job `j` owns blocks `j, j + n_jobs, ...` so the ranked input's four
+/// quartiles stay positionally interleaved across the worker pool while each
+/// queue claim remains a contiguous, cache-line-aligned 8 KiB run (128 chunks
+/// x 64 bytes). Finer grain than the 640-slab baseline with half the per-claim
+/// length of the 1,024-job variant, trading queue visits for DRAM bank spread.
+const AB_PRE_BLOCK_CHUNKS: usize = 128;
+const AB_PRE_N_JOBS: usize = 2048;
+
+/// Queue count for the block-cyclic ranked AB drain.
 #[inline]
-fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
-    n_chunks.div_ceil(640).max(1)
+fn ab_pre_block_cyclic_n_jobs(n_chunks: usize) -> usize {
+    AB_PRE_N_JOBS.min(n_chunks).max(1)
 }
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
@@ -938,43 +946,43 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     }
 
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
-    // Process each queue-owned slab monotonically. This removes permutation
-    // generation and maximizes spatial locality; queue-level heterogeneity still
-    // distributes independent slabs dynamically.
-    let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
-    let n_jobs = n_chunks.div_ceil(chunks_per_job);
+    // Process each queue-owned 128-chunk block monotonically, striding
+    // round-robin so a worker's claims stay positionally dispersed; queue-level
+    // heterogeneity still distributes independent blocks dynamically.
+    let n_jobs = ab_pre_block_cyclic_n_jobs(n_chunks);
+    let n_blocks = n_chunks.div_ceil(AB_PRE_BLOCK_CHUNKS);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
-            let chunk_start = job * chunks_per_job;
-            let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
-            let slab_len = chunk_end - chunk_start;
-            for offset in 0..slab_len {
-                let x_outer = chunk_start + offset;
-                // SAFETY: offset is within this queue job's disjoint output slab.
-                let out_outer = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        out_base.ptr().add(x_outer * OUTER_BYTES),
-                        OUTER_BYTES,
-                    )
-                };
-                precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    within_outer_mask,
-                    b_med_counts,
-                    blake3_static_layout,
-                    static_b_context,
-                    nt,
-                    compact,
-                    x_outer,
-                    out_outer,
-                    a_col,
-                    b_col,
-                );
+            for block in (job..n_blocks).step_by(n_jobs) {
+                let start = block * AB_PRE_BLOCK_CHUNKS;
+                let end = (start + AB_PRE_BLOCK_CHUNKS).min(n_chunks);
+                for x_outer in start..end {
+                    // SAFETY: this queue job exclusively owns `block`.
+                    let out_outer = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            out_base.ptr().add(x_outer * OUTER_BYTES),
+                            OUTER_BYTES,
+                        )
+                    };
+                    precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        within_outer_mask,
+                        b_med_counts,
+                        blake3_static_layout,
+                        static_b_context,
+                        nt,
+                        compact,
+                        x_outer,
+                        out_outer,
+                        a_col,
+                        b_col,
+                    );
+                }
             }
         },
     );
