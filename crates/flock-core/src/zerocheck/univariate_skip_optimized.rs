@@ -855,6 +855,25 @@ fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
     n_chunks.div_ceil(640).max(1)
 }
 
+/// Narrow job size for the queue-tail taper (see the mapping in
+/// [`precompute_ab_hetero`]): the incumbent 64-chunk claim granularity,
+/// whose worst-case efficiency-core tail the old queue's sizing comment
+/// already budgeted at ~200 µs.
+const AB_PRE_TAIL_JOB_CHUNKS: usize = 64;
+
+/// How many trailing slabs' worth of chunks the taper re-partitions.
+const AB_PRE_TAIL_SLABS: usize = 3;
+
+/// Kill switch for the deep-slab queue-tail taper:
+/// `FLOCK_NO_ZC_AB_PRE_TAPER=1` restores the flat slab mapping as a
+/// same-binary control. Mapping only — the bytes written are identical.
+pub const ENV_NO_ZC_AB_PRE_TAPER: &str = "FLOCK_NO_ZC_AB_PRE_TAPER";
+
+fn ab_pre_taper_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_TAPER).is_none())
+}
+
 /// Ranked-shape selector for resolving the process-wide Horner policy once
 /// before the AB queue starts. Every other shape retains the incumbent
 /// per-row policy lookup so this codegen specialization cannot perturb
@@ -942,14 +961,37 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // generation and maximizes spatial locality; queue-level heterogeneity still
     // distributes independent slabs dynamically.
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
-    let n_jobs = n_chunks.div_ceil(chunks_per_job);
+    // Tail taper for the deep-slab queue: with ~640 slabs of ~820 chunks the
+    // worst final claim a ~3× slower efficiency-core worker can own is one
+    // full slab (~0.75 ms of P-core work, several ms of join tail on an
+    // E-core) — an order of magnitude above the old 64-chunk queue's
+    // documented ~200 µs bound. The last few slabs' worth of chunks are
+    // therefore handed out in 64-chunk jobs, restoring that bound while
+    // leaving the head's sequential-slab locality untouched. Chunk→job
+    // mapping only: every chunk is still claimed exactly once and writes its
+    // own disjoint 1 KiB, so output bytes are identical. A/B-CONTROL:
+    // `FLOCK_NO_ZC_AB_PRE_TAPER=1` restores the flat slab mapping.
+    let taper = ab_pre_taper_enabled() && n_chunks > 8 * chunks_per_job;
+    let head_chunks = if taper {
+        n_chunks - (AB_PRE_TAIL_SLABS * chunks_per_job).min(n_chunks / 2)
+    } else {
+        n_chunks
+    };
+    let head_jobs = head_chunks.div_ceil(chunks_per_job);
+    let n_jobs =
+        head_jobs + (n_chunks - head_chunks).div_ceil(AB_PRE_TAIL_JOB_CHUNKS);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
-            let chunk_start = job * chunks_per_job;
-            let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
+            let (chunk_start, chunk_end) = if job < head_jobs {
+                let s = job * chunks_per_job;
+                (s, (s + chunks_per_job).min(head_chunks))
+            } else {
+                let s = head_chunks + (job - head_jobs) * AB_PRE_TAIL_JOB_CHUNKS;
+                (s, (s + AB_PRE_TAIL_JOB_CHUNKS).min(n_chunks))
+            };
             let slab_len = chunk_end - chunk_start;
             for offset in 0..slab_len {
                 let x_outer = chunk_start + offset;
