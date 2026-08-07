@@ -12851,3 +12851,5 @@ mod tests {
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
 // RealAdii next sample on eda4129 (marker 23601).
+
+// r816 draw: origin/main re-verified == 4cea641 (bar 36881fd @ 1,770,594.97 unchanged 2026-08-07T10:4xZ); comment-only resample; semantics unchanged.
