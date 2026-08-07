@@ -675,7 +675,14 @@ const GPU_GRIND_CALIBRATION_LENGTHS: [u32; 7] = [
     1 << 14,
     1 << 14,
 ];
-const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
+// GPU admission overdraw multiplier. Historically 1/(1-e^-1)=1.582 (the
+// expected block count of unbounded serial first-success) taxed the Metal
+// arm as a mean-moment cost, but the scored statistic is the 50th-percentile
+// trial whose geometric MEDIAN block count is 1 for both arms, and the tree's
+// hybrid prefetch already covers the second round trip from the CPU window on
+// a GPU miss (production GPU cost ~= 1 block). Re-priced to 1.1: a 10%
+// handicap over parity that still excludes arms within ~9%% of CPU parity.
+const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.1;
 // Two-sample engagement margin for the Metal grind arm. The min-of-two
 // estimator already prices one-sided calibration contention (a draw can only
 // be slowed by contention, never sped up), so a 1.5 ms protected margin
@@ -1260,8 +1267,11 @@ mod tests {
         assert_eq!(GPU_GRIND_CALIBRATION_LENGTHS.len(), 7);
         assert_eq!(GPU_GRIND_MIN_BITS, 14);
         assert_eq!(GPU_GRIND_CALIBRATION_BITS, 19);
-        let exact_geometric = 1.0 / (1.0 - (-1.0f64).exp());
-        assert!((GPU_GRIND_BLOCK_OVERDRAW - exact_geometric).abs() < 1e-12);
+        // Re-priced from the 1/(1-e^-1) mean-block tax to a 1.1 handicap:
+        // median-scored statistic + hybrid CPU prefetch => production GPU
+        // cost ~= 1 block, so the stale 1.582 multiplier only barred the
+        // 0.632-0.91x cpu arm class. Pin the exact re-derived constant.
+        assert_eq!(GPU_GRIND_BLOCK_OVERDRAW, 1.1);
     }
 
     /// A completed persistent-worker hit owns the earlier nonce block, so an
