@@ -12851,3 +12851,6 @@ mod tests {
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
 // RealAdii next sample on eda4129 (marker 23601).
+
+// r805 bar-tree resample marker: 20260807T0507Z; semantics unchanged.
+// draw #6 of the 4cea641 lane (r798 -0.72 / r800 -0.03 / r802 -0.72 / r803 -0.46 / r804b -0.17).
