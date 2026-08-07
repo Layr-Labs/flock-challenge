@@ -12851,3 +12851,8 @@ mod tests {
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
 // RealAdii next sample on eda4129 (marker 23601).
+
+// r815 probe draw: board tip 4cea641 is a comment-only resample of our own
+// 24b7c3d tree (git diff eda4129 4cea641 = 1 comment line); bar margin is
+// 113.10 pts = 9.5us on the median, inside the draw-noise band. Comment-only;
+// semantics unchanged.
