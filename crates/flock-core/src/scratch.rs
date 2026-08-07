@@ -646,69 +646,6 @@ pub fn give_u8(v: Vec<u8>) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Recursive-Merkle flat-tree pool.
-//
-// The Ligerito open builds two flat `Vec<Hash>` trees per prove (16 MiB at
-// L1, 4 MiB at L2) on the FS-serial opening spine. A fresh
-// `alloc_uninit_vec` pays its ~4k first-touch page faults inside the timed
-// window and a single-threaded munmap on the following drop; recycling the
-// two buffers across proves keeps their pages resident. Contents are NOT
-// cleared; callers must write every node before reading (both builders do:
-// the GPU copy-out writes the whole tree, the CPU builder writes leaves
-// then every parent level).
-// ---------------------------------------------------------------------------
-
-static POOL_HASH_TREE: Mutex<Vec<Vec<crate::merkle::Hash>>> = Mutex::new(Vec::new());
-
-/// Only the two recursive shapes (plus transient test shapes) ever exist.
-const MAX_POOLED_HASH_TREES: usize = 4;
-
-/// Take a length-`n` hash vector, preferring a pooled buffer (smallest
-/// capacity >= `n`); falls back to a fresh uninitialized allocation.
-/// Contents are UNINITIALIZED in both cases (write-before-read contract,
-/// same as [`take_u8`]).
-pub(crate) fn take_hash_tree(n: usize) -> Vec<crate::merkle::Hash> {
-    {
-        let mut pool = POOL_HASH_TREE.lock().unwrap();
-        let mut best: Option<usize> = None;
-        for (i, v) in pool.iter().enumerate() {
-            if v.capacity() >= n && best.is_none_or(|b| v.capacity() < pool[b].capacity()) {
-                best = Some(i);
-            }
-        }
-        if let Some(i) = best {
-            let mut v = pool.swap_remove(i);
-            // SAFETY: capacity >= n was checked above; `Hash` is `[u8; 32]`
-            // (Copy, no Drop), so exposing stale bytes is sound to *hold* —
-            // the caller upholds write-before-read per this function's
-            // contract.
-            unsafe { v.set_len(n) };
-            return v;
-        }
-    }
-    crate::alloc_uninit_vec(n)
-}
-
-/// Return a flat tree to the pool for reuse (smallest-first eviction when
-/// full, same policy as the byte pool).
-pub(crate) fn give_hash_tree(v: Vec<crate::merkle::Hash>) {
-    if v.capacity() == 0 {
-        return;
-    }
-    let mut pool = POOL_HASH_TREE.lock().unwrap();
-    pool.push(v);
-    if pool.len() > MAX_POOLED_HASH_TREES {
-        let smallest = pool
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, v)| v.capacity())
-            .map(|(i, _)| i)
-            .expect("pool non-empty");
-        pool.swap_remove(smallest);
-    }
-}
-
 /// Byte-addressable scratch that retains the allocation's original element
 /// type, alignment, and deallocation layout.
 ///
