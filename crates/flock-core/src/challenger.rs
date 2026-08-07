@@ -680,9 +680,9 @@ const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
 // estimator already prices one-sided calibration contention (a draw can only
 // be slowed by contention, never sped up), so a 1.5 ms protected margin
 // over-rejects the Metal arm when its measured edge is real but modest.
-// 300 us keeps a 2x safety factor over per-draw noise while admitting an
-// arm whose measured per-trial saving clears ~150 us.
-const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(300);
+// 600 us keeps a meaningful guard over per-draw noise while admitting an
+// arm whose measured per-trial saving clears ~300 us.
+const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(600);
 static GPU_GRIND_LATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -715,7 +715,9 @@ fn cpu_blake3_pow_window_inner(
     const CHUNK: u64 = 960;
     const NO_MATCH: u64 = u64::MAX;
     let n_chunks = usize::try_from(u64::from(len).div_ceil(CHUNK)).expect("chunk count");
-    let results: Vec<AtomicU64> = (0..n_chunks).map(|_| AtomicU64::new(NO_MATCH)).collect();
+    // Every worker only lowers this value, so one atomic minimum preserves the
+    // exact lowest nonce without allocating and rereading one atomic per chunk.
+    let best = AtomicU64::new(NO_MATCH);
     let next = AtomicUsize::new(0);
     let worker = || loop {
         if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -730,7 +732,7 @@ fn cpu_blake3_pow_window_inner(
         if let Some(nonce) =
             blake3_pow_scan(state_digest, start.saturating_add(offset), chunk_len, bits)
         {
-            results[chunk].store(nonce, Ordering::Release);
+            best.fetch_min(nonce, Ordering::Release);
         }
     };
     let main_threads = rayon::current_num_threads();
@@ -747,11 +749,10 @@ fn cpu_blake3_pow_window_inner(
         }),
         None => drain_main(),
     }
-    results
-        .iter()
-        .map(|result| result.load(Ordering::Acquire))
-        .filter(|&nonce| nonce != NO_MATCH)
-        .min()
+    match best.load(Ordering::Relaxed) {
+        NO_MATCH => None,
+        nonce => Some(nonce),
+    }
 }
 
 fn cpu_gpu_grind_calibration(state_digest: &[u8; 32]) -> Vec<Option<u64>> {
