@@ -12851,3 +12851,8 @@ mod tests {
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
 // RealAdii next sample on eda4129 (marker 23601).
+
+// r809 draw: draw #2 of the r807-note standing cap (r808..r810) after r808
+// verdict landed REJECTED -0.61% (1,767,421.30 vs bar 1,770,594.97). The
+// r805 closure rule fires only at the cap boundary; 11-draw re-evaluation
+// gate applies after r810. Comment-only; semantics unchanged.
