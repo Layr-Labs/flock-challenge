@@ -3184,6 +3184,12 @@ fn ligero_commit_impl(
     kind: HashKind,
     fuse_from_message: bool,
 ) -> LigeroWitness {
+    const REC_L1_UNDECIDED: u8 = 0;
+    const REC_L1_ON: u8 = 1;
+    const REC_L1_OFF: u8 = 2;
+    static REC_L1_GATE: std::sync::atomic::AtomicU8 =
+        std::sync::atomic::AtomicU8::new(REC_L1_UNDECIDED);
+
     let msg_cols = 1usize << log_msg_cols;
     let num_interleaved = 1usize << log_num_interleaved;
     let block_len = msg_cols << log_inv_rate;
@@ -3191,8 +3197,40 @@ fn ligero_commit_impl(
     assert_eq!(poly.len(), num_interleaved * msg_cols);
     assert!(log_block_len <= ntt.log_domain_size());
 
+    // The exact L1 shape can be committed from its compact 8 MiB message by
+    // one Metal graph (rate expansion, full eight-lane NTT, and Merkle). The
+    // first invocation dual-runs the incumbent and admits the graph only when
+    // every output byte agrees and its complete path is at least 7% faster.
+    // Any failure permanently preserves the incumbent for this worker.
+    let rec_l1_shape = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && matches!(kind, HashKind::Blake3)
+        && (log_msg_cols, log_num_interleaved, log_inv_rate) == (16, 3, 2);
+    let rec_l1_gate = REC_L1_GATE.load(std::sync::atomic::Ordering::Acquire);
     let timing = std::env::var_os("LIG_PROVE_TRACE").is_some()
         || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let mut rec_l1_candidate = if rec_l1_shape && rec_l1_gate != REC_L1_OFF {
+        crate::gpu_commit::gpu_recursive_l1_commit_blake3(poly)
+    } else {
+        None
+    };
+    if rec_l1_shape && rec_l1_gate == REC_L1_ON {
+        if let Some((mat, tree, wall_ms)) = rec_l1_candidate.take() {
+            if std::env::var_os("LIG_PROVE_TRACE").is_some()
+                || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+            {
+                eprintln!("    [recursive-commit L1] compact-metal={wall_ms:.2} ms");
+            }
+            return LigeroWitness {
+                mat,
+                tree,
+                block_len,
+                num_interleaved,
+            };
+        }
+        REC_L1_GATE.store(REC_L1_OFF, std::sync::atomic::Ordering::Release);
+    }
+    let rec_l1_cpu_start = rec_l1_candidate.as_ref().map(|_| std::time::Instant::now());
+
     let total_start = timing.then(std::time::Instant::now);
 
     // LSB-lane layout: input matches `data[pos * num_interleaved + lane]`.
@@ -3268,6 +3306,41 @@ fn ligero_commit_impl(
                 merkle_elapsed.as_secs_f64() * 1e3,
                 total_elapsed.as_secs_f64() * 1e3,
             );
+        }
+    }
+
+    if rec_l1_gate == REC_L1_UNDECIDED {
+        if let (Some(cpu_start), Some((gpu_mat, gpu_tree, gpu_ms))) =
+            (rec_l1_cpu_start, rec_l1_candidate.take())
+        {
+            let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1e3;
+            let exact = gpu_mat == mat && gpu_tree == tree;
+            let faster = gpu_ms * 100.0 <= cpu_ms * 93.0;
+            let selected = exact && faster;
+            REC_L1_GATE.store(
+                if selected { REC_L1_ON } else { REC_L1_OFF },
+                std::sync::atomic::Ordering::Release,
+            );
+            if timing {
+                eprintln!(
+                    "    [recursive-commit L1 gate] metal={gpu_ms:.2} ms incumbent={cpu_ms:.2} ms exact={exact} selected={selected}"
+                );
+            }
+            if selected {
+                crate::scratch::give_f128(mat);
+                return LigeroWitness {
+                    mat: gpu_mat,
+                    tree: gpu_tree,
+                    block_len,
+                    num_interleaved,
+                };
+            }
+            // The Metal matrix is drawn from the same scratch class as the
+            // incumbent. Return it explicitly when calibration rejects the
+            // arm instead of letting its pinned allocation escape the pool.
+            crate::scratch::give_f128(gpu_mat);
+        } else if rec_l1_shape {
+            REC_L1_GATE.store(REC_L1_OFF, std::sync::atomic::Ordering::Release);
         }
     }
 

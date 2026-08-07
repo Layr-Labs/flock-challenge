@@ -533,6 +533,16 @@ pub fn gpu_recursive_merkle_blake3(
     imp::gpu_recursive_merkle_blake3(data, num_leaves)
 }
 
+/// Compact-message recursive L1 commitment. Metal writes the returned
+/// codeword and tree directly into owned vectors; `wall_ms` covers the
+/// steady-state graph plus host submission overhead. `None` preserves the
+/// CPU commitment path.
+pub(crate) fn gpu_recursive_l1_commit_blake3(
+    poly: &[F128],
+) -> Option<(Vec<F128>, Vec<crate::merkle::Hash>, f64)> {
+    imp::gpu_recursive_l1_commit_copy(poly)
+}
+
 /// Exact rollback for the PCS Fiat--Shamir BLAKE3 grind scanner.  The first
 /// untimed ranked grind still has to prove that Metal returns the same
 /// globally-smallest nonce and clears the target-side timing gate before the
@@ -9543,27 +9553,474 @@ LC_KERNEL(lc_fold_stripes, 4)
         }
     }
 
+    /// Compile one supplemental library and derive several pipelines from it.
+    /// This keeps the per-worker warmup cost independent of kernel count.
+    unsafe fn compile_supplemental_pipelines<const N: usize>(
+        gpu: &Gpu,
+        source: &str,
+        names: [&str; N],
+    ) -> Result<[Id; N], String> {
+        unsafe {
+            let src = gpu.api.nsstring(source)?;
+            let mut err: Id = NIL;
+            let library: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newLibraryWithSource:options:error:",
+                src,
+                NIL,
+                &mut err
+            );
+            if library.is_null() {
+                return Err(format!(
+                    "supplemental shader compile failed: {}",
+                    gpu.api.error_string(err)
+                ));
+            }
+            let mut psos = [NIL; N];
+            for (i, &name) in names.iter().enumerate() {
+                let ns = gpu.api.nsstring(name)?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    for &pso in &psos[..i] {
+                        gpu.release(pso);
+                    }
+                    gpu.release(library);
+                    return Err(format!("supplemental kernel {name} not found"));
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                gpu.release(f);
+                if pso.is_null() {
+                    for &built in &psos[..i] {
+                        gpu.release(built);
+                    }
+                    gpu.release(library);
+                    return Err(format!(
+                        "supplemental pipeline {name}: {}",
+                        gpu.api.error_string(perr)
+                    ));
+                }
+                psos[i] = pso;
+            }
+            gpu.release(library);
+            Ok(psos)
+        }
+    }
+
     // =======================================================================
-    // Recursive Ligerito Merkle offload (128-byte leaves).
+    // Recursive Ligerito L1 commitment (128-byte leaves).
     //
-    // The L1/L2 recursive commitment trees are the only serial CPU BLAKE3
-    // blocks in the opening spine while the GPU sits idle (the commit graph
-    // ended long before; the grind scans are sub-millisecond). One dispatch
-    // chain — a two-block chunk kernel over 128-byte leaves plus the ordinary
-    // parent ladder — replaces them with bit-identical bytes. The input
-    // matrix is wrapped no-copy (cached by address; creation cost lands on
-    // the untimed warmup prove in the common case), the flat tree is built in
-    // a persistent shared buffer and copied out in one parallel pass.
+    // A three-pass staged additive NTT reads the compact message and writes
+    // the codeword directly into its owned output. The final pass also hashes
+    // each 128-byte leaf and builds five local Merkle levels; only the 2^13
+    // subtree roots continue through the global parent ladder.
     // =======================================================================
 
-    /// Leaf kernel for 128-byte leaves (one BLAKE3 chunk of exactly two
-    /// blocks: CHUNK_START on block 0, CHUNK_END on block 1, never ROOT —
-    /// matches `Hasher::update(128B).finalize_non_root`) plus the standard
-    /// parent kernel, compiled as a supplemental library so the embedded
-    /// incumbent metallib stays byte-for-byte intact.
+    /// Supplemental fixed-shape NTT and BLAKE3 kernels. A 128-byte leaf is one
+    /// chunk of exactly two blocks: CHUNK_START on block 0, CHUNK_END on block
+    /// 1, never ROOT, matching `Hasher::update(128B).finalize_non_root`.
     const REC_MERKLE_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
+
+// Eight-lane additive NTT for the recursive L1 commitment. Three staged
+// passes transform the compact message directly into the position-major
+// `[position][lane]` codeword consumed by the fused BLAKE3 tail.
+static inline uint4 rec_gf_mulx(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 rec_gf_shl8(uint4 a) {
+    uint h = a.w >> 24;
+    uint4 r;
+    r.w = (a.w << 8) | (a.z >> 24);
+    r.z = (a.z << 8) | (a.y >> 24);
+    r.y = (a.y << 8) | (a.x >> 24);
+    r.x = (a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+static inline uint4 rec_gf_mul_tab(
+    uint4 v,
+    threadgroup const uint4* tab)
+{
+    uint4 acc = uint4(0u);
+    for (int i = 15; i >= 0; i--) {
+        acc = rec_gf_shl8(acc);
+        uint b = (v[i >> 2] >> ((i & 3) * 8)) & 0xffu;
+        acc ^= tab[b & 15u] ^ tab[16u + (b >> 4)];
+    }
+    return acc;
+}
+
+static inline void rec_build_ntt_tabs(
+    device const uint4* twiddles,
+    uint L,
+    uint B,
+    uint lid,
+    threadgroup uint4* tabs)
+{
+    constexpr uint NTW = 15u;
+    for (uint ei = lid; ei < NTW * 32u; ei += 64u) {
+        uint t = ei >> 5;
+        uint sub = ei & 31u;
+        uint hi = sub >> 4;
+        uint n = sub & 15u;
+        uint j = 31u - clz(t + 1u);
+        uint c = t + 1u - (1u << j);
+        uint tw = (1u << (L + j)) - 1u + (B << j) + c;
+        uint4 p = twiddles[tw];
+        if (hi != 0u) {
+            p = rec_gf_mulx(rec_gf_mulx(rec_gf_mulx(rec_gf_mulx(p))));
+        }
+        uint4 val = uint4(0u);
+        for (uint k = 0; k < 4u; k++) {
+            if ((n >> k) & 1u) { val ^= p; }
+            p = rec_gf_mulx(p);
+        }
+        tabs[ei] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// At l=2 the rate-four-expanded blocks are identical. Read the compact
+// message once and write the result after layers 2..5 directly, deleting
+// both the expansion write and the first pass's expanded-codeword read.
+kernel void rec_ntt4_8_from_message(
+    device const uint4* msg             [[buffer(0)]],
+    device uint4* data                  [[buffer(1)]],
+    device const uint4* twiddles        [[buffer(2)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u;
+    constexpr uint NF = 16u;
+    constexpr uint L = 2u;
+    constexpr uint S = 12u;
+    threadgroup uint4 tabs[15u * 32u];
+    const uint lane = lid & 7u;
+    const uint rr = lid >> 3;
+    const uint B = tgid >> (S - 3u);
+    const uint r_base = (tgid & ((1u << (S - 3u)) - 1u)) << 3;
+    const uint r = r_base + rr;
+    const uint pos_base = (B << (18u - L)) + r;
+
+    rec_build_ntt_tabs(twiddles, L, B, lid, tabs);
+    uint4 elems[NF];
+    for (uint e = 0; e < NF; e++) {
+        elems[e] = msg[(((e << S) + r) << 3) + lane];
+    }
+    for (uint j = 0; j < F; j++) {
+        uint bpos = F - 1u - j;
+        for (uint b = 0; b < (NF >> 1); b++) {
+            uint low = b & ((1u << bpos) - 1u);
+            uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+            uint ev = eu | (1u << bpos);
+            uint tsel = ((1u << j) - 1u) + (eu >> (F - j));
+            uint4 nu = elems[eu]
+                ^ rec_gf_mul_tab(elems[ev], &tabs[tsel << 5]);
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+    for (uint e = 0; e < NF; e++) {
+        data[((pos_base + (e << S)) << 3) + lane] = elems[e];
+    }
+}
+
+// The middle passes have at least eight same-B r-tiles. One 64-thread group
+// owns eight tiles x eight lanes and shares the one twiddle-table set. L/S
+// are template constants so address arithmetic is folded into each pipeline.
+template <uint L, uint S>
+static inline void rec_ntt4_8_group8_impl(
+    device uint4* data,
+    device const uint4* twiddles,
+    threadgroup uint4* tabs,
+    uint tgid,
+    uint lid)
+{
+    constexpr uint F = 4u;
+    constexpr uint NF = 16u;
+    const uint lane = lid & 7u;
+    const uint rr = lid >> 3;
+    const uint B = tgid >> (S - 3u);
+    const uint r_base = (tgid & ((1u << (S - 3u)) - 1u)) << 3;
+    const uint r = r_base + rr;
+    const uint pos_base = (B << (18u - L)) + r;
+
+    rec_build_ntt_tabs(twiddles, L, B, lid, tabs);
+    uint4 elems[NF];
+    for (uint e = 0; e < NF; e++) {
+        elems[e] = data[((pos_base + (e << S)) << 3) + lane];
+    }
+    for (uint j = 0; j < F; j++) {
+        uint bpos = F - 1u - j;
+        for (uint b = 0; b < (NF >> 1); b++) {
+            uint low = b & ((1u << bpos) - 1u);
+            uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+            uint ev = eu | (1u << bpos);
+            uint tsel = ((1u << j) - 1u) + (eu >> (F - j));
+            uint4 nu = elems[eu]
+                ^ rec_gf_mul_tab(elems[ev], &tabs[tsel << 5]);
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+    for (uint e = 0; e < NF; e++) {
+        data[((pos_base + (e << S)) << 3) + lane] = elems[e];
+    }
+}
+
+kernel void rec_ntt4_8_l6(
+    device uint4* data                 [[buffer(0)]],
+    device const uint4* twiddles       [[buffer(1)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 tabs[15u * 32u];
+    rec_ntt4_8_group8_impl<6u, 8u>(data, twiddles, tabs, tgid, lid);
+}
+
+kernel void rec_ntt4_8_l10(
+    device uint4* data                 [[buffer(0)]],
+    device const uint4* twiddles       [[buffer(1)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 tabs[15u * 32u];
+    rec_ntt4_8_group8_impl<10u, 4u>(data, twiddles, tabs, tgid, lid);
+}
+
+// Final pass: each B has one r-tile. All threads load its static tables and
+// the first eight transform the independent lanes.
+kernel void rec_ntt4_8_final(
+    device uint4* data                 [[buffer(0)]],
+    device const uint4* twiddles       [[buffer(1)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u;
+    constexpr uint NF = 16u;
+    constexpr uint L = 14u;
+    threadgroup uint4 tabs[15u * 32u];
+    const uint B = tgid;
+    rec_build_ntt_tabs(twiddles, L, B, lid, tabs);
+    if (lid >= 8u) { return; }
+    const uint lane = lid;
+    const uint pos_base = B << (18u - L);
+    uint4 elems[NF];
+    for (uint e = 0; e < NF; e++) {
+        elems[e] = data[((pos_base + e) << 3) + lane];
+    }
+    for (uint j = 0; j < F; j++) {
+        uint bpos = F - 1u - j;
+        for (uint b = 0; b < (NF >> 1); b++) {
+            uint low = b & ((1u << bpos) - 1u);
+            uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+            uint ev = eu | (1u << bpos);
+            uint tsel = ((1u << j) - 1u) + (eu >> (F - j));
+            uint4 nu = elems[eu]
+                ^ rec_gf_mul_tab(elems[ev], &tabs[tsel << 5]);
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+    for (uint e = 0; e < NF; e++) {
+        data[((pos_base + e) << 3) + lane] = elems[e];
+    }
+}
+
+// Three-pass staged transform for the fixed L1 shape. One thread owns one
+// lane butterfly, while equal-B r-tiles share the stage's twiddle tables.
+// Relative to the register-private radix-16 graph this keeps the arithmetic
+// count unchanged but removes one complete 32 MiB read/write pass.
+template <uint L, uint THREADS>
+static inline void rec_build_stage_tabs(
+    device const uint4* twiddles,
+    uint B,
+    uint j,
+    uint lid,
+    threadgroup uint4* tabs)
+{
+    const uint n_tw = 1u << j;
+    const uint n_entries = n_tw << 5;
+    for (uint ei = lid; ei < n_entries; ei += THREADS) {
+        uint c = ei >> 5;
+        uint sub = ei & 31u;
+        uint hi = sub >> 4;
+        uint n = sub & 15u;
+        uint4 p = twiddles[(1u << (L + j)) - 1u + (B << j) + c];
+        if (hi != 0u) {
+            p = rec_gf_mulx(rec_gf_mulx(rec_gf_mulx(rec_gf_mulx(p))));
+        }
+        uint4 val = uint4(0u);
+        for (uint k = 0; k < 4u; k++) {
+            if ((n >> k) & 1u) { val ^= p; }
+            p = rec_gf_mulx(p);
+        }
+        tabs[ei] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template <uint L, uint F, uint BATCH, uint THREADS>
+static inline void rec_staged_butterflies(
+    device const uint4* twiddles,
+    threadgroup uint4* tile,
+    threadgroup uint4* tabs,
+    uint B,
+    uint lid)
+{
+    constexpr uint NF = 1u << F;
+    const uint lane = lid & 7u;
+    const uint b = lid >> 3;
+    for (uint j = 0; j < F; j++) {
+        rec_build_stage_tabs<L, THREADS>(twiddles, B, j, lid, tabs);
+        uint bpos = F - 1u - j;
+        uint low = b & ((1u << bpos) - 1u);
+        uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+        uint ev = eu | (1u << bpos);
+        uint tsel = eu >> (F - j);
+        for (uint rb = 0; rb < BATCH; rb++) {
+            uint base = rb * NF * 8u;
+            uint iu = base + (eu << 3) + lane;
+            uint iv = base + (ev << 3) + lane;
+            uint4 v = tile[iv];
+            uint4 nu = tile[iu] ^ rec_gf_mul_tab(v, &tabs[tsel << 5]);
+            tile[iu] = nu;
+            tile[iv] = nu ^ v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// Layers 2..7 directly from the compact message. Two adjacent r-tiles share
+// 63 twiddle tables; 16 KiB tile + 16 KiB tables fits the 32 KiB limit.
+kernel void rec_ntt6_8_from_message(
+    device const uint4* msg             [[buffer(0)]],
+    device uint4* data                  [[buffer(1)]],
+    device const uint4* twiddles        [[buffer(2)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint L = 2u;
+    constexpr uint F = 6u;
+    constexpr uint S = 10u;
+    constexpr uint NF = 1u << F;
+    constexpr uint BATCH = 2u;
+    constexpr uint THREADS = 256u;
+    threadgroup uint4 tile[BATCH * NF * 8u];
+    threadgroup uint4 tabs[(NF >> 1) * 32u];
+    const uint B = tgid >> (S - 1u);
+    const uint r_base = (tgid & ((1u << (S - 1u)) - 1u)) << 1;
+    for (uint idx = lid; idx < BATCH * NF * 8u; idx += THREADS) {
+        uint rb = idx / (NF * 8u);
+        uint local = idx - rb * NF * 8u;
+        uint e = local >> 3;
+        uint lane = local & 7u;
+        uint r = r_base + rb;
+        tile[idx] = msg[(((e << S) + r) << 3) + lane];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    rec_staged_butterflies<L, F, BATCH, THREADS>(twiddles, tile, tabs, B, lid);
+    for (uint idx = lid; idx < BATCH * NF * 8u; idx += THREADS) {
+        uint rb = idx / (NF * 8u);
+        uint local = idx - rb * NF * 8u;
+        uint e = local >> 3;
+        uint lane = local & 7u;
+        uint r = r_base + rb;
+        uint pos = (B << (18u - L)) + (e << S) + r;
+        data[(pos << 3) + lane] = tile[idx];
+    }
+}
+
+// Layers 8..12, four adjacent r-tiles per group (16 KiB tile + 8 KiB tabs).
+kernel void rec_ntt5_8_l8(
+    device uint4* data                  [[buffer(0)]],
+    device const uint4* twiddles        [[buffer(1)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint L = 8u;
+    constexpr uint F = 5u;
+    constexpr uint S = 5u;
+    constexpr uint NF = 1u << F;
+    constexpr uint BATCH = 4u;
+    constexpr uint THREADS = 128u;
+    threadgroup uint4 tile[BATCH * NF * 8u];
+    threadgroup uint4 tabs[(NF >> 1) * 32u];
+    const uint B = tgid >> (S - 2u);
+    const uint r_base = (tgid & ((1u << (S - 2u)) - 1u)) << 2;
+    for (uint idx = lid; idx < BATCH * NF * 8u; idx += THREADS) {
+        uint rb = idx / (NF * 8u);
+        uint local = idx - rb * NF * 8u;
+        uint e = local >> 3;
+        uint lane = local & 7u;
+        uint pos = (B << (18u - L)) + (e << S) + r_base + rb;
+        tile[idx] = data[(pos << 3) + lane];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    rec_staged_butterflies<L, F, BATCH, THREADS>(twiddles, tile, tabs, B, lid);
+    for (uint idx = lid; idx < BATCH * NF * 8u; idx += THREADS) {
+        uint rb = idx / (NF * 8u);
+        uint local = idx - rb * NF * 8u;
+        uint e = local >> 3;
+        uint lane = local & 7u;
+        uint pos = (B << (18u - L)) + (e << S) + r_base + rb;
+        data[(pos << 3) + lane] = tile[idx];
+    }
+}
+
+// Layers 13..17. There is one r-tile per B at the tail.
+kernel void rec_ntt5_8_l13(
+    device uint4* data                  [[buffer(0)]],
+    device const uint4* twiddles        [[buffer(1)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint L = 13u;
+    constexpr uint F = 5u;
+    constexpr uint NF = 1u << F;
+    constexpr uint THREADS = 128u;
+    threadgroup uint4 tile[NF * 8u];
+    threadgroup uint4 tabs[(NF >> 1) * 32u];
+    const uint B = tgid;
+    for (uint idx = lid; idx < NF * 8u; idx += THREADS) {
+        uint e = idx >> 3;
+        uint lane = idx & 7u;
+        uint pos = (B << (18u - L)) + e;
+        tile[idx] = data[(pos << 3) + lane];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    rec_staged_butterflies<L, F, 1u, THREADS>(twiddles, tile, tabs, B, lid);
+    for (uint idx = lid; idx < NF * 8u; idx += THREADS) {
+        uint e = idx >> 3;
+        uint lane = idx & 7u;
+        uint pos = (B << (18u - L)) + e;
+        data[(pos << 3) + lane] = tile[idx];
+    }
+}
 
 constant uint B3_IV[8] = {
     0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
@@ -9621,6 +10078,94 @@ kernel void leaf_hash128(device const uint* codeword [[buffer(0)]],
     for (int i = 0; i < 8; i++) out[id * 8u + i] = cv[i];
 }
 
+// Final five NTT layers plus the 128-byte leaf hashes and five local Merkle
+// levels while each completed 32-row tile is still resident in threadgroup
+// memory. The codeword and every tree node remain available for openings.
+kernel void rec_ntt5_8_l13_leaf128(
+    device uint4* data                  [[buffer(0)]],
+    device const uint4* twiddles        [[buffer(1)]],
+    device uint* out                    [[buffer(2)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint L = 13u;
+    constexpr uint F = 5u;
+    constexpr uint NF = 1u << F;
+    constexpr uint THREADS = 128u;
+    threadgroup uint4 tile[NF * 8u];
+    threadgroup uint4 tabs[(NF >> 1) * 32u];
+    threadgroup uint local_cvs[NF * 8u];
+    const uint B = tgid;
+    for (uint idx = lid; idx < NF * 8u; idx += THREADS) {
+        uint e = idx >> 3;
+        uint lane = idx & 7u;
+        uint pos = (B << (18u - L)) + e;
+        tile[idx] = data[(pos << 3) + lane];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    rec_staged_butterflies<L, F, 1u, THREADS>(twiddles, tile, tabs, B, lid);
+    for (uint idx = lid; idx < NF * 8u; idx += THREADS) {
+        uint e = idx >> 3;
+        uint lane = idx & 7u;
+        uint pos = (B << (18u - L)) + e;
+        data[(pos << 3) + lane] = tile[idx];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < NF) {
+        uint cv[8];
+        for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+        uint block[16];
+        for (uint q = 0; q < 4u; q++) {
+            uint4 w = tile[(lid << 3) + q];
+            for (uint k = 0; k < 4u; k++) block[(q << 2) + k] = w[k];
+        }
+        b3_compress(cv, block, 64u, B3_CHUNK_START);
+        for (uint q = 0; q < 4u; q++) {
+            uint4 w = tile[(lid << 3) + 4u + q];
+            for (uint k = 0; k < 4u; k++) block[(q << 2) + k] = w[k];
+        }
+        b3_compress(cv, block, 64u, B3_CHUNK_END);
+        uint pos = (B << (18u - L)) + lid;
+        for (int i = 0; i < 8; i++) {
+            local_cvs[lid * 8u + i] = cv[i];
+            out[pos * 8u + i] = cv[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each group owns 32 adjacent leaves. Build its first five parent levels
+    // locally, retaining only 2^13 subtree roots for the global parent pass.
+    uint level_len = NF;
+    uint level_start = 1u << 18u;
+    for (uint depth = 1u; depth <= 5u; depth++) {
+        uint n_out = level_len >> 1u;
+        uint block[16];
+        if (lid < n_out) {
+            for (uint i = 0u; i < 8u; i++) {
+                block[i] = local_cvs[(lid * 2u) * 8u + i];
+                block[8u + i] = local_cvs[(lid * 2u + 1u) * 8u + i];
+            }
+        }
+        // All child CVs have been copied to registers before the compacting
+        // in-place writes can overwrite their old threadgroup locations.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < n_out) {
+            uint cv[8];
+            for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+            b3_compress(cv, block, 64u, B3_PARENT);
+            uint pos = level_start + B * n_out + lid;
+            for (int i = 0; i < 8; i++) {
+                local_cvs[lid * 8u + i] = cv[i];
+                out[pos * 8u + i] = cv[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        level_start += 1u << (18u - depth);
+        level_len = n_out;
+    }
+}
+
 kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                             device uint* parents        [[buffer(1)]],
                             uint id [[thread_position_in_grid]])
@@ -9634,21 +10179,25 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 }
 "#;
 
-    /// The exact recursive shapes worth offloading. L1 (2^18 leaves) wins
-    /// ~0.9 ms per timed prove; L2 (2^16 leaves) was measured NET NEGATIVE
-    /// (GPU 1.06 ms vs CPU 0.81 ms — the fixed wrap/submit/wait roundtrip
-    /// dominates at 16 MiB) and is deliberately excluded.
+    /// The fixed L1 production shape. Smaller recursive layers retain the CPU
+    /// path because command submission dominates their shorter commitments.
     const REC_MERKLE_SHAPES: [usize; 1] = [1usize << 18];
 
     /// Process-lifetime Metal state for the recursive Merkle offload.
     struct RecMerkle {
+        pso_ntt6_8_from_message: Id,
+        pso_ntt5_8_l8: Id,
+        pso_ntt5_8_l13_leaf128: Id,
         pso_leaf128: Id,
         pso_parent: Id,
+        /// The fixed breadth-first L1 twiddle table.
+        twiddle_buf: Id,
         /// Persistent flat-tree output buffers, one per supported shape
         /// (`2 * n - 1` nodes each); allocated once, untimed.
         tree_bufs: [(usize, Id); REC_MERKLE_SHAPES.len()],
         /// Cached no-copy wraps of caller matrices: `(ptr, len, buffer)`.
         wraps: Vec<(usize, usize, Id)>,
+        l1_primed: bool,
         hits: usize,
         misses: usize,
     }
@@ -9667,26 +10216,37 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         unsafe {
             let pool = gpu.pool_push();
             let built = (|| -> Result<RecMerkle, String> {
-                let pso_leaf128 =
-                    compile_supplemental_pipeline(gpu, REC_MERKLE_MSL_SOURCE, "leaf_hash128")?;
-                let pso_parent = match compile_supplemental_pipeline(
+                let [
+                    pso_ntt6_8_from_message,
+                    pso_ntt5_8_l8,
+                    pso_ntt5_8_l13_leaf128,
+                    pso_leaf128,
+                    pso_parent,
+                ] = compile_supplemental_pipelines(
                     gpu,
                     REC_MERKLE_MSL_SOURCE,
-                    "rec_parent_hash",
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        gpu.release(pso_leaf128);
-                        return Err(e);
-                    }
-                };
+                    [
+                        "rec_ntt6_8_from_message",
+                        "rec_ntt5_8_l8",
+                        "rec_ntt5_8_l13_leaf128",
+                        "leaf_hash128",
+                        "rec_parent_hash",
+                    ],
+                )?;
                 let mut tree_bufs = [(0usize, NIL); REC_MERKLE_SHAPES.len()];
                 for (slot, &n) in tree_bufs.iter_mut().zip(REC_MERKLE_SHAPES.iter()) {
                     match gpu.new_buffer((2 * n - 1) * 32) {
                         Ok(buf) => *slot = (n, buf),
                         Err(e) => {
-                            gpu.release(pso_leaf128);
-                            gpu.release(pso_parent);
+                            for &pso in &[
+                                pso_ntt6_8_from_message,
+                                pso_ntt5_8_l8,
+                                pso_ntt5_8_l13_leaf128,
+                                pso_leaf128,
+                                pso_parent,
+                            ] {
+                                gpu.release(pso);
+                            }
                             for &(_, b) in tree_bufs.iter() {
                                 if !b.is_null() {
                                     gpu.release(b);
@@ -9696,11 +10256,44 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                         }
                     }
                 }
+                let rec_ntt = AdditiveNttF128::standard(18);
+                let twiddles = super::flat_twiddle_table(&rec_ntt, 18);
+                let twiddle_bytes = core::mem::size_of_val(twiddles.as_slice());
+                let twiddle_buf = match gpu.new_buffer(twiddle_bytes) {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        for &pso in &[
+                            pso_ntt6_8_from_message,
+                            pso_ntt5_8_l8,
+                            pso_ntt5_8_l13_leaf128,
+                            pso_leaf128,
+                            pso_parent,
+                        ] {
+                            gpu.release(pso);
+                        }
+                        for &(_, b) in tree_bufs.iter() {
+                            if !b.is_null() {
+                                gpu.release(b);
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+                std::ptr::copy_nonoverlapping(
+                    twiddles.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(twiddle_buf),
+                    twiddle_bytes,
+                );
                 let mut state = RecMerkle {
+                    pso_ntt6_8_from_message,
+                    pso_ntt5_8_l8,
+                    pso_ntt5_8_l13_leaf128,
                     pso_leaf128,
                     pso_parent,
+                    twiddle_buf,
                     tree_bufs,
                     wraps: Vec::new(),
+                    l1_primed: false,
                     hits: 0,
                     misses: 0,
                 };
@@ -9764,6 +10357,276 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             gpu.pool_pop(pool);
             built
         }
+    }
+
+    /// Copy-out oracle for the compact-message L1 Metal graph. Production
+    /// adopts the same persistent buffers through leased views only after
+    /// this graph has been byte-gated against the CPU commitment.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn gpu_recursive_l1_commit_copy(
+        poly: &[F128],
+    ) -> Option<(Vec<F128>, Vec<Hash>, f64)> {
+        const LOG_D: usize = 18;
+        const LANES: usize = 8;
+        const MSG_ELEMS: usize = (1usize << 16) * LANES;
+        const CODEWORD_ELEMS: usize = (1usize << LOG_D) * LANES;
+        const N_LEAVES: usize = 1usize << LOG_D;
+        const LOCAL_PARENT_LEVELS: usize = 5;
+        const LOCAL_ROOTS_START: usize = 2 * N_LEAVES - (N_LEAVES >> (LOCAL_PARENT_LEVELS - 1));
+        const LOCAL_ROOTS: usize = N_LEAVES >> LOCAL_PARENT_LEVELS;
+        if !super::gpu_recursive_merkle_enabled() || poly.len() != MSG_ELEMS {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let mut guard = match REC_MERKLE.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                REC_MERKLE.clear_poison();
+                note_poisoned_lock("rec-merkle", true);
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
+        if guard.is_none() {
+            *guard = Some(rec_merkle_init(gpu));
+        }
+        let state = match guard.as_mut() {
+            Some(Ok(state)) => state,
+            Some(Err(e)) => {
+                if rec_merkle_debug() {
+                    eprintln!("[gpu-rec-l1] unavailable ({e})");
+                }
+                return None;
+            }
+            None => unreachable!("initialized above"),
+        };
+
+        let poly_addr = poly.as_ptr() as usize;
+        let poly_bytes = core::mem::size_of_val(poly);
+        let poly_buf = match state
+            .wraps
+            .iter()
+            .find(|(p, l, _)| *p == poly_addr && *l == poly_bytes)
+            .map(|&(_, _, buf)| buf)
+        {
+            Some(buf) => buf,
+            None => match unsafe { gpu.wrap_buffer(poly.as_ptr().cast_mut().cast(), poly_bytes) } {
+                Ok(buf) => {
+                    state.wraps.push((poly_addr, poly_bytes, buf));
+                    buf
+                }
+                Err(e) => {
+                    if rec_merkle_debug() {
+                        eprintln!("[gpu-rec-l1] message wrap failed ({e})");
+                    }
+                    return None;
+                }
+            },
+        };
+        // Metal writes directly into ordinary Rust-owned output allocations.
+        // The matrix comes from the scratch pool's pinned L1 slot, so its
+        // no-copy view is created/wired during warmup and remains valid for
+        // the process. The flat tree is one hash short of a page multiple;
+        // reserve one padding hash while wrapped, then truncate it without
+        // ever reading the padding bytes after the completed graph.
+        let setup_started = std::time::Instant::now();
+        let mut mat = crate::scratch::take_f128(CODEWORD_ELEMS);
+        let mat_bytes = core::mem::size_of_val(mat.as_slice());
+        let mat_addr = mat.as_ptr() as usize;
+        let (mat_buf, release_mat_buf) = match state
+            .wraps
+            .iter()
+            .find(|(p, l, _)| *p == mat_addr && *l == mat_bytes)
+            .map(|&(_, _, buf)| buf)
+        {
+            Some(buf) => (buf, false),
+            None => match unsafe { gpu.wrap_buffer(mat.as_mut_ptr().cast::<u8>(), mat_bytes) } {
+                Ok(buf) => {
+                    if crate::scratch::f128_range_overlaps_pin(mat_addr, mat_bytes) {
+                        state.wraps.push((mat_addr, mat_bytes, buf));
+                        (buf, false)
+                    } else {
+                        (buf, true)
+                    }
+                }
+                Err(e) => {
+                    if rec_merkle_debug() {
+                        eprintln!("[gpu-rec-l1] matrix wrap failed ({e})");
+                    }
+                    crate::scratch::give_f128(mat);
+                    return None;
+                }
+            },
+        };
+        let mut tree: Vec<Hash> = crate::alloc_uninit_vec(2 * N_LEAVES);
+        let tree_wrap_bytes = core::mem::size_of_val(tree.as_slice());
+        let tree_buf =
+            match unsafe { gpu.wrap_buffer(tree.as_mut_ptr().cast::<u8>(), tree_wrap_bytes) } {
+                Ok(buf) => buf,
+                Err(e) => {
+                    if release_mat_buf {
+                        unsafe { gpu.release(mat_buf) };
+                    }
+                    crate::scratch::give_f128(mat);
+                    if rec_merkle_debug() {
+                        eprintln!("[gpu-rec-l1] tree wrap failed ({e})");
+                    }
+                    return None;
+                }
+            };
+        let setup_ms = setup_started.elapsed().as_secs_f64() * 1e3;
+        if rec_merkle_debug() {
+            let stage_times = unsafe {
+                let pool = gpu.pool_push();
+                let measured = (|| -> Result<[f64; 4], String> {
+                    let time_stage = |encode: &mut dyn FnMut(Id)| -> Result<f64, String> {
+                        let cb = gpu.command_buffer()?;
+                        let enc = gpu.compute_encoder(cb)?;
+                        encode(enc);
+                        gpu.end_encoding(enc);
+                        gpu.commit_and_wait(cb)?;
+                        let (start, end) = cb_gpu_interval(gpu, cb);
+                        Ok((end - start) * 1e3)
+                    };
+                    let first = time_stage(&mut |enc| {
+                        gpu.set_pipeline(enc, state.pso_ntt6_8_from_message);
+                        gpu.set_buffer(enc, poly_buf, 0, 0);
+                        gpu.set_buffer(enc, mat_buf, 0, 1);
+                        gpu.set_buffer(enc, state.twiddle_buf, 0, 2);
+                        gpu.dispatch(enc, (1usize << (LOG_D - 6 - 1)) as u64, 256);
+                    })?;
+                    let mid8 = time_stage(&mut |enc| {
+                        gpu.set_pipeline(enc, state.pso_ntt5_8_l8);
+                        gpu.set_buffer(enc, mat_buf, 0, 0);
+                        gpu.set_buffer(enc, state.twiddle_buf, 0, 1);
+                        gpu.dispatch(enc, (1usize << (LOG_D - 5 - 2)) as u64, 128);
+                    })?;
+                    let final_leaf = time_stage(&mut |enc| {
+                        gpu.set_pipeline(enc, state.pso_ntt5_8_l13_leaf128);
+                        gpu.set_buffer(enc, mat_buf, 0, 0);
+                        gpu.set_buffer(enc, state.twiddle_buf, 0, 1);
+                        gpu.set_buffer(enc, tree_buf, 0, 2);
+                        gpu.dispatch(enc, (1usize << (LOG_D - 5)) as u64, 128);
+                    })?;
+                    let parents = time_stage(&mut |enc| {
+                        gpu.set_pipeline(enc, state.pso_parent);
+                        let mut read_start = LOCAL_ROOTS_START;
+                        let mut read_len = LOCAL_ROOTS;
+                        while read_len > 1 {
+                            let write_start = read_start + read_len;
+                            let n_out = read_len / 2;
+                            gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                            gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
+                            let tpg = 256u64.min(n_out as u64);
+                            gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                            read_start = write_start;
+                            read_len = n_out;
+                        }
+                    })?;
+                    Ok([first, mid8, final_leaf, parents])
+                })();
+                gpu.pool_pop(pool);
+                measured
+            };
+            match stage_times {
+                Ok([first, mid8, final_leaf, parents]) => eprintln!(
+                    "[gpu-rec-l1 stages] f6={first:.2} l8f5={mid8:.2} l13f5+leaves={final_leaf:.2} parents={parents:.2} ms"
+                ),
+                Err(e) => eprintln!("[gpu-rec-l1 stages] unavailable ({e})"),
+            }
+        }
+        let needs_prime = !state.l1_primed;
+        state.l1_primed = true;
+        let run_graph = || unsafe {
+            let pool = gpu.pool_push();
+            let run = (|| -> Result<f64, String> {
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+
+                gpu.set_pipeline(enc, state.pso_ntt6_8_from_message);
+                gpu.set_buffer(enc, poly_buf, 0, 0);
+                gpu.set_buffer(enc, mat_buf, 0, 1);
+                gpu.set_buffer(enc, state.twiddle_buf, 0, 2);
+                gpu.dispatch(enc, (1usize << (LOG_D - 6 - 1)) as u64, 256);
+
+                gpu.set_buffer(enc, mat_buf, 0, 0);
+                gpu.set_buffer(enc, state.twiddle_buf, 0, 1);
+                gpu.set_pipeline(enc, state.pso_ntt5_8_l8);
+                gpu.dispatch(enc, (1usize << (LOG_D - 5 - 2)) as u64, 128);
+                gpu.set_pipeline(enc, state.pso_ntt5_8_l13_leaf128);
+                gpu.set_buffer(enc, tree_buf, 0, 2);
+                gpu.dispatch(enc, (1usize << (LOG_D - 5)) as u64, 128);
+
+                gpu.set_pipeline(enc, state.pso_parent);
+                let mut read_start = LOCAL_ROOTS_START;
+                let mut read_len = LOCAL_ROOTS;
+                while read_len > 1 {
+                    let write_start = read_start + read_len;
+                    let n_out = read_len / 2;
+                    gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                    gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
+                    let tpg = 256u64.min(n_out as u64);
+                    gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                    read_start = write_start;
+                    read_len = n_out;
+                }
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb)?;
+                let (gpu_start, gpu_end) = cb_gpu_interval(gpu, cb);
+                Ok((gpu_end - gpu_start) * 1e3)
+            })();
+            gpu.pool_pop(pool);
+            run
+        };
+        if needs_prime && let Err(e) = run_graph() {
+            unsafe {
+                if release_mat_buf {
+                    gpu.release(mat_buf);
+                }
+                gpu.release(tree_buf);
+            }
+            crate::scratch::give_f128(mat);
+            if rec_merkle_debug() {
+                eprintln!("[gpu-rec-l1] primer failed ({e})");
+            }
+            *guard = Some(Err(format!("recursive L1 primer failed ({e})")));
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let run = run_graph();
+        let gpu_ms = match run {
+            Ok(ms) => ms,
+            Err(e) => {
+                unsafe {
+                    if release_mat_buf {
+                        gpu.release(mat_buf);
+                    }
+                    gpu.release(tree_buf);
+                }
+                crate::scratch::give_f128(mat);
+                if rec_merkle_debug() {
+                    eprintln!("[gpu-rec-l1] submit failed ({e})");
+                }
+                *guard = Some(Err(format!("recursive L1 submit failed ({e})")));
+                return None;
+            }
+        };
+        unsafe {
+            if release_mat_buf {
+                gpu.release(mat_buf);
+            }
+            gpu.release(tree_buf);
+        }
+        tree.truncate(2 * N_LEAVES - 1);
+        let wall_ms = setup_ms + started.elapsed().as_secs_f64() * 1e3;
+        if rec_merkle_debug() {
+            eprintln!(
+                "[gpu-rec-l1] GPU {gpu_ms:.2} ms, setup+submit {:.2} ms, total {wall_ms:.2} ms",
+                wall_ms - gpu_ms
+            );
+        }
+        Some((mat, tree, wall_ms))
     }
 
     pub(crate) fn gpu_recursive_merkle_blake3(data: &[u8], num_leaves: usize) -> Option<Vec<Hash>> {
@@ -12338,6 +13201,12 @@ mod imp {
         None
     }
 
+    pub(crate) fn gpu_recursive_l1_commit_copy(
+        _poly: &[F128],
+    ) -> Option<(Vec<F128>, Vec<crate::merkle::Hash>, f64)> {
+        None
+    }
+
     pub(crate) struct FromZFirstPassStream;
 
     impl FromZFirstPassStream {
@@ -13553,6 +14422,39 @@ mod tests {
             };
             assert!(super::gpu_recursive_merkle_blake3(small_bytes, n).is_none());
         }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_recursive_l1_compact_commit_matches_cpu_oracle() {
+        const LOG_D: usize = 18;
+        const LANES: usize = 8;
+        let mut rng = Rng::new(0xC01D_C0DE_18);
+        let poly = rng.vec((1usize << 16) * LANES);
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let mut cpu_mat = vec![F128::ZERO; (1usize << LOG_D) * LANES];
+        crate::pcs::commit::replicate_message_fill(&mut cpu_mat, &poly);
+        ntt.forward_transform_interleaved_from_layer(&mut cpu_mat, LANES, 2);
+        let cpu_bytes = unsafe {
+            core::slice::from_raw_parts(
+                cpu_mat.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(cpu_mat.as_slice()),
+            )
+        };
+        let cpu_tree =
+            crate::merkle::merkle_tree(cpu_bytes, 1usize << LOG_D, crate::merkle::HashKind::Blake3);
+        let Some((gpu_mat, gpu_tree, wall_ms)) = imp::gpu_recursive_l1_commit_copy(&poly) else {
+            match imp::gpu().map(|_| ()) {
+                Ok(()) => panic!("GPU available but compact L1 commitment returned None"),
+                Err(e) => {
+                    eprintln!("skipping GPU test: {e}");
+                    return;
+                }
+            }
+        };
+        assert_eq!(gpu_mat, cpu_mat, "recursive L1 GPU NTT diverged");
+        assert_eq!(gpu_tree, cpu_tree, "recursive L1 GPU tree diverged");
+        eprintln!("recursive L1 compact Metal graph: {wall_ms:.2} ms");
     }
 
     /// Occupancy-sensitivity probe for the g4 mid-pass kernel: identical
