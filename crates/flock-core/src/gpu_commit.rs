@@ -7919,6 +7919,79 @@ kernel void NAME(                                                       \
 }
 
 LC_KERNEL(lc_fold_stripes, 4)
+
+// Row-major sibling: consume the packed witness directly. Two adjacent
+// threads share each source byte (eight inner columns) with a SIMD shuffle;
+// each thread transposes one four-column nibble across eight outer rows into
+// the four byte-table indices consumed by LC_STEP.
+kernel void lc_fold_row_major(
+    device const uchar*    z8       [[buffer(0)]],
+    device const uint4*    eq       [[buffer(1)]],
+    device uint4*          partials [[buffer(2)]],
+    constant LcFoldParams& p        [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]])
+{
+    threadgroup uint4 tg_eq[4 * 8];
+    threadgroup uint4 tab[4 * 256];
+    uint chunk  = tgid / p.i_groups;
+    uint ig     = tgid - chunk * p.i_groups;
+    uint i_base = ig * 1024u;
+    uint s_lo = chunk * p.stripes_per_chunk;
+    uint s_hi = min(s_lo + p.stripes_per_chunk, p.stripe_hi);
+    uint4 a0 = uint4(0u), a1 = uint4(0u), a2 = uint4(0u), a3 = uint4(0u);
+    uint c0 = i_base + 4u * lid;
+    bool live = c0 < p.useful;
+    uint row_bytes = p.k >> 3;
+    uint byte_col = c0 >> 3;
+    uint nibble_shift = 4u * (lid & 1u);
+    ushort pair_lane = ushort(lid & 30u);
+
+    for (uint sb = s_lo; sb < s_hi; sb += 4u) {
+        uint ns = min(4u, s_hi - sb);
+        uint w[4] = { 0u, 0u, 0u, 0u };
+        for (uint t = 0u; t < ns; ++t) {
+            uint wt = 0u;
+            for (uint r = 0u; r < 8u; ++r) {
+                uint raw = 0u;
+                if (live && (lid & 1u) == 0u) {
+                    uint row = 8u * (sb + t) + r;
+                    raw = z8[row * row_bytes + byte_col];
+                }
+                raw = simd_shuffle(raw, pair_lane);
+                uint n = (raw >> nibble_shift) & 15u;
+                wt |= (n & 1u) << r;
+                wt |= (n & 2u) << (7u + r);
+                wt |= (n & 4u) << (14u + r);
+                wt |= (n & 8u) << (21u + r);
+            }
+            w[t] = wt;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < ns * 8u) { tg_eq[lid] = eq[sb * 8u + lid]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 0u; s < ns; ++s) {
+            uint4 v = uint4(0u);
+            uint mask = lid;
+            while (mask != 0u) {
+                v ^= tg_eq[s * 8u + ctz(mask)];
+                mask &= mask - 1u;
+            }
+            tab[s * 256u + lid] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (live) {
+            for (uint t = 0u; t < ns; ++t) {
+                LC_STEP(&tab[t * 256u], w[t]);
+            }
+        }
+    }
+    device uint4* out = partials + chunk * p.k + c0;
+    out[0u] = a0;
+    out[1u] = a1;
+    out[2u] = a2;
+    out[3u] = a3;
+}
 "#;
 
     /// Output partials produced by the GPU fold. Fixed so the buffer set and
@@ -7947,6 +8020,8 @@ LC_KERNEL(lc_fold_stripes, 4)
         /// to compile). Lincheck then falls back to its incumbent CPU fold;
         /// zerocheck falls back to its shipped nibble-table pipeline.
         pso_lc_fold: Id,
+        /// Direct row-major witness fold; NIL leaves that lineage on CPU.
+        pso_lc_raw_fold: Id,
         /// eq_outer upload (n_outer x 16 B).
         eq_buf: Id,
         eq_cap: usize,
@@ -8085,9 +8160,9 @@ LC_KERNEL(lc_fold_stripes, 4)
             // source; a failure here must NOT take down the shipped
             // zerocheck arm, so it degrades to NIL pipelines (the lincheck
             // launcher treats NIL as "stay on the incumbent CPU fold").
-            let pso_lc_fold = {
+            let (pso_lc_fold, pso_lc_raw_fold) = {
                 let pool = gpu.pool_push();
-                let built_lc = (|| -> Result<Id, String> {
+                let built_lc = (|| -> Result<(Id, Id), String> {
                     let src = gpu.api.nsstring(LC_FOLD_MSL_SOURCE)?;
                     let mut err: Id = NIL;
                     let library: Id = send!(
@@ -8136,23 +8211,37 @@ LC_KERNEL(lc_fold_stripes, 4)
                             Ok(pso)
                         }
                     };
-                    let out = build("lc_fold_stripes");
+                    let stripe = build("lc_fold_stripes");
+                    let raw = build("lc_fold_row_major");
                     send!(
                         gpu.api,
                         unsafe extern "C" fn(Id, Sel) -> Id,
                         library,
                         c"release"
                     );
-                    out
+                    match (stripe, raw) {
+                        (Ok(stripe), Ok(raw)) => Ok((stripe, raw)),
+                        (Ok(stripe), Err(e)) => {
+                            if super::gpu_lincheck_debug() {
+                                eprintln!("[gpu-lincheck] row-major kernel unavailable: {e}");
+                            }
+                            Ok((stripe, NIL))
+                        }
+                        (Err(e), Ok(raw)) => {
+                            gpu.release(raw);
+                            Err(e)
+                        }
+                        (Err(e), Err(_)) => Err(e),
+                    }
                 })();
                 gpu.pool_pop(pool);
                 match built_lc {
-                    Ok(pso) => pso,
+                    Ok(psos) => psos,
                     Err(e) => {
                         if super::gpu_lincheck_debug() {
                             eprintln!("[gpu-lincheck] byte-table kernel unavailable: {e}");
                         }
-                        NIL
+                        (NIL, NIL)
                     }
                 }
             };
@@ -8161,6 +8250,7 @@ LC_KERNEL(lc_fold_stripes, 4)
                 pso_fold,
                 pso_reduce,
                 pso_lc_fold,
+                pso_lc_raw_fold,
                 eq_buf: NIL,
                 eq_cap: 0,
                 part_buf: NIL,
@@ -9054,7 +9144,42 @@ LC_KERNEL(lc_fold_stripes, 4)
         if !super::gpu_zerocheck_enabled() {
             return None;
         }
-        launch_fold_prefix(FoldArm::Zc, z_packed, m, k_log, useful_bits, eq_outer)
+        launch_fold_prefix(
+            FoldArm::Zc,
+            z_packed,
+            m,
+            k_log,
+            useful_bits,
+            eq_outer,
+            false,
+        )
+    }
+
+    pub(crate) fn launch_zerocheck_c_fold_row_major(
+        z_packed: &[F128],
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+        eq_outer: &[F128],
+    ) -> Option<ZcFoldJob> {
+        if !super::gpu_zerocheck_enabled() {
+            return None;
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(z_packed),
+            )
+        };
+        launch_fold_prefix(
+            FoldArm::Zc,
+            bytes,
+            m,
+            k_log,
+            useful_bits,
+            eq_outer,
+            true,
+        )
     }
 
     /// Commit-tail fill, GPU half (see `ENV_NO_COMMIT_TAIL_FILL`): build the
@@ -9070,6 +9195,33 @@ LC_KERNEL(lc_fold_stripes, 4)
         useful_bits: usize,
         r: &[F128],
     ) -> bool {
+        stage_zerocheck_c_fold_prefix_impl(z_packed, m, k_log, useful_bits, r, false)
+    }
+
+    pub(crate) fn stage_zerocheck_c_fold_prefix_row_major(
+        z_packed: &[F128],
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+        r: &[F128],
+    ) -> bool {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(z_packed),
+            )
+        };
+        stage_zerocheck_c_fold_prefix_impl(bytes, m, k_log, useful_bits, r, true)
+    }
+
+    fn stage_zerocheck_c_fold_prefix_impl(
+        z_packed: &[u8],
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+        r: &[F128],
+        row_major: bool,
+    ) -> bool {
         if !super::gpu_zerocheck_enabled() {
             return false;
         }
@@ -9081,6 +9233,7 @@ LC_KERNEL(lc_fold_stripes, 4)
             k_log,
             useful_bits,
             eq_outer.as_slice(),
+            row_major,
         ) else {
             return false;
         };
@@ -9193,6 +9346,19 @@ LC_KERNEL(lc_fold_stripes, 4)
         Some((eq, job, submitted))
     }
 
+    pub(crate) fn adopt_staged_zc_fold_row_major(
+        z_packed: &[F128],
+        r: &[F128],
+    ) -> Option<(FoldEqTable, ZcFoldJob, std::time::Instant)> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(z_packed),
+            )
+        };
+        adopt_staged_zc_fold(bytes, r)
+    }
+
     /// Submit the GPU prefix of the LINCHECK window's witness-stripe fold —
     /// the same gather+XOR kernel over the same no-copy wrapped stripe and
     /// the same oblock claim partition as the round-one C fold, gated by
@@ -9211,7 +9377,42 @@ LC_KERNEL(lc_fold_stripes, 4)
         if !super::gpu_lincheck_enabled() {
             return None;
         }
-        launch_fold_prefix(FoldArm::Lincheck, z_packed, m, k_log, useful_bits, eq_outer)
+        launch_fold_prefix(
+            FoldArm::Lincheck,
+            z_packed,
+            m,
+            k_log,
+            useful_bits,
+            eq_outer,
+            false,
+        )
+    }
+
+    pub(crate) fn launch_lincheck_fold_row_major(
+        z_packed: &[F128],
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+        eq_outer: &[F128],
+    ) -> Option<ZcFoldJob> {
+        if !super::gpu_lincheck_enabled() {
+            return None;
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(z_packed),
+            )
+        };
+        launch_fold_prefix(
+            FoldArm::Lincheck,
+            bytes,
+            m,
+            k_log,
+            useful_bits,
+            eq_outer,
+            true,
+        )
     }
 
     fn launch_fold_prefix(
@@ -9221,9 +9422,13 @@ LC_KERNEL(lc_fold_stripes, 4)
         k_log: usize,
         useful_bits: usize,
         eq_outer: &[F128],
+        row_major: bool,
     ) -> Option<ZcFoldJob> {
         let k = 1usize << k_log;
         if !k.is_multiple_of(ZC_FOLD_COLS_PER_TG) || m <= k_log + 3 {
+            return None;
+        }
+        if z_packed.len() != (1usize << m) / 8 {
             return None;
         }
         let n_claims = crate::lincheck::oblock_claim_count(m, k_log);
@@ -9280,12 +9485,18 @@ LC_KERNEL(lc_fold_stripes, 4)
             // its exact rollback (and a byte-pipeline compile failure) keeps
             // the shipped nibble B8 route. Lincheck keeps its existing B4
             // route and stays CPU-only when that pipeline is unavailable.
-            let (pso_fold, block, kernel, byte_fold) = match arm {
-                FoldArm::Zc if super::zc_byte_fold_enabled() && !state.pso_lc_fold.is_null() => {
-                    (state.pso_lc_fold, 4, "byte-b4", true)
+            let (pso_fold, block, kernel, byte_fold) = if row_major {
+                (state.pso_lc_raw_fold, 4, "row-major-b4", true)
+            } else {
+                match arm {
+                    FoldArm::Zc
+                        if super::zc_byte_fold_enabled() && !state.pso_lc_fold.is_null() =>
+                    {
+                        (state.pso_lc_fold, 4, "byte-b4", true)
+                    }
+                    FoldArm::Zc => (state.pso_fold, 8, "nibble-b8", false),
+                    FoldArm::Lincheck => (state.pso_lc_fold, 4, "byte-b4", true),
                 }
-                FoldArm::Zc => (state.pso_fold, 8, "nibble-b8", false),
-                FoldArm::Lincheck => (state.pso_lc_fold, 4, "byte-b4", true),
             };
             if pso_fold.is_null() {
                 if arm.debug() {
@@ -12291,14 +12502,18 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{
-    ZcFoldJob, launch_lincheck_fold, launch_zerocheck_c_fold, zerocheck_gpu_submits,
+    ZcFoldJob, launch_lincheck_fold, launch_lincheck_fold_row_major, launch_zerocheck_c_fold,
+    launch_zerocheck_c_fold_row_major, zerocheck_gpu_submits,
 };
 
 /// Commit-tail fill: staged/adopted round-one C-fold prefix (see
 /// `ENV_NO_COMMIT_TAIL_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix};
+pub(crate) use imp::{
+    adopt_staged_zc_fold, adopt_staged_zc_fold_row_major, stage_zerocheck_c_fold_prefix,
+    stage_zerocheck_c_fold_prefix_row_major,
+};
 
 /// eq-direct staging for the two fold arms (see `ENV_NO_EQ_DIRECT`): the
 /// producers build eq_outer straight into the arms' persistent upload

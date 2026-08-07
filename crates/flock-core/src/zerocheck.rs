@@ -304,6 +304,12 @@ pub struct CapturedSHatVC {
     pub fold8: Option<Vec<F128>>,
 }
 
+#[derive(Clone, Copy)]
+enum CReuseInput<'a> {
+    Stripe(&'a [u8]),
+    RowMajor(&'a [F128]),
+}
+
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
 /// transform prepared while the witness commitment was being built. The
 /// original A and B buffers are still required and remain untouched for the
@@ -360,7 +366,40 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c<
         padding,
         true,
         Some(ab_inner),
-        Some(c_lincheck),
+        Some(CReuseInput::Stripe(c_lincheck)),
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce s_hat_v_c"),
+    )
+}
+
+/// Identity-C specialization that folds the PCS row-major witness directly,
+/// avoiding the full lincheck-stripe materialization.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_row_major_c<
+    C: Challenger,
+>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    c_row_major: &[F128],
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+    let (proof, claim, captured) = prove_packed_padded_inner(
+        a_packed,
+        b_packed,
+        c_packed,
+        m,
+        padding,
+        true,
+        Some(ab_inner),
+        Some(CReuseInput::RowMajor(c_row_major)),
         challenger,
     );
     (
@@ -436,6 +475,49 @@ pub fn stage_commit_tail_fill<C: Challenger>(
     }
 }
 
+pub fn stage_commit_tail_fill_row_major<C: Challenger>(
+    forked: C,
+    r1cs: &crate::r1cs::BlockR1cs,
+    commitment: &crate::pcs::Commitment,
+    c_row_major: &[F128],
+    padding: &PaddingSpec,
+) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let mut forked = forked;
+        let m = r1cs.m;
+        let k_skip = K_SKIP;
+        const N_INNER: usize = 7;
+        if m < k_skip + N_INNER {
+            return;
+        }
+        crate::proof::bind_statement(&mut forked, r1cs, commitment);
+        forked.observe_label(b"flock-zerocheck-v0");
+        let r_skip = forked.sample_f128_vec(k_skip);
+        let r_outer = forked.sample_f128_vec(m - k_skip - N_INNER);
+        let mut r = vec![F128::ZERO; m];
+        r[..k_skip].copy_from_slice(&r_skip);
+        for (i, val) in small_challenges_ghash().iter().enumerate() {
+            r[k_skip + i] = *val;
+        }
+        for (i, val) in medium_challenges_ghash().iter().enumerate() {
+            r[k_skip + 3 + i] = *val;
+        }
+        r[k_skip + N_INNER..].copy_from_slice(&r_outer);
+        univariate_skip_optimized::stage_c_prelude_for_tail_fill_row_major(
+            c_row_major,
+            m,
+            padding.k_log,
+            padding.useful_bits_per_block,
+            &r,
+        );
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (forked, r1cs, commitment, c_row_major, padding);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_packed_padded_inner<C: Challenger>(
     a_packed: &[u8],
@@ -445,7 +527,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     padding: &PaddingSpec,
     capture_s_hat_v_c: bool,
     precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
-    c_lincheck: Option<&[u8]>,
+    c_lincheck: Option<CReuseInput<'_>>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
     let k_skip = K_SKIP;
@@ -514,13 +596,26 @@ fn prove_packed_padded_inner<C: Challenger>(
             // transcript only advances after the round-one messages), so the
             // prefix runs concurrently with the AB completion AND with the
             // CPU's own share of the C fold.
-            let c_prelude = crate::zerocheck::univariate_skip_optimized::round1_c_prelude(
-                c_lincheck,
-                m,
-                padding.k_log,
-                padding.useful_bits_per_block,
-                &r,
-            );
+            let c_prelude = match c_lincheck {
+                CReuseInput::Stripe(stripe) => {
+                    crate::zerocheck::univariate_skip_optimized::round1_c_prelude(
+                        stripe,
+                        m,
+                        padding.k_log,
+                        padding.useful_bits_per_block,
+                        &r,
+                    )
+                }
+                CReuseInput::RowMajor(row_major) => {
+                    crate::zerocheck::univariate_skip_optimized::round1_c_prelude_row_major(
+                        row_major,
+                        m,
+                        padding.k_log,
+                        padding.useful_bits_per_block,
+                        &r,
+                    )
+                }
+            };
             // ZC-window GPU idle fill (`FLOCK_NO_ZC_IDLE_FILL=1` kills):
             // with the C fold's GPU prefix in flight, stage round two's
             // GPU-arm window setup behind it. Round two's eq split derives
@@ -540,7 +635,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             }
             let cpu_ab = crate::pcs::commit::commit_cpu_ms();
             let t_ab = std::time::Instant::now();
-            let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+            let recover_linear_ab = ab_inner.linear_rows_elided();
+            let mut ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
                 ab_inner,
                 m,
                 k_skip,
@@ -557,17 +653,21 @@ fn prove_packed_padded_inner<C: Challenger>(
             let cpu_c = crate::pcs::commit::commit_cpu_ms();
             let t_c = std::time::Instant::now();
             if crate::pcs::ranked_direct_fold8_enabled() {
-                let (c, s_hat_v_c, quad, fold8) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
-                        c_lincheck,
-                        m,
-                        padding.k_log,
-                        k_skip,
-                        padding.useful_bits_per_block,
-                        &r,
-                        inv_table,
-                        c_prelude,
-                    );
+                let (c, s_hat_v_c, quad, fold8, linear_ab) = match c_lincheck {
+                    CReuseInput::Stripe(stripe) => crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
+                        stripe, m, padding.k_log, k_skip, padding.useful_bits_per_block, &r,
+                        inv_table, c_prelude,
+                    ),
+                    CReuseInput::RowMajor(row_major) => crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_row_major(
+                        row_major, m, padding.k_log, k_skip, padding.useful_bits_per_block, &r,
+                        inv_table, c_prelude,
+                    ),
+                };
+                if recover_linear_ab {
+                    for (dst, src) in ab.iter_mut().zip(linear_ab) {
+                        *dst += src;
+                    }
+                }
                 if zc_timing {
                     eprintln!(
                         "[zc-timing] round1 lincheck-stripe C (fold8): {:.2} ms cpu={:.1}",
@@ -586,17 +686,21 @@ fn prove_packed_padded_inner<C: Challenger>(
                     }),
                 )
             } else {
-                let (c, s_hat_v_c, quad, fold4) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
-                        c_lincheck,
-                        m,
-                        padding.k_log,
-                        k_skip,
-                        padding.useful_bits_per_block,
-                        &r,
-                        inv_table,
-                        c_prelude,
-                    );
+                let (c, s_hat_v_c, quad, fold4, linear_ab) = match c_lincheck {
+                    CReuseInput::Stripe(stripe) => crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
+                        stripe, m, padding.k_log, k_skip, padding.useful_bits_per_block, &r,
+                        inv_table, c_prelude,
+                    ),
+                    CReuseInput::RowMajor(row_major) => crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_row_major(
+                        row_major, m, padding.k_log, k_skip, padding.useful_bits_per_block, &r,
+                        inv_table, c_prelude,
+                    ),
+                };
+                if recover_linear_ab {
+                    for (dst, src) in ab.iter_mut().zip(linear_ab) {
+                        *dst += src;
+                    }
+                }
                 if zc_timing {
                     eprintln!(
                         "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",
@@ -1482,7 +1586,7 @@ mod tests {
             &padding,
             true,
             Some(new_ab),
-            Some(&c_lincheck),
+            Some(CReuseInput::Stripe(&c_lincheck)),
             &mut new_ch,
         );
 
@@ -1578,7 +1682,7 @@ mod tests {
                 &padding,
                 true,
                 Some(new_ab),
-                Some(&c_lincheck),
+                Some(CReuseInput::Stripe(&c_lincheck)),
                 &mut new_ch,
             );
             assert!(

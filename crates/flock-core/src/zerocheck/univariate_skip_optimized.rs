@@ -559,6 +559,7 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
 /// original A and B tables after the round-1 transcript challenge is sampled.
 pub struct Round1AbInner {
     storage: Vec<F128>,
+    linear_rows_elided: bool,
 }
 
 impl Round1AbInner {
@@ -575,6 +576,11 @@ impl Round1AbInner {
     /// Resident scratch bytes retained until the challenge-weighted finish.
     pub fn len_bytes(&self) -> usize {
         self.storage.len() * core::mem::size_of::<F128>()
+    }
+
+    #[inline]
+    pub(crate) fn linear_rows_elided(&self) -> bool {
+        self.linear_rows_elided
     }
 
     /// Donate the now-dead transform to a byte-oriented scratch consumer
@@ -683,6 +689,34 @@ pub fn precompute_round1_ab_inner_packed_padded(
         padding,
         ab_pre_nt_enabled(),
         ab_compact_store_enabled(),
+        false,
+    )
+}
+
+/// Ranked BLAKE3 specialization: omit the K rows whose B polynomial is the
+/// constant one. Their exact contribution is recovered later from the
+/// already-required outer-folded identity-C column.
+pub fn precompute_round1_ab_inner_packed_padded_elide_linear(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Round1AbInner {
+    assert_eq!(m, 32, "linear-row elision is ranked-only");
+    assert_eq!(padding.k_log, 14);
+    assert_eq!(padding.useful_bits_per_block, 15_409);
+    precompute_round1_ab_inner_packed_padded_with_flavor(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        ab_compact_store_enabled(),
+        true,
     )
 }
 
@@ -699,6 +733,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     padding: &PaddingSpec,
     nt: bool,
     compact: bool,
+    linear_rows_elided: bool,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -785,6 +820,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
+                    linear_rows_elided,
                     n_chunks,
                     out_bytes,
                 );
@@ -799,6 +835,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
+                    linear_rows_elided,
                     n_chunks,
                     out_bytes,
                 );
@@ -814,11 +851,15 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 static_b_context,
                 nt,
                 compact,
+                linear_rows_elided,
                 n_chunks,
                 out_bytes,
             );
         }
-        return Round1AbInner { storage };
+        return Round1AbInner {
+            storage,
+            linear_rows_elided,
+        };
     }
 
     out_bytes
@@ -837,6 +878,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
+                    linear_rows_elided,
                     x_outer,
                     out_outer,
                     a_col,
@@ -845,7 +887,10 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
             },
         );
 
-    Round1AbInner { storage }
+    Round1AbInner {
+        storage,
+        linear_rows_elided,
+    }
 }
 
 /// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
@@ -924,6 +969,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     static_b_context: Option<kernels::StaticBContext>,
     nt: bool,
     compact: bool,
+    linear_rows_elided: bool,
     n_chunks: usize,
     out_bytes: &mut [u8],
 ) {
@@ -970,6 +1016,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     static_b_context,
                     nt,
                     compact,
+                    linear_rows_elided,
                     x_outer,
                     out_outer,
                     a_col,
@@ -995,6 +1042,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     static_b_context: Option<kernels::StaticBContext>,
     nt: bool,
     compact: bool,
+    linear_rows_elided: bool,
     x_outer: usize,
     out_outer: &mut [u8],
     a_col: &mut [F8; ELL],
@@ -1020,6 +1068,19 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     };
     let mut tmp = [0u8; 64];
     for b_med in 0..n_b_med {
+        let full_identity_row = linear_rows_elided && within_hash_outer == 0 && b_med < 2;
+        let identity_k_mask = if linear_rows_elided && within_hash_outer == 0 && b_med == 2 {
+            0x03
+        } else if linear_rows_elided && within_hash_outer == 1 && b_med + 2 == n_b_med {
+            0xf0
+        } else {
+            0
+        };
+
+        if full_identity_row {
+            continue;
+        }
+
         let dst: &mut [u8; 64] = if nt && !direct {
             &mut tmp
         } else {
@@ -1027,32 +1088,47 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 .try_into()
                 .expect("one transformed b_med block")
         };
-        shift_reduce_inner_ab::<FAST_POLICY>(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med,
-            dst,
-            a_col,
-            b_col,
-            !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
-            !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-            if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
-                0x03
-            } else if blake3_static_layout && within_hash_outer == 1 && b_med + 2 == n_b_med {
-                0xf0
-            } else {
-                0
-            },
-            if blake3_static_layout {
-                within_hash_outer
-            } else {
-                usize::MAX
-            },
-            static_b_context,
-            direct,
-        );
+        if identity_k_mask != 0 {
+            kernels::shift_reduce_inner_ab_omit_identity(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                identity_k_mask,
+                dst,
+                a_col,
+                b_col,
+                direct,
+            );
+        } else {
+            shift_reduce_inner_ab::<FAST_POLICY>(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                dst,
+                a_col,
+                b_col,
+                !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
+                !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
+                if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
+                    0x03
+                } else if blake3_static_layout && within_hash_outer == 1 && b_med + 2 == n_b_med {
+                    0xf0
+                } else {
+                    0
+                },
+                if blake3_static_layout {
+                    within_hash_outer
+                } else {
+                    usize::MAX
+                },
+                static_b_context,
+                direct,
+            );
+        }
         if nt && !direct {
             // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
             // 64 destination bytes are in-bounds of `out_outer`.
@@ -1692,6 +1768,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
     within_outer_mask: usize,
     b_med_counts: &[u8],
     ab_inner: &[u8],
+    linear_rows_elided: bool,
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
@@ -1706,13 +1783,19 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
     let t_ab = timing_cpu_ns.map(|_| std::time::Instant::now());
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
-        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
         if n_b_med == 0 {
             continue;
         }
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        kernels::accumulate_convert_ab(
+        kernels::accumulate_convert_ab_from(
             precomputed_ab_rows(ab_inner, chunk_byte_base),
+            if linear_rows_elided && within_hash_outer == 0 {
+                2
+            } else {
+                0
+            },
             n_b_med,
             convert,
             eq_lo_scaled[x_outer_lo],
@@ -1763,6 +1846,7 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let convert = convert_table();
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
+    let linear_rows_elided = ab_inner.linear_rows_elided();
 
     let mut partials = vec![[F128::ZERO; ELL]; hi_size];
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -1775,6 +1859,7 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
             within_outer_mask,
             &b_med_counts,
             ab_inner_bytes,
+            linear_rows_elided,
             &eq_lo_scaled,
             eq.hi[x_hi],
             convert,
@@ -1860,6 +1945,33 @@ pub(crate) fn stage_c_prelude_for_tail_fill(
     }
 }
 
+pub(crate) fn stage_c_prelude_for_tail_fill_row_major(
+    c_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    r: &[F128],
+) -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if !ranked_c_fold_shape(m, k_log) {
+            return false;
+        }
+        crate::gpu_commit::stage_zerocheck_c_fold_prefix_row_major(
+            c_row_major,
+            m,
+            k_log,
+            useful_bits,
+            r,
+        )
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (c_row_major, m, k_log, useful_bits, r);
+        false
+    }
+}
+
 /// The one production shape the GPU C-fold arm is tuned and gated for
 /// (`m = 32`, `k_log = 14`). Everything else takes the exact CPU path.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1930,6 +2042,57 @@ pub(crate) fn round1_c_prelude(
     }
 }
 
+pub(crate) fn round1_c_prelude_row_major(
+    c_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    r: &[F128],
+) -> Round1CPrelude {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if ranked_c_fold_shape(m, k_log) {
+            if let Some((eq_outer, job, submitted)) =
+                crate::gpu_commit::adopt_staged_zc_fold_row_major(c_row_major, r)
+            {
+                return Round1CPrelude {
+                    eq_outer,
+                    gpu: Some(job),
+                    submitted,
+                };
+            }
+        }
+        let eq_outer = if ranked_c_fold_shape(m, k_log) {
+            crate::gpu_commit::zc_fold_eq_table(&r[k_log..])
+        } else {
+            crate::gpu_commit::FoldEqTable::Owned(crate::lincheck::build_eq_table(&r[k_log..]))
+        };
+        let gpu = ranked_c_fold_shape(m, k_log)
+            .then(|| {
+                crate::gpu_commit::launch_zerocheck_c_fold_row_major(
+                    c_row_major,
+                    m,
+                    k_log,
+                    useful_bits,
+                    eq_outer.as_slice(),
+                )
+            })
+            .flatten();
+        Round1CPrelude {
+            eq_outer,
+            gpu,
+            submitted: std::time::Instant::now(),
+        }
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (c_row_major, m, useful_bits);
+        Round1CPrelude {
+            eq_outer: crate::lincheck::build_eq_table(&r[k_log..]),
+        }
+    }
+}
+
 /// Fold the lincheck stripe against `eq_outer`, draining the GPU prefix when
 /// one is in flight. Bit-identical to `partial_fold_packed_z_best` in every
 /// case: GF(2¹²⁸) add is XOR, so splitting the stripe range between the two
@@ -1993,6 +2156,82 @@ fn round1_c_inner_fold(
     )
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn round1_c_inner_fold_row_major(
+    prelude: Round1CPrelude,
+    c_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+) -> Vec<F128> {
+    let Round1CPrelude {
+        eq_outer,
+        gpu,
+        submitted,
+    } = prelude;
+    if let Some(job) = gpu {
+        let claim_lo = job.claim_lo();
+        let stripe_lo = crate::lincheck::oblock_claim_stripe_base(claim_lo);
+        let head_ms = submitted.elapsed().as_secs_f64() * 1e3;
+        let t_suffix = std::time::Instant::now();
+        let mut out = crate::lincheck::partial_fold_row_major_packed_z_range(
+            c_row_major,
+            m,
+            k_log,
+            useful_bits,
+            eq_outer.as_slice(),
+            stripe_lo,
+            usize::MAX,
+        );
+        let suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
+        match job.finish_xor_into(&mut out, head_ms, suffix_ms) {
+            Ok(()) => return out,
+            Err(e) => {
+                if crate::gpu_commit::gpu_zerocheck_debug() {
+                    eprintln!("[gpu-zc] row-major prefix failed, CPU redo: {e}");
+                }
+                let prefix = crate::lincheck::partial_fold_row_major_packed_z_range(
+                    c_row_major,
+                    m,
+                    k_log,
+                    useful_bits,
+                    eq_outer.as_slice(),
+                    0,
+                    stripe_lo,
+                );
+                for (a, b) in out.iter_mut().zip(prefix) {
+                    *a += b;
+                }
+                return out;
+            }
+        }
+    }
+    crate::lincheck::partial_fold_row_major_packed_z(
+        c_row_major,
+        m,
+        k_log,
+        useful_bits,
+        eq_outer.as_slice(),
+    )
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn round1_c_inner_fold_row_major(
+    prelude: Round1CPrelude,
+    c_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+) -> Vec<F128> {
+    crate::lincheck::partial_fold_row_major_packed_z(
+        c_row_major,
+        m,
+        k_log,
+        useful_bits,
+        &prelude.eq_outer,
+    )
+}
+
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn round1_c_inner_fold(
     prelude: Round1CPrelude,
@@ -2008,6 +2247,33 @@ fn round1_c_inner_fold(
         useful_bits,
         &prelude.eq_outer,
     )
+}
+
+/// Recover the exact round-one AB contribution of the ranked rows where the
+/// constraint has `B == 1` and therefore `A * B == A == C` as a polynomial.
+/// The large AB transform omits these rows; the already outer-folded C table
+/// contains the same values, so only a 2^14-element masked inner fold remains.
+fn linear_ab_from_c_inner(
+    c_inner: &[F128],
+    k_log: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
+    assert_eq!(k_log, 14, "ranked linear rows fix k_log=14");
+    assert_eq!(k_skip, K_SKIP);
+    assert_eq!(c_inner.len(), 1usize << k_log);
+
+    let eq_inner = build_eq(&r[k_skip..k_log]);
+    let c_s_inv = c_s_f128().inv();
+    let mut res_s = [F128::ZERO; ELL];
+    for q in (0..18).chain(236..240) {
+        let weight = c_s_inv * eq_inner[q];
+        for lane in 0..ELL {
+            res_s[lane] += weight * c_inner[q * ELL + lane];
+        }
+    }
+    ntt_extend_f128_vec_ghash(&res_s, inv_table)
 }
 
 /// Derive the exact legacy C round-one message and its existing RingSwitch
@@ -2026,7 +2292,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
     prelude: Round1CPrelude,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     assert_eq!(k_skip, K_SKIP);
     assert!(
         k_log >= k_skip + 5,
@@ -2036,6 +2302,37 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
+    finish_round1_c_fold4(c_inner, k_log, k_skip, r, inv_table)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn round1_c_fold4_from_row_major(
+    c_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    prelude: Round1CPrelude,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    assert_eq!(k_skip, K_SKIP);
+    assert!(k_log >= k_skip + 5);
+    assert_eq!(r.len(), m);
+    assert_eq!(c_row_major.len(), (1usize << m) / 128);
+    let c_inner =
+        round1_c_inner_fold_row_major(prelude, c_row_major, m, k_log, useful_bits);
+    finish_round1_c_fold4(c_inner, k_log, k_skip, r, inv_table)
+}
+
+fn finish_round1_c_fold4(
+    c_inner: Vec<F128>,
+    k_log: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    let identity_ab = linear_ab_from_c_inner(&c_inner, k_log, k_skip, r, inv_table);
     let inner_tail = &r[k_skip + 1..k_log];
     let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold4(&fold4, &inner_tail[..4]);
@@ -2067,7 +2364,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
         res_c_s[lane] = c_s_inv * naive;
     }
     let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (round1_c_opt, s_hat_v_c, quad, fold4)
+    (round1_c_opt, s_hat_v_c, quad, fold4, identity_ab)
 }
 
 /// Fold8 sibling of [`round1_c_fold4_from_lincheck_stripe`]: same single
@@ -2086,7 +2383,7 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
     prelude: Round1CPrelude,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     assert_eq!(k_skip, K_SKIP);
     assert!(
         k_log >= k_skip + 7,
@@ -2096,6 +2393,37 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
+    finish_round1_c_fold8(c_inner, k_log, k_skip, r, inv_table)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn round1_c_fold8_from_row_major(
+    c_row_major: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+    prelude: Round1CPrelude,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    assert_eq!(k_skip, K_SKIP);
+    assert!(k_log >= k_skip + 7);
+    assert_eq!(r.len(), m);
+    assert_eq!(c_row_major.len(), (1usize << m) / 128);
+    let c_inner =
+        round1_c_inner_fold_row_major(prelude, c_row_major, m, k_log, useful_bits);
+    finish_round1_c_fold8(c_inner, k_log, k_skip, r, inv_table)
+}
+
+fn finish_round1_c_fold8(
+    c_inner: Vec<F128>,
+    k_log: usize,
+    k_skip: usize,
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    let identity_ab = linear_ab_from_c_inner(&c_inner, k_log, k_skip, r, inv_table);
     let inner_tail = &r[k_skip + 1..k_log];
     let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &inner_tail[..6]);
@@ -2127,7 +2455,7 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
         res_c_s[lane] = c_s_inv * naive;
     }
     let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (round1_c_opt, s_hat_v_c, quad, fold8)
+    (round1_c_opt, s_hat_v_c, quad, fold8, identity_ab)
 }
 
 /// Pair-fused C job with the original 32-bank accumulator and one job per
@@ -2995,6 +3323,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
                     within_outer_mask,
                     &b_med_counts,
                     ab_inner_bytes,
+                    ab_inner.linear_rows_elided(),
                     &eq_lo_scaled,
                     eq_hi[x_hi],
                     convert,
@@ -3069,6 +3398,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
                 within_outer_mask,
                 &b_med_counts,
                 ab_inner_bytes,
+                ab_inner.linear_rows_elided(),
                 &eq_lo_scaled,
                 eq_hi[x_hi],
                 convert,
@@ -3466,6 +3796,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             0,
             &mut cached,
             &mut cached_a_col,
@@ -3484,6 +3815,7 @@ mod tests {
             false,
             None,
             true,
+            false,
             false,
             0,
             &mut direct,
@@ -3834,10 +4166,10 @@ mod tests {
             // both flavors with `compact = false` so the dead tail is zeroed
             // deterministically and the full-buffer comparison stays valid.
             let plain = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, false, false,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, false, false, false,
             );
             let nt = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, true, false,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, true, false, false,
             );
             assert_eq!(
                 plain.as_bytes(),
@@ -3889,10 +4221,10 @@ mod tests {
             let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
             for nt in [false, true] {
                 let filled = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, false,
+                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, false, false,
                 );
                 let compact = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
+                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true, false,
                 );
                 let filled = filled.as_bytes();
                 let compact = compact.as_bytes();
@@ -3944,14 +4276,14 @@ mod tests {
         // exercises the shipped QS3 path (dead tail rows never stored).
         for nt in [false, true] {
             let _ = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true, false,
             );
         }
         for rep in 0..4 {
             for nt in [rep % 2 == 1, rep % 2 == 0] {
                 let t0 = std::time::Instant::now();
                 let out = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
+                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true, false,
                 );
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
                 println!("rep={rep} nt={nt}: {ms:.2} ms");
@@ -5774,40 +6106,82 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn ranked_linear_ab_elision_matches_full_transform() {
+        const M: usize = 17;
+        const K_LOG: usize = 14;
+        let padding = PaddingSpec {
+            k_log: K_LOG,
+            useful_bits_per_block: 15_409,
+        };
+        let mut rng = Rng::new(0x1D3E_71A1_u64);
+        let total_bits = 1usize << M;
+        let mut a = rng.bits(total_bits);
+        let mut b = rng.bits(total_bits);
+        let mut c = rng.bits(total_bits);
+
+        for block in 0..(total_bits >> K_LOG) {
+            let base = block << K_LOG;
+            for bit in padding.useful_bits_per_block..(1usize << K_LOG) {
+                a[base + bit] = false;
+                b[base + bit] = false;
+                c[base + bit] = false;
+            }
+            for bit in (0..1_152).chain(15_104..15_360) {
+                b[base + bit] = true;
+                c[base + bit] = a[base + bit];
+            }
+        }
+
+        let a = pack_bits(&a);
+        let b = pack_bits(&b);
+        let c = pack_bits(&c);
+        let outer = rng.f128_vec(M - K_SKIP - N_INNER);
+        let r = build_protocol_r(M, &outer);
+        let inv_table = make_inv_table();
+
+        let full = precompute_round1_ab_inner_packed_padded_with_flavor(
+            &a, &b, M, K_SKIP, &inv_table, &padding, false, false, false,
+        );
+        let elided = precompute_round1_ab_inner_packed_padded_with_flavor(
+            &a, &b, M, K_SKIP, &inv_table, &padding, false, false, true,
+        );
+        let full_ab = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &full, M, K_SKIP, &r, &padding,
+        );
+        let mut recovered_ab = round1_shift_reduce_ab_packed_padded_with_precomputed(
+            &elided, M, K_SKIP, &r, &padding,
+        );
+
+        let c_words: Vec<F128> = c
+            .chunks_exact(16)
+            .map(|bytes| F128 {
+                lo: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+            })
+            .collect();
+        let c_lincheck = crate::lincheck::pack_z_lincheck_from_packed(&c_words, M, K_LOG);
+        let linear_ab = round1_c_fold4_from_lincheck_stripe(
+            &c_lincheck,
+            M,
+            K_LOG,
+            K_SKIP,
+            padding.useful_bits_per_block,
+            &r,
+            &inv_table,
+            round1_c_prelude(
+                &c_lincheck,
+                M,
+                K_LOG,
+                padding.useful_bits_per_block,
+                &r,
+            ),
+        )
+        .4;
+        for (dst, src) in recovered_ab.iter_mut().zip(linear_ab) {
+            *dst += src;
+        }
+        assert_eq!(recovered_ab, full_ab);
+    }
 }
-// r495 archive identity: preserve scalar fallback semantics while forcing a distinct candidate archive.
-
-// Competition candidate r497-20260806T021939Z: preserve kernel semantics while forcing a distinct editable archive.
-
-// Competition candidate r501: terminal-slot-release archive identity; preserve scalar fallback semantics.
-
-// r505: retain the specialized skip-optimized path as an explicit benchmark candidate.
-
-// r506: archive identity marker; no runtime effect.
-
-// Submission archive nonce r507: semantics-neutral; forces a distinct packaged candidate.
-
-// Competition archive nonce r511: 1785983977508655435
-
-// Competition archive nonce r512: 1785984029943258358
-
-// chewy archive nonce r514 20260806T024159Z
-
-// Submission archive nonce r538: 20260806T030901Z.
-// chewy-cadence: r553 source-distinct submission candidate
-
-// chewy-cadence: r555 1785988171001930925
-
-// chewy-cadence: r557 1785988378687326387
-
-// chewy-cadence: r558 1785988571742870116
-
-// chewy-cadence: r560 20260806T040229Z
-
-// r561 archive-distinct hot-line marker: 20260806T040426Z
-
-// r562 archive-distinct hot-line marker: 20260806T040635Z
-
-// chewy-cadence: r578 20260806T044834Z
-
-// chewy-cadence: r582 20260806T045819Z

@@ -147,6 +147,7 @@ pub(crate) unsafe fn accumulate_convert(
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab(
     chunk_ab_bytes: &[[u8; 64]; 16],
+    start_b_med: usize,
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
@@ -154,7 +155,8 @@ pub(crate) unsafe fn accumulate_convert_ab(
 ) {
     use core::arch::aarch64::*;
 
-    debug_assert!(n_b_med <= 16);
+    debug_assert!(start_b_med <= n_b_med && n_b_med <= 16);
+    debug_assert!(start_b_med.is_multiple_of(2));
     debug_assert_eq!(convert.len(), 16 * 256);
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
@@ -163,7 +165,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
     // 16 convert blocks.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        let n_pairs = n_b_med / 2;
+        let n_pairs = (n_b_med - start_b_med) / 2;
         for lane in (0..64).step_by(8) {
             // 8 live accumulator q-registers (8 lanes × 1 bank); the removed
             // C side leaves room for the gather temporaries.
@@ -177,7 +179,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
             let mut ab7 = vdupq_n_u8(0);
 
             for p in 0..n_pairs {
-                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let (b_even, b_odd) = (start_b_med + 2 * p, start_b_med + 2 * p + 1);
                 let t_even = convert_ptr.add(b_even * 256 * 16);
                 let t_odd = convert_ptr.add(b_odd * 256 * 16);
 
@@ -231,7 +233,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
             }
 
             // Odd trailing b_med: unpaired fallback.
-            if n_b_med & 1 == 1 {
+            if (n_b_med - start_b_med) & 1 == 1 {
                 let b_med = n_b_med - 1;
                 let table = convert_ptr.add(b_med * 256 * 16);
                 let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u64).read_unaligned()
@@ -1780,6 +1782,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
     const ONE_MASK: u8,
     const STATIC_A: bool,
     const A_LOW5_K: u8,
+    const OMIT_MASK: u8,
 >(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -1812,6 +1815,9 @@ fn shift_reduce_inner_mixed_const_b_h4<
 
         macro_rules! products {
             ($at:expr, $at_sw:expr, $k:literal) => {{
+                if OMIT_MASK & (1 << $k) != 0 {
+                    [vdupq_n_u16(0); 8]
+                } else {
                 let (da0, da1, da2, da3) = if STATIC_A && $k == 1 {
                     let p = a_k1_partial.unwrap_unchecked().as_ptr();
                     (
@@ -1845,7 +1851,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
                     ));
                     apply_word_into_4_regs($at, $at_sw, aw)
                 };
-                if ONE_MASK & (1 << $k) != 0 {
+                let product = if ONE_MASK & (1 << $k) != 0 {
                     [
                         widen_lo(da0),
                         widen_hi(da0),
@@ -1871,6 +1877,8 @@ fn shift_reduce_inner_mixed_const_b_h4<
                         pmull_lo_u16(da3, db3),
                         pmull_hi_u16(da3, db3),
                     ]
+                };
+                product
                 }
             }};
         }
@@ -1905,6 +1913,44 @@ fn shift_reduce_inner_mixed_const_b_h4<
         let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
 
         store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
+    }
+}
+
+/// Produce only the nonlinear remainder of a mixed row. The omitted K rows
+/// are fixed to `B == 1` by the ranked BLAKE3 circuit and are recovered from
+/// the outer-folded C column.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn shift_reduce_inner_ab_omit_identity(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    omit_mask: u8,
+    out: &mut [u8; 64],
+    nt_store: bool,
+) {
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    match omit_mask {
+        0x03 => shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0, 0x03>(
+            a_packed,
+            b_packed,
+            inv_table,
+            byte_base_b,
+            None,
+            out,
+            nt_store,
+        ),
+        0xf0 => shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, 0xf0>(
+            a_packed,
+            b_packed,
+            inv_table,
+            byte_base_b,
+            None,
+            out,
+            nt_store,
+        ),
+        _ => unreachable!("ranked identity-row mask must be 0x03 or 0xf0"),
     }
 }
 
@@ -2967,7 +3013,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     )
                 });
                 if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
-                    shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03>(
+                    shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, 0>(
                         a_packed,
                         b_packed,
                         inv_table,
@@ -2986,7 +3032,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                                 static_a_k1_partial(inv_table)
                             }
                         };
-                        shift_reduce_inner_mixed_const_b_h4::<0x03, true, 0>(
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, true, 0, 0>(
                             a_packed,
                             b_packed,
                             inv_table,
@@ -2996,7 +3042,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                             nt_store,
                         );
                     } else {
-                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0>(
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0, 0>(
                             a_packed,
                             b_packed,
                             inv_table,
@@ -3021,7 +3067,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         }
         0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
             if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0>(
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, 0>(
                     a_packed,
                     b_packed,
                     inv_table,

@@ -930,6 +930,75 @@ fn partial_fold_packed_z_best_gpu_split(
     partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, eq_outer)
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn partial_fold_row_major_packed_z_best_gpu_split(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    let gpu = ranked_lincheck_fold_gpu_shape(m, k_log)
+        .then(|| {
+            crate::gpu_commit::launch_lincheck_fold_row_major(
+                z_packed,
+                m,
+                k_log,
+                useful_bits,
+                eq_outer,
+            )
+        })
+        .flatten();
+    if let Some(job) = gpu {
+        let claim_lo = job.claim_lo();
+        let stripe_lo = oblock_claim_stripe_base(claim_lo);
+        let t_suffix = std::time::Instant::now();
+        let mut out = partial_fold_row_major_packed_z_range(
+            z_packed,
+            m,
+            k_log,
+            useful_bits,
+            eq_outer,
+            stripe_lo,
+            usize::MAX,
+        );
+        let suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
+        match job.finish_xor_into(&mut out, 0.0, suffix_ms) {
+            Ok(()) => return out,
+            Err(e) => {
+                if crate::gpu_commit::gpu_lincheck_debug() {
+                    eprintln!("[gpu-lincheck] row-major prefix failed, CPU redo: {e}");
+                }
+                let prefix = partial_fold_row_major_packed_z_range(
+                    z_packed,
+                    m,
+                    k_log,
+                    useful_bits,
+                    eq_outer,
+                    0,
+                    stripe_lo,
+                );
+                for (a, b) in out.iter_mut().zip(prefix) {
+                    *a += b;
+                }
+                return out;
+            }
+        }
+    }
+    partial_fold_row_major_packed_z(z_packed, m, k_log, useful_bits, eq_outer)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn partial_fold_row_major_packed_z_best_gpu_split(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    partial_fold_row_major_packed_z(z_packed, m, k_log, useful_bits, eq_outer)
+}
+
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn partial_fold_packed_z_best_gpu_split(
     z_packed: &[u8],
@@ -1060,6 +1129,126 @@ pub fn pack_z_lincheck_from_packed(
         }
     });
     z_packed
+}
+
+/// Fold a row-major, polynomial-basis packed witness directly over its outer
+/// coordinate, without materializing the byte-transposed lincheck stripe.
+///
+/// `z_packed_f128` stores consecutive length-`k` bit rows. Eight adjacent
+/// rows are transposed one 64-bit word at a time, and each resulting byte is
+/// consumed immediately by the same 256-entry subset-sum table used by the
+/// stripe fold. The returned vector is therefore bit-identical to
+/// `partial_fold_packed_z_best(pack_z_lincheck_from_packed(z), ...)`.
+pub(crate) fn partial_fold_row_major_packed_z_range(
+    z_packed_f128: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+    stripe_lo: usize,
+    stripe_hi: usize,
+) -> Vec<F128> {
+    let k = 1usize << k_log;
+    let n_total = 1usize << m;
+    let n_outer = 1usize << (m - k_log);
+    assert!(k_log >= 7, "packed rows must contain whole F128 words");
+    assert_eq!(z_packed_f128.len(), n_total / 128);
+    assert_eq!(eq_outer.len(), n_outer);
+    assert!(useful_bits <= k);
+    assert_eq!(n_outer % 8, 0, "need at least one eight-row stripe");
+
+    let n_stripes = n_outer / 8;
+    let stripe_lo = stripe_lo.min(n_stripes);
+    let stripe_hi = stripe_hi.min(n_stripes).max(stripe_lo);
+    let useful_words = useful_bits.div_ceil(64);
+    let u64_per_row = k / 64;
+    // Match the incumbent oblock grain: bounded partial count and one
+    // length-k private accumulator per claim.
+    const STRIPES_PER_CLAIM: usize = 512;
+    let n_claims = (stripe_hi - stripe_lo).div_ceil(STRIPES_PER_CLAIM);
+    if n_claims == 0 {
+        return vec![F128::ZERO; k];
+    }
+
+    // SAFETY: F128 is repr(C) as two little-endian u64 halves.
+    let z_u64: &[u64] = unsafe {
+        std::slice::from_raw_parts(z_packed_f128.as_ptr().cast::<u64>(), z_packed_f128.len() * 2)
+    };
+    let mut partials = crate::alloc_uninit_f128_vec(n_claims * k);
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(n_claims, |claim| {
+        let lo = stripe_lo + claim * STRIPES_PER_CLAIM;
+        let hi = (lo + STRIPES_PER_CLAIM).min(stripe_hi);
+        // SAFETY: every claim owns one disjoint partial and initializes it
+        // fully before reading or publishing it.
+        let out = unsafe {
+            std::slice::from_raw_parts_mut(partials_base.ptr().add(claim * k), k)
+        };
+        unsafe { std::ptr::write_bytes(out.as_mut_ptr(), 0, k) };
+        const TILE: usize = 8;
+        let mut tables = vec![F128::ZERO; TILE * 256];
+        let mut columns = [[0u8; 64]; TILE];
+        for stripe_base in (lo..hi).step_by(TILE) {
+            let n_tile = (hi - stripe_base).min(TILE);
+            for t in 0..n_tile {
+                let stripe = stripe_base + t;
+                build_sum_table(
+                    &eq_outer[8 * stripe..8 * stripe + 8],
+                    &mut tables[t * 256..(t + 1) * 256],
+                );
+            }
+            for word in 0..useful_words {
+                for t in 0..n_tile {
+                    let first_row = (stripe_base + t) * 8;
+                    let lanes: [u64; 8] = std::array::from_fn(|row| {
+                        z_u64[(first_row + row) * u64_per_row + word]
+                    });
+                    crate::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut columns[t]);
+                }
+                let col_base = word * 64;
+                let live = (useful_bits - col_base).min(64);
+                for col in 0..live {
+                    let mut value = out[col_base + col];
+                    for t in 0..n_tile {
+                        value += tables[t * 256 + columns[t][col] as usize];
+                    }
+                    out[col_base + col] = value;
+                }
+            }
+        }
+    });
+
+    use rayon::prelude::*;
+    let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
+    let mut out = vec![F128::ZERO; k];
+    out.par_chunks_mut(band).enumerate().for_each(|(band_index, dst)| {
+        let lo = band_index * band;
+        for claim in 0..n_claims {
+            let src = &partials[claim * k + lo..claim * k + lo + dst.len()];
+            for (d, s) in dst.iter_mut().zip(src) {
+                *d += *s;
+            }
+        }
+    });
+    out
+}
+
+pub(crate) fn partial_fold_row_major_packed_z(
+    z_packed_f128: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    partial_fold_row_major_packed_z_range(
+        z_packed_f128,
+        m,
+        k_log,
+        useful_bits,
+        eq_outer,
+        0,
+        usize::MAX,
+    )
 }
 
 /// Build the **quirky eq table** for a claim point on the inner half:
@@ -1330,6 +1519,12 @@ fn sumcheck_bind_both_and_eval_next(
 // API
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
+enum LincheckWitness<'a> {
+    Stripe(&'a [u8]),
+    RowMajor(&'a [F128]),
+}
+
 /// Prove the lincheck statement for the block-diagonal R1CS instance
 /// `A = I_{2^n_log} ⊗ a_0`, `B = I ⊗ b_0`, `C = I ⊗ c_0`.
 ///
@@ -1378,7 +1573,7 @@ pub fn prove_padded<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
     let (proof, claim, _) = prove_padded_inner(
-        z_packed,
+        LincheckWitness::Stripe(z_packed),
         m,
         k_log,
         k_skip,
@@ -1411,7 +1606,37 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_padded_inner(
-        z_packed,
+        LincheckWitness::Stripe(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        true,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("capture=true must produce z_vec"),
+    )
+}
+
+/// Row-major sibling of [`prove_padded_capture_z_vec`]. It consumes the PCS
+/// witness packing directly and never constructs the 512 MiB lincheck stripe.
+pub fn prove_padded_capture_z_vec_row_major<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        LincheckWitness::RowMajor(z_packed),
         m,
         k_log,
         k_skip,
@@ -1430,7 +1655,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
 
 #[allow(clippy::too_many_arguments)]
 fn prove_padded_inner<Ch: Challenger>(
-    z_packed: &[u8],
+    z_packed: LincheckWitness<'_>,
     m: usize,
     k_log: usize,
     k_skip: usize,
@@ -1508,13 +1733,24 @@ fn prove_padded_inner<Ch: Challenger>(
             None
         };
         let eq_x_outer = build_z_fold_eq_table(m, k_log, &x_ab.x_outer);
-        let z_vec = partial_fold_packed_z_best_gpu_split(
-            z_packed,
-            m,
-            k_log,
-            useful_bits,
-            eq_x_outer.as_slice(),
-        );
+        let z_vec = match z_packed {
+            LincheckWitness::Stripe(stripe) => partial_fold_packed_z_best_gpu_split(
+                stripe,
+                m,
+                k_log,
+                useful_bits,
+                eq_x_outer.as_slice(),
+            ),
+            LincheckWitness::RowMajor(row_major) => {
+                partial_fold_row_major_packed_z_best_gpu_split(
+                    row_major,
+                    m,
+                    k_log,
+                    useful_bits,
+                    eq_x_outer.as_slice(),
+                )
+            }
+        };
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",
@@ -2051,6 +2287,61 @@ mod tests {
             let serial = partial_fold_packed_z(&z_packed, m, k_log, &eq);
             let fast = partial_fold_packed_z_fast(&z_packed, m, k_log, &eq);
             assert_eq!(serial, fast, "at m={m}, k_log={k_log}");
+        }
+    }
+
+    #[test]
+    fn row_major_direct_fold_matches_materialized_stripe() {
+        for &(m, k_log, useful_bits) in &[
+            (14usize, 7usize, 113usize),
+            (17, 8, 201),
+            (20, 10, 997),
+        ] {
+            let mut rng = Rng::new(0xD1CE_7F00 + m as u64);
+            let mut z = rng.bits(1 << m);
+            let k = 1usize << k_log;
+            for (index, bit) in z.iter_mut().enumerate() {
+                if index % k >= useful_bits {
+                    *bit = false;
+                }
+            }
+            let row_major = crate::pcs::pack::pack_witness(&z, m);
+            let stripe = pack_z_lincheck_from_packed(&row_major, m, k_log);
+            let eq = build_eq_table(&rng.f128_vec(m - k_log));
+            let want = partial_fold_packed_z_best(&stripe, m, k_log, useful_bits, &eq);
+            let got = partial_fold_row_major_packed_z(
+                &row_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+            );
+            assert_eq!(got, want, "full direct fold at m={m}, k_log={k_log}");
+
+            let n_stripes = (1usize << (m - k_log)) / 8;
+            let split = n_stripes / 3;
+            let mut union = partial_fold_row_major_packed_z_range(
+                &row_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+                0,
+                split,
+            );
+            let suffix = partial_fold_row_major_packed_z_range(
+                &row_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+                split,
+                usize::MAX,
+            );
+            for (a, b) in union.iter_mut().zip(suffix) {
+                *a += b;
+            }
+            assert_eq!(union, want, "partitioned direct fold at m={m}, k_log={k_log}");
         }
     }
 

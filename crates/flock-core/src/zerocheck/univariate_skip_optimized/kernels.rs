@@ -225,6 +225,51 @@ pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(super) fn shift_reduce_inner_ab_omit_identity(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    omit_mask: u8,
+    out: &mut [u8; 64],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+    nt_store: bool,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = (a_col, b_col);
+        aarch64::shift_reduce_inner_ab_omit_identity(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            omit_mask,
+            out,
+            nt_store,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = nt_store;
+        portable::shift_reduce_inner_ab_omit_scalar(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            omit_mask,
+            out,
+            a_col,
+            b_col,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn accumulate_convert(
     chunk_ab_bytes: &[[u8; 64]; 16],
@@ -479,11 +524,37 @@ pub(super) fn accumulate_convert_ab(
     eq_lo_val: super::F128,
     partial_ab: &mut [super::F128; 64],
 ) {
+    accumulate_convert_ab_from(
+        chunk_ab_bytes,
+        0,
+        n_b_med,
+        convert,
+        eq_lo_val,
+        partial_ab,
+    );
+}
+
+#[inline]
+pub(super) fn accumulate_convert_ab_from(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    start_b_med: usize,
+    n_b_med: usize,
+    convert: &[super::F128],
+    eq_lo_val: super::F128,
+    partial_ab: &mut [super::F128; 64],
+) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
     // every table-selected load.
     unsafe {
-        aarch64::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
+        aarch64::accumulate_convert_ab(
+            chunk_ab_bytes,
+            start_b_med,
+            n_b_med,
+            convert,
+            eq_lo_val,
+            partial_ab,
+        );
     }
 
     #[cfg(all(
@@ -494,13 +565,24 @@ pub(super) fn accumulate_convert_ab(
     // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
     // cover every four-lane load/store.
     unsafe {
-        x86_64::accumulate_convert_ab_x86_avx512(
-            chunk_ab_bytes,
-            n_b_med,
-            convert,
-            eq_lo_val,
-            partial_ab,
-        );
+        if start_b_med == 0 {
+            x86_64::accumulate_convert_ab_x86_avx512(
+                chunk_ab_bytes,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                partial_ab,
+            );
+        } else {
+            portable::accumulate_convert_ab_from(
+                chunk_ab_bytes,
+                start_b_med,
+                n_b_med,
+                convert,
+                eq_lo_val,
+                partial_ab,
+            );
+        }
     }
 
     #[cfg(not(any(
@@ -511,7 +593,14 @@ pub(super) fn accumulate_convert_ab(
             target_feature = "vpclmulqdq"
         )
     )))]
-    portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
+    portable::accumulate_convert_ab_from(
+        chunk_ab_bytes,
+        start_b_med,
+        n_b_med,
+        convert,
+        eq_lo_val,
+        partial_ab,
+    );
 }
 
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64

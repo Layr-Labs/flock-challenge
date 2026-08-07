@@ -51,6 +51,40 @@ pub(in super::super) fn shift_reduce_inner_ab_scalar(
     }
 }
 
+/// Scalar oracle for the ranked linear-row elision. Rows selected by
+/// `omit_mask` have `B == 1` and are recovered from the separately folded C
+/// column, so their contribution is intentionally absent here.
+#[allow(clippy::too_many_arguments)]
+pub(in super::super) fn shift_reduce_inner_ab_omit_scalar(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    omit_mask: u8,
+    out: &mut [u8; 64],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+) {
+    let mut acc = [0u16; 64];
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    for k in 0..8 {
+        if omit_mask & (1 << k) != 0 {
+            continue;
+        }
+        let chunk_off = byte_base_b + k * N_CHUNKS;
+        inv_table.apply(&a_packed[chunk_off..chunk_off + N_CHUNKS], a_col);
+        inv_table.apply(&b_packed[chunk_off..chunk_off + N_CHUNKS], b_col);
+        for lane in 0..64 {
+            let y = (a_col[lane] * b_col[lane]).0 as u16;
+            acc[lane] ^= y << k;
+        }
+    }
+    for lane in 0..64 {
+        out[lane] = gf8_reduce(acc[lane]);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(not(target_arch = "aarch64"))]
 pub(super) fn accumulate_convert(
@@ -93,9 +127,28 @@ pub(super) fn accumulate_convert_ab(
     eq_lo_val: F128,
     partial_ab: &mut [F128; 64],
 ) {
+    accumulate_convert_ab_from(
+        chunk_ab_bytes,
+        0,
+        n_b_med,
+        convert,
+        eq_lo_val,
+        partial_ab,
+    );
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn accumulate_convert_ab_from(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    start_b_med: usize,
+    n_b_med: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; 64],
+) {
     for lane in 0..64 {
         let mut converted_ab = F128::ZERO;
-        for b_med in 0..n_b_med {
+        for b_med in start_b_med..n_b_med {
             converted_ab += convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
         }
         partial_ab[lane] += converted_ab * eq_lo_val;
