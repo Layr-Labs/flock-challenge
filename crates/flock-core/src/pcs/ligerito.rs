@@ -12851,3 +12851,10 @@ mod tests {
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
 // RealAdii next sample on eda4129 (marker 23601).
+
+// r810 draw: draw #3 (last) of the r807-note standing cap (r808..r810).
+// r809 verdict (647a4e2, commit a994f58) still validating at 06:10Z, 5+h
+// after submission — within the observed verdict latency envelope (r802 took
+// ~6h); if it lands rejected in any band, r810 is the cap's final
+// pre-authorized draw before the 11-draw re-evaluation gate. Comment-only;
+// semantics unchanged.
