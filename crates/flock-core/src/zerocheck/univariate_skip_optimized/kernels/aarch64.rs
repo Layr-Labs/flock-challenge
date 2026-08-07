@@ -152,10 +152,28 @@ pub(crate) unsafe fn accumulate_convert_ab(
     eq_lo_val: F128,
     partial_ab: &mut [F128; 64],
 ) {
-    use core::arch::aarch64::*;
-
     debug_assert!(n_b_med <= 16);
     debug_assert_eq!(convert.len(), 16 * 256);
+
+    // Full windows dominate the ranked workload. Give that shape a const
+    // trip count so LLVM can remove the pair-count and odd-tail control flow;
+    // padded boundary windows retain the exact runtime-count implementation.
+    if n_b_med == 16 {
+        accumulate_convert_ab_impl::<true>(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
+    } else {
+        accumulate_convert_ab_impl::<false>(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
+    }
+}
+
+#[inline(always)]
+unsafe fn accumulate_convert_ab_impl<const FULL_B_MED: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    eq_lo_val: F128,
+    partial_ab: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     // Every table offset below is a `u8` index scaled by the 16-byte row size,
@@ -163,10 +181,12 @@ pub(crate) unsafe fn accumulate_convert_ab(
     // 16 convert blocks.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        let n_pairs = n_b_med / 2;
+        let n_pairs = if FULL_B_MED { 8 } else { n_b_med / 2 };
         for lane in (0..64).step_by(8) {
-            // 8 live accumulator q-registers (8 lanes × 1 bank); the removed
-            // C side leaves room for the gather temporaries.
+            // The paired convert tables are contiguous. Keep a cursor over
+            // the two-table spans instead of rebuilding scaled offsets from
+            // the pair index in every hot-loop iteration.
+            let mut pair_tables = convert_ptr;
             let mut ab0 = vdupq_n_u8(0);
             let mut ab1 = vdupq_n_u8(0);
             let mut ab2 = vdupq_n_u8(0);
@@ -175,66 +195,95 @@ pub(crate) unsafe fn accumulate_convert_ab(
             let mut ab5 = vdupq_n_u8(0);
             let mut ab6 = vdupq_n_u8(0);
             let mut ab7 = vdupq_n_u8(0);
+            // The input rows are contiguous just like the paired table
+            // blocks. Walk them with a cursor too, so the hot pair loop does
+            // not rebuild `2 * pair` and perform two indexed row lookups.
+            let mut row_pair = chunk_ab_bytes.as_ptr();
 
-            for p in 0..n_pairs {
-                let (b_even, b_odd) = (2 * p, 2 * p + 1);
-                let t_even = convert_ptr.add(b_even * 256 * 16);
-                let t_odd = convert_ptr.add(b_odd * 256 * 16);
+            // Process two b_med pairs per control iteration. The gather body
+            // remains identical, but the hot loop performs one counter
+            // comparison/branch for two paired table traversals.
+            macro_rules! accumulate_pair {
+                ($t_even:expr, $t_odd:expr, $we:expr, $wo:expr) => {{
+                    ab0 = xor3_u8(
+                        ab0,
+                        vld1q_u8($t_even.add(($we & 0xff) * 16)),
+                        vld1q_u8($t_odd.add(($wo & 0xff) * 16)),
+                    );
+                    ab1 = xor3_u8(
+                        ab1,
+                        vld1q_u8($t_even.add((($we >> 8) & 0xff) * 16)),
+                        vld1q_u8($t_odd.add((($wo >> 8) & 0xff) * 16)),
+                    );
+                    ab2 = xor3_u8(
+                        ab2,
+                        vld1q_u8($t_even.add((($we >> 16) & 0xff) * 16)),
+                        vld1q_u8($t_odd.add((($wo >> 16) & 0xff) * 16)),
+                    );
+                    ab3 = xor3_u8(
+                        ab3,
+                        vld1q_u8($t_even.add((($we >> 24) & 0xff) * 16)),
+                        vld1q_u8($t_odd.add((($wo >> 24) & 0xff) * 16)),
+                    );
+                    ab4 = xor3_u8(
+                        ab4,
+                        vld1q_u8($t_even.add((($we >> 32) & 0xff) * 16)),
+                        vld1q_u8($t_odd.add((($wo >> 32) & 0xff) * 16)),
+                    );
+                    ab5 = xor3_u8(
+                        ab5,
+                        vld1q_u8($t_even.add((($we >> 40) & 0xff) * 16)),
+                        vld1q_u8($t_odd.add((($wo >> 40) & 0xff) * 16)),
+                    );
+                    ab6 = xor3_u8(
+                        ab6,
+                        vld1q_u8($t_even.add((($we >> 48) & 0xff) * 16)),
+                        vld1q_u8($t_odd.add((($wo >> 48) & 0xff) * 16)),
+                    );
+                    ab7 = xor3_u8(
+                        ab7,
+                        vld1q_u8($t_even.add(($we >> 56) * 16)),
+                        vld1q_u8($t_odd.add(($wo >> 56) * 16)),
+                    );
+                }};
+            }
 
-                // One u64 load per b_med covers the 8 adjacent lanes; each
-                // extracted byte addresses the same table row as the original
-                // byte-load form.
-                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u64).read_unaligned()
+            let mut pair = 0;
+            while pair + 1 < n_pairs {
+                for _ in 0..2 {
+                    let t_even = pair_tables;
+                    let t_odd = pair_tables.add(256 * 16);
+                    // One u64 load per b_med covers the 8 adjacent lanes;
+                    // each extracted byte addresses the same table row as
+                    // the original byte-load form.
+                    let we = ((*row_pair).as_ptr().add(lane) as *const u64)
+                        .read_unaligned() as usize;
+                    let wo = ((*row_pair.add(1)).as_ptr().add(lane) as *const u64)
+                        .read_unaligned() as usize;
+                    accumulate_pair!(t_even, t_odd, we, wo);
+                    pair_tables = pair_tables.add(2 * 256 * 16);
+                    row_pair = row_pair.add(2);
+                    pair += 1;
+                }
+            }
+            if pair < n_pairs {
+                let t_even = pair_tables;
+                let t_odd = pair_tables.add(256 * 16);
+                let we = ((*row_pair).as_ptr().add(lane) as *const u64).read_unaligned()
                     as usize;
-                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u64).read_unaligned()
-                    as usize;
-                ab0 = xor3_u8(
-                    ab0,
-                    vld1q_u8(t_even.add((we & 0xff) * 16)),
-                    vld1q_u8(t_odd.add((wo & 0xff) * 16)),
-                );
-                ab1 = xor3_u8(
-                    ab1,
-                    vld1q_u8(t_even.add(((we >> 8) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 8) & 0xff) * 16)),
-                );
-                ab2 = xor3_u8(
-                    ab2,
-                    vld1q_u8(t_even.add(((we >> 16) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 16) & 0xff) * 16)),
-                );
-                ab3 = xor3_u8(
-                    ab3,
-                    vld1q_u8(t_even.add(((we >> 24) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 24) & 0xff) * 16)),
-                );
-                ab4 = xor3_u8(
-                    ab4,
-                    vld1q_u8(t_even.add(((we >> 32) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 32) & 0xff) * 16)),
-                );
-                ab5 = xor3_u8(
-                    ab5,
-                    vld1q_u8(t_even.add(((we >> 40) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 40) & 0xff) * 16)),
-                );
-                ab6 = xor3_u8(
-                    ab6,
-                    vld1q_u8(t_even.add(((we >> 48) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 48) & 0xff) * 16)),
-                );
-                ab7 = xor3_u8(
-                    ab7,
-                    vld1q_u8(t_even.add((we >> 56) * 16)),
-                    vld1q_u8(t_odd.add((wo >> 56) * 16)),
-                );
+                let wo = ((*row_pair.add(1)).as_ptr().add(lane) as *const u64)
+                    .read_unaligned() as usize;
+                accumulate_pair!(t_even, t_odd, we, wo);
+                pair_tables = pair_tables.add(2 * 256 * 16);
+                row_pair = row_pair.add(2);
             }
 
             // Odd trailing b_med: unpaired fallback.
             if n_b_med & 1 == 1 {
-                let b_med = n_b_med - 1;
-                let table = convert_ptr.add(b_med * 256 * 16);
-                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u64).read_unaligned()
+                // After the paired walk, both cursors point at the final odd
+                // row and its table block.
+                let table = pair_tables;
+                let wa = ((*row_pair).as_ptr().add(lane) as *const u64).read_unaligned()
                     as usize;
                 ab0 = veorq_u8(ab0, vld1q_u8(table.add((wa & 0xff) * 16)));
                 ab1 = veorq_u8(ab1, vld1q_u8(table.add(((wa >> 8) & 0xff) * 16)));
@@ -439,6 +488,9 @@ pub(crate) unsafe fn accumulate_c_banks(
             // The old scalar drain kept only the low/high pair for one lane in
             // flight, leaving the dependent L1 gather latency on the critical
             // chain even though the register file has ample headroom.
+            // Bank-major order keeps each partial bank's read/modify/write
+            // stream contiguous before advancing to the next bank, while
+            // four lanes still expose independent table loads per iteration.
             for s in 0..8 {
                 let bank = partial_c[s].as_mut_ptr() as *mut u8;
                 for lane in (0..64).step_by(4) {
