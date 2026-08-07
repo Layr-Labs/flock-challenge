@@ -2954,10 +2954,20 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                 // A K0/K1 words' top three bytes are structurally zero
                 // (2048/2048 measured on the scored distribution), so the h4
                 // kernel's K0 and K1 a-side transforms can drop bytes 5-7's
-                // twelve table loads and six XORs. This fires on every scored
-                // block. The guard is witness-safe: any block whose K0/K1 top
-                // bytes are nonzero takes the legacy whole-word static-A arm
-                // (retained as a documented fallback) or the generic h4 arm.
+                // twelve table loads and six XORs. The byte census
+                // (zc-a-full-topbyte-512, seed C3A5E5) additionally shows A K1
+                // is the exact constant 0x0000_0016_0000_0080 in 512/512.
+                // Test that FIRST so the hot path takes the precomputed K1
+                // transform (four contiguous 16-byte loads from the 64-byte
+                // partial) instead of the low-five-byte table gathers; K0
+                // stays on the low5 path. The two kernels are bit-identical on
+                // the guarded inputs (the const's bytes 5-7 are zero, so its
+                // full table transform equals the low5 transform; table row 0
+                // is the zero vector). Every other witness falls to exactly
+                // the kernel the old dispatch chose, so behavior is unchanged
+                // for all inputs.
+                const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
+                const STATIC_A_K0_TOP3_MASK: u64 = 0xffff_ff00_0000_0000;
                 let a_k0 = u64::from_le(unsafe {
                     core::ptr::read_unaligned(a_packed.as_ptr().add(byte_base_b).cast::<u64>())
                 });
@@ -2966,7 +2976,23 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                         a_packed.as_ptr().add(byte_base_b + N_CHUNKS).cast::<u64>(),
                     )
                 });
-                if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
+                if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_TOP3_MASK == 0 {
+                    let static_a_k1 = match static_b_context {
+                        Some(StaticBContext::Prepared { static_a_k1, .. }) => static_a_k1,
+                        Some(StaticBContext::LegacyPerCall) | None => {
+                            static_a_k1_partial(inv_table)
+                        }
+                    };
+                    shift_reduce_inner_mixed_const_b_h4::<0x03, true, 0>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base_b,
+                        Some(static_a_k1),
+                        out,
+                        nt_store,
+                    );
+                } else if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
                     shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03>(
                         a_packed,
                         b_packed,
@@ -2977,35 +3003,15 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                         nt_store,
                     );
                 } else {
-                    const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
-                    const STATIC_A_K0_TOP3_MASK: u64 = 0xffff_ff00_0000_0000;
-                    if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_TOP3_MASK == 0 {
-                        let static_a_k1 = match static_b_context {
-                            Some(StaticBContext::Prepared { static_a_k1, .. }) => static_a_k1,
-                            Some(StaticBContext::LegacyPerCall) | None => {
-                                static_a_k1_partial(inv_table)
-                            }
-                        };
-                        shift_reduce_inner_mixed_const_b_h4::<0x03, true, 0>(
-                            a_packed,
-                            b_packed,
-                            inv_table,
-                            byte_base_b,
-                            Some(static_a_k1),
-                            out,
-                            nt_store,
-                        );
-                    } else {
-                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0>(
-                            a_packed,
-                            b_packed,
-                            inv_table,
-                            byte_base_b,
-                            None,
-                            out,
-                            nt_store,
-                        );
-                    }
+                    shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base_b,
+                        None,
+                        out,
+                        nt_store,
+                    );
                 }
             } else {
                 shift_reduce_inner_mixed_const_b::<0x03>(

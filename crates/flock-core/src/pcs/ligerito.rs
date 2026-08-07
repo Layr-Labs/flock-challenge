@@ -12851,3 +12851,5 @@ mod tests {
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
 // RealAdii next sample on eda4129 (marker 23601).
+// r797: K1-first dispatch candidate (STATIC_A exact-const K1 arm before low5);
+// archive-distinct identity marker, no semantic change.
