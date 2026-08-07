@@ -12850,4 +12850,5 @@ mod tests {
 // r580: archive-distinct candidate; no semantic change.
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
-// RealAdii next sample on eda4129 (marker 23601).
+
+// r801 resample marker of the 512-seq scheduler variant (1ae6e42 tree).
