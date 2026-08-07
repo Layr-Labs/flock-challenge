@@ -3097,11 +3097,13 @@ pub(crate) struct LigeroWitness {
     pub num_interleaved: usize,
 }
 
-// Recycle the codeword matrix (128 MB for L1 at m=29) through the scratch
-// pool when a level's witness is replaced/dropped.
+// Recycle the codeword matrix (128 MB for L1 at m=29) and the flat Merkle
+// tree (16 MiB at L1) through their scratch pools when a level's witness is
+// replaced/dropped.
 impl Drop for LigeroWitness {
     fn drop(&mut self) {
         crate::scratch::give_f128(std::mem::take(&mut self.mat));
+        crate::scratch::give_hash_tree(std::mem::take(&mut self.tree));
     }
 }
 
@@ -3248,7 +3250,15 @@ fn ligero_commit_impl(
     };
     let tree = match gpu_tree {
         Some(tree) => tree,
-        None => merkle::merkle_tree(data_bytes, block_len, kind),
+        // Pooled tree storage for the CPU builder (the GPU offload's
+        // copy-out is pooled inside `gpu_recursive_merkle_blake3`): same
+        // fault/munmap argument, byte-identical output.
+        None => merkle::merkle_tree_into(
+            crate::scratch::take_hash_tree(2 * block_len - 1),
+            data_bytes,
+            block_len,
+            kind,
+        ),
     };
     let merkle_elapsed = merkle_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
 
@@ -6212,7 +6222,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             // Final open complete — recycle last recursive codeword/tree before
             // proof-object assembly (transcript copy etc.).
             crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-            wtns_prev.tree = Vec::new();
+            crate::scratch::give_hash_tree(std::mem::take(&mut wtns_prev.tree));
             if trace {
                 let total = t_total.elapsed();
                 eprintln!("[lig-prove] total = {:.2} ms", total.as_secs_f64() * 1e3);

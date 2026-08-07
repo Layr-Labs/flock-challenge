@@ -9663,6 +9663,17 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         *ON.get_or_init(|| std::env::var_os("FLOCK_GPU_RECMERKLE_DEBUG").is_some())
     }
 
+    /// Bounded-spin drain for the recursive-Merkle command buffer (exact
+    /// same-binary latency control; see the call site). Only the exact
+    /// value `1` restores the incumbent blocking wait.
+    fn rec_merkle_spin_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_RECMERKLE_SPIN").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+        })
+    }
+
     fn rec_merkle_init(gpu: &'static Gpu) -> Result<RecMerkle, String> {
         unsafe {
             let pool = gpu.pool_push();
@@ -9868,7 +9879,20 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     read_len = n_out;
                 }
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                // This dispatch sits on the opening's FS-serial spine with
+                // every CPU thread otherwise idle, the exact shape
+                // `commit_and_spin` exists for: the blocking wait pays a
+                // thread park + completion-handler wake per call (measured
+                // ~0.3–0.5 ms at the grind sites). The spin consumes the
+                // same completed buffer with the same status check and past
+                // its budget degrades to the exact blocking wait — proof
+                // bytes untouched. A/B-CONTROL: FLOCK_NO_RECMERKLE_SPIN=1
+                // (exact '1') restores the incumbent blocking wait.
+                if rec_merkle_spin_enabled() {
+                    gpu.commit_and_spin(cb, 4.0)
+                } else {
+                    gpu.commit_and_wait(cb)
+                }
             })();
             gpu.pool_pop(pool);
             run
@@ -9884,7 +9908,11 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             return None;
         }
 
-        let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
+        // Pooled destination: a fresh 16 MiB uninit Vec pays ~4k first-touch
+        // page faults inside this FS-serial copy and a single-threaded munmap
+        // on the following drop; the recycled buffer's pages stay resident
+        // across proves (write-before-read: the copy below writes all of it).
+        let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
         unsafe {
             let dst =
                 core::slice::from_raw_parts_mut(tree.as_mut_ptr().cast::<u8>(), total_nodes * 32);
