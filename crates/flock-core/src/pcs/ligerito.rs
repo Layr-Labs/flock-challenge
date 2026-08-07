@@ -12851,3 +12851,8 @@ mod tests {
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
 // RealAdii next sample on eda4129 (marker 23601).
+
+// r808 draw: pre-authorized by the r807-note standing cap (r808..r810) after
+// r807 verdict landed REJECTED -0.29% (1,769,104.08 vs bar 1,770,594.97),
+// inside the pre-registered -0.3%..0 draw-again band. Comment-only; semantics
+// unchanged.
