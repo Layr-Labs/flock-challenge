@@ -3084,20 +3084,17 @@ struct PowParams {
     uint start_lo;
     uint start_hi;
     uint len;
-    uint bits;
+    uint mask;
 };
 
-// The caller admits bits in 1..=32 only, so full_bytes = bits>>3 is at
-// most 4 and every byte tested by the predicate lives in cv[0] alone
-// (byte index i < 4 => i>>2 == 0; the extra top bits of byte `full_bytes`
-// are also within cv[0] because full_bytes == 4 forces extra == 0).
-// One mask computation and one word compare replace the byte loop.
-static inline bool pow_has_leading_zero_bits(uint cv0, uint bits) {
-    uint full_bytes = bits >> 3u;
-    uint extra = bits & 7u;
-    uint mask = (full_bytes == 4u) ? 0xffffffffu
-        : (((1u << (full_bytes << 3u)) - 1u)
-           | (((0xffu << (8u - extra)) & 0xffu) << (full_bytes << 3u)));
+// The predicate mask is computed once on the host (gpu_pow_predicate_mask,
+// which mirrors the byte-level specification: the low `full_bytes` bytes of
+// cv0 all zero plus the top `extra` bits of the next byte zero, byte 0 being
+// cv0's LSB) and shipped in PowParams, so each thread pays one mask load
+// plus one AND instead of the per-thread shift/select chain. The Rust side
+// mirrors this mask expression bit-for-bit and unit-tests it against the
+// byte-level spec.
+static inline bool pow_has_leading_zero_bits(uint cv0, uint mask) {
     return (cv0 & mask) == 0u;
 }
 
@@ -3164,14 +3161,29 @@ kernel void blake3_pow_scan(
     constant uint* state_words [[buffer(0)]],
     device atomic_uint* best   [[buffer(1)]],
     constant PowParams& params [[buffer(2)]],
-    uint id [[thread_position_in_grid]])
+    uint id [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]])
 {
-    if (id >= params.len || id >= atomic_load_explicit(best, memory_order_relaxed)) return;
+    // One relaxed atomic load per 32-thread threadgroup instead of one per
+    // thread. The load gates the whole ALU body, so a per-thread load puts
+    // an L2 round trip on every thread's critical path even while `best` is
+    // still unset (the common case in every block but the matching one).
+    // With a 32-thread group (one Apple SIMD-group) the leader load plus
+    // intra-SIMD threadgroup barrier amortizes that traffic 32x. The cached
+    // snapshot may lag the true best (relaxed ordering), which only lets
+    // extra threads run a no-op fetch_min -- atomic minimum semantics still
+    // record the globally smallest matching nonce.
+    threadgroup uint tg_best;
+    if (lid == 0u) {
+        tg_best = atomic_load_explicit(best, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (id >= params.len || id >= tg_best) return;
     uint nonce_lo = params.start_lo + id;
     uint carry = nonce_lo < params.start_lo ? 1u : 0u;
     uint nonce_hi = params.start_hi + carry;
     uint cv0 = pow_compress0(state_words, nonce_lo, nonce_hi);
-    if (pow_has_leading_zero_bits(cv0, params.bits)) {
+    if (pow_has_leading_zero_bits(cv0, params.mask)) {
         atomic_fetch_min_explicit(best, id, memory_order_relaxed);
     }
 }
@@ -7567,6 +7579,24 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// Mirror of the MSL `pow_has_leading_zero_bits` mask (byte 0 of cv0 is
+    /// its LSB): low `bits/8` bytes all ones plus the top `bits%8` bits of
+    /// the next byte. Shipped in `PowParams.mask` so the GPU kernel pays one
+    /// AND instead of a per-thread shift/select chain.
+    fn gpu_pow_predicate_mask(bits: u32) -> u32 {
+        debug_assert!((1..=32).contains(&bits));
+        if bits == 32 {
+            return u32::MAX;
+        }
+        let full_bytes = (bits / 8) as u32;
+        let extra = bits % 8;
+        let mut mask = (1u32 << (full_bytes * 8)).wrapping_sub(1);
+        if extra > 0 {
+            mask |= ((0xffu32 << (8 - extra)) & 0xff) << (full_bytes * 8);
+        }
+        mask
+    }
+
     pub(crate) fn gpu_blake3_pow_scan(
         state_digest: &[u8; 32],
         start: u64,
@@ -7594,7 +7624,7 @@ kernel void blake3_pow_scan(
             let result = (|| -> Result<Option<u64>, String> {
                 let out = gpu.buffer_contents(gpu.pow_out).cast::<u32>();
                 out.write_volatile(u32::MAX);
-                let params = [start as u32, (start >> 32) as u32, len, bits];
+                let params = [start as u32, (start >> 32) as u32, len, gpu_pow_predicate_mask(bits)];
                 let params_bytes = core::slice::from_raw_parts(
                     params.as_ptr().cast::<u8>(),
                     core::mem::size_of_val(&params),
@@ -12638,6 +12668,39 @@ mod tests {
             }
             Err(e) => panic!("GPU error: {e}"),
         }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_pow_predicate_mask_matches_byte_spec() {
+        // Byte-level spec: bytes[0..bits/8] all zero, plus top `bits%8` bits
+        // of the next byte zero. cv0 is little-endian bytes of the word.
+        let mut fail = None;
+        for bits in 1..=32u32 {
+            let mask = super::imp::gpu_pow_predicate_mask(bits);
+            for byte in 0..=255u32 {
+                let pass_msl = (byte & mask) == 0;
+                let mut pass_spec = true;
+                let full = (bits / 8) as usize;
+                let extra = bits % 8;
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&byte.to_le_bytes());
+                if full > 0 && bytes[..full].iter().any(|&b| b != 0) {
+                    pass_spec = false;
+                }
+                if extra > 0 && bytes[full] >> (8 - extra) != 0 {
+                    pass_spec = false;
+                }
+                if pass_msl != pass_spec {
+                    fail = Some((bits, byte, mask));
+                    break;
+                }
+            }
+            if fail.is_some() {
+                break;
+            }
+        }
+        assert!(fail.is_none(), "mask diverges from byte spec: {fail:?}");
     }
 
     #[test]

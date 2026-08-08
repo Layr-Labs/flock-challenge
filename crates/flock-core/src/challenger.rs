@@ -950,27 +950,54 @@ fn run_cpu_window_after_persistent_gpu(
     }
 }
 
+/// Per-bits multiplier for the GPU grind dispatch window (r840).
+///
+/// Each `gpu_blake3_pow_scan` pays a fixed ~0.5 ms commit-and-spin
+/// roundtrip that is independent of the scanned window; the kernel takes
+/// the minimum matching offset over the whole window, so a wider window
+/// returns the same nonce as the serialized K=1 walk — only the number of
+/// roundtrips changes. Small blocks are kernel-cheap (2^14 nonces ≈ tens of
+/// µs) and commit-dominated, so K=4 drops the expected dispatch count from
+/// 1/(1−e⁻¹) ≈ 1.58 to 1/(1−e⁻⁴) ≈ 1.02 per grind. At 19-bit the kernel is
+/// no longer negligible and the multiplier backs off (K=2), then returns to
+/// K=1 where doubling the kernel would cost more than the roundtrip it
+/// saves.
+const fn gpu_grind_window_k(bits: u32) -> u32 {
+    match bits {
+        0..=16 => 4,
+        17..=18 => 2,
+        _ => 1,
+    }
+}
+
 fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, String> {
     debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
+    // Dispatch window = K expected-hit blocks. The GPU scans the whole
+    // window in one commit-and-spin roundtrip; the CPU prefetch covers the
+    // first block *after* the window (K ≥ 1), so on a window miss the walk
+    // advances past it with no gap and GPU-first nonce selection stays
+    // byte-identical to the serialized walk (see `gpu_blake3_pow_nonce` doc
+    // invariant).
     let block_len = 1u32 << bits.min(24);
+    let scan_len = block_len.saturating_mul(gpu_grind_window_k(bits));
     let hybrid = grind_hybrid_enabled() && rayon::current_num_threads() > 1;
     let mut start = 0u64;
     loop {
         if !hybrid {
             if let Some(nonce) =
-                crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, block_len, bits)?
+                crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, scan_len, bits)?
             {
                 return Ok(nonce);
             }
             start = start
-                .checked_add(u64::from(block_len))
+                .checked_add(u64::from(scan_len))
                 .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
             continue;
         }
         let next_start = start
-            .checked_add(u64::from(block_len))
+            .checked_add(u64::from(scan_len))
             .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
-        // The prefetch result is consumed only when the GPU block misses, so
+        // The prefetch result is consumed only when the GPU window misses, so
         // the GPU thread flags a hit as soon as its spin returns and the CPU
         // window bails between chunks instead of draining a scan whose result
         // is already dead. On a GPU miss the flag is never set and the window
@@ -984,7 +1011,7 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         let (gpu_result, cpu_next) = match grind_worker::dispatch_async(
             state_digest,
             start,
-            block_len,
+            scan_len,
             bits,
             std::sync::Arc::clone(&stop),
             abort,
@@ -1040,7 +1067,7 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                     let gpu = crate::gpu_commit::gpu_blake3_pow_scan(
                         state_digest,
                         start,
-                        block_len,
+                        scan_len,
                         bits,
                     );
                     if abort && matches!(&gpu, Ok(Some(_))) {
@@ -1076,8 +1103,12 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         if let Some(nonce) = cpu_next {
             return Ok(nonce);
         }
-        start = next_start
-            .checked_add(u64::from(block_len))
+        // Total miss: advance past the whole dispatched window, not just the
+        // CPU prefetch block, so the window's trailing blocks (which the
+        // kernel already proved empty) are never re-scanned by the next
+        // dispatch.
+        start = start
+            .checked_add(u64::from(scan_len))
             .ok_or_else(|| "GPU grind nonce range exhausted".to_string())?;
     }
 }
