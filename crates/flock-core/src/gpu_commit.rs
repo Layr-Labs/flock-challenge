@@ -4102,20 +4102,25 @@ kernel void blake3_pow_scan(
         pub(crate) unsafe fn commit_and_spin(&self, cb: Id, budget_ms: f64) -> Result<(), String> {
             unsafe {
                 send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
+                // Hoist the per-poll sel_register lookups out of the spin:
+                // each registration walks the objc selector table, and the
+                // status poll dominates the loop count of sub-millisecond
+                // serial dispatches (grind spine). Same selectors/fns, same
+                // call order, zero behavior change.
+                let status_sel = (self.api.sel_register)(c"status".as_ptr());
+                let error_sel = (self.api.sel_register)(c"error".as_ptr());
+                let status_fn: unsafe extern "C" fn(Id, Sel) -> u64 =
+                    core::mem::transmute(self.api.msg_send);
+                let error_fn: unsafe extern "C" fn(Id, Sel) -> Id =
+                    core::mem::transmute(self.api.msg_send);
                 let start = std::time::Instant::now();
                 loop {
-                    let status: u64 = send!(
-                        self.api,
-                        unsafe extern "C" fn(Id, Sel) -> u64,
-                        cb,
-                        c"status"
-                    );
+                    let status: u64 = status_fn(cb, status_sel);
                     if status >= 4 {
                         if status == 4 {
                             return Ok(());
                         }
-                        let err: Id =
-                            send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
+                        let err: Id = error_fn(cb, error_sel);
                         return Err(format!(
                             "command buffer status {status}: {}",
                             self.api.error_string(err)
@@ -4137,20 +4142,20 @@ kernel void blake3_pow_scan(
         /// wait.
         pub(crate) unsafe fn spin_wait_cb(&self, cb: Id, budget_ms: f64) -> Result<(), String> {
             unsafe {
+                let status_sel = (self.api.sel_register)(c"status".as_ptr());
+                let error_sel = (self.api.sel_register)(c"error".as_ptr());
+                let status_fn: unsafe extern "C" fn(Id, Sel) -> u64 =
+                    core::mem::transmute(self.api.msg_send);
+                let error_fn: unsafe extern "C" fn(Id, Sel) -> Id =
+                    core::mem::transmute(self.api.msg_send);
                 let start = std::time::Instant::now();
                 loop {
-                    let status: u64 = send!(
-                        self.api,
-                        unsafe extern "C" fn(Id, Sel) -> u64,
-                        cb,
-                        c"status"
-                    );
+                    let status: u64 = status_fn(cb, status_sel);
                     if status >= 4 {
                         if status == 4 {
                             return Ok(());
                         }
-                        let err: Id =
-                            send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
+                        let err: Id = error_fn(cb, error_sel);
                         return Err(format!(
                             "command buffer status {status}: {}",
                             self.api.error_string(err)
@@ -4180,19 +4185,19 @@ kernel void blake3_pow_scan(
             deadline: std::time::Instant,
         ) -> Result<(), String> {
             unsafe {
+                let status_sel = (self.api.sel_register)(c"status".as_ptr());
+                let error_sel = (self.api.sel_register)(c"error".as_ptr());
+                let status_fn: unsafe extern "C" fn(Id, Sel) -> u64 =
+                    core::mem::transmute(self.api.msg_send);
+                let error_fn: unsafe extern "C" fn(Id, Sel) -> Id =
+                    core::mem::transmute(self.api.msg_send);
                 loop {
-                    let status: u64 = send!(
-                        self.api,
-                        unsafe extern "C" fn(Id, Sel) -> u64,
-                        cb,
-                        c"status"
-                    );
+                    let status: u64 = status_fn(cb, status_sel);
                     if status >= 4 {
                         if status == 4 {
                             return Ok(());
                         }
-                        let err: Id =
-                            send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
+                        let err: Id = error_fn(cb, error_sel);
                         return Err(format!(
                             "command buffer status {status}: {}",
                             self.api.error_string(err)
