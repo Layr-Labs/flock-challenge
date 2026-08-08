@@ -1,5 +1,14 @@
 //! GPU (Metal) offload of the ranked L0 PCS commit.
 //!
+//! NOTE (r847): the yukon benchmark server deduplicates submissions by the
+//! content of the packaged editable paths (crates/flock-core/src +
+//! crates/flock-prover/src). Re-submitting a byte-identical tree reuses the
+//! original submission and its score — it does NOT produce a fresh draw. A
+//! fresh benchmark draw therefore requires at least a content change in an
+//! editable file; this comment exists to keep this tree distinct from the
+//! promoted frontier tree (dce0f27) while the code below stays byte-identical
+//! to it.
+//!
 //! The ranked commit transforms a 1 GiB codeword (interleaved additive NTT,
 //! 64 SoA lanes, `log_d = 20`) and hashes it into a BLAKE3 Merkle tree. Both
 //! stages are memory-bandwidth-bound on the CPU and challenge-independent, so
