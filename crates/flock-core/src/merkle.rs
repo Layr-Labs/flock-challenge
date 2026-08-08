@@ -683,24 +683,6 @@ pub fn merkle_root(data: &[u8], num_leaves: usize, kind: HashKind) -> Hash {
     tree[tree.len() - 1]
 }
 
-/// [`merkle_tree`] into caller-provided (typically pooled) tree storage.
-/// `tree.len()` must be `2 * num_leaves - 1`; contents may be uninitialized
-/// (every node is written before it is read, exactly as in [`merkle_tree`]).
-/// Byte-identical output to [`merkle_tree`].
-pub(crate) fn merkle_tree_into(
-    mut tree: Vec<Hash>,
-    data: &[u8],
-    num_leaves: usize,
-    kind: HashKind,
-) -> Vec<Hash> {
-    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
-    assert_eq!(data.len() % num_leaves, 0);
-    assert_eq!(tree.len(), 2 * num_leaves - 1);
-    let leaf_size = data.len() / num_leaves;
-    hash_leaves(data, leaf_size, &mut tree[..num_leaves], kind);
-    merkle_tree_from_prehashed_leaves(tree, num_leaves, kind)
-}
-
 /// Compute the full Merkle tree (flat layout, see module docs) for `data`
 /// split into `num_leaves` equal-sized leaves, hashed under `kind`.
 pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> {
