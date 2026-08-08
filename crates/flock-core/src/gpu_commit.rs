@@ -3078,8 +3078,6 @@ constant uint POW_IV[8] = {
     0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
     0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
 };
-constant uchar POW_PERM[16] = {2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8};
-
 struct PowParams {
     uint start_lo;
     uint start_hi;
@@ -3111,23 +3109,46 @@ static inline uint pow_compress0(thread const uint* cv_in, thread const uint* m_
     v[14] = 64u;
     v[15] = 11u; // CHUNK_START | CHUNK_END | ROOT
     for (uint i = 0u; i < 16u; i++) m[i] = m_in[i];
-    for (uint round = 0u; round < 7u; round++) {
-        #define POW_G(a,b,c,d,x,y) \
-            v[a] = v[a] + v[b] + x; v[d] = rotate(v[d]^v[a], 16u); \
-            v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 20u); \
-            v[a] = v[a] + v[b] + y; v[d] = rotate(v[d]^v[a], 24u); \
-            v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 25u);
-        POW_G(0,4,8,12,  m[0], m[1]);  POW_G(1,5,9,13,  m[2], m[3]);
-        POW_G(2,6,10,14, m[4], m[5]);  POW_G(3,7,11,15, m[6], m[7]);
-        POW_G(0,5,10,15, m[8], m[9]);  POW_G(1,6,11,12, m[10],m[11]);
-        POW_G(2,7,8,13,  m[12],m[13]); POW_G(3,4,9,14,  m[14],m[15]);
-        #undef POW_G
-        if (round < 6u) {
-            uint next[16];
-            for (uint i = 0u; i < 16u; i++) next[i] = m[POW_PERM[i]];
-            for (uint i = 0u; i < 16u; i++) m[i] = next[i];
-        }
-    }
+    // Seven fixed rounds, fully unrolled with each round's message indices
+    // pre-permuted (perm^round) at author time. This removes the per-round
+    // `next[16]` staging buffer and the 16-element gather loop from the
+    // hot loop, leaving only 56 straight-line G evaluations. Equivalence:
+    // the old code applied POW_PERM after rounds 0..5, so round r read
+    // m[PERM^r[i]]; each POW_G below uses exactly that index.
+    #define POW_G(a,b,c,d,x,y) \
+        v[a] = v[a] + v[b] + x; v[d] = rotate(v[d]^v[a], 16u); \
+        v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 20u); \
+        v[a] = v[a] + v[b] + y; v[d] = rotate(v[d]^v[a], 24u); \
+        v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 25u);
+    POW_G(0,4,8,12, m[0], m[1]);  POW_G(1,5,9,13, m[2], m[3]);
+    POW_G(2,6,10,14, m[4], m[5]); POW_G(3,7,11,15, m[6], m[7]);
+    POW_G(0,5,10,15, m[8], m[9]); POW_G(1,6,11,12, m[10], m[11]);
+    POW_G(2,7,8,13, m[12], m[13]); POW_G(3,4,9,14, m[14], m[15]);
+    POW_G(0,4,8,12, m[2], m[6]);  POW_G(1,5,9,13, m[3], m[10]);
+    POW_G(2,6,10,14, m[7], m[0]); POW_G(3,7,11,15, m[4], m[13]);
+    POW_G(0,5,10,15, m[1], m[11]); POW_G(1,6,11,12, m[12], m[5]);
+    POW_G(2,7,8,13, m[9], m[14]); POW_G(3,4,9,14, m[15], m[8]);
+    POW_G(0,4,8,12, m[3], m[4]);  POW_G(1,5,9,13, m[10], m[12]);
+    POW_G(2,6,10,14, m[13], m[2]); POW_G(3,7,11,15, m[7], m[14]);
+    POW_G(0,5,10,15, m[6], m[5]); POW_G(1,6,11,12, m[9], m[0]);
+    POW_G(2,7,8,13, m[11], m[15]); POW_G(3,4,9,14, m[8], m[1]);
+    POW_G(0,4,8,12, m[10], m[7]); POW_G(1,5,9,13, m[12], m[9]);
+    POW_G(2,6,10,14, m[14], m[3]); POW_G(3,7,11,15, m[13], m[15]);
+    POW_G(0,5,10,15, m[4], m[0]); POW_G(1,6,11,12, m[11], m[2]);
+    POW_G(2,7,8,13, m[5], m[8]); POW_G(3,4,9,14, m[1], m[6]);
+    POW_G(0,4,8,12, m[12], m[13]); POW_G(1,5,9,13, m[9], m[11]);
+    POW_G(2,6,10,14, m[15], m[10]); POW_G(3,7,11,15, m[14], m[8]);
+    POW_G(0,5,10,15, m[7], m[2]); POW_G(1,6,11,12, m[5], m[3]);
+    POW_G(2,7,8,13, m[0], m[1]); POW_G(3,4,9,14, m[6], m[4]);
+    POW_G(0,4,8,12, m[9], m[14]); POW_G(1,5,9,13, m[11], m[5]);
+    POW_G(2,6,10,14, m[8], m[12]); POW_G(3,7,11,15, m[15], m[1]);
+    POW_G(0,5,10,15, m[13], m[3]); POW_G(1,6,11,12, m[0], m[10]);
+    POW_G(2,7,8,13, m[2], m[6]); POW_G(3,4,9,14, m[4], m[7]);
+    POW_G(0,4,8,12, m[11], m[15]); POW_G(1,5,9,13, m[5], m[0]);
+    POW_G(2,6,10,14, m[1], m[9]); POW_G(3,7,11,15, m[8], m[6]);
+    POW_G(0,5,10,15, m[14], m[10]); POW_G(1,6,11,12, m[2], m[12]);
+    POW_G(2,7,8,13, m[3], m[4]); POW_G(3,4,9,14, m[7], m[13]);
+    #undef POW_G
     // Only word 0 of the final chaining value is consumed by the
     // predicate, so materialize just v[0] ^ v[8].
     return v[0] ^ v[8u];
