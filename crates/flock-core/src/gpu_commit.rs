@@ -3104,6 +3104,7 @@ static inline bool pow_has_leading_zero_bits(uint cv0, uint bits) {
 static inline uint pow_compress0(thread const uint* cv_in, thread const uint* m_in) {
     uint v[16];
     uint m[16];
+    uint mm[16];
     for (uint i = 0u; i < 8u; i++) v[i] = cv_in[i];
     for (uint i = 0u; i < 4u; i++) v[8u + i] = POW_IV[i];
     v[12] = 0u;
@@ -3111,23 +3112,38 @@ static inline uint pow_compress0(thread const uint* cv_in, thread const uint* m_
     v[14] = 64u;
     v[15] = 11u; // CHUNK_START | CHUNK_END | ROOT
     for (uint i = 0u; i < 16u; i++) m[i] = m_in[i];
-    for (uint round = 0u; round < 7u; round++) {
-        #define POW_G(a,b,c,d,x,y) \
-            v[a] = v[a] + v[b] + x; v[d] = rotate(v[d]^v[a], 16u); \
-            v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 20u); \
-            v[a] = v[a] + v[b] + y; v[d] = rotate(v[d]^v[a], 24u); \
-            v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 25u);
-        POW_G(0,4,8,12,  m[0], m[1]);  POW_G(1,5,9,13,  m[2], m[3]);
-        POW_G(2,6,10,14, m[4], m[5]);  POW_G(3,7,11,15, m[6], m[7]);
-        POW_G(0,5,10,15, m[8], m[9]);  POW_G(1,6,11,12, m[10],m[11]);
-        POW_G(2,7,8,13,  m[12],m[13]); POW_G(3,4,9,14,  m[14],m[15]);
-        #undef POW_G
-        if (round < 6u) {
-            uint next[16];
-            for (uint i = 0u; i < 16u; i++) next[i] = m[POW_PERM[i]];
-            for (uint i = 0u; i < 16u; i++) m[i] = next[i];
+    // Seven fixed rounds over a two-buffer message schedule. Round r reads
+    // one buffer holding PERM^r of the original message with plain indices;
+    // the gather `other[i] = buf[POW_PERM[i]]` rotates the schedule for the
+    // following round. Ping-ponging between `m` and `mm` drops the copy-back
+    // half of the in-place permutation (16 loads + 16 stores per round)
+    // without unrolling all seven round bodies, so the compact round stays
+    // register-light. The loop steps by two: iteration `round` reads from `m`
+    // (rounds 0,2,4) then `mm` (rounds 1,3,5); each gather applies exactly
+    // one POW_PERM application, so after the loop `m` holds PERM^6 and the
+    // seventh round reads it directly. Round bodies are the plain BLAKE3
+    // column/diagonal mix — no per-round index permutation needed.
+    #define POW_G(a,b,c,d,x,y) \
+        v[a] = v[a] + v[b] + x; v[d] = rotate(v[d]^v[a], 16u); \
+        v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 20u); \
+        v[a] = v[a] + v[b] + y; v[d] = rotate(v[d]^v[a], 24u); \
+        v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 25u);
+    #define POW_ROUND(buf) \
+        POW_G(0,4,8,12,  buf[0], buf[1]);  POW_G(1,5,9,13,  buf[2], buf[3]); \
+        POW_G(2,6,10,14, buf[4], buf[5]);  POW_G(3,7,11,15, buf[6], buf[7]); \
+        POW_G(0,5,10,15, buf[8], buf[9]);  POW_G(1,6,11,12, buf[10], buf[11]); \
+        POW_G(2,7,8,13,  buf[12], buf[13]); POW_G(3,4,9,14,  buf[14], buf[15]);
+    for (uint round = 0u; round + 1u < 7u; round += 2u) {
+        POW_ROUND(m)
+        for (uint i = 0u; i < 16u; i++) mm[i] = m[POW_PERM[i]];
+        POW_ROUND(mm)
+        if (round + 1u < 6u) {
+            for (uint i = 0u; i < 16u; i++) m[i] = mm[POW_PERM[i]];
         }
     }
+    POW_ROUND(m)
+    #undef POW_ROUND
+    #undef POW_G
     // Only word 0 of the final chaining value is consumed by the
     // predicate, so materialize just v[0] ^ v[8].
     return v[0] ^ v[8u];
