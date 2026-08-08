@@ -89,6 +89,7 @@ use flock_core::pcs::Commitment;
 use flock_core::proof::{R1csClaim, R1csProofLigerito};
 use rayon::prelude::*;
 
+use crate::proof_io::R1csProofBundleLigerito;
 use crate::r1cs_hashes::blake3::Compression;
 
 /// What `Blake3Setup::prove_fast` returns and what a speculative run hands
@@ -752,13 +753,44 @@ fn speculative_main(
     }));
 
     match outcome {
-        Ok(out) => {
+        Ok((proof, commitment, claim)) => {
+            // Direct publish: the speculative thread itself serializes the
+            // bundle and atomically renames it into place BEFORE the adoption
+            // result is stored, so the timed window's tail (bincode encode,
+            // 438 kB fs::write, rename) runs on this thread with no condvar
+            // wake / thread migration in front of it. An adopting wrapper main
+            // finds the file already present and skips its own write; any
+            // publish failure here just leaves the wrapper's ordinary write
+            // path in charge (it re-checks existence before writing).
+            let (proof, commitment) = if let Some(path) = ranked_proof_path() {
+                let bundle = R1csProofBundleLigerito {
+                    commitment,
+                    proof,
+                };
+                let bytes = bundle.to_bytes();
+                let tmp = format!("{}.tmp", path.display());
+                if std::fs::write(&tmp, &bytes).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
+                }
+                let R1csProofBundleLigerito { commitment, proof } = bundle;
+                (proof, commitment)
+            } else {
+                (proof, commitment)
+            };
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
-            state.result = Some(out);
+            state.result = Some((proof, commitment, claim));
             shared().signal.notify_all();
         }
         Err(_) => mark_dead(),
     }
+}
+
+/// Proof path for the direct publish, set by the ranked worker main before
+/// the warm-up prove (read lazily, once per trial, on the speculative thread).
+fn ranked_proof_path() -> Option<std::path::PathBuf> {
+    let raw = std::env::var_os("FLOCK_RANKED_PROOF_PATH")?;
+    let path = std::path::PathBuf::from(raw);
+    (path.file_name().is_some() && path.as_os_str().len() > 1).then_some(path)
 }
 
 // ---------------------------------------------------------------------------

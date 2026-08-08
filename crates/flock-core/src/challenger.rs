@@ -539,13 +539,26 @@ impl Challenger for FsChallenger {
             && !GPU_GRIND_FAILED.load(std::sync::atomic::Ordering::Relaxed)
         {
             match GPU_GRIND_LATCH.get().copied() {
-                Some(true) => match gpu_blake3_pow_nonce(&state_digest, bits) {
-                    Ok(nonce) => nonce,
-                    Err(_) => {
-                        GPU_GRIND_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                Some(true) => {
+                    if bits < gpu_crossover_bits() {
+                        // Per-bits engagement floor: below the calibrated
+                        // crossover the GPU window's fixed commit/spin round
+                        // trip costs more than the CPU two-pool scan's linear
+                        // work, so run those ladder grinds on the CPU. The
+                        // nonce is identical either way (both arms return the
+                        // globally smallest satisfying nonce).
                         cpu_scan()
+                    } else {
+                        match gpu_blake3_pow_nonce(&state_digest, bits) {
+                            Ok(nonce) => nonce,
+                            Err(_) => {
+                                GPU_GRIND_FAILED
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                cpu_scan()
+                            }
+                        }
                     }
-                },
+                }
                 Some(false) => cpu_scan(),
                 None if bits == GPU_GRIND_CALIBRATION_BITS
                     && crate::gpu_commit::gpu_grind_enabled() =>
@@ -556,7 +569,7 @@ impl Challenger for FsChallenger {
                     // transcript state.  Fixed windows remove the warm seed's
                     // random first-hit distance from the admission decision.
                     let cpu_1_started = std::time::Instant::now();
-                    let cpu_1 = cpu_gpu_grind_calibration(&state_digest);
+                    let (cpu_1, cpu_1_wins) = cpu_gpu_grind_calibration(&state_digest);
                     let cpu_1_time = cpu_1_started.elapsed();
                     let gpu_1_started = std::time::Instant::now();
                     let gpu_1 = gpu_grind_calibration(&state_digest);
@@ -566,11 +579,13 @@ impl Challenger for FsChallenger {
                     let gpu_2 = gpu_grind_calibration(&state_digest);
                     let gpu_2_time = gpu_2_started.elapsed();
                     let cpu_2_started = std::time::Instant::now();
-                    let cpu_2 = cpu_gpu_grind_calibration(&state_digest);
+                    let (cpu_2, cpu_2_wins) = cpu_gpu_grind_calibration(&state_digest);
                     let cpu_2_time = cpu_2_started.elapsed();
 
-                    let exact = matches!((&gpu_1, &gpu_2), (Ok(a), Ok(b)) if *a == cpu_1 && *b == cpu_1)
-                        && cpu_2 == cpu_1;
+                    let exact = matches!(
+                        (&gpu_1, &gpu_2),
+                        (Ok((a, _)), Ok((b, _))) if *a == cpu_1 && *b == cpu_1
+                    ) && cpu_2 == cpu_1;
                     // A fixed N-nonce Metal block succeeds with probability
                     // 1-e^-1, so an unbounded grind consumes 1/(1-e^-1) =
                     // 1.582 blocks on average.  Charge that overdraw (including
@@ -625,6 +640,40 @@ impl Challenger for FsChallenger {
                     }
                     let _ = GPU_GRIND_LATCH.set(enable);
                     if enable {
+                        // Per-size engagement floor: price each ranked ladder
+                        // window individually (min-of-two per arm, same
+                        // one-sided-contention correction as the totals) and
+                        // route bits below the smallest window where the GPU
+                        // wins to the CPU two-pool scan. The 2^14 window is
+                        // measured twice; the last (smallest-bit) GPU win
+                        // decides. No window winning keeps the status-quo
+                        // floor, so a noisy per-window draw can never enable
+                        // less GPU work than today's aggregate decision.
+                        match (&gpu_1, &gpu_2) {
+                            (Ok((_, g1_wins)), Ok((_, g2_wins))) => {
+                                let mut crossover: u32 = GPU_GRIND_MIN_BITS;
+                                for (i, _len) in
+                                    GPU_GRIND_CALIBRATION_LENGTHS.iter().enumerate()
+                                {
+                                    let bit = (GPU_GRIND_CALIBRATION_BITS
+                                        .saturating_sub(i as u32))
+                                        .clamp(GPU_GRIND_MIN_BITS, GPU_GRIND_CALIBRATION_BITS);
+                                    let g_best = g1_wins[i].min(g2_wins[i]);
+                                    let c_best = cpu_1_wins[i].min(cpu_2_wins[i]);
+                                    if g_best < c_best {
+                                        crossover = bit;
+                                    }
+                                }
+                                let _ = GPU_GRIND_CROSSOVER_BITS.set(crossover);
+                                if grind_trace_enabled() {
+                                    eprintln!(
+                                        "[grind] per-bits crossover: bits<{crossover} -> CPU \
+                                         (floor was {GPU_GRIND_MIN_BITS})"
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
                         match gpu_blake3_pow_nonce(&state_digest, bits) {
                             Ok(nonce) => nonce,
                             Err(_) => {
@@ -695,6 +744,19 @@ const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
 const GPU_GRIND_MIN_TWO_SAMPLE_GAIN: std::time::Duration = std::time::Duration::from_micros(300);
 static GPU_GRIND_LATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Per-process per-bits GPU engagement floor, decided by the warm-prove
+/// calibration: the smallest ranked grind bit whose measured GPU window
+/// (fixed commit/spin round trip + kernel) beat the CPU two-pool window at
+/// that size. Bits below it run the pure-CPU scan, whose expected cost is
+/// linear in 2^bits while the GPU arm pays its round trip even for tiny
+/// windows. Unset (no calibration, or a GPU-disabled device) defaults to
+/// `GPU_GRIND_MIN_BITS` — byte-identical nonces either way, since both arms
+/// return the globally smallest satisfying nonce.
+static GPU_GRIND_CROSSOVER_BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+fn gpu_crossover_bits() -> u32 {
+    *GPU_GRIND_CROSSOVER_BITS.get().unwrap_or(&GPU_GRIND_MIN_BITS)
+}
 
 /// CPU oracle/throughput arm for one fixed calibration window.  Unlike the
 /// production search it intentionally drains every chunk, making runtime
@@ -764,38 +826,51 @@ fn cpu_blake3_pow_window_inner(
         .min()
 }
 
-fn cpu_gpu_grind_calibration(state_digest: &[u8; 32]) -> Vec<Option<u64>> {
+/// CPU calibration arm: per-window nonce results plus per-window wall times,
+/// so the caller can price each ranked dispatch size individually instead of
+/// only the aggregate.
+fn cpu_gpu_grind_calibration(
+    state_digest: &[u8; 32],
+) -> (Vec<Option<u64>>, Vec<std::time::Duration>) {
     let mut start = 0u64;
-    GPU_GRIND_CALIBRATION_LENGTHS
-        .into_iter()
-        .map(|len| {
-            let result = cpu_blake3_pow_window(
-                state_digest,
-                start,
-                len,
-                GPU_GRIND_CALIBRATION_PREDICATE_BITS,
-            );
-            start += u64::from(len);
-            result
-        })
-        .collect()
+    let mut results = Vec::with_capacity(GPU_GRIND_CALIBRATION_LENGTHS.len());
+    let mut times = Vec::with_capacity(GPU_GRIND_CALIBRATION_LENGTHS.len());
+    for len in GPU_GRIND_CALIBRATION_LENGTHS {
+        let t = std::time::Instant::now();
+        let result = cpu_blake3_pow_window(
+            state_digest,
+            start,
+            len,
+            GPU_GRIND_CALIBRATION_PREDICATE_BITS,
+        );
+        times.push(t.elapsed());
+        start += u64::from(len);
+        results.push(result);
+    }
+    (results, times)
 }
 
-fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, String> {
+/// GPU calibration arm: per-window nonce results plus per-window wall times
+/// (each window is one Metal commit/spin round trip).
+fn gpu_grind_calibration(
+    state_digest: &[u8; 32],
+) -> Result<(Vec<Option<u64>>, Vec<std::time::Duration>), String> {
     let mut start = 0u64;
-    GPU_GRIND_CALIBRATION_LENGTHS
-        .into_iter()
-        .map(|len| {
-            let result = crate::gpu_commit::gpu_blake3_pow_scan(
-                state_digest,
-                start,
-                len,
-                GPU_GRIND_CALIBRATION_PREDICATE_BITS,
-            );
-            start += u64::from(len);
-            result
-        })
-        .collect()
+    let mut results = Vec::with_capacity(GPU_GRIND_CALIBRATION_LENGTHS.len());
+    let mut times = Vec::with_capacity(GPU_GRIND_CALIBRATION_LENGTHS.len());
+    for len in GPU_GRIND_CALIBRATION_LENGTHS {
+        let t = std::time::Instant::now();
+        let result = crate::gpu_commit::gpu_blake3_pow_scan(
+            state_digest,
+            start,
+            len,
+            GPU_GRIND_CALIBRATION_PREDICATE_BITS,
+        );
+        times.push(t.elapsed());
+        start += u64::from(len);
+        results.push(result?);
+    }
+    Ok((results, times))
 }
 
 /// Metal scans fixed ascending blocks and reports the smallest match in each

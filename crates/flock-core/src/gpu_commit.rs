@@ -3164,9 +3164,24 @@ kernel void blake3_pow_scan(
     constant uint* state_words [[buffer(0)]],
     device atomic_uint* best   [[buffer(1)]],
     constant PowParams& params [[buffer(2)]],
-    uint id [[thread_position_in_grid]])
+    uint id [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]])
 {
-    if (id >= params.len || id >= atomic_load_explicit(best, memory_order_relaxed)) return;
+    // One relaxed atomic load per 32-thread threadgroup instead of one per
+    // thread. The load gates the whole ALU body, so a per-thread load puts
+    // an L2 round trip on every thread's critical path even while `best` is
+    // still unset (the common case in every block but the matching one).
+    // With a 32-thread group (one Apple SIMD-group) the leader load plus
+    // intra-SIMD threadgroup barrier amortizes that traffic 32x. The cached
+    // snapshot may lag the true best (relaxed ordering), which only lets
+    // extra threads run a no-op fetch_min -- atomic minimum semantics still
+    // record the globally smallest matching nonce.
+    threadgroup uint tg_best;
+    if (lid == 0u) {
+        tg_best = atomic_load_explicit(best, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (id >= params.len || id >= tg_best) return;
     uint nonce_lo = params.start_lo + id;
     uint carry = nonce_lo < params.start_lo ? 1u : 0u;
     uint nonce_hi = params.start_hi + carry;
