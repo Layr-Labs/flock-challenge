@@ -613,16 +613,6 @@ impl Challenger for FsChallenger {
                             && gpu_2_time.mul_f64(GPU_GRIND_BLOCK_OVERDRAW) < cpu_2_time
                             && protected_gain >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN
                     };
-                    if grind_trace_enabled() {
-                        eprintln!(
-                            "[grind] latch decision: enable={enable} exact={exact} \
-                             cpu1={:.3}ms cpu2={:.3}ms gpu1={:.3}ms gpu2={:.3}ms",
-                            cpu_1_time.as_secs_f64() * 1e3,
-                            cpu_2_time.as_secs_f64() * 1e3,
-                            gpu_1_time.as_secs_f64() * 1e3,
-                            gpu_2_time.as_secs_f64() * 1e3,
-                        );
-                    }
                     let _ = GPU_GRIND_LATCH.set(enable);
                     if enable {
                         match gpu_blake3_pow_nonce(&state_digest, bits) {
@@ -884,21 +874,19 @@ mod grind_worker {
         .as_ref()
     }
 
-    /// Dispatch one GPU grind scan through the persistent worker without
-    /// waiting for it. Returns `None` when the worker is unavailable (kill
-    /// switch or setup failure) and the caller must run the incumbent
-    /// scope-spawn path; `Some(rx)` delivers the scan outcome with the same
-    /// `Err` surface as a direct `gpu_blake3_pow_scan` call (a closed
-    /// channel — worker thread died — surfaces as `Err` on `recv`, exactly
-    /// like the previous blocking `dispatch`).
-    pub(super) fn dispatch_async(
+    /// Dispatch one GPU grind scan through the persistent worker. Returns
+    /// `None` when the worker is unavailable (kill switch or setup failure)
+    /// and the caller must run the incumbent scope-spawn path; `Some(result)`
+    /// is the scan outcome with the same `Err` surface as a direct
+    /// `gpu_blake3_pow_scan` call.
+    pub(super) fn dispatch(
         state_digest: &[u8; 32],
         start: u64,
         len: u32,
         bits: u32,
         stop: Arc<AtomicBool>,
         abort: bool,
-    ) -> Option<Receiver<Result<Option<u64>, String>>> {
+    ) -> Option<Result<Option<u64>, String>> {
         let w = worker()?;
         let (done_tx, done_rx) = channel();
         let job = Job {
@@ -911,20 +899,12 @@ mod grind_worker {
             done: done_tx,
         };
         if w.tx.send(job).is_err() {
-            // Preserve the incumbent surface: the send failure is reported
-            // through the receiver (its sender is dropped here), so `recv`
-            // yields the same channel-closed error the blocking path
-            // returned.
-            return Some(done_rx);
+            return Some(Err("GPU grind worker channel closed".to_string()));
         }
-        Some(done_rx)
-    }
-
-    /// Receive one result from [`dispatch_async`], mapping a closed channel
-    /// to the incumbent error string.
-    pub(super) fn recv(rx: Receiver<Result<Option<u64>, String>>) -> Result<Option<u64>, String> {
-        rx.recv()
-            .unwrap_or_else(|_| Err("GPU grind worker channel closed".to_string()))
+        match done_rx.recv() {
+            Ok(res) => Some(res),
+            Err(_) => Some(Err("GPU grind worker channel closed".to_string())),
+        }
     }
 }
 
@@ -980,8 +960,7 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         let abort = grind_hybrid_abort_enabled();
         // Persistent dispatch worker when available; the incumbent
         // scope-spawn path otherwise (see `grind_worker`).
-        let t_iter = grind_trace_enabled().then(std::time::Instant::now);
-        let (gpu_result, cpu_next) = match grind_worker::dispatch_async(
+        let (gpu_result, cpu_next) = match grind_worker::dispatch(
             state_digest,
             start,
             block_len,
@@ -989,51 +968,30 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             std::sync::Arc::clone(&stop),
             abort,
         ) {
-            Some(done_rx) => {
-                if grind_prefetch_overlap_enabled() {
-                    // The worker owns the GPU scan; this thread — which
-                    // would otherwise park in `recv` — drains the CPU
-                    // next-block window in parallel, restoring the overlap
-                    // the scope-spawn path always had. On a hit the worker
-                    // pre-sets `stop` (abort policy), the window exits
-                    // between chunks, and its result is discarded below;
-                    // on a miss the flag never fires and the window drains
-                    // fully. Either way the emitted nonce is byte-identical
-                    // to the serialized shape.
-                    let cpu = cpu_blake3_pow_window_inner(
-                        state_digest,
-                        next_start,
-                        block_len,
-                        bits,
-                        abort.then_some(stop.as_ref()),
-                    );
-                    let gpu = grind_worker::recv(done_rx);
-                    (gpu, cpu)
-                } else {
-                    // A/B-CONTROL (FLOCK_NO_GRIND_PREFETCH_OVERLAP=1): the
-                    // prior serialized shape. On a hit the following CPU
-                    // block is later in nonce order and its result is
-                    // unconditionally discarded below, while the pre-set
-                    // stop flag makes every worker exit immediately. Avoid
-                    // the otherwise-dead allocation, Rayon drain, and
-                    // E-pool broadcast.
-                    let gpu = grind_worker::recv(done_rx);
-                    let cpu = run_cpu_window_after_persistent_gpu(
-                        &gpu,
-                        abort,
-                        grind_skip_dead_cpu_enabled(),
-                        || {
-                            cpu_blake3_pow_window_inner(
-                                state_digest,
-                                next_start,
-                                block_len,
-                                bits,
-                                abort.then_some(stop.as_ref()),
-                            )
-                        },
-                    );
-                    (gpu, cpu)
-                }
+            Some(gpu) => {
+                // `dispatch` has already waited for this persistent-worker
+                // result. On a hit the following CPU block is later in
+                // nonce order and its result is unconditionally discarded
+                // below, while the pre-set stop flag makes every worker
+                // exit immediately. Avoid the otherwise-dead allocation,
+                // Rayon drain, and E-pool broadcast. Misses, errors,
+                // abort-disabled diagnostics, and the scope-spawn fallback
+                // retain the incumbent behavior exactly.
+                let cpu = run_cpu_window_after_persistent_gpu(
+                    &gpu,
+                    abort,
+                    grind_skip_dead_cpu_enabled(),
+                    || {
+                        cpu_blake3_pow_window_inner(
+                            state_digest,
+                            next_start,
+                            block_len,
+                            bits,
+                            abort.then_some(stop.as_ref()),
+                        )
+                    },
+                );
+                (gpu, cpu)
             }
             None => std::thread::scope(|s| {
                 let gpu_scan = s.spawn(|| {
@@ -1061,15 +1019,6 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                 (gpu, cpu)
             }),
         };
-        if let Some(t) = t_iter {
-            eprintln!(
-                "[grind] bits={bits} block=2^{} gpu_hit={} cpu_hit={} iter_wall={:.3} ms",
-                bits.min(24),
-                matches!(&gpu_result, Ok(Some(_))),
-                cpu_next.is_some(),
-                t.elapsed().as_secs_f64() * 1e3,
-            );
-        }
         if let Some(nonce) = gpu_result? {
             return Ok(nonce);
         }
@@ -1112,38 +1061,6 @@ fn grind_hybrid_abort_enabled() -> bool {
 fn grind_skip_dead_cpu_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_SKIP_DEAD_CPU").is_none())
-}
-
-/// Run the CPU next-block prefetch window *concurrently* with the persistent
-/// GPU worker's scan, on the dispatching thread, instead of serialized behind
-/// `done_rx.recv()`. The scope-spawn fallback always had this overlap; the
-/// persistent worker lost it when it replaced the per-call thread. Nonce
-/// selection is untouched (GPU block consulted first, CPU window second), so
-/// the emitted nonce — and the proof bytes — are identical for every
-/// hit/miss interleaving; only the wall changes. On a GPU hit with the abort
-/// policy armed the worker thread sets `stop` and the window exits between
-/// chunks, which is the exact incumbent scope-spawn behavior.
-/// A/B-CONTROL: `FLOCK_NO_GRIND_PREFETCH_OVERLAP=1` restores the serialized
-/// wait-then-window shape (including its skip-dead-CPU cut) for same-binary
-/// comparison; ranked workers run the compile-time default below.
-const GRIND_PREFETCH_OVERLAP_DEFAULT: bool = true;
-fn grind_prefetch_overlap_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        if std::env::var_os("FLOCK_NO_GRIND_PREFETCH_OVERLAP").is_some() {
-            false
-        } else {
-            GRIND_PREFETCH_OVERLAP_DEFAULT
-        }
-    })
-}
-
-/// Diagnostic-only: `FLOCK_GRIND_TRACE=1` prints one line per GPU-hybrid
-/// grind iteration (bits, GPU hit/miss, GPU wall, CPU-window wall). Local
-/// tooling; ranked workers never set it.
-fn grind_trace_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_GRIND_TRACE").is_some())
 }
 
 // ---------------------------------------------------------------------------

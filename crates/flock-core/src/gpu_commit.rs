@@ -3087,25 +3087,20 @@ struct PowParams {
     uint bits;
 };
 
-static inline bool pow_has_leading_zero_bits(thread const uint* cv, uint bits) {
+static inline bool pow_has_leading_zero_bits(uint cv0, uint bits) {
     uint full_bytes = bits >> 3;
     uint extra = bits & 7u;
-    for (uint i = 0u; i < full_bytes; i++) {
-        uint byte_value = (cv[i >> 2] >> ((i & 3u) << 3)) & 0xffu;
-        if (byte_value != 0u) return false;
-    }
+    uint mask = full_bytes == 4u ? 0xffffffffu : ((1u << (full_bytes << 3)) - 1u);
     if (extra != 0u) {
-        uint i = full_bytes;
-        uint byte_value = (cv[i >> 2] >> ((i & 3u) << 3)) & 0xffu;
-        if ((byte_value >> (8u - extra)) != 0u) return false;
+        mask |= ((0xffu << (8u - extra)) & 0xffu) << (full_bytes << 3);
     }
-    return true;
+    return (cv0 & mask) == 0u;
 }
 
-static inline void pow_compress(thread uint* cv, thread const uint* m_in) {
+static inline uint pow_compress0(thread const uint* m_in) {
     uint v[16];
     uint m[16];
-    for (uint i = 0u; i < 8u; i++) v[i] = cv[i];
+    for (uint i = 0u; i < 8u; i++) v[i] = POW_IV[i];
     for (uint i = 0u; i < 4u; i++) v[8u + i] = POW_IV[i];
     v[12] = 0u;
     v[13] = 0u;
@@ -3129,7 +3124,7 @@ static inline void pow_compress(thread uint* cv, thread const uint* m_in) {
             for (uint i = 0u; i < 16u; i++) m[i] = next[i];
         }
     }
-    for (uint i = 0u; i < 8u; i++) cv[i] = v[i] ^ v[8u + i];
+    return v[0] ^ v[8];
 }
 
 kernel void blake3_pow_scan(
@@ -3147,10 +3142,8 @@ kernel void blake3_pow_scan(
     block[8] = nonce_lo;
     block[9] = nonce_hi;
     for (uint i = 10u; i < 16u; i++) block[i] = 0u;
-    uint cv[8];
-    for (uint i = 0u; i < 8u; i++) cv[i] = POW_IV[i];
-    pow_compress(cv, block);
-    if (pow_has_leading_zero_bits(cv, params.bits)) {
+    uint cv0 = pow_compress0(block);
+    if (pow_has_leading_zero_bits(cv0, params.bits)) {
         atomic_fetch_min_explicit(best, id, memory_order_relaxed);
     }
 }
@@ -7584,10 +7577,10 @@ kernel void blake3_pow_scan(
                 gpu.set_bytes(enc, state_digest, 0);
                 gpu.set_buffer(enc, gpu.pow_out, 0, 1);
                 gpu.set_bytes(enc, params_bytes, 2);
-                // A 64-thread group keeps useful SIMD occupancy without
-                // assuming this register-heavy BLAKE3 pipeline admits a
-                // 256-thread group on every measured worker.
-                const THREADS: u64 = 64;
+                // One Apple SIMD-group per threadgroup lowers the aggregate
+                // register footprint of this register-heavy BLAKE3 kernel,
+                // allowing the GPU scheduler to keep more groups resident.
+                const THREADS: u64 = 32;
                 gpu.dispatch(enc, u64::from(len).div_ceil(THREADS), THREADS);
                 gpu.end_encoding(enc);
                 // The grind sits on the transcript's serial spine: nothing
@@ -9663,17 +9656,6 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         *ON.get_or_init(|| std::env::var_os("FLOCK_GPU_RECMERKLE_DEBUG").is_some())
     }
 
-    /// Bounded-spin drain for the recursive-Merkle command buffer (exact
-    /// same-binary latency control; see the call site). Only the exact
-    /// value `1` restores the incumbent blocking wait.
-    fn rec_merkle_spin_enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var_os("FLOCK_NO_RECMERKLE_SPIN").as_deref()
-                != Some(std::ffi::OsStr::new("1"))
-        })
-    }
-
     fn rec_merkle_init(gpu: &'static Gpu) -> Result<RecMerkle, String> {
         unsafe {
             let pool = gpu.pool_push();
@@ -9879,20 +9861,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     read_len = n_out;
                 }
                 gpu.end_encoding(enc);
-                // This dispatch sits on the opening's FS-serial spine with
-                // every CPU thread otherwise idle, the exact shape
-                // `commit_and_spin` exists for: the blocking wait pays a
-                // thread park + completion-handler wake per call (measured
-                // ~0.3–0.5 ms at the grind sites). The spin consumes the
-                // same completed buffer with the same status check and past
-                // its budget degrades to the exact blocking wait — proof
-                // bytes untouched. A/B-CONTROL: FLOCK_NO_RECMERKLE_SPIN=1
-                // (exact '1') restores the incumbent blocking wait.
-                if rec_merkle_spin_enabled() {
-                    gpu.commit_and_spin(cb, 4.0)
-                } else {
-                    gpu.commit_and_wait(cb)
-                }
+                gpu.commit_and_wait(cb)
             })();
             gpu.pool_pop(pool);
             run
@@ -9908,11 +9877,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             return None;
         }
 
-        // Pooled destination: a fresh 16 MiB uninit Vec pays ~4k first-touch
-        // page faults inside this FS-serial copy and a single-threaded munmap
-        // on the following drop; the recycled buffer's pages stay resident
-        // across proves (write-before-read: the copy below writes all of it).
-        let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
+        let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
         unsafe {
             let dst =
                 core::slice::from_raw_parts_mut(tree.as_mut_ptr().cast::<u8>(), total_nodes * 32);
