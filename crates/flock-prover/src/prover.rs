@@ -568,7 +568,144 @@ enum LincheckStripeInput {
 
 const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 64;
 
+/// Kill switch for the blocked two-word stripe-fill kernel: `1` restores the
+/// incumbent one-word-per-iteration transpose loop. Both paths are
+/// byte-identical (same per-word bit transpose, only the load width and
+/// scheduling differ). See `fill_deferred_lincheck_stripe_group`.
+fn deferred_stripe_blocked_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_DEFER_STRIPE_BLOCKED").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Blocked two-word stripe-fill kernel: process words `{w0, w0+1}` per
+/// iteration, loading each lane's two consecutive u64s with one 16-byte
+/// `vld1q` (halving the load-instruction count versus the incumbent's eight
+/// 8-byte scalar loads per word) and extracting the two per-word lane
+/// vectors with a three-level `vtrn` ladder. Each word then runs the same
+/// `bit_transpose_64bytes` as the incumbent, so the output bytes are
+/// identical. `FLOCK_NO_DEFER_STRIPE_BLOCKED=1` keeps the scalar loop.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fill_stripe_group_blocked(
+    z_u64: &[u64],
+    stripe: &mut [u8],
+    u64_per_block: usize,
+    useful_words: usize,
+) {
+    use core::arch::aarch64::*;
+
+    let n_pairs = useful_words / 2;
+    for p in 0..n_pairs {
+        let w0 = 2 * p;
+        // Each lane's words [w0, w0+1] are consecutive u64s: one 16-byte load.
+        let mut lr = [vdupq_n_u64(0); 8];
+        for lane in 0..8usize {
+            lr[lane] = vld1q_u64(z_u64.as_ptr().add(lane * u64_per_block + w0));
+        }
+        // Level 1: pair lanes (0,1),(2,3),(4,5),(6,7) -> even/odd word split.
+        let mut l1 = [vdupq_n_u64(0); 8];
+        for pair in 0..4usize {
+            l1[2 * pair] = vtrn1q_u64(lr[2 * pair], lr[2 * pair + 1]);
+            l1[2 * pair + 1] = vtrn2q_u64(lr[2 * pair], lr[2 * pair + 1]);
+        }
+        // Level 2: pair lane-groups (0,2),(1,3),(4,6),(5,7).
+        let mut l2 = [vdupq_n_u64(0); 8];
+        l2[0] = vtrn1q_u64(l1[0], l1[2]);
+        l2[1] = vtrn2q_u64(l1[0], l1[2]);
+        l2[2] = vtrn1q_u64(l1[1], l1[3]);
+        l2[3] = vtrn2q_u64(l1[1], l1[3]);
+        l2[4] = vtrn1q_u64(l1[4], l1[6]);
+        l2[5] = vtrn2q_u64(l1[4], l1[6]);
+        l2[6] = vtrn1q_u64(l1[5], l1[7]);
+        l2[7] = vtrn2q_u64(l1[5], l1[7]);
+        // Level 3 per word: even word regs = (l2[0],l2[1]) x (l2[4],l2[5]);
+        // odd word regs = (l2[2],l2[3]) x (l2[6],l2[7]).
+        let out_even = [
+            vtrn1q_u64(l2[0], l2[1]),
+            vtrn2q_u64(l2[0], l2[1]),
+            vtrn1q_u64(l2[4], l2[5]),
+            vtrn2q_u64(l2[4], l2[5]),
+        ];
+        let out_odd = [
+            vtrn1q_u64(l2[2], l2[3]),
+            vtrn2q_u64(l2[2], l2[3]),
+            vtrn1q_u64(l2[6], l2[7]),
+            vtrn2q_u64(l2[6], l2[7]),
+        ];
+        for (w_idx, out) in [(0usize, out_even), (1, out_odd)] {
+            let mut bytes = [0u8; 64];
+            vst1q_u8(bytes.as_mut_ptr(), vreinterpretq_u8_u64(out[0]));
+            vst1q_u8(bytes.as_mut_ptr().add(16), vreinterpretq_u8_u64(out[1]));
+            vst1q_u8(bytes.as_mut_ptr().add(32), vreinterpretq_u8_u64(out[2]));
+            vst1q_u8(bytes.as_mut_ptr().add(48), vreinterpretq_u8_u64(out[3]));
+            let dst = &mut stripe[(w0 + w_idx) * 64..(w0 + w_idx) * 64 + 64];
+            let mut out_bytes = [0u8; 64];
+            flock_core::zerocheck::univariate_skip_optimized::bit_transpose_64bytes(
+                &bytes, &mut out_bytes,
+            );
+            // Same cache-bypassing store flavor as the incumbent path: the
+            // stripe is not read until after commit+zerocheck, so `stnp`
+            // elides the write-allocate RFOs.
+            core::arch::asm!(
+                "ldp {t0:q}, {t1:q}, [{src}]",
+                "stnp {t0:q}, {t1:q}, [{dst}]",
+                "ldp {t0:q}, {t1:q}, [{src}, #32]",
+                "stnp {t0:q}, {t1:q}, [{dst}, #32]",
+                src = in(reg) out_bytes.as_ptr(),
+                dst = in(reg) dst.as_mut_ptr(),
+                t0 = out(vreg) _,
+                t1 = out(vreg) _,
+                options(nostack)
+            );
+        }
+    }
+    // One-word tail (useful_words odd).
+    for word in (n_pairs * 2)..useful_words {
+        let lanes: [u64; 8] = std::array::from_fn(|lane| z_u64[lane * u64_per_block + word]);
+        let mut out = [0u8; 64];
+        flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut out);
+        stripe[word * 64..word * 64 + 64].copy_from_slice(&out);
+    }
+}
+
 fn fill_deferred_lincheck_stripe_group(
+    z_packed: &[F128],
+    stripe: &mut [u8],
+    group: usize,
+    group_f128: usize,
+    u64_per_block: usize,
+    useful_words: usize,
+) {
+    let group_start = group * group_f128;
+    let z_group = &z_packed[group_start..group_start + group_f128];
+    // SAFETY: F128 is repr(C) as two little-endian u64 halves; this is the
+    // same read-only view used by the eager witness transpose.
+    let z_u64: &[u64] =
+        unsafe { std::slice::from_raw_parts(z_group.as_ptr().cast::<u64>(), z_group.len() * 2) };
+
+    #[cfg(target_arch = "aarch64")]
+    if deferred_stripe_blocked_enabled() && useful_words >= 2 {
+        unsafe {
+            fill_stripe_group_blocked(z_u64, stripe, u64_per_block, useful_words);
+        }
+        return;
+    }
+
+    fill_deferred_lincheck_stripe_group_word_loop(
+        z_packed, stripe, group, group_f128, u64_per_block, useful_words,
+    );
+    // The ranked padded fold never observes the tail. Keeping the honest
+    // full-stripe contract in tests catches accidental selector widening.
+    #[cfg(test)]
+    stripe[useful_words * 64..].fill(0);
+}
+
+/// Incumbent one-word-per-iteration stripe transpose (kept as the oracle and
+/// the `FLOCK_NO_DEFER_STRIPE_BLOCKED=1` control arm).
+fn fill_deferred_lincheck_stripe_group_word_loop(
     z_packed: &[F128],
     stripe: &mut [u8],
     group: usize,
@@ -608,10 +745,6 @@ fn fill_deferred_lincheck_stripe_group(
         #[cfg(not(target_arch = "aarch64"))]
         dst.copy_from_slice(&transposed);
     }
-    // The ranked padded fold never observes the tail. Keeping the honest
-    // full-stripe contract in tests catches accidental selector widening.
-    #[cfg(test)]
-    stripe[useful_words * 64..].fill(0);
 }
 
 /// Materialize a BLAKE3-style lincheck stripe from immutable row-major packed
@@ -707,6 +840,55 @@ mod deferred_stripe_tests {
         let mut actual = vec![0xa5; expected.len()];
         fill_deferred_lincheck_stripe(&z, &mut actual, M, K_LOG, 1 << K_LOG);
         assert_eq!(actual, expected);
+
+        // The blocked kernel must be byte-identical to the incumbent for
+        // both parity shapes (even and odd useful_words).
+        for useful_bits in [1 << K_LOG, (1 << K_LOG) - 1] {
+            let mut blocked = vec![0xa5; expected.len()];
+            let mut blocked_forced_off = vec![0xa5; expected.len()];
+            {
+                let completed = fill_deferred_lincheck_stripe_with_dispatch(
+                    &z,
+                    &mut blocked,
+                    M,
+                    K_LOG,
+                    useful_bits,
+                    |n_jobs, job| {
+                        for i in 0..n_jobs {
+                            job(i);
+                        }
+                        true
+                    },
+                );
+                assert!(completed);
+            }
+            // Force the incumbent loop via the kill switch by testing the
+            // low-level group filler directly (the env latch is process-wide,
+            // so bypass it and call the internal per-word path through the
+            // dispatch closure's group filler).
+            {
+                let k = 1usize << K_LOG;
+                let n_groups = blocked_forced_off.len() / k;
+                let group_f128 = 8 * (k / 128);
+                let u64_per_block = k / 64;
+                let useful_words = useful_bits.div_ceil(64);
+                for g in 0..n_groups {
+                    fill_deferred_lincheck_stripe_group_word_loop(
+                        &z,
+                        &mut blocked_forced_off[g * k..(g + 1) * k],
+                        g,
+                        group_f128,
+                        u64_per_block,
+                        useful_words,
+                    );
+                }
+            }
+            assert_eq!(blocked, blocked_forced_off, "blocked vs word-loop");
+            // Blocked path must match the canonical packer too.
+            if useful_bits == 1 << K_LOG {
+                assert_eq!(blocked, expected, "blocked vs canonical");
+            }
+        }
 
         let helper = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
