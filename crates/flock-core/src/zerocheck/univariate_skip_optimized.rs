@@ -1546,7 +1546,7 @@ fn process_one_x_hi_with_s_hat_v(
 #[allow(clippy::too_many_arguments)]
 fn process_one_x_hi_with_precomputed_ab(
     x_hi: usize,
-    big_lo_size: usize,
+    x_lo_range: std::ops::Range<usize>,
     n_lo_and_inner: usize,
     within_outer_mask: usize,
     b_med_counts: &[u8],
@@ -1576,7 +1576,7 @@ fn process_one_x_hi_with_precomputed_ab(
         // population first, then drain C in a second linear pass; the witness
         // bytes read are unchanged and characteristic-two accumulation makes
         // the reordering bit-exact.
-        for x_outer_lo in 0..big_lo_size {
+        for x_outer_lo in x_lo_range.clone() {
             let x_outer = x_outer_lo | (x_hi << n_lo);
             let within_hash_outer = x_outer & within_outer_mask;
             let n_b_med = b_med_counts[within_hash_outer] as usize;
@@ -1604,7 +1604,7 @@ fn process_one_x_hi_with_precomputed_ab(
             );
         }
 
-        for x_outer_lo in 0..big_lo_size {
+        for x_outer_lo in x_lo_range.clone() {
             let x_outer = x_outer_lo | (x_hi << n_lo);
             let within_hash_outer = x_outer & within_outer_mask;
             let n_b_med = b_med_counts[within_hash_outer] as usize;
@@ -1628,7 +1628,7 @@ fn process_one_x_hi_with_precomputed_ab(
             );
         }
     } else {
-        for x_outer_lo in 0..big_lo_size {
+        for x_outer_lo in x_lo_range.clone() {
             let x_outer = x_outer_lo | (x_hi << n_lo);
             let within_hash_outer = x_outer & within_outer_mask;
             let n_b_med = b_med_counts[within_hash_outer] as usize;
@@ -1687,7 +1687,7 @@ fn process_one_x_hi_with_precomputed_ab(
 #[allow(clippy::too_many_arguments)]
 fn process_one_x_hi_with_precomputed_ab_fold4_ab(
     x_hi: usize,
-    big_lo_size: usize,
+    x_lo_range: std::ops::Range<usize>,
     n_lo_and_inner: usize,
     within_outer_mask: usize,
     b_med_counts: &[u8],
@@ -1704,7 +1704,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
 
     // Ranked AB policy: its 64 KiB table stays resident for the complete band.
     let t_ab = timing_cpu_ns.map(|_| std::time::Instant::now());
-    for x_outer_lo in 0..big_lo_size {
+    for x_outer_lo in x_lo_range {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
         if n_b_med == 0 {
@@ -1770,7 +1770,7 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
         let mut partial = [F128::ZERO; ELL];
         process_one_x_hi_with_precomputed_ab_fold4_ab(
             x_hi,
-            big_lo_size,
+            0..big_lo_size,
             n_lo_and_inner,
             within_outer_mask,
             &b_med_counts,
@@ -2215,13 +2215,14 @@ fn process_one_x_hi_with_precomputed_ab_fold4_c_pair(
 }
 
 /// Four-block follow-on to pair fusion. Two pair-table values are combined
-/// before one 32-bank accumulator update, while retaining the same monolithic
-/// per-x_hi scheduling and deterministic reduction shape.
+/// before one 32-bank accumulator update, while retaining the same
+/// deterministic reduction shape (the r853 lo-split partitions the band into
+/// quartet-aligned sub-ranges; each task owns its own accumulator).
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn process_one_x_hi_with_precomputed_ab_fold4_c_four(
     x_hi: usize,
-    big_lo_size: usize,
+    x_lo_range: std::ops::Range<usize>,
     n_lo_and_inner: usize,
     within_outer_mask: usize,
     b_med_counts: &[u8],
@@ -2231,12 +2232,15 @@ fn process_one_x_hi_with_precomputed_ab_fold4_c_four(
     timing_cpu_ns: Option<&[std::sync::atomic::AtomicU64; 3]>,
     partial_c: &mut [[F128; ELL]; N_C_FOLD4_BANKS],
 ) {
-    assert!(big_lo_size >= 4 && big_lo_size % 4 == 0);
+    assert!(
+        x_lo_range.start % 4 == 0 && x_lo_range.end % 4 == 0 && x_lo_range.start < x_lo_range.end,
+        "fold4 c_four requires a non-empty 4-aligned x_outer_lo range"
+    );
     partial_c.iter_mut().for_each(|bank| bank.fill(F128::ZERO));
 
     let n_lo = n_lo_and_inner - N_INNER;
     let t_c = timing_cpu_ns.map(|_| std::time::Instant::now());
-    for quartet in 0..big_lo_size / 4 {
+    for quartet in x_lo_range.start / 4..x_lo_range.end / 4 {
         let lo_base = 4 * quartet;
         let n_b_med: [usize; 4] = std::array::from_fn(|side| {
             let x_outer_lo = lo_base + side;
@@ -2739,6 +2743,24 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_s_hat_v(
     (res_ab, res_c_lifted, s_hat_v_c)
 }
 
+/// Split each `x_hi` sweep into this many `x_outer_lo` sub-ranges so the
+/// hetero queue sees more, shorter chunks than the 8 `x_hi` indices alone
+/// (10+ consumers on the M4, 24 on the x86 host; 8 chunks leave most idle).
+/// Sub-ranges also cross [`crate::epool::EPOOL_MIN_CHUNKS`] (16) so the
+/// efficiency cores join the drain. Bit-exact: every split sums the same
+/// (x_hi, x_outer_lo) pair set and F128 addition is XOR, so the reduction
+/// order is irrelevant.
+const ZC_LO_CHUNKS_DEFAULT: usize = 4;
+
+/// A/B override seam: `FLOCK_ZC_LO_CHUNKS=N` changes the sub-range count.
+fn zc_lo_chunks() -> usize {
+    std::env::var("FLOCK_ZC_LO_CHUNKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(ZC_LO_CHUNKS_DEFAULT)
+        .max(1)
+}
+
 /// Challenge-weighted completion of round 1 using AB blocks returned by
 /// [`precompute_round1_ab_inner_packed_padded`]. This is byte-identical to
 /// [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v_quad`], while
@@ -2786,14 +2808,29 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     // the shared P/E-core queue without changing the hot conversion kernel.
     // A fixed per-index partial keeps the nondeterministic claim order out of
     // the output; the final operation is XOR, so serial reduction is exact.
+    //
+    // r852: each x_hi is split into `zc_lo_chunks` x_outer_lo sub-ranges so
+    // the queue sees hi_size×zc_lo_chunks tasks instead of hi_size. With only
+    // 8 chunks most consumers grab one chunk and idle (10 cores on the M4
+    // runner, 24 on the x86 host), and 8 < EPOOL_MIN_CHUNKS (16) keeps the
+    // efficiency cores out of the drain entirely. Sub-ranges cross the
+    // 16-chunk floor, so the E-cores join. Accumulation stays bit-exact:
+    // every task sums the same (x_hi, x_outer_lo) pair set, F128 add is XOR,
+    // and the serial reduction order is irrelevant.
+    let zc_lo_chunks = zc_lo_chunks();
+    let n_sweep_tasks = hi_size * zc_lo_chunks;
     let mut partials: Vec<([F128; ELL], [[F128; ELL]; N_C_BANKS])> =
-        vec![([F128::ZERO; ELL], [[F128::ZERO; ELL]; N_C_BANKS]); hi_size];
+        vec![([F128::ZERO; ELL], [[F128::ZERO; ELL]; N_C_BANKS]); n_sweep_tasks];
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    crate::epool::run_hetero_chunks(n_sweep_tasks, |task| {
+        let x_hi = task / zc_lo_chunks;
+        let lo_chunk = task % zc_lo_chunks;
+        let lo_start = lo_chunk * big_lo_size / zc_lo_chunks;
+        let lo_end = (lo_chunk + 1) * big_lo_size / zc_lo_chunks;
         let mut state = WorkerStateWithSHatV::new();
         process_one_x_hi_with_precomputed_ab(
             x_hi,
-            big_lo_size,
+            lo_start..lo_end,
             n_lo_and_inner,
             within_outer_mask,
             &b_med_counts,
@@ -2808,11 +2845,11 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
             c_drain4,
             &mut state,
         );
-        // SAFETY: the queue hands out each x_hi exactly once, so this task is
-        // the exclusive owner of partials[x_hi]. The queue's completion join
+        // SAFETY: the queue hands out each task exactly once, so this task is
+        // the exclusive owner of partials[task]. The queue's completion join
         // publishes every write before the reduction below reads the vector.
         unsafe {
-            *partials_base.ptr().add(x_hi) = (state.local_res_ab, state.local_res_c_s);
+            *partials_base.ptr().add(task) = (state.local_res_ab, state.local_res_c_s);
         }
     });
     let (res_ab, banks) = partials.into_iter().fold(
@@ -2990,7 +3027,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
                 let mut partial_ab = [F128::ZERO; ELL];
                 process_one_x_hi_with_precomputed_ab_fold4_ab(
                     x_hi,
-                    big_lo_size,
+                    0..big_lo_size,
                     n_lo_and_inner,
                     within_outer_mask,
                     &b_med_counts,
@@ -3056,15 +3093,56 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
         (res_ab, banks, queue_jobs, queue_ms, reduce_ms)
     } else {
         type Fold4Partial = ([F128; ELL], Box<[[F128; ELL]; N_C_FOLD4_BANKS]>);
-        let mut partials: Vec<Option<Fold4Partial>> =
-            std::iter::repeat_with(|| None).take(hi_size).collect();
+        // r853: extend the r852 lo-split seam to the ranked fold4 producer.
+        // The monolithic schedule hands the queue `hi_size` (128) tasks, each
+        // sweeping the whole x_outer_lo band of one x_hi. Splitting the band
+        // into quartet-aligned sub-ranges raises the count to
+        // hi_size × zc_lo_chunks (512 at the ranked shape: lo band is 4096
+        // slots, so the default 4 sub-ranges of 1024 slots each),
+        // so the shared P/E-core queue has finer granularity to keep the M4's
+        // efficiency cores draining uniform work. F128 add is XOR: disjoint
+        // sub-ranges accumulated into per-task slots and reduced in task order
+        // are byte-identical to the monolithic sweep. The split engages only
+        // on the production pair4 path; the pair-fused kill-switch route keeps
+        // its historical whole-band schedule.
+        //
+        // r856: harness forensics (benchmark-tools/harness run_trial) show the
+        // board worker runs with `env_clear()` + only RAYON_NUM_THREADS and
+        // TMPDIR set, stdout/stderr both null, so every FLOCK_* env gate in
+        // this file (FLOCK_ZC_TIMING, FLOCK_NO_ZC_AB_PRE_*, ...) is inert on
+        // the scored path — board behavior is exactly the compiled defaults,
+        // and no worker-side probe output can ever reach the submission
+        // record (officialMetrics carries only harness-computed fields). Any
+        // future mechanism change must therefore be default-on in code.
+        let lo_chunks = if pair4 && big_lo_size >= 4 {
+            zc_lo_chunks().min(big_lo_size / 4).max(1)
+        } else {
+            1
+        };
+        let mut partials: Vec<Option<Fold4Partial>> = std::iter::repeat_with(|| None)
+            .take(hi_size * lo_chunks)
+            .collect();
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
         let t_queue = std::time::Instant::now();
-        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        crate::epool::run_hetero_chunks(hi_size * lo_chunks, |task| {
+            let x_hi = task / lo_chunks;
+            let lo_chunk = task % lo_chunks;
+            // Quartet-aligned sub-range: 4-aligned by construction for any
+            // chunk count, and a contiguous cover of [0, big_lo_size).
+            let lo_start = if lo_chunks == 1 {
+                0
+            } else {
+                4 * (lo_chunk * (big_lo_size / 4) / lo_chunks)
+            };
+            let lo_end = if lo_chunks == 1 {
+                big_lo_size
+            } else {
+                4 * ((lo_chunk + 1) * (big_lo_size / 4) / lo_chunks)
+            };
             let mut partial_ab = [F128::ZERO; ELL];
             process_one_x_hi_with_precomputed_ab_fold4_ab(
                 x_hi,
-                big_lo_size,
+                lo_start..lo_end,
                 n_lo_and_inner,
                 within_outer_mask,
                 &b_med_counts,
@@ -3079,7 +3157,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
             if pair4 && big_lo_size >= 4 {
                 process_one_x_hi_with_precomputed_ab_fold4_c_four(
                     x_hi,
-                    big_lo_size,
+                    lo_start..lo_end,
                     n_lo_and_inner,
                     within_outer_mask,
                     &b_med_counts,
@@ -3103,10 +3181,10 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
                     &mut partial_c,
                 );
             }
-            // SAFETY: each x_hi owns one indexed slot; the epool join
-            // publishes it before deterministic reduction.
+            // SAFETY: each (x_hi, lo_chunk) owns one indexed slot; the epool
+            // join publishes it before deterministic reduction.
             unsafe {
-                *partials_base.clone().ptr().add(x_hi) = Some((partial_ab, partial_c));
+                *partials_base.clone().ptr().add(task) = Some((partial_ab, partial_c));
             }
         });
         let queue_ms = t_queue.elapsed().as_secs_f64() * 1e3;
@@ -3127,7 +3205,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
             },
         );
         let reduce_ms = t_reduce.elapsed().as_secs_f64() * 1e3;
-        (res_ab, banks, hi_size, queue_ms, reduce_ms)
+        (res_ab, banks, hi_size * lo_chunks, queue_ms, reduce_ms)
     };
 
     crate::scratch::give_f128(c_fold4_pair_mask_tables);
