@@ -1,5 +1,16 @@
 //! Round-1 prover message — fully optimized (shift_reduce + extract_c, scalar).
 //!
+//! NOTE (r858): this file is restored to the promoted kernel tree (r851
+//! `63b290a`, pre-r852) — the r852/r853 lo-band task-split is reverted. Board
+//! verdict on the split tree after 3 fresh draws (829607e1, 43861e33,
+//! 79954f4d): medians 148.042/147.945/147.763 ms, ranks 5/12/16 of the 24
+//! 8/8 family runs, exact Mann-Whitney P=0.37 vs the pre-split tree — no
+//! measurable benefit, and the split never drew below 147.763 while the
+//! promoted pre-split tree drew 147.690/147.713/147.733/147.748. The split was
+//! theory (M4 P/E-core draining) never validated on the board; this draw
+//! returns the draw stream to the exact code of the current frontier
+//! (54b8dbf). Content delta vs r851 = this comment only.
+//!
 //! Scalar Rust implementation (no NEON). Three layered optimizations on top of
 //! the [`super::round1_extract_c`] scaffold:
 //!
