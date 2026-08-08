@@ -3087,25 +3087,24 @@ struct PowParams {
     uint bits;
 };
 
-static inline bool pow_has_leading_zero_bits(thread const uint* cv, uint bits) {
-    uint full_bytes = bits >> 3;
+// The caller admits bits in 1..=32 only, so full_bytes = bits>>3 is at
+// most 4 and every byte tested by the predicate lives in cv[0] alone
+// (byte index i < 4 => i>>2 == 0; the extra top bits of byte `full_bytes`
+// are also within cv[0] because full_bytes == 4 forces extra == 0).
+// One mask computation and one word compare replace the byte loop.
+static inline bool pow_has_leading_zero_bits(uint cv0, uint bits) {
+    uint full_bytes = bits >> 3u;
     uint extra = bits & 7u;
-    for (uint i = 0u; i < full_bytes; i++) {
-        uint byte_value = (cv[i >> 2] >> ((i & 3u) << 3)) & 0xffu;
-        if (byte_value != 0u) return false;
-    }
-    if (extra != 0u) {
-        uint i = full_bytes;
-        uint byte_value = (cv[i >> 2] >> ((i & 3u) << 3)) & 0xffu;
-        if ((byte_value >> (8u - extra)) != 0u) return false;
-    }
-    return true;
+    uint mask = (full_bytes == 4u) ? 0xffffffffu
+        : (((1u << (full_bytes << 3u)) - 1u)
+           | (((0xffu << (8u - extra)) & 0xffu) << (full_bytes << 3u)));
+    return (cv0 & mask) == 0u;
 }
 
-static inline void pow_compress(thread uint* cv, thread const uint* m_in) {
+static inline uint pow_compress0(thread const uint* cv_in, thread const uint* m_in) {
     uint v[16];
     uint m[16];
-    for (uint i = 0u; i < 8u; i++) v[i] = cv[i];
+    for (uint i = 0u; i < 8u; i++) v[i] = cv_in[i];
     for (uint i = 0u; i < 4u; i++) v[8u + i] = POW_IV[i];
     v[12] = 0u;
     v[13] = 0u;
@@ -3129,7 +3128,9 @@ static inline void pow_compress(thread uint* cv, thread const uint* m_in) {
             for (uint i = 0u; i < 16u; i++) m[i] = next[i];
         }
     }
-    for (uint i = 0u; i < 8u; i++) cv[i] = v[i] ^ v[8u + i];
+    // Only word 0 of the final chaining value is consumed by the
+    // predicate, so materialize just v[0] ^ v[8].
+    return v[0] ^ v[8u];
 }
 
 kernel void blake3_pow_scan(
@@ -3149,8 +3150,8 @@ kernel void blake3_pow_scan(
     for (uint i = 10u; i < 16u; i++) block[i] = 0u;
     uint cv[8];
     for (uint i = 0u; i < 8u; i++) cv[i] = POW_IV[i];
-    pow_compress(cv, block);
-    if (pow_has_leading_zero_bits(cv, params.bits)) {
+    uint cv0 = pow_compress0(cv, block);
+    if (pow_has_leading_zero_bits(cv0, params.bits)) {
         atomic_fetch_min_explicit(best, id, memory_order_relaxed);
     }
 }
@@ -7584,10 +7585,13 @@ kernel void blake3_pow_scan(
                 gpu.set_bytes(enc, state_digest, 0);
                 gpu.set_buffer(enc, gpu.pow_out, 0, 1);
                 gpu.set_bytes(enc, params_bytes, 2);
-                // A 64-thread group keeps useful SIMD occupancy without
-                // assuming this register-heavy BLAKE3 pipeline admits a
-                // 256-thread group on every measured worker.
-                const THREADS: u64 = 64;
+                // A 32-thread group is one Apple SIMD-group per
+                // threadgroup: it lowers the aggregate register footprint of
+                // this register-heavy BLAKE3 kernel (16 v-words + 16
+                // m-words + addressing per thread), letting the GPU
+                // scheduler keep more threadgroups resident per wave on the
+                // small serial scans this kernel performs.
+                const THREADS: u64 = 32;
                 gpu.dispatch(enc, u64::from(len).div_ceil(THREADS), THREADS);
                 gpu.end_encoding(enc);
                 // The grind sits on the transcript's serial spine: nothing
