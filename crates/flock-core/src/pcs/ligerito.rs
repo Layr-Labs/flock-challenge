@@ -4583,8 +4583,14 @@ fn materialize_direct_fold8(
         super::round0_deferred(f_out, b_out)
     };
 
-    let mut folded_f = crate::scratch::take_f128(out_len);
-    let mut folded_b = crate::scratch::take_f128(out_len);
+    // Unpinned takes: the GPU prefix arm below creates its OWN no-copy Metal
+    // views over these outputs on a timed prove, so they must never alias a
+    // pinned (already externally wrapped) allocation — the same rule the
+    // zerocheck tail arms follow. For every non-ranked length this take is
+    // behaviorally identical to `take_f128` (the pinned slots only serve
+    // exact-length matches, and neither pin class is `out_len` long).
+    let mut folded_f = crate::scratch::take_f128_unpinned(out_len);
+    let mut folded_b = crate::scratch::take_f128_unpinned(out_len);
     let stats = if super::use_open_mat_hetero(
         packed_witness.len(),
         block_len,
@@ -4600,6 +4606,32 @@ fn materialize_direct_fold8(
         // reduced by block index after the join; in char 2 the sum is an
         // XOR multiset, so the message equals the rayon `reduce` bitwise.
         let n_blocks = out_len / block_len;
+        // GPU prefix arm (`FLOCK_NO_GPU_LIG_MAT8`, see
+        // `gpu_commit::launch_lig_mat8`): launched at the exact point the
+        // CPU drain would start — all six fold challenges are bound and the
+        // weights/tables above are final, so FS-ordering is untouched. On a
+        // calibrating (untimed warmup) prove the CPU still runs every block
+        // and the probe is byte-compared at the join before a share is
+        // published; on a timed prove the GPU owns blocks `[0, gpu_split)`
+        // outright — `folded_f`/`folded_b` stripes plus the per-block
+        // round-0 partials — and the CPU drain skips them. Every gate
+        // failure or Metal error degrades to the exact incumbent CPU path.
+        let gpu_job = crate::gpu_commit::launch_lig_mat8(
+            &packed_witness,
+            [&direct_tables[0], &direct_tables[1]],
+            [&claims[0].eq_lo, &claims[1].eq_lo],
+            [&claims[0].eq_hi, &claims[1].eq_hi],
+            &fold_weight,
+            crate::gpu_commit::LigMat8Targets {
+                folded_f_ptr: folded_f.as_mut_ptr(),
+                folded_b_ptr: folded_b.as_mut_ptr(),
+                out_len,
+            },
+            block_len,
+            n_blocks,
+        );
+        let gpu_split = gpu_job.as_ref().map_or(0, |job| job.cpu_split());
+        let drain_started = std::time::Instant::now();
         let mut partials = vec![(F128::ZERO, F128::ZERO); n_blocks];
         let f_base = crate::epool::SyncPtr(folded_f.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(folded_b.as_mut_ptr());
@@ -4608,6 +4640,11 @@ fn materialize_direct_fold8(
             n_blocks,
             || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
             |scratch, block| {
+                // GPU-owned prefix blocks (timed prove only): their output
+                // stripes and partial slots are published at the join below.
+                if block < gpu_split {
+                    return;
+                }
                 // SAFETY: the queue hands out each `block` exactly once; it
                 // owns output range `[block·B, (block+1)·B)` in both arrays
                 // and one partial slot; the two-pool join publishes all
@@ -4628,6 +4665,68 @@ fn materialize_direct_fold8(
                 }
             },
         );
+        if let Some(job) = gpu_job {
+            let cpu_wall_ms = drain_started.elapsed().as_secs_f64() * 1e3;
+            let probe = job.chunks;
+            if job.is_calibration() {
+                // Untimed warmup: the CPU ran every block above, so its
+                // values are authoritative regardless of the outcome; the
+                // wait byte-compares the probe and latches the share.
+                let _ = crate::gpu_commit::lig_mat8_wait(
+                    job,
+                    Some(&folded_f[..probe * block_len]),
+                    Some(&folded_b[..probe * block_len]),
+                    Some(&partials[..probe]),
+                    cpu_wall_ms,
+                    n_blocks,
+                );
+            } else {
+                match crate::gpu_commit::lig_mat8_wait(
+                    job, None, None, None, cpu_wall_ms, n_blocks,
+                ) {
+                    crate::gpu_commit::LigMat8Result::Prefix(gpu_partials) => {
+                        // GF add = XOR: slotting the GPU's per-block
+                        // partials into the block-indexed vector keeps the
+                        // reduce below bit-identical to the incumbent.
+                        for (block, partial) in gpu_partials.into_iter().enumerate() {
+                            partials[block] = partial;
+                        }
+                    }
+                    _ => {
+                        // Metal failed after admission (arm now poisoned):
+                        // redo the skipped prefix with the exact incumbent
+                        // per-block body.
+                        use rayon::prelude::*;
+                        let redo: Vec<(F128, F128)> = (0..gpu_split)
+                            .into_par_iter()
+                            .map_init(
+                                || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                                |scratch, block| {
+                                    // SAFETY: same ownership contract as the
+                                    // drain above — each redo block owns its
+                                    // disjoint output stripes, and the
+                                    // par_iter join publishes the writes.
+                                    unsafe {
+                                        let f_out = core::slice::from_raw_parts_mut(
+                                            f_base.ptr().add(block * block_len),
+                                            block_len,
+                                        );
+                                        let b_out = core::slice::from_raw_parts_mut(
+                                            b_base.ptr().add(block * block_len),
+                                            block_len,
+                                        );
+                                        fold8_block(scratch, block, b_out, f_out)
+                                    }
+                                },
+                            )
+                            .collect();
+                        for (block, partial) in redo.into_iter().enumerate() {
+                            partials[block] = partial;
+                        }
+                    }
+                }
+            }
+        }
         partials
             .into_iter()
             .fold((F128::ZERO, F128::ZERO), |(x0, x2), (y0, y2)| {

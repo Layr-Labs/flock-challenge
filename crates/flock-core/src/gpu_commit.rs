@@ -426,6 +426,57 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
     *ON
 }
 
+/// Kill switch for the round-two FULL-CHUNK GPU arm (`FLOCK_NO_ZC_R2_FULL8=1`):
+/// the `zc_r2_full8` kernel additionally stores the prefix chunks' compact
+/// anchors and deltas (byte-identical to the CPU's `r2_pair_fold_and_store`)
+/// and returns all eight lookahead slots, so the CPU skips offloaded chunks
+/// entirely instead of running the anchors-only ~0.55x pass over them. With
+/// the switch set (or when the anchor/delta buffers cannot legally take a
+/// no-copy wrap — alignment, pinned-range overlap), the arm falls back to the
+/// incumbent products-only division of labour within the same binary.
+pub const ENV_NO_ZC_R2_FULL8: &str = "FLOCK_NO_ZC_R2_FULL8";
+
+pub(crate) fn gpu_zc_r2_full8_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_R2_FULL8).is_none());
+    *ON
+}
+
+/// Kill switch for the cascade K-pass (rounds 3+4) GPU products arm
+/// (`FLOCK_NO_GPU_ZC_K45=1`): the `zc_k45_products` kernel reconstructs a
+/// prefix of the K chunks' round-4 operands redundantly from the compact
+/// anchors+deltas and computes their eight message slots on the otherwise
+/// idle GPU, while the CPU runs a reconstruction-only sibling with
+/// byte-identical stores. With the switch set the whole pass stays on the
+/// exact incumbent CPU path.
+pub const ENV_NO_GPU_ZC_K45: &str = "FLOCK_NO_GPU_ZC_K45";
+
+pub(crate) fn gpu_zc_k45_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_K45).is_none());
+    *ON
+}
+
+/// Kill switch for the ligerito direct-fold8 materialize GPU prefix arm
+/// (`FLOCK_NO_GPU_LIG_MAT8=1`): the `lig_mat8_blocks` kernel owns a measured
+/// prefix of the 256 disjoint fold8 blocks outright — the 64-bank weighted
+/// witness folds (`folded_f`), both claims' composed byte-table basis folds
+/// (`folded_b`), and the per-block round-0 `(u_0, u_2)` partials — while the
+/// CPU drains the remaining blocks through the incumbent hetero queue. Every
+/// value is bit-exact by construction (exact emulated carry-less multiplies,
+/// F2-linear byte/nibble table folds, order-independent XOR accumulation of
+/// reduced products), and the warmup calibration byte-compares the probe's
+/// stores AND partials against the CPU's own values before a share is
+/// published. With the switch set (or on any gate failure) the whole
+/// materialize stays on the exact incumbent CPU path.
+pub const ENV_NO_GPU_LIG_MAT8: &str = "FLOCK_NO_GPU_LIG_MAT8";
+
+pub(crate) fn gpu_lig_mat8_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_LIG_MAT8).is_none());
+    *ON
+}
+
 /// Kill switch for the zerocheck C-fold-window GPU idle fill
 /// (`FLOCK_NO_ZC_IDLE_FILL=1`, exact): the ranked ZC byte-B4 fold drains in
 /// ~5.5 ms under a ~9.7 ms CPU AB head, leaving ~4 ms of GPU idle inside the
@@ -10356,11 +10407,474 @@ kernel void zc_r2_products(
         partials[tgid * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
     }
 }
+
+// Full-chunk variant: the GPU owns everything the CPU lookahead kernel
+// produces for a prefix chunk, so the CPU can skip those chunks entirely.
+// One thread owns one round-three GROUP (two adjacent pairs 2g, 2g+1): the
+// group's four rows are live together, exactly like the CPU kernel
+// (`fold_round2_compact_chunk_neon_lookahead_8`), and the six deferred
+// round-three aggregates cost no extra table lookups.
+//
+// Stores are byte-identical to `r2_pair_fold_and_store`: per pair,
+// `anchors_out[2p] = fold(row0_a)`, `anchors_out[2p+1] = fold(row0_b)`
+// (interleaved [a, b], 32 B/pair) and `deltas_out[p] = [a0c^a1c, b0c^b1c]`
+// as two LE u64 (16 B/pair); padded pairs store zeros. The CPU's degen
+// shortcut is intentionally NOT replicated: when the b codes are all-ones,
+// `fold(ones)` IS the stored `b_ones` anchor and the shortcut's product
+// skips all multiply exact zeros, so taking the general path yields
+// bit-identical bytes and (after the final reduction) bit-identical field
+// values. The calibration oracle verifies both claims on the target machine
+// before this kernel is ever admitted.
+//
+// Weighting mirrors the CPU: one weight `w = eq_lo[2g+1]` per group, four
+// reduced row scalings, eight unreduced products. Slots 0/1 (even-parity
+// round-two products) are rescaled by `kappa = (1+r1)/r1` here (thread 0,
+// once per chunk) so the returned slots line up with the incumbent GPU
+// contract: `[p1_even, pinf_even, p1_odd, pinf_odd, r1W0, r1W3, r1W4,
+// r1W5]`, all eq_hi-weighted, with slots 0..4 matching `zc_r2_products`.
+struct ZcR2FParams { uint lo_size; uint gpt; uint mask; uint useful; uint4 kappa; };
+
+kernel void zc_r2_full8(
+    device const uint4* a_in  [[buffer(0)]],
+    device const uint4* b_in  [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       partials    [[buffer(5)]],
+    constant ZcR2FParams& p         [[buffer(6)]],
+    device uint4*       anchors_out [[buffer(7)]],
+    device uint4*       deltas_out  [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 nib[256];
+    threadgroup uint4 red[256];
+    nib[lid] = nib_tab_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduced (128-bit) accumulators: GF(2^128) reduction is F2-linear, so
+    // reducing each product before the XOR accumulate is bit-identical to
+    // the CPU's accumulate-unreduced-then-reduce — and halves the register
+    // footprint, which is what keeps this kernel's occupancy (and therefore
+    // its measured per-chunk price) close to the products kernel's.
+    uint4 s_p1e = uint4(0u), s_pinfe = uint4(0u);
+    uint4 s_p1o = uint4(0u), s_pinfo = uint4(0u);
+    uint4 s_w0 = uint4(0u), s_w3 = uint4(0u);
+    uint4 s_w4 = uint4(0u), s_w5 = uint4(0u);
+
+    for (uint k = 0u; k < p.gpt; k++) {
+        uint g = k * 256u + lid;
+        uint pair0 = tgid * p.lo_size + 2u * g;
+        uint pair1 = pair0 + 1u;
+        bool pad0 = ((pair0 & p.mask) >= p.useful);
+        bool pad1 = ((pair1 & p.mask) >= p.useful);
+        uint4 w = eq_lo[2u * g + 1u];
+
+        // Phased per-pair processing: each pair's rows are folded, stored,
+        // scaled, and folded INTO the running e/o partials immediately, so
+        // no more than one pair's rows are ever live. This keeps the
+        // register footprint (and so the occupancy and the measured
+        // per-chunk price) near the products kernel's — a naive
+        // both-pairs-live formulation measured ~3.5x slower per chunk.
+        uint4 e_aw = uint4(0u), o_aw = uint4(0u);
+        uint4 e_b = uint4(0u), o_b = uint4(0u);
+
+        if (!pad0) {
+            uint4 ar = a_in[pair0];
+            uint4 br = b_in[pair0];
+            uint4 a0 = zc_r2_fold8(ar.x, ar.y, nib);
+            uint4 a1 = zc_r2_fold8(ar.z, ar.w, nib);
+            uint4 b0 = zc_r2_fold8(br.x, br.y, nib);
+            uint4 b1 = zc_r2_fold8(br.z, br.w, nib);
+            ulong da = ((ulong(ar.y) << 32) | ar.x) ^ ((ulong(ar.w) << 32) | ar.z);
+            ulong db = ((ulong(br.y) << 32) | br.x) ^ ((ulong(br.w) << 32) | br.z);
+            anchors_out[2u * pair0]      = a0;
+            anchors_out[2u * pair0 + 1u] = b0;
+            deltas_out[pair0] = uint4(uint(da), uint(da >> 32), uint(db), uint(db >> 32));
+            uint4 a0w = gf_reduce(clmul128(w, a0));
+            uint4 a1w = gf_reduce(clmul128(w, a1));
+            s_p1e ^= gf_reduce(clmul128(a1w, b1));
+            s_pinfe ^= gf_reduce(clmul128(a0w ^ a1w, b0 ^ b1));
+            e_aw = a0w;
+            o_aw = a1w;
+            e_b = b0;
+            o_b = b1;
+        } else {
+            anchors_out[2u * pair0]      = uint4(0u);
+            anchors_out[2u * pair0 + 1u] = uint4(0u);
+            deltas_out[pair0] = uint4(0u);
+        }
+
+        if (!pad1) {
+            uint4 ar = a_in[pair1];
+            uint4 br = b_in[pair1];
+            uint4 a2 = zc_r2_fold8(ar.x, ar.y, nib);
+            uint4 a3 = zc_r2_fold8(ar.z, ar.w, nib);
+            uint4 b2 = zc_r2_fold8(br.x, br.y, nib);
+            uint4 b3 = zc_r2_fold8(br.z, br.w, nib);
+            ulong da = ((ulong(ar.y) << 32) | ar.x) ^ ((ulong(ar.w) << 32) | ar.z);
+            ulong db = ((ulong(br.y) << 32) | br.x) ^ ((ulong(br.w) << 32) | br.z);
+            anchors_out[2u * pair1]      = a2;
+            anchors_out[2u * pair1 + 1u] = b2;
+            deltas_out[pair1] = uint4(uint(da), uint(da >> 32), uint(db), uint(db >> 32));
+            uint4 a2w = gf_reduce(clmul128(w, a2));
+            uint4 a3w = gf_reduce(clmul128(w, a3));
+            s_p1o ^= gf_reduce(clmul128(a3w, b3));
+            s_pinfo ^= gf_reduce(clmul128(a2w ^ a3w, b2 ^ b3));
+            s_w0 ^= gf_reduce(clmul128(a2w, b2));
+            e_aw ^= a2w;
+            o_aw ^= a3w;
+            e_b ^= b2;
+            o_b ^= b3;
+        } else {
+            anchors_out[2u * pair1]      = uint4(0u);
+            anchors_out[2u * pair1 + 1u] = uint4(0u);
+            deltas_out[pair1] = uint4(0u);
+        }
+
+        if (pad0 && pad1) { continue; }
+        s_w3 ^= gf_reduce(clmul128(e_aw, e_b));
+        s_w4 ^= gf_reduce(clmul128(o_aw, o_b));
+        s_w5 ^= gf_reduce(clmul128(e_aw ^ o_aw, e_b ^ o_b));
+    }
+
+    // Eight fully unrolled threadgroup reductions (no dynamically indexed
+    // slot array — that would spill every accumulator to thread memory).
+#define ZC_R2_F8_REDUCE(ACC, SLOT, KAPPA)                                      \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    red[lid] = ACC;                                                            \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    for (uint s = 128u; s > 0u; s >>= 1u) {                                    \
+        if (lid < s) { red[lid] ^= red[lid + s]; }                             \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+    }                                                                          \
+    if (lid == 0u) {                                                           \
+        uint4 r = red[0];                                                      \
+        if (KAPPA) { r = gf_reduce(clmul128(p.kappa, r)); }                    \
+        partials[tgid * 8u + (SLOT)] = gf_reduce(clmul128(eq_hi[tgid], r));    \
+    }
+
+    ZC_R2_F8_REDUCE(s_p1e, 0u, true)
+    ZC_R2_F8_REDUCE(s_pinfe, 1u, true)
+    ZC_R2_F8_REDUCE(s_p1o, 2u, false)
+    ZC_R2_F8_REDUCE(s_pinfo, 3u, false)
+    ZC_R2_F8_REDUCE(s_w0, 4u, false)
+    ZC_R2_F8_REDUCE(s_w3, 5u, false)
+    ZC_R2_F8_REDUCE(s_w4, 6u, false)
+    ZC_R2_F8_REDUCE(s_w5, 7u, false)
+#undef ZC_R2_F8_REDUCE
+}
+
+// Cascade K pass (rounds 3+4) products arm: reconstruct four K outputs per
+// round-5 group from the compact anchors+deltas (T3-style nibble lookups
+// against TWO lambda-scaled tables plus the rho2 anchor fold) and accumulate
+// the eight round-4/5 message slots exactly like the CPU kernel
+// `fold2_compact_and_round45_chunk_neon_8` — same group weight
+// `w = eq_lo[2t+1]`, kappa baked into the even pair, eq_hi into all eight.
+// Products only: the CPU (reconstruction-only sibling) keeps every
+// `a_out`/`b_out` byte, so this kernel's entire output surface is eight
+// reduced F128 per chunk. The CPU's degen/b-flat shortcuts are value-gated
+// (zero deltas fold to zero through linear tables; b-equal-one kills every
+// difference product), so the general path below is bit-identical.
+//
+// Register discipline mirrors zc_r2_full8: lanes are processed in two
+// phases (two K outputs each), products fold into four running e/o partials
+// immediately, accumulators are reduced uint4 (GF-reduction is F2-linear),
+// and the slot reductions are fully unrolled.
+struct ZcK45Params { uint lo_size; uint gpt; uint4 kappa; uint4 rho2; };
+
+static inline uint4 zc_k45_fold8(uint lo, uint hi, threadgroup const uint4* nib) {
+    uint4 acc = uint4(0u);
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (lo >> (8u * j)) & 0xffu;
+        acc ^= nib[j * 32u + (b & 15u)] ^ nib[j * 32u + 16u + (b >> 4u)];
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (hi >> (8u * j)) & 0xffu;
+        acc ^= nib[(j + 4u) * 32u + (b & 15u)] ^ nib[(j + 4u) * 32u + 16u + (b >> 4u)];
+    }
+    return acc;
+}
+
+// One K output: anchors_in[4g..4g+4] = [a0_anchor, b0_anchor, a1_anchor,
+// b1_anchor], deltas_in rows 2g/2g+1 = [da0|db0], [da1|db1] as LE u64
+// halves. Returns (a, b) for group g via two lambda lookups each plus the
+// rho2 anchor fold.
+static inline void zc_k45_reconstruct(
+    device const uint4* anchors_in,
+    device const uint4* deltas_in,
+    threadgroup const uint4* nib1,
+    threadgroup const uint4* nib3,
+    uint4 rho2,
+    uint g,
+    thread uint4& a_val,
+    thread uint4& b_val)
+{
+    uint4 anc_a0 = anchors_in[4u * g];
+    uint4 anc_b0 = anchors_in[4u * g + 1u];
+    uint4 anc_a1 = anchors_in[4u * g + 2u];
+    uint4 anc_b1 = anchors_in[4u * g + 3u];
+    uint4 d0 = deltas_in[2u * g];
+    uint4 d1 = deltas_in[2u * g + 1u];
+    uint4 a_delta = zc_k45_fold8(d0.x, d0.y, nib1) ^ zc_k45_fold8(d1.x, d1.y, nib3);
+    uint4 b_delta = zc_k45_fold8(d0.z, d0.w, nib1) ^ zc_k45_fold8(d1.z, d1.w, nib3);
+    a_val = anc_a0 ^ gf_reduce(clmul128(rho2, anc_a0 ^ anc_a1)) ^ a_delta;
+    b_val = anc_b0 ^ gf_reduce(clmul128(rho2, anc_b0 ^ anc_b1)) ^ b_delta;
+}
+
+kernel void zc_k45_products(
+    device const uint4* anchors_in [[buffer(0)]],
+    device const uint4* deltas_in  [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       partials    [[buffer(5)]],
+    constant ZcK45Params& p         [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 nib1[256];
+    threadgroup uint4 nib3[256];
+    threadgroup uint4 red[256];
+    nib1[lid] = nib_tab_dev[lid];
+    nib3[lid] = nib_tab_dev[256u + lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint4 s_p1e = uint4(0u), s_pinfe = uint4(0u);
+    uint4 s_p1o = uint4(0u), s_pinfo = uint4(0u);
+    uint4 s_w0 = uint4(0u), s_w3 = uint4(0u);
+    uint4 s_w4 = uint4(0u), s_w5 = uint4(0u);
+
+    // Chunk-local group base: `out_pairs = lo_size` round-4 pairs per chunk
+    // = lo_size/2 round-5 groups, each consuming K outputs 4t..4t+4 of the
+    // chunk's 2*lo_size K groups.
+    uint chunk_group_base = tgid * 2u * p.lo_size;
+    for (uint k = 0u; k < p.gpt; k++) {
+        uint t = k * 256u + lid;
+        uint g0 = chunk_group_base + 4u * t;
+        uint4 w = eq_lo[2u * t + 1u];
+
+        uint4 av0, bv0, av1, bv1;
+        zc_k45_reconstruct(anchors_in, deltas_in, nib1, nib3, p.rho2, g0, av0, bv0);
+        zc_k45_reconstruct(anchors_in, deltas_in, nib1, nib3, p.rho2, g0 + 1u, av1, bv1);
+        uint4 a0w = gf_reduce(clmul128(w, av0));
+        uint4 a1w = gf_reduce(clmul128(w, av1));
+        s_p1e ^= gf_reduce(clmul128(a1w, bv1));
+        s_pinfe ^= gf_reduce(clmul128(a0w ^ a1w, bv0 ^ bv1));
+        uint4 e_aw = a0w;
+        uint4 o_aw = a1w;
+        uint4 e_b = bv0;
+        uint4 o_b = bv1;
+
+        zc_k45_reconstruct(anchors_in, deltas_in, nib1, nib3, p.rho2, g0 + 2u, av0, bv0);
+        zc_k45_reconstruct(anchors_in, deltas_in, nib1, nib3, p.rho2, g0 + 3u, av1, bv1);
+        uint4 a2w = gf_reduce(clmul128(w, av0));
+        uint4 a3w = gf_reduce(clmul128(w, av1));
+        s_p1o ^= gf_reduce(clmul128(a3w, bv1));
+        s_pinfo ^= gf_reduce(clmul128(a2w ^ a3w, bv0 ^ bv1));
+        s_w0 ^= gf_reduce(clmul128(a2w, bv0));
+        e_aw ^= a2w;
+        o_aw ^= a3w;
+        e_b ^= bv0;
+        o_b ^= bv1;
+
+        s_w3 ^= gf_reduce(clmul128(e_aw, e_b));
+        s_w4 ^= gf_reduce(clmul128(o_aw, o_b));
+        s_w5 ^= gf_reduce(clmul128(e_aw ^ o_aw, e_b ^ o_b));
+    }
+
+#define ZC_K45_REDUCE(ACC, SLOT, KAPPA)                                        \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    red[lid] = ACC;                                                            \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    for (uint s = 128u; s > 0u; s >>= 1u) {                                    \
+        if (lid < s) { red[lid] ^= red[lid + s]; }                             \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+    }                                                                          \
+    if (lid == 0u) {                                                           \
+        uint4 r = red[0];                                                      \
+        if (KAPPA) { r = gf_reduce(clmul128(p.kappa, r)); }                    \
+        partials[tgid * 8u + (SLOT)] = gf_reduce(clmul128(eq_hi[tgid], r));    \
+    }
+
+    ZC_K45_REDUCE(s_p1e, 0u, true)
+    ZC_K45_REDUCE(s_pinfe, 1u, true)
+    ZC_K45_REDUCE(s_p1o, 2u, false)
+    ZC_K45_REDUCE(s_pinfo, 3u, false)
+    ZC_K45_REDUCE(s_w0, 4u, false)
+    ZC_K45_REDUCE(s_w3, 5u, false)
+    ZC_K45_REDUCE(s_w4, 6u, false)
+    ZC_K45_REDUCE(s_w5, 7u, false)
+#undef ZC_K45_REDUCE
+}
+
+// Ligerito direct-fold8 materialize arm: one threadgroup per fold8 BLOCK.
+// The block reads its disjoint 64·B-slot witness stripe and fully owns its
+// B-slot folded_f/folded_b output stripes plus one (u0, u2) partial pair —
+// the exact contract of the CPU's `fold8_block` body, so the CPU drain can
+// skip offloaded blocks entirely.
+//
+// Per slot: `folded_f[s] = Σ_{bank<64} weight[bank] · wit[64s+bank]` (64
+// emulated clmuls, REDUCED uint4 accumulation — GF reduction is F2-linear,
+// so reduce-then-XOR equals the CPU's XOR-unreduced-then-reduce bitwise) and
+// `folded_b[s] = Σ_c Φ_c(eq_lo_c[s])`, where Φ_c is claim c's composed
+// byte table for this block. The composition is rebuilt here exactly as the
+// CPU builds it: generators `g_c[bit] = fold(x^bit · eq_hi_c[block],
+// table_c)` (the monomial product is one exact clmul+reduce — the same
+// field element the CPU's mul_by_x ladder walks to), then 4-bit subset sums
+// into per-byte nibble tables, so every folded value is the same XOR
+// multiset of the same exact field products as the CPU's
+// `compose_fold_byte_table_into` + `fold_one_slot` pair.
+//
+// The round-0 partial mirrors `round0_deferred` over the block's slots:
+// `u0 ^= f_even·b_even`, `u2 ^= (f_e^f_o)·(b_e^b_o)` per adjacent pair,
+// threadgroup-XOR-reduced (order-free in char 2).
+//
+// Register discipline follows zc_r2_full8: no dynamically indexed thread
+// arrays, one pair's four values live at a time, reduced accumulators,
+// fully unrolled slot reductions.
+struct LigMat8Params { uint block_len; uint ppt; uint n_blocks; uint _pad; };
+
+// 16-byte-bank fold of a full F128 against a per-block composed NIBBLE
+// table (16 banks x [16 low-nibble | 16 high-nibble] uint4 entries).
+static inline uint4 lig_mat8_nib16(uint4 e, threadgroup const uint4* nib) {
+    uint4 acc = uint4(0u);
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (e.x >> (8u * j)) & 0xffu;
+        acc ^= nib[j * 32u + (b & 15u)] ^ nib[j * 32u + 16u + (b >> 4u)];
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (e.y >> (8u * j)) & 0xffu;
+        acc ^= nib[(j + 4u) * 32u + (b & 15u)] ^ nib[(j + 4u) * 32u + 16u + (b >> 4u)];
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (e.z >> (8u * j)) & 0xffu;
+        acc ^= nib[(j + 8u) * 32u + (b & 15u)] ^ nib[(j + 8u) * 32u + 16u + (b >> 4u)];
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (e.w >> (8u * j)) & 0xffu;
+        acc ^= nib[(j + 12u) * 32u + (b & 15u)] ^ nib[(j + 12u) * 32u + 16u + (b >> 4u)];
+    }
+    return acc;
+}
+
+// 16-byte-bank fold against a device-resident FULL byte table (16 x 256
+// entries) — used only for the 128 per-claim generators of the composition.
+static inline uint4 lig_mat8_byte16(uint4 e, device const uint4* tab) {
+    uint4 acc = uint4(0u);
+    for (uint j = 0u; j < 4u; j++) { acc ^= tab[j * 256u + ((e.x >> (8u * j)) & 0xffu)]; }
+    for (uint j = 0u; j < 4u; j++) { acc ^= tab[(j + 4u) * 256u + ((e.y >> (8u * j)) & 0xffu)]; }
+    for (uint j = 0u; j < 4u; j++) { acc ^= tab[(j + 8u) * 256u + ((e.z >> (8u * j)) & 0xffu)]; }
+    for (uint j = 0u; j < 4u; j++) { acc ^= tab[(j + 12u) * 256u + ((e.w >> (8u * j)) & 0xffu)]; }
+    return acc;
+}
+
+kernel void lig_mat8_blocks(
+    device const uint4* f_in     [[buffer(0)]],
+    device const uint4* tables   [[buffer(1)]],  // [claim0 4096 | claim1 4096]
+    device const uint4* eq_lo    [[buffer(2)]],  // [claim0 B | claim1 B]
+    device const uint4* eq_hi    [[buffer(3)]],  // [claim0 n_blocks | claim1 n_blocks]
+    device const uint4* weight   [[buffer(4)]],  // 64 fold weights
+    device uint4*       partials [[buffer(5)]],  // 2 per block: [u0, u2]
+    constant LigMat8Params& p    [[buffer(6)]],
+    device uint4*       f_out    [[buffer(7)]],
+    device uint4*       b_out    [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 nib0[512];
+    threadgroup uint4 nib1[512];
+    // Doubles as the 128-entry generator scratch during composition.
+    threadgroup uint4 red[256];
+
+    // Phase 1: compose both claims' per-block nibble tables.
+    for (uint c = 0u; c < 2u; c++) {
+        threadgroup uint4* nib = (c == 0u) ? nib0 : nib1;
+        uint4 e_hi = eq_hi[c * p.n_blocks + tgid];
+        // red[] hand-off: claim 1 must not overwrite the generators while
+        // claim 0's nibble build still reads them.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < 128u) {
+            uint4 mono = uint4(0u);
+            if (lid < 32u)      { mono.x = 1u << lid; }
+            else if (lid < 64u) { mono.y = 1u << (lid - 32u); }
+            else if (lid < 96u) { mono.z = 1u << (lid - 64u); }
+            else                { mono.w = 1u << (lid - 96u); }
+            uint4 basis_product = gf_reduce(clmul128(mono, e_hi));
+            red[lid] = lig_mat8_byte16(basis_product, tables + c * 4096u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // 512 nibble entries: nib[k*32 + h*16 + v] = XOR of g[8k + 4h + i]
+        // over the set bits i of v.
+        for (uint i = lid; i < 512u; i += 256u) {
+            uint k = i >> 5u;
+            uint h = (i >> 4u) & 1u;
+            uint v = i & 15u;
+            uint base = 8u * k + 4u * h;
+            uint4 acc = uint4(0u);
+            if (v & 1u) { acc ^= red[base]; }
+            if (v & 2u) { acc ^= red[base + 1u]; }
+            if (v & 4u) { acc ^= red[base + 2u]; }
+            if (v & 8u) { acc ^= red[base + 3u]; }
+            nib[i] = acc;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: pair loop. One thread owns adjacent slot pairs (2p, 2p+1),
+    // matching round0's pairing, so the partial products need no re-reads.
+    uint4 acc_u0 = uint4(0u);
+    uint4 acc_u2 = uint4(0u);
+    uint slot_base = tgid * p.block_len;
+    for (uint k = 0u; k < p.ppt; k++) {
+        uint pr = k * 256u + lid;
+        uint s0 = 2u * pr;
+        uint s1 = s0 + 1u;
+        device const uint4* x0 = f_in + 64u * (slot_base + s0);
+        uint4 f0 = uint4(0u);
+        uint4 f1 = uint4(0u);
+        for (uint bank = 0u; bank < 64u; bank++) {
+            uint4 w = weight[bank];
+            f0 ^= gf_reduce(clmul128(w, x0[bank]));
+            f1 ^= gf_reduce(clmul128(w, x0[64u + bank]));
+        }
+        uint4 b0 = lig_mat8_nib16(eq_lo[s0], nib0)
+                 ^ lig_mat8_nib16(eq_lo[p.block_len + s0], nib1);
+        uint4 b1 = lig_mat8_nib16(eq_lo[s1], nib0)
+                 ^ lig_mat8_nib16(eq_lo[p.block_len + s1], nib1);
+        f_out[slot_base + s0] = f0;
+        f_out[slot_base + s1] = f1;
+        b_out[slot_base + s0] = b0;
+        b_out[slot_base + s1] = b1;
+        acc_u0 ^= gf_reduce(clmul128(f0, b0));
+        acc_u2 ^= gf_reduce(clmul128(f0 ^ f1, b0 ^ b1));
+    }
+
+    // Two fully unrolled threadgroup reductions (no dynamically indexed
+    // slot array — that would spill every accumulator to thread memory).
+#define LIG_MAT8_REDUCE(ACC, SLOT)                                             \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    red[lid] = ACC;                                                            \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    for (uint s = 128u; s > 0u; s >>= 1u) {                                    \
+        if (lid < s) { red[lid] ^= red[lid + s]; }                             \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+    }                                                                          \
+    if (lid == 0u) { partials[tgid * 2u + (SLOT)] = red[0]; }
+
+    LIG_MAT8_REDUCE(acc_u0, 0u)
+    LIG_MAT8_REDUCE(acc_u2, 1u)
+#undef LIG_MAT8_REDUCE
+}
 "#;
 
     /// Process-lifetime Metal state for the round-two products arm.
     struct ZcR2 {
         pso: Id,
+        /// Pipeline for the full-chunk `zc_r2_full8` kernel (anchors/deltas
+        /// stores + all eight lookahead slots). `NIL` when its compile failed;
+        /// the arm then runs products-only.
+        full8_pso: Id,
         /// Persistent small buffers: nibble table (4 KiB), eq_lo, eq_hi,
         /// reduced partials. Sized on first use for the ranked shape.
         nib_buf: Id,
@@ -10372,11 +10886,50 @@ kernel void zc_r2_products(
         part_cap: usize,
         /// Cached no-copy wraps of the packed witness inputs `(ptr, len, buf)`.
         wraps: Vec<(usize, usize, Id)>,
+        /// Calibration-only discard targets for the full8 probe's anchor and
+        /// delta stores (the CPU writes the real ranges during calibration, so
+        /// the probe must not). Released after the calibration join.
+        calib_anchor_buf: Id,
+        calib_delta_buf: Id,
         /// In-flight ZC-idle-fill primer command buffer (see
         /// [`super::ENV_NO_ZC_IDLE_FILL`]); `NIL` when none. Drained (wait +
         /// release) before anything rewrites the buffers it binds — the next
         /// round-two launch or the next prove's staging, whichever first.
         prefetch_cb: Id,
+        /// Pipeline for the cascade K-pass products kernel `zc_k45_products`.
+        /// Lives in the SAME state as the round-two arm on purpose: the K
+        /// pass reads exactly the anchor/delta ranges the full8 timed launch
+        /// wraps, and sharing this state's `wraps` cache is what guarantees
+        /// no second overlapping no-copy view is ever created over them.
+        k45_pso: Id,
+        /// Two-table nibble buffer for the K arm (8 KiB: lambda1 then
+        /// lambda3).
+        k45_nib_buf: Id,
+        /// Pipeline for the ligerito direct-fold8 materialize kernel
+        /// `lig_mat8_blocks` (see `super::ENV_NO_GPU_LIG_MAT8`). Shares this
+        /// state (and its `wraps` cache) so no second no-copy view is ever
+        /// created over pages another arm — or the latched commit — already
+        /// wrapped. `NIL` when its compile failed; the arm never launches.
+        mat8_pso: Id,
+        /// Persistent lig-mat8 buffers, all lazily created/grown at launch:
+        /// both claims' direct byte tables (128 KiB), the concatenated
+        /// eq_lo/eq_hi uploads, the 64 fold weights (1 KiB), and the reduced
+        /// `(u0, u2)` per-block partials.
+        mat8_tab_buf: Id,
+        mat8_tab_cap: usize,
+        mat8_eq_lo_buf: Id,
+        mat8_eq_lo_cap: usize,
+        mat8_eq_hi_buf: Id,
+        mat8_eq_hi_cap: usize,
+        mat8_w_buf: Id,
+        mat8_part_buf: Id,
+        mat8_part_cap: usize,
+        /// Calibration-only discard targets for the lig-mat8 probe's
+        /// folded_f/folded_b stores (the CPU writes the real ranges during
+        /// calibration, so the probe must not). Released after the
+        /// calibration join.
+        mat8_calib_f_buf: Id,
+        mat8_calib_b_buf: Id,
     }
 
     // SAFETY: the Metal pipeline and buffer handles are only touched under
@@ -10391,12 +10944,19 @@ kernel void zc_r2_products(
         std::sync::atomic::AtomicUsize::new(usize::MAX);
     static ZC_R2_POISONED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    /// Calibrated mode: true = the published share was priced with the
+    /// full-chunk `zc_r2_full8` kernel (stores + eight slots), false =
+    /// products-only. Timed launches follow the calibrated mode so the share
+    /// and the cost model it solves stay consistent.
+    static ZC_R2_FULL8_MODE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     #[cfg(test)]
     pub(crate) fn zc_r2_test_reset() {
         use std::sync::atomic::Ordering;
         ZC_R2_TUNED.store(usize::MAX, Ordering::Relaxed);
         ZC_R2_POISONED.store(false, Ordering::Relaxed);
+        ZC_R2_FULL8_MODE.store(false, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -10463,6 +11023,27 @@ kernel void zc_r2_products(
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
     pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
+        zc_r2_gate_share_with_alpha(ratio, hi_size, ZC_R2_ALPHA, 1.0)
+    }
+
+    /// Full8 share: the CPU does no work at all on an offloaded chunk
+    /// (`alpha = 0`), so the balance is `(hi - g) c_f = g u_g`. The 0.95
+    /// CPU-ward bias absorbs warmup-vs-timed ratio drift: an overshot share
+    /// makes the GPU the timed straggler (the join blocks on it), while an
+    /// undershot share merely leaves the CPU a few fused chunks — on the
+    /// quiet ranked runner the drift is small and the asymmetry cheap.
+    const ZC_R2_FULL8_BIAS: f64 = 0.95;
+
+    pub(crate) fn zc_r2_full8_gate_share(ratio: f64, hi_size: usize) -> usize {
+        zc_r2_gate_share_with_alpha(ratio, hi_size, 0.0, ZC_R2_FULL8_BIAS)
+    }
+
+    fn zc_r2_gate_share_with_alpha(
+        ratio: f64,
+        hi_size: usize,
+        alpha: f64,
+        bias: f64,
+    ) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
         }
@@ -10472,14 +11053,14 @@ kernel void zc_r2_products(
             }
             return 0;
         }
-        let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
+        let g = (bias * hi_size as f64 / (ratio + (1.0 - alpha))).round();
         (g as usize).min(hi_size * 15 / 16)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
         unsafe {
             let pool = gpu.pool_push();
-            let built = (|| -> Result<Id, String> {
+            let built = (|| -> Result<(Id, Id, Id, Id), String> {
                 let src = gpu.api.nsstring(ZC_R2_MSL_SOURCE)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
@@ -10524,25 +11105,107 @@ kernel void zc_r2_products(
                     &mut perr
                 );
                 send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-                send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel) -> Id,
-                    library,
-                    c"release"
-                );
                 if pso.is_null() {
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
                     return Err(format!(
                         "zc_r2_products pipeline: {}",
                         gpu.api.error_string(perr)
                     ));
                 }
-                Ok(pso)
+                // Full8 pipeline from the same library. Its failure is not
+                // fatal: the arm degrades to products-only.
+                let full8_pso: Id = (|| {
+                    let Ok(ns8) = gpu.api.nsstring("zc_r2_full8") else {
+                        return NIL;
+                    };
+                    let f8: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns8
+                    );
+                    if f8.is_null() {
+                        return NIL;
+                    }
+                    let mut p8err: Id = NIL;
+                    let p8: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f8,
+                        &mut p8err
+                    );
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f8, c"release");
+                    p8
+                })();
+                // K-pass products pipeline from the same library; failure is
+                // not fatal (the K arm simply never launches).
+                let k45_pso: Id = (|| {
+                    let Ok(nsk) = gpu.api.nsstring("zc_k45_products") else {
+                        return NIL;
+                    };
+                    let fk: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        nsk
+                    );
+                    if fk.is_null() {
+                        return NIL;
+                    }
+                    let mut pkerr: Id = NIL;
+                    let pk: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        fk,
+                        &mut pkerr
+                    );
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, fk, c"release");
+                    pk
+                })();
+                // Lig-mat8 pipeline from the same library; failure is not
+                // fatal (the materialize arm simply never launches).
+                let mat8_pso: Id = (|| {
+                    let Ok(nsm) = gpu.api.nsstring("lig_mat8_blocks") else {
+                        return NIL;
+                    };
+                    let fm: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        nsm
+                    );
+                    if fm.is_null() {
+                        return NIL;
+                    }
+                    let mut pmerr: Id = NIL;
+                    let pm: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        fm,
+                        &mut pmerr
+                    );
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, fm, c"release");
+                    pm
+                })();
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                Ok((pso, full8_pso, k45_pso, mat8_pso))
             })();
             gpu.pool_pop(pool);
-            let pso = built?;
+            let (pso, full8_pso, k45_pso, mat8_pso) = built?;
             let nib_buf = gpu.new_buffer(256 * 16)?;
+            let k45_nib_buf = gpu.new_buffer(512 * 16)?;
             Ok(ZcR2 {
                 pso,
+                full8_pso,
                 nib_buf,
                 eq_lo_buf: NIL,
                 eq_lo_cap: 0,
@@ -10551,7 +11214,23 @@ kernel void zc_r2_products(
                 part_buf: NIL,
                 part_cap: 0,
                 wraps: Vec::new(),
+                calib_anchor_buf: NIL,
+                calib_delta_buf: NIL,
                 prefetch_cb: NIL,
+                k45_pso,
+                k45_nib_buf,
+                mat8_pso,
+                mat8_tab_buf: NIL,
+                mat8_tab_cap: 0,
+                mat8_eq_lo_buf: NIL,
+                mat8_eq_lo_cap: 0,
+                mat8_eq_hi_buf: NIL,
+                mat8_eq_hi_cap: 0,
+                mat8_w_buf: NIL,
+                mat8_part_buf: NIL,
+                mat8_part_cap: 0,
+                mat8_calib_f_buf: NIL,
+                mat8_calib_b_buf: NIL,
             })
         }
     }
@@ -10577,9 +11256,11 @@ kernel void zc_r2_products(
         cb: Id,
         pub chunks: usize,
         calibration: bool,
+        full8: bool,
         lo_size: usize,
         mask: u32,
         useful: u32,
+        kappa: F128,
         submitted: std::time::Instant,
     }
 
@@ -10588,9 +11269,10 @@ kernel void zc_r2_products(
     unsafe impl Send for ZcR2Job {}
 
     impl ZcR2Job {
-        /// How many leading chunks the CPU should run anchors-only. Zero
-        /// during calibration: the CPU runs every chunk fused (the GPU
-        /// probe is compared against its values, then discarded).
+        /// How many leading chunks the CPU should run anchors-only (or, in
+        /// full8 mode, skip entirely). Zero during calibration: the CPU runs
+        /// every chunk fused (the GPU probe is compared against its values,
+        /// then discarded).
         pub(crate) fn cpu_split(&self) -> usize {
             if self.calibration { 0 } else { self.chunks }
         }
@@ -10598,7 +11280,36 @@ kernel void zc_r2_products(
         pub(crate) fn is_calibration(&self) -> bool {
             self.calibration
         }
+
+        /// Whether this launch runs the full-chunk kernel: the GPU stores the
+        /// prefix chunks' anchors/deltas and returns all eight slots, so the
+        /// CPU sweep must skip those chunks instead of running anchors-only.
+        pub(crate) fn is_full8(&self) -> bool {
+            self.full8
+        }
     }
+
+    /// Raw store targets for the full8 arm: the real compact-state anchor and
+    /// delta buffers the timed launch wraps no-copy and the GPU writes
+    /// directly (prefix chunks only; the CPU owns the rest — disjoint,
+    /// page-multiple chunk ranges). Raw pointers because the CPU sweep holds
+    /// the same buffers mutably for its own chunk ranges.
+    #[derive(Clone, Copy)]
+    pub(crate) struct ZcR2StoreTargets {
+        pub anchors_ptr: *mut F128,
+        /// Length in F128 elements (= `2 * n_pairs`).
+        pub anchors_len: usize,
+        pub deltas_ptr: *mut u8,
+        /// Length in bytes (= `16 * n_pairs`).
+        pub deltas_len: usize,
+        /// `kappa = (1 + r1) / r1`, baked into slots 0/1 by the kernel so the
+        /// returned even-parity products match the incumbent GPU contract.
+        pub kappa: F128,
+    }
+
+    // SAFETY: the pointers are only dereferenced by the GPU via the no-copy
+    // wrap; the struct itself is plain data handed to the launching thread.
+    unsafe impl Send for ZcR2StoreTargets {}
 
     /// Result of draining the round-two products arm.
     pub(crate) enum ZcR2Result {
@@ -10608,6 +11319,11 @@ kernel void zc_r2_products(
         /// Timed-prove prefix partials, bit-exact per chunk, parity-split as
         /// `[p1_even, pinf_even, p1_odd, pinf_odd]` (all eq_hi-weighted).
         Prefix(Vec<[F128; 4]>),
+        /// Timed-prove full8 prefix: `[p1_even, pinf_even, p1_odd, pinf_odd,
+        /// r1W0, r1W3, r1W4, r1W5]` per chunk (eq_hi-weighted, kappa baked
+        /// into the even slots), with the chunks' anchors/deltas already
+        /// stored to the real compact-state buffers by the GPU.
+        Prefix8(Vec<[F128; 8]>),
         /// Metal failed after admission; the caller must CPU-redo the
         /// prefix products. The arm is poisoned for the process.
         Failed,
@@ -10668,6 +11384,60 @@ kernel void zc_r2_products(
         let buf = unsafe { gpu.wrap_buffer(data.as_ptr().cast_mut(), len)? };
         state.wraps.push((ptr, len, buf));
         Ok(buf)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn zc_r2_submit_full8(
+        gpu: &Gpu,
+        state: &ZcR2,
+        a_buf: Id,
+        b_buf: Id,
+        anchors_buf: Id,
+        deltas_buf: Id,
+        chunks: usize,
+        lo_size: usize,
+        mask: u32,
+        useful: u32,
+        kappa: F128,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct P8 {
+                lo_size: u32,
+                gpt: u32,
+                mask: u32,
+                useful: u32,
+                kappa: [u8; 16],
+            }
+            let params = P8 {
+                lo_size: lo_size as u32,
+                gpt: (lo_size / 512) as u32,
+                mask,
+                useful,
+                kappa: core::mem::transmute::<F128, [u8; 16]>(kappa),
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P8>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.full8_pso);
+            gpu.set_buffer(enc, a_buf, 0, 0);
+            gpu.set_buffer(enc, b_buf, 0, 1);
+            gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
+            gpu.set_buffer(enc, state.eq_hi_buf, 0, 3);
+            gpu.set_buffer(enc, state.nib_buf, 0, 4);
+            gpu.set_buffer(enc, state.part_buf, 0, 5);
+            gpu.set_bytes(enc, pb, 6);
+            gpu.set_buffer(enc, anchors_buf, 0, 7);
+            gpu.set_buffer(enc, deltas_buf, 0, 8);
+            gpu.dispatch(enc, chunks as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
     }
 
     // -------------------------------------------------------------------
@@ -10859,6 +11629,13 @@ kernel void zc_r2_products(
     /// Launch the round-two products prefix. `None` = whole round stays on
     /// the exact incumbent CPU path (kill switch, poisoned, share 0,
     /// non-ranked shape, no Metal, or wrap failure).
+    ///
+    /// `store_targets` opts the launch into the full-chunk `zc_r2_full8`
+    /// kernel: the GPU additionally stores the prefix chunks' anchors/deltas
+    /// (into the given real buffers on a timed prove, into discard buffers
+    /// during calibration) and returns all eight lookahead slots. The mode
+    /// actually taken is reported by [`ZcR2Job::is_full8`]; every gate
+    /// failure degrades to the incumbent products-only launch.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch_zc_r2_products(
         a_packed: &[u8],
@@ -10870,6 +11647,7 @@ kernel void zc_r2_products(
         hi_size: usize,
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
+        store_targets: Option<ZcR2StoreTargets>,
     ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
@@ -10890,6 +11668,36 @@ kernel void zc_r2_products(
             return None;
         }
         let calibration = tuned == usize::MAX;
+        // Full8 admission: caller opted in, kill switch off, the pipeline
+        // built, the group loop can partition lo (512 pairs per 256-thread
+        // pass), the target lengths match the shape, and both target ranges
+        // can legally take a no-copy wrap (16 KiB page alignment, no overlap
+        // with an already-wrapped pinned allocation). On a timed prove the
+        // mode must also match what calibration priced.
+        let page = 16384usize;
+        let full8 = match store_targets {
+            Some(t)
+                if super::gpu_zc_r2_full8_enabled()
+                    && lo_size.is_multiple_of(512)
+                    && t.anchors_len == 2 * lo_size * hi_size
+                    && t.deltas_len == 16 * lo_size * hi_size
+                    && (t.anchors_ptr as usize).is_multiple_of(page)
+                    && (t.anchors_len * 16).is_multiple_of(page)
+                    && (t.deltas_ptr as usize).is_multiple_of(page)
+                    && t.deltas_len.is_multiple_of(page)
+                    && !crate::scratch::f128_range_overlaps_pin(
+                        t.anchors_ptr as usize,
+                        t.anchors_len * 16,
+                    )
+                    && !crate::scratch::f128_range_overlaps_pin(
+                        t.deltas_ptr as usize,
+                        t.deltas_len,
+                    ) =>
+            {
+                calibration || ZC_R2_FULL8_MODE.load(Ordering::Relaxed)
+            }
+            _ => false,
+        };
         let chunks = if calibration {
             // Calibration cost is paid by EVERY worker process inside the
             // CI job wall (~120 of them per ranked run) and this lineage
@@ -10961,9 +11769,10 @@ kernel void zc_r2_products(
                 gpu.buffer_contents(state.eq_hi_buf),
                 need_hi,
             );
-            // Four F128 per chunk: the parity-split
-            // `[p1_even, pinf_even, p1_odd, pinf_odd]`.
-            let need_part = hi_size * 64;
+            // Reduced partials: 4 F128/chunk for the products kernel, 8 for
+            // full8. The two kernels use different strides, so size for the
+            // larger one; the wait reads back with the job's own stride.
+            let need_part = hi_size * 128;
             if state.part_cap < need_part {
                 if state.part_cap > 0 {
                     gpu.release(state.part_buf);
@@ -10973,24 +11782,76 @@ kernel void zc_r2_products(
             }
             let a_buf = zc_r2_wrap(&mut state, gpu, a_packed).ok()?;
             let b_buf = zc_r2_wrap(&mut state, gpu, b_packed).ok()?;
-            let cb = zc_r2_submit(
-                gpu,
-                &state,
-                a_buf,
-                b_buf,
-                chunks,
-                lo_size,
-                pair_in_block_mask as u32,
-                useful_pairs_inclusive as u32,
-            )
-            .ok()?;
+            let full8 = full8 && !state.full8_pso.is_null();
+            let cb = if full8 {
+                let t = store_targets.unwrap();
+                // Store destinations: the real compact-state buffers on a
+                // timed prove (no-copy wraps, GPU-owned prefix ranges are
+                // disjoint from every CPU-written range), discard buffers
+                // during calibration (the CPU writes the real ranges then,
+                // and the oracle byte-compares the two).
+                let (anchors_buf, deltas_buf) = if calibration {
+                    let need_a = chunks * 2 * lo_size * 16;
+                    let need_d = chunks * 16 * lo_size;
+                    if state.calib_anchor_buf.is_null() {
+                        state.calib_anchor_buf = gpu.new_buffer(need_a).ok()?;
+                        state.calib_delta_buf = match gpu.new_buffer(need_d) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                gpu.release(state.calib_anchor_buf);
+                                state.calib_anchor_buf = NIL;
+                                return None;
+                            }
+                        };
+                    }
+                    (state.calib_anchor_buf, state.calib_delta_buf)
+                } else {
+                    let anchors_bytes = std::slice::from_raw_parts(
+                        t.anchors_ptr.cast::<u8>(),
+                        t.anchors_len * 16,
+                    );
+                    let deltas_bytes =
+                        std::slice::from_raw_parts(t.deltas_ptr, t.deltas_len);
+                    let ab = zc_r2_wrap(&mut state, gpu, anchors_bytes).ok()?;
+                    let db = zc_r2_wrap(&mut state, gpu, deltas_bytes).ok()?;
+                    (ab, db)
+                };
+                zc_r2_submit_full8(
+                    gpu,
+                    &state,
+                    a_buf,
+                    b_buf,
+                    anchors_buf,
+                    deltas_buf,
+                    chunks,
+                    lo_size,
+                    pair_in_block_mask as u32,
+                    useful_pairs_inclusive as u32,
+                    t.kappa,
+                )
+                .ok()?
+            } else {
+                zc_r2_submit(
+                    gpu,
+                    &state,
+                    a_buf,
+                    b_buf,
+                    chunks,
+                    lo_size,
+                    pair_in_block_mask as u32,
+                    useful_pairs_inclusive as u32,
+                )
+                .ok()?
+            };
             Some(ZcR2Job {
                 cb,
                 chunks,
                 calibration,
+                full8,
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
+                kappa: store_targets.map_or(F128::ZERO, |t| t.kappa),
                 submitted: std::time::Instant::now(),
             })
         }
@@ -11002,10 +11863,16 @@ kernel void zc_r2_products(
     /// `cpu_la` carries the CPU's six per-chunk round-three lookahead
     /// aggregates; slots 0 and 1 are the odd-parity round-two products, so
     /// the oracle can check the parity split and not merely its sum.
+    /// For a full8 calibration, `cpu_anchors` / `cpu_deltas` must hold the
+    /// CPU-written compact state (as bytes) so the probe's stores can be
+    /// byte-compared before the mode is admitted.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn zc_r2_wait(
         job: ZcR2Job,
         cpu_partials: Option<&[(F128, F128)]>,
         cpu_la: Option<&[[F128; 6]]>,
+        cpu_anchors: Option<&[u8]>,
+        cpu_deltas: Option<&[u8]>,
         cpu_wall_ms: f64,
         hi_size: usize,
     ) -> ZcR2Result {
@@ -11044,28 +11911,34 @@ kernel void zc_r2_products(
                     return poison(job.cb);
                 }
             };
+            let stride = if job.full8 { 8 } else { 4 };
             let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
-            let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
+            let mut out: Vec<[F128; 8]> = Vec::with_capacity(job.chunks);
             for c in 0..job.chunks {
-                out.push([
-                    *parts.add(c * 4),
-                    *parts.add(c * 4 + 1),
-                    *parts.add(c * 4 + 2),
-                    *parts.add(c * 4 + 3),
-                ]);
+                let mut v = [F128::ZERO; 8];
+                for (i, slot) in v.iter_mut().enumerate().take(stride) {
+                    *slot = *parts.add(c * stride + i);
+                }
+                out.push(v);
             }
             if !job.calibration {
                 gpu.release(job.cb);
                 if super::gpu_zc_r2_debug() {
                     eprintln!(
-                        "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
+                        "[zc-r2] timed prefix {}/{} chunks (full8={}): gpu={first_wall:.2}ms \
                          cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms",
                         job.chunks,
                         hi_size,
+                        job.full8,
                         job.submitted.elapsed().as_secs_f64() * 1e3,
                     );
                 }
-                return ZcR2Result::Prefix(out);
+                if job.full8 {
+                    return ZcR2Result::Prefix8(out);
+                }
+                return ZcR2Result::Prefix(
+                    out.iter().map(|v| [v[0], v[1], v[2], v[3]]).collect(),
+                );
             }
 
             // ---- Calibration (untimed warmup prove, once per process) ----
@@ -11077,12 +11950,21 @@ kernel void zc_r2_products(
             // Both the summed pair the round-two message consumes AND the
             // odd-parity half the round-three lookahead consumes are checked,
             // so a kernel that got the right total from the wrong split
-            // cannot be admitted.
+            // cannot be admitted. In full8 mode the four deferred lookahead
+            // slots are held to the same standard.
             for c in 0..job.chunks {
                 let summed = (out[c][0] + out[c][2], out[c][1] + out[c][3]);
-                let split_ok =
-                    cpu_la.is_none_or(|la| la[c][0] == out[c][2] && la[c][1] == out[c][3]);
-                if summed != cpu_all[c] || !split_ok {
+                let split_ok = cpu_la.is_none_or(|la| {
+                    la[c][0] == out[c][2] && la[c][1] == out[c][3]
+                });
+                let la_ok = !job.full8
+                    || cpu_la.is_none_or(|la| {
+                        la[c][2] == out[c][4]
+                            && la[c][3] == out[c][5]
+                            && la[c][4] == out[c][6]
+                            && la[c][5] == out[c][7]
+                    });
+                if summed != cpu_all[c] || !split_ok || !la_ok {
                     if super::gpu_zc_r2_debug() {
                         eprintln!(
                             "[zc-r2] CALIBRATION MISMATCH at chunk {c}: gpu={:?} \
@@ -11095,11 +11977,46 @@ kernel void zc_r2_products(
                     return poison(job.cb);
                 }
             }
+            // Full8 store oracle: the probe's anchor and delta stores in the
+            // discard buffers must be byte-identical to what the CPU's fused
+            // sweep wrote to the real ranges for the same chunks. This covers
+            // padded-pair zeroing and the degen store shortcut by
+            // construction — any deviation refuses the mode outright.
+            if job.full8 {
+                let (Some(cpu_anchor_bytes), Some(cpu_delta_bytes)) =
+                    (cpu_anchors, cpu_deltas)
+                else {
+                    return poison(job.cb);
+                };
+                let a_chunk = 2 * job.lo_size * 16;
+                let d_chunk = 16 * job.lo_size;
+                let ga = gpu.buffer_contents(state.calib_anchor_buf);
+                let gd = gpu.buffer_contents(state.calib_delta_buf);
+                let need_a = job.chunks * a_chunk;
+                let need_d = job.chunks * d_chunk;
+                let gpu_a = std::slice::from_raw_parts(ga, need_a);
+                let gpu_d = std::slice::from_raw_parts(gd, need_d);
+                if cpu_anchor_bytes.len() < need_a
+                    || cpu_delta_bytes.len() < need_d
+                    || gpu_a != &cpu_anchor_bytes[..need_a]
+                    || gpu_d != &cpu_delta_bytes[..need_d]
+                {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[zc-r2] FULL8 STORE MISMATCH over {} probe chunks — poisoned",
+                            job.chunks,
+                        );
+                    }
+                    return poison(job.cb);
+                }
+            }
             // Ramp-robust GPU pricing: replay the probe back-to-back to a
             // plateau (>=3 replays, stop when a replay stops improving the
             // best seen by >5%), price from the minimum wall. Budget 5:
             // every replay is job-wall time paid by ~120 processes on a
             // cap-adjacent lineage, and the local trace plateaus by 3.
+            // Full8 calibrations replay the full8 kernel so the priced cost
+            // includes its extra products and store traffic.
             let mut walls = [0.0f64; 5];
             walls[0] = first_wall.max(0.0);
             let mut n_walls = usize::from(walls[0] > 0.0);
@@ -11109,16 +12026,27 @@ kernel void zc_r2_products(
                 (state.wraps.first(), state.wraps.get(1))
             {
                 while n_walls < walls.len() {
-                    let Ok(cb2) = zc_r2_submit(
-                        gpu,
-                        &state,
-                        a_buf,
-                        b_buf,
-                        job.chunks,
-                        job.lo_size,
-                        job.mask,
-                        job.useful,
-                    ) else {
+                    let submitted = if job.full8 {
+                        zc_r2_submit_full8(
+                            gpu,
+                            &state,
+                            a_buf,
+                            b_buf,
+                            state.calib_anchor_buf,
+                            state.calib_delta_buf,
+                            job.chunks,
+                            job.lo_size,
+                            job.mask,
+                            job.useful,
+                            job.kappa,
+                        )
+                    } else {
+                        zc_r2_submit(
+                            gpu, &state, a_buf, b_buf, job.chunks, job.lo_size, job.mask,
+                            job.useful,
+                        )
+                    };
+                    let Ok(cb2) = submitted else {
                         break;
                     };
                     let w = if gpu.wait_cb(cb2).is_ok() {
@@ -11149,11 +12077,508 @@ kernel void zc_r2_products(
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
-                let g = zc_r2_gate_share(ratio, hi_size);
+                let g = if job.full8 {
+                    zc_r2_full8_gate_share(ratio, hi_size)
+                } else {
+                    zc_r2_gate_share(ratio, hi_size)
+                };
                 if super::gpu_zc_r2_debug() {
                     eprintln!("[zc-r2] gate replay walls: {:?}", &walls[..n_walls]);
                     eprintln!(
                         "[zc-r2] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
+                         ratio={:.3} full8={} -> share {g}/{hi_size}",
+                        u_gpu / u_cpu,
+                        job.full8,
+                    );
+                }
+                g
+            } else {
+                0
+            };
+            // Calibration scratch is warmup-only; the timed prove writes
+            // through no-copy wraps of the real buffers.
+            {
+                let mut state = match state_mutex.lock() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        note_poisoned_lock("zc-r2 calib teardown", false);
+                        ZC_R2_TUNED.store(0, Ordering::Relaxed);
+                        return ZcR2Result::Calibrated;
+                    }
+                };
+                if !state.calib_anchor_buf.is_null() {
+                    gpu.release(state.calib_anchor_buf);
+                    state.calib_anchor_buf = NIL;
+                }
+                if !state.calib_delta_buf.is_null() {
+                    gpu.release(state.calib_delta_buf);
+                    state.calib_delta_buf = NIL;
+                }
+            }
+            ZC_R2_FULL8_MODE.store(job.full8 && share > 0, Ordering::Relaxed);
+            ZC_R2_TUNED.store(share, Ordering::Relaxed);
+            ZcR2Result::Calibrated
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cascade K-pass (rounds 3+4) products GPU arm (`zc_k45_products`, see
+    // `super::ENV_NO_GPU_ZC_K45`).
+    //
+    // The K pass reconstructs every round-4 operand pair from round two's
+    // compact anchors+deltas through TWO lambda-scaled byte tables plus a
+    // rho2 anchor fold, stores the reconstructions for rounds 5+6, and
+    // accumulates the eight round-4/5 message slots. During the entire pass
+    // the GPU is otherwise idle. This arm offloads the PRODUCTS for a
+    // measured prefix of the hi-chunks: the CPU runs the
+    // reconstruction-only sibling there (byte-identical `a_out`/`b_out`
+    // stores), and the GPU's per-chunk output is eight reduced F128.
+    //
+    // The arm deliberately lives inside the zc-r2 state: it reads exactly
+    // the anchor/delta ranges the full8 timed launch already wraps, and
+    // sharing that state's wrap cache is what guarantees no second
+    // overlapping no-copy view is ever created over the same pages.
+    // -----------------------------------------------------------------------
+
+    static ZC_K45_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static ZC_K45_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    pub(crate) fn zc_k45_test_reset() {
+        use std::sync::atomic::Ordering;
+        ZC_K45_TUNED.store(usize::MAX, Ordering::Relaxed);
+        ZC_K45_POISONED.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_k45_test_state() -> (usize, bool) {
+        use std::sync::atomic::Ordering;
+        (
+            ZC_K45_TUNED.load(Ordering::Relaxed),
+            ZC_K45_POISONED.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_k45_test_set_share(share: usize) {
+        ZC_K45_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ratio-gate override (`FLOCK_ZC_K45_GPU_FORCE_RATIO=<f64>`).
+    fn zc_k45_forced_ratio() -> Option<f64> {
+        static V: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_ZC_K45_GPU_FORCE_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+        *V
+    }
+
+    /// The reconstruction-only CPU sibling keeps all 32 table lookups, both
+    /// rho2 folds and both non-temporal stores per K group and drops only
+    /// the round-5 product block, so its measured fraction of the fused
+    /// chunk is high — 0.65 is the T3 arm's measured analog for the same
+    /// drop shape and is the starting constant here (the on-machine ratio,
+    /// not this constant, decides the share). Cap at 7·hi/8: at that share
+    /// the GPU only becomes the timed straggler above ratio ~0.77.
+    const ZC_K45_ALPHA: f64 = 0.65;
+
+    pub(crate) fn zc_k45_gate_share(ratio: f64, hi_size: usize) -> usize {
+        zc_r2_gate_share_with_alpha(ratio, hi_size, ZC_K45_ALPHA, 1.0)
+            .min(hi_size * 7 / 8)
+    }
+
+    pub(crate) struct ZcK45Job {
+        cb: Id,
+        pub chunks: usize,
+        calibration: bool,
+        lo_size: usize,
+        kappa: F128,
+        rho2: F128,
+        submitted: std::time::Instant,
+    }
+
+    // SAFETY: the command buffer handle is only waited/released from the
+    // launching thread; Metal command buffers are themselves thread-safe.
+    unsafe impl Send for ZcK45Job {}
+
+    impl ZcK45Job {
+        /// How many leading chunks the CPU should run reconstruction-only.
+        /// Zero during calibration: the CPU runs every chunk fused and the
+        /// GPU probe is compared against its values, then discarded.
+        pub(crate) fn cpu_split(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    /// Result of draining the K-pass products arm.
+    pub(crate) enum ZcK45Result {
+        Calibrated,
+        /// Timed-prove prefix: `[p1_even, pinf_even, p1_odd, pinf_odd,
+        /// r'W0', r'W3', r'W4', r'W5']` per chunk, kappa baked into the even
+        /// pair and eq_hi into all eight — exactly the driver's per-chunk
+        /// `partials`/`la_partials` assignments.
+        Prefix8(Vec<[F128; 8]>),
+        /// Metal failed after admission; the caller must CPU-redo the
+        /// prefix chunks fused. The arm is poisoned for the process.
+        Failed,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn zc_k45_submit(
+        gpu: &Gpu,
+        state: &ZcR2,
+        anchors_buf: Id,
+        deltas_buf: Id,
+        chunks: usize,
+        lo_size: usize,
+        kappa: F128,
+        rho2: F128,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct Pk {
+                lo_size: u32,
+                gpt: u32,
+                _pad: [u32; 2],
+                kappa: [u8; 16],
+                rho2: [u8; 16],
+            }
+            let params = Pk {
+                lo_size: lo_size as u32,
+                gpt: (lo_size / 512) as u32,
+                _pad: [0; 2],
+                kappa: core::mem::transmute::<F128, [u8; 16]>(kappa),
+                rho2: core::mem::transmute::<F128, [u8; 16]>(rho2),
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<Pk>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.k45_pso);
+            gpu.set_buffer(enc, anchors_buf, 0, 0);
+            gpu.set_buffer(enc, deltas_buf, 0, 1);
+            gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
+            gpu.set_buffer(enc, state.eq_hi_buf, 0, 3);
+            gpu.set_buffer(enc, state.k45_nib_buf, 0, 4);
+            gpu.set_buffer(enc, state.part_buf, 0, 5);
+            gpu.set_bytes(enc, pb, 6);
+            gpu.dispatch(enc, chunks as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// Launch the K-pass products prefix. `None` = the whole pass stays on
+    /// the exact incumbent CPU path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_k45_products(
+        anchors: &[F128],
+        deltas: &[u8],
+        table_l1: &[F128],
+        table_l3: &[F128],
+        rho2: F128,
+        kappa: F128,
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+    ) -> Option<ZcK45Job> {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_zc_k45_enabled() || ZC_K45_POISONED.load(Ordering::Relaxed) {
+            return None;
+        }
+        // Shape gates: two 8-bank tables, 512-partitionable round-5 groups,
+        // exact compact-state lengths, wrap-legal input ranges.
+        let page = 16384usize;
+        if table_l1.len() != 8 * 256
+            || table_l3.len() != 8 * 256
+            || lo_size < 512
+            || !lo_size.is_multiple_of(512)
+            || hi_size < 8
+            || anchors.len() != 8 * lo_size * hi_size
+            || deltas.len() != 64 * lo_size * hi_size
+            || !(anchors.as_ptr() as usize).is_multiple_of(page)
+            || !(anchors.len() * 16).is_multiple_of(page)
+            || !(deltas.as_ptr() as usize).is_multiple_of(page)
+            || !deltas.len().is_multiple_of(page)
+            || crate::scratch::f128_range_overlaps_pin(
+                anchors.as_ptr() as usize,
+                anchors.len() * 16,
+            )
+            || crate::scratch::f128_range_overlaps_pin(deltas.as_ptr() as usize, deltas.len())
+        {
+            if super::gpu_zc_r2_debug() {
+                eprintln!(
+                    "[zc-k45] launch declined: shapes t1={} t3={} lo={lo_size} hi={hi_size} \
+                     anch={}(want {}) delt={}(want {}) a_al={} d_al={}",
+                    table_l1.len(),
+                    table_l3.len(),
+                    anchors.len(),
+                    8 * lo_size * hi_size,
+                    deltas.len(),
+                    64 * lo_size * hi_size,
+                    (anchors.as_ptr() as usize) % page,
+                    (deltas.as_ptr() as usize) % page,
+                );
+            }
+            return None;
+        }
+        let tuned = ZC_K45_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let chunks = if calibration {
+            (hi_size / 32).clamp(8, 64)
+        } else {
+            tuned.min(hi_size * 7 / 8)
+        };
+        if chunks == 0 {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_r2_state()?;
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("zc-k45 launch", false);
+                return None;
+            }
+        };
+        if state.k45_pso.is_null() {
+            return None;
+        }
+        unsafe {
+            // The K pass runs strictly after the round-two join, so any
+            // idle-fill primer has already been drained there; drain again
+            // for safety (no-op in the steady state).
+            zc_r2_drain_prefetch(gpu, &mut state);
+            // Two nibble decompositions: lambda1 banks at 0..256, lambda3 at
+            // 256..512 (per prove; both tables depend on rho1/rho2).
+            let nib = gpu.buffer_contents(state.k45_nib_buf).cast::<F128>();
+            for (t, table) in [table_l1, table_l3].iter().enumerate() {
+                let base = t * 256;
+                for j in 0..8 {
+                    for n in 0..16 {
+                        *nib.add(base + j * 32 + n) = table[j * 256 + n];
+                        *nib.add(base + j * 32 + 16 + n) = table[j * 256 + (n << 4)];
+                    }
+                }
+            }
+            // eq uploads reuse the r2 arm's persistent buffers: the round-two
+            // job was fully drained at its own join, so overwriting is safe.
+            let need_lo = lo_size * 16;
+            if state.eq_lo_cap < need_lo {
+                if state.eq_lo_cap > 0 {
+                    gpu.release(state.eq_lo_buf);
+                }
+                state.eq_lo_buf = gpu.new_buffer(need_lo).ok()?;
+                state.eq_lo_cap = need_lo;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_lo.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_lo_buf),
+                need_lo,
+            );
+            let need_hi = hi_size * 16;
+            if state.eq_hi_cap < need_hi {
+                if state.eq_hi_cap > 0 {
+                    gpu.release(state.eq_hi_buf);
+                }
+                state.eq_hi_buf = gpu.new_buffer(need_hi).ok()?;
+                state.eq_hi_cap = need_hi;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_hi.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_hi_buf),
+                need_hi,
+            );
+            let need_part = hi_size * 128;
+            if state.part_cap < need_part {
+                if state.part_cap > 0 {
+                    gpu.release(state.part_buf);
+                }
+                state.part_buf = gpu.new_buffer(need_part).ok()?;
+                state.part_cap = need_part;
+            }
+            // Input wraps THROUGH THE SHARED CACHE: if the full8 timed
+            // launch already wrapped these exact ranges this is a cache hit,
+            // and if not, the wrap created here is the only view.
+            let anchors_bytes = std::slice::from_raw_parts(
+                anchors.as_ptr().cast::<u8>(),
+                anchors.len() * 16,
+            );
+            let a_buf = zc_r2_wrap(&mut state, gpu, anchors_bytes).ok()?;
+            let d_buf = zc_r2_wrap(&mut state, gpu, deltas).ok()?;
+            let cb = zc_k45_submit(
+                gpu, &state, a_buf, d_buf, chunks, lo_size, kappa, rho2,
+            )
+            .ok()?;
+            Some(ZcK45Job {
+                cb,
+                chunks,
+                calibration,
+                lo_size,
+                kappa,
+                rho2,
+                submitted: std::time::Instant::now(),
+            })
+        }
+    }
+
+    /// Drain the K-pass arm. During calibration `cpu_partials`/`cpu_la` must
+    /// hold the CPU's full per-chunk vectors (the oracle checks the summed
+    /// pair, the odd split, and all four deferred slots) and `cpu_wall_ms`
+    /// the fused CPU sweep wall.
+    pub(crate) fn zc_k45_wait(
+        job: ZcK45Job,
+        cpu_partials: Option<&[(F128, F128)]>,
+        cpu_la: Option<&[[F128; 6]]>,
+        cpu_wall_ms: f64,
+        hi_size: usize,
+    ) -> ZcK45Result {
+        use std::sync::atomic::Ordering;
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return ZcK45Result::Failed,
+        };
+        let poison = |cb: Id| {
+            ZC_K45_POISONED.store(true, Ordering::Relaxed);
+            ZC_K45_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            ZcK45Result::Failed
+        };
+        unsafe {
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+                return poison(job.cb);
+            }
+            let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+            let state_mutex = match zc_r2_state() {
+                Some(s) => s,
+                None => return poison(job.cb),
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    note_poisoned_lock("zc-k45 wait", false);
+                    return poison(job.cb);
+                }
+            };
+            let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
+            let mut out: Vec<[F128; 8]> = Vec::with_capacity(job.chunks);
+            for c in 0..job.chunks {
+                let mut v = [F128::ZERO; 8];
+                for (i, slot) in v.iter_mut().enumerate() {
+                    *slot = *parts.add(c * 8 + i);
+                }
+                out.push(v);
+            }
+            if !job.calibration {
+                gpu.release(job.cb);
+                if super::gpu_zc_r2_debug() {
+                    eprintln!(
+                        "[zc-k45] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
+                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms",
+                        job.chunks,
+                        hi_size,
+                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                return ZcK45Result::Prefix8(out);
+            }
+
+            // ---- Calibration ----
+            let (Some(cpu_all), Some(la)) = (cpu_partials, cpu_la) else {
+                return poison(job.cb);
+            };
+            for c in 0..job.chunks {
+                let summed = (out[c][0] + out[c][2], out[c][1] + out[c][3]);
+                let ok = summed == cpu_all[c]
+                    && la[c][0] == out[c][2]
+                    && la[c][1] == out[c][3]
+                    && la[c][2] == out[c][4]
+                    && la[c][3] == out[c][5]
+                    && la[c][4] == out[c][6]
+                    && la[c][5] == out[c][7];
+                if !ok {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[zc-k45] CALIBRATION MISMATCH at chunk {c}: gpu={:?} \
+                             cpu={:?} cpu_la={:?} — poisoned",
+                            out[c], cpu_all[c], la[c],
+                        );
+                    }
+                    return poison(job.cb);
+                }
+            }
+            // Replay pricing, k45 kernel, same plateau discipline as zc-r2.
+            let mut walls = [0.0f64; 5];
+            walls[0] = first_wall.max(0.0);
+            let mut n_walls = usize::from(walls[0] > 0.0);
+            let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
+            gpu.release(job.cb);
+            // The wrap cache holds (anchors, deltas) among its entries; the
+            // last two wraps created by this launch are the ones to replay
+            // against. Look them up by length instead of position: anchors
+            // are the only 16*8*lo*hi-byte entry, deltas the only
+            // 64*lo*hi-byte entry among wraps used by this arm.
+            let a_len = 8 * job.lo_size * hi_size * 16;
+            let d_len = 64 * job.lo_size * hi_size;
+            let a_buf = state.wraps.iter().rev().find(|&&(_, l, _)| l == a_len);
+            let d_buf = state.wraps.iter().rev().find(|&&(_, l, _)| l == d_len);
+            if let (Some(&(_, _, a_buf)), Some(&(_, _, d_buf))) = (a_buf, d_buf) {
+                while n_walls < walls.len() {
+                    let Ok(cb2) = zc_k45_submit(
+                        gpu, &state, a_buf, d_buf, job.chunks, job.lo_size, job.kappa, job.rho2,
+                    ) else {
+                        break;
+                    };
+                    let w = if gpu.wait_cb(cb2).is_ok() {
+                        zc_fold_gpu_wall_ms(gpu, cb2)
+                    } else {
+                        0.0
+                    };
+                    gpu.release(cb2);
+                    if w <= 0.0 {
+                        break;
+                    }
+                    walls[n_walls] = w;
+                    n_walls += 1;
+                    let prev_min = w_min;
+                    w_min = w_min.min(w);
+                    if n_walls >= 3 && w > 0.95 * prev_min {
+                        break;
+                    }
+                }
+            }
+            drop(state);
+            let u_gpu = if n_walls > 0 && w_min < f64::MAX {
+                w_min / job.chunks as f64
+            } else {
+                f64::INFINITY
+            };
+            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+                let measured = u_gpu / u_cpu;
+                let ratio = zc_k45_forced_ratio().unwrap_or(measured);
+                let g = zc_k45_gate_share(ratio, hi_size);
+                if super::gpu_zc_r2_debug() {
+                    eprintln!(
+                        "[zc-k45] gate replay walls: {:?}", &walls[..n_walls]
+                    );
+                    eprintln!(
+                        "[zc-k45] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
                          ratio={:.3} -> share {g}/{hi_size}",
                         u_gpu / u_cpu,
                     );
@@ -11162,8 +12587,639 @@ kernel void zc_r2_products(
             } else {
                 0
             };
-            ZC_R2_TUNED.store(share, Ordering::Relaxed);
-            ZcR2Result::Calibrated
+            ZC_K45_TUNED.store(share, Ordering::Relaxed);
+            ZcK45Result::Calibrated
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Ligerito direct-fold8 materialize GPU prefix arm (`lig_mat8_blocks`,
+    // see `super::ENV_NO_GPU_LIG_MAT8`).
+    //
+    // The ligerito open's fold8 materialize streams the 512 MiB committed
+    // witness once (2^25 F128 = ~33.5M banked GF(2^128) products) and folds
+    // both claims' composed byte-table bases, drained as 256 disjoint
+    // blocks. The GPU is otherwise idle for the whole pass (its next use is
+    // the L1 recursive Merkle). This arm gives a measured prefix of the
+    // blocks to the GPU OUTRIGHT — folded_f/folded_b stores through no-copy
+    // wraps plus the per-block round-0 partials — so the CPU drain skips
+    // those blocks entirely (alpha = 0, the full8 cost model).
+    //
+    // The arm lives inside the zc-r2 state on purpose: the witness it reads
+    // is the SAME allocation the latched commit persistently wrapped (and
+    // pin-registered), so the launch reuses that exact wrap — discovered
+    // via `latched_wrap_lookup` — and otherwise goes through this state's
+    // shared `zc_r2_wrap` cache, guaranteeing no second no-copy view is
+    // ever created over pages another arm already wrapped.
+    //
+    // Bit-exactness: identical argument to zc-r2/k45 — every folded value
+    // is an XOR multiset of exact field products (oracle-proven emulated
+    // clmul, F2-linear reduction commuting with XOR), the composition
+    // generators are the same exact field elements the CPU's mul_by_x
+    // ladder walks to, and the calibration oracle byte-compares the probe's
+    // stores AND partials on the target machine before a share is
+    // published.
+    // -----------------------------------------------------------------------
+
+    static LIG_MAT8_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static LIG_MAT8_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    pub(crate) fn lig_mat8_test_reset() {
+        use std::sync::atomic::Ordering;
+        LIG_MAT8_TUNED.store(usize::MAX, Ordering::Relaxed);
+        LIG_MAT8_POISONED.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lig_mat8_test_state() -> (usize, bool) {
+        use std::sync::atomic::Ordering;
+        (
+            LIG_MAT8_TUNED.load(Ordering::Relaxed),
+            LIG_MAT8_POISONED.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lig_mat8_test_set_share(share: usize) {
+        LIG_MAT8_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Ratio-gate override (`FLOCK_LIG_MAT8_GPU_FORCE_RATIO=<f64>`).
+    fn lig_mat8_forced_ratio() -> Option<f64> {
+        static V: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_LIG_MAT8_GPU_FORCE_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+        *V
+    }
+
+    /// The CPU does no work at all on an offloaded fold8 block — stores and
+    /// partial included — so this is exactly the full8 cost model: alpha 0,
+    /// the 0.95 CPU-ward bias absorbing warmup-vs-timed drift, and the
+    /// 15/16 overshoot cap (an optimistic warmup ratio must not make the
+    /// GPU the timed straggler at the join).
+    pub(crate) fn lig_mat8_gate_share(ratio: f64, n_blocks: usize) -> usize {
+        zc_r2_gate_share_with_alpha(ratio, n_blocks, 0.0, ZC_R2_FULL8_BIAS)
+    }
+
+    /// Exact-range lookup of a persistent no-copy wrap created by the
+    /// latched commit over the caller's z (witness) allocation. Read-only
+    /// peek — never creates state; called BEFORE the zc-r2 state lock is
+    /// taken so the two mutexes are never nested.
+    fn latched_wrap_lookup(ptr: usize, len: usize) -> Option<Id> {
+        let guard = LATCH.lock().ok()?;
+        if let LatchState::On(latched) = &*guard {
+            latched
+                .wraps
+                .iter()
+                .find(|&&(p, l, _)| p == ptr && l == len)
+                .map(|&(_, _, buf)| buf)
+        } else {
+            None
+        }
+    }
+
+    /// Raw store targets for the lig-mat8 arm: the real folded_f/folded_b
+    /// buffers the timed launch wraps no-copy and the GPU writes directly
+    /// (prefix blocks only; the CPU owns the rest — disjoint block stripes).
+    /// Raw pointers because the CPU drain holds the same buffers mutably for
+    /// its own block ranges.
+    #[derive(Clone, Copy)]
+    pub(crate) struct LigMat8Targets {
+        pub folded_f_ptr: *mut F128,
+        pub folded_b_ptr: *mut F128,
+        /// Length in F128 elements of EACH output (== block_len * n_blocks).
+        pub out_len: usize,
+    }
+
+    pub(crate) struct LigMat8Job {
+        cb: Id,
+        pub chunks: usize,
+        calibration: bool,
+        block_len: usize,
+        n_blocks: usize,
+        wit_buf: Id,
+        fout_buf: Id,
+        bout_buf: Id,
+        submitted: std::time::Instant,
+    }
+
+    // SAFETY: the command buffer handle is only waited/released from the
+    // launching thread; Metal command buffers are themselves thread-safe.
+    unsafe impl Send for LigMat8Job {}
+
+    impl LigMat8Job {
+        /// How many leading blocks the CPU drain should skip entirely. Zero
+        /// during calibration: the CPU runs every block and the GPU probe is
+        /// compared against its values, then discarded.
+        pub(crate) fn cpu_split(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    /// Result of draining the lig-mat8 arm.
+    pub(crate) enum LigMat8Result {
+        /// Warmup calibration completed (share published, GPU values
+        /// discarded); the caller's CPU outputs are authoritative.
+        Calibrated,
+        /// Timed-prove prefix: per-block `(u_0, u_2)` round-0 partials,
+        /// bit-exact, with the blocks' folded_f/folded_b stripes already
+        /// stored to the real buffers by the GPU.
+        Prefix(Vec<(F128, F128)>),
+        /// Metal failed after admission; the caller must CPU-redo the
+        /// prefix blocks. The arm is poisoned for the process.
+        Failed,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn lig_mat8_submit(
+        gpu: &Gpu,
+        state: &ZcR2,
+        wit_buf: Id,
+        fout_buf: Id,
+        bout_buf: Id,
+        blocks: usize,
+        block_len: usize,
+        n_blocks: usize,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct Pm {
+                block_len: u32,
+                ppt: u32,
+                n_blocks: u32,
+                _pad: u32,
+            }
+            let params = Pm {
+                block_len: block_len as u32,
+                ppt: (block_len / 512) as u32,
+                n_blocks: n_blocks as u32,
+                _pad: 0,
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<Pm>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.mat8_pso);
+            gpu.set_buffer(enc, wit_buf, 0, 0);
+            gpu.set_buffer(enc, state.mat8_tab_buf, 0, 1);
+            gpu.set_buffer(enc, state.mat8_eq_lo_buf, 0, 2);
+            gpu.set_buffer(enc, state.mat8_eq_hi_buf, 0, 3);
+            gpu.set_buffer(enc, state.mat8_w_buf, 0, 4);
+            gpu.set_buffer(enc, state.mat8_part_buf, 0, 5);
+            gpu.set_bytes(enc, pb, 6);
+            gpu.set_buffer(enc, fout_buf, 0, 7);
+            gpu.set_buffer(enc, bout_buf, 0, 8);
+            gpu.dispatch(enc, blocks as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// Launch the direct-fold8 materialize prefix. `None` = the whole pass
+    /// stays on the exact incumbent CPU path (kill switch, poisoned, share
+    /// 0, non-ranked shape, no Metal, illegal wrap surface, or wrap
+    /// failure). Called at the exact point the CPU drain starts — all six
+    /// fold challenges are bound and the tables/weights are final, so
+    /// FS-ordering is untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_lig_mat8(
+        witness: &[F128],
+        tables: [&[F128]; 2],
+        eq_lo: [&[F128]; 2],
+        eq_hi: [&[F128]; 2],
+        fold_weight: &[F128; 64],
+        targets: LigMat8Targets,
+        block_len: usize,
+        n_blocks: usize,
+    ) -> Option<LigMat8Job> {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_lig_mat8_enabled() || LIG_MAT8_POISONED.load(Ordering::Relaxed) {
+            return None;
+        }
+        // Shape gates: two 16-byte-bank tables, 512-partitionable slots
+        // (one 256-thread group owns block_len/2 pairs), exact lengths, and
+        // a wrap-legal output surface (16 KiB page alignment, no overlap
+        // with a pinned — already externally wrapped — allocation).
+        let page = 16384usize;
+        let out_len = targets.out_len;
+        if tables[0].len() != 16 * 256
+            || tables[1].len() != 16 * 256
+            || block_len < 512
+            || !block_len.is_multiple_of(512)
+            || n_blocks < 8
+            || out_len != block_len * n_blocks
+            || witness.len() != 64 * out_len
+            || eq_lo[0].len() != block_len
+            || eq_lo[1].len() != block_len
+            || eq_hi[0].len() != n_blocks
+            || eq_hi[1].len() != n_blocks
+            || !(targets.folded_f_ptr as usize).is_multiple_of(page)
+            || !(targets.folded_b_ptr as usize).is_multiple_of(page)
+            || !(out_len * 16).is_multiple_of(page)
+            || crate::scratch::f128_range_overlaps_pin(
+                targets.folded_f_ptr as usize,
+                out_len * 16,
+            )
+            || crate::scratch::f128_range_overlaps_pin(
+                targets.folded_b_ptr as usize,
+                out_len * 16,
+            )
+        {
+            if super::gpu_zc_r2_debug() {
+                eprintln!(
+                    "[lig-mat8] launch declined: shapes t0={} t1={} B={block_len} n={n_blocks} \
+                     out={out_len} wit={} f_al={} b_al={}",
+                    tables[0].len(),
+                    tables[1].len(),
+                    witness.len(),
+                    (targets.folded_f_ptr as usize) % page,
+                    (targets.folded_b_ptr as usize) % page,
+                );
+            }
+            return None;
+        }
+        let tuned = LIG_MAT8_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let blocks = if calibration {
+            (n_blocks / 16).clamp(8, 128)
+        } else {
+            tuned.min(n_blocks * 15 / 16)
+        };
+        if blocks == 0 {
+            return None;
+        }
+        // Witness wrap resolution BEFORE the zc-r2 state lock (the latch
+        // holds its own mutex; the two are never nested). The committed
+        // witness is normally the pin-registered z allocation the latched
+        // commit persistently wrapped: reuse that exact handle. A pinned
+        // range WITHOUT a discoverable wrap must decline — creating a
+        // second no-copy view over externally wrapped pages is illegal.
+        let wit_ptr = witness.as_ptr() as usize;
+        let wit_bytes = witness.len() * 16;
+        let latch_wit = latched_wrap_lookup(wit_ptr, wit_bytes);
+        if latch_wit.is_none()
+            && crate::scratch::f128_range_overlaps_pin(wit_ptr, wit_bytes)
+        {
+            if super::gpu_zc_r2_debug() {
+                eprintln!(
+                    "[lig-mat8] launch declined: witness pinned without a reusable latch wrap"
+                );
+            }
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_r2_state()?;
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("lig-mat8 launch", false);
+                return None;
+            }
+        };
+        if state.mat8_pso.is_null() {
+            return None;
+        }
+        unsafe {
+            // The materialize runs long after the zerocheck joins, so any
+            // idle-fill primer is already drained; drain again for safety
+            // (no-op in the steady state).
+            zc_r2_drain_prefetch(gpu, &mut state);
+            // Both claims' direct byte tables (128 KiB, per prove — they
+            // depend on the six fold challenges).
+            let tab_half = 16 * 256 * 16;
+            let need_tab = 2 * tab_half;
+            if state.mat8_tab_cap < need_tab {
+                if state.mat8_tab_cap > 0 {
+                    gpu.release(state.mat8_tab_buf);
+                }
+                state.mat8_tab_buf = gpu.new_buffer(need_tab).ok()?;
+                state.mat8_tab_cap = need_tab;
+            }
+            let tab_dst = gpu.buffer_contents(state.mat8_tab_buf);
+            std::ptr::copy_nonoverlapping(tables[0].as_ptr().cast::<u8>(), tab_dst, tab_half);
+            std::ptr::copy_nonoverlapping(
+                tables[1].as_ptr().cast::<u8>(),
+                tab_dst.add(tab_half),
+                tab_half,
+            );
+            // Concatenated per-claim eq_lo / eq_hi and the 64 fold weights.
+            let lo_half = block_len * 16;
+            let need_lo = 2 * lo_half;
+            if state.mat8_eq_lo_cap < need_lo {
+                if state.mat8_eq_lo_cap > 0 {
+                    gpu.release(state.mat8_eq_lo_buf);
+                }
+                state.mat8_eq_lo_buf = gpu.new_buffer(need_lo).ok()?;
+                state.mat8_eq_lo_cap = need_lo;
+            }
+            let lo_dst = gpu.buffer_contents(state.mat8_eq_lo_buf);
+            std::ptr::copy_nonoverlapping(eq_lo[0].as_ptr().cast::<u8>(), lo_dst, lo_half);
+            std::ptr::copy_nonoverlapping(
+                eq_lo[1].as_ptr().cast::<u8>(),
+                lo_dst.add(lo_half),
+                lo_half,
+            );
+            let hi_half = n_blocks * 16;
+            let need_hi = 2 * hi_half;
+            if state.mat8_eq_hi_cap < need_hi {
+                if state.mat8_eq_hi_cap > 0 {
+                    gpu.release(state.mat8_eq_hi_buf);
+                }
+                state.mat8_eq_hi_buf = gpu.new_buffer(need_hi).ok()?;
+                state.mat8_eq_hi_cap = need_hi;
+            }
+            let hi_dst = gpu.buffer_contents(state.mat8_eq_hi_buf);
+            std::ptr::copy_nonoverlapping(eq_hi[0].as_ptr().cast::<u8>(), hi_dst, hi_half);
+            std::ptr::copy_nonoverlapping(
+                eq_hi[1].as_ptr().cast::<u8>(),
+                hi_dst.add(hi_half),
+                hi_half,
+            );
+            if state.mat8_w_buf.is_null() {
+                state.mat8_w_buf = gpu.new_buffer(64 * 16).ok()?;
+            }
+            std::ptr::copy_nonoverlapping(
+                fold_weight.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.mat8_w_buf),
+                64 * 16,
+            );
+            let need_part = n_blocks * 32;
+            if state.mat8_part_cap < need_part {
+                if state.mat8_part_cap > 0 {
+                    gpu.release(state.mat8_part_buf);
+                }
+                state.mat8_part_buf = gpu.new_buffer(need_part).ok()?;
+                state.mat8_part_cap = need_part;
+            }
+            // Witness buffer: the latched commit's persistent wrap when it
+            // exists, otherwise THROUGH THE SHARED CACHE (cache hit when
+            // this exact range was wrapped before; the only view otherwise).
+            let wit_buf = match latch_wit {
+                Some(buf) => buf,
+                None => {
+                    let bytes = std::slice::from_raw_parts(
+                        witness.as_ptr().cast::<u8>(),
+                        wit_bytes,
+                    );
+                    zc_r2_wrap(&mut state, gpu, bytes).ok()?
+                }
+            };
+            // Store destinations: the real folded_f/folded_b buffers on a
+            // timed prove (no-copy wraps; GPU-owned prefix stripes are
+            // disjoint from every CPU-written stripe), discard buffers
+            // during calibration (the CPU writes the real ranges then, and
+            // the oracle byte-compares the two).
+            let (fout_buf, bout_buf) = if calibration {
+                let need = blocks * block_len * 16;
+                if state.mat8_calib_f_buf.is_null() {
+                    state.mat8_calib_f_buf = gpu.new_buffer(need).ok()?;
+                    state.mat8_calib_b_buf = match gpu.new_buffer(need) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            gpu.release(state.mat8_calib_f_buf);
+                            state.mat8_calib_f_buf = NIL;
+                            return None;
+                        }
+                    };
+                }
+                (state.mat8_calib_f_buf, state.mat8_calib_b_buf)
+            } else {
+                let f_bytes = std::slice::from_raw_parts(
+                    targets.folded_f_ptr.cast::<u8>(),
+                    out_len * 16,
+                );
+                let b_bytes = std::slice::from_raw_parts(
+                    targets.folded_b_ptr.cast::<u8>(),
+                    out_len * 16,
+                );
+                let fb = zc_r2_wrap(&mut state, gpu, f_bytes).ok()?;
+                let bb = zc_r2_wrap(&mut state, gpu, b_bytes).ok()?;
+                (fb, bb)
+            };
+            let cb = lig_mat8_submit(
+                gpu, &state, wit_buf, fout_buf, bout_buf, blocks, block_len, n_blocks,
+            )
+            .ok()?;
+            Some(LigMat8Job {
+                cb,
+                chunks: blocks,
+                calibration,
+                block_len,
+                n_blocks,
+                wit_buf,
+                fout_buf,
+                bout_buf,
+                submitted: std::time::Instant::now(),
+            })
+        }
+    }
+
+    /// Drain the lig-mat8 arm. During calibration `cpu_folded_f` /
+    /// `cpu_folded_b` must hold the CPU's own outputs for (at least) the
+    /// probe blocks, `cpu_partials` its per-block round-0 partials, and
+    /// `cpu_wall_ms` the wall of the full CPU drain that produced them
+    /// (per-block cost denominator). Every value must compare equal —
+    /// stores byte-for-byte, partials bit-for-bit — before a share is
+    /// published; any deviation poisons the arm for the process.
+    pub(crate) fn lig_mat8_wait(
+        job: LigMat8Job,
+        cpu_folded_f: Option<&[F128]>,
+        cpu_folded_b: Option<&[F128]>,
+        cpu_partials: Option<&[(F128, F128)]>,
+        cpu_wall_ms: f64,
+        n_blocks: usize,
+    ) -> LigMat8Result {
+        use std::sync::atomic::Ordering;
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return LigMat8Result::Failed,
+        };
+        let poison = |cb: Id| {
+            LIG_MAT8_POISONED.store(true, Ordering::Relaxed);
+            LIG_MAT8_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            LigMat8Result::Failed
+        };
+        unsafe {
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+                return poison(job.cb);
+            }
+            let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+            let state_mutex = match zc_r2_state() {
+                Some(s) => s,
+                None => return poison(job.cb),
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    note_poisoned_lock("lig-mat8 wait", false);
+                    return poison(job.cb);
+                }
+            };
+            let parts = gpu.buffer_contents(state.mat8_part_buf).cast::<F128>();
+            let mut out: Vec<(F128, F128)> = Vec::with_capacity(job.chunks);
+            for c in 0..job.chunks {
+                out.push((*parts.add(c * 2), *parts.add(c * 2 + 1)));
+            }
+            if !job.calibration {
+                gpu.release(job.cb);
+                if super::gpu_zc_r2_debug() {
+                    eprintln!(
+                        "[lig-mat8] timed prefix {}/{} blocks: gpu={first_wall:.2}ms \
+                         cpu-drain={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms",
+                        job.chunks,
+                        n_blocks,
+                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                return LigMat8Result::Prefix(out);
+            }
+
+            // ---- Calibration (untimed warmup prove, once per process) ----
+            // Target-machine equality oracle before anything else: probe
+            // partials bit-for-bit, probe folded_f/folded_b stores
+            // byte-for-byte against the CPU's own values.
+            let (Some(cpu_f), Some(cpu_b), Some(cpu_all)) =
+                (cpu_folded_f, cpu_folded_b, cpu_partials)
+            else {
+                return poison(job.cb);
+            };
+            if cpu_all.len() < job.chunks {
+                return poison(job.cb);
+            }
+            for c in 0..job.chunks {
+                if out[c] != cpu_all[c] {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[lig-mat8] CALIBRATION MISMATCH at block {c}: gpu={:?} \
+                             cpu={:?} — poisoned",
+                            out[c], cpu_all[c],
+                        );
+                    }
+                    return poison(job.cb);
+                }
+            }
+            let need = job.chunks * job.block_len * 16;
+            let gf = std::slice::from_raw_parts(
+                gpu.buffer_contents(state.mat8_calib_f_buf),
+                need,
+            );
+            let gb = std::slice::from_raw_parts(
+                gpu.buffer_contents(state.mat8_calib_b_buf),
+                need,
+            );
+            let cf =
+                std::slice::from_raw_parts(cpu_f.as_ptr().cast::<u8>(), cpu_f.len() * 16);
+            let cbb =
+                std::slice::from_raw_parts(cpu_b.as_ptr().cast::<u8>(), cpu_b.len() * 16);
+            if cf.len() < need || cbb.len() < need || gf != &cf[..need] || gb != &cbb[..need] {
+                if super::gpu_zc_r2_debug() {
+                    eprintln!(
+                        "[lig-mat8] STORE MISMATCH over {} probe blocks — poisoned",
+                        job.chunks,
+                    );
+                }
+                return poison(job.cb);
+            }
+            // Ramp-robust GPU pricing: replay the probe back-to-back to a
+            // plateau (>=3 replays, stop when a replay stops improving the
+            // best seen by >5%), price from the minimum wall.
+            let mut walls = [0.0f64; 5];
+            walls[0] = first_wall.max(0.0);
+            let mut n_walls = usize::from(walls[0] > 0.0);
+            let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
+            gpu.release(job.cb);
+            while n_walls < walls.len() {
+                let Ok(cb2) = lig_mat8_submit(
+                    gpu,
+                    &state,
+                    job.wit_buf,
+                    job.fout_buf,
+                    job.bout_buf,
+                    job.chunks,
+                    job.block_len,
+                    job.n_blocks,
+                ) else {
+                    break;
+                };
+                let w = if gpu.wait_cb(cb2).is_ok() {
+                    zc_fold_gpu_wall_ms(gpu, cb2)
+                } else {
+                    0.0
+                };
+                gpu.release(cb2);
+                if w <= 0.0 {
+                    break;
+                }
+                walls[n_walls] = w;
+                n_walls += 1;
+                let prev_min = w_min;
+                w_min = w_min.min(w);
+                if n_walls >= 3 && w > 0.95 * prev_min {
+                    break;
+                }
+            }
+            drop(state);
+            let u_gpu = if n_walls > 0 && w_min < f64::MAX {
+                w_min / job.chunks as f64
+            } else {
+                f64::INFINITY
+            };
+            let u_cpu = cpu_wall_ms / n_blocks.max(1) as f64;
+            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+                let measured = u_gpu / u_cpu;
+                let ratio = lig_mat8_forced_ratio().unwrap_or(measured);
+                let g = lig_mat8_gate_share(ratio, n_blocks);
+                if super::gpu_zc_r2_debug() {
+                    eprintln!("[lig-mat8] gate replay walls: {:?}", &walls[..n_walls]);
+                    eprintln!(
+                        "[lig-mat8] gate u_gpu={u_gpu:.4}ms/block u_cpu={u_cpu:.4}ms/block \
+                         ratio={:.3} -> share {g}/{n_blocks}",
+                        u_gpu / u_cpu,
+                    );
+                }
+                g
+            } else {
+                0
+            };
+            // Calibration scratch is warmup-only; the timed prove writes
+            // through no-copy wraps of the real buffers.
+            {
+                let mut state = match state_mutex.lock() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        note_poisoned_lock("lig-mat8 calib teardown", false);
+                        LIG_MAT8_TUNED.store(0, Ordering::Relaxed);
+                        return LigMat8Result::Calibrated;
+                    }
+                };
+                if !state.mat8_calib_f_buf.is_null() {
+                    gpu.release(state.mat8_calib_f_buf);
+                    state.mat8_calib_f_buf = NIL;
+                }
+                if !state.mat8_calib_b_buf.is_null() {
+                    gpu.release(state.mat8_calib_b_buf);
+                    state.mat8_calib_b_buf = NIL;
+                }
+            }
+            LIG_MAT8_TUNED.store(share, Ordering::Relaxed);
+            LigMat8Result::Calibrated
         }
     }
 
@@ -12574,7 +14630,9 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 /// Zerocheck round-two products GPU arm (see `ENV_NO_GPU_ZC_R2`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+pub(crate) use imp::{
+    ZcR2Job, ZcR2Result, ZcR2StoreTargets, launch_zc_r2_products, zc_r2_wait,
+};
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -12585,6 +14643,19 @@ pub(crate) use imp::{stage_zc_r2_idle_fill, zc_r2_idle_fill_viable};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcT3Job, ZcT3Result, launch_zc_t3_products, zc_t3_wait};
+
+/// Cascade K-pass products GPU arm (see `ENV_NO_GPU_ZC_K45`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{ZcK45Job, ZcK45Result, launch_zc_k45_products, zc_k45_wait};
+
+/// Ligerito direct-fold8 materialize GPU prefix arm (see
+/// `ENV_NO_GPU_LIG_MAT8`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{
+    LigMat8Job, LigMat8Result, LigMat8Targets, launch_lig_mat8, lig_mat8_wait,
+};
 
 /// Zerocheck large tail loop-round products GPU arm (see `ENV_NO_GPU_ZC_LOOP`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -12689,16 +14760,88 @@ mod imp {
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}
 
     pub(crate) fn staging_released() {}
+
+    /// Non-Metal stub of the lig-mat8 arm: the launch always declines, so
+    /// the materialize stays on the exact incumbent CPU path.
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)]
+    pub(crate) struct LigMat8Targets {
+        pub folded_f_ptr: *mut F128,
+        pub folded_b_ptr: *mut F128,
+        pub out_len: usize,
+    }
+
+    #[allow(dead_code)]
+    pub(crate) struct LigMat8Job {
+        pub chunks: usize,
+    }
+
+    impl LigMat8Job {
+        #[allow(dead_code)]
+        pub(crate) fn cpu_split(&self) -> usize {
+            0
+        }
+
+        #[allow(dead_code)]
+        pub(crate) fn is_calibration(&self) -> bool {
+            true
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) enum LigMat8Result {
+        Calibrated,
+        Prefix(Vec<(F128, F128)>),
+        Failed,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_lig_mat8(
+        _witness: &[F128],
+        _tables: [&[F128]; 2],
+        _eq_lo: [&[F128]; 2],
+        _eq_hi: [&[F128]; 2],
+        _fold_weight: &[F128; 64],
+        _targets: LigMat8Targets,
+        _block_len: usize,
+        _n_blocks: usize,
+    ) -> Option<LigMat8Job> {
+        None
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn lig_mat8_wait(
+        _job: LigMat8Job,
+        _cpu_folded_f: Option<&[F128]>,
+        _cpu_folded_b: Option<&[F128]>,
+        _cpu_partials: Option<&[(F128, F128)]>,
+        _cpu_wall_ms: f64,
+        _n_blocks: usize,
+    ) -> LigMat8Result {
+        LigMat8Result::Failed
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 
+/// Ligerito direct-fold8 materialize GPU prefix arm (non-Metal stub).
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{
+    LigMat8Job, LigMat8Result, LigMat8Targets, launch_lig_mat8, lig_mat8_wait,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::field::F128;
+
+    /// The zc-r2 arm's share/poison/mode latches are process-global, so the
+    /// two tests that reset and drive them must not interleave under the
+    /// default parallel test runner.
+    static ZC_R2_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// GPU idle-decay probe at ranked size: full commit graph wall
     /// back-to-back vs after idle gaps. Ignored; run with --ignored --nocapture.
@@ -14565,6 +16708,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// the timed prefix path.
     #[test]
     fn gpu_zc_r2_products_match_cpu_oracle() {
+        let _guard = ZC_R2_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
             *rng ^= *rng << 13;
@@ -14660,20 +16804,21 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // Calibration probe: internal equality oracle + share publication.
         imp::zc_r2_test_reset();
         let job = imp::launch_zc_r2_products(
-            &a_packed,
-            &b_packed,
-            &table_data,
-            &eq_lo,
-            &eq_hi,
-            lo_size,
-            hi_size,
-            mask,
-            useful,
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            None,
         )
         .expect("calibration launch must succeed on real Metal");
         assert!(job.is_calibration());
         assert_eq!(job.cpu_split(), 0);
-        let res = imp::zc_r2_wait(job, Some(&cpu_partials), Some(&cpu_la), 50.0, hi_size);
+        let res = imp::zc_r2_wait(
+            job,
+            Some(&cpu_partials),
+            Some(&cpu_la),
+            None,
+            None,
+            50.0,
+            hi_size,
+        );
         assert!(matches!(res, imp::ZcR2Result::Calibrated));
         let (tuned, poisoned) = imp::zc_r2_test_state();
         assert!(
@@ -14685,21 +16830,14 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // Timed prefix path at a forced share.
         imp::zc_r2_test_set_share(hi_size / 2);
         let job2 = imp::launch_zc_r2_products(
-            &a_packed,
-            &b_packed,
-            &table_data,
-            &eq_lo,
-            &eq_hi,
-            lo_size,
-            hi_size,
-            mask,
-            useful,
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            None,
         )
         .expect("timed launch must succeed");
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
-        match imp::zc_r2_wait(job2, None, None, 0.0, hi_size) {
+        match imp::zc_r2_wait(job2, None, None, None, None, 0.0, hi_size) {
             imp::ZcR2Result::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);
                 assert_eq!(
@@ -14715,6 +16853,564 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             _ => panic!("timed drain must return prefix partials"),
         }
         imp::zc_r2_test_reset();
+    }
+
+    /// Full8 arm oracle: the `zc_r2_full8` kernel must reproduce, bit for
+    /// bit, (a) all eight lookahead slots the CPU lookahead kernel emits —
+    /// kappa baked into the even pair, eq_hi into all — and (b) the exact
+    /// anchor/delta bytes of `r2_pair_fold_and_store`, including zeroed
+    /// padded pairs. Exercises full8 calibration (slot oracle + store byte
+    /// oracle + mode latch) and the timed path's stores into no-copy-wrapped
+    /// real buffers.
+    #[test]
+    fn gpu_zc_r2_full8_matches_cpu_oracle() {
+        let _guard = ZC_R2_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fn xs(rng: &mut u64) -> u64 {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng
+        }
+        fn rand_f128(rng: &mut u64) -> F128 {
+            F128 { lo: xs(rng), hi: xs(rng) }
+        }
+        let mut rng = 0xA076_1D64_78BD_642Fu64;
+
+        // F2-linear byte table (nibble decomposition requires it).
+        let mut table_data = vec![F128::ZERO; 8 * 256];
+        for j in 0..8 {
+            let basis: Vec<F128> = (0..8).map(|_| rand_f128(&mut rng)).collect();
+            for v in 1usize..256 {
+                let mut acc = F128::ZERO;
+                for b in 0..8 {
+                    if v & (1 << b) != 0 {
+                        acc += basis[b];
+                    }
+                }
+                table_data[j * 256 + v] = acc;
+            }
+        }
+        let fold_row = |code: u64| -> F128 {
+            let mut acc = F128::ZERO;
+            for j in 0..8 {
+                acc += table_data[j * 256 + ((code >> (8 * j)) & 0xff) as usize];
+            }
+            acc
+        };
+
+        let lo_size = 512usize;
+        let hi_size = 64usize;
+        let n_pairs = lo_size * hi_size;
+        let mask = 4095usize;
+        let useful = 3900usize;
+        let kappa = rand_f128(&mut rng);
+
+        let mut a_packed = vec![0u8; n_pairs * 16];
+        let mut b_packed = vec![0u8; n_pairs * 16];
+        for byte in a_packed.iter_mut() {
+            *byte = (xs(&mut rng) & 0xff) as u8;
+        }
+        for byte in b_packed.iter_mut() {
+            *byte = (xs(&mut rng) & 0xff) as u8;
+        }
+        let eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
+        let eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
+
+        // CPU reference: eight slots per chunk with the driver's exact
+        // weighting, plus the reference anchor/delta bytes.
+        let read = |packed: &[u8], row: usize| -> u64 {
+            u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
+        };
+        let mut cpu_slots: Vec<[F128; 8]> = Vec::with_capacity(hi_size);
+        let mut ref_anchors = vec![F128::ZERO; 2 * n_pairs];
+        let mut ref_deltas = vec![0u8; 16 * n_pairs];
+        for x_hi in 0..hi_size {
+            let mut s = [F128::ZERO; 8];
+            for g in 0..lo_size / 2 {
+                let p0 = x_hi * lo_size + 2 * g;
+                let p1 = p0 + 1;
+                let w = eq_lo[2 * g + 1];
+                let mut rows = [F128::ZERO; 8];
+                for (i, &p) in [p0, p1].iter().enumerate() {
+                    if (p & mask) >= useful {
+                        continue;
+                    }
+                    let a0c = read(&a_packed, 2 * p);
+                    let a1c = read(&a_packed, 2 * p + 1);
+                    let b0c = read(&b_packed, 2 * p);
+                    let b1c = read(&b_packed, 2 * p + 1);
+                    rows[4 * i] = fold_row(a0c);
+                    rows[4 * i + 1] = fold_row(a1c);
+                    rows[4 * i + 2] = fold_row(b0c);
+                    rows[4 * i + 3] = fold_row(b1c);
+                    ref_anchors[2 * p] = rows[4 * i];
+                    ref_anchors[2 * p + 1] = rows[4 * i + 2];
+                    ref_deltas[p * 16..p * 16 + 8]
+                        .copy_from_slice(&(a0c ^ a1c).to_le_bytes());
+                    ref_deltas[p * 16 + 8..p * 16 + 16]
+                        .copy_from_slice(&(b0c ^ b1c).to_le_bytes());
+                }
+                let [a0, a1, b0, b1, a2, a3, b2, b3] = rows;
+                let (a0w, a1w, a2w, a3w) = (w * a0, w * a1, w * a2, w * a3);
+                s[0] += a1w * b1;
+                s[1] += (a0w + a1w) * (b0 + b1);
+                s[2] += a3w * b3;
+                s[3] += (a2w + a3w) * (b2 + b3);
+                s[4] += a2w * b2;
+                let (e_aw, o_aw) = (a0w + a2w, a1w + a3w);
+                let (e_b, o_b) = (b0 + b2, b1 + b3);
+                s[5] += e_aw * e_b;
+                s[6] += o_aw * o_b;
+                s[7] += (e_aw + o_aw) * (e_b + o_b);
+            }
+            let eq_h = eq_hi[x_hi];
+            cpu_slots.push([
+                eq_h * (kappa * s[0]),
+                eq_h * (kappa * s[1]),
+                eq_h * s[2],
+                eq_h * s[3],
+                eq_h * s[4],
+                eq_h * s[5],
+                eq_h * s[6],
+                eq_h * s[7],
+            ]);
+        }
+        let cpu_partials: Vec<(F128, F128)> = cpu_slots
+            .iter()
+            .map(|v| (v[0] + v[2], v[1] + v[3]))
+            .collect();
+        let cpu_la: Vec<[F128; 6]> = cpu_slots
+            .iter()
+            .map(|v| [v[2], v[3], v[4], v[5], v[6], v[7]])
+            .collect();
+        let ref_anchor_bytes = unsafe {
+            std::slice::from_raw_parts(ref_anchors.as_ptr().cast::<u8>(), ref_anchors.len() * 16)
+        };
+
+        // Real store targets: pooled allocations, page-aligned like the
+        // ranked compact state.
+        let mut anchors = crate::scratch::take_f128_unpinned(2 * n_pairs);
+        let mut deltas = crate::scratch::take_u8(16 * n_pairs);
+        anchors.fill(F128::ZERO);
+        deltas.fill(0);
+        let targets = imp::ZcR2StoreTargets {
+            anchors_ptr: anchors.as_mut_ptr(),
+            anchors_len: anchors.len(),
+            deltas_ptr: deltas.as_mut_ptr(),
+            deltas_len: deltas.len(),
+            kappa,
+        };
+
+        // Full8 calibration: slot oracle + store byte oracle + mode latch.
+        imp::zc_r2_test_reset();
+        let job = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            Some(targets),
+        )
+        .expect("full8 calibration launch must succeed on real Metal");
+        assert!(job.is_calibration());
+        assert!(job.is_full8(), "full8 mode must be admitted at this shape");
+        let probe_chunks = job.chunks;
+        let res = imp::zc_r2_wait(
+            job,
+            Some(&cpu_partials),
+            Some(&cpu_la),
+            Some(ref_anchor_bytes),
+            Some(&ref_deltas),
+            50.0,
+            hi_size,
+        );
+        assert!(matches!(res, imp::ZcR2Result::Calibrated));
+        let (tuned, poisoned) = imp::zc_r2_test_state();
+        assert!(
+            !poisoned,
+            "full8 probe slots and store bytes must match the CPU reference"
+        );
+        assert_ne!(tuned, usize::MAX, "calibration must publish a share");
+        assert!(probe_chunks >= 8);
+
+        // Timed full8 path: Prefix8 slots + stores into the wrapped real
+        // buffers, prefix chunks only.
+        imp::zc_r2_test_set_share(hi_size / 2);
+        let job2 = imp::launch_zc_r2_products(
+            &a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+            Some(targets),
+        )
+        .expect("timed full8 launch must succeed");
+        assert!(!job2.is_calibration());
+        assert!(job2.is_full8(), "timed launch must follow the calibrated mode");
+        let prefix = job2.cpu_split();
+        assert_eq!(prefix, hi_size / 2);
+        match imp::zc_r2_wait(job2, None, None, None, None, 0.0, hi_size) {
+            imp::ZcR2Result::Prefix8(vals) => {
+                assert_eq!(vals.len(), prefix);
+                assert_eq!(&vals[..], &cpu_slots[..prefix], "all eight slots bit-exact");
+            }
+            _ => panic!("timed full8 drain must return Prefix8"),
+        }
+        let anchor_prefix_bytes = 2 * lo_size * 16 * prefix;
+        let delta_prefix_bytes = 16 * lo_size * prefix;
+        let got_anchor_bytes = unsafe {
+            std::slice::from_raw_parts(anchors.as_ptr().cast::<u8>(), anchor_prefix_bytes)
+        };
+        assert_eq!(
+            got_anchor_bytes,
+            &ref_anchor_bytes[..anchor_prefix_bytes],
+            "GPU anchor stores byte-identical over the prefix"
+        );
+        assert_eq!(
+            &deltas[..delta_prefix_bytes],
+            &ref_deltas[..delta_prefix_bytes],
+            "GPU delta stores byte-identical over the prefix"
+        );
+        crate::scratch::give_f128(anchors);
+        crate::scratch::give_u8(deltas);
+        imp::zc_r2_test_reset();
+    }
+
+    /// K-pass products arm oracle: the `zc_k45_products` kernel must
+    /// reproduce, bit for bit, all eight message slots the fused CPU K
+    /// kernel emits — two-lambda-table reconstruction with the rho2 anchor
+    /// fold, group weight `eq_lo[2t+1]`, kappa baked into the even pair and
+    /// eq_hi into all eight. Exercises full8-style calibration (8-slot
+    /// oracle, share latch) and the timed prefix path.
+    #[test]
+    fn gpu_zc_k45_products_match_cpu_oracle() {
+        let _guard = ZC_R2_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fn xs(rng: &mut u64) -> u64 {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng
+        }
+        fn rand_f128(rng: &mut u64) -> F128 {
+            F128 { lo: xs(rng), hi: xs(rng) }
+        }
+        let mut rng = 0x5851_F42D_4C95_7F2Du64;
+
+        // Two independent F2-linear byte tables (lambda1/lambda3 stand-ins).
+        let mut mk_table = |rng: &mut u64| {
+            let mut t = vec![F128::ZERO; 8 * 256];
+            for j in 0..8 {
+                let basis: Vec<F128> = (0..8).map(|_| rand_f128(rng)).collect();
+                for v in 1usize..256 {
+                    let mut acc = F128::ZERO;
+                    for b in 0..8 {
+                        if v & (1 << b) != 0 {
+                            acc += basis[b];
+                        }
+                    }
+                    t[j * 256 + v] = acc;
+                }
+            }
+            t
+        };
+        let table_l1 = mk_table(&mut rng);
+        let table_l3 = mk_table(&mut rng);
+        let fold = |t: &[F128], code: u64| -> F128 {
+            let mut acc = F128::ZERO;
+            for j in 0..8 {
+                acc += t[j * 256 + ((code >> (8 * j)) & 0xff) as usize];
+            }
+            acc
+        };
+
+        let lo_size = 512usize;
+        let hi_size = 64usize;
+        let n_groups = 2 * lo_size * hi_size;
+        let rho2 = rand_f128(&mut rng);
+        let kappa = rand_f128(&mut rng);
+
+        let mut anchors = crate::scratch::take_f128_unpinned(4 * n_groups);
+        let mut deltas = crate::scratch::take_u8(32 * n_groups);
+        for a in anchors.iter_mut() {
+            *a = rand_f128(&mut rng);
+        }
+        for byte in deltas.iter_mut() {
+            *byte = (xs(&mut rng) & 0xff) as u8;
+        }
+        let eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
+        let eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
+
+        // CPU reference slots with the driver's exact weighting.
+        let read_d = |g: usize, off: usize| -> u64 {
+            u64::from_le_bytes(deltas[32 * g + off..32 * g + off + 8].try_into().unwrap())
+        };
+        let recon = |g: usize| -> (F128, F128) {
+            let a = anchors[4 * g]
+                + rho2 * (anchors[4 * g] + anchors[4 * g + 2])
+                + fold(&table_l1, read_d(g, 0))
+                + fold(&table_l3, read_d(g, 16));
+            let b = anchors[4 * g + 1]
+                + rho2 * (anchors[4 * g + 1] + anchors[4 * g + 3])
+                + fold(&table_l1, read_d(g, 8))
+                + fold(&table_l3, read_d(g, 24));
+            (a, b)
+        };
+        let mut cpu_slots: Vec<[F128; 8]> = Vec::with_capacity(hi_size);
+        for x_hi in 0..hi_size {
+            let mut s = [F128::ZERO; 8];
+            for t in 0..lo_size / 2 {
+                let g0 = x_hi * 2 * lo_size + 4 * t;
+                let w = eq_lo[2 * t + 1];
+                let (a0, b0) = recon(g0);
+                let (a1, b1) = recon(g0 + 1);
+                let (a2, b2) = recon(g0 + 2);
+                let (a3, b3) = recon(g0 + 3);
+                let (a0w, a1w, a2w, a3w) = (w * a0, w * a1, w * a2, w * a3);
+                s[0] += a1w * b1;
+                s[1] += (a0w + a1w) * (b0 + b1);
+                s[2] += a3w * b3;
+                s[3] += (a2w + a3w) * (b2 + b3);
+                s[4] += a2w * b2;
+                let (e_aw, o_aw) = (a0w + a2w, a1w + a3w);
+                let (e_b, o_b) = (b0 + b2, b1 + b3);
+                s[5] += e_aw * e_b;
+                s[6] += o_aw * o_b;
+                s[7] += (e_aw + o_aw) * (e_b + o_b);
+            }
+            let eq_h = eq_hi[x_hi];
+            cpu_slots.push([
+                eq_h * (kappa * s[0]),
+                eq_h * (kappa * s[1]),
+                eq_h * s[2],
+                eq_h * s[3],
+                eq_h * s[4],
+                eq_h * s[5],
+                eq_h * s[6],
+                eq_h * s[7],
+            ]);
+        }
+        let cpu_partials: Vec<(F128, F128)> = cpu_slots
+            .iter()
+            .map(|v| (v[0] + v[2], v[1] + v[3]))
+            .collect();
+        let cpu_la: Vec<[F128; 6]> = cpu_slots
+            .iter()
+            .map(|v| [v[2], v[3], v[4], v[5], v[6], v[7]])
+            .collect();
+
+        // Calibration: 8-slot oracle + share latch.
+        imp::zc_k45_test_reset();
+        let job = imp::launch_zc_k45_products(
+            &anchors, &deltas, &table_l1, &table_l3, rho2, kappa, &eq_lo, &eq_hi, lo_size,
+            hi_size,
+        )
+        .expect("k45 calibration launch must succeed on real Metal");
+        assert!(job.is_calibration());
+        assert_eq!(job.cpu_split(), 0);
+        let res = imp::zc_k45_wait(job, Some(&cpu_partials), Some(&cpu_la), 50.0, hi_size);
+        assert!(matches!(res, imp::ZcK45Result::Calibrated));
+        let (tuned, poisoned) = imp::zc_k45_test_state();
+        assert!(!poisoned, "k45 probe slots must equal the CPU reference");
+        assert_ne!(tuned, usize::MAX, "calibration must publish a share");
+
+        // Timed prefix at a forced share.
+        imp::zc_k45_test_set_share(hi_size / 2);
+        let job2 = imp::launch_zc_k45_products(
+            &anchors, &deltas, &table_l1, &table_l3, rho2, kappa, &eq_lo, &eq_hi, lo_size,
+            hi_size,
+        )
+        .expect("timed k45 launch must succeed");
+        assert!(!job2.is_calibration());
+        let prefix = job2.cpu_split();
+        assert_eq!(prefix, hi_size / 2);
+        match imp::zc_k45_wait(job2, None, None, 0.0, hi_size) {
+            imp::ZcK45Result::Prefix8(vals) => {
+                assert_eq!(vals.len(), prefix);
+                assert_eq!(&vals[..], &cpu_slots[..prefix], "all eight slots bit-exact");
+            }
+            _ => panic!("timed k45 drain must return Prefix8"),
+        }
+        crate::scratch::give_f128(anchors);
+        crate::scratch::give_u8(deltas);
+        imp::zc_k45_test_reset();
+    }
+
+    /// Ligerito direct-fold8 materialize arm oracle: the `lig_mat8_blocks`
+    /// kernel must reproduce, bit for bit, the CPU's fold8 block body — the
+    /// 64-bank weighted witness folds (`folded_f`), both claims' composed
+    /// byte-table basis folds (`folded_b`, generators `g[bit] =
+    /// fold(x^bit · eq_hi[block], table)` then subset sums), and the
+    /// per-block round-0 `(u_0, u_2)` partials. Exercises calibration
+    /// (store + partial oracle, share latch) and the forced-share timed
+    /// path with byte-exact prefix stores.
+    #[test]
+    fn gpu_lig_mat8_matches_cpu_oracle() {
+        let _guard = ZC_R2_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fn xs(rng: &mut u64) -> u64 {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng
+        }
+        fn rand_f128(rng: &mut u64) -> F128 {
+            F128 { lo: xs(rng), hi: xs(rng) }
+        }
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+
+        let block_len = 512usize;
+        let n_blocks = 32usize;
+        let out_len = block_len * n_blocks;
+
+        let mut witness = crate::scratch::take_f128_unpinned(64 * out_len);
+        for w in witness.iter_mut() {
+            *w = rand_f128(&mut rng);
+        }
+        let fold_weight: [F128; 64] = core::array::from_fn(|_| rand_f128(&mut rng));
+        let tables: [Vec<F128>; 2] = core::array::from_fn(|_| {
+            (0..16 * 256).map(|_| rand_f128(&mut rng)).collect()
+        });
+        let eq_lo: [Vec<F128>; 2] =
+            core::array::from_fn(|_| (0..block_len).map(|_| rand_f128(&mut rng)).collect());
+        let eq_hi: [Vec<F128>; 2] =
+            core::array::from_fn(|_| (0..n_blocks).map(|_| rand_f128(&mut rng)).collect());
+
+        // Scalar reference — plain reduced field ops throughout (reduction
+        // is F2-linear, so this equals the deferred CPU kernels bitwise).
+        let monomial = |bit: usize| -> F128 {
+            if bit < 64 {
+                F128 { lo: 1u64 << bit, hi: 0 }
+            } else {
+                F128 { lo: 0, hi: 1u64 << (bit - 64) }
+            }
+        };
+        let fold_table = |t: &[F128], e: F128| -> F128 {
+            let lo = e.lo.to_le_bytes();
+            let hi = e.hi.to_le_bytes();
+            let mut acc = F128::ZERO;
+            for k in 0..8 {
+                acc += t[k * 256 + lo[k] as usize];
+                acc += t[(k + 8) * 256 + hi[k] as usize];
+            }
+            acc
+        };
+        let mut ref_f = vec![F128::ZERO; out_len];
+        let mut ref_b = vec![F128::ZERO; out_len];
+        let mut ref_partials: Vec<(F128, F128)> = Vec::with_capacity(n_blocks);
+        for block in 0..n_blocks {
+            // Per-claim composition generators for this block.
+            let mut gens = [[F128::ZERO; 128]; 2];
+            for (c, claim_gens) in gens.iter_mut().enumerate() {
+                let e_hi = eq_hi[c][block];
+                for (bit, g) in claim_gens.iter_mut().enumerate() {
+                    *g = fold_table(&tables[c], monomial(bit) * e_hi);
+                }
+            }
+            let basis_fold = |c: usize, e: F128| -> F128 {
+                let mut acc = F128::ZERO;
+                for bit in 0..64 {
+                    if (e.lo >> bit) & 1 == 1 {
+                        acc += gens[c][bit];
+                    }
+                    if (e.hi >> bit) & 1 == 1 {
+                        acc += gens[c][64 + bit];
+                    }
+                }
+                acc
+            };
+            for slot in 0..block_len {
+                let g = block * block_len + slot;
+                let mut f = F128::ZERO;
+                for bank in 0..64 {
+                    f += fold_weight[bank] * witness[64 * g + bank];
+                }
+                ref_f[g] = f;
+                ref_b[g] = basis_fold(0, eq_lo[0][slot]) + basis_fold(1, eq_lo[1][slot]);
+            }
+            let (mut u0, mut u2) = (F128::ZERO, F128::ZERO);
+            for pair in 0..block_len / 2 {
+                let g = block * block_len + 2 * pair;
+                u0 += ref_f[g] * ref_b[g];
+                u2 += (ref_f[g] + ref_f[g + 1]) * (ref_b[g] + ref_b[g + 1]);
+            }
+            ref_partials.push((u0, u2));
+        }
+
+        let mut gpu_f = crate::scratch::take_f128_unpinned(out_len);
+        let mut gpu_b = crate::scratch::take_f128_unpinned(out_len);
+
+        // Calibration: probe writes to discard buffers; the wait's oracle
+        // compares them (and the partials) against the CPU reference before
+        // latching a share.
+        imp::lig_mat8_test_reset();
+        let job = imp::launch_lig_mat8(
+            &witness,
+            [&tables[0], &tables[1]],
+            [&eq_lo[0], &eq_lo[1]],
+            [&eq_hi[0], &eq_hi[1]],
+            &fold_weight,
+            imp::LigMat8Targets {
+                folded_f_ptr: gpu_f.as_mut_ptr(),
+                folded_b_ptr: gpu_b.as_mut_ptr(),
+                out_len,
+            },
+            block_len,
+            n_blocks,
+        )
+        .expect("lig-mat8 calibration launch must succeed on real Metal");
+        assert!(job.is_calibration());
+        assert_eq!(job.cpu_split(), 0);
+        let probe = job.chunks;
+        let res = imp::lig_mat8_wait(
+            job,
+            Some(&ref_f[..probe * block_len]),
+            Some(&ref_b[..probe * block_len]),
+            Some(&ref_partials[..probe]),
+            50.0,
+            n_blocks,
+        );
+        assert!(matches!(res, imp::LigMat8Result::Calibrated));
+        let (tuned, poisoned) = imp::lig_mat8_test_state();
+        assert!(!poisoned, "probe stores/partials must equal the CPU reference");
+        assert_ne!(tuned, usize::MAX, "calibration must publish a share");
+
+        // Timed prefix at a forced share: the GPU writes the real output
+        // ranges and returns the blocks' partials.
+        imp::lig_mat8_test_set_share(n_blocks / 2);
+        let job2 = imp::launch_lig_mat8(
+            &witness,
+            [&tables[0], &tables[1]],
+            [&eq_lo[0], &eq_lo[1]],
+            [&eq_hi[0], &eq_hi[1]],
+            &fold_weight,
+            imp::LigMat8Targets {
+                folded_f_ptr: gpu_f.as_mut_ptr(),
+                folded_b_ptr: gpu_b.as_mut_ptr(),
+                out_len,
+            },
+            block_len,
+            n_blocks,
+        )
+        .expect("timed lig-mat8 launch must succeed");
+        assert!(!job2.is_calibration());
+        let prefix = job2.cpu_split();
+        assert_eq!(prefix, n_blocks / 2);
+        match imp::lig_mat8_wait(job2, None, None, None, 0.0, n_blocks) {
+            imp::LigMat8Result::Prefix(partials) => {
+                assert_eq!(partials.len(), prefix);
+                assert_eq!(
+                    &partials[..],
+                    &ref_partials[..prefix],
+                    "per-block (u0, u2) partials bit-exact"
+                );
+            }
+            _ => panic!("timed lig-mat8 drain must return Prefix"),
+        }
+        assert_eq!(
+            &gpu_f[..prefix * block_len],
+            &ref_f[..prefix * block_len],
+            "folded_f prefix stores byte-exact"
+        );
+        assert_eq!(
+            &gpu_b[..prefix * block_len],
+            &ref_b[..prefix * block_len],
+            "folded_b prefix stores byte-exact"
+        );
+        crate::scratch::give_f128(witness);
+        crate::scratch::give_f128(gpu_f);
+        crate::scratch::give_f128(gpu_b);
+        imp::lig_mat8_test_reset();
     }
 
     /// T3 products arm oracle: the GPU's per-chunk reduced partials must

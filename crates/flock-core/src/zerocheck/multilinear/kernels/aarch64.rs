@@ -1158,6 +1158,91 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
     }
 }
 
+/// Reconstruction-only sibling of [`fold2_compact_and_round45_chunk_neon_8`]
+/// for GPU-offloaded chunks of the cascade K pass: writes the identical
+/// `a_out`/`b_out` bytes (same loads, same ρ₂ anchor fold, same λ₁/λ₃ delta
+/// lookups, same non-temporal stores) and skips only the round-4/5 message
+/// products, which the GPU arm's per-chunk partials replace after the join.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold2_compact_reconstruct_only_8(
+    table_l1: *const u8,
+    table_l3: *const u8,
+    rho2: F128,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    out_pairs: usize,
+    degen: bool,
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
+        debug_assert!(out_pairs >= 2 && out_pairs.is_multiple_of(2));
+        let n5 = out_pairs / 2;
+        for t in 0..n5 {
+            let mut av = [vdupq_n_u64(0); 4];
+            let mut bv = [vdupq_n_u64(0); 4];
+            for lane in 0..4usize {
+                let g = 4 * t + lane;
+                let ap = anchors.add(4 * g).cast::<u64>();
+                let anc_a0 = vld1q_u64(ap);
+                let anc_b0 = vld1q_u64(ap.add(2));
+                let anc_a1 = vld1q_u64(ap.add(4));
+                let anc_b1 = vld1q_u64(ap.add(6));
+
+                let dp = deltas.add(32 * g);
+                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
+                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
+                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
+                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
+
+                let a_delta = veorq_u64(
+                    lookup_lanes_q::<8>(table_l1, da0, 0),
+                    lookup_lanes_q::<8>(table_l3, da1, 0),
+                );
+                av[lane] = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
+
+                if degen && (db0 | db1) == 0 {
+                    let bd = veorq_u64(anc_b0, anc_b1);
+                    bv[lane] = if is_zero_q(bd) {
+                        anc_b0
+                    } else {
+                        veorq_u64(anc_b0, mul_q(rho2_q, bd))
+                    };
+                } else {
+                    let b_delta = veorq_u64(
+                        lookup_lanes_q::<8>(table_l1, db0, 0),
+                        lookup_lanes_q::<8>(table_l3, db1, 0),
+                    );
+                    bv[lane] =
+                        xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta);
+                }
+            }
+            store_pair_nt(a_out.add(4 * t), av[0], av[1]);
+            store_pair_nt(a_out.add(4 * t + 2), av[2], av[3]);
+            store_pair_nt(b_out.add(4 * t), bv[0], bv[1]);
+            store_pair_nt(b_out.add(4 * t + 2), bv[2], bv[3]);
+        }
+    }
+}
+
 /// XOR of the `L` table entries for byte lanes `lane0..lane0 + L` of `code`.
 /// One 16-byte L1 load per lane; the tree shape matches `fold_row_q` so the
 /// full-width (`L = 8`, `lane0 = 0`) case is instruction-equivalent.
