@@ -110,20 +110,38 @@ fn cascade3_off() -> bool {
 pub(crate) static ZC_CASCADE4_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Kill switch for the cascaded rounds-9/10 lookahead: `FLOCK_NO_ZC_CASCADE4=1`
-/// (exact '1') restores the cascade3 i=6/i=7 tail route within the same
-/// binary (and with the deeper levels off, their respective routes).
-/// OnceLock-latched: the environment is read once per process. Bit-identical
-/// either way — same pure-reassociation argument as the levels above,
-/// asserted by the cascade4 transcript-identity test.
+/// Test-only forced-ON latch: with the engagement demoted to opt-in, the
+/// transcript-identity test engages the route through this latch instead of
+/// the process environment, keeping the on-vs-off comparison real.
+#[cfg(test)]
+pub(crate) static ZC_CASCADE4_FORCED_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The cascaded rounds-9/10 lookahead is opt-in: `FLOCK_ZC_CASCADE4=1`
+/// (exact '1') engages it; by default the promoted cascade3 i=6/i=7 tail
+/// route runs. Demoted from default-on because the only pre-registered
+/// ranked isolation of this engagement (three-draw chain, engaged draws
+/// −2.63%/−2.71% against an in-band −0.82% default-off control on the same
+/// tree family) priced it as a systematic ranked regression, while every
+/// favorable measurement of it is local quiet-seat evidence, which this
+/// board has repeatedly shown does not transfer in either direction. The
+/// route, its forced-on/forced-off test latches, its transcript-identity
+/// test, and its oracles all stay in-tree. OnceLock-latched: the
+/// environment is read once per process. Bit-identical either way — same
+/// pure-reassociation argument as the levels above.
 #[inline]
 fn cascade4_off() -> bool {
     #[cfg(test)]
-    if ZC_CASCADE4_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
+    {
+        if ZC_CASCADE4_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        if ZC_CASCADE4_FORCED_ON.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
     }
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE4").is_some_and(|v| v == *"1"))
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*ON.get_or_init(|| std::env::var_os("FLOCK_ZC_CASCADE4").is_some_and(|v| v == *"1"))
 }
 
 /// Number of variables folded in round 1 via the additive-NTT univariate skip.
@@ -2218,14 +2236,13 @@ mod tests {
             let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
             let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
 
-            ZC_CASCADE4_FORCED_OFF.store(false, Ordering::Relaxed);
+            ZC_CASCADE4_FORCED_ON.store(true, Ordering::Relaxed);
             let mut ch_on = FsChallenger::new(b"flock-test-v0");
             let (proof_on, claim_on) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_on);
+            ZC_CASCADE4_FORCED_ON.store(false, Ordering::Relaxed);
 
-            ZC_CASCADE4_FORCED_OFF.store(true, Ordering::Relaxed);
             let mut ch_off = FsChallenger::new(b"flock-test-v0");
             let (proof_off, claim_off) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_off);
-            ZC_CASCADE4_FORCED_OFF.store(false, Ordering::Relaxed);
 
             assert_eq!(proof_on.round1_ab, proof_off.round1_ab, "round1_ab m={m}");
             assert_eq!(proof_on.round1_c, proof_off.round1_c, "round1_c m={m}");
