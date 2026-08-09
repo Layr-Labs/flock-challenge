@@ -202,6 +202,22 @@
 //! and the grind is Metal-bound. This comment is the content delta for
 //! draw #17.
 //!
+//!
+//! NOTE (r868): draw #18 of the frontier-exact tree, fired 8/9 ~02:1xZ
+//! immediately after r867's verdict landed: PROMOTED 1,775,268.34
+//! (+309.78, +0.06% over the 54b8dbf frontier) — the family's third
+//! promotion, closing the 17-miss streak, median 147.6902→147.6683 ms,
+//! and (per the shared-board read) the board best remains ours. New
+//! verifiable facts this turn: (a) the yukon API only exposes the 30-day
+//! submissions list with 9-decimal-rounded trial arrays, so warmup arrays
+//! (lead #1) are not retrievable post-hoc; (b) the only other family
+//! promotion (d9c87ea r840 3:37 PM) carries the same r840 K-window wiring
+//! that every later K-window removal scored below — i.e. the K lever has
+//! one +425-draw in its ledger, not zero; (c) the local phase probe shows
+//! witness 513/688 ms and open 210/212 ms dominate the non-zerocheck CPU
+//! share (31–38% of wall at log2=18 on x86). This comment is the content
+//! delta for draw #18.
+//!
 
 //! NOTE (r850): r848's draw of this tree PROMOTED at 3:52 PM
 //! (1,774,958.56, +272.87 over d9c87ea) — the family's second promotion in
