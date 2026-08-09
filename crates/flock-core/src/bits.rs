@@ -38,6 +38,18 @@ pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
     crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes(input, out64);
 }
 
+/// Bit-identical sibling of [`transpose_8_u64s_to_64_bytes`] whose AArch64
+/// output uses non-temporal pair stores. Use only for a cold destination that
+/// is fully overwritten and will not be read again soon.
+#[inline(always)]
+pub fn transpose_8_u64s_to_64_bytes_nt(lanes: &[u64; 8], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), 64);
+    // SAFETY: [u64; 8] is 64 bytes with no padding; u8 has weaker alignment.
+    let input: &[u8; 64] = unsafe { &*(lanes.as_ptr() as *const [u8; 64]) };
+    let out64: &mut [u8; 64] = out.try_into().expect("64-byte stripe slice");
+    crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes_nt(input, out64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +101,35 @@ mod tests {
             transpose_8_u64s_to_64_bytes(&lanes, &mut fast);
             transpose_8_u64s_to_64_bytes_scalar(&lanes, &mut oracle);
             assert_eq!(fast, oracle, "lanes={lanes:?}");
+        }
+    }
+
+    /// The direct non-temporal output flavor must emit exactly the ordinary
+    /// transpose bytes; only the final store placement differs.
+    #[test]
+    fn transpose_8_u64s_nt_matches_cached() {
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for _ in 0..256 {
+            let lanes: [u64; 8] = std::array::from_fn(|_| next());
+            let mut cached = [0u8; 64];
+            let mut nt = [0xA5u8; 64];
+            transpose_8_u64s_to_64_bytes(&lanes, &mut cached);
+            transpose_8_u64s_to_64_bytes_nt(&lanes, &mut nt);
+            assert_eq!(nt, cached);
+        }
+        for lanes in [[0u64; 8], [u64::MAX; 8], std::array::from_fn(|i| 1u64 << i)] {
+            let mut cached = [0u8; 64];
+            let mut nt = [0xA5u8; 64];
+            transpose_8_u64s_to_64_bytes(&lanes, &mut cached);
+            transpose_8_u64s_to_64_bytes_nt(&lanes, &mut nt);
+            assert_eq!(nt, cached, "lanes={lanes:?}");
         }
     }
 

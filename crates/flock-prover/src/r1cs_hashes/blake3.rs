@@ -728,14 +728,16 @@ impl<'a> ReverseTranspose<'a> {
         // Row i reads x[i] in A, y[i] in B, and carry[0..i] in both.
         // Accumulating the latter backwards turns the triangular row walk into
         // one suffix scan over the 31 carry columns.
-        let alpha_plus_one = self.alpha + F128::ONE;
         let mut suffix = F128::ZERO;
         for i in (0..CARRY_BITS_PER_ADD).rev() {
             self.comb[carry_base + i] += suffix;
             let e = self.eq_inner[carry_base + i];
-            self.adjoints[x][i] += self.alpha * e;
+            let alpha_e = self.alpha * e;
+            self.adjoints[x][i] += alpha_e;
             self.adjoints[y][i] += e;
-            suffix += alpha_plus_one * e;
+            // Characteristic two: (alpha + 1) * e = alpha * e + e. Reuse
+            // the product already needed by x instead of multiplying twice.
+            suffix += alpha_e + e;
         }
         out
     }
@@ -2084,10 +2086,11 @@ pub(crate) mod witgen_simd {
 
             // ---- L1 stages (block-lane words; drained by `dump` at the
             // end so each block's 2 KiB is one ascending burst) ----
-            // Every element is written before it is read: prefix/out_lo own
-            // words 0..35, W32 owns 36..481, and the explicit suffix owns
-            // 482..511. Keep the stages uninitialized so each quad avoids
-            // three redundant 8 KiB bzero calls before those full writes.
+            // Every element that `dump_range` loads is initialized first.
+            // On an elision hit, the skipped prefix/suffix words are neither
+            // written nor loaded because their destination already contains
+            // the required constants. Keep the stages uninitialized so each
+            // quad avoids three redundant 8 KiB bzero calls.
             let zero = vdupq_n_u32(0);
             let mut zs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
             let mut ast = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
@@ -2104,8 +2107,15 @@ pub(crate) mod witgen_simd {
             }
             let maxv = vdupq_n_u32(u32::MAX);
             // b prefix words 0..36 = MAX (the out_lo slot is MAX too — the
-            // scalar writes MAX over MAX, so b needs no out_lo pass).
-            for w in 0..36usize {
+            // scalar writes MAX over MAX, so b needs no out_lo pass). On a
+            // token hit dump_elide starts at word 32, so the first 32 stage
+            // words are dead; words 32..36 still feed the boundary chunk.
+            let b_prefix_start = if elide[2] {
+                8 * ELIDE_B_PREFIX_CHUNKS
+            } else {
+                0
+            };
+            for w in b_prefix_start..36usize {
                 vst1q_u32(bs.add(w) as *mut u32, maxv);
             }
             // Message region words 16..36: word16 = 1|m0<<1, then
@@ -2116,18 +2126,13 @@ pub(crate) mod witgen_simd {
                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
                 m[13], m[14], m[15], tlo, thi, blen, flags,
             ];
-            vst1q_u32(
-                zs.add(16) as *mut u32,
-                vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
-            );
+            let word16 = vorrq_u32(one, vshlq_n_u32::<1>(chain[0]));
+            vst1q_u32(zs.add(16) as *mut u32, word16);
+            vst1q_u32(ast.add(16) as *mut u32, word16);
             for k in 1..20usize {
                 let w = vorrq_u32(vshrq_n_u32::<31>(chain[k - 1]), vshlq_n_u32::<1>(chain[k]));
                 vst1q_u32(zs.add(16 + k) as *mut u32, w);
-            }
-            // a's message region equals z's.
-            for w in 16..36usize {
-                let v = vld1q_u32(zs.add(w) as *const u32);
-                vst1q_u32(ast.add(w) as *mut u32, v);
+                vst1q_u32(ast.add(16 + k) as *mut u32, w);
             }
 
             // ---- G stream (bits 1153..15409): sequential push network ----
@@ -2233,10 +2238,26 @@ pub(crate) mod witgen_simd {
             const {
                 assert!(U32_PER_BLOCK - ZF == 30);
             }
-            for w in 0..30usize {
-                vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
+            const ELIDE_ZERO_WORD: usize = 8 * ELIDE_ZERO_CHUNK;
+            for w in ZF..ELIDE_ZERO_WORD {
+                vst1q_u32(zs.add(w) as *mut u32, zero);
+                vst1q_u32(ast.add(w) as *mut u32, zero);
+                vst1q_u32(bs.add(w) as *mut u32, zero);
+            }
+            if !elide[0] {
+                for w in ELIDE_ZERO_WORD..U32_PER_BLOCK {
+                    vst1q_u32(zs.add(w) as *mut u32, zero);
+                }
+            }
+            if !elide[1] {
+                for w in ELIDE_ZERO_WORD..U32_PER_BLOCK {
+                    vst1q_u32(ast.add(w) as *mut u32, zero);
+                }
+            }
+            if !elide[2] {
+                for w in ELIDE_ZERO_WORD..U32_PER_BLOCK {
+                    vst1q_u32(bs.add(w) as *mut u32, zero);
+                }
             }
 
             // ---- out_lo slot, words 8..16 (z/a only) ----
@@ -2400,21 +2421,37 @@ pub(crate) mod witgen_simd {
             #[cfg(debug_assertions)]
             debug_verify_elided_group(z_grp, a_grp, b_grp, elide);
             for half in 0..2 {
-                // Owned synth storage for the lazy path; unread when
-                // `spec_init` is `None`, so it costs nothing on the ordinary
-                // path. Declared out here so its borrows outlive the builder
-                // call below.
-                let synth: [Compression; 4];
+                // Four final storage slots let each closed-form generator
+                // write directly where the builder will borrow it. Building
+                // an aggregate through array::from_fn made LLVM return a
+                // second 448-byte aggregate and memcpy it once per quad.
+                let synth0: Compression;
+                let synth1: Compression;
+                let synth2: Compression;
+                let synth3: Compression;
                 let quad: [&Compression; 4] = if let Some(init) = spec_init {
-                    synth = std::array::from_fn(|j| {
-                        let idx = 8 * g + 4 * half + j;
-                        if idx < n_blocks {
-                            crate::seed_pipe::gen_block_with(init, idx, gen_ilp)
-                        } else {
-                            padding
-                        }
-                    });
-                    std::array::from_fn(|j| &synth[j])
+                    let idx = 8 * g + 4 * half;
+                    synth0 = if idx < n_blocks {
+                        crate::seed_pipe::gen_block_with(init, idx, gen_ilp)
+                    } else {
+                        padding
+                    };
+                    synth1 = if idx + 1 < n_blocks {
+                        crate::seed_pipe::gen_block_with(init, idx + 1, gen_ilp)
+                    } else {
+                        padding
+                    };
+                    synth2 = if idx + 2 < n_blocks {
+                        crate::seed_pipe::gen_block_with(init, idx + 2, gen_ilp)
+                    } else {
+                        padding
+                    };
+                    synth3 = if idx + 3 < n_blocks {
+                        crate::seed_pipe::gen_block_with(init, idx + 3, gen_ilp)
+                    } else {
+                        padding
+                    };
+                    [&synth0, &synth1, &synth2, &synth3]
                 } else {
                     std::array::from_fn(|j| {
                         let idx = 8 * g + 4 * half + j;
@@ -4422,26 +4459,38 @@ mod tests {
                         }
                     }
                 };
-                let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
-                let mut ae = ze;
-                let mut be = ze;
-                seed_consts(&mut ze, false);
-                seed_consts(&mut ae, false);
-                seed_consts(&mut be, true);
-                unsafe {
-                    witgen_simd::build_quad_witness_ab_stream_neon_elide(
-                        [&inputs[0], &inputs[1], &inputs[2], &inputs[3]],
-                        ze.as_mut_ptr() as *mut u32,
-                        ae.as_mut_ptr() as *mut u32,
-                        be.as_mut_ptr() as *mut u32,
-                        z_nt,
-                        ab_nt,
-                        [true; 3],
+                for mask in 0u8..8 {
+                    let elide = [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0];
+                    let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
+                    let mut ae = ze;
+                    let mut be = ze;
+                    seed_consts(&mut ze, false);
+                    seed_consts(&mut ae, false);
+                    seed_consts(&mut be, true);
+                    unsafe {
+                        witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                            [&inputs[0], &inputs[1], &inputs[2], &inputs[3]],
+                            ze.as_mut_ptr() as *mut u32,
+                            ae.as_mut_ptr() as *mut u32,
+                            be.as_mut_ptr() as *mut u32,
+                            z_nt,
+                            ab_nt,
+                            elide,
+                        );
+                    }
+                    assert_eq!(
+                        ze, zq,
+                        "elided z diverged mask={mask:#05b} z_nt={z_nt} ab_nt={ab_nt}"
+                    );
+                    assert_eq!(
+                        ae, aq,
+                        "elided a diverged mask={mask:#05b} z_nt={z_nt} ab_nt={ab_nt}"
+                    );
+                    assert_eq!(
+                        be, bq,
+                        "elided b diverged mask={mask:#05b} z_nt={z_nt} ab_nt={ab_nt}"
                     );
                 }
-                assert_eq!(ze, zq, "elided z diverged z_nt={z_nt} ab_nt={ab_nt}");
-                assert_eq!(ae, aq, "elided a diverged z_nt={z_nt} ab_nt={ab_nt}");
-                assert_eq!(be, bq, "elided b diverged z_nt={z_nt} ab_nt={ab_nt}");
             }
         }
         // Driver equality incl. padding slots and the stripe.

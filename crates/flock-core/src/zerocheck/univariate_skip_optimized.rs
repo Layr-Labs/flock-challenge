@@ -561,6 +561,14 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     kernels::bit_transpose_64bytes(input, output);
 }
 
+/// Bit-identical sibling of [`bit_transpose_64bytes`] whose AArch64 output
+/// uses non-temporal pair stores. Intended for cold, fully-overwritten
+/// destinations such as the deferred lincheck stripe.
+#[inline(always)]
+pub fn bit_transpose_64bytes_nt(input: &[u8; 64], output: &mut [u8; 64]) {
+    kernels::bit_transpose_64bytes_nt(input, output);
+}
+
 /// Challenge-independent AB half of the optimized round-1 kernel.
 ///
 /// The storage has exactly the same byte length and block layout as either

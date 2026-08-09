@@ -106,6 +106,21 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     portable::bit_transpose_64bytes_scalar(input, output);
 }
 
+/// Bit-identical transpose whose AArch64 output uses non-temporal pair
+/// stores. Other targets retain the ordinary store flavor.
+#[inline(always)]
+pub(super) fn bit_transpose_64bytes_nt(input: &[u8; 64], output: &mut [u8; 64]) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON, and both fixed-size
+    // references cover the kernel's complete 64-byte load/store ranges.
+    unsafe {
+        aarch64::bit_transpose_64bytes_neon_nt(input, output);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    bit_transpose_64bytes(input, output);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
     a_packed: &[u8],

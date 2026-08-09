@@ -1055,7 +1055,10 @@ unsafe fn xor3_u8(
 ///      lanes do the actual 8×8 bit transpose.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
+unsafe fn bit_transpose_64bytes_neon_impl<const NT_OUTPUT: bool>(
+    input: &[u8; 64],
+    output: &mut [u8; 64],
+) {
     use core::arch::aarch64::*;
 
     unsafe {
@@ -1113,11 +1116,44 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [
         y3 = xor3_u64(y3, t3, vshlq_n_u64::<28>(t3));
 
         let out_ptr = output.as_mut_ptr();
-        vst1q_u8(out_ptr, vreinterpretq_u8_u64(y0));
-        vst1q_u8(out_ptr.add(16), vreinterpretq_u8_u64(y1));
-        vst1q_u8(out_ptr.add(32), vreinterpretq_u8_u64(y2));
-        vst1q_u8(out_ptr.add(48), vreinterpretq_u8_u64(y3));
+        let o0 = vreinterpretq_u8_u64(y0);
+        let o1 = vreinterpretq_u8_u64(y1);
+        let o2 = vreinterpretq_u8_u64(y2);
+        let o3 = vreinterpretq_u8_u64(y3);
+        if NT_OUTPUT {
+            // The deferred lincheck stripe is not read until well after this
+            // write. Store the four live result registers directly instead
+            // of bouncing them through a 64-byte stack temporary merely to
+            // change the final store flavor.
+            core::arch::asm!(
+                "stnp {o0:q}, {o1:q}, [{dst}]",
+                "stnp {o2:q}, {o3:q}, [{dst}, #32]",
+                o0 = in(vreg) o0,
+                o1 = in(vreg) o1,
+                o2 = in(vreg) o2,
+                o3 = in(vreg) o3,
+                dst = in(reg) out_ptr,
+                options(nostack)
+            );
+        } else {
+            vst1q_u8(out_ptr, o0);
+            vst1q_u8(out_ptr.add(16), o1);
+            vst1q_u8(out_ptr.add(32), o2);
+            vst1q_u8(out_ptr.add(48), o3);
+        }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
+    unsafe { bit_transpose_64bytes_neon_impl::<false>(input, output) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn bit_transpose_64bytes_neon_nt(input: &[u8; 64], output: &mut [u8; 64]) {
+    unsafe { bit_transpose_64bytes_neon_impl::<true>(input, output) }
 }
 
 // Intermediate-stage NEON kernel: scalar `inv_table.apply` writing to

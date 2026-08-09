@@ -568,6 +568,17 @@ enum LincheckStripeInput {
 
 const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 64;
 
+/// Direct-register output for the deferred stripe transpose. The choice is
+/// latched process-wide and consulted once per group, never inside the 241-row
+/// ranked hot loop. Exact `1` restores the incumbent stack-bounce store path.
+#[inline]
+fn deferred_stripe_fused_store_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("FLOCK_NO_DEFER_STRIPE_FUSED_STORE").is_ok_and(|value| value == "1")
+    })
+}
+
 fn fill_deferred_lincheck_stripe_group(
     z_packed: &[F128],
     stripe: &mut [u8],
@@ -582,31 +593,41 @@ fn fill_deferred_lincheck_stripe_group(
     // same read-only view used by the eager witness transpose.
     let z_u64: &[u64] =
         unsafe { std::slice::from_raw_parts(z_group.as_ptr().cast::<u64>(), z_group.len() * 2) };
-    let mut transposed = [0u8; 64];
-    for word in 0..useful_words {
-        let lanes: [u64; 8] = std::array::from_fn(|lane| z_u64[lane * u64_per_block + word]);
-        flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
-        let dst = &mut stripe[word * 64..word * 64 + 64];
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            // The stripe is not read until after commit+zerocheck, so use the
-            // same cache-bypassing store flavor as the eager SIMD witness
-            // path. `ldp/stnp` permit these 64-byte slices and the stack
-            // temporary without an extra alignment contract.
-            core::arch::asm!(
-                "ldp {t0:q}, {t1:q}, [{src}]",
-                "stnp {t0:q}, {t1:q}, [{dst}]",
-                "ldp {t0:q}, {t1:q}, [{src}, #32]",
-                "stnp {t0:q}, {t1:q}, [{dst}, #32]",
-                src = in(reg) transposed.as_ptr(),
-                dst = in(reg) dst.as_mut_ptr(),
-                t0 = out(vreg) _,
-                t1 = out(vreg) _,
-                options(nostack)
-            );
+    if deferred_stripe_fused_store_enabled() {
+        for word in 0..useful_words {
+            let lanes: [u64; 8] = std::array::from_fn(|lane| z_u64[lane * u64_per_block + word]);
+            let dst = &mut stripe[word * 64..word * 64 + 64];
+            // The AArch64 transpose keeps its four output registers live into
+            // the final STNP pair, deleting the incumbent 64-byte stack spill
+            // and immediate reload. Other targets use the cached-store oracle.
+            flock_core::bits::transpose_8_u64s_to_64_bytes_nt(&lanes, dst);
         }
-        #[cfg(not(target_arch = "aarch64"))]
-        dst.copy_from_slice(&transposed);
+    } else {
+        let mut transposed = [0u8; 64];
+        for word in 0..useful_words {
+            let lanes: [u64; 8] = std::array::from_fn(|lane| z_u64[lane * u64_per_block + word]);
+            flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
+            let dst = &mut stripe[word * 64..word * 64 + 64];
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                // Exact rollback oracle: transpose into the stack temporary,
+                // reload it, then issue the same non-temporal destination
+                // stores as the fused path.
+                core::arch::asm!(
+                    "ldp {t0:q}, {t1:q}, [{src}]",
+                    "stnp {t0:q}, {t1:q}, [{dst}]",
+                    "ldp {t0:q}, {t1:q}, [{src}, #32]",
+                    "stnp {t0:q}, {t1:q}, [{dst}, #32]",
+                    src = in(reg) transposed.as_ptr(),
+                    dst = in(reg) dst.as_mut_ptr(),
+                    t0 = out(vreg) _,
+                    t1 = out(vreg) _,
+                    options(nostack)
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            dst.copy_from_slice(&transposed);
+        }
     }
     // The ranked padded fold never observes the tail. Keeping the honest
     // full-stripe contract in tests catches accidental selector widening.

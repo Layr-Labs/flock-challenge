@@ -441,7 +441,7 @@ fn messages_from_direct_products(
 ) -> ((F128, F128), [F128; 6]) {
     let mut h = [F128::ZERO; 16];
     for claim in products {
-        for (out, value) in h.iter_mut().zip(claim.products) {
+        for (out, value) in h.iter_mut().zip(claim.products.iter().copied()) {
             *out += value;
         }
     }
@@ -577,7 +577,7 @@ pub(crate) fn messages_from_direct_products_fold4(
 ) -> ((F128, F128), [F128; 6], Fold4Lookahead2, Fold4Lookahead3) {
     let mut h = [F128::ZERO; 256];
     for claim in factors {
-        for (out, value) in h.iter_mut().zip(claim.products) {
+        for (out, value) in h.iter_mut().zip(claim.products.iter().copied()) {
             *out += value;
         }
     }
@@ -680,7 +680,7 @@ pub(crate) fn messages_from_direct_products_fold8(
 ) {
     let mut h = [F128::ZERO; 4096];
     for claim in factors {
-        for (out, value) in h.iter_mut().zip(claim.products) {
+        for (out, value) in h.iter_mut().zip(claim.products.iter().copied()) {
             *out += value;
         }
     }
