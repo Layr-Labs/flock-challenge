@@ -2478,7 +2478,7 @@ pub(crate) fn fold2_plain_and_round6_into(
     let nt_stores = {
         use std::sync::OnceLock;
         static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-        quarter >= (1usize << 21)
+        quarter >= (1usize << 20) // was 2^21; 2^20 covers ranked R7/8 out (32 MiB)
             && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
     };
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -2683,7 +2683,7 @@ pub(crate) fn fold2_plain_and_round67_into(
     let nt_stores = {
         use std::sync::OnceLock;
         static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-        quarter >= (1usize << 21)
+        quarter >= (1usize << 20)
             && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
     };
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -3320,7 +3320,7 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     let nt_stores = {
         use std::sync::OnceLock;
         static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-        half >= (1usize << 21)
+        half >= (1usize << 20)
             && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
     };
     // Total non-bound multilinear vars is log_n - 1; eq covers log_n - 2 of those.
