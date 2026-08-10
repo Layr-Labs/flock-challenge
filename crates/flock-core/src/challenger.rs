@@ -189,6 +189,27 @@ const OP_BYTES: u8 = 0x05;
 const KIND_SCALAR: u8 = 0x01;
 const KIND_SLICE: u8 = 0x02;
 
+#[cfg(target_endian = "little")]
+#[inline]
+fn f128s_as_bytes(values: &[F128]) -> &[u8] {
+    // SAFETY: F128 is exactly two adjacent u64 fields under repr(C, align(16)),
+    // so it has no padding and every byte is initialized. On little-endian
+    // targets this is the canonical lo.to_le_bytes() || hi.to_le_bytes() layout.
+    unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn f128s_as_bytes_mut(values: &mut [F128]) -> &mut [u8] {
+    let byte_len = core::mem::size_of_val(values);
+    // SAFETY: F128 has the padding-free layout documented above, and all bit
+    // patterns are valid because both fields are u64. The caller initializes
+    // the F128 slice before exposing its bytes.
+    unsafe { core::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), byte_len) }
+}
+
 /// Global Fiat–Shamir hash counters, enabled with `--features hash-count`.
 /// Tracks the squeeze count and the PoW checks; absorbed transcript bytes are
 /// tracked via [`FsChallenger::absorbed_bytes`].
@@ -356,6 +377,11 @@ impl Challenger for FsChallenger {
     fn observe_f128_slice(&mut self, values: &[F128]) {
         self.absorb(&[OP_OBSERVE, KIND_SLICE]);
         self.absorb(&(values.len() as u64).to_le_bytes());
+
+        #[cfg(target_endian = "little")]
+        self.absorb(f128s_as_bytes(values));
+
+        #[cfg(not(target_endian = "little"))]
         for v in values {
             self.absorb_f128(*v);
         }
@@ -385,17 +411,30 @@ impl Challenger for FsChallenger {
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.absorb(&[OP_SQUEEZE, KIND_SLICE]);
         self.absorb(&(n as u64).to_le_bytes());
-        let mut buf = vec![0u8; n * 16];
-        self.squeeze_into(&mut buf);
-        self.absorb(&buf);
-        buf.as_chunks::<16>()
-            .0
-            .iter()
-            .map(|c| F128 {
-                lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
-                hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
-            })
-            .collect()
+
+        #[cfg(target_endian = "little")]
+        {
+            let mut values = vec![F128::ZERO; n];
+            let bytes = f128s_as_bytes_mut(&mut values);
+            self.squeeze_into(bytes);
+            self.absorb(bytes);
+            values
+        }
+
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut buf = vec![0u8; n * 16];
+            self.squeeze_into(&mut buf);
+            self.absorb(&buf);
+            buf.as_chunks::<16>()
+                .0
+                .iter()
+                .map(|c| F128 {
+                    lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                    hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+                })
+                .collect()
+        }
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
@@ -1400,6 +1439,43 @@ mod tests {
     /// only the primitive differs.
     const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
 
+    fn challenger_with_test_prestate(kind: HashKind) -> FsChallenger {
+        let mut challenger = FsChallenger::with_hash(b"legacy-equivalence", kind);
+        challenger.observe_label(b"nontrivial-prestate");
+        challenger.observe_bytes(b"transcript bytes before the operation under test");
+        challenger.observe_f128(F128 {
+            lo: 0x0123_4567_89AB_CDEF,
+            hi: 0xFEDC_BA98_7654_3210,
+        });
+        challenger
+    }
+
+    fn legacy_observe_f128_slice(challenger: &mut FsChallenger, values: &[F128]) {
+        challenger.absorb(&[OP_OBSERVE, KIND_SLICE]);
+        challenger.absorb(&(values.len() as u64).to_le_bytes());
+        for value in values {
+            challenger.absorb(&value.lo.to_le_bytes());
+            challenger.absorb(&value.hi.to_le_bytes());
+        }
+    }
+
+    fn legacy_sample_f128_vec(challenger: &mut FsChallenger, n: usize) -> Vec<F128> {
+        challenger.absorb(&[OP_SQUEEZE, KIND_SLICE]);
+        challenger.absorb(&(n as u64).to_le_bytes());
+        let mut bytes = vec![0u8; n * 16];
+        challenger.squeeze_into(&mut bytes);
+        challenger.absorb(&bytes);
+        bytes
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|chunk| F128 {
+                lo: u64::from_le_bytes(chunk[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(chunk[8..].try_into().unwrap()),
+            })
+            .collect()
+    }
+
     /// The two-pool early-exit grind must emit exactly the smallest
     /// satisfying nonce — proof bytes depend on it. The oracle is the
     /// library's own `pow_scan` over ascending blocks, which is the
@@ -1930,6 +2006,117 @@ mod tests {
     }
 
     // ---- FsChallenger ------------------------------------------------------
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn f128_byte_views_match_canonical_little_endian_layout() {
+        assert_eq!(core::mem::size_of::<F128>(), 16);
+        assert_eq!(core::mem::align_of::<F128>(), 16);
+
+        let values = [
+            F128 {
+                lo: 0x0102_0304_0506_0708,
+                hi: 0x1112_1314_1516_1718,
+            },
+            F128 {
+                lo: 0x8182_8384_8586_8788,
+                hi: 0x9192_9394_9596_9798,
+            },
+        ];
+        let base = core::ptr::addr_of!(values[0]) as usize;
+        assert_eq!(core::ptr::addr_of!(values[0].lo) as usize - base, 0);
+        assert_eq!(core::ptr::addr_of!(values[0].hi) as usize - base, 8);
+        assert_eq!(core::ptr::addr_of!(values[1]) as usize - base, 16);
+
+        let mut expected = [0u8; 32];
+        expected[..8].copy_from_slice(&values[0].lo.to_le_bytes());
+        expected[8..16].copy_from_slice(&values[0].hi.to_le_bytes());
+        expected[16..24].copy_from_slice(&values[1].lo.to_le_bytes());
+        expected[24..].copy_from_slice(&values[1].hi.to_le_bytes());
+        assert_eq!(f128s_as_bytes(&values), expected.as_slice());
+
+        let mut decoded = [F128::ZERO; 2];
+        f128s_as_bytes_mut(&mut decoded).copy_from_slice(&expected);
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn fs_challenger_observe_slice_matches_legacy_transcript() {
+        for kind in KINDS {
+            for n in [0usize, 1, 2, 64, 128] {
+                let values: Vec<F128> = (0..n)
+                    .map(|i| F128 {
+                        lo: 0x1020_3040_5060_7080 ^ i as u64,
+                        hi: 0x90A0_B0C0_D0E0_F000 ^ (i as u64).rotate_left(17),
+                    })
+                    .collect();
+                let mut optimized = challenger_with_test_prestate(kind);
+                let mut legacy = optimized.clone();
+
+                optimized.observe_f128_slice(&values);
+                legacy_observe_f128_slice(&mut legacy, &values);
+
+                assert_eq!(optimized.n_absorbed, legacy.n_absorbed, "{kind}, n={n}");
+                assert_eq!(
+                    optimized.sample_f128_vec(4),
+                    legacy.sample_f128_vec(4),
+                    "{kind}, n={n}"
+                );
+                assert_eq!(
+                    optimized.sample_f128(),
+                    legacy.sample_f128(),
+                    "{kind}, n={n}: subsequent state diverged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fs_challenger_sample_vec_matches_legacy_transcript() {
+        for kind in KINDS {
+            for n in [0usize, 1, 2, 3, 8, 19, 64] {
+                let mut optimized = challenger_with_test_prestate(kind);
+                let mut legacy = optimized.clone();
+
+                let got = optimized.sample_f128_vec(n);
+                let expected = legacy_sample_f128_vec(&mut legacy, n);
+
+                assert_eq!(got, expected, "{kind}, n={n}");
+                assert_eq!(optimized.n_absorbed, legacy.n_absorbed, "{kind}, n={n}");
+                assert_eq!(
+                    optimized.sample_f128(),
+                    legacy.sample_f128(),
+                    "{kind}, n={n}: reabsorbed state diverged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fs_challenger_empty_observe_slice_is_framed() {
+        for kind in KINDS {
+            let mut framed = challenger_with_test_prestate(kind);
+            let mut omitted = framed.clone();
+            let before = framed.n_absorbed;
+            framed.observe_f128_slice(&[]);
+
+            assert_eq!(framed.n_absorbed - before, 10, "{kind}");
+            assert_ne!(framed.sample_f128(), omitted.sample_f128(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn fs_challenger_empty_sample_vec_is_framed() {
+        for kind in KINDS {
+            let mut framed = challenger_with_test_prestate(kind);
+            let mut omitted = framed.clone();
+            let before = framed.n_absorbed;
+            assert!(framed.sample_f128_vec(0).is_empty(), "{kind}");
+
+            assert_eq!(framed.n_absorbed - before, 10, "{kind}");
+            assert_ne!(framed.sample_f128(), omitted.sample_f128(), "{kind}");
+        }
+    }
 
     #[test]
     fn fs_challenger_identical_scripts_produce_identical_output() {

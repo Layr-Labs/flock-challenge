@@ -157,21 +157,6 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             &prover_data.codeword,
             &*prover_data.merkle_tree,
             combined.round0_prime,
-            combined
-                .round1_lookahead
-                .expect("direct-fold8 requires round-1 lookahead"),
-            combined
-                .round2_lookahead
-                .expect("direct-fold8 requires round-2 lookahead"),
-            combined
-                .round3_lookahead
-                .expect("direct-fold8 requires round-3 lookahead"),
-            combined
-                .round4_lookahead
-                .expect("direct-fold8 requires round-4 lookahead"),
-            combined
-                .round5_lookahead
-                .expect("direct-fold8 requires round-5 lookahead"),
             challenger,
         )
     } else if let Some(direct) = combined.direct_fold4 {
@@ -255,10 +240,6 @@ struct CombinedClaim {
     round2_lookahead: Option<Fold4Lookahead2>,
     /// Experimental direct-fold4 round-3 trivariate lookahead.
     round3_lookahead: Option<Fold4Lookahead3>,
-    /// Direct-fold8 round-4 quadrivariate lookahead.
-    round4_lookahead: Option<Fold8Lookahead4>,
-    /// Direct-fold8 round-5 quintivariate lookahead.
-    round5_lookahead: Option<Fold8Lookahead5>,
     /// Per-claim sufficient statistics for direct materialization after rounds
     /// 0/1. `b_combined` still contains every ordinary claim (currently C) —
     /// unless deferred-C is active, in which case C rides along here as a
@@ -608,6 +589,7 @@ pub(crate) fn messages_from_direct_products_fold4(
 /// Selected banks always form a subcube, so the product sum iterates set
 /// mask bits only (Σ_r 2·3^r·2^(5−r) configs × E|selected|² = 2^(r+1) ≈ 47K
 /// F128 adds total — scalar-negligible).
+#[cfg(test)]
 fn direct_fold8_message_coefficients(h: &[F128; 4096], round: usize) -> (Vec<F128>, Vec<F128>) {
     debug_assert!(round < 6);
     let grid_len = 3usize.pow(round as u32);
@@ -668,8 +650,9 @@ fn direct_fold8_message_coefficients(h: &[F128; 4096], round: usize) -> (Vec<F12
 /// sufficient statistics, without materializing either N-sized polynomial.
 /// The returned lookaheads are respectively uni-, bi-, tri-, quadri-, and
 /// quintivariate quadratics in the already-sampled challenges.
+#[cfg(test)]
 pub(crate) fn messages_from_direct_products_fold8(
-    factors: &[ring_switch::DirectFold8Factors],
+    h: &[F128; 4096],
 ) -> (
     (F128, F128),
     [F128; 6],
@@ -678,19 +661,12 @@ pub(crate) fn messages_from_direct_products_fold8(
     Fold8Lookahead4,
     Fold8Lookahead5,
 ) {
-    let mut h = [F128::ZERO; 4096];
-    for claim in factors {
-        for (out, value) in h.iter_mut().zip(claim.products) {
-            *out += value;
-        }
-    }
-
-    let (round0_u0, round0_u2) = direct_fold8_message_coefficients(&h, 0);
-    let (round1_u0, round1_u2) = direct_fold8_message_coefficients(&h, 1);
-    let (round2_u0, round2_u2) = direct_fold8_message_coefficients(&h, 2);
-    let (round3_u0, round3_u2) = direct_fold8_message_coefficients(&h, 3);
-    let (round4_u0, round4_u2) = direct_fold8_message_coefficients(&h, 4);
-    let (round5_u0, round5_u2) = direct_fold8_message_coefficients(&h, 5);
+    let (round0_u0, round0_u2) = direct_fold8_message_coefficients(h, 0);
+    let (round1_u0, round1_u2) = direct_fold8_message_coefficients(h, 1);
+    let (round2_u0, round2_u2) = direct_fold8_message_coefficients(h, 2);
+    let (round3_u0, round3_u2) = direct_fold8_message_coefficients(h, 3);
+    let (round4_u0, round4_u2) = direct_fold8_message_coefficients(h, 4);
+    let (round5_u0, round5_u2) = direct_fold8_message_coefficients(h, 5);
 
     let mut round1 = [F128::ZERO; 6];
     round1[..3].copy_from_slice(&round1_u0);
@@ -716,6 +692,22 @@ pub(crate) fn messages_from_direct_products_fold8(
         round4,
         round5,
     )
+}
+
+/// Round-zero message from the factorized sixty-four-bank state. Each claim's
+/// contribution is cached by its parallel ring-switch tail, so this step only
+/// sums the tuples into the message for their combined 64x64 product matrix.
+fn message_from_direct_factors_fold8(factors: &[ring_switch::DirectFold8Factors]) -> (F128, F128) {
+    factors
+        .iter()
+        .map(|claim| {
+            assert_eq!(claim.a_state.len(), (1 << LOG_PACKING) * 64);
+            assert_eq!(claim.w_state.len(), claim.a_state.len());
+            claim.round0
+        })
+        .fold((F128::ZERO, F128::ZERO), |(a0, a2), (b0, b2)| {
+            (a0 + b0, a2 + b2)
+        })
 }
 
 /// Exact ranked shape for the heterogeneous combined-basis queue. The gate is
@@ -1298,10 +1290,13 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         };
     let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1e3;
     let t_fold = std::time::Instant::now();
-    let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_direct_fold8 || use_direct_fold4 {
-        // All six (fold8) / four (fold4) initial messages come from the two
-        // claims' 64×64 / 16×16 product matrices below; no L-sized basis
-        // exists to sweep.
+    let (mut round0_u0, mut round0_u2, round1_lookahead) = if use_direct_fold8 {
+        // Fold8's round-zero message comes from its factor state below. Later
+        // messages are derived online after their preceding challenges.
+        (F128::ZERO, F128::ZERO, None)
+    } else if use_direct_fold4 {
+        // All four initial messages come from the two claims' 16x16 product
+        // matrices below; no L-sized basis exists to sweep.
         (F128::ZERO, F128::ZERO, Some([F128::ZERO; 6]))
     } else if use_direct_all {
         // Every claim's round-0 and round-1 contribution comes from its own
@@ -1504,29 +1499,10 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let mut round1_lookahead = round1_lookahead;
     let mut round2_lookahead = None;
     let mut round3_lookahead = None;
-    let mut round4_lookahead = None;
-    let mut round5_lookahead = None;
     if let Some(direct) = direct_fold8.as_ref() {
-        let (
-            direct_round0,
-            direct_round1,
-            direct_round2,
-            direct_round3,
-            direct_round4,
-            direct_round5,
-        ) = messages_from_direct_products_fold8(direct);
+        let direct_round0 = message_from_direct_factors_fold8(direct);
         round0_u0 += direct_round0.0;
         round0_u2 += direct_round0.1;
-        let combined_round1 = round1_lookahead
-            .as_mut()
-            .expect("direct-fold8 gate requires round-1 lookahead storage");
-        for (out, value) in combined_round1.iter_mut().zip(direct_round1) {
-            *out += value;
-        }
-        round2_lookahead = Some(direct_round2);
-        round3_lookahead = Some(direct_round3);
-        round4_lookahead = Some(direct_round4);
-        round5_lookahead = Some(direct_round5);
     }
     if let Some(direct) = direct_fold4.as_ref() {
         let (direct_round0, direct_round1, direct_round2, direct_round3) =
@@ -1627,8 +1603,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         round1_lookahead,
         round2_lookahead,
         round3_lookahead,
-        round4_lookahead,
-        round5_lookahead,
         direct_fold2,
         direct_fold4,
         direct_fold8,
@@ -1919,6 +1893,35 @@ mod tests {
         assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 1, 0));
         assert!(!is_ranked_hetero_open_combine_shape(1 << 25, 1 << 15, 2, 1));
     }
+
+    #[test]
+    fn direct_fold8_cached_round0_matches_two_fresh_claim_scans() {
+        let mut rng = Rng::new(0xD1CE_CACE);
+        let factors: Vec<_> = (0..2)
+            .map(|_| {
+                let len = (1usize << LOG_PACKING) * 64;
+                let a_state: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
+                let w_state: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
+                let round0 = round0_deferred(&a_state, &w_state);
+                ring_switch::DirectFold8Factors {
+                    eq_lo: vec![F128::ONE],
+                    eq_hi: vec![F128::ONE],
+                    a_state,
+                    w_state,
+                    round0,
+                }
+            })
+            .collect();
+        let expected = factors
+            .iter()
+            .map(|claim| round0_deferred(&claim.a_state, &claim.w_state))
+            .fold((F128::ZERO, F128::ZERO), |(a0, a2), (b0, b2)| {
+                (a0 + b0, a2 + b2)
+            });
+
+        assert_eq!(message_from_direct_factors_fold8(&factors), expected);
+    }
+
     #[test]
     fn direct_ab_gate_rejects_sparse_c_without_consuming_ab_state() {
         let direct = || ring_switch::DirectFold2Factors {

@@ -9,6 +9,9 @@
 //! boolean (`k = 2^k_log`). `C_0 = I_k` is implicit (we still carry the
 //! materialized `c_0` matrix for utilities like `satisfies`).
 
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+
 /// Sparse boolean matrix. `rows[i]` lists the column indices where the entry is 1.
 #[derive(Clone, Debug)]
 pub struct SparseBinaryMatrix {
@@ -131,14 +134,20 @@ impl BlockR1cs {
     /// convention (`C = I` ⇒ `c = C·z = z`). The generic provers use this to
     /// alias `c` to `z` instead of running a full block-diagonal apply.
     pub fn c0_is_identity(&self) -> bool {
-        self.c_0.num_rows == self.k()
-            && self.c_0.num_cols == self.k()
-            && self
-                .c_0
-                .rows
-                .iter()
-                .enumerate()
-                .all(|(i, row)| row.as_slice() == [i])
+        // Proof paths warm the statement digest before their repeated identity
+        // checks. Its matrix walk publishes this result without adding another
+        // cache field to the public, struct-literal-constructed `BlockR1cs`.
+        if let Some(digest) = self.digest_cache.get()
+            && let Some(is_identity) = cached_c0_identity(digest)
+        {
+            return is_identity;
+        }
+
+        // Do not publish a fallback result under `digest_cache`: callers can
+        // mutate the public matrices after warming that cache, so its digest
+        // may be stale. A global insertion here could otherwise contaminate a
+        // different `BlockR1cs` carrying the original statement.
+        c0_is_identity_scan(self.k(), &self.c_0)
     }
 
     /// Default `LincheckCircuit` wrapping this R1CS's sparse matrices.
@@ -346,8 +355,10 @@ impl BlockR1cs {
             }]);
             absorb_matrix(&mut h, &self.a_0);
             absorb_matrix(&mut h, &self.b_0);
-            absorb_matrix(&mut h, &self.c_0);
-            *h.finalize().as_bytes()
+            let c0_is_identity = absorb_c0_and_check_identity(&mut h, self.k(), &self.c_0);
+            let digest = *h.finalize().as_bytes();
+            cache_c0_identity(digest, c0_is_identity);
+            digest
         })
     }
 
@@ -369,6 +380,50 @@ impl BlockR1cs {
     }
 }
 
+type C0IdentityCache = HashMap<[u8; 32], bool>;
+
+/// Statement digests provide a process-wide, content-addressed key for sharing
+/// this tiny derived fact across clones and equal instances. Entries are
+/// published only by the digest computation that inspected the same matrix
+/// contents, never by an object address or a potentially stale key.
+static C0_IDENTITY_CACHE: OnceLock<RwLock<C0IdentityCache>> = OnceLock::new();
+
+#[inline]
+fn cached_c0_identity(digest: &[u8; 32]) -> Option<bool> {
+    C0_IDENTITY_CACHE
+        .get()?
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(digest)
+        .copied()
+}
+
+fn cache_c0_identity(digest: [u8; 32], is_identity: bool) {
+    let mut cache = C0_IDENTITY_CACHE
+        .get_or_init(|| RwLock::new(HashMap::new()))
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match cache.entry(digest) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(is_identity);
+        }
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            debug_assert_eq!(*entry.get(), is_identity, "statement digest collision");
+        }
+    }
+}
+
+#[inline]
+fn c0_is_identity_scan(k: usize, c_0: &SparseBinaryMatrix) -> bool {
+    c_0.num_rows == k
+        && c_0.num_cols == k
+        && c_0
+            .rows
+            .iter()
+            .enumerate()
+            .all(|(i, row)| row.as_slice() == [i])
+}
+
 /// Length-prefixed absorption of a sparse matrix into a BLAKE3 hasher.
 /// `(num_rows, num_cols, [(row_len, col_indices...) for each row])`, all
 /// little-endian u64, so two matrices with different shapes/contents always
@@ -382,6 +437,25 @@ fn absorb_matrix(h: &mut blake3::Hasher, m: &SparseBinaryMatrix) {
             h.update(&(col as u64).to_le_bytes());
         }
     }
+}
+
+/// Absorb `C_0` while deriving the identity predicate in the same row walk.
+fn absorb_c0_and_check_identity(
+    h: &mut blake3::Hasher,
+    k: usize,
+    c_0: &SparseBinaryMatrix,
+) -> bool {
+    h.update(&(c_0.num_rows as u64).to_le_bytes());
+    h.update(&(c_0.num_cols as u64).to_le_bytes());
+    let mut is_identity = c_0.num_rows == k && c_0.num_cols == k;
+    for (i, row) in c_0.rows.iter().enumerate() {
+        h.update(&(row.len() as u64).to_le_bytes());
+        for &col in row {
+            h.update(&(col as u64).to_le_bytes());
+        }
+        is_identity &= row.as_slice() == [i];
+    }
+    is_identity
 }
 
 /// Block-diagonal `(I_{2^n_log} ⊗ M_0) · z` over GF(2).
@@ -745,6 +819,101 @@ mod tests {
         }
     }
 
+    fn test_r1cs(
+        a_0: SparseBinaryMatrix,
+        b_0: SparseBinaryMatrix,
+        c_0: SparseBinaryMatrix,
+    ) -> BlockR1cs {
+        BlockR1cs {
+            m: 6,
+            k_log: 3,
+            k_skip: 2,
+            useful_bits: 1 << 3,
+            a_0,
+            b_0,
+            c_0,
+            layout: WitnessLayout::RowMajor,
+            const_pin: None,
+            digest_cache: std::sync::OnceLock::new(),
+            csc_cache: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[test]
+    fn c0_identity_cold_scan_tracks_mutation() {
+        let mut r1cs = test_r1cs(identity(8), identity(8), identity(8));
+        assert!(r1cs.digest_cache.get().is_none());
+        assert!(r1cs.c0_is_identity());
+        r1cs.c_0.rows[3] = vec![2];
+        assert!(!r1cs.c0_is_identity());
+        assert!(r1cs.digest_cache.get().is_none());
+    }
+
+    #[test]
+    fn statement_digest_warms_c0_identity_cache() {
+        let mut r1cs = test_r1cs(identity(8), identity(8), identity(8));
+        let digest = r1cs.statement_digest();
+        assert_eq!(cached_c0_identity(&digest), Some(true));
+
+        // Once the digest is warm, both caches intentionally have the same
+        // public-field mutation caveat. A clone starts with a fresh digest and
+        // therefore scans its mutated matrix instead of reusing the old key.
+        r1cs.c_0.rows[0].clear();
+        assert!(r1cs.c0_is_identity());
+        let cloned = r1cs.clone();
+        assert!(cloned.digest_cache.get().is_none());
+        assert!(!cloned.c0_is_identity());
+    }
+
+    #[test]
+    fn statement_digest_caches_nonidentity_c0() {
+        let mut c_0 = identity(8);
+        c_0.rows[3] = vec![2];
+        let mut r1cs = test_r1cs(identity(8), identity(8), c_0);
+        // Keep this test's statement key distinct from the identity-cache test
+        // even when the test harness runs both concurrently.
+        r1cs.m = 7;
+        let digest = r1cs.statement_digest();
+        assert_eq!(cached_c0_identity(&digest), Some(false));
+        assert!(!r1cs.c0_is_identity());
+    }
+
+    #[test]
+    fn c0_identity_absorption_preserves_digest_bytes() {
+        for (expected, c_0) in [
+            (true, identity(8)),
+            (false, {
+                let mut matrix = identity(8);
+                matrix.rows[3] = vec![2];
+                matrix
+            }),
+        ] {
+            let mut old = blake3::Hasher::new();
+            absorb_matrix(&mut old, &c_0);
+
+            let mut combined = blake3::Hasher::new();
+            assert_eq!(
+                absorb_c0_and_check_identity(&mut combined, 8, &c_0),
+                expected
+            );
+            assert_eq!(old.finalize(), combined.finalize());
+        }
+    }
+
+    #[test]
+    fn unpublished_digest_falls_back_without_global_insert() {
+        let mut r1cs = test_r1cs(identity(8), identity(8), identity(8));
+        let unpublished = [0xFF; 32];
+        assert_eq!(cached_c0_identity(&unpublished), None);
+        r1cs.digest_cache
+            .set(unpublished)
+            .expect("fresh digest cache");
+
+        r1cs.c_0.rows[3] = vec![2];
+        assert!(!r1cs.c0_is_identity());
+        assert_eq!(cached_c0_identity(&unpublished), None);
+    }
+
     /// Packed apply_a matches bool apply_a.
     #[test]
     fn packed_matches_bool_apply() {
@@ -808,19 +977,11 @@ mod tests {
         // makes the circuit-R1CS constraint trivially satisfied for any z.
         let k_log = 3;
         let m = 6;
-        let r1cs = BlockR1cs {
-            m,
-            k_log,
-            k_skip: 2,
-            useful_bits: 1 << k_log,
-            a_0: identity(1 << k_log),
-            b_0: identity(1 << k_log),
-            c_0: identity(1 << k_log),
-            layout: WitnessLayout::RowMajor,
-            const_pin: None,
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
-        };
+        let r1cs = test_r1cs(
+            identity(1 << k_log),
+            identity(1 << k_log),
+            identity(1 << k_log),
+        );
         for seed in 0..4 {
             let z: Vec<bool> = (0..(1 << m)).map(|i| ((i ^ seed) & 1) == 1).collect();
             assert!(r1cs.satisfies(&z), "seed={seed}");
@@ -837,19 +998,7 @@ mod tests {
             num_cols: 1 << k_log,
             rows: vec![Vec::new(); 1 << k_log],
         };
-        let r1cs = BlockR1cs {
-            m,
-            k_log,
-            k_skip: 2,
-            useful_bits: 1 << k_log,
-            a_0: zero.clone(),
-            b_0: zero,
-            c_0: identity(1 << k_log),
-            layout: WitnessLayout::RowMajor,
-            const_pin: None,
-            digest_cache: std::sync::OnceLock::new(),
-            csc_cache: std::sync::OnceLock::new(),
-        };
+        let r1cs = test_r1cs(zero.clone(), zero, identity(1 << k_log));
         let z_zero = vec![false; 1 << m];
         assert!(r1cs.satisfies(&z_zero));
         let mut z_nonzero = vec![false; 1 << m];

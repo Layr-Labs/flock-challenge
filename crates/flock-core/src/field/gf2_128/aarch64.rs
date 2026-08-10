@@ -331,6 +331,7 @@ pub unsafe fn ghash_mul_low_constants_vec2_neon(
 /// # Safety
 /// Requires the `aes` target feature (compiles to PMULL); only call where
 /// `aes` is statically enabled or has been runtime-detected.
+#[inline]
 #[target_feature(enable = "aes")]
 pub unsafe fn ghash_mul_const_vec2_neon(c: F128, b: [F128; 2]) -> [F128; 2] {
     // SAFETY: function carries the aes target feature; pmull requires it.

@@ -556,9 +556,16 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
 /// independently of [`build_eq_table`]. Keeping this separate leaves the
 /// generic builder available as an exact same-binary control.
 pub(crate) fn build_eq_table_optimized(point: &[F128]) -> Vec<F128> {
+    let mut out = crate::alloc_uninit_f128_vec(1usize << point.len());
+    build_eq_table_optimized_into(point, &mut out);
+    out
+}
+
+/// Caller-provided-storage variant of [`build_eq_table_optimized`].
+pub(crate) fn build_eq_table_optimized_into(point: &[F128], out: &mut [F128]) {
     use rayon::prelude::*;
 
-    let mut out = crate::alloc_uninit_f128_vec(1usize << point.len());
+    assert_eq!(out.len(), 1usize << point.len());
     out[0] = F128::ONE;
     // The two-lane PMULL kernel makes the smaller expansion levels too short
     // to amortize a Rayon fork/join. Production-geometry crossover sweeps put
@@ -579,7 +586,6 @@ pub(crate) fn build_eq_table_optimized(point: &[F128]) -> Vec<F128> {
                 });
         }
     }
-    out
 }
 
 /// Fold a sparse boolean matrix's rows against an eq table at the row
@@ -833,6 +839,36 @@ pub(crate) fn partial_fold_packed_z_best(
 #[cfg(target_arch = "aarch64")]
 const OBLOCK_MIN_N_LOG: usize = 16;
 
+/// Strict rollback for the ranked lincheck outer-equality product pairing.
+/// `FLOCK_NO_LINCHECK_EQ_PAIR=1` restores the generic scalar builder.
+pub const ENV_NO_LINCHECK_EQ_PAIR: &str = "FLOCK_NO_LINCHECK_EQ_PAIR";
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn lincheck_eq_pair_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn ranked_lincheck_eq_pair_enabled(
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    outer_len: usize,
+) -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        lincheck_eq_pair_value_enabled(std::env::var_os(ENV_NO_LINCHECK_EQ_PAIR).as_deref())
+    });
+    cfg!(target_feature = "aes")
+        && m == 32
+        && k_log == 14
+        && k_skip == 6
+        && useful_bits == 15_409
+        && outer_len == 18
+        && rayon::current_num_threads() == 10
+        && *ON
+}
+
 /// The one production shape the lincheck GPU fold arm is tuned and gated
 /// for (`m = 32`, `k_log = 14`). Everything else takes the exact CPU path.
 /// `n_log ≥ 6` keeps the CPU claim suffix's structural preconditions
@@ -847,27 +883,39 @@ fn ranked_lincheck_fold_gpu_shape(m: usize, k_log: usize) -> bool {
         && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Build eq(x_outer, ·) for the witness-stripe fold. At the GPU-arm shape
-/// the table is built in place in the fold arm's persistent upload buffer so
-/// the launch skips its 4 MiB memcpy (`FLOCK_NO_EQ_DIRECT=1` restores the
-/// owned build + copy); every other shape keeps the incumbent Vec. Bytes and
-/// lane order are identical either way — only the table's location changes.
+/// Build eq(x_outer, ·) for the witness-stripe fold. The exact ranked shape
+/// pairs shared-constant products; every other shape keeps the scalar builder.
+/// At the GPU-arm shape the table is built in place in the fold arm's persistent
+/// upload buffer so the launch skips its 4 MiB memcpy (`FLOCK_NO_EQ_DIRECT=1`
+/// restores the owned build + copy). Bytes and lane order are identical.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn build_z_fold_eq_table(
     m: usize,
     k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
     x_outer: &[F128],
 ) -> crate::gpu_commit::FoldEqTable {
+    let pair_products =
+        ranked_lincheck_eq_pair_enabled(m, k_log, k_skip, useful_bits, x_outer.len());
     if ranked_lincheck_fold_gpu_shape(m, k_log) {
-        crate::gpu_commit::lincheck_fold_eq_table(x_outer)
+        crate::gpu_commit::lincheck_fold_eq_table(x_outer, pair_products)
+    } else if pair_products {
+        crate::gpu_commit::FoldEqTable::Owned(build_eq_table_optimized(x_outer))
     } else {
         crate::gpu_commit::FoldEqTable::Owned(build_eq_table(x_outer))
     }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn build_z_fold_eq_table(m: usize, k_log: usize, x_outer: &[F128]) -> Vec<F128> {
-    let _ = (m, k_log);
+fn build_z_fold_eq_table(
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    x_outer: &[F128],
+) -> Vec<F128> {
+    let _ = (m, k_log, k_skip, useful_bits);
     build_eq_table(x_outer)
 }
 
@@ -1507,7 +1555,7 @@ fn prove_padded_inner<Ch: Challenger>(
         } else {
             None
         };
-        let eq_x_outer = build_z_fold_eq_table(m, k_log, &x_ab.x_outer);
+        let eq_x_outer = build_z_fold_eq_table(m, k_log, k_skip, useful_bits, &x_ab.x_outer);
         let z_vec = partial_fold_packed_z_best_gpu_split(
             z_packed,
             m,

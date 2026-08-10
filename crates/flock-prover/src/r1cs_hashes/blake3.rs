@@ -91,6 +91,8 @@
 use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use flock_core::field::gf2_128::aarch64::ghash_mul_const_vec2_neon;
 use flock_core::merkle::HashKind;
 use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::R1csClaim;
@@ -670,6 +672,19 @@ enum ReverseWordOp {
     },
 }
 
+#[inline]
+fn mul_alpha_pair(alpha: F128, values: [F128; 2]) -> [F128; 2] {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: this branch is compiled only when AES/PMULL is enabled.
+        unsafe { ghash_mul_const_vec2_neon(alpha, values) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        [alpha * values[0], alpha * values[1]]
+    }
+}
+
 /// Reverse-mode evaluator for `alpha * A_0^T * eq + B_0^T * eq`.
 ///
 /// Each logical 32-bit value is a DAG node.  Row weights are first attached
@@ -728,14 +743,34 @@ impl<'a> ReverseTranspose<'a> {
         // Row i reads x[i] in A, y[i] in B, and carry[0..i] in both.
         // Accumulating the latter backwards turns the triangular row walk into
         // one suffix scan over the 31 carry columns.
-        let alpha_plus_one = self.alpha + F128::ONE;
         let mut suffix = F128::ZERO;
-        for i in (0..CARRY_BITS_PER_ADD).rev() {
-            self.comb[carry_base + i] += suffix;
-            let e = self.eq_inner[carry_base + i];
-            self.adjoints[x][i] += self.alpha * e;
-            self.adjoints[y][i] += e;
-            suffix += alpha_plus_one * e;
+        let mut remaining = CARRY_BITS_PER_ADD;
+        while remaining >= 2 {
+            let hi = remaining - 1;
+            let lo = remaining - 2;
+            let e_hi = self.eq_inner[carry_base + hi];
+            let e_lo = self.eq_inner[carry_base + lo];
+            let [alpha_e_hi, alpha_e_lo] = mul_alpha_pair(self.alpha, [e_hi, e_lo]);
+
+            self.comb[carry_base + hi] += suffix;
+            self.adjoints[x][hi] += alpha_e_hi;
+            self.adjoints[y][hi] += e_hi;
+            suffix += alpha_e_hi + e_hi;
+
+            // The lower row sees the suffix after the higher row is included.
+            self.comb[carry_base + lo] += suffix;
+            self.adjoints[x][lo] += alpha_e_lo;
+            self.adjoints[y][lo] += e_lo;
+            suffix += alpha_e_lo + e_lo;
+            remaining -= 2;
+        }
+
+        if remaining == 1 {
+            let e = self.eq_inner[carry_base];
+            let alpha_e = self.alpha * e;
+            self.comb[carry_base] += suffix;
+            self.adjoints[x][0] += alpha_e;
+            self.adjoints[y][0] += e;
         }
         out
     }
@@ -747,6 +782,26 @@ impl<'a> ReverseTranspose<'a> {
         let e = self.eq_inner[row];
         self.adjoints[value][bit] += self.alpha * e;
         self.comb[Z_CONST_POS] += e;
+    }
+
+    /// Attach two independent lin-id rows while sharing their A-side scale.
+    #[inline]
+    fn seed_lin_rows2(
+        &mut self,
+        first_value: usize,
+        second_value: usize,
+        bit: usize,
+        first_row: usize,
+        second_row: usize,
+    ) {
+        let first_e = self.eq_inner[first_row];
+        let second_e = self.eq_inner[second_row];
+        let [first_alpha_e, second_alpha_e] = mul_alpha_pair(self.alpha, [first_e, second_e]);
+
+        self.adjoints[first_value][bit] += first_alpha_e;
+        self.comb[Z_CONST_POS] += first_e;
+        self.adjoints[second_value][bit] += second_alpha_e;
+        self.comb[Z_CONST_POS] += second_e;
     }
 
     fn finish(mut self) -> Vec<F128> {
@@ -865,8 +920,13 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
 
                 let b_new = reverse.xor_rot(b_1, c_2, 7);
                 for i in 0..WORD_BITS {
-                    reverse.seed_lin_row(b_new, i, g_lin_bit(g, LIN_B_NEW, i));
-                    reverse.seed_lin_row(d_2, i, g_lin_bit(g, LIN_D_NEW, i));
+                    reverse.seed_lin_rows2(
+                        b_new,
+                        d_2,
+                        i,
+                        g_lin_bit(g, LIN_B_NEW, i),
+                        g_lin_bit(g, LIN_D_NEW, i),
+                    );
                 }
 
                 state[la] = a_2;
@@ -1534,13 +1594,15 @@ fn build_block_witness_ab_stream_into(
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod witgen_simd {
     use super::{
-        BLAKE3_IV, Compression, G_STRIDE, GS_BASE, K, OUT_HI_BASE, REC_C0, REC_C1, REC_C2, REC_C3,
-        REC_C4, REC_C5, REC_LIN0, REC_LIN1, USEFUL_BITS,
+        BLAKE3_IV, Compression, G_STRIDE, GS_BASE, K, N_G, OUT_HI_BASE, REC_C0, REC_C1, REC_C2,
+        REC_C3, REC_C4, REC_C5, REC_LIN0, REC_LIN1, USEFUL_BITS,
     };
     use core::arch::aarch64::*;
     use flock_core::bits::transpose_8_u64s_to_64_bytes;
     use flock_core::field::F128;
     use std::sync::LazyLock;
+
+    use crate::seed_pipe::CompressionQuadSoa;
 
     const U32_PER_BLOCK: usize = K / 32; // 512
     const F128_PER_BLOCK: usize = K / 128;
@@ -1552,17 +1614,20 @@ pub(crate) mod witgen_simd {
     //
     // z/a/b come from the recycling scratch pool. At this fixed layout the
     // builder rewrites the same per-block constants every prove: the zero
-    // fill (u32 words 482..512 of every block, all three buffers) and b's
-    // MAX prefix (words 0..36). When the pool proves — via a provenance
+    // fill (u32 words 482..512 of every block, all three buffers), b's MAX
+    // prefix (words 0..36), and b's fixed final lin/output/padding suffix.
+    // When the pool proves — via a provenance
     // token attached at the previous release and dropped by any other
     // custody event — that the handed-out allocation still holds exactly a
     // previous prove's output of this same layout, those regions already
     // contain the right bytes and their dump chunks are skipped. Skips are
     // dump-chunk (32 B/block) granular and stay strictly INSIDE the
-    // constant regions: the zero tail skips words 488..512 (chunk 60 still
-    // carries data words 480/481 and is always written), b's prefix skips
-    // words 0..32 (chunk 4 carries data words 36..39 and the residual
-    // constant words 32..35, always written).
+    // constant regions: z/a's zero tail skips words 488..512 (chunk 60 still
+    // carries data words 480/481 and is always written), while b can skip
+    // from word 472 because its remaining lin-id/output bits are fixed ones
+    // before the zero padding. b's prefix skips words 0..32 (chunk 4 carries
+    // data words 36..39 and the residual constant words 32..35, always
+    // written).
     //
     // The constants are content-independent — every completed witgen of
     // this layout writes identical bytes there (padding blocks included) —
@@ -1574,16 +1639,30 @@ pub(crate) mod witgen_simd {
 
     /// First skippable chunk of the zero tail: words 488..512.
     const ELIDE_ZERO_CHUNK: usize = 61;
+    /// First skippable b suffix chunk: words 472..512.
+    const ELIDE_B_TAIL_CHUNK: usize = 59;
     /// Leading skippable chunks of b's MAX prefix: words 0..32.
     const ELIDE_B_PREFIX_CHUNKS: usize = 4;
     const BLOCK_BYTES: usize = U32_PER_BLOCK * 4; // 2048
     const ZERO_TAIL_BYTE: usize = ELIDE_ZERO_CHUNK * 32; // 1952
+    const B_TAIL_BYTE: usize = ELIDE_B_TAIL_CHUNK * 32; // 1888
+    const B_FULL_ONES_END_BYTE: usize = USEFUL_BITS / 8; // 1926
+    const B_LAST_BYTE_VALUE: u8 = (1u8 << (USEFUL_BITS % 8)) - 1; // 0x01
+    const B_ZERO_START_BYTE: usize = USEFUL_BITS.div_ceil(8); // 1927
     const B_PREFIX_BYTES: usize = ELIDE_B_PREFIX_CHUNKS * 32; // 128
     const _ELIDE_GEOMETRY: () = {
         // Skipped zero-tail words start at or after the zero fill's first
         // word (USEFUL_BITS.div_ceil(32) = 482)...
         assert!(8 * ELIDE_ZERO_CHUNK >= USEFUL_BITS.div_ceil(32));
         assert!(8 * ELIDE_ZERO_CHUNK < U32_PER_BLOCK);
+        // The final G's two B-side lin-id rows and every B-side out_hi row are
+        // ones, so the chunk-aligned B suffix begins inside that fixed run.
+        let b_fixed_one_start = GS_BASE + (N_G - 1) * G_STRIDE + REC_LIN0;
+        assert!(256 * (ELIDE_B_TAIL_CHUNK - 1) < b_fixed_one_start);
+        assert!(256 * ELIDE_B_TAIL_CHUNK >= b_fixed_one_start);
+        assert!(256 * ELIDE_B_TAIL_CHUNK < USEFUL_BITS);
+        assert!(USEFUL_BITS % 8 == 1);
+        assert!(B_ZERO_START_BYTE <= ZERO_TAIL_BYTE);
         // ...and skipped b-prefix words end at or before the MAX prefix's
         // last word (36).
         assert!(8 * ELIDE_B_PREFIX_CHUNKS <= 36);
@@ -1591,7 +1670,7 @@ pub(crate) mod witgen_simd {
 
     /// Provenance-tag layout version: bump on ANY change to the witness
     /// block layout or to the elision geometry above.
-    const WITGEN_SCRATCH_LAYOUT_V: u64 = 1;
+    const WITGEN_SCRATCH_LAYOUT_V: u64 = 2;
     pub(crate) const ROLE_Z: u64 = 1;
     pub(crate) const ROLE_A: u64 = 2;
     pub(crate) const ROLE_B: u64 = 3;
@@ -1632,23 +1711,39 @@ pub(crate) mod witgen_simd {
         use flock_core::scratch::ReleaseProbe;
         let mut blocks = [0, 1, n_total / 2, n_total - 2, n_total - 1];
         blocks.sort_unstable();
-        let mut probes = Vec::with_capacity(2 * blocks.len());
+        let mut probes = Vec::with_capacity(if b_flavor { 4 } else { 1 } * blocks.len());
         let mut last = usize::MAX;
         for &blk in &blocks {
             if blk == last {
                 continue;
             }
             last = blk;
-            probes.push(ReleaseProbe {
-                byte_off: blk * BLOCK_BYTES + ZERO_TAIL_BYTE,
-                len: BLOCK_BYTES - ZERO_TAIL_BYTE,
-                value: 0x00,
-            });
             if b_flavor {
                 probes.push(ReleaseProbe {
                     byte_off: blk * BLOCK_BYTES,
                     len: B_PREFIX_BYTES,
                     value: 0xFF,
+                });
+                probes.push(ReleaseProbe {
+                    byte_off: blk * BLOCK_BYTES + B_TAIL_BYTE,
+                    len: B_FULL_ONES_END_BYTE - B_TAIL_BYTE,
+                    value: 0xFF,
+                });
+                probes.push(ReleaseProbe {
+                    byte_off: blk * BLOCK_BYTES + B_FULL_ONES_END_BYTE,
+                    len: 1,
+                    value: B_LAST_BYTE_VALUE,
+                });
+                probes.push(ReleaseProbe {
+                    byte_off: blk * BLOCK_BYTES + B_ZERO_START_BYTE,
+                    len: BLOCK_BYTES - B_ZERO_START_BYTE,
+                    value: 0x00,
+                });
+            } else {
+                probes.push(ReleaseProbe {
+                    byte_off: blk * BLOCK_BYTES + ZERO_TAIL_BYTE,
+                    len: BLOCK_BYTES - ZERO_TAIL_BYTE,
+                    value: 0x00,
                 });
             }
         }
@@ -1666,7 +1761,7 @@ pub(crate) mod witgen_simd {
             core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v))
         };
         for blk in 0..8 {
-            let tail = blk * BLOCK_BYTES + ZERO_TAIL_BYTE..(blk + 1) * BLOCK_BYTES;
+            let block = blk * BLOCK_BYTES;
             for (i, (buf, on)) in [(z, elide[0]), (a, elide[1]), (b, elide[2])]
                 .into_iter()
                 .enumerate()
@@ -1674,16 +1769,34 @@ pub(crate) mod witgen_simd {
                 if !on {
                     continue;
                 }
+                let zero_start = if i == 2 {
+                    B_ZERO_START_BYTE
+                } else {
+                    ZERO_TAIL_BYTE
+                };
                 assert!(
-                    bytes(buf)[tail.clone()].iter().all(|&x| x == 0),
+                    bytes(buf)[block + zero_start..block + BLOCK_BYTES]
+                        .iter()
+                        .all(|&x| x == 0),
                     "elide zero-tail mismatch buf={i} blk={blk}"
                 );
             }
             if elide[2] {
-                let prefix = blk * BLOCK_BYTES..blk * BLOCK_BYTES + B_PREFIX_BYTES;
+                let prefix = block..block + B_PREFIX_BYTES;
                 assert!(
                     bytes(b)[prefix].iter().all(|&x| x == 0xFF),
                     "elide b-prefix mismatch blk={blk}"
+                );
+                assert!(
+                    bytes(b)[block + B_TAIL_BYTE..block + B_FULL_ONES_END_BYTE]
+                        .iter()
+                        .all(|&x| x == 0xFF),
+                    "elide b-one-tail mismatch blk={blk}"
+                );
+                assert_eq!(
+                    bytes(b)[block + B_FULL_ONES_END_BYTE],
+                    B_LAST_BYTE_VALUE,
+                    "elide b-last-byte mismatch blk={blk}"
                 );
             }
         }
@@ -1718,6 +1831,11 @@ pub(crate) mod witgen_simd {
     }
 
     type V4 = uint32x4_t;
+
+    pub(crate) enum QuadInput<'a> {
+        Blocks([&'a Compression; 4]),
+        Seeded(&'a CompressionQuadSoa),
+    }
 
     /// Fixed 4x4 u32 transpose. Both orientations use the same network:
     /// (word w across 4 blocks) <-> (block j's 4 consecutive words). Pure
@@ -1966,7 +2084,17 @@ pub(crate) mod witgen_simd {
         z_nt: bool,
         ab_nt: bool,
     ) {
-        unsafe { build_quad_witness_ab_stream_neon_elide(inputs, z, a, b, z_nt, ab_nt, [false; 3]) }
+        unsafe {
+            build_quad_witness_ab_stream_neon_elide(
+                QuadInput::Blocks(inputs),
+                z,
+                a,
+                b,
+                z_nt,
+                ab_nt,
+                [false; 3],
+            )
+        }
     }
 
     /// [`dump`] with the constant-region skips applied: `elide_tail` drops
@@ -1979,17 +2107,14 @@ pub(crate) mod witgen_simd {
         dst: *mut u32,
         elide_tail: bool,
         elide_prefix: bool,
+        tail_chunk: usize,
     ) {
         let g0 = if elide_prefix {
             ELIDE_B_PREFIX_CHUNKS
         } else {
             0
         };
-        let g1 = if elide_tail {
-            ELIDE_ZERO_CHUNK
-        } else {
-            DUMP_CHUNKS
-        };
+        let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
         unsafe { dump_range::<NT>(stage, dst, g0, g1) }
     }
 
@@ -2000,7 +2125,7 @@ pub(crate) mod witgen_simd {
     /// both its MAX prefix and its zero tail).
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn build_quad_witness_ab_stream_neon_elide(
-        inputs: [&Compression; 4],
+        inputs: QuadInput<'_>,
         z: *mut u32,
         a: *mut u32,
         b: *mut u32,
@@ -2009,69 +2134,90 @@ pub(crate) mod witgen_simd {
         elide: [bool; 3],
     ) {
         unsafe {
-            // ---- gather: SoA block-lane vectors via 4x4 transposes ----
-            let ptrs = [
-                inputs[0].0.as_ptr(),
-                inputs[1].0.as_ptr(),
-                inputs[2].0.as_ptr(),
-                inputs[3].0.as_ptr(),
-            ];
-            let (cv0, cv1, cv2, cv3) = tr4(
-                vld1q_u32(ptrs[0]),
-                vld1q_u32(ptrs[1]),
-                vld1q_u32(ptrs[2]),
-                vld1q_u32(ptrs[3]),
-            );
-            let (cv4, cv5, cv6, cv7) = tr4(
-                vld1q_u32(ptrs[0].add(4)),
-                vld1q_u32(ptrs[1].add(4)),
-                vld1q_u32(ptrs[2].add(4)),
-                vld1q_u32(ptrs[3].add(4)),
-            );
-            let cv_v = [cv0, cv1, cv2, cv3, cv4, cv5, cv6, cv7];
-            let mptrs = [
-                inputs[0].1.as_ptr(),
-                inputs[1].1.as_ptr(),
-                inputs[2].1.as_ptr(),
-                inputs[3].1.as_ptr(),
-            ];
-            let mut m: [V4; 16] = [cv0; 16];
-            for wgrp in 0..4 {
-                let (m0, m1, m2, m3) = tr4(
-                    vld1q_u32(mptrs[0].add(4 * wgrp)),
-                    vld1q_u32(mptrs[1].add(4 * wgrp)),
-                    vld1q_u32(mptrs[2].add(4 * wgrp)),
-                    vld1q_u32(mptrs[3].add(4 * wgrp)),
-                );
-                m[4 * wgrp] = m0;
-                m[4 * wgrp + 1] = m1;
-                m[4 * wgrp + 2] = m2;
-                m[4 * wgrp + 3] = m3;
-            }
-            let mut tlo_a = [0u32; 4];
-            let mut thi_a = [0u32; 4];
-            let mut bl_a = [0u32; 4];
-            let mut fl_a = [0u32; 4];
-            for j in 0..4 {
-                tlo_a[j] = inputs[j].2 as u32;
-                thi_a[j] = (inputs[j].2 >> 32) as u32;
-                bl_a[j] = inputs[j].3;
-                fl_a[j] = inputs[j].4;
-            }
-            let tlo = vld1q_u32(tlo_a.as_ptr());
-            let thi = vld1q_u32(thi_a.as_ptr());
-            let blen = vld1q_u32(bl_a.as_ptr());
-            let flags = vld1q_u32(fl_a.as_ptr());
+            let (cv_v, m, tlo, thi, blen, flags) = match inputs {
+                QuadInput::Blocks(inputs) => {
+                    // Ordinary callers retain the incumbent AoS gather and
+                    // fixed 4x4 transpose networks unchanged.
+                    let ptrs = [
+                        inputs[0].0.as_ptr(),
+                        inputs[1].0.as_ptr(),
+                        inputs[2].0.as_ptr(),
+                        inputs[3].0.as_ptr(),
+                    ];
+                    let (cv0, cv1, cv2, cv3) = tr4(
+                        vld1q_u32(ptrs[0]),
+                        vld1q_u32(ptrs[1]),
+                        vld1q_u32(ptrs[2]),
+                        vld1q_u32(ptrs[3]),
+                    );
+                    let (cv4, cv5, cv6, cv7) = tr4(
+                        vld1q_u32(ptrs[0].add(4)),
+                        vld1q_u32(ptrs[1].add(4)),
+                        vld1q_u32(ptrs[2].add(4)),
+                        vld1q_u32(ptrs[3].add(4)),
+                    );
+                    let cv_v = [cv0, cv1, cv2, cv3, cv4, cv5, cv6, cv7];
+                    let mptrs = [
+                        inputs[0].1.as_ptr(),
+                        inputs[1].1.as_ptr(),
+                        inputs[2].1.as_ptr(),
+                        inputs[3].1.as_ptr(),
+                    ];
+                    let mut m: [V4; 16] = [cv0; 16];
+                    for wgrp in 0..4 {
+                        let (m0, m1, m2, m3) = tr4(
+                            vld1q_u32(mptrs[0].add(4 * wgrp)),
+                            vld1q_u32(mptrs[1].add(4 * wgrp)),
+                            vld1q_u32(mptrs[2].add(4 * wgrp)),
+                            vld1q_u32(mptrs[3].add(4 * wgrp)),
+                        );
+                        m[4 * wgrp] = m0;
+                        m[4 * wgrp + 1] = m1;
+                        m[4 * wgrp + 2] = m2;
+                        m[4 * wgrp + 3] = m3;
+                    }
+                    let mut tlo_a = [0u32; 4];
+                    let mut thi_a = [0u32; 4];
+                    let mut bl_a = [0u32; 4];
+                    let mut fl_a = [0u32; 4];
+                    for j in 0..4 {
+                        tlo_a[j] = inputs[j].2 as u32;
+                        thi_a[j] = (inputs[j].2 >> 32) as u32;
+                        bl_a[j] = inputs[j].3;
+                        fl_a[j] = inputs[j].4;
+                    }
+                    (
+                        cv_v,
+                        m,
+                        vld1q_u32(tlo_a.as_ptr()),
+                        vld1q_u32(thi_a.as_ptr()),
+                        vld1q_u32(bl_a.as_ptr()),
+                        vld1q_u32(fl_a.as_ptr()),
+                    )
+                }
+                QuadInput::Seeded(inputs) => {
+                    let cv_v = std::array::from_fn(|w| vld1q_u32(inputs.cv[w].as_ptr()));
+                    let m = std::array::from_fn(|w| vld1q_u32(inputs.message[w].as_ptr()));
+                    (
+                        cv_v,
+                        m,
+                        vld1q_u32(inputs.counter_lo.as_ptr()),
+                        vld1q_u32(inputs.counter_hi.as_ptr()),
+                        vld1q_u32(inputs.block_len.as_ptr()),
+                        vld1q_u32(inputs.flags.as_ptr()),
+                    )
+                }
+            };
 
             let mut state: [V4; 16] = [
-                cv0,
-                cv1,
-                cv2,
-                cv3,
-                cv4,
-                cv5,
-                cv6,
-                cv7,
+                cv_v[0],
+                cv_v[1],
+                cv_v[2],
+                cv_v[3],
+                cv_v[4],
+                cv_v[5],
+                cv_v[6],
+                cv_v[7],
                 vdupq_n_u32(BLAKE3_IV[0]),
                 vdupq_n_u32(BLAKE3_IV[1]),
                 vdupq_n_u32(BLAKE3_IV[2]),
@@ -2248,16 +2394,16 @@ pub(crate) mod witgen_simd {
 
             // ---- drain stages: per-block 2 KiB ascending bursts ----
             if z_nt {
-                dump_elide::<true>(zs, z, elide[0], false);
+                dump_elide::<true>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
             } else {
-                dump_elide::<false>(zs, z, elide[0], false);
+                dump_elide::<false>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
             }
             if ab_nt {
-                dump_elide::<true>(ast, a, elide[1], false);
-                dump_elide::<true>(bs, b, elide[2], elide[2]);
+                dump_elide::<true>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
+                dump_elide::<true>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
             } else {
-                dump_elide::<false>(ast, a, elide[1], false);
-                dump_elide::<false>(bs, b, elide[2], elide[2]);
+                dump_elide::<false>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
+                dump_elide::<false>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
             }
         }
     }
@@ -2284,14 +2430,15 @@ pub(crate) mod witgen_simd {
         let n_blocks = blocks.len();
         assert!(n_blocks <= n_total);
         // QS1 seed→witness overlap: when `blocks` is the seed-pipe's lazy
-        // speculative buffer, its slots were never filled — the counter-based
+        // speculative buffer, its slots contain sentinels — the counter-based
         // generator lets each quad regenerate its own four blocks from the
-        // init constant instead. `spec_init` is `None` for every other slice
-        // (the wrapper's own blocks, warm-up, tests), leaving them on the
-        // ordinary slab-read path. The quad loop below owns disjoint 8-block
-        // ranges, so `gen_block(init, idx)` reproduces exactly the value the
-        // eager fill would have written to `blocks[idx]` (both are the one
-        // `crate::seed_pipe::gen_block` closed form).
+        // init constant instead of reading them. `spec_init` is `None` for
+        // every other slice (the wrapper's own blocks, warm-up, tests), leaving
+        // them on the ordinary slab-read path. The quad loop below owns
+        // disjoint 8-block ranges. The default word-major
+        // `gen_quad_soa(init, first)` is pinned
+        // lane-by-lane to four scalar `gen_block` results; that scalar form is
+        // in turn pinned against the eager protected-generator fill.
         let spec_init = crate::seed_pipe::spec_gen_init(blocks);
         // Item C: resolve the gen_block ILP/scalar choice once per witgen
         // (the quad synth below calls it per block).
@@ -2400,6 +2547,31 @@ pub(crate) mod witgen_simd {
             #[cfg(debug_assertions)]
             debug_verify_elided_group(z_grp, a_grp, b_grp, elide);
             for half in 0..2 {
+                let first = 8 * g + 4 * half;
+                let base = half * 4 * F128_PER_BLOCK;
+                // Ranked lazy input: generate the four protected-generator
+                // blocks directly in the word-major shape consumed below.
+                // The scalar generator kill switch and every partial/padded
+                // shape retain the incumbent AoS path as an exact fallback.
+                if let Some(init) = spec_init {
+                    if gen_ilp && first + 4 <= n_blocks {
+                        let seeded = crate::seed_pipe::gen_quad_soa(init, first);
+                        // SAFETY: each quad fully owns its four block slots in
+                        // every buffer; groups are disjoint across workers.
+                        unsafe {
+                            build_quad_witness_ab_stream_neon_elide(
+                                QuadInput::Seeded(&seeded),
+                                z_grp[base..].as_mut_ptr() as *mut u32,
+                                a_grp[base..].as_mut_ptr() as *mut u32,
+                                b_grp[base..].as_mut_ptr() as *mut u32,
+                                z_nt,
+                                nt,
+                                elide,
+                            );
+                        }
+                        continue;
+                    }
+                }
                 // Owned synth storage for the lazy path; unread when
                 // `spec_init` is `None`, so it costs nothing on the ordinary
                 // path. Declared out here so its borrows outlive the builder
@@ -2407,7 +2579,7 @@ pub(crate) mod witgen_simd {
                 let synth: [Compression; 4];
                 let quad: [&Compression; 4] = if let Some(init) = spec_init {
                     synth = std::array::from_fn(|j| {
-                        let idx = 8 * g + 4 * half + j;
+                        let idx = first + j;
                         if idx < n_blocks {
                             crate::seed_pipe::gen_block_with(init, idx, gen_ilp)
                         } else {
@@ -2417,7 +2589,7 @@ pub(crate) mod witgen_simd {
                     std::array::from_fn(|j| &synth[j])
                 } else {
                     std::array::from_fn(|j| {
-                        let idx = 8 * g + 4 * half + j;
+                        let idx = first + j;
                         if idx < n_blocks {
                             &blocks[idx]
                         } else {
@@ -2425,12 +2597,11 @@ pub(crate) mod witgen_simd {
                         }
                     })
                 };
-                let base = half * 4 * F128_PER_BLOCK;
                 // SAFETY: each quad fully owns its four block slots in every
                 // buffer; groups are disjoint across workers.
                 unsafe {
                     build_quad_witness_ab_stream_neon_elide(
-                        quad,
+                        QuadInput::Blocks(quad),
                         z_grp[base..].as_mut_ptr() as *mut u32,
                         a_grp[base..].as_mut_ptr() as *mut u32,
                         b_grp[base..].as_mut_ptr() as *mut u32,
@@ -2875,10 +3046,10 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     match rate2_codeword {
         Some(codeword) => {
             // Scalar driver: reads the block slice directly, so if this is the
-            // QS1 lazy speculative buffer its slots must be filled first (the
-            // SIMD quad path synthesizes per group and never reaches here).
-            // No-op for every non-speculative slice.
-            crate::seed_pipe::materialize_spec_blocks(blocks);
+            // QS1 lazy speculative buffer, generate a separate owned input
+            // vector first. The SIMD quad path never reaches here.
+            let generated = crate::seed_pipe::materialize_spec_blocks(blocks);
+            let blocks = generated.as_deref().unwrap_or(blocks);
             super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword(
                 blocks,
                 &padding,
@@ -2897,8 +3068,9 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
             if witgen_simd::enabled() {
                 return witgen_simd::generate(blocks, n_blocks_log);
             }
-            // Scalar fallback reads the slice; backfill the lazy buffer first.
-            crate::seed_pipe::materialize_spec_blocks(blocks);
+            // Scalar fallback reads a generated owned slice in lazy mode.
+            let generated = crate::seed_pipe::materialize_spec_blocks(blocks);
+            let blocks = generated.as_deref().unwrap_or(blocks);
             super::common::drive_witness_packed_and_lincheck_full_write(
                 blocks,
                 &padding,
@@ -2987,9 +3159,9 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
             use_deferred_ranked_lincheck_stripe(n_blocks_log, pcs_params),
         );
     }
-    // Scalar streamed fallback reads the slice; backfill the QS1 lazy buffer
-    // first. No-op for every non-speculative slice.
-    crate::seed_pipe::materialize_spec_blocks(blocks);
+    // Scalar streamed fallback reads a generated owned slice in lazy mode.
+    let generated = crate::seed_pipe::materialize_spec_blocks(blocks);
+    let blocks = generated.as_deref().unwrap_or(blocks);
     let (z, a, b, stripe, stream) =
         super::common::drive_witness_packed_and_lincheck_full_write_streamed(
             blocks,
@@ -3278,8 +3450,9 @@ impl Blake3Setup {
         if call == 0 {
             let (proof, commitment) = warm_publish_path(proof, commitment);
             // Still untimed: prove here, against the wrapper's own warm-up
-            // blocks, that our parallel generator reproduces the protected one.
-            // That retires the timed path's 59 MiB adoption comparison.
+            // blocks, that both our AoS and word-major generators reproduce
+            // the protected one. That retires the timed path's 59 MiB adoption
+            // comparison and enables lazy seeded witness input.
             if self.n_blocks.is_power_of_two() {
                 crate::seed_pipe::verify_generator_at_warmup(
                     self.n_blocks.trailing_zeros(),
@@ -3831,10 +4004,10 @@ pub fn generate_witness_batch_major(
     Vec<u8>,
 ) {
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    // Batch-major driver reads the block slice directly; if this is the QS1
-    // lazy speculative buffer (only if a batch-major setup were ever routed
-    // through the seed pipe), backfill it first. No-op otherwise.
-    crate::seed_pipe::materialize_spec_blocks(blocks);
+    // Batch-major reads a generated owned slice if a lazy speculative input is
+    // ever routed here.
+    let generated = crate::seed_pipe::materialize_spec_blocks(blocks);
+    let blocks = generated.as_deref().unwrap_or(blocks);
     super::common::drive_witness_batch_major(
         blocks,
         &padding,
@@ -4416,9 +4589,13 @@ mod tests {
                     };
                     const BLOCK_BYTES: usize = K / 8; // 2048
                     for blk in 0..4 {
-                        bytes[blk * BLOCK_BYTES + 1952..(blk + 1) * BLOCK_BYTES].fill(0x00);
+                        let block = blk * BLOCK_BYTES;
+                        bytes[block + 1952..block + BLOCK_BYTES].fill(0x00);
                         if b_flavor {
-                            bytes[blk * BLOCK_BYTES..blk * BLOCK_BYTES + 128].fill(0xFF);
+                            bytes[block..block + 128].fill(0xFF);
+                            bytes[block + 1888..block + 1926].fill(0xFF);
+                            bytes[block + 1926] = 0x01;
+                            bytes[block + 1927..block + BLOCK_BYTES].fill(0x00);
                         }
                     }
                 };
@@ -4430,7 +4607,9 @@ mod tests {
                 seed_consts(&mut be, true);
                 unsafe {
                     witgen_simd::build_quad_witness_ab_stream_neon_elide(
-                        [&inputs[0], &inputs[1], &inputs[2], &inputs[3]],
+                        witgen_simd::QuadInput::Blocks([
+                            &inputs[0], &inputs[1], &inputs[2], &inputs[3],
+                        ]),
                         ze.as_mut_ptr() as *mut u32,
                         ae.as_mut_ptr() as *mut u32,
                         be.as_mut_ptr() as *mut u32,
@@ -4468,6 +4647,51 @@ mod tests {
             assert_eq!(a_s, ar, "a mismatch n_blocks={n_blocks}");
             assert_eq!(bs, br, "b mismatch n_blocks={n_blocks}");
             assert_eq!(ss, sr, "stripe mismatch n_blocks={n_blocks}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn seeded_soa_quad_witness_matches_aos_quad() {
+        use super::witgen_simd;
+        const WORDS: usize = K / 64;
+        for &(init, first) in &[
+            (0u64, 0usize),
+            (0xDEAD_BEEF_1234_5678, 4092),
+            (u64::MAX, (1usize << 18) - 4),
+        ] {
+            let soa = crate::seed_pipe::gen_quad_soa(init, first);
+            let blocks: [Compression; 4] =
+                std::array::from_fn(|lane| crate::seed_pipe::gen_block_scalar(init, first + lane));
+            let refs = [&blocks[0], &blocks[1], &blocks[2], &blocks[3]];
+            let mut za = [0u64; 4 * WORDS];
+            let mut aa = [0u64; 4 * WORDS];
+            let mut ba = [0u64; 4 * WORDS];
+            let mut zs = [0u64; 4 * WORDS];
+            let mut as_ = [0u64; 4 * WORDS];
+            let mut bs = [0u64; 4 * WORDS];
+            unsafe {
+                witgen_simd::build_quad_witness_ab_stream_neon(
+                    refs,
+                    za.as_mut_ptr().cast(),
+                    aa.as_mut_ptr().cast(),
+                    ba.as_mut_ptr().cast(),
+                    false,
+                    false,
+                );
+                witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                    witgen_simd::QuadInput::Seeded(&soa),
+                    zs.as_mut_ptr().cast(),
+                    as_.as_mut_ptr().cast(),
+                    bs.as_mut_ptr().cast(),
+                    false,
+                    false,
+                    [false; 3],
+                );
+            }
+            assert_eq!(zs, za, "seeded z diverged init={init:#x} first={first}");
+            assert_eq!(as_, aa, "seeded a diverged init={init:#x} first={first}");
+            assert_eq!(bs, ba, "seeded b diverged init={init:#x} first={first}");
         }
     }
 

@@ -1479,6 +1479,30 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         n_packed * n_tail,
     );
 
+    if x_inner_rest_tail.len() == 7 {
+        // The scored shape has one coordinate left after retaining six. Fold
+        // its two contiguous 64-bank halves with one product per output.
+        let r = x_inner_rest_tail[6];
+        let half = 64 * n_packed;
+        let (z0, z1) = z_vec.split_at(half);
+        let mut out = vec![F128::ZERO; half];
+        out.par_iter_mut()
+            .zip(z0.par_iter())
+            .zip(z1.par_iter())
+            .for_each(|((out, &z0), &z1)| *out = z0 + r * (z0 + z1));
+        return out;
+    }
+
+    s_hat_v_fold8_from_z_vec_generic(z_vec, x_inner_rest_tail, n_packed)
+}
+
+fn s_hat_v_fold8_from_z_vec_generic(
+    z_vec: &[F128],
+    x_inner_rest_tail: &[F128],
+    n_packed: usize,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
     let eq_tail = build_eq_parallel(&x_inner_rest_tail[6..]);
     eq_tail
         .par_iter()
@@ -1843,14 +1867,13 @@ pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
-        for value in 0..FOLD_TABLE_SIZE {
-            let mut acc = F128::ZERO;
-            for bit_in_byte in 0..8 {
-                if (value >> bit_in_byte) & 1 == 1 {
-                    acc += eq_r_dprime[bit_base + bit_in_byte];
-                }
+        let table = &mut tables[byte_idx * FOLD_TABLE_SIZE..(byte_idx + 1) * FOLD_TABLE_SIZE];
+        table[0] = F128::ZERO;
+        for (bit_in_byte, &generator) in eq_r_dprime[bit_base..bit_base + 8].iter().enumerate() {
+            let half = 1usize << bit_in_byte;
+            for value in 0..half {
+                table[value + half] = table[value] + generator;
             }
-            tables[byte_idx * FOLD_TABLE_SIZE + value] = acc;
         }
     }
     tables
@@ -2032,12 +2055,53 @@ pub(crate) fn build_direct_fold4_table(
     build_direct_fold_table(low_eq, fold_weight, base)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_direct_fold8_table(
     low_eq: &[F128; 64],
     fold_weight: &[F128; 64],
     base: &[F128],
 ) -> Vec<F128> {
     build_direct_fold_table(low_eq, fold_weight, base)
+}
+
+/// Encode the same direct-fold8 map as [`build_direct_fold8_table`] from the
+/// generators built for the sixty-four-bank factor state.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn build_direct_fold8_table_from_w_prime(
+    w_prime: &[F128],
+    fold_weight: &[F128; 64],
+) -> Vec<F128> {
+    const N_BITS: usize = 1 << LOG_PACKING;
+    assert_eq!(w_prime.len(), 64 * N_BITS);
+
+    let mut generators = [F128::ZERO; N_BITS];
+    for (row, &weight) in w_prime.chunks_exact(N_BITS).zip(fold_weight) {
+        for (generator, &value) in generators.iter_mut().zip(row) {
+            *generator += weight * value;
+        }
+    }
+
+    build_direct_fold8_table_from_generators(&generators)
+}
+
+/// Encode a direct-fold byte map from its 128 polynomial-basis generators.
+/// The stateful fold8 path obtains exactly this vector after binding its six
+/// retained bank coordinates.
+pub(crate) fn build_direct_fold8_table_from_generators(generators: &[F128]) -> Vec<F128> {
+    assert_eq!(generators.len(), 1 << LOG_PACKING);
+
+    let mut out = vec![F128::ZERO; FOLD_TABLE_LEN];
+    for byte in 0..FOLD_N_BYTES {
+        let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
+        table[0] = F128::ZERO;
+        for (bit, &generator) in generators[byte * 8..byte * 8 + 8].iter().enumerate() {
+            let half = 1usize << bit;
+            for value in 0..half {
+                table[value + half] = table[value] + generator;
+            }
+        }
+    }
+    out
 }
 
 /// Per-output-index value of a [`RsEqInd::DeferredDense`] fold (the value the
@@ -2481,10 +2545,16 @@ pub(crate) struct DirectFold4Factors {
 pub(crate) struct DirectFold8Factors {
     pub(crate) eq_lo: Vec<F128>,
     pub(crate) eq_hi: Vec<F128>,
-    pub(crate) low_eq: [F128; 64],
-    pub(crate) table: Vec<F128>,
-    /// `H[e,d] = Σ_h f[64h+e] B_k[64h+d]`.
-    pub(crate) products: [F128; 4096],
+    /// `A[b,e] = transpose(s_hat_v_fold8[e])[b]`. The physical bit-major
+    /// layout makes adjacent retained-coordinate banks adjacent in memory, so
+    /// the ordinary pair-fold kernels can bind one coordinate in place.
+    pub(crate) a_state: Vec<F128>,
+    /// `W[b,d] = Φ(low_eq[d]·x^b)`, in the same bit-major layout. After
+    /// six state folds its sole bank is the final byte-map generator vector.
+    pub(crate) w_state: Vec<F128>,
+    /// Round-zero contribution, cached while both factor states are still
+    /// local to the parallel ring-switch tail that constructed them.
+    pub(crate) round0: (F128, F128),
 }
 
 /// Per-claim output of [`prove_batched`]. Mirrors [`RingSwitchOutput`] but lets
@@ -3138,47 +3208,40 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                         let low_eq: [F128; 64] = build_eq(&suffix[..6])
                             .try_into()
                             .expect("six-coordinate eq has sixty-four entries");
-                        // products[e][d] = ⟨transpose(low_eq[d]·bank_e), w⟩ with
-                        // w = scaled_eq_r_dprime. Mul-by-low_eq[d] and the
-                        // transpose are both F2-linear, so with
-                        // w'_d[k] = φ_w(low_eq[d]·e_k) = fold_one_slot(low_eq[d]·e_k, table)
-                        // the product equals ⟨transpose(bank_e), w'_d⟩ — bitwise
-                        // identical (char 2), 64 transposes per claim instead of
-                        // 4,096.
-                        let mut w_prime = vec![F128::ZERO; 64 * n_packed];
-                        for (d_low, w_prime_d) in w_prime.chunks_mut(n_packed).enumerate() {
+                        // H[e,d] factors as ⟨A_e,W_d⟩ with
+                        // A_e = transpose(bank_e) and
+                        // W_d[k] = φ_w(low_eq[d]·e_k). Keep the two factor
+                        // families instead of materializing all 4,096 dots: the
+                        // first six PCS challenges fold their bank coordinate
+                        // online. Store bit-major so adjacent banks are adjacent
+                        // for the existing pair-fold kernels.
+                        let mut w_state = vec![F128::ZERO; 64 * n_packed];
+                        for d_low in 0..64 {
                             let scale = low_eq[d_low];
-                            for (bit, out) in w_prime_d.iter_mut().enumerate() {
-                                let basis = if bit < 64 {
-                                    F128::new(1u64 << bit, 0)
-                                } else {
-                                    F128::new(0, 1u64 << (bit - 64))
-                                };
-                                *out = fold_one_slot(scale * basis, &table);
+                            let mut basis_product = scale;
+                            w_state[d_low] = fold_one_slot(basis_product, &table);
+                            for bit in 1..n_packed {
+                                basis_product = mul_by_x(basis_product);
+                                w_state[bit * 64 + d_low] = fold_one_slot(basis_product, &table);
                             }
                         }
-                        let mut products = [F128::ZERO; 4096];
-                        products
-                            .par_chunks_mut(64)
-                            .enumerate()
-                            .for_each(|(e, chunk)| {
-                                let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-                                let transposed = tensor_algebra_transpose(bank);
-                                for (d_low, out) in chunk.iter_mut().enumerate() {
-                                    *out = inner_product(
-                                        &transposed,
-                                        &w_prime[d_low * n_packed..(d_low + 1) * n_packed],
-                                    );
-                                }
-                            });
+                        let mut a_state = vec![F128::ZERO; 64 * n_packed];
+                        for e in 0..64 {
+                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
+                            let transposed = tensor_algebra_transpose(bank);
+                            for (bit, value) in transposed.into_iter().enumerate() {
+                                a_state[bit * 64 + e] = value;
+                            }
+                        }
+                        let round0 = super::round0_deferred(&a_state, &w_state);
                         let tail = &suffix[6..];
                         let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
                         Some(DirectFold8Factors {
                             eq_lo,
                             eq_hi,
-                            low_eq,
-                            table: table.clone(),
-                            products,
+                            a_state,
+                            w_state,
+                            round0,
                         })
                     }
                     _ => None,
@@ -3563,6 +3626,30 @@ mod tests {
             F128 {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
+            }
+        }
+    }
+
+    #[test]
+    fn fold_byte_table_matches_bit_scan() {
+        let mut rng = Rng::new(0xF01D_B17E);
+        for trial in 0..4 {
+            let eq_r_dprime: Vec<F128> = (0..(1 << LOG_PACKING)).map(|_| rng.f128()).collect();
+            let table = build_fold_byte_table(&eq_r_dprime);
+            for byte in 0..FOLD_N_BYTES {
+                for value in 0..FOLD_TABLE_SIZE {
+                    let mut expected = F128::ZERO;
+                    for bit in 0..8 {
+                        if (value >> bit) & 1 == 1 {
+                            expected += eq_r_dprime[byte * 8 + bit];
+                        }
+                    }
+                    assert_eq!(
+                        table[byte * FOLD_TABLE_SIZE + value],
+                        expected,
+                        "trial={trial} byte={byte} value={value}",
+                    );
+                }
             }
         }
     }
@@ -4216,6 +4303,27 @@ mod tests {
     }
 
     #[test]
+    fn sixtyfour_bank_fold8_single_tail_fold_matches_generic_randomized() {
+        let n_packed = 1usize << LOG_PACKING;
+        for case in 0..8u64 {
+            let mut rng = Rng::new(0xD1CE_8007_u64.wrapping_add(case));
+            let mut tail: Vec<F128> = (0..7).map(|_| rng.f128()).collect();
+            if case == 0 {
+                tail[6] = F128::ZERO;
+            } else if case == 1 {
+                tail[6] = F128::ONE;
+            }
+            let z_vec: Vec<F128> = (0..n_packed * (1 << tail.len()))
+                .map(|_| rng.f128())
+                .collect();
+
+            let want = s_hat_v_fold8_from_z_vec_generic(&z_vec, &tail, n_packed);
+            let got = s_hat_v_fold8_from_z_vec(&z_vec, &tail);
+            assert_eq!(got, want, "one-coordinate Fold8 mismatch in case {case}");
+        }
+    }
+
+    #[test]
     fn sixtyfour_bank_fold8_intake_matches_ring_wire_and_product_oracle() {
         use crate::challenger::FsChallenger;
         use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
@@ -4300,7 +4408,23 @@ mod tests {
                 }
             }
         }
-        assert_eq!(factors.products, product_oracle);
+        assert_eq!(factors.a_state.len(), 64 * (1usize << LOG_PACKING));
+        assert_eq!(factors.w_state.len(), factors.a_state.len());
+        assert_eq!(
+            factors.round0,
+            crate::pcs::round0_deferred(&factors.a_state, &factors.w_state),
+            "cached round zero must match a fresh factor-state scan"
+        );
+        let mut factored = [F128::ZERO; 4096];
+        for e in 0..64 {
+            for d in 0..64 {
+                for bit in 0..(1usize << LOG_PACKING) {
+                    factored[64 * e + d] +=
+                        factors.a_state[bit * 64 + e] * factors.w_state[bit * 64 + d];
+                }
+            }
+        }
+        assert_eq!(factored, product_oracle);
     }
 
     #[test]

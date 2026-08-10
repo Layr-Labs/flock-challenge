@@ -2307,7 +2307,6 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
     let inner_tail = &r[k_skip + 1..k_log];
     let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
-    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold4(&fold4, &inner_tail[..4]);
 
     // Fold only retained coordinates 2 and 3 to recover the incumbent
     // four-bank tensor (coordinates 0 and 1 remain bank selectors).
@@ -2323,6 +2322,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
             }
         }
     }
+    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
 
     // RingSwitch leaves global bit k_skip as its 128-way prefix. Fold that
     // bit at the original C point to recover C's 64 S-domain evaluations.
@@ -2367,7 +2367,6 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
     let inner_tail = &r[k_skip + 1..k_log];
     let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
-    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &inner_tail[..6]);
 
     // Fold retained coordinates 2..6 to recover the incumbent four-bank
     // tensor (coordinates 0 and 1 remain bank selectors).
@@ -2383,6 +2382,7 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
             }
         }
     }
+    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
 
     // RingSwitch leaves global bit k_skip as its 128-way prefix. Fold that
     // bit at the original C point to recover C's 64 S-domain evaluations.

@@ -8545,15 +8545,31 @@ LC_KERNEL(lc_fold_stripes, 4)
     /// Build eq(point, ·) for the zerocheck C-fold window — in place in the
     /// arm's upload buffer when the arm and staging are both available.
     pub(crate) fn zc_fold_eq_table(point: &[F128]) -> FoldEqTable {
-        fold_eq_table(super::gpu_zerocheck_enabled(), point)
+        fold_eq_table(super::gpu_zerocheck_enabled(), point, false)
     }
 
     /// Same for the lincheck gather-fold window.
-    pub(crate) fn lincheck_fold_eq_table(point: &[F128]) -> FoldEqTable {
-        fold_eq_table(super::gpu_lincheck_enabled(), point)
+    pub(crate) fn lincheck_fold_eq_table(point: &[F128], pair_products: bool) -> FoldEqTable {
+        fold_eq_table(super::gpu_lincheck_enabled(), point, pair_products)
     }
 
-    fn fold_eq_table(arm_enabled: bool, point: &[F128]) -> FoldEqTable {
+    fn build_fold_eq_table_into(point: &[F128], out: &mut [F128], pair_products: bool) {
+        if pair_products {
+            crate::lincheck::build_eq_table_optimized_into(point, out);
+        } else {
+            crate::lincheck::build_eq_table_into(point, out);
+        }
+    }
+
+    fn build_fold_eq_table_owned(point: &[F128], pair_products: bool) -> Vec<F128> {
+        if pair_products {
+            crate::lincheck::build_eq_table_optimized(point)
+        } else {
+            crate::lincheck::build_eq_table(point)
+        }
+    }
+
+    fn fold_eq_table(arm_enabled: bool, point: &[F128], pair_products: bool) -> FoldEqTable {
         // Staging leans on the worker's single-prove-in-flight contract (see
         // `FoldEqStage`). The unit-test harness breaks that contract: many
         // proves run concurrently in one process and `cfg!(test)` widens the
@@ -8568,11 +8584,39 @@ LC_KERNEL(lc_fold_stripes, 4)
                 // SAFETY: the stage covers exactly `1 << point.len()` lanes
                 // and no other reader exists until this build returns.
                 let out = unsafe { std::slice::from_raw_parts_mut(stage.ptr, stage.len) };
-                crate::lincheck::build_eq_table_into(point, out);
+                build_fold_eq_table_into(point, out, pair_products);
                 return FoldEqTable::Staged(stage);
             }
         }
-        FoldEqTable::Owned(crate::lincheck::build_eq_table(point))
+        FoldEqTable::Owned(build_fold_eq_table_owned(point, pair_products))
+    }
+
+    #[cfg(test)]
+    mod fold_eq_build_tests {
+        use super::*;
+
+        #[test]
+        fn ranked_paired_eq_build_matches_generic_in_staged_storage() {
+            let point: Vec<F128> = (0..18)
+                .map(|i| F128 {
+                    lo: 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1),
+                    hi: 0xbf58_476d_1ce4_e5b9u64.wrapping_mul(i as u64 + 3),
+                })
+                .collect();
+            let generic = crate::lincheck::build_eq_table(&point);
+            let mut staged = vec![
+                F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX,
+                };
+                generic.len()
+            ];
+
+            build_fold_eq_table_into(&point, &mut staged, true);
+
+            assert_eq!(staged, generic);
+            assert_eq!(build_fold_eq_table_owned(&point, true), generic);
+        }
     }
 
     /// Which window a submitted fold prefix belongs to. The two arms share

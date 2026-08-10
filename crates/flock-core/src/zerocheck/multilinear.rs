@@ -60,6 +60,11 @@ use kernels::aarch64::{
     fold2_and_message_aarch64, fold2_and_message_lookahead_aarch64,
     fold2_compact_and_round4_chunk_neon_8, fold2_compact_and_round45_chunk_neon_8,
 };
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use kernels::aarch64::{
+    fold2_and_message_lookahead_normal_expanded_aarch64,
+    fold2_and_message_lookahead_nt_expanded_aarch64, fold2_and_message_normal_expanded_aarch64,
+};
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -252,6 +257,59 @@ fn zc_tail_split11_enabled() -> bool {
     use std::sync::LazyLock;
     static ENABLED: LazyLock<bool> =
         LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_SPLIT11").is_none());
+    *ENABLED
+}
+
+/// Exact same-binary rollback for the expanded fold4 pair. The control keeps
+/// the incumbent arithmetic and the same NT stores; only the fold schedule
+/// changes. Read once outside the per-chunk closure.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+fn zc_cascade_fold4_pair_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_CASCADE_FOLD4_PAIR").is_none_or(|value| value != *"1")
+    });
+    *ENABLED
+}
+
+/// The two ordinary-store lookahead outputs at the ranked `m = 32` shape:
+/// rounds 7/8 produce `2^20` values per table and rounds 9/10 produce `2^18`.
+/// Keep the next rung exact rather than changing smaller/non-ranked cascades.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn ranked_normal_fold4_pair_output(output_len: usize) -> bool {
+    matches!(output_len, 1_048_576 | 262_144)
+}
+
+/// Rung-local rollback: the parent switch still disables every expanded fold4
+/// pair, while this one disables only the ranked ordinary-store extension and
+/// leaves the already-screened NT rounds-5/6 specialization enabled.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+fn zc_cascade_fold4_pair_normal_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_CASCADE_FOLD4_PAIR_NORMAL").is_none_or(|value| value != *"1")
+    });
+    *ENABLED
+}
+
+/// The final direct composed pass at the ranked `m = 32` shape: rounds 11/12
+/// produce exactly `2^16` values per table. No earlier direct fallback or
+/// smaller non-ranked cascade enters this rung.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn ranked_direct_fold4_pair_output(output_len: usize) -> bool {
+    output_len == 65_536
+}
+
+/// Delta-only rollback for the direct rounds-11/12 expansion. The parent and
+/// normal-lookahead switches keep controlling E038/E039 independently.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+fn zc_cascade_fold4_pair_direct_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_CASCADE_FOLD4_PAIR_DIRECT").is_none_or(|value| value != *"1")
+    });
     *ENABLED
 }
 
@@ -2423,10 +2481,33 @@ pub(crate) fn fold2_plain_and_round6_into(
         quarter >= (1usize << 21)
             && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
     };
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_expanded_direct = !nt_stores
+        && ranked_direct_fold4_pair_output(quarter)
+        && zc_cascade_fold4_pair_enabled()
+        && zc_cascade_fold4_pair_direct_enabled();
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let rho34 = if use_expanded_direct {
+        rho3 * rho4
+    } else {
+        F128::ZERO
+    };
 
     let chunk_partial =
         |a_in: &[F128], b_in: &[F128], a_out: &mut [F128], b_out: &mut [F128]| -> (F128, F128) {
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            {
+                if use_expanded_direct {
+                    fold2_and_message_normal_expanded_aarch64(
+                        a_in, b_in, a_out, b_out, rho3, rho4, rho34, eq_lo,
+                    )
+                } else {
+                    fold2_and_message_aarch64(
+                        a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores,
+                    )
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
             {
                 fold2_and_message_aarch64(a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores)
             }
@@ -2605,10 +2686,39 @@ pub(crate) fn fold2_plain_and_round67_into(
         quarter >= (1usize << 21)
             && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
     };
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_expanded_fold4_pair = zc_cascade_fold4_pair_enabled()
+        && (nt_stores
+            || (ranked_normal_fold4_pair_output(quarter)
+                && zc_cascade_fold4_pair_normal_enabled()));
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let rho34 = if use_expanded_fold4_pair {
+        rho3 * rho4
+    } else {
+        F128::ZERO
+    };
 
     let chunk_partial =
         |a_in: &[F128], b_in: &[F128], a_out: &mut [F128], b_out: &mut [F128]| -> [F128; 8] {
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            {
+                if use_expanded_fold4_pair {
+                    if nt_stores {
+                        fold2_and_message_lookahead_nt_expanded_aarch64(
+                            a_in, b_in, a_out, b_out, rho3, rho4, rho34, eq_lo,
+                        )
+                    } else {
+                        fold2_and_message_lookahead_normal_expanded_aarch64(
+                            a_in, b_in, a_out, b_out, rho3, rho4, rho34, eq_lo,
+                        )
+                    }
+                } else {
+                    fold2_and_message_lookahead_aarch64(
+                        a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores,
+                    )
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
             {
                 fold2_and_message_lookahead_aarch64(
                     a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores,
@@ -3643,6 +3753,28 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn ranked_normal_fold4_pair_output_selector_is_exact() {
+        assert!(ranked_normal_fold4_pair_output(1 << 20));
+        assert!(ranked_normal_fold4_pair_output(1 << 18));
+        assert!(!ranked_normal_fold4_pair_output(1 << 22));
+        assert!(!ranked_normal_fold4_pair_output(1 << 21));
+        assert!(!ranked_normal_fold4_pair_output(1 << 19));
+        assert!(!ranked_normal_fold4_pair_output(1 << 17));
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn ranked_direct_fold4_pair_output_selector_is_exact() {
+        assert!(ranked_direct_fold4_pair_output(1 << 16));
+        assert!(!ranked_direct_fold4_pair_output(1 << 18));
+        assert!(!ranked_direct_fold4_pair_output(1 << 17));
+        assert!(!ranked_direct_fold4_pair_output((1 << 16) - 1));
+        assert!(!ranked_direct_fold4_pair_output((1 << 16) + 1));
+        assert!(!ranked_direct_fold4_pair_output(1 << 15));
+    }
 
     struct Rng(u64);
     impl Rng {

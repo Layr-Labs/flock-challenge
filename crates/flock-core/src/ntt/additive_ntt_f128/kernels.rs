@@ -81,6 +81,41 @@ pub(super) fn butterfly_fused_2layer(
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
+/// AArch64 block form of [`butterfly_fused_2layer`] that retains the three
+/// twiddles across all row groups. Returns `false` when the incumbent row
+/// dispatcher should be used instead.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn try_butterfly_fused_2layer_rows(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+) -> bool {
+    debug_assert!(quarter > 0);
+    debug_assert!(num_ntts > 0);
+    debug_assert!(odd_tail < num_ntts);
+    debug_assert!(odd_tail == 0 || quarter.is_multiple_of(2));
+    debug_assert_eq!(block.len(), 4 * quarter * num_ntts);
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies `aes`; the block geometry is established
+    // by the deep fused-pair scheduler and asserted above.
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_2layer_rows(
+                block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts, odd_tail,
+            );
+            return true;
+        }
+    }
+
+    false
+}
+
 /// AArch64 specialization for a fused pair whose three twiddles all have a
 /// zero high limb. Other targets retain the ordinary field-multiply kernel.
 #[allow(clippy::too_many_arguments)]
