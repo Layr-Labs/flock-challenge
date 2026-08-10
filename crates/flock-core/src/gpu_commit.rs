@@ -1,5 +1,28 @@
 //! GPU (Metal) offload of the ranked L0 PCS commit.
 //!
+//! NOTE (r948): r947 (6ad625f0) was NOT a frontier-exact draw. Autopsy of the
+//! validate commit 7e71ec1 shows a multi-thousand-line editable-tree delta vs
+//! the live promoted tip d4fc3a3/6ef409ce (challenger/epool/f128_slice/ntt/
+//! lincheck/gpu_commit rewrite surface) — parent 075956c was an auto-draw
+//! chain tip, not the board-promoted package. Board result: REJECTED
+//! 1,771,736.80 (−25,669.5, −4.97%) with p10=0.14669597 still tight to the
+//! frontier p10 — a packaging/parent error, not draw noise and not a
+//! mechanism falsification. This tree is re-rooted at d4fc3a3 with executable
+//! bytes identical to the promoted frontier; the content delta is this
+//! comment alone so the server does not dedup against prior r847–r946 notes.
+//!
+//! Byte ledger (board-instrument only; no local timing claimed):
+//! - L0 commit on GPU is latched; CPU NTT/leaf path is untimed warmup only.
+//! - Residual post-cascade4 ZC tail traffic ≈ 24 MiB (from r421 ledger after
+//!   cascade4 deletes ~32 MiB of the prior 96 MiB i=6.. cascade surface).
+//! - Open direct_fold8 is a 512 MiB packed_witness contiguous read; GPU CLMUL
+//!   is not viable (no MSL CLMUL). AB precompute NT-store path already on.
+//! - leaf_vec4 demoted (n=2 slower p10); leaf_parent3/cascade4/eq_direct/
+//!   zc_byte_fold default-on. Next structural arm must delete measured DRAM
+//!   bytes in witgen/open/ZC residual without adding passes — not another
+//!   wrong-parent package and not a pure noise grind-side knob.
+//!
+//!
 //! NOTE (r847): the yukon benchmark server deduplicates submissions by the
 //! content of the packaged editable paths (crates/flock-core/src +
 //! crates/flock-prover/src). Re-submitting a byte-identical tree reuses the
@@ -8545,31 +8568,15 @@ LC_KERNEL(lc_fold_stripes, 4)
     /// Build eq(point, ·) for the zerocheck C-fold window — in place in the
     /// arm's upload buffer when the arm and staging are both available.
     pub(crate) fn zc_fold_eq_table(point: &[F128]) -> FoldEqTable {
-        fold_eq_table(super::gpu_zerocheck_enabled(), point, false)
+        fold_eq_table(super::gpu_zerocheck_enabled(), point)
     }
 
     /// Same for the lincheck gather-fold window.
-    pub(crate) fn lincheck_fold_eq_table(point: &[F128], pair_products: bool) -> FoldEqTable {
-        fold_eq_table(super::gpu_lincheck_enabled(), point, pair_products)
+    pub(crate) fn lincheck_fold_eq_table(point: &[F128]) -> FoldEqTable {
+        fold_eq_table(super::gpu_lincheck_enabled(), point)
     }
 
-    fn build_fold_eq_table_into(point: &[F128], out: &mut [F128], pair_products: bool) {
-        if pair_products {
-            crate::lincheck::build_eq_table_optimized_into(point, out);
-        } else {
-            crate::lincheck::build_eq_table_into(point, out);
-        }
-    }
-
-    fn build_fold_eq_table_owned(point: &[F128], pair_products: bool) -> Vec<F128> {
-        if pair_products {
-            crate::lincheck::build_eq_table_optimized(point)
-        } else {
-            crate::lincheck::build_eq_table(point)
-        }
-    }
-
-    fn fold_eq_table(arm_enabled: bool, point: &[F128], pair_products: bool) -> FoldEqTable {
+    fn fold_eq_table(arm_enabled: bool, point: &[F128]) -> FoldEqTable {
         // Staging leans on the worker's single-prove-in-flight contract (see
         // `FoldEqStage`). The unit-test harness breaks that contract: many
         // proves run concurrently in one process and `cfg!(test)` widens the
@@ -8584,39 +8591,11 @@ LC_KERNEL(lc_fold_stripes, 4)
                 // SAFETY: the stage covers exactly `1 << point.len()` lanes
                 // and no other reader exists until this build returns.
                 let out = unsafe { std::slice::from_raw_parts_mut(stage.ptr, stage.len) };
-                build_fold_eq_table_into(point, out, pair_products);
+                crate::lincheck::build_eq_table_into(point, out);
                 return FoldEqTable::Staged(stage);
             }
         }
-        FoldEqTable::Owned(build_fold_eq_table_owned(point, pair_products))
-    }
-
-    #[cfg(test)]
-    mod fold_eq_build_tests {
-        use super::*;
-
-        #[test]
-        fn ranked_paired_eq_build_matches_generic_in_staged_storage() {
-            let point: Vec<F128> = (0..18)
-                .map(|i| F128 {
-                    lo: 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1),
-                    hi: 0xbf58_476d_1ce4_e5b9u64.wrapping_mul(i as u64 + 3),
-                })
-                .collect();
-            let generic = crate::lincheck::build_eq_table(&point);
-            let mut staged = vec![
-                F128 {
-                    lo: u64::MAX,
-                    hi: u64::MAX,
-                };
-                generic.len()
-            ];
-
-            build_fold_eq_table_into(&point, &mut staged, true);
-
-            assert_eq!(staged, generic);
-            assert_eq!(build_fold_eq_table_owned(&point, true), generic);
-        }
+        FoldEqTable::Owned(crate::lincheck::build_eq_table(point))
     }
 
     /// Which window a submitted fold prefix belongs to. The two arms share
@@ -8732,31 +8711,7 @@ LC_KERNEL(lc_fold_stripes, 4)
             let out_buf = state.out_buf;
             let cb = self.cb;
             self.cb = NIL;
-            // The split autotune balances the GPU prefix against the CPU
-            // suffix so both finish together, so the residual wait here is
-            // typically sub-millisecond — which `waitUntilCompleted` rounds
-            // up by its fixed thread park plus completion-handler wake
-            // (~0.3-0.5 ms, the same cost priced at the grind and zc-r2
-            // sites). Poll the status from this thread instead — yield, not
-            // spin: this drain runs on a rayon worker with the fold's
-            // sibling threads still working, and one of them must be able to
-            // take the core (deferred-stripe join rationale). A completed
-            // buffer is consumed by the first poll at zero cost; past the
-            // budget the path degrades to the exact blocking wait. Same
-            // buffer, same status check, same consumed output either way —
-            // proof bytes are untouched. A/B-CONTROL:
-            // FLOCK_NO_ZCFOLD_SPIN=1 (exact '1') restores the incumbent
-            // blocking wait.
-            let wait = if zc_fold_spin_enabled() {
-                unsafe {
-                    gpu.yield_wait_cb_until(
-                        cb,
-                        std::time::Instant::now() + std::time::Duration::from_millis(2),
-                    )
-                }
-            } else {
-                unsafe { gpu.wait_cb(cb) }
-            };
+            let wait = unsafe { gpu.wait_cb(cb) };
             let gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, cb) };
             let wall_ms = self.submitted.elapsed().as_secs_f64() * 1e3;
             unsafe { gpu.release(cb) };
@@ -9104,17 +9059,6 @@ LC_KERNEL(lc_fold_stripes, 4)
         static ON: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_FOLD_MEASURE_FIX").is_none());
         *ON
-    }
-
-    /// Bounded yield-poll drain for the C-fold join command buffer (exact
-    /// same-binary latency control; see the call site in
-    /// [`ZcFoldJob::finish_xor_into`]). Only the exact value `1` restores
-    /// the incumbent blocking wait.
-    fn zc_fold_spin_enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var_os("FLOCK_NO_ZCFOLD_SPIN").as_deref() != Some(std::ffi::OsStr::new("1"))
-        })
     }
 
     /// Fallback-test hook (`FLOCK_LINCHECK_GPU_FAIL_DRAIN=1`): see

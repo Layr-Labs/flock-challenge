@@ -57,17 +57,15 @@
 //! no cross-block state — and the SIMD witgen quad loop owns each 8-block
 //! range exclusively. So in lazy mode (the default) the prove starts the
 //! instant the seed parses, and each witgen quad regenerates its own four
-//! blocks into registers/L1. The buffer contains valid all-zero sentinels that
-//! are never read as generated inputs. It still exists because adoption keys
-//! on it: [`try_adopt`]'s gate
+//! blocks into registers/L1; the buffer's slots are never written *or read*.
+//! The buffer still exists because adoption keys on it: [`try_adopt`]'s gate
 //! compares length plus two privately stored endpoint **copies**
 //! (`State::endpoints`) instead of dereferencing the vector's interior — the
 //! same O(1) argument as the fast gate, and valid for the same reason (lazy
-//! mode is armed only when the warm-up proved both [`gen_block`] and
-//! [`gen_quad_soa`] reproduce the protected generator, and both sides parsed
-//! the identical forwarded bytes).
+//! mode is armed only when the warm-up proved [`gen_block`] reproduces the
+//! protected generator, and both sides parsed the identical forwarded bytes).
 //! Witgen paths that read the slice itself (the scalar/common drivers, i.e.
-//! kill-switch territory) generate a separate owned block vector via
+//! kill-switch territory) backfill the slots first via
 //! [`materialize_spec_blocks`]. `FLOCK_NO_SPEC_LAZY_BLOCKS=1` restores the
 //! eager parallel fill unchanged.
 //!
@@ -106,7 +104,6 @@ pub const BENCH_DOMAIN: &[u8] = b"flock-bench-v0";
 const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
 /// `cv[8] + message[16] + counter[1]` draws per generated compression.
 const DRAWS_PER_BLOCK: usize = 25;
-const ZERO_COMPRESSION: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
 
 // ---------------------------------------------------------------------------
 // Counter-based reproduction of the protected generator
@@ -128,19 +125,26 @@ fn mix(mut z: u64) -> u32 {
 /// `seed_pipe_matches_reference_generator` checks the full ranked-size output
 /// against a literal transcription of the reference.
 pub fn generate_compressions_par(log2_size: u32, seed: u64) -> Vec<Compression> {
-    let mut out = zero_blocks(1usize << log2_size);
+    let mut out = uninit_blocks(1usize << log2_size);
     fill_compressions_par(&mut out, log2_size, seed);
     out
 }
 
-/// Allocate `count` valid sentinel blocks.
+/// Reserve `count` block slots without the 28 MiB zero-fill.
 ///
-/// A `Vec<Compression>` may expose only initialized elements, even when the
-/// element type is `Copy` and has no drop glue. Lazy witgen identifies this
-/// allocation by address and synthesizes the real blocks without reading these
-/// sentinels as inputs.
-fn zero_blocks(count: usize) -> Vec<Compression> {
-    vec![ZERO_COMPRESSION; count]
+/// Skipping the zero-fill matters: at ~1.5 ms it would be half the block we are
+/// trying to reclaim. No slot is ever read before it is written: the eager path
+/// fills all of them via [`fill_compressions_par`], and the lazy path (QS1)
+/// reads none at all — witgen synthesizes contents and the adoption gate reads
+/// endpoint copies.
+#[allow(clippy::uninit_vec)]
+fn uninit_blocks(count: usize) -> Vec<Compression> {
+    let mut v: Vec<Compression> = Vec::with_capacity(count);
+    // SAFETY: capacity == count was just reserved; `Compression` is a tuple of
+    // `Copy` scalars so it has no `Drop` glue and leaking uninitialized slots
+    // is a no-op.
+    unsafe { v.set_len(count) };
+    v
 }
 
 /// Reserve the speculative block buffer **and commit its pages**, during the
@@ -153,14 +157,14 @@ fn zero_blocks(count: usize) -> Vec<Compression> {
 /// on the critical path because the proof cannot start until the blocks exist.
 /// Writing one byte per page here moves them out of every measured interval.
 pub(crate) fn prefaulted_blocks(count: usize) -> Vec<Compression> {
-    let mut v = zero_blocks(count);
+    let mut v = uninit_blocks(count);
     let bytes = std::mem::size_of_val(v.as_slice());
     let base = v.as_mut_ptr().cast::<u8>();
     let mut offset = 0usize;
     while offset < bytes {
-        // SAFETY: `offset < bytes`, so this writes zero inside the uniquely
-        // owned, fully initialized allocation. Every bit pattern is valid for
-        // `Compression`'s integer fields.
+        // SAFETY: `offset < bytes`, so this writes inside the allocation. The
+        // slots hold plain `Copy` scalars with no validity invariant, and every
+        // one is fully overwritten before it is read.
         unsafe { base.add(offset).write_volatile(0) };
         // Stride below the 16 KiB Apple Silicon page so the walk is correct on
         // any page size the kernel picks.
@@ -181,12 +185,11 @@ fn generator_init(log2_size: u32, seed: u64) -> u64 {
 ///
 /// The reference RNG's state recurrence is `s += GOLDEN` (the mixing function
 /// is not fed back), so the state before block `i`'s first draw is
-/// `init + 25·i·GOLDEN` and every block is computable in isolation. Both the
-/// eager parallel fill and the lazy per-quad AoS fallback write through this
-/// definition. `seed_pipe_matches_reference_generator`
-/// pins it against a literal transcription of the reference, and
-/// `gen_quad_soa_matches_four_reference_blocks` independently pins the ranked
-/// word-major quad form to four results from this scalar recurrence.
+/// `init + 25·i·GOLDEN` and every block is computable in isolation. This is
+/// the single definition both the eager parallel fill and the lazy per-quad
+/// witgen regeneration write through, so their bit-exactness is one property:
+/// `seed_pipe_matches_reference_generator` pins it against a literal
+/// transcription of the reference.
 #[inline(always)]
 pub(crate) fn gen_block(init: u64, block: usize) -> Compression {
     gen_block_with(init, block, !gen_block_ilp_killed())
@@ -274,93 +277,6 @@ pub(crate) fn gen_block_ilp(init: u64, block: usize) -> Compression {
     (cv, message, u64::from(out[24]), 64, 11)
 }
 
-/// Four consecutive protected-generator inputs in the word-major layout the
-/// ranked NEON witness builder consumes. Every field is initialized normally;
-/// this small value carries generated inputs rather than the lazy backing
-/// vector's valid sentinel values.
-#[repr(align(16))]
-pub(crate) struct CompressionQuadSoa {
-    pub(crate) cv: [[u32; 4]; 8],
-    pub(crate) message: [[u32; 4]; 16],
-    pub(crate) counter_lo: [u32; 4],
-    pub(crate) counter_hi: [u32; 4],
-    pub(crate) block_len: [u32; 4],
-    pub(crate) flags: [u32; 4],
-}
-
-/// Generate blocks `first_block..first_block + 4` directly in word-major
-/// form. The four RNG states are independent counter streams separated by
-/// exactly `25 * GOLDEN`; stepping them together exposes the same four-way ILP
-/// as [`gen_block_ilp`] without first materializing four AoS `Compression`s or
-/// transposing their words in the witness builder.
-#[inline(always)]
-pub(crate) fn gen_quad_soa(init: u64, first_block: usize) -> CompressionQuadSoa {
-    let first_state =
-        init.wrapping_add(((DRAWS_PER_BLOCK * first_block) as u64).wrapping_mul(GOLDEN));
-    let block_stride = (DRAWS_PER_BLOCK as u64).wrapping_mul(GOLDEN);
-    let mut states = [
-        first_state,
-        first_state.wrapping_add(block_stride),
-        first_state.wrapping_add(block_stride.wrapping_mul(2)),
-        first_state.wrapping_add(block_stride.wrapping_mul(3)),
-    ];
-
-    #[inline(always)]
-    fn draw_row(states: &mut [u64; 4]) -> [u32; 4] {
-        states[0] = states[0].wrapping_add(GOLDEN);
-        states[1] = states[1].wrapping_add(GOLDEN);
-        states[2] = states[2].wrapping_add(GOLDEN);
-        states[3] = states[3].wrapping_add(GOLDEN);
-        [
-            mix(states[0]),
-            mix(states[1]),
-            mix(states[2]),
-            mix(states[3]),
-        ]
-    }
-
-    let cv = std::array::from_fn(|_| draw_row(&mut states));
-    let message = std::array::from_fn(|_| draw_row(&mut states));
-    let counter_lo = draw_row(&mut states);
-    CompressionQuadSoa {
-        cv,
-        message,
-        counter_lo,
-        counter_hi: [0; 4],
-        block_len: [64; 4],
-        flags: [11; 4],
-    }
-}
-
-/// Full fail-closed oracle for the ranked word-major generator. This is called
-/// only during the protected worker's untimed warm-up, after `blocks` has
-/// already been byte-matched to the protected generator.
-fn generated_quads_match_blocks(init: u64, blocks: &[Compression]) -> bool {
-    if !blocks.len().is_multiple_of(4) {
-        return false;
-    }
-    (0..blocks.len() / 4).into_par_iter().all(|quad_index| {
-        let first = 4 * quad_index;
-        let quad = gen_quad_soa(init, first);
-        (0..4).all(|lane| {
-            let (cv, message, counter, block_len, flags) = &blocks[first + lane];
-            quad.cv
-                .iter()
-                .zip(cv)
-                .all(|(words, expected)| words[lane] == *expected)
-                && quad
-                    .message
-                    .iter()
-                    .zip(message)
-                    .all(|(words, expected)| words[lane] == *expected)
-                && (u64::from(quad.counter_lo[lane]) | (u64::from(quad.counter_hi[lane]) << 32))
-                    == *counter
-                && quad.block_len[lane] == *block_len
-                && quad.flags[lane] == *flags
-        })
-    })
-}
-
 /// Fill `out` with the blocks the protected generator would produce.
 fn fill_compressions_par(out: &mut [Compression], log2_size: u32, seed: u64) {
     fill_compressions_from_init(out, generator_init(log2_size, seed));
@@ -387,11 +303,13 @@ fn fill_compressions_from_init(out: &mut [Compression], init: u64) {
 // ---------------------------------------------------------------------------
 
 /// Data pointer of the lazy speculative buffer, or 0 when no lazy run is in
-/// flight. This is read-only identity metadata: the allocation contains valid
-/// zero sentinels and is never mutated after it is shared through `Arc`.
-/// Published with `Release` after [`SPEC_LEN`]/[`SPEC_INIT`]; readers pair with
-/// `Acquire`. Never recycled: the pipe state holds the `Arc` for the life of
-/// the process, so a stale non-zero value cannot identify another live slice.
+/// flight. Captured from the vec's own `as_mut_ptr` *before* it is frozen
+/// behind the pipe's `Arc` (the allocation's address survives the move), so
+/// [`materialize_spec_blocks`] can backfill through a pointer with write
+/// provenance. Published with `Release` after [`SPEC_LEN`]/[`SPEC_INIT`];
+/// readers pair with `Acquire`. Never recycled: the pipe state holds the
+/// `Arc` for the life of the process, so a stale non-zero value can never
+/// alias another live slice.
 static SPEC_BASE: AtomicUsize = AtomicUsize::new(0);
 static SPEC_LEN: AtomicUsize = AtomicUsize::new(0);
 static SPEC_INIT: AtomicU64 = AtomicU64::new(0);
@@ -402,9 +320,8 @@ fn lazy_blocks_killed() -> bool {
 }
 
 /// If `blocks` is the live lazy speculative buffer, return the generator
-/// init so the caller synthesizes block contents via [`gen_quad_soa`] (or the
-/// [`gen_block`] scalar fallback) instead of reading its sentinel slots.
-/// `None` for every other slice —
+/// init so the caller synthesizes block contents via [`gen_block`] instead of
+/// reading slots that were never written. `None` for every other slice —
 /// the wrapper's own blocks, warm-up blocks, tests — which keeps all of them
 /// on their ordinary read path at the cost of one relaxed-ish load.
 #[inline]
@@ -419,15 +336,33 @@ pub(crate) fn spec_gen_init(blocks: &[Compression]) -> Option<u64> {
     Some(SPEC_INIT.load(Ordering::Relaxed))
 }
 
-/// Generate an owned block vector for scalar/common witgen paths that must read
-/// their input slice. Returns `None` for every slice other than the live lazy
-/// buffer. The caller must keep the returned vector alive and pass its slice to
-/// the driver; the shared sentinel backing is never mutated.
-pub(crate) fn materialize_spec_blocks(blocks: &[Compression]) -> Option<Vec<Compression>> {
-    let init = spec_gen_init(blocks)?;
-    let mut generated = zero_blocks(blocks.len());
-    fill_compressions_from_init(&mut generated, init);
-    Some(generated)
+/// Backfill the whole lazy buffer for witgen paths that read the slice
+/// itself (the scalar/common drivers — kill-switch territory; the ranked
+/// SIMD quad path synthesizes per group and never calls this). No-op for
+/// every slice that is not the live lazy buffer.
+///
+/// Single writer by construction: only the seed-pipe thread's prove reaches
+/// a witgen entry with the matching pointer, and each witgen entry runs the
+/// backfill before any block is read, on the same call stack.
+pub(crate) fn materialize_spec_blocks(blocks: &[Compression]) {
+    let base = SPEC_BASE.load(Ordering::Acquire);
+    if base == 0
+        || base != blocks.as_ptr() as usize
+        || SPEC_LEN.load(Ordering::Relaxed) != blocks.len()
+    {
+        return;
+    }
+    let init = SPEC_INIT.load(Ordering::Relaxed);
+    // SAFETY: `base` is the buffer's own `as_mut_ptr`, captured before the
+    // vec was frozen behind the pipe's `Arc`, which the pipe state keeps
+    // alive for the process lifetime; the length was stored alongside it.
+    // Nothing reads a slot until this fill returns (the adoption gate reads
+    // endpoint copies, never slots), and no other writer exists.
+    let out = unsafe { std::slice::from_raw_parts_mut(base as *mut Compression, blocks.len()) };
+    fill_compressions_from_init(out, init);
+    // The buffer is now an ordinary filled vector; drop the lazy identity so
+    // any later reader takes the plain slice path.
+    SPEC_BASE.store(0, Ordering::Release);
 }
 
 /// Parallel byte-equality over the two block vectors.
@@ -472,8 +407,8 @@ struct State {
     blocks: Option<Arc<Vec<Compression>>>,
     /// Lazy mode only: copies of block 0 and block N−1, regenerated from the
     /// parsed seed at publish time. The adoption gate compares these instead
-    /// of `blocks[0]`/`blocks[N−1]` because in lazy mode those slots contain
-    /// sentinels rather than generated inputs; the buffer is the run's identity.
+    /// of `blocks[0]`/`blocks[N−1]` because in lazy mode those slots were
+    /// never written — the buffer exists purely as the run's identity.
     endpoints: Option<(Compression, Compression)>,
     result: Option<ProveOut>,
     dead: bool,
@@ -491,11 +426,11 @@ struct Pipe {
 
 /// The protected wrapper's untimed warm-up seed
 /// (`benchmark-tools/worker/src/main.rs`). Only ever used to establish, outside
-/// every measured interval, that both our AoS and word-major quad generators
-/// agree with the harness's on this build and this machine.
+/// every measured interval, that our parallel generator agrees with the
+/// harness's on this build and this machine.
 const WARMUP_SEED: u64 = 0x00C0_FFEE_BEEF_D15C;
 
-/// Set once the warm-up proved both generators reproduce the protected one.
+/// Set once the warm-up proved our generator reproduces the protected one.
 static GENERATOR_VERIFIED: AtomicBool = AtomicBool::new(false);
 
 static PIPE: OnceLock<Pipe> = OnceLock::new();
@@ -607,12 +542,12 @@ pub(crate) fn is_ranked_worker() -> bool {
 ///
 /// `try_adopt`'s adoption gate reads ~59 MiB — two 29.4 MiB block vectors —
 /// **inside the timed window and on the proving pool**, to check a property
-/// that is entirely *static*: either our AoS and word-major reproductions of
-/// `flock_benchmark_common::generate_compressions` match the protected one for
-/// this build and this machine, or they never do. Nothing about it varies per
-/// trial. The warm-up hands us the wrapper's own blocks for a known constant
-/// seed, so both checks can be made here instead, outside every measured
-/// interval.
+/// that is entirely *static*: either our parallel reproduction of
+/// `flock_benchmark_common::generate_compressions` matches the protected one
+/// for this build and this machine, or it never does. Nothing about it varies
+/// per trial. The warm-up hands us the wrapper's own blocks for a known
+/// constant seed, so the identical check can be made here instead, for free,
+/// outside every measured interval.
 ///
 /// Deliberately fail-closed: any disagreement at all — including the wrapper's
 /// warm-up seed changing out from under `WARMUP_SEED` — simply leaves the flag
@@ -626,8 +561,7 @@ pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compre
         return;
     }
     let ours = generate_compressions_par(log2_size, WARMUP_SEED);
-    let init = generator_init(log2_size, WARMUP_SEED);
-    if blocks_eq_serial(&ours, warmup_blocks) && generated_quads_match_blocks(init, warmup_blocks) {
+    if blocks_eq_serial(&ours, warmup_blocks) {
         GENERATOR_VERIFIED.store(true, Ordering::SeqCst);
     }
 }
@@ -738,18 +672,10 @@ fn speculative_main(
     let line = read_line_fd(real_stdin);
 
     // The seed's first byte has arrived: this thread is about to forward it and
-    // start the speculative prove. Signal the CPU keep-alive down immediately —
-    // the spin threads notice within one ~1024-op slice and exit on their own —
-    // but defer their 10–14 sequential joins until after the seed forward, so
-    // that pure serial join time is off the timed window's first microseconds.
-    // `FLOCK_NO_KEEPALIVE_DEFER=1` (exact '1') restores signal+join up front.
-    let defer_join =
-        std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1"));
-    if defer_join {
-        flock_core::cpu_keepalive::keepalive_signal();
-    } else {
-        flock_core::cpu_keepalive::keepalive_stop();
-    }
+    // start the speculative prove. Halt the CPU keep-alive immediately, before
+    // any of that timed work, so the P-cores it was warming across the idle gap
+    // are handed straight to the prover instead of shared with a spin thread.
+    flock_core::cpu_keepalive::keepalive_stop();
 
     // Forward first and unconditionally. Everything after this point can fail
     // without ever leaving the worker blocked on stdin.
@@ -772,13 +698,6 @@ fn speculative_main(
         }
     }
 
-    // Seed forwarded: drain the keep-alive joins now. The spin threads were
-    // signalled before the forward and have already exited by this point, so
-    // the joins are reaping, not waiting.
-    if defer_join {
-        flock_core::cpu_keepalive::keepalive_join();
-    }
-
     let parsed = line
         .as_deref()
         .and_then(|b| std::str::from_utf8(b).ok())
@@ -793,8 +712,8 @@ fn speculative_main(
         let mut buf = std::mem::take(&mut scratch);
         let n_total = 1usize << log2_size;
         // QS1 lazy mode: skip the eager fill barrier entirely. The prove
-        // starts right now; witgen regenerates blocks into local SIMD values
-        // or builds an owned input vector (scalar paths, via
+        // starts right now; witgen regenerates blocks in place (SIMD quad
+        // path) or backfills the buffer first (scalar paths, via
         // `materialize_spec_blocks`). Gated on the warm-up generator proof
         // because the adoption gate's endpoint *copies* below are only as
         // trustworthy as `gen_block` itself — without that proof the timed
@@ -806,9 +725,9 @@ fn speculative_main(
         let (blocks, endpoints) = if lazy {
             let init = generator_init(log2_size, seed);
             let endpoints = (gen_block(init, 0), gen_block(init, n_total - 1));
-            // Read-only identity; the allocation address is stable across the
-            // move into the Arc.
-            let base = buf.as_ptr() as usize;
+            // Write provenance for a possible backfill; the address is
+            // stable across the move into the Arc.
+            let base = buf.as_mut_ptr() as usize;
             SPEC_INIT.store(init, Ordering::Relaxed);
             SPEC_LEN.store(buf.len(), Ordering::Relaxed);
             SPEC_BASE.store(base, Ordering::Release);
@@ -881,8 +800,8 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
 
     let fast_gate = GENERATOR_VERIFIED.load(Ordering::SeqCst);
     let matched = if let Some((first, last)) = &endpoints {
-        // QS1 lazy buffer: its interior holds sentinels, not generated inputs,
-        // so the gate must not compare it. Length plus the regenerated endpoint
+        // QS1 lazy buffer: its interior slots were never written, so the gate
+        // must not dereference them. Length plus the two regenerated endpoint
         // copies is the same O(1) argument as the fast gate below — lazy mode
         // only arms when the warm-up proved `gen_block` reproduces the
         // wrapper's generator, and both sides parsed identical forwarded
@@ -941,18 +860,6 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static SPEC_IDENTITY_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    struct SpecIdentityReset;
-
-    impl Drop for SpecIdentityReset {
-        fn drop(&mut self) {
-            SPEC_BASE.store(0, Ordering::Release);
-            SPEC_LEN.store(0, Ordering::Relaxed);
-            SPEC_INIT.store(0, Ordering::Relaxed);
-        }
-    }
 
     /// Literal transcription of `flock_benchmark_common::generate_compressions`
     /// and its `Rng`, so the parallel form is checked against the protected
@@ -1042,8 +949,8 @@ mod tests {
         assert_ne!(a.last(), b.last());
     }
 
-    /// The lazy witgen fallback regenerates single blocks via `gen_block`; pin
-    /// it against the parallel fill (itself pinned against the reference), at
+    /// The lazy witgen path regenerates single blocks via `gen_block`; pin it
+    /// against the parallel fill (itself pinned against the reference), at
     /// every position class the quad loop can ask for.
     #[test]
     fn gen_block_matches_the_parallel_fill_at_every_index() {
@@ -1081,92 +988,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gen_quad_soa_matches_four_reference_blocks() {
-        assert_eq!(std::mem::size_of::<CompressionQuadSoa>(), 4 * 112);
-        assert_eq!(std::mem::align_of::<CompressionQuadSoa>(), 16);
-        for &(log2, seed) in &[
-            (8u32, 0u64),
-            (13, 0xDEAD_BEEF_1234_5678),
-            (18, u64::MAX),
-            (32, 0x0123_4567_89AB_CDEF),
-        ] {
-            let init = generator_init(log2, seed);
-            let n = 1usize << log2.min(18);
-            for &first in &[0usize, 4, 4092, 4096, n / 2, n - 4] {
-                let quad = gen_quad_soa(init, first);
-                let blocks: [Compression; 4] =
-                    std::array::from_fn(|lane| gen_block_scalar(init, first + lane));
-                for lane in 0..4 {
-                    assert_eq!(
-                        std::array::from_fn::<_, 8, _>(|word| quad.cv[word][lane]),
-                        blocks[lane].0,
-                        "cv log2={log2} seed={seed:#x} block={}",
-                        first + lane
-                    );
-                    assert_eq!(
-                        std::array::from_fn::<_, 16, _>(|word| quad.message[word][lane]),
-                        blocks[lane].1,
-                        "message log2={log2} seed={seed:#x} block={}",
-                        first + lane
-                    );
-                    assert_eq!(u64::from(quad.counter_lo[lane]), blocks[lane].2);
-                    assert_eq!(quad.counter_hi[lane], 0);
-                    assert_eq!(quad.block_len[lane], blocks[lane].3);
-                    assert_eq!(quad.flags[lane], blocks[lane].4);
-                }
-            }
-        }
-
-        let (log2, seed) = (8u32, 0xA55A_1234_5678_9ABC);
-        let init = generator_init(log2, seed);
-        let mut protected = reference(log2, seed);
-        assert!(generated_quads_match_blocks(init, &protected));
-        protected[77].1[5] ^= 1;
-        assert!(!generated_quads_match_blocks(init, &protected));
-        assert!(!generated_quads_match_blocks(init, &protected[..255]));
-    }
-
     /// Slices that are not the live lazy buffer must take the ordinary read
-    /// path: no synth init and no owned materialization.
+    /// path: no synth init, and materialization must be a no-op.
     #[test]
     fn lazy_identity_is_inert_for_foreign_slices() {
-        let _serial = SPEC_IDENTITY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let blocks = generate_compressions_par(8, 42);
         assert!(spec_gen_init(&blocks).is_none());
-        assert!(materialize_spec_blocks(&blocks).is_none());
-    }
-
-    #[test]
-    fn lazy_materialization_keeps_the_shared_backing_immutable() {
-        let _serial = SPEC_IDENTITY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _reset = SpecIdentityReset;
-        let (log2, seed) = (8u32, 0x0123_4567_89AB_CDEF);
-        let init = generator_init(log2, seed);
-        let backing = Arc::new(prefaulted_blocks(1usize << log2));
-        assert!(backing.iter().all(|block| *block == ZERO_COMPRESSION));
-
-        SPEC_INIT.store(init, Ordering::Relaxed);
-        SPEC_LEN.store(backing.len(), Ordering::Relaxed);
-        SPEC_BASE.store(backing.as_ptr() as usize, Ordering::Release);
-
-        assert_eq!(spec_gen_init(backing.as_slice()), Some(init));
-        let generated = materialize_spec_blocks(backing.as_slice())
-            .expect("live lazy identity must produce owned blocks");
-        assert_eq!(generated, reference(log2, seed));
-        let expected_witness =
-            crate::r1cs_hashes::blake3::generate_witness_batch_major(&generated, log2 as usize);
-        let lazy_witness = crate::r1cs_hashes::blake3::generate_witness_batch_major(
-            backing.as_slice(),
-            log2 as usize,
-        );
-        assert_eq!(lazy_witness, expected_witness);
-        assert!(backing.iter().all(|block| *block == ZERO_COMPRESSION));
-        assert_eq!(spec_gen_init(backing.as_slice()), Some(init));
+        let before = blocks.clone();
+        materialize_spec_blocks(&blocks);
+        assert_eq!(blocks, before);
     }
 
     #[test]
