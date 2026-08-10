@@ -8688,7 +8688,31 @@ LC_KERNEL(lc_fold_stripes, 4)
             let out_buf = state.out_buf;
             let cb = self.cb;
             self.cb = NIL;
-            let wait = unsafe { gpu.wait_cb(cb) };
+            // The split autotune balances the GPU prefix against the CPU
+            // suffix so both finish together, so the residual wait here is
+            // typically sub-millisecond — which `waitUntilCompleted` rounds
+            // up by its fixed thread park plus completion-handler wake
+            // (~0.3-0.5 ms, the same cost priced at the grind and zc-r2
+            // sites). Poll the status from this thread instead — yield, not
+            // spin: this drain runs on a rayon worker with the fold's
+            // sibling threads still working, and one of them must be able to
+            // take the core (deferred-stripe join rationale). A completed
+            // buffer is consumed by the first poll at zero cost; past the
+            // budget the path degrades to the exact blocking wait. Same
+            // buffer, same status check, same consumed output either way —
+            // proof bytes are untouched. A/B-CONTROL:
+            // FLOCK_NO_ZCFOLD_SPIN=1 (exact '1') restores the incumbent
+            // blocking wait.
+            let wait = if zc_fold_spin_enabled() {
+                unsafe {
+                    gpu.yield_wait_cb_until(
+                        cb,
+                        std::time::Instant::now() + std::time::Duration::from_millis(2),
+                    )
+                }
+            } else {
+                unsafe { gpu.wait_cb(cb) }
+            };
             let gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, cb) };
             let wall_ms = self.submitted.elapsed().as_secs_f64() * 1e3;
             unsafe { gpu.release(cb) };
@@ -9036,6 +9060,17 @@ LC_KERNEL(lc_fold_stripes, 4)
         static ON: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_FOLD_MEASURE_FIX").is_none());
         *ON
+    }
+
+    /// Bounded yield-poll drain for the C-fold join command buffer (exact
+    /// same-binary latency control; see the call site in
+    /// [`ZcFoldJob::finish_xor_into`]). Only the exact value `1` restores
+    /// the incumbent blocking wait.
+    fn zc_fold_spin_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_ZCFOLD_SPIN").as_deref() != Some(std::ffi::OsStr::new("1"))
+        })
     }
 
     /// Fallback-test hook (`FLOCK_LINCHECK_GPU_FAIL_DRAIN=1`): see

@@ -30,9 +30,18 @@
 //! With a deliberately single-threaded main pool (`RAYON_NUM_THREADS=1`) the
 //! queue runs inline on the calling thread and spawns nothing, preserving
 //! truly serial execution.
+//!
+//! Handing the helper pool a `broadcast` needs a thread that is neither a main
+//! worker (it would cost a performance core) nor a helper worker (it would sit
+//! inside the pool it is waking). That used to be a fresh `std::thread::scope`
+//! + `spawn` per engaged drain — one OS thread created and joined every time.
+//! [`Relay`] replaces it with a single persistent thread that parks between
+//! drains, so an engaged drain costs a condvar signal instead of a thread
+//! lifecycle. `FLOCK_NO_EPOOL_RELAY=1` restores the per-drain spawn; so does
+//! any drain that finds the relay already carrying a concurrent one.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use rayon::prelude::*;
 
@@ -72,9 +81,21 @@ fn ecore_count() -> usize {
     }
 }
 
+/// Off-target hosts have no efficiency cores, so the helper pool is absent and
+/// every hetero drain runs main-pool-only.
+///
+/// `FLOCK_EPOOL_FORCE_THREADS=<n>` (n > 0) synthesizes an n-thread helper pool
+/// so the two-pool drain — and the broadcast relay that feeds it — can be
+/// exercised, counted, and A/B-timed on non-Apple hardware, where this module
+/// would otherwise be dead code. Diagnostic only: this arm is never compiled
+/// for the ranked aarch64-macOS target, and with the variable unset it returns
+/// 0 exactly as before.
 #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
 fn ecore_count() -> usize {
-    0
+    std::env::var("FLOCK_EPOOL_FORCE_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 /// Tag the current thread `QOS_CLASS_UTILITY` (Darwin value `0x11`). Utility
@@ -154,6 +175,287 @@ static EPOOL_HELPER_CHUNKS: AtomicUsize = AtomicUsize::new(0);
 /// Total chunks claimed by the helper pool so far (monotonic).
 pub fn helper_chunks_claimed() -> usize {
     EPOOL_HELPER_CHUNKS.load(Ordering::Relaxed)
+}
+
+/// Helper broadcasts issued by the two hetero drains across all of this
+/// process (diagnostic only; relaxed ordering). One increment per *engaged*
+/// drain, i.e. exactly the kickoffs [`drain_hetero`] carries. Drains that skip
+/// the helper (no pool, fewer than [`EPOOL_MIN_CHUNKS`] chunks, a
+/// single-threaded main pool, zero chunks) do not count, and neither does
+/// [`run_chunks_with_helper_only`] — that path never used a relay thread. Read
+/// deltas around a window to price the per-drain kickoff for that window.
+static EPOOL_BROADCASTS: AtomicU64 = AtomicU64::new(0);
+
+/// Total helper broadcasts issued by the hetero drains so far (monotonic).
+pub fn helper_broadcasts_issued() -> u64 {
+    EPOOL_BROADCASTS.load(Ordering::Relaxed)
+}
+
+/// Whether engaged drains go through the persistent [`Relay`]. Kill switch:
+/// `FLOCK_NO_EPOOL_RELAY=1` (exactly `"1"`) restores the per-drain
+/// `std::thread::scope` + `spawn`. Read once per process.
+fn relay_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !relay_killed_by(std::env::var("FLOCK_NO_EPOOL_RELAY").ok().as_deref()))
+}
+
+/// Kill rule for [`relay_enabled`]: the value must be exactly `"1"`. Anything
+/// else — `"true"`, `"0"`, an empty string, an unset variable — keeps the
+/// relay, so a stray export can never silently change the ranked shape.
+fn relay_killed_by(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Type-erased pointer to a broadcast closure living on a drain's stack frame:
+/// a thin data pointer plus the monomorphized thunk that restores its type. A
+/// thunk rather than `dyn Fn` because the closure's lifetime is the drain's,
+/// not `'static`, and a raw trait-object pointer cannot express that.
+#[derive(Clone, Copy)]
+struct JobPtr {
+    data: *const (),
+    call: unsafe fn(*const ()),
+}
+
+// SAFETY: the referent is `Sync`, so invoking it from the relay thread is the
+// same as invoking it through a shared reference. `PostedJob`'s `Drop` keeps
+// the posting frame alive until the relay reports the job complete, so the
+// pointer is never dereferenced after its referent dies.
+unsafe impl Send for JobPtr {}
+
+impl JobPtr {
+    fn new<B: Fn() + Sync>(broadcast: &B) -> Self {
+        /// # Safety
+        /// `data` must be a live `&B` produced by [`JobPtr::new`].
+        unsafe fn thunk<B: Fn() + Sync>(data: *const ()) {
+            // SAFETY: guaranteed by the caller (`Relay::run`, which only ever
+            // runs a job the posting drain is still blocked on).
+            unsafe { (*data.cast::<B>())() }
+        }
+        Self {
+            data: (broadcast as *const B).cast::<()>(),
+            call: thunk::<B>,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RelayState {
+    /// Job posted and not yet picked up.
+    job: Option<JobPtr>,
+    /// Jobs posted so far; a job's sequence number is `posted` after its post.
+    posted: u64,
+    /// Jobs the relay thread has finished.
+    done: u64,
+    /// Whether the most recently finished job unwound.
+    panicked: bool,
+}
+
+/// The process-wide broadcast relay: one persistent thread that hands the
+/// helper pool a `broadcast` on request, so an engaged drain no longer creates
+/// and joins an OS thread. It is a plain `std::thread` — never a rayon worker
+/// — so it occupies neither pool, and it is created lazily on the first
+/// engaged drain, which on the ranked worker falls inside the untimed warm-up
+/// proof. A prove that engages no drain never creates it.
+struct Relay {
+    state: Mutex<RelayState>,
+    /// Signalled on post (the relay waits on it) and on completion (the
+    /// posting drain waits on it).
+    signal: Condvar,
+    /// Held for the whole of one relayed drain. A concurrent (e.g. nested)
+    /// drain that cannot take it falls back to the per-drain spawn rather than
+    /// queueing behind this one.
+    busy: AtomicBool,
+}
+
+/// A poisoned relay mutex must degrade to "keep running", never to a panic:
+/// the relay only ever holds it across bookkeeping, so its contents stay
+/// consistent even if some other thread unwound while waiting.
+fn relay_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Relay {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RelayState::default()),
+            signal: Condvar::new(),
+            busy: AtomicBool::new(false),
+        }
+    }
+
+    /// Take exclusive use of the relay, or report that another drain has it.
+    fn try_acquire(&self) -> bool {
+        self.busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Hand `job` to the relay thread; returns its sequence number.
+    ///
+    /// # Safety
+    /// `job` must stay valid until [`Relay::wait_done`] has returned for the
+    /// sequence number this call yields.
+    unsafe fn post(&self, job: JobPtr) -> u64 {
+        let seq = {
+            let mut st = relay_lock(&self.state);
+            st.job = Some(job);
+            st.posted += 1;
+            st.panicked = false;
+            st.posted
+        };
+        self.signal.notify_all();
+        seq
+    }
+
+    /// Block until the relay thread has finished job `seq`; reports whether
+    /// that job unwound.
+    fn wait_done(&self, seq: u64) -> bool {
+        let mut st = relay_lock(&self.state);
+        while st.done < seq {
+            st = self
+                .signal
+                .wait(st)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        st.panicked
+    }
+
+    /// Relay thread body: park until a job arrives, run it, report completion.
+    fn run(&self) -> ! {
+        loop {
+            let job = {
+                let mut st = relay_lock(&self.state);
+                loop {
+                    if let Some(job) = st.job.take() {
+                        break job;
+                    }
+                    st = self
+                        .signal
+                        .wait(st)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            };
+            // SAFETY: the posting drain blocks in `PostedJob::drop` until
+            // `done` reaches this job's sequence, so the closure and every
+            // frame it borrows are still live for the whole call. Unwinding is
+            // contained here so `done` always advances — a lost completion
+            // would hang the poster instead of surfacing the panic, which
+            // `PostedJob::drop` re-raises on the poster's own thread (the
+            // per-drain scope did the same).
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                (job.call)(job.data);
+            }))
+            .is_ok();
+            {
+                let mut st = relay_lock(&self.state);
+                st.done += 1;
+                st.panicked = !ok;
+            }
+            self.signal.notify_all();
+        }
+    }
+}
+
+/// The process-wide relay, or `None` when its thread could not be spawned (in
+/// which case every drain keeps using the per-drain spawn).
+fn relay() -> Option<&'static Relay> {
+    static RELAY: OnceLock<Option<&'static Relay>> = OnceLock::new();
+    *RELAY.get_or_init(|| {
+        let relay: &'static Relay = Box::leak(Box::new(Relay::new()));
+        // No QoS call: the thread inherits the class of whichever thread first
+        // engaged a drain — a main-pool worker in the warm-up proof — exactly
+        // as the per-drain scoped threads it replaces did.
+        std::thread::Builder::new()
+            .name("flock-epool-relay".to_string())
+            .spawn(move || relay.run())
+            .ok()
+            .map(|_handle| relay)
+    })
+}
+
+/// Ties a posted job to the drain that posted it. Dropping it — on the normal
+/// path *and* while unwinding — waits for the relay to finish before this
+/// frame (and the broadcast closure borrowing it) goes away, then frees the
+/// relay for the next drain. This is what makes [`JobPtr`] sound.
+struct PostedJob<'a> {
+    relay: &'a Relay,
+    /// Sequence number of this drain's job, or 0 if it never posted one.
+    seq: AtomicU64,
+}
+
+impl Drop for PostedJob<'_> {
+    fn drop(&mut self) {
+        let seq = self.seq.load(Ordering::Relaxed);
+        let panicked = seq != 0 && self.relay.wait_done(seq);
+        self.relay.busy.store(false, Ordering::Release);
+        if panicked && !std::thread::panicking() {
+            panic!("epool: helper-pool broadcast panicked");
+        }
+    }
+}
+
+/// Drain one *engaged* hetero chunk queue: `main_threads` main-pool workers
+/// running `worker`, concurrently with one helper-pool `broadcast`. Returns
+/// only once both sides are finished, so every chunk has been executed exactly
+/// once and its writes are visible.
+///
+/// WAKE ORDER. The relay path requests the broadcast from *inside* the
+/// main-pool `for_each` body, ahead of that worker's own drain loop, so no
+/// E-worker can be woken until a main-pool worker has already entered the
+/// drain — and the signal still has to travel through the mutex, the condvar,
+/// the relay's wake-up and rayon's broadcast injection before one runs. The
+/// per-drain-spawn arm below issues its `spawn` *before* `drain_main` is even
+/// called. The relay therefore starts the helper strictly no earlier, relative
+/// to the main drain, than the shape it replaces; it only removes the thread
+/// creation and join that used to sit on the main thread's critical path.
+///
+/// QUEUE SEMANTICS. Neither arm touches the shared cursor or the chunk
+/// closure: which worker set drains the queue is unobservable in the output by
+/// construction.
+fn drain_hetero<B>(main_threads: usize, worker: &(dyn Fn() + Sync), broadcast: &B, use_relay: bool)
+where
+    B: Fn() + Sync,
+{
+    if use_relay
+        && let Some(relay) = relay()
+        && relay.try_acquire()
+    {
+        let job = PostedJob {
+            relay,
+            seq: AtomicU64::new(0),
+        };
+        let posted = AtomicBool::new(false);
+        (0..main_threads)
+            .into_par_iter()
+            .with_max_len(1)
+            .for_each(|_| {
+                // Exactly one main worker posts, and only once it is already
+                // inside the drain. The relaxed load keeps every later worker
+                // off the contended cache line.
+                if !posted.load(Ordering::Relaxed) && !posted.swap(true, Ordering::Relaxed) {
+                    // SAFETY: `job`'s `Drop` below blocks until the relay
+                    // reports this sequence complete, so `broadcast` outlives
+                    // every dereference of the pointer we hand over.
+                    let seq = unsafe { relay.post(JobPtr::new(broadcast)) };
+                    job.seq.store(seq, Ordering::Relaxed);
+                }
+                worker();
+            });
+        // Explicit: this join is the safety condition, not a cleanup detail.
+        drop(job);
+        return;
+    }
+    // Per-drain relay — kill switch, no relay thread, or the relay is already
+    // carrying a concurrent drain. The scoped thread parks inside `broadcast`
+    // while the E-workers drain; it costs no main-pool worker, and the scope
+    // join bounds the tail wait at one chunk on one efficiency core.
+    std::thread::scope(|s| {
+        s.spawn(|| broadcast());
+        (0..main_threads)
+            .into_par_iter()
+            .with_max_len(1)
+            .for_each(|_| worker());
+    });
 }
 
 pub fn run_hetero_chunks<F>(n_chunks: usize, f: F)
@@ -241,6 +543,19 @@ pub fn run_chunks_with_helper<F>(n_chunks: usize, f: &F, helper: Option<&rayon::
 where
     F: Fn(usize) + Sync,
 {
+    run_chunks_with_helper_relay(n_chunks, f, helper, relay_enabled());
+}
+
+/// [`run_chunks_with_helper`] with the relay choice forced, so tests can cover
+/// both the persistent-relay and the per-drain-spawn arm in one process.
+fn run_chunks_with_helper_relay<F>(
+    n_chunks: usize,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+    use_relay: bool,
+) where
+    F: Fn(usize) + Sync,
+{
     if n_chunks == 0 {
         return;
     }
@@ -273,11 +588,9 @@ where
             .for_each(|_| worker());
     };
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
-        Some(ep) => std::thread::scope(|s| {
-            // The scoped thread parks inside `broadcast` while the E-workers
-            // drain; it costs no main-pool worker. The scope join bounds the
-            // tail wait at one chunk on one efficiency core.
-            s.spawn(|| {
+        Some(ep) => {
+            EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
+            let broadcast = || {
                 ep.broadcast(|_| {
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -287,10 +600,10 @@ where
                         EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
                         f(i);
                     }
-                })
-            });
-            drain_main();
-        }),
+                });
+            };
+            drain_hetero(main_threads, &worker, &broadcast, use_relay);
+        }
         None => drain_main(),
     }
 }
@@ -302,6 +615,21 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
     init: &I,
     f: &F,
     helper: Option<&rayon::ThreadPool>,
+) where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
+    run_chunks_with_helper_stateful_relay(n_chunks, init, f, helper, relay_enabled());
+}
+
+/// [`run_chunks_with_helper_stateful`] with the relay choice forced, so tests
+/// can cover both arms in one process.
+fn run_chunks_with_helper_stateful_relay<S, I, F>(
+    n_chunks: usize,
+    init: &I,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+    use_relay: bool,
 ) where
     I: Fn() -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
@@ -335,8 +663,9 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
             .for_each(|_| worker());
     };
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
-        Some(ep) => std::thread::scope(|s| {
-            s.spawn(|| {
+        Some(ep) => {
+            EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
+            let broadcast = || {
                 ep.broadcast(|_| {
                     let mut state = init();
                     loop {
@@ -347,10 +676,10 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
                         EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
                         f(&mut state, i);
                     }
-                })
-            });
-            drain_main();
-        }),
+                });
+            };
+            drain_hetero(main_threads, &worker, &broadcast, use_relay);
+        }
         None => drain_main(),
     }
 }
@@ -523,6 +852,171 @@ mod tests {
             uses[state.load(Ordering::Relaxed)] += 1;
         }
         assert!(uses.into_iter().any(|n_uses| n_uses > 1));
+    }
+
+    /// Both kickoff arms — the persistent relay and the per-drain spawn the
+    /// kill switch restores — execute every chunk exactly once. Running many
+    /// drains through one relay also proves it is reusable: a per-drain thread
+    /// would have to be recreated, a broken relay would hang here.
+    #[test]
+    fn both_kickoff_arms_run_each_chunk_exactly_once() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let n = 997;
+        for use_relay in [true, false] {
+            for _ in 0..16 {
+                let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+                run_chunks_with_helper_relay(
+                    n,
+                    &|i| {
+                        counts[i].fetch_add(1, Ordering::Relaxed);
+                    },
+                    Some(&helper),
+                    use_relay,
+                );
+                assert!(
+                    counts.iter().all(|c| c.load(Ordering::Relaxed) == 1),
+                    "use_relay={use_relay}"
+                );
+            }
+        }
+    }
+
+    /// The stateful drain behaves identically on both arms: state is per
+    /// worker (not per chunk) and every chunk still runs exactly once.
+    #[test]
+    fn both_kickoff_arms_reuse_stateful_worker_state() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let n = 1000;
+        for use_relay in [true, false] {
+            let next_state = AtomicUsize::new(0);
+            let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+            run_chunks_with_helper_stateful_relay(
+                n,
+                &|| next_state.fetch_add(1, Ordering::Relaxed),
+                &|_state, i| {
+                    counts[i].fetch_add(1, Ordering::Relaxed);
+                },
+                Some(&helper),
+                use_relay,
+            );
+            assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+            assert!(
+                next_state.load(Ordering::Relaxed) < n,
+                "state must be per worker, not per chunk (use_relay={use_relay})"
+            );
+        }
+    }
+
+    /// Drains that overlap in time cannot both own the single relay: the loser
+    /// falls back to the per-drain spawn instead of blocking. Both must still
+    /// complete, and neither may deadlock.
+    #[test]
+    fn concurrent_relayed_drains_all_complete() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let n = 512;
+        let counts: Vec<Vec<AtomicUsize>> = (0..4)
+            .map(|_| (0..n).map(|_| AtomicUsize::new(0)).collect())
+            .collect();
+        std::thread::scope(|s| {
+            for lane in &counts {
+                s.spawn(|| {
+                    for _ in 0..8 {
+                        run_chunks_with_helper_relay(
+                            n,
+                            &|i| {
+                                lane[i].fetch_add(1, Ordering::Relaxed);
+                            },
+                            Some(&helper),
+                            true,
+                        );
+                    }
+                });
+            }
+        });
+        for lane in &counts {
+            assert!(lane.iter().all(|c| c.load(Ordering::Relaxed) == 8));
+        }
+    }
+
+    /// A panicking chunk closure surfaces as a panic on the caller's thread on
+    /// both arms — it must never leave the relay holding a dangling job or a
+    /// stuck `busy` flag, which would hang this test rather than fail it.
+    #[test]
+    fn panicking_chunk_propagates_and_leaves_the_relay_usable() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for use_relay in [true, false] {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_chunks_with_helper_relay(
+                    64,
+                    &|_| panic!("chunk exploded"),
+                    Some(&helper),
+                    use_relay,
+                );
+            }));
+            assert!(caught.is_err(), "use_relay={use_relay}");
+        }
+        // The relay must still serve a normal drain afterwards.
+        let n = 128;
+        let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        run_chunks_with_helper_relay(
+            n,
+            &|i| {
+                counts[i].fetch_add(1, Ordering::Relaxed);
+            },
+            Some(&helper),
+            true,
+        );
+        assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+    }
+
+    /// Engaged drains bump the broadcast counter. Only a lower bound is
+    /// asserted: the counter is process-global and the test harness runs other
+    /// drains concurrently.
+    #[test]
+    fn engaged_drains_count_broadcasts() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let drains = 12;
+        let before = helper_broadcasts_issued();
+        for _ in 0..drains {
+            run_chunks_with_helper(EPOOL_MIN_CHUNKS, &|_| {}, Some(&helper));
+        }
+        assert!(helper_broadcasts_issued() - before >= drains);
+        // A drain with no helper cannot issue a broadcast, so the counter is
+        // still at least where the engaged drains left it.
+        let after_engaged = helper_broadcasts_issued();
+        run_chunks_with_helper(1024, &|_| {}, None);
+        assert!(helper_broadcasts_issued() >= after_engaged);
+    }
+
+    /// The kill switch reads exactly `"1"`; nothing else disables the relay.
+    #[test]
+    fn relay_kill_switch_matches_exactly_one() {
+        assert!(relay_killed_by(Some("1")));
+        for keep in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("11"),
+            Some(" 1"),
+        ] {
+            assert!(!relay_killed_by(keep), "{keep:?} must not kill the relay");
+        }
     }
 
     /// The stateful single-thread path preserves strict chunk order and owns

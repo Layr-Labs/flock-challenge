@@ -3122,6 +3122,33 @@ pub fn fold_and_compute_round_pair_optimized(
 /// buffers, so the ~22 decreasing-size buffers are allocated/freed once rather
 /// than per round. The per-round `munmap` of the old buffer (64 MB at m=29)
 /// runs single-threaded and otherwise caps the tail's parallel speedup.
+/// Floor on per-chunk output size for the small tail rounds: keep each
+/// chunk's output at or above `2^TAIL_CHUNK_MIN_OUT_LOG` elements (8 KiB of
+/// F128) so the fixed 512-chunk fan-out never shrinks to sub-kilobyte chunks
+/// whose dispatch overhead exceeds their work — measured flat at log_n 16
+/// and inverted at log_n 15 under thread scaling. Regrouping across chunk
+/// boundaries is exact: the lo/hi split is an exact tensor factorisation and
+/// deferred reduction is F2-linear (see the n_hi 9-vs-11 regression test).
+const TAIL_CHUNK_MIN_OUT_LOG: usize = 9;
+
+/// Kill switch: `FLOCK_NO_ZC_TAIL_ADAPT=1` (exact '1') restores the fixed
+/// `MAX_N_HI` fan-out for these rounds.
+fn zc_tail_adapt_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_ZC_TAIL_ADAPT").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Size-adaptive hi-split for the generic tail rounds: cap the chunk count
+/// so each chunk keeps at least `2^TAIL_CHUNK_MIN_OUT_LOG` outputs.
+fn tail_n_hi_for(half: usize) -> usize {
+    let log_half = half.trailing_zeros() as usize;
+    SplitEqGhash::MAX_N_HI
+        .min(log_half.saturating_sub(TAIL_CHUNK_MIN_OUT_LOG))
+        .max(1)
+}
+
 pub fn fold_and_compute_round_pair_into(
     a: &[F128],
     b: &[F128],
@@ -3130,14 +3157,19 @@ pub fn fold_and_compute_round_pair_into(
     r_fold: F128,
     r_next: &[F128],
 ) -> (F128, F128) {
+    let default_n_hi = if zc_tail_adapt_enabled() {
+        tail_n_hi_for(a.len() / 2)
+    } else {
+        SplitEqGhash::MAX_N_HI
+    };
     #[cfg(target_arch = "aarch64")]
     let n_hi = if a.len() / 2 >= LARGE_TAIL_EQ_MIN_HALF && zc_tail_split11_enabled() {
         LARGE_TAIL_EQ_N_HI
     } else {
-        SplitEqGhash::MAX_N_HI
+        default_n_hi
     };
     #[cfg(not(target_arch = "aarch64"))]
-    let n_hi = SplitEqGhash::MAX_N_HI;
+    let n_hi = default_n_hi;
 
     fold_and_compute_round_pair_into_with_n_hi(a, b, a_out, b_out, r_fold, r_next, n_hi)
 }
