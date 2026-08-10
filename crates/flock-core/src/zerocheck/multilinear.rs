@@ -2541,7 +2541,7 @@ pub(crate) fn fold2_plain_and_round6_into(
     // Same scheduling policy as the plain tail: DRAM-bound sizes drain
     // through the hetero E-core queue, LLC-resident ones stay on rayon.
     #[cfg(target_arch = "aarch64")]
-    let hetero = quarter >= (1usize << 21) && zc_tail_hetero_enabled();
+    let hetero = quarter >= (1usize << 20) && zc_tail_hetero_enabled(); // was 2^21; 2^20 covers ranked R7/8 out
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
@@ -2780,7 +2780,7 @@ pub(crate) fn fold2_plain_and_round67_into(
 
     // Same scheduling policy as the plain composed pass.
     #[cfg(target_arch = "aarch64")]
-    let hetero = quarter >= (1usize << 21) && zc_tail_hetero_enabled();
+    let hetero = quarter >= (1usize << 20) && zc_tail_hetero_enabled(); // was 2^21; 2^20 covers ranked R7/8 out
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
@@ -3512,7 +3512,7 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     // H2: drain the DRAM-bound rounds (outputs past LLC) through the hetero
     // E-core queue — the same contract as the T3 compact reconstruction.
     #[cfg(target_arch = "aarch64")]
-    let hetero = half >= (1usize << 21) && zc_tail_hetero_enabled();
+    let hetero = half >= (1usize << 20) && zc_tail_hetero_enabled(); // was 2^21; 2^20 covers 32 MiB half-steps
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
