@@ -6351,7 +6351,19 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // so they do not stack under wtns_next (already committed) + induce temps.
         // Bit-identical: no further reads of wtns_prev.mat/tree this iteration.
         crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-        wtns_prev.tree = Vec::new();
+        // Recycle the intermediate level's flat tree through the same pool the
+        // final level uses (see the `give_hash_tree` above the trace block):
+        // dropping it here returned multi-MiB of resident pages to the OS that
+        // the next prove's `take_hash_tree` then re-faulted in. Allocation-only
+        // and transcript-invariant by construction — the tree is dead per the
+        // note above, so no read of it can observe the pool.
+        // A/B-CONTROL: FLOCK_NO_TREE_POOL_FULL=1 (exact '1') restores the
+        // incumbent drop.
+        if crate::scratch::tree_pool_full_enabled() {
+            crate::scratch::give_hash_tree(std::mem::take(&mut wtns_prev.tree));
+        } else {
+            wtns_prev.tree = Vec::new();
+        }
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
         let (basis_i_induced, enforced_sum_i) =

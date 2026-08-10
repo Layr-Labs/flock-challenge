@@ -661,8 +661,32 @@ pub fn give_u8(v: Vec<u8>) {
 
 static POOL_HASH_TREE: Mutex<Vec<Vec<crate::merkle::Hash>>> = Mutex::new(Vec::new());
 
-/// Only the two recursive shapes (plus transient test shapes) ever exist.
-const MAX_POOLED_HASH_TREES: usize = 4;
+/// One prove hands back all five of its level trees (L0, the recursive
+/// levels, and the final level), so a four-slot cap evicted one of them —
+/// smallest-first — on every prove and re-faulted it on the next. Six slots
+/// hold the whole per-prove set with room for the transient test shapes.
+const MAX_POOLED_HASH_TREES: usize = 6;
+
+/// Strict kill switch for the intermediate recursive-level tree recycle in
+/// the Ligerito opening spine (the one level tree that used to be dropped
+/// instead of pooled). Only the exact value `1` restores the incumbent
+/// drop. Pooling is allocation plumbing — it changes only which pages stay
+/// resident, never proof bytes. With the recycle off, a prove returns just
+/// the two trees it always returned, so the pool never reaches even the old
+/// four-slot cap and the raised cap above is inert under the switch: this
+/// is an exact same-binary rollback.
+pub(crate) const ENV_NO_TREE_POOL_FULL: &str = "FLOCK_NO_TREE_POOL_FULL";
+
+fn tree_pool_full_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+pub(crate) fn tree_pool_full_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        tree_pool_full_value_enabled(std::env::var_os(ENV_NO_TREE_POOL_FULL).as_deref())
+    })
+}
 
 /// Take a length-`n` hash vector, preferring a pooled buffer (smallest
 /// capacity >= `n`); falls back to a fresh uninitialized allocation.
@@ -838,6 +862,26 @@ mod tests {
         }
         assert!(POOL.lock().unwrap().len() <= MAX_POOLED);
         clear();
+    }
+
+    #[test]
+    fn hash_tree_pool_is_bounded() {
+        // Unconditional invariant: every `give_hash_tree` evicts back to the
+        // cap, so the assertion holds whatever else the process pooled.
+        for _ in 0..(MAX_POOLED_HASH_TREES + 4) {
+            give_hash_tree(take_hash_tree(16));
+        }
+        assert!(POOL_HASH_TREE.lock().unwrap().len() <= MAX_POOLED_HASH_TREES);
+    }
+
+    #[test]
+    fn exact_one_is_the_only_tree_pool_full_kill_value() {
+        use std::ffi::OsStr;
+        assert_eq!(ENV_NO_TREE_POOL_FULL, "FLOCK_NO_TREE_POOL_FULL");
+        assert!(!tree_pool_full_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(tree_pool_full_value_enabled(value.map(OsStr::new)));
+        }
     }
 
     #[test]
