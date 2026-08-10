@@ -892,17 +892,21 @@ pub(super) unsafe fn butterfly_block_pair(chunk: &mut [F128], t_a: F128, t_b: F1
 /// Same contract as the portable form; caller guarantees equal slice
 /// lengths (asserted upstream) and the `aes` target feature.
 #[target_feature(enable = "aes")]
-unsafe fn butterfly_fused_2layer_row_with_q(
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_2layer(
     a: &mut [F128],
     b: &mut [F128],
     c: &mut [F128],
     d: &mut [F128],
-    to: core::arch::aarch64::uint64x2_t,
-    ta: core::arch::aarch64::uint64x2_t,
-    tb: core::arch::aarch64::uint64x2_t,
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
 ) {
     use core::arch::aarch64::*;
     unsafe {
+        let to = vld1q_u64((&raw const t_outer).cast::<u64>());
+        let ta = vld1q_u64((&raw const t_inner_a).cast::<u64>());
+        let tb = vld1q_u64((&raw const t_inner_b).cast::<u64>());
         for lane in 0..a.len() {
             let xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
             let xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
@@ -920,81 +924,6 @@ unsafe fn butterfly_fused_2layer_row_with_q(
             vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb);
             vst1q_u64((&raw mut c[lane]).cast::<u64>(), fc);
             vst1q_u64((&raw mut d[lane]).cast::<u64>(), fd);
-        }
-    }
-}
-
-#[target_feature(enable = "aes")]
-#[allow(clippy::too_many_arguments)]
-/// # Safety
-/// Same contract as the portable form; the caller guarantees equal slice
-/// lengths and the `aes` target feature.
-pub(super) unsafe fn butterfly_fused_2layer(
-    a: &mut [F128],
-    b: &mut [F128],
-    c: &mut [F128],
-    d: &mut [F128],
-    t_outer: F128,
-    t_inner_a: F128,
-    t_inner_b: F128,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let to = vld1q_u64((&raw const t_outer).cast::<u64>());
-        let ta = vld1q_u64((&raw const t_inner_a).cast::<u64>());
-        let tb = vld1q_u64((&raw const t_inner_b).cast::<u64>());
-        butterfly_fused_2layer_row_with_q(a, b, c, d, to, ta, tb);
-    }
-}
-
-/// Process every row group in one fused-two-layer block while keeping the
-/// three twiddles in q registers across the block.
-///
-/// # Safety
-/// The caller guarantees the asserted four-quarter geometry, that any odd
-/// tail is valid for each row group, and the `aes` target feature.
-#[target_feature(enable = "aes")]
-#[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn butterfly_fused_2layer_rows(
-    block: &mut [F128],
-    t_outer: F128,
-    t_inner_a: F128,
-    t_inner_b: F128,
-    quarter: usize,
-    num_ntts: usize,
-    odd_tail: usize,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let to = vld1q_u64((&raw const t_outer).cast::<u64>());
-        let ta = vld1q_u64((&raw const t_inner_a).cast::<u64>());
-        let tb = vld1q_u64((&raw const t_inner_b).cast::<u64>());
-        let stride = quarter * num_ntts;
-        let (top_half, bot_half) = block.split_at_mut(2 * stride);
-        let (q1, q2) = top_half.split_at_mut(stride);
-        let (q3, q4) = bot_half.split_at_mut(stride);
-
-        for (r, (((row_a, row_b), row_c), row_d)) in q1
-            .chunks_exact_mut(num_ntts)
-            .zip(q2.chunks_exact_mut(num_ntts))
-            .zip(q3.chunks_exact_mut(num_ntts))
-            .zip(q4.chunks_exact_mut(num_ntts))
-            .enumerate()
-        {
-            let lanes = if r & 1 == 1 {
-                num_ntts - odd_tail
-            } else {
-                num_ntts
-            };
-            butterfly_fused_2layer_row_with_q(
-                &mut row_a[..lanes],
-                &mut row_b[..lanes],
-                &mut row_c[..lanes],
-                &mut row_d[..lanes],
-                to,
-                ta,
-                tb,
-            );
         }
     }
 }

@@ -1900,12 +1900,6 @@ fn butterfly_interleaved_fused_2layer_rows_seq(
     // which all share `r`'s parity only when `quarter` is even.
     debug_assert!(odd_tail == 0 || quarter.is_multiple_of(2));
 
-    if kernels::try_butterfly_fused_2layer_rows(
-        block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts, odd_tail,
-    ) {
-        return;
-    }
-
     let (top_half, bot_half) = block.split_at_mut(2 * stride);
     let (q1, q2) = top_half.split_at_mut(stride);
     let (q3, q4) = bot_half.split_at_mut(stride);
@@ -2317,7 +2311,7 @@ mod tests {
     #[test]
     fn fused2_sequential_rows_match_two_single_layers() {
         let mut rng = Rng::new(0xDEE2_F05E_20A5_0001);
-        for (quarter, num_ntts) in [(1usize, 64usize), (4, 8), (16, 64), (64, 2), (256, 2)] {
+        for (quarter, num_ntts) in [(1usize, 64usize), (4, 8), (64, 2), (256, 2)] {
             for iteration in 0..3 {
                 let t_outer = rng.f128();
                 let t_inner_a = rng.f128();

@@ -514,49 +514,6 @@ pub(super) fn accumulate_convert_ab(
     portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
 }
 
-/// Multiply-free twin of [`accumulate_convert_ab`], for the banked `eq_lo`
-/// tensor fold.
-///
-/// `convert` is the pre-scaled table `T_w[i] = convert[i] * eq_top[w]` for the
-/// current chunk's high `x_lo` bits, and `bank` is the accumulator for its low
-/// `x_lo` bits; the caller applies `eq_bot[u]` to each bank once per `x_hi`
-/// band. Same gathers as the incumbent, zero GHASH multiplies.
-#[inline]
-pub(super) fn accumulate_convert_ab_nomul(
-    chunk_ab_bytes: &[[u8; 64]; 16],
-    n_b_med: usize,
-    convert: &[super::F128],
-    bank: &mut [super::F128; 64],
-) {
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
-    // every table-selected load and every bank slot drained.
-    unsafe {
-        aarch64::accumulate_convert_ab_nomul(chunk_ab_bytes, n_b_med, convert, bank);
-    }
-
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "vpclmulqdq"
-    ))]
-    // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
-    // cover every four-lane load/store.
-    unsafe {
-        x86_64::accumulate_convert_ab_nomul_x86_avx512(chunk_ab_bytes, n_b_med, convert, bank);
-    }
-
-    #[cfg(not(any(
-        target_arch = "aarch64",
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        )
-    )))]
-    portable::accumulate_convert_ab_nomul(chunk_ab_bytes, n_b_med, convert, bank);
-}
-
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
 /// kernel is tested against.
 ///

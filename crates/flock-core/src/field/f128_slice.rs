@@ -215,32 +215,6 @@ pub(crate) fn fold_two_and_msg(
     unsafe { aarch64::fold_two_and_msg(f, b, base, nf, nb, r) }
 }
 
-/// Fold two same-sized states into their own lower halves and return the next
-/// round's message. The allocation and capacity of both vectors are retained.
-#[inline]
-pub(crate) fn fold_two_and_msg_in_place(
-    f: &mut Vec<F128>,
-    b: &mut Vec<F128>,
-    r: F128,
-) -> (F128, F128) {
-    assert_eq!(f.len(), b.len());
-    assert!(f.len().is_multiple_of(4));
-    let half = f.len() / 2;
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: the cfg gate supplies PMULL and the length checks establish the
-    // complete in-place kernel shape. The kernel's raw-pointer loop loads each
-    // source group before overwriting its lower-half output slots.
-    let message = unsafe { aarch64::fold_two_and_msg_in_place(f, b, r) };
-
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-    let message = portable::fold_two_and_msg_in_place(f, b, r);
-
-    f.truncate(half);
-    b.truncate(half);
-    message
-}
-
 /// Fold `f` and `b`, add `scale * basis_addend` to the folded basis, and
 /// accumulate the next-round message over the corrected `(nf, nb)` state.
 ///
@@ -579,56 +553,6 @@ mod tests {
         fold_pairs(&src, 3, &mut actual, r);
 
         assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn direct_fold8_in_place_five_rounds_match_allocating_oracle() {
-        let mut state = 0x494E_504C_4143_4538u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-
-        for trial in 0..8 {
-            let mut actual_f: Vec<F128> = (0..8192).map(|_| F128::new(next(), next())).collect();
-            let mut actual_b: Vec<F128> = (0..8192).map(|_| F128::new(next(), next())).collect();
-            let mut expected_f = actual_f.clone();
-            let mut expected_b = actual_b.clone();
-            let actual_f_ptr = actual_f.as_ptr();
-            let actual_b_ptr = actual_b.as_ptr();
-            let actual_f_capacity = actual_f.capacity();
-            let actual_b_capacity = actual_b.capacity();
-
-            for round in 0..5 {
-                let r = F128::new(next(), next());
-                let half = expected_f.len() / 2;
-                let mut next_f = vec![F128::ZERO; half];
-                let mut next_b = vec![F128::ZERO; half];
-                portable::fold_pairs(&expected_f, 0, &mut next_f, r);
-                portable::fold_pairs(&expected_b, 0, &mut next_b, r);
-                let mut expected_message = (F128::ZERO, F128::ZERO);
-                for t in (0..half).step_by(2) {
-                    expected_message.0 += next_f[t] * next_b[t];
-                    expected_message.1 += (next_f[t] + next_f[t + 1]) * (next_b[t] + next_b[t + 1]);
-                }
-
-                let actual_message = fold_two_and_msg_in_place(&mut actual_f, &mut actual_b, r);
-                assert_eq!(actual_f, next_f, "f trial={trial} round={round}");
-                assert_eq!(actual_b, next_b, "b trial={trial} round={round}");
-                assert_eq!(
-                    actual_message, expected_message,
-                    "message trial={trial} round={round}"
-                );
-                assert_eq!(actual_f.as_ptr(), actual_f_ptr);
-                assert_eq!(actual_b.as_ptr(), actual_b_ptr);
-                assert_eq!(actual_f.capacity(), actual_f_capacity);
-                assert_eq!(actual_b.capacity(), actual_b_capacity);
-                expected_f = next_f;
-                expected_b = next_b;
-            }
-        }
     }
 
     /// The `nt_stores` arm of the fold2 kernel is size-gated to beyond-LLC

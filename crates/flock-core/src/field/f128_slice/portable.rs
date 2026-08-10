@@ -33,45 +33,6 @@ pub(super) fn fold_pairs(src: &[F128], base: usize, dst: &mut [F128], r: F128) {
     }
 }
 
-/// Portable in-place counterpart of the fused AArch64 fold/message kernel.
-/// Each four-element source group is copied before its two output slots are
-/// overwritten, so later source groups remain intact.
-#[inline]
-#[allow(dead_code)]
-pub(super) fn fold_two_and_msg_in_place(f: &mut [F128], b: &mut [F128], r: F128) -> (F128, F128) {
-    debug_assert_eq!(f.len(), b.len());
-    debug_assert!(f.len().is_multiple_of(4));
-    let half = f.len() / 2;
-    let one_plus_r = F128::ONE + r;
-    let mut u_0 = F128::ZERO;
-    let mut u_2 = F128::ZERO;
-    let mut t = 0;
-    while t < half {
-        let source = 2 * t;
-        let f_even_0 = f[source];
-        let f_odd_0 = f[source + 1];
-        let f_even_1 = f[source + 2];
-        let f_odd_1 = f[source + 3];
-        let b_even_0 = b[source];
-        let b_odd_0 = b[source + 1];
-        let b_even_1 = b[source + 2];
-        let b_odd_1 = b[source + 3];
-
-        let f_0 = f_even_0 * one_plus_r + f_odd_0 * r;
-        let f_1 = f_even_1 * one_plus_r + f_odd_1 * r;
-        let b_0 = b_even_0 * one_plus_r + b_odd_0 * r;
-        let b_1 = b_even_1 * one_plus_r + b_odd_1 * r;
-        f[t] = f_0;
-        f[t + 1] = f_1;
-        b[t] = b_0;
-        b[t + 1] = b_1;
-        u_0 += f_0 * b_0;
-        u_2 += (f_0 + f_1) * (b_0 + b_1);
-        t += 2;
-    }
-    (u_0, u_2)
-}
-
 /// Portable reference for the fused deferred-basis/OOD-correction fold.
 /// Shape and alignment checks live in the architecture-selecting wrapper.
 #[inline]
