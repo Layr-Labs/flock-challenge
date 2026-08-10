@@ -37,3 +37,5 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker 809314772-r949
 
 // dispersion-resample marker 332358
+
+// witgen-gmix-carry-algebra marker 772184903-r968-add-carry-xor-elim

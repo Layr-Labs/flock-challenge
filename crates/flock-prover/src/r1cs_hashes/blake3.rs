@@ -2045,13 +2045,20 @@ pub(crate) mod witgen_simd {
     /// The three row values retain their irrelevant bit 31. [`W32::push`]
     /// consumes only the low 31 bits and overwrites that dirty boundary bit,
     /// removing two vector masks from every one of the 336 additions.
+    ///
+    /// Algebraic form (r968): `left = sum ⊕ y` and `right = sum ⊕ x` are
+    /// identical to the classical `cin = sum ⊕ x ⊕ y; left = x ⊕ cin;
+    /// right = y ⊕ cin` expansion, so the explicit `cin` temporary and its two
+    /// XORs drop out. Per compression that removes 2·336 NEON XORs from the
+    /// G-mix add spine (6 ADDs × 56 G) while preserving every pushed carry
+    /// row bit-exactly — pure ALU, not a store/drain/floor tune.
     #[inline(always)]
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
         unsafe {
             let sum = vaddq_u32(x, y);
-            let cin = veorq_u32(veorq_u32(sum, x), y);
-            let left = veorq_u32(x, cin);
-            let right = veorq_u32(y, cin);
+            // left = x ⊕ cin = sum ⊕ y; right = y ⊕ cin = sum ⊕ x.
+            let left = veorq_u32(sum, y);
+            let right = veorq_u32(sum, x);
             let carry = vandq_u32(left, right);
             (sum, left, right, carry)
         }
