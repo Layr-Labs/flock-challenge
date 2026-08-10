@@ -508,6 +508,90 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+
+/// Banked deferred-reduction folds of four adjacent output slots. Each weight
+/// loads once per bank and fans out to four independent Karatsuba accumulators
+/// (two `xor_karatsuba_const_pair` calls). Bit-identical to four
+/// [`fold_banked_slot`] results; doubles the slots2 weight-sharing width.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `input` must hold at least
+/// `4 * BANKS` elements, with slot `s` starting at `input[s * BANKS]`.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_slots4<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    input: &[F128],
+) -> [F128; 4] {
+    unsafe {
+        debug_assert!(input.len() >= 4 * BANKS);
+        let zero = vdupq_n_u64(0);
+        let mut s0 = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut s1 = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut s2 = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut s3 = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+
+        let w = weight.as_ptr();
+        let x0 = input.as_ptr();
+        let x1 = input.as_ptr().add(BANKS);
+        let x2 = input.as_ptr().add(2 * BANKS);
+        let x3 = input.as_ptr().add(3 * BANKS);
+        let main = BANKS & !1;
+        let mut bank = 0usize;
+        while bank < main {
+            let w0 = vld1q_u64(w.add(bank).cast::<u64>());
+            let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
+            let x00 = vld1q_u64(x0.add(bank).cast::<u64>());
+            let x10 = vld1q_u64(x1.add(bank).cast::<u64>());
+            let x20 = vld1q_u64(x2.add(bank).cast::<u64>());
+            let x30 = vld1q_u64(x3.add(bank).cast::<u64>());
+            let x01 = vld1q_u64(x0.add(bank + 1).cast::<u64>());
+            let x11 = vld1q_u64(x1.add(bank + 1).cast::<u64>());
+            let x21 = vld1q_u64(x2.add(bank + 1).cast::<u64>());
+            let x31 = vld1q_u64(x3.add(bank + 1).cast::<u64>());
+            xor_karatsuba_const_pair(&mut s0, &mut s1, x00, x10, w0);
+            xor_karatsuba_const_pair(&mut s2, &mut s3, x20, x30, w0);
+            xor_karatsuba_const_pair(&mut s0, &mut s1, x01, x11, w1);
+            xor_karatsuba_const_pair(&mut s2, &mut s3, x21, x31, w1);
+            bank += 2;
+        }
+        if bank < BANKS {
+            let wk = vld1q_u64(w.add(bank).cast::<u64>());
+            let a = vld1q_u64(x0.add(bank).cast::<u64>());
+            let b = vld1q_u64(x1.add(bank).cast::<u64>());
+            let c = vld1q_u64(x2.add(bank).cast::<u64>());
+            let d = vld1q_u64(x3.add(bank).cast::<u64>());
+            xor_karatsuba_const_pair(&mut s0, &mut s1, a, b, wk);
+            xor_karatsuba_const_pair(&mut s2, &mut s3, c, d, wk);
+        }
+
+        let r01 = reduce_wide_pair(karatsuba_to_wide(s0), karatsuba_to_wide(s1));
+        let r23 = reduce_wide_pair(karatsuba_to_wide(s2), karatsuba_to_wide(s3));
+        [
+            transmute::<uint64x2_t, F128>(r01[0]),
+            transmute::<uint64x2_t, F128>(r01[1]),
+            transmute::<uint64x2_t, F128>(r23[0]),
+            transmute::<uint64x2_t, F128>(r23[1]),
+        ]
+    }
+}
+
 /// Deferred-reduction round-zero message `(u_0, u_2)` over paired slots.
 ///
 /// Bitwise-identical to the scalar pair loop: both accumulate
