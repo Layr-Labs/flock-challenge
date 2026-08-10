@@ -728,6 +728,90 @@ mod deferred_stripe_tests {
         ));
         assert_eq!(helper_actual, expected);
     }
+
+    /// The witgen-side stage emission (`stripe_words_from_group_stages`) must
+    /// reproduce [`fill_deferred_lincheck_stripe_group`] byte-for-byte on
+    /// compact congruent shapes (the exact fill oracle's cheap unit-test
+    /// surface). The stages are derived from packed z through the SIMD
+    /// builder's pinned stage↔z relationship — u32 word `w` of quad-lane `j`
+    /// at `stage[w*4 + j]`, drained to z by `dump_range` — so z stays the
+    /// single ground truth on both sides of the comparison.
+    #[test]
+    fn witgen_stage_stripe_emission_matches_deferred_fill_oracle() {
+        use crate::r1cs_hashes::common::{QUAD_STAGE_LANES, stripe_words_from_group_stages};
+        for (k_log, useful_bits) in [(7usize, 128usize), (8, 180), (9, 460)] {
+            let k = 1usize << k_log;
+            let f128_per_block = k / 128;
+            let u64_per_block = k / 64;
+            let u32_per_block = k / 32;
+            let group_f128 = 8 * f128_per_block;
+            let useful_words = useful_bits.div_ceil(64);
+            let n_groups = 3usize;
+            let z: Vec<F128> = (0..n_groups * group_f128)
+                .map(|i| {
+                    let x = (i as u64 ^ ((k_log as u64) << 40)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    F128::new(x ^ x.rotate_left(17), (!x).rotate_right(11))
+                })
+                .collect();
+            for group in 0..n_groups {
+                let mut oracle = vec![0xa5u8; u64_per_block * 64];
+                fill_deferred_lincheck_stripe_group(
+                    &z,
+                    &mut oracle,
+                    group,
+                    group_f128,
+                    u64_per_block,
+                    useful_words,
+                );
+                // Derive the two quad stages from the SAME raw u64 view the
+                // oracle reads.
+                let z_group = &z[group * group_f128..(group + 1) * group_f128];
+                // SAFETY: same repr(C) two-LE-u64-halves view as the oracle.
+                let z_u64: &[u64] = unsafe {
+                    std::slice::from_raw_parts(z_group.as_ptr().cast::<u64>(), z_group.len() * 2)
+                };
+                let mut stage_lo = vec![0u32; u32_per_block * QUAD_STAGE_LANES];
+                let mut stage_hi = vec![0u32; u32_per_block * QUAD_STAGE_LANES];
+                for j in 0..8 {
+                    let (stage, lane) = if j < QUAD_STAGE_LANES {
+                        (&mut stage_lo, j)
+                    } else {
+                        (&mut stage_hi, j - QUAD_STAGE_LANES)
+                    };
+                    for w in 0..u32_per_block {
+                        let word = z_u64[j * u64_per_block + w / 2];
+                        stage[w * QUAD_STAGE_LANES + lane] = if w.is_multiple_of(2) {
+                            word as u32
+                        } else {
+                            (word >> 32) as u32
+                        };
+                    }
+                }
+                let mut actual = vec![0xa5u8; u64_per_block * 64];
+                let mut emitted = 0usize;
+                stripe_words_from_group_stages(
+                    &stage_lo,
+                    &stage_hi,
+                    u32_per_block,
+                    useful_words,
+                    |word, chunk| {
+                        actual[word * 64..word * 64 + 64].copy_from_slice(chunk);
+                        emitted += 1;
+                    },
+                );
+                assert_eq!(emitted, useful_words);
+                assert_eq!(
+                    actual[..useful_words * 64],
+                    oracle[..useful_words * 64],
+                    "k_log={k_log} useful_bits={useful_bits} group={group}"
+                );
+                // The emission never touches the tail (the incumbent
+                // production contract); the oracle's zero pad is test-only.
+                assert!(actual[useful_words * 64..].iter().all(|&b| b == 0xa5));
+                assert!(oracle[useful_words * 64..].iter().all(|&b| b == 0));
+            }
+        }
+    }
 }
 
 /// Build the witness commitment and the challenge-independent half of

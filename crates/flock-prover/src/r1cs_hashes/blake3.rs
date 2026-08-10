@@ -1589,6 +1589,8 @@ fn build_block_witness_ab_stream_into(
 // `FLOCK_WITGEN_SIMD_PLAIN_STORES=1` replaces every z/a/b NT drain with plain
 // stores (same-binary store-flavor A/B). `FLOCK_NO_WITGEN_Z_NT=1` disables
 // only z's deferred-stream NT drain while preserving the incumbent a/b mode.
+// `FLOCK_NO_WITGEN_STRIPE=1` kills the warmup-latched witgen-side lincheck
+// stripe emission (the timed prove keeps the deferred fill).
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "aarch64")]
@@ -2134,6 +2136,38 @@ pub(crate) mod witgen_simd {
         elide: [bool; 3],
     ) {
         unsafe {
+            build_quad_witness_ab_stream_neon_elide_staged(
+                inputs,
+                z,
+                a,
+                b,
+                z_nt,
+                ab_nt,
+                elide,
+                core::ptr::null_mut(),
+            )
+        }
+    }
+
+    /// [`build_quad_witness_ab_stream_neon_elide`] with an optional caller
+    /// owned z stage: when `z_stage_out` is non-null the builder uses it (a
+    /// fully-written `[V4; U32_PER_BLOCK]`) instead of its stack temporary,
+    /// so the word-major quad words survive the call for the witgen-side
+    /// lincheck stripe emission (`stripe_words_from_group_stages`). The
+    /// drains and every store are byte-identical either way — only the
+    /// stage's address changes.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn build_quad_witness_ab_stream_neon_elide_staged(
+        inputs: QuadInput<'_>,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        z_nt: bool,
+        ab_nt: bool,
+        elide: [bool; 3],
+        z_stage_out: *mut V4,
+    ) {
+        unsafe {
             let (cv_v, m, tlo, thi, blen, flags) = match inputs {
                 QuadInput::Blocks(inputs) => {
                     // Ordinary callers retain the incumbent AoS gather and
@@ -2235,10 +2269,16 @@ pub(crate) mod witgen_simd {
             // 482..511. Keep the stages uninitialized so each quad avoids
             // three redundant 8 KiB bzero calls before those full writes.
             let zero = vdupq_n_u32(0);
-            let mut zs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let mut zs_local = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
             let mut ast = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
             let mut bs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
-            let zs = zs.as_mut_ptr().cast::<V4>();
+            // Caller-persisted z stage (witgen-side stripe) or the incumbent
+            // stack temporary — same layout, same full write, same drain.
+            let zs = if z_stage_out.is_null() {
+                zs_local.as_mut_ptr().cast::<V4>()
+            } else {
+                z_stage_out
+            };
             let ast = ast.as_mut_ptr().cast::<V4>();
             let bs = bs.as_mut_ptr().cast::<V4>();
 
@@ -2500,9 +2540,33 @@ pub(crate) mod witgen_simd {
         // Omit the eager L1-hot transpose only when the exact streamed Metal
         // lease was actually acquired. A warmup/failure/non-ranked miss keeps
         // the ordinary stripe so no fallback can observe an absent buffer.
+        let defer_requested = defer_ranked_stripe;
         let defer_ranked_stripe = defer_ranked_stripe && stream.is_some();
-        let mut z_lincheck =
-            (!defer_ranked_stripe).then(|| flock_core::scratch::take_u8((n_total / 8) * K));
+        // Witgen-side stripe: with the stream live and the warmup probe
+        // latched On, emit the stripe from the L1-hot quad stages while z
+        // KEEPS its non-temporal stores (`select_z_nt` still sees
+        // `defer_ranked_stripe`); the prover's deferred fill (and its 482 MiB
+        // z re-read) is skipped entirely because the caller receives a ready
+        // stripe. Anything else — kill switch, unprobed, rejected — keeps
+        // the incumbent deferred path bit-for-bit.
+        let witgen_stripe = super::select_witgen_stripe(
+            defer_ranked_stripe,
+            super::witgen_stripe_killed(),
+            super::witgen_stripe_latch::PROD.latched_on(),
+        );
+        // Warmup probe: the deferral selector fired but there is no Metal
+        // lease (the untimed warmup), so the eager arm below runs anyway;
+        // dual-compute each group's stripe chunks and byte-compare. The CAS
+        // gives exactly one call the probe.
+        let probe_witgen_stripe = super::select_witgen_stripe_probe(
+            defer_requested,
+            stream.is_some(),
+            super::witgen_stripe_killed(),
+        ) && super::witgen_stripe_latch::PROD.try_begin_probe();
+        let probe_mismatch = std::sync::atomic::AtomicBool::new(false);
+        let probe_groups = std::sync::atomic::AtomicUsize::new(0);
+        let mut z_lincheck = (!defer_ranked_stripe || witgen_stripe)
+            .then(|| flock_core::scratch::take_u8((n_total / 8) * K));
 
         #[derive(Clone, Copy)]
         struct WritePtr<T>(*mut T);
@@ -2546,7 +2610,21 @@ pub(crate) mod witgen_simd {
             // untouched).
             #[cfg(debug_assertions)]
             debug_verify_elided_group(z_grp, a_grp, b_grp, elide);
+            // Witgen-side stripe (or its warmup probe): persist the two quad
+            // z stages past the builder calls so the group's stripe can be
+            // emitted from L1 instead of re-reading z. 16 KiB of worker
+            // stack; both stages are fully written by their builder call.
+            let want_stages = witgen_stripe || probe_witgen_stripe;
+            let mut stage_lo = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let mut stage_hi = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
             for half in 0..2 {
+                let z_stage_out: *mut V4 = if !want_stages {
+                    core::ptr::null_mut()
+                } else if half == 0 {
+                    stage_lo.as_mut_ptr().cast::<V4>()
+                } else {
+                    stage_hi.as_mut_ptr().cast::<V4>()
+                };
                 let first = 8 * g + 4 * half;
                 let base = half * 4 * F128_PER_BLOCK;
                 // Ranked lazy input: generate the four protected-generator
@@ -2559,7 +2637,7 @@ pub(crate) mod witgen_simd {
                         // SAFETY: each quad fully owns its four block slots in
                         // every buffer; groups are disjoint across workers.
                         unsafe {
-                            build_quad_witness_ab_stream_neon_elide(
+                            build_quad_witness_ab_stream_neon_elide_staged(
                                 QuadInput::Seeded(&seeded),
                                 z_grp[base..].as_mut_ptr() as *mut u32,
                                 a_grp[base..].as_mut_ptr() as *mut u32,
@@ -2567,6 +2645,7 @@ pub(crate) mod witgen_simd {
                                 z_nt,
                                 nt,
                                 elide,
+                                z_stage_out,
                             );
                         }
                         continue;
@@ -2600,7 +2679,7 @@ pub(crate) mod witgen_simd {
                 // SAFETY: each quad fully owns its four block slots in every
                 // buffer; groups are disjoint across workers.
                 unsafe {
-                    build_quad_witness_ab_stream_neon_elide(
+                    build_quad_witness_ab_stream_neon_elide_staged(
                         QuadInput::Blocks(quad),
                         z_grp[base..].as_mut_ptr() as *mut u32,
                         a_grp[base..].as_mut_ptr() as *mut u32,
@@ -2608,33 +2687,107 @@ pub(crate) mod witgen_simd {
                         z_nt,
                         nt,
                         elide,
+                        z_stage_out,
                     );
                 }
             }
             if let Some(stripe_base) = stripe_base {
-                // Bit-transpose 8 z chunks into the lincheck stripe
-                // (identical to the generic driver). This immediate-stripe
-                // arm necessarily has z_nt=false, so the re-read is L1-hot;
-                // the ranked deferred arm skips this whole block and
-                // reconstructs from immutable z.
                 let stripe =
                     unsafe { std::slice::from_raw_parts_mut(stripe_base.get().add(g * K), K) };
-                let z_u64_all: &[u64] = unsafe {
-                    std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
-                };
-                let u64_per_block = K / 64;
                 let useful_words = stripe_useful_bits.div_ceil(64);
-                let mut tmp = [0u8; 64];
-                for i in 0..useful_words {
-                    let lanes: [u64; 8] = std::array::from_fn(|j| z_u64_all[j * u64_per_block + i]);
-                    if nt {
-                        transpose_8_u64s_to_64_bytes(&lanes, &mut tmp);
-                        // SAFETY: stripe chunk i is 64 in-bounds bytes.
-                        unsafe {
-                            stripe_store_nt(tmp.as_ptr(), stripe.as_mut_ptr().add(i * 64));
+                const STAGE_U32S: usize = U32_PER_BLOCK * super::super::common::QUAD_STAGE_LANES;
+                if witgen_stripe {
+                    // Stage-sourced emission: z was just NT-stored for the
+                    // Metal stream, so the incumbent re-read would come back
+                    // from DRAM; the two 8 KiB quad stages are still L1-hot
+                    // and hold the same words. Shared portable arithmetic
+                    // (`stripe_words_from_group_stages`); the store below is
+                    // the same contiguous ascending per-group stnp burst as
+                    // the incumbent arm.
+                    debug_assert!(want_stages);
+                    // SAFETY: `want_stages` is true, so both stages were
+                    // fully written by the two builder calls above.
+                    let s_lo: &[u32] = unsafe {
+                        core::slice::from_raw_parts(stage_lo.as_ptr().cast::<u32>(), STAGE_U32S)
+                    };
+                    let s_hi: &[u32] = unsafe {
+                        core::slice::from_raw_parts(stage_hi.as_ptr().cast::<u32>(), STAGE_U32S)
+                    };
+                    super::super::common::stripe_words_from_group_stages(
+                        s_lo,
+                        s_hi,
+                        U32_PER_BLOCK,
+                        useful_words,
+                        |word, chunk| {
+                            if nt {
+                                // SAFETY: stripe chunk `word` is 64 in-bounds
+                                // bytes.
+                                unsafe {
+                                    stripe_store_nt(
+                                        chunk.as_ptr(),
+                                        stripe.as_mut_ptr().add(word * 64),
+                                    );
+                                }
+                            } else {
+                                stripe[word * 64..word * 64 + 64].copy_from_slice(chunk);
+                            }
+                        },
+                    );
+                } else {
+                    // Bit-transpose 8 z chunks into the lincheck stripe
+                    // (identical to the generic driver). This immediate-stripe
+                    // arm has z_nt=false, so the re-read is L1-hot; the
+                    // ranked deferred arm skips this whole block and
+                    // reconstructs from immutable z.
+                    let z_u64_all: &[u64] = unsafe {
+                        std::slice::from_raw_parts(z_grp.as_ptr() as *const u64, z_grp.len() * 2)
+                    };
+                    let u64_per_block = K / 64;
+                    let mut tmp = [0u8; 64];
+                    for i in 0..useful_words {
+                        let lanes: [u64; 8] =
+                            std::array::from_fn(|j| z_u64_all[j * u64_per_block + i]);
+                        if nt {
+                            transpose_8_u64s_to_64_bytes(&lanes, &mut tmp);
+                            // SAFETY: stripe chunk i is 64 in-bounds bytes.
+                            unsafe {
+                                stripe_store_nt(tmp.as_ptr(), stripe.as_mut_ptr().add(i * 64));
+                            }
+                        } else {
+                            transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
                         }
-                    } else {
-                        transpose_8_u64s_to_64_bytes(&lanes, &mut stripe[i * 64..i * 64 + 64]);
+                    }
+                    if probe_witgen_stripe {
+                        // Warmup dual-compute: replay this group's chunks
+                        // from the stages through the exact production
+                        // emission arithmetic and byte-compare against the
+                        // z-sourced bytes just stored (the deferred fill's
+                        // algorithm on the same data). Untimed, so the NT
+                        // stripe read-back cost is irrelevant.
+                        // SAFETY: `want_stages` is true in probe mode, so
+                        // both stages were fully written above.
+                        let s_lo: &[u32] = unsafe {
+                            core::slice::from_raw_parts(stage_lo.as_ptr().cast::<u32>(), STAGE_U32S)
+                        };
+                        let s_hi: &[u32] = unsafe {
+                            core::slice::from_raw_parts(stage_hi.as_ptr().cast::<u32>(), STAGE_U32S)
+                        };
+                        let mut bad = false;
+                        super::super::common::stripe_words_from_group_stages(
+                            s_lo,
+                            s_hi,
+                            U32_PER_BLOCK,
+                            useful_words,
+                            |word, chunk| {
+                                if stripe[word * 64..word * 64 + 64] != chunk[..] {
+                                    bad = true;
+                                }
+                            },
+                        );
+                        if bad {
+                            probe_mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        probe_groups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 // Mirrors the generic driver: the padded fold never observes
@@ -2851,6 +3004,25 @@ pub(crate) mod witgen_simd {
             }
         } else {
             super::super::common::drain_group_jobs(n_groups, &process_group);
+        }
+        if probe_witgen_stripe {
+            // The drain join above happens-before this read of the workers'
+            // Relaxed probe stores. Latch On only on full-coverage equality;
+            // any other outcome (mismatch, short coverage) pins the timed
+            // prove to the incumbent deferred fill.
+            let validated = super::witgen_stripe_probe_validates(
+                probe_mismatch.load(std::sync::atomic::Ordering::Relaxed),
+                probe_groups.load(std::sync::atomic::Ordering::Relaxed),
+                n_groups,
+            );
+            super::witgen_stripe_latch::PROD.record_probe(validated);
+            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+                eprintln!(
+                    "[witgen-stripe] warmup probe: {} ({} of {n_groups} groups compared)",
+                    if validated { "validated" } else { "REJECTED" },
+                    probe_groups.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
         }
         if let Some(before) = claimed_before {
             eprintln!(
@@ -3119,6 +3291,128 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
         std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some(),
         std::env::var_os("FLOCK_FULL_STRIPE").is_some(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Warmup-latched witgen-side lincheck stripe.
+//
+// With the streamed Metal lease active, the SIMD witgen can emit the lincheck
+// stripe from each group's two L1-hot quad stages — the same data the drain
+// is about to store into z — while z keeps its non-temporal stores for the
+// GPU stream. That removes the deferred pass's ~482 MiB re-read of z from
+// DRAM (`crate::prover`'s `fill_deferred_lincheck_stripe_group`).
+//
+// Fail-safe adoption (mirrors `seed_pipe::verify_generator_at_warmup` and the
+// `gpu_commit` warmup latch): the untimed warmup prove has no Metal lease, so
+// it runs the incumbent eager stripe arm; there the probe computes every
+// group's stripe chunks BOTH ways — the incumbent z-sourced transpose (the
+// deferred fill's exact algorithm on the same bytes) and the new
+// stage-sourced emission — and byte-compares them. The latch flips On only
+// if every chunk of every group of the whole warmup witness matched; any
+// mismatch, partial coverage, or a mid-probe panic leaves the incumbent
+// deferred path untouched for the timed prove.
+//
+// `FLOCK_NO_WITGEN_STRIPE=1` is the unconditional kill switch (no probe, no
+// engagement); `FLOCK_NO_DEFER_LINCHECK_STRIPE=1` keeps its incumbent
+// meaning and, by turning the deferral selector off, also disables this
+// path (no deferral means the eager stripe already avoids the re-read).
+// ---------------------------------------------------------------------------
+
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+mod witgen_stripe_latch {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    pub(super) const UNTESTED: u8 = 0;
+    pub(super) const PROBING: u8 = 1;
+    pub(super) const VALIDATED: u8 = 2;
+    pub(super) const REJECTED: u8 = 3;
+
+    /// Three-way adoption latch. `Untested → Probing` is claimed by exactly
+    /// one warmup-shaped witgen (CAS), which alone stores the verdict; every
+    /// reader treats anything but `VALIDATED` as "use the incumbent path".
+    pub(super) struct Latch {
+        state: AtomicU8,
+    }
+
+    impl Latch {
+        pub(super) const fn new() -> Self {
+            Self {
+                state: AtomicU8::new(UNTESTED),
+            }
+        }
+
+        /// Claim probing rights; `false` means another call owns (or owned)
+        /// the probe and this call must stay on the incumbent path.
+        pub(super) fn try_begin_probe(&self) -> bool {
+            self.state
+                .compare_exchange(UNTESTED, PROBING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }
+
+        /// Publish the probe verdict (claimant only).
+        pub(super) fn record_probe(&self, validated: bool) {
+            self.state.store(
+                if validated { VALIDATED } else { REJECTED },
+                Ordering::Release,
+            );
+        }
+
+        pub(super) fn latched_on(&self) -> bool {
+            self.state.load(Ordering::Acquire) == VALIDATED
+        }
+
+        #[cfg(test)]
+        pub(super) fn state(&self) -> u8 {
+            self.state.load(Ordering::Acquire)
+        }
+    }
+
+    pub(super) static PROD: Latch = Latch::new();
+}
+
+/// Unconditional kill switch for the witgen-side stripe emission:
+/// `FLOCK_NO_WITGEN_STRIPE=1` forces the incumbent deferred fill (and skips
+/// the warmup probe entirely).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn witgen_stripe_killed() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_WITGEN_STRIPE").is_some())
+}
+
+/// Timed-path engagement: stage-sourced stripe emission runs only under a
+/// live deferred-ranked stream, with the kill switch clear, after the warmup
+/// probe latched On. Everything else keeps the incumbent deferred fill.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const fn select_witgen_stripe(
+    defer_ranked_stripe_active: bool,
+    killed: bool,
+    latched_on: bool,
+) -> bool {
+    defer_ranked_stripe_active && !killed && latched_on
+}
+
+/// Warmup-probe engagement: the deferral selector fired but no Metal lease
+/// exists (the untimed warmup's eager-stripe arm), and the kill switch is
+/// clear. The `Latch::try_begin_probe` CAS is applied on top of this gate.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const fn select_witgen_stripe_probe(
+    defer_requested: bool,
+    stream_acquired: bool,
+    killed: bool,
+) -> bool {
+    defer_requested && !stream_acquired && !killed
+}
+
+/// Probe verdict: latch On only when no chunk mismatched AND every group of
+/// the warmup witness was actually compared (a short-circuited or empty
+/// probe must not vouch for the path).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const fn witgen_stripe_probe_validates(
+    mismatch: bool,
+    probed_groups: usize,
+    n_groups: usize,
+) -> bool {
+    !mismatch && probed_groups == n_groups && n_groups > 0
 }
 
 #[inline]
@@ -4257,6 +4551,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Witgen-side stripe selectors: engagement requires live deferral AND a
+    /// clear kill switch AND a validated latch; the warmup probe requires a
+    /// requested-but-unacquired deferral (the warmup shape) AND a clear kill
+    /// switch. `select_z_nt` stays coupled to `defer_ranked_stripe` alone
+    /// (tested above), so z keeps NT stores when the witgen stripe engages.
+    #[test]
+    fn witgen_stripe_selectors_are_exact() {
+        for defer_active in [false, true] {
+            for killed in [false, true] {
+                for latched in [false, true] {
+                    assert_eq!(
+                        select_witgen_stripe(defer_active, killed, latched),
+                        defer_active && !killed && latched,
+                    );
+                }
+            }
+        }
+        for defer_requested in [false, true] {
+            for stream_acquired in [false, true] {
+                for killed in [false, true] {
+                    assert_eq!(
+                        select_witgen_stripe_probe(defer_requested, stream_acquired, killed),
+                        defer_requested && !stream_acquired && !killed,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Probe verdict: full coverage with zero mismatches, on a non-empty
+    /// witness, is the only latching outcome.
+    #[test]
+    fn witgen_stripe_probe_verdict_is_full_coverage_equality_only() {
+        assert!(witgen_stripe_probe_validates(false, 32768, 32768));
+        assert!(!witgen_stripe_probe_validates(true, 32768, 32768));
+        assert!(!witgen_stripe_probe_validates(false, 32767, 32768));
+        assert!(!witgen_stripe_probe_validates(false, 0, 32768));
+        assert!(!witgen_stripe_probe_validates(false, 0, 0));
+        assert!(!witgen_stripe_probe_validates(true, 0, 0));
+    }
+
+    /// Latch state machine: exactly one probe claim; the verdict is read back
+    /// exactly; a claimed-but-unresolved probe (mid-probe panic) never
+    /// latches On.
+    #[test]
+    fn witgen_stripe_latch_state_machine() {
+        use super::witgen_stripe_latch::{Latch, PROBING, REJECTED, UNTESTED, VALIDATED};
+
+        let latch = Latch::new();
+        assert_eq!(latch.state(), UNTESTED);
+        assert!(!latch.latched_on());
+        assert!(latch.try_begin_probe());
+        assert_eq!(latch.state(), PROBING);
+        // Second claimant is refused while (and after) the first owns it.
+        assert!(!latch.try_begin_probe());
+        // Unresolved probe == incumbent path.
+        assert!(!latch.latched_on());
+        latch.record_probe(true);
+        assert_eq!(latch.state(), VALIDATED);
+        assert!(latch.latched_on());
+        assert!(!latch.try_begin_probe());
+
+        let rejected = Latch::new();
+        assert!(rejected.try_begin_probe());
+        rejected.record_probe(false);
+        assert_eq!(rejected.state(), REJECTED);
+        assert!(!rejected.latched_on());
+        assert!(!rejected.try_begin_probe());
     }
 
     /// Batch-major witness equality vs the row-major driver (word-transpose

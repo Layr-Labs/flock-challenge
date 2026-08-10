@@ -915,6 +915,57 @@ pub(crate) unsafe fn stripe_from_rows(
     }
 }
 
+/// Number of interleaved block lanes in one SIMD quad stage: the aarch64
+/// witgen builder processes four compressions in u32-lane lockstep, so its
+/// L1 stage stores one `uint32x4_t` (four blocks' copies of the same u32
+/// word) per block word.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const QUAD_STAGE_LANES: usize = 4;
+
+/// Emit the lincheck byte-stripe chunks for one 8-block group from the two
+/// word-major SIMD quad stages that produced the group's z blocks, instead
+/// of re-reading z (whose ranked stores are non-temporal) back from DRAM.
+///
+/// Stage layout (the aarch64 `witgen_simd` builder's L1 stage, pinned by its
+/// `dump_range` drain into z): u32 word `w` of quad-lane `j` lives at
+/// `stage[w * QUAD_STAGE_LANES + j]`; `stage_lo` holds the group's blocks
+/// 0..4 and `stage_hi` blocks 4..8. Block `j`'s u64 word `word` is the
+/// little-endian composition of its two u32 halves,
+/// `stage[(2·word)·4 + j] | stage[(2·word+1)·4 + j] << 32` — exactly the u64
+/// the deferred fill oracle reads back from packed z as
+/// `z_u64[j * u64_per_block + word]`
+/// (`crate::prover`'s `fill_deferred_lincheck_stripe_group`). All geometry is
+/// parameterized; `emit(word, chunk)` receives the 64 transposed bytes
+/// destined for stripe offset `word * 64`, so the store flavor (plain vs
+/// `stnp`) stays with the caller while the arithmetic lives here once.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn stripe_words_from_group_stages(
+    stage_lo: &[u32],
+    stage_hi: &[u32],
+    u32_per_block: usize,
+    useful_words: usize,
+    mut emit: impl FnMut(usize, &[u8; 64]),
+) {
+    assert_eq!(stage_lo.len(), u32_per_block * QUAD_STAGE_LANES);
+    assert_eq!(stage_hi.len(), u32_per_block * QUAD_STAGE_LANES);
+    assert!(2 * useful_words <= u32_per_block);
+    let mut chunk = [0u8; 64];
+    for word in 0..useful_words {
+        let lanes: [u64; 8] = std::array::from_fn(|lane| {
+            let (stage, j) = if lane < QUAD_STAGE_LANES {
+                (stage_lo, lane)
+            } else {
+                (stage_hi, lane - QUAD_STAGE_LANES)
+            };
+            let lo = stage[(2 * word) * QUAD_STAGE_LANES + j] as u64;
+            let hi = stage[(2 * word + 1) * QUAD_STAGE_LANES + j] as u64;
+            lo | (hi << 32)
+        });
+        transpose_8_u64s_to_64_bytes(&lanes, &mut chunk);
+        emit(word, &chunk);
+    }
+}
+
 /// V-wide [`add_carry_parts`]: per-instance `(sum, left, right, carry_aux)`.
 #[inline(always)]
 pub(crate) fn add_carry_parts_v(
