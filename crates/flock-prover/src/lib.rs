@@ -37,3 +37,15 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker 809314772-r949
 
 // dispersion-resample marker 332358
+
+// dispersion-resample marker 174492601-r952
+
+// dispersion-resample marker 918273645-r954
+
+// dispersion-resample marker 445566778-r955
+
+// dispersion-resample marker 137955824-r956
+
+// dispersion-resample marker 660199473-r957
+
+// dispersion-resample marker 284917506-r958
