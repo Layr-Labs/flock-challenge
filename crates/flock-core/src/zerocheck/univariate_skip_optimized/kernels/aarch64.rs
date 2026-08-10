@@ -267,6 +267,135 @@ pub(crate) unsafe fn accumulate_convert_ab(
     }
 }
 
+/// Multiply-free twin of [`accumulate_convert_ab`] for the banked `eq_lo`
+/// tensor fold.
+///
+/// Identical gathers, identical `b_med` pairing — only the drain changes. The
+/// `eq_lo` scale no longer rides on the accumulator: its `x_lo`-high factor is
+/// pre-multiplied into the convert table the caller selects
+/// (`T_w[i] = convert[i] · eq_top[w]`) and its `x_lo`-low factor is applied
+/// once per band to the bank this call XORs into. So the eight lanes drain as
+/// a plain 128-bit EOR into memory and the kernel issues no GHASH multiply at
+/// all.
+///
+/// Bit-exactness: F₁₂₈ multiplication is F₂-bilinear, so scaling every table
+/// row by `eq_top[w]` before the XOR chain equals scaling the chain's result
+/// after it, and the deferred `eq_bot[u]` fold re-associates the same product
+/// terms — no term is added, dropped, or reordered within a lane.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_nomul(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    bank: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(n_b_med <= 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
+    // Table offsets are `u8` indices scaled by the 16-byte row size within the
+    // debug-asserted table length, and every drain address is one 16-byte
+    // `F128` slot of the fixed-size bank.
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        let n_pairs = n_b_med / 2;
+        for lane in (0..64).step_by(8) {
+            let mut ab0 = vdupq_n_u8(0);
+            let mut ab1 = vdupq_n_u8(0);
+            let mut ab2 = vdupq_n_u8(0);
+            let mut ab3 = vdupq_n_u8(0);
+            let mut ab4 = vdupq_n_u8(0);
+            let mut ab5 = vdupq_n_u8(0);
+            let mut ab6 = vdupq_n_u8(0);
+            let mut ab7 = vdupq_n_u8(0);
+
+            for p in 0..n_pairs {
+                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let t_even = convert_ptr.add(b_even * 256 * 16);
+                let t_odd = convert_ptr.add(b_odd * 256 * 16);
+
+                let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u64).read_unaligned()
+                    as usize;
+                let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u64).read_unaligned()
+                    as usize;
+                ab0 = xor3_u8(
+                    ab0,
+                    vld1q_u8(t_even.add((we & 0xff) * 16)),
+                    vld1q_u8(t_odd.add((wo & 0xff) * 16)),
+                );
+                ab1 = xor3_u8(
+                    ab1,
+                    vld1q_u8(t_even.add(((we >> 8) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 8) & 0xff) * 16)),
+                );
+                ab2 = xor3_u8(
+                    ab2,
+                    vld1q_u8(t_even.add(((we >> 16) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 16) & 0xff) * 16)),
+                );
+                ab3 = xor3_u8(
+                    ab3,
+                    vld1q_u8(t_even.add(((we >> 24) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 24) & 0xff) * 16)),
+                );
+                ab4 = xor3_u8(
+                    ab4,
+                    vld1q_u8(t_even.add(((we >> 32) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 32) & 0xff) * 16)),
+                );
+                ab5 = xor3_u8(
+                    ab5,
+                    vld1q_u8(t_even.add(((we >> 40) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 40) & 0xff) * 16)),
+                );
+                ab6 = xor3_u8(
+                    ab6,
+                    vld1q_u8(t_even.add(((we >> 48) & 0xff) * 16)),
+                    vld1q_u8(t_odd.add(((wo >> 48) & 0xff) * 16)),
+                );
+                ab7 = xor3_u8(
+                    ab7,
+                    vld1q_u8(t_even.add((we >> 56) * 16)),
+                    vld1q_u8(t_odd.add((wo >> 56) * 16)),
+                );
+            }
+
+            // Odd trailing b_med: unpaired fallback.
+            if n_b_med & 1 == 1 {
+                let b_med = n_b_med - 1;
+                let table = convert_ptr.add(b_med * 256 * 16);
+                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u64).read_unaligned()
+                    as usize;
+                ab0 = veorq_u8(ab0, vld1q_u8(table.add((wa & 0xff) * 16)));
+                ab1 = veorq_u8(ab1, vld1q_u8(table.add(((wa >> 8) & 0xff) * 16)));
+                ab2 = veorq_u8(ab2, vld1q_u8(table.add(((wa >> 16) & 0xff) * 16)));
+                ab3 = veorq_u8(ab3, vld1q_u8(table.add(((wa >> 24) & 0xff) * 16)));
+                ab4 = veorq_u8(ab4, vld1q_u8(table.add(((wa >> 32) & 0xff) * 16)));
+                ab5 = veorq_u8(ab5, vld1q_u8(table.add(((wa >> 40) & 0xff) * 16)));
+                ab6 = veorq_u8(ab6, vld1q_u8(table.add(((wa >> 48) & 0xff) * 16)));
+                ab7 = veorq_u8(ab7, vld1q_u8(table.add((wa >> 56) * 16)));
+            }
+
+            macro_rules! drain_lane {
+                ($offset:literal, $ab:ident) => {{
+                    let slot = bank.as_mut_ptr().add(lane + $offset) as *mut u8;
+                    vst1q_u8(slot, veorq_u8(vld1q_u8(slot), $ab));
+                }};
+            }
+            drain_lane!(0, ab0);
+            drain_lane!(1, ab1);
+            drain_lane!(2, ab2);
+            drain_lane!(3, ab3);
+            drain_lane!(4, ab4);
+            drain_lane!(5, ab5);
+            drain_lane!(6, ab6);
+            drain_lane!(7, ab7);
+        }
+    }
+}
+
 /// Eight α-free single-bit-`K` C banks, NEON — straight off the packed witness.
 ///
 /// Three phases, no multiplies, no convert-table gathers, and **no per-`b_med`

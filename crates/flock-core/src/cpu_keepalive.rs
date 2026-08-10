@@ -77,6 +77,24 @@ pub fn keepalive_stop() {
     imp::stop();
 }
 
+/// Signal-only half of [`keepalive_stop`]: clear the run flag so every spin
+/// thread starts exiting (they notice within one ~1024-op spin slice), but do
+/// not join them. The seed-pipe thread uses this so the 10–14 sequential
+/// thread joins — pure serial time at the very front of the timed window —
+/// happen after the seed is forwarded instead of before it. Pair with
+/// [`keepalive_join`]; calling [`keepalive_stop`] later is also safe.
+pub fn keepalive_signal() {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    imp::signal();
+}
+
+/// Join-only half of [`keepalive_stop`]: drain and join any spin threads that
+/// have been signalled. Idempotent; a no-op when nothing was started.
+pub fn keepalive_join() {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    imp::join_all();
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod imp {
     use std::sync::Mutex;
@@ -158,9 +176,22 @@ mod imp {
     pub(super) fn stop() {
         // Signal first so the threads start winding down before we take the
         // lock to join them.
-        if !RUNNING.swap(false, Ordering::SeqCst) {
-            return;
-        }
+        signal();
+        join_all();
+    }
+
+    /// Clear the run flag without joining. Threads notice within one spin
+    /// slice and exit on their own; the handles stay parked until
+    /// [`join_all`] (or a later [`stop`]) drains them.
+    pub(super) fn signal() {
+        RUNNING.swap(false, Ordering::SeqCst);
+    }
+
+    /// Drain and join every parked handle. Runs after the seed forward on
+    /// the deferred path, so the sequential joins are off the timed
+    /// window's serial prologue. Idempotent: an empty handle list is a
+    /// no-op, and `start` refuses to run while `RUNNING` is still set.
+    pub(super) fn join_all() {
         let drained: Vec<JoinHandle<()>> = {
             let mut handles = HANDLES.lock().unwrap_or_else(|e| e.into_inner());
             handles.drain(..).collect()

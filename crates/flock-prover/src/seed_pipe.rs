@@ -672,10 +672,18 @@ fn speculative_main(
     let line = read_line_fd(real_stdin);
 
     // The seed's first byte has arrived: this thread is about to forward it and
-    // start the speculative prove. Halt the CPU keep-alive immediately, before
-    // any of that timed work, so the P-cores it was warming across the idle gap
-    // are handed straight to the prover instead of shared with a spin thread.
-    flock_core::cpu_keepalive::keepalive_stop();
+    // start the speculative prove. Signal the CPU keep-alive down immediately —
+    // the spin threads notice within one ~1024-op slice and exit on their own —
+    // but defer their 10–14 sequential joins until after the seed forward, so
+    // that pure serial join time is off the timed window's first microseconds.
+    // `FLOCK_NO_KEEPALIVE_DEFER=1` (exact '1') restores signal+join up front.
+    let defer_join =
+        std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1"));
+    if defer_join {
+        flock_core::cpu_keepalive::keepalive_signal();
+    } else {
+        flock_core::cpu_keepalive::keepalive_stop();
+    }
 
     // Forward first and unconditionally. Everything after this point can fail
     // without ever leaving the worker blocked on stdin.
@@ -696,6 +704,13 @@ fn speculative_main(
             mark_dead();
             return;
         }
+    }
+
+    // Seed forwarded: drain the keep-alive joins now. The spin threads were
+    // signalled before the forward and have already exited by this point, so
+    // the joins are reaping, not waiting.
+    if defer_join {
+        flock_core::cpu_keepalive::keepalive_join();
     }
 
     let parsed = line

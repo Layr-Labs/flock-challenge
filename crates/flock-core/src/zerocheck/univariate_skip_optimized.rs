@@ -1749,6 +1749,204 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
     }
 }
 
+// ---------------------------------------------------------------------------
+// eq_lo tensor fold for the ranked AB completion drain.
+//
+// The drain above pays one GHASH multiply per lane per chunk:
+// `partial_ab[lane] += converted_ab[lane] * eq_lo_scaled[x_lo]`, i.e.
+// 2^n_hi * 2^n_lo * ELL = 33.5 M multiplies per prove at the ranked shape
+// (n_hi = 7, n_lo = 12, ELL = 64). None of them is necessary.
+//
+// `eq_lo` is a tensor product over its challenge bits (`build_eq` gives bit i
+// of the index to `r_lo[i]`), so splitting `x_lo = w·2^s + u` factors it
+// exactly:
+//
+//     eq_lo_scaled[w·2^s + u] == eq_top_scaled[w] * eq_bot[u]
+//     eq_top_scaled = build_eq(r_lo[s..]) · D^-1,  eq_bot = build_eq(r_lo[..s])
+//
+// F128 multiplication is F2-bilinear, so the `eq_top[w]` factor can be pushed
+// through the whole gather chain and pre-multiplied into the convert table
+// once per prove (`T_w[i] = convert[i] * eq_top_scaled[w]`, 2^(n_lo-s) tables
+// of 64 KiB), and the `eq_bot[u]` factor can be deferred out of the chunk loop
+// into 2^s per-worker banks:
+//
+//     bank[u][lane]    ^= gather(T_w, chunk)[lane]        (no multiply)
+//     partial_ab[lane]  = XOR_u eq_bot[u] * bank[u][lane]  (once per band)
+//
+// which is the same sum of the same products, re-associated — bit-identical,
+// not merely equal. The multiply count drops to
+// 2^(n_lo-s)·|convert| + 2^n_hi·2^s·ELL ≈ 1.2 M per prove.
+//
+// `s` trades table footprint against bank footprint. The default keeps
+// `AB_EQ_FOLD_TABLE_BITS` bits in the table index, so the ranked shape gets 32
+// tables (2 MiB total, small enough to stay resident in the efficiency
+// cluster's L2 as well as the performance cluster's) whose hot window is one
+// 64 KiB table per 2^s consecutive chunks — exactly the incumbent convert
+// table's residency — and 128 banks (128 KiB per worker, L2-resident on both
+// core types). Both pools of `run_hetero_chunks` run the same `s`; nothing in
+// the mechanism is core-type specific, and the E-core arm sees the same
+// 64 KiB hot table it sees today. `FLOCK_ZC_AB_EQ_FOLD_S` overrides it for
+// tuning sweeps.
+// ---------------------------------------------------------------------------
+
+/// Kill switch for the `eq_lo` tensor fold in the ranked AB completion:
+/// exactly `FLOCK_NO_ZC_AB_EQ_FOLD=1` restores the incumbent per-chunk
+/// multiply as a same-binary control. Output is bit-identical either way.
+pub const ENV_NO_ZC_AB_EQ_FOLD: &str = "FLOCK_NO_ZC_AB_EQ_FOLD";
+
+/// Tuning seam for the fold's bank/table split `s` (see the block comment):
+/// an integer in `0..=16`, clamped to `n_lo`. Unset picks the default from
+/// `n_lo`. Invalid values fail loudly, like the Fold4 split seam — silently
+/// accepting a typo would make component profiles incomparable.
+pub const ENV_ZC_AB_EQ_FOLD_S: &str = "FLOCK_ZC_AB_EQ_FOLD_S";
+
+/// `x_lo` bits kept in the pre-scaled table index; the rest select the bank.
+const AB_EQ_FOLD_TABLE_BITS: usize = 5;
+
+/// Fold policy for [`round1_shift_reduce_ab_packed_padded_with_precomputed`].
+/// Threaded as an argument rather than read from the environment inside the
+/// drain so the differential test can run both arms in one process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AbEqFold {
+    /// Incumbent: one multiply per lane per chunk.
+    Off,
+    /// Banked fold with `s` low `x_lo` bits; `None` takes the default for the
+    /// shape.
+    On(Option<usize>),
+}
+
+impl AbEqFold {
+    /// Resolved bank-index width, or `None` when the fold is off.
+    fn bank_bits(self, n_lo: usize) -> Option<usize> {
+        match self {
+            AbEqFold::Off => None,
+            AbEqFold::On(explicit) => Some(
+                explicit
+                    .unwrap_or_else(|| n_lo.saturating_sub(AB_EQ_FOLD_TABLE_BITS))
+                    .min(n_lo),
+            ),
+        }
+    }
+}
+
+fn ab_eq_fold_from_env() -> AbEqFold {
+    static POLICY: OnceLock<AbEqFold> = OnceLock::new();
+    *POLICY.get_or_init(|| {
+        if std::env::var_os(ENV_NO_ZC_AB_EQ_FOLD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+            return AbEqFold::Off;
+        }
+        AbEqFold::On(std::env::var_os(ENV_ZC_AB_EQ_FOLD_S).map(|value| {
+            value
+                .to_str()
+                .and_then(|text| text.parse::<usize>().ok())
+                .filter(|s| *s <= 16)
+                .expect("FLOCK_ZC_AB_EQ_FOLD_S must be an integer in 0..=16")
+        }))
+    })
+}
+
+std::thread_local! {
+    /// Per-worker `u`-banks for the folded drain (`2^s * ELL` F128). Held per
+    /// thread so no band allocates: both `run_hetero_chunks` pools reuse the
+    /// same buffer across every band and every prove.
+    static AB_EQ_FOLD_BANKS: std::cell::RefCell<Vec<F128>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Tensor factors of the scaled lo-eq weight for a `bank_bits = s` split:
+/// `(eq_bot, eq_top_scaled)` with
+/// `eq.lo[(w << s) | u] * D^-1 == eq_top_scaled[w] * eq_bot[u]`.
+///
+/// `SplitEqGhash` builds `lo` from `r_lo` LSB-first (`build_eq` gives index
+/// bit `i` to `r_lo[i]`), so the low `s` index bits are exactly the
+/// `r_lo[..s]` sub-product and the rest exactly the `r_lo[s..]` one.
+fn ab_eq_fold_factors(r_lo: &[F128], bank_bits: usize) -> (Vec<F128>, Vec<F128>) {
+    let eq_bot = build_eq(&r_lo[..bank_bits]);
+    let eq_top_scaled = build_eq(&r_lo[bank_bits..])
+        .into_iter()
+        .map(|v| v * d_inv())
+        .collect();
+    (eq_bot, eq_top_scaled)
+}
+
+/// Pre-scaled convert tables for the fold: `T_w[i] = convert[i] *
+/// eq_top_scaled[w]`, built once per prove and shared read-only by every
+/// worker (mirrors [`build_c_mask_tables`]).
+fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
+    // Fully overwritten below (one write per slot before any read), so an
+    // uninitialized scratch buffer is sound and skips a zeroing pass.
+    let mut tables = crate::scratch::take_f128(eq_top_scaled.len() * CONVERT_TABLE_SIZE);
+    tables
+        .par_chunks_mut(CONVERT_TABLE_SIZE)
+        .zip(eq_top_scaled.par_iter())
+        .for_each(|(slot, scale)| {
+            for (out, base) in slot.iter_mut().zip(convert.iter()) {
+                *out = *base * *scale;
+            }
+        });
+    tables
+}
+
+/// Folded twin of [`process_one_x_hi_with_precomputed_ab_fold4_ab`]: same
+/// chunk sweep and same gathers, but the per-chunk `eq_lo` multiply is gone —
+/// the table carries `eq_top[w]` and the band-end fold carries `eq_bot[u]`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
+    x_hi: usize,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    eq_bot: &[F128],
+    eq_hi_val: F128,
+    tables: &[F128],
+    bank_bits: usize,
+    banks: &mut [F128],
+    partial_ab: &mut [F128; ELL],
+) {
+    debug_assert_eq!(banks.len(), eq_bot.len() * ELL);
+    debug_assert_eq!(eq_bot.len(), 1usize << bank_bits);
+    banks.fill(F128::ZERO);
+
+    let n_lo = n_lo_and_inner - N_INNER;
+    let bank_mask = (1usize << bank_bits) - 1;
+
+    for x_outer_lo in 0..big_lo_size {
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let w = x_outer_lo >> bank_bits;
+        let u = x_outer_lo & bank_mask;
+        let bank: &mut [F128; ELL] = (&mut banks[u * ELL..(u + 1) * ELL])
+            .try_into()
+            .expect("one ELL-lane bank per low x_lo index");
+        kernels::accumulate_convert_ab_nomul(
+            precomputed_ab_rows(ab_inner, chunk_byte_base),
+            n_b_med,
+            &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE],
+            bank,
+        );
+    }
+
+    partial_ab.fill(F128::ZERO);
+    for (bank, eq_bot_val) in banks.chunks_exact(ELL).zip(eq_bot) {
+        for (out, value) in partial_ab.iter_mut().zip(bank) {
+            *out += *eq_bot_val * *value;
+        }
+    }
+    for value in partial_ab {
+        *value *= eq_hi_val;
+    }
+}
+
 /// Challenge-weighted AB completion for the retained-coordinate ranked path,
 /// without the independent C drain.  The legacy wire AB message is unchanged;
 /// callers that can derive C from another honest representation use this to
@@ -1760,6 +1958,26 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     r: &[F128],
     padding: &PaddingSpec,
 ) -> Vec<F128> {
+    round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
+        ab_inner,
+        m,
+        k_skip,
+        r,
+        padding,
+        ab_eq_fold_from_env(),
+    )
+}
+
+/// [`round1_shift_reduce_ab_packed_padded_with_precomputed`] with the `eq_lo`
+/// fold policy supplied explicitly. Every arm must return the same bytes.
+fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
+    ab_inner: &Round1AbInner,
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    padding: &PaddingSpec,
+    fold: AbEqFold,
+) -> Vec<F128> {
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     let total_bytes = (1usize << m) / 8;
     assert_eq!(ab_inner.len_bytes(), total_bytes);
@@ -1770,32 +1988,72 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
-    let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
     let convert = convert_table();
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
 
     let mut partials = vec![[F128::ZERO; ELL]; hi_size];
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        let mut partial = [F128::ZERO; ELL];
-        process_one_x_hi_with_precomputed_ab_fold4_ab(
-            x_hi,
-            big_lo_size,
-            n_lo_and_inner,
-            within_outer_mask,
-            &b_med_counts,
-            ab_inner_bytes,
-            &eq_lo_scaled,
-            eq.hi[x_hi],
-            convert,
-            None,
-            &mut partial,
-        );
-        // SAFETY: each queue index owns one disjoint output slot and the
-        // synchronous queue join publishes all writes before reduction.
-        unsafe { *partials_base.ptr().add(x_hi) = partial };
-    });
+    match fold.bank_bits(eq.n_lo) {
+        None => {
+            let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
+            crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+                let mut partial = [F128::ZERO; ELL];
+                process_one_x_hi_with_precomputed_ab_fold4_ab(
+                    x_hi,
+                    big_lo_size,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &b_med_counts,
+                    ab_inner_bytes,
+                    &eq_lo_scaled,
+                    eq.hi[x_hi],
+                    convert,
+                    None,
+                    &mut partial,
+                );
+                // SAFETY: each queue index owns one disjoint output slot and
+                // the synchronous queue join publishes all writes before
+                // reduction.
+                unsafe { *partials_base.ptr().add(x_hi) = partial };
+            });
+        }
+        Some(bank_bits) => {
+            let r_lo = &r[k_skip + N_INNER..k_skip + N_INNER + eq.n_lo];
+            let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
+            let tables = build_ab_eq_fold_tables(&eq_top_scaled, convert);
+            let bank_len = eq_bot.len() * ELL;
+            crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+                let mut partial = [F128::ZERO; ELL];
+                AB_EQ_FOLD_BANKS.with(|cell| {
+                    let mut banks = cell.borrow_mut();
+                    if banks.len() != bank_len {
+                        banks.clear();
+                        banks.resize(bank_len, F128::ZERO);
+                    }
+                    process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
+                        x_hi,
+                        big_lo_size,
+                        n_lo_and_inner,
+                        within_outer_mask,
+                        &b_med_counts,
+                        ab_inner_bytes,
+                        &eq_bot,
+                        eq.hi[x_hi],
+                        &tables,
+                        bank_bits,
+                        &mut banks,
+                        &mut partial,
+                    );
+                });
+                // SAFETY: each queue index owns one disjoint output slot and
+                // the synchronous queue join publishes all writes before
+                // reduction.
+                unsafe { *partials_base.ptr().add(x_hi) = partial };
+            });
+            crate::scratch::give_f128(tables);
+        }
+    }
 
     partials
         .into_iter()
@@ -4869,6 +5127,185 @@ mod tests {
             );
 
             assert_eq!(got, expected, "split round-1 mismatch at m={m}");
+        }
+    }
+
+    /// The eq_lo fold's whole premise. At the ranked split shape the weight
+    /// the incumbent drain multiplies each chunk by must be exactly the
+    /// product of the two tensor factors the fold pushes into the pre-scaled
+    /// table and the deferred bank fold. Derived through the production
+    /// helper, checked against `SplitEqGhash`'s independently built `lo`.
+    #[test]
+    fn ab_eq_fold_factors_reproduce_split_eq_lo() {
+        // Ranked shape: m = 32 leaves 19 outer challenges, of which the
+        // Fold4 default keeps n_hi = 7 in the hi half.
+        const N_OUTER: usize = 32 - K_SKIP - N_INNER;
+        let mut rng = Rng::new(0x5EED_F01D);
+        let outer = rng.f128_vec(N_OUTER);
+        let eq = SplitEqGhash::with_n_hi(&outer, fold4_n_hi_from_env());
+        assert_eq!((eq.n_hi, eq.n_lo), (7, 12), "ranked fold4 lo/hi split");
+
+        let r_lo = &outer[..eq.n_lo];
+        let default_bits = AbEqFold::On(None)
+            .bank_bits(eq.n_lo)
+            .expect("On resolves to a bank width");
+        assert_eq!(
+            default_bits,
+            eq.n_lo - AB_EQ_FOLD_TABLE_BITS,
+            "default keeps AB_EQ_FOLD_TABLE_BITS bits in the table index"
+        );
+        assert_eq!(AbEqFold::Off.bank_bits(eq.n_lo), None, "kill switch");
+
+        for bank_bits in [0, 1, default_bits, eq.n_lo] {
+            let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
+            assert_eq!(eq_bot.len(), 1 << bank_bits, "bank count at s={bank_bits}");
+            assert_eq!(
+                eq_top_scaled.len(),
+                1 << (eq.n_lo - bank_bits),
+                "table count at s={bank_bits}"
+            );
+            let bank_mask = (1usize << bank_bits) - 1;
+            for (x, lo) in eq.lo.iter().enumerate() {
+                assert_eq!(
+                    *lo * d_inv(),
+                    eq_top_scaled[x >> bank_bits] * eq_bot[x & bank_mask],
+                    "eq_lo tensor factorization at x={x}, s={bank_bits}"
+                );
+            }
+        }
+    }
+
+    /// The gather is an XOR chain over convert rows, so the pre-scaled table
+    /// has to keep the convert table's F₂-linearity in the gathered byte (and
+    /// its zero row). That is exactly what makes the scaled gather equal the
+    /// unscaled gather times `eq_top[w]`, i.e. what lets the multiply leave
+    /// the kernel.
+    #[test]
+    fn ab_eq_fold_tables_stay_linear_in_the_gathered_byte() {
+        let mut rng = Rng::new(0x7AB1_E5);
+        let scales = rng.f128_vec(4);
+        let convert = convert_table();
+        let tables = build_ab_eq_fold_tables(&scales, convert);
+        assert_eq!(tables.len(), scales.len() * CONVERT_TABLE_SIZE);
+
+        for (w, scale) in scales.iter().enumerate() {
+            let table = &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE];
+            for b_med in 0..1 << N_MEDIUM {
+                let base = b_med * 256;
+                assert_eq!(table[base], F128::ZERO, "T[{w}] row {b_med} zero index");
+                for _ in 0..16 {
+                    let left = (rng.next_u64() & 0xff) as usize;
+                    let right = (rng.next_u64() & 0xff) as usize;
+                    assert_eq!(
+                        table[base + (left ^ right)],
+                        table[base + left] + table[base + right],
+                        "T[{w}] row {b_med} additive at ({left},{right})"
+                    );
+                    assert_eq!(
+                        table[base + left],
+                        convert[base + left] * *scale,
+                        "T[{w}] row {b_med} scale at {left}"
+                    );
+                }
+            }
+        }
+        crate::scratch::give_f128(tables);
+    }
+
+    /// End-to-end producer gate for the fold: the banked drain must return
+    /// the incumbent AB message bit-for-bit at every bank/table split of the
+    /// shape, including a padded block whose chunks are skipped entirely.
+    #[test]
+    fn ab_eq_fold_matches_incumbent_round1_ab() {
+        // Match the sibling round-one gates: the padded debug precompute
+        // exceeds Rayon's default worker stack on AArch64.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .stack_size(16 << 20)
+            .build()
+            .unwrap();
+        pool.install(ab_eq_fold_matches_incumbent_round1_ab_inner);
+    }
+
+    fn ab_eq_fold_matches_incumbent_round1_ab_inner() {
+        const K_LOG: usize = 14;
+        // m >= 21 is the first dimension whose Fold4 lo half is non-empty,
+        // i.e. the first one where the fold has a split to get wrong.
+        for m in 21usize..=23 {
+            for useful in [1usize << K_LOG, 15_409, 1 << 13] {
+                let padding = PaddingSpec {
+                    k_log: K_LOG,
+                    useful_bits_per_block: useful,
+                };
+                let mut rng = Rng::new(0xE9F0_1D00 ^ ((m as u64) << 8) ^ useful as u64);
+                let total_bits = 1usize << m;
+                let mut a = rng.bits(total_bits);
+                let mut b = rng.bits(total_bits);
+                if useful < (1usize << K_LOG) {
+                    for block in 0..(total_bits >> K_LOG) {
+                        for bit in useful..(1usize << K_LOG) {
+                            let index = (block << K_LOG) + bit;
+                            a[index] = false;
+                            b[index] = false;
+                        }
+                    }
+                }
+                let a = pack_bits(&a);
+                let b = pack_bits(&b);
+                let outer = rng.f128_vec(m - K_SKIP - N_INNER);
+                let r = build_protocol_r(m, &outer);
+                let inv_table = make_inv_table();
+                let ab_inner = precompute_round1_ab_inner_packed_padded(
+                    &a, &b, m, K_SKIP, &inv_table, &padding,
+                );
+                let n_lo =
+                    SplitEqGhash::with_n_hi(&r[K_SKIP + N_INNER..], fold4_n_hi_from_env()).n_lo;
+                assert!(n_lo > 0, "m={m} must exercise a non-trivial lo half");
+
+                let want = round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
+                    &ab_inner,
+                    m,
+                    K_SKIP,
+                    &r,
+                    &padding,
+                    AbEqFold::Off,
+                );
+                for bank_bits in 0..=n_lo {
+                    let got = round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
+                        &ab_inner,
+                        m,
+                        K_SKIP,
+                        &r,
+                        &padding,
+                        AbEqFold::On(Some(bank_bits)),
+                    );
+                    assert_eq!(
+                        got, want,
+                        "folded AB mismatch at m={m}, useful={useful}, s={bank_bits}"
+                    );
+                }
+                let got_default = round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
+                    &ab_inner,
+                    m,
+                    K_SKIP,
+                    &r,
+                    &padding,
+                    AbEqFold::On(None),
+                );
+                assert_eq!(
+                    got_default, want,
+                    "default-split AB mismatch at m={m}, useful={useful}"
+                );
+                // Whatever the environment resolves to, the shipped entry
+                // point must land on the same bytes.
+                let got_entry = round1_shift_reduce_ab_packed_padded_with_precomputed(
+                    &ab_inner, m, K_SKIP, &r, &padding,
+                );
+                assert_eq!(
+                    got_entry, want,
+                    "entry-point AB mismatch at m={m}, useful={useful}"
+                );
+            }
         }
     }
 

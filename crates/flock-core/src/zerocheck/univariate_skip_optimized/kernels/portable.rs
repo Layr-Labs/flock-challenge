@@ -101,3 +101,30 @@ pub(super) fn accumulate_convert_ab(
         partial_ab[lane] += converted_ab * eq_lo_val;
     }
 }
+
+/// Multiply-free twin of [`accumulate_convert_ab`] for the banked `eq_lo`
+/// tensor fold: the `eq_lo` scale rides on the caller-selected table
+/// (`T_w[i] = convert[i] * eq_top[w]`) and on the once-per-band `eq_bot[u]`
+/// fold of the bank, so the gathered lane is XORed in unscaled.
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )
+)))]
+pub(super) fn accumulate_convert_ab_nomul(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    n_b_med: usize,
+    convert: &[F128],
+    bank: &mut [F128; 64],
+) {
+    for lane in 0..64 {
+        let mut converted_ab = F128::ZERO;
+        for b_med in 0..n_b_med {
+            converted_ab += convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
+        }
+        bank[lane] += converted_ab;
+    }
+}
