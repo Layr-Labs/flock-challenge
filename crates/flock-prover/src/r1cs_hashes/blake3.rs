@@ -2046,6 +2046,12 @@ pub(crate) mod witgen_simd {
     /// consumes only the low 31 bits and overwrites that dirty boundary bit,
     /// removing two vector masks from every one of the 336 additions.
     #[inline(always)]
+    fn dual_g_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DUAL_G").is_none())
+    }
+
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
         unsafe {
             let sum = vaddq_u32(x, y);
@@ -2327,19 +2333,123 @@ pub(crate) mod witgen_simd {
                     state[$ld] = d2;
                 }};
             }
+            // Dual-G ILP: column G's (and diagonal G's) touch disjoint state
+            // lanes, so pairing adjacent independent G's keeps two add_carry /
+            // xor_rotr chains in flight. W32::pushf is a *sequential bit
+            // stream* (pending straddles words), so all stores for G0 must
+            // still land before G1's — only the ALU is dual-issued. Kill:
+            // FLOCK_NO_DUAL_G=1 restores sequential g!.
+            macro_rules! g_pair {
+                ($g0:expr, $la0:literal, $lb0:literal, $lc0:literal, $ld0:literal, $mx0:literal, $my0:literal,
+                 $g1:expr, $la1:literal, $lb1:literal, $lc1:literal, $ld1:literal, $mx1:literal, $my1:literal) => {{
+                    // ---- ALU dual-issue (no stores) ----
+                    let (t0_0, l0_0, r0_0, c0_0) = add_carry_parts_v(state[$la0], state[$lb0]);
+                    let (t0_1, l0_1, r0_1, c0_1) = add_carry_parts_v(state[$la1], state[$lb1]);
+                    let (a1_0, l1_0, r1_0, c1_0) = add_carry_parts_v(t0_0, m[$mx0]);
+                    let (a1_1, l1_1, r1_1, c1_1) = add_carry_parts_v(t0_1, m[$mx1]);
+                    let d1_0 = xor_rotr::<16, 16>(state[$ld0], a1_0);
+                    let d1_1 = xor_rotr::<16, 16>(state[$ld1], a1_1);
+                    let (c1s_0, l2_0, r2_0, c2_0) = add_carry_parts_v(state[$lc0], d1_0);
+                    let (c1s_1, l2_1, r2_1, c2_1) = add_carry_parts_v(state[$lc1], d1_1);
+                    let b1_0 = xor_rotr::<12, 20>(state[$lb0], c1s_0);
+                    let b1_1 = xor_rotr::<12, 20>(state[$lb1], c1s_1);
+                    let (t1_0, l3_0, r3_0, c3_0) = add_carry_parts_v(a1_0, b1_0);
+                    let (t1_1, l3_1, r3_1, c3_1) = add_carry_parts_v(a1_1, b1_1);
+                    let (a2_0, l4_0, r4_0, c4_0) = add_carry_parts_v(t1_0, m[$my0]);
+                    let (a2_1, l4_1, r4_1, c4_1) = add_carry_parts_v(t1_1, m[$my1]);
+                    let d2_0 = xor_rotr::<8, 24>(d1_0, a2_0);
+                    let d2_1 = xor_rotr::<8, 24>(d1_1, a2_1);
+                    let (c2s_0, l5_0, r5_0, c5_0) = add_carry_parts_v(c1s_0, d2_0);
+                    let (c2s_1, l5_1, r5_1, c5_1) = add_carry_parts_v(c1s_1, d2_1);
+                    let bn_0 = xor_rotr::<7, 25>(b1_0, c2s_0);
+                    let bn_1 = xor_rotr::<7, 25>(b1_1, c2s_1);
+                    // ---- stream stores: full G0 then full G1 (pending order) ----
+                    pushf!(wz, GS_BASE + G_STRIDE * $g0 + REC_C0, 31, c0_0);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g0 + REC_C0, 31, l0_0);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g0 + REC_C0, 31, r0_0);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g0 + REC_C1, 31, c1_0);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g0 + REC_C1, 31, l1_0);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g0 + REC_C1, 31, r1_0);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g0 + REC_C2, 31, c2_0);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g0 + REC_C2, 31, l2_0);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g0 + REC_C2, 31, r2_0);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g0 + REC_C3, 31, c3_0);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g0 + REC_C3, 31, l3_0);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g0 + REC_C3, 31, r3_0);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g0 + REC_C4, 31, c4_0);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g0 + REC_C4, 31, l4_0);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g0 + REC_C4, 31, r4_0);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g0 + REC_C5, 31, c5_0);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g0 + REC_C5, 31, l5_0);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g0 + REC_C5, 31, r5_0);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g0 + REC_LIN0, 32, bn_0);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g0 + REC_LIN0, 32, bn_0);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g0 + REC_LIN0, 32, maxv);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g0 + REC_LIN1, 32, d2_0);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g0 + REC_LIN1, 32, d2_0);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g0 + REC_LIN1, 32, maxv);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g1 + REC_C0, 31, c0_1);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g1 + REC_C0, 31, l0_1);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g1 + REC_C0, 31, r0_1);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g1 + REC_C1, 31, c1_1);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g1 + REC_C1, 31, l1_1);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g1 + REC_C1, 31, r1_1);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g1 + REC_C2, 31, c2_1);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g1 + REC_C2, 31, l2_1);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g1 + REC_C2, 31, r2_1);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g1 + REC_C3, 31, c3_1);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g1 + REC_C3, 31, l3_1);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g1 + REC_C3, 31, r3_1);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g1 + REC_C4, 31, c4_1);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g1 + REC_C4, 31, l4_1);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g1 + REC_C4, 31, r4_1);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g1 + REC_C5, 31, c5_1);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g1 + REC_C5, 31, l5_1);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g1 + REC_C5, 31, r5_1);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g1 + REC_LIN0, 32, bn_1);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g1 + REC_LIN0, 32, bn_1);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g1 + REC_LIN0, 32, maxv);
+                    pushf!(wz, GS_BASE + G_STRIDE * $g1 + REC_LIN1, 32, d2_1);
+                    pushf!(wa, GS_BASE + G_STRIDE * $g1 + REC_LIN1, 32, d2_1);
+                    pushf!(wb, GS_BASE + G_STRIDE * $g1 + REC_LIN1, 32, maxv);
+                    state[$la0] = a2_0;
+                    state[$lb0] = bn_0;
+                    state[$lc0] = c2s_0;
+                    state[$ld0] = d2_0;
+                    state[$la1] = a2_1;
+                    state[$lb1] = bn_1;
+                    state[$lc1] = c2s_1;
+                    state[$ld1] = d2_1;
+                }};
+            }
             macro_rules! round {
                 ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal,
                  $m4:literal, $m5:literal, $m6:literal, $m7:literal,
                  $m8:literal, $m9:literal, $m10:literal, $m11:literal,
                  $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
-                    g!($gb, 0, 4, 8, 12, $m0, $m1);
-                    g!($gb + 1, 1, 5, 9, 13, $m2, $m3);
-                    g!($gb + 2, 2, 6, 10, 14, $m4, $m5);
-                    g!($gb + 3, 3, 7, 11, 15, $m6, $m7);
-                    g!($gb + 4, 0, 5, 10, 15, $m8, $m9);
-                    g!($gb + 5, 1, 6, 11, 12, $m10, $m11);
-                    g!($gb + 6, 2, 7, 8, 13, $m12, $m13);
-                    g!($gb + 7, 3, 4, 9, 14, $m14, $m15);
+                    // dual_g_enabled is OnceLock; call inside macro to dodge
+                    // macro_rules hygiene on an outer `let dual_g`.
+                    if dual_g_enabled() {
+                        // Column G's: lanes {0,4,8,12}⊥{1,5,9,13}⊥{2,6,10,14}⊥{3,7,11,15}
+                        g_pair!($gb, 0, 4, 8, 12, $m0, $m1,
+                                $gb + 1, 1, 5, 9, 13, $m2, $m3);
+                        g_pair!($gb + 2, 2, 6, 10, 14, $m4, $m5,
+                                $gb + 3, 3, 7, 11, 15, $m6, $m7);
+                        // Diagonal G's: similarly disjoint after column update
+                        g_pair!($gb + 4, 0, 5, 10, 15, $m8, $m9,
+                                $gb + 5, 1, 6, 11, 12, $m10, $m11);
+                        g_pair!($gb + 6, 2, 7, 8, 13, $m12, $m13,
+                                $gb + 7, 3, 4, 9, 14, $m14, $m15);
+                    } else {
+                        g!($gb, 0, 4, 8, 12, $m0, $m1);
+                        g!($gb + 1, 1, 5, 9, 13, $m2, $m3);
+                        g!($gb + 2, 2, 6, 10, 14, $m4, $m5);
+                        g!($gb + 3, 3, 7, 11, 15, $m6, $m7);
+                        g!($gb + 4, 0, 5, 10, 15, $m8, $m9);
+                        g!($gb + 5, 1, 6, 11, 12, $m10, $m11);
+                        g!($gb + 6, 2, 7, 8, 13, $m12, $m13);
+                        g!($gb + 7, 3, 4, 9, 14, $m14, $m15);
+                    }
                 }};
             }
             round!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
