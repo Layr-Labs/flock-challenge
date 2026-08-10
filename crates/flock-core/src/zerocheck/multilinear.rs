@@ -228,6 +228,25 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     (pairs_per_block - 1, useful_pairs)
 }
 
+/// Kill switch for the round-two dead-pair store/read skip:
+/// `FLOCK_NO_R2_DEADPAIR_SKIP=1` (exact `1`) restores the incumbent behaviour
+/// on BOTH sides — the compact producers zero-fill every padded pair's anchor
+/// and delta slots again, mark the compact state dense, and every consumer
+/// then blind-reads those zeros exactly as before.
+///
+/// With the skip enabled (default), producers leave the padded pairs' slots
+/// untouched (they hold unspecified pool/donated bytes) and stamp the periodic
+/// dead-pair geometry into [`UniSkipCompactFold`]; every consumer masks those
+/// pairs at read, substituting the zeros the incumbent stored. Values on the
+/// wire are bit-identical either way.
+fn r2_deadpair_skip_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none_or(|v| v != *"1")
+    });
+    *ENABLED
+}
+
 /// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
 /// through the hetero E-core queue (H2). `FLOCK_NO_ZC_TAIL_HETERO=1` keeps
 /// them on the main rayon pool. Bit-identical either way — chunk ownership
@@ -795,6 +814,15 @@ pub struct UniSkipCompactFold {
     pub anchors: Vec<F128>,
     /// Interleaved `[a_delta; 8], [b_delta; 8]`, sixteen bytes per row pair.
     pub deltas: ScratchBytes,
+    /// Periodic dead-pair geometry (see [`round2_pair_skip`]): pair `k` is a
+    /// zero-padding pair iff `(k & pair_in_block_mask) >= useful_pairs_inclusive`.
+    /// When the producer ran with the dead-pair skip enabled, those pairs'
+    /// anchor/delta slots hold UNSPECIFIED bytes and every consumer must
+    /// substitute zeros for them at read. `(0, usize::MAX)` marks a dense
+    /// state (every slot written; incumbent blind-read is valid).
+    pub pair_in_block_mask: usize,
+    /// See `pair_in_block_mask`.
+    pub useful_pairs_inclusive: usize,
 }
 
 impl UniSkipCompactFold {
@@ -808,11 +836,39 @@ impl UniSkipCompactFold {
         self.anchors.is_empty()
     }
 
+    /// True when every anchor/delta slot was written by the producer, so
+    /// consumers may read all of them without masking.
+    #[inline]
+    pub fn is_dense(&self) -> bool {
+        self.useful_pairs_inclusive == usize::MAX
+    }
+
+    /// True when pair `pair_idx`'s anchor/delta slots are dead padding whose
+    /// contents are unspecified; consumers must treat them as zero.
+    #[inline]
+    pub fn pair_is_dead(&self, pair_idx: usize) -> bool {
+        (pair_idx & self.pair_in_block_mask) >= self.useful_pairs_inclusive
+    }
+
     /// Return both large buffers to their process-wide scratch pools.
     pub fn recycle(self) {
-        let Self { anchors, deltas } = self;
+        let Self {
+            anchors, deltas, ..
+        } = self;
         crate::scratch::give_f128(anchors);
         deltas.recycle();
+    }
+}
+
+/// The geometry stamp for a compact producer run: the real periodic dead-pair
+/// mask when the store-skip is active, the dense marker when it is not (kill
+/// switch, or a shape with no dead pairs).
+#[inline]
+fn compact_geometry(pair_in_block_mask: usize, useful_pairs_inclusive: usize) -> (usize, usize) {
+    if useful_pairs_inclusive != usize::MAX && r2_deadpair_skip_enabled() {
+        (pair_in_block_mask, useful_pairs_inclusive)
+    } else {
+        (0, usize::MAX)
     }
 }
 
@@ -874,9 +930,18 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         deltas_len,
         "donated compact delta backing has the wrong byte length"
     );
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    // Dead-pair store skip (see `r2_deadpair_skip_enabled`): with the skip on,
+    // the kernels below never write the padded pairs' anchor/delta slots and
+    // the compact state is stamped with the periodic geometry so every
+    // consumer masks those slots at read.
+    let (geo_mask, geo_useful) = compact_geometry(pair_in_block_mask, useful_pairs_inclusive);
+    let skip_dead_stores = geo_useful != usize::MAX;
     let mut compact = UniSkipCompactFold {
         anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
+        pair_in_block_mask: geo_mask,
+        useful_pairs_inclusive: geo_useful,
     };
 
     let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -887,7 +952,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     let eq_lo = &eq.lo;
     let anchor_chunk_size = 2 * lo_size;
     let delta_chunk_size = 2 * lo_size * n_chunks;
-    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
 
@@ -961,6 +1025,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                         pair_idx_base,
                         pair_in_block_mask,
                         useful_pairs_inclusive,
+                        skip_dead_stores,
                     );
                 }
                 return;
@@ -980,6 +1045,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                     pair_in_block_mask,
                     useful_pairs_inclusive,
                     degen,
+                    skip_dead_stores,
                 )
             };
 
@@ -989,9 +1055,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                 let mut pinf_acc = F256Unreduced::ZERO;
                 for x_lo in 0..lo_size {
                     if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                        anchors[2 * x_lo] = F128::ZERO;
-                        anchors[2 * x_lo + 1] = F128::ZERO;
-                        deltas[2 * x_lo * n_chunks..2 * (x_lo + 1) * n_chunks].fill(0);
+                        if !skip_dead_stores {
+                            anchors[2 * x_lo] = F128::ZERO;
+                            anchors[2 * x_lo + 1] = F128::ZERO;
+                            deltas[2 * x_lo * n_chunks..2 * (x_lo + 1) * n_chunks].fill(0);
+                        }
                         continue;
                     }
 
@@ -1077,6 +1145,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                             pair_in_block_mask,
                             useful_pairs_inclusive,
                             degen,
+                            skip_dead_stores,
                         )
                     };
                     let eq_h = eq_hi[x_hi];
@@ -1137,9 +1206,13 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
         assert_eq!(b_packed.len(), n_out * n_chunks);
         assert_eq!(mlv_challenges.len(), m - k_skip);
 
+        // Probe-only entry point: keeps the incumbent zero-fill schedule, so
+        // the state is dense by construction.
         let mut compact = UniSkipCompactFold {
             anchors: crate::scratch::take_f128(2 * n_pairs),
             deltas: ScratchBytes::take(2 * n_pairs * n_chunks),
+            pair_in_block_mask: 0,
+            useful_pairs_inclusive: usize::MAX,
         };
 
         let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -1257,6 +1330,11 @@ pub fn fold_compact_and_compute_round_pair_stream(
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // The streaming kernels blind-read every slot; a mask-stamped compact
+        // state takes the (bit-identical) masked base route instead.
+        if !compact.is_dense() {
+            return fold_compact_and_compute_round_pair(compact, table, r_fold, r_next);
+        }
         let n = compact.len();
         assert!(!compact.is_empty() && n.is_power_of_two() && n >= 4);
         assert_eq!(compact.anchors.len(), 2 * n);
@@ -1416,7 +1494,9 @@ pub fn fold_compact_and_compute_round_pair(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     const ZC_T3_INTEGRATION_PARKED: bool = true;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = if ZC_T3_INTEGRATION_PARKED {
+    let gpu_job = if ZC_T3_INTEGRATION_PARKED || !compact.is_dense() {
+        // The GPU T3 kernel blind-reads the whole compact state, so it is
+        // only admissible on a dense (fully written) state.
         None
     } else {
         crate::gpu_commit::launch_zc_t3_products(
@@ -1463,6 +1543,9 @@ pub fn fold_compact_and_compute_round_pair(
                         a_out.as_mut_ptr(),
                         b_out.as_mut_ptr(),
                         lo_size,
+                        base,
+                        compact.pair_in_block_mask,
+                        compact.useful_pairs_inclusive,
                     );
                 }
                 return;
@@ -1479,6 +1562,9 @@ pub fn fold_compact_and_compute_round_pair(
                     eq_lo.as_ptr(),
                     lo_size,
                     degen,
+                    base,
+                    compact.pair_in_block_mask,
+                    compact.useful_pairs_inclusive,
                 )
             };
 
@@ -1490,6 +1576,15 @@ pub fn fold_compact_and_compute_round_pair(
                     let out = 2 * x_lo;
                     for lane in 0..2 {
                         let index = base + out + lane;
+                        // Dead pair: its slots are unspecified under the
+                        // store-skip; the incumbent stored zeros and its
+                        // reconstruction was `0 + Σ scaled_table[0]` = 0
+                        // (table entry 0 is zero), so substitute exactly that.
+                        if compact.pair_is_dead(index) {
+                            a_out[out + lane] = F128::ZERO;
+                            b_out[out + lane] = F128::ZERO;
+                            continue;
+                        }
                         let mut a = compact.anchors[2 * index];
                         let mut b = compact.anchors[2 * index + 1];
                         for j in 0..table.n_chunks {
@@ -1559,6 +1654,9 @@ pub fn fold_compact_and_compute_round_pair(
                             eq_lo.as_ptr(),
                             lo_size,
                             degen,
+                            base,
+                            compact.pair_in_block_mask,
+                            compact.useful_pairs_inclusive,
                         )
                     };
                     let eq_h = eq_hi[x_hi];
@@ -1672,9 +1770,18 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         deltas_len,
         "donated compact delta backing has the wrong byte length"
     );
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    // Dead-pair store skip (see `r2_deadpair_skip_enabled`): with the skip on,
+    // the kernels below never write the padded pairs' anchor/delta slots and
+    // the compact state is stamped with the periodic geometry so every
+    // consumer masks those slots at read.
+    let (geo_mask, geo_useful) = compact_geometry(pair_in_block_mask, useful_pairs_inclusive);
+    let skip_dead_stores = geo_useful != usize::MAX;
     let mut compact = UniSkipCompactFold {
         anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
+        pair_in_block_mask: geo_mask,
+        useful_pairs_inclusive: geo_useful,
     };
 
     let n_vars = mlv_challenges.len() - 1;
@@ -1691,7 +1798,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let eq_lo = &eq.lo;
     let anchor_chunk_size = 2 * lo_size;
     let delta_chunk_size = 2 * lo_size * n_chunks;
-    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
     #[cfg(target_arch = "aarch64")]
@@ -1771,6 +1877,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        skip_dead_stores,
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu {
@@ -1787,6 +1894,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        skip_dead_stores,
                         out.as_mut_ptr(),
                     );
                 } else {
@@ -1803,6 +1911,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        skip_dead_stores,
                         out.as_mut_ptr(),
                     );
                 }
@@ -1825,6 +1934,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                 pair_idx_base,
                 pair_in_block_mask,
                 useful_pairs_inclusive,
+                skip_dead_stores,
             );
         }
 
@@ -1909,6 +2019,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                             useful_pairs_inclusive,
                             degen,
                             periodic_padding,
+                            skip_dead_stores,
                             out.as_mut_ptr(),
                         );
                     }
@@ -1968,6 +2079,7 @@ fn round2_lookahead_chunk_scalar(
     pair_idx_base: usize,
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
+    skip_dead_stores: bool,
 ) -> [F128; 8] {
     let n_chunks = table.n_chunks;
     let mut p1_even = F256Unreduced::ZERO;
@@ -1978,9 +2090,11 @@ fn round2_lookahead_chunk_scalar(
 
     let mut fold_pair = |x_lo: usize, anchors: &mut [F128], deltas: &mut [u8]| {
         if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-            anchors[2 * x_lo] = F128::ZERO;
-            anchors[2 * x_lo + 1] = F128::ZERO;
-            deltas[2 * x_lo * n_chunks..2 * (x_lo + 1) * n_chunks].fill(0);
+            if !skip_dead_stores {
+                anchors[2 * x_lo] = F128::ZERO;
+                anchors[2 * x_lo + 1] = F128::ZERO;
+                deltas[2 * x_lo * n_chunks..2 * (x_lo + 1) * n_chunks].fill(0);
+            }
             return None;
         }
         let x0g = row_base + 2 * x_lo;
@@ -2114,6 +2228,9 @@ pub(crate) fn fold2_compact_and_round4_into(
                 eq_lo.as_ptr(),
                 lo_size,
                 degen,
+                pair_base,
+                compact.pair_in_block_mask,
+                compact.useful_pairs_inclusive,
             )
         };
 
@@ -2126,15 +2243,39 @@ pub(crate) fn fold2_compact_and_round4_into(
             let nc = table.n_chunks;
             for g_local in 0..out_chunk {
                 let g = x_hi * out_chunk + g_local;
+                // Dead pairs' slots are unspecified under the store-skip;
+                // substitute the zeros the incumbent stored (a zero delta
+                // code folds to zero through the tables' zero entry).
+                let dead0 = compact.pair_is_dead(2 * g);
+                let dead1 = compact.pair_is_dead(2 * g + 1);
+                if dead0 && dead1 {
+                    a_out[g_local] = F128::ZERO;
+                    b_out[g_local] = F128::ZERO;
+                    continue;
+                }
                 let anc = &compact.anchors[4 * g..4 * g + 4];
                 let d = &compact.deltas[32 * g..32 * g + 32];
-                let mut a = anc[0] + rho2 * (anc[0] + anc[2]);
-                let mut b = anc[1] + rho2 * (anc[1] + anc[3]);
+                let (a0, b0) = if dead0 {
+                    (F128::ZERO, F128::ZERO)
+                } else {
+                    (anc[0], anc[1])
+                };
+                let (a1, b1) = if dead1 {
+                    (F128::ZERO, F128::ZERO)
+                } else {
+                    (anc[2], anc[3])
+                };
+                let mut a = a0 + rho2 * (a0 + a1);
+                let mut b = b0 + rho2 * (b0 + b1);
                 for j in 0..nc {
-                    a += table_l1[j * 256 + d[j] as usize];
-                    b += table_l1[j * 256 + d[nc + j] as usize];
-                    a += table_l3[j * 256 + d[2 * nc + j] as usize];
-                    b += table_l3[j * 256 + d[3 * nc + j] as usize];
+                    if !dead0 {
+                        a += table_l1[j * 256 + d[j] as usize];
+                        b += table_l1[j * 256 + d[nc + j] as usize];
+                    }
+                    if !dead1 {
+                        a += table_l3[j * 256 + d[2 * nc + j] as usize];
+                        b += table_l3[j * 256 + d[3 * nc + j] as usize];
+                    }
                 }
                 a_out[g_local] = a;
                 b_out[g_local] = b;
@@ -2295,6 +2436,9 @@ pub(crate) fn fold2_compact_and_round45_into(
                 eq_lo.as_ptr(),
                 lo_size,
                 degen,
+                pair_base,
+                compact.pair_in_block_mask,
+                compact.useful_pairs_inclusive,
                 outv.as_mut_ptr(),
             );
         }
@@ -2380,18 +2524,40 @@ fn fold2_round45_chunk_scalar(
     let mut w = [F256Unreduced::ZERO; 4];
 
     // Materialize the chunk's composed outputs first (identical expressions
-    // to the incumbent scalar path)…
+    // to the incumbent scalar path, with the incumbent's zeros substituted
+    // for dead pairs' unspecified slots — see `fold2_compact_and_round4_into`)…
     for g_local in 0..out_chunk {
         let g = x_hi * out_chunk + g_local;
+        let dead0 = compact.pair_is_dead(2 * g);
+        let dead1 = compact.pair_is_dead(2 * g + 1);
+        if dead0 && dead1 {
+            a_out[g_local] = F128::ZERO;
+            b_out[g_local] = F128::ZERO;
+            continue;
+        }
         let anc = &compact.anchors[4 * g..4 * g + 4];
         let d = &compact.deltas[32 * g..32 * g + 32];
-        let mut a = anc[0] + rho2 * (anc[0] + anc[2]);
-        let mut b = anc[1] + rho2 * (anc[1] + anc[3]);
+        let (a0, b0) = if dead0 {
+            (F128::ZERO, F128::ZERO)
+        } else {
+            (anc[0], anc[1])
+        };
+        let (a1, b1) = if dead1 {
+            (F128::ZERO, F128::ZERO)
+        } else {
+            (anc[2], anc[3])
+        };
+        let mut a = a0 + rho2 * (a0 + a1);
+        let mut b = b0 + rho2 * (b0 + b1);
         for j in 0..nc {
-            a += table_l1[j * 256 + d[j] as usize];
-            b += table_l1[j * 256 + d[nc + j] as usize];
-            a += table_l3[j * 256 + d[2 * nc + j] as usize];
-            b += table_l3[j * 256 + d[3 * nc + j] as usize];
+            if !dead0 {
+                a += table_l1[j * 256 + d[j] as usize];
+                b += table_l1[j * 256 + d[nc + j] as usize];
+            }
+            if !dead1 {
+                a += table_l3[j * 256 + d[2 * nc + j] as usize];
+                b += table_l3[j * 256 + d[3 * nc + j] as usize];
+            }
         }
         a_out[g_local] = a;
         b_out[g_local] = b;
@@ -4381,6 +4547,195 @@ mod tests {
         hi: 0x5a5a_5a5a_5a5a_5a5a,
     };
 
+    /// Dead-pair store/read skip oracle (`FLOCK_NO_R2_DEADPAIR_SKIP`): at the
+    /// ranked periodic padding the producers leave the dead pairs' anchor and
+    /// delta slots unwritten. This pre-poisons those slots with nonzero
+    /// garbage through the scratch pool and a donated delta backing, proves
+    /// the producer really skipped the stores (the poison survives), and then
+    /// proves every consumer of the compact state — the T3 reconstruction,
+    /// its streaming entry, the K pass, and the cascade K pass — reproduces a
+    /// dense incumbent twin (same state with the incumbent's zeros in the
+    /// dead slots) bit-for-bit, i.e. no consumer ever reads the garbage.
+    #[test]
+    fn deadpair_skip_chain_matches_incumbent_with_poisoned_slots() {
+        const K_SKIP: usize = 6;
+        assert!(
+            std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none_or(|v| v != *"1"),
+            "test requires the dead-pair skip enabled"
+        );
+        let poison_bytes: [u8; 16] = unsafe { core::mem::transmute(LA_POISON) };
+        for m in [16usize, 20] {
+            let f = la_fixture(m, 0xDEAD_5C1F ^ (m as u64), true);
+            let r_next3 = la_r_next3(&f);
+            let r_next4 = la_r_next4(&f);
+            crate::scratch::clear();
+
+            let n_out = 1usize << (m - K_SKIP);
+            let n_pairs = n_out / 2;
+            let deltas_len = n_out * 8;
+
+            // Pre-poison the anchor allocation in the pool and donate a
+            // poisoned delta backing, so unwritten slots provably hold
+            // nonzero garbage after production.
+            let mut poison_anchors = crate::scratch::take_f128(2 * n_pairs);
+            poison_anchors.fill(LA_POISON);
+            crate::scratch::give_f128(poison_anchors);
+            let donor = vec![LA_POISON; deltas_len / core::mem::size_of::<F128>()];
+            let (compact, m1, mi, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                K_SKIP,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+                Some(ScratchBytes::from_initialized_f128(donor)),
+            );
+            assert!(!compact.is_dense(), "ranked padding must be mask-stamped");
+            assert_eq!(compact.pair_in_block_mask, 127, "m={m}");
+            assert_eq!(compact.useful_pairs_inclusive, 121, "m={m}");
+
+            let assert_dead_slots_poisoned = |compact: &UniSkipCompactFold| {
+                for pair in 0..n_pairs {
+                    if !compact.pair_is_dead(pair) {
+                        continue;
+                    }
+                    assert_eq!(
+                        compact.anchors[2 * pair],
+                        LA_POISON,
+                        "dead a-anchor written, m={m}, pair={pair}"
+                    );
+                    assert_eq!(
+                        compact.anchors[2 * pair + 1],
+                        LA_POISON,
+                        "dead b-anchor written, m={m}, pair={pair}"
+                    );
+                    assert_eq!(
+                        &compact.deltas[16 * pair..16 * pair + 16],
+                        &poison_bytes[..],
+                        "dead delta written, m={m}, pair={pair}"
+                    );
+                }
+            };
+            assert_dead_slots_poisoned(&compact);
+
+            // Round-two wire message: unchanged by the store handling.
+            let (compact_p, m1_p, mi_p) = uni_skip_fold_and_round_pair_compact_padded(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                K_SKIP,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+            );
+            assert_eq!((m1, mi), (m1_p, mi_p), "round-two message, m={m}");
+            compact_p.recycle();
+
+            // Incumbent twin: identical bytes with the incumbent's zeros in
+            // the dead slots, marked dense (blind reads are valid there).
+            let mut dense = UniSkipCompactFold {
+                anchors: compact.anchors.clone(),
+                deltas: {
+                    let mut d = ScratchBytes::take(deltas_len);
+                    d.copy_from_slice(&compact.deltas);
+                    d
+                },
+                pair_in_block_mask: 0,
+                useful_pairs_inclusive: usize::MAX,
+            };
+            for pair in 0..n_pairs {
+                if compact.pair_is_dead(pair) {
+                    dense.anchors[2 * pair] = F128::ZERO;
+                    dense.anchors[2 * pair + 1] = F128::ZERO;
+                    dense.deltas[16 * pair..16 * pair + 16].fill(0);
+                }
+            }
+
+            // T3 reconstruction + round-three message, plus the streaming
+            // entry point (which must take the masked route when sparse).
+            for &rho1 in &f.rho_grid {
+                let (a_s, b_s, e1_s, ei_s) =
+                    fold_compact_and_compute_round_pair(&compact, &f.table, rho1, &r_next3);
+                let (a_d, b_d, e1_d, ei_d) =
+                    fold_compact_and_compute_round_pair(&dense, &f.table, rho1, &r_next3);
+                assert_eq!(a_s, a_d, "T3 A, m={m}, rho1={rho1:?}");
+                assert_eq!(b_s, b_d, "T3 B, m={m}, rho1={rho1:?}");
+                assert_eq!(
+                    (e1_s, ei_s),
+                    (e1_d, ei_d),
+                    "round-three message, m={m}, rho1={rho1:?}"
+                );
+                assert_eq!(
+                    eval_round3_lookahead(&la, rho1),
+                    (e1_d, ei_d),
+                    "lookahead round-three message, m={m}, rho1={rho1:?}"
+                );
+                let (a_t, b_t, e1_t, ei_t) = fold_compact_and_compute_round_pair_stream(
+                    &compact, &f.table, rho1, &r_next3, 8,
+                );
+                assert_eq!(a_t, a_d, "stream T3 A, m={m}, rho1={rho1:?}");
+                assert_eq!(b_t, b_d, "stream T3 B, m={m}, rho1={rho1:?}");
+                assert_eq!(
+                    (e1_t, ei_t),
+                    (e1_d, ei_d),
+                    "stream round-three message, m={m}, rho1={rho1:?}"
+                );
+                crate::scratch::give_f128(a_s);
+                crate::scratch::give_f128(b_s);
+                crate::scratch::give_f128(a_d);
+                crate::scratch::give_f128(b_d);
+                crate::scratch::give_f128(a_t);
+                crate::scratch::give_f128(b_t);
+            }
+
+            // K pass and cascade K pass (rounds three/four composed).
+            let n_groups = compact.len() / 2;
+            for &(rho1, rho2) in &[
+                (f.rho_grid[3], f.rho_grid[2]),
+                (F128::ONE, f.rho_grid[3]),
+                (F128::ZERO, f.rho_grid[3]),
+            ] {
+                let mut a_s = vec![LA_POISON; n_groups];
+                let mut b_s = vec![LA_POISON; n_groups];
+                let mut a_d = vec![LA_POISON; n_groups];
+                let mut b_d = vec![LA_POISON; n_groups];
+                let msg_s = fold2_compact_and_round4_into(
+                    &compact, &f.table, rho1, rho2, &r_next4, &mut a_s, &mut b_s,
+                );
+                let msg_d = fold2_compact_and_round4_into(
+                    &dense, &f.table, rho1, rho2, &r_next4, &mut a_d, &mut b_d,
+                );
+                assert_eq!(a_s, a_d, "K A'', m={m}, rho1={rho1:?}, rho2={rho2:?}");
+                assert_eq!(b_s, b_d, "K B'', m={m}, rho1={rho1:?}, rho2={rho2:?}");
+                assert_eq!(msg_s, msg_d, "round-four message, m={m}");
+
+                let mut a_c = vec![LA_POISON; n_groups];
+                let mut b_c = vec![LA_POISON; n_groups];
+                let mut a_e = vec![LA_POISON; n_groups];
+                let mut b_e = vec![LA_POISON; n_groups];
+                let (c1, ci, la5_s) = fold2_compact_and_round45_into(
+                    &compact, &f.table, rho1, rho2, &r_next4, &mut a_c, &mut b_c,
+                );
+                let (d1, di, la5_d) = fold2_compact_and_round45_into(
+                    &dense, &f.table, rho1, rho2, &r_next4, &mut a_e, &mut b_e,
+                );
+                assert_eq!(a_c, a_e, "cascade A'', m={m}, rho1={rho1:?}, rho2={rho2:?}");
+                assert_eq!(b_c, b_e, "cascade B'', m={m}, rho1={rho1:?}, rho2={rho2:?}");
+                assert_eq!((c1, ci), (d1, di), "cascade round-four message, m={m}");
+                assert_eq!(la5_s, la5_d, "round-five lookahead, m={m}");
+                assert_eq!(a_c, a_d, "cascade vs K outputs, m={m}");
+            }
+
+            // Nothing may have zero-filled the dead slots behind the mask.
+            assert_dead_slots_poisoned(&compact);
+
+            compact.recycle();
+            dense.recycle();
+            crate::scratch::clear();
+        }
+    }
+
     struct LaFixture {
         m: usize,
         table: UniSkipFoldTable,
@@ -4517,8 +4872,30 @@ mod tests {
                         None,
                     );
                 assert_eq!((m1_n, mi_n), (m1_l, mi_l), "round-two message, m={m}");
-                assert_eq!(compact_n.anchors, compact.anchors, "anchors, m={m}");
-                assert_eq!(&compact_n.deltas[..], &compact.deltas[..], "deltas, m={m}");
+                // Dead pairs' slots are unspecified under the store-skip
+                // (both producers left them untouched), so compare the
+                // compact state pair-by-pair over the useful range only.
+                assert_eq!(
+                    (compact_n.pair_in_block_mask, compact_n.useful_pairs_inclusive),
+                    (compact.pair_in_block_mask, compact.useful_pairs_inclusive),
+                    "geometry, m={m}"
+                );
+                assert_eq!(compact_n.len(), compact.len(), "len, m={m}");
+                for pair in 0..compact.len() {
+                    if compact.pair_is_dead(pair) {
+                        continue;
+                    }
+                    assert_eq!(
+                        compact_n.anchors[2 * pair..2 * pair + 2],
+                        compact.anchors[2 * pair..2 * pair + 2],
+                        "anchors, m={m}, pair={pair}"
+                    );
+                    assert_eq!(
+                        compact_n.deltas[16 * pair..16 * pair + 16],
+                        compact.deltas[16 * pair..16 * pair + 16],
+                        "deltas, m={m}, pair={pair}"
+                    );
+                }
 
                 for &rho1 in &f.rho_grid {
                     let (a3, b3, e1, ei) =

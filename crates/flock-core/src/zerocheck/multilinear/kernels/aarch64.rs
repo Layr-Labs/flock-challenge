@@ -507,6 +507,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
     degen: bool,
+    skip_dead_stores: bool,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -541,8 +542,13 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
 
         for x_lo in 0..lo_size {
             if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                // Dead-pair skip: leave the padded pair's slots untouched;
+                // the compact state's mask makes every consumer substitute
+                // the zeros this branch used to store.
+                if !skip_dead_stores {
+                    store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
+                    vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                }
                 continue;
             }
 
@@ -615,6 +621,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
     pair_idx_base: usize,
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
+    skip_dead_stores: bool,
 ) {
     use core::arch::aarch64::*;
 
@@ -635,8 +642,11 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
         let zero = vdupq_n_u64(0);
         for x_lo in 0..lo_size {
             if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                // Dead-pair skip: same contract as the fused kernel above.
+                if !skip_dead_stores {
+                    store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
+                    vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                }
                 continue;
             }
             let row0 = 2 * x_lo;
@@ -684,6 +694,7 @@ unsafe fn r2_pair_fold_and_store(
     x_lo: usize,
     padded: bool,
     degen: bool,
+    skip_dead_stores: bool,
     b_ones: core::arch::aarch64::uint64x2_t,
 ) -> (
     core::arch::aarch64::uint64x2_t,
@@ -710,8 +721,13 @@ unsafe fn r2_pair_fold_and_store(
     unsafe {
         let zero = vdupq_n_u64(0);
         if padded {
-            store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            // Dead-pair skip: leave the padded pair's slots untouched; the
+            // compact state's mask makes every consumer substitute the zeros
+            // this branch used to store.
+            if !skip_dead_stores {
+                store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            }
             return (zero, zero, zero, zero, false);
         }
 
@@ -804,6 +820,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     useful_pairs_inclusive: usize,
     degen: bool,
     periodic_padding: bool,
+    skip_dead_stores: bool,
     out: *mut F128,
 ) {
     use core::arch::aarch64::*;
@@ -841,12 +858,16 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 
         macro_rules! zero_group {
             ($u:expr) => {{
-                let x_lo0 = 2 * $u;
-                let x_lo1 = x_lo0 + 1;
-                store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
-                store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                // Dead-pair skip: no zero-fill stores; the compact state's
+                // mask makes every consumer substitute these zeros at read.
+                if !skip_dead_stores {
+                    let x_lo0 = 2 * $u;
+                    let x_lo1 = x_lo0 + 1;
+                    store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
+                    vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
+                    store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
+                    vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                }
             }};
         }
 
@@ -858,10 +879,28 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let pad1 = $pad1;
 
                 let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
+                    table_data,
+                    a_packed,
+                    b_packed,
+                    anchors,
+                    deltas,
+                    x_lo0,
+                    pad0,
+                    degen,
+                    skip_dead_stores,
+                    b_ones,
                 );
                 let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
+                    table_data,
+                    a_packed,
+                    b_packed,
+                    anchors,
+                    deltas,
+                    x_lo1,
+                    pad1,
+                    degen,
+                    skip_dead_stores,
+                    b_ones,
                 );
 
                 // The odd lane's weight drives the whole group; see the doc above.
@@ -966,17 +1005,115 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     }
 }
 
+/// Compose one K output (round-4 table entry) from its round-4 group's two
+/// compact pairs `2g`/`2g+1`, with the dead-pair mask applied at load:
+/// `alive0`/`alive1` = false substitutes the zeros the incumbent zero-fill
+/// stored for that pair (anchor = 0, delta code = 0; a zero delta code folds
+/// to zero through the λ-tables' zero entry, so the composed value is exactly
+/// the incumbent's). With both flags `true` — the constant-folded fast path —
+/// this is the incumbent lane body verbatim.
+///
+/// Returns `(a_value, b_value, lane_b_flat)`; `lane_b_flat` is the same
+/// per-lane flag the incumbent loops tracked. Every product shortcut the
+/// callers gate on it is additionally value-gated, so the flag is
+/// timing-only.
+///
+/// Same inline/feature split as [`r2_pair_fold_and_store`]: `inline(always)`
+/// without its own `target_feature`, relying on the enabling caller.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn k_lane_compose_8(
+    table_l1: *const u8,
+    table_l3: *const u8,
+    rho2_q: core::arch::aarch64::uint64x2_t,
+    anchors: *const F128,
+    deltas: *const u8,
+    g: usize,
+    degen: bool,
+    alive0: bool,
+    alive1: bool,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    bool,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        if !alive0 && !alive1 {
+            // Fully dead group: the incumbent composed `0 + ρ₂·0 + fold(0)`.
+            return (zero, zero, true);
+        }
+        let ap = anchors.add(4 * g).cast::<u64>();
+        let dp = deltas.add(32 * g);
+        let (anc_a0, anc_b0, da0, db0) = if alive0 {
+            (
+                vld1q_u64(ap),
+                vld1q_u64(ap.add(2)),
+                u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>())),
+                u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>())),
+            )
+        } else {
+            (zero, zero, 0u64, 0u64)
+        };
+        let (anc_a1, anc_b1, da1, db1) = if alive1 {
+            (
+                vld1q_u64(ap.add(4)),
+                vld1q_u64(ap.add(6)),
+                u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>())),
+                u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>())),
+            )
+        } else {
+            (zero, zero, 0u64, 0u64)
+        };
+
+        let a_delta = veorq_u64(
+            lookup_lanes_q::<8>(table_l1, da0, 0),
+            lookup_lanes_q::<8>(table_l3, da1, 0),
+        );
+        let av = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
+
+        if degen && (db0 | db1) == 0 {
+            // b rows are constant across the group: zero deltas mean both b
+            // halves equal their anchors.
+            let bd = veorq_u64(anc_b0, anc_b1);
+            if is_zero_q(bd) {
+                (av, anc_b0, true)
+            } else {
+                (av, veorq_u64(anc_b0, mul_q(rho2_q, bd)), false)
+            }
+        } else {
+            let b_delta = veorq_u64(
+                lookup_lanes_q::<8>(table_l1, db0, 0),
+                lookup_lanes_q::<8>(table_l3, db1, 0),
+            );
+            (
+                av,
+                xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta),
+                false,
+            )
+        }
+    }
+}
+
 /// Bind **both** ρ₁ and ρ₂ straight out of the compact round-two state and
 /// emit the round-four message in the same pass (variant K).
 ///
 /// `A''[y] = [anc0 + ρ₂(anc0+anc1)] + fold_{λ₁}(δ0) + fold_{λ₃}(δ1)` with
 /// `λ₁ = ρ₁(1+ρ₂)`, `λ₃ = ρ₁ρ₂` — in characteristic two `λ₀+λ₁ = 1+ρ₂` and
 /// `λ₂+λ₃ = ρ₂`, so the two anchors collapse into one ordinary ρ₂ fold and
-/// only the two deltas need λ-scaled tables. Padding needs no predicate: the
-/// compact state already carries zero anchors and zero deltas there, and a
-/// zero delta code folds to zero through the table's zero entry.
+/// only the two deltas need λ-scaled tables.
+///
+/// Padding: a DENSE compact state (`useful_pairs_inclusive = usize::MAX`)
+/// needs no predicate — its zero anchors and zero delta codes compose to zero
+/// through the table's zero entry. A mask-stamped state (dead-pair store skip)
+/// instead hoists one alive test per round-4 pair (`chunk_first_pair` is the
+/// absolute compact-pair index of this chunk's first pair) and substitutes
+/// those zeros at load via [`k_lane_compose_8`].
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
     table_l1: *const u8,
     table_l3: *const u8,
@@ -988,6 +1125,9 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
     eq_lo: *const F128,
     out_pairs: usize,
     degen: bool,
+    chunk_first_pair: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -1012,47 +1152,31 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
         let mut pinf_acc = WideNeon { lo: zero, hi: zero };
 
         for u in 0..out_pairs {
+            // Dead-pair mask, hoisted to one branch per round-4 pair (four
+            // compact pairs = 192 B): dense states and every fully-useful
+            // group take the constant-folded incumbent body.
+            let all_alive = ((chunk_first_pair + 4 * u) & pair_in_block_mask) + 3
+                < useful_pairs_inclusive;
             let mut av = [zero; 2];
             let mut bv = [zero; 2];
             let mut b_flat = true;
             for lane in 0..2usize {
                 let g = 2 * u + lane;
-                let ap = anchors.add(4 * g).cast::<u64>();
-                let anc_a0 = vld1q_u64(ap);
-                let anc_b0 = vld1q_u64(ap.add(2));
-                let anc_a1 = vld1q_u64(ap.add(4));
-                let anc_b1 = vld1q_u64(ap.add(6));
-
-                let dp = deltas.add(32 * g);
-                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
-                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
-                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
-
-                let a_delta = veorq_u64(
-                    lookup_lanes_q::<8>(table_l1, da0, 0),
-                    lookup_lanes_q::<8>(table_l3, da1, 0),
-                );
-                av[lane] = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
-
-                if degen && (db0 | db1) == 0 {
-                    // b rows are constant across the group: zero deltas mean
-                    // both b halves equal their anchors.
-                    let bd = veorq_u64(anc_b0, anc_b1);
-                    bv[lane] = if is_zero_q(bd) {
-                        anc_b0
-                    } else {
-                        b_flat = false;
-                        veorq_u64(anc_b0, mul_q(rho2_q, bd))
-                    };
+                let (a, b, lane_flat) = if all_alive {
+                    k_lane_compose_8(
+                        table_l1, table_l3, rho2_q, anchors, deltas, g, degen, true, true,
+                    )
                 } else {
-                    b_flat = false;
-                    let b_delta = veorq_u64(
-                        lookup_lanes_q::<8>(table_l1, db0, 0),
-                        lookup_lanes_q::<8>(table_l3, db1, 0),
-                    );
-                    bv[lane] = xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta);
-                }
+                    let p0 = chunk_first_pair + 2 * g;
+                    let alive0 = (p0 & pair_in_block_mask) < useful_pairs_inclusive;
+                    let alive1 = ((p0 + 1) & pair_in_block_mask) < useful_pairs_inclusive;
+                    k_lane_compose_8(
+                        table_l1, table_l3, rho2_q, anchors, deltas, g, degen, alive0, alive1,
+                    )
+                };
+                av[lane] = a;
+                bv[lane] = b;
+                b_flat &= lane_flat;
             }
 
             store_pair_nt(a_out.add(2 * u), av[0], av[1]);
@@ -1136,6 +1260,9 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
     eq_lo: *const F128,
     out_pairs: usize,
     degen: bool,
+    chunk_first_pair: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
     out: *mut F128,
 ) {
     use core::arch::aarch64::*;
@@ -1169,47 +1296,31 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
         debug_assert!(out_pairs >= 2 && out_pairs.is_multiple_of(2));
         let n5 = out_pairs / 2;
         for t in 0..n5 {
+            // Dead-pair mask, hoisted to one branch per round-5 group (eight
+            // compact pairs = 384 B): dense states and every fully-useful
+            // group take the constant-folded incumbent body.
+            let all_alive = ((chunk_first_pair + 8 * t) & pair_in_block_mask) + 7
+                < useful_pairs_inclusive;
             let mut av = [zero; 4];
             let mut bv = [zero; 4];
             let mut b_flat = true;
             for lane in 0..4usize {
                 let g = 4 * t + lane;
-                let ap = anchors.add(4 * g).cast::<u64>();
-                let anc_a0 = vld1q_u64(ap);
-                let anc_b0 = vld1q_u64(ap.add(2));
-                let anc_a1 = vld1q_u64(ap.add(4));
-                let anc_b1 = vld1q_u64(ap.add(6));
-
-                let dp = deltas.add(32 * g);
-                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
-                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
-                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
-
-                let a_delta = veorq_u64(
-                    lookup_lanes_q::<8>(table_l1, da0, 0),
-                    lookup_lanes_q::<8>(table_l3, da1, 0),
-                );
-                av[lane] = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
-
-                if degen && (db0 | db1) == 0 {
-                    // b rows are constant across the group: zero deltas mean
-                    // both b halves equal their anchors.
-                    let bd = veorq_u64(anc_b0, anc_b1);
-                    bv[lane] = if is_zero_q(bd) {
-                        anc_b0
-                    } else {
-                        b_flat = false;
-                        veorq_u64(anc_b0, mul_q(rho2_q, bd))
-                    };
+                let (a, b, lane_flat) = if all_alive {
+                    k_lane_compose_8(
+                        table_l1, table_l3, rho2_q, anchors, deltas, g, degen, true, true,
+                    )
                 } else {
-                    b_flat = false;
-                    let b_delta = veorq_u64(
-                        lookup_lanes_q::<8>(table_l1, db0, 0),
-                        lookup_lanes_q::<8>(table_l3, db1, 0),
-                    );
-                    bv[lane] = xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta);
-                }
+                    let p0 = chunk_first_pair + 2 * g;
+                    let alive0 = (p0 & pair_in_block_mask) < useful_pairs_inclusive;
+                    let alive1 = ((p0 + 1) & pair_in_block_mask) < useful_pairs_inclusive;
+                    k_lane_compose_8(
+                        table_l1, table_l3, rho2_q, anchors, deltas, g, degen, alive0, alive1,
+                    )
+                };
+                av[lane] = a;
+                bv[lane] = b;
+                b_flat &= lane_flat;
             }
 
             store_pair_nt(a_out.add(4 * t), av[0], av[1]);
@@ -1560,6 +1671,9 @@ pub(crate) unsafe fn fold_compact_chunk_neon_reconstruct_only_8(
     a_out: *mut F128,
     b_out: *mut F128,
     lo_size: usize,
+    chunk_first_pair: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
 ) {
     use core::arch::aarch64::*;
 
@@ -1577,8 +1691,38 @@ pub(crate) unsafe fn fold_compact_chunk_neon_reconstruct_only_8(
     }
 
     unsafe {
+        let zero = vdupq_n_u64(0);
         for x_lo in 0..lo_size {
             let out = 2 * x_lo;
+            // Dead-pair mask, hoisted to one branch per output pair (two
+            // compact pairs = 96 B): dense states and fully-useful groups
+            // take the incumbent body below the guard.
+            let p0 = chunk_first_pair + out;
+            if (p0 & pair_in_block_mask) + 1 >= useful_pairs_inclusive {
+                if (p0 & pair_in_block_mask) >= useful_pairs_inclusive {
+                    // Both pairs dead: the incumbent reconstructed
+                    // `0 + scaled_fold(0) = 0` (table entry 0 is zero).
+                    store_pair_nt(a_out.add(out), zero, zero);
+                    store_pair_nt(b_out.add(out), zero, zero);
+                    continue;
+                }
+                // Mixed: pair `p0` useful, pair `p0 + 1` dead — substitute
+                // the incumbent's zeros for the dead pair's outputs.
+                let delta = deltas.add(out * 16);
+                let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
+                let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
+                let a0 = veorq_u64(
+                    vld1q_u64(anchors.add(2 * out).cast::<u64>()),
+                    lookup_lanes_q::<8>(scaled_table, a0_code, 0),
+                );
+                let b0 = veorq_u64(
+                    vld1q_u64(anchors.add(2 * out + 1).cast::<u64>()),
+                    lookup_lanes_q::<8>(scaled_table, b0_code, 0),
+                );
+                store_pair_nt(a_out.add(out), a0, zero);
+                store_pair_nt(b_out.add(out), b0, zero);
+                continue;
+            }
             let delta = deltas.add(out * 16);
             let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
             let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
@@ -1631,6 +1775,9 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
     eq_lo: *const F128,
     lo_size: usize,
     degen: bool,
+    chunk_first_pair: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -1656,6 +1803,45 @@ pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
 
         for x_lo in 0..lo_size {
             let out = 2 * x_lo;
+            // Dead-pair mask, hoisted to one branch per product group (two
+            // compact pairs = 96 B): dense states and fully-useful groups
+            // take the incumbent body below the guard.
+            let p0 = chunk_first_pair + out;
+            if (p0 & pair_in_block_mask) + 1 >= useful_pairs_inclusive {
+                if (p0 & pair_in_block_mask) >= useful_pairs_inclusive {
+                    // Both pairs dead: the incumbent reconstructed
+                    // `0 + scaled_fold(0) = 0` for all four outputs (table
+                    // entry 0 is zero) and both its products vanished.
+                    store_pair_nt(a_out.add(out), zero, zero);
+                    store_pair_nt(b_out.add(out), zero, zero);
+                    continue;
+                }
+                // Mixed: pair `p0` useful, pair `p0 + 1` dead — substitute
+                // the incumbent's zeros (`a1 = b1 = 0`), so `G(1)`'s product
+                // vanishes and `G(∞)`'s collapses to `a0·b0`.
+                let delta = deltas.add(out * 16);
+                let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
+                let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
+                let a0 = veorq_u64(
+                    vld1q_u64(anchors.add(2 * out).cast::<u64>()),
+                    lookup_lanes_q::<8>(scaled_table, a0_code, 0),
+                );
+                let b0 = if degen && b0_code == 0 {
+                    // Same value-preserving shortcut as the incumbent degen
+                    // branch (its `b1_code` was the stored zero).
+                    vld1q_u64(anchors.add(2 * out + 1).cast::<u64>())
+                } else {
+                    veorq_u64(
+                        vld1q_u64(anchors.add(2 * out + 1).cast::<u64>()),
+                        lookup_lanes_q::<8>(scaled_table, b0_code, 0),
+                    )
+                };
+                store_pair_nt(a_out.add(out), a0, zero);
+                store_pair_nt(b_out.add(out), b0, zero);
+                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
+                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, mul_q(a0, b0)));
+                continue;
+            }
             let delta = deltas.add(out * 16);
             let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
             let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
@@ -2745,7 +2931,7 @@ mod tests {
             .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
             .collect();
 
-        let run = |periodic_padding: bool| {
+        let run = |periodic_padding: bool, skip_dead_stores: bool| {
             let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
             let mut anchors = vec![poison; 2 * LO_SIZE];
             let mut deltas = vec![0xa5u8; 2 * LO_SIZE * N_CHUNKS];
@@ -2764,16 +2950,42 @@ mod tests {
                     121,
                     true,
                     periodic_padding,
+                    skip_dead_stores,
                     out.as_mut_ptr(),
                 );
             }
             (anchors, deltas, out)
         };
 
-        let periodic = run(true);
-        let generic = run(false);
-        assert_eq!(periodic.0, generic.0, "anchor schedule mismatch");
-        assert_eq!(periodic.1, generic.1, "delta schedule mismatch");
-        assert_eq!(periodic.2, generic.2, "message/lookahead mismatch");
+        for skip_dead_stores in [false, true] {
+            let periodic = run(true, skip_dead_stores);
+            let generic = run(false, skip_dead_stores);
+            assert_eq!(
+                periodic.0, generic.0,
+                "anchor schedule mismatch, skip={skip_dead_stores}"
+            );
+            assert_eq!(
+                periodic.1, generic.1,
+                "delta schedule mismatch, skip={skip_dead_stores}"
+            );
+            assert_eq!(
+                periodic.2, generic.2,
+                "message/lookahead mismatch, skip={skip_dead_stores}"
+            );
+            if skip_dead_stores {
+                // The dead pairs' slots (in-block pair index >= 121) must be
+                // untouched poison on both schedules.
+                let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
+                for pair in 0..2 * LO_SIZE / 2 {
+                    if (pair & 127) >= 121 {
+                        assert_eq!(periodic.0[2 * pair], poison, "anchor written, pair={pair}");
+                        assert!(
+                            periodic.1[pair * 16..(pair + 1) * 16].iter().all(|&b| b == 0xa5),
+                            "delta written, pair={pair}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
