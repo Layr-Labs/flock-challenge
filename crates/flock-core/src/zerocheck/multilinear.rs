@@ -228,6 +228,16 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     (pairs_per_block - 1, useful_pairs)
 }
 
+/// Kill-switch for W6–W9 block-local in-place cascade folds (R5/6…R9/10).
+/// Default ON. Set `FLOCK_ZC_NO_CASCADE_INPLACE=1` to restore the separate
+/// ping-pong `a2_out` allocations (peak +~170 MiB at ranked).
+#[inline]
+fn zc_cascade_inplace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_ZC_NO_CASCADE_INPLACE").is_none())
+}
+
 /// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
 /// through the hetero E-core queue (H2). `FLOCK_NO_ZC_TAIL_HETERO=1` keeps
 /// them on the main rayon pool. Bit-identical either way — chunk ownership
@@ -2857,6 +2867,480 @@ pub(crate) fn fold2_plain_and_round67_into(
     (r_next6[0] * sum1, sum_inf, la7)
 }
 
+/// Block-local 4:1 in-place twin of [`fold2_plain_and_round6_into`].
+///
+/// Each hetero/rayon chunk owns a disjoint `chunk_in = 4·chunk_out` stripe.
+/// The chunk folds through private `chunk_out` scratch into the **front** of
+/// that stripe; after the join a linear compact packs fronts into
+/// `a[0..quarter)` / `b[0..quarter)` and both vecs truncate.
+///
+/// Peak DRAM drops the separate `a2_out`/`b2_out` ping-pong (2·quarter F128
+/// ≈ 128 MiB at the ranked R5/6 rung). Arithmetic matches the out-of-place
+/// path term-for-term.
+pub(crate) fn fold2_plain_and_round6_inplace(
+    a: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    rho3: F128,
+    rho4: F128,
+    r_next6: &[F128],
+) -> (F128, F128) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 16);
+    let quarter = n / 4;
+    // Kill-switch: restore separate ping-pong destination buffers.
+    if !zc_cascade_inplace_enabled() {
+        let mut a_out = crate::scratch::take_f128_unpinned(quarter);
+        let mut b_out = crate::scratch::take_f128_unpinned(quarter);
+        let msg = fold2_plain_and_round6_into(a, b, &mut a_out, &mut b_out, rho3, rho4, r_next6);
+        a.clear();
+        b.clear();
+        a.append(&mut a_out);
+        b.append(&mut b_out);
+        return msg;
+    }
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next6.len(), log_n - 2);
+
+    let n_vars = r_next6.len() - 1;
+    let n_hi = SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(1));
+    let eq = SplitEqGhash::with_n_hi(&r_next6[1..], n_hi);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size >= 2, "composed fold requires lo_size ≥ 2");
+    assert_eq!(lo_size * hi_size * 2, quarter);
+
+    let chunk_in = 8 * lo_size;
+    let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+
+    #[cfg(target_arch = "aarch64")]
+    let nt_stores = {
+        use std::sync::OnceLock;
+        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
+        quarter >= (1usize << 21)
+            && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
+    };
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_expanded_direct = !nt_stores
+        && ranked_direct_fold4_pair_output(quarter)
+        && zc_cascade_fold4_pair_enabled()
+        && zc_cascade_fold4_pair_direct_enabled();
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let rho34 = if use_expanded_direct {
+        rho3 * rho4
+    } else {
+        F128::ZERO
+    };
+
+    let chunk_partial =
+        |a_in: &[F128], b_in: &[F128], a_out: &mut [F128], b_out: &mut [F128]| -> (F128, F128) {
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            {
+                if use_expanded_direct {
+                    fold2_and_message_normal_expanded_aarch64(
+                        a_in, b_in, a_out, b_out, rho3, rho4, rho34, eq_lo,
+                    )
+                } else {
+                    fold2_and_message_aarch64(
+                        a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores,
+                    )
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+            {
+                fold2_and_message_aarch64(a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores)
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut p1_acc = F256Unreduced::ZERO;
+                let mut pinf_acc = F256Unreduced::ZERO;
+                for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
+                    let i = 8 * x_lo;
+                    let o = 2 * x_lo;
+                    let fold4 = |v: &[F128], i: usize| {
+                        let t0 = v[i] + rho3 * (v[i] + v[i + 1]);
+                        let t1 = v[i + 2] + rho3 * (v[i + 2] + v[i + 3]);
+                        t0 + rho4 * (t0 + t1)
+                    };
+                    let a0 = fold4(a_in, i);
+                    let a1 = fold4(a_in, i + 4);
+                    let b0 = fold4(b_in, i);
+                    let b1 = fold4(b_in, i + 4);
+                    a_out[o] = a0;
+                    a_out[o + 1] = a1;
+                    b_out[o] = b0;
+                    b_out[o + 1] = b1;
+                    p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+                    pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+                }
+                (p1_acc.reduce(), pinf_acc.reduce())
+            }
+        };
+
+    #[cfg(target_arch = "aarch64")]
+    let hetero = quarter >= (1usize << 21) && zc_tail_hetero_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    let hetero = false;
+
+    let (sum1, sum_inf) = if hetero {
+        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let a_base = crate::epool::SyncPtr(a.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks_stateful(
+            hi_size,
+            || {
+                (
+                    crate::alloc_uninit_vec::<F128>(chunk_out),
+                    crate::alloc_uninit_vec::<F128>(chunk_out),
+                )
+            },
+            |scratch, x_hi| {
+                let (ta, tb) = scratch;
+                // SAFETY: chunk x_hi exclusively owns a/b stripe
+                // [x_hi·cin, (x_hi+1)·cin). Private scratch receives the fold;
+                // only the front cout slots of that stripe are rewritten.
+                unsafe {
+                    let a_in = std::slice::from_raw_parts(
+                        a_base.ptr().add(x_hi * chunk_in),
+                        chunk_in,
+                    );
+                    let b_in = std::slice::from_raw_parts(
+                        b_base.ptr().add(x_hi * chunk_in),
+                        chunk_in,
+                    );
+                    let (p1, pinf) = chunk_partial(a_in, b_in, ta.as_mut_slice(), tb.as_mut_slice());
+                    let a_dst = std::slice::from_raw_parts_mut(
+                        a_base.ptr().add(x_hi * chunk_in),
+                        chunk_out,
+                    );
+                    let b_dst = std::slice::from_raw_parts_mut(
+                        b_base.ptr().add(x_hi * chunk_in),
+                        chunk_out,
+                    );
+                    a_dst.copy_from_slice(ta);
+                    b_dst.copy_from_slice(tb);
+                    let eq_h = eq_hi[x_hi];
+                    *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+                }
+            },
+        );
+        partials
+            .iter()
+            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
+                (s1 + c1, sinf + cinf)
+            })
+    } else {
+        use rayon::prelude::*;
+        let a_base = crate::epool::SyncPtr(a.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b.as_mut_ptr());
+        (0..hi_size)
+            .into_par_iter()
+            .map(|x_hi| {
+                let mut ta = crate::alloc_uninit_vec::<F128>(chunk_out);
+                let mut tb = crate::alloc_uninit_vec::<F128>(chunk_out);
+                // SAFETY: each x_hi owns a unique stripe; rayon join publishes.
+                unsafe {
+                    let a_in = std::slice::from_raw_parts(
+                        a_base.ptr().add(x_hi * chunk_in),
+                        chunk_in,
+                    );
+                    let b_in = std::slice::from_raw_parts(
+                        b_base.ptr().add(x_hi * chunk_in),
+                        chunk_in,
+                    );
+                    let (p1, pinf) =
+                        chunk_partial(a_in, b_in, ta.as_mut_slice(), tb.as_mut_slice());
+                    let a_dst = std::slice::from_raw_parts_mut(
+                        a_base.ptr().add(x_hi * chunk_in),
+                        chunk_out,
+                    );
+                    let b_dst = std::slice::from_raw_parts_mut(
+                        b_base.ptr().add(x_hi * chunk_in),
+                        chunk_out,
+                    );
+                    a_dst.copy_from_slice(&ta);
+                    b_dst.copy_from_slice(&tb);
+                    let eq_h = eq_hi[x_hi];
+                    (eq_h * p1, eq_h * pinf)
+                }
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
+            )
+    };
+
+    // Pack block-local fronts into a contiguous quarter-size prefix.
+    for x in 1..hi_size {
+        let src = x * chunk_in;
+        let dst = x * chunk_out;
+        a.copy_within(src..src + chunk_out, dst);
+        b.copy_within(src..src + chunk_out, dst);
+    }
+    a.truncate(quarter);
+    b.truncate(quarter);
+
+    (r_next6[0] * sum1, sum_inf)
+}
+
+/// Block-local 4:1 in-place twin of [`fold2_plain_and_round67_into`].
+pub(crate) fn fold2_plain_and_round67_inplace(
+    a: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    rho3: F128,
+    rho4: F128,
+    r_next6: &[F128],
+) -> (F128, F128, Round3Lookahead) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 16);
+    let quarter = n / 4;
+    if !zc_cascade_inplace_enabled() {
+        let mut a_out = crate::scratch::take_f128_unpinned(quarter);
+        let mut b_out = crate::scratch::take_f128_unpinned(quarter);
+        let (m1, minf, la) =
+            fold2_plain_and_round67_into(a, b, &mut a_out, &mut b_out, rho3, rho4, r_next6);
+        a.clear();
+        b.clear();
+        a.append(&mut a_out);
+        b.append(&mut b_out);
+        return (m1, minf, la);
+    }
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next6.len(), log_n - 2);
+    let r_par = r_next6[1];
+    assert_ne!(r_par, F128::ZERO, "cascade requires a non-zero r_next6[1]");
+
+    let n_vars = r_next6.len() - 1;
+    let n_hi = SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(1));
+    let eq = SplitEqGhash::with_n_hi(&r_next6[1..], n_hi);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size >= 2, "composed fold requires lo_size ≥ 2");
+    assert_eq!(lo_size * hi_size * 2, quarter);
+
+    let kappa = (F128::ONE + r_par) * r_par.inv();
+    let chunk_in = 8 * lo_size;
+    let chunk_out = 2 * lo_size;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+
+    #[cfg(target_arch = "aarch64")]
+    let nt_stores = {
+        use std::sync::OnceLock;
+        static NT_ENABLED: OnceLock<bool> = OnceLock::new();
+        quarter >= (1usize << 21)
+            && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
+    };
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let use_expanded_fold4_pair = zc_cascade_fold4_pair_enabled()
+        && (nt_stores
+            || (ranked_normal_fold4_pair_output(quarter)
+                && zc_cascade_fold4_pair_normal_enabled()));
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let rho34 = if use_expanded_fold4_pair {
+        rho3 * rho4
+    } else {
+        F128::ZERO
+    };
+
+    let chunk_partial =
+        |a_in: &[F128], b_in: &[F128], a_out: &mut [F128], b_out: &mut [F128]| -> [F128; 8] {
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            {
+                if use_expanded_fold4_pair {
+                    if nt_stores {
+                        fold2_and_message_lookahead_nt_expanded_aarch64(
+                            a_in, b_in, a_out, b_out, rho3, rho4, rho34, eq_lo,
+                        )
+                    } else {
+                        fold2_and_message_lookahead_normal_expanded_aarch64(
+                            a_in, b_in, a_out, b_out, rho3, rho4, rho34, eq_lo,
+                        )
+                    }
+                } else {
+                    fold2_and_message_lookahead_aarch64(
+                        a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores,
+                    )
+                }
+            }
+            #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+            {
+                fold2_and_message_lookahead_aarch64(
+                    a_in, b_in, a_out, b_out, rho3, rho4, eq_lo, nt_stores,
+                )
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut acc = [F256Unreduced::ZERO; 8];
+                let fold4 = |v: &[F128], i: usize| {
+                    let t0 = v[i] + rho3 * (v[i] + v[i + 1]);
+                    let t1 = v[i + 2] + rho3 * (v[i + 2] + v[i + 3]);
+                    t0 + rho4 * (t0 + t1)
+                };
+                for t in 0..eq_lo.len() / 2 {
+                    let i = 16 * t;
+                    let o = 4 * t;
+                    let a0 = fold4(a_in, i);
+                    let a1 = fold4(a_in, i + 4);
+                    let a2 = fold4(a_in, i + 8);
+                    let a3 = fold4(a_in, i + 12);
+                    let b0 = fold4(b_in, i);
+                    let b1 = fold4(b_in, i + 4);
+                    let b2 = fold4(b_in, i + 8);
+                    let b3 = fold4(b_in, i + 12);
+                    a_out[o] = a0;
+                    a_out[o + 1] = a1;
+                    a_out[o + 2] = a2;
+                    a_out[o + 3] = a3;
+                    b_out[o] = b0;
+                    b_out[o + 1] = b1;
+                    b_out[o + 2] = b2;
+                    b_out[o + 3] = b3;
+                    let wt = eq_lo[2 * t + 1];
+                    let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
+                    acc[0] ^= a1w.mul_unreduced(b1);
+                    acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
+                    acc[2] ^= a3w.mul_unreduced(b3);
+                    acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
+                    acc[4] ^= a2w.mul_unreduced(b2);
+                    let (e_aw, e_b) = (a0w + a2w, b0 + b2);
+                    let (o_aw, o_b) = (a1w + a3w, b1 + b3);
+                    acc[5] ^= e_aw.mul_unreduced(e_b);
+                    acc[6] ^= o_aw.mul_unreduced(o_b);
+                    acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
+                }
+                [
+                    acc[0].reduce(),
+                    acc[1].reduce(),
+                    acc[2].reduce(),
+                    acc[3].reduce(),
+                    acc[4].reduce(),
+                    acc[5].reduce(),
+                    acc[6].reduce(),
+                    acc[7].reduce(),
+                ]
+            }
+        };
+
+    #[cfg(target_arch = "aarch64")]
+    let hetero = quarter >= (1usize << 21) && zc_tail_hetero_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    let hetero = false;
+
+    let partials: Vec<[F128; 8]> = if hetero {
+        let mut partials: Vec<[F128; 8]> = vec![[F128::ZERO; 8]; hi_size];
+        let a_base = crate::epool::SyncPtr(a.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks_stateful(
+            hi_size,
+            || {
+                (
+                    crate::alloc_uninit_vec::<F128>(chunk_out),
+                    crate::alloc_uninit_vec::<F128>(chunk_out),
+                )
+            },
+            |scratch, x_hi| {
+                let (ta, tb) = scratch;
+                unsafe {
+                    let a_in = std::slice::from_raw_parts(
+                        a_base.ptr().add(x_hi * chunk_in),
+                        chunk_in,
+                    );
+                    let b_in = std::slice::from_raw_parts(
+                        b_base.ptr().add(x_hi * chunk_in),
+                        chunk_in,
+                    );
+                    let outv = chunk_partial(a_in, b_in, ta.as_mut_slice(), tb.as_mut_slice());
+                    let a_dst = std::slice::from_raw_parts_mut(
+                        a_base.ptr().add(x_hi * chunk_in),
+                        chunk_out,
+                    );
+                    let b_dst = std::slice::from_raw_parts_mut(
+                        b_base.ptr().add(x_hi * chunk_in),
+                        chunk_out,
+                    );
+                    a_dst.copy_from_slice(ta);
+                    b_dst.copy_from_slice(tb);
+                    *partials_base.ptr().add(x_hi) = outv;
+                }
+            },
+        );
+        partials
+    } else {
+        use rayon::prelude::*;
+        let a_base = crate::epool::SyncPtr(a.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b.as_mut_ptr());
+        (0..hi_size)
+            .into_par_iter()
+            .map(|x_hi| {
+                let mut ta = crate::alloc_uninit_vec::<F128>(chunk_out);
+                let mut tb = crate::alloc_uninit_vec::<F128>(chunk_out);
+                unsafe {
+                    let a_in = std::slice::from_raw_parts(
+                        a_base.ptr().add(x_hi * chunk_in),
+                        chunk_in,
+                    );
+                    let b_in = std::slice::from_raw_parts(
+                        b_base.ptr().add(x_hi * chunk_in),
+                        chunk_in,
+                    );
+                    let outv = chunk_partial(a_in, b_in, ta.as_mut_slice(), tb.as_mut_slice());
+                    let a_dst = std::slice::from_raw_parts_mut(
+                        a_base.ptr().add(x_hi * chunk_in),
+                        chunk_out,
+                    );
+                    let b_dst = std::slice::from_raw_parts_mut(
+                        b_base.ptr().add(x_hi * chunk_in),
+                        chunk_out,
+                    );
+                    a_dst.copy_from_slice(&ta);
+                    b_dst.copy_from_slice(&tb);
+                    outv
+                }
+            })
+            .collect()
+    };
+
+    for x in 1..hi_size {
+        let src = x * chunk_in;
+        let dst = x * chunk_out;
+        a.copy_within(src..src + chunk_out, dst);
+        b.copy_within(src..src + chunk_out, dst);
+    }
+    a.truncate(quarter);
+    b.truncate(quarter);
+
+    let mut sum1 = F128::ZERO;
+    let mut sum_inf = F128::ZERO;
+    let mut agg = [F128::ZERO; 6];
+    for (x_hi, outv) in partials.iter().enumerate() {
+        let eq_h = eq_hi[x_hi];
+        sum1 += eq_h * (kappa * outv[0] + outv[2]);
+        sum_inf += eq_h * (kappa * outv[1] + outv[3]);
+        for (aslot, &v) in agg.iter_mut().zip(outv[2..].iter()) {
+            *aslot += eq_h * v;
+        }
+    }
+    let r_inv = r_par.inv();
+    let w1 = r_inv * agg[0];
+    let w2 = r_inv * agg[1];
+    let w0 = r_inv * agg[2];
+    let w3 = r_inv * agg[3];
+    let w4 = r_inv * agg[4];
+    let w5 = r_inv * agg[5];
+    let la7 = Round3Lookahead {
+        c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
+    };
+
+    (r_next6[0] * sum1, sum_inf, la7)
+}
+
+
 /// Optimized fused fold (at the URM challenge `z`, baked into `table`) plus
 /// round-2 prover message. **Packed input** (LSB-first bit packing). **Parallel
 /// by default** via rayon — the outer x_hi loop is distributed across workers,
@@ -4929,7 +5413,8 @@ mod tests {
                 assert_eq!(
                     (m6_1, m6_inf),
                     msg_l,
-                    "round-six message log_n={log_n} rho3={rho3:?} rho4={rho4:?}"
+                    "round-six message log_n={log_n}
+ rho3={rho3:?} rho4={rho4:?}"
                 );
                 assert_eq!(a_n, a_l, "A''' log_n={log_n} rho3={rho3:?} rho4={rho4:?}");
                 assert_eq!(b_n, b_l, "B''' log_n={log_n} rho3={rho3:?} rho4={rho4:?}");
@@ -4948,6 +5433,63 @@ mod tests {
             }
         }
     }
+
+    /// W6–W9 block-local in-place cascade: outputs and messages must match the
+    /// separate-destination `*_into` composed folds elementwise (and the
+    /// deferred round-seven quadratic must eval-agree at a fresh challenge).
+    #[test]
+    fn fold2_plain_cascade_inplace_matches_into_oracle() {
+        let mut rng = Rng::new(0x0CA5_1B15);
+        for log_n in [4usize, 6, 8, 10, 12] {
+            let n = 1usize << log_n;
+            let a0: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b0: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let rho3 = rng.f128();
+            let rho4 = rng.f128();
+            let mut r_next6 = vec![F128::ONE; log_n - 2];
+            for slot in r_next6[1..].iter_mut() {
+                *slot = rng.f128();
+            }
+            assert_ne!(r_next6[1], F128::ZERO);
+
+            let mut a_into = vec![F128::ZERO; n / 4];
+            let mut b_into = vec![F128::ZERO; n / 4];
+            let msg_into = fold2_plain_and_round6_into(
+                &a0, &b0, &mut a_into, &mut b_into, rho3, rho4, &r_next6,
+            );
+            let mut a_ip = a0.clone();
+            let mut b_ip = b0.clone();
+            let msg_ip =
+                fold2_plain_and_round6_inplace(&mut a_ip, &mut b_ip, rho3, rho4, &r_next6);
+            assert_eq!(msg_ip, msg_into, "r6 msg log_n={log_n}");
+            assert_eq!(&a_ip[..], &a_into[..], "r6 a log_n={log_n}");
+            assert_eq!(&b_ip[..], &b_into[..], "r6 b log_n={log_n}");
+            assert_eq!(a_ip.len(), n / 4);
+            assert_eq!(b_ip.len(), n / 4);
+
+            let mut a_into = vec![F128::ZERO; n / 4];
+            let mut b_into = vec![F128::ZERO; n / 4];
+            let (m1_into, minf_into, la_into) = fold2_plain_and_round67_into(
+                &a0, &b0, &mut a_into, &mut b_into, rho3, rho4, &r_next6,
+            );
+            let mut a_ip = a0.clone();
+            let mut b_ip = b0.clone();
+            let (m1_ip, minf_ip, la_ip) =
+                fold2_plain_and_round67_inplace(&mut a_ip, &mut b_ip, rho3, rho4, &r_next6);
+            assert_eq!(m1_ip, m1_into, "r67 m1 log_n={log_n}");
+            assert_eq!(minf_ip, minf_into, "r67 minf log_n={log_n}");
+            let z = rng.f128();
+            assert_eq!(
+                eval_round3_lookahead(&la_ip, z),
+                eval_round3_lookahead(&la_into, z),
+                "r67 la eval log_n={log_n}"
+            );
+            assert_eq!(&a_ip[..], &a_into[..], "r67 a log_n={log_n}");
+            assert_eq!(&b_ip[..], &b_into[..], "r67 b log_n={log_n}");
+        }
+    }
+
+
 
     /// D2 — the composed rounds-7/8 double-fold at cascade3's call shape:
     /// starting from a composed-5/6 output, one composed pass at (ρ₅, ρ₆)
