@@ -2026,14 +2026,33 @@ pub(crate) fn induce_sumcheck_poly(
         .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
         .collect();
 
-    // Per-thread chunked accumulation: each thread accumulates a partial
+    // Per-worker chunked accumulation: each worker accumulates a partial
     // basis_poly (length n) and a partial enforced_sum, then we reduce.
-    let n_threads = rayon::current_num_threads().max(1);
+    // With a live E-core helper pool the same query chunks drain through the
+    // shared P+E queue instead — one chunk per potential worker, so the four
+    // UTILITY-QoS helpers claim query chunks the main pool would otherwise
+    // serialize behind its own. Grouping queries differently across
+    // accumulators cannot change bytes: every query contributes the same
+    // scaled basis vector and dot product, and the cross-chunk merge is a
+    // GF(2^128) XOR sum. `FLOCK_NO_LIG_INDUCE_HETERO=1` (exactly `"1"`)
+    // restores the incumbent main-pool split as the same-binary A/B control.
+    let helper_threads = if lig_induce_hetero_enabled() {
+        crate::epool::epool().map_or(0, rayon::ThreadPool::current_num_threads)
+    } else {
+        0
+    };
+    // 16 chunks when hetero: the queue's engagement floor (EPOOL_MIN_CHUNKS),
+    // and enough claims that the four helpers stay fed without inflating the
+    // serial partial reduce below by more than two extra length-n passes.
+    let n_threads = if helper_threads > 0 {
+        (rayon::current_num_threads().max(1) + helper_threads).max(16)
+    } else {
+        rayon::current_num_threads().max(1)
+    };
     let chunk_size = (n_queries + n_threads - 1) / n_threads.max(1);
 
-    let partials: Vec<(Vec<F128>, F128)> = (0..n_threads)
-        .into_par_iter()
-        .map(|t| {
+    let chunk_partial = |t: usize| -> (Vec<F128>, F128) {
+        {
             let start = t * chunk_size;
             let end = (start + chunk_size).min(n_queries);
             if start >= end {
@@ -2092,8 +2111,32 @@ pub(crate) fn induce_sumcheck_poly(
                 }
             }
             (accum_basis, local_sum)
-        })
-        .collect();
+        }
+    };
+    let partials: Vec<(Vec<F128>, F128)> = if helper_threads > 0 {
+        let mut slots: Vec<Option<(Vec<F128>, F128)>> = (0..n_threads).map(|_| None).collect();
+        // Raw address rather than `SyncPtr` because the slot type is not
+        // `Copy` (same aliasing contract as the stripe fill's `as usize`).
+        let slots_addr = slots.as_mut_ptr() as usize;
+        crate::epool::run_hetero_chunks(n_threads, |t| {
+            // SAFETY: the queue claims each `t` exactly once; each slot is
+            // written by its unique claimant and published by the join.
+            unsafe {
+                (slots_addr as *mut Option<(Vec<F128>, F128)>)
+                    .add(t)
+                    .write(Some(chunk_partial(t)));
+            }
+        });
+        slots
+            .into_iter()
+            .map(|s| s.expect("hetero queue ran every chunk"))
+            .collect()
+    } else {
+        (0..n_threads)
+            .into_par_iter()
+            .map(chunk_partial)
+            .collect()
+    };
 
     // Reduce across threads: seed with the first non-empty partial (a move —
     // deletes the zero-seeded output buffer and its redundant first XOR-add
@@ -3718,6 +3761,16 @@ fn lig_fold_hetero_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !std::env::var("FLOCK_NO_LIG_FOLD_HETERO").is_ok_and(|v| v == "1")
+    })
+}
+
+/// Same contract for the dense recursive-commit basis induction sweep:
+/// `FLOCK_NO_LIG_INDUCE_HETERO=1` (exactly `"1"`) restores the incumbent
+/// main-pool-only per-worker query split.
+fn lig_induce_hetero_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("FLOCK_NO_LIG_INDUCE_HETERO").is_ok_and(|v| v == "1")
     })
 }
 
