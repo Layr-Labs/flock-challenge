@@ -2,6 +2,9 @@
 // Modifications copyright 2026 Succinct Labs, Benedikt Bunz, William Wang
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //
+// r1021 marker: recursive top hetero producer (new mechanism on the 3b070a2
+// frontier = L2 gate resample that promoted +0.02% at 7:43 AM CDT).
+//
 // The algorithm skeleton (iterative LCH NTT, neighbors-last ordering) is
 // derived from binius64's `NeighborsLastReference`
 // (https://github.com/binius-zk/binius64, `crates/math/src/ntt/reference.rs`).
@@ -360,6 +363,18 @@ fn trace_recursive_ntt_epool() -> bool {
         l1 || l2
     });
     *ENABLED
+}
+
+/// Kill switch for the heterogeneous claim-queue producer on the recursive
+/// L1/L2 from-message radix-8 top (`FLOCK_NO_RECURSIVE_TOP_HETERO=1`):
+/// restores the incumbent main-Rayon `into_par_iter` fan-out for the top
+/// pass. The queue only reassigns identical per-tile kernels onto the
+/// otherwise-idle efficiency cores (the same ownership argument as the
+/// ranked L0 top); outputs are bit-identical either way because every
+/// (block, tile) job writes disjoint destination rows.
+#[inline]
+fn recursive_top_hetero_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_none()
 }
 
 // ---------------------------------------------------------------------------
@@ -768,42 +783,58 @@ impl AdditiveNttF128 {
         let tiles_per_block = eighth.div_ceil(ROWS_PER_TILE);
         let src = msg.as_ptr() as usize;
         let dst = data.as_mut_ptr() as usize;
-        (0..num_blocks * tiles_per_block)
-            .into_par_iter()
-            .for_each(|job| {
-                let block = job / tiles_per_block;
-                let tile = job % tiles_per_block;
-                let row_start = tile * ROWS_PER_TILE;
-                let row_end = (row_start + ROWS_PER_TILE).min(eighth);
-                // SAFETY: each `(block, tile)` job owns all eight destination
-                // rows for one disjoint row interval. `msg` is immutable and
-                // has one complete layer-start block; every derived address
-                // is in the validated source/destination geometry.
-                unsafe {
-                    let dst_block = (dst as *mut F128).add(block * block_elems);
-                    for row in row_start..row_end {
-                        if block == 0 {
-                            kernels::butterfly_fused_3layer_zero_root_from_src_row(
-                                src as *const F128,
-                                dst_block,
-                                eighth,
-                                num_ntts,
-                                row,
-                                &twiddles[block],
-                            );
-                        } else {
-                            kernels::butterfly_fused_3layer_from_src_row(
-                                src as *const F128,
-                                dst_block,
-                                eighth,
-                                num_ntts,
-                                row,
-                                &twiddles[block],
-                            );
-                        }
+        let top = |job: usize| {
+            let block = job / tiles_per_block;
+            let tile = job % tiles_per_block;
+            let row_start = tile * ROWS_PER_TILE;
+            let row_end = (row_start + ROWS_PER_TILE).min(eighth);
+            // SAFETY: each `(block, tile)` job owns all eight destination
+            // rows for one disjoint row interval. `msg` is immutable and
+            // has one complete layer-start block; every derived address
+            // is in the validated source/destination geometry.
+            unsafe {
+                let dst_block = (dst as *mut F128).add(block * block_elems);
+                for row in row_start..row_end {
+                    if block == 0 {
+                        kernels::butterfly_fused_3layer_zero_root_from_src_row(
+                            src as *const F128,
+                            dst_block,
+                            eighth,
+                            num_ntts,
+                            row,
+                            &twiddles[block],
+                        );
+                    } else {
+                        kernels::butterfly_fused_3layer_from_src_row(
+                            src as *const F128,
+                            dst_block,
+                            eighth,
+                            num_ntts,
+                            row,
+                            &twiddles[block],
+                        );
                     }
                 }
-            });
+            }
+        };
+        if recursive_l1_helper.is_some() && recursive_top_hetero_enabled() {
+            // Heterogeneous claim queue for the radix-8 producer: the ranked
+            // L0 top already proves this pattern at the exact 1 GiB codeword
+            // (`is_ranked_top_hetero_fused3_pass`), where the shared atomic
+            // queue bounds the heterogeneous tail to one 128-row tile per
+            // worker. The recursive L1/L2 tops currently leave the efficiency
+            // cores idle while the main pool writes the 32 MiB / 8 MiB
+            // codewords; claiming fixed tiles there overlaps the otherwise
+            // idle E cores with the top pass, then the deep tail proceeds on
+            // the helper pool exactly as before. Output is bit-identical: the
+            // same per-tile kernel runs on either pool and every (block,
+            // tile) job owns disjoint destination rows.
+            crate::epool::run_hetero_chunks(num_blocks * tiles_per_block, top);
+        } else {
+            (0..num_blocks * tiles_per_block)
+                .into_par_iter()
+                .for_each(top);
+        }
 
         let top_trace = top_trace.map(|(started, claims, broadcasts)| {
             (
