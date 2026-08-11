@@ -393,6 +393,59 @@ unsafe fn fold_two_row_codes_q(
     }
 }
 
+/// Fold the two live rows at the exact ranked BLAKE3 padding boundary.
+///
+/// Both rows contain 49 useful low bits: bytes 0..5 are arbitrary, byte 6 is
+/// either zero or the low basis bit, and byte 7 is zero. The two byte-6 basis
+/// lookups are therefore one shared load plus independent bit masks, while the
+/// byte-7 zero entries need no loads at all.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_two_low49_codes_q(
+    table_data: *const u8,
+    row0: u64,
+    row1: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        debug_assert_eq!(row0 >> 49, 0, "ranked A boundary has non-zero padding");
+        debug_assert_eq!(row1 >> 49, 0, "ranked B boundary has non-zero padding");
+
+        let load = |row: u64, chunk: usize| {
+            let shift = 8 * chunk;
+            let offset = chunk * STRIDE;
+            let index = ((row >> shift) & 0xff) as usize;
+            vld1q_u64(
+                table_data
+                    .add(offset + index * core::mem::size_of::<F128>())
+                    .cast::<u64>(),
+            )
+        };
+
+        let mut acc0 = xor3_u64(load(row0, 0), load(row0, 1), load(row0, 2));
+        let mut acc1 = xor3_u64(load(row1, 0), load(row1, 1), load(row1, 2));
+        acc0 = xor3_u64(acc0, load(row0, 3), load(row0, 4));
+        acc1 = xor3_u64(acc1, load(row1, 3), load(row1, 4));
+        acc0 = veorq_u64(acc0, load(row0, 5));
+        acc1 = veorq_u64(acc1, load(row1, 5));
+
+        let bit48_basis = vld1q_u64(
+            table_data
+                .add(6 * STRIDE + core::mem::size_of::<F128>())
+                .cast::<u64>(),
+        );
+        let mask0 = vdupq_n_u64(0u64.wrapping_sub((row0 >> 48) & 1));
+        let mask1 = vdupq_n_u64(0u64.wrapping_sub((row1 >> 48) & 1));
+        acc0 = veorq_u64(acc0, vandq_u64(bit48_basis, mask0));
+        acc1 = veorq_u64(acc1, vandq_u64(bit48_basis, mask1));
+        (acc0, acc1)
+    }
+}
+
 /// Returns `true` iff a 128-bit vector is all-zero.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -804,6 +857,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     useful_pairs_inclusive: usize,
     degen: bool,
     periodic_padding: bool,
+    mixed49: bool,
     out: *mut F128,
 ) {
     use core::arch::aarch64::*;
@@ -847,6 +901,43 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
                 store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
                 vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+            }};
+        }
+
+        macro_rules! process_mixed49_group {
+            ($u:expr) => {{
+                let x_lo0 = 2 * $u;
+                let x_lo1 = x_lo0 + 1;
+                debug_assert_eq!(x_lo0 & 127, 120);
+
+                // Pair 120 has one 49-bit row followed by an all-zero row.
+                // Pair 121 is wholly padding. Read and fold only the two live
+                // A/B row codes, while emitting the exact incumbent compact
+                // representation for both pairs.
+                let row0 = 2 * x_lo0;
+                let a0_code = u64::from_le(core::ptr::read_unaligned(
+                    a_packed.add(row0 * 8).cast::<u64>(),
+                ));
+                let b0_code = u64::from_le(core::ptr::read_unaligned(
+                    b_packed.add(row0 * 8).cast::<u64>(),
+                ));
+                let (a0, b0) = fold_two_low49_codes_q(table_data, a0_code, b0_code);
+                store_anchor_pair_nt(anchors.add(2 * x_lo0), a0, b0);
+                let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code, b0_code]);
+                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), delta_pair);
+                store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
+                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+
+                // The four logical rows are (a0, 0, 0, 0) and
+                // (b0, 0, 0, 0). One weighted product is therefore shared by
+                // G(infinity), W3 and W5; every other aggregate is zero.
+                let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
+                let q = mul_unreduced_q(mul_q(w, a0), b0);
+                if FULL {
+                    wide_xor(&mut pinf_even, q);
+                }
+                wide_xor(&mut w3, q);
+                wide_xor(&mut w5, q);
             }};
         }
 
@@ -936,7 +1027,11 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 for u in first..first + 60 {
                     process_group!(u, false, false);
                 }
-                process_group!(first + 60, false, true);
+                if mixed49 {
+                    process_mixed49_group!(first + 60);
+                } else {
+                    process_group!(first + 60, false, true);
+                }
                 for u in first + 61..first + 64 {
                     zero_group!(u);
                 }
@@ -2477,6 +2572,58 @@ mod tests {
         z ^ (z >> 31)
     }
 
+    fn linear_fold_table(state: &mut u64) -> Vec<F128> {
+        let mut table = vec![F128::ZERO; 8 * 256];
+        for chunk in 0..8 {
+            let basis: [F128; 8] =
+                std::array::from_fn(|_| F128::new(splitmix64(state), splitmix64(state)));
+            for value in 1usize..256 {
+                let mut entry = F128::ZERO;
+                for (bit, &b) in basis.iter().enumerate() {
+                    if value & (1 << bit) != 0 {
+                        entry += b;
+                    }
+                }
+                table[chunk * 256 + value] = entry;
+            }
+        }
+        table
+    }
+
+    fn run_round2_lookahead<const FULL: bool, const ODD_ON_GPU: bool>(
+        table: &[F128],
+        a_packed: &[u8],
+        b_packed: &[u8],
+        eq_lo: &[F128],
+        mixed49: bool,
+    ) -> (Vec<F128>, Vec<u8>, [F128; 8]) {
+        const LO_SIZE: usize = 128;
+        const N_CHUNKS: usize = 8;
+        let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
+        let mut anchors = vec![poison; 2 * LO_SIZE];
+        let mut deltas = vec![0xa5u8; 2 * LO_SIZE * N_CHUNKS];
+        let mut out = [poison; 8];
+        unsafe {
+            fold_round2_compact_chunk_neon_lookahead_8::<FULL, ODD_ON_GPU>(
+                table.as_ptr().cast::<u8>(),
+                a_packed.as_ptr(),
+                b_packed.as_ptr(),
+                anchors.as_mut_ptr(),
+                deltas.as_mut_ptr(),
+                eq_lo.as_ptr(),
+                LO_SIZE,
+                0,
+                127,
+                121,
+                true,
+                true,
+                mixed49,
+                out.as_mut_ptr(),
+            );
+        }
+        (anchors, deltas, out)
+    }
+
     fn fold4_scalar(values: &[F128], i: usize, rho_a: F128, rho_b: F128) -> F128 {
         let t0 = values[i] + rho_a * (values[i] + values[i + 1]);
         let t1 = values[i + 2] + rho_a * (values[i + 2] + values[i + 3]);
@@ -2586,6 +2733,32 @@ mod tests {
                     fold4_scalar(&values, 4, rho_a, rho_b),
                 ],
                 "expanded pair mismatch at case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn low49_row_fold_matches_full_linear_lookup() {
+        let mut state = 0x4c4f_5734_3946_4f4c;
+        let table = linear_fold_table(&mut state);
+        let mask49 = (1u64 << 49) - 1;
+
+        for case in 0..256 {
+            let a = splitmix64(&mut state) & mask49;
+            let b = splitmix64(&mut state) & mask49;
+            let (actual_a, actual_b) =
+                unsafe { fold_two_low49_codes_q(table.as_ptr().cast::<u8>(), a, b) };
+            let (expected_a, expected_b) =
+                unsafe { fold_two_row_codes_q(table.as_ptr().cast::<u8>(), a, b) };
+            assert_eq!(
+                unsafe { core::mem::transmute::<uint64x2_t, F128>(actual_a) },
+                unsafe { core::mem::transmute::<uint64x2_t, F128>(expected_a) },
+                "A low49 fold mismatch at case {case}"
+            );
+            assert_eq!(
+                unsafe { core::mem::transmute::<uint64x2_t, F128>(actual_b) },
+                unsafe { core::mem::transmute::<uint64x2_t, F128>(expected_b) },
+                "B low49 fold mismatch at case {case}"
             );
         }
     }
@@ -2764,6 +2937,7 @@ mod tests {
                     121,
                     true,
                     periodic_padding,
+                    false,
                     out.as_mut_ptr(),
                 );
             }
@@ -2775,5 +2949,67 @@ mod tests {
         assert_eq!(periodic.0, generic.0, "anchor schedule mismatch");
         assert_eq!(periodic.1, generic.1, "delta schedule mismatch");
         assert_eq!(periodic.2, generic.2, "message/lookahead mismatch");
+    }
+
+    #[test]
+    fn round2_mixed49_boundary_matches_periodic_oracle() {
+        const LO_SIZE: usize = 128;
+        const N_CHUNKS: usize = 8;
+        const BOUNDARY_ROW: usize = 2 * 120;
+
+        let mut state = 0x4d49_5845_4434_3942;
+        let table = linear_fold_table(&mut state);
+        let mut a_packed = vec![0u8; 2 * LO_SIZE * N_CHUNKS];
+        let mut b_packed = vec![0u8; 2 * LO_SIZE * N_CHUNKS];
+        for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
+            *byte = splitmix64(&mut state) as u8;
+        }
+
+        // Ranked honest padding: row 240 has 49 useful low bits, row 241 and
+        // every later row are zero. This is the sole extra fact used by the
+        // mixed-boundary specialization.
+        let mask49 = (1u64 << 49) - 1;
+        let a_boundary = splitmix64(&mut state) & mask49;
+        let b_boundary = splitmix64(&mut state) & mask49;
+        a_packed[BOUNDARY_ROW * 8..(BOUNDARY_ROW + 1) * 8]
+            .copy_from_slice(&a_boundary.to_le_bytes());
+        b_packed[BOUNDARY_ROW * 8..(BOUNDARY_ROW + 1) * 8]
+            .copy_from_slice(&b_boundary.to_le_bytes());
+        a_packed[(BOUNDARY_ROW + 1) * 8..].fill(0);
+        b_packed[(BOUNDARY_ROW + 1) * 8..].fill(0);
+
+        let eq_lo: Vec<F128> = (0..LO_SIZE)
+            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+            .collect();
+
+        macro_rules! check_variant {
+            ($full:literal, $odd_on_gpu:literal) => {{
+                let oracle = run_round2_lookahead::<$full, $odd_on_gpu>(
+                    &table, &a_packed, &b_packed, &eq_lo, false,
+                );
+                let candidate = run_round2_lookahead::<$full, $odd_on_gpu>(
+                    &table, &a_packed, &b_packed, &eq_lo, true,
+                );
+                assert_eq!(
+                    candidate.0, oracle.0,
+                    "anchor mismatch for FULL={} ODD_ON_GPU={}",
+                    $full, $odd_on_gpu
+                );
+                assert_eq!(
+                    candidate.1, oracle.1,
+                    "delta mismatch for FULL={} ODD_ON_GPU={}",
+                    $full, $odd_on_gpu
+                );
+                assert_eq!(
+                    candidate.2, oracle.2,
+                    "message/lookahead mismatch for FULL={} ODD_ON_GPU={}",
+                    $full, $odd_on_gpu
+                );
+            }};
+        }
+
+        check_variant!(true, false);
+        check_variant!(false, false);
+        check_variant!(false, true);
     }
 }

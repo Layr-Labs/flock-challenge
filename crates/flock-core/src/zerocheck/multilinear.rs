@@ -101,6 +101,15 @@ fn r2_periodic_padding_enabled() -> bool {
     std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
 }
 
+/// Kill switch for the exact ranked BLAKE3 mixed boundary row. Each 16,384-bit
+/// circuit block ends with one 64-bit round-two row containing 49 useful bits,
+/// followed by an all-zero row. `FLOCK_NO_ZC_R2_MIXED49=1` keeps that boundary
+/// on the ordinary four-row lookahead kernel for same-binary A/B screening.
+#[cfg(target_arch = "aarch64")]
+fn r2_mixed49_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_ZC_R2_MIXED49").is_none_or(|v| v != *"1")
+}
+
 /// Kill switch for adopting the round-two GPU arm's odd-parity products as the
 /// round-three lookahead's `W1`/`W2`: `FLOCK_NO_ZC_R2_ODD_OFFLOAD=1` makes the
 /// CPU recompute the odd pair on offloaded chunks, which is the incumbent
@@ -1696,6 +1705,12 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let degen = r2_degen_enabled();
     #[cfg(target_arch = "aarch64")]
     let periodic_padding = r2_periodic_padding_enabled();
+    #[cfg(target_arch = "aarch64")]
+    let mixed49 = m == 32
+        && k_skip == 6
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+        && r2_mixed49_enabled();
 
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
@@ -1771,6 +1786,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        mixed49,
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu {
@@ -1787,6 +1803,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        mixed49,
                         out.as_mut_ptr(),
                     );
                 } else {
@@ -1803,6 +1820,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        mixed49,
                         out.as_mut_ptr(),
                     );
                 }
@@ -1909,6 +1927,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                             useful_pairs_inclusive,
                             degen,
                             periodic_padding,
+                            mixed49,
                             out.as_mut_ptr(),
                         );
                     }
