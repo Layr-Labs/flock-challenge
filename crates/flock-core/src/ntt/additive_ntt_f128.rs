@@ -2,6 +2,8 @@
 // Modifications copyright 2026 Succinct Labs, Benedikt Bunz, William Wang
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //
+// r1019 marker: tip-exact AB resample of the 92df27c frontier package.
+//
 // The algorithm skeleton (iterative LCH NTT, neighbors-last ordering) is
 // derived from binius64's `NeighborsLastReference`
 // (https://github.com/binius-zk/binius64, `crates/math/src/ntt/reference.rs`).
