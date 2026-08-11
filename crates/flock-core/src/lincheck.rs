@@ -1433,7 +1433,7 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        ZVecCapture::None,
         challenger,
     );
     (proof, claim)
@@ -1466,14 +1466,61 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        ZVecCapture::BeforeSumcheck,
         challenger,
     );
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured.expect("pre-sumcheck capture must produce z_vec"),
     )
+}
+
+/// Variant of [`prove_padded_capture_z_vec`] that captures `z_vec` after the
+/// first (top-variable) sumcheck bind. The proof and claim are unchanged; the
+/// returned vector has length `2^(k_log - 1)` and equals the pre-sumcheck
+/// vector folded at `claim.r_inner_rest.last()`.
+///
+/// This is the exact sufficient statistic used by ranked DirectFold8, whose
+/// only non-retained tail coordinate is that top variable. Callers with a
+/// different PCS layout should keep using the pre-sumcheck capture.
+pub fn prove_padded_capture_z_vec_after_first_fold<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    assert!(
+        k_log > k_skip,
+        "post-first-fold capture requires at least one lincheck round"
+    );
+    let (proof, claim, captured) = prove_padded_inner(
+        z_packed,
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        ZVecCapture::AfterFirstFold,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("post-first-fold capture must produce z_vec"),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ZVecCapture {
+    None,
+    BeforeSumcheck,
+    AfterFirstFold,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1485,7 +1532,7 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture_z_vec: ZVecCapture,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
     let k = 1usize << k_log;
@@ -1580,7 +1627,7 @@ fn prove_padded_inner<Ch: Challenger>(
     // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
     //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
     //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
+    let mut captured_z_vec: Option<Vec<F128>> = if capture_z_vec == ZVecCapture::BeforeSumcheck {
         Some(z_vec.clone())
     } else {
         None
@@ -1618,6 +1665,9 @@ fn prove_padded_inner<Ch: Challenger>(
                 // Final round: just fold; z_vec collapses to z_partial.
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
+            }
+            if t == 0 && capture_z_vec == ZVecCapture::AfterFirstFold {
+                captured_z_vec = Some(z_vec.clone());
             }
         }
     }
@@ -2430,6 +2480,74 @@ mod tests {
                 claim_v.w,
                 mle_eval_bool_quirky(&z, m, k_log, k_skip, &pt),
                 "w wrong at m={m}, k_log={k_log}, k_skip={k_skip}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_first_fold_capture_matches_direct_fold8_statistic() {
+        struct IdentityPairCircuit(usize);
+        impl LincheckCircuit for IdentityPairCircuit {
+            fn n_cols(&self) -> usize {
+                self.0
+            }
+
+            fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+                eq_inner.iter().map(|&eq| alpha * eq + eq).collect()
+            }
+        }
+
+        // DirectFold8 retains six packed-index coordinates. At k_log=14 and
+        // k_skip=6, dropping prefix0 leaves seven coordinates, so lincheck's
+        // first/top bind is exactly the sole fold performed by the ranked
+        // `s_hat_v_fold8_from_z_vec` specialization.
+        let m = 17usize;
+        let k_log = 14usize;
+        let k_skip = 6usize;
+        let mut rng = Rng::new(0x504F_5354_464F_4C44);
+        let z = rng.bits(1 << m);
+        let z_packed = pack_z_lincheck(&z, m, k_log);
+        let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+        let circuit = IdentityPairCircuit(1 << k_log);
+
+        let mut pre_challenger = FsChallenger::new(b"flock-postfold-capture-v0");
+        let (pre_proof, pre_claim, pre) = prove_padded_capture_z_vec(
+            &z_packed,
+            m,
+            k_log,
+            k_skip,
+            1 << k_log,
+            &circuit,
+            &x_ab,
+            &mut pre_challenger,
+        );
+        let mut post_challenger = FsChallenger::new(b"flock-postfold-capture-v0");
+        let (post_proof, post_claim, post) = prove_padded_capture_z_vec_after_first_fold(
+            &z_packed,
+            m,
+            k_log,
+            k_skip,
+            1 << k_log,
+            &circuit,
+            &x_ab,
+            &mut post_challenger,
+        );
+
+        assert_eq!(post_proof, pre_proof, "capture timing changed the proof");
+        assert_eq!(post_claim, pre_claim, "capture timing changed the claim");
+        assert_eq!(pre.len(), 1 << k_log);
+        assert_eq!(post.len(), 1 << (k_log - 1));
+
+        let expected =
+            crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&pre, &pre_claim.r_inner_rest[1..]);
+        assert_eq!(post, expected, "post-fold capture differs from DirectFold8");
+
+        let r_top = *pre_claim.r_inner_rest.last().unwrap();
+        for i in 0..post.len() {
+            assert_eq!(
+                post[i],
+                pre[i] + r_top * (pre[i] + pre[i + post.len()]),
+                "top-variable fold mismatch at {i}"
             );
         }
     }

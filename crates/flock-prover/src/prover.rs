@@ -68,6 +68,19 @@ fn ranked_direct_fold8_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.k_log >= r1cs.k_skip + 7
 }
 
+/// Ranked DirectFold8 has exactly one suffix coordinate left after retaining
+/// its six banks. Lincheck has already folded that coordinate after sumcheck
+/// round zero, so capture the resulting 8,192-element vector directly instead
+/// of cloning 16,384 elements and folding them again after lincheck.
+#[inline]
+fn ranked_lincheck_postfold_capture_enabled(r1cs: &BlockR1cs) -> bool {
+    ranked_direct_fold8_precompute_enabled(r1cs)
+        && r1cs.k_log == 14
+        && r1cs.k_skip == zerocheck::K_SKIP
+        && std::env::var_os("FLOCK_NO_LINCHECK_POSTFOLD_CAPTURE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+}
+
 /// Exact-shape gate for deriving identity C from the already-materialized
 /// lincheck stripe. Keep this narrower than the generic DirectFold4 gate:
 /// the shortcut relies on ranked BLAKE3's block geometry and honest padding,
@@ -1174,18 +1187,33 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let t_lc = std::time::Instant::now();
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
-    // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
-    // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
+    // At the ranked DirectFold8 shape, round zero has already performed the
+    // sole fold that `s_hat_v_fold8_from_z_vec` would repeat. Other shapes
+    // retain the generic pre-sumcheck capture.
+    let postfold_capture = ranked_lincheck_postfold_capture_enabled(r1cs);
+    let (lc_proof, lc_claim, z_vec_pre) = if postfold_capture {
+        lincheck::prove_padded_capture_z_vec_after_first_fold(
+            &z_packed_lincheck,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        )
+    } else {
+        lincheck::prove_padded_capture_z_vec(
+            &z_packed_lincheck,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        )
+    };
     // The lincheck stripe copy of z is dead from here on; return it to the
     // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
     // m = 32) so the next prove reuses its resident pages.
@@ -1204,9 +1232,16 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // (everything past prefix0). Byte-identical to `fold_1b_rows` on the AB
     // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
     // (only test setups; real R1CS has k_log >= 16).
-    let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-    // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-    flock_core::scratch::give_f128(z_vec_pre);
+    let s_hat_v_ab = if postfold_capture {
+        debug_assert_eq!(z_vec_pre.len(), 64 * (1usize << pcs::LOG_PACKING));
+        Some(z_vec_pre)
+    } else {
+        let out = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
+        // The pre-sumcheck capture only fed s_hat_v_ab; recycle it before PCS
+        // open residency. The post-fold arm moves its smaller Vec into `out`.
+        flock_core::scratch::give_f128(z_vec_pre);
+        out
+    };
     if phase_timing {
         let wall = t_lc.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_lc0.unwrap_or(0.0);
