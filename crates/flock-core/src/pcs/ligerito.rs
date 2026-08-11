@@ -3403,9 +3403,9 @@ fn ligero_commit_impl(
     };
     let tree = match gpu_tree {
         Some(tree) => tree,
-        // Pooled tree storage for the CPU builder (the GPU offload's
-        // copy-out is pooled inside `gpu_recursive_merkle_blake3`): same
-        // fault/munmap argument, byte-identical output.
+        // Pooled tree storage for the CPU builder (the GPU offload also takes
+        // its direct destination from this pool): same fault/munmap argument,
+        // byte-identical output.
         None => merkle::merkle_tree_into(
             crate::scratch::take_hash_tree(2 * block_len - 1),
             data_bytes,

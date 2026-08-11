@@ -10266,8 +10266,9 @@ kernel void lc_fold_stripes_factored_b4(
     // chain — a two-block chunk kernel over 128-byte leaves plus the ordinary
     // parent ladder — replaces them with bit-identical bytes. The input
     // matrix is wrapped no-copy (cached by address; creation cost lands on
-    // the untimed warmup prove in the common case), the flat tree is built in
-    // a persistent shared buffer and copied out in one parallel pass.
+    // the untimed warmup prove in the common case), and the flat tree is built
+    // directly in a pooled page-aligned CPU allocation. Persistent shared
+    // output buffers preserve the exact fallback when that wrap is unavailable.
     // =======================================================================
 
     /// Leaf kernel for 128-byte leaves (one BLAKE3 chunk of exactly two
@@ -10348,17 +10349,16 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 }
 "#;
 
-    /// The exact recursive shapes worth offloading. L1 (2^18 leaves) wins
-    /// ~0.9 ms per timed prove; L2 (2^16 leaves) was measured NET NEGATIVE
-    /// (GPU 1.06 ms vs CPU 0.81 ms — the fixed wrap/submit/wait roundtrip
-    /// dominates at 16 MiB) and is deliberately excluded.
-    const REC_MERKLE_SHAPES: [usize; 1] = [1usize << 18];
+    /// The exact recursive shapes worth offloading. Direct pooled output
+    /// removes the copy that previously made L2 net-negative, so both ranked
+    /// recursive levels now clear their CPU builders.
+    const REC_MERKLE_SHAPES: [usize; 2] = [1usize << 18, 1usize << 16];
 
     /// Process-lifetime Metal state for the recursive Merkle offload.
     struct RecMerkle {
         pso_leaf128: Id,
         pso_parent: Id,
-        /// Persistent flat-tree output buffers, one per supported shape
+        /// Persistent fallback output buffers, one per supported shape
         /// (`2 * n - 1` nodes each); allocated once, untimed.
         tree_bufs: [(usize, Id); REC_MERKLE_SHAPES.len()],
         /// Cached no-copy wraps of caller matrices: `(ptr, len, buffer)`.
@@ -10385,6 +10385,21 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         *ON.get_or_init(|| {
             std::env::var_os("FLOCK_NO_RECMERKLE_SPIN").as_deref()
                 != Some(std::ffi::OsStr::new("1"))
+        })
+    }
+
+    fn rec_merkle_direct_output_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_RECMERKLE_DIRECT_OUTPUT").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+        })
+    }
+
+    fn rec_merkle_l2_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_RECMERKLE_L2").as_deref() != Some(std::ffi::OsStr::new("1"))
         })
     }
 
@@ -10494,6 +10509,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     pub(crate) fn gpu_recursive_merkle_blake3(data: &[u8], num_leaves: usize) -> Option<Vec<Hash>> {
         if !super::gpu_recursive_merkle_enabled()
             || !REC_MERKLE_SHAPES.contains(&num_leaves)
+            || (num_leaves == 1usize << 16 && !rec_merkle_l2_enabled())
             || data.len() != num_leaves * 128
         {
             return None;
@@ -10569,6 +10585,23 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             .expect("shape checked above");
 
         let total_nodes = 2 * num_leaves - 1;
+        let direct = if rec_merkle_direct_output_enabled() {
+            let mut tree = crate::scratch::take_hash_tree(total_nodes + 1);
+            let tree_bytes = (total_nodes + 1) * core::mem::size_of::<Hash>();
+            match unsafe { gpu.wrap_buffer(tree.as_mut_ptr().cast::<u8>(), tree_bytes) } {
+                Ok(buf) => Some((tree, buf)),
+                Err(e) => {
+                    if rec_merkle_debug() {
+                        eprintln!("[gpu-recmerkle] direct output wrap failed ({e})");
+                    }
+                    crate::scratch::give_hash_tree(tree);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let output_buf = direct.as_ref().map_or(tree_buf, |(_, buf)| *buf);
         let run = unsafe {
             let pool = gpu.pool_push();
             let run = (|| -> Result<(), String> {
@@ -10576,7 +10609,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 let enc = gpu.compute_encoder(cb)?;
                 gpu.set_pipeline(enc, state.pso_leaf128);
                 gpu.set_buffer(enc, data_buf, 0, 0);
-                gpu.set_buffer(enc, tree_buf, 0, 1);
+                gpu.set_buffer(enc, output_buf, 0, 1);
                 let tpg = 256u64.min(num_leaves as u64);
                 gpu.dispatch(enc, num_leaves as u64 / tpg, tpg);
                 gpu.set_pipeline(enc, state.pso_parent);
@@ -10585,8 +10618,8 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 while read_len > 1 {
                     let write_start = read_start + read_len;
                     let n_out = read_len / 2;
-                    gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
-                    gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
+                    gpu.set_buffer(enc, output_buf, read_start * 32, 0);
+                    gpu.set_buffer(enc, output_buf, write_start * 32, 1);
                     let tpg = 256u64.min(n_out as u64);
                     gpu.dispatch(enc, n_out as u64 / tpg, tpg);
                     read_start = write_start;
@@ -10611,7 +10644,13 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             gpu.pool_pop(pool);
             run
         };
+        if let Some((_, buf)) = direct.as_ref() {
+            unsafe { gpu.release(*buf) };
+        }
         if let Err(e) = run {
+            if let Some((tree, _)) = direct {
+                crate::scratch::give_hash_tree(tree);
+            }
             // Poison the state: a mid-prove Metal failure is not a shape to
             // retry against; every later call falls back to the CPU builder.
             let msg = format!("submit failed ({e})");
@@ -10622,16 +10661,20 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             return None;
         }
 
-        // Pooled destination: a fresh 16 MiB uninit Vec pays ~4k first-touch
-        // page faults inside this FS-serial copy and a single-threaded munmap
-        // on the following drop; the recycled buffer's pages stay resident
-        // across proves (write-before-read: the copy below writes all of it).
-        let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
-        unsafe {
-            let dst =
-                core::slice::from_raw_parts_mut(tree.as_mut_ptr().cast::<u8>(), total_nodes * 32);
-            copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
-        }
+        let tree = if let Some((mut tree, _)) = direct {
+            tree.truncate(total_nodes);
+            tree
+        } else {
+            let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
+            unsafe {
+                let dst = core::slice::from_raw_parts_mut(
+                    tree.as_mut_ptr().cast::<u8>(),
+                    total_nodes * 32,
+                );
+                copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
+            }
+            tree
+        };
         if let Some(t) = started {
             eprintln!(
                 "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms (wrap hits {} misses {})",
@@ -14252,7 +14295,7 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_recursive_merkle_matches_cpu_tree() {
         let mut rng = Rng::new(0x51AB);
-        for log_leaves in [18usize] {
+        for log_leaves in [18usize, 16] {
             let n_leaves = 1usize << log_leaves;
             let data_f128 = rng.vec(n_leaves * 8); // 128 B per leaf
             let data: &[u8] = unsafe {
@@ -14282,9 +14325,8 @@ mod tests {
                 .expect("second call must succeed");
             assert!(again == cpu_tree);
         }
-        // Unsupported shapes refuse: below the gate list and the measured
-        // net-negative L2 (2^16) both fall back to the CPU builder.
-        for log_leaves in [10usize, 16] {
+        // Unsupported shapes refuse and fall back to the CPU builder.
+        for log_leaves in [10usize] {
             let n = 1usize << log_leaves;
             let small = rng.vec(n * 8);
             let small_bytes: &[u8] = unsafe {

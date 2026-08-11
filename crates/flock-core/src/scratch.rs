@@ -655,7 +655,7 @@ pub fn give_u8(v: Vec<u8>) {
 // window and a single-threaded munmap on the following drop; recycling the
 // two buffers across proves keeps their pages resident. Contents are NOT
 // cleared; callers must write every node before reading (both builders do:
-// the GPU copy-out writes the whole tree, the CPU builder writes leaves
+// the GPU builder writes the whole tree, the CPU builder writes leaves
 // then every parent level).
 // ---------------------------------------------------------------------------
 
