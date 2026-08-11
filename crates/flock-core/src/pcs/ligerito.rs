@@ -2811,6 +2811,17 @@ fn transform_active_windows(
         });
 }
 
+const INACTIVE_WINDOW: usize = usize::MAX;
+
+fn active_window_to_arena(groups: &[ActiveWindow], n_windows: usize) -> Vec<usize> {
+    let mut window_to_arena = vec![INACTIVE_WINDOW; n_windows];
+    for (arena_index, group) in groups.iter().enumerate() {
+        debug_assert!(group.window_index < n_windows);
+        window_to_arena[group.window_index] = arena_index;
+    }
+    window_to_arena
+}
+
 fn densify_active_windows(
     arena: &[F128],
     groups: &[ActiveWindow],
@@ -2819,21 +2830,17 @@ fn densify_active_windows(
 ) -> Vec<F128> {
     use rayon::prelude::*;
 
-    const INACTIVE: usize = usize::MAX;
     let n = 1usize << log_d;
     let window_len = 1usize << prefix_k;
     let n_windows = n / window_len;
-    let mut window_to_arena = vec![INACTIVE; n_windows];
-    for (arena_index, group) in groups.iter().enumerate() {
-        window_to_arena[group.window_index] = arena_index;
-    }
+    let window_to_arena = active_window_to_arena(groups, n_windows);
 
     let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
     data.par_chunks_mut(window_len)
         .enumerate()
         .for_each(|(window_index, destination)| {
             let arena_index = window_to_arena[window_index];
-            if arena_index == INACTIVE {
+            if arena_index == INACTIVE_WINDOW {
                 destination.fill(F128::ZERO);
             } else {
                 let source = &arena[arena_index * window_len..(arena_index + 1) * window_len];
@@ -2844,6 +2851,144 @@ fn densify_active_windows(
     // the fill/copy branches above, so all uninitialized elements are written
     // before the dense transpose can read them.
     data
+}
+
+/// Materialize the sparse-window arena directly through the first dense
+/// three-layer transpose group.
+///
+/// With a `2^prefix_k` sparse window, that group consumes exactly eight
+/// adjacent windows per block. Gathering those eight inputs from the arena
+/// (or substituting zero for an inactive window) is therefore byte-identical
+/// to first densifying and then running [`transpose_forward_ntt_fused_3layer`].
+/// It removes the full-domain densify write and the first group's matching
+/// input read. A block with no active input is linear-zero and can initialize
+/// its complete output block without executing any field products.
+fn densify_active_windows_fused_first_3layer(
+    ntt: &AdditiveNttF128,
+    arena: &[F128],
+    groups: &[ActiveWindow],
+    log_d: usize,
+    prefix_k: usize,
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    assert!(
+        log_d >= prefix_k + 3,
+        "fused densification requires a complete three-layer suffix group"
+    );
+    let n = 1usize << log_d;
+    let window_len = 1usize << prefix_k;
+    let n_windows = n / window_len;
+    let first_layer = log_d - prefix_k - 3;
+    let num_blocks = 1usize << first_layer;
+    let block_size = window_len << 3;
+    debug_assert_eq!(num_blocks * block_size, n);
+    debug_assert_eq!(n_windows, num_blocks << 3);
+    debug_assert_eq!(arena.len(), groups.len() * window_len);
+
+    let window_to_arena = active_window_to_arena(groups, n_windows);
+    let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+        .map(|block| {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = ntt.twiddle(first_layer, block);
+            for half in 0..2 {
+                tw[1 + half] = ntt.twiddle(first_layer + 1, 2 * block + half);
+            }
+            for quarter in 0..4 {
+                tw[3 + quarter] = ntt.twiddle(first_layer + 2, 4 * block + quarter);
+            }
+            tw
+        })
+        .collect();
+
+    // Keep the vector length at zero until every Rayon job has initialized its
+    // disjoint block. This avoids ever constructing a safe reference to an
+    // uninitialized `F128`; a panic before `set_len` merely drops capacity.
+    let mut data = Vec::<F128>::with_capacity(n);
+    let data_ptr = data.as_mut_ptr() as usize;
+    (0..num_blocks).into_par_iter().for_each(|block| {
+        let arena_indices: [usize; 8] = core::array::from_fn(|i| window_to_arena[8 * block + i]);
+        let output_start = block * block_size;
+        let output_ptr = data_ptr as *mut F128;
+
+        // SAFETY: every job owns the disjoint initialized range
+        // `[output_start, output_start + block_size)`. `data` has capacity `n`
+        // but length zero throughout the parallel region, and no read of its
+        // storage occurs. F128 is exactly two `u64` limbs, so all-zero bytes are
+        // its valid `ZERO` representation.
+        unsafe {
+            if arena_indices
+                .iter()
+                .all(|&arena_index| arena_index == INACTIVE_WINDOW)
+            {
+                core::ptr::write_bytes(output_ptr.add(output_start), 0, block_size);
+                return;
+            }
+
+            let tw = &twiddles[block];
+            for row in 0..window_len {
+                let mut values: [F128; 8] = core::array::from_fn(|i| {
+                    let arena_index = arena_indices[i];
+                    if arena_index == INACTIVE_WINDOW {
+                        F128::ZERO
+                    } else {
+                        arena[arena_index * window_len + row]
+                    }
+                });
+
+                #[inline(always)]
+                fn butterfly(values: &mut [F128; 8], top: usize, bottom: usize, twiddle: F128) {
+                    let sum = values[top] + values[bottom];
+                    values[top] = sum;
+                    values[bottom] = twiddle * sum + values[bottom];
+                }
+
+                for pair in 0..4 {
+                    butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
+                }
+                for half in 0..2 {
+                    butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
+                    butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
+                }
+                for top in 0..4 {
+                    butterfly(&mut values, top, top + 4, tw[0]);
+                }
+
+                for (i, value) in values.into_iter().enumerate() {
+                    output_ptr
+                        .add(output_start + row + i * window_len)
+                        .write(value);
+                }
+            }
+        }
+    });
+
+    // SAFETY: the block partition covers `[0, n)` exactly, and every block
+    // takes either the full zero-write branch or writes all eight values for
+    // every row before the parallel iterator joins above.
+    unsafe {
+        data.set_len(n);
+    }
+    data
+}
+
+#[inline]
+fn is_ranked_fused_densify_first_shape(log_d: usize, prefix_k: usize, n_positions: usize) -> bool {
+    prefix_k == 8 && matches!((log_d, n_positions), (20, 218) | (18, 106))
+}
+
+#[inline]
+fn use_ranked_fused_densify_first(log_d: usize, prefix_k: usize, n_positions: usize) -> bool {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        || !is_ranked_fused_densify_first_shape(log_d, prefix_k, n_positions)
+    {
+        return false;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_INDUCE_FUSED_DENSIFY_FIRST").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 fn transpose_forward_ntt_dense_suffix_impl(
@@ -2991,13 +3136,21 @@ fn transpose_forward_ntt_sparse_impl(
 
     transform_active_windows(ntt, &mut arena, &groups, k, log_d);
 
-    let mut data = densify_active_windows(&arena, &groups, log_d, k);
+    let use_fused_densify = use_ranked_fused_densify_first(log_d, k, positions.len());
+    let (mut data, dense_prefix_k) = if use_fused_densify {
+        (
+            densify_active_windows_fused_first_3layer(ntt, &arena, &groups, log_d, k),
+            k + 3,
+        )
+    } else {
+        (densify_active_windows(&arena, &groups, log_d, k), k)
+    };
 
     let intro_msg = transpose_forward_ntt_dense_suffix_impl(
         ntt,
         &mut data,
         log_d,
-        k,
+        dense_prefix_k,
         truncate_final_group,
         round_f,
     );
@@ -10217,7 +10370,7 @@ mod tests {
         for &log_d in &[12usize, 14, 18, 20] {
             let n = 1usize << log_d;
             let ntt = AdditiveNttF128::standard(log_d);
-            for &n_queries in &[0usize, 1, 5, 43, 218] {
+            for &n_queries in &[0usize, 1, 5, 43, 106, 218] {
                 let mut challenger = crate::challenger::RandomChallenger::new(
                     0x11EA_2105 ^ ((log_d as u64) << 32) ^ n_queries as u64,
                 );
@@ -10275,6 +10428,208 @@ mod tests {
             transpose_forward_ntt_sparse_hashmap(&ntt, &positions, &values, log_d, 8, false);
         let linear = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
         assert_eq!(linear, legacy, "all-active-window case changed");
+    }
+
+    /// The direct gather/materialize kernel must equal the incumbent two-step
+    /// `densify + first fused-three-layer pass` for every sparse-frontier edge
+    /// shape, including the exact ranked L0/L1 query counts.
+    #[test]
+    fn fused_densify_first_3layer_matches_incumbent_stage() {
+        use crate::challenger::Challenger;
+
+        fn check_case(log_d: usize, mut pairs: Vec<(usize, F128)>, label: &str) {
+            const PREFIX_K: usize = 8;
+            pairs.sort_unstable_by_key(|&(position, _)| position);
+            let (positions, values): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+            let ntt = AdditiveNttF128::standard(log_d);
+            let groups = group_sorted_positions(&positions, PREFIX_K);
+            let mut arena = scatter_active_windows(&groups, &positions, &values, PREFIX_K);
+            transform_active_windows(&ntt, &mut arena, &groups, PREFIX_K, log_d);
+
+            let mut expected = densify_active_windows(&arena, &groups, log_d, PREFIX_K);
+            let first_layer = log_d - PREFIX_K - 3;
+            transpose_forward_ntt_fused_3layer(&ntt, &mut expected, log_d, first_layer);
+            let actual =
+                densify_active_windows_fused_first_3layer(&ntt, &arena, &groups, log_d, PREFIX_K);
+            assert_eq!(actual, expected, "{label}: log_d={log_d}");
+        }
+
+        check_case(12, Vec::new(), "empty");
+        check_case(18, vec![(0, F128::ONE)], "single");
+        check_case(
+            12,
+            vec![
+                (0, F128::ONE),
+                (0, F128::ONE),
+                (1, F128::new(2, 0)),
+                (255, F128::new(3, 1)),
+                (256, F128::new(4, 2)),
+                (256, F128::new(5, 3)),
+                ((1 << 12) - 1, F128::new(6, 4)),
+            ],
+            "duplicates",
+        );
+
+        let all_active: Vec<(usize, F128)> = (0..1usize << 12)
+            .step_by(1 << 8)
+            .enumerate()
+            .map(|(i, position)| (position, F128::new(i as u64 + 1, (i as u64).rotate_left(7))))
+            .collect();
+        check_case(12, all_active, "all-active");
+
+        for &(log_d, n_queries) in &[(14usize, 43usize), (18, 106), (20, 218)] {
+            let n = 1usize << log_d;
+            let mut challenger = crate::challenger::RandomChallenger::new(
+                0xF05E_D3A5_1F1E_0000 ^ ((log_d as u64) << 24) ^ n_queries as u64,
+            );
+            let mut pairs = Vec::with_capacity(n_queries);
+            while pairs.len() < n_queries {
+                let position = (challenger.sample_f128().lo as usize) % n;
+                if !pairs.iter().any(|&(p, _)| p == position) {
+                    pairs.push((position, challenger.sample_f128()));
+                }
+            }
+            check_case(log_d, pairs, "random/ranked");
+        }
+    }
+
+    #[test]
+    fn ranked_fused_densify_first_shape_gate_is_narrow() {
+        assert!(is_ranked_fused_densify_first_shape(20, 8, 218));
+        assert!(is_ranked_fused_densify_first_shape(18, 8, 106));
+        for &(log_d, prefix_k, n_positions) in &[
+            (20usize, 7usize, 218usize),
+            (20, 8, 217),
+            (20, 8, 219),
+            (19, 8, 218),
+            (18, 7, 106),
+            (18, 8, 105),
+            (18, 8, 107),
+            (17, 8, 106),
+        ] {
+            assert!(!is_ranked_fused_densify_first_shape(
+                log_d,
+                prefix_k,
+                n_positions,
+            ));
+        }
+    }
+
+    /// Exact ranked component adjudication. The control times the incumbent
+    /// full-domain densification plus its first dense radix-8 pass; the
+    /// candidate times their direct gather/materialize replacement. Sparse
+    /// grouping and the eight local prefix layers are common setup outside the
+    /// measured spans. Arm order reverses every pair and allocations are
+    /// dropped outside both timers.
+    ///
+    /// ```text
+    /// FLOCK_RUN_INDUCE_FUSED_DENSIFY_TIMING=1 RAYON_NUM_THREADS=10 \
+    /// cargo +1.97.0 test --locked --offline --profile challenge -p flock-core --lib \
+    /// pcs::ligerito::tests::fused_densify_first_ranked_shapes_paired_timing -- \
+    /// --ignored --exact --nocapture --test-threads=1
+    /// ```
+    #[test]
+    #[ignore]
+    fn fused_densify_first_ranked_shapes_paired_timing() {
+        use crate::challenger::Challenger;
+
+        if std::env::var_os("FLOCK_RUN_INDUCE_FUSED_DENSIFY_TIMING").is_none() {
+            eprintln!("set FLOCK_RUN_INDUCE_FUSED_DENSIFY_TIMING=1 to run");
+            return;
+        }
+
+        const PREFIX_K: usize = 8;
+        const WARMUP_PAIRS: usize = 6;
+        const MEASURED_PAIRS: usize = 48;
+
+        for &(label, log_d, n_queries) in &[("L0", 20usize, 218usize), ("L1", 18, 106)] {
+            let n = 1usize << log_d;
+            let mut challenger = crate::challenger::RandomChallenger::new(
+                0xD3A5_1F1E_71A1_0000 ^ ((log_d as u64) << 24) ^ n_queries as u64,
+            );
+            let mut pairs = Vec::with_capacity(n_queries);
+            while pairs.len() < n_queries {
+                let position = (challenger.sample_f128().lo as usize) % n;
+                if !pairs.iter().any(|&(p, _)| p == position) {
+                    pairs.push((position, challenger.sample_f128()));
+                }
+            }
+            pairs.sort_unstable_by_key(|&(position, _)| position);
+            let (positions, values): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+            let ntt = AdditiveNttF128::standard(log_d);
+            let groups = group_sorted_positions(&positions, PREFIX_K);
+            let mut arena = scatter_active_windows(&groups, &positions, &values, PREFIX_K);
+            transform_active_windows(&ntt, &mut arena, &groups, PREFIX_K, log_d);
+            let first_layer = log_d - PREFIX_K - 3;
+
+            let mut active_blocks = 0usize;
+            let mut previous_block = None;
+            for group in &groups {
+                let block = group.window_index >> 3;
+                if previous_block != Some(block) {
+                    active_blocks += 1;
+                    previous_block = Some(block);
+                }
+            }
+
+            let run_control = || {
+                let started = std::time::Instant::now();
+                let mut data = densify_active_windows(&arena, &groups, log_d, PREFIX_K);
+                transpose_forward_ntt_fused_3layer(&ntt, &mut data, log_d, first_layer);
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+                let anchor =
+                    std::hint::black_box(data[0] + data[n / 7] + data[n / 2] + data[n - 1]);
+                (elapsed_ms, anchor)
+            };
+            let run_candidate = || {
+                let started = std::time::Instant::now();
+                let data = densify_active_windows_fused_first_3layer(
+                    &ntt, &arena, &groups, log_d, PREFIX_K,
+                );
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+                let anchor =
+                    std::hint::black_box(data[0] + data[n / 7] + data[n / 2] + data[n - 1]);
+                (elapsed_ms, anchor)
+            };
+
+            let mut control_ms = Vec::with_capacity(MEASURED_PAIRS);
+            let mut candidate_ms = Vec::with_capacity(MEASURED_PAIRS);
+            let mut deltas_ms = Vec::with_capacity(MEASURED_PAIRS);
+            for pair in 0..WARMUP_PAIRS + MEASURED_PAIRS {
+                let ((control_elapsed, control_anchor), (candidate_elapsed, candidate_anchor)) =
+                    if pair.is_multiple_of(2) {
+                        let control = run_control();
+                        let candidate = run_candidate();
+                        (control, candidate)
+                    } else {
+                        let candidate = run_candidate();
+                        let control = run_control();
+                        (control, candidate)
+                    };
+                assert_eq!(candidate_anchor, control_anchor, "{label}: pair={pair}");
+                if pair >= WARMUP_PAIRS {
+                    control_ms.push(control_elapsed);
+                    candidate_ms.push(candidate_elapsed);
+                    deltas_ms.push(candidate_elapsed - control_elapsed);
+                }
+            }
+
+            let wins = deltas_ms.iter().filter(|&&delta| delta < 0.0).count();
+            let mean_delta_ms = deltas_ms.iter().sum::<f64>() / deltas_ms.len() as f64;
+            println!(
+                "fused-densify {label} windows={} active_blocks={}/{} pairs={} wins={} control_median_ms={:.6} candidate_median_ms={:.6} paired_delta_median_ms={:.6} paired_delta_mean_ms={:.6} paired_delta_p90_ms={:.6}",
+                groups.len(),
+                active_blocks,
+                1usize << first_layer,
+                MEASURED_PAIRS,
+                wins,
+                lazy_ood_timing_median(&control_ms),
+                lazy_ood_timing_median(&candidate_ms),
+                lazy_ood_timing_median(&deltas_ms),
+                mean_delta_ms,
+                lazy_ood_timing_percentile(&deltas_ms, 90, 100),
+            );
+        }
     }
 
     #[test]
