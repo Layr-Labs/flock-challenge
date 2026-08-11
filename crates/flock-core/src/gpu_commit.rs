@@ -356,6 +356,85 @@ pub(crate) fn gpu_lincheck_enabled() -> bool {
     *ON
 }
 
+/// Exact same-binary rollback for the supplemental factored byte-table B4
+/// builder used by the lincheck fold arm. `FLOCK_NO_LINCHECK_FACTORED_B4=1`
+/// skips the candidate source compile and keeps the incumbent B4 pipeline;
+/// every other value enables the candidate when its isolated compile and PSO
+/// creation succeed. A candidate init failure is therefore also an exact
+/// fallback to the incumbent kernel, never a reason to disable GPU lincheck.
+pub const ENV_NO_LINCHECK_FACTORED_B4: &str = "FLOCK_NO_LINCHECK_FACTORED_B4";
+
+fn lincheck_factored_b4_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn lincheck_factored_b4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        lincheck_factored_b4_value_enabled(std::env::var_os(ENV_NO_LINCHECK_FACTORED_B4).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod lincheck_factored_b4_gate_tests {
+    use crate::field::F128;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_factored_b4_rollback_value() {
+        assert!(!super::lincheck_factored_b4_value_enabled(Some(
+            OsStr::new("1")
+        )));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::lincheck_factored_b4_value_enabled(
+                value.map(OsStr::new)
+            ));
+        }
+    }
+
+    #[test]
+    fn six_plus_two_factored_b4_tables_match_byte_subset_oracle() {
+        let eq: [[F128; 8]; 4] = std::array::from_fn(|s| {
+            std::array::from_fn(|b| F128 {
+                lo: 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(1 + s as u64 * 8 + b as u64),
+                hi: 0xbf58_476d_1ce4_e5b9u64.wrapping_mul(17 + s as u64 * 8 + b as u64),
+            })
+        });
+        let mut incumbent = [[F128::ZERO; 256]; 4];
+        let mut factored = [[F128::ZERO; 256]; 4];
+
+        for s in 0..4 {
+            for byte in 0..256usize {
+                for bit in 0..8 {
+                    if byte & (1 << bit) != 0 {
+                        incumbent[s][byte] += eq[s][bit];
+                    }
+                }
+            }
+            for h in 0..64usize {
+                let mut l6 = F128::ZERO;
+                for bit in 0..6 {
+                    if h & (1 << bit) != 0 {
+                        l6 += eq[s][bit];
+                    }
+                }
+                let l6e6 = l6 + eq[s][6];
+                let l6e7 = l6 + eq[s][7];
+                factored[s][h] = l6;
+                factored[s][h + 64] = l6e6;
+                factored[s][h + 128] = l6e7;
+                factored[s][h + 192] = l6e6 + eq[s][7];
+            }
+        }
+
+        assert_eq!(factored, incumbent);
+    }
+}
+
 /// Diagnostic trace for the lincheck fold arm (`FLOCK_LINCHECK_GPU_DEBUG=1`).
 pub(crate) fn gpu_lincheck_debug() -> bool {
     static ON: std::sync::LazyLock<bool> =
@@ -8157,6 +8236,125 @@ kernel void NAME(                                                       \
 LC_KERNEL(lc_fold_stripes, 4)
 "#;
 
+    /// Supplemental byte-table B4 kernel with a factored 6+2-bit table
+    /// builder. This lives in its own MSL string/library/PSO so a frontend or
+    /// pipeline failure cannot disturb the incumbent `lc_fold_stripes` PSO.
+    ///
+    /// For one stripe, the incumbent assigns one thread to each byte value
+    /// and rebuilds that value as the subset XOR of all eight eq lanes
+    /// (1024 lane XORs over the 256-entry table). The factored builder assigns
+    /// 64 threads to a stripe. Thread `h` first builds the subset of eq[0..6)
+    /// selected by the low six bits, then emits the four entries obtained by
+    /// choosing neither/eq6/eq7/both. The stores are disjoint and exhaustive:
+    /// `h`, `h+64`, `h+128`, `h+192`. Explicit common subexpressions make the
+    /// construction 384 lane XORs per stripe independent of backend CSE. It
+    /// retains the incumbent's exact three converged barriers per B4 block
+    /// and its 16.5 KiB threadgroup footprint.
+    const LC_FACTORED_B4_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct LcFactoredB4Params {
+    uint k;
+    uint useful;
+    uint stripe_hi;
+    uint stripes_per_chunk;
+    uint i_groups;
+};
+
+#define LC_FACTORED_B4_STEP(TT, W) {            \
+    a0 ^= (TT)[(W) & 255u];                     \
+    a1 ^= (TT)[((W) >> 8) & 255u];              \
+    a2 ^= (TT)[((W) >> 16) & 255u];             \
+    a3 ^= (TT)[(W) >> 24];                      \
+}
+
+kernel void lc_fold_stripes_factored_b4(
+    device const uint*               z32      [[buffer(0)]],
+    device const uint4*              eq       [[buffer(1)]],
+    device uint4*                    partials [[buffer(2)]],
+    constant LcFactoredB4Params&     p        [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]])
+{
+    constexpr uint B = 4u;
+    threadgroup uint4 tg_eq[B * 8u];
+    threadgroup uint4 tab[B * 256u];
+
+    uint chunk  = tgid / p.i_groups;
+    uint ig     = tgid - chunk * p.i_groups;
+    uint i_base = ig * 1024u;
+    uint s_lo = chunk * p.stripes_per_chunk;
+    uint s_hi = min(s_lo + p.stripes_per_chunk, p.stripe_hi);
+
+    uint4 a0 = uint4(0u), a1 = uint4(0u), a2 = uint4(0u), a3 = uint4(0u);
+    uint c0 = i_base + 4u * lid;
+    bool live = c0 < p.useful;
+    uint kw = p.k >> 2;
+
+    for (uint sb = s_lo; sb < s_hi; sb += B) {
+        uint ns = min(B, s_hi - sb);
+        uint w[B];
+        for (uint t = 0u; t < B; ++t) { w[t] = 0u; }
+        if (live && ns == B) {
+            uint q = (sb * p.k + c0) >> 2;
+            for (uint t = 0u; t < B; ++t) { w[t] = z32[q + t * kw]; }
+        }
+
+        // All lanes rendezvous before the next block reuses tables that the
+        // previous block's lookups may still be reading.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < ns * 8u) {
+            tg_eq[lid] = eq[sb * 8u + lid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Four stripes x 64 builders exactly occupy the 256-lane group.
+        // For a short final block, stale tables for s >= ns are never read.
+        if (lid < ns * 64u) {
+            uint s = lid >> 6;
+            uint h = lid & 63u;
+            uint eq_base = s * 8u;
+            uint4 l6 = uint4(0u);
+            uint hm = h;
+            while (hm != 0u) {
+                l6 ^= tg_eq[eq_base + ctz(hm)];
+                hm &= hm - 1u;
+            }
+            uint4 e6 = tg_eq[eq_base + 6u];
+            uint4 e7 = tg_eq[eq_base + 7u];
+            uint4 l6e6 = l6 ^ e6;
+            uint4 l6e7 = l6 ^ e7;
+            uint tab_base = s * 256u + h;
+            tab[tab_base]        = l6;
+            tab[tab_base + 64u]  = l6e6;
+            tab[tab_base + 128u] = l6e7;
+            tab[tab_base + 192u] = l6e6 ^ e7;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (live) {
+            if (ns == B) {
+                for (uint t = 0u; t < B; ++t) {
+                    LC_FACTORED_B4_STEP(&tab[t * 256u], w[t]);
+                }
+            } else {
+                for (uint t = 0u; t < ns; ++t) {
+                    uint wt = z32[((sb + t) * p.k + c0) >> 2];
+                    LC_FACTORED_B4_STEP(&tab[t * 256u], wt);
+                }
+            }
+        }
+    }
+
+    device uint4* out = partials + chunk * p.k + c0;
+    out[0u] = a0;
+    out[1u] = a1;
+    out[2u] = a2;
+    out[3u] = a3;
+}
+"#;
+
     /// Output partials produced by the GPU fold. Fixed so the buffer set and
     /// the reduce dispatch are size-stable across proves.
     const ZC_FOLD_CHUNKS: usize = 64;
@@ -8183,6 +8381,10 @@ LC_KERNEL(lc_fold_stripes, 4)
         /// to compile). Lincheck then falls back to its incumbent CPU fold;
         /// zerocheck falls back to its shipped nibble-table pipeline.
         pso_lc_fold: Id,
+        /// Supplemental factored-builder B4 pipeline. Compiled from an
+        /// isolated source/library and `NIL` on exact rollback or any init
+        /// failure; lincheck then keeps `pso_lc_fold` unchanged.
+        pso_lc_factored_b4: Id,
         /// eq_outer upload (n_outer x 16 B).
         eq_buf: Id,
         eq_cap: usize,
@@ -8392,11 +8594,37 @@ LC_KERNEL(lc_fold_stripes, 4)
                     }
                 }
             };
+            // Compile the candidate from a separate source and MTLLibrary.
+            // Exact rollback skips this work entirely; any candidate error
+            // leaves the already-created incumbent `pso_lc_fold` intact.
+            let pso_lc_factored_b4 = if super::lincheck_factored_b4_enabled() {
+                let pool = gpu.pool_push();
+                let built = compile_supplemental_pipeline(
+                    gpu,
+                    LC_FACTORED_B4_MSL_SOURCE,
+                    "lc_fold_stripes_factored_b4",
+                );
+                gpu.pool_pop(pool);
+                match built {
+                    Ok(pso) => pso,
+                    Err(e) => {
+                        if super::gpu_lincheck_debug() {
+                            eprintln!(
+                                "[gpu-lincheck] factored B4 unavailable; using incumbent: {e}"
+                            );
+                        }
+                        NIL
+                    }
+                }
+            } else {
+                NIL
+            };
             Ok(ZcFold {
                 gpu,
                 pso_fold,
                 pso_reduce,
                 pso_lc_fold,
+                pso_lc_factored_b4,
                 eq_buf: NIL,
                 eq_cap: 0,
                 part_buf: NIL,
@@ -8906,7 +9134,7 @@ LC_KERNEL(lc_fold_stripes, 4)
                     if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() && u_gpu > 0.0 {
                         let measured = u_gpu / u_cpu;
                         let ratio = lincheck_fold_forced_ratio().unwrap_or(measured);
-                        let g = lincheck_gate_share(ratio, self.n_claims);
+                        let g = lincheck_gate_share(ratio, self.n_claims, self.plan.factored_b4);
                         self.arm
                             .tuned()
                             .store(g, std::sync::atomic::Ordering::Relaxed);
@@ -9159,10 +9387,14 @@ LC_KERNEL(lc_fold_stripes, 4)
     ///
     /// Default policy is the balanced split: equalizing `g·u_gpu =
     /// (n−g)·u_cpu` gives `g = n/(1+ratio)`, rounded to the nearest claim.
-    /// The cap at `5n/8` absorbs warmup CPU samples that were measured under
-    /// transient load — uncapped, an optimistic ratio makes the GPU the
-    /// timed straggler, which costs wall directly (measured balance basin on
-    /// the ranked shape: 39–40 of 64 claims).
+    /// The incumbent B4 cap at `5n/8` absorbs warmup CPU samples that were
+    /// measured under transient load — uncapped, an optimistic ratio makes
+    /// that GPU kernel the timed straggler, which costs wall directly
+    /// (measured balance basin on the ranked shape: 39–40 of 64 claims).
+    /// The supplemental factored B4 PSO has a separately measured basin at
+    /// 48 claims and therefore uses a `3n/4` cap, but only when that PSO was
+    /// actually selected. Exact rollback or supplemental init failure selects
+    /// the incumbent PSO and its unchanged `5n/8` cap.
     /// `FLOCK_LINCHECK_GPU_LEGACY_SPLIT` selects the previous
     /// `floor(0.9·n/(1+ratio))`-clamped-to-`n/2` policy for same-binary
     /// causal comparison.
@@ -9174,19 +9406,28 @@ LC_KERNEL(lc_fold_stripes, 4)
         share.clamp(0.0, (n_claims / 2) as f64) as usize
     }
 
-    pub(crate) fn lincheck_gate_share_balanced(ratio: f64, n_claims: usize) -> usize {
+    pub(crate) fn lincheck_gate_share_balanced(
+        ratio: f64,
+        n_claims: usize,
+        factored_b4: bool,
+    ) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 || ratio > LINCHECK_FOLD_MAX_GPU_RATIO {
             return 0;
         }
         let share = (n_claims as f64 / (1.0 + ratio)).round();
-        share.clamp(0.0, (n_claims * 5 / 8) as f64) as usize
+        let cap = if factored_b4 {
+            n_claims * 3 / 4
+        } else {
+            n_claims * 5 / 8
+        };
+        share.clamp(0.0, cap as f64) as usize
     }
 
-    pub(crate) fn lincheck_gate_share(ratio: f64, n_claims: usize) -> usize {
+    pub(crate) fn lincheck_gate_share(ratio: f64, n_claims: usize, factored_b4: bool) -> usize {
         if std::env::var_os("FLOCK_LINCHECK_GPU_LEGACY_SPLIT").is_some() {
             lincheck_gate_share_legacy(ratio, n_claims)
         } else {
-            lincheck_gate_share_balanced(ratio, n_claims)
+            lincheck_gate_share_balanced(ratio, n_claims, factored_b4)
         }
     }
 
@@ -9307,6 +9548,11 @@ LC_KERNEL(lc_fold_stripes, 4)
         /// split tuner uses the measured headroom to admit a complete-GPU
         /// fold only for this faster route; rollback preserves the old cap.
         byte_fold: bool,
+        /// This dispatch selected the supplemental factored B4 PSO. Only
+        /// that exact route may use the wider lincheck share cap; rollback
+        /// and supplemental-init failure select the incumbent PSO and leave
+        /// this false.
+        factored_b4: bool,
         k: usize,
         useful: usize,
         stripe_hi: usize,
@@ -9353,6 +9599,153 @@ LC_KERNEL(lc_fold_stripes, 4)
             let cb = gpu.retain(cb);
             gpu.commit_async(cb);
             Ok(cb)
+        }
+    }
+
+    /// Direct, fixed-plan candidate/control result for the real-Metal B4
+    /// oracle. This path deliberately bypasses `FoldArm::claims_for`,
+    /// `ZcFoldJob::finish_xor_into`, submit counters, calibration, and every
+    /// tuned-share static: the only difference between its two dispatches is
+    /// the explicitly supplied candidate versus incumbent PSO.
+    #[cfg(test)]
+    pub(crate) struct LincheckB4PsoPair {
+        pub(crate) candidate: Vec<F128>,
+        pub(crate) incumbent: Vec<F128>,
+        pub(crate) candidate_gpu_ms: f64,
+        pub(crate) incumbent_gpu_ms: f64,
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_lincheck_b4_psos_for_test(
+        z_packed: &[u8],
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+        eq_outer: &[F128],
+        stripe_hi: usize,
+        stripes_per_chunk: usize,
+        candidate_first: bool,
+    ) -> Result<LincheckB4PsoPair, String> {
+        let k = 1usize << k_log;
+        let n_outer = 1usize << (m - k_log);
+        if z_packed.len() != (1usize << m) / 8 {
+            return Err("direct B4 oracle stripe length mismatch".to_string());
+        }
+        if eq_outer.len() != n_outer {
+            return Err("direct B4 oracle eq length mismatch".to_string());
+        }
+        if !k.is_multiple_of(ZC_FOLD_COLS_PER_TG) {
+            return Err("direct B4 oracle k must be a 1024-column multiple".to_string());
+        }
+        if stripe_hi == 0
+            || stripe_hi > n_outer / 8
+            || stripes_per_chunk == 0
+            || stripe_hi > ZC_FOLD_CHUNKS.saturating_mul(stripes_per_chunk)
+        {
+            return Err("direct B4 oracle invalid stripe plan".to_string());
+        }
+
+        let gpu = gpu()?;
+        let mut guard = match ZC_FOLD.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                ZC_FOLD.clear_poison();
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
+        if guard.is_none() {
+            *guard = Some(zc_fold_init(gpu));
+        }
+        let state = guard
+            .as_mut()
+            .expect("direct B4 oracle initialized state")
+            .as_mut()
+            .map_err(|e| e.clone())?;
+        if state.pso_lc_fold.is_null() {
+            return Err("direct B4 oracle incumbent PSO is NIL".to_string());
+        }
+        if state.pso_lc_factored_b4.is_null() {
+            return Err("direct B4 oracle candidate PSO is NIL".to_string());
+        }
+
+        unsafe {
+            let pool = gpu.pool_push();
+            let result = (|| -> Result<LincheckB4PsoPair, String> {
+                abandon_staged_prefix(state);
+                let z_buf = state.wrap_z(z_packed)?;
+                let (mut eq_buf, mut eq_cap) = (state.eq_buf, state.eq_cap);
+                state.ensure(&mut eq_buf, &mut eq_cap, n_outer * 16)?;
+                state.eq_buf = eq_buf;
+                state.eq_cap = eq_cap;
+                let (mut part_buf, mut part_cap) = (state.part_buf, state.part_cap);
+                state.ensure(&mut part_buf, &mut part_cap, ZC_FOLD_CHUNKS * k * 16)?;
+                state.part_buf = part_buf;
+                state.part_cap = part_cap;
+                let (mut out_buf, mut out_cap) = (state.out_buf, state.out_cap);
+                state.ensure(&mut out_buf, &mut out_cap, k * 16)?;
+                state.out_buf = out_buf;
+                state.out_cap = out_cap;
+                let eq_dst = gpu.buffer_contents(state.eq_buf);
+                if !std::ptr::eq(eq_outer.as_ptr().cast::<u8>(), eq_dst.cast_const()) {
+                    std::ptr::copy_nonoverlapping(
+                        eq_outer.as_ptr().cast::<u8>(),
+                        eq_dst,
+                        n_outer * 16,
+                    );
+                }
+
+                let useful = (useful_bits.div_ceil(8) * 8).min(k);
+                let run = |pso: Id, factored_b4: bool| -> Result<(Vec<F128>, f64), String> {
+                    let plan = ZcFoldPlan {
+                        z_buf,
+                        pso_fold: pso,
+                        byte_fold: true,
+                        factored_b4,
+                        k,
+                        useful,
+                        stripe_hi,
+                        stripes_per_chunk,
+                        i_groups: k / ZC_FOLD_COLS_PER_TG,
+                    };
+                    let cb = zc_fold_submit(gpu, state, &plan)?;
+                    let waited = gpu.wait_cb(cb);
+                    let gpu_ms = zc_fold_gpu_wall_ms(gpu, cb);
+                    if let Err(e) = waited {
+                        gpu.release(cb);
+                        return Err(e);
+                    }
+                    let mut out = crate::alloc_uninit_f128_vec(k);
+                    std::ptr::copy_nonoverlapping(
+                        gpu.buffer_contents(state.out_buf).cast::<F128>(),
+                        out.as_mut_ptr(),
+                        k,
+                    );
+                    gpu.release(cb);
+                    Ok((out, gpu_ms))
+                };
+
+                let ((candidate, candidate_gpu_ms), (incumbent, incumbent_gpu_ms)) =
+                    if candidate_first {
+                        (
+                            run(state.pso_lc_factored_b4, true)?,
+                            run(state.pso_lc_fold, false)?,
+                        )
+                    } else {
+                        let incumbent = run(state.pso_lc_fold, false)?;
+                        let candidate = run(state.pso_lc_factored_b4, true)?;
+                        (candidate, incumbent)
+                    };
+                Ok(LincheckB4PsoPair {
+                    candidate,
+                    incumbent,
+                    candidate_gpu_ms,
+                    incumbent_gpu_ms,
+                })
+            })();
+            gpu.pool_pop(pool);
+            result
         }
     }
 
@@ -9593,14 +9986,19 @@ LC_KERNEL(lc_fold_stripes, 4)
             // Fold pipeline + stripe-block size for this arm. Zerocheck
             // normally reuses the already-compiled byte-table B4 pipeline;
             // its exact rollback (and a byte-pipeline compile failure) keeps
-            // the shipped nibble B8 route. Lincheck keeps its existing B4
-            // route and stays CPU-only when that pipeline is unavailable.
-            let (pso_fold, block, kernel, byte_fold) = match arm {
+            // the shipped nibble B8 route. Lincheck prefers the isolated
+            // factored B4 candidate and falls back to its existing B4 PSO on
+            // exact rollback or candidate-init failure; only an incumbent B4
+            // failure keeps the arm CPU-only.
+            let (pso_fold, block, kernel, byte_fold, factored_b4) = match arm {
                 FoldArm::Zc if super::zc_byte_fold_enabled() && !state.pso_lc_fold.is_null() => {
-                    (state.pso_lc_fold, 4, "byte-b4", true)
+                    (state.pso_lc_fold, 4, "byte-b4", true, false)
                 }
-                FoldArm::Zc => (state.pso_fold, 8, "nibble-b8", false),
-                FoldArm::Lincheck => (state.pso_lc_fold, 4, "byte-b4", true),
+                FoldArm::Zc => (state.pso_fold, 8, "nibble-b8", false, false),
+                FoldArm::Lincheck if !state.pso_lc_factored_b4.is_null() => {
+                    (state.pso_lc_factored_b4, 4, "byte-b4-factored", true, true)
+                }
+                FoldArm::Lincheck => (state.pso_lc_fold, 4, "byte-b4", true, false),
             };
             if pso_fold.is_null() {
                 if arm.debug() {
@@ -9646,6 +10044,7 @@ LC_KERNEL(lc_fold_stripes, 4)
                         z_buf,
                         pso_fold,
                         byte_fold,
+                        factored_b4,
                         k,
                         useful,
                         stripe_hi,
@@ -14312,6 +14711,153 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         });
     }
 
+    /// Scalar byte-table oracle for an arbitrary stripe prefix. The production
+    /// CPU range helper works in whole oblock claims; this smaller oracle lets
+    /// the direct Metal test force final B4 blocks with ns = 1, 2, and 3.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn lincheck_stripe_prefix_oracle(
+        z: &[u8],
+        k: usize,
+        useful_bits: usize,
+        eq: &[F128],
+        stripe_hi: usize,
+    ) -> Vec<F128> {
+        let useful = (useful_bits.div_ceil(8) * 8).min(k);
+        let mut out = vec![F128::ZERO; k];
+        let mut table = [F128::ZERO; 256];
+        for stripe in 0..stripe_hi {
+            table.fill(F128::ZERO);
+            for byte in 1..256usize {
+                for bit in 0..8 {
+                    if byte & (1 << bit) != 0 {
+                        table[byte] += eq[stripe * 8 + bit];
+                    }
+                }
+            }
+            let row = &z[stripe * k..(stripe + 1) * k];
+            for i in 0..useful {
+                out[i] += table[row[i] as usize];
+            }
+        }
+        out
+    }
+
+    /// Direct real-Metal candidate/control oracle for short final B4 blocks.
+    /// The helper supplies each PSO explicitly under one state lock, so this
+    /// cannot silently select the same kernel twice or touch split tuning.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_lincheck_factored_b4_direct_tail_blocks_match_cpu() {
+        let (m, k_log, useful_bits) = (26usize, 10usize, 997usize);
+        let k = 1usize << k_log;
+        if gpu_or_skip(imp::gpu()).is_none() {
+            return;
+        }
+        let z = leak_page_aligned((1usize << m) / 8);
+        fill_stripe(z, 0xB4FA_C701_2345_6789);
+        let mut rng = Rng::new(0x5EED_00B4);
+        let eq = rng.vec(1usize << (m - k_log));
+
+        for (i, stripe_hi) in [1usize, 2, 3].into_iter().enumerate() {
+            let pair = imp::run_lincheck_b4_psos_for_test(
+                z,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+                stripe_hi,
+                4,
+                i % 2 == 0,
+            )
+            .expect("both direct B4 PSOs must compile and run");
+            let want = lincheck_stripe_prefix_oracle(z, k, useful_bits, &eq, stripe_hi);
+            assert_eq!(pair.candidate, want, "candidate ns={stripe_hi}");
+            assert_eq!(pair.incumbent, want, "incumbent ns={stripe_hi}");
+            let useful = useful_bits.div_ceil(8) * 8;
+            assert!(pair.candidate[useful..].iter().all(|v| *v == F128::ZERO));
+            assert!(pair.incumbent[useful..].iter().all(|v| *v == F128::ZERO));
+        }
+    }
+
+    /// Ranked g=40 direct PSO screen: one fixed plan and buffer set, explicit
+    /// candidate/incumbent order balancing, CPU-prefix equality, and padding.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_lincheck_factored_b4_direct_ranked_g40_matches_cpu() {
+        let (m, k_log, useful_bits) = (32usize, 14usize, 15_409usize);
+        if gpu_or_skip(imp::gpu()).is_none() {
+            return;
+        }
+        let z = leak_page_aligned((1usize << m) / 8);
+        fill_stripe(z, 0xB4FA_C740_1234_5678);
+        let mut rng = Rng::new(0x5EED_40B4);
+        let eq = rng.vec(1usize << (m - k_log));
+        let claims = 40usize;
+        let stripe_hi = crate::lincheck::oblock_claim_stripe_base(claims);
+        let stripes_per_chunk = stripe_hi.div_ceil(64).next_multiple_of(4);
+        let want = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_range(
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+            0,
+            claims,
+        );
+
+        // First pair wires the no-copy pages and warms both PSOs; its timings
+        // are deliberately excluded from the balanced screen.
+        let primer = imp::run_lincheck_b4_psos_for_test(
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+            stripe_hi,
+            stripes_per_chunk,
+            true,
+        )
+        .expect("ranked direct B4 primer must run both PSOs");
+        assert_eq!(primer.candidate, want);
+        assert_eq!(primer.incumbent, want);
+
+        let mut candidate_ms = Vec::new();
+        let mut incumbent_ms = Vec::new();
+        for (sample, candidate_first) in [true, false, false, true].into_iter().enumerate() {
+            let pair = imp::run_lincheck_b4_psos_for_test(
+                z,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+                stripe_hi,
+                stripes_per_chunk,
+                candidate_first,
+            )
+            .expect("ranked direct B4 pair must run both PSOs");
+            assert_eq!(pair.candidate, want, "candidate sample {sample}");
+            assert_eq!(pair.incumbent, want, "incumbent sample {sample}");
+            candidate_ms.push(pair.candidate_gpu_ms);
+            incumbent_ms.push(pair.incumbent_gpu_ms);
+            eprintln!(
+                "[factored-b4-direct] sample={sample} order={} candidate={:.6}ms incumbent={:.6}ms",
+                if candidate_first { "C/R" } else { "R/C" },
+                pair.candidate_gpu_ms,
+                pair.incumbent_gpu_ms,
+            );
+        }
+        let c_mean = candidate_ms.iter().sum::<f64>() / candidate_ms.len() as f64;
+        let r_mean = incumbent_ms.iter().sum::<f64>() / incumbent_ms.len() as f64;
+        eprintln!(
+            "[factored-b4-direct] g40 candidate_mean={c_mean:.6}ms incumbent_mean={r_mean:.6}ms improvement={:.3}%",
+            100.0 * (r_mean - c_mean) / r_mean,
+        );
+        assert!(candidate_ms.iter().all(|ms| *ms > 0.0));
+        assert!(incumbent_ms.iter().all(|ms| *ms > 0.0));
+        let useful = useful_bits.div_ceil(8) * 8;
+        assert!(want[useful..].iter().all(|v| *v == F128::ZERO));
+    }
+
     /// The GPU prefix equals the CPU fold over exactly the claims it owns,
     /// and prefix ⊕ CPU-suffix equals the whole-range production fold.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -14441,28 +14987,49 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     fn lincheck_gate_share_formula_and_disable() {
         use imp::{lincheck_gate_share_balanced, lincheck_gate_share_legacy};
         // Balanced default: round(64 / 2) = 32.
-        assert_eq!(lincheck_gate_share_balanced(1.0, 64), 32);
+        assert_eq!(lincheck_gate_share_balanced(1.0, 64, false), 32);
+        assert_eq!(lincheck_gate_share_balanced(1.0, 64, true), 32);
         // v1's measured local ratio: round(64 / 2.52) = 25.
-        assert_eq!(lincheck_gate_share_balanced(1.52, 64), 25);
+        assert_eq!(lincheck_gate_share_balanced(1.52, 64, false), 25);
+        assert_eq!(lincheck_gate_share_balanced(1.52, 64, true), 25);
         // Ranked M3 Max ratios land in the measured 39–40 basin.
-        assert_eq!(lincheck_gate_share_balanced(0.61, 64), 40);
-        assert_eq!(lincheck_gate_share_balanced(0.64, 64), 39);
+        assert_eq!(lincheck_gate_share_balanced(0.61, 64, false), 40);
+        assert_eq!(lincheck_gate_share_balanced(0.61, 64, true), 40);
+        assert_eq!(lincheck_gate_share_balanced(0.64, 64, false), 39);
+        assert_eq!(lincheck_gate_share_balanced(0.64, 64, true), 39);
         // The threshold itself still runs: round(64 / 3) = 21.
-        assert_eq!(lincheck_gate_share_balanced(2.0, 64), 21);
+        assert_eq!(lincheck_gate_share_balanced(2.0, 64, false), 21);
+        assert_eq!(lincheck_gate_share_balanced(2.0, 64, true), 21);
         // Above it the arm is OFF (0 = exact incumbent).
-        assert_eq!(lincheck_gate_share_balanced(2.01, 64), 0);
-        assert_eq!(lincheck_gate_share_balanced(3.0, 64), 0);
-        // Fast GPU: capped at five eighths (overshoot makes the GPU the
-        // timed straggler).
-        assert_eq!(lincheck_gate_share_balanced(0.5, 64), 40);
-        assert_eq!(lincheck_gate_share_balanced(0.1, 64), 40);
+        assert_eq!(lincheck_gate_share_balanced(2.01, 64, false), 0);
+        assert_eq!(lincheck_gate_share_balanced(2.01, 64, true), 0);
+        assert_eq!(lincheck_gate_share_balanced(3.0, 64, false), 0);
+        assert_eq!(lincheck_gate_share_balanced(3.0, 64, true), 0);
+        // Fast GPU: actual factored-PSO selection widens only the cap. The
+        // ratio math is unchanged (round(64 / 1.1) = 58 before clamping).
+        assert_eq!(lincheck_gate_share_balanced(0.1, 64, false), 40);
+        assert_eq!(lincheck_gate_share_balanced(0.1, 64, true), 48);
+        // At an observed factored ratio the natural share, not the cap,
+        // remains authoritative.
+        assert_eq!(lincheck_gate_share_balanced(0.33, 64, false), 40);
+        assert_eq!(lincheck_gate_share_balanced(0.33, 64, true), 48);
+        assert_eq!(lincheck_gate_share_balanced(0.5, 64, false), 40);
+        assert_eq!(lincheck_gate_share_balanced(0.5, 64, true), 43);
         // Unusable samples disable rather than guess.
-        assert_eq!(lincheck_gate_share_balanced(f64::NAN, 64), 0);
-        assert_eq!(lincheck_gate_share_balanced(f64::INFINITY, 64), 0);
-        assert_eq!(lincheck_gate_share_balanced(0.0, 64), 0);
-        assert_eq!(lincheck_gate_share_balanced(-1.0, 64), 0);
+        assert_eq!(lincheck_gate_share_balanced(f64::NAN, 64, false), 0);
+        assert_eq!(lincheck_gate_share_balanced(f64::NAN, 64, true), 0);
+        assert_eq!(lincheck_gate_share_balanced(f64::INFINITY, 64, false), 0);
+        assert_eq!(lincheck_gate_share_balanced(f64::INFINITY, 64, true), 0);
+        assert_eq!(lincheck_gate_share_balanced(0.0, 64, false), 0);
+        assert_eq!(lincheck_gate_share_balanced(0.0, 64, true), 0);
+        assert_eq!(lincheck_gate_share_balanced(-1.0, 64, false), 0);
+        assert_eq!(lincheck_gate_share_balanced(-1.0, 64, true), 0);
         // Small test shapes scale (16 claims: ratio 1 -> round(8) = 8).
-        assert_eq!(lincheck_gate_share_balanced(1.0, 16), 8);
+        assert_eq!(lincheck_gate_share_balanced(1.0, 16, false), 8);
+        assert_eq!(lincheck_gate_share_balanced(1.0, 16, true), 8);
+        // Fallback retains the old proportional ceiling on small shapes too.
+        assert_eq!(lincheck_gate_share_balanced(0.1, 16, false), 10);
+        assert_eq!(lincheck_gate_share_balanced(0.1, 16, true), 12);
         // The legacy policy is preserved exactly for causal comparison.
         assert_eq!(lincheck_gate_share_legacy(1.0, 64), 28);
         assert_eq!(lincheck_gate_share_legacy(1.52, 64), 22);
