@@ -240,6 +240,29 @@ fn zc_tail_hetero_enabled() -> bool {
     *ENABLED
 }
 
+/// Hetero admission floor for the composed tail folds, decoupled from the
+/// NT-store policy that shares the historical `2^19` size test. The 2^21→2^19
+/// lowering (promoted `db0b668`) admitted the 7+8 fold; this floor extends
+/// the same scheduling — and only the scheduling — down to the 9+10 and 11+12
+/// composed folds and the first loop rounds, whose 2×≤8 MiB ping-pong outputs
+/// are LLC-resident and must therefore keep cached stores (the NT gates stay
+/// keyed on `2^19`). Compile-time default per the cleared ranked environment;
+/// `FLOCK_NO_ZC_TAIL_HETERO_LOW=1` (exactly `"1"`) restores the incumbent
+/// `2^19` admission as the same-binary A/B control. Bit-identical either way:
+/// the hetero branch owns the same disjoint per-`x_hi` output ranges, and the
+/// message partials are XOR sums.
+#[cfg(target_arch = "aarch64")]
+const ZC_TAIL_HETERO_LOW_FLOOR: usize = 1 << 17;
+
+#[cfg(target_arch = "aarch64")]
+fn zc_tail_hetero_low_floor() -> usize {
+    use std::sync::LazyLock;
+    static LOW: LazyLock<bool> = LazyLock::new(|| {
+        !std::env::var("FLOCK_NO_ZC_TAIL_HETERO_LOW").is_ok_and(|v| v == "1")
+    });
+    if *LOW { ZC_TAIL_HETERO_LOW_FLOOR } else { 1 << 19 }
+}
+
 /// Give the three largest ordinary tail rounds 2,048 independent chunks.
 ///
 /// At log_n=25 this reduces each worker claim from roughly 3 MiB to 768 KiB
@@ -2541,7 +2564,7 @@ pub(crate) fn fold2_plain_and_round6_into(
     // Same scheduling policy as the plain tail: DRAM-bound sizes drain
     // through the hetero E-core queue, LLC-resident ones stay on rayon.
     #[cfg(target_arch = "aarch64")]
-    let hetero = quarter >= (1usize << 19) && zc_tail_hetero_enabled();
+    let hetero = quarter >= zc_tail_hetero_low_floor() && zc_tail_hetero_enabled();
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
@@ -2780,7 +2803,7 @@ pub(crate) fn fold2_plain_and_round67_into(
 
     // Same scheduling policy as the plain composed pass.
     #[cfg(target_arch = "aarch64")]
-    let hetero = quarter >= (1usize << 19) && zc_tail_hetero_enabled();
+    let hetero = quarter >= zc_tail_hetero_low_floor() && zc_tail_hetero_enabled();
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
@@ -3512,7 +3535,7 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     // H2: drain the DRAM-bound rounds (outputs past LLC) through the hetero
     // E-core queue — the same contract as the T3 compact reconstruction.
     #[cfg(target_arch = "aarch64")]
-    let hetero = half >= (1usize << 19) && zc_tail_hetero_enabled();
+    let hetero = half >= zc_tail_hetero_low_floor() && zc_tail_hetero_enabled();
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 

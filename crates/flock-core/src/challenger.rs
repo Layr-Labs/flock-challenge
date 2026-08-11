@@ -552,13 +552,30 @@ impl Challenger for FsChallenger {
                     match crate::epool::epool()
                         .filter(|_| main_threads > 1 && n_chunks >= GRIND_EPOOL_MIN_CHUNKS)
                     {
-                        Some(ep) => std::thread::scope(|s| {
-                            // The scoped thread parks in `broadcast` while the
-                            // E-workers drain; the scope join bounds the tail wait
-                            // at one chunk on one efficiency core.
-                            s.spawn(|| ep.broadcast(|_| worker()));
-                            drain_main();
-                        }),
+                        Some(ep) => {
+                            // Engaged grind drain: same two-pool shape as the
+                            // fold drains, so route the broadcast through the
+                            // persistent relay instead of creating and joining
+                            // one OS thread per engaged grind (7-8 of them sit
+                            // on the serial Fiat-Shamir spine per prove). The
+                            // relay posts from inside a main worker, so the
+                            // E-broadcast starts no earlier relative to the
+                            // main drain than the spawn it replaces, and a
+                            // busy or disabled relay falls back to the exact
+                            // incumbent scoped spawn. Chunk claims and the
+                            // lowest-chunk match rule are untouched, so the
+                            // nonce — and every transcript byte after it — is
+                            // identical either way.
+                            let broadcast = || {
+                                ep.broadcast(|_| worker());
+                            };
+                            crate::epool::drain_hetero(
+                                main_threads,
+                                &worker,
+                                &broadcast,
+                                grind_relay_enabled() && crate::epool::relay_enabled(),
+                            );
+                        }
                         None => drain_main(),
                     }
                     // Both pools joined (Release stores in `results` are
@@ -1128,6 +1145,24 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
 fn grind_latch_min_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_LATCH_MIN").is_none())
+}
+
+/// Route the engaged CPU-grind drain's helper broadcast through the epool's
+/// persistent relay instead of a fresh scoped thread per engaged grind.
+/// Compile-time default so the cleared ranked environment ships the decision;
+/// `FLOCK_NO_GRIND_RELAY=1` (exactly `"1"`, per the grind-reg precedent)
+/// restores the incumbent per-grind spawn as the same-binary A/B control.
+/// `FLOCK_NO_EPOOL_RELAY=1` also restores it, transitively, by disabling the
+/// relay itself.
+pub const GRIND_RELAY_DEFAULT: bool = true;
+pub const ENV_NO_GRIND_RELAY: &str = "FLOCK_NO_GRIND_RELAY";
+
+fn grind_relay_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        GRIND_RELAY_DEFAULT
+            && std::env::var(ENV_NO_GRIND_RELAY).map(|v| v != "1").unwrap_or(true)
+    })
 }
 
 /// `FLOCK_NO_GRIND_HYBRID` kills the CPU-prefetch arm of the GPU grind,
