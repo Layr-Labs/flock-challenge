@@ -262,10 +262,6 @@ fn is_ranked_top_hetero_fused3_pass(
 /// large enough to amortize the existing P+E shared queue while the efficiency
 /// cores would otherwise be idle. The radix-8 producer remains on its incumbent
 /// Rayon schedule; only the cache-resident tail uses the helper pool.
-///
-/// Keep this gate separate from the ranked L0 selectors above. In particular,
-/// this changes scheduling only: the recursive tail continues to use its
-/// independently tuned single-layer arithmetic.
 #[inline]
 fn is_recursive_l1_ntt_epool_shape(log_d: usize, num_ntts: usize, start_layer: usize) -> bool {
     cfg!(all(
@@ -277,37 +273,91 @@ fn is_recursive_l1_ntt_epool_shape(log_d: usize, num_ntts: usize, start_layer: u
         && start_layer == 2
 }
 
+/// The second recursive Ligerito commitment (L2: 8 MiB, `log_msg_cols=13`,
+/// `log_inv_rate=3`) shares the same eight-lane direct-from-message geometry
+/// at `log_d = 16`. Its 32 x 256 KiB deep-tail claims ride the same P+E queue
+/// in the window immediately after L1's deep tail, where the helper pool is
+/// otherwise idle. The tail kernel, layer order, and twiddles are identical to
+/// the incumbent single-layer loop — this changes ownership/scheduling only.
+#[inline]
+fn is_recursive_l2_ntt_epool_shape(log_d: usize, num_ntts: usize, start_layer: usize) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && log_d == 16
+        && num_ntts == 8
+        && start_layer == 3
+}
+
+// r1020 resample marker: AB redraw of 4912aee after the r1019 frontier control
+// landed in-band (−0.47%); comment-only delta versus the r1018 archive.
+/// The union gate for both recursive-commit epool shapes. Keep it separate
+/// from the ranked L0 selectors above: this changes scheduling only, and the
+/// recursive tail continues to use its independently tuned single-layer
+/// arithmetic on either shape.
+#[inline]
+fn is_recursive_ntt_epool_shape(log_d: usize, num_ntts: usize, start_layer: usize) -> bool {
+    is_recursive_l1_ntt_epool_shape(log_d, num_ntts, start_layer)
+        || is_recursive_l2_ntt_epool_shape(log_d, num_ntts, start_layer)
+}
+
 /// Exact rollback rule for the recursive-L1 heterogeneous NTT schedule.
 /// Values other than the documented `1` cannot silently disable the path.
 #[inline]
-fn recursive_l1_ntt_epool_killed_by(value: Option<&str>) -> bool {
+fn recursive_ntt_epool_killed_by(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Exact rollback rule for the L2 extension: `FLOCK_NO_RECURSIVE_L2_NTT_EPOOL=1`
+/// disables only the second recursive commitment's helper schedule, leaving
+/// the shipped L1 path (and its documented `FLOCK_NO_RECURSIVE_L1_NTT_EPOOL`
+/// rollback) untouched. Values other than `1` cannot silently disable the path.
+#[inline]
+fn l2_recursive_ntt_epool_killed_by(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
 #[inline]
-fn use_recursive_l1_ntt_epool(log_d: usize, num_ntts: usize, start_layer: usize) -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        !recursive_l1_ntt_epool_killed_by(
+fn use_recursive_ntt_epool(log_d: usize, num_ntts: usize, start_layer: usize) -> bool {
+    static L1_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !recursive_ntt_epool_killed_by(
             std::env::var("FLOCK_NO_RECURSIVE_L1_NTT_EPOOL")
                 .ok()
                 .as_deref(),
         )
     });
-    is_recursive_l1_ntt_epool_shape(log_d, num_ntts, start_layer)
-        && *ENABLED
-        && crate::epool::helper_pool_available()
+    static L2_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !l2_recursive_ntt_epool_killed_by(
+            std::env::var("FLOCK_NO_RECURSIVE_L2_NTT_EPOOL")
+                .ok()
+                .as_deref(),
+        )
+    });
+    if is_recursive_l1_ntt_epool_shape(log_d, num_ntts, start_layer) {
+        *L1_ENABLED && crate::epool::helper_pool_available()
+    } else if is_recursive_l2_ntt_epool_shape(log_d, num_ntts, start_layer) {
+        *L2_ENABLED && crate::epool::helper_pool_available()
+    } else {
+        false
+    }
 }
 
 /// Explicit diagnostic only. With the variable unset, the production path
 /// takes no timestamps and reads no helper counters; it pays only the cold
-/// static-boolean branch at the exact recursive-L1 shape.
+/// static-boolean branch at the exact recursive shapes.
 #[inline]
-fn trace_recursive_l1_ntt_epool() -> bool {
+fn trace_recursive_ntt_epool() -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_TRACE_RECURSIVE_L1_NTT_EPOOL")
+        let l1 = std::env::var("FLOCK_TRACE_RECURSIVE_L1_NTT_EPOOL")
             .ok()
             .as_deref()
-            == Some("1")
+            == Some("1");
+        let l2 = std::env::var("FLOCK_TRACE_RECURSIVE_NTT_EPOOL")
+            .ok()
+            .as_deref()
+            == Some("1");
+        l1 || l2
     });
     *ENABLED
 }
@@ -649,7 +699,7 @@ impl AdditiveNttF128 {
         start_layer: usize,
     ) {
         let log_d = log2_pow2(data.len() / num_ntts);
-        let recursive_l1_helper = if use_recursive_l1_ntt_epool(log_d, num_ntts, start_layer) {
+        let recursive_l1_helper = if use_recursive_ntt_epool(log_d, num_ntts, start_layer) {
             crate::epool::helper_pool()
         } else {
             None
@@ -675,8 +725,8 @@ impl AdditiveNttF128 {
     ) {
         use rayon::prelude::*;
 
-        let trace = is_recursive_l1_ntt_epool_shape(log_d, num_ntts, start_layer)
-            && trace_recursive_l1_ntt_epool();
+        let trace = is_recursive_ntt_epool_shape(log_d, num_ntts, start_layer)
+            && trace_recursive_ntt_epool();
         let top_trace = trace.then(|| {
             (
                 std::time::Instant::now(),
@@ -770,8 +820,7 @@ impl AdditiveNttF128 {
             )
         });
         if let Some(helper) = recursive_l1_helper {
-            debug_assert_eq!((log_d, num_ntts, start_layer), (18, 8, 2));
-            self.forward_transform_interleaved_recursive_l1_deep_with_helper(
+            self.forward_transform_interleaved_recursive_deep_with_helper(
                 data,
                 num_ntts,
                 start_layer + 3,
@@ -1450,7 +1499,12 @@ impl AdditiveNttF128 {
     /// exposes 32 uniform 1 MiB sub-transforms to the existing shared P+E
     /// queue. Each job still executes the ordinary single-layer tail below.
     #[inline]
-    fn forward_transform_interleaved_recursive_l1_deep_with_helper(
+    /// Deep tail of a recursive-commit transform on the P+E helper queue.
+    /// Both ranked recursive shapes — L1 (32 x 1 MiB at log_d 18) and L2
+    /// (32 x 256 KiB at log_d 16) — partition into 32 independent
+    /// cache-resident sub-transforms; each sub runs the identical
+    /// single-layer subtree loop, so this changes ownership/scheduling only.
+    fn forward_transform_interleaved_recursive_deep_with_helper(
         &self,
         data: &mut [F128],
         num_ntts: usize,
@@ -1460,7 +1514,10 @@ impl AdditiveNttF128 {
         const N_TOP: usize = 5;
 
         let log_d = log2_pow2(data.len() / num_ntts);
-        debug_assert_eq!((log_d, num_ntts, start_layer), (18, 8, N_TOP));
+        debug_assert!(
+            matches!((log_d, num_ntts, start_layer), (18, 8, 5) | (16, 8, 6)),
+            "recursive deep helper only serves the L1/L2 ranked shapes"
+        );
         let sub_size_positions = 1usize << (log_d - N_TOP);
         let sub_bytes = sub_size_positions * num_ntts;
         let num_subs = 1usize << N_TOP;
@@ -2974,14 +3031,36 @@ mod tests {
         assert!(!is_recursive_l1_ntt_epool_shape(18, 8, 1));
         assert!(!is_recursive_l1_ntt_epool_shape(18, 8, 5));
 
-        assert!(!recursive_l1_ntt_epool_killed_by(None));
-        assert!(!recursive_l1_ntt_epool_killed_by(Some("")));
-        assert!(!recursive_l1_ntt_epool_killed_by(Some("0")));
-        assert!(!recursive_l1_ntt_epool_killed_by(Some("true")));
-        assert!(recursive_l1_ntt_epool_killed_by(Some("1")));
+        // L2 shares the eight-lane direct-from-message geometry at log_d 16.
+        assert_eq!(is_recursive_l2_ntt_epool_shape(16, 8, 3), enabled_here);
+        assert!(!is_recursive_l2_ntt_epool_shape(15, 8, 3));
+        assert!(!is_recursive_l2_ntt_epool_shape(16, 4, 3));
+        assert!(!is_recursive_l2_ntt_epool_shape(16, 8, 2));
+
+        assert!(!recursive_ntt_epool_killed_by(None));
+        assert!(!recursive_ntt_epool_killed_by(Some("")));
+        assert!(!recursive_ntt_epool_killed_by(Some("0")));
+        assert!(!recursive_ntt_epool_killed_by(Some("true")));
+        assert!(recursive_ntt_epool_killed_by(Some("1")));
+
+        assert!(!l2_recursive_ntt_epool_killed_by(None));
+        assert!(!l2_recursive_ntt_epool_killed_by(Some("0")));
+        assert!(l2_recursive_ntt_epool_killed_by(Some("1")));
+
+        // The union gate matches each shape exactly, independent of env.
+        assert_eq!(
+            is_recursive_ntt_epool_shape(18, 8, 2),
+            enabled_here
+        );
+        assert_eq!(
+            is_recursive_ntt_epool_shape(16, 8, 3),
+            enabled_here
+        );
+        assert!(!is_recursive_ntt_epool_shape(17, 8, 2));
+        assert!(!is_recursive_ntt_epool_shape(16, 8, 2));
     }
 
-    /// Exercise the exact production geometry through an injected helper pool.
+    /// Exercise the exact L1 production geometry through an injected helper pool.
     /// The control retains the incumbent 16 × 2 MiB Rayon deep partition; the
     /// candidate uses 32 × 1 MiB P+E claims. Both run the same direct-message
     /// radix-8 kernels and the same extracted single-layer subtree loop.
@@ -3033,6 +3112,63 @@ mod tests {
         assert!(
             crate::epool::helper_chunks_claimed() > claimed_before,
             "injected helper never claimed an exact-shape deep subtree"
+        );
+        assert_eq!(candidate, incumbent);
+    }
+
+    /// Exercise the exact L2 production geometry (log_d 16, 8 lanes, rate
+    /// entry at layer 3) through an injected helper pool. The control keeps
+    /// the incumbent single-layer Rayon tail; the candidate routes the same
+    /// 32 × 256 KiB sub-transforms over the P+E queue. Outputs must be
+    /// byte-identical because both run the identical subtree loop.
+    #[test]
+    fn recursive_l2_ntt_epool_exact_shape_matches_incumbent() {
+        const LOG_D: usize = 16;
+        const NUM_NTTS: usize = 8;
+        const START_LAYER: usize = 3;
+
+        let main = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("recursive-l2-main-test-{i}"))
+            .build()
+            .unwrap();
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("recursive-l2-helper-test-{i}"))
+            .build()
+            .unwrap();
+
+        let mut rng = Rng::new(0x12C2_9E41_0D71_8B34);
+        let msg_len = (1usize << (LOG_D - START_LAYER)) * NUM_NTTS;
+        let msg = rand_vec(&mut rng, msg_len);
+        let poison = F128::new(0xA5A5_A5A5_A5A5_A5A5, 0x5A5A_5A5A_5A5A_5A5A);
+        let mut incumbent = vec![poison; msg_len << START_LAYER];
+        let mut candidate = incumbent.clone();
+
+        let claimed_before = crate::epool::helper_chunks_claimed();
+        main.install(|| {
+            let ntt = AdditiveNttF128::standard(LOG_D);
+            ntt.forward_transform_interleaved_from_message_fused3_with_helper(
+                &msg,
+                &mut incumbent,
+                NUM_NTTS,
+                START_LAYER,
+                LOG_D,
+                None,
+            );
+            ntt.forward_transform_interleaved_from_message_fused3_with_helper(
+                &msg,
+                &mut candidate,
+                NUM_NTTS,
+                START_LAYER,
+                LOG_D,
+                Some(&helper),
+            );
+        });
+
+        assert!(
+            crate::epool::helper_chunks_claimed() > claimed_before,
+            "injected helper never claimed an exact L2-shape deep subtree"
         );
         assert_eq!(candidate, incumbent);
     }
