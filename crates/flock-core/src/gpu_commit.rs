@@ -379,6 +379,347 @@ pub(crate) fn lincheck_factored_b4_enabled() -> bool {
     })
 }
 
+/// Exact same-binary rollback for the lincheck split-share BASIN FLOOR
+/// ([`lincheck_split_basin_floor`]). `FLOCK_NO_LINCHECK_SPLIT_FLOOR=1` restores
+/// the incumbent warmup-ratio split policy bit for bit; every other value keeps
+/// the floor.
+pub const ENV_NO_LINCHECK_SPLIT_FLOOR: &str = "FLOCK_NO_LINCHECK_SPLIT_FLOOR";
+
+fn lincheck_split_floor_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn lincheck_split_floor_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        lincheck_split_floor_value_enabled(std::env::var_os(ENV_NO_LINCHECK_SPLIT_FLOOR).as_deref())
+    })
+}
+
+/// Widest measured per-claim GPU:CPU ratio at which the basin floor may bind.
+///
+/// The floor replaces the balanced share `n/(1+r)` with `3n/4`. Under the
+/// warmup model itself the GPU arm is the straggler exactly when `3r/4 > 1/4`,
+/// i.e. `r > 1/3` — which is precisely where the floor starts to bind — so
+/// inside the binding region the model predicts a window of `(3n·r/4)·u_cpu`
+/// against the balanced `(n·r/(1+r))·u_cpu`, a factor `D(r) = 3(1+r)/4`.
+/// `D(1/3) = 1` (the floor is free where it first binds) and `D(2/3) = 1.25`.
+/// So on the ranked ~4.3 ms basin the model's WORST case anywhere inside this
+/// window is ~1.07 ms — smaller than the ~1.6 ms tail the floor removes — and
+/// the window still covers every ratio for which the split has actually been
+/// measured. Past it there is no measurement, so the model gets the benefit of
+/// the doubt and the incumbent balanced share is used unchanged.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) const LINCHECK_FOLD_FLOOR_MAX_RATIO: f64 = 2.0 / 3.0;
+
+/// Measured-basin FLOOR for the lincheck GPU/CPU claim split — the campaign's
+/// first VARIANCE-cut mechanism (kill: [`ENV_NO_LINCHECK_SPLIT_FLOOR`]).
+///
+/// The official score is `2^18 / MEDIAN seconds` over 100 fresh workers, so a
+/// slow TAIL on a random subset of trials moves the score and a constant shave
+/// barely does. The warmup ratio gate
+/// (`imp::lincheck_gate_share_balanced`) publishes a per-PROCESS share from a
+/// per-process random variable: `ratio` is measured on a COOL warmup prove and
+/// then applied to the CONTENDED timed round. Two draws in one disclosed trace
+/// pair on the same machine and binary were 0.371 and 0.565 — 47 and 41 of the
+/// ranked 64 claims. A forced-share measurement of the LINCheck + `s_hat_v`
+/// phase puts 40 claims at 5.89 ms against 48 at 4.27, 50 at 4.39 and 51 at
+/// 4.15: the low draws land ~1.5 ms outside the basin, on a random subset of
+/// the trials, which is exactly what sets a median.
+///
+/// The floor removes that tail by lifting an unlucky draw to the measured
+/// basin point `3n/4` (48 at the ranked `n_claims = 64`), and nothing else:
+///
+/// * it is a POST-filter on the incumbent's already-capped share, so the
+///   incumbent expression is untouched and every non-selected path is
+///   bit-identical by construction rather than by arithmetic argument;
+/// * it binds ONLY when the supplemental factored-B4 PSO was actually
+///   SELECTED for this dispatch (`factored_b4`, i.e. the candidate pipeline
+///   compiled AND this arm chose it) — capability is not selection, and exact
+///   rollback or a supplemental-init failure leaves the incumbent PSO and its
+///   unchanged `5n/8` cap alone;
+/// * the cap is NOT widened. `3n/4` is both the incumbent cap and the floor,
+///   so the floor can never admit a share the incumbent policy could not
+///   already produce, and never extrapolates past a measured point;
+/// * `capped_share == 0` (arm disabled: unusable sample, or a ratio past
+///   `imp::LINCHECK_FOLD_MAX_GPU_RATIO`) is returned untouched — the floor
+///   can never switch the arm back on;
+/// * outside `(0, LINCHECK_FOLD_FLOOR_MAX_RATIO]` — including NaN, which fails
+///   both comparisons — the incumbent share is returned unchanged.
+///
+/// Correctness obligation: none. The share only moves the boundary between the
+/// GPU claim prefix and the CPU claim suffix of the same oblock fold, and
+/// GF(2^128) addition is XOR — associative and commutative — so any partition
+/// of the claim range reproduces the whole-range result bit for bit (see
+/// `lincheck::partial_fold_packed_z_neon_oblock_padded_suffix` and
+/// [`ENV_NO_GPU_LINCHECK`]). The share is a free parameter; what has to be
+/// proved is the POLICY, which
+/// `lincheck_split_basin_floor_is_exhaustively_bounded` does.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn lincheck_split_basin_floor(
+    capped_share: usize,
+    n_claims: usize,
+    factored_b4: bool,
+    ratio: f64,
+) -> usize {
+    lincheck_split_basin_floor_with(
+        capped_share,
+        n_claims,
+        factored_b4,
+        ratio,
+        lincheck_split_floor_enabled(),
+    )
+}
+
+/// [`lincheck_split_basin_floor`] with the rollback lever supplied explicitly,
+/// so the kill switch's exact-identity property is testable in-process (the
+/// live gate is a `OnceLock` read of the environment).
+fn lincheck_split_basin_floor_with(
+    capped_share: usize,
+    n_claims: usize,
+    factored_b4: bool,
+    ratio: f64,
+    enabled: bool,
+) -> usize {
+    if capped_share == 0 || !factored_b4 || !enabled {
+        return capped_share;
+    }
+    // NaN fails both comparisons, so an unusable ratio keeps the incumbent.
+    if !(ratio > 0.0 && ratio <= LINCHECK_FOLD_FLOOR_MAX_RATIO) {
+        return capped_share;
+    }
+    capped_share.max(n_claims * 3 / 4)
+}
+
+/// Proof obligations for the lincheck split-share basin floor. The floor is a
+/// pure integer/f64 policy, so unlike the Metal kernels it is proved on the
+/// real function on EVERY target, not only under the Apple shim.
+#[cfg(test)]
+mod lincheck_split_floor_tests {
+    use super::{
+        LINCHECK_FOLD_FLOOR_MAX_RATIO, lincheck_split_basin_floor_with,
+        lincheck_split_floor_value_enabled,
+    };
+    use std::ffi::OsStr;
+
+    /// Shapes: the ranked `n_claims = 64` (m = 32, k_log = 14 ⇒
+    /// `(1 << 18)/8/8` tiles / 64 tiles-per-claim = 64 claims), the 16-claim
+    /// test shape, and enough others to catch a `3n/4` truncation edge.
+    const SHAPES: [usize; 9] = [64, 16, 4, 8, 12, 32, 96, 100, 1];
+
+    /// Every equivalence class of `ratio` for this policy: the function only
+    /// compares against `0.0` and `LINCHECK_FOLD_FLOOR_MAX_RATIO`, so the two
+    /// ULP-neighbourhoods plus interior/exterior representatives and the
+    /// non-finite values partition the whole of `f64`.
+    fn ratio_classes() -> Vec<(f64, bool)> {
+        let f = LINCHECK_FOLD_FLOOR_MAX_RATIO;
+        vec![
+            (f64::NAN, false),
+            (f64::NEG_INFINITY, false),
+            (-1.0, false),
+            (-f64::MIN_POSITIVE, false),
+            (-0.0, false),
+            (0.0, false),
+            (f64::MIN_POSITIVE, true),
+            (1e-300, true),
+            (0.1, true),
+            (1.0 / 3.0, true), // the floor first binds here
+            (0.371, true),     // disclosed draw A
+            (0.5, true),
+            (0.565, true), // disclosed draw B
+            (0.61, true),
+            (0.64, true),
+            (f64::from_bits(f.to_bits() - 1), true), // 2/3 − 1 ULP
+            (f, true),                               // 2/3 exactly
+            (f64::from_bits(f.to_bits() + 1), false), // 2/3 + 1 ULP
+            (0.7, false),
+            (1.0, false),
+            (2.0, false),
+            (3.0, false),
+            (f64::MAX, false),
+            (f64::INFINITY, false),
+        ]
+    }
+
+    /// EXHAUSTIVE over the whole input domain of the new policy: every
+    /// `capped_share` the incumbent can produce (`0..=n`), both selection
+    /// states, both rollback states, and every `ratio` equivalence class.
+    ///
+    /// Obligation (1): the output never leaves `[floor, cap]`, and equals the
+    /// incumbent whenever the incumbent already lands in-basin.
+    /// Obligation (2): `factored_b4 == false` is bit-identical to the
+    /// incumbent, as is the kill switch.
+    #[test]
+    fn lincheck_split_basin_floor_is_exhaustively_bounded() {
+        let mut lifted = 0usize;
+        for n in SHAPES {
+            let cap = n * 3 / 4; // the SELECTED route's cap == the floor
+            for capped in 0..=n {
+                for (ratio, in_window) in ratio_classes() {
+                    // (2a) NOT SELECTED ⇒ bit-identical to the incumbent.
+                    for enabled in [false, true] {
+                        assert_eq!(
+                            lincheck_split_basin_floor_with(capped, n, false, ratio, enabled),
+                            capped,
+                            "unselected n={n} capped={capped} ratio={ratio} enabled={enabled}"
+                        );
+                    }
+                    // (2b) kill switch ⇒ bit-identical to the incumbent.
+                    assert_eq!(
+                        lincheck_split_basin_floor_with(capped, n, true, ratio, false),
+                        capped,
+                        "killed n={n} capped={capped} ratio={ratio}"
+                    );
+
+                    let got = lincheck_split_basin_floor_with(capped, n, true, ratio, true);
+                    let want_floor = in_window && capped > 0;
+                    if want_floor {
+                        // (1a) pinned at the measured basin point.
+                        assert_eq!(
+                            got,
+                            capped.max(cap),
+                            "floored n={n} capped={capped} ratio={ratio}"
+                        );
+                        // (1b) a share the incumbent could actually publish on
+                        // the selected route (capped <= cap) lands exactly on
+                        // the basin, i.e. inside [floor, cap].
+                        if capped <= cap {
+                            assert_eq!(got, cap, "basin n={n} capped={capped} ratio={ratio}");
+                        }
+                        if got != capped {
+                            lifted += 1;
+                        }
+                    } else {
+                        // (1c) outside the window: exactly the incumbent.
+                        assert_eq!(
+                            got, capped,
+                            "passthrough n={n} capped={capped} ratio={ratio}"
+                        );
+                    }
+                    // (1d) never sheds GPU claims, never re-enables the arm.
+                    assert!(
+                        got >= capped,
+                        "monotone n={n} capped={capped} ratio={ratio}"
+                    );
+                    assert_eq!(
+                        got == 0,
+                        capped == 0,
+                        "arm on/off n={n} capped={capped} ratio={ratio}"
+                    );
+                }
+            }
+        }
+        assert!(lifted > 0, "the floor must actually bind somewhere");
+    }
+
+    /// The composed policy at the ranked shape, on a fine rational grid: the
+    /// candidate is the incumbent everywhere except a lift toward `3n/4`, and
+    /// only inside the measured window. (`imp::lincheck_gate_share_balanced`
+    /// itself is macOS-gated; `lincheck_gate_share_basin_floor_window` pins
+    /// the real function against these same values there.)
+    #[test]
+    fn lincheck_split_floor_composed_policy_is_a_pure_lift() {
+        const STEPS: u64 = 400_000;
+        const MAX_GPU_RATIO: f64 = 2.0; // imp::LINCHECK_FOLD_MAX_GPU_RATIO
+        for n in SHAPES {
+            let cap = n * 3 / 4;
+            for i in 0..=STEPS {
+                let ratio = 2.0 * i as f64 / STEPS as f64;
+                let incumbent = if ratio <= 0.0 || ratio > MAX_GPU_RATIO {
+                    0
+                } else {
+                    (n as f64 / (1.0 + ratio)).round().clamp(0.0, cap as f64) as usize
+                };
+                let candidate = lincheck_split_basin_floor_with(incumbent, n, true, ratio, true);
+                assert!(candidate <= cap, "cap n={n} ratio={ratio}");
+                assert!(candidate >= incumbent, "monotone n={n} ratio={ratio}");
+                if incumbent >= cap || ratio > LINCHECK_FOLD_FLOOR_MAX_RATIO {
+                    assert_eq!(
+                        candidate, incumbent,
+                        "in-basin/out-of-window n={n} r={ratio}"
+                    );
+                } else if incumbent > 0 {
+                    assert_eq!(candidate, cap, "lift n={n} ratio={ratio}");
+                }
+            }
+        }
+    }
+
+    /// The two per-process draws in the disclosed trace pair, at the ranked
+    /// shape: both land on the basin instead of 47 and 41.
+    #[test]
+    fn disclosed_ranked_draws_land_on_the_measured_basin() {
+        let n = 64usize;
+        for (ratio, incumbent) in [(0.371f64, 47usize), (0.565, 41)] {
+            assert_eq!(
+                (n as f64 / (1.0 + ratio)).round() as usize,
+                incumbent,
+                "incumbent balanced share at ratio {ratio}"
+            );
+            assert_eq!(
+                lincheck_split_basin_floor_with(incumbent, n, true, ratio, true),
+                48,
+                "floored share at ratio {ratio}"
+            );
+            // Not selected: the incumbent 5n/8 route is untouched.
+            assert_eq!(
+                lincheck_split_basin_floor_with(incumbent.min(40), n, false, ratio, true),
+                incumbent.min(40)
+            );
+        }
+    }
+
+    /// The window edge is a stated constant, not an accident, and the floor
+    /// can never exceed the cap it shares with the selected route.
+    #[test]
+    fn split_floor_window_and_cap_constants_are_pinned() {
+        assert_eq!(LINCHECK_FOLD_FLOOR_MAX_RATIO, 2.0 / 3.0);
+        // D(r) = 3(1+r)/4 is the warmup model's predicted window factor for
+        // the floor; it is 1.0 where the floor first binds and 1.25 at the
+        // window edge — under the ~4.3 ms ranked basin that worst case is
+        // ~1.07 ms, below the ~1.6 ms tail the floor removes.
+        let d = |r: f64| 3.0 * (1.0 + r) / 4.0;
+        assert!((d(1.0 / 3.0) - 1.0).abs() < 1e-12);
+        assert!((d(LINCHECK_FOLD_FLOOR_MAX_RATIO) - 1.25).abs() < 1e-12);
+        for n in SHAPES {
+            // The floor the function applies IS the selected route's cap, so
+            // the clamp is well-formed and the floor can never admit a share
+            // the incumbent policy could not already publish.
+            assert_eq!(
+                lincheck_split_basin_floor_with(1, n, true, 0.5, true),
+                (n * 3 / 4).max(1),
+                "floor value at n={n}"
+            );
+            assert!(
+                n * 3 / 4 >= n * 5 / 8,
+                "selected cap is the wider one (n={n})"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_one_is_the_only_split_floor_rollback_value() {
+        assert_eq!(
+            super::ENV_NO_LINCHECK_SPLIT_FLOOR,
+            "FLOCK_NO_LINCHECK_SPLIT_FLOOR"
+        );
+        assert!(!lincheck_split_floor_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(lincheck_split_floor_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod lincheck_factored_b4_gate_tests {
     use crate::field::F128;
@@ -9395,9 +9736,18 @@ kernel void lc_fold_stripes_factored_b4(
     /// 48 claims and therefore uses a `3n/4` cap, but only when that PSO was
     /// actually selected. Exact rollback or supplemental init failure selects
     /// the incumbent PSO and its unchanged `5n/8` cap.
+    ///
+    /// On that same selected route the balanced share is then FLOORED to the
+    /// measured basin — see [`super::lincheck_split_basin_floor`], the
+    /// variance cut. `ratio` is a per-process random variable (cool warmup,
+    /// contended timed round), so without a floor an unlucky draw pushes a
+    /// random subset of the 100 measured workers ~1.5 ms outside the basin,
+    /// which is what a MEDIAN-scored benchmark charges for. The floor never
+    /// widens the cap and never re-enables a disabled arm.
     /// `FLOCK_LINCHECK_GPU_LEGACY_SPLIT` selects the previous
     /// `floor(0.9·n/(1+ratio))`-clamped-to-`n/2` policy for same-binary
-    /// causal comparison.
+    /// causal comparison; `FLOCK_NO_LINCHECK_SPLIT_FLOOR=1` keeps this
+    /// balanced policy but drops the floor.
     pub(crate) fn lincheck_gate_share_legacy(ratio: f64, n_claims: usize) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 || ratio > LINCHECK_FOLD_MAX_GPU_RATIO {
             return 0;
@@ -9420,7 +9770,12 @@ kernel void lc_fold_stripes_factored_b4(
         } else {
             n_claims * 5 / 8
         };
-        share.clamp(0.0, cap as f64) as usize
+        // Incumbent share, unchanged. The basin floor is a POST-filter: with
+        // `factored_b4 == false`, the floor disabled, or a ratio outside the
+        // measured window it returns this value untouched, so every path but
+        // the one measured route stays bit-identical by construction.
+        let capped = share.clamp(0.0, cap as f64) as usize;
+        super::lincheck_split_basin_floor(capped, n_claims, factored_b4, ratio)
     }
 
     pub(crate) fn lincheck_gate_share(ratio: f64, n_claims: usize, factored_b4: bool) -> usize {
@@ -14992,11 +15347,15 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // v1's measured local ratio: round(64 / 2.52) = 25.
         assert_eq!(lincheck_gate_share_balanced(1.52, 64, false), 25);
         assert_eq!(lincheck_gate_share_balanced(1.52, 64, true), 25);
-        // Ranked M3 Max ratios land in the measured 39–40 basin.
+        // Ranked M3 Max ratios land in the measured 39–40 basin on the
+        // incumbent PSO. On the SELECTED factored route the basin floor lifts
+        // them to that PSO's own measured basin at 48 (see
+        // `lincheck_split_basin_floor`) — these two draws are inside the
+        // window, so this is where the variance cut shows up.
         assert_eq!(lincheck_gate_share_balanced(0.61, 64, false), 40);
-        assert_eq!(lincheck_gate_share_balanced(0.61, 64, true), 40);
+        assert_eq!(lincheck_gate_share_balanced(0.61, 64, true), 48);
         assert_eq!(lincheck_gate_share_balanced(0.64, 64, false), 39);
-        assert_eq!(lincheck_gate_share_balanced(0.64, 64, true), 39);
+        assert_eq!(lincheck_gate_share_balanced(0.64, 64, true), 48);
         // The threshold itself still runs: round(64 / 3) = 21.
         assert_eq!(lincheck_gate_share_balanced(2.0, 64, false), 21);
         assert_eq!(lincheck_gate_share_balanced(2.0, 64, true), 21);
@@ -15009,12 +15368,14 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // ratio math is unchanged (round(64 / 1.1) = 58 before clamping).
         assert_eq!(lincheck_gate_share_balanced(0.1, 64, false), 40);
         assert_eq!(lincheck_gate_share_balanced(0.1, 64, true), 48);
-        // At an observed factored ratio the natural share, not the cap,
-        // remains authoritative.
+        // At an observed factored ratio the natural share already equals the
+        // cap, so cap, natural share and floor all agree.
         assert_eq!(lincheck_gate_share_balanced(0.33, 64, false), 40);
         assert_eq!(lincheck_gate_share_balanced(0.33, 64, true), 48);
         assert_eq!(lincheck_gate_share_balanced(0.5, 64, false), 40);
-        assert_eq!(lincheck_gate_share_balanced(0.5, 64, true), 43);
+        // …until the basin floor, which pins the selected route at 48 for
+        // every ratio in the measured window (the natural share here is 43).
+        assert_eq!(lincheck_gate_share_balanced(0.5, 64, true), 48);
         // Unusable samples disable rather than guess.
         assert_eq!(lincheck_gate_share_balanced(f64::NAN, 64, false), 0);
         assert_eq!(lincheck_gate_share_balanced(f64::NAN, 64, true), 0);
@@ -15037,6 +15398,49 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(lincheck_gate_share_legacy(2.01, 64), 0);
         assert_eq!(lincheck_gate_share_legacy(0.5, 64), 32);
         assert_eq!(lincheck_gate_share_legacy(1.0, 16), 7);
+    }
+
+    /// The basin floor on the REAL composed policy: the exact window edge,
+    /// the two disclosed per-process draws, and the paths that must stay
+    /// bit-identical to the incumbent.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn lincheck_gate_share_basin_floor_window() {
+        use imp::lincheck_gate_share_balanced as share;
+        const FMAX: f64 = super::LINCHECK_FOLD_FLOOR_MAX_RATIO;
+
+        // The two per-process draws in the disclosed trace pair. Incumbent
+        // 47 and 41 of 64; the 41-claim arm measured 5.89 ms against 4.27 at
+        // 48 — a ~1.5 ms tail on a random subset of the 100 timed workers.
+        assert_eq!(share(0.371, 64, true), 48);
+        assert_eq!(share(0.565, 64, true), 48);
+        // Same draws, PSO not selected: the incumbent 5n/8 route, untouched.
+        assert_eq!(share(0.371, 64, false), 40);
+        assert_eq!(share(0.565, 64, false), 40);
+
+        // The window edge is exact: 2/3 floors, one ULP past it does not.
+        assert_eq!(share(FMAX, 64, true), 48);
+        assert_eq!(share(f64::from_bits(FMAX.to_bits() - 1), 64, true), 48);
+        assert_eq!(share(f64::from_bits(FMAX.to_bits() + 1), 64, true), 38);
+        // Where the floor first binds it is a no-op: round(64/(4/3)) = 48.
+        assert_eq!(share(1.0 / 3.0, 64, true), 48);
+
+        // Past the window the incumbent balanced share is authoritative
+        // again, all the way to the disable threshold.
+        assert_eq!(share(0.7, 64, true), 38);
+        assert_eq!(share(1.0, 64, true), 32);
+        assert_eq!(share(2.0, 64, true), 21);
+        // The floor can never re-enable a disabled arm.
+        assert_eq!(share(2.01, 64, true), 0);
+        assert_eq!(share(f64::NAN, 64, true), 0);
+        assert_eq!(share(f64::INFINITY, 64, true), 0);
+        assert_eq!(share(0.0, 64, true), 0);
+        assert_eq!(share(-1.0, 64, true), 0);
+
+        // Shape scaling: the floor is the selected route's own 3n/4 cap.
+        assert_eq!(share(0.5, 16, true), 12);
+        assert_eq!(share(0.5, 16, false), 10);
+        assert_eq!(share(0.5, 32, true), 24);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

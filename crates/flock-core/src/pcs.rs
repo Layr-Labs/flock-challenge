@@ -120,6 +120,38 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
+    open_batch_mixed_ligerito_with_precollapsed_s_hat_v(
+        packed_witness,
+        prover_data,
+        commitment,
+        x_outers,
+        precomputed_s_hat_v,
+        &[],
+        packed_direct,
+        padding,
+        lig_config,
+        challenger,
+    )
+}
+
+/// [`open_batch_mixed_ligerito_with_precomputed_s_hat_v`] that also forwards,
+/// per claim, an already-collapsed canonical `s_hat_v`
+/// ([`ring_switch::PreCollapsedSHatV`]). Byte-identical output; the vector
+/// only lets ring-switch skip collapsing a sixty-four-bank precompute it
+/// would otherwise re-derive.
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_mixed_ligerito_with_precollapsed_s_hat_v<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    prover_data: &ProverData,
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    precollapsed_s_hat_v: &[Option<ring_switch::PreCollapsedSHatV<'_>>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    lig_config: &ligerito::ProverConfig,
+    challenger: &mut Ch,
+) -> BatchOpeningProofLigerito {
     let trace =
         std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
     let t_total = std::time::Instant::now();
@@ -139,6 +171,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         &packed_witness,
         x_outers,
         precomputed_s_hat_v,
+        precollapsed_s_hat_v,
         packed_direct,
         padding,
         challenger,
@@ -1026,6 +1059,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     packed_witness: &[F128],
     x_outers: &[&[F128]],
     precomputed_s_hat_v: &[Option<&[F128]>],
+    precollapsed_s_hat_v: &[Option<ring_switch::PreCollapsedSHatV<'_>>],
     packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
     challenger: &mut Ch,
@@ -1049,10 +1083,11 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
     ) = if n_rs > 0 {
-        ring_switch::prove_batched_padded_with_precomputed(
+        ring_switch::prove_batched_padded_with_precollapsed(
             packed_witness,
             x_outers,
             precomputed_s_hat_v,
+            precollapsed_s_hat_v,
             padding,
             challenger,
         )
@@ -1909,6 +1944,7 @@ mod tests {
                     a_state,
                     w_state,
                     round0,
+                    dead_tail_banks: 0,
                 }
             })
             .collect();

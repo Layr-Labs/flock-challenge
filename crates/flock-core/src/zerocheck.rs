@@ -344,6 +344,12 @@ pub struct CapturedSHatVC {
     /// `suffix[..6]` to `s_hat_v_c` exactly like `fold4` does under
     /// `suffix[..4]`. Present only behind the shared DirectFold8 opt-in.
     pub fold8: Option<Vec<F128>>,
+    /// The six retained inner coordinates the wider tensors collapse under —
+    /// `r[k_skip + 1 .. k_skip + 7]`, the head of the producer's `inner_tail`.
+    /// Carried so a consumer can compare it against the claim's own first six
+    /// suffix coordinates before reusing `s_hat_v_c` in place of the collapse;
+    /// empty when the witness has fewer than six retained coordinates.
+    pub collapse_point: Vec<F128>,
 }
 
 /// Capture-`s_hat_v_c` prover that consumes a challenge-independent AB inner
@@ -526,6 +532,11 @@ fn prove_packed_padded_inner<C: Challenger>(
     }
     r[k_skip + N_INNER..].copy_from_slice(&r_outer);
 
+    // The six retained inner coordinates every wider C statistic collapses
+    // under. `m >= k_skip + N_INNER` (asserted above, N_INNER = 7) makes the
+    // range always present.
+    let collapse_point: Vec<F128> = r[k_skip + 1..k_skip + 7].to_vec();
+
     // ---- 3. Round 1: URM (extract_c, parallel) ----
     //
     // The optimized URM drops a `C_s = φ_8(0x1C)` scalar from its accumulators
@@ -625,6 +636,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         quad,
                         fold4: None,
                         fold8: Some(fold8),
+                        collapse_point: collapse_point.clone(),
                     }),
                 )
             } else {
@@ -654,6 +666,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         quad,
                         fold4: Some(fold4),
                         fold8: None,
+                        collapse_point: collapse_point.clone(),
                     }),
                 )
             }
@@ -676,6 +689,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     quad,
                     fold4: Some(fold4),
                     fold8: None,
+                    collapse_point: collapse_point.clone(),
                 }),
             )
         } else {
@@ -697,6 +711,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     quad,
                     fold4: None,
                     fold8: None,
+                    collapse_point: collapse_point.clone(),
                 }),
             )
         }
@@ -720,6 +735,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 quad,
                 fold4: None,
                 fold8: None,
+                collapse_point: collapse_point.clone(),
             }),
         )
     } else {

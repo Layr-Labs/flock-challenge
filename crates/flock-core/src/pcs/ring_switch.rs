@@ -2555,7 +2555,39 @@ pub(crate) struct DirectFold8Factors {
     /// Round-zero contribution, cached while both factor states are still
     /// local to the parallel ring-switch tail that constructed them.
     pub(crate) round0: (F128, F128),
+    /// Trailing packed-witness banks the sixty-four-bank materializer may
+    /// drop from every odd slot, or 0. See [`fold8_dead_tail_banks`] — the
+    /// value is a property of the R1CS padding, carried here because the
+    /// materializer runs where the [`PaddingSpec`] is no longer in scope.
+    pub(crate) dead_tail_banks: usize,
 }
+
+/// Trailing banks of every **odd** packed-witness slot that the R1CS padding
+/// forces to zero, for the sixty-four-bank direct-fold8 materializer.
+///
+/// The packed witness stores block `b` of the R1CS witness at word indices
+/// `[b·2^(k_log−7), (b+1)·2^(k_log−7))`, and the padding rows `0·0 = z[i]`
+/// force every word past `ceil(useful_bits_per_block / 128)` of a block to
+/// zero. When a block is exactly two sixty-four-bank slots wide the whole
+/// zero suffix lands inside the block's odd slot, so the materializer's
+/// 128-aligned fold pair sees its last `dead` inputs identically zero.
+///
+/// That is precisely the geometry
+/// [`ZeroOddTailLanes::lanes_for_padding`](crate::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding)
+/// already derives for the commit transform's SoA lanes — the packed-witness
+/// index decomposition `i = pos·64 + lane` is the same one the materializer
+/// folds over (`lane` = bank, `pos` = slot) — so this defers to it rather
+/// than re-deriving it, and inherits its fail-closed 0 for every other shape.
+pub(crate) fn fold8_dead_tail_banks(padding: &PaddingSpec) -> usize {
+    crate::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+        DIRECT_FOLD8_BANKS,
+        padding.k_log,
+        padding.useful_bits_per_block,
+    )
+}
+
+/// Bank count of the direct-fold8 materializer (six folded coordinates).
+pub(crate) const DIRECT_FOLD8_BANKS: usize = 64;
 
 /// Per-claim output of [`prove_batched`]. Mirrors [`RingSwitchOutput`] but lets
 /// the prover skip the dense `2^(m-7)` `rs_eq_ind` allocation for claims whose
@@ -2831,7 +2863,97 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut Ch,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
+    prove_batched_padded_with_precollapsed(
+        packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        &[],
+        padding,
+        challenger,
+    )
+}
+
+/// A transcript-visible `s_hat_v` the caller already holds, together with the
+/// six-coordinate point its wider tensor collapses under.
+///
+/// The zerocheck's round-1 C producer computes the canonical 128-vector on
+/// its way to the round message and then discards it, while ring-switch
+/// re-derives the identical bits by collapsing the sixty-four-bank tensor
+/// (64 · 128 serial multiplies). Handing the vector back closes that loop.
+///
+/// The reuse is guarded by `point`: it is taken only when `point` equals the
+/// claim's own first six suffix coordinates, which is the exact condition
+/// under which [`collapse_s_hat_v_fold8`] of the shipped tensor would produce
+/// `value`. Any drift falls back to the collapse — a performance loss, never
+/// a transcript change.
+#[derive(Clone, Copy, Debug)]
+pub struct PreCollapsedSHatV<'a> {
+    /// Canonical `2^LOG_PACKING` statistic.
+    pub value: &'a [F128],
+    /// The point `value` was collapsed at.
+    pub point: &'a [F128],
+}
+
+const ENV_NO_SHATV_REUSE: &str = "FLOCK_NO_SHATV_REUSE";
+
+/// Exact-`1` rollback for the pre-collapsed `s_hat_v` reuse. Every other
+/// value leaves the candidate enabled, so control and candidate use the same
+/// binary.
+fn s_hat_v_reuse_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+/// Shared latch for both halves of the `s_hat_v` reuse: the C claim's
+/// pre-collapsed transcript vector here, and the AB claim's post-round-0
+/// lincheck capture in `flock_prover::prover`. One switch, one process-wide
+/// decision, so the two halves can never disagree.
+pub fn s_hat_v_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| s_hat_v_reuse_value_enabled(std::env::var_os(ENV_NO_SHATV_REUSE).as_deref()))
+}
+
+/// The pre-collapsed statistic for a claim, or `None` when it must be
+/// collapsed here: the reuse is disabled, nothing was offered, the offered
+/// vector is not the canonical width, or it was collapsed at a different
+/// point than this claim's `suffix[..6]`.
+fn reusable_precollapsed<'a>(
+    precollapsed: Option<PreCollapsedSHatV<'a>>,
+    suffix: &[F128],
+    n_packed: usize,
+) -> Option<&'a [F128]> {
+    let pre = precollapsed?;
+    if !s_hat_v_reuse_enabled()
+        || pre.value.len() != n_packed
+        || pre.point.len() != 6
+        || suffix.len() < 6
+        || pre.point != &suffix[..6]
+    {
+        return None;
+    }
+    Some(pre.value)
+}
+
+/// [`prove_batched_padded_with_precomputed`] that also accepts, per claim, an
+/// already-collapsed canonical `s_hat_v` (see [`PreCollapsedSHatV`]). Output
+/// is byte-identical either way; the pre-collapsed vector only removes the
+/// `collapse_s_hat_v_fold8` sweep over a sixty-four-bank precompute.
+///
+/// `precollapsed` must be `&[]` or have length equal to `x_outers.len()`.
+pub fn prove_batched_padded_with_precollapsed<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    precollapsed: &[Option<PreCollapsedSHatV<'_>>],
+    padding: &PaddingSpec,
+    challenger: &mut Ch,
+) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
+    assert!(
+        precollapsed.is_empty() || precollapsed.len() == x_outers.len(),
+        "precollapsed: must be empty or length {}, got {}",
+        x_outers.len(),
+        precollapsed.len(),
+    );
     let trace =
         std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
     let n = x_outers.len();
@@ -2962,7 +3084,14 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     dense_suffixes[d].len() >= 6,
                     "sixty-four-bank s_hat_v requires at least six suffix coordinates"
                 );
-                collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6])
+                match reusable_precollapsed(
+                    precollapsed.get(dense_to_orig[d]).copied().flatten(),
+                    dense_suffixes[d],
+                    n_packed,
+                ) {
+                    Some(value) => value.to_vec(),
+                    None => collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6]),
+                }
             } else if p.len() == 16 * n_packed {
                 assert!(
                     dense_suffixes[d].len() >= 4,
@@ -2991,7 +3120,14 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     sparse_suffixes[s].len() >= 6,
                     "sixty-four-bank s_hat_v requires at least six suffix coordinates"
                 );
-                collapse_s_hat_v_fold8(p, &sparse_suffixes[s][..6])
+                match reusable_precollapsed(
+                    precollapsed.get(sparse_to_orig[s]).copied().flatten(),
+                    sparse_suffixes[s],
+                    n_packed,
+                ) {
+                    Some(value) => value.to_vec(),
+                    None => collapse_s_hat_v_fold8(p, &sparse_suffixes[s][..6]),
+                }
             } else if p.len() == 16 * n_packed {
                 assert!(
                     sparse_suffixes[s].len() >= 4,
@@ -3242,6 +3378,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                             a_state,
                             w_state,
                             round0,
+                            dead_tail_banks: fold8_dead_tail_banks(padding),
                         })
                     }
                     _ => None,
@@ -4425,6 +4562,140 @@ mod tests {
             }
         }
         assert_eq!(factored, product_oracle);
+    }
+
+    /// Reuse-vs-recompute oracle for the pre-collapsed `s_hat_v`.
+    ///
+    /// Handing ring-switch the canonical statistic the zerocheck already
+    /// computed must reproduce the collapse-from-tensor path byte for byte —
+    /// same proof, same `sumcheck_claim`, same `rs_eq_ind`, same fold8
+    /// factors. And the point guard must be load-bearing: a vector offered at
+    /// the wrong point, or with the wrong width, falls back to the collapse
+    /// rather than reaching the transcript.
+    #[test]
+    fn precollapsed_s_hat_v_reuse_matches_collapse_and_fails_closed() {
+        use crate::challenger::FsChallenger;
+        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
+
+        const M: usize = 18;
+        const K_LOG: usize = 14;
+        const K_SKIP: usize = 6;
+        let mut rng = Rng::new(0x5CAF_F01D);
+        let z = rng.bits(1 << M);
+        let packed = pack_witness(&z, M);
+        let z_packed_lincheck = pack_z_lincheck(&z, M, K_LOG);
+        let inner_rest: Vec<F128> = (0..(K_LOG - K_SKIP)).map(|_| rng.f128()).collect();
+        let outer: Vec<F128> = (0..(M - K_LOG)).map(|_| rng.f128()).collect();
+        let mut point = inner_rest.clone();
+        point.extend_from_slice(&outer);
+        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
+        let fold8 = s_hat_v_fold8_from_z_vec(&z_vec, &inner_rest[1..]);
+
+        // The point-equality obligation, in the shape ring-switch sees it:
+        // the claim's suffix is `point[1..]`, so its first six coordinates
+        // are `inner_rest[1..7]` — exactly the head of the producer's
+        // `inner_tail`, which is what the wider tensor collapses under.
+        let suffix = &point[1..];
+        let collapse_point = &inner_rest[1..7];
+        assert_eq!(&suffix[..6], collapse_point);
+        let collapsed = collapse_s_hat_v_fold8(&fold8, collapse_point);
+        assert_eq!(collapsed, s_hat_v_from_z_vec(&z_vec, &inner_rest[1..]));
+
+        let padding = PaddingSpec::dense(M);
+        let run = |precollapsed: &[Option<PreCollapsedSHatV<'_>>]| {
+            let mut challenger = FsChallenger::new(b"precollapsed-s-hat-v-reuse");
+            prove_batched_padded_with_precollapsed(
+                &packed,
+                &[&point],
+                &[Some(fold8.as_slice())],
+                precollapsed,
+                &padding,
+                &mut challenger,
+            )
+        };
+        let expect_collapse = |label: &str, precollapsed: &[Option<PreCollapsedSHatV<'_>>]| {
+            let (baseline, baseline_gammas) = run(&[]);
+            let (got, gammas) = run(precollapsed);
+            assert_eq!(gammas, baseline_gammas, "{label}: gammas");
+            assert_eq!(got[0].0, baseline[0].0, "{label}: proof");
+            assert_eq!(
+                got[0].1.sumcheck_claim, baseline[0].1.sumcheck_claim,
+                "{label}: sumcheck claim"
+            );
+            assert_eq!(
+                got[0].1.rs_eq_ind.to_dense(),
+                baseline[0].1.rs_eq_ind.to_dense(),
+                "{label}: rs_eq_ind"
+            );
+            let a = got[0].1.direct_fold8.as_ref().expect("fold8 factors");
+            let b = baseline[0].1.direct_fold8.as_ref().expect("fold8 factors");
+            assert_eq!(a.a_state, b.a_state, "{label}: A state");
+            assert_eq!(a.w_state, b.w_state, "{label}: W state");
+            assert_eq!(a.eq_lo, b.eq_lo, "{label}: eq_lo");
+            assert_eq!(a.eq_hi, b.eq_hi, "{label}: eq_hi");
+            assert_eq!(a.round0, b.round0, "{label}: round0");
+        };
+
+        // The honest offer: reuse must be byte-identical to the collapse.
+        expect_collapse(
+            "reuse",
+            &[Some(PreCollapsedSHatV {
+                value: &collapsed,
+                point: collapse_point,
+            })],
+        );
+        // Nothing offered at all.
+        expect_collapse("none", &[None]);
+
+        // Fail-closed guards. Each of these offers a vector that is NOT the
+        // honest statistic; the transcript must be unchanged, which can only
+        // happen if the guard rejected it and collapsed instead.
+        let wrong_value: Vec<F128> = collapsed.iter().map(|v| *v + F128::ONE).collect();
+        let wrong_point: Vec<F128> = collapse_point.iter().map(|v| *v + F128::ONE).collect();
+        expect_collapse(
+            "wrong point",
+            &[Some(PreCollapsedSHatV {
+                value: &wrong_value,
+                point: &wrong_point,
+            })],
+        );
+        expect_collapse(
+            "short point",
+            &[Some(PreCollapsedSHatV {
+                value: &wrong_value,
+                point: &collapse_point[..5],
+            })],
+        );
+        expect_collapse(
+            "wrong width",
+            &[Some(PreCollapsedSHatV {
+                value: &wrong_value[..64],
+                point: collapse_point,
+            })],
+        );
+
+        // Control: with the guard satisfied the vector really is consumed —
+        // an honest point plus a corrupted value must change the transcript.
+        let (baseline, _) = run(&[]);
+        let (poisoned, _) = run(&[Some(PreCollapsedSHatV {
+            value: &wrong_value,
+            point: collapse_point,
+        })]);
+        assert_ne!(
+            poisoned[0].0, baseline[0].0,
+            "the reuse never engaged — the equalities above prove nothing",
+        );
+    }
+
+    /// Exact-`1` rollback for the pre-collapsed reuse.
+    #[test]
+    fn s_hat_v_reuse_gate_is_exact() {
+        use std::ffi::OsStr;
+
+        assert!(!super::s_hat_v_reuse_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::s_hat_v_reuse_value_enabled(value.map(OsStr::new)));
+        }
     }
 
     #[test]

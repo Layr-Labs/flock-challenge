@@ -1433,7 +1433,7 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        None,
         challenger,
     );
     (proof, claim)
@@ -1458,6 +1458,53 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    prove_padded_capture_z_vec_mode(
+        z_packed,
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        ZVecCapture::PreSumcheck,
+        challenger,
+    )
+}
+
+/// Which snapshot of the sumcheck's `z` table [`prove_padded_capture_z_vec_mode`]
+/// hands back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ZVecCapture {
+    /// The pre-sumcheck table, `output[i_inner] = ẑ(i_inner, x_ab.x_outer)`,
+    /// length `2^k_log`.
+    PreSumcheck,
+    /// The table after round 0's bind, length `2^(k_log − 1)`.
+    ///
+    /// Round 0 binds the TOP remaining bit at `r_rounds[0]`, and step 9's
+    /// MSB→LSB reversal makes `r_rounds[0] = r_inner_rest[inner_rest_len − 1]`.
+    /// So when `inner_rest_len == 8` this snapshot is exactly
+    /// [`crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec`] of the
+    /// pre-sumcheck table at `r_inner_rest[1..]` — the AB claim's
+    /// sixty-four-bank statistic, computed once instead of twice. See
+    /// `fold8_ranked_fast_path_equals_lincheck_round0_bind`.
+    AfterRound0,
+}
+
+/// [`prove_padded_capture_z_vec`] with an explicit capture point. The proof,
+/// the claim and every transcript byte are identical either way; only which
+/// snapshot is cloned out changes.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_mode<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZVecCapture,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_padded_inner(
         z_packed,
         m,
@@ -1466,13 +1513,13 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        Some(capture),
         challenger,
     );
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured.expect("a requested capture must produce z_vec"),
     )
 }
 
@@ -1485,7 +1532,7 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture_z_vec: Option<ZVecCapture>,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
     let k = 1usize << k_log;
@@ -1577,10 +1624,16 @@ fn prove_padded_inner<Ch: Challenger>(
     } else {
         rayon::join(comb_branch, z_branch)
     };
-    // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
-    //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
-    //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
+    // 3b. Optional capture: clone the z_vec for downstream reuse (PCS open's
+    //     AB-claim s_hat_v skipping fold_1b_rows). Only pay the clone when
+    //     explicitly requested, and only at the requested point — the
+    //     post-round-0 snapshot is half the bytes AND already carries the
+    //     fold the sixty-four-bank statistic would otherwise redo.
+    assert!(
+        capture_z_vec != Some(ZVecCapture::AfterRound0) || inner_rest_len > 0,
+        "AfterRound0 capture needs at least one sumcheck round"
+    );
+    let mut captured_z_vec: Option<Vec<F128>> = if capture_z_vec == Some(ZVecCapture::PreSumcheck) {
         Some(z_vec.clone())
     } else {
         None
@@ -1618,6 +1671,9 @@ fn prove_padded_inner<Ch: Challenger>(
                 // Final round: just fold; z_vec collapses to z_partial.
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
+            }
+            if t == 0 && capture_z_vec == Some(ZVecCapture::AfterRound0) {
+                captured_z_vec = Some(z_vec.clone());
             }
         }
     }
@@ -1865,6 +1921,62 @@ mod tests {
         }
         fn bits(&mut self, n: usize) -> Vec<bool> {
             (0..n).map(|_| self.next_u64() & 1 == 1).collect()
+        }
+    }
+
+    /// Coordinate-order lemma: the AB claim's sixty-four-bank statistic is
+    /// lincheck's own round-0 bind.
+    ///
+    /// `s_hat_v_fold8_from_z_vec`'s ranked fast path (a seven-coordinate tail,
+    /// i.e. `k_log = k_skip + 8`) folds exactly ONE coordinate —
+    /// `x_inner_rest_tail[6]` — over the pre-sumcheck `z_vec`, while lincheck
+    /// round 0 binds the TOP remaining bit at `r_rounds[0]`. Those are the
+    /// same pass only because of the MSB→LSB reversal at step 9 of `prove`:
+    /// `r_inner_rest[j] = r_rounds[inner_rest_len − 1 − j]`, which puts
+    /// `x_inner_rest_tail[6] = r_inner_rest[7] = r_rounds[0]`.
+    ///
+    /// Checked against both bind kernels lincheck can run in round 0 — the
+    /// plain top bind and the fused bind-and-evaluate-next.
+    #[test]
+    fn fold8_ranked_fast_path_equals_lincheck_round0_bind() {
+        const K_SKIP: usize = 6;
+        // Ranked geometry: k_log = 14, so inner_rest_len = 8 and the fold8
+        // tail (`r_inner_rest[1..]`) has the seven coordinates the fast path
+        // is specialized for.
+        const INNER_REST_LEN: usize = 8;
+        let n_packed = 1usize << crate::pcs::LOG_PACKING;
+        assert_eq!(1usize << K_SKIP, n_packed >> 1);
+
+        for case in 0..8u64 {
+            let mut rng = Rng::new(0x11C4_8007u64.wrapping_add(case));
+            let mut r_rounds = rng.f128_vec(INNER_REST_LEN);
+            if case == 1 {
+                r_rounds[0] = F128::ZERO;
+            } else if case == 2 {
+                r_rounds[0] = F128::ONE;
+            }
+            // Step 9 of `prove`, verbatim.
+            let mut r_inner_rest = r_rounds.clone();
+            r_inner_rest.reverse();
+            let tail = &r_inner_rest[1..];
+            assert_eq!(tail.len(), 7, "ranked fast path needs a seven-coord tail");
+            assert_eq!(
+                tail[6], r_rounds[0],
+                "the reversal must line the fold8 head coordinate up with round 0"
+            );
+
+            let z_vec = rng.f128_vec(n_packed << tail.len());
+            let got = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&z_vec, tail);
+
+            let mut want = z_vec.clone();
+            sumcheck_bind_top_in_place_par(&mut want, r_rounds[0]);
+            assert_eq!(got, want, "case {case}: fold8 != plain top bind");
+
+            // The round lincheck actually runs when a later round exists.
+            let mut fused = z_vec.clone();
+            let mut comb = rng.f128_vec(z_vec.len());
+            let _ = sumcheck_bind_both_and_eval_next(&mut comb, &mut fused, r_rounds[0]);
+            assert_eq!(got, fused, "case {case}: fold8 != fused round-0 bind");
         }
     }
 
@@ -2432,6 +2544,61 @@ mod tests {
                 "w wrong at m={m}, k_log={k_log}, k_skip={k_skip}"
             );
         }
+    }
+
+    /// End-to-end oracle for the AB half of the `s_hat_v` reuse: capturing
+    /// after round 0 must leave every transcript byte alone and must hand
+    /// back exactly the sixty-four-bank statistic the pre-sumcheck capture
+    /// would have been folded into.
+    #[test]
+    fn after_round0_capture_is_the_fold8_statistic_and_transcript_neutral() {
+        const K_SKIP: usize = 6;
+        const K_LOG: usize = K_SKIP + 8;
+        const M: usize = K_LOG + 3;
+
+        let k = 1usize << K_LOG;
+        let mut rng = Rng::new(0xAB_5417_0000);
+        let a_0 = random_sparse_matrix(k, 2 * k, &mut rng);
+        let b_0 = random_sparse_matrix(k, 2 * k, &mut rng);
+        let z = rng.bits(1 << M);
+        let z_packed = pack_z_lincheck(&z, M, K_LOG);
+        let x_ab = random_quirky_point(M, K_LOG, K_SKIP, &mut rng);
+        let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
+
+        let run = |capture: ZVecCapture| {
+            let mut challenger = FsChallenger::new(b"flock-test-v0");
+            let out = prove_padded_capture_z_vec_mode(
+                &z_packed,
+                M,
+                K_LOG,
+                K_SKIP,
+                1 << K_LOG,
+                &circuit,
+                &x_ab,
+                capture,
+                &mut challenger,
+            );
+            (out, challenger.sample_f128())
+        };
+
+        let ((pre_proof, pre_claim, pre_z), pre_tag) = run(ZVecCapture::PreSumcheck);
+        let ((post_proof, post_claim, post_z), post_tag) = run(ZVecCapture::AfterRound0);
+
+        assert_eq!(pre_proof.rounds, post_proof.rounds, "round messages");
+        assert_eq!(pre_proof.z_partial, post_proof.z_partial, "z_partial");
+        assert_eq!(pre_claim, post_claim, "claim");
+        assert_eq!(pre_tag, post_tag, "challenger diverged after the proof");
+
+        assert_eq!(pre_z.len(), 1 << K_LOG);
+        assert_eq!(post_z.len(), 1 << (K_LOG - 1));
+        let tail = &pre_claim.r_inner_rest[1..];
+        assert_eq!(
+            post_z,
+            crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&pre_z, tail),
+            "post-round-0 capture is not the sixty-four-bank statistic",
+        );
+        // Not vacuous: the two snapshots really are different vectors.
+        assert_ne!(pre_z[..post_z.len()], post_z[..]);
     }
 
     /// Verify must reject byte-mutated proofs. Mutation positions are picked

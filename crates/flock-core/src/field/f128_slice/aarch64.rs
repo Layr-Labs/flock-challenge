@@ -508,6 +508,131 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+/// Banked deferred-reduction fold of a bank *prefix*: the same accumulation
+/// as [`fold_banked_slot`] over `banks` banks instead of a compile-time
+/// width. Used where the trailing inputs are structurally zero, so the
+/// dropped products could only have contributed zero.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `weight` and `input` must each
+/// hold at least `banks` elements.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_prefix(weight: &[F128], input: &[F128], banks: usize) -> F128 {
+    unsafe {
+        debug_assert!(weight.len() >= banks && input.len() >= banks);
+        let zero = vdupq_n_u64(0);
+        let mut a0 = WideNeon { lo: zero, hi: zero };
+        let mut a1 = WideNeon { lo: zero, hi: zero };
+        let mut a2 = WideNeon { lo: zero, hi: zero };
+        let mut a3 = WideNeon { lo: zero, hi: zero };
+
+        let w = weight.as_ptr();
+        let x = input.as_ptr();
+        let main = banks & !3;
+        let mut k = 0usize;
+        while k < main {
+            let w0 = vld1q_u64(w.add(k).cast::<u64>());
+            let w1 = vld1q_u64(w.add(k + 1).cast::<u64>());
+            let w2 = vld1q_u64(w.add(k + 2).cast::<u64>());
+            let w3 = vld1q_u64(w.add(k + 3).cast::<u64>());
+            let x0 = vld1q_u64(x.add(k).cast::<u64>());
+            let x1 = vld1q_u64(x.add(k + 1).cast::<u64>());
+            let x2 = vld1q_u64(x.add(k + 2).cast::<u64>());
+            let x3 = vld1q_u64(x.add(k + 3).cast::<u64>());
+            xor_wide(&mut a0, mul_unreduced(w0, x0));
+            xor_wide(&mut a1, mul_unreduced(w1, x1));
+            xor_wide(&mut a2, mul_unreduced(w2, x2));
+            xor_wide(&mut a3, mul_unreduced(w3, x3));
+            k += 4;
+        }
+        while k < banks {
+            let wk = vld1q_u64(w.add(k).cast::<u64>());
+            let xk = vld1q_u64(x.add(k).cast::<u64>());
+            xor_wide(&mut a0, mul_unreduced(wk, xk));
+            k += 1;
+        }
+
+        xor_wide(&mut a0, a1);
+        xor_wide(&mut a2, a3);
+        xor_wide(&mut a0, a2);
+        transmute::<uint64x2_t, F128>(reduce_wide(a0))
+    }
+}
+
+/// [`fold_banked_slots2`] with the second slot truncated to its first
+/// `second_banks` banks. The shared-weight pair loop covers the banks both
+/// slots need; the first slot's remaining banks are accumulated alone into
+/// the same unreduced Karatsuba domain, so the pair still reduces exactly
+/// twice and every retained product is bit-identical to the full kernel's.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `input` must hold at least
+/// `BANKS + second_banks` elements, with the second slot starting at
+/// `input[BANKS]`, and `second_banks <= BANKS`.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_slots2_head<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    input: &[F128],
+    second_banks: usize,
+) -> [F128; 2] {
+    unsafe {
+        debug_assert!(second_banks <= BANKS);
+        debug_assert!(input.len() >= BANKS + second_banks);
+        let zero = vdupq_n_u64(0);
+        let mut first = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut second = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut solo = WideNeon { lo: zero, hi: zero };
+
+        let w = weight.as_ptr();
+        let x0 = input.as_ptr();
+        let x1 = input.as_ptr().add(BANKS);
+        let main = second_banks & !1;
+        let mut bank = 0usize;
+        while bank < main {
+            let w0 = vld1q_u64(w.add(bank).cast::<u64>());
+            let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
+            let x00 = vld1q_u64(x0.add(bank).cast::<u64>());
+            let x10 = vld1q_u64(x1.add(bank).cast::<u64>());
+            let x01 = vld1q_u64(x0.add(bank + 1).cast::<u64>());
+            let x11 = vld1q_u64(x1.add(bank + 1).cast::<u64>());
+            xor_karatsuba_const_pair(&mut first, &mut second, x00, x10, w0);
+            xor_karatsuba_const_pair(&mut first, &mut second, x01, x11, w1);
+            bank += 2;
+        }
+        if bank < second_banks {
+            let wk = vld1q_u64(w.add(bank).cast::<u64>());
+            let first_x = vld1q_u64(x0.add(bank).cast::<u64>());
+            let second_x = vld1q_u64(x1.add(bank).cast::<u64>());
+            xor_karatsuba_const_pair(&mut first, &mut second, first_x, second_x, wk);
+            bank += 1;
+        }
+        while bank < BANKS {
+            let wk = vld1q_u64(w.add(bank).cast::<u64>());
+            let xk = vld1q_u64(x0.add(bank).cast::<u64>());
+            xor_wide(&mut solo, mul_unreduced(wk, xk));
+            bank += 1;
+        }
+
+        let mut first_wide = karatsuba_to_wide(first);
+        xor_wide(&mut first_wide, solo);
+        let reduced = reduce_wide_pair(first_wide, karatsuba_to_wide(second));
+        [
+            transmute::<uint64x2_t, F128>(reduced[0]),
+            transmute::<uint64x2_t, F128>(reduced[1]),
+        ]
+    }
+}
+
 /// Deferred-reduction round-zero message `(u_0, u_2)` over paired slots.
 ///
 /// Bitwise-identical to the scalar pair loop: both accumulate
