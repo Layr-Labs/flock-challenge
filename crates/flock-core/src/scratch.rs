@@ -655,8 +655,8 @@ pub fn give_u8(v: Vec<u8>) {
 // window and a single-threaded munmap on the following drop; recycling the
 // two buffers across proves keeps their pages resident. Contents are NOT
 // cleared; callers must write every node before reading (both builders do:
-// the GPU copy-out writes the whole tree, the CPU builder writes leaves
-// then every parent level).
+// the GPU direct builder or copy-out writes the whole tree, while the CPU
+// builder writes leaves then every parent level).
 // ---------------------------------------------------------------------------
 
 static POOL_HASH_TREE: Mutex<Vec<Vec<crate::merkle::Hash>>> = Mutex::new(Vec::new());
