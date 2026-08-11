@@ -1998,7 +1998,61 @@ pub(crate) mod witgen_simd {
     #[inline(always)]
     unsafe fn dump_range<const NT: bool>(stage: *const V4, dst: *mut u32, g0: usize, g1: usize) {
         unsafe {
-            for g in g0..g1 {
+            // Chunk-PAIRED drain: two dump chunks (16 stage words → 16 live
+            // V4) per iteration, so every block destination receives its
+            // 64 bytes as one back-to-back burst before the next
+            // destination is touched. The per-chunk drain left each
+            // destination's 64-B granule half-open across an iteration while
+            // the other streams' stores interleaved (4 destinations × 3
+            // buffers close in time); the pair closes each aligned 64-B
+            // granule inside its own burst, so at most one partially-filled
+            // write-combine granule is live per worker at any instant. Same
+            // bytes, same per-block ascending order, same NT/plain flavor —
+            // pure store scheduling. Callers' ranges start even (g0 ∈
+            // {0, ELIDE_B_PREFIX_CHUNKS}); odd-length ranges (elided tails
+            // end at chunk 61 or 59) finish with one incumbent-shaped
+            // single-chunk drain.
+            let mut g = g0;
+            while g + 1 < g1 {
+                let w = 8 * g;
+                let x0 = vld4q_u32(stage.add(w) as *const u32);
+                let y0 = vld4q_u32(stage.add(w + 4) as *const u32);
+                let x1 = vld4q_u32(stage.add(w + 8) as *const u32);
+                let y1 = vld4q_u32(stage.add(w + 12) as *const u32);
+                let p0 = dst.add(w);
+                let p1 = dst.add(U32_PER_BLOCK + w);
+                let p2 = dst.add(2 * U32_PER_BLOCK + w);
+                let p3 = dst.add(3 * U32_PER_BLOCK + w);
+                if NT {
+                    store_nt_pair(x0.0, y0.0, p0);
+                    store_nt_pair(x1.0, y1.0, p0.add(8));
+                    store_nt_pair(x0.1, y0.1, p1);
+                    store_nt_pair(x1.1, y1.1, p1.add(8));
+                    store_nt_pair(x0.2, y0.2, p2);
+                    store_nt_pair(x1.2, y1.2, p2.add(8));
+                    store_nt_pair(x0.3, y0.3, p3);
+                    store_nt_pair(x1.3, y1.3, p3.add(8));
+                } else {
+                    vst1q_u32(p0, x0.0);
+                    vst1q_u32(p0.add(4), y0.0);
+                    vst1q_u32(p0.add(8), x1.0);
+                    vst1q_u32(p0.add(12), y1.0);
+                    vst1q_u32(p1, x0.1);
+                    vst1q_u32(p1.add(4), y0.1);
+                    vst1q_u32(p1.add(8), x1.1);
+                    vst1q_u32(p1.add(12), y1.1);
+                    vst1q_u32(p2, x0.2);
+                    vst1q_u32(p2.add(4), y0.2);
+                    vst1q_u32(p2.add(8), x1.2);
+                    vst1q_u32(p2.add(12), y1.2);
+                    vst1q_u32(p3, x0.3);
+                    vst1q_u32(p3.add(4), y0.3);
+                    vst1q_u32(p3.add(8), x1.3);
+                    vst1q_u32(p3.add(12), y1.3);
+                }
+                g += 2;
+            }
+            if g < g1 {
                 let w = 8 * g;
                 let x = vld4q_u32(stage.add(w) as *const u32);
                 let y = vld4q_u32(stage.add(w + 4) as *const u32);
@@ -4649,6 +4703,73 @@ mod tests {
             assert_eq!(ss, sr, "stripe mismatch n_blocks={n_blocks}");
         }
     }
+    /// Portable structural twin of `witgen_simd::dump_range`'s paired drain:
+    /// same chunk-pair loop bound (`g + 1 < g1`), same trailing single-chunk
+    /// drain, same per-block destination addressing `j * U32_PER_BLOCK + w`
+    /// — scalar word copies standing in for `vld4q_u32`/`stnp`. The stage is
+    /// block-lane interleaved: word `w` of block `j` lives at u32 index
+    /// `4 * w + j`. Compiled on every arch so the x86 suite pins the
+    /// pairing/range decomposition the NEON drain uses (the aarch64-only
+    /// quad-equality tests bind the NEON drain itself to the scalar
+    /// builder). Keep structurally identical to the NEON `dump_range`.
+    fn dump_range_paired_portable(stage: &[u32], dst: &mut [u32], g0: usize, g1: usize) {
+        const U32_PER_BLOCK: usize = super::K / 32;
+        // Words `w..w+span` of all four blocks, block-major (one 4·span-byte
+        // burst per destination before advancing) — the vld4 deinterleave.
+        let drain_span = |dst: &mut [u32], w: usize, span: usize| {
+            for j in 0..4 {
+                for k in 0..span {
+                    dst[j * U32_PER_BLOCK + w + k] = stage[4 * (w + k) + j];
+                }
+            }
+        };
+        let mut g = g0;
+        while g + 1 < g1 {
+            drain_span(dst, 8 * g, 16);
+            g += 2;
+        }
+        if g < g1 {
+            drain_span(dst, 8 * g, 8);
+        }
+    }
+
+    /// Incumbent per-chunk drain shape (the pre-r959 `dump_range` loop),
+    /// kept as the oracle the paired twin must match byte-for-byte.
+    fn dump_range_single_portable(stage: &[u32], dst: &mut [u32], g0: usize, g1: usize) {
+        const U32_PER_BLOCK: usize = super::K / 32;
+        for g in g0..g1 {
+            let w = 8 * g;
+            for j in 0..4 {
+                for k in 0..8 {
+                    dst[j * U32_PER_BLOCK + w + k] = stage[4 * (w + k) + j];
+                }
+            }
+        }
+    }
+
+    /// r959 paired-drain oracle: for every dump range the real callers
+    /// produce — full `(0, DUMP_CHUNKS=64)`, z/a elided tail
+    /// `(0, ELIDE_ZERO_CHUNK=61)`, b elided prefix+tail
+    /// `(ELIDE_B_PREFIX_CHUNKS=4, ELIDE_B_TAIL_CHUNK=59)` — the paired
+    /// drain must write byte-identical z/a/b block output AND touch exactly
+    /// the same words as the incumbent per-chunk drain (sentinel bytes
+    /// outside the range must survive, pinning that elision geometry is
+    /// untouched and no layout-version bump is owed).
+    #[test]
+    fn paired_dump_drain_matches_single_chunk_drain() {
+        const U32_PER_QUAD: usize = 4 * (super::K / 32); // 4 blocks x 512 words
+        let mut rng = Rng::new(0xD0_D0_9A12);
+        // (g0, g1) per buffer role: z, a, b — plus the full-range shape.
+        for (g0, g1) in [(0usize, 64usize), (0, 61), (4, 59)] {
+            let stage: Vec<u32> = (0..U32_PER_QUAD).map(|_| rng.next_u32()).collect();
+            let mut want = vec![0xA5A5_A5A5u32; U32_PER_QUAD];
+            let mut got = want.clone();
+            dump_range_single_portable(&stage, &mut want, g0, g1);
+            dump_range_paired_portable(&stage, &mut got, g0, g1);
+            assert_eq!(got, want, "paired drain diverged for range ({g0}, {g1})");
+        }
+    }
+
 
     #[cfg(target_arch = "aarch64")]
     #[test]
