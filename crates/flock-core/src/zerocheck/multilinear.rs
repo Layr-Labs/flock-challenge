@@ -3754,6 +3754,88 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 mod tests {
     use super::*;
 
+    /// The round-two dead-group geometry, derived from the R1CS padding.
+    ///
+    /// The ranked BLAKE3 block is `2^14` bits of which 15,409 are useful, so
+    /// at `k_skip = 6` only `ceil(15409 / 128) = 121` of every 128 chunk
+    /// pairs carry data — `round2_pair_skip` must report `(127, 121)`, the
+    /// exact pair the NEON lookahead kernel's `ranked_periodic` schedule
+    /// engages on. This pins the constant so a padding change disengages the
+    /// schedule instead of mis-engaging it.
+    ///
+    /// It also checks the schedule itself against the generic per-group
+    /// predicate: over a 128-pair block the periodic form claims 60 fully
+    /// useful groups, one boundary group `(pad0, pad1) = (false, true)`, and
+    /// three fully padded groups — and that partition must be exactly the one
+    /// `((pair_idx_base + x_lo) & mask) >= useful` induces, at every group of
+    /// every window, for a 128-aligned base. A misaligned base must NOT
+    /// reproduce it, which is why the kernel guards on `pair_idx_base & 127`.
+    #[test]
+    fn round2_pair_skip_ranked_geometry_matches_periodic_block_schedule() {
+        const K_SKIP: usize = 6;
+        let ranked = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        assert_eq!(round2_pair_skip(&ranked, K_SKIP), (127, 121));
+
+        // Shapes with nothing to skip must report the no-skip sentinel.
+        for spec in [
+            PaddingSpec {
+                k_log: 14,
+                useful_bits_per_block: 1 << 14,
+            },
+            PaddingSpec::dense(32),
+            PaddingSpec {
+                k_log: K_SKIP + 1,
+                useful_bits_per_block: 100,
+            },
+        ] {
+            assert_eq!(round2_pair_skip(&spec, K_SKIP), (0, usize::MAX));
+        }
+
+        let (mask, useful) = round2_pair_skip(&ranked, K_SKIP);
+        // Two full 64-group windows, 128-aligned as the kernel requires.
+        let n_groups = 128usize;
+        for base in [0usize, 128, 2048] {
+            assert_eq!(base & 127, 0);
+            for u in 0..n_groups {
+                let pad0 = ((base + 2 * u) & mask) >= useful;
+                let pad1 = ((base + 2 * u + 1) & mask) >= useful;
+                let local = u % 64;
+                let want = if local < 60 {
+                    (false, false)
+                } else if local == 60 {
+                    (false, true)
+                } else {
+                    (true, true)
+                };
+                assert_eq!(
+                    (pad0, pad1),
+                    want,
+                    "block schedule diverges at base={base} group={u}"
+                );
+            }
+        }
+
+        // The alignment guard is load-bearing: at a base that is not a
+        // multiple of 128 the periodic partition is wrong for some group.
+        let base = 2usize; // one pair into the block
+        assert!((0..64).any(|u| {
+            let pad0 = ((base + 2 * u) & mask) >= useful;
+            let pad1 = ((base + 2 * u + 1) & mask) >= useful;
+            let local = u % 64;
+            let want = if local < 60 {
+                (false, false)
+            } else if local == 60 {
+                (false, true)
+            } else {
+                (true, true)
+            };
+            (pad0, pad1) != want
+        }));
+    }
+
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     #[test]
     fn ranked_normal_fold4_pair_output_selector_is_exact() {

@@ -321,6 +321,62 @@ fn l2_recursive_ntt_epool_killed_by(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+/// Claim granularity `4eab658` shipped for the recursive deep tail: 32
+/// sub-transforms, shared by both recursive shapes.
+const RECURSIVE_DEEP_N_TOP_INCUMBENT: usize = 5;
+
+/// Exact rollback rule for the structure-maximal deep-tail granularity.
+/// Values other than the documented `1` cannot silently change the partition.
+#[inline]
+fn recursive_deep_fine_claims_killed_by(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Whether the recursive deep tail splits at the finest layer its producer has
+/// already finished. Kill switch: `FLOCK_NO_RECURSIVE_DEEP_FINE_CLAIMS=1`
+/// (exactly `"1"`) restores [`RECURSIVE_DEEP_N_TOP_INCUMBENT`] on both shapes.
+/// Read once per process.
+#[inline]
+fn recursive_deep_fine_claims_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !recursive_deep_fine_claims_killed_by(
+            std::env::var("FLOCK_NO_RECURSIVE_DEEP_FINE_CLAIMS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Claim granularity for a recursive deep tail entered at `start_layer`.
+///
+/// Layers `start_layer..log_d` of an additive NTT never cross a
+/// layer-`start_layer` block boundary, so one such block is the finest claim
+/// the structure admits: `n_top = start_layer` splits the codeword into
+/// `2^start_layer` independently-owned sub-transforms, and any larger `n_top`
+/// would *skip* layers (the subtree loop starts at `n_top.max(start_layer)`).
+///
+/// L1 enters at layer 5 and is therefore already maximal — `4eab658` swept it
+/// to exactly its ceiling and stopped, and this returns its shipped 5. L2
+/// enters at layer 6 but inherited L1's constant when `3b070a2` reused this
+/// helper, leaving it one notch coarse at 32 x 256 KiB where its own structure
+/// admits 64 x 128 KiB. Taking that notch is free: the per-block slices, the
+/// absolute `global_block` twiddle indices, and the butterfly order are all
+/// unchanged (see `recursive_deep_claim_partition_is_exact_at_both_granularities`),
+/// so only ownership and the scheduler's tail quantum move.
+#[inline]
+fn recursive_deep_claim_n_top(start_layer: usize) -> usize {
+    debug_assert!(
+        start_layer >= RECURSIVE_DEEP_N_TOP_INCUMBENT,
+        "the deep tail never splits coarser than the shipped granularity"
+    );
+    if recursive_deep_fine_claims_enabled() {
+        start_layer
+    } else {
+        RECURSIVE_DEEP_N_TOP_INCUMBENT
+    }
+}
+
 #[inline]
 fn use_recursive_ntt_epool(log_d: usize, num_ntts: usize, start_layer: usize) -> bool {
     static L1_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -1532,9 +1588,10 @@ impl AdditiveNttF128 {
     #[inline]
     /// Deep tail of a recursive-commit transform on the P+E helper queue.
     /// Both ranked recursive shapes — L1 (32 x 1 MiB at log_d 18) and L2
-    /// (32 x 256 KiB at log_d 16) — partition into 32 independent
-    /// cache-resident sub-transforms; each sub runs the identical
-    /// single-layer subtree loop, so this changes ownership/scheduling only.
+    /// (64 x 128 KiB at log_d 16) — partition into independent cache-resident
+    /// sub-transforms at [`recursive_deep_claim_n_top`], each running the
+    /// identical single-layer subtree loop, so this changes ownership and the
+    /// scheduler's tail quantum only.
     fn forward_transform_interleaved_recursive_deep_with_helper(
         &self,
         data: &mut [F128],
@@ -1542,16 +1599,15 @@ impl AdditiveNttF128 {
         start_layer: usize,
         helper: &rayon::ThreadPool,
     ) {
-        const N_TOP: usize = 5;
-
         let log_d = log2_pow2(data.len() / num_ntts);
         debug_assert!(
             matches!((log_d, num_ntts, start_layer), (18, 8, 5) | (16, 8, 6)),
             "recursive deep helper only serves the L1/L2 ranked shapes"
         );
-        let sub_size_positions = 1usize << (log_d - N_TOP);
+        let n_top = recursive_deep_claim_n_top(start_layer);
+        let sub_size_positions = 1usize << (log_d - n_top);
         let sub_bytes = sub_size_positions * num_ntts;
-        let num_subs = 1usize << N_TOP;
+        let num_subs = 1usize << n_top;
         debug_assert_eq!(data.len(), num_subs * sub_bytes);
 
         let base = crate::epool::SyncPtr(data.as_mut_ptr());
@@ -1566,12 +1622,39 @@ impl AdditiveNttF128 {
                 sub_data,
                 num_ntts,
                 start_layer,
-                N_TOP,
+                n_top,
                 log_d,
                 sub_idx,
             );
         };
         crate::epool::run_chunks_with_helper(num_subs, &run_sub, Some(helper));
+    }
+
+    /// Serial oracle for the recursive deep-tail partition at a chosen
+    /// `n_top`: exactly the closure the queue drains, with the pools removed.
+    /// Proving two granularities agree on arbitrary post-radix-8 state is
+    /// strictly stronger than proving it through one producer, and it isolates
+    /// the only axis this candidate moves.
+    #[cfg(test)]
+    fn forward_transform_interleaved_recursive_deep_serial(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        n_top: usize,
+    ) {
+        let log_d = log2_pow2(data.len() / num_ntts);
+        let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
+        for (sub_idx, sub_data) in data.chunks_mut(sub_elems).enumerate() {
+            self.forward_transform_interleaved_deep_subtree(
+                sub_data,
+                num_ntts,
+                start_layer,
+                n_top,
+                log_d,
+                sub_idx,
+            );
+        }
     }
 
     #[inline(always)]
@@ -3202,6 +3285,180 @@ mod tests {
             "injected helper never claimed an exact L2-shape deep subtree"
         );
         assert_eq!(candidate, incumbent);
+    }
+
+    /// Enumerate the deep-tail partition the way
+    /// [`AdditiveNttF128::forward_transform_interleaved_deep_subtree`] does:
+    /// one `(layer, absolute element range, global_block)` record per butterfly
+    /// block, over every sub-transform.
+    fn deep_partition_records(
+        log_d: usize,
+        num_ntts: usize,
+        start_layer: usize,
+        n_top: usize,
+    ) -> Vec<(usize, usize, usize, usize)> {
+        let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
+        let mut out = Vec::new();
+        for sub_idx in 0..(1usize << n_top) {
+            for layer in n_top.max(start_layer)..log_d {
+                let num_blocks_in_sub = 1usize << (layer - n_top);
+                let block_elems = (1usize << (log_d - layer)) * num_ntts;
+                for block_in_sub in 0..num_blocks_in_sub {
+                    let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                    let abs_start = sub_idx * sub_elems + block_in_sub * block_elems;
+                    out.push((layer, abs_start, block_elems, global_block));
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Proof obligation 1 for the re-granularized L2 deep tail: at the exact
+    /// ranked shape the 64 x 128 KiB partition and the incumbent 32 x 256 KiB
+    /// partition issue *the same set of butterfly blocks* — same layer, same
+    /// absolute element range, same absolute `global_block` (hence the same
+    /// twiddle). Each layer's blocks are additionally proven pairwise disjoint,
+    /// exhaustive over the codeword, and to cover `0..2^layer` exactly once, so
+    /// no claim can overlap another and none is dropped or repeated.
+    #[test]
+    fn recursive_deep_claim_partition_is_exact_at_both_granularities() {
+        const LOG_D: usize = 16;
+        const NUM_NTTS: usize = 8;
+        const START_LAYER: usize = 6;
+        let total = (1usize << LOG_D) * NUM_NTTS;
+
+        for n_top in [RECURSIVE_DEEP_N_TOP_INCUMBENT, START_LAYER] {
+            let records = deep_partition_records(LOG_D, NUM_NTTS, START_LAYER, n_top);
+            // Sub-transform slices themselves tile the codeword exactly.
+            assert_eq!(
+                (1usize << n_top) * ((1usize << (LOG_D - n_top)) * NUM_NTTS),
+                total
+            );
+            for layer in START_LAYER..LOG_D {
+                let at_layer: Vec<_> = records.iter().filter(|r| r.0 == layer).collect();
+                assert_eq!(at_layer.len(), 1usize << layer, "layer {layer} block count");
+                // Pairwise disjoint + exhaustive: sorted ranges must abut and
+                // together cover the whole codeword.
+                let mut cursor = 0usize;
+                for &&(_, start, len, _) in &at_layer {
+                    assert_eq!(start, cursor, "layer {layer} range gap/overlap");
+                    cursor += len;
+                }
+                assert_eq!(cursor, total, "layer {layer} ranges not exhaustive");
+                // Absolute twiddle indices cover 0..2^layer exactly once.
+                let mut blocks: Vec<usize> = at_layer.iter().map(|r| r.3).collect();
+                blocks.sort_unstable();
+                assert_eq!(blocks, (0..1usize << layer).collect::<Vec<_>>());
+            }
+        }
+
+        // The two granularities are the *same* partition, re-owned.
+        assert_eq!(
+            deep_partition_records(LOG_D, NUM_NTTS, START_LAYER, START_LAYER),
+            deep_partition_records(LOG_D, NUM_NTTS, START_LAYER, RECURSIVE_DEEP_N_TOP_INCUMBENT),
+        );
+    }
+
+    /// Proof obligation 2: the drained closure carries no cross-claim
+    /// dependency, so re-granularizing it is byte-identical on *arbitrary*
+    /// post-radix-8 state — not merely on state one particular producer emits.
+    /// Runs the exact subtree loop serially at both granularities and compares.
+    /// L1 (deep entry at layer 5) must be untouched: it is already at its
+    /// structural ceiling, so both arms select `n_top = 5`.
+    #[test]
+    fn recursive_deep_claim_regranularization_is_bit_identical() {
+        // Small shapes cover the index algebra (including two-notch moves);
+        // (16, 6) is the exact ranked L2 geometry this candidate re-owns. The
+        // ranked L1 geometry needs no arm here: its deep entry is layer 5, so
+        // `recursive_deep_claim_gate_and_rollback_are_exact` pins both arms to
+        // the same `n_top = 5` and no bytes can move.
+        for (log_d, start_layer) in [
+            (10usize, 5usize),
+            (11, 5),
+            (11, 6),
+            (12, 6),
+            (12, 7),
+            (16, 6),
+        ] {
+            const NUM_NTTS: usize = 8;
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut rng =
+                Rng::new(0x5EED_0C7A_1B2C_3D4E ^ ((log_d as u64) << 8) ^ start_layer as u64);
+            let state = rand_vec(&mut rng, (1usize << log_d) * NUM_NTTS);
+
+            let mut coarse = state.clone();
+            ntt.forward_transform_interleaved_recursive_deep_serial(
+                &mut coarse,
+                NUM_NTTS,
+                start_layer,
+                RECURSIVE_DEEP_N_TOP_INCUMBENT,
+            );
+            let mut fine = state.clone();
+            ntt.forward_transform_interleaved_recursive_deep_serial(
+                &mut fine,
+                NUM_NTTS,
+                start_layer,
+                start_layer,
+            );
+            assert_eq!(
+                fine, coarse,
+                "log_d {log_d} start_layer {start_layer} deep tail changed bytes"
+            );
+
+            // And both agree with the plain whole-codeword layer loop.
+            let mut oracle = state.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut oracle, NUM_NTTS, start_layer);
+            assert_eq!(
+                fine, oracle,
+                "log_d {log_d} start_layer {start_layer} deep tail vs scalar oracle"
+            );
+        }
+    }
+
+    /// The granularity selector is exact: it never returns a value that would
+    /// skip layers (`n_top > start_layer`) or regress below the shipped
+    /// partition, and only the literal `"1"` rolls it back.
+    #[test]
+    fn recursive_deep_claim_gate_and_rollback_are_exact() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("11"),
+            Some(" 1"),
+        ] {
+            assert!(
+                !recursive_deep_fine_claims_killed_by(value),
+                "{value:?} must not roll back the partition"
+            );
+        }
+        assert!(recursive_deep_fine_claims_killed_by(Some("1")));
+
+        // Both arms, independent of the ambient environment.
+        for &start_layer in &[5usize, 6] {
+            for fine in [true, false] {
+                let n_top = if fine {
+                    start_layer
+                } else {
+                    RECURSIVE_DEEP_N_TOP_INCUMBENT
+                };
+                assert!(n_top <= start_layer, "n_top {n_top} would skip layers");
+                assert!(n_top >= RECURSIVE_DEEP_N_TOP_INCUMBENT);
+            }
+        }
+        // L1's ceiling is its shipped value: the candidate cannot move it.
+        assert_eq!(
+            recursive_deep_claim_n_top(5),
+            RECURSIVE_DEEP_N_TOP_INCUMBENT
+        );
+        // ...and with the switch unset, L2 does take its own ceiling, so the
+        // ranked deep tail really drains 64 claims rather than 32.
+        if std::env::var("FLOCK_NO_RECURSIVE_DEEP_FINE_CLAIMS").as_deref() != Ok("1") {
+            assert_eq!(recursive_deep_claim_n_top(6), 6);
+            assert_eq!(1usize << recursive_deep_claim_n_top(6), 64);
+        }
     }
 
     /// The ranked split extension must produce three consecutive radix-8
