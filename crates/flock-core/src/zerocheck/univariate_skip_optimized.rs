@@ -863,7 +863,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
 /// shape exposes roughly sixty-four scheduling waves on the ten-thread worker.
 #[inline]
 fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
-    n_chunks.div_ceil(640).max(1)
+    n_chunks.div_ceil(320).max(1)
 }
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
