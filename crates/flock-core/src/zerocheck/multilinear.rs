@@ -2478,7 +2478,7 @@ pub(crate) fn fold2_plain_and_round6_into(
     let nt_stores = {
         use std::sync::OnceLock;
         static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-        quarter >= (1usize << 19)
+        quarter >= (1usize << 18)
             && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
     };
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -2541,7 +2541,7 @@ pub(crate) fn fold2_plain_and_round6_into(
     // Same scheduling policy as the plain tail: DRAM-bound sizes drain
     // through the hetero E-core queue, LLC-resident ones stay on rayon.
     #[cfg(target_arch = "aarch64")]
-    let hetero = quarter >= (1usize << 19) && zc_tail_hetero_enabled();
+    let hetero = quarter >= (1usize << 18) && zc_tail_hetero_enabled();
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
@@ -2683,7 +2683,7 @@ pub(crate) fn fold2_plain_and_round67_into(
     let nt_stores = {
         use std::sync::OnceLock;
         static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-        quarter >= (1usize << 19)
+        quarter >= (1usize << 18)
             && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
     };
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -2780,7 +2780,7 @@ pub(crate) fn fold2_plain_and_round67_into(
 
     // Same scheduling policy as the plain composed pass.
     #[cfg(target_arch = "aarch64")]
-    let hetero = quarter >= (1usize << 19) && zc_tail_hetero_enabled();
+    let hetero = quarter >= (1usize << 18) && zc_tail_hetero_enabled();
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
@@ -3320,7 +3320,7 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     let nt_stores = {
         use std::sync::OnceLock;
         static NT_ENABLED: OnceLock<bool> = OnceLock::new();
-        half >= (1usize << 19)
+        half >= (1usize << 18)
             && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
     };
     // Total non-bound multilinear vars is log_n - 1; eq covers log_n - 2 of those.
@@ -3512,7 +3512,7 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     // H2: drain the DRAM-bound rounds (outputs past LLC) through the hetero
     // E-core queue — the same contract as the T3 compact reconstruction.
     #[cfg(target_arch = "aarch64")]
-    let hetero = half >= (1usize << 19) && zc_tail_hetero_enabled();
+    let hetero = half >= (1usize << 18) && zc_tail_hetero_enabled();
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
