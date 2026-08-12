@@ -1668,6 +1668,27 @@ pub(crate) mod witgen_simd {
         assert!(8 * ELIDE_B_PREFIX_CHUNKS <= 36);
     };
 
+    /// Stage-write liveness bounds (C2). The per-role stage-write elision skips
+    /// exactly the words `dump_range` does not drain and keeps every drained
+    /// word live; these mirror the dump geometry above. The exhaustive
+    /// `Drained ⊆ Written` proof (8 masks × 3 roles × 512 words) lives in the
+    /// Z3 obligation and the `stage_liveness_poison_oracle_all_masks` oracle.
+    const _STAGE_LIVENESS_BOUNDS: () = {
+        // z/a stage writes are the contiguous run [0, z_zero_end); on a hit
+        // z_zero_end = 8·ELIDE_ZERO_CHUNK is the dump's drained tail end, and it
+        // stays at or past the zero fill's first word so chunk 60 is written.
+        assert!(8 * ELIDE_ZERO_CHUNK <= U32_PER_BLOCK);
+        assert!(8 * ELIDE_ZERO_CHUNK >= USEFUL_BITS.div_ceil(32));
+        // b keeps the prefix run [8·ELIDE_B_PREFIX_CHUNKS, 36); word 36 is
+        // W32's first store, so the loop must still reach 36.
+        assert!(8 * ELIDE_B_PREFIX_CHUNKS <= 36);
+        // b's drained tail end (8·ELIDE_B_TAIL_CHUNK) is at or below the zero
+        // fill's first word (USEFUL_BITS.div_ceil(32)), so a b hit's zero loop
+        // `ZF..(8·ELIDE_B_TAIL_CHUNK)` is empty and the only over-write is the
+        // W32 out_hi tail [8·ELIDE_B_TAIL_CHUNK, ZF) (proved residual).
+        assert!(8 * ELIDE_B_TAIL_CHUNK <= USEFUL_BITS.div_ceil(32));
+    };
+
     /// Provenance-tag layout version: bump on ANY change to the witness
     /// block layout or to the elision geometry above.
     const WITGEN_SCRATCH_LAYOUT_V: u64 = 2;
@@ -1693,6 +1714,21 @@ pub(crate) mod witgen_simd {
     /// toggle it.
     fn const_elide_killed() -> bool {
         std::env::var("FLOCK_NO_SCRATCH_CONST_ELIDE").is_ok_and(|v| v == "1")
+    }
+
+    /// Exact-`1` kill switch for the stage-write liveness elision (C2). With a
+    /// per-role item-B token hit, the stage words whose sole reader — a
+    /// half-open [`dump_range`] — is elided are never drained, so writing them
+    /// is dead. This skips those writes. `FLOCK_NO_STAGE_LIVENESS=1` restores
+    /// the full stage write for every role (the dump elision is independent and
+    /// keeps its own switch). Cached once per process; a same-binary A/B toggles
+    /// it as two processes, like the store-flavor switches above.
+    fn stage_liveness_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_STAGE_LIVENESS").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+        })
     }
 
     /// Bitmask of token hits (bit0 z, bit1 a, bit2 b) of the most recent
@@ -2242,6 +2278,30 @@ pub(crate) mod witgen_simd {
             let ast = ast.as_mut_ptr().cast::<V4>();
             let bs = bs.as_mut_ptr().cast::<V4>();
 
+            // ---- C2 stage-write liveness ----
+            // When role r's dump range elides its token-verified constant
+            // chunks (item B), the stage words those chunks would drain are
+            // never read — the stage's only reader is `dump_range`. Skip
+            // writing them. `Drained ⊆ Written` is proven for all 8 masks × 3
+            // roles × 512 words (`_STAGE_LIVENESS_BOUNDS` plus the
+            // `stage_liveness_poison_oracle_all_masks` bit-identity oracle).
+            // Gated by FLOCK_NO_STAGE_LIVENESS; the dump elision below is
+            // unchanged and keeps its own switch.
+            //
+            // SAFETY of the write-skip: a staged word may be read by the
+            // drain (dump_range, which skips exactly `elide[r]`) AND by the
+            // z->a message copy that reloads zs[16,36). `stage_elide` is
+            // `elide` masked by one global bool, so it is never more
+            // aggressive than the drain skip, and it never touches [16,36)
+            // (that region is written unconditionally at the msg copy below).
+            // Any future widening of this elision MUST re-check both readers,
+            // not just the drain.
+            let stage_elide = if stage_liveness_enabled() {
+                elide
+            } else {
+                [false; 3]
+            };
+
             // ---- prefix (bits 0..1153), straight into the stages ----
             // cv slot, words 0..8: z=a=cv, b=MAX.
             for w in 0..8usize {
@@ -2251,7 +2311,16 @@ pub(crate) mod witgen_simd {
             let maxv = vdupq_n_u32(u32::MAX);
             // b prefix words 0..36 = MAX (the out_lo slot is MAX too — the
             // scalar writes MAX over MAX, so b needs no out_lo pass).
-            for w in 0..36usize {
+            // Stage-liveness: on a b token hit the dump drains b from chunk
+            // ELIDE_B_PREFIX_CHUNKS (word 8·4 = 32), so words 0..32 are dead.
+            // Words 32..35 stay live — chunk 4 also carries W32's first store
+            // (word 36) — so the loop still runs through word 35.
+            let b_prefix_start = if stage_elide[2] {
+                8 * ELIDE_B_PREFIX_CHUNKS
+            } else {
+                0
+            };
+            for w in b_prefix_start..36usize {
                 vst1q_u32(bs.add(w) as *mut u32, maxv);
             }
             // Message region words 16..36: word16 = 1|m0<<1, then
@@ -2379,10 +2448,33 @@ pub(crate) mod witgen_simd {
             const {
                 assert!(U32_PER_BLOCK - ZF == 30);
             }
-            for w in 0..30usize {
-                vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
+            // Stage-liveness: the zero tail is drained only up to each role's
+            // dump boundary. z/a keep words 482..488 (chunk 60 is always
+            // drained); a b hit drains only through word 8·59 = 472 (< ZF) so
+            // its zero fill is entirely dead and the `ZF..472` loop is empty.
+            let z_zero_end = if stage_elide[0] {
+                8 * ELIDE_ZERO_CHUNK
+            } else {
+                U32_PER_BLOCK
+            };
+            let a_zero_end = if stage_elide[1] {
+                8 * ELIDE_ZERO_CHUNK
+            } else {
+                U32_PER_BLOCK
+            };
+            let b_zero_end = if stage_elide[2] {
+                8 * ELIDE_B_TAIL_CHUNK
+            } else {
+                U32_PER_BLOCK
+            };
+            for w in ZF..z_zero_end {
+                vst1q_u32(zs.add(w) as *mut u32, zero);
+            }
+            for w in ZF..a_zero_end {
+                vst1q_u32(ast.add(w) as *mut u32, zero);
+            }
+            for w in ZF..b_zero_end {
+                vst1q_u32(bs.add(w) as *mut u32, zero);
             }
 
             // ---- out_lo slot, words 8..16 (z/a only) ----
@@ -4692,6 +4784,104 @@ mod tests {
             assert_eq!(zs, za, "seeded z diverged init={init:#x} first={first}");
             assert_eq!(as_, aa, "seeded a diverged init={init:#x} first={first}");
             assert_eq!(bs, ba, "seeded b diverged init={init:#x} first={first}");
+        }
+    }
+
+    /// C2 stage-write liveness poison oracle. For every token mask (z,a,b) and
+    /// every drain store mode, the stage-liveness elision (skipping stage words
+    /// the dump never drains) must reproduce the full scalar construction
+    /// byte-for-byte, given the dump-skipped dst regions pre-hold the recycled
+    /// constants. Every other dst byte is poisoned (0xA5), so any drained word
+    /// served from an un-written stage slot diverges from the scalar reference.
+    /// The interval safety (`Drained ⊆ Written`) is proved exhaustively by the
+    /// Z3 obligation and `_STAGE_LIVENESS_BOUNDS`; this pins the running build.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn stage_liveness_poison_oracle_all_masks() {
+        use super::witgen_simd;
+        const WORDS: usize = K / 64; // u64 words per block
+        const BLOCK_BYTES: usize = K / 8; // 2048
+        let mut rng = Rng::new(0x57A9_E11C_0DE0_1234);
+        let mk = |rng: &mut Rng| -> Compression {
+            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let counter = ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64;
+            (cv, m, counter, rng.next_u32(), rng.next_u32())
+        };
+        // Pre-hold a dst's dump-skipped constant regions for an elided role,
+        // mirroring the item-B recycled-scratch layout exactly.
+        let seed = |dst: &mut [u64; 4 * WORDS], role_b: bool| {
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    dst.as_mut_ptr().cast::<u8>(),
+                    core::mem::size_of_val(dst),
+                )
+            };
+            for blk in 0..4 {
+                let base = blk * BLOCK_BYTES;
+                bytes[base + 1952..base + BLOCK_BYTES].fill(0x00);
+                if role_b {
+                    bytes[base..base + 128].fill(0xFF);
+                    bytes[base + 1888..base + 1926].fill(0xFF);
+                    bytes[base + 1926] = 0x01;
+                    bytes[base + 1927..base + BLOCK_BYTES].fill(0x00);
+                }
+            }
+        };
+        for (z_nt, ab_nt) in [(false, false), (false, true), (true, false), (true, true)] {
+            for mask in 0u8..8 {
+                let elide = [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0];
+                for _ in 0..4 {
+                    let inputs: [Compression; 4] = std::array::from_fn(|_| mk(&mut rng));
+                    // Full scalar reference, assembled per block.
+                    let mut zr = [0u64; 4 * WORDS];
+                    let mut ar = [0u64; 4 * WORDS];
+                    let mut br = [0u64; 4 * WORDS];
+                    for (j, inp) in inputs.iter().enumerate() {
+                        let (cv, m, t, bl, fl) = inp;
+                        build_block_witness_ab_stream_into(
+                            cv,
+                            m,
+                            *t,
+                            *bl,
+                            *fl,
+                            &mut zr[j * WORDS..(j + 1) * WORDS],
+                            &mut ar[j * WORDS..(j + 1) * WORDS],
+                            &mut br[j * WORDS..(j + 1) * WORDS],
+                        );
+                    }
+                    // Poison every byte, then pre-hold constants only where the
+                    // dump elides for this mask.
+                    let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
+                    let mut ae = ze;
+                    let mut be = ze;
+                    if elide[0] {
+                        seed(&mut ze, false);
+                    }
+                    if elide[1] {
+                        seed(&mut ae, false);
+                    }
+                    if elide[2] {
+                        seed(&mut be, true);
+                    }
+                    unsafe {
+                        witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                            witgen_simd::QuadInput::Blocks([
+                                &inputs[0], &inputs[1], &inputs[2], &inputs[3],
+                            ]),
+                            ze.as_mut_ptr() as *mut u32,
+                            ae.as_mut_ptr() as *mut u32,
+                            be.as_mut_ptr() as *mut u32,
+                            z_nt,
+                            ab_nt,
+                            elide,
+                        );
+                    }
+                    assert_eq!(ze, zr, "z mask={mask:03b} z_nt={z_nt} ab_nt={ab_nt}");
+                    assert_eq!(ae, ar, "a mask={mask:03b} z_nt={z_nt} ab_nt={ab_nt}");
+                    assert_eq!(be, br, "b mask={mask:03b} z_nt={z_nt} ab_nt={ab_nt}");
+                }
+            }
         }
     }
 

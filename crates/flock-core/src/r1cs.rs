@@ -839,6 +839,56 @@ mod tests {
         }
     }
 
+    /// Point-equality obligation behind the pre-collapsed `s_hat_v` reuse.
+    ///
+    /// The zerocheck's round-1 C producer collapses its wider statistic under
+    /// `inner_tail[..6] = r[k_skip+1 .. k_skip+7]`; ring-switch collapses the
+    /// same tensor under the C claim's own `suffix[..6]`. Reusing one for the
+    /// other is only sound because those points coincide — and they do in
+    /// BOTH witness layouts, because `x_inner_rest ‖ x_outer` (the PCS
+    /// `x_outer_full`, assembled by `prover::quirky_x_outer_full`) is exactly
+    /// `r_rest = r[k_skip..m]`, so the suffix that drops its first coordinate
+    /// is `r[k_skip+1..m]`.
+    #[test]
+    fn c_claim_point_suffix_head_is_the_c_collapse_point() {
+        const K_SKIP: usize = 6;
+        const K_LOG: usize = 14;
+        const M: usize = 18;
+
+        let r: Vec<crate::field::F128> = (0..M)
+            .map(|i| {
+                crate::field::F128::new(
+                    0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1),
+                    i as u64 + 7,
+                )
+            })
+            .collect();
+        let r_rest = &r[K_SKIP..];
+        let z_skip = r[0];
+
+        for layout in [WitnessLayout::RowMajor, WitnessLayout::BatchMajor] {
+            let mut r1cs = test_r1cs(identity(8), identity(8), identity(8));
+            r1cs.m = M;
+            r1cs.k_log = K_LOG;
+            r1cs.k_skip = K_SKIP;
+            r1cs.useful_bits = 1 << K_LOG;
+            r1cs.layout = layout;
+
+            let point = r1cs.c_claim_point(z_skip, r_rest);
+            // `quirky_x_outer_full`'s concatenation, in the PCS's order.
+            let mut x_outer_full = point.x_inner_rest.clone();
+            x_outer_full.extend_from_slice(&point.x_outer);
+            assert_eq!(x_outer_full, r_rest, "{layout:?}: x_outer_full != r_rest");
+
+            let suffix = &x_outer_full[1..];
+            assert_eq!(
+                &suffix[..6],
+                &r[K_SKIP + 1..K_SKIP + 7],
+                "{layout:?}: claim suffix head != the C collapse point",
+            );
+        }
+    }
+
     #[test]
     fn c0_identity_cold_scan_tracks_mutation() {
         let mut r1cs = test_r1cs(identity(8), identity(8), identity(8));

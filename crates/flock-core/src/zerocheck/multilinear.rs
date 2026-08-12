@@ -228,6 +228,102 @@ fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     (pairs_per_block - 1, useful_pairs)
 }
 
+/// Record the round-two pad geometry on the compact state, or `None` when the
+/// producing sweep applied no periodic pad skip at all.
+#[inline]
+fn pad_skip_record(
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> Option<(usize, usize)> {
+    if pair_in_block_mask == 0 || useful_pairs_inclusive == usize::MAX {
+        None
+    } else {
+        Some((pair_in_block_mask, useful_pairs_inclusive))
+    }
+}
+
+/// Kill switch for the K-pass dead-group skip: `FLOCK_NO_KPASS_DEAD_GROUP_SKIP=1`
+/// (exactly `"1"`) restores the unpredicated kernel byte-for-byte by refusing to
+/// derive any dead period. Bit-identical either way — the skipped groups feed
+/// zero anchors and zero deltas, so their outputs are zero and every wide
+/// accumulator they enter receives zero (see [`kpass_dead_groups`]).
+fn kpass_dead_group_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        kpass_dead_group_skip_env(std::env::var_os("FLOCK_NO_KPASS_DEAD_GROUP_SKIP").as_deref())
+    })
+}
+
+/// Pure form of the [`kpass_dead_group_skip_enabled`] environment read, so the
+/// exact-`"1"` contract is testable without a `OnceLock` round trip.
+#[inline]
+fn kpass_dead_group_skip_env(raw: Option<&std::ffi::OsStr>) -> bool {
+    !raw.is_some_and(|v| v == std::ffi::OsStr::new("1"))
+}
+
+/// Dead-group period for the K pass, derived from the round-two pad geometry.
+///
+/// The K pass visits round-two **groups**: group `g` consumes pairs `2g` and
+/// `2g+1` (`anchors.add(4*g)` spans `[a0,b0]` of pair `2g` and `[a0,b0]` of pair
+/// `2g+1`, `deltas.add(32*g)` their two 16-byte delta records). Group `g` is
+/// therefore all-zero exactly when both of those pairs are padding.
+///
+/// With [`round2_pair_skip`] reporting `(P-1, U)`, pair `p` is padding iff
+/// `p mod P >= U`. Writing `m = g mod (P/2)` gives `2g mod P = 2m`, so
+/// `2g` is padding iff `2m >= U` iff `m >= ceil(U/2)`, and `2g+1` is padding iff
+/// `2m+1 >= U` iff `m >= ceil((U-1)/2)`. The first bound dominates, so
+///
+/// > group `g` is all-zero ⟺ `g mod (P/2) >= ceil(U/2)`.
+///
+/// At the ranked shape (`k_log = 14`, `k_skip = 6`, `useful_bits = 15409`)
+/// `round2_pair_skip` reports `(127, 121)`, giving `P/2 = 64` groups per block
+/// and `ceil(121/2) = 61` live ones — exactly three dead groups in every 64.
+///
+/// Returns `(groups_per_block, first_dead_group)`, or `None` when no periodic
+/// all-zero group tail exists. `P >= 8` keeps `groups_per_block >= 4`, the
+/// cascade K pass's iteration width.
+fn kpass_dead_groups(pad_skip: Option<(usize, usize)>) -> Option<(usize, usize)> {
+    let (mask, useful) = pad_skip?;
+    let pairs_per_block = mask.checked_add(1)?;
+    if !pairs_per_block.is_power_of_two() || pairs_per_block < 8 {
+        return None;
+    }
+    if useful >= pairs_per_block {
+        return None;
+    }
+    let groups_per_block = pairs_per_block / 2;
+    let first_dead = useful.div_ceil(2);
+    if first_dead >= groups_per_block {
+        return None;
+    }
+    Some((groups_per_block, first_dead))
+}
+
+/// Chunk-local form of [`kpass_dead_groups`] for one K-pass driver.
+///
+/// `lane_groups` is the number of groups the kernel visits per iteration (two
+/// for the round-four K pass, four for the cascade); it must divide the block so
+/// the dead suffix lands in whole iterations. `out_chunk` must be a multiple of
+/// the block so that every chunk's global group base `x_hi * out_chunk` is
+/// block-aligned and the predicate is chunk-local. `(0, 0)` = skip disabled.
+fn kpass_dead_period(
+    pad_skip: Option<(usize, usize)>,
+    out_chunk: usize,
+    lane_groups: usize,
+) -> (usize, usize) {
+    if !kpass_dead_group_skip_enabled() {
+        return (0, 0);
+    }
+    let Some((groups_per_block, first_dead)) = kpass_dead_groups(pad_skip) else {
+        return (0, 0);
+    };
+    if !groups_per_block.is_multiple_of(lane_groups) || !out_chunk.is_multiple_of(groups_per_block)
+    {
+        return (0, 0);
+    }
+    (groups_per_block, first_dead)
+}
+
 /// Kill switch for draining the DRAM-bound tail loop rounds (half ≥ 2^21)
 /// through the hetero E-core queue (H2). `FLOCK_NO_ZC_TAIL_HETERO=1` keeps
 /// them on the main rayon pool. Bit-identical either way — chunk ownership
@@ -818,6 +914,12 @@ pub struct UniSkipCompactFold {
     pub anchors: Vec<F128>,
     /// Interleaved `[a_delta; 8], [b_delta; 8]`, sixteen bytes per row pair.
     pub deltas: ScratchBytes,
+    /// The round-two pad geometry `(pair_in_block_mask, useful_pairs_inclusive)`
+    /// that [`round2_pair_skip`] reported for the sweep which produced this
+    /// state. The K pass derives its dead-group predicate from this field and
+    /// nothing else, so a state built at any other shape — or by a producer
+    /// that leaves this `None` — auto-disables the skip.
+    pub pad_skip: Option<(usize, usize)>,
 }
 
 impl UniSkipCompactFold {
@@ -833,7 +935,11 @@ impl UniSkipCompactFold {
 
     /// Return both large buffers to their process-wide scratch pools.
     pub fn recycle(self) {
-        let Self { anchors, deltas } = self;
+        let Self {
+            anchors,
+            deltas,
+            pad_skip: _,
+        } = self;
         crate::scratch::give_f128(anchors);
         deltas.recycle();
     }
@@ -897,9 +1003,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         deltas_len,
         "donated compact delta backing has the wrong byte length"
     );
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
     let mut compact = UniSkipCompactFold {
         anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
+        pad_skip: pad_skip_record(pair_in_block_mask, useful_pairs_inclusive),
     };
 
     let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -910,7 +1018,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     let eq_lo = &eq.lo;
     let anchor_chunk_size = 2 * lo_size;
     let delta_chunk_size = 2 * lo_size * n_chunks;
-    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
 
@@ -1160,9 +1267,11 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
         assert_eq!(b_packed.len(), n_out * n_chunks);
         assert_eq!(mlv_challenges.len(), m - k_skip);
 
+        let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
         let mut compact = UniSkipCompactFold {
             anchors: crate::scratch::take_f128(2 * n_pairs),
             deltas: ScratchBytes::take(2 * n_pairs * n_chunks),
+            pad_skip: pad_skip_record(pair_in_block_mask, useful_pairs_inclusive),
         };
 
         let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -1173,7 +1282,6 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
         let eq_lo = &eq.lo;
         let anchor_chunk_size = 2 * lo_size;
         let delta_chunk_size = 2 * lo_size * n_chunks;
-        let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
 
         let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
         let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
@@ -1695,9 +1803,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         deltas_len,
         "donated compact delta backing has the wrong byte length"
     );
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
     let mut compact = UniSkipCompactFold {
         anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
+        pad_skip: pad_skip_record(pair_in_block_mask, useful_pairs_inclusive),
     };
 
     let n_vars = mlv_challenges.len() - 1;
@@ -1714,7 +1824,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let eq_lo = &eq.lo;
     let anchor_chunk_size = 2 * lo_size;
     let delta_chunk_size = 2 * lo_size * n_chunks;
-    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
     #[cfg(target_arch = "aarch64")]
@@ -2107,6 +2216,11 @@ pub(crate) fn fold2_compact_and_round4_into(
     let out_chunk = 2 * lo_size;
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    // Value-derived: the dead-group period comes from the round-two pad
+    // geometry this compact state was built with, so any other shape (or the
+    // kill switch) leaves the kernel unpredicated. The kernel visits two groups
+    // per iteration.
+    let (dead_period, first_dead) = kpass_dead_period(compact.pad_skip, out_chunk, 2);
 
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
@@ -2137,6 +2251,8 @@ pub(crate) fn fold2_compact_and_round4_into(
                 eq_lo.as_ptr(),
                 lo_size,
                 degen,
+                dead_period,
+                first_dead,
             )
         };
 
@@ -2148,6 +2264,13 @@ pub(crate) fn fold2_compact_and_round4_into(
             let mut pinf_acc = F256Unreduced::ZERO;
             let nc = table.n_chunks;
             for g_local in 0..out_chunk {
+                // Structurally zero group: its anchors and deltas are all zero,
+                // so the composed output is zero without reading either.
+                if dead_period != 0 && g_local % dead_period >= first_dead {
+                    a_out[g_local] = F128::ZERO;
+                    b_out[g_local] = F128::ZERO;
+                    continue;
+                }
                 let g = x_hi * out_chunk + g_local;
                 let anc = &compact.anchors[4 * g..4 * g + 4];
                 let d = &compact.deltas[32 * g..32 * g + 32];
@@ -2284,6 +2407,9 @@ pub(crate) fn fold2_compact_and_round45_into(
     let out_chunk = 2 * lo_size;
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    // Value-derived dead-group period; the cascade kernel visits four groups
+    // (one round-five group) per iteration. See `kpass_dead_period`.
+    let (dead_period, first_dead) = kpass_dead_period(compact.pad_skip, out_chunk, 4);
 
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     // [p1_odd, pinf_odd, W0', W3', W4', W5'], eq_hi-weighted, one per chunk.
@@ -2319,6 +2445,8 @@ pub(crate) fn fold2_compact_and_round45_into(
                 lo_size,
                 degen,
                 outv.as_mut_ptr(),
+                dead_period,
+                first_dead,
             );
         }
 
@@ -2327,7 +2455,18 @@ pub(crate) fn fold2_compact_and_round45_into(
             let a_out = unsafe { std::slice::from_raw_parts_mut(a_ptr, out_chunk) };
             let b_out = unsafe { std::slice::from_raw_parts_mut(b_ptr, out_chunk) };
             outv = fold2_round45_chunk_scalar(
-                compact, table, &table_l1, &table_l3, rho2, a_out, b_out, eq_lo, lo_size, x_hi,
+                compact,
+                table,
+                &table_l1,
+                &table_l3,
+                rho2,
+                a_out,
+                b_out,
+                eq_lo,
+                lo_size,
+                x_hi,
+                dead_period,
+                first_dead,
             );
         }
 
@@ -2393,6 +2532,8 @@ fn fold2_round45_chunk_scalar(
     eq_lo: &[F128],
     lo_size: usize,
     x_hi: usize,
+    dead_period: usize,
+    first_dead: usize,
 ) -> [F128; 8] {
     let nc = table.n_chunks;
     let out_chunk = a_out.len();
@@ -2405,6 +2546,13 @@ fn fold2_round45_chunk_scalar(
     // Materialize the chunk's composed outputs first (identical expressions
     // to the incumbent scalar path)…
     for g_local in 0..out_chunk {
+        // Structurally zero group: its anchors and deltas are all zero, so the
+        // composed output is zero without reading either.
+        if dead_period != 0 && g_local % dead_period >= first_dead {
+            a_out[g_local] = F128::ZERO;
+            b_out[g_local] = F128::ZERO;
+            continue;
+        }
         let g = x_hi * out_chunk + g_local;
         let anc = &compact.anchors[4 * g..4 * g + 4];
         let d = &compact.deltas[32 * g..32 * g + 32];
@@ -3776,6 +3924,395 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The round-two dead-group geometry, derived from the R1CS padding.
+    ///
+    /// The ranked BLAKE3 block is `2^14` bits of which 15,409 are useful, so
+    /// at `k_skip = 6` only `ceil(15409 / 128) = 121` of every 128 chunk
+    /// pairs carry data — `round2_pair_skip` must report `(127, 121)`, the
+    /// exact pair the NEON lookahead kernel's `ranked_periodic` schedule
+    /// engages on. This pins the constant so a padding change disengages the
+    /// schedule instead of mis-engaging it.
+    ///
+    /// It also checks the schedule itself against the generic per-group
+    /// predicate: over a 128-pair block the periodic form claims 60 fully
+    /// useful groups, one boundary group `(pad0, pad1) = (false, true)`, and
+    /// three fully padded groups — and that partition must be exactly the one
+    /// `((pair_idx_base + x_lo) & mask) >= useful` induces, at every group of
+    /// every window, for a 128-aligned base. A misaligned base must NOT
+    /// reproduce it, which is why the kernel guards on `pair_idx_base & 127`.
+    #[test]
+    fn round2_pair_skip_ranked_geometry_matches_periodic_block_schedule() {
+        const K_SKIP: usize = 6;
+        let ranked = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        assert_eq!(round2_pair_skip(&ranked, K_SKIP), (127, 121));
+
+        // Shapes with nothing to skip must report the no-skip sentinel.
+        for spec in [
+            PaddingSpec {
+                k_log: 14,
+                useful_bits_per_block: 1 << 14,
+            },
+            PaddingSpec::dense(32),
+            PaddingSpec {
+                k_log: K_SKIP + 1,
+                useful_bits_per_block: 100,
+            },
+        ] {
+            assert_eq!(round2_pair_skip(&spec, K_SKIP), (0, usize::MAX));
+        }
+
+        let (mask, useful) = round2_pair_skip(&ranked, K_SKIP);
+        // Two full 64-group windows, 128-aligned as the kernel requires.
+        let n_groups = 128usize;
+        for base in [0usize, 128, 2048] {
+            assert_eq!(base & 127, 0);
+            for u in 0..n_groups {
+                let pad0 = ((base + 2 * u) & mask) >= useful;
+                let pad1 = ((base + 2 * u + 1) & mask) >= useful;
+                let local = u % 64;
+                let want = if local < 60 {
+                    (false, false)
+                } else if local == 60 {
+                    (false, true)
+                } else {
+                    (true, true)
+                };
+                assert_eq!(
+                    (pad0, pad1),
+                    want,
+                    "block schedule diverges at base={base} group={u}"
+                );
+            }
+        }
+
+        // The alignment guard is load-bearing: at a base that is not a
+        // multiple of 128 the periodic partition is wrong for some group.
+        let base = 2usize; // one pair into the block
+        assert!((0..64).any(|u| {
+            let pad0 = ((base + 2 * u) & mask) >= useful;
+            let pad1 = ((base + 2 * u + 1) & mask) >= useful;
+            let local = u % 64;
+            let want = if local < 60 {
+                (false, false)
+            } else if local == 60 {
+                (false, true)
+            } else {
+                (true, true)
+            };
+            (pad0, pad1) != want
+        }));
+    }
+
+    // ----------------------------------------------------------------------
+    // Z1 — the K-pass dead-group skip.
+    // ----------------------------------------------------------------------
+
+    /// Z1-P1 — the dead-group derivation, exhaustively over `k_log ∈ [13, 18]`.
+    ///
+    /// For every `useful_bits` that can produce a given `useful_pairs` class
+    /// (both endpoints of the class, so every rounding boundary is hit) this
+    /// checks, against brute force over several 128-aligned windows:
+    ///
+    /// 1. `round2_pair_skip` reports `ceil(useful_bits / (2·2^k_skip))`;
+    /// 2. the dead-pair set is exactly `[useful_pairs, pairs_per_block)`;
+    /// 3. the pair→group map `p ↦ floor(p/2)` preserves block alignment — a
+    ///    block of `P` pairs is exactly `P/2` groups, with no group straddling;
+    /// 4. `kpass_dead_groups` characterizes the all-zero groups *exactly*
+    ///    (no false positives, which would delete live data, and no false
+    ///    negatives, which would only cost time).
+    #[test]
+    fn kpass_dead_group_predicate_matches_brute_force() {
+        const K_SKIP: usize = 6;
+        for k_log in 13usize..=18 {
+            let block = 1usize << k_log;
+            let pairs_per_block = 1usize << (k_log - K_SKIP - 1);
+            let per_pair_bits = 2 * (1usize << K_SKIP);
+            assert_eq!(pairs_per_block * per_pair_bits, block);
+            for p in 1..=pairs_per_block {
+                for useful_bits in [per_pair_bits * (p - 1) + 1, per_pair_bits * p] {
+                    let spec = PaddingSpec {
+                        k_log,
+                        useful_bits_per_block: useful_bits,
+                    };
+                    let got = round2_pair_skip(&spec, K_SKIP);
+                    if p >= pairs_per_block {
+                        assert_eq!(got, (0, usize::MAX), "k_log={k_log} useful={useful_bits}");
+                        assert_eq!(
+                            kpass_dead_groups(pad_skip_record(got.0, got.1)),
+                            None,
+                            "a fully useful block has no dead group"
+                        );
+                        continue;
+                    }
+                    let (mask, useful_pairs) = got;
+                    assert_eq!(
+                        (mask, useful_pairs),
+                        (pairs_per_block - 1, p),
+                        "k_log={k_log} useful={useful_bits}"
+                    );
+
+                    // (2) dead pairs are exactly [useful_pairs, P).
+                    for q in 0..pairs_per_block {
+                        assert_eq!(
+                            (q & mask) >= useful_pairs,
+                            q >= p,
+                            "dead-pair set k_log={k_log} p={p} q={q}"
+                        );
+                    }
+
+                    // (3)+(4) the group predicate, brute-forced over four
+                    // aligned windows. `p ↦ floor(p/2)` never straddles a block
+                    // boundary, so the group predicate is periodic in `P/2`.
+                    let want_gpb = pairs_per_block / 2;
+                    let brute: Vec<bool> = (0..4 * want_gpb)
+                        .map(|g| {
+                            assert_eq!(
+                                (2 * g) / pairs_per_block,
+                                (2 * g + 1) / pairs_per_block,
+                                "group {g} straddles a block"
+                            );
+                            ((2 * g) & mask) >= useful_pairs && ((2 * g + 1) & mask) >= useful_pairs
+                        })
+                        .collect();
+                    match kpass_dead_groups(pad_skip_record(mask, useful_pairs)) {
+                        Some((gpb, first_dead)) => {
+                            assert_eq!(gpb, want_gpb, "groups per block");
+                            assert!(brute.iter().any(|&d| d), "claimed a dead group with none");
+                            for (g, &dead) in brute.iter().enumerate() {
+                                assert_eq!(
+                                    dead,
+                                    g % gpb >= first_dead,
+                                    "group predicate k_log={k_log} p={p} g={g}"
+                                );
+                            }
+                        }
+                        // Refusing is only allowed when nothing is provably
+                        // dead — a missed skip costs time, never correctness.
+                        None => assert!(
+                            !brute.iter().any(|&d| d),
+                            "missed a dead group at k_log={k_log} p={p}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Z1-P1b — the ranked shape's constants, pinned.
+    #[test]
+    fn kpass_ranked_geometry_is_three_dead_groups_in_sixty_four() {
+        const K_SKIP: usize = 6;
+        let ranked = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let (mask, useful) = round2_pair_skip(&ranked, K_SKIP);
+        assert_eq!((mask, useful), (127, 121));
+        let record = pad_skip_record(mask, useful);
+        assert_eq!(kpass_dead_groups(record), Some((64, 61)));
+        assert_eq!((0..64).filter(|g| *g % 64 >= 61).count(), 3);
+
+        // The ranked K-pass chunk is 128 whole blocks, so the predicate is
+        // chunk-local for both kernel widths.
+        for lane_groups in [2usize, 4] {
+            assert_eq!(kpass_dead_period(record, 8192, lane_groups), (64, 61));
+        }
+    }
+
+    /// Z1-P4 — the value-derived gate. Anything that is not a block-aligned,
+    /// lane-aligned periodic pad geometry must disable the skip outright.
+    #[test]
+    fn kpass_dead_period_gate_auto_disables_off_shape() {
+        let ranked = Some((127usize, 121usize));
+        // No recorded geometry, and the no-skip sentinel, both disable.
+        assert_eq!(kpass_dead_period(None, 8192, 4), (0, 0));
+        assert_eq!(pad_skip_record(0, usize::MAX), None);
+        // Chunk not a whole number of blocks: the chunk-local residue would be
+        // wrong, so refuse.
+        assert_eq!(kpass_dead_period(ranked, 8192 + 16, 4), (0, 0));
+        assert_eq!(kpass_dead_period(ranked, 32, 4), (0, 0));
+        // Smaller but still admissible geometries stay enabled…
+        assert_eq!(kpass_dead_period(Some((15, 13)), 8192, 4), (8, 7));
+        assert_eq!(kpass_dead_period(Some((7, 5)), 8192, 4), (4, 3));
+        // …until the kernel's iteration width no longer divides the block.
+        assert_eq!(kpass_dead_period(Some((7, 5)), 8192, 8), (0, 0));
+        // Blocks below the four-group cascade width are refused outright.
+        assert_eq!(kpass_dead_groups(Some((3, 1))), None);
+        // Degenerate geometries.
+        assert_eq!(kpass_dead_groups(Some((127, 128))), None);
+        // `mask + 1` must be a power of two — the pad period is a block size.
+        assert_eq!(kpass_dead_groups(Some((126, 121))), None);
+        // `ceil(127/2) = 64` is the whole block: nothing is provably dead.
+        assert_eq!(kpass_dead_groups(Some((127, 127))), None);
+    }
+
+    /// Z1 kill switch — `FLOCK_NO_KPASS_DEAD_GROUP_SKIP` is exact-`"1"`.
+    #[test]
+    fn kpass_kill_switch_reads_exact_one() {
+        use std::ffi::OsStr;
+        assert!(!kpass_dead_group_skip_env(Some(OsStr::new("1"))));
+        assert!(kpass_dead_group_skip_env(None));
+        for other in ["", "0", "11", " 1", "1 ", "true", "yes"] {
+            assert!(
+                kpass_dead_group_skip_env(Some(OsStr::new(other))),
+                "{other:?} must not trip the kill switch"
+            );
+        }
+    }
+
+    /// Synthetic compact round-two state whose padding groups follow the
+    /// `(mask, useful)` pad geometry. `dead_poison` fills the provably-zero
+    /// groups with garbage instead of zeros; `record` decides whether the state
+    /// advertises its geometry (a `None` record is exactly what the kill switch
+    /// produces, since `kpass_dead_period` then returns `(0, 0)`).
+    fn synth_compact(
+        n_groups: usize,
+        mask: usize,
+        useful: usize,
+        record: bool,
+        dead_poison: bool,
+        seed: u64,
+    ) -> UniSkipCompactFold {
+        let groups_per_block = (mask + 1) / 2;
+        let first_dead = useful.div_ceil(2);
+        let mut rng = Rng::new(seed);
+        let n_pairs = 2 * n_groups;
+        let mut anchors = vec![F128::ZERO; 2 * n_pairs];
+        let mut deltas = ScratchBytes::take(2 * n_pairs * 8);
+        for g in 0..n_groups {
+            let dead = g % groups_per_block >= first_dead;
+            for i in 0..4 {
+                anchors[4 * g + i] = if !dead {
+                    rng.f128()
+                } else if dead_poison {
+                    LA_POISON
+                } else {
+                    F128::ZERO
+                };
+            }
+            for j in 0..32 {
+                let byte = if !dead {
+                    (rng.next_u64() & 0xff) as u8
+                } else if dead_poison {
+                    0xA5
+                } else {
+                    0
+                };
+                deltas[32 * g + j] = byte;
+            }
+        }
+        UniSkipCompactFold {
+            anchors,
+            deltas,
+            pad_skip: if record { Some((mask, useful)) } else { None },
+        }
+    }
+
+    /// Z1-P2/P3 — the zero-propagation lemma and the poison oracle, driven
+    /// through the real K-pass entry points (so this exercises the NEON kernels
+    /// on the target and the scalar reference on x86).
+    ///
+    /// Four arms over the same live data:
+    ///
+    /// * **ref** — honest zero padding, skip disabled (`pad_skip = None`, the
+    ///   exact state the kill switch produces). This is the oracle.
+    /// * **lemma** — honest zero padding, skip enabled. Zero anchors and zero
+    ///   deltas give `av = bv = 0`, so all eight wide accumulators receive zero
+    ///   and the outputs are zero: must be byte-identical to **ref**.
+    /// * **poison** — garbage in every dead anchor and delta byte, skip
+    ///   enabled. The skip must never read them: must be byte-identical to
+    ///   **ref**, including the zeros stored for the dead outputs.
+    /// * **teeth** — the same garbage with the skip disabled. Must *differ*,
+    ///   which is what proves the poison is observable at all.
+    #[test]
+    fn kpass_dead_group_skip_poison_oracle() {
+        // `(log2(n_groups), mask, useful)`: the first is a small geometry whose
+        // boundary quad has the same (live, dead, dead, dead) shape as the
+        // ranked one; the second is the ranked geometry itself, at the smallest
+        // group count whose K chunk is a whole number of 64-group blocks.
+        for &(log_groups, mask, useful) in &[(15usize, 31usize, 25usize), (17, 127, 121)] {
+            let n_groups = 1usize << log_groups;
+            let z = Rng::new(0x5EED_0201u64.wrapping_add(log_groups as u64)).f128();
+            let table = UniSkipFoldTable::new(6, z);
+            let mut rng = Rng::new(0xF10C_0001 ^ log_groups as u64);
+            let rho1 = rng.f128();
+            let rho2 = rng.f128();
+            let mut r_next4 = vec![F128::ONE; log_groups];
+            for slot in r_next4[1..].iter_mut() {
+                *slot = rng.f128();
+            }
+            assert_ne!(r_next4[1], F128::ZERO);
+
+            let arms = [
+                ("ref", false, false),
+                ("lemma", true, false),
+                ("poison", true, true),
+                ("teeth", false, true),
+            ];
+            let mut cascade: Vec<(Vec<F128>, Vec<F128>, F128, F128, [F128; 6])> = Vec::new();
+            let mut plain: Vec<(Vec<F128>, Vec<F128>, F128, F128)> = Vec::new();
+            for &(_, record, poison) in &arms {
+                let compact = synth_compact(n_groups, mask, useful, record, poison, 0xC0FFEE);
+                let mut a5 = vec![LA_POISON; n_groups];
+                let mut b5 = vec![LA_POISON; n_groups];
+                let (m1, minf, la5) = fold2_compact_and_round45_into(
+                    &compact, &table, rho1, rho2, &r_next4, &mut a5, &mut b5,
+                );
+                cascade.push((a5, b5, m1, minf, la5.c));
+                let mut a4 = vec![LA_POISON; n_groups];
+                let mut b4 = vec![LA_POISON; n_groups];
+                let (n1, ninf) = fold2_compact_and_round4_into(
+                    &compact, &table, rho1, rho2, &r_next4, &mut a4, &mut b4,
+                );
+                plain.push((a4, b4, n1, ninf));
+                compact.recycle();
+            }
+
+            let groups_per_block = (mask + 1) / 2;
+            let first_dead = useful.div_ceil(2);
+            for (arm, out) in ["lemma", "poison"].iter().zip([1usize, 2]) {
+                assert_eq!(cascade[out].0, cascade[0].0, "{arm} A'' log={log_groups}");
+                assert_eq!(cascade[out].1, cascade[0].1, "{arm} B'' log={log_groups}");
+                assert_eq!(
+                    (cascade[out].2, cascade[out].3, cascade[out].4),
+                    (cascade[0].2, cascade[0].3, cascade[0].4),
+                    "{arm} round-4/5 messages log={log_groups}"
+                );
+                assert_eq!(plain[out].0, plain[0].0, "{arm} K A'' log={log_groups}");
+                assert_eq!(plain[out].1, plain[0].1, "{arm} K B'' log={log_groups}");
+                assert_eq!(
+                    (plain[out].2, plain[out].3),
+                    (plain[0].2, plain[0].3),
+                    "{arm} K round-4 message log={log_groups}"
+                );
+            }
+
+            // The dead outputs really are zero (not merely equal to the
+            // reference by both being unwritten poison).
+            for g in 0..n_groups {
+                if g % groups_per_block >= first_dead {
+                    assert_eq!(cascade[0].0[g], F128::ZERO, "dead A'' g={g}");
+                    assert_eq!(cascade[0].1[g], F128::ZERO, "dead B'' g={g}");
+                }
+            }
+
+            // Teeth: the poison must be observable when the skip is off.
+            assert_ne!(
+                (&cascade[3].0, cascade[3].2, cascade[3].3),
+                (&cascade[0].0, cascade[0].2, cascade[0].3),
+                "poison must perturb the unpredicated pass (log={log_groups})"
+            );
+            assert_ne!(
+                (&plain[3].0, plain[3].2, plain[3].3),
+                (&plain[0].0, plain[0].2, plain[0].3),
+                "poison must perturb the unpredicated K pass (log={log_groups})"
+            );
+        }
+    }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     #[test]
