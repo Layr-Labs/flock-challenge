@@ -194,7 +194,7 @@ pub fn helper_broadcasts_issued() -> u64 {
 /// Whether engaged drains go through the persistent [`Relay`]. Kill switch:
 /// `FLOCK_NO_EPOOL_RELAY=1` (exactly `"1"`) restores the per-drain
 /// `std::thread::scope` + `spawn`. Read once per process.
-pub(crate) fn relay_enabled() -> bool {
+fn relay_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| !relay_killed_by(std::env::var("FLOCK_NO_EPOOL_RELAY").ok().as_deref()))
 }
@@ -412,12 +412,8 @@ impl Drop for PostedJob<'_> {
 /// QUEUE SEMANTICS. Neither arm touches the shared cursor or the chunk
 /// closure: which worker set drains the queue is unobservable in the output by
 /// construction.
-pub(crate) fn drain_hetero<B>(
-    main_threads: usize,
-    worker: &(dyn Fn() + Sync),
-    broadcast: &B,
-    use_relay: bool,
-) where
+fn drain_hetero<B>(main_threads: usize, worker: &(dyn Fn() + Sync), broadcast: &B, use_relay: bool)
+where
     B: Fn() + Sync,
 {
     if use_relay
