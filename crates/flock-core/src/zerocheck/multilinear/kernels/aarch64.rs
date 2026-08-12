@@ -972,11 +972,22 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 /// `A''[y] = [anc0 + ρ₂(anc0+anc1)] + fold_{λ₁}(δ0) + fold_{λ₃}(δ1)` with
 /// `λ₁ = ρ₁(1+ρ₂)`, `λ₃ = ρ₁ρ₂` — in characteristic two `λ₀+λ₁ = 1+ρ₂` and
 /// `λ₂+λ₃ = ρ₂`, so the two anchors collapse into one ordinary ρ₂ fold and
-/// only the two deltas need λ-scaled tables. Padding needs no predicate: the
-/// compact state already carries zero anchors and zero deltas there, and a
-/// zero delta code folds to zero through the table's zero entry.
+/// only the two deltas need λ-scaled tables. Padding is *correct* without a
+/// predicate — the compact state already carries zero anchors and zero deltas
+/// there, and a zero delta code folds to zero through the table's zero entry —
+/// but it is not free: those groups still pay their gathers, folds and
+/// multiplies.
+///
+/// `dead_period`/`first_dead` (`0` = disabled) name the periodic all-zero group
+/// tail derived from the round-two pad geometry: group `g` is all-zero exactly
+/// when `g % dead_period >= first_dead`. Such a group reads no anchors, no
+/// deltas and no table entries; its two outputs are stored as zero from the
+/// zero register (cheaper than a second zero-filling pass over the NT-stored
+/// output stream), and every accumulator term with a provably zero factor is
+/// dropped. At the ranked shape this is three of every 64 outputs.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
     table_l1: *const u8,
     table_l3: *const u8,
@@ -988,6 +999,8 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
     eq_lo: *const F128,
     out_pairs: usize,
     degen: bool,
+    dead_period: usize,
+    first_dead: usize,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
@@ -1011,73 +1024,128 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
         let mut p1_acc = WideNeon { lo: zero, hi: zero };
         let mut pinf_acc = WideNeon { lo: zero, hi: zero };
 
-        for u in 0..out_pairs {
-            let mut av = [zero; 2];
-            let mut bv = [zero; 2];
-            let mut b_flat = true;
-            for lane in 0..2usize {
-                let g = 2 * u + lane;
-                let ap = anchors.add(4 * g).cast::<u64>();
-                let anc_a0 = vld1q_u64(ap);
-                let anc_b0 = vld1q_u64(ap.add(2));
-                let anc_a1 = vld1q_u64(ap.add(4));
-                let anc_b1 = vld1q_u64(ap.add(6));
+        macro_rules! k4_pair {
+            ($u:expr, $d0:expr, $d1:expr) => {{
+                let u = $u;
+                let dead = [$d0, $d1];
+                let any_dead = dead[0] | dead[1];
+                let mut av = [zero; 2];
+                let mut bv = [zero; 2];
+                let mut b_flat = true;
+                for lane in 0..2usize {
+                    if dead[lane] {
+                        // Structurally zero group: zero anchors and zero deltas
+                        // fold to zero, so both outputs stay at the zero
+                        // register and nothing is loaded.
+                        continue;
+                    }
+                    let g = 2 * u + lane;
+                    let ap = anchors.add(4 * g).cast::<u64>();
+                    let anc_a0 = vld1q_u64(ap);
+                    let anc_b0 = vld1q_u64(ap.add(2));
+                    let anc_a1 = vld1q_u64(ap.add(4));
+                    let anc_b1 = vld1q_u64(ap.add(6));
 
-                let dp = deltas.add(32 * g);
-                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
-                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
-                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
+                    let dp = deltas.add(32 * g);
+                    let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
+                    let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
+                    let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
+                    let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
 
-                let a_delta = veorq_u64(
-                    lookup_lanes_q::<8>(table_l1, da0, 0),
-                    lookup_lanes_q::<8>(table_l3, da1, 0),
-                );
-                av[lane] = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
+                    let a_delta = veorq_u64(
+                        lookup_lanes_q::<8>(table_l1, da0, 0),
+                        lookup_lanes_q::<8>(table_l3, da1, 0),
+                    );
+                    av[lane] = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
 
-                if degen && (db0 | db1) == 0 {
-                    // b rows are constant across the group: zero deltas mean
-                    // both b halves equal their anchors.
-                    let bd = veorq_u64(anc_b0, anc_b1);
-                    bv[lane] = if is_zero_q(bd) {
-                        anc_b0
+                    if degen && (db0 | db1) == 0 {
+                        // b rows are constant across the group: zero deltas mean
+                        // both b halves equal their anchors.
+                        let bd = veorq_u64(anc_b0, anc_b1);
+                        bv[lane] = if is_zero_q(bd) {
+                            anc_b0
+                        } else {
+                            b_flat = false;
+                            veorq_u64(anc_b0, mul_q(rho2_q, bd))
+                        };
                     } else {
                         b_flat = false;
-                        veorq_u64(anc_b0, mul_q(rho2_q, bd))
+                        let b_delta = veorq_u64(
+                            lookup_lanes_q::<8>(table_l1, db0, 0),
+                            lookup_lanes_q::<8>(table_l3, db1, 0),
+                        );
+                        bv[lane] =
+                            xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta);
+                    }
+                }
+
+                store_pair_nt(a_out.add(2 * u), av[0], av[1]);
+                store_pair_nt(b_out.add(2 * u), bv[0], bv[1]);
+
+                let eq_l = vld1q_u64(eq_lo.add(u).cast::<u64>());
+                if !any_dead && b_flat {
+                    // Value-forced shortcuts on the static b≡1 mass, gated on the
+                    // loaded values so they stay bit-exact.
+                    let g1 = if is_zero_q(veorq_u64(bv[1], one_q)) {
+                        av[1]
+                    } else {
+                        mul_q(av[1], bv[1])
                     };
+                    wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                    let b_sum = veorq_u64(bv[0], bv[1]);
+                    if !is_zero_q(b_sum) {
+                        let g_inf = mul_q(veorq_u64(av[0], av[1]), b_sum);
+                        wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+                    }
                 } else {
-                    b_flat = false;
-                    let b_delta = veorq_u64(
-                        lookup_lanes_q::<8>(table_l1, db0, 0),
-                        lookup_lanes_q::<8>(table_l3, db1, 0),
-                    );
-                    bv[lane] = xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta);
+                    // `av[i] = bv[i] = 0` on a dead lane, so `a1·b1` vanishes
+                    // when lane 1 is dead; the `inf` product survives on the
+                    // live lane and is kept.
+                    if !dead[1] {
+                        let g1 = mul_q(av[1], bv[1]);
+                        wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                    }
+                    if !(dead[0] & dead[1]) {
+                        let g_inf = mul_q(veorq_u64(av[0], av[1]), veorq_u64(bv[0], bv[1]));
+                        wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+                    }
+                }
+            }};
+        }
+
+        macro_rules! k4_dead_pair {
+            ($u:expr) => {{
+                let u = $u;
+                // Both groups all-zero: both outputs are zero and both products
+                // vanish, so only the stores remain.
+                store_pair_nt(a_out.add(2 * u), zero, zero);
+                store_pair_nt(b_out.add(2 * u), zero, zero);
+            }};
+        }
+
+        if dead_period != 0 {
+            // Groups per iteration = 2, and `dead_period % 2 == 0` is enforced
+            // by the driver, so the dead suffix of each block is one boundary
+            // iteration plus whole all-dead iterations.
+            let u_per_block = dead_period / 2;
+            debug_assert!(u_per_block > 0 && out_pairs.is_multiple_of(u_per_block));
+            debug_assert!(first_dead < dead_period);
+            let live_u = first_dead / 2;
+            let base = 2 * live_u;
+            let (d0, d1) = (base >= first_dead, base + 1 >= first_dead);
+            for block in 0..out_pairs / u_per_block {
+                let first = block * u_per_block;
+                for u in first..first + live_u {
+                    k4_pair!(u, false, false);
+                }
+                k4_pair!(first + live_u, d0, d1);
+                for u in first + live_u + 1..first + u_per_block {
+                    k4_dead_pair!(u);
                 }
             }
-
-            store_pair_nt(a_out.add(2 * u), av[0], av[1]);
-            store_pair_nt(b_out.add(2 * u), bv[0], bv[1]);
-
-            let eq_l = vld1q_u64(eq_lo.add(u).cast::<u64>());
-            if b_flat {
-                // Value-forced shortcuts on the static b≡1 mass, gated on the
-                // loaded values so they stay bit-exact.
-                let g1 = if is_zero_q(veorq_u64(bv[1], one_q)) {
-                    av[1]
-                } else {
-                    mul_q(av[1], bv[1])
-                };
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                let b_sum = veorq_u64(bv[0], bv[1]);
-                if !is_zero_q(b_sum) {
-                    let g_inf = mul_q(veorq_u64(av[0], av[1]), b_sum);
-                    wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-                }
-            } else {
-                let g1 = mul_q(av[1], bv[1]);
-                let g_inf = mul_q(veorq_u64(av[0], av[1]), veorq_u64(bv[0], bv[1]));
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
+        } else {
+            for u in 0..out_pairs {
+                k4_pair!(u, false, false);
             }
         }
 
@@ -1122,6 +1190,16 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
 /// 0`) and the three survivors are `w·a1`, `w·a3`, `w·a2` — three unreduced
 /// multiplies for the whole group. Mixed groups take the full path, which is
 /// value-identical (products of genuinely-zero factors XOR in as zero).
+///
+/// `dead_period`/`first_dead` (`0` = disabled) name the periodic all-zero group
+/// tail derived from the round-two pad geometry: group `g` is all-zero exactly
+/// when `g % dead_period >= first_dead`. Such a lane reads no anchors, no
+/// deltas and no table entries, and contributes zero to every one of the eight
+/// wide accumulators — so each product with a provably zero factor is dropped
+/// while the outputs are still stored as zero from the zero register. At the
+/// ranked shape (`dead_period = 64`, `first_dead = 61`) exactly one round-five
+/// group in sixteen is affected, with three of its four lanes dead: only
+/// `pinf_even`, `w3` and `w5` survive there, on the single live lane.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
@@ -1137,6 +1215,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
     out_pairs: usize,
     degen: bool,
     out: *mut F128,
+    dead_period: usize,
+    first_dead: usize,
 ) {
     use core::arch::aarch64::*;
 
@@ -1168,103 +1248,180 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
 
         debug_assert!(out_pairs >= 2 && out_pairs.is_multiple_of(2));
         let n5 = out_pairs / 2;
-        for t in 0..n5 {
-            let mut av = [zero; 4];
-            let mut bv = [zero; 4];
-            let mut b_flat = true;
-            for lane in 0..4usize {
-                let g = 4 * t + lane;
-                let ap = anchors.add(4 * g).cast::<u64>();
-                let anc_a0 = vld1q_u64(ap);
-                let anc_b0 = vld1q_u64(ap.add(2));
-                let anc_a1 = vld1q_u64(ap.add(4));
-                let anc_b1 = vld1q_u64(ap.add(6));
 
-                let dp = deltas.add(32 * g);
-                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
-                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
-                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
+        macro_rules! k5_group {
+            ($t:expr, $d0:expr, $d1:expr, $d2:expr, $d3:expr) => {{
+                let t = $t;
+                let dead = [$d0, $d1, $d2, $d3];
+                let any_dead = dead[0] | dead[1] | dead[2] | dead[3];
+                let mut av = [zero; 4];
+                let mut bv = [zero; 4];
+                let mut b_flat = true;
+                for lane in 0..4usize {
+                    if dead[lane] {
+                        // Structurally zero group: zero anchors and zero deltas
+                        // fold to zero, so this lane stays at the zero register
+                        // and nothing is loaded.
+                        continue;
+                    }
+                    let g = 4 * t + lane;
+                    let ap = anchors.add(4 * g).cast::<u64>();
+                    let anc_a0 = vld1q_u64(ap);
+                    let anc_b0 = vld1q_u64(ap.add(2));
+                    let anc_a1 = vld1q_u64(ap.add(4));
+                    let anc_b1 = vld1q_u64(ap.add(6));
 
-                let a_delta = veorq_u64(
-                    lookup_lanes_q::<8>(table_l1, da0, 0),
-                    lookup_lanes_q::<8>(table_l3, da1, 0),
-                );
-                av[lane] = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
+                    let dp = deltas.add(32 * g);
+                    let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
+                    let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
+                    let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
+                    let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
 
-                if degen && (db0 | db1) == 0 {
-                    // b rows are constant across the group: zero deltas mean
-                    // both b halves equal their anchors.
-                    let bd = veorq_u64(anc_b0, anc_b1);
-                    bv[lane] = if is_zero_q(bd) {
-                        anc_b0
+                    let a_delta = veorq_u64(
+                        lookup_lanes_q::<8>(table_l1, da0, 0),
+                        lookup_lanes_q::<8>(table_l3, da1, 0),
+                    );
+                    av[lane] = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
+
+                    if degen && (db0 | db1) == 0 {
+                        // b rows are constant across the group: zero deltas mean
+                        // both b halves equal their anchors.
+                        let bd = veorq_u64(anc_b0, anc_b1);
+                        bv[lane] = if is_zero_q(bd) {
+                            anc_b0
+                        } else {
+                            b_flat = false;
+                            veorq_u64(anc_b0, mul_q(rho2_q, bd))
+                        };
                     } else {
                         b_flat = false;
-                        veorq_u64(anc_b0, mul_q(rho2_q, bd))
-                    };
-                } else {
-                    b_flat = false;
-                    let b_delta = veorq_u64(
-                        lookup_lanes_q::<8>(table_l1, db0, 0),
-                        lookup_lanes_q::<8>(table_l3, db1, 0),
-                    );
-                    bv[lane] = xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta);
+                        let b_delta = veorq_u64(
+                            lookup_lanes_q::<8>(table_l1, db0, 0),
+                            lookup_lanes_q::<8>(table_l3, db1, 0),
+                        );
+                        bv[lane] =
+                            xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta);
+                    }
                 }
-            }
 
-            store_pair_nt(a_out.add(4 * t), av[0], av[1]);
-            store_pair_nt(a_out.add(4 * t + 2), av[2], av[3]);
-            store_pair_nt(b_out.add(4 * t), bv[0], bv[1]);
-            store_pair_nt(b_out.add(4 * t + 2), bv[2], bv[3]);
+                store_pair_nt(a_out.add(4 * t), av[0], av[1]);
+                store_pair_nt(a_out.add(4 * t + 2), av[2], av[3]);
+                store_pair_nt(b_out.add(4 * t), bv[0], bv[1]);
+                store_pair_nt(b_out.add(4 * t + 2), bv[2], bv[3]);
 
-            // The odd round-4 pair's weight drives the whole group; see doc.
-            let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
+                // The odd round-4 pair's weight drives the whole group; see doc.
+                let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
 
-            if b_flat {
-                // Every b output equals its anchor; check the b≡1 mass.
-                let ones_miss = vorrq_u64(
-                    vorrq_u64(veorq_u64(bv[0], one_q), veorq_u64(bv[1], one_q)),
-                    vorrq_u64(veorq_u64(bv[2], one_q), veorq_u64(bv[3], one_q)),
-                );
-                if is_zero_q(ones_miss) {
+                // A dead lane forces `bv = 0 ≠ 1`, so the b≡1 shortcut can
+                // never fire on a group that has one; testing `any_dead` first
+                // keeps that reasoning local (and folds away when it is the
+                // literal `false` of the all-live loop).
+                let ones_hit = !any_dead
+                    && b_flat
+                    && is_zero_q(vorrq_u64(
+                        vorrq_u64(veorq_u64(bv[0], one_q), veorq_u64(bv[1], one_q)),
+                        vorrq_u64(veorq_u64(bv[2], one_q), veorq_u64(bv[3], one_q)),
+                    ));
+                if ones_hit {
                     wide_xor(&mut p1_even, mul_unreduced_q(w, av[1]));
                     wide_xor(&mut p1_odd, mul_unreduced_q(w, av[3]));
                     wide_xor(&mut w0, mul_unreduced_q(w, av[2]));
-                    continue;
+                } else {
+                    // Weight-sharing reshape: four reduced row scalings, then every
+                    // product below is one unreduced multiply. Every term whose
+                    // two factors are both structurally zero is dropped; the
+                    // accumulators are XOR sums, so dropping a zero addend is
+                    // the identity.
+                    let a0w = if dead[0] { zero } else { mul_q(w, av[0]) };
+                    let a1w = if dead[1] { zero } else { mul_q(w, av[1]) };
+                    let a2w = if dead[2] { zero } else { mul_q(w, av[2]) };
+                    let a3w = if dead[3] { zero } else { mul_q(w, av[3]) };
+
+                    // ---- round-four products, split by round-4-pair parity ----
+                    if !dead[1] {
+                        wide_xor(&mut p1_even, mul_unreduced_q(a1w, bv[1]));
+                    }
+                    if !(dead[0] & dead[1]) {
+                        wide_xor(
+                            &mut pinf_even,
+                            mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(bv[0], bv[1])),
+                        );
+                    }
+                    if !dead[3] {
+                        wide_xor(&mut p1_odd, mul_unreduced_q(a3w, bv[3]));
+                    }
+                    if !(dead[2] & dead[3]) {
+                        wide_xor(
+                            &mut pinf_odd,
+                            mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(bv[2], bv[3])),
+                        );
+                    }
+
+                    // ---- deferred round-five aggregates (no extra loads) ----
+                    if !dead[2] {
+                        wide_xor(&mut w0, mul_unreduced_q(a2w, bv[2]));
+                    }
+                    let e_aw = veorq_u64(a0w, a2w);
+                    let o_aw = veorq_u64(a1w, a3w);
+                    let e_b = veorq_u64(bv[0], bv[2]);
+                    let o_b = veorq_u64(bv[1], bv[3]);
+                    if !(dead[0] & dead[2]) {
+                        wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+                    }
+                    if !(dead[1] & dead[3]) {
+                        wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+                    }
+                    if !(dead[0] & dead[1] & dead[2] & dead[3]) {
+                        wide_xor(
+                            &mut w5,
+                            mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                        );
+                    }
+                }
+            }};
+        }
+
+        macro_rules! k5_dead_group {
+            ($t:expr) => {{
+                let t = $t;
+                // All four groups all-zero: four zero outputs and eight zero
+                // products, so only the stores remain.
+                store_pair_nt(a_out.add(4 * t), zero, zero);
+                store_pair_nt(a_out.add(4 * t + 2), zero, zero);
+                store_pair_nt(b_out.add(4 * t), zero, zero);
+                store_pair_nt(b_out.add(4 * t + 2), zero, zero);
+            }};
+        }
+
+        if dead_period != 0 {
+            // Groups per iteration = 4, and `dead_period % 4 == 0` is enforced
+            // by the driver, so the dead suffix of each block is one boundary
+            // iteration plus whole all-dead iterations.
+            let t_per_block = dead_period / 4;
+            debug_assert!(t_per_block > 0 && n5.is_multiple_of(t_per_block));
+            debug_assert!(first_dead < dead_period);
+            let live_t = first_dead / 4;
+            let base = 4 * live_t;
+            let (d0, d1, d2, d3) = (
+                base >= first_dead,
+                base + 1 >= first_dead,
+                base + 2 >= first_dead,
+                base + 3 >= first_dead,
+            );
+            for block in 0..n5 / t_per_block {
+                let first = block * t_per_block;
+                for t in first..first + live_t {
+                    k5_group!(t, false, false, false, false);
+                }
+                k5_group!(first + live_t, d0, d1, d2, d3);
+                for t in first + live_t + 1..first + t_per_block {
+                    k5_dead_group!(t);
                 }
             }
-
-            // Weight-sharing reshape: four reduced row scalings, then every
-            // product below is one unreduced multiply.
-            let a0w = mul_q(w, av[0]);
-            let a1w = mul_q(w, av[1]);
-            let a2w = mul_q(w, av[2]);
-            let a3w = mul_q(w, av[3]);
-
-            // ---- round-four products, split by round-4-pair parity ----
-            wide_xor(&mut p1_even, mul_unreduced_q(a1w, bv[1]));
-            wide_xor(
-                &mut pinf_even,
-                mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(bv[0], bv[1])),
-            );
-            wide_xor(&mut p1_odd, mul_unreduced_q(a3w, bv[3]));
-            wide_xor(
-                &mut pinf_odd,
-                mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(bv[2], bv[3])),
-            );
-
-            // ---- deferred round-five aggregates (no extra loads) ----
-            wide_xor(&mut w0, mul_unreduced_q(a2w, bv[2]));
-            let e_aw = veorq_u64(a0w, a2w);
-            let o_aw = veorq_u64(a1w, a3w);
-            let e_b = veorq_u64(bv[0], bv[2]);
-            let o_b = veorq_u64(bv[1], bv[3]);
-            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
-            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
-            wide_xor(
-                &mut w5,
-                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
-            );
+        } else {
+            for t in 0..n5 {
+                k5_group!(t, false, false, false, false);
+            }
         }
 
         *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));
@@ -2775,5 +2932,162 @@ mod tests {
         assert_eq!(periodic.0, generic.0, "anchor schedule mismatch");
         assert_eq!(periodic.1, generic.1, "delta schedule mismatch");
         assert_eq!(periodic.2, generic.2, "message/lookahead mismatch");
+    }
+
+    /// Z1 poison oracle at the NEON kernel boundary, ranked geometry
+    /// (`dead_period = 64`, `first_dead = 61` — three dead groups in 64).
+    ///
+    /// Both K kernels are run three ways over the same live data: unpredicated
+    /// over honest zero padding (the reference, and exactly what the kill
+    /// switch restores), predicated over honest zero padding (the
+    /// zero-propagation lemma), and predicated over dead ranges filled with
+    /// garbage (the skip must not read them). All three must agree byte for
+    /// byte on `a_out`, `b_out` and every message slot; the fourth combination
+    /// — unpredicated over garbage — must differ, proving the poison is
+    /// observable.
+    #[test]
+    fn kpass_dead_group_skip_matches_unpredicated_kernel() {
+        const OUT_PAIRS: usize = 128;
+        const N_GROUPS: usize = 2 * OUT_PAIRS;
+        const N_CHUNKS: usize = 8;
+        const DEAD_PERIOD: usize = 64;
+        const FIRST_DEAD: usize = 61;
+
+        let mut state = 0x5A31_4B50_4153_5344;
+        let mut table = |state: &mut u64| {
+            let mut t: Vec<F128> = (0..N_CHUNKS * 256)
+                .map(|_| F128::new(splitmix64(state), splitmix64(state)))
+                .collect();
+            // A zero delta code must fold to zero — that is the identity the
+            // dead-group skip rests on.
+            for lane in 0..N_CHUNKS {
+                t[lane * 256] = F128::ZERO;
+            }
+            t
+        };
+        let table_l1 = table(&mut state);
+        let table_l3 = table(&mut state);
+        let rho2 = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+        let eq_lo: Vec<F128> = (0..OUT_PAIRS)
+            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+            .collect();
+
+        let poison = F128::new(0xa5a5_a5a5_a5a5_a5a5, 0x5a5a_5a5a_5a5a_5a5a);
+        let build = |state: &mut u64, dead_poison: bool| {
+            let mut anchors = vec![F128::ZERO; 4 * N_GROUPS];
+            let mut deltas = vec![0u8; 32 * N_GROUPS];
+            for g in 0..N_GROUPS {
+                let dead = g % DEAD_PERIOD >= FIRST_DEAD;
+                for i in 0..4 {
+                    anchors[4 * g + i] = if !dead {
+                        F128::new(splitmix64(state), splitmix64(state))
+                    } else if dead_poison {
+                        poison
+                    } else {
+                        F128::ZERO
+                    };
+                }
+                for j in 0..32 {
+                    deltas[32 * g + j] = if !dead {
+                        splitmix64(state) as u8
+                    } else if dead_poison {
+                        0xa5
+                    } else {
+                        0
+                    };
+                }
+            }
+            (anchors, deltas)
+        };
+
+        type KpassArm = (
+            Vec<F128>,
+            Vec<F128>,
+            [F128; 8],
+            Vec<F128>,
+            Vec<F128>,
+            (F128, F128),
+        );
+
+        for degen in [false, true] {
+            let mut reference: Option<KpassArm> = None;
+            for &(dead_poison, period) in &[
+                (false, 0usize),
+                (false, DEAD_PERIOD),
+                (true, DEAD_PERIOD),
+                (true, 0),
+            ] {
+                let mut live = state;
+                let (anchors, deltas) = build(&mut live, dead_poison);
+                let mut a45 = vec![poison; N_GROUPS];
+                let mut b45 = vec![poison; N_GROUPS];
+                let mut out45 = [poison; 8];
+                let mut a4 = vec![poison; N_GROUPS];
+                let mut b4 = vec![poison; N_GROUPS];
+                let msg4 = unsafe {
+                    fold2_compact_and_round45_chunk_neon_8(
+                        table_l1.as_ptr().cast::<u8>(),
+                        table_l3.as_ptr().cast::<u8>(),
+                        rho2,
+                        anchors.as_ptr(),
+                        deltas.as_ptr(),
+                        a45.as_mut_ptr(),
+                        b45.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        OUT_PAIRS,
+                        degen,
+                        out45.as_mut_ptr(),
+                        period,
+                        FIRST_DEAD,
+                    );
+                    fold2_compact_and_round4_chunk_neon_8(
+                        table_l1.as_ptr().cast::<u8>(),
+                        table_l3.as_ptr().cast::<u8>(),
+                        rho2,
+                        anchors.as_ptr(),
+                        deltas.as_ptr(),
+                        a4.as_mut_ptr(),
+                        b4.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        OUT_PAIRS,
+                        degen,
+                        period,
+                        FIRST_DEAD,
+                    )
+                };
+                let got = (a45, b45, out45, a4, b4, msg4);
+                if !dead_poison && period == 0 {
+                    // The reference arm. Dead outputs must be genuine zeros.
+                    for g in 0..N_GROUPS {
+                        if g % DEAD_PERIOD >= FIRST_DEAD {
+                            assert_eq!(got.0[g], F128::ZERO, "dead A g={g}");
+                            assert_eq!(got.1[g], F128::ZERO, "dead B g={g}");
+                        }
+                    }
+                    reference = Some(got);
+                } else {
+                    let want = reference.as_ref().expect("reference arm runs first");
+                    if period != 0 {
+                        assert_eq!(got.0, want.0, "A'' degen={degen} poison={dead_poison}");
+                        assert_eq!(got.1, want.1, "B'' degen={degen} poison={dead_poison}");
+                        assert_eq!(got.2, want.2, "W' slots degen={degen}");
+                        assert_eq!(got.3, want.3, "K A'' degen={degen}");
+                        assert_eq!(got.4, want.4, "K B'' degen={degen}");
+                        assert_eq!(got.5, want.5, "K message degen={degen}");
+                    } else {
+                        assert_ne!(
+                            (&got.0, got.2),
+                            (&want.0, want.2),
+                            "poison must perturb the unpredicated kernel"
+                        );
+                        assert_ne!(
+                            (&got.3, got.5),
+                            (&want.3, want.5),
+                            "poison must perturb the unpredicated K kernel"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

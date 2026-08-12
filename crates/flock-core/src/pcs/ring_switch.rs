@@ -2555,7 +2555,39 @@ pub(crate) struct DirectFold8Factors {
     /// Round-zero contribution, cached while both factor states are still
     /// local to the parallel ring-switch tail that constructed them.
     pub(crate) round0: (F128, F128),
+    /// Trailing packed-witness banks the sixty-four-bank materializer may
+    /// drop from every odd slot, or 0. See [`fold8_dead_tail_banks`] — the
+    /// value is a property of the R1CS padding, carried here because the
+    /// materializer runs where the [`PaddingSpec`] is no longer in scope.
+    pub(crate) dead_tail_banks: usize,
 }
+
+/// Trailing banks of every **odd** packed-witness slot that the R1CS padding
+/// forces to zero, for the sixty-four-bank direct-fold8 materializer.
+///
+/// The packed witness stores block `b` of the R1CS witness at word indices
+/// `[b·2^(k_log−7), (b+1)·2^(k_log−7))`, and the padding rows `0·0 = z[i]`
+/// force every word past `ceil(useful_bits_per_block / 128)` of a block to
+/// zero. When a block is exactly two sixty-four-bank slots wide the whole
+/// zero suffix lands inside the block's odd slot, so the materializer's
+/// 128-aligned fold pair sees its last `dead` inputs identically zero.
+///
+/// That is precisely the geometry
+/// [`ZeroOddTailLanes::lanes_for_padding`](crate::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding)
+/// already derives for the commit transform's SoA lanes — the packed-witness
+/// index decomposition `i = pos·64 + lane` is the same one the materializer
+/// folds over (`lane` = bank, `pos` = slot) — so this defers to it rather
+/// than re-deriving it, and inherits its fail-closed 0 for every other shape.
+pub(crate) fn fold8_dead_tail_banks(padding: &PaddingSpec) -> usize {
+    crate::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+        DIRECT_FOLD8_BANKS,
+        padding.k_log,
+        padding.useful_bits_per_block,
+    )
+}
+
+/// Bank count of the direct-fold8 materializer (six folded coordinates).
+pub(crate) const DIRECT_FOLD8_BANKS: usize = 64;
 
 /// Per-claim output of [`prove_batched`]. Mirrors [`RingSwitchOutput`] but lets
 /// the prover skip the dense `2^(m-7)` `rs_eq_ind` allocation for claims whose
@@ -2831,7 +2863,276 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut Ch,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
+    prove_batched_padded_with_precollapsed(
+        packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        &[],
+        padding,
+        challenger,
+    )
+}
+
+/// A transcript-visible `s_hat_v` the caller already holds, together with the
+/// six-coordinate point its wider tensor collapses under.
+///
+/// The zerocheck's round-1 C producer computes the canonical 128-vector on
+/// its way to the round message and then discards it, while ring-switch
+/// re-derives the identical bits by collapsing the sixty-four-bank tensor
+/// (64 · 128 serial multiplies). Handing the vector back closes that loop.
+///
+/// The reuse is guarded by `point`: it is taken only when `point` equals the
+/// claim's own first six suffix coordinates, which is the exact condition
+/// under which [`collapse_s_hat_v_fold8`] of the shipped tensor would produce
+/// `value`. Any drift falls back to the collapse — a performance loss, never
+/// a transcript change.
+#[derive(Clone, Copy, Debug)]
+pub struct PreCollapsedSHatV<'a> {
+    /// Canonical `2^LOG_PACKING` statistic.
+    pub value: &'a [F128],
+    /// The point `value` was collapsed at.
+    pub point: &'a [F128],
+}
+
+const ENV_NO_SHATV_REUSE: &str = "FLOCK_NO_SHATV_REUSE";
+
+/// Exact-`1` rollback for the pre-collapsed `s_hat_v` reuse. Every other
+/// value leaves the candidate enabled, so control and candidate use the same
+/// binary.
+fn s_hat_v_reuse_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+/// Shared latch for both halves of the `s_hat_v` reuse: the C claim's
+/// pre-collapsed transcript vector here, and the AB claim's post-round-0
+/// lincheck capture in `flock_prover::prover`. One switch, one process-wide
+/// decision, so the two halves can never disagree.
+pub fn s_hat_v_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| s_hat_v_reuse_value_enabled(std::env::var_os(ENV_NO_SHATV_REUSE).as_deref()))
+}
+
+const ENV_NO_SHATV_LANE_HETERO: &str = "FLOCK_NO_SHATV_LANE_HETERO";
+
+/// Exact-`1` rollback for the s_hat_v-lane hetero drain (the DirectFold8
+/// factor-state builds below). Every other value leaves the candidate
+/// enabled, so control and candidate use the same binary and a stray export
+/// can never silently change the ranked shape.
+fn shatv_lane_hetero_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+/// Whether the DirectFold8 factor states drain through the shared P+E hetero
+/// chunk queue instead of running as two serial column loops inside each
+/// claim's per-opening tail. Read once per process.
+///
+/// This is the only remaining producer in this file with real mass at the
+/// ranked shape: the promoted DirectFold8 precompute route already deletes
+/// the whole `fold_1b_rows_*` family here (both ranked claims arrive with a
+/// precomputed `s_hat_v`, so `dense_needs_fold` is empty), leaving the
+/// factor-state builds — 64 `W` columns and 64 `A` columns per claim — as the
+/// serial body of a two-way-parallel tail.
+pub(crate) fn shatv_lane_hetero_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        shatv_lane_hetero_value_enabled(std::env::var_os(ENV_NO_SHATV_LANE_HETERO).as_deref())
+    })
+}
+
+/// Fill column `d_low` of a DirectFold8 `w_state`:
+/// `W[b, d_low] = Φ(low_eq[d_low] · x^b)` for every bit `b ∈ [0, n_packed)`,
+/// in the bit-major layout (`slot = b·64 + d_low`).
+///
+/// The `mul_by_x` ladder is sequential **within** a column and completely
+/// independent **across** columns — column `d_low` reads only `scale` and the
+/// shared read-only `table`, and writes only the slot set `{b·64 + d_low}`.
+///
+/// # Safety
+///
+/// `base` must point to `64 · n_packed` writable `F128`s. Concurrent calls
+/// must use pairwise-distinct `d_low` in `[0, 64)`: the slot sets
+/// `{b·64 + d_low}` are pairwise disjoint over distinct `d_low < 64`, so no
+/// two callers ever alias. Every slot is written exactly once, so the buffer
+/// needs no prior initialization and the result does not depend on the order
+/// the columns run in.
+#[inline]
+unsafe fn fold8_w_state_column(
+    base: *mut F128,
+    d_low: usize,
+    scale: F128,
+    table: &[F128],
+    n_packed: usize,
+) {
+    let mut basis_product = scale;
+    // SAFETY: `d_low < 64 <= 64·n_packed`; the caller owns this column.
+    unsafe { base.add(d_low).write(fold_one_slot(basis_product, table)) };
+    for bit in 1..n_packed {
+        basis_product = mul_by_x(basis_product);
+        // SAFETY: `bit < n_packed`, so `bit·64 + d_low < 64·n_packed`.
+        unsafe {
+            base.add(bit * 64 + d_low)
+                .write(fold_one_slot(basis_product, table))
+        };
+    }
+}
+
+/// Fill column `e` of a DirectFold8 `a_state`:
+/// `A[b, e] = tensor_algebra_transpose(bank_e)[b]`, same bit-major layout.
+///
+/// # Safety
+///
+/// Identical contract to [`fold8_w_state_column`]: `base` points to
+/// `64 · n_packed` writable `F128`s and concurrent calls use
+/// pairwise-distinct `e ∈ [0, 64)`, whose slot sets `{b·64 + e}` are pairwise
+/// disjoint. `bank` must be the `e`-th `n_packed`-wide bank.
+#[inline]
+unsafe fn fold8_a_state_column(base: *mut F128, e: usize, bank: &[F128]) {
+    let transposed = tensor_algebra_transpose(bank);
+    for (bit, value) in transposed.into_iter().enumerate() {
+        // SAFETY: `bit < n_packed` and `e < 64`.
+        unsafe { base.add(bit * 64 + e).write(value) };
+    }
+}
+
+/// Chunks the factor-state drain issues per DirectFold8 claim: 64 `W`
+/// columns followed by 64 `A` columns.
+const FOLD8_STATE_CHUNKS_PER_CLAIM: usize = 128;
+
+/// Decode a factor-state drain chunk index into
+/// `(claim slot, family, column)`, where family `0` is `W` and `1` is `A`.
+///
+/// The map is a bijection from `[0, claims·128)` onto
+/// `[0, claims) × {W, A} × [0, 64)`, which is what makes the partition
+/// exhaustive and disjoint — see
+/// `fold8_factor_state_partition_is_exhaustive_and_disjoint`.
+#[inline]
+fn fold8_state_chunk(chunk: usize) -> (usize, usize, usize) {
+    let slot = chunk / FOLD8_STATE_CHUNKS_PER_CLAIM;
+    let within = chunk % FOLD8_STATE_CHUNKS_PER_CLAIM;
+    (slot, within / 64, within % 64)
+}
+
+/// Build the `(a_state, w_state)` pair for every DirectFold8 claim.
+///
+/// `banks[j]` is claim `j`'s sixty-four-bank statistic, `low_eqs[j]` its
+/// `build_eq(suffix[..6])`, `tables[j]` its γ-baked fold byte table.
+///
+/// **Order independence.** Both families are pure *maps*: every output slot
+/// has exactly one writer and its value is a function of that writer's own
+/// inputs only. There is no reduction, so there is nothing whose merge order
+/// could matter — the drained result equals the serial result slot by slot,
+/// not merely as a multiset. `hetero == false` runs the identical kernels as
+/// two serial column loops, which is exactly the incumbent inline code.
+///
+/// **Chunk floor.** The drain issues `128` chunks per claim, so any non-empty
+/// call is already at or above the queue's own `EPOOL_MIN_CHUNKS` engagement
+/// floor; no site gate is needed, and an empty claim list issues zero chunks,
+/// which `run_hetero_chunks` returns from immediately.
+fn build_fold8_factor_states(
+    banks: &[&[F128]],
+    low_eqs: &[[F128; 64]],
+    tables: &[&[F128]],
+    n_packed: usize,
+    hetero: bool,
+) -> Vec<(Vec<F128>, Vec<F128>)> {
+    let claims = banks.len();
+    debug_assert_eq!(low_eqs.len(), claims);
+    debug_assert_eq!(tables.len(), claims);
+    let mut states: Vec<(Vec<F128>, Vec<F128>)> = (0..claims)
+        .map(|_| {
+            (
+                vec![F128::ZERO; 64 * n_packed],
+                vec![F128::ZERO; 64 * n_packed],
+            )
+        })
+        .collect();
+    if claims == 0 {
+        return states;
+    }
+    let a_bases: Vec<crate::epool::SyncPtr<F128>> = states
+        .iter_mut()
+        .map(|(a, _)| crate::epool::SyncPtr(a.as_mut_ptr()))
+        .collect();
+    let w_bases: Vec<crate::epool::SyncPtr<F128>> = states
+        .iter_mut()
+        .map(|(_, w)| crate::epool::SyncPtr(w.as_mut_ptr()))
+        .collect();
+    let column = |chunk: usize| {
+        let (slot, family, col) = fold8_state_chunk(chunk);
+        if family == 0 {
+            // SAFETY: the queue (or the serial loop) issues each chunk index
+            // exactly once, so column `col` of claim `slot`'s `w_state` has a
+            // single writer; distinct columns write disjoint slot sets.
+            unsafe {
+                fold8_w_state_column(
+                    w_bases[slot].ptr(),
+                    col,
+                    low_eqs[slot][col],
+                    tables[slot],
+                    n_packed,
+                );
+            }
+        } else {
+            let bank = &banks[slot][col * n_packed..(col + 1) * n_packed];
+            // SAFETY: as above, for `a_state`.
+            unsafe { fold8_a_state_column(a_bases[slot].ptr(), col, bank) };
+        }
+    };
+    let n_chunks = claims * FOLD8_STATE_CHUNKS_PER_CLAIM;
+    if hetero {
+        crate::epool::run_hetero_chunks(n_chunks, column);
+    } else {
+        for chunk in 0..n_chunks {
+            column(chunk);
+        }
+    }
+    // The hetero drain's join publishes every write before this return; the
+    // serial arm is trivially ordered.
+    states
+}
+
+/// The pre-collapsed statistic for a claim, or `None` when it must be
+/// collapsed here: the reuse is disabled, nothing was offered, the offered
+/// vector is not the canonical width, or it was collapsed at a different
+/// point than this claim's `suffix[..6]`.
+fn reusable_precollapsed<'a>(
+    precollapsed: Option<PreCollapsedSHatV<'a>>,
+    suffix: &[F128],
+    n_packed: usize,
+) -> Option<&'a [F128]> {
+    let pre = precollapsed?;
+    if !s_hat_v_reuse_enabled()
+        || pre.value.len() != n_packed
+        || pre.point.len() != 6
+        || suffix.len() < 6
+        || pre.point != &suffix[..6]
+    {
+        return None;
+    }
+    Some(pre.value)
+}
+
+/// [`prove_batched_padded_with_precomputed`] that also accepts, per claim, an
+/// already-collapsed canonical `s_hat_v` (see [`PreCollapsedSHatV`]). Output
+/// is byte-identical either way; the pre-collapsed vector only removes the
+/// `collapse_s_hat_v_fold8` sweep over a sixty-four-bank precompute.
+///
+/// `precollapsed` must be `&[]` or have length equal to `x_outers.len()`.
+pub fn prove_batched_padded_with_precollapsed<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    precollapsed: &[Option<PreCollapsedSHatV<'_>>],
+    padding: &PaddingSpec,
+    challenger: &mut Ch,
+) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
+    assert!(
+        precollapsed.is_empty() || precollapsed.len() == x_outers.len(),
+        "precollapsed: must be empty or length {}, got {}",
+        x_outers.len(),
+        precollapsed.len(),
+    );
     let trace =
         std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
     let n = x_outers.len();
@@ -2962,7 +3263,14 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     dense_suffixes[d].len() >= 6,
                     "sixty-four-bank s_hat_v requires at least six suffix coordinates"
                 );
-                collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6])
+                match reusable_precollapsed(
+                    precollapsed.get(dense_to_orig[d]).copied().flatten(),
+                    dense_suffixes[d],
+                    n_packed,
+                ) {
+                    Some(value) => value.to_vec(),
+                    None => collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6]),
+                }
             } else if p.len() == 16 * n_packed {
                 assert!(
                     dense_suffixes[d].len() >= 4,
@@ -2991,7 +3299,14 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     sparse_suffixes[s].len() >= 6,
                     "sixty-four-bank s_hat_v requires at least six suffix coordinates"
                 );
-                collapse_s_hat_v_fold8(p, &sparse_suffixes[s][..6])
+                match reusable_precollapsed(
+                    precollapsed.get(sparse_to_orig[s]).copied().flatten(),
+                    sparse_suffixes[s],
+                    n_packed,
+                ) {
+                    Some(value) => value.to_vec(),
+                    None => collapse_s_hat_v_fold8(p, &sparse_suffixes[s][..6]),
+                }
             } else if p.len() == 16 * n_packed {
                 assert!(
                     sparse_suffixes[s].len() >= 4,
@@ -3127,6 +3442,73 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         && !has_quad[1]
         && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none();
 
+    // γ-baked per-claim eq and byte table. Hoisted out of the tail below so
+    // the DirectFold8 factor states can be built from them in ONE drain
+    // instead of once inside each claim's tail; the values are identical
+    // (same γ, same `eq_r_dprime`, same pure builder) and the build is two
+    // 128-element scalings plus two 16×256 tables.
+    let scaled_eqs: Vec<Vec<F128>> = work
+        .iter()
+        .zip(gammas_rs.iter())
+        .map(|(w, &g)| w.eq_r_dprime.iter().map(|value| g * *value).collect())
+        .collect();
+    let tables: Vec<Vec<F128>> = scaled_eqs
+        .iter()
+        .map(|scaled| build_fold_byte_table(scaled))
+        .collect();
+
+    // Claims that take the DirectFold8 route, in claim order. The predicate
+    // is exactly the one the tail's `direct_fold8` arm matches on, so the
+    // hoisted build covers precisely the claims that consume it.
+    let fold8_slots: Vec<usize> = (0..n)
+        .filter(|&i| match kinds[i] {
+            Kind::Dense(d) => {
+                use_split && dense_suffixes[d].len() >= 6 && work[i].s_hat_v_fold8.is_some()
+            }
+            Kind::Sparse(_) => false,
+        })
+        .collect();
+    // One hetero drain for every DirectFold8 factor column across all claims
+    // (128 chunks per claim). The two families are pure maps over disjoint
+    // slot sets, so this is a scheduling change only — see
+    // `build_fold8_factor_states`. `FLOCK_NO_SHATV_LANE_HETERO=1` (exactly
+    // `"1"`) restores the incumbent serial column loops as the same-binary
+    // A/B control.
+    let mut fold8_states: Vec<Option<(Vec<F128>, Vec<F128>)>> = (0..n).map(|_| None).collect();
+    {
+        let banks: Vec<&[F128]> = fold8_slots
+            .iter()
+            .map(|&i| {
+                work[i]
+                    .s_hat_v_fold8
+                    .as_deref()
+                    .expect("fold8 slot has a sixty-four-bank statistic")
+            })
+            .collect();
+        let low_eqs: Vec<[F128; 64]> = fold8_slots
+            .iter()
+            .map(|&i| {
+                let Kind::Dense(d) = kinds[i] else {
+                    unreachable!("fold8 slots are dense by construction")
+                };
+                build_eq(&dense_suffixes[d][..6])
+                    .try_into()
+                    .expect("six-coordinate eq has sixty-four entries")
+            })
+            .collect();
+        let table_refs: Vec<&[F128]> = fold8_slots.iter().map(|&i| tables[i].as_slice()).collect();
+        let built = build_fold8_factor_states(
+            &banks,
+            &low_eqs,
+            &table_refs,
+            n_packed,
+            shatv_lane_hetero_enabled(),
+        );
+        for (&i, state) in fold8_slots.iter().zip(built) {
+            fold8_states[i] = Some(state);
+        }
+    }
+
     // Per-opening tails are independent once every γ_rs is sampled (the
     // transcript work above is complete), so run the two openings' table and
     // split builds in parallel instead of serially at ~2 active threads.
@@ -3134,12 +3516,11 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     let results: Vec<(RingSwitchProof, RingSwitchBatchOutput)> = {
         use rayon::prelude::*;
         work.into_par_iter()
-            .zip(gammas_rs.par_iter())
+            .zip(scaled_eqs.into_par_iter())
+            .zip(tables.into_par_iter())
+            .zip(fold8_states.into_par_iter())
             .enumerate()
-            .map(|(i, (w, &g))| {
-                let scaled_eq_r_dprime: Vec<F128> =
-                    w.eq_r_dprime.iter().map(|value| g * *value).collect();
-                let table = build_fold_byte_table(&scaled_eq_r_dprime);
+            .map(|(i, (((w, scaled_eq_r_dprime), table), fold8_state))| {
                 let direct_fold2 = match (kinds[i], w.s_hat_v_quad.as_deref()) {
                     (Kind::Dense(d), Some(quad)) if use_split && dense_suffixes[d].len() >= 2 => {
                         let suffix = dense_suffixes[d];
@@ -3202,37 +3583,18 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                     }
                     _ => None,
                 };
-                let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.as_deref()) {
-                    (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
+                // H[e,d] factors as ⟨A_e,W_d⟩ with A_e = transpose(bank_e) and
+                // W_d[k] = φ_w(low_eq[d]·e_k). Keep the two factor families
+                // instead of materializing all 4,096 dots: the first six PCS
+                // challenges fold their bank coordinate online. Both states
+                // are stored bit-major so adjacent banks are adjacent for the
+                // existing pair-fold kernels, and both were filled column by
+                // column by the hoisted drain above.
+                let direct_fold8 = match (kinds[i], fold8_state) {
+                    (Kind::Dense(d), Some((a_state, w_state)))
+                        if use_split && dense_suffixes[d].len() >= 6 =>
+                    {
                         let suffix = dense_suffixes[d];
-                        let low_eq: [F128; 64] = build_eq(&suffix[..6])
-                            .try_into()
-                            .expect("six-coordinate eq has sixty-four entries");
-                        // H[e,d] factors as ⟨A_e,W_d⟩ with
-                        // A_e = transpose(bank_e) and
-                        // W_d[k] = φ_w(low_eq[d]·e_k). Keep the two factor
-                        // families instead of materializing all 4,096 dots: the
-                        // first six PCS challenges fold their bank coordinate
-                        // online. Store bit-major so adjacent banks are adjacent
-                        // for the existing pair-fold kernels.
-                        let mut w_state = vec![F128::ZERO; 64 * n_packed];
-                        for d_low in 0..64 {
-                            let scale = low_eq[d_low];
-                            let mut basis_product = scale;
-                            w_state[d_low] = fold_one_slot(basis_product, &table);
-                            for bit in 1..n_packed {
-                                basis_product = mul_by_x(basis_product);
-                                w_state[bit * 64 + d_low] = fold_one_slot(basis_product, &table);
-                            }
-                        }
-                        let mut a_state = vec![F128::ZERO; 64 * n_packed];
-                        for e in 0..64 {
-                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-                            let transposed = tensor_algebra_transpose(bank);
-                            for (bit, value) in transposed.into_iter().enumerate() {
-                                a_state[bit * 64 + e] = value;
-                            }
-                        }
                         let round0 = super::round0_deferred(&a_state, &w_state);
                         let tail = &suffix[6..];
                         let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
@@ -3242,6 +3604,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                             a_state,
                             w_state,
                             round0,
+                            dead_tail_banks: fold8_dead_tail_banks(padding),
                         })
                     }
                     _ => None,
@@ -4425,6 +4788,353 @@ mod tests {
             }
         }
         assert_eq!(factored, product_oracle);
+    }
+
+    /// Reuse-vs-recompute oracle for the pre-collapsed `s_hat_v`.
+    ///
+    /// Handing ring-switch the canonical statistic the zerocheck already
+    /// computed must reproduce the collapse-from-tensor path byte for byte —
+    /// same proof, same `sumcheck_claim`, same `rs_eq_ind`, same fold8
+    /// factors. And the point guard must be load-bearing: a vector offered at
+    /// the wrong point, or with the wrong width, falls back to the collapse
+    /// rather than reaching the transcript.
+    #[test]
+    fn precollapsed_s_hat_v_reuse_matches_collapse_and_fails_closed() {
+        use crate::challenger::FsChallenger;
+        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
+
+        const M: usize = 18;
+        const K_LOG: usize = 14;
+        const K_SKIP: usize = 6;
+        let mut rng = Rng::new(0x5CAF_F01D);
+        let z = rng.bits(1 << M);
+        let packed = pack_witness(&z, M);
+        let z_packed_lincheck = pack_z_lincheck(&z, M, K_LOG);
+        let inner_rest: Vec<F128> = (0..(K_LOG - K_SKIP)).map(|_| rng.f128()).collect();
+        let outer: Vec<F128> = (0..(M - K_LOG)).map(|_| rng.f128()).collect();
+        let mut point = inner_rest.clone();
+        point.extend_from_slice(&outer);
+        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
+        let fold8 = s_hat_v_fold8_from_z_vec(&z_vec, &inner_rest[1..]);
+
+        // The point-equality obligation, in the shape ring-switch sees it:
+        // the claim's suffix is `point[1..]`, so its first six coordinates
+        // are `inner_rest[1..7]` — exactly the head of the producer's
+        // `inner_tail`, which is what the wider tensor collapses under.
+        let suffix = &point[1..];
+        let collapse_point = &inner_rest[1..7];
+        assert_eq!(&suffix[..6], collapse_point);
+        let collapsed = collapse_s_hat_v_fold8(&fold8, collapse_point);
+        assert_eq!(collapsed, s_hat_v_from_z_vec(&z_vec, &inner_rest[1..]));
+
+        let padding = PaddingSpec::dense(M);
+        let run = |precollapsed: &[Option<PreCollapsedSHatV<'_>>]| {
+            let mut challenger = FsChallenger::new(b"precollapsed-s-hat-v-reuse");
+            prove_batched_padded_with_precollapsed(
+                &packed,
+                &[&point],
+                &[Some(fold8.as_slice())],
+                precollapsed,
+                &padding,
+                &mut challenger,
+            )
+        };
+        let expect_collapse = |label: &str, precollapsed: &[Option<PreCollapsedSHatV<'_>>]| {
+            let (baseline, baseline_gammas) = run(&[]);
+            let (got, gammas) = run(precollapsed);
+            assert_eq!(gammas, baseline_gammas, "{label}: gammas");
+            assert_eq!(got[0].0, baseline[0].0, "{label}: proof");
+            assert_eq!(
+                got[0].1.sumcheck_claim, baseline[0].1.sumcheck_claim,
+                "{label}: sumcheck claim"
+            );
+            assert_eq!(
+                got[0].1.rs_eq_ind.to_dense(),
+                baseline[0].1.rs_eq_ind.to_dense(),
+                "{label}: rs_eq_ind"
+            );
+            let a = got[0].1.direct_fold8.as_ref().expect("fold8 factors");
+            let b = baseline[0].1.direct_fold8.as_ref().expect("fold8 factors");
+            assert_eq!(a.a_state, b.a_state, "{label}: A state");
+            assert_eq!(a.w_state, b.w_state, "{label}: W state");
+            assert_eq!(a.eq_lo, b.eq_lo, "{label}: eq_lo");
+            assert_eq!(a.eq_hi, b.eq_hi, "{label}: eq_hi");
+            assert_eq!(a.round0, b.round0, "{label}: round0");
+        };
+
+        // The honest offer: reuse must be byte-identical to the collapse.
+        expect_collapse(
+            "reuse",
+            &[Some(PreCollapsedSHatV {
+                value: &collapsed,
+                point: collapse_point,
+            })],
+        );
+        // Nothing offered at all.
+        expect_collapse("none", &[None]);
+
+        // Fail-closed guards. Each of these offers a vector that is NOT the
+        // honest statistic; the transcript must be unchanged, which can only
+        // happen if the guard rejected it and collapsed instead.
+        let wrong_value: Vec<F128> = collapsed.iter().map(|v| *v + F128::ONE).collect();
+        let wrong_point: Vec<F128> = collapse_point.iter().map(|v| *v + F128::ONE).collect();
+        expect_collapse(
+            "wrong point",
+            &[Some(PreCollapsedSHatV {
+                value: &wrong_value,
+                point: &wrong_point,
+            })],
+        );
+        expect_collapse(
+            "short point",
+            &[Some(PreCollapsedSHatV {
+                value: &wrong_value,
+                point: &collapse_point[..5],
+            })],
+        );
+        expect_collapse(
+            "wrong width",
+            &[Some(PreCollapsedSHatV {
+                value: &wrong_value[..64],
+                point: collapse_point,
+            })],
+        );
+
+        // Control: with the guard satisfied the vector really is consumed —
+        // an honest point plus a corrupted value must change the transcript.
+        let (baseline, _) = run(&[]);
+        let (poisoned, _) = run(&[Some(PreCollapsedSHatV {
+            value: &wrong_value,
+            point: collapse_point,
+        })]);
+        assert_ne!(
+            poisoned[0].0, baseline[0].0,
+            "the reuse never engaged — the equalities above prove nothing",
+        );
+    }
+
+    /// Exact-`1` rollback for the pre-collapsed reuse.
+    #[test]
+    fn s_hat_v_reuse_gate_is_exact() {
+        use std::ffi::OsStr;
+
+        assert!(!super::s_hat_v_reuse_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::s_hat_v_reuse_value_enabled(value.map(OsStr::new)));
+        }
+    }
+
+    /// Exact-`1` rollback for the s_hat_v-lane hetero drain.
+    #[test]
+    fn shatv_lane_hetero_gate_is_exact() {
+        use std::ffi::OsStr;
+
+        let enabled = super::shatv_lane_hetero_value_enabled;
+        assert!(!enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(enabled(value.map(OsStr::new)));
+        }
+        // A stray export must never flip the ranked shape: only the exact
+        // string `1` rolls back.
+        assert!(enabled(Some(OsStr::new(" 1"))));
+    }
+
+    /// **Proof obligation 1 — partition exhaustiveness and disjointness.**
+    ///
+    /// The factor-state drain issues `claims · 128` chunks. Decode every one
+    /// of them the way the drained closure does and record the absolute
+    /// `(claim, buffer, slot)` each chunk writes. Every slot of every
+    /// `64 · n_packed` buffer must be written **exactly once**: no chunk may
+    /// overlap another (disjointness) and none may be dropped (exhaustive
+    /// coverage). Because every slot has a single writer whose value depends
+    /// only on that writer's own inputs, there is no reduction at all — so
+    /// the drained result equals the serial result slot by slot, and chunk
+    /// claim order is unobservable.
+    #[test]
+    fn fold8_factor_state_partition_is_exhaustive_and_disjoint() {
+        const N_PACKED: usize = 1usize << LOG_PACKING;
+        for claims in [1usize, 2, 3] {
+            let n_chunks = claims * super::FOLD8_STATE_CHUNKS_PER_CLAIM;
+            // [claim][family][slot] write counts; family 0 = W, 1 = A.
+            let mut writes = vec![[vec![0u32; 64 * N_PACKED], vec![0u32; 64 * N_PACKED]]; claims];
+            let mut seen_columns: Vec<(usize, usize, usize)> = Vec::with_capacity(n_chunks);
+            for chunk in 0..n_chunks {
+                let (slot, family, col) = super::fold8_state_chunk(chunk);
+                assert!(slot < claims, "chunk {chunk} decoded past the claim list");
+                assert!(family < 2, "chunk {chunk} decoded an unknown family");
+                assert!(col < 64, "chunk {chunk} decoded a column past 64");
+                seen_columns.push((slot, family, col));
+                // The exact slot set each kernel writes.
+                for bit in 0..N_PACKED {
+                    writes[slot][family][bit * 64 + col] += 1;
+                }
+            }
+            // The decode is a bijection onto claims × {W,A} × columns.
+            let mut sorted = seen_columns.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                n_chunks,
+                "claims={claims}: two chunks decoded to the same column"
+            );
+            for claim in &writes {
+                for (family, buffer) in claim.iter().enumerate() {
+                    assert!(
+                        buffer.iter().all(|&c| c == 1),
+                        "claims={claims} family={family}: a slot was written {} times",
+                        buffer.iter().copied().max().unwrap_or(0)
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Proof obligation 2 — the drain reproduces the incumbent loops.**
+    ///
+    /// The serial column loops the hoisted drain replaced are reproduced
+    /// verbatim here as an independent oracle, and both arms of
+    /// [`super::build_fold8_factor_states`] — the hetero queue and the serial
+    /// fallback the kill switch selects — must equal it exactly, for one, two
+    /// and three claims. Chunk-claim order is genuinely nondeterministic in
+    /// the queue arm, so equality here is the order-independence property in
+    /// its strongest form: slot-for-slot, not merely as a multiset.
+    #[test]
+    fn fold8_factor_states_match_the_serial_column_loops() {
+        const N_PACKED: usize = 1usize << LOG_PACKING;
+        let mut rng = Rng::new(0x0FD8_57A7);
+        for claims in [1usize, 2, 3] {
+            let banks_owned: Vec<Vec<F128>> = (0..claims)
+                .map(|_| (0..64 * N_PACKED).map(|_| rng.f128()).collect())
+                .collect();
+            let low_eqs: Vec<[F128; 64]> = (0..claims)
+                .map(|_| std::array::from_fn(|_| rng.f128()))
+                .collect();
+            let tables_owned: Vec<Vec<F128>> = (0..claims)
+                .map(|_| {
+                    let eq: Vec<F128> = (0..N_PACKED).map(|_| rng.f128()).collect();
+                    build_fold_byte_table(&eq)
+                })
+                .collect();
+            let banks: Vec<&[F128]> = banks_owned.iter().map(Vec::as_slice).collect();
+            let tables: Vec<&[F128]> = tables_owned.iter().map(Vec::as_slice).collect();
+
+            // Independent oracle: the exact loops this mechanism replaced.
+            let oracle: Vec<(Vec<F128>, Vec<F128>)> = (0..claims)
+                .map(|j| {
+                    let table = tables[j];
+                    let low_eq = &low_eqs[j];
+                    let fold8 = banks[j];
+                    let mut w_state = vec![F128::ZERO; 64 * N_PACKED];
+                    for d_low in 0..64 {
+                        let mut basis_product = low_eq[d_low];
+                        w_state[d_low] = fold_one_slot(basis_product, table);
+                        for bit in 1..N_PACKED {
+                            basis_product = mul_by_x(basis_product);
+                            w_state[bit * 64 + d_low] = fold_one_slot(basis_product, table);
+                        }
+                    }
+                    let mut a_state = vec![F128::ZERO; 64 * N_PACKED];
+                    for e in 0..64 {
+                        let bank = &fold8[e * N_PACKED..(e + 1) * N_PACKED];
+                        let transposed = tensor_algebra_transpose(bank);
+                        for (bit, value) in transposed.into_iter().enumerate() {
+                            a_state[bit * 64 + e] = value;
+                        }
+                    }
+                    (a_state, w_state)
+                })
+                .collect();
+
+            for hetero in [false, true] {
+                let got =
+                    super::build_fold8_factor_states(&banks, &low_eqs, &tables, N_PACKED, hetero);
+                assert_eq!(got.len(), claims);
+                for (j, ((a, w), (a_oracle, w_oracle))) in got.iter().zip(oracle.iter()).enumerate()
+                {
+                    assert_eq!(a, a_oracle, "claims={claims} hetero={hetero} claim {j}: A");
+                    assert_eq!(w, w_oracle, "claims={claims} hetero={hetero} claim {j}: W");
+                }
+            }
+        }
+        // Degenerate input: no DirectFold8 claim issues no chunks at all.
+        assert!(super::build_fold8_factor_states(&[], &[], &[], N_PACKED, true).is_empty());
+    }
+
+    /// **Proof obligation 3 — the end-to-end tail consumes exactly what the
+    /// serial loops would have produced.**
+    ///
+    /// Drives the real batched prover on a sixty-four-bank intake and checks
+    /// the `DirectFold8Factors` it emits against the serial arm of the
+    /// hoisted builder, so the hoist out of the two-way per-opening tail is
+    /// pinned to be value-neutral rather than merely argued. `round0` is
+    /// re-derived from the two states, closing the cached-value loop.
+    #[test]
+    fn prove_batched_fold8_states_equal_the_serial_builder() {
+        use crate::challenger::FsChallenger;
+        use crate::lincheck::{pack_z_lincheck, partial_fold_packed_z};
+
+        const M: usize = 18;
+        const K_LOG: usize = 14;
+        const K_SKIP: usize = 6;
+        const N_PACKED: usize = 1usize << LOG_PACKING;
+        let mut rng = Rng::new(0x51A7_E5B0);
+        let z = rng.bits(1 << M);
+        let packed = pack_witness(&z, M);
+        let z_packed_lincheck = pack_z_lincheck(&z, M, K_LOG);
+        let inner_rest: Vec<F128> = (0..(K_LOG - K_SKIP)).map(|_| rng.f128()).collect();
+        let outer: Vec<F128> = (0..(M - K_LOG)).map(|_| rng.f128()).collect();
+        let mut point = inner_rest.clone();
+        point.extend_from_slice(&outer);
+        let z_vec = partial_fold_packed_z(&z_packed_lincheck, M, K_LOG, &build_eq(&outer));
+        let fold8 = s_hat_v_fold8_from_z_vec(&z_vec, &inner_rest[1..]);
+        let padding = PaddingSpec::dense(M);
+
+        let mut challenger = FsChallenger::new(b"fold8-state-hoist");
+        let (out, gammas) = prove_batched_padded_with_precomputed(
+            &packed,
+            &[&point],
+            &[Some(fold8.as_slice())],
+            &padding,
+            &mut challenger,
+        );
+        let factors = out[0]
+            .1
+            .direct_fold8
+            .as_ref()
+            .expect("sixty-four-bank intake must expose DirectFold8Factors");
+
+        // Rebuild the inputs the tail fed the hoisted builder.
+        let suffix = &point[1..];
+        let low_eq: [F128; 64] = build_eq(&suffix[..6])
+            .try_into()
+            .expect("six-coordinate eq has sixty-four entries");
+        let r_dprime_eq = {
+            // The tail bakes γ into `eq_r_dprime` before building the table;
+            // recover the same table from the emitted factors' own inputs by
+            // replaying the transcript-visible scaling.
+            let mut replay = FsChallenger::new(b"fold8-state-hoist");
+            replay.observe_label(b"flock-ring-switch-v0");
+            replay.observe_f128_slice(&out[0].0.s_hat_v);
+            let r_dprime = replay.sample_f128_vec(LOG_PACKING);
+            let eq = build_eq(&r_dprime);
+            eq.iter().map(|v| gammas[0] * *v).collect::<Vec<F128>>()
+        };
+        let table = build_fold_byte_table(&r_dprime_eq);
+        let serial = super::build_fold8_factor_states(
+            &[fold8.as_slice()],
+            &[low_eq],
+            &[table.as_slice()],
+            N_PACKED,
+            false,
+        );
+        assert_eq!(factors.a_state, serial[0].0, "A state");
+        assert_eq!(factors.w_state, serial[0].1, "W state");
+        assert_eq!(
+            factors.round0,
+            crate::pcs::round0_deferred(&factors.a_state, &factors.w_state),
+            "cached round zero must match a fresh factor-state scan"
+        );
     }
 
     #[test]

@@ -149,6 +149,70 @@ pub(crate) fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+/// Fold the first `banks` banks of one banked output slot:
+/// `Σ_{k<banks} weight[k] · input[k]`, reduced once.
+///
+/// The runtime-width sibling of [`fold_banked_slot`], for callers whose
+/// trailing inputs are structurally zero. Because reduction is F₂-linear,
+/// the result is bit-identical to the fully-reduced loop over `banks` banks —
+/// and therefore to the full-width fold whenever the dropped inputs really
+/// are zero.
+#[inline]
+pub(crate) fn fold_banked_prefix(weight: &[F128], input: &[F128], banks: usize) -> F128 {
+    debug_assert!(weight.len() >= banks && input.len() >= banks);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the cfg gate supplies PMULL through `aes`; the debug
+        // assertion above is the kernel's complete slice-shape contract, and
+        // the caller's sub-slices are at least `banks` long in release too.
+        unsafe { aarch64::fold_banked_prefix(weight, input, banks) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let mut acc = super::F256Unreduced::ZERO;
+        for k in 0..banks {
+            acc ^= weight[k].mul_unreduced(input[k]);
+        }
+        acc.reduce()
+    }
+}
+
+/// [`fold_banked_slots2`] with the second slot truncated to its first
+/// `second_banks` banks: `[0]` sums all `BANKS` banks of `input[..BANKS]`,
+/// `[1]` sums only `input[BANKS..BANKS + second_banks]`.
+///
+/// For callers whose second slot has a structurally zero bank tail. With
+/// `second_banks == BANKS` this is exactly [`fold_banked_slots2`]; otherwise
+/// it is bit-identical to it on any input whose dropped banks are zero.
+#[inline]
+pub(crate) fn fold_banked_slots2_head<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    input: &[F128],
+    second_banks: usize,
+) -> [F128; 2] {
+    debug_assert!(second_banks <= BANKS);
+    debug_assert!(input.len() >= BANKS + second_banks);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the cfg gate supplies PMULL through `aes`; the caller's
+        // sub-slice covers the first slot in full and the second slot's
+        // retained prefix.
+        unsafe { aarch64::fold_banked_slots2_head::<BANKS>(weight, input, second_banks) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let mut first = super::F256Unreduced::ZERO;
+        let mut second = super::F256Unreduced::ZERO;
+        for (bank, w) in weight.iter().enumerate() {
+            first ^= w.mul_unreduced(input[bank]);
+            if bank < second_banks {
+                second ^= w.mul_unreduced(input[BANKS + bank]);
+            }
+        }
+        [first.reduce(), second.reduce()]
+    }
+}
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -1005,6 +1069,69 @@ mod tests {
                     oracle(&w6, &buf[off6 + 6..off6 + 12]),
                 ],
                 "pair banks=6 trial={trial}"
+            );
+        }
+    }
+
+    /// Oracle for the truncated banked folds that drop a structurally zero
+    /// bank tail: over any input the retained products must equal the
+    /// fully-reduced accumulation over the same prefix, and over an input
+    /// whose dropped banks are zero they must equal the full-width fold bit
+    /// for bit.
+    #[test]
+    fn truncated_banked_folds_match_fully_reduced_oracle() {
+        let mut state = 0x510e_527f_ade6_82d1_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        fn oracle(weight: &[F128], input: &[F128], banks: usize) -> F128 {
+            let mut value = F128::ZERO;
+            for bank in 0..banks {
+                value += weight[bank] * input[bank];
+            }
+            value
+        }
+
+        for trial in 0..64 {
+            let w64: [F128; 64] = std::array::from_fn(|_| F128::new(next(), next()));
+            let buf: Vec<F128> = (0..256).map(|_| F128::new(next(), next())).collect();
+            let off = 64 * (trial % 3);
+            // Ranked tail (57 live banks of 64), plus widths that exercise
+            // the odd pair remainder and both loop extremes.
+            for banks in [57usize, 0, 1, 2, 3, 63, 64] {
+                assert_eq!(
+                    fold_banked_prefix(&w64, &buf[off..off + 64], banks),
+                    oracle(&w64, &buf[off..off + 64], banks),
+                    "prefix banks={banks} trial={trial}"
+                );
+                assert_eq!(
+                    fold_banked_slots2_head::<64>(&w64, &buf[off..off + 128], banks),
+                    [
+                        oracle(&w64, &buf[off..off + 64], 64),
+                        oracle(&w64, &buf[off + 64..off + 128], banks),
+                    ],
+                    "head banks={banks} trial={trial}"
+                );
+            }
+            // With the dropped banks actually zero, the truncated kernels are
+            // bit-identical to the full-width ones.
+            let mut zeroed = buf[off..off + 128].to_vec();
+            for value in zeroed.iter_mut().skip(64 + 57) {
+                *value = F128::ZERO;
+            }
+            assert_eq!(
+                fold_banked_slots2_head::<64>(&w64, &zeroed, 57),
+                fold_banked_slots2::<64>(&w64, &zeroed),
+                "zero-tail head trial={trial}"
+            );
+            assert_eq!(
+                fold_banked_prefix(&w64, &zeroed[64..], 57),
+                fold_banked_slot::<64>(&w64, &zeroed[64..]),
+                "zero-tail prefix trial={trial}"
             );
         }
     }

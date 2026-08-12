@@ -4399,6 +4399,56 @@ fn direct_fold8_claim_parallel_enabled() -> bool {
     })
 }
 
+const ENV_NO_FOLD8_TAIL_SKIP: &str = "FLOCK_NO_FOLD8_TAIL_SKIP";
+
+/// Exact-`1` rollback for the fold8 zero-tail bank skip. Every other value
+/// leaves the candidate enabled, so control and candidate use the same binary.
+fn fold8_tail_skip_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn fold8_tail_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        fold8_tail_skip_value_enabled(std::env::var_os(ENV_NO_FOLD8_TAIL_SKIP).as_deref())
+    })
+}
+
+/// Trailing witness banks [`materialize_direct_fold8`] may drop from every
+/// odd slot, given the claims it was handed and the block width it folds.
+///
+/// The count itself comes from the R1CS padding via
+/// [`ring_switch::fold8_dead_tail_banks`]; this adds the materializer's own
+/// **index lemma** and fails closed whenever any part of it does not hold:
+///
+/// * block `i` reads the witness stripe starting at `64·i·block_len`, so with
+///   an even `block_len` every stripe starts on a multiple of 128 and a local
+///   slot's parity equals the parity of its global packed-witness position —
+///   the position the padding geometry is stated in;
+/// * therefore the pair loop, which always anchors on an even local slot,
+///   spans exactly one (even, odd) global position pair and its dead inputs
+///   are exactly the last `dead` of the 128-element window;
+/// * all claims must agree, since they describe one shared packed witness;
+/// * a full dead slot (`dead >= 64`) is never claimed here — the padding
+///   derivation already fails closed on it, and this refuses it again.
+///
+/// [`ring_switch::fold8_dead_tail_banks`]: super::ring_switch::fold8_dead_tail_banks
+fn direct_fold8_dead_tail_banks(
+    claims: &[super::ring_switch::DirectFold8Factors],
+    block_len: usize,
+) -> usize {
+    let dead = claims[0].dead_tail_banks;
+    if dead == 0
+        || dead >= super::ring_switch::DIRECT_FOLD8_BANKS
+        || !block_len.is_multiple_of(2)
+        || !claims.iter().all(|claim| claim.dead_tail_banks == dead)
+        || !fold8_tail_skip_enabled()
+    {
+        return 0;
+    }
+    dead
+}
+
 #[inline]
 fn select_direct_fold8_claim_parallel(
     claim_count: usize,
@@ -4956,6 +5006,13 @@ fn materialize_direct_fold8(
     let pair_fold64 = deferred_reduce
         && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
         && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none();
+    // Trailing banks of every odd witness slot that the R1CS padding forces
+    // to zero (see `direct_fold8_dead_tail_banks` for the index lemma; the
+    // `block_len` parity it needs is the assertion above). Their products are
+    // zero, so dropping them cannot change a bit. The witness only — the
+    // ordinary basis carries no per-block padding structure.
+    let dead_tail = direct_fold8_dead_tail_banks(claims, block_len);
+    let live_banks = 64 - dead_tail;
 
     // One shared per-block body for both drains below, so the scheduling
     // choice cannot drift from the value computation. For block `i` it fully
@@ -4975,16 +5032,23 @@ fn materialize_direct_fold8(
         } else {
             &[]
         };
-        let fold64 = |input: &[F128], slot: usize| {
+        let fold64 = |input: &[F128], slot: usize, banks: usize| {
             let base = 64 * slot;
             if deferred_reduce {
-                return crate::field::f128_slice::fold_banked_slot::<64>(
+                if banks == 64 {
+                    return crate::field::f128_slice::fold_banked_slot::<64>(
+                        &fold_weight,
+                        &input[base..base + 64],
+                    );
+                }
+                return crate::field::f128_slice::fold_banked_prefix(
                     &fold_weight,
                     &input[base..base + 64],
+                    banks,
                 );
             }
             let mut value = F128::ZERO;
-            for bank in 0..64 {
+            for bank in 0..banks {
                 value += fold_weight[bank] * input[base + bank];
             }
             value
@@ -5001,10 +5065,18 @@ fn materialize_direct_fold8(
         if pair_fold64 {
             while slot + 1 < block_len {
                 let base = 64 * slot;
-                let folded_f = crate::field::f128_slice::fold_banked_slots2::<64>(
-                    &fold_weight,
-                    &f_in[base..base + 128],
-                );
+                let folded_f = if dead_tail == 0 {
+                    crate::field::f128_slice::fold_banked_slots2::<64>(
+                        &fold_weight,
+                        &f_in[base..base + 128],
+                    )
+                } else {
+                    crate::field::f128_slice::fold_banked_slots2_head::<64>(
+                        &fold_weight,
+                        &f_in[base..base + 128],
+                        live_banks,
+                    )
+                };
                 f_out[slot] = folded_f[0];
                 f_out[slot + 1] = folded_f[1];
 
@@ -5026,10 +5098,11 @@ fn materialize_direct_fold8(
             }
         }
         while slot < block_len {
-            f_out[slot] = fold64(f_in, slot);
+            let f_banks = if slot % 2 == 1 { live_banks } else { 64 };
+            f_out[slot] = fold64(f_in, slot, f_banks);
             let direct = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
             b_out[slot] = if has_ordinary {
-                direct + fold64(b_in, slot)
+                direct + fold64(b_in, slot, 64)
             } else {
                 direct
             };
@@ -12265,6 +12338,159 @@ mod tests {
         assert!(!select(2, 8192, 10, true, false));
     }
 
+    /// The fold8 zero-tail skip is exact-`1` and its index lemma fails closed.
+    #[test]
+    fn direct_fold8_tail_skip_gate_is_exact_and_lemma_checked() {
+        use std::ffi::OsStr;
+
+        assert!(!super::fold8_tail_skip_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::fold8_tail_skip_value_enabled(value.map(OsStr::new)));
+        }
+
+        let claims = |dead: [usize; 2]| -> Vec<super::super::ring_switch::DirectFold8Factors> {
+            dead.iter()
+                .map(
+                    |&dead_tail_banks| super::super::ring_switch::DirectFold8Factors {
+                        eq_lo: vec![F128::ONE; 4],
+                        eq_hi: vec![F128::ONE; 2],
+                        a_state: Vec::new(),
+                        w_state: Vec::new(),
+                        round0: (F128::ZERO, F128::ZERO),
+                        dead_tail_banks,
+                    },
+                )
+                .collect()
+        };
+        // Even block width: stripes start on a multiple of 128, so local slot
+        // parity is global position parity and the skip is honored.
+        assert_eq!(super::direct_fold8_dead_tail_banks(&claims([7, 7]), 4), 7);
+        assert_eq!(super::direct_fold8_dead_tail_banks(&claims([7, 7]), 2), 7);
+        // Odd block width breaks the alignment lemma.
+        assert_eq!(super::direct_fold8_dead_tail_banks(&claims([7, 7]), 3), 0);
+        // One shared witness: disagreeing claims cannot both be right.
+        assert_eq!(super::direct_fold8_dead_tail_banks(&claims([7, 3]), 4), 0);
+        assert_eq!(super::direct_fold8_dead_tail_banks(&claims([0, 7]), 4), 0);
+        // Never a whole dead slot.
+        assert_eq!(super::direct_fold8_dead_tail_banks(&claims([64, 64]), 4), 0);
+        assert_eq!(super::direct_fold8_dead_tail_banks(&claims([0, 0]), 4), 0);
+    }
+
+    /// Bit-identity oracle for the materializer's structurally-zero bank tail.
+    ///
+    /// The ranked BLAKE3 padding leaves the last seven of every 128 packed
+    /// witness words identically zero, which the sixty-four-bank fold sees as
+    /// a dead tail in every odd slot. Folding a witness carrying exactly that
+    /// geometry with the padding-derived skip must be bit-equal to folding it
+    /// with the skip off — and both the negative control (a nonzero word in
+    /// the dead tail) and a padding that exposes no tail must diverge, so the
+    /// equality above cannot be vacuous.
+    #[test]
+    fn direct_fold8_zero_tail_bank_skip_is_bit_identical() {
+        use crate::challenger::Challenger;
+        use crate::zerocheck::PaddingSpec;
+
+        // The skip count is derived from the padding descriptor, never
+        // assumed: ranked BLAKE3 is `k_log = 14` with 15,409 useful bits, so
+        // 121 of each block's 128 packed words are useful and seven are dead.
+        let ranked = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let dead = super::super::ring_switch::fold8_dead_tail_banks(&ranked);
+        assert_eq!(dead, 7, "ranked padding must expose a seven-bank dead tail");
+        for spec in [
+            // Block with no padding at all.
+            PaddingSpec {
+                k_log: 14,
+                useful_bits_per_block: 16_384,
+            },
+            // Block narrower than a fold pair.
+            PaddingSpec {
+                k_log: 13,
+                useful_bits_per_block: 15_409,
+            },
+            // Block wider than a fold pair.
+            PaddingSpec {
+                k_log: 15,
+                useful_bits_per_block: 15_409,
+            },
+            // Zero tail wider than one slot: it no longer lands only in the
+            // odd slot, so nothing may be skipped.
+            PaddingSpec {
+                k_log: 14,
+                useful_bits_per_block: 5_000,
+            },
+            PaddingSpec::dense(25),
+        ] {
+            assert_eq!(
+                super::super::ring_switch::fold8_dead_tail_banks(&spec),
+                0,
+                "skip must auto-disable at {spec:?}",
+            );
+        }
+
+        let mut rng = crate::challenger::RandomChallenger::new(0x0FF8_7A11);
+        let n_packed = 1usize << crate::pcs::LOG_PACKING;
+        let block_len = 4usize;
+        let n_hi = 2usize;
+        // Four whole 128-word padding blocks, two materializer blocks of four
+        // slots each: every stripe starts at `64 · block · block_len`, a
+        // multiple of 128, so slot parity is packed-position parity.
+        let witness_len = 64 * block_len * n_hi;
+        let words_per_block = 2 * 64;
+        let live_words = words_per_block - dead;
+
+        let mut witness: Vec<F128> = (0..witness_len).map(|_| rng.sample_f128()).collect();
+        for (index, word) in witness.iter_mut().enumerate() {
+            if index % words_per_block >= live_words {
+                *word = F128::ZERO;
+            }
+        }
+        let basis: Vec<F128> = (0..witness_len).map(|_| rng.sample_f128()).collect();
+        let eq_lo: Vec<F128> = (0..block_len).map(|_| rng.sample_f128()).collect();
+        let eq_hi: Vec<F128> = (0..n_hi).map(|_| rng.sample_f128()).collect();
+        let w_state: Vec<F128> = (0..2 * n_packed).map(|_| rng.sample_f128()).collect();
+        let challenges: [F128; 6] = std::array::from_fn(|_| rng.sample_f128());
+
+        let run = |input: &[F128], dead_tail_banks: usize| {
+            let claims = vec![super::super::ring_switch::DirectFold8Factors {
+                eq_lo: eq_lo.clone(),
+                eq_hi: eq_hi.clone(),
+                a_state: Vec::new(),
+                w_state: w_state.clone(),
+                round0: (F128::ZERO, F128::ZERO),
+                dead_tail_banks,
+            }];
+            super::materialize_direct_fold8(input.to_vec(), basis.clone(), &claims, challenges)
+        };
+
+        let skipped = run(&witness, dead);
+        let full = run(&witness, 0);
+        assert_eq!(skipped.0, full.0, "folded witness differs under the skip");
+        assert_eq!(skipped.1, full.1, "folded basis differs under the skip");
+        assert_eq!(skipped.2, full.2, "round message differs under the skip");
+
+        // Negative control: a nonzero word inside the dead tail must now be
+        // dropped by the skip and kept without it.
+        let mut broken = witness.clone();
+        broken[witness_len - 1] = F128::ONE;
+        assert_ne!(
+            run(&broken, dead).0,
+            run(&broken, 0).0,
+            "the skip never engaged — the equality above proves nothing",
+        );
+
+        // A witness with no zero tail: the derived skip is 0 there, and that
+        // auto-disable is exactly what keeps the fold correct.
+        let plain: Vec<F128> = (0..witness_len).map(|_| rng.sample_f128()).collect();
+        assert_ne!(
+            run(&plain, dead).0,
+            run(&plain, 0).0,
+            "skipping live banks must change the fold",
+        );
+    }
+
     #[test]
     fn direct_fold8_two_claim_parallel_rounds_match_serial() {
         use crate::challenger::Challenger;
@@ -12278,6 +12504,7 @@ mod tests {
                 a_state: (0..64 * n_packed).map(|_| rng.sample_f128()).collect(),
                 w_state: (0..64 * n_packed).map(|_| rng.sample_f128()).collect(),
                 round0: (rng.sample_f128(), rng.sample_f128()),
+                dead_tail_banks: 0,
             })
             .collect();
         let challenges: [F128; 5] = std::array::from_fn(|_| rng.sample_f128());
@@ -12361,6 +12588,7 @@ mod tests {
             a_state,
             w_state,
             round0: cached_round0,
+            dead_tail_banks: 0,
         }];
         let (round0, round1, mut round2, mut round3, mut round4, mut round5) =
             super::super::messages_from_direct_products_fold8(&products);
@@ -12528,6 +12756,7 @@ mod tests {
             a_state,
             w_state,
             round0: cached_round0,
+            dead_tail_banks: 0,
         }];
         let (round0, round1, _, _, _, _) =
             super::super::messages_from_direct_products_fold8(&products);

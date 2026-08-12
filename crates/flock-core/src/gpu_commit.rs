@@ -1238,6 +1238,460 @@ mod tuner_arm_timing_gate_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Broad exact-A/B split sweep: score the JOIN WINDOW, not the graph arm.
+//
+// The sweep's per-candidate probe is one `rayon::join` whose arms are (a) the
+// GPU commit graph with its `k/16` CPU suffix and (b) a replay of the real
+// round-1 A/B precompute. That is the same two-arm shape the timed prove runs
+// (`flock-prover/src/prover.rs`, the commit/precompute `rayon::join`), and the
+// two arms are NOT independent: the CPU suffix drives the global rayon pool
+// (`par_chunks` over the suffix leaf jobs and `into_par_iter` over the suffix
+// parent levels inside `run_commit_graph_from_z_hybrid_impl`) while the A/B
+// precompute drains the same pool plus the shared E-helper pool
+// (`epool::run_hetero_chunks_stateful` in `zerocheck::univariate_skip_optimized`).
+// Raising `k` therefore shortens the graph arm by taking cores away from the
+// sibling arm.
+//
+// The incumbent objective minimised the graph arm alone, on the premise that
+// the A/B arm is k-independent so a shorter graph is "free". It is free only
+// when the graph is the binding arm. In the regime this tree actually measures
+// (`univariate_skip_optimized`'s QS5 note, 2026-08-05, this hardware class: A/B
+// arm 58.2 ms ~ window 58.3 ms while the graph finishes at 41-53 ms with
+// 0.00 ms host wait) the A/B arm binds and the graph carries 5-17 ms of slack,
+// so every core-ms the CPU suffix takes is charged straight to the window.
+//
+// The quantity that a candidate costs the timed prove is `max(graph, ab)`.
+// Selecting on it is bounded-optimal: the selected candidate's measured window
+// is always within the near-tie band of the table's best window, whereas
+// graph-arm selection admits no such bound once `ab` moves with `k`. Where the
+// graph is the binding arm the two objectives coincide exactly, which is the
+// never-worse direction (see `hybrid_window_scoring_tests`).
+// ---------------------------------------------------------------------------
+
+/// The incumbent graph-arm selection rule, extracted pure so both objectives
+/// are testable on non-Apple hosts (`imp` is Apple-gated) and so the
+/// never-worse comparison in `hybrid_window_scoring_tests` runs against the
+/// real incumbent rather than a copy of it. `imp::choose_hybrid_k` is a thin
+/// environment-reading wrapper over this function; the body is unchanged.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn select_hybrid_split_graph_arm(
+    candidates: &[usize],
+    best_ms: &[f64],
+    default_k: usize,
+    tie: f64,
+    keep_default_band: bool,
+) -> Option<usize> {
+    let default_i = candidates
+        .iter()
+        .position(|&k| k == default_k)
+        .expect("default split is a sweep candidate");
+    let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+    let chosen_i = (0..candidates.len()).find(|&i| best_ms[i] <= fastest * (1.0 + tie))?;
+    let mut chosen = candidates[chosen_i];
+    if keep_default_band && best_ms[default_i] <= fastest * (1.0 + tie) {
+        chosen = default_k;
+    }
+    if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
+        chosen = default_k;
+    }
+    Some(chosen)
+}
+
+/// Per-candidate arm walls from the broad exact-A/B split sweep.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct HybridSweepScore {
+    /// Mean wall of the commit-graph arm over the sweep's two passes.
+    pub(crate) graph_ms: f64,
+    /// Mean wall of the sibling A/B replay arm over the same two passes.
+    pub(crate) ab_ms: f64,
+    /// Half this candidate's pass-to-pass spread, maximised over the two arms:
+    /// the sweep's own in-run noise sample for this candidate.
+    pub(crate) half_spread_ms: f64,
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+impl HybridSweepScore {
+    /// The join window this candidate would present to the timed prove.
+    pub(crate) fn window_ms(&self) -> f64 {
+        self.graph_ms.max(self.ab_ms)
+    }
+}
+
+/// Slack the pure-GPU graph must clear inside the A/B arm, in milliseconds.
+///
+/// Derived from the sweep, not invented. Two floors, whichever binds:
+/// - `tie * ab_ms`. `tie` is the tree's own declared resolution for these
+///   walls — the near-tie band (0.02) below which the selector already refuses
+///   to distinguish two candidates. Applied to the binding arm's magnitude it
+///   restates that resolution in milliseconds.
+/// - the largest per-candidate half-spread in the table. The sweep takes a
+///   second, reverse-order pass precisely so thermal drift and queue warmup
+///   surface as pass-to-pass disagreement; that disagreement is this host's
+///   measured scatter for exactly these walls.
+///
+/// Requiring both means the graph must fit inside the A/B arm by more than the
+/// declared resolution AND by more than the run's own observed scatter.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn hybrid_sweep_noise_ms(scores: &[HybridSweepScore], tie: f64, ab_ms: f64) -> f64 {
+    let spread = scores
+        .iter()
+        .map(|s| s.half_spread_ms)
+        .fold(0.0f64, f64::max);
+    (tie * ab_ms).max(spread)
+}
+
+/// Pure window-objective selection over the sweep's per-candidate arm walls.
+///
+/// `candidates` is ascending and must contain `default_k`. The shape mirrors
+/// `imp::choose_hybrid_k` exactly — smallest share within the near-tie band of
+/// the fastest, optional keep-default band, then a pure-GPU gate — with two
+/// substitutions:
+/// 1. the scored quantity is the join window `max(graph, ab)` instead of the
+///    graph arm alone;
+/// 2. the pure-GPU gate accepts k=0 on EITHER the incumbent's "beats the
+///    default by more than 4%" test OR a new slack test: the pure-GPU graph
+///    finishes inside the sibling A/B arm by more than
+///    [`hybrid_sweep_noise_ms`]. When the graph fits under the binding arm, no
+///    CPU suffix can shorten the window — it can only lengthen the arm that is
+///    already setting it.
+///
+/// Keeping the 4% test as an alternative (not a replacement) is what makes the
+/// change never-worse: whenever the graph is the binding arm the window equals
+/// the graph, the band arithmetic is identical, and every k=0 the incumbent
+/// would have kept is still kept.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn select_hybrid_split(
+    candidates: &[usize],
+    scores: &[HybridSweepScore],
+    default_k: usize,
+    tie: f64,
+    keep_default_band: bool,
+) -> Option<usize> {
+    if candidates.len() != scores.len() || candidates.is_empty() {
+        return None;
+    }
+    let default_i = candidates.iter().position(|&k| k == default_k)?;
+    let fastest = scores
+        .iter()
+        .map(HybridSweepScore::window_ms)
+        .fold(f64::INFINITY, f64::min);
+    if !fastest.is_finite() {
+        return None;
+    }
+    let band = fastest * (1.0 + tie);
+    let chosen_i = (0..candidates.len()).find(|&i| scores[i].window_ms() <= band)?;
+    let mut chosen = candidates[chosen_i];
+    if keep_default_band && scores[default_i].window_ms() <= band {
+        chosen = default_k;
+    }
+    if chosen == 0 {
+        let s = scores[chosen_i];
+        let beats_default = s.window_ms() <= scores[default_i].window_ms() * (1.0 - 0.04);
+        let fits_under_ab = s.graph_ms + hybrid_sweep_noise_ms(scores, tie, s.ab_ms) <= s.ab_ms;
+        if !beats_default && !fits_under_ab {
+            chosen = default_k;
+        }
+    }
+    Some(chosen)
+}
+
+/// Local-only rollback for the window objective. Exact value `1`.
+///
+/// The ranked benchmark harness env-clears its workers (see the A/B-CONTROL
+/// note on `gpu_commit_enabled`), so this switch CANNOT reach a ranked worker.
+/// It exists for same-binary local comparison and in-process tests only; the
+/// window objective is and must be the default. For an exact source-level
+/// control on a ranked runner, flip `HYBRID_WINDOW_SCORE_DEFAULT` instead —
+/// the same compile-time pattern `HYBRID_LOCAL_PARENTS_DEFAULT` and
+/// `GPU_COMMIT_DEFAULT` already use.
+pub const ENV_NO_HYBRID_WINDOW_SCORE: &str = "FLOCK_NO_HYBRID_WINDOW_SCORE";
+
+/// A/B-CONTROL: set to `false` to build an exact graph-arm-scoring control
+/// binary that reaches the ranked runner (where the environment is cleared).
+const HYBRID_WINDOW_SCORE_DEFAULT: bool = true;
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn hybrid_window_score_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    HYBRID_WINDOW_SCORE_DEFAULT && value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn hybrid_window_score_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        hybrid_window_score_value_enabled(std::env::var_os(ENV_NO_HYBRID_WINDOW_SCORE).as_deref())
+    })
+}
+
+/// Selection-rule properties for the broad exact-A/B split sweep.
+///
+/// These run on every host: `imp` is Apple-gated, so both objectives are pure
+/// module-level functions and the tables below are synthetic sweep results.
+#[cfg(test)]
+mod hybrid_window_scoring_tests {
+    use super::{
+        HybridSweepScore, hybrid_sweep_noise_ms, hybrid_window_score_value_enabled,
+        select_hybrid_split, select_hybrid_split_graph_arm,
+    };
+    use std::ffi::OsStr;
+
+    /// The ranked candidate set, ascending, default k=5 at the end.
+    const C: [usize; 4] = [0, 2, 3, 5];
+    const DEF: usize = 5;
+    /// The in-tree near-tie band.
+    const TIE: f64 = 0.02;
+
+    /// Build a table with no pass-to-pass scatter, so the noise floor reduces
+    /// to the declared resolution `TIE * ab_ms` alone.
+    fn table(graph: [f64; 4], ab: [f64; 4]) -> [HybridSweepScore; 4] {
+        std::array::from_fn(|i| HybridSweepScore {
+            graph_ms: graph[i],
+            ab_ms: ab[i],
+            half_spread_ms: 0.0,
+        })
+    }
+
+    fn incumbent(graph: [f64; 4]) -> Option<usize> {
+        select_hybrid_split_graph_arm(&C, &graph, DEF, TIE, false)
+    }
+
+    fn windowed(scores: &[HybridSweepScore; 4]) -> Option<usize> {
+        select_hybrid_split(&C, scores, DEF, TIE, false)
+    }
+
+    /// PIN 1 — never-worse, the core obligation. Whenever the A/B arm is
+    /// constant across candidates AND the graph is the binding arm everywhere,
+    /// the window equals the graph and window scoring must reproduce the
+    /// incumbent's choice exactly, table for table.
+    #[test]
+    fn k_independent_ab_under_a_binding_graph_reproduces_the_incumbent() {
+        let graph_tables: [[f64; 4]; 8] = [
+            // flat basin
+            [100.0, 100.0, 100.0, 100.0],
+            // monotone decreasing in k (CPU helps)
+            [200.0, 150.0, 120.0, 100.0],
+            // monotone increasing in k (CPU hurts)
+            [100.0, 120.0, 150.0, 200.0],
+            // interior minimum at k=2
+            [200.0, 100.0, 130.0, 140.0],
+            // near-tie between k=3 and the default
+            [200.0, 150.0, 100.0, 101.5],
+            // pure-GPU wins outright by far more than 4%
+            [100.0, 200.0, 210.0, 220.0],
+            // pure-GPU wins, but by less than the 4% pure-GPU gate
+            [98.0, 99.0, 99.5, 100.0],
+            // pure-GPU exactly on the 4% gate boundary
+            [96.0, 120.0, 130.0, 100.0],
+        ];
+        for graph in graph_tables {
+            // A/B constant and strictly below every graph wall: graph binds.
+            let ab = [10.0; 4];
+            assert_eq!(
+                windowed(&table(graph, ab)),
+                incumbent(graph),
+                "graph-critical table {graph:?} must reproduce the incumbent"
+            );
+        }
+    }
+
+    /// PIN 2 — the measured in-tree regime. A/B binds (58.2 ms ~ the window)
+    /// while the graph basin is flat with 5-17 ms of slack. The incumbent's
+    /// flat basin resolves to k=0 and is then flipped to the default by the 4%
+    /// pure-GPU gate; window scoring must instead take the minimal share,
+    /// returning the CPU suffix's core-ms to the binding arm.
+    #[test]
+    fn flat_basin_with_a_binding_ab_arm_selects_the_minimal_share() {
+        // Graph walls spread by 1.5% — inside the 2% band, i.e. the flat basin
+        // the tree's own candidate-set note describes. Slack at k=0 is
+        // 58.2 - 52.6 = 5.6 ms, the pessimistic end of the measured 41-53 ms
+        // graph range against the measured 58.2 ms A/B arm. A/B rises with the
+        // CPU share because the suffix takes cores from it.
+        let graph = [52.6, 52.2, 52.0, 51.8];
+        let scores = table(graph, [58.2, 59.4, 60.1, 61.3]);
+        // Incumbent: the flat basin resolves to k=0, then the 4% pure-GPU gate
+        // flips it to the default — the maximum CPU share, charged to the
+        // binding arm.
+        assert_eq!(incumbent(graph), Some(DEF));
+        assert_eq!(windowed(&scores), Some(0));
+    }
+
+    /// PIN 3 — the slack test must not fire when the pure-GPU graph does not
+    /// fit inside the A/B arm. With the windows near-tied and no 4% pure-GPU
+    /// win, the incumbent's protective flip to the default stands.
+    #[test]
+    fn pure_gpu_that_overruns_the_ab_arm_keeps_the_default() {
+        // Every graph wall sits within a whisker of the 58.2 ms A/B arm, so the
+        // windows tie at 58.2 and k=0 wins the band — but k=0's graph has no
+        // slack under its own A/B arm and does not beat the default by 4%.
+        let scores = table([58.0, 58.1, 58.15, 58.19], [58.2; 4]);
+        assert_eq!(windowed(&scores), Some(DEF));
+    }
+
+    /// PIN 3b — where CPU help is real, window scoring keeps it. A pure-GPU
+    /// candidate that overruns its A/B arm badly must not be selected just
+    /// because it is the smallest share.
+    #[test]
+    fn a_graph_bound_pure_gpu_candidate_is_not_selected() {
+        let scores = table([70.0, 60.0, 59.0, 58.5], [58.2, 59.0, 59.5, 60.0]);
+        // Windows: [70.0, 60.0, 59.5, 60.0]. k=0 is 17% off the best and loses
+        // the band; k=2 is the smallest share inside it.
+        assert_eq!(windowed(&scores), Some(2));
+    }
+
+    /// PIN 4 — the slack test is a strict inequality against the derived
+    /// margin, not a bare comparison. At exactly `ab - tie*ab` the graph does
+    /// not clear the declared resolution and k=0 is refused; a hair more slack
+    /// accepts it.
+    #[test]
+    fn slack_test_respects_the_derived_noise_margin() {
+        let ab = 58.2;
+        let margin = TIE * ab; // 1.164 ms
+        // Flat A/B so only the slack test can move the decision, and a flat
+        // graph so the 4% pure-GPU gate cannot fire.
+        let just_short = table([ab - margin + 0.05; 4], [ab; 4]);
+        assert_eq!(hybrid_sweep_noise_ms(&just_short, TIE, ab), margin);
+        assert_eq!(windowed(&just_short), Some(DEF));
+
+        let just_clear = table([ab - margin - 0.05; 4], [ab; 4]);
+        assert_eq!(windowed(&just_clear), Some(0));
+    }
+
+    /// PIN 5 — observed scatter can veto the slack test. Same walls as the
+    /// accepting case above, but the sweep's two passes disagreed by more than
+    /// the slack, so the margin rises to the measured half-spread and k=0 is
+    /// refused.
+    #[test]
+    fn measured_pass_spread_raises_the_margin_and_vetoes_thin_slack() {
+        let ab = 58.2;
+        let mut scores = table([ab - TIE * ab - 0.05; 4], [ab; 4]);
+        assert_eq!(windowed(&scores), Some(0));
+        // One candidate's two passes disagreed by 8 ms → half-spread 4 ms.
+        scores[2].half_spread_ms = 4.0;
+        assert_eq!(hybrid_sweep_noise_ms(&scores, TIE, ab), 4.0);
+        assert_eq!(windowed(&scores), Some(DEF));
+    }
+
+    /// PIN 6 — a fully collapsed table (both arms identical across every
+    /// candidate, which is what `FLOCK_HYBRID_SCORE_JOIN_WALL=1` feeds in)
+    /// carries no slack, so selection falls back to the incumbent join-max
+    /// behaviour: the default.
+    #[test]
+    fn collapsed_join_wall_table_reproduces_the_incumbent_join_max_choice() {
+        let joined = [58.2, 58.3, 58.25, 58.4];
+        let scores = table(joined, joined);
+        assert_eq!(windowed(&scores), Some(DEF));
+        assert_eq!(incumbent(joined), Some(DEF));
+    }
+
+    /// PIN 7 — bounded optimality. The selected candidate's measured window is
+    /// always within the near-tie band of the table's best window. The
+    /// incumbent has no such bound: the measured-regime table above is a
+    /// counterexample to it, which is exactly the loss this build recovers.
+    #[test]
+    fn selected_window_is_always_within_the_tie_band_of_the_best() {
+        // A deterministic spread of tables, including adversarial A/B slopes.
+        let graphs: [[f64; 4]; 6] = [
+            [52.6, 52.2, 52.0, 51.8],
+            [53.0, 52.4, 52.0, 51.6],
+            [200.0, 150.0, 120.0, 100.0],
+            [100.0, 100.0, 100.0, 100.0],
+            [70.0, 60.0, 59.0, 58.5],
+            [40.0, 45.0, 50.0, 55.0],
+        ];
+        let abs: [[f64; 4]; 4] = [
+            [58.2, 59.4, 60.1, 61.3],
+            [10.0, 10.0, 10.0, 10.0],
+            [58.2, 58.2, 58.2, 58.2],
+            [90.0, 100.0, 115.0, 130.0],
+        ];
+        for graph in graphs {
+            for ab in abs {
+                let scores = table(graph, ab);
+                let best = scores
+                    .iter()
+                    .map(HybridSweepScore::window_ms)
+                    .fold(f64::INFINITY, f64::min);
+                let chosen = windowed(&scores).expect("selection succeeds");
+                let i = C.iter().position(|&k| k == chosen).unwrap();
+                assert!(
+                    scores[i].window_ms() <= best * (1.0 + TIE) + 1e-9,
+                    "window scoring picked k={chosen} at {:.3} ms, best {best:.3} ms \
+                     (graph {graph:?}, ab {ab:?})",
+                    scores[i].window_ms()
+                );
+            }
+        }
+        // The incumbent violates the same bound on the measured regime: it
+        // selects the maximum CPU share, whose window (61.3 ms) is 5.3% past
+        // the best available window (58.2 ms at k=0). That excess is the loss
+        // this build recovers.
+        let graph = [52.6, 52.2, 52.0, 51.8];
+        let ab = [58.2, 59.4, 60.1, 61.3];
+        let scores = table(graph, ab);
+        let inc = incumbent(graph).unwrap();
+        let i = C.iter().position(|&k| k == inc).unwrap();
+        assert_eq!(inc, DEF);
+        assert!(scores[i].window_ms() > 58.2 * (1.0 + TIE));
+    }
+
+    /// PIN 8 — the keep-default band behaves as it does for the incumbent.
+    #[test]
+    fn keep_default_band_pins_the_default_when_it_is_in_band() {
+        let scores = table([53.0, 52.4, 52.0, 51.6], [58.2, 58.3, 58.35, 58.4]);
+        assert_eq!(select_hybrid_split(&C, &scores, DEF, TIE, false), Some(0));
+        assert_eq!(select_hybrid_split(&C, &scores, DEF, TIE, true), Some(DEF));
+    }
+
+    /// PIN 9 — malformed tables are rejected rather than silently selected.
+    #[test]
+    fn mismatched_or_nonfinite_tables_return_none() {
+        let scores = table([53.0, 52.4, 52.0, 51.6], [58.2, 59.4, 60.1, 61.3]);
+        assert_eq!(select_hybrid_split(&C[..3], &scores, DEF, TIE, false), None);
+        assert_eq!(select_hybrid_split(&C, &scores, 4, TIE, false), None);
+        let nan = table([f64::NAN; 4], [f64::NAN; 4]);
+        assert_eq!(windowed(&nan), None);
+    }
+
+    /// PIN 10 — the rollback is local-only and accepts the exact value `1`,
+    /// matching `FLOCK_NO_TREE_POOL3` / `FLOCK_TUNER_ARM_TIMING` precedent.
+    /// The mechanism is the default because the ranked harness clears the
+    /// worker environment.
+    #[test]
+    fn window_scoring_is_the_default_and_rolls_back_only_on_exact_one() {
+        assert_eq!(
+            super::ENV_NO_HYBRID_WINDOW_SCORE,
+            "FLOCK_NO_HYBRID_WINDOW_SCORE"
+        );
+        assert!(!hybrid_window_score_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(hybrid_window_score_value_enabled(value.map(OsStr::new)));
+        }
+    }
+}
+
 /// Latched once: pass tuning enabled unless the kill switch is set.
 pub(crate) fn pass_tune_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -6187,33 +6641,41 @@ kernel void blake3_pow_scan(
     /// already prefers the smaller (more GPU) share, and the k=0 4% gate still
     /// guards the pure-GPU artifact. `FLOCK_HYBRID_KEEP_DEFAULT_BAND=1`
     /// restores the old keep-default behaviour for same-binary comparison.
+    ///
+    /// Scope note: this rule is still live for the NARROW synthetic-burn tuner
+    /// below. For the BROAD exact-A/B tuner it is now the rollback path only —
+    /// that tuner scores the join window (`select_hybrid_split`), because its
+    /// probe measures both arms of the real two-arm join and the graph arm
+    /// alone is not what a candidate costs the timed prove. The rule body lives
+    /// in `select_hybrid_split_graph_arm` so both objectives are testable on
+    /// non-Apple hosts.
     fn choose_hybrid_k(candidates: &[usize], best_ms: &[f64], default_k: usize) -> Option<usize> {
-        let default_i = candidates
-            .iter()
-            .position(|&k| k == default_k)
-            .expect("default split is a sweep candidate");
-        let fastest = best_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-        // Near-tie band: 2.0% (was 1.5%). With graph-arm scoring the band
-        // adjudicates real k differences rather than AB-dominated join noise,
-        // so a slightly wider GPU-ward bias is safe and prefers the smaller
-        // CPU share when margins are thin. `FLOCK_HYBRID_TIE_BAND=0.015`
-        // restores the old 1.5% width.
-        let tie = std::env::var("FLOCK_HYBRID_TIE_BAND")
+        super::select_hybrid_split_graph_arm(
+            candidates,
+            best_ms,
+            default_k,
+            hybrid_tie_band(),
+            hybrid_keep_default_band(),
+        )
+    }
+
+    /// Near-tie band: 2.0% (was 1.5%). The band adjudicates real k differences
+    /// rather than replay noise, so a slightly wider GPU-ward bias is safe and
+    /// prefers the smaller CPU share when margins are thin.
+    /// `FLOCK_HYBRID_TIE_BAND=0.015` restores the old 1.5% width. This is also
+    /// the tree's declared resolution for these walls, which is what the
+    /// window objective's slack margin is derived from
+    /// (see `hybrid_sweep_noise_ms`).
+    fn hybrid_tie_band() -> f64 {
+        std::env::var("FLOCK_HYBRID_TIE_BAND")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0 && *v < 0.1)
-            .unwrap_or(0.02);
-        let chosen_i = (0..candidates.len()).find(|&i| best_ms[i] <= fastest * (1.0 + tie))?;
-        let mut chosen = candidates[chosen_i];
-        if std::env::var_os("FLOCK_HYBRID_KEEP_DEFAULT_BAND").is_some()
-            && best_ms[default_i] <= fastest * (1.0 + tie)
-        {
-            chosen = default_k;
-        }
-        if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
-            chosen = default_k;
-        }
-        Some(chosen)
+            .unwrap_or(0.02)
+    }
+
+    fn hybrid_keep_default_band() -> bool {
+        std::env::var_os("FLOCK_HYBRID_KEEP_DEFAULT_BAND").is_some()
     }
 
     /// Candidate set inside the historical flat basin [0..5]. Trimmed from
@@ -6230,11 +6692,11 @@ kernel void blake3_pow_scan(
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
     /// either end of the search range. Selection consumes the mean rather
     /// than a noise-sensitive minimum.
-    fn collect_ranked_exact_samples<E>(
+    fn collect_ranked_exact_samples<T: Copy + Default, E>(
         mut reprime: impl FnMut() -> Result<(), E>,
-        mut sample: impl FnMut(usize) -> Result<f64, E>,
-    ) -> Result<[[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()], E> {
-        let mut walls = [[0.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+        mut sample: impl FnMut(usize) -> Result<T, E>,
+    ) -> Result<[[T; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()], E> {
+        let mut walls = [[T::default(); 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
         for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES.iter().enumerate() {
             reprime()?;
             walls[i][0] = sample(k)?;
@@ -6257,6 +6719,35 @@ kernel void blake3_pow_scan(
             *mean = (a + b) * 0.5;
         }
         Some(means)
+    }
+
+    /// Project the two-arm samples onto the graph arm alone, for the legacy
+    /// graph-arm objective. Keeping the legacy path on the exact incumbent
+    /// helpers (`mean_ranked_exact_samples` + `choose_hybrid_k`) makes the
+    /// rollback bit-identical in behaviour to the incumbent selector.
+    fn graph_arm_samples(
+        samples: [[(f64, f64); 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
+    ) -> [[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()] {
+        core::array::from_fn(|i| [samples[i][0].0, samples[i][1].0])
+    }
+
+    /// Mean each arm over the sweep's two passes and record the pass-to-pass
+    /// half-spread (maximised over the arms) as this candidate's in-run noise
+    /// sample. Same validity rule as `mean_ranked_exact_samples`: any
+    /// non-finite or negative wall voids the whole table.
+    fn score_ranked_exact_samples(
+        samples: [[(f64, f64); 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
+    ) -> Option<[super::HybridSweepScore; RANKED_EXACT_TUNE_CANDIDATES.len()]> {
+        let mut scores = [super::HybridSweepScore::default(); RANKED_EXACT_TUNE_CANDIDATES.len()];
+        for (score, [(g0, a0), (g1, a1)]) in scores.iter_mut().zip(samples) {
+            if [g0, a0, g1, a1].iter().any(|v| !v.is_finite() || *v < 0.0) {
+                return None;
+            }
+            score.graph_ms = (g0 + g1) * 0.5;
+            score.ab_ms = (a0 + a1) * 0.5;
+            score.half_spread_ms = (g0 - g1).abs().max((a0 - a1).abs()) * 0.5;
+        }
+        Some(scores)
     }
 
     #[inline]
@@ -6661,30 +7152,46 @@ kernel void blake3_pow_scan(
                 }
             }
         };
-        // Score by the graph arm alone under exact AB contention, not by the
-        // join wall. The AB replay is k-independent; when it outlasts the
-        // graph the join wall contains no information about k (wayfinder F2).
-        // Minimising the graph arm is never wrong: where the graph is
-        // critical it minimises the join too; where it is not, a shorter
-        // graph is free. `FLOCK_HYBRID_SCORE_JOIN_WALL=1` restores the
-        // incumbent join-max objective for same-binary comparison.
-        let sample = |k: usize| -> Result<f64, String> {
+        // Time BOTH arms of the probe join, not just the graph. The scored
+        // quantity is the join window `max(graph, ab)` — what a candidate
+        // actually costs the timed prove — because the two arms share the
+        // rayon pool and the E-helper pool, so the CPU suffix shortens the
+        // graph by lengthening its sibling. See the window-objective block
+        // above `pass_tune_enabled` for the full derivation and the
+        // never-worse argument; `select_hybrid_split` consumes these.
+        //
+        // The arm timers are two `Instant` reads per sample, the same
+        // instrumentation the real prove already carries on this join
+        // (`note_precompute_branch_wall_ms`), and this whole sweep runs inside
+        // the untimed warmup prove.
+        //
+        // `FLOCK_HYBRID_SCORE_JOIN_WALL=1` still restores the incumbent
+        // join-max objective: it reports the joined wall as both arms, which
+        // collapses the window to that wall and leaves no slack for the
+        // pure-GPU test, reproducing the incumbent decision under either
+        // objective.
+        let sample = |k: usize| -> Result<(f64, f64), String> {
             let score_join = std::env::var_os("FLOCK_HYBRID_SCORE_JOIN_WALL").is_some();
             let t0 = std::time::Instant::now();
-            let (graph_arm, ()) = rayon::join(
+            let (graph_arm, ab_ms) = rayon::join(
                 || {
                     let tg = std::time::Instant::now();
                     let r = timed_graph(k);
                     (r, tg.elapsed().as_secs_f64() * 1e3)
                 },
-                || replay_ab(),
+                || {
+                    let ta = std::time::Instant::now();
+                    replay_ab();
+                    ta.elapsed().as_secs_f64() * 1e3
+                },
             );
             let (graph, graph_ms) = graph_arm;
             graph?;
             Ok(if score_join {
-                t0.elapsed().as_secs_f64() * 1e3
+                let join_ms = t0.elapsed().as_secs_f64() * 1e3;
+                (join_ms, join_ms)
             } else {
-                graph_ms
+                (graph_ms, ab_ms)
             })
         };
         let reprime = || unsafe {
@@ -6702,12 +7209,25 @@ kernel void blake3_pow_scan(
                 return;
             }
         };
-        let Some(means) = mean_ranked_exact_samples(samples) else {
+        let Some(scores) = score_ranked_exact_samples(samples) else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
-        let Some(chosen) = choose_hybrid_k(&RANKED_EXACT_TUNE_CANDIDATES, &means, DEFAULT_HYBRID_K)
-        else {
+        let selected = if super::hybrid_window_score_enabled() {
+            super::select_hybrid_split(
+                &RANKED_EXACT_TUNE_CANDIDATES,
+                &scores,
+                DEFAULT_HYBRID_K,
+                hybrid_tie_band(),
+                hybrid_keep_default_band(),
+            )
+        } else {
+            // Rollback: the exact incumbent path, graph-arm means and all.
+            mean_ranked_exact_samples(graph_arm_samples(samples)).and_then(|means| {
+                choose_hybrid_k(&RANKED_EXACT_TUNE_CANDIDATES, &means, DEFAULT_HYBRID_K)
+            })
+        };
+        let Some(chosen) = selected else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
@@ -6764,8 +7284,14 @@ kernel void blake3_pow_scan(
                 .enumerate()
                 .map(|(i, k)| {
                     format!(
-                        "k={k}:[{:.1},{:.1}] mean={:.1}ms",
-                        samples[i][0], samples[i][1], means[i]
+                        "k={k}:graph[{:.1},{:.1}]={:.1} ab[{:.1},{:.1}]={:.1} window={:.1}ms",
+                        samples[i][0].0,
+                        samples[i][1].0,
+                        scores[i].graph_ms,
+                        samples[i][0].1,
+                        samples[i][1].1,
+                        scores[i].ab_ms,
+                        scores[i].window_ms(),
                     )
                 })
                 .collect();
