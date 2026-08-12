@@ -43,7 +43,7 @@
 
 use std::sync::OnceLock;
 
-use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
+use crate::field::{F8, F128, F256Unreduced, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
 use super::PaddingSpec;
@@ -2372,16 +2372,22 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     // tensor (coordinates 0 and 1 remain bank selectors).
     let retained_hi_eq = build_eq(&inner_tail[2..6]);
     let n_packed = 1usize << crate::pcs::LOG_PACKING;
-    let mut quad = vec![F128::ZERO; 4 * n_packed];
+    // Polynomial reduction is F2-linear. Keep each quad destination wide
+    // across its sixteen products, then reduce once instead of reducing every
+    // product before the XOR. The q-major traversal remains unchanged, so the
+    // compact 128 KiB fold8 input is still streamed in source order.
+    let mut quad_wide = [F256Unreduced::ZERO; 4 * (1usize << crate::pcs::LOG_PACKING)];
     for q in 0..16 {
         for e in 0..4 {
             let src = (e + 4 * q) * n_packed;
             let dst = e * n_packed;
             for packed in 0..n_packed {
-                quad[dst + packed] += retained_hi_eq[q] * fold8[src + packed];
+                quad_wide[dst + packed] ^=
+                    retained_hi_eq[q].mul_unreduced(fold8[src + packed]);
             }
         }
     }
+    let quad: Vec<F128> = quad_wide.into_iter().map(F256Unreduced::reduce).collect();
     let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
 
     // RingSwitch leaves global bit k_skip as its 128-way prefix. Fold that
