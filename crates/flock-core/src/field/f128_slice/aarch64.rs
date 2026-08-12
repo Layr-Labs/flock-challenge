@@ -311,6 +311,49 @@ unsafe fn reduce_wide_pair(first: WideNeon, second: WideNeon) -> [uint64x2_t; 2]
     }
 }
 
+/// Deferred-reduction dot product. Four independent wide accumulators keep
+/// the XOR dependency chain short; the final reduction is F2-linear and thus
+/// identical to XORing individually reduced products.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn dot_product(lhs: &[F128], rhs: &[F128]) -> F128 {
+    unsafe {
+        debug_assert_eq!(lhs.len(), rhs.len());
+        let zero = vdupq_n_u64(0);
+        let mut a0 = WideNeon { lo: zero, hi: zero };
+        let mut a1 = WideNeon { lo: zero, hi: zero };
+        let mut a2 = WideNeon { lo: zero, hi: zero };
+        let mut a3 = WideNeon { lo: zero, hi: zero };
+        let main = lhs.len() & !3;
+        let mut i = 0usize;
+        while i < main {
+            let x0 = vld1q_u64(lhs.as_ptr().add(i).cast::<u64>());
+            let x1 = vld1q_u64(lhs.as_ptr().add(i + 1).cast::<u64>());
+            let x2 = vld1q_u64(lhs.as_ptr().add(i + 2).cast::<u64>());
+            let x3 = vld1q_u64(lhs.as_ptr().add(i + 3).cast::<u64>());
+            let y0 = vld1q_u64(rhs.as_ptr().add(i).cast::<u64>());
+            let y1 = vld1q_u64(rhs.as_ptr().add(i + 1).cast::<u64>());
+            let y2 = vld1q_u64(rhs.as_ptr().add(i + 2).cast::<u64>());
+            let y3 = vld1q_u64(rhs.as_ptr().add(i + 3).cast::<u64>());
+            xor_wide(&mut a0, mul_unreduced(x0, y0));
+            xor_wide(&mut a1, mul_unreduced(x1, y1));
+            xor_wide(&mut a2, mul_unreduced(x2, y2));
+            xor_wide(&mut a3, mul_unreduced(x3, y3));
+            i += 4;
+        }
+        while i < lhs.len() {
+            let x = vld1q_u64(lhs.as_ptr().add(i).cast::<u64>());
+            let y = vld1q_u64(rhs.as_ptr().add(i).cast::<u64>());
+            xor_wide(&mut a0, mul_unreduced(x, y));
+            i += 1;
+        }
+        xor_wide(&mut a0, a1);
+        xor_wide(&mut a2, a3);
+        xor_wide(&mut a0, a2);
+        transmute::<uint64x2_t, F128>(reduce_wide(a0))
+    }
+}
+
 /// Accumulate the ranked opening's round-zero message and round-one
 /// lookahead without reducing every product individually.
 ///

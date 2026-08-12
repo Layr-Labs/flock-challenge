@@ -116,3 +116,12 @@ pub(super) fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend(
     }
     (u_0, u_2)
 }
+
+#[inline]
+pub(super) fn dot_product(lhs: &[F128], rhs: &[F128]) -> F128 {
+    debug_assert_eq!(lhs.len(), rhs.len());
+    lhs.iter()
+        .zip(rhs)
+        .map(|(&a, &b)| a * b)
+        .fold(F128::ZERO, |acc, product| acc + product)
+}

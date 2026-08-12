@@ -15,6 +15,26 @@ mod aarch64;
 ))]
 mod x86_64;
 
+/// Dot product over two equal-length field slices.
+///
+/// On AArch64+PMULL the product sum stays unreduced for the complete slice and
+/// is reduced once at the end. Reduction in GF(2^128) is F2-linear, so this is
+/// byte-identical to reducing every product before the XOR sum.
+#[inline]
+pub(crate) fn dot_product(lhs: &[F128], rhs: &[F128]) -> F128 {
+    assert_eq!(lhs.len(), rhs.len());
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies PMULL and the equality check establishes
+    // the architecture kernel's complete slice contract.
+    unsafe {
+        return aarch64::dot_product(lhs, rhs);
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    portable::dot_product(lhs, rhs)
+}
+
 /// AArch64 deferred-reduction kernel for the ranked opening lookahead scan.
 /// The caller retains the scalar implementation as the portable and exact
 /// same-binary fallback.

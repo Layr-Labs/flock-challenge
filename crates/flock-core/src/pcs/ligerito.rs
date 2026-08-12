@@ -2619,12 +2619,7 @@ fn induce_sumcheck_poly_via_ntt_impl(
     // per-level opens and the transpose.
     const PAR_QUERY_THRESHOLD: usize = 32;
     let query_term = |i: usize| -> F128 {
-        let dot: F128 = opened_rows[i]
-            .iter()
-            .zip(eq.iter())
-            .map(|(&r, &e)| r * e)
-            .fold(F128::ZERO, |a, v| a + v);
-        dot * alpha_pows[i]
+        crate::field::f128_slice::dot_product(&opened_rows[i], &eq) * alpha_pows[i]
     };
     let enforced_sum = if n_queries >= PAR_QUERY_THRESHOLD {
         use rayon::prelude::*;
