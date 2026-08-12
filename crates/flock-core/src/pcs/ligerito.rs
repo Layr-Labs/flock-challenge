@@ -2626,12 +2626,35 @@ fn induce_sumcheck_poly_via_ntt_impl(
             .fold(F128::ZERO, |a, v| a + v);
         dot * alpha_pows[i]
     };
+    // Compute-heavy per-query dot products — the same job profile as the dense
+    // `induce_sumcheck_poly` chunks the winning hetero change drains through
+    // the shared P+E queue — so route them the same way (kill switch
+    // FLOCK_NO_LIG_INDUCE_NTT_DOT_HETERO=1, exact `"1"`, restores the
+    // incumbent main-pool reduce).
     let enforced_sum = if n_queries >= PAR_QUERY_THRESHOLD {
-        use rayon::prelude::*;
-        (0..n_queries)
-            .into_par_iter()
-            .map(query_term)
-            .reduce(|| F128::ZERO, |a, b| a + b)
+        if lig_induce_ntt_dot_hetero_enabled() {
+            let mut slots: Vec<Option<F128>> = (0..n_queries).map(|_| None).collect();
+            let slots_addr = slots.as_mut_ptr() as usize;
+            crate::epool::run_hetero_chunks(n_queries, |i| {
+                // SAFETY: the queue claims each `i` exactly once; each slot is
+                // written by its unique claimant and published by the join.
+                unsafe {
+                    (slots_addr as *mut Option<F128>)
+                        .add(i)
+                        .write(Some(query_term(i)));
+                }
+            });
+            slots
+                .into_iter()
+                .map(|s| s.expect("hetero queue ran every query"))
+                .fold(F128::ZERO, |a, b| a + b)
+        } else {
+            use rayon::prelude::*;
+            (0..n_queries)
+                .into_par_iter()
+                .map(query_term)
+                .reduce(|| F128::ZERO, |a, b| a + b)
+        }
     } else {
         (0..n_queries)
             .map(query_term)
@@ -3771,6 +3794,16 @@ fn lig_induce_hetero_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         !std::env::var("FLOCK_NO_LIG_INDUCE_HETERO").is_ok_and(|v| v == "1")
+    })
+}
+
+/// Same contract for the NTT-variant per-query enforced-sum dot products:
+/// `FLOCK_NO_LIG_INDUCE_NTT_DOT_HETERO=1` (exactly `"1"`) restores the
+/// incumbent main-pool-only query reduce.
+fn lig_induce_ntt_dot_hetero_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("FLOCK_NO_LIG_INDUCE_NTT_DOT_HETERO").is_ok_and(|v| v == "1")
     })
 }
 
