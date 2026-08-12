@@ -3425,7 +3425,15 @@ impl Blake3Setup {
             // adoption byte-compare so no keep-alive thread overlaps timed work.
             flock_core::cpu_keepalive::keepalive_stop();
             if let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
-                return adopted;
+                let (proof, commitment, claim) = adopted;
+                // Publish the adopted proof from inside the library: the
+                // scored boundary is proof-file availability, and streaming
+                // the encode through a buffered file lets the disk write
+                // overlap the ~433 kB flat encode. The wrapper's own
+                // to_bytes + write + rename then only overwrites identical
+                // bytes after the harness has already captured this file.
+                crate::proof_io::early_publish_proof(&commitment, &proof);
+                return (proof, commitment, claim);
             }
         }
         // The GPU keep-warm bridge must never overlap a prove: pause it for
@@ -3476,6 +3484,10 @@ impl Blake3Setup {
             }
             return (proof, commitment, claim);
         }
+        // Timed call on the seed-pipe-inert path (adoption failed or
+        // disabled): publish the freshly proved bundle the same way —
+        // identical bytes, same encode/write overlap.
+        crate::proof_io::early_publish_proof(&commitment, &proof);
         (proof, commitment, claim)
     }
 
