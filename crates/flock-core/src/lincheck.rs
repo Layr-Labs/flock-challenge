@@ -1165,7 +1165,6 @@ fn sparse_row_fold_alpha_batched(
     b_0: &SparseBinaryMatrix,
     eq_table: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
     let n_cols = a_0.num_cols;
     debug_assert_eq!(b_0.num_cols, n_cols);
     debug_assert_eq!(eq_table.len(), a_0.num_rows);
@@ -1207,28 +1206,37 @@ fn sparse_row_fold_alpha_batched(
     let chunk_rows = (n_rows.div_ceil(p * 4)).max(256);
     let n_chunks = n_rows.div_ceil(chunk_rows);
 
-    let partials: Vec<Vec<F128>> = (0..n_chunks)
-        .into_par_iter()
-        .map(|ci| {
-            let lo = ci * chunk_rows;
-            let hi = ((ci + 1) * chunk_rows).min(n_rows);
-            let mut acc = vec![F128::ZERO; n_cols];
-            for r in lo..hi {
-                let ea = alpha * eq_table[r];
-                let eb = eq_table[r];
-                for &c in &a_0.rows[r] {
-                    acc[c] += ea;
-                }
-                for &c in &b_0.rows[r] {
-                    acc[c] += eb;
-                }
+    // Drain the row-chunk scatter-reduce through the hetero queue (main
+    // rayon pool + efficiency-core helper pool when present) instead of the
+    // main pool alone. GF(2^128) addition is XOR — order-independent — so
+    // chunk order and pool assignment never affect output bytes: the emitted
+    // proof is bit-identical to the main-pool-only path and only the
+    // scheduling changes. Each chunk publishes its accumulator exactly once,
+    // so `OnceLock` avoids both a zero-filled placeholder and mutex traffic.
+    let partials: Vec<std::sync::OnceLock<Vec<F128>>> =
+        (0..n_chunks).map(|_| std::sync::OnceLock::new()).collect();
+    crate::epool::run_hetero_chunks(n_chunks, |ci| {
+        let lo = ci * chunk_rows;
+        let hi = ((ci + 1) * chunk_rows).min(n_rows);
+        let mut acc = vec![F128::ZERO; n_cols];
+        for r in lo..hi {
+            let ea = alpha * eq_table[r];
+            let eb = eq_table[r];
+            for &c in &a_0.rows[r] {
+                acc[c] += ea;
             }
-            acc
-        })
-        .collect();
+            for &c in &b_0.rows[r] {
+                acc[c] += eb;
+            }
+        }
+        partials[ci]
+            .set(acc)
+            .unwrap_or_else(|_| unreachable!("each chunk executes exactly once"));
+    });
 
     let mut out = vec![F128::ZERO; n_cols];
     for acc in &partials {
+        let acc = acc.get().expect("every chunk completed before reduction");
         for i in 0..n_cols {
             out[i] += acc[i];
         }
