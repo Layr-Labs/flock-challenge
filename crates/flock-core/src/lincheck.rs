@@ -1059,6 +1059,7 @@ pub fn pack_z_lincheck(z_logical: &[bool], m: usize, k_log: usize) -> Vec<u8> {
 /// Same output as [`pack_z_lincheck`] but reads bits from an F_{2^128}-packed
 /// witness (polynomial basis: bit `i` of logical = bit `i % 128` of
 /// `z_packed_f128[i / 128]`).
+#[inline(always)]
 pub fn pack_z_lincheck_from_packed(
     z_packed_f128: &[crate::field::F128],
     m: usize,
@@ -1082,32 +1083,118 @@ pub fn pack_z_lincheck_from_packed(
     // chunk writes only its own k-byte stripe; output is bit-identical by
     // construction.
     let stripes = z_packed.len() / k;
+    // Two-stripe claims balance queue overhead against tail imbalance: each job
+    // still amortizes one claim while exposing twice as many jobs as r1057.
+    let stripe_batch = 2;
+    let jobs = stripes.div_ceil(stripe_batch);
     let z_base = crate::epool::SyncPtr(z_packed.as_mut_ptr());
-    crate::epool::run_hetero_chunks(stripes, |byte_idx| {
+    crate::epool::run_hetero_chunks(jobs, |job_idx| {
+        let stripe_lo = job_idx * stripe_batch;
+        let stripe_hi = (stripe_lo + stripe_batch).min(stripes);
+        for byte_idx in stripe_lo..stripe_hi {
         // SAFETY: the queue hands out each stripe exactly once; stripe
         // byte_idx exclusively owns z_packed[byte_idx*k..][..k]; the queue's
         // completion join publishes the writes before the caller reads.
         let chunk = unsafe { std::slice::from_raw_parts_mut(z_base.ptr().add(byte_idx * k), k) };
-        for i_inner in 0..k {
-            let mut byte = 0u8;
-            for r in 0..8 {
-                let i_outer = 8 * byte_idx + r;
-                let logical_idx = i_inner + i_outer * k;
-                let f128_idx = logical_idx / 128;
-                let local_bit = logical_idx % 128;
-                let bit = if local_bit < 64 {
-                    (z_packed_f128[f128_idx].lo >> local_bit) & 1 == 1
-                } else {
-                    (z_packed_f128[f128_idx].hi >> (local_bit - 64)) & 1 == 1
-                };
-                if bit {
-                    byte |= 1u8 << r;
+        if k >= 128 {
+            // Process complete F128 words so limb selection is made once per
+            // 64-byte half-word instead of once per output byte.
+            let f128_step = k / 128;
+            let stripe_base = 8 * byte_idx * f128_step;
+              for word_offset in 0..f128_step {
+                  let output_base = word_offset * 128;
+                  let source_base = stripe_base + word_offset;
+                  // Gather each strided source word once before transposing its
+                  // low and high limbs into this block's 128 output bytes.
+                  let words = unsafe {
+                      [
+                          *z_packed_f128.get_unchecked(source_base),
+                          *z_packed_f128.get_unchecked(source_base + f128_step),
+                          *z_packed_f128.get_unchecked(source_base + 2 * f128_step),
+                          *z_packed_f128.get_unchecked(source_base + 3 * f128_step),
+                          *z_packed_f128.get_unchecked(source_base + 4 * f128_step),
+                          *z_packed_f128.get_unchecked(source_base + 5 * f128_step),
+                          *z_packed_f128.get_unchecked(source_base + 6 * f128_step),
+                          *z_packed_f128.get_unchecked(source_base + 7 * f128_step),
+                      ]
+                  };
+                    // Transpose eight 8x8 bit tiles per limb. This replaces
+                    // scalar bit-at-a-time gathers with SWAR transposes and
+                    // contiguous eight-byte stores.
+                    for byte_lane in 0..8 {
+                        let shift = byte_lane * 8;
+                        let mask = 0xff;
+                        let lo_rows = ((words[0].lo >> shift) & mask)
+                            | (((words[1].lo >> shift) & mask) << 8)
+                            | (((words[2].lo >> shift) & mask) << 16)
+                            | (((words[3].lo >> shift) & mask) << 24)
+                            | (((words[4].lo >> shift) & mask) << 32)
+                            | (((words[5].lo >> shift) & mask) << 40)
+                            | (((words[6].lo >> shift) & mask) << 48)
+                            | (((words[7].lo >> shift) & mask) << 56);
+                        let hi_rows = ((words[0].hi >> shift) & mask)
+                            | (((words[1].hi >> shift) & mask) << 8)
+                            | (((words[2].hi >> shift) & mask) << 16)
+                            | (((words[3].hi >> shift) & mask) << 24)
+                            | (((words[4].hi >> shift) & mask) << 32)
+                            | (((words[5].hi >> shift) & mask) << 40)
+                            | (((words[6].hi >> shift) & mask) << 48)
+                            | (((words[7].hi >> shift) & mask) << 56);
+                        let lo_cols = transpose_8x8_bits(lo_rows).to_le();
+                        let hi_cols = transpose_8x8_bits(hi_rows).to_le();
+                        // Store each transposed tile as one unaligned word. The
+                        // offsets are bounded by the 128-byte output block, and
+                        // avoiding temporary byte arrays plus slice copies gives
+                        // LLVM a direct pair of stores for this hot path.
+                        unsafe {
+                            std::ptr::write_unaligned(
+                                chunk.as_mut_ptr().add(output_base + shift).cast::<u64>(),
+                                lo_cols,
+                            );
+                            std::ptr::write_unaligned(
+                                chunk
+                                    .as_mut_ptr()
+                                    .add(output_base + 64 + shift)
+                                    .cast::<u64>(),
+                                hi_cols,
+                            );
+                        }
+                    }
+              }
+        } else {
+            // Small-k fallback may cross an F128 word boundary within one
+            // output byte, so retain the fully general addressing path.
+            for (i_inner, output) in chunk.iter_mut().enumerate() {
+                let mut byte = 0u8;
+                let mut logical_idx = i_inner + 8 * byte_idx * k;
+                for r in 0..8 {
+                    let f128_idx = logical_idx / 128;
+                    let local_bit = logical_idx % 128;
+                    let bit = if local_bit < 64 {
+                        (unsafe { z_packed_f128.get_unchecked(f128_idx) }.lo >> local_bit) & 1
+                    } else {
+                        (unsafe { z_packed_f128.get_unchecked(f128_idx) }.hi >> (local_bit - 64)) & 1
+                    };
+                    byte |= (bit as u8) << r;
+                    logical_idx += k;
                 }
+                *output = byte;
             }
-            chunk[i_inner] = byte;
+        }
         }
     });
     z_packed
+}
+
+/// Transpose an 8x8 bit matrix stored as eight little-endian row bytes.
+#[inline(always)]
+fn transpose_8x8_bits(mut x: u64) -> u64 {
+    let mut t = (x ^ (x >> 7)) & 0x00aa_00aa_00aa_00aa;
+    x ^= t ^ (t << 7);
+    t = (x ^ (x >> 14)) & 0x0000_cccc_0000_cccc;
+    x ^= t ^ (t << 14);
+    t = (x ^ (x >> 28)) & 0x0000_0000_f0f0_f0f0;
+    x ^ t ^ (t << 28)
 }
 
 /// Build the **quirky eq table** for a claim point on the inner half:
@@ -1144,16 +1231,27 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
 /// Dot product of two equal-length F128 slices.
 fn inner_product(a: &[F128], b: &[F128]) -> F128 {
     assert_eq!(a.len(), b.len());
-    let mut acc = F128::ZERO;
-    for (x, y) in a.iter().zip(b.iter()) {
-        acc += *x * *y;
+    // Four independent dependency chains expose field-multiply ILP to the CPU;
+    // GF(2^128) addition is exact XOR, so the reassociation is bit-identical.
+    let mut acc = [F128::ZERO; 4];
+    let mut a_chunks = a.chunks_exact(4);
+    let mut b_chunks = b.chunks_exact(4);
+    for (xs, ys) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        acc[0] += xs[0] * ys[0];
+        acc[1] += xs[1] * ys[1];
+        acc[2] += xs[2] * ys[2];
+        acc[3] += xs[3] * ys[3];
     }
-    acc
+    let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        sum += x * y;
+    }
+    sum
 }
 
 /// Length above which the inner product / element-wise kernels split via
 /// rayon. Below it, sequential beats dispatch overhead.
-const SUMCHECK_PAR_THRESHOLD: usize = 1usize << 12;
+const SUMCHECK_PAR_THRESHOLD: usize = 1usize << 13;
 
 /// Fused `sparse_row_fold(A) + α-batch + sparse_row_fold(B)`: produces the
 /// `comb_vec[c] = α · (A^T·eq)[c] + (B^T·eq)[c]` in a single pass, halving the
@@ -1165,7 +1263,6 @@ fn sparse_row_fold_alpha_batched(
     b_0: &SparseBinaryMatrix,
     eq_table: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
     let n_cols = a_0.num_cols;
     debug_assert_eq!(b_0.num_cols, n_cols);
     debug_assert_eq!(eq_table.len(), a_0.num_rows);
@@ -1175,15 +1272,16 @@ fn sparse_row_fold_alpha_batched(
     if total_rows < SPARSE_ROW_FOLD_PAR_THRESHOLD {
         // Scalar fused path.
         let mut out = vec![F128::ZERO; n_cols];
-        for (r, row) in a_0.rows.iter().enumerate() {
-            let e = alpha * eq_table[r];
-            for &c in row {
-                out[c] += e;
+        for ((&e, a_row), b_row) in eq_table
+            .iter()
+            .zip(&a_0.rows)
+            .zip(&b_0.rows)
+        {
+            let ea = alpha * e;
+            for &c in a_row {
+                out[c] += ea;
             }
-        }
-        for (r, row) in b_0.rows.iter().enumerate() {
-            let e = eq_table[r];
-            for &c in row {
+            for &c in b_row {
                 out[c] += e;
             }
         }
@@ -1202,37 +1300,59 @@ fn sparse_row_fold_alpha_batched(
     // num_chunks ≈ 4× the thread count — negligible vs. the 21M-add body.
     let n_rows = a_0.num_rows;
     let p = rayon::current_num_threads().max(1);
-    // ~4 chunks per worker for work-stealing balance, ≥256 rows each to keep
-    // accumulator alloc/reduce overhead amortized.
-    let chunk_rows = (n_rows.div_ceil(p * 4)).max(256);
+    // ~2 chunks per worker retain work-stealing slack while halving the number of
+    // 256-KiB private accumulators and the O(n_cols * n_chunks) final merge.
+    let chunk_rows = (n_rows.div_ceil(p * 2)).max(256);
     let n_chunks = n_rows.div_ceil(chunk_rows);
 
-    let partials: Vec<Vec<F128>> = (0..n_chunks)
-        .into_par_iter()
-        .map(|ci| {
-            let lo = ci * chunk_rows;
-            let hi = ((ci + 1) * chunk_rows).min(n_rows);
-            let mut acc = vec![F128::ZERO; n_cols];
-            for r in lo..hi {
-                let ea = alpha * eq_table[r];
-                let eb = eq_table[r];
-                for &c in &a_0.rows[r] {
-                    acc[c] += ea;
-                }
-                for &c in &b_0.rows[r] {
-                    acc[c] += eb;
-                }
+    // Drain the row-chunk scatter-reduce through the hetero queue (main
+    // rayon pool + efficiency-core helper pool when present) instead of the
+    // main pool alone. GF(2^128) addition is XOR — order-independent — so
+    // chunk order and pool assignment never affect output bytes: the emitted
+    // proof is bit-identical to the main-pool-only path and only the
+    // scheduling changes. Each chunk publishes its accumulator exactly once,
+    // so `OnceLock` avoids both a zero-filled placeholder and mutex traffic.
+    let partials: Vec<std::sync::OnceLock<Vec<F128>>> =
+        (0..n_chunks).map(|_| std::sync::OnceLock::new()).collect();
+    crate::epool::run_hetero_chunks(n_chunks, |ci| {
+        let lo = ci * chunk_rows;
+        let hi = ((ci + 1) * chunk_rows).min(n_rows);
+        let mut acc = vec![F128::ZERO; n_cols];
+        for ((&e, a_row), b_row) in eq_table[lo..hi]
+            .iter()
+            .zip(&a_0.rows[lo..hi])
+            .zip(&b_0.rows[lo..hi])
+        {
+            let ea = alpha * e;
+            for &c in a_row {
+                acc[c] += ea;
             }
-            acc
-        })
-        .collect();
-
-    let mut out = vec![F128::ZERO; n_cols];
-    for acc in &partials {
-        for i in 0..n_cols {
-            out[i] += acc[i];
+            for &c in b_row {
+                acc[c] += e;
+            }
         }
-    }
+        partials[ci]
+            .set(acc)
+            .unwrap_or_else(|_| unreachable!("each chunk executes exactly once"));
+    });
+
+    // Reuse one completed chunk accumulator as the output buffer. This avoids
+    // allocating and zero-filling another n_cols-wide vector and removes one
+    // full accumulator read/add from the merge. The remaining chunks are read
+    // column-wise in parallel; GF(2^128) addition is associative XOR.
+    let mut partials: Vec<Vec<F128>> = partials
+        .into_iter()
+        .map(|acc| acc.into_inner().expect("every chunk completed before reduction"))
+        .collect();
+    use rayon::prelude::*;
+    let mut out = partials
+        .pop()
+        .expect("parallel sparse fold always has at least one row chunk");
+    out.par_iter_mut().enumerate().for_each(|(col, out_i)| {
+        for acc in &partials {
+            *out_i += acc[col];
+        }
+    });
     out
 }
 
@@ -1248,18 +1368,40 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
     if half < SUMCHECK_PAR_THRESHOLD {
         let mut e1 = F128::ZERO;
         let mut einf = F128::ZERO;
-        for i in 0..half {
-            e1 += chi[i] * zhi[i];
-            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+        for (((&clo_i, &chi_i), &zlo_i), &zhi_i) in clo
+            .iter()
+            .zip(chi)
+            .zip(zlo)
+            .zip(zhi)
+        {
+            e1 += chi_i * zhi_i;
+            einf += (chi_i + clo_i) * (zhi_i + zlo_i);
         }
         return (e1, einf);
     }
-    (0..half)
-        .into_par_iter()
-        .map(|i| {
-            let e1_i = chi[i] * zhi[i];
-            let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
-            (e1_i, einf_i)
+    // Process four aligned products per Rayon fold call. This preserves the
+    // independent accumulator lanes while removing the per-element lane counter
+    // and reducing iterator/fold bookkeeping by roughly fourfold.
+    chi.par_chunks(4)
+        .zip(zhi.par_chunks(4))
+        .zip(clo.par_chunks(4).zip(zlo.par_chunks(4)))
+        .fold(
+            || ([F128::ZERO; 4], [F128::ZERO; 4]),
+            |mut acc, ((chi_chunk, zhi_chunk), (clo_chunk, zlo_chunk))| {
+                for lane in 0..chi_chunk.len() {
+                    acc.0[lane] += chi_chunk[lane] * zhi_chunk[lane];
+                    acc.1[lane] +=
+                        (chi_chunk[lane] + clo_chunk[lane])
+                            * (zhi_chunk[lane] + zlo_chunk[lane]);
+                }
+                acc
+            },
+        )
+        .map(|(e1, einf)| {
+            (
+                (e1[0] + e1[1]) + (e1[2] + e1[3]),
+                (einf[0] + einf[1]) + (einf[2] + einf[3]),
+            )
         })
         .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
 }
@@ -1270,8 +1412,9 @@ fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     use rayon::prelude::*;
     let half = v.len() / 2;
     if half < SUMCHECK_PAR_THRESHOLD {
-        for i in 0..half {
-            v[i] = v[i] + r * (v[i + half] + v[i]);
+        let (lo, hi) = v.split_at_mut(half);
+        for (lo_i, &hi_i) in lo.iter_mut().zip(&hi[..half]) {
+            *lo_i = *lo_i + r * (hi_i + *lo_i);
         }
     } else {
         let (lo, hi) = v.split_at_mut(half);
@@ -1333,15 +1476,24 @@ fn sumcheck_bind_both_and_eval_next(
     let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
         let mut e1 = F128::ZERO;
         let mut einf = F128::ZERO;
-        for i in 0..half2 {
-            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
-            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
-            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
-            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
-            cq0[i] = lo;
-            cq1[i] = hi;
-            zq0[i] = zlo;
-            zq1[i] = zhi;
+        for (((((((c0, c1), &c2), &c3), z0), z1), &z2), &z3) in cq0
+            .iter_mut()
+            .zip(cq1.iter_mut())
+            .zip(cq2.iter())
+            .zip(cq3.iter())
+            .zip(zq0.iter_mut())
+            .zip(zq1.iter_mut())
+            .zip(zq2.iter())
+            .zip(zq3.iter())
+        {
+            let lo = *c0 + r * (c2 + *c0);
+            let hi = *c1 + r * (c3 + *c1);
+            let zlo = *z0 + r * (z2 + *z0);
+            let zhi = *z1 + r * (z3 + *z1);
+            *c0 = lo;
+            *c1 = hi;
+            *z0 = zlo;
+            *z1 = zhi;
             e1 += hi * zhi;
             einf += (hi + lo) * (zhi + zlo);
         }
