@@ -1,3 +1,6 @@
+// winpipe-r1045: halve sparse-fold chunk count to reduce private-accumulator merge traffic
+// winpipe-r1043 activation marker: distinct sparse-reduction candidate
+// winpipe-r1038: expose four-way instruction-level parallelism in field dot products.
 //! `flock-prover`: the Apple-silicon-optimized end-to-end Flock prover.
 //!
 //! Builds on [`flock_core`] (the protocol library + verifier) with the
@@ -38,3 +41,4 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
 // dispersion-resample marker 71r1024-1044-qz2
 // dispersion-resample marker r1025-3f8c7d
+// winpipe activation marker r1028-3f7ab1
