@@ -2026,33 +2026,14 @@ pub(crate) fn induce_sumcheck_poly(
         .map(|&v| if v.is_zero() { F128::ZERO } else { v.inv() })
         .collect();
 
-    // Per-worker chunked accumulation: each worker accumulates a partial
+    // Per-thread chunked accumulation: each thread accumulates a partial
     // basis_poly (length n) and a partial enforced_sum, then we reduce.
-    // With a live E-core helper pool the same query chunks drain through the
-    // shared P+E queue instead — one chunk per potential worker, so the four
-    // UTILITY-QoS helpers claim query chunks the main pool would otherwise
-    // serialize behind its own. Grouping queries differently across
-    // accumulators cannot change bytes: every query contributes the same
-    // scaled basis vector and dot product, and the cross-chunk merge is a
-    // GF(2^128) XOR sum. `FLOCK_NO_LIG_INDUCE_HETERO=1` (exactly `"1"`)
-    // restores the incumbent main-pool split as the same-binary A/B control.
-    let helper_threads = if lig_induce_hetero_enabled() {
-        crate::epool::epool().map_or(0, rayon::ThreadPool::current_num_threads)
-    } else {
-        0
-    };
-    // 16 chunks when hetero: the queue's engagement floor (EPOOL_MIN_CHUNKS),
-    // and enough claims that the four helpers stay fed without inflating the
-    // serial partial reduce below by more than two extra length-n passes.
-    let n_threads = if helper_threads > 0 {
-        (rayon::current_num_threads().max(1) + helper_threads).max(16)
-    } else {
-        rayon::current_num_threads().max(1)
-    };
+    let n_threads = rayon::current_num_threads().max(1);
     let chunk_size = (n_queries + n_threads - 1) / n_threads.max(1);
 
-    let chunk_partial = |t: usize| -> (Vec<F128>, F128) {
-        {
+    let partials: Vec<(Vec<F128>, F128)> = (0..n_threads)
+        .into_par_iter()
+        .map(|t| {
             let start = t * chunk_size;
             let end = (start + chunk_size).min(n_queries);
             if start >= end {
@@ -2111,32 +2092,8 @@ pub(crate) fn induce_sumcheck_poly(
                 }
             }
             (accum_basis, local_sum)
-        }
-    };
-    let partials: Vec<(Vec<F128>, F128)> = if helper_threads > 0 {
-        let mut slots: Vec<Option<(Vec<F128>, F128)>> = (0..n_threads).map(|_| None).collect();
-        // Raw address rather than `SyncPtr` because the slot type is not
-        // `Copy` (same aliasing contract as the stripe fill's `as usize`).
-        let slots_addr = slots.as_mut_ptr() as usize;
-        crate::epool::run_hetero_chunks(n_threads, |t| {
-            // SAFETY: the queue claims each `t` exactly once; each slot is
-            // written by its unique claimant and published by the join.
-            unsafe {
-                (slots_addr as *mut Option<(Vec<F128>, F128)>)
-                    .add(t)
-                    .write(Some(chunk_partial(t)));
-            }
-        });
-        slots
-            .into_iter()
-            .map(|s| s.expect("hetero queue ran every chunk"))
-            .collect()
-    } else {
-        (0..n_threads)
-            .into_par_iter()
-            .map(chunk_partial)
-            .collect()
-    };
+        })
+        .collect();
 
     // Reduce across threads: seed with the first non-empty partial (a move —
     // deletes the zero-seeded output buffer and its redundant first XOR-add
@@ -3747,33 +3704,6 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
     *evals = folded;
 }
 
-/// Route the Ligerito per-round fold/message passes through the shared P+E
-/// hetero chunk queue when the round is wide enough to amortize the kickoff.
-/// The mid-size rounds (the largest ones drain through the epool combine and
-/// the stateful big-round queues) previously ran main-pool-only while the
-/// four E-cores idled between the round-5 materializer and the recursive
-/// commits. Chunk geometry, per-chunk kernels, and the XOR message merge are
-/// unchanged, so output bytes are identical; only which pool claims a chunk
-/// differs. Compile-time default per the cleared ranked environment;
-/// `FLOCK_NO_LIG_FOLD_HETERO=1` (exactly `"1"`) restores the incumbent
-/// rayon-only passes as the same-binary A/B control.
-fn lig_fold_hetero_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !std::env::var("FLOCK_NO_LIG_FOLD_HETERO").is_ok_and(|v| v == "1")
-    })
-}
-
-/// Same contract for the dense recursive-commit basis induction sweep:
-/// `FLOCK_NO_LIG_INDUCE_HETERO=1` (exactly `"1"`) restores the incumbent
-/// main-pool-only per-worker query split.
-fn lig_induce_hetero_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !std::env::var("FLOCK_NO_LIG_INDUCE_HETERO").is_ok_and(|v| v == "1")
-    })
-}
-
 /// Fused fold + next-round message in a SINGLE parallel pass.
 ///
 /// Replaces the three separate passes a sumcheck fold otherwise needs
@@ -3838,67 +3768,38 @@ fn fold_and_msg_lsb_into(
     // power of two, so every chunk has even length and starts at an even
     // global index — message pairs (2k, 2k+1) never straddle a chunk boundary.
     const CHUNK: usize = 2048;
-    let chunk_body = |ci: usize, fc: &mut [F128], bc: &mut [F128]| -> (F128, F128) {
-        let base = ci * CHUNK;
-        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-        {
-            return crate::field::f128_slice::fold_two_and_msg(f, b, base, fc, bc, r);
-        }
-
-        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-        {
-            let len = fc.len();
-            let mut u0 = F128::ZERO;
-            let mut u2 = F128::ZERO;
-            // Fold this slice, then pair up the just-folded values for the msg.
-            crate::field::f128_slice::fold_pairs(f, base, fc, r);
-            crate::field::f128_slice::fold_pairs(b, base, bc, r);
-            let mut k = 0;
-            while k + 1 < len {
-                let f0 = fc[k];
-                let f1 = fc[k + 1];
-                let b0 = bc[k];
-                let b1 = bc[k + 1];
-                u0 += f0 * b0;
-                u2 += (f0 + f1) * (b0 + b1);
-                k += 2;
-            }
-            (u0, u2)
-        }
-    };
-    // Hetero queue when the round is wide enough that every chunk claim is
-    // useful work: `half` is a power of two, so `half / CHUNK` chunks divide
-    // the outputs exactly; each chunk owns `[ci*CHUNK, (ci+1)*CHUNK)` of both
-    // outputs and one partial slot. Same chunk grid as the rayon path below,
-    // so bytes are identical either way.
-    if half >= 16 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
-        let n_chunks = half / CHUNK;
-        let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
-        let f_base = crate::epool::SyncPtr(nf.as_mut_ptr());
-        let b_base = crate::epool::SyncPtr(nb.as_mut_ptr());
-        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_hetero_chunks(n_chunks, |ci| {
-            // SAFETY: the queue claims each `ci` exactly once; the ranges and
-            // the partial slot are disjoint per chunk and the two-pool join
-            // publishes every write before the reduce below reads them.
-            unsafe {
-                let fc = core::slice::from_raw_parts_mut(f_base.ptr().add(ci * CHUNK), CHUNK);
-                let bc = core::slice::from_raw_parts_mut(b_base.ptr().add(ci * CHUNK), CHUNK);
-                partials_base.ptr().add(ci).write(chunk_body(ci, fc, bc));
-            }
-        });
-        let (u_0, u_2) = partials
-            .into_iter()
-            .fold((F128::ZERO, F128::ZERO), |(a0, a2), (c0, c2)| {
-                (a0 + c0, a2 + c2)
-            });
-        return SumcheckMessage { u_0, u_2 };
-    }
     let (u_0, u_2) = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
         .enumerate()
-        .map(|(ci, (fc, bc))| chunk_body(ci, fc, bc))
+        .map(|(ci, (fc, bc))| {
+            let base = ci * CHUNK;
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            {
+                return crate::field::f128_slice::fold_two_and_msg(f, b, base, fc, bc, r);
+            }
+
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+            {
+                let len = fc.len();
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                // Fold this slice, then pair up the just-folded values for the msg.
+                crate::field::f128_slice::fold_pairs(f, base, fc, r);
+                crate::field::f128_slice::fold_pairs(b, base, bc, r);
+                let mut k = 0;
+                while k + 1 < len {
+                    let f0 = fc[k];
+                    let f1 = fc[k + 1];
+                    let b0 = bc[k];
+                    let b1 = bc[k + 1];
+                    u0 += f0 * b0;
+                    u2 += (f0 + f1) * (b0 + b1);
+                    k += 2;
+                }
+                (u0, u2)
+            }
+        })
         .reduce(
             || (F128::ZERO, F128::ZERO),
             |(a0, a2), (c0, c2)| (a0 + c0, a2 + c2),
@@ -3961,68 +3862,42 @@ fn fold_and_msg_lsb_into_with_lazy_ood_eq(
 
     let gamma = beta * (F128::ONE + z_0 + r);
     let alpha_r = deferred_basis.map(|(_, alpha)| alpha * r);
-    let chunk_body = |high_index: usize, f_chunk: &mut [F128], b_chunk: &mut [F128]| {
-        let base = high_index * eq_lo.len();
-        let chunk_scale = gamma * eq_hi[high_index];
-        match deferred_basis {
-            Some((deferred_basis, alpha)) => {
-                crate::field::f128_slice::fold_two_and_msg_with_deferred_basis_and_scaled_local_addend(
+    let (u_0, u_2) = nf
+        .par_chunks_mut(eq_lo.len())
+        .zip(nb.par_chunks_mut(eq_lo.len()))
+        .zip(eq_hi.par_iter())
+        .enumerate()
+        .map(|(high_index, ((f_chunk, b_chunk), &hi_weight))| {
+            let base = high_index * eq_lo.len();
+            let chunk_scale = gamma * hi_weight;
+            match deferred_basis {
+                Some((deferred_basis, alpha)) => {
+                    crate::field::f128_slice::fold_two_and_msg_with_deferred_basis_and_scaled_local_addend(
+                        f,
+                        b,
+                        deferred_basis,
+                        eq_lo,
+                        base,
+                        f_chunk,
+                        b_chunk,
+                        r,
+                        alpha,
+                        alpha_r.expect("deferred basis scale product"),
+                        chunk_scale,
+                    )
+                }
+                None => crate::field::f128_slice::fold_two_and_msg_with_scaled_local_basis_addend(
                     f,
                     b,
-                    deferred_basis,
                     eq_lo,
                     base,
                     f_chunk,
                     b_chunk,
                     r,
-                    alpha,
-                    alpha_r.expect("deferred basis scale product"),
                     chunk_scale,
-                )
+                ),
             }
-            None => crate::field::f128_slice::fold_two_and_msg_with_scaled_local_basis_addend(
-                f,
-                b,
-                eq_lo,
-                base,
-                f_chunk,
-                b_chunk,
-                r,
-                chunk_scale,
-            ),
-        }
-    };
-    // Hetero queue over the same per-`high_index` chunk grid (chunk width =
-    // `eq_lo.len()`, one chunk per `eq_hi` entry — 128 × 2,048 at the ranked
-    // geometry). Identical kernels and chunk bases, so bytes are unchanged.
-    let chunk_w = eq_lo.len();
-    if eq_hi.len() >= 16 && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
-        let n_chunks = eq_hi.len();
-        let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
-        let f_base = crate::epool::SyncPtr(nf.as_mut_ptr());
-        let b_base = crate::epool::SyncPtr(nb.as_mut_ptr());
-        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_hetero_chunks(n_chunks, |hi| {
-            // SAFETY: each `hi` is claimed exactly once; output ranges and the
-            // partial slot are disjoint per chunk and published by the join.
-            unsafe {
-                let fc = core::slice::from_raw_parts_mut(f_base.ptr().add(hi * chunk_w), chunk_w);
-                let bc = core::slice::from_raw_parts_mut(b_base.ptr().add(hi * chunk_w), chunk_w);
-                partials_base.ptr().add(hi).write(chunk_body(hi, fc, bc));
-            }
-        });
-        let (u_0, u_2) = partials
-            .into_iter()
-            .fold((F128::ZERO, F128::ZERO), |(a_0, a_2), (b_0, b_2)| {
-                (a_0 + b_0, a_2 + b_2)
-            });
-        return SumcheckMessage { u_0, u_2 };
-    }
-    let (u_0, u_2) = nf
-        .par_chunks_mut(chunk_w)
-        .zip(nb.par_chunks_mut(chunk_w))
-        .enumerate()
-        .map(|(high_index, (f_chunk, b_chunk))| chunk_body(high_index, f_chunk, b_chunk))
+        })
         .reduce(
             || (F128::ZERO, F128::ZERO),
             |(a_0, a_2), (b_0, b_2)| (a_0 + b_0, a_2 + b_2),
@@ -4083,8 +3958,11 @@ fn fold2_and_msgs_lsb(
         quarter >= (1usize << 21)
             && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_LIG_NT_LEGACY").is_none())
     };
-    let chunk_body = |ci: usize, wfc: &mut [F128], wbc: &mut [F128]| -> (F128, F128, [F128; 6]) {
-        {
+    let acc = wf
+        .par_chunks_mut(CHUNK)
+        .zip(wb.par_chunks_mut(CHUNK))
+        .enumerate()
+        .map(|(ci, (wfc, wbc))| {
             let base = ci * CHUNK; // output index base
             #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
             {
@@ -4154,46 +4032,17 @@ fn fold2_and_msgs_lsb(
                 }
                 (m_u0, m_u2, c)
             }
-        }
-    };
-    let merge = |(a0, a2, ac): (F128, F128, [F128; 6]),
-                 (b0, b2, bc): (F128, F128, [F128; 6])| {
-        let mut c = ac;
-        for (x, y) in c.iter_mut().zip(bc.iter()) {
-            *x += *y;
-        }
-        (a0 + b0, a2 + b2, c)
-    };
-    // Hetero queue over the identical chunk grid: same bases, same kernel,
-    // XOR-merged partials — bytes unchanged, only chunk ownership differs.
-    let acc = if quarter >= 16 * CHUNK
-        && lig_fold_hetero_enabled()
-        && crate::epool::epool().is_some()
-    {
-        let n_chunks = quarter / CHUNK;
-        let mut partials = vec![(F128::ZERO, F128::ZERO, [F128::ZERO; 6]); n_chunks];
-        let f_base = crate::epool::SyncPtr(wf.as_mut_ptr());
-        let b_base = crate::epool::SyncPtr(wb.as_mut_ptr());
-        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_hetero_chunks(n_chunks, |ci| {
-            // SAFETY: each `ci` claimed exactly once; disjoint output ranges
-            // and partial slot per chunk, published by the two-pool join.
-            unsafe {
-                let wfc = core::slice::from_raw_parts_mut(f_base.ptr().add(ci * CHUNK), CHUNK);
-                let wbc = core::slice::from_raw_parts_mut(b_base.ptr().add(ci * CHUNK), CHUNK);
-                partials_base.ptr().add(ci).write(chunk_body(ci, wfc, wbc));
-            }
-        });
-        partials
-            .into_iter()
-            .fold((F128::ZERO, F128::ZERO, [F128::ZERO; 6]), merge)
-    } else {
-        wf.par_chunks_mut(CHUNK)
-            .zip(wb.par_chunks_mut(CHUNK))
-            .enumerate()
-            .map(|(ci, (wfc, wbc))| chunk_body(ci, wfc, wbc))
-            .reduce(|| (F128::ZERO, F128::ZERO, [F128::ZERO; 6]), merge)
-    };
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO, [F128::ZERO; 6]),
+            |(a0, a2, ac), (b0, b2, bc)| {
+                let mut c = ac;
+                for (x, y) in c.iter_mut().zip(bc.iter()) {
+                    *x += *y;
+                }
+                (a0 + b0, a2 + b2, c)
+            },
+        );
     (
         SumcheckMessage {
             u_0: acc.0,
@@ -4245,46 +4094,22 @@ fn fold2_and_msg_lsb(
             quarter >= (1usize << 21)
                 && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_LIG_NT_LEGACY").is_none())
         };
-        let chunk_body = |chunk: usize, f_out: &mut [F128], b_out: &mut [F128]| {
-            crate::field::f128_slice::fold2_two_and_msg(
-                f,
-                b,
-                chunk * CHUNK,
-                f_out,
-                b_out,
-                r_a,
-                r_b,
-                nt_stores,
-            )
-        };
-        // Hetero queue over the identical chunk grid — bytes unchanged.
-        if quarter >= 16 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
-            let n_chunks = quarter / CHUNK;
-            let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
-            let f_base = crate::epool::SyncPtr(wf.as_mut_ptr());
-            let b_base = crate::epool::SyncPtr(wb.as_mut_ptr());
-            let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-            crate::epool::run_hetero_chunks(n_chunks, |ci| {
-                // SAFETY: each `ci` claimed exactly once; disjoint output
-                // ranges and partial slot, published by the two-pool join.
-                unsafe {
-                    let fc = core::slice::from_raw_parts_mut(f_base.ptr().add(ci * CHUNK), CHUNK);
-                    let bc = core::slice::from_raw_parts_mut(b_base.ptr().add(ci * CHUNK), CHUNK);
-                    partials_base.ptr().add(ci).write(chunk_body(ci, fc, bc));
-                }
-            });
-            let (u_0, u_2) = partials
-                .into_iter()
-                .fold((F128::ZERO, F128::ZERO), |(a0, a2), (b0, b2)| {
-                    (a0 + b0, a2 + b2)
-                });
-            return SumcheckMessage { u_0, u_2 };
-        }
         let (u_0, u_2) = wf
             .par_chunks_mut(CHUNK)
             .zip(wb.par_chunks_mut(CHUNK))
             .enumerate()
-            .map(|(chunk, (f_out, b_out))| chunk_body(chunk, f_out, b_out))
+            .map(|(chunk, (f_out, b_out))| {
+                crate::field::f128_slice::fold2_two_and_msg(
+                    f,
+                    b,
+                    chunk * CHUNK,
+                    f_out,
+                    b_out,
+                    r_a,
+                    r_b,
+                    nt_stores,
+                )
+            })
             .reduce(
                 || (F128::ZERO, F128::ZERO),
                 |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2),

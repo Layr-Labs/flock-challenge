@@ -1144,16 +1144,27 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
 /// Dot product of two equal-length F128 slices.
 fn inner_product(a: &[F128], b: &[F128]) -> F128 {
     assert_eq!(a.len(), b.len());
-    let mut acc = F128::ZERO;
-    for (x, y) in a.iter().zip(b.iter()) {
-        acc += *x * *y;
+    // Four independent dependency chains expose field-multiply ILP to the CPU;
+    // GF(2^128) addition is exact XOR, so the reassociation is bit-identical.
+    let mut acc = [F128::ZERO; 4];
+    let mut a_chunks = a.chunks_exact(4);
+    let mut b_chunks = b.chunks_exact(4);
+    for (xs, ys) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
+        acc[0] += xs[0] * ys[0];
+        acc[1] += xs[1] * ys[1];
+        acc[2] += xs[2] * ys[2];
+        acc[3] += xs[3] * ys[3];
     }
-    acc
+    let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        sum += x * y;
+    }
+    sum
 }
 
 /// Length above which the inner product / element-wise kernels split via
 /// rayon. Below it, sequential beats dispatch overhead.
-const SUMCHECK_PAR_THRESHOLD: usize = 1usize << 12;
+const SUMCHECK_PAR_THRESHOLD: usize = 1usize << 13;
 
 /// Fused `sparse_row_fold(A) + α-batch + sparse_row_fold(B)`: produces the
 /// `comb_vec[c] = α · (A^T·eq)[c] + (B^T·eq)[c]` in a single pass, halving the
@@ -1165,7 +1176,6 @@ fn sparse_row_fold_alpha_batched(
     b_0: &SparseBinaryMatrix,
     eq_table: &[F128],
 ) -> Vec<F128> {
-    use rayon::prelude::*;
     let n_cols = a_0.num_cols;
     debug_assert_eq!(b_0.num_cols, n_cols);
     debug_assert_eq!(eq_table.len(), a_0.num_rows);
@@ -1175,15 +1185,16 @@ fn sparse_row_fold_alpha_batched(
     if total_rows < SPARSE_ROW_FOLD_PAR_THRESHOLD {
         // Scalar fused path.
         let mut out = vec![F128::ZERO; n_cols];
-        for (r, row) in a_0.rows.iter().enumerate() {
-            let e = alpha * eq_table[r];
-            for &c in row {
-                out[c] += e;
+        for ((&e, a_row), b_row) in eq_table
+            .iter()
+            .zip(&a_0.rows)
+            .zip(&b_0.rows)
+        {
+            let ea = alpha * e;
+            for &c in a_row {
+                out[c] += ea;
             }
-        }
-        for (r, row) in b_0.rows.iter().enumerate() {
-            let e = eq_table[r];
-            for &c in row {
+            for &c in b_row {
                 out[c] += e;
             }
         }
@@ -1207,32 +1218,55 @@ fn sparse_row_fold_alpha_batched(
     let chunk_rows = (n_rows.div_ceil(p * 4)).max(256);
     let n_chunks = n_rows.div_ceil(chunk_rows);
 
-    let partials: Vec<Vec<F128>> = (0..n_chunks)
-        .into_par_iter()
-        .map(|ci| {
-            let lo = ci * chunk_rows;
-            let hi = ((ci + 1) * chunk_rows).min(n_rows);
-            let mut acc = vec![F128::ZERO; n_cols];
-            for r in lo..hi {
-                let ea = alpha * eq_table[r];
-                let eb = eq_table[r];
-                for &c in &a_0.rows[r] {
-                    acc[c] += ea;
-                }
-                for &c in &b_0.rows[r] {
-                    acc[c] += eb;
-                }
+    // Drain the row-chunk scatter-reduce through the hetero queue (main
+    // rayon pool + efficiency-core helper pool when present) instead of the
+    // main pool alone. GF(2^128) addition is XOR — order-independent — so
+    // chunk order and pool assignment never affect output bytes: the emitted
+    // proof is bit-identical to the main-pool-only path and only the
+    // scheduling changes. Each chunk publishes its accumulator exactly once,
+    // so `OnceLock` avoids both a zero-filled placeholder and mutex traffic.
+    let partials: Vec<std::sync::OnceLock<Vec<F128>>> =
+        (0..n_chunks).map(|_| std::sync::OnceLock::new()).collect();
+    crate::epool::run_hetero_chunks(n_chunks, |ci| {
+        let lo = ci * chunk_rows;
+        let hi = ((ci + 1) * chunk_rows).min(n_rows);
+        let mut acc = vec![F128::ZERO; n_cols];
+        for ((&e, a_row), b_row) in eq_table[lo..hi]
+            .iter()
+            .zip(&a_0.rows[lo..hi])
+            .zip(&b_0.rows[lo..hi])
+        {
+            let ea = alpha * e;
+            for &c in a_row {
+                acc[c] += ea;
             }
-            acc
-        })
-        .collect();
-
-    let mut out = vec![F128::ZERO; n_cols];
-    for acc in &partials {
-        for i in 0..n_cols {
-            out[i] += acc[i];
+            for &c in b_row {
+                acc[c] += e;
+            }
         }
-    }
+        partials[ci]
+            .set(acc)
+            .unwrap_or_else(|_| unreachable!("each chunk executes exactly once"));
+    });
+
+    // Reduce by output column in parallel. Each worker writes a disjoint output
+    // slot and reads the same column from every completed chunk accumulator.
+    // Addition in GF(2^128) is XOR, so this produces exactly the same values as
+    // the former chunk-major serial reduction while using all cores for the
+    // O(n_cols * n_chunks) merge.
+    let partials: Vec<Vec<F128>> = partials
+        .into_iter()
+        .map(|acc| acc.into_inner().expect("every chunk completed before reduction"))
+        .collect();
+    use rayon::prelude::*;
+    let mut out = vec![F128::ZERO; n_cols];
+    out.par_iter_mut().enumerate().for_each(|(col, out_i)| {
+        let mut sum = F128::ZERO;
+        for acc in &partials {
+            sum += acc[col];
+        }
+        *out_i = sum;
+    });
     out
 }
 
@@ -1248,18 +1282,40 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
     if half < SUMCHECK_PAR_THRESHOLD {
         let mut e1 = F128::ZERO;
         let mut einf = F128::ZERO;
-        for i in 0..half {
-            e1 += chi[i] * zhi[i];
-            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+        for (((&clo_i, &chi_i), &zlo_i), &zhi_i) in clo
+            .iter()
+            .zip(chi)
+            .zip(zlo)
+            .zip(zhi)
+        {
+            e1 += chi_i * zhi_i;
+            einf += (chi_i + clo_i) * (zhi_i + zlo_i);
         }
         return (e1, einf);
     }
-    (0..half)
-        .into_par_iter()
-        .map(|i| {
-            let e1_i = chi[i] * zhi[i];
-            let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
-            (e1_i, einf_i)
+    // Process four aligned products per Rayon fold call. This preserves the
+    // independent accumulator lanes while removing the per-element lane counter
+    // and reducing iterator/fold bookkeeping by roughly fourfold.
+    chi.par_chunks(4)
+        .zip(zhi.par_chunks(4))
+        .zip(clo.par_chunks(4).zip(zlo.par_chunks(4)))
+        .fold(
+            || ([F128::ZERO; 4], [F128::ZERO; 4]),
+            |mut acc, ((chi_chunk, zhi_chunk), (clo_chunk, zlo_chunk))| {
+                for lane in 0..chi_chunk.len() {
+                    acc.0[lane] += chi_chunk[lane] * zhi_chunk[lane];
+                    acc.1[lane] +=
+                        (chi_chunk[lane] + clo_chunk[lane])
+                            * (zhi_chunk[lane] + zlo_chunk[lane]);
+                }
+                acc
+            },
+        )
+        .map(|(e1, einf)| {
+            (
+                (e1[0] + e1[1]) + (e1[2] + e1[3]),
+                (einf[0] + einf[1]) + (einf[2] + einf[3]),
+            )
         })
         .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
 }
@@ -1270,8 +1326,9 @@ fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     use rayon::prelude::*;
     let half = v.len() / 2;
     if half < SUMCHECK_PAR_THRESHOLD {
-        for i in 0..half {
-            v[i] = v[i] + r * (v[i + half] + v[i]);
+        let (lo, hi) = v.split_at_mut(half);
+        for (lo_i, &hi_i) in lo.iter_mut().zip(&hi[..half]) {
+            *lo_i = *lo_i + r * (hi_i + *lo_i);
         }
     } else {
         let (lo, hi) = v.split_at_mut(half);
@@ -1333,15 +1390,24 @@ fn sumcheck_bind_both_and_eval_next(
     let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
         let mut e1 = F128::ZERO;
         let mut einf = F128::ZERO;
-        for i in 0..half2 {
-            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
-            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
-            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
-            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
-            cq0[i] = lo;
-            cq1[i] = hi;
-            zq0[i] = zlo;
-            zq1[i] = zhi;
+        for (((((((c0, c1), &c2), &c3), z0), z1), &z2), &z3) in cq0
+            .iter_mut()
+            .zip(cq1.iter_mut())
+            .zip(cq2.iter())
+            .zip(cq3.iter())
+            .zip(zq0.iter_mut())
+            .zip(zq1.iter_mut())
+            .zip(zq2.iter())
+            .zip(zq3.iter())
+        {
+            let lo = *c0 + r * (c2 + *c0);
+            let hi = *c1 + r * (c3 + *c1);
+            let zlo = *z0 + r * (z2 + *z0);
+            let zhi = *z1 + r * (z3 + *z1);
+            *c0 = lo;
+            *c1 = hi;
+            *z0 = zlo;
+            *z1 = zhi;
             e1 += hi * zhi;
             einf += (hi + lo) * (zhi + zlo);
         }
