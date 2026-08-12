@@ -243,16 +243,16 @@ fn zc_tail_hetero_enabled() -> bool {
 /// Hetero admission floor for the composed tail folds, decoupled from the
 /// NT-store policy that shares the historical `2^19` size test. The 2^21→2^19
 /// lowering (promoted `db0b668`) admitted the 7+8 fold; this floor extends
-/// the same scheduling — and only the scheduling — down to the 9+10 and 11+12
-/// composed folds and the first loop rounds, whose 2×≤8 MiB ping-pong outputs
-/// are LLC-resident and must therefore keep cached stores (the NT gates stay
-/// keyed on `2^19`). Compile-time default per the cleared ranked environment;
-/// `FLOCK_NO_ZC_TAIL_HETERO_LOW=1` (exactly `"1"`) restores the incumbent
-/// `2^19` admission as the same-binary A/B control. Bit-identical either way:
-/// the hetero branch owns the same disjoint per-`x_hi` output ranges, and the
-/// message partials are XOR sums.
+/// the same scheduling — and only the scheduling — down the composed tail
+/// ladder (9+10, 11+12, and subsequent LLC-resident loop rounds). Ping-pong
+/// outputs at these sizes stay LLC-resident so NT gates remain keyed on
+/// `2^19` (cached stores only). Default floor is `2^16` (one octave below the
+/// promoted `18b8fe8b`/`3bdc695` `2^17` seam); `FLOCK_NO_ZC_TAIL_HETERO_LOW=1`
+/// (exactly `"1"`) restores the incumbent `2^19` admission as the same-binary
+/// A/B control. Bit-identical either way: the hetero branch owns the same
+/// disjoint per-`x_hi` output ranges, and the message partials are XOR sums.
 #[cfg(target_arch = "aarch64")]
-const ZC_TAIL_HETERO_LOW_FLOOR: usize = 1 << 17;
+const ZC_TAIL_HETERO_LOW_FLOOR: usize = 1 << 16;
 
 #[cfg(target_arch = "aarch64")]
 fn zc_tail_hetero_low_floor() -> usize {
