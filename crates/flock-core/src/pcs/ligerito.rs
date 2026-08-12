@@ -3289,6 +3289,7 @@ fn transpose_forward_ntt_sparse_hashmap_impl(
 pub(crate) struct LigeroWitness {
     pub mat: Vec<F128>,
     pub tree: Vec<Hash>,
+    gpu_tree: Option<crate::gpu_commit::GpuRecursiveMerkleTree>,
     pub block_len: usize,
     pub num_interleaved: usize,
 }
@@ -3324,7 +3325,25 @@ impl LigeroWitness {
 
     #[inline]
     pub fn root(&self) -> Hash {
-        self.tree[self.tree.len() - 1]
+        self.gpu_tree
+            .as_ref()
+            .map_or_else(|| self.tree[self.tree.len() - 1], |tree| tree.root())
+    }
+
+    fn merkle_multi_proof(&self, queries: &[usize]) -> Vec<Hash> {
+        self.gpu_tree.as_ref().map_or_else(
+            || merkle_multi_proof_for(&self.tree, self.block_len, queries),
+            |tree| tree.multi_proof(queries),
+        )
+    }
+
+    fn clear_tree(&mut self, recycle_cpu_tree: bool) {
+        if recycle_cpu_tree {
+            crate::scratch::give_hash_tree(std::mem::take(&mut self.tree));
+        } else {
+            self.tree = Vec::new();
+        }
+        self.gpu_tree = None;
     }
 }
 
@@ -3439,22 +3458,43 @@ fn ligero_commit_impl(
     // returns the bit-identical flat tree or `None` for the exact CPU path
     // (kill switch `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, non-Blake3 hashes,
     // other shapes, and every GPU failure).
-    let gpu_tree = if matches!(kind, HashKind::Blake3) && leaf_size_bytes == 128 {
-        crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
+    let gpu_shape = matches!(kind, HashKind::Blake3) && leaf_size_bytes == 128;
+    let (tree, gpu_tree) = if gpu_shape && crate::gpu_commit::gpu_recursive_merkle_lease_enabled() {
+        match crate::gpu_commit::gpu_recursive_merkle_blake3_leased(data_bytes, block_len) {
+            Some(tree) => (Vec::new(), Some(tree)),
+            None => (
+                merkle::merkle_tree_into(
+                    crate::scratch::take_hash_tree(2 * block_len - 1),
+                    data_bytes,
+                    block_len,
+                    kind,
+                ),
+                None,
+            ),
+        }
+    } else if gpu_shape {
+        match crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len) {
+            Some(tree) => (tree, None),
+            None => (
+                merkle::merkle_tree_into(
+                    crate::scratch::take_hash_tree(2 * block_len - 1),
+                    data_bytes,
+                    block_len,
+                    kind,
+                ),
+                None,
+            ),
+        }
     } else {
-        None
-    };
-    let tree = match gpu_tree {
-        Some(tree) => tree,
-        // Pooled tree storage for the CPU builder (the GPU offload's
-        // copy-out is pooled inside `gpu_recursive_merkle_blake3`): same
-        // fault/munmap argument, byte-identical output.
-        None => merkle::merkle_tree_into(
-            crate::scratch::take_hash_tree(2 * block_len - 1),
-            data_bytes,
-            block_len,
-            kind,
-        ),
+        (
+            merkle::merkle_tree_into(
+                crate::scratch::take_hash_tree(2 * block_len - 1),
+                data_bytes,
+                block_len,
+                kind,
+            ),
+            None,
+        )
     };
     let merkle_elapsed = merkle_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
 
@@ -3480,6 +3520,7 @@ fn ligero_commit_impl(
     LigeroWitness {
         mat,
         tree,
+        gpu_tree,
         block_len,
         num_interleaved,
     }
@@ -5831,6 +5872,7 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
     let wtns_0 = LigeroWitness {
         mat: l0_codeword,
         tree: l0_tree,
+        gpu_tree: None,
         block_len,
         num_interleaved,
     };
@@ -6607,15 +6649,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     .map(|&q| wtns_prev.row(q).to_vec())
                     .collect()
             };
-            let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+            let merkle_proof_last = wtns_prev.merkle_multi_proof(&queries_last);
             if trace {
                 t_opens += _t.elapsed();
             }
             // Final open complete — recycle last recursive codeword/tree before
             // proof-object assembly (transcript copy etc.).
             crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-            crate::scratch::give_hash_tree(std::mem::take(&mut wtns_prev.tree));
+            wtns_prev.clear_tree(true);
             if trace {
                 let total = t_total.elapsed();
                 eprintln!("[lig-prove] total = {:.2} ms", total.as_secs_f64() * 1e3);
@@ -6734,8 +6775,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 .map(|&q| wtns_prev.row(q).to_vec())
                 .collect()
         };
-        let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+        let merkle_proof_i = wtns_prev.merkle_multi_proof(&queries_i);
         if trace {
             t_opens += _t.elapsed();
         }
@@ -6753,9 +6793,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // A/B-CONTROL: FLOCK_NO_TREE_POOL_FULL=1 (exact '1') restores the
         // incumbent drop.
         if crate::scratch::tree_pool_full_enabled() {
-            crate::scratch::give_hash_tree(std::mem::take(&mut wtns_prev.tree));
+            wtns_prev.clear_tree(true);
         } else {
-            wtns_prev.tree = Vec::new();
+            wtns_prev.clear_tree(false);
         }
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
@@ -7878,13 +7918,13 @@ fn recursive_prover_inner<Ch: Challenger>(
             .map(|&q| wtns_0.row(q).to_vec())
             .collect()
     };
-    let merkle_proof_0 = merkle_multi_proof_for(&wtns_0.tree, wtns_0.block_len, &queries_0);
+    let merkle_proof_0 = wtns_0.merkle_multi_proof(&queries_0);
     t_opens += t.elapsed();
     // L0 mat/tree dead after open copies; recycle before induce.
     {
         let mut wtns_0 = wtns_0;
         crate::scratch::give_f128(std::mem::take(&mut wtns_0.mat));
-        wtns_0.tree = Vec::new();
+        wtns_0.clear_tree(false);
     }
 
     // ---- Induce basis from wtns_0 opens ----
@@ -7965,10 +8005,9 @@ fn recursive_prover_inner<Ch: Challenger>(
                     .map(|&q| wtns_prev.row(q).to_vec())
                     .collect()
             };
-            let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
+            let merkle_proof_last = wtns_prev.merkle_multi_proof(&queries_last);
             crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-            wtns_prev.tree = Vec::new();
+            wtns_prev.clear_tree(false);
             return LigeritoProof {
                 initial_root,
                 initial_proof,
@@ -8028,12 +8067,11 @@ fn recursive_prover_inner<Ch: Challenger>(
                 .map(|&q| wtns_prev.row(q).to_vec())
                 .collect()
         };
-        let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
+        let merkle_proof_i = wtns_prev.merkle_multi_proof(&queries_i);
         t_opens += t.elapsed();
         // Prior-level mat/tree dead after the open; recycle before induce.
         crate::scratch::give_f128(std::mem::take(&mut wtns_prev.mat));
-        wtns_prev.tree = Vec::new();
+        wtns_prev.clear_tree(false);
 
         // Induce fresh basis from these opens.
         let sks_vks_i = eval_sk_at_vks(n_next);

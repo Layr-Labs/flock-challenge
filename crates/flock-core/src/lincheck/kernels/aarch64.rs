@@ -621,6 +621,14 @@ pub fn partial_fold_packed_z_neon_oblock16_padded(
 /// arm can express its stripe prefix in the same units the CPU claims use.
 pub(crate) const OBLOCK_TILES_PER_CLAIM: usize = 64;
 
+fn oblock_reduce_hetero_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_OBLOCK_REDUCE_HETERO").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 /// Number of oblock tile claims for `(m, k_log)` at the default tile factor.
 pub(crate) fn oblock_claim_count(m: usize, k_log: usize) -> usize {
     let n_stripes = (1usize << (m - k_log)) / 8;
@@ -838,16 +846,33 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     // That is `n_workers - 1` accumulator reads and writes (≈2.5× the traffic
     // here) and 9 barriers instead of 1 at `n_workers = 10`; measured ≈0.7 ms
     // of the fold at m=32, k_log=14.
-    let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
+    const HETERO_BAND: usize = 1024;
+    let n_bands = useful.div_ceil(HETERO_BAND);
     let mut out = vec![F128::ZERO; k];
-    out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
-        let lo = bi * band;
-        for w in 0..n_workers {
-            let src = &partials[w * k + lo..w * k + lo + dst.len()];
-            for (o, s) in dst.iter_mut().zip(src.iter()) {
-                *o += *s;
+    if n_bands >= 16 && oblock_reduce_hetero_enabled() && crate::epool::epool().is_some() {
+        let out_base = crate::epool::SyncPtr(out.as_mut_ptr());
+        crate::epool::run_hetero_chunks(n_bands, |bi| {
+            let lo = bi * HETERO_BAND;
+            let len = (useful - lo).min(HETERO_BAND);
+            let dst = unsafe { std::slice::from_raw_parts_mut(out_base.ptr().add(lo), len) };
+            for w in 0..n_workers {
+                let src = &partials[w * k + lo..w * k + lo + len];
+                for (o, s) in dst.iter_mut().zip(src.iter()) {
+                    *o += *s;
+                }
             }
-        }
-    });
+        });
+    } else {
+        let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
+        out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
+            let lo = bi * band;
+            for w in 0..n_workers {
+                let src = &partials[w * k + lo..w * k + lo + dst.len()];
+                for (o, s) in dst.iter_mut().zip(src.iter()) {
+                    *o += *s;
+                }
+            }
+        });
+    }
     out
 }

@@ -795,6 +795,9 @@ pub const ENV_NO_GPU_KEEPWARM: &str = "FLOCK_NO_GPU_KEEPWARM";
 /// or submission failure falls back to the untouched CPU builder.
 pub const ENV_NO_GPU_RECURSIVE_MERKLE: &str = "FLOCK_NO_GPU_RECURSIVE_MERKLE";
 
+/// `FLOCK_NO_GPU_RECMERKLE_LEASE=1` restores the full recursive-tree copy-out.
+pub const ENV_NO_GPU_RECMERKLE_LEASE: &str = "FLOCK_NO_GPU_RECMERKLE_LEASE";
+
 fn gpu_recursive_merkle_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -812,8 +815,15 @@ pub(crate) fn gpu_recursive_merkle_enabled() -> bool {
     })
 }
 
-/// GPU BLAKE3 Merkle tree for the recursive Ligerito 128-byte-leaf shapes
-/// (2^18 or 2^16 leaves). Returns `None` whenever the GPU path is disabled,
+pub(crate) fn gpu_recursive_merkle_lease_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_GPU_RECMERKLE_LEASE).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// GPU BLAKE3 Merkle tree for the recursive Ligerito 128-byte-leaf shape
+/// (2^18 leaves). Returns `None` whenever the GPU path is disabled,
 /// unavailable, or fails — the caller then builds the identical tree on the
 /// CPU. `Some(tree)` is bit-identical to `merkle::merkle_tree(data,
 /// num_leaves, HashKind::Blake3)`.
@@ -821,7 +831,93 @@ pub fn gpu_recursive_merkle_blake3(
     data: &[u8],
     num_leaves: usize,
 ) -> Option<Vec<crate::merkle::Hash>> {
-    imp::gpu_recursive_merkle_blake3(data, num_leaves)
+    let tree = imp::gpu_recursive_merkle_blake3_leased(data, num_leaves)?;
+    Some(imp::materialize_recursive_merkle_tree(&tree))
+}
+
+pub(crate) struct GpuRecursiveMerkleTree {
+    root: crate::merkle::Hash,
+    num_leaves: usize,
+    tree_ptr: *const crate::merkle::Hash,
+}
+
+unsafe impl Send for GpuRecursiveMerkleTree {}
+unsafe impl Sync for GpuRecursiveMerkleTree {}
+
+impl GpuRecursiveMerkleTree {
+    #[inline]
+    pub(crate) fn root(&self) -> crate::merkle::Hash {
+        self.root
+    }
+
+    pub(crate) fn multi_proof(&self, positions: &[usize]) -> Vec<crate::merkle::Hash> {
+        assert!(self.num_leaves.is_power_of_two() && self.num_leaves > 0);
+        if positions.is_empty() || self.num_leaves == 1 {
+            return Vec::new();
+        }
+
+        let mut active = positions.to_vec();
+        active.sort_unstable();
+        active.dedup();
+        debug_assert!(active.iter().all(|&position| position < self.num_leaves));
+
+        let depth = self.num_leaves.trailing_zeros() as usize;
+        let mut sibling_indices = Vec::with_capacity(positions.len() * depth);
+        let mut next = Vec::with_capacity(active.len());
+        let mut level_start = 0usize;
+        let mut level_len = self.num_leaves;
+        while level_len > 1 {
+            next.clear();
+            let mut index = 0;
+            while index < active.len() {
+                let position = active[index];
+                let sibling_active =
+                    index + 1 < active.len() && active[index + 1] == (position ^ 1);
+                if sibling_active {
+                    index += 2;
+                } else {
+                    sibling_indices.push(level_start + (position ^ 1));
+                    index += 1;
+                }
+                next.push(position >> 1);
+            }
+            std::mem::swap(&mut active, &mut next);
+            level_start += level_len;
+            level_len >>= 1;
+        }
+
+        let mut proof = Vec::with_capacity(sibling_indices.len());
+        for (offset, &tree_index) in sibling_indices.iter().enumerate() {
+            #[cfg(target_arch = "aarch64")]
+            if let Some(&prefetch_index) = sibling_indices.get(offset + 8) {
+                unsafe {
+                    let address = self.tree_ptr.add(prefetch_index);
+                    core::arch::asm!(
+                        "prfm pldl1keep, [{address}]",
+                        address = in(reg) address,
+                        options(readonly, nostack, preserves_flags)
+                    );
+                }
+            }
+            unsafe {
+                proof.push(*self.tree_ptr.add(tree_index));
+            }
+        }
+        proof
+    }
+}
+
+impl Drop for GpuRecursiveMerkleTree {
+    fn drop(&mut self) {
+        imp::release_recursive_merkle_tree_lease();
+    }
+}
+
+pub(crate) fn gpu_recursive_merkle_blake3_leased(
+    data: &[u8],
+    num_leaves: usize,
+) -> Option<GpuRecursiveMerkleTree> {
+    imp::gpu_recursive_merkle_blake3_leased(data, num_leaves)
 }
 
 /// Exact rollback for the PCS Fiat--Shamir BLAKE3 grind scanner.  The first
@@ -10371,6 +10467,16 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     unsafe impl Send for RecMerkle {}
 
     static REC_MERKLE: Mutex<Option<Result<RecMerkle, String>>> = Mutex::new(None);
+    static REC_MERKLE_TREE_LEASED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    struct RecMerkleLeaseOnFailure;
+
+    impl Drop for RecMerkleLeaseOnFailure {
+        fn drop(&mut self) {
+            REC_MERKLE_TREE_LEASED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
 
     fn rec_merkle_debug() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -10491,13 +10597,28 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
-    pub(crate) fn gpu_recursive_merkle_blake3(data: &[u8], num_leaves: usize) -> Option<Vec<Hash>> {
+    pub(crate) fn gpu_recursive_merkle_blake3_leased(
+        data: &[u8],
+        num_leaves: usize,
+    ) -> Option<GpuRecursiveMerkleTree> {
         if !super::gpu_recursive_merkle_enabled()
             || !REC_MERKLE_SHAPES.contains(&num_leaves)
             || data.len() != num_leaves * 128
         {
             return None;
         }
+        if REC_MERKLE_TREE_LEASED
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        let lease_on_failure = RecMerkleLeaseOnFailure;
         let gpu = gpu().ok()?;
         let started = rec_merkle_debug().then(std::time::Instant::now);
         // Poison-tolerant for the same reason as `ZC_FOLD`: discard torn
@@ -10622,26 +10743,41 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             return None;
         }
 
-        // Pooled destination: a fresh 16 MiB uninit Vec pays ~4k first-touch
-        // page faults inside this FS-serial copy and a single-threaded munmap
-        // on the following drop; the recycled buffer's pages stay resident
-        // across proves (write-before-read: the copy below writes all of it).
-        let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
-        unsafe {
-            let dst =
-                core::slice::from_raw_parts_mut(tree.as_mut_ptr().cast::<u8>(), total_nodes * 32);
-            copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
-        }
+        let tree_ptr = unsafe { gpu.buffer_contents(tree_buf).cast::<Hash>() };
+        let root = unsafe { *tree_ptr.add(total_nodes - 1) };
         if let Some(t) = started {
             eprintln!(
-                "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms (wrap hits {} misses {})",
+                "[gpu-recmerkle] n_leaves=2^{} leased wall {:.2} ms (wrap hits {} misses {})",
                 num_leaves.trailing_zeros(),
                 t.elapsed().as_secs_f64() * 1e3,
                 state.hits,
                 state.misses,
             );
         }
-        Some(tree)
+        std::mem::forget(lease_on_failure);
+        Some(GpuRecursiveMerkleTree {
+            root,
+            num_leaves,
+            tree_ptr,
+        })
+    }
+
+    pub(crate) fn materialize_recursive_merkle_tree(tree: &GpuRecursiveMerkleTree) -> Vec<Hash> {
+        let total_nodes = 2 * tree.num_leaves - 1;
+        let mut out: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
+        unsafe {
+            let src = tree.tree_ptr.cast::<u8>();
+            let dst = core::slice::from_raw_parts_mut(
+                out.as_mut_ptr().cast::<u8>(),
+                total_nodes * core::mem::size_of::<Hash>(),
+            );
+            copy_bytes_parallel(src, dst);
+        }
+        out
+    }
+
+    pub(crate) fn release_recursive_merkle_tree_lease() {
+        REC_MERKLE_TREE_LEASED.store(false, std::sync::atomic::Ordering::Release);
     }
 
     // -----------------------------------------------------------------------
@@ -13073,12 +13209,20 @@ pub(crate) use imp::{ZcLoopJob, ZcLoopResult, launch_zc_loop_products, zc_loop_w
 mod imp {
     use super::*;
 
-    pub(crate) fn gpu_recursive_merkle_blake3(
+    pub(crate) fn gpu_recursive_merkle_blake3_leased(
         _data: &[u8],
         _num_leaves: usize,
-    ) -> Option<Vec<crate::merkle::Hash>> {
+    ) -> Option<GpuRecursiveMerkleTree> {
         None
     }
+
+    pub(crate) fn materialize_recursive_merkle_tree(
+        _tree: &GpuRecursiveMerkleTree,
+    ) -> Vec<crate::merkle::Hash> {
+        unreachable!("non-Metal targets never create a recursive Merkle lease")
+    }
+
+    pub(crate) fn release_recursive_merkle_tree_lease() {}
 
     pub(crate) struct FromZFirstPassStream;
 
@@ -14246,8 +14390,9 @@ mod tests {
     }
 
     /// The recursive-Merkle offload must reproduce the CPU flat tree
-    /// bit-for-bit at both supported 128-byte-leaf shapes, and its repeated
-    /// calls must reuse the cached input wrap.
+    /// bit-for-bit at the supported 128-byte-leaf shape. The leased view must
+    /// also emit the same root and canonical sparse multi-proof without a
+    /// full copy-out, and repeated calls must reuse the cached input wrap.
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_recursive_merkle_matches_cpu_tree() {
@@ -14277,6 +14422,15 @@ mod tests {
                 gpu_tree == cpu_tree,
                 "GPU tree diverges at 2^{log_leaves} leaves"
             );
+            let leased = super::gpu_recursive_merkle_blake3_leased(data, n_leaves)
+                .expect("leased recursive tree must succeed");
+            assert_eq!(leased.root(), cpu_tree[cpu_tree.len() - 1]);
+            let positions = [0, 1, 17, n_leaves / 3, n_leaves / 2, n_leaves - 1];
+            assert_eq!(
+                leased.multi_proof(&positions),
+                crate::merkle::merkle_multi_proof(&cpu_tree, n_leaves, &positions),
+            );
+            drop(leased);
             // Second call on the same allocation: cached wrap, same bytes.
             let again = super::gpu_recursive_merkle_blake3(data, n_leaves)
                 .expect("second call must succeed");
