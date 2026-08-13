@@ -859,11 +859,12 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     Round1AbInner { storage }
 }
 
-/// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
-/// shape exposes roughly sixty-four scheduling waves on the ten-thread worker.
+/// Keep queue claims short enough that efficiency cores joining after the
+/// deferred stripe cannot leave one long AB slab at the end of the join.
+/// The ranked shape exposes roughly 128 scheduling waves on ten P-cores.
 #[inline]
 fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
-    n_chunks.div_ceil(640).max(1)
+    n_chunks.div_ceil(1280).max(1)
 }
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
