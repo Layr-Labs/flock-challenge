@@ -39,3 +39,19 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker 71r1024-1044-qz2
 // dispersion-resample marker r1025-3f8c7d
 // dispersion-resample marker r1100-flash-1786577283-3769
+
+// dispersion-resample marker fable5-s1-1786632193-6222
+// dispersion-resample marker fable5-s2-1786632880-27556
+// dispersion-resample marker fable5-s3-1786633583-15063
+// dispersion-resample marker fable5-s4-1786634246-7433
+// dispersion-resample marker fable5-s5-1786634875-26809
+// dispersion-resample marker fable5-s6-1786635510-15799
+// dispersion-resample marker fable5-s7-1786636137-16452
+// dispersion-resample marker fable5-s8-1786636797-23675
+// dispersion-resample marker fable5-s9-stock-1786637449-21665
+// dispersion-resample marker fable5-s10-rider-1786638071-6615
+// dispersion-resample marker fable5-s11-stock-1786638725-22305
+// dispersion-resample marker fable5-s12-stock-1786639407-3317
+// dispersion-resample marker fable5-s13-stock-1786640154-7266
+// dispersion-resample marker fable5-s13-stock-1786640201-20309
+// dispersion-resample marker fable5-s14-stock-1786640820-13162
