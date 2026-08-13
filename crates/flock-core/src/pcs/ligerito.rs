@@ -2398,6 +2398,130 @@ fn transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
     SumcheckMessage { u_0, u_2 }
 }
 
+/// Exact ranked-L1 tail: apply transpose layers 3, 2, 1, and 0 while
+/// materializing only the low quarter, and accumulate its ordinary
+/// introduction message against `f` before the retained coefficients leave
+/// registers.
+///
+/// After layers 3 and 2, a retained root output is
+///
+/// ```text
+/// y[j] = v[j] + v[j + 4] + v[j + 8] + v[j + 12],  j = 0..4.
+/// ```
+///
+/// These are the top outputs of both layer-1 butterflies followed by the top
+/// output of layer 0. Neither top operation uses its twiddle, so the layer-1
+/// and layer-0 bottom products and all outputs outside the low quarter are
+/// dead. At the ranked rate-four L1 induction this replaces a full fused
+/// 3/2/1 pass, a separate full root pass, and a separate `round_msg_lsb` pass.
+fn transpose_forward_ntt_fused_final_4layer_low_quarter_with_round_msg(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    log_d: usize,
+    f: &[F128],
+) -> SumcheckMessage {
+    use rayon::prelude::*;
+
+    #[inline(always)]
+    fn butterfly(values: &mut [F128; 16], a: usize, b: usize, twiddle: F128) {
+        let sum = values[a] + values[b];
+        values[a] = sum;
+        values[b] = twiddle * sum + values[b];
+    }
+
+    #[inline(always)]
+    unsafe fn retained_row(
+        ptr: *mut F128,
+        row: usize,
+        sixteenth: usize,
+        layer_2_twiddles: &[F128; 4],
+        layer_3_twiddles: &[F128; 8],
+    ) -> [F128; 4] {
+        let mut values = [F128::ZERO; 16];
+        for (i, value) in values.iter_mut().enumerate() {
+            // SAFETY: established by the caller's disjoint paired-row range.
+            *value = unsafe { *ptr.add(row + i * sixteenth) };
+        }
+        for pair in 0..8 {
+            butterfly(&mut values, 2 * pair, 2 * pair + 1, layer_3_twiddles[pair]);
+        }
+        for block in 0..4 {
+            butterfly(
+                &mut values,
+                4 * block,
+                4 * block + 2,
+                layer_2_twiddles[block],
+            );
+            butterfly(
+                &mut values,
+                4 * block + 1,
+                4 * block + 3,
+                layer_2_twiddles[block],
+            );
+        }
+        core::array::from_fn(|i| values[i] + values[i + 4] + values[i + 8] + values[i + 12])
+    }
+
+    assert!(log_d >= 5);
+    assert_eq!(data.len(), 1usize << log_d);
+    assert_eq!(f.len(), data.len() >> 2);
+    let sixteenth = data.len() >> 4;
+    assert!(sixteenth.is_multiple_of(2));
+    let mut layer_2_twiddles = [F128::ZERO; 4];
+    let mut layer_3_twiddles = [F128::ZERO; 8];
+    for (block, twiddle) in layer_2_twiddles.iter_mut().enumerate() {
+        *twiddle = ntt.twiddle(2, block);
+    }
+    for (block, twiddle) in layer_3_twiddles.iter_mut().enumerate() {
+        *twiddle = ntt.twiddle(3, block);
+    }
+
+    let data_ptr = data.as_mut_ptr() as usize;
+    let (u_0, u_2) = (0..sixteenth / 2)
+        .into_par_iter()
+        .map(|row_pair| {
+            let even_row = 2 * row_pair;
+            let odd_row = even_row + 1;
+            let mut local_u_0 = F128::ZERO;
+            let mut local_u_2 = F128::ZERO;
+            // SAFETY: one job first reads, then writes, the two row offsets it
+            // uniquely owns. Jobs have disjoint offsets in all 16 source
+            // segments and in the four retained destination segments.
+            unsafe {
+                let ptr = data_ptr as *mut F128;
+                let even = retained_row(
+                    ptr,
+                    even_row,
+                    sixteenth,
+                    &layer_2_twiddles,
+                    &layer_3_twiddles,
+                );
+                let odd = retained_row(
+                    ptr,
+                    odd_row,
+                    sixteenth,
+                    &layer_2_twiddles,
+                    &layer_3_twiddles,
+                );
+                for segment in 0..4 {
+                    let even_index = segment * sixteenth + even_row;
+                    ptr.add(even_index).write(even[segment]);
+                    ptr.add(even_index + 1).write(odd[segment]);
+                    let f_0 = f[even_index];
+                    let f_1 = f[even_index + 1];
+                    local_u_0 += f_0 * even[segment];
+                    local_u_2 += (f_0 + f_1) * (even[segment] + odd[segment]);
+                }
+            }
+            (local_u_0, local_u_2)
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(a_0, a_2), (b_0, b_2)| (a_0 + b_0, a_2 + b_2),
+        );
+    SumcheckMessage { u_0, u_2 }
+}
+
 /// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
 /// Forward butterfly is `M=[[1,t],[1,t+1]]`; transpose `Mᵀ=[[1,1],[t,t+1]]` is
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
@@ -2529,6 +2653,83 @@ fn use_ranked_induce_fused_msg(
         && std::env::var_os("FLOCK_NO_LIG_INDUCE_FUSED_MSG").is_none()
 }
 
+/// Pure selector for the ranked L1 rate-four induced-basis tail. Keeping the
+/// complete geometry here makes the production gate fail closed if the
+/// security configuration, query count, lane fold, or retained witness size
+/// changes.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn ranked_l1_induce_quarter_msg_selected(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+    f_len: usize,
+    platform_supported: bool,
+    disabled: bool,
+) -> bool {
+    platform_supported
+        && !disabled
+        && log_msg_cols == 16
+        && log_inv_rate == 2
+        && log_num_interleaved == 3
+        && n_queries == 106
+        && alpha_len == 7
+        && f_len == (1usize << 16)
+}
+
+#[inline]
+fn use_ranked_l1_induce_quarter_msg(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+    f_len: usize,
+) -> bool {
+    ranked_l1_induce_quarter_msg_selected(
+        log_msg_cols,
+        log_inv_rate,
+        log_num_interleaved,
+        n_queries,
+        alpha_len,
+        f_len,
+        cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        )),
+        std::env::var_os("FLOCK_NO_LIG_L1_QUARTER_MSG").as_deref()
+            == Some(std::ffi::OsStr::new("1")),
+    )
+}
+
+/// Bind the local L1 tuple to the complete ranked M32 Fast protocol context.
+/// This prevents a custom prover config that happens to share `(n_next,
+/// rate, queries)` from entering the specialized production path.
+#[inline]
+fn is_ranked_m32_fast_l1_induce_context(
+    config: &ProverConfig,
+    log_n: usize,
+    recursion_index: usize,
+) -> bool {
+    log_n == 25
+        && recursion_index == 0
+        && config.initial_log_msg_cols == 19
+        && config.initial_log_num_interleaved == 6
+        && config.initial_k == 6
+        && config.recursive_steps == 5
+        && config.recursive_log_msg_cols.as_slice() == [16, 13, 10, 7, 4]
+        && config.recursive_ks.as_slice() == [3, 3, 3, 3, 3]
+        && config.log_inv_rates.as_slice() == [1, 2, 3, 4, 5, 6]
+        && config.queries.as_slice() == [218, 106, 71, 53, 43, 36]
+        && config.grinding_bits.as_slice() == [0, 0, 0, 0, 0, 0]
+        && config.fold_grinding_bits.as_slice() == [19, 14, 11, 8, 6, 4]
+        && config.ood_samples.as_slice() == [0, 1, 1, 1, 1, 1]
+        && config.merkle_hash == HashKind::Blake3
+}
+
 #[cfg(test)]
 fn with_truncated_final_ntt_override<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
     TEST_TRUNCATED_FINAL_NTT_OVERRIDE.with(|slot| {
@@ -2572,6 +2773,53 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
     (basis, enforced_sum)
 }
 
+/// Ranked L1 wrapper. Candidate mode lets the final low-quarter transpose
+/// return the ordinary introduction message. The exact-one rollback and every
+/// non-ranked shape call the untouched public NTT path and return `None`, so
+/// the caller performs the incumbent `introduce_new` pass.
+#[allow(clippy::too_many_arguments)]
+fn induce_sumcheck_poly_via_ntt_with_ranked_l1_msg(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    opened_rows: &[Vec<F128>],
+    v_challenges: &[F128],
+    queries: &[usize],
+    alpha: &[F128],
+    f: &[F128],
+    exact_ranked_context: bool,
+) -> (Vec<F128>, F128, Option<SumcheckMessage>) {
+    if exact_ranked_context
+        && use_ranked_l1_induce_quarter_msg(
+            log_msg_cols,
+            log_inv_rate,
+            v_challenges.len(),
+            queries.len(),
+            alpha.len(),
+            f.len(),
+        )
+    {
+        induce_sumcheck_poly_via_ntt_impl(
+            log_msg_cols,
+            log_inv_rate,
+            opened_rows,
+            v_challenges,
+            queries,
+            alpha,
+            Some(f),
+        )
+    } else {
+        let (basis, enforced_sum) = induce_sumcheck_poly_via_ntt(
+            log_msg_cols,
+            log_inv_rate,
+            opened_rows,
+            v_challenges,
+            queries,
+            alpha,
+        );
+        (basis, enforced_sum, None)
+    }
+}
+
 fn induce_sumcheck_poly_via_ntt_impl(
     log_msg_cols: usize,
     log_inv_rate: usize,
@@ -2593,9 +2841,20 @@ fn induce_sumcheck_poly_via_ntt_impl(
         n_queries,
         alpha.len(),
     );
+    let truncate_final_quarter = round_f.is_some_and(|f| {
+        use_ranked_l1_induce_quarter_msg(
+            log_msg_cols,
+            log_inv_rate,
+            v_challenges.len(),
+            n_queries,
+            alpha.len(),
+            f.len(),
+        )
+    });
+    assert!(!(truncate_final_group && truncate_final_quarter));
     assert!(
-        round_f.is_none() || truncate_final_group,
-        "fused induction message requires the truncated final group"
+        round_f.is_none() || truncate_final_group || truncate_final_quarter,
+        "fused induction message requires an exact ranked truncation"
     );
     if let Some(f) = round_f {
         assert_eq!(f.len(), n, "induction message witness length changed");
@@ -2653,6 +2912,7 @@ fn induce_sumcheck_poly_via_ntt_impl(
             &alpha_pows,
             log_block,
             truncate_final_group,
+            truncate_final_quarter,
             round_f,
         )
     };
@@ -3040,6 +3300,7 @@ fn transpose_forward_ntt_dense_suffix_impl(
     log_d: usize,
     prefix_k: usize,
     truncate_final_group: bool,
+    truncate_final_quarter: bool,
     round_f: Option<&[F128]>,
 ) -> Option<SumcheckMessage> {
     use rayon::prelude::*;
@@ -3047,16 +3308,35 @@ fn transpose_forward_ntt_dense_suffix_impl(
     let mut remaining = log_d - prefix_k;
     let mut intro_msg = None;
     assert!(
-        round_f.is_none() || truncate_final_group,
+        round_f.is_none() || truncate_final_group || truncate_final_quarter,
         "fused message requires truncated dense suffix"
     );
+    assert!(!(truncate_final_group && truncate_final_quarter));
     if truncate_final_group {
         // The optimized ranked schedule ends in the fused layers 2,1,0.
         // Keep the gate explicit so another sparse geometry cannot silently
         // skip outputs from a differently shaped suffix schedule.
         assert!(remaining >= 3 && remaining.is_multiple_of(3));
     }
+    if truncate_final_quarter {
+        // Both ranked L1 prefix routes leave 4 mod 3 dense layers: the
+        // ordinary sparse prefix leaves ten, while fused densification leaves
+        // seven. Complete groups run first; the exact final four are fused.
+        assert!(remaining >= 4 && (remaining - 4).is_multiple_of(3));
+    }
     while remaining >= 3 {
+        if truncate_final_quarter && remaining == 4 {
+            intro_msg = Some(
+                transpose_forward_ntt_fused_final_4layer_low_quarter_with_round_msg(
+                    ntt,
+                    data,
+                    log_d,
+                    round_f.expect("ranked L1 quarter tail requires round witness"),
+                ),
+            );
+            remaining = 0;
+            break;
+        }
         let layer = remaining - 3;
         if truncate_final_group && layer == 0 {
             if let Some(f) = round_f {
@@ -3126,6 +3406,7 @@ fn transpose_forward_ntt_sparse(
         values,
         log_d,
         truncate_final_group,
+        false,
         None,
     );
     debug_assert!(intro_msg.is_none());
@@ -3138,6 +3419,7 @@ fn transpose_forward_ntt_sparse_impl(
     values: &[F128],
     log_d: usize,
     truncate_final_group: bool,
+    truncate_final_quarter: bool,
     round_f: Option<&[F128]>,
 ) -> (Vec<F128>, Option<SumcheckMessage>) {
     let n = 1usize << log_d;
@@ -3146,6 +3428,7 @@ fn transpose_forward_ntt_sparse_impl(
 
     if k == 0 {
         assert!(!truncate_final_group);
+        assert!(!truncate_final_quarter);
         assert!(round_f.is_none());
         let mut data = vec![F128::ZERO; n];
         for (&p, &v) in positions.iter().zip(values) {
@@ -3169,6 +3452,7 @@ fn transpose_forward_ntt_sparse_impl(
             log_d,
             k,
             truncate_final_group,
+            truncate_final_quarter,
             round_f,
         );
     }
@@ -3195,10 +3479,13 @@ fn transpose_forward_ntt_sparse_impl(
         log_d,
         dense_prefix_k,
         truncate_final_group,
+        truncate_final_quarter,
         round_f,
     );
     if truncate_final_group {
         data.truncate(n >> 1);
+    } else if truncate_final_quarter {
+        data.truncate(n >> 2);
     }
     (data, intro_msg)
 }
@@ -3219,6 +3506,7 @@ fn transpose_forward_ntt_sparse_hashmap(
         log_d,
         prefix_k,
         truncate_final_group,
+        false,
         None,
     );
     debug_assert!(intro_msg.is_none());
@@ -3232,6 +3520,7 @@ fn transpose_forward_ntt_sparse_hashmap_impl(
     log_d: usize,
     prefix_k: usize,
     truncate_final_group: bool,
+    truncate_final_quarter: bool,
     round_f: Option<&[F128]>,
 ) -> (Vec<F128>, Option<SumcheckMessage>) {
     use rayon::prelude::*;
@@ -3269,10 +3558,13 @@ fn transpose_forward_ntt_sparse_hashmap_impl(
         log_d,
         prefix_k,
         truncate_final_group,
+        truncate_final_quarter,
         round_f,
     );
     if truncate_final_group {
         data.truncate(n >> 1);
+    } else if truncate_final_quarter {
+        data.truncate(n >> 2);
     }
     (data, intro_msg)
 }
@@ -6759,25 +7051,28 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         }
         let sks_vks_i = eval_sk_at_vks(n_next);
         let _t = std::time::Instant::now();
-        let (basis_i_induced, enforced_sum_i) =
+        let (basis_i_induced, enforced_sum_i, induced_intro_msg_i) =
             if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
-                induce_sumcheck_poly_via_ntt(
+                induce_sumcheck_poly_via_ntt_with_ranked_l1_msg(
                     n_next,
                     config.log_inv_rates[i + 1],
                     &opened_rows_i,
                     &level_rs,
                     &queries_i,
                     &alpha_i,
+                    sc_prover.f(),
+                    is_ranked_m32_fast_l1_induce_context(config, log_n, i),
                 )
             } else {
-                induce_sumcheck_poly(
+                let (basis, enforced_sum) = induce_sumcheck_poly(
                     n_next,
                     &sks_vks_i,
                     &opened_rows_i,
                     &level_rs,
                     &queries_i,
                     &alpha_i,
-                )
+                );
+                (basis, enforced_sum, None)
             };
         if trace {
             t_induce += _t.elapsed();
@@ -6791,7 +7086,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         });
 
         let _t = std::time::Instant::now();
-        let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
+        let intro_msg_i = if let Some(msg) = induced_intro_msg_i {
+            sc_prover.introduce_new_with_precomputed_msg(basis_i_induced, enforced_sum_i, msg)
+        } else {
+            sc_prover.introduce_new(basis_i_induced, enforced_sum_i)
+        };
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
@@ -10856,6 +11155,47 @@ mod tests {
         });
     }
 
+    #[test]
+    fn ranked_l1_induce_quarter_msg_selector_is_fail_closed() {
+        let selected = |shape: (usize, usize, usize, usize, usize, usize), disabled| {
+            ranked_l1_induce_quarter_msg_selected(
+                shape.0, shape.1, shape.2, shape.3, shape.4, shape.5, true, disabled,
+            )
+        };
+        let ranked = (16, 2, 3, 106, 7, 1 << 16);
+        assert!(selected(ranked, false));
+        assert!(!selected(ranked, true), "exact-one rollback must win");
+        for shape in [
+            (15, 2, 3, 106, 7, 1 << 16),
+            (16, 1, 3, 106, 7, 1 << 16),
+            (16, 2, 2, 106, 7, 1 << 16),
+            (16, 2, 3, 105, 7, 1 << 16),
+            (16, 2, 3, 106, 6, 1 << 16),
+            (16, 2, 3, 106, 7, (1 << 16) - 1),
+        ] {
+            assert!(
+                !selected(shape, false),
+                "unexpected selected shape: {shape:?}"
+            );
+        }
+        assert!(!ranked_l1_induce_quarter_msg_selected(
+            ranked.0, ranked.1, ranked.2, ranked.3, ranked.4, ranked.5, false, false,
+        ));
+
+        let mut config =
+            prover_config_for(25, 6, LigeritoProfile::Fast).expect("embedded M32 Fast config");
+        config.merkle_hash = HashKind::Blake3;
+        assert!(is_ranked_m32_fast_l1_induce_context(&config, 25, 0));
+        assert!(!is_ranked_m32_fast_l1_induce_context(&config, 24, 0));
+        assert!(!is_ranked_m32_fast_l1_induce_context(&config, 25, 1));
+        let mut wrong_query = config.clone();
+        wrong_query.queries[1] += 1;
+        assert!(!is_ranked_m32_fast_l1_induce_context(&wrong_query, 25, 0,));
+        let mut wrong_hash = config;
+        wrong_hash.merkle_hash = HashKind::Sha256;
+        assert!(!is_ranked_m32_fast_l1_induce_context(&wrong_hash, 25, 0,));
+    }
+
     /// Independent oracle for the final fused group. The optimized kernel
     /// must reproduce the retained half while leaving every discarded slot
     /// untouched, proving that the dead root stores are absent.
@@ -10947,6 +11287,118 @@ mod tests {
                     "discarded-half write at log_d={log_d}, case={case}",
                 );
             }
+        }
+    }
+
+    /// Independent single-layer oracle for the ranked-L1 final-four tail.
+    /// It proves both retained coefficients and the fused ordinary message,
+    /// while poison preservation proves no discarded-quarter store occurs.
+    #[test]
+    fn transpose_final_4layer_low_quarter_with_msg_matches_full_oracle() {
+        use crate::challenger::Challenger;
+
+        fn final_four_reference(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
+            for layer in (0..4).rev() {
+                let block_size = 1usize << (log_d - layer);
+                let half = block_size >> 1;
+                for block in 0..1usize << layer {
+                    let start = block * block_size;
+                    let twiddle = ntt.twiddle(layer, block);
+                    for row in 0..half {
+                        let a = data[start + row];
+                        let b = data[start + half + row];
+                        let sum = a + b;
+                        data[start + row] = sum;
+                        data[start + half + row] = twiddle * sum + b;
+                    }
+                }
+            }
+        }
+
+        for &log_d in &[5usize, 7, 10, 14] {
+            let n = 1usize << log_d;
+            for case in 0..4u64 {
+                let mut challenger = crate::challenger::RandomChallenger::new(
+                    0x14F0_1D00_0000_0000 ^ ((log_d as u64) << 8) ^ case,
+                );
+                let source = challenger.sample_f128_vec(n);
+                let f = match case {
+                    0 => vec![F128::ZERO; n >> 2],
+                    1 => vec![F128::ONE; n >> 2],
+                    _ => challenger.sample_f128_vec(n >> 2),
+                };
+                let ntt = AdditiveNttF128::standard(log_d);
+                let mut expected = source.clone();
+                let mut actual = source.clone();
+                final_four_reference(&ntt, &mut expected, log_d);
+                let expected_msg = round_msg_lsb(&f, &expected[..n >> 2]);
+                let actual_msg =
+                    transpose_forward_ntt_fused_final_4layer_low_quarter_with_round_msg(
+                        &ntt,
+                        &mut actual,
+                        log_d,
+                        &f,
+                    );
+                assert_eq!(actual_msg, expected_msg, "log_d={log_d}, case={case}");
+                assert_eq!(
+                    &actual[..n >> 2],
+                    &expected[..n >> 2],
+                    "retained quarter differs at log_d={log_d}, case={case}",
+                );
+                assert_eq!(
+                    &actual[n >> 2..],
+                    &source[n >> 2..],
+                    "discarded-quarter store at log_d={log_d}, case={case}",
+                );
+            }
+        }
+    }
+
+    /// Complete sparse-prefix mechanical oracle for both possible ranked-L1
+    /// prefix depths: ordinary densification (ten dense layers) and the
+    /// incumbent fused first group (seven dense layers).
+    #[test]
+    fn sparse_l1_quarter_tail_and_message_match_full_transform() {
+        use crate::challenger::Challenger;
+
+        for &(log_d, prefix_k) in &[(14usize, 4usize), (14, 7)] {
+            let n = 1usize << log_d;
+            let mut challenger = crate::challenger::RandomChallenger::new(
+                0x5A95_14F0 ^ ((log_d as u64) << 8) ^ prefix_k as u64,
+            );
+            let mut pairs = Vec::new();
+            while pairs.len() < 43 {
+                let position = (challenger.sample_f128().lo as usize) % n;
+                if !pairs.iter().any(|&(p, _)| p == position) {
+                    pairs.push((position, challenger.sample_f128()));
+                }
+            }
+            pairs.sort_unstable_by_key(|&(position, _)| position);
+            let (positions, values): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+            let f = challenger.sample_f128_vec(n >> 2);
+            let ntt = AdditiveNttF128::standard(log_d);
+
+            let mut expected = transpose_forward_ntt_sparse_hashmap(
+                &ntt, &positions, &values, log_d, prefix_k, false,
+            );
+            expected.truncate(n >> 2);
+            let expected_msg = round_msg_lsb(&f, &expected);
+            let (actual, actual_msg) = transpose_forward_ntt_sparse_hashmap_impl(
+                &ntt,
+                &positions,
+                &values,
+                log_d,
+                prefix_k,
+                false,
+                true,
+                Some(&f),
+            );
+            assert_eq!(actual, expected, "prefix_k={prefix_k}: coefficients");
+            assert_eq!(
+                actual_msg,
+                Some(expected_msg),
+                "prefix_k={prefix_k}: message"
+            );
         }
     }
 
