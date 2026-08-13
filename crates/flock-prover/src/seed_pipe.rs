@@ -772,10 +772,19 @@ fn speculative_main(
         }
     }
 
-    // Seed forwarded: drain the keep-alive joins now. The spin threads were
-    // signalled before the forward and have already exited by this point, so
-    // the joins are reaping, not waiting.
-    if defer_join {
+    // Seed forwarded: the spin threads were signalled before the forward and
+    // have already exited by this point, so joining here is reaping, not
+    // waiting — but it is still 10–14 serial pthread_join calls on this
+    // thread, which sits on the speculative prove's critical path. The worker
+    // main thread's `prove_fast` calls the idempotent `keepalive_stop` a few
+    // milliseconds later in its adoption-wait slack, which performs the same
+    // reap off the timed path, so the default skips the join here entirely.
+    // `FLOCK_NO_KEEPALIVE_MAIN_REAP=1` (exact '1') restores the incumbent
+    // spec-thread join.
+    if defer_join
+        && std::env::var_os("FLOCK_NO_KEEPALIVE_MAIN_REAP").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    {
         flock_core::cpu_keepalive::keepalive_join();
     }
 
