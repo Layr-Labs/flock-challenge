@@ -19,6 +19,12 @@ pub(super) mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub(super) use aarch64::StaticBContext;
 
+#[cfg(target_arch = "aarch64")]
+pub(super) use aarch64::verify_bstatic_guards;
+
+#[cfg(target_arch = "aarch64")]
+pub(super) use aarch64::bstatic_block_varying_bytes;
+
 #[cfg(not(target_arch = "aarch64"))]
 #[derive(Clone, Copy)]
 pub(super) struct StaticBContext;
@@ -56,6 +62,68 @@ pub(super) fn static_b_context_is_prepared(context: Option<StaticBContext>) -> b
     {
         let _ = context;
         false
+    }
+}
+
+/// True when the once-per-prove verification established the window-0
+/// a-only blocks (b_med 0/1) — the exact condition under which the
+/// dispatcher routes those rows to `shift_reduce_inner_a_only_const_b`
+/// and the GPU const-b offload may replace them.
+#[inline]
+pub(super) fn static_b_a_only_specialized(context: Option<StaticBContext>) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::static_b_a_only_specialized(context)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = context;
+        false
+    }
+}
+
+/// CPU recompute of the window-0 a-only rows (b_med 0/1) with the same
+/// kernel the dispatcher would have used — the correctness fallback for a
+/// failed GPU const-b join. Writes 64-byte rows at `(2t)*1024 + b*64` for
+/// `t in 0..n_w0`, `b in {0, 1}`.
+#[inline]
+pub(super) fn recompute_a_only_rows(
+    a_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    n_w0: usize,
+    out_bytes: &mut [u8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON.
+    unsafe {
+        aarch64::a_only_rows_cpu(a_packed, inv_table, n_w0, out_bytes);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (a_packed, inv_table, n_w0, out_bytes);
+    }
+}
+
+/// Diagnostic: same rows written CONTIGUOUSLY (GPU layout) into a
+/// caller-provided buffer.
+#[inline]
+pub(super) fn recompute_a_only_rows_into(
+    a_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    n_w0: usize,
+    contiguous_out: &mut [u8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON.
+    unsafe {
+        aarch64::a_only_rows_cpu_into(a_packed, inv_table, n_w0, contiguous_out);
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (a_packed, inv_table, n_w0, contiguous_out);
     }
 }
 
