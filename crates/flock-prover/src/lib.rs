@@ -28,6 +28,7 @@ pub mod seed_pipe;
 #[global_allocator]
 static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
+// r1301 rec-merkle no-copy L1 view
 // dispersion-resample marker 172525636-o
 
 // keepalive-resample marker 2325618933

@@ -795,6 +795,41 @@ pub const ENV_NO_GPU_KEEPWARM: &str = "FLOCK_NO_GPU_KEEPWARM";
 /// or submission failure falls back to the untouched CPU builder.
 pub const ENV_NO_GPU_RECURSIVE_MERKLE: &str = "FLOCK_NO_GPU_RECURSIVE_MERKLE";
 
+/// Exact-`1` control restoring the incumbent 16 MiB host copy-out of the
+/// recursive L1 GPU tree. Default is a leased zero-copy view of the
+/// persistent Metal buffer (`RecMerkleTree::Gpu`). Proof bytes are identical
+/// either way — the copy is only host DRAM traffic on the FS-serial open
+/// spine. A live view of the same shape refuses a second GPU write (the
+/// caller then takes the CPU builder).
+pub const ENV_NO_REC_MERKLE_NOCOPY: &str = "FLOCK_NO_REC_MERKLE_NOCOPY";
+
+fn rec_merkle_nocopy_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn rec_merkle_nocopy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        rec_merkle_nocopy_value_enabled(std::env::var_os(ENV_NO_REC_MERKLE_NOCOPY).as_deref())
+    })
+}
+
+#[cfg(test)]
+mod rec_merkle_nocopy_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_copyout_value() {
+        assert_eq!(super::ENV_NO_REC_MERKLE_NOCOPY, "FLOCK_NO_REC_MERKLE_NOCOPY");
+        assert!(!super::rec_merkle_nocopy_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::rec_merkle_nocopy_value_enabled(
+                value.map(OsStr::new)
+            ));
+        }
+    }
+}
+
 fn gpu_recursive_merkle_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -813,14 +848,12 @@ pub(crate) fn gpu_recursive_merkle_enabled() -> bool {
 }
 
 /// GPU BLAKE3 Merkle tree for the recursive Ligerito 128-byte-leaf shapes
-/// (2^18 or 2^16 leaves). Returns `None` whenever the GPU path is disabled,
-/// unavailable, or fails — the caller then builds the identical tree on the
-/// CPU. `Some(tree)` is bit-identical to `merkle::merkle_tree(data,
-/// num_leaves, HashKind::Blake3)`.
-pub fn gpu_recursive_merkle_blake3(
-    data: &[u8],
-    num_leaves: usize,
-) -> Option<Vec<crate::merkle::Hash>> {
+/// (2^18 leaves on the current gate). Returns `None` whenever the GPU path
+/// is disabled, unavailable, fails, or a same-shape no-copy view is already
+/// live — the caller then builds the identical tree on the CPU.
+/// `Some(tree)` is bit-identical to `merkle::merkle_tree(data, num_leaves,
+/// HashKind::Blake3)`.
+pub fn gpu_recursive_merkle_blake3(data: &[u8], num_leaves: usize) -> Option<RecMerkleTree> {
     imp::gpu_recursive_merkle_blake3(data, num_leaves)
 }
 
@@ -1430,6 +1463,127 @@ impl core::ops::Deref for GpuMerkleTree {
     fn deref(&self) -> &[crate::merkle::Hash] {
         // SAFETY: contract of `new`.
         unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// Read-only recursive Ligerito Merkle tree sitting in the process-persistent
+/// Metal output buffer. Dropping it releases the per-shape lease so the next
+/// same-shape offload may reuse the buffer. CPU reads are ordinary unified-
+/// memory loads — the same contract as [`GpuMerkleTree`].
+pub struct GpuRecMerkleTree {
+    ptr: *const crate::merkle::Hash,
+    len: usize,
+    num_leaves: usize,
+}
+unsafe impl Send for GpuRecMerkleTree {}
+unsafe impl Sync for GpuRecMerkleTree {}
+impl GpuRecMerkleTree {
+    /// SAFETY: `ptr` must point at `len` initialized Hash nodes in the
+    /// persistent rec-merkle output buffer for `num_leaves`, and the
+    /// corresponding per-shape lease must already be held.
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) unsafe fn new(
+        ptr: *const crate::merkle::Hash,
+        len: usize,
+        num_leaves: usize,
+    ) -> Self {
+        Self {
+            ptr,
+            len,
+            num_leaves,
+        }
+    }
+}
+impl core::ops::Deref for GpuRecMerkleTree {
+    type Target = [crate::merkle::Hash];
+    fn deref(&self) -> &[crate::merkle::Hash] {
+        // SAFETY: the pointer is the persistent rec-merkle output buffer,
+        // valid and un-mutated for this value's lifetime (the per-shape lease
+        // refuses a second GPU write while we exist).
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+impl Drop for GpuRecMerkleTree {
+    fn drop(&mut self) {
+        imp::release_rec_merkle_view(self.num_leaves);
+    }
+}
+
+/// Storage for a recursive-level Merkle tree. The GPU L1 offload returns a
+/// zero-copy view of its persistent 16 MiB output buffer; every other path
+/// (CPU builder, kill-switch copy-out, lease conflict) owns a pooled `Vec`.
+pub enum RecMerkleTree {
+    Cpu(Vec<crate::merkle::Hash>),
+    Gpu(GpuRecMerkleTree),
+}
+
+impl RecMerkleTree {
+    #[inline]
+    pub fn empty() -> Self {
+        RecMerkleTree::Cpu(Vec::new())
+    }
+
+    /// Recycle a CPU tree through the hash-tree pool. A GPU view is just
+    /// dropped (releases the per-shape lease).
+    pub fn recycle(self) {
+        match self {
+            RecMerkleTree::Cpu(v) => crate::scratch::give_hash_tree(v),
+            RecMerkleTree::Gpu(g) => drop(g),
+        }
+    }
+
+    /// Take the owned CPU bytes. A live GPU view is copied out (test / L0
+    /// handoff paths only — the ranked open never needs this).
+    pub fn into_cpu_vec(self) -> Vec<crate::merkle::Hash> {
+        match self {
+            RecMerkleTree::Cpu(v) => v,
+            RecMerkleTree::Gpu(g) => g.to_vec(),
+        }
+    }
+}
+
+impl core::ops::Deref for RecMerkleTree {
+    type Target = [crate::merkle::Hash];
+    fn deref(&self) -> &[crate::merkle::Hash] {
+        match self {
+            RecMerkleTree::Cpu(v) => v,
+            RecMerkleTree::Gpu(g) => g,
+        }
+    }
+}
+
+impl core::fmt::Debug for RecMerkleTree {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RecMerkleTree")
+            .field("kind", &match self {
+                RecMerkleTree::Cpu(_) => "cpu",
+                RecMerkleTree::Gpu(_) => "gpu",
+            })
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl PartialEq for RecMerkleTree {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for RecMerkleTree {}
+
+impl PartialEq<Vec<crate::merkle::Hash>> for RecMerkleTree {
+    fn eq(&self, other: &Vec<crate::merkle::Hash>) -> bool {
+        self.as_ref() == other.as_slice()
+    }
+}
+
+impl PartialEq<RecMerkleTree> for Vec<crate::merkle::Hash> {
+    fn eq(&self, other: &RecMerkleTree) -> bool {
+        self.as_slice() == other.as_ref()
     }
 }
 
@@ -10365,6 +10519,9 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         wraps: Vec<(usize, usize, Id)>,
         hits: usize,
         misses: usize,
+        /// Per-shape lease: a live [`super::GpuRecMerkleTree`] is reading
+        /// this buffer. A second same-shape offload must not overwrite it.
+        view_live: [bool; REC_MERKLE_SHAPES.len()],
     }
     // SAFETY: Metal objects are thread-safe; every access is serialized by
     // the REC_MERKLE mutex.
@@ -10428,6 +10585,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     wraps: Vec::new(),
                     hits: 0,
                     misses: 0,
+                    view_live: [false; REC_MERKLE_SHAPES.len()],
                 };
                 // Pin one exact-fit L1 matrix allocation into the scratch
                 // pool's dedicated second slot, then wrap and wire it here
@@ -10491,7 +10649,25 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         }
     }
 
-    pub(crate) fn gpu_recursive_merkle_blake3(data: &[u8], num_leaves: usize) -> Option<Vec<Hash>> {
+    pub(crate) fn release_rec_merkle_view(num_leaves: usize) {
+        let mut guard = match REC_MERKLE.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                REC_MERKLE.clear_poison();
+                poisoned.into_inner()
+            }
+        };
+        if let Some(Ok(state)) = guard.as_mut() {
+            if let Some(i) = REC_MERKLE_SHAPES.iter().position(|&n| n == num_leaves) {
+                state.view_live[i] = false;
+            }
+        }
+    }
+
+    pub(crate) fn gpu_recursive_merkle_blake3(
+        data: &[u8],
+        num_leaves: usize,
+    ) -> Option<super::RecMerkleTree> {
         if !super::gpu_recursive_merkle_enabled()
             || !REC_MERKLE_SHAPES.contains(&num_leaves)
             || data.len() != num_leaves * 128
@@ -10528,6 +10704,19 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             }
             None => unreachable!("initialized above"),
         };
+
+        let shape_idx = REC_MERKLE_SHAPES
+            .iter()
+            .position(|&n| n == num_leaves)
+            .expect("shape checked above");
+        // A live no-copy view is reading this buffer. Running the kernel
+        // would overwrite it; refuse so the caller builds a CPU tree.
+        if super::rec_merkle_nocopy_enabled() && state.view_live[shape_idx] {
+            if rec_merkle_debug() {
+                eprintln!("[gpu-recmerkle] lease busy — CPU fallback");
+            }
+            return None;
+        }
 
         let data_addr = data.as_ptr() as usize;
         if rec_merkle_debug() {
@@ -10622,21 +10811,35 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             return None;
         }
 
-        // Pooled destination: a fresh 16 MiB uninit Vec pays ~4k first-touch
-        // page faults inside this FS-serial copy and a single-threaded munmap
-        // on the following drop; the recycled buffer's pages stay resident
-        // across proves (write-before-read: the copy below writes all of it).
-        let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
-        unsafe {
-            let dst =
-                core::slice::from_raw_parts_mut(tree.as_mut_ptr().cast::<u8>(), total_nodes * 32);
-            copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
-        }
+        // Default: lease a zero-copy view of the persistent Metal tree
+        // (unified memory — later merkle_multi_proof loads are ordinary
+        // cached reads). The incumbent 16 MiB host copy-out is restored by
+        // FLOCK_NO_REC_MERKLE_NOCOPY=1. Both are bit-identical.
+        let tree = if super::rec_merkle_nocopy_enabled() {
+            state.view_live[shape_idx] = true;
+            let ptr = unsafe { gpu.buffer_contents(tree_buf) }.cast::<Hash>();
+            super::RecMerkleTree::Gpu(unsafe {
+                super::GpuRecMerkleTree::new(ptr, total_nodes, num_leaves)
+            })
+        } else {
+            // Pooled destination: a fresh 16 MiB uninit Vec pays ~4k
+            // first-touch page faults inside this FS-serial copy.
+            let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
+            unsafe {
+                let dst = core::slice::from_raw_parts_mut(
+                    tree.as_mut_ptr().cast::<u8>(),
+                    total_nodes * 32,
+                );
+                copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
+            }
+            super::RecMerkleTree::Cpu(tree)
+        };
         if let Some(t) = started {
             eprintln!(
-                "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms (wrap hits {} misses {})",
+                "[gpu-recmerkle] n_leaves=2^{} wall {:.2} ms nocopy={} (wrap hits {} misses {})",
                 num_leaves.trailing_zeros(),
                 t.elapsed().as_secs_f64() * 1e3,
+                super::rec_merkle_nocopy_enabled(),
                 state.hits,
                 state.misses,
             );
@@ -13076,9 +13279,11 @@ mod imp {
     pub(crate) fn gpu_recursive_merkle_blake3(
         _data: &[u8],
         _num_leaves: usize,
-    ) -> Option<Vec<crate::merkle::Hash>> {
+    ) -> Option<super::RecMerkleTree> {
         None
     }
+
+    pub(crate) fn release_rec_merkle_view(_num_leaves: usize) {}
 
     pub(crate) struct FromZFirstPassStream;
 
@@ -14277,6 +14482,9 @@ mod tests {
                 gpu_tree == cpu_tree,
                 "GPU tree diverges at 2^{log_leaves} leaves"
             );
+            // Drop the leased view before the second dispatch — the no-copy
+            // path refuses to overwrite a live view of the same shape.
+            drop(gpu_tree);
             // Second call on the same allocation: cached wrap, same bytes.
             let again = super::gpu_recursive_merkle_blake3(data, n_leaves)
                 .expect("second call must succeed");
