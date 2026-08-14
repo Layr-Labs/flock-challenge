@@ -732,7 +732,15 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     // K4..7 at second-window b_med 13. Restrict runtime sniffing to these five
     // candidates; every other block enters the generic kernel directly.
     let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
-    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
+    // Once-per-prove verification of the static-B guards against the actual
+    // witness bytes: blocks whose per-row guards are established to pass run
+    // the guard-free pure kernel (see `kernels::verify_bstatic_guards`).
+    // `FLOCK_ZC_BSTATIC_PURE=1` restores the incumbent guarded kernels as the
+    // same-binary A/B control.
+    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout)
+        .map(|ctx| {
+            kernels::verify_bstatic_guards(ctx, b_packed, total_bytes, &b_med_counts, within_outer_mask)
+        });
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
@@ -780,7 +788,46 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
             kernels::static_b_context_is_prepared(static_b_context),
             zc_ab_pre_fast_policy_hoist_enabled(),
         ) && kernels::fast_shift_reduce_enabled();
+        if std::env::var_os("FLOCK_GPU_AB_DEBUG").is_some() {
+            eprintln!(
+                "ab-gpu: ranked={ranked_fast_policy} mask={within_outer_mask} a_only={} prepared={} m={m} k_skip={k_skip} n_chunks={n_chunks} k_log={} useful={} main={} helper={}",
+                kernels::static_b_a_only_specialized(static_b_context),
+                kernels::static_b_context_is_prepared(static_b_context),
+                padding.k_log,
+                padding.useful_bits_per_block,
+                rayon::current_num_threads(),
+                crate::epool::helper_pool().map_or(0, rayon::ThreadPool::current_num_threads),
+            );
+        }
         if ranked_fast_policy {
+            // GPU const-b offload for the window-0 a-only blocks (b_med
+            // 0/1): launch before the queue drains so the GPU computes the
+            // 64-byte rows in place while the CPU drains the remaining
+            // blocks. Fires only under the exact condition the dispatcher
+            // would use to route those rows to
+            // `shift_reduce_inner_a_only_const_b` (verified bits 0/1) plus
+            // the ranked window structure (low-bit mask == 1 ⇒ window 0 =
+            // even chunks); anything else keeps the incumbent CPU path. The
+            // join waits for the dispatch and falls back to a CPU recompute
+            // on error, so a GPU fault can never corrupt the proof.
+            let ab_gpu_job = if within_outer_mask == 1
+                && kernels::static_b_a_only_specialized(static_b_context)
+            {
+                let (tp, th) = inv_table.gpu_images();
+                match (tp, th) {
+                    (Some(plain), Some(hs)) => crate::gpu_commit::launch_ab_const_b(
+                        a_packed,
+                        plain,
+                        hs,
+                        out_bytes,
+                        n_chunks / 2,
+                    ),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let gpu_a_only = ab_gpu_job.is_some();
             // Resolve the process-wide direct-store switch once before the
             // queue starts. The ranked/default arm is compiled without the
             // per-chunk OnceLock probe, temporary buffer, or per-row bounce
@@ -796,6 +843,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
+                    gpu_a_only,
                     n_chunks,
                     out_bytes,
                 );
@@ -810,9 +858,18 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
+                    gpu_a_only,
                     n_chunks,
                     out_bytes,
                 );
+            }
+            if let Some(job) = ab_gpu_job {
+                if crate::gpu_commit::finish_ab_const_b(job).is_err() {
+                    // GPU join failed: recompute the skipped rows with the
+                    // exact dispatcher kernel before any consumer reads the
+                    // matrix (correctness fallback, not a fast path).
+                    kernels::recompute_a_only_rows(a_packed, inv_table, n_chunks / 2, out_bytes);
+                }
             }
         } else {
             precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
@@ -825,6 +882,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 static_b_context,
                 nt,
                 compact,
+                false,
                 n_chunks,
                 out_bytes,
             );
@@ -848,6 +906,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     static_b_context,
                     nt,
                     compact,
+                    false,
                     x_outer,
                     out_outer,
                     a_col,
@@ -935,6 +994,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     static_b_context: Option<kernels::StaticBContext>,
     nt: bool,
     compact: bool,
+    gpu_a_only: bool,
     n_chunks: usize,
     out_bytes: &mut [u8],
 ) {
@@ -981,6 +1041,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     static_b_context,
                     nt,
                     compact,
+                    gpu_a_only,
                     x_outer,
                     out_outer,
                     a_col,
@@ -1006,6 +1067,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     static_b_context: Option<kernels::StaticBContext>,
     nt: bool,
     compact: bool,
+    gpu_a_only: bool,
     x_outer: usize,
     out_outer: &mut [u8],
     a_col: &mut [F8; ELL],
@@ -1031,6 +1093,15 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     };
     let mut tmp = [0u8; 64];
     for b_med in 0..n_b_med {
+        // GPU const-b offload (window-0 a-only blocks): when the launch
+        // succeeded, the once-per-prove verification had established the
+        // verified bits for b_med 0/1 of window 0, so the dispatcher
+        // would have routed these rows to `shift_reduce_inner_a_only_const_b`
+        // — the exact computation the GPU performs in place. The join
+        // (`finish_ab_const_b`) runs before any consumer reads the matrix.
+        if gpu_a_only && within_hash_outer == 0 && b_med < 2 {
+            continue;
+        }
         let dst: &mut [u8; 64] = if nt && !direct {
             &mut tmp
         } else {
@@ -3605,6 +3676,65 @@ mod tests {
         InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l)
     }
 
+    /// GPU const-b kernel oracle: the MSL kernel must reproduce the CPU
+    /// a-only kernel (`shift_reduce_inner_a_only_const_b`) byte-for-byte on
+    /// a synthetic witness at the production table shape (ell = 64). The
+    /// GPU rows are contiguous (`(t + block*n_w0)*64`); the CPU rows are
+    /// strided (`(2t)*1024 + block*64`) — both must agree.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn ab_const_b_gpu_matches_cpu_kernel() {
+        use std::alloc::{alloc_zeroed, dealloc, Layout};
+        const N_W0: usize = 128;
+        const A_LEN: usize = 262_144;
+        const OUT_LEN: usize = 262_144;
+        let a_layout = Layout::from_size_align(A_LEN, 16384).unwrap();
+        let out_layout = Layout::from_size_align(OUT_LEN, 16384).unwrap();
+        let a_ptr = unsafe { alloc_zeroed(a_layout) };
+        let out_cpu_ptr = unsafe { alloc_zeroed(out_layout) };
+        let out_gpu_ptr = unsafe { alloc_zeroed(out_layout) };
+        let a_packed: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(a_ptr, A_LEN) };
+        let out_cpu: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(out_cpu_ptr, OUT_LEN) };
+        let out_gpu: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(out_gpu_ptr, OUT_LEN) };
+        let mut rng = Rng::new(0xABCD_1234_5678_9ABC);
+        for b in a_packed.iter_mut() {
+            *b = (rng.next_u64() >> 32) as u8;
+        }
+        let inv = make_inv_table();
+        let (plain, hs) = match inv.gpu_images() {
+            (Some(p), Some(h)) => (p, h),
+            _ => panic!("gpu table images unavailable at ell=64"),
+        };
+        kernels::recompute_a_only_rows(a_packed, &inv, N_W0, out_cpu);
+        // Canary: distinguish "kernel never wrote" (stays 0xFF) from
+        // "kernel ran with zero inputs" (becomes 0x00).
+        out_gpu.fill(0xFF);
+        let job = crate::gpu_commit::launch_ab_const_b(a_packed, plain, hs, out_gpu, N_W0)
+            .expect("GPU const-b launch (Metal device required)");
+        crate::gpu_commit::finish_ab_const_b(job).expect("GPU const-b join");
+        let first = out_gpu[0];
+        assert!(
+            first != 0xFF,
+            "GPU kernel never wrote: out_gpu still 0xFF canary"
+        );
+        assert!(
+            first != 0x00 || out_gpu[1..64].iter().all(|&b| b == 0),
+            "GPU kernel wrote zeros (inputs zero?)"
+        );
+        for t in 0..N_W0 {
+            for b in 0..2usize {
+                let g = &out_gpu[(t + b * N_W0) * 64..(t + b * N_W0) * 64 + 64];
+                let c = &out_cpu[(2 * t) * 1024 + b * 64..(2 * t) * 1024 + b * 64 + 64];
+                assert_eq!(g, c, "row t={t} block={b}");
+            }
+        }
+        unsafe {
+            dealloc(a_ptr, a_layout);
+            dealloc(out_cpu_ptr, out_layout);
+            dealloc(out_gpu_ptr, out_layout);
+        }
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn ranked_ab_pre_fast_policy_hoist_selector_is_exact() {
@@ -3735,6 +3865,7 @@ mod tests {
             None,
             false,
             false,
+            false,
             0,
             &mut cached,
             &mut cached_a_col,
@@ -3753,6 +3884,7 @@ mod tests {
             false,
             None,
             true,
+            false,
             false,
             0,
             &mut direct,
@@ -4641,14 +4773,14 @@ mod tests {
                             );
                             let mut slow = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false>(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false, false>(
                                     &a_packed, &b, &table, 0, b_med, w, context, &mut slow, false,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );
                             let mut fast = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true>(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true, false>(
                                     &a_packed, &b, &table, 0, b_med, w, context, &mut fast, true,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
@@ -4661,6 +4793,27 @@ mod tests {
                                 fast, slow,
                                 "fast bstatic differs (w={w}, b_med={b_med}, variant={variant})"
                             );
+                            // Variant 1 satisfies every guard by construction,
+                            // so the pure (guard-free) kernel must reproduce
+                            // the guarded static path exactly. Variants >= 2
+                            // deliberately break one *fixed* bit per row, which
+                            // the once-per-prove verifier would detect (the
+                            // verified bit stays clear) — for such witnesses
+                            // the pure kernel is intentionally not selected.
+                            if variant == 1 {
+                                let mut pure = [0u8; 64];
+                                assert!(
+                                    kernels::aarch64::shift_reduce_inner_ab_bstatic::<true, true>(
+                                        &a_packed, &b, &table, 0, b_med, w, context, &mut pure,
+                                        true,
+                                    ),
+                                    "arm (w={w}, b_med={b_med}) must be live"
+                                );
+                                assert_eq!(
+                                    pure, fast,
+                                    "pure bstatic differs from guarded (w={w}, b_med={b_med}, variant={variant})"
+                                );
+                            }
                         }
                         arms += 1;
                     }
@@ -4670,6 +4823,91 @@ mod tests {
             .expect("spawn bstatic oracle")
             .join()
             .expect("bstatic oracle thread");
+    }
+
+    /// The once-per-prove guard verifier sets bits exactly when every sampled
+    /// position's guards pass on the actual witness bytes, and leaves them
+    /// clear under the kill switch or on a random (non-BLAKE3) witness.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn bstatic_guard_verifier_matches_guards() {
+        use kernels::aarch64::{BSTATIC_MASKS, StaticBContext, verify_bstatic_guards};
+        let table = make_inv_table();
+        let context = kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+            .expect("prepared static-B context");
+        const OUTER_BYTES: usize = 16 * 64;
+        let n_outer = 32usize;
+        let within_mask = 1usize; // two 8192-bit windows per block
+        let counts = [16u8, 16u8]; // every window fully live
+        let mut b = vec![0u8; n_outer * OUTER_BYTES];
+        for x in 0..n_outer {
+            // Each x_outer is one 8192-bit window: fill only the blocks of
+            // this window's own `w` (the byte offsets are shared between the
+            // two windows, so window-1 values must not overwrite window-0's).
+            let w = x & within_mask;
+            for b_med in 0..16 {
+                if w == 1 && b_med >= 15 {
+                    continue;
+                }
+                let blk = w * 16 + b_med;
+                for k in 0..8 {
+                    let (m, e) = BSTATIC_MASKS[blk][k];
+                    // A word equal to the census expected value satisfies the
+                    // guard whenever the census is mask-closed (`e & !m == 0`);
+                    // entries that are not mask-closed can never pass and the
+                    // verifier must leave their block unverified.
+                    let off = x * OUTER_BYTES + b_med * 64 + k * 8;
+                    b[off..off + 8].copy_from_slice(&e.to_le_bytes());
+                }
+            }
+        }
+        // Exhaustive expectation: a block is verifiable iff every one of its
+        // eight guard pairs is mask-closed (then `e` passes everywhere).
+        let mut expect: u64 = 0;
+        for blk in 0..31 {
+            let w = blk / 16;
+            let b_med = blk % 16;
+            if w == 1 && b_med >= 15 {
+                continue;
+            }
+            let mask_closed = (0..8).all(|k| BSTATIC_MASKS[blk][k].1 & !BSTATIC_MASKS[blk][k].0 == 0);
+            if mask_closed {
+                expect |= 1u64 << blk;
+            }
+        }
+        let verified = match verify_bstatic_guards(context, &b, b.len(), &counts, within_mask) {
+            StaticBContext::Prepared { verified, .. } => verified,
+            _ => panic!("expected Prepared context"),
+        };
+        // The verifier's sampled check agrees with the exhaustive one.
+        assert_eq!(verified, expect);
+        // The ranked census is mask-closed on every dispatched block; keep
+        // that property pinned so a census regeneration cannot silently widen
+        // the pure-path surface.
+        assert_eq!(expect, 0x7FFF_FFFF);
+        // Kill switch forces the guarded path (all bits clear).
+        unsafe { std::env::set_var("FLOCK_ZC_BSTATIC_PURE", "1") };
+        let killed = match verify_bstatic_guards(context, &b, b.len(), &counts, within_mask) {
+            StaticBContext::Prepared { verified, .. } => verified,
+            _ => panic!("expected Prepared context"),
+        };
+        unsafe { std::env::remove_var("FLOCK_ZC_BSTATIC_PURE") };
+        assert_eq!(killed, 0);
+        // A random witness leaves every bit clear (guards genuinely checked).
+        let mut rng = Rng::new(0xB57A_71C0_F457_0002);
+        for x in 0..n_outer {
+            for b_med in 0..16 {
+                for k in 0..8 {
+                    let off = x * OUTER_BYTES + b_med * 64 + k * 8;
+                    b[off..off + 8].copy_from_slice(&rng.next_u64().to_le_bytes());
+                }
+            }
+        }
+        let random = match verify_bstatic_guards(context, &b, b.len(), &counts, within_mask) {
+            StaticBContext::Prepared { verified, .. } => verified,
+            _ => panic!("expected Prepared context"),
+        };
+        assert_eq!(random, 0);
     }
 
     #[cfg(target_arch = "aarch64")]
