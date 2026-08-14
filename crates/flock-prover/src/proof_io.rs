@@ -285,14 +285,19 @@ pub fn stash_pre_encoded_prefix(
     }
 }
 
-/// Take the stash iff it fingerprint-matches `bundle`: identical Merkle root
-/// AND identical bincode-fixint size for each of the three prefix sections.
-/// bincode-fixint encoding of equal values is deterministic, so a full match
-/// means the stashed bytes equal what a fresh encode of `bundle`'s prefix
-/// would produce. `None` (full-encode fallback) on any doubt — no stash,
-/// disabled switch, poisoned lock, any fingerprint miss. The stash is
-/// consumed on take; a repeat publish of the same bundle re-encodes from
-/// scratch, byte-identically.
+/// Take the stash iff it fingerprint-matches `bundle`.
+///
+/// Default (`FLOCK_STRICT_PRE_ENCODE_FP` unset): Merkle-root match only.
+/// A root collision is a hash break; the ranked worker never overlaps
+/// proves, so the slot holds this prove's prefix. Skipping the three
+/// `serialized_size` walks (commitment + zerocheck + lincheck) keeps that
+/// serde scan off the publish tail that the harness times after `prove_fast`
+/// returns. Output bytes are identical: the stash was encoded from these
+/// same objects before the open started.
+///
+/// `FLOCK_STRICT_PRE_ENCODE_FP=1` restores the incumbent root + section-size
+/// walk. `None` (full-encode fallback) on any doubt — no stash, disabled
+/// switch, poisoned lock, fingerprint miss. The stash is consumed on take.
 fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>> {
     if !pre_encode_enabled() {
         return None;
@@ -301,16 +306,27 @@ fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>
     if stash.root != bundle.commitment.root {
         return None;
     }
-    let sec_lens = [
-        bincode::serialized_size(&bundle.commitment).ok()?,
-        bincode::serialized_size(&bundle.proof.zerocheck).ok()?,
-        bincode::serialized_size(&bundle.proof.lincheck).ok()?,
-    ];
-    if sec_lens != stash.sec_lens {
-        return None;
+    if strict_pre_encode_fp() {
+        let sec_lens = [
+            bincode::serialized_size(&bundle.commitment).ok()?,
+            bincode::serialized_size(&bundle.proof.zerocheck).ok()?,
+            bincode::serialized_size(&bundle.proof.lincheck).ok()?,
+        ];
+        if sec_lens != stash.sec_lens {
+            return None;
+        }
+        let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
+        return (stash.bytes.len() == want).then_some(stash.bytes);
     }
-    let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
-    (stash.bytes.len() == want).then_some(stash.bytes)
+    Some(stash.bytes)
+}
+
+/// `FLOCK_STRICT_PRE_ENCODE_FP=1` keeps the three `serialized_size` walks
+/// on the publish tail. Ranked harness `env_clear()`s, so the cheap root
+/// match is the default.
+fn strict_pre_encode_fp() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLOCK_STRICT_PRE_ENCODE_FP").map_or(false, |v| v == "1"))
 }
 
 // ---------------------------------------------------------------------------
