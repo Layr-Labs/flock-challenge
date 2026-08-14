@@ -732,7 +732,22 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     // K4..7 at second-window b_med 13. Restrict runtime sniffing to these five
     // candidates; every other block enters the generic kernel directly.
     let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
-    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
+    // Once-per-prove verification of the static-B guards against the actual
+    // witness bytes: blocks whose per-row guards are established to pass run
+    // the guard-free pure kernel (see `kernels::verify_bstatic_guards`).
+    // `FLOCK_ZC_BSTATIC_PURE=1` restores the incumbent guarded kernels as the
+    // same-binary A/B control.
+    let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout)
+        .map(|ctx| {
+            kernels::verify_bstatic_guards(
+                ctx,
+                a_packed,
+                b_packed,
+                total_bytes,
+                &b_med_counts,
+                within_outer_mask,
+            )
+        });
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
@@ -4641,14 +4656,14 @@ mod tests {
                             );
                             let mut slow = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false>(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false, false>(
                                     &a_packed, &b, &table, 0, b_med, w, context, &mut slow, false,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );
                             let mut fast = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true>(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true, false>(
                                     &a_packed, &b, &table, 0, b_med, w, context, &mut fast, true,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
@@ -4661,6 +4676,27 @@ mod tests {
                                 fast, slow,
                                 "fast bstatic differs (w={w}, b_med={b_med}, variant={variant})"
                             );
+                            // Variant 1 satisfies every guard by construction,
+                            // so the pure (guard-free) kernel must reproduce
+                            // the guarded static path exactly. Variants >= 2
+                            // deliberately break one *fixed* bit per row, which
+                            // the once-per-prove verifier would detect (the
+                            // verified bit stays clear) — for such witnesses
+                            // the pure kernel is intentionally not selected.
+                            if variant == 1 {
+                                let mut pure = [0u8; 64];
+                                assert!(
+                                    kernels::aarch64::shift_reduce_inner_ab_bstatic::<true, true>(
+                                        &a_packed, &b, &table, 0, b_med, w, context, &mut pure,
+                                        true,
+                                    ),
+                                    "arm (w={w}, b_med={b_med}) must be live"
+                                );
+                                assert_eq!(
+                                    pure, fast,
+                                    "pure bstatic differs from guarded (w={w}, b_med={b_med}, variant={variant})"
+                                );
+                            }
                         }
                         arms += 1;
                     }
@@ -4670,6 +4706,205 @@ mod tests {
             .expect("spawn bstatic oracle")
             .join()
             .expect("bstatic oracle thread");
+    }
+
+    /// The once-per-prove guard verifier sets bits exactly when every sampled
+    /// position's guards pass on the actual witness bytes, and leaves them
+    /// clear under the kill switch or on a random (non-BLAKE3) witness.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn bstatic_guard_verifier_matches_guards() {
+        use kernels::aarch64::{BSTATIC_MASKS, StaticBContext, verify_bstatic_guards};
+        let table = make_inv_table();
+        let context = kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+            .expect("prepared static-B context");
+        const OUTER_BYTES: usize = 16 * 64;
+        let n_outer = 32usize;
+        let within_mask = 1usize; // two 8192-bit windows per block
+        let counts = [16u8, 16u8]; // every window fully live
+        let mut b = vec![0u8; n_outer * OUTER_BYTES];
+        for x in 0..n_outer {
+            // Each x_outer is one 8192-bit window: fill only the blocks of
+            // this window's own `w` (the byte offsets are shared between the
+            // two windows, so window-1 values must not overwrite window-0's).
+            let w = x & within_mask;
+            for b_med in 0..16 {
+                if w == 1 && b_med >= 15 {
+                    continue;
+                }
+                let blk = w * 16 + b_med;
+                for k in 0..8 {
+                    let (m, e) = BSTATIC_MASKS[blk][k];
+                    // A word equal to the census expected value satisfies the
+                    // guard whenever the census is mask-closed (`e & !m == 0`);
+                    // entries that are not mask-closed can never pass and the
+                    // verifier must leave their block unverified.
+                    let off = x * OUTER_BYTES + b_med * 64 + k * 8;
+                    b[off..off + 8].copy_from_slice(&e.to_le_bytes());
+                }
+            }
+        }
+        // Exhaustive expectation: a block is verifiable iff every one of its
+        // eight guard pairs is mask-closed (then `e` passes everywhere).
+        let mut expect: u64 = 0;
+        for blk in 0..31 {
+            let w = blk / 16;
+            let b_med = blk % 16;
+            if w == 1 && b_med >= 15 {
+                continue;
+            }
+            let mask_closed = (0..8).all(|k| BSTATIC_MASKS[blk][k].1 & !BSTATIC_MASKS[blk][k].0 == 0);
+            if mask_closed {
+                expect |= 1u64 << blk;
+            }
+        }
+        // `a` all zero: every a-side branch condition holds.
+        let a = vec![0u8; n_outer * OUTER_BYTES];
+        let verify = |ctx, a: &[u8], b: &[u8]| -> (u64, u64) {
+            match verify_bstatic_guards(ctx, a, b, b.len(), &counts, within_mask) {
+                StaticBContext::Prepared { verified, specialized, .. } => (verified, specialized),
+                _ => panic!("expected Prepared context"),
+            }
+        };
+        let (verified, specialized) = verify(context, &a, &b);
+        // The verifier's sampled check agrees with the exhaustive one.
+        assert_eq!(verified, expect);
+        // The ranked census is mask-closed on every dispatched block; keep
+        // that property pinned so a census regeneration cannot silently widen
+        // the pure-path surface.
+        assert_eq!(expect, 0x7FFF_FFFF);
+        // Specialized sniffs: blks 0, 1 (a-only) and 29 (h4 f0) follow from
+        // the bstatic verified bits; blks 2 (h4 03 fast arm) and 30
+        // (single_k0_static_b<true>) additionally require the a-side top-byte
+        // condition, which the all-zero `a` satisfies.
+        assert_eq!(specialized, (0b11) | (1 << 2) | (1 << 29) | (1 << 30));
+        // Nonzero a top bytes clear exactly blks 2 and 30 from `specialized`
+        // while `verified` stays intact.
+        let mut a_bad = a.clone();
+        for x in 0..n_outer {
+            if (x & within_mask) == 0 {
+                // blk 2's a_k0 top 3 bytes (a_k0 at b_med 2, K0)
+                let off = x * OUTER_BYTES + 2 * 64;
+                a_bad[off + 7] = 0x80;
+            } else {
+                // blk 30's a_word top byte (b_med 14, K0)
+                let off = x * OUTER_BYTES + 14 * 64;
+                a_bad[off + 7] = 0x80;
+            }
+        }
+        let (verified_bad, specialized_bad) = verify(context, &a_bad, &b);
+        assert_eq!(verified_bad, expect);
+        assert_eq!(specialized_bad, (0b11) | (1 << 29));
+        // Kill switch forces the guarded path (all bits clear).
+        unsafe { std::env::set_var("FLOCK_ZC_BSTATIC_PURE", "1") };
+        let (killed_verified, killed_specialized) = verify(context, &a, &b);
+        unsafe { std::env::remove_var("FLOCK_ZC_BSTATIC_PURE") };
+        assert_eq!(killed_verified, 0);
+        assert_eq!(killed_specialized, 0);
+        // A random witness leaves every bit clear (guards genuinely checked).
+        let mut rng = Rng::new(0xB57A_71C0_F457_0002);
+        for x in 0..n_outer {
+            for b_med in 0..16 {
+                for k in 0..8 {
+                    let off = x * OUTER_BYTES + b_med * 64 + k * 8;
+                    b[off..off + 8].copy_from_slice(&rng.next_u64().to_le_bytes());
+                }
+            }
+        }
+        let (random, random_spec) = verify(context, &a, &b);
+        assert_eq!(random, 0);
+        assert_eq!(random_spec, 0);
+    }
+
+    /// Dispatcher differential: with a verified+specialized context, the
+    /// direct routes produce exactly the bytes the incumbent sniff path
+    /// produces for the same witness — for every (w, b_med) arm and the exact
+    /// caller flag geometry of the ranked precompute.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn specialized_routes_match_incumbent_sniffs() {
+        // Same stack-headroom rationale as the other generated-kernel
+        // oracles: the dispatcher instantiates the frame-heavy generated
+        // kernels in debug builds.
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| {
+                use kernels::aarch64::{
+                    BSTATIC_MASKS, StaticBContext,
+                    shift_reduce_inner_ab_fused_neon_checked_with_fast_policy,
+                    verify_bstatic_guards,
+                };
+                use kernels::AB_FAST_POLICY_FORCE_FAST;
+                let table = make_inv_table();
+                const OUTER_BYTES: usize = 16 * 64;
+                let n_outer = 4usize;
+                let within_mask = 1usize;
+                let counts = [16u8, 15u8]; // window 1 has one dead b_med (padding)
+                let mut a = vec![0u8; n_outer * OUTER_BYTES];
+                let mut b = vec![0u8; n_outer * OUTER_BYTES];
+                for x in 0..n_outer {
+                    let w = x & within_mask;
+                    let n_b_med = counts[w] as usize;
+                    for b_med in 0..n_b_med {
+                        let blk = w * 16 + b_med;
+                        for k in 0..8 {
+                            let (_, e) = BSTATIC_MASKS[blk][k];
+                            let off = x * OUTER_BYTES + b_med * 64 + k * 8;
+                            b[off..off + 8].copy_from_slice(&e.to_le_bytes());
+                        }
+                    }
+                }
+                let ctx =
+                    kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+                        .expect("prepared context");
+                let ctx = verify_bstatic_guards(ctx, &a, &b, b.len(), &counts, within_mask);
+                let plain =
+                    kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+                        .expect("plain context"); // verified = specialized = 0
+                let (verified, specialized) = match ctx {
+                    StaticBContext::Prepared { verified, specialized, .. } => (verified, specialized),
+                    _ => panic!("expected Prepared"),
+                };
+                assert_eq!(verified, 0x7FFF_FFFF);
+                assert_eq!(specialized, (0b11) | (1 << 2) | (1 << 29) | (1 << 30));
+                for x in 0..n_outer {
+                    let w = x & within_mask;
+                    let n_b_med = counts[w] as usize;
+                    for b_med in 0..n_b_med {
+                        let mut want = [0u8; 64];
+                        let mut got = [0u8; 64];
+                        let flags = |b_med: usize| -> (bool, bool, u8) {
+                            (
+                                w == 0 && b_med < 2,
+                                w == 1 && b_med + 1 == n_b_med,
+                                if w == 0 && b_med == 2 {
+                                    0x03
+                                } else if w == 1 && b_med + 2 == n_b_med {
+                                    0xf0
+                                } else {
+                                    0
+                                },
+                            )
+                        };
+                        let (ca, cs, cm) = flags(b_med);
+                        shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<AB_FAST_POLICY_FORCE_FAST>(
+                            &a, &b, &table, x * OUTER_BYTES, b_med, &mut want, ca, cs, cm, w,
+                            Some(plain), false,
+                        );
+                        shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<AB_FAST_POLICY_FORCE_FAST>(
+                            &a, &b, &table, x * OUTER_BYTES, b_med, &mut got, ca, cs, cm, w,
+                            Some(ctx), false,
+                        );
+                        assert_eq!(
+                            got, want,
+                            "specialized dispatch differs (w={w}, b_med={b_med}, x={x})"
+                        );
+                    }
+                }
+            })
+            .expect("spawn dispatcher oracle")
+            .join()
+            .expect("dispatcher oracle thread");
     }
 
     #[cfg(target_arch = "aarch64")]
