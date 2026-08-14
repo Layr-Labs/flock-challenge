@@ -1043,6 +1043,12 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
 
             let eq_h = eq_hi[x_hi];
             // SAFETY: exclusive owner of partials[x_hi] (see above).
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            unsafe {
+                let prod = crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(eq_h, [p1, pinf]);
+                *partials_base.ptr().add(x_hi) = (prod[0], prod[1]);
+            }
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
             unsafe {
                 *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
             }
@@ -1857,6 +1863,23 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         let p1 = kappa * out[0] + out[2];
         let pinf = kappa * out[1] + out[3];
         // SAFETY: exclusive owner of both partial slots (see above).
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        unsafe {
+            let p_prod = crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(eq_h, [p1, pinf]);
+            *partials_base.ptr().add(x_hi) = (p_prod[0], p_prod[1]);
+            let la01 = crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(eq_h, [out[2], out[3]]);
+            let la23 = crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(eq_h, [out[4], out[5]]);
+            let la45 = crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(eq_h, [out[6], out[7]]);
+            *la_base.ptr().add(x_hi) = [
+                la01[0],
+                la01[1],
+                la23[0],
+                la23[1],
+                la45[0],
+                la45[1],
+            ];
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
         unsafe {
             *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
             *la_base.ptr().add(x_hi) = [

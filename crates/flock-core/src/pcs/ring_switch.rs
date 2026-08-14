@@ -1446,9 +1446,29 @@ pub(crate) fn collapse_s_hat_v_fold4(s_hat_v_fold4: &[F128], low_point: &[F128])
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = build_eq(low_point);
     let mut out = vec![F128::ZERO; n_packed];
-    for bank in 0..16 {
-        for packed in 0..n_packed {
-            out[packed] += low_eq[bank] * s_hat_v_fold4[bank * n_packed + packed];
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        for bank in 0..16 {
+            let weight = low_eq[bank];
+            let bank_slice = &s_hat_v_fold4[bank * n_packed..(bank + 1) * n_packed];
+            let mut packed = 0;
+            while packed < n_packed {
+                let pair = [bank_slice[packed], bank_slice[packed + 1]];
+                let prod = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(weight, pair)
+                };
+                out[packed] += prod[0];
+                out[packed + 1] += prod[1];
+                packed += 2;
+            }
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        for bank in 0..16 {
+            for packed in 0..n_packed {
+                out[packed] += low_eq[bank] * s_hat_v_fold4[bank * n_packed + packed];
+            }
         }
     }
     out
@@ -1486,10 +1506,37 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let half = 64 * n_packed;
         let (z0, z1) = z_vec.split_at(half);
         let mut out = vec![F128::ZERO; half];
-        out.par_iter_mut()
-            .zip(z0.par_iter())
-            .zip(z1.par_iter())
-            .for_each(|((out, &z0), &z1)| *out = z0 + r * (z0 + z1));
+        const CHUNK: usize = 512;
+        out.par_chunks_mut(CHUNK)
+            .zip(z0.par_chunks(CHUNK))
+            .zip(z1.par_chunks(CHUNK))
+            .for_each(|((out_chunk, z0_chunk), z1_chunk)| {
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                {
+                    let len = out_chunk.len();
+                    let paired = len & !1;
+                    let mut i = 0;
+                    while i < paired {
+                        let x0 = z0_chunk[i] + z1_chunk[i];
+                        let x1 = z0_chunk[i + 1] + z1_chunk[i + 1];
+                        let prod = unsafe {
+                            crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, [x0, x1])
+                        };
+                        out_chunk[i] = z0_chunk[i] + prod[0];
+                        out_chunk[i + 1] = z0_chunk[i + 1] + prod[1];
+                        i += 2;
+                    }
+                    if i < len {
+                        out_chunk[i] = z0_chunk[i] + r * (z0_chunk[i] + z1_chunk[i]);
+                    }
+                }
+                #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+                {
+                    for i in 0..out_chunk.len() {
+                        out_chunk[i] = z0_chunk[i] + r * (z0_chunk[i] + z1_chunk[i]);
+                    }
+                }
+            });
         return out;
     }
 
@@ -1542,13 +1589,34 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = build_eq(low_point);
     let mut out = vec![F128::ZERO; n_packed];
-    for bank in 0..64 {
-        for packed in 0..n_packed {
-            out[packed] += low_eq[bank] * s_hat_v_fold8[bank * n_packed + packed];
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        for bank in 0..64 {
+            let weight = low_eq[bank];
+            let bank_slice = &s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed];
+            let mut packed = 0;
+            while packed < n_packed {
+                let pair = [bank_slice[packed], bank_slice[packed + 1]];
+                let prod = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(weight, pair)
+                };
+                out[packed] += prod[0];
+                out[packed + 1] += prod[1];
+                packed += 2;
+            }
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        for bank in 0..64 {
+            for packed in 0..n_packed {
+                out[packed] += low_eq[bank] * s_hat_v_fold8[bank * n_packed + packed];
+            }
         }
     }
     out
 }
+
 
 /// Compute the slice-MLE vector `s_hat_v` (length 128) from a packed witness
 /// and a tensor-expanded suffix point.

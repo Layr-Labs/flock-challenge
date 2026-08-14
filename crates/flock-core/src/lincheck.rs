@@ -1276,11 +1276,38 @@ fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     } else {
         let (lo, hi) = v.split_at_mut(half);
         let hi = &hi[..half];
-        lo.par_iter_mut()
-            .zip(hi.par_iter())
-            .for_each(|(lo_i, &hi_i)| {
-                *lo_i = *lo_i + r * (hi_i + *lo_i);
-            });
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        {
+            const CHUNK: usize = 256;
+            lo.par_chunks_mut(CHUNK)
+                .zip(hi.par_chunks(CHUNK))
+                .for_each(|(lo_chunk, hi_chunk)| {
+                    let len = lo_chunk.len();
+                    let paired = len & !1;
+                    let mut i = 0;
+                    while i < paired {
+                        let diff0 = hi_chunk[i] + lo_chunk[i];
+                        let diff1 = hi_chunk[i + 1] + lo_chunk[i + 1];
+                        let prod = unsafe {
+                            crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, [diff0, diff1])
+                        };
+                        lo_chunk[i] += prod[0];
+                        lo_chunk[i + 1] += prod[1];
+                        i += 2;
+                    }
+                    if i < len {
+                        lo_chunk[i] += r * (hi_chunk[i] + lo_chunk[i]);
+                    }
+                });
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        {
+            lo.par_iter_mut()
+                .zip(hi.par_iter())
+                .for_each(|(lo_i, &hi_i)| {
+                    *lo_i = *lo_i + r * (hi_i + *lo_i);
+                });
+        }
     }
     v.truncate(half);
 }
@@ -1334,10 +1361,30 @@ fn sumcheck_bind_both_and_eval_next(
         let mut e1 = F128::ZERO;
         let mut einf = F128::ZERO;
         for i in 0..half2 {
-            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
-            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
-            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
-            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            let (lo, hi, zlo, zhi) = {
+                let c_diff = [cq2[i] + cq0[i], cq3[i] + cq1[i]];
+                let z_diff = [zq2[i] + zq0[i], zq3[i] + zq1[i]];
+                let c_prod = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, c_diff)
+                };
+                let z_prod = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, z_diff)
+                };
+                (
+                    cq0[i] + c_prod[0],
+                    cq1[i] + c_prod[1],
+                    zq0[i] + z_prod[0],
+                    zq1[i] + z_prod[1],
+                )
+            };
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+            let (lo, hi, zlo, zhi) = (
+                cq0[i] + r * (cq2[i] + cq0[i]),
+                cq1[i] + r * (cq3[i] + cq1[i]),
+                zq0[i] + r * (zq2[i] + zq0[i]),
+                zq1[i] + r * (zq3[i] + zq1[i]),
+            );
             cq0[i] = lo;
             cq1[i] = hi;
             zq0[i] = zlo;
@@ -1356,10 +1403,30 @@ fn sumcheck_bind_both_and_eval_next(
             .zip(zq2.par_iter())
             .zip(zq3.par_iter())
             .map(|(((((((c0, c1), c2), c3), z0), z1), z2), z3)| {
-                let lo = *c0 + r * (*c2 + *c0);
-                let hi = *c1 + r * (*c3 + *c1);
-                let zlo = *z0 + r * (*z2 + *z0);
-                let zhi = *z1 + r * (*z3 + *z1);
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                let (lo, hi, zlo, zhi) = {
+                    let c_diff = [*c2 + *c0, *c3 + *c1];
+                    let z_diff = [*z2 + *z0, *z3 + *z1];
+                    let c_prod = unsafe {
+                        crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, c_diff)
+                    };
+                    let z_prod = unsafe {
+                        crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, z_diff)
+                    };
+                    (
+                        *c0 + c_prod[0],
+                        *c1 + c_prod[1],
+                        *z0 + z_prod[0],
+                        *z1 + z_prod[1],
+                    )
+                };
+                #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+                let (lo, hi, zlo, zhi) = (
+                    *c0 + r * (*c2 + *c0),
+                    *c1 + r * (*c3 + *c1),
+                    *z0 + r * (*z2 + *z0),
+                    *z1 + r * (*z3 + *z1),
+                );
                 *c0 = lo;
                 *c1 = hi;
                 *z0 = zlo;

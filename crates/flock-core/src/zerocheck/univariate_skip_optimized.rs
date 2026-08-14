@@ -1937,13 +1937,43 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     }
 
     partial_ab.fill(F128::ZERO);
-    for (bank, eq_bot_val) in banks.chunks_exact(ELL).zip(eq_bot) {
-        for (out, value) in partial_ab.iter_mut().zip(bank) {
-            *out += *eq_bot_val * *value;
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        for (bank, eq_bot_val) in banks.chunks_exact(ELL).zip(eq_bot) {
+            let w = *eq_bot_val;
+            let mut i = 0;
+            while i < ELL {
+                let pair = [bank[i], bank[i + 1]];
+                let prod = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(w, pair)
+                };
+                partial_ab[i] += prod[0];
+                partial_ab[i + 1] += prod[1];
+                i += 2;
+            }
+        }
+        let w_hi = eq_hi_val;
+        let mut i = 0;
+        while i < ELL {
+            let pair = [partial_ab[i], partial_ab[i + 1]];
+            let prod = unsafe {
+                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(w_hi, pair)
+            };
+            partial_ab[i] = prod[0];
+            partial_ab[i + 1] = prod[1];
+            i += 2;
         }
     }
-    for value in partial_ab {
-        *value *= eq_hi_val;
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        for (bank, eq_bot_val) in banks.chunks_exact(ELL).zip(eq_bot) {
+            for (out, value) in partial_ab.iter_mut().zip(bank) {
+                *out += *eq_bot_val * *value;
+            }
+        }
+        for value in partial_ab {
+            *value *= eq_hi_val;
+        }
     }
 }
 
