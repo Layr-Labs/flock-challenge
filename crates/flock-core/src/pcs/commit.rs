@@ -154,6 +154,20 @@ pub struct ProverData {
     pub merkle_tree: MerkleTreeBuf,
 }
 
+impl ProverData {
+    /// Move the L0 codeword + tree out so the open can drop them after the
+    /// L0 row gather / multi-proof (those are the last reads). Ranked GPU
+    /// staging is ~1 GiB of unified memory; holding it through induce +
+    /// recursive commits stacks it under L1's 32 MiB matrix and the rest of
+    /// the open. Empty placeholders remain so `Drop` is a no-op.
+    pub fn take_l0_for_open(&mut self) -> (CodewordBuf, MerkleTreeBuf) {
+        (
+            std::mem::replace(&mut self.codeword, CodewordBuf::Cpu(Vec::new())),
+            std::mem::replace(&mut self.merkle_tree, MerkleTreeBuf::Cpu(Vec::new())),
+        )
+    }
+}
+
 /// Storage for the L0 codeword. Normally a pooled `Vec` (CPU commit); with
 /// the GPU commit latched on it is a view into the process-persistent Metal
 /// staging buffer instead (unified memory — CPU reads during the open are

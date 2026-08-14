@@ -314,7 +314,7 @@ fn ligerito_verifier_config(num_vars: usize) -> VerifierConfig {
 /// takes it by value).
 fn open_v<C: Challenger>(
     poly: Vec<F128>,
-    prover_data: &ProverData,
+    prover_data: &mut ProverData,
     commitment: &Commitment,
     claims: &[PackedDirectClaim],
     ch: &mut C,
@@ -545,7 +545,7 @@ pub fn prove<C: Challenger>(
     // binding `v` before the zerocheck challenges (a known `ρ` would break
     // zerocheck soundness).
     let params_v = pcs_params(mu + 1);
-    let (commitment_v, pdata_v) = commit(&v, &params_v);
+    let (commitment_v, mut pdata_v) = commit(&v, &params_v);
     tp("commit(v)");
     ch.observe_bytes(&commitment_v.root);
     ch.observe_f128(claimed_product);
@@ -611,7 +611,7 @@ pub fn prove<C: Challenger>(
             eq_ind: DirectEqInd::Dense(build_eq(point)),
         })
         .collect();
-    let v_open = open_v(v, &pdata_v, &commitment_v, &v_claims, ch);
+    let v_open = open_v(v, &mut pdata_v, &commitment_v, &v_claims, ch);
     tp("open(v)");
 
     let proof = PermutationProof {
