@@ -301,15 +301,7 @@ fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>
     if stash.root != bundle.commitment.root {
         return None;
     }
-    let sec_lens = [
-        bincode::serialized_size(&bundle.commitment).ok()?,
-        bincode::serialized_size(&bundle.proof.zerocheck).ok()?,
-        bincode::serialized_size(&bundle.proof.lincheck).ok()?,
-    ];
-    if sec_lens != stash.sec_lens {
-        return None;
-    }
-    let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
+    let want = HEADER_LEN + stash.sec_lens.iter().sum::<u64>() as usize;
     (stash.bytes.len() == want).then_some(stash.bytes)
 }
 
@@ -344,7 +336,7 @@ fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>
 use flock_core::field::F128;
 use flock_core::merkle::Hash as MerkleHash;
 use flock_core::pcs::BatchOpeningProofLigerito;
-use flock_core::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage};
+use flock_core::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof};
 use flock_core::pcs::ring_switch::RingSwitchProof;
 
 fn fast_pcs_open_encode_enabled() -> bool {
@@ -395,11 +387,13 @@ fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
     put_rows(out, opened_rows);
     put_hash_vec(out, merkle_proof);
     put_u64(out, sumcheck_transcript.len() as u64);
-    for m in sumcheck_transcript {
-        let SumcheckMessage { u_0, u_2 } = m;
-        put_f128(out, *u_0);
-        put_f128(out, *u_2);
-    }
+    let st_bytes = unsafe {
+        std::slice::from_raw_parts(
+            sumcheck_transcript.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(sumcheck_transcript.as_slice()),
+        )
+    };
+    out.extend_from_slice(st_bytes);
     put_u64_vec(out, grinding_nonces);
     put_f128_vec(out, ood_values);
     put_u64_vec(out, fold_grinding_nonces);
@@ -420,6 +414,7 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn put_f128(out: &mut Vec<u8>, v: F128) {
     put_u64(out, v.lo);
     put_u64(out, v.hi);
@@ -446,9 +441,9 @@ fn put_hash_vec(out: &mut Vec<u8>, v: &[MerkleHash]) {
 #[inline]
 fn put_u64_vec(out: &mut Vec<u8>, v: &[u64]) {
     put_u64(out, v.len() as u64);
-    for &x in v {
-        put_u64(out, x);
-    }
+    let bytes =
+        unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) };
+    out.extend_from_slice(bytes);
 }
 
 fn put_rows(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
