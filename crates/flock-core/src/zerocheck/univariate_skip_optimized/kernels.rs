@@ -19,6 +19,9 @@ pub(super) mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub(super) use aarch64::StaticBContext;
 
+#[cfg(target_arch = "aarch64")]
+pub(super) use aarch64::verify_bstatic_guards;
+
 #[cfg(not(target_arch = "aarch64"))]
 #[derive(Clone, Copy)]
 pub(super) struct StaticBContext;
