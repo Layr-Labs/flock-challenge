@@ -176,6 +176,36 @@ impl InvNttTableByteSingleGf8 {
         unsafe { self.data.as_ptr().add(self.data_offset + 256 * self.ell) as *const u8 }
     }
 
+    /// The two AArch64 table images (plain and half-swapped) as byte slices,
+    /// for zero-copy GPU uploads of the collapsed inverse-NTT table. The GPU
+    /// const-b kernel is specialized to the production `ell = 64` image
+    /// layout (256 × 64-byte rows); any other shape returns `(None, None)`
+    /// and the caller stays on the CPU path.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn gpu_images(&self) -> (Option<&[u8]>, Option<&[u8]>) {
+        if self.ell != 64 {
+            return (None, None);
+        }
+        let table_len = 256 * self.ell;
+        // SAFETY: `data_offset` selects a position within the over-allocated
+        // buffer, the allocation cannot move while borrowed through self, and
+        // the aarch64 build appends four full images (`table_images = 4`).
+        unsafe {
+            let plain =
+                core::slice::from_raw_parts(self.data_ptr(), table_len);
+            let hs = core::slice::from_raw_parts(
+                self.data.as_ptr().add(self.data_offset + table_len) as *const u8,
+                table_len,
+            );
+            (Some(plain), Some(hs))
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    pub(crate) fn gpu_images(&self) -> (Option<&[u8]>, Option<&[u8]>) {
+        (None, None)
+    }
+
     /// AArch64-only table image pre-multiplied by the field constant `x^4`.
     /// Applying the byte-collapse out of this image returns `x^4 · T(w)`.
     #[cfg(target_arch = "aarch64")]

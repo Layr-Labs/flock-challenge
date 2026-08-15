@@ -2902,6 +2902,15 @@ pub(crate) enum StaticBContext {
     Prepared {
         partials: &'static [[u8; 64]; 248],
         static_a_k1: &'static [u8; 64],
+        /// One bit per static-B block (`blk = w * 16 + b_med`, bits 0..=30):
+        /// set after a once-per-prove verification that every per-row guard
+        /// `(b_word & MASK) == EXPECTED` for this block passes on the actual
+        /// witness bytes (see [`verify_bstatic_guards`]). The fixed bits the
+        /// guards inspect are circuit-invariant, so a passing sample means
+        /// every row of every call takes the static path; the pure kernel
+        /// then skips the per-row guard entirely. `FLOCK_ZC_BSTATIC_PURE=1`
+        /// forces all bits clear as the exact same-binary A/B control.
+        verified: u64,
     },
     /// Exact same-binary control: retain both historical per-call OnceLock
     /// queries while leaving the generated static-B kernel enabled.
@@ -2951,7 +2960,196 @@ pub(crate) fn prepare_static_b_context_with_policy(
         Some(StaticBContext::Prepared {
             partials: bstatic_partials(inv_table),
             static_a_k1: static_a_k1_partial(inv_table),
+            verified: 0,
         })
+    }
+}
+
+/// Kill switch for the once-per-prove guard verification: with
+/// `FLOCK_ZC_BSTATIC_PURE=1` (exact string), every verified bit stays clear
+/// and the incumbent per-row guarded kernels run — the same-binary A/B
+/// control. The ranked harness clears the environment, so the pure path is
+/// the default there.
+fn bstatic_pure_enabled() -> bool {
+    std::env::var_os("FLOCK_ZC_BSTATIC_PURE").is_none()
+}
+
+/// Sample the actual witness `b` bytes once per prove and set the
+/// [`StaticBContext::Prepared::verified`] bits for every static-B block whose
+/// per-row guards `(b_word & MASK) == EXPECTED` hold on the samples.
+///
+/// The guard-protected bits are circuit-invariant (the struct_census masks
+/// mark byte positions the BLAKE3 R1CS fixes independently of the inputs), so
+/// a few positions spread across the sweep are sufficient: if every sampled
+/// position passes, every position passes, and the pure kernel's output is
+/// bit-identical to the guarded kernel. Any mismatch (census drift, a
+/// non-ranked witness, or `FLOCK_ZC_BSTATIC_PURE=1`) leaves the bit clear and
+/// the incumbent guarded kernel runs unchanged.
+///
+/// Layout matches the kernel's reads: `b_packed` is the packed witness with
+/// `OUTER_BYTES = 1024` bytes per `x_outer` (16 b_med × 64) and 8 bytes per
+/// K-row; `b_med_counts[within_hash_outer]` (with `within_hash_outer =
+/// x_outer & within_outer_mask`) is the live-b_med count, exactly as the
+/// sweep uses it. Blocks that are never live are left unverified (harmless:
+/// they are never dispatched).
+pub(crate) fn verify_bstatic_guards(
+    context: StaticBContext,
+    b_packed: &[u8],
+    total_bytes: usize,
+    b_med_counts: &[u8],
+    within_outer_mask: usize,
+) -> StaticBContext {
+    let StaticBContext::Prepared {
+        partials,
+        static_a_k1,
+        ..
+    } = context
+    else {
+        return context;
+    };
+    if !bstatic_pure_enabled() {
+        return StaticBContext::Prepared {
+            partials,
+            static_a_k1,
+            verified: 0,
+        };
+    }
+    const OUTER_BYTES: usize = (1 << 4) * 64; // 16 b_med × 64 B per x_outer
+    let n_outer = total_bytes / OUTER_BYTES;
+    if n_outer == 0 {
+        return StaticBContext::Prepared {
+            partials,
+            static_a_k1,
+            verified: 0,
+        };
+    }
+    // Spread samples across the whole sweep (start, end, and interior).
+    let n = n_outer;
+    let mut samples: Vec<usize> = vec![
+        0,
+        1,
+        n / 8,
+        n / 4,
+        n / 2,
+        n - n / 4,
+        n.saturating_sub(2),
+        n.saturating_sub(1),
+    ];
+    samples.sort_unstable();
+    samples.dedup();
+
+    let mut verified: u64 = 0;
+    for blk in 0..31 {
+        let w = blk / 16;
+        let b_med = blk % 16;
+        if w == 1 && b_med >= 15 {
+            continue; // never dispatched (kernel rejects w==1 && b_med>=15)
+        }
+        let mut any_live = false;
+        let mut all_pass = true;
+        for &x_outer in &samples {
+            let within = x_outer & within_outer_mask;
+            if within != w {
+                // This position belongs to the other window: the kernel reads
+                // the same byte offsets for both windows, so window-1 bytes
+                // must not be judged against window-0 census expectations.
+                continue;
+            }
+            if (b_med_counts[within] as usize) <= b_med {
+                continue; // this block is dead at this position
+            }
+            any_live = true;
+            let base = x_outer * OUTER_BYTES + b_med * 64;
+            for k in 0..8 {
+                let word = u64::from_le_bytes(
+                    b_packed[base + k * 8..base + k * 8 + 8]
+                        .try_into()
+                        .expect("b word"),
+                );
+                let (m, e) = BSTATIC_MASKS[blk][k];
+                if (word & m) != e {
+                    all_pass = false;
+                    break;
+                }
+            }
+            if !all_pass {
+                break;
+            }
+        }
+        if any_live && all_pass {
+            verified |= 1u64 << blk;
+        }
+    }
+    StaticBContext::Prepared {
+        partials,
+        static_a_k1,
+        verified,
+    }
+}
+
+/// True when the once-per-prove verification established the window-0
+/// a-only blocks (b_med 0/1) — the exact condition under which the
+/// dispatcher routes those rows to `shift_reduce_inner_a_only_const_b`
+/// and the GPU const-b offload may replace them.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn static_b_a_only_specialized(context: Option<StaticBContext>) -> bool {
+    matches!(
+        context,
+        Some(StaticBContext::Prepared { verified, .. }) if verified & 0b11 == 0b11
+    )
+}
+
+/// CPU recompute of the window-0 a-only rows (b_med 0/1) with the exact
+/// kernel the dispatcher's specialized route would have used — the
+/// correctness fallback when a GPU const-b join fails. Rows are 64 bytes at
+/// `(2t)*1024 + b*64` for `t in 0..n_w0`, `b in {0, 1}` (window 0 = low-bit
+/// mask on `x_outer`).
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn a_only_rows_cpu(
+    a_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    n_w0: usize,
+    out_bytes: &mut [u8],
+) {
+    const OUTER_BYTES: usize = 1024;
+    for t in 0..n_w0 {
+        let chunk_base = (2 * t) * OUTER_BYTES;
+        let dst0: &mut [u8; 64] = (&mut out_bytes[chunk_base..chunk_base + 64])
+            .try_into()
+            .expect("a-only row 0 in bounds");
+        shift_reduce_inner_a_only_const_b(a_packed, inv_table, chunk_base, dst0, false);
+        let dst1: &mut [u8; 64] = (&mut out_bytes[chunk_base + 64..chunk_base + 128])
+            .try_into()
+            .expect("a-only row 1 in bounds");
+        shift_reduce_inner_a_only_const_b(a_packed, inv_table, chunk_base + 64, dst1, false);
+    }
+}
+
+/// Diagnostic variant of [`a_only_rows_cpu`] that writes the rows
+/// CONTIGUOUSLY (`(t + b*n_w0)*64` — the GPU kernel's layout) into a
+/// caller-provided buffer, for integration checks against the matrix.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn a_only_rows_cpu_into(
+    a_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    n_w0: usize,
+    contiguous_out: &mut [u8],
+) {
+    const OUTER_BYTES: usize = 1024;
+    for t in 0..n_w0 {
+        for b in 0..2usize {
+            let dst: &mut [u8; 64] = (&mut contiguous_out[(t + b * n_w0) * 64..(t + b * n_w0) * 64 + 64])
+                .try_into()
+                .expect("contiguous a-only row in bounds");
+            shift_reduce_inner_a_only_const_b(
+                a_packed,
+                inv_table,
+                (2 * t) * OUTER_BYTES + b * 64,
+                dst,
+                false,
+            );
+        }
     }
 }
 
@@ -3182,10 +3380,43 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         // `FAST` is a const generic so the per-K table choice, the `x^2`
         // constant multiply and the residual shift all fold away at
         // monomorphization; the kill switch picks a whole kernel, never a
-        // branch inside one.
+        // branch inside one. `PURE` likewise: when the once-per-prove
+        // verification (see [`verify_bstatic_guards`]) has established that
+        // every guard for this block passes on the actual witness, the
+        // per-row guard is dead code and the static path is unconditional.
+        let pure = matches!(
+            context,
+            StaticBContext::Prepared { verified, .. } if (verified >> (bstatic_w * 16 + b_med)) & 1 == 1
+        );
         let handled = enabled
             && if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                shift_reduce_inner_ab_bstatic::<true>(
+                if pure {
+                    shift_reduce_inner_ab_bstatic::<true, true, true>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        bstatic_w,
+                        context,
+                        out,
+                        nt_store,
+                    )
+                } else {
+                    shift_reduce_inner_ab_bstatic::<true, false, true>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        bstatic_w,
+                        context,
+                        out,
+                        nt_store,
+                    )
+                }
+            } else if pure {
+                shift_reduce_inner_ab_bstatic::<false, true, true>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -3197,7 +3428,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     nt_store,
                 )
             } else {
-                shift_reduce_inner_ab_bstatic::<false>(
+                shift_reduce_inner_ab_bstatic::<false, false, true>(
                     a_packed,
                     b_packed,
                     inv_table,
