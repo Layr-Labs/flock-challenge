@@ -1155,6 +1155,11 @@ fn inner_product(a: &[F128], b: &[F128]) -> F128 {
 /// rayon. Below it, sequential beats dispatch overhead.
 const SUMCHECK_PAR_THRESHOLD: usize = 1usize << 12;
 
+/// Chunk size for the lincheck hetero E-core drains. One heap allocation per
+/// lincheck is reused for every round that engages the drain; smaller chunks
+/// expose more parallelism, 2048 is the incumbent Ligerito hetero chunk size.
+const LINCHECK_HETERO_CHUNK: usize = 2048;
+
 /// Fused `sparse_row_fold(A) + α-batch + sparse_row_fold(B)`: produces the
 /// `comb_vec[c] = α · (A^T·eq)[c] + (B^T·eq)[c]` in a single pass, halving the
 /// allocations and reduction phases vs. two separate sparse_row_folds + an
@@ -1239,7 +1244,24 @@ fn sparse_row_fold_alpha_batched(
 /// One round of product-sumcheck on `(c, z)`: compute `(q(1), q(∞))` =
 /// `(Σ c_hi·z_hi, Σ (c_hi+c_lo)·(z_hi+z_lo))` over the top-bit split. The
 /// `len()` of `c` and `z` is even; `half = len/2`.
-fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
+/// E-core hetero scheduling for the lincheck round-0 evaluation.
+///
+/// The round message is a GF(2^128) XOR sum over read-only quarter slices,
+/// so chunking through the helper pool and XOR-merging partials is byte-
+/// identical to the rayon-only path. `FLOCK_NO_LINCHECK_EVAL_HETERO=1`
+/// (exactly `"1"`) restores the incumbent path.
+fn lincheck_eval_hetero_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("FLOCK_NO_LINCHECK_EVAL_HETERO").is_ok_and(|v| v == "1")
+    })
+}
+
+fn sumcheck_round_eval_par(
+    c: &[F128],
+    z: &[F128],
+    partials_buf: &mut Vec<(F128, F128)>,
+) -> (F128, F128) {
     use rayon::prelude::*;
     let half = c.len() / 2;
     debug_assert_eq!(z.len(), c.len());
@@ -1254,6 +1276,50 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
         }
         return (e1, einf);
     }
+
+    // Hetero E-core drain for the wide round-0 eval. Same per-element work,
+    // same XOR partial merge, no writes to shared tables. Reuses the caller's
+    // pre-sized partials buffer to avoid one heap alloc per lincheck round.
+    let chunk = LINCHECK_HETERO_CHUNK;
+    if half >= 16 * chunk
+        && half % chunk == 0
+        && lincheck_eval_hetero_enabled()
+        && crate::epool::epool().is_some()
+    {
+        let n_chunks = half / chunk;
+        let partials = partials_buf;
+        // SAFETY: `partials_buf` was pre-initialized to at least `n_chunks`
+        // elements by the caller; we overwrite every index in the drain.
+        unsafe { partials.set_len(n_chunks) };
+        let c_base = crate::epool::SyncPtr(c.as_ptr() as *mut F128);
+        let z_base = crate::epool::SyncPtr(z.as_ptr() as *mut F128);
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(n_chunks, |ci| {
+            // SAFETY: the queue claims each `ci` exactly once; c and z are
+            // read-only and outlive the drain; partials[ci] is disjoint.
+            unsafe {
+                let cp = c_base.ptr();
+                let zp = z_base.ptr();
+                let start = ci * chunk;
+                let mut e1 = F128::ZERO;
+                let mut einf = F128::ZERO;
+                for i in start..start + chunk {
+                    let clo_i = *cp.add(i);
+                    let chi_i = *cp.add(half + i);
+                    let zlo_i = *zp.add(i);
+                    let zhi_i = *zp.add(half + i);
+                    e1 += chi_i * zhi_i;
+                    einf += (chi_i + clo_i) * (zhi_i + zlo_i);
+                }
+                partials_base.ptr().add(ci).write((e1, einf));
+            }
+        });
+        return partials.iter().copied().fold(
+            (F128::ZERO, F128::ZERO),
+            |(a0, a1), (c0, c1)| (a0 + c0, a1 + c1),
+        );
+    }
+
     (0..half)
         .into_par_iter()
         .map(|i| {
@@ -1285,6 +1351,22 @@ fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     v.truncate(half);
 }
 
+/// E-core hetero scheduling for the fused lincheck sumcheck step.
+///
+/// The fused step's per-element work is identical regardless of which pool
+/// claims a chunk: each chunk owns disjoint index ranges in `comb` and `z`
+/// (writes to the low quarters only), and the round message `(e1, einf)` is a
+/// GF(2^128) XOR sum of per-chunk partials — associative and commutative, so
+/// the merge order cannot change bytes. `FLOCK_NO_LINCHECK_FUSED_HETERO=1`
+/// (exactly `"1"`) restores the incumbent rayon-only path as the same-binary
+/// A/B control.
+fn lincheck_fused_hetero_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("FLOCK_NO_LINCHECK_FUSED_HETERO").is_ok_and(|v| v == "1")
+    })
+}
+
 /// **Fused fold + next-round evaluation.** Binds the top variable of *both*
 /// `comb` and `z` at `r` (in place, each length halves) AND returns the next
 /// product-sumcheck round's message `(q(1), q(∞))` over the just-bound tables —
@@ -1314,6 +1396,7 @@ fn sumcheck_bind_both_and_eval_next(
     comb: &mut Vec<F128>,
     z: &mut Vec<F128>,
     r: F128,
+    partials_buf: &mut Vec<(F128, F128)>,
 ) -> (F128, F128) {
     use rayon::prelude::*;
     let len = comb.len();
@@ -1321,6 +1404,74 @@ fn sumcheck_bind_both_and_eval_next(
     let half = len / 2;
     let half2 = half / 2;
     debug_assert!(half2 >= 1, "fused step needs a well-defined next round");
+
+    // Hetero E-core drain: same chunk grid, same per-element arithmetic, same
+    // XOR-merge of partials. Each chunk owns [ci*CHUNK, (ci+1)*CHUNK) across
+    // all four quarters of both tables; writes are disjoint per chunk and the
+    // two-pool join publishes every write before the fold reads the partials.
+    // The four quarters of `comb`/`z` are contiguous in memory
+    // ([0..h2), [h2..2h2), [2h2..3h2), [3h2..4h2)), so raw-pointer indexing
+    // reaches every quarter without the split-at-mut borrows the rayon path
+    // needs — those borrows would conflict with `as_mut_ptr` below. Reuses the
+    // caller's pre-sized partials buffer to avoid one heap alloc per round.
+    let chunk = LINCHECK_HETERO_CHUNK;
+    if half2 >= 16 * chunk
+        && half2 % chunk == 0
+        && lincheck_fused_hetero_enabled()
+        && crate::epool::epool().is_some()
+    {
+        let n_chunks = half2 / chunk;
+        let partials = partials_buf;
+        // SAFETY: `partials_buf` was pre-initialized to at least `n_chunks`
+        // elements by the caller; we overwrite every index in the drain.
+        unsafe { partials.set_len(n_chunks) };
+        let comb_base = crate::epool::SyncPtr(comb.as_mut_ptr());
+        let z_base = crate::epool::SyncPtr(z.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        let h2 = half2;
+        crate::epool::run_hetero_chunks(n_chunks, |ci| {
+            // SAFETY: the queue claims each `ci` exactly once; the four
+            // quarter ranges are disjoint per chunk and the two-pool join
+            // publishes every write before the fold below reads the partials.
+            unsafe {
+                let p = comb_base.ptr();
+                let zp = z_base.ptr();
+                let start = ci * chunk;
+                let mut e1 = F128::ZERO;
+                let mut einf = F128::ZERO;
+                for i in start..start + chunk {
+                    let c0 = *p.add(i);
+                    let c1 = *p.add(h2 + i);
+                    let c2 = *p.add(2 * h2 + i);
+                    let c3 = *p.add(3 * h2 + i);
+                    let z0 = *zp.add(i);
+                    let z1 = *zp.add(h2 + i);
+                    let z2 = *zp.add(2 * h2 + i);
+                    let z3 = *zp.add(3 * h2 + i);
+                    let lo = c0 + r * (c2 + c0);
+                    let hi = c1 + r * (c3 + c1);
+                    let zlo = z0 + r * (z2 + z0);
+                    let zhi = z1 + r * (z3 + z1);
+                    *p.add(i) = lo;
+                    *p.add(h2 + i) = hi;
+                    *zp.add(i) = zlo;
+                    *zp.add(h2 + i) = zhi;
+                    e1 += hi * zhi;
+                    einf += (hi + lo) * (zhi + zlo);
+                }
+                partials_base.ptr().add(ci).write((e1, einf));
+            }
+        });
+        let (e1, einf) = partials
+            .iter()
+            .copied()
+            .fold((F128::ZERO, F128::ZERO), |(a0, a1), (c0, c1)| {
+                (a0 + c0, a1 + c1)
+            });
+        comb.truncate(half);
+        z.truncate(half);
+        return (e1, einf);
+    }
 
     // q0,q1 = low half (written); q2,q3 = high half (read-only).
     let (c_lo, c_hi) = comb.split_at_mut(half);
@@ -1598,11 +1749,21 @@ fn prove_padded_inner<Ch: Challenger>(
     //    rayon when the residual table is large enough.
     let mut rounds = Vec::with_capacity(inner_rest_len);
     let mut r_rounds = Vec::with_capacity(inner_rest_len);
+
+    // Pre-size a single partials buffer for all lincheck sumcheck rounds that
+    // engage the E-core hetero drains. Round 0 needs the most chunks; fused
+    // rounds need at most half as many, so the same buffer is reused with
+    // `set_len` per call instead of allocating a fresh `Vec` every round.
+    let round0_half = comb_vec.len() / 2;
+    let max_lincheck_partials = round0_half / LINCHECK_HETERO_CHUNK;
+    let mut lincheck_partials = vec![(F128::ZERO, F128::ZERO); max_lincheck_partials];
+
     if inner_rest_len > 0 {
         // Round 0's message is the only standalone evaluation pass; every later
         // round's message falls out of binding the previous round (fold +
         // next-eval fused into one pass — see `sumcheck_bind_both_and_eval_next`).
-        let (mut e1, mut einf) = sumcheck_round_eval_par(&comb_vec, &z_vec);
+        let (mut e1, mut einf) =
+            sumcheck_round_eval_par(&comb_vec, &z_vec, &mut lincheck_partials);
         for t in 0..inner_rest_len {
             challenger.observe_f128(e1);
             challenger.observe_f128(einf);
@@ -1611,7 +1772,12 @@ fn prove_padded_inner<Ch: Challenger>(
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
+                let (ne1, neinf) = sumcheck_bind_both_and_eval_next(
+                    &mut comb_vec,
+                    &mut z_vec,
+                    r,
+                    &mut lincheck_partials,
+                );
                 e1 = ne1;
                 einf = neinf;
             } else {
