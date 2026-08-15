@@ -509,6 +509,60 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
             .zip(data.par_chunks(leaf_size))
             .for_each(|(o, leaf)| *o = blake3_leaf_cv(leaf)),
         HashKind::Sha256 => {
+            // Chunk-queue dispatch for the four-way SHA-256 leaf kernel, so
+            // the efficiency-core helper pool (when present) can drain leaves
+            // alongside the main pool — the same contract as the BLAKE3 leaf
+            // path above. Chunks are aligned to the four-way kernel (each
+            // full chunk is a whole number of quads), and chunk `i` writes
+            // only its own `out` range, so output is byte-identical to the
+            // static rayon split regardless of claim order.
+            // `FLOCK_NO_SHA256_MERKLE_HETERO=1` restores the incumbent
+            // main-pool-only split as the same-binary A/B control.
+            let sha256_hetero = std::env::var_os("FLOCK_NO_SHA256_MERKLE_HETERO").is_none();
+            const SHA256_LEAVES_PER_CHUNK: usize = 256; // 64 four-way quads
+            let n = out.len();
+            let n_chunks = n / SHA256_LEAVES_PER_CHUNK;
+            let tail = n % SHA256_LEAVES_PER_CHUNK;
+            if sha256_hetero && crate::epool::epool().is_some() && n_chunks >= 4 {
+                let out_base = crate::epool::SyncPtr(out.as_mut_ptr());
+                crate::epool::run_hetero_chunks(n_chunks, |i| {
+                    let start = i * SHA256_LEAVES_PER_CHUNK;
+                    let end = start + SHA256_LEAVES_PER_CHUNK;
+                    // SAFETY: `Hash` is `[u8; 32]` (Copy, no padding); the
+                    // queue hands out each `i` exactly once and the
+                    // `[start, end)` ranges are pairwise disjoint and
+                    // in-bounds, so each closure holds the only `&mut` into
+                    // its range.
+                    let outs = unsafe {
+                        core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
+                    };
+                    let leaves = &data[start * leaf_size..end * leaf_size];
+                    for quad in 0..SHA256_LEAVES_PER_CHUNK / 4 {
+                        let o = &mut outs[quad * 4..quad * 4 + 4];
+                        let l = &leaves[quad * 4 * leaf_size..(quad * 4 + 4) * leaf_size];
+                        sha256_hash4(
+                            [
+                                &l[..leaf_size],
+                                &l[leaf_size..2 * leaf_size],
+                                &l[2 * leaf_size..3 * leaf_size],
+                                &l[3 * leaf_size..],
+                            ],
+                            o,
+                        );
+                    }
+                });
+                // Unaligned tail (non-ranked shapes): serial, four-way where
+                // a quad fits, single otherwise.
+                if tail > 0 {
+                    let start = n - tail;
+                    let outs = &mut out[start..];
+                    let leaves = &data[start * leaf_size..];
+                    for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
+                        *out = Sha256::digest(leaf).into();
+                    }
+                }
+                return;
+            }
             out.par_chunks_mut(4)
                 .zip(data.par_chunks(4 * leaf_size))
                 .for_each(|(outs, leaves)| {
@@ -664,10 +718,68 @@ fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
                     hash_quad(outs, children);
                 }
             } else {
-                write
-                    .par_chunks_mut(4)
-                    .zip(read_bytes.par_chunks(256))
-                    .for_each(|(outs, children)| hash_quad(outs, children));
+                // Chunk-queue dispatch so the efficiency-core helper pool can
+                // drain wide SHA-256 parent levels alongside the main pool —
+                // same contract as the BLAKE3 parent path. Chunks are aligned
+                // to the four-way kernel (1024 = 256 quads per chunk) and
+                // chunk `i` writes only its own `write` range, so output is
+                // byte-identical to the static rayon split regardless of
+                // claim order. `FLOCK_NO_SHA256_MERKLE_HETERO=1` restores the
+                // incumbent main-pool-only split.
+                let sha256_hetero = std::env::var_os("FLOCK_NO_SHA256_MERKLE_HETERO").is_none();
+                const SHA256_PARENTS_PER_CHUNK: usize = 1024; // 256 four-way quads
+                let n = write.len();
+                let n_chunks = n / SHA256_PARENTS_PER_CHUNK;
+                let tail = n % SHA256_PARENTS_PER_CHUNK;
+                if sha256_hetero && crate::epool::epool().is_some() && n_chunks >= 4 {
+                    let out_base = crate::epool::SyncPtr(write.as_mut_ptr());
+                    let read_base = read_bytes.as_ptr() as usize;
+                    crate::epool::run_hetero_chunks(n_chunks, |i| {
+                        let start = i * SHA256_PARENTS_PER_CHUNK;
+                        let end = start + SHA256_PARENTS_PER_CHUNK;
+                        // SAFETY: `Hash` is `[u8; 32]` (Copy, no padding); the
+                        // queue hands out each `i` exactly once and the
+                        // `[start, end)` ranges are pairwise disjoint and
+                        // in-bounds, so each closure holds the only `&mut`
+                        // into its output range. The read side is immutable
+                        // for the whole level.
+                        let outs = unsafe {
+                            core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
+                        };
+                        let children = unsafe {
+                            core::slice::from_raw_parts(
+                                (read_base as *const u8).add(start * 64),
+                                (end - start) * 64,
+                            )
+                        };
+                        for quad in 0..SHA256_PARENTS_PER_CHUNK / 4 {
+                            let o = &mut outs[quad * 4..quad * 4 + 4];
+                            let ch = &children[quad * 256..(quad + 1) * 256];
+                            sha256_hash4(
+                                [
+                                    &ch[..64],
+                                    &ch[64..128],
+                                    &ch[128..192],
+                                    &ch[192..256],
+                                ],
+                                o,
+                            );
+                        }
+                    });
+                    if tail > 0 {
+                        let start = n - tail;
+                        let outs = &mut write[start..];
+                        let children = &read_bytes[start * 64..];
+                        for (outs, children) in outs.chunks_mut(4).zip(children.chunks(256)) {
+                            hash_quad(outs, children);
+                        }
+                    }
+                } else {
+                    write
+                        .par_chunks_mut(4)
+                        .zip(read_bytes.par_chunks(256))
+                        .for_each(|(outs, children)| hash_quad(outs, children));
+                }
             }
         }
     }

@@ -343,12 +343,42 @@ fn bstatic_partials(inv_table: &InvNttTableByteSingleGf8) -> &'static [[u8; 64];
 #[cfg(target_arch = "aarch64")]
 static BSTATIC_ARM_LIVE: [bool; 31] = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];
 
+/// Per-block CPU cost estimate: total varying B bytes across the 8 K rows
+/// (mask bytes that are not all-ones need a runtime table gather). Used to
+/// pick the GPU-offload blocks (the most expensive rows first).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn bstatic_block_varying_bytes() -> [u16; 31] {
+    let mut out = [0u16; 31];
+    for blk in 0..31 {
+        let mut cost = 0u16;
+        for k in 0..8 {
+            let (m, _e) = BSTATIC_MASKS[blk][k];
+            for s in 0..8 {
+                if ((m >> (8 * s)) & 0xff) != 0xff {
+                    cost += 1;
+                }
+            }
+        }
+        out[blk] = cost;
+    }
+    out
+}
+
 /// Guarded static-b variant of [`shift_reduce_inner_ab_fused_neon`].
 /// Returns `false` when this (w, b_med) position has no static plan, in
 /// which case the caller must run the generic kernel.
+///
+/// `PURE` (const): when true, the caller has already verified once per prove
+/// that every per-row guard for this `(w, b_med)` passes on the actual
+/// witness bytes (see `kernels::verify_bstatic_guards`), so the per-row mask
+/// lookups, AND/CMP and branch are dead code and the static path is taken
+/// unconditionally. `b_word` is still loaded when the row has varying bytes
+/// (the `xor_vary_*` gathers need it); for fully-static rows it is dead and
+/// eliminated. Output is bit-identical to the guarded kernel whenever the
+/// guards pass, which the once-per-prove verification establishes.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_lines)]
-pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
+pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool, const PURE: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -436,9 +466,15 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                 let off = byte_base_b + $k * N_CHUNKS;
                 let a_row = a_packed.as_ptr().add(off);
                 let b_row = b_packed.as_ptr().add(off);
-                let (m, e) = BSTATIC_MASKS[blk][$k];
+                // `PURE` is a const generic: with it set, the guard below
+                // folds to `true`, dead-stripping the mask loads, AND/CMP and
+                // branch. `b_word` is still loaded whenever the row has
+                // varying bytes (the `xor_vary_*` gathers need the real
+                // bytes); fully-static rows (empty vary lists) see the load
+                // eliminated as well.
+                #[allow(unused_variables)]
                 let b_word = u64::from_le(core::ptr::read_unaligned(b_row.cast::<u64>()));
-                if (b_word & m) == e {
+                if PURE || (b_word & BSTATIC_MASKS[blk][$k].0) == BSTATIC_MASKS[blk][$k].1 {
                     let pp = partials[blk * 8 + $k].as_ptr();
                     #[allow(unused_mut)]
                     let mut db0 = vld1q_u8(pp);
