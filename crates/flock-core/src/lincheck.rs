@@ -1070,24 +1070,18 @@ pub fn pack_z_lincheck_from_packed(
     let n_outer = n_total / k;
     assert_eq!(n_outer % 8, 0, "need n_outer ≥ 8 for byte stripes");
 
-    // Uninit alloc — the par_chunks_mut loop below writes every byte of
-    // every k-byte stripe exactly once. Saves ~10 ms of sequential
-    // zero-fill at m=29 (64 MB byte buffer) on the main thread.
+    // Uninit alloc — the loop below writes every byte of every k-byte stripe
+    // exactly once. Saves ~10 ms of sequential zero-fill at m=29 (64 MB byte
+    // buffer) on the main thread.
     let mut z_packed: Vec<u8> = crate::alloc_uninit_vec(n_total / 8);
-    // Each stripe (byte_idx) writes a disjoint k-byte chunk — process them in
-    // parallel. Inside one stripe, k independent output bytes.
-    // Hetero-queue drain (same contract as the promoted zerocheck
-    // conversions): pure bit-extraction compute over disjoint stripes with
-    // no reduction — the ideal shape for the efficiency-core queue. Each
-    // chunk writes only its own k-byte stripe; output is bit-identical by
-    // construction.
+    // Each stripe (byte_idx) writes a disjoint k-byte chunk. This is the ideal
+    // shape for the efficiency-core queue, but only when there are enough
+    // stripes to keep the helper pool from becoming a tail: with very few
+    // stripes an E-core can claim half the work and the much faster P-cores
+    // wait for it. Below the threshold we stay on the main pool only (or the
+    // main-only fallback on x86), which is what the M3 BLAKE3-size calls hit.
     let stripes = z_packed.len() / k;
-    let z_base = crate::epool::SyncPtr(z_packed.as_mut_ptr());
-    crate::epool::run_hetero_chunks(stripes, |byte_idx| {
-        // SAFETY: the queue hands out each stripe exactly once; stripe
-        // byte_idx exclusively owns z_packed[byte_idx*k..][..k]; the queue's
-        // completion join publishes the writes before the caller reads.
-        let chunk = unsafe { std::slice::from_raw_parts_mut(z_base.ptr().add(byte_idx * k), k) };
+    let pack_one_stripe = |byte_idx: usize, chunk: &mut [u8]| {
         for i_inner in 0..k {
             let mut byte = 0u8;
             for r in 0..8 {
@@ -1106,7 +1100,26 @@ pub fn pack_z_lincheck_from_packed(
             }
             chunk[i_inner] = byte;
         }
-    });
+    };
+
+    const HETERO_THRESHOLD: usize = 16;
+    if stripes >= HETERO_THRESHOLD && crate::epool::epool().is_some() {
+        let z_base = crate::epool::SyncPtr(z_packed.as_mut_ptr());
+        crate::epool::run_hetero_chunks(stripes, |byte_idx| {
+            // SAFETY: the queue hands out each stripe exactly once; stripe
+            // byte_idx exclusively owns z_packed[byte_idx*k..][..k]; the
+            // queue's completion join publishes the writes before the caller reads.
+            let chunk =
+                unsafe { std::slice::from_raw_parts_mut(z_base.ptr().add(byte_idx * k), k) };
+            pack_one_stripe(byte_idx, chunk);
+        });
+    } else {
+        use rayon::prelude::*;
+        z_packed
+            .par_chunks_mut(k)
+            .enumerate()
+            .for_each(|(byte_idx, chunk)| pack_one_stripe(byte_idx, chunk));
+    }
     z_packed
 }
 
