@@ -3431,7 +3431,7 @@ fn ligero_commit_impl(
         // race's tree (the incumbent arm's) lands in `raced_tree`; `None`
         // there means the CPU builder below, exactly the incumbent fallback.
         Some(session) if session.measuring() => {
-            raced_tree = l1_overlap_warmup_race(
+            raced_tree = overlap_warmup_race(
                 session,
                 poly,
                 &mut mat,
@@ -3544,18 +3544,23 @@ fn ligero_commit_impl(
     }
 }
 
-/// L1 overlap warmup race (see `gpu_commit::l1_overlap_report`): decide the
-/// process latch by racing the overlapped commit arm against the incumbent
-/// over the same message and codeword storage — the fused3 transform rewrites
-/// every codeword element from `poly`, so re-running is byte-idempotent. An
-/// untimed incumbent PRIMER first brings the codeword, wrap and GPU to the
-/// stationary hot state the timed prove sees (without it the first arm eats
-/// the cold-clock/cold-cache bias alone); each arm then runs three times and
+/// Overlap warmup race (see `gpu_commit::l1_overlap_report` /
+/// `l2_overlap_report`): decide the level's process latch by racing the
+/// overlapped commit arm against the incumbent over the same message and
+/// codeword storage — the fused3 transform rewrites every codeword element
+/// from `poly`, so re-running is byte-idempotent. An untimed incumbent
+/// PRIMER first brings the codeword, wrap and GPU to the stationary hot
+/// state the timed prove sees (without it the first arm eats the
+/// cold-clock/cold-cache bias alone); each arm then runs three times and
 /// the per-arm MINIMUM walls race, damping scheduler noise. Every overlapped
 /// tree is byte-compared against the incumbent's; any mismatch or failure
-/// latches Off. Returns an INCUMBENT-arm GPU tree (`None` → the caller's CPU
-/// builder), so the warmup prove's bytes never depend on the overlapped arm.
-fn l1_overlap_warmup_race(
+/// latches Off. The incumbent is the level's production fallback — the
+/// whole-tree GPU offload at L1 (2^18 leaves), the pooled CPU merkle at L2
+/// (the sync GPU path rejects 2^16) — so the race prices exactly the arm
+/// the timed prove would otherwise run. Returns an INCUMBENT-arm tree
+/// (`None` → the caller's CPU builder), so the warmup prove's bytes never
+/// depend on the overlapped arm.
+fn overlap_warmup_race(
     session: crate::gpu_commit::L1MerkleOverlap,
     poly: &[F128],
     mat: &mut [F128],
@@ -3564,6 +3569,14 @@ fn l1_overlap_warmup_race(
     ntt: &AdditiveNttF128,
     block_len: usize,
 ) -> Option<Vec<Hash>> {
+    let is_l1 = block_len == 1 << 18;
+    let report = |overlap_ms: f64, incumbent_ms: f64, equal: Option<bool>| {
+        if is_l1 {
+            crate::gpu_commit::l1_overlap_report(overlap_ms, incumbent_ms, equal);
+        } else {
+            crate::gpu_commit::l2_overlap_report(overlap_ms, incumbent_ms, equal);
+        }
+    };
     let run_incumbent = |mat: &mut [F128]| -> (Option<Vec<Hash>>, f64) {
         let t = std::time::Instant::now();
         ntt.forward_transform_interleaved_from_message_fused3(
@@ -3575,7 +3588,16 @@ fn l1_overlap_warmup_race(
         let data_bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(mat.as_ptr().cast::<u8>(), core::mem::size_of_val(mat))
         };
-        let tree = crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len);
+        let tree = if is_l1 {
+            crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
+        } else {
+            Some(merkle::merkle_tree_into(
+                crate::scratch::take_hash_tree(2 * block_len - 1),
+                data_bytes,
+                block_len,
+                HashKind::Blake3,
+            ))
+        };
         (tree, t.elapsed().as_secs_f64() * 1e3)
     };
 
@@ -3583,7 +3605,7 @@ fn l1_overlap_warmup_race(
     let (primer_tree, _) = run_incumbent(mat);
     let Some(mut incumbent_tree) = primer_tree else {
         // No incumbent GPU tree — nothing to overlap with; latch Off.
-        crate::gpu_commit::l1_overlap_report(f64::INFINITY, 0.0, None);
+        report(f64::INFINITY, 0.0, None);
         return None;
     };
 
@@ -3612,7 +3634,7 @@ fn l1_overlap_warmup_race(
                 block_len,
             )
         }) else {
-            crate::gpu_commit::l1_overlap_report(f64::INFINITY, wall_b, None);
+            report(f64::INFINITY, wall_b, None);
             return Some(incumbent_tree);
         };
         settle();
@@ -3627,7 +3649,7 @@ fn l1_overlap_warmup_race(
         let tree_a = s.finish();
         wall_a = wall_a.min(t.elapsed().as_secs_f64() * 1e3);
         let Some(tree_a) = tree_a else {
-            crate::gpu_commit::l1_overlap_report(f64::INFINITY, wall_b, None);
+            report(f64::INFINITY, wall_b, None);
             return Some(incumbent_tree);
         };
         equal &= tree_a == incumbent_tree;
@@ -3637,13 +3659,13 @@ fn l1_overlap_warmup_race(
         settle();
         let (tree_b, round_wall_b) = run_incumbent(mat);
         let Some(tree_b) = tree_b else {
-            crate::gpu_commit::l1_overlap_report(wall_a, f64::INFINITY, None);
+            report(wall_a, f64::INFINITY, None);
             return Some(incumbent_tree);
         };
         wall_b = wall_b.min(round_wall_b);
         crate::scratch::give_hash_tree(std::mem::replace(&mut incumbent_tree, tree_b));
     }
-    crate::gpu_commit::l1_overlap_report(wall_a, wall_b, Some(equal));
+    report(wall_a, wall_b, Some(equal));
     Some(incumbent_tree)
 }
 
