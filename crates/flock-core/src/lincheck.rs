@@ -1285,6 +1285,22 @@ fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     v.truncate(half);
 }
 
+/// E-core hetero scheduling for the fused lincheck sumcheck step.
+///
+/// The fused step's per-element work is identical regardless of which pool
+/// claims a chunk: each chunk owns disjoint index ranges in `comb` and `z`
+/// (writes to the low quarters only), and the round message `(e1, einf)` is a
+/// GF(2^128) XOR sum of per-chunk partials — associative and commutative, so
+/// the merge order cannot change bytes. `FLOCK_NO_LINCHECK_FUSED_HETERO=1`
+/// (exactly `"1"`) restores the incumbent rayon-only path as the same-binary
+/// A/B control.
+fn lincheck_fused_hetero_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("FLOCK_NO_LINCHECK_FUSED_HETERO").is_ok_and(|v| v == "1")
+    })
+}
+
 /// **Fused fold + next-round evaluation.** Binds the top variable of *both*
 /// `comb` and `z` at `r` (in place, each length halves) AND returns the next
 /// product-sumcheck round's message `(q(1), q(∞))` over the just-bound tables —
@@ -1321,6 +1337,69 @@ fn sumcheck_bind_both_and_eval_next(
     let half = len / 2;
     let half2 = half / 2;
     debug_assert!(half2 >= 1, "fused step needs a well-defined next round");
+
+    // Hetero E-core drain: same chunk grid, same per-element arithmetic, same
+    // XOR-merge of partials. Each chunk owns [ci*CHUNK, (ci+1)*CHUNK) across
+    // all four quarters of both tables; writes are disjoint per chunk and the
+    // two-pool join publishes every write before the fold reads the partials.
+    // The four quarters of `comb`/`z` are contiguous in memory
+    // ([0..h2), [h2..2h2), [2h2..3h2), [3h2..4h2)), so raw-pointer indexing
+    // reaches every quarter without the split-at-mut borrows the rayon path
+    // needs — those borrows would conflict with `as_mut_ptr` below.
+    const FUSED_CHUNK: usize = 2048;
+    if half2 >= 16 * FUSED_CHUNK
+        && half2 % FUSED_CHUNK == 0
+        && lincheck_fused_hetero_enabled()
+        && crate::epool::epool().is_some()
+    {
+        let n_chunks = half2 / FUSED_CHUNK;
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
+        let comb_base = crate::epool::SyncPtr(comb.as_mut_ptr());
+        let z_base = crate::epool::SyncPtr(z.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        let h2 = half2;
+        crate::epool::run_hetero_chunks(n_chunks, |ci| {
+            // SAFETY: the queue claims each `ci` exactly once; the four
+            // quarter ranges are disjoint per chunk and the two-pool join
+            // publishes every write before the fold below reads the partials.
+            unsafe {
+                let p = comb_base.ptr();
+                let zp = z_base.ptr();
+                let start = ci * FUSED_CHUNK;
+                let mut e1 = F128::ZERO;
+                let mut einf = F128::ZERO;
+                for i in start..start + FUSED_CHUNK {
+                    let c0 = *p.add(i);
+                    let c1 = *p.add(h2 + i);
+                    let c2 = *p.add(2 * h2 + i);
+                    let c3 = *p.add(3 * h2 + i);
+                    let z0 = *zp.add(i);
+                    let z1 = *zp.add(h2 + i);
+                    let z2 = *zp.add(2 * h2 + i);
+                    let z3 = *zp.add(3 * h2 + i);
+                    let lo = c0 + r * (c2 + c0);
+                    let hi = c1 + r * (c3 + c1);
+                    let zlo = z0 + r * (z2 + z0);
+                    let zhi = z1 + r * (z3 + z1);
+                    *p.add(i) = lo;
+                    *p.add(h2 + i) = hi;
+                    *zp.add(i) = zlo;
+                    *zp.add(h2 + i) = zhi;
+                    e1 += hi * zhi;
+                    einf += (hi + lo) * (zhi + zlo);
+                }
+                partials_base.ptr().add(ci).write((e1, einf));
+            }
+        });
+        let (e1, einf) = partials
+            .into_iter()
+            .fold((F128::ZERO, F128::ZERO), |(a0, a1), (c0, c1)| {
+                (a0 + c0, a1 + c1)
+            });
+        comb.truncate(half);
+        z.truncate(half);
+        return (e1, einf);
+    }
 
     // q0,q1 = low half (written); q2,q3 = high half (read-only).
     let (c_lo, c_hi) = comb.split_at_mut(half);
