@@ -75,3 +75,36 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker fable5-s32-stock-1786662240-18063
 // dispersion-resample marker fable5-s33-stock-1786662839-16995
 // dispersion-resample marker fable5-s34-stock-1786663417-1627
+// dispersion-resample marker angel-0815-s35-1786715100-0001
+// dispersion-resample marker angel-0815-s36-1786715200-0002
+// dispersion-resample marker angel-0815-s37-1786777029-0003
+// dispersion-resample marker angel-0815-s38-1786777784-0004
+// dispersion-resample marker angel-0815-s39-1786779000-0005
+// dispersion-resample marker angel-0815-s40-1786779600-0006
+// dispersion-resample marker angel-0815-s41-1786779427-0007
+// dispersion-resample marker angel-0815-s42-1786781614-0008
+// dispersion-resample marker angel-0815-s43-1786781934-0009
+// dispersion-resample marker angel-0815-s44-1786782358-0010
+// dispersion-resample marker angel-0815-s45-1786783136-0011
+// dispersion-resample marker angel-0815-s46-1786783813-0012
+// dispersion-resample marker angel-0815-s47-1786784448-0013
+
+// dispersion-resample marker s48
+
+// dispersion-resample marker sample-90-20260815-0933
+// dispersion-resample marker sample-91-20260815-0945
+// dispersion-resample marker sample-92-20260815-0950
+
+// dispersion-resample marker sample-95-20260815-1016
+
+// dispersion-resample marker sample-96-20260815-1037
+
+// dispersion-resample marker sample-97-20260815-1050
+
+// dispersion-resample marker sample-98-20260815-1100
+// dispersion-resample marker sample-99-20260815-1108
+
+// dispersion-resample marker sample-100-20260815-1119
+// dispersion-resample marker sample-101-20260815-1131
+// dispersion-resample marker sample-106-20260815-1228
+// dispersion-resample marker sample-107-20260815-1237
