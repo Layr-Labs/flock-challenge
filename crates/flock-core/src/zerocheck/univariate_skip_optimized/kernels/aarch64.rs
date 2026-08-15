@@ -1,5 +1,60 @@
 use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
 
+/// Exact-`1` kill for the completion-side `ldnp` bounce of live `ab_inner`
+/// rows. Default ON: the 496 MiB write-once surface is consumed once after
+/// the commitment root and never reread, so temporal loads only pollute the
+/// convert-table / bank working set. Bytes are identical either way.
+pub const ENV_NO_ZC_AB_COMPLETION_NT_LOAD: &str = "FLOCK_NO_ZC_AB_COMPLETION_NT_LOAD";
+
+fn ab_completion_nt_load_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_ZC_AB_COMPLETION_NT_LOAD).as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Copy `n` 64-byte rows with `ldnp` (no cache allocate on the source) into
+/// a stack twin. Source rows are 16-byte aligned (`F128` pool). Destination
+/// is a local `[[u8; 64]; 16]`.
+#[inline(always)]
+unsafe fn ldnp_bounce_ab_rows(src: &[[u8; 64]; 16], n: usize, dst: &mut [[u8; 64]; 16]) {
+    debug_assert!(n <= 16);
+    for i in 0..n {
+        let s = src[i].as_ptr();
+        let d = dst[i].as_mut_ptr();
+        unsafe {
+        core::arch::asm!(
+            "ldnp {q0:q}, {q1:q}, [{src}]",
+            "ldnp {q2:q}, {q3:q}, [{src}, #32]",
+            "stp  {q0:q}, {q1:q}, [{dst}]",
+            "stp  {q2:q}, {q3:q}, [{dst}, #32]",
+            src = in(reg) s,
+            dst = in(reg) d,
+            q0 = out(vreg) _,
+            q1 = out(vreg) _,
+            q2 = out(vreg) _,
+            q3 = out(vreg) _,
+            options(nostack, preserves_flags),
+        );
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn ab_rows_for_accumulate<'a>(
+    src: &'a [[u8; 64]; 16],
+    n_b_med: usize,
+    bounce: &'a mut [[u8; 64]; 16],
+) -> &'a [[u8; 64]; 16] {
+    if ab_completion_nt_load_enabled() {
+        unsafe { ldnp_bounce_ab_rows(src, n_b_med, bounce) };
+        bounce
+    } else {
+        src
+    }
+}
+
 /// Four-lane convert-table fold.
 ///
 /// Mirrors [`accumulate_convert_with_s_hat_v`]: four lanes are processed
@@ -162,6 +217,8 @@ pub(crate) unsafe fn accumulate_convert_ab(
     // bounded by the debug-asserted table length: `b_med < 16` selects one of
     // 16 convert blocks.
     unsafe {
+        let mut bounce = [[0u8; 64]; 16];
+        let chunk_ab_bytes = ab_rows_for_accumulate(chunk_ab_bytes, n_b_med, &mut bounce);
         let convert_ptr = convert.as_ptr() as *const u8;
         let n_pairs = n_b_med / 2;
         for lane in (0..64).step_by(8) {
@@ -299,6 +356,8 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul(
     // debug-asserted table length, and every drain address is one 16-byte
     // `F128` slot of the fixed-size bank.
     unsafe {
+        let mut bounce = [[0u8; 64]; 16];
+        let chunk_ab_bytes = ab_rows_for_accumulate(chunk_ab_bytes, n_b_med, &mut bounce);
         let convert_ptr = convert.as_ptr() as *const u8;
         let n_pairs = n_b_med / 2;
         for lane in (0..64).step_by(8) {
@@ -393,6 +452,21 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul(
             drain_lane!(6, ab6);
             drain_lane!(7, ab7);
         }
+    }
+}
+
+#[cfg(test)]
+mod ab_completion_nt_load_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_off_value() {
+        assert_eq!(
+            super::ENV_NO_ZC_AB_COMPLETION_NT_LOAD,
+            "FLOCK_NO_ZC_AB_COMPLETION_NT_LOAD"
+        );
+        // The OnceLock is process-wide; this test only pins the token.
+        let _ = OsStr::new("1");
     }
 }
 
