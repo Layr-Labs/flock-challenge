@@ -19,9 +19,33 @@ pub(super) mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub(super) use aarch64::StaticBContext;
 
+#[cfg(target_arch = "aarch64")]
+pub(super) use aarch64::verify_bstatic_guards;
+
 #[cfg(not(target_arch = "aarch64"))]
 #[derive(Clone, Copy)]
 pub(super) struct StaticBContext;
+
+/// Portable/x86 fallback: those targets never prepare a static-B context, so
+/// preserve the inert token and let the existing scalar/x86 dispatcher run.
+#[cfg(not(target_arch = "aarch64"))]
+pub(super) fn verify_bstatic_guards(
+    context: StaticBContext,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    total_bytes: usize,
+    b_med_counts: &[u8],
+    within_outer_mask: usize,
+) -> StaticBContext {
+    let _ = (
+        a_packed,
+        b_packed,
+        total_bytes,
+        b_med_counts,
+        within_outer_mask,
+    );
+    context
+}
 
 #[cfg(target_arch = "x86_64")]
 pub(super) mod x86_64;
@@ -50,6 +74,29 @@ pub(super) fn static_b_context_is_prepared(context: Option<StaticBContext>) -> b
     #[cfg(target_arch = "aarch64")]
     {
         matches!(context, Some(StaticBContext::Prepared { .. }))
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = context;
+        false
+    }
+}
+
+/// Gate for the branch-free ranked dispatcher: every live static-B arm and
+/// all five specialized sniff predicates were verified once for this proof.
+#[inline]
+pub(super) fn static_b_context_is_ranked_verified(context: Option<StaticBContext>) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        matches!(
+            context,
+            Some(StaticBContext::Prepared {
+                verified: 0x7fff_ffff,
+                specialized,
+                ..
+            }) if specialized & 0x6000_0007 == 0x6000_0007
+        )
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -222,6 +269,64 @@ pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
             b_col,
         );
     }
+}
+
+/// Ranked-shape specialization of [`shift_reduce_inner_ab`]. The caller has
+/// checked [`static_b_context_is_ranked_verified`], so aarch64 compiles out
+/// the per-row verified/specialized mask probes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn shift_reduce_inner_ab_ranked_verified<const FAST_POLICY: u8>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out: &mut [u8; 64],
+    a_col: &mut [F8],
+    b_col: &mut [F8],
+    check_all_ones: bool,
+    check_single_k0: bool,
+    const_one_mask: u8,
+    bstatic_w: usize,
+    static_b_context: Option<StaticBContext>,
+    nt_store: bool,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = (a_col, b_col);
+        aarch64::shift_reduce_inner_ab_fused_neon_ranked_verified::<FAST_POLICY>(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            out,
+            check_all_ones,
+            check_single_k0,
+            const_one_mask,
+            bstatic_w,
+            static_b_context,
+            nt_store,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    shift_reduce_inner_ab::<FAST_POLICY>(
+        a_packed,
+        b_packed,
+        inv_table,
+        chunk_byte_base,
+        b_med,
+        out,
+        a_col,
+        b_col,
+        check_all_ones,
+        check_single_k0,
+        const_one_mask,
+        bstatic_w,
+        static_b_context,
+        nt_store,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
