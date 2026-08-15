@@ -75,3 +75,6 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker fable5-s32-stock-1786662240-18063
 // dispersion-resample marker fable5-s33-stock-1786662839-16995
 // dispersion-resample marker fable5-s34-stock-1786663417-1627
+// dispersion-resample marker angel-0815-s35-1786715100-0001
+// dispersion-resample marker angel-0815-s36-1786715200-0002
+// dispersion-resample marker angel-0815-s37-1786777029-0003
