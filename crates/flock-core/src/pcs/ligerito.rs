@@ -5897,17 +5897,22 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
 /// side effect while building `b_initial` — passing them in here lets
 /// `SumcheckProver::new` skip the redundant 256 MB read pass over (f, b1).
 #[allow(clippy::too_many_arguments)]
-pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
+pub fn recursive_prover_with_basis_precomputed_round0<Ch, CW, TR>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     b_initial: Vec<F128>,
     target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
+    l0_codeword: CW,
+    l0_tree: TR,
     round0_uv: (F128, F128),
     round1_lookahead: Option<[F128; 6]>,
     challenger: &mut Ch,
-) -> LigeritoProof {
+) -> LigeritoProof
+where
+    Ch: Challenger,
+    CW: core::ops::Deref<Target = [F128]>,
+    TR: core::ops::Deref<Target = [Hash]>,
+{
     recursive_prover_with_basis_impl(
         config,
         packed_witness,
@@ -5934,18 +5939,23 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
 /// that stays on the incumbent materialized path (currently C); `direct`
 /// contains only the AB sufficient statistics.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
+pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch, CW, TR>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     direct: Vec<super::ring_switch::DirectFold2Factors>,
     target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
+    l0_codeword: CW,
+    l0_tree: TR,
     round0_uv: (F128, F128),
     round1_lookahead: [F128; 6],
     challenger: &mut Ch,
-) -> LigeritoProof {
+) -> LigeritoProof
+where
+    Ch: Challenger,
+    CW: core::ops::Deref<Target = [F128]>,
+    TR: core::ops::Deref<Target = [Hash]>,
+{
     recursive_prover_with_basis_impl(
         config,
         packed_witness,
@@ -5973,20 +5983,25 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
 /// entirely from `direct` product matrices; after four sequential FS samples
 /// the state is materialized at N/16 and rejoins the incumbent final fold2.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
+pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch, CW, TR>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     direct: Vec<super::ring_switch::DirectFold4Factors>,
     target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
+    l0_codeword: CW,
+    l0_tree: TR,
     round0_uv: (F128, F128),
     round1_lookahead: [F128; 6],
     round2_lookahead: super::Fold4Lookahead2,
     round3_lookahead: super::Fold4Lookahead3,
     challenger: &mut Ch,
-) -> LigeritoProof {
+) -> LigeritoProof
+where
+    Ch: Challenger,
+    CW: core::ops::Deref<Target = [F128]>,
+    TR: core::ops::Deref<Target = [Hash]>,
+{
     assert_eq!(
         config.initial_k, 6,
         "direct-fold4 scaffold requires initial_k=6"
@@ -6019,17 +6034,22 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
 /// resumes — the fold2 pair of the fold4 route never runs (the 2^21 and
 /// 2^20 states never exist).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
+pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch, CW, TR>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     direct: Vec<super::ring_switch::DirectFold8Factors>,
     target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
+    l0_codeword: CW,
+    l0_tree: TR,
     round0_uv: (F128, F128),
     challenger: &mut Ch,
-) -> LigeritoProof {
+) -> LigeritoProof
+where
+    Ch: Challenger,
+    CW: core::ops::Deref<Target = [F128]>,
+    TR: core::ops::Deref<Target = [Hash]>,
+{
     assert_eq!(
         config.initial_k, 6,
         "direct-fold8 scaffold requires initial_k=6"
@@ -6056,14 +6076,44 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
         challenger,
     )
 }
+/// Exact-`1` control restoring incumbent L0 residency: the ~1 GiB GPU
+/// staging / CPU codeword and the tree view stay live until the recursive
+/// prover returns. Default drops them after the L0 row gather + multi-proof.
+pub const ENV_NO_L0_EARLY_RELEASE: &str = "FLOCK_NO_L0_EARLY_RELEASE";
+
+fn l0_early_release_enabled() -> bool {
+    l0_early_release_enabled_for(std::env::var_os(ENV_NO_L0_EARLY_RELEASE).as_deref())
+}
+
+#[cfg(test)]
+mod l0_early_release_gate_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_is_the_only_hold_value() {
+        assert_eq!(
+            super::ENV_NO_L0_EARLY_RELEASE,
+            "FLOCK_NO_L0_EARLY_RELEASE"
+        );
+        assert!(!super::l0_early_release_enabled_for(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::l0_early_release_enabled_for(value.map(OsStr::new)));
+        }
+    }
+}
+
+fn l0_early_release_enabled_for(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
 #[allow(clippy::too_many_arguments)]
-fn recursive_prover_with_basis_impl<Ch: Challenger>(
+fn recursive_prover_with_basis_impl<Ch, CW, TR>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     b_initial: Vec<F128>,
     target: F128,
-    l0_codeword: &[F128],
-    l0_tree: &[Hash],
+    l0_codeword: CW,
+    l0_tree: TR,
     first_msg: Option<SumcheckMessage>,
     round1_lookahead: Option<[F128; 6]>,
     round2_lookahead: Option<super::Fold4Lookahead2>,
@@ -6074,7 +6124,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     direct_fold4: Option<Vec<super::ring_switch::DirectFold4Factors>>,
     direct_fold8: Option<Vec<super::ring_switch::DirectFold8Factors>>,
     challenger: &mut Ch,
-) -> LigeritoProof {
+) -> LigeritoProof
+where
+    Ch: Challenger,
+    CW: core::ops::Deref<Target = [F128]>,
+    TR: core::ops::Deref<Target = [Hash]>,
+{
     let log_n = packed_witness.len().trailing_zeros() as usize;
     let r = config.recursive_steps;
     let initial_k = config.initial_k;
@@ -6109,8 +6164,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let log_msg_cols_0 = log_n - initial_k;
     let block_len_0 = 1usize << (log_msg_cols_0 + log_inv_rate_0);
     let num_interleaved_0 = 1usize << initial_k;
-    assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
-    assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
+    let l0_codeword_slice: &[F128] = &l0_codeword;
+    let l0_tree_slice: &[Hash] = &l0_tree;
+    assert_eq!(l0_codeword_slice.len(), block_len_0 * num_interleaved_0);
+    assert_eq!(l0_tree_slice.len(), 2 * block_len_0 - 1);
 
     let trace =
         std::env::var("LIG_PROVE_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
@@ -6127,15 +6184,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     challenger.observe_label(b"flock-ligerito-basis-v0");
     challenger.observe_f128(target);
 
-    // L0 codeword + tree are borrowed (reused from upstream `pcs::commit`).
+    // L0 codeword + tree are reused from upstream `pcs::commit`.
     // wtns_0 access reduces to: root (last tree node), row(q), block_len.
-    let initial_root: Hash = l0_tree[l0_tree.len() - 1];
+    let initial_root: Hash = l0_tree_slice[l0_tree_slice.len() - 1];
     let l0_block_len = block_len_0;
     let l0_num_interleaved = num_interleaved_0;
-    let l0_row = |q: usize| -> &[F128] {
-        let start = q * l0_num_interleaved;
-        &l0_codeword[start..start + l0_num_interleaved]
-    };
     challenger.observe_bytes(&initial_root);
 
     // L0 takes no explicit OOD samples: it is bound by the opening's own
@@ -6507,11 +6560,28 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         use rayon::prelude::*;
         // Indexed parallel collect is order-preserving: bit-identical to
         // the serial map; each row copy is independent of the challenger.
-        queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect()
+        queries_0
+            .par_iter()
+            .map(|&q| {
+                let start = q * l0_num_interleaved;
+                l0_codeword_slice[start..start + l0_num_interleaved].to_vec()
+            })
+            .collect()
     };
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+    let merkle_proof_0 = merkle_multi_proof_for(l0_tree_slice, l0_block_len, &queries_0);
     if trace {
         t_opens += _t.elapsed();
+    }
+    // Last L0 reads are above. Drop the owned GPU staging (~1 GiB unified
+    // memory) and tree view before induce + recursive commits so they do
+    // not stack under L1's 32 MiB matrix. Slice borrows end here.
+    // A/B-CONTROL: FLOCK_NO_L0_EARLY_RELEASE=1 (exact '1') holds the
+    // buffers until this function returns (incumbent residency).
+    let _ = l0_codeword_slice;
+    let _ = l0_tree_slice;
+    if l0_early_release_enabled() {
+        drop(l0_codeword);
+        drop(l0_tree);
     }
     // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
     // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
