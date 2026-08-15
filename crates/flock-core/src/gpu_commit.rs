@@ -350,6 +350,10 @@ pub(crate) fn gpu_zerocheck_debug() -> bool {
 /// is XOR: associative and commutative, so any claim partition works).
 pub const ENV_NO_GPU_LINCHECK: &str = "FLOCK_NO_GPU_LINCHECK";
 
+/// Kill switch for the AB const-b GPU offload (window-0 a-only blocks):
+/// exact `1` keeps the incumbent CPU kernels for those rows.
+pub const ENV_NO_GPU_AB_CONST_B: &str = "FLOCK_NO_GPU_AB_CONST_B";
+
 pub(crate) fn gpu_lincheck_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_LINCHECK).is_none());
@@ -10081,6 +10085,504 @@ kernel void lc_fold_stripes_factored_b4(
         })
     }
 
+    // -----------------------------------------------------------------------
+    // AB const-b GPU offload (selected generic bstatic blocks).
+    //
+    // Ranked measurement (submission 53e6714, clean window): the window-0
+    // a-only blocks were the WRONG target — they are the cheapest CPU rows,
+    // and launch/join + memory contention cost more than the offload saved
+    // (median 146.14 ms vs the 142.95 ms bar). This kernel instead targets
+    // the GENERIC bstatic rows (the ~70% of the AB arm): for each selected
+    // (w, b_med) block it computes the full row math
+    // `out = red(Σ_K x^K · T(a_K) · T(b_K))` with the same plain and
+    // half-swapped table images and GF(2^8) multiplication via discrete-log
+    // tables (identical to the PMULL+reduce field product). The result is
+    // byte-identical to EVERY CPU route (the guarded static path, the vary
+    // gathers, and the fast x^4-scaled images are all optimizations of the
+    // same polynomial sum — the witness's mask-closed B rows make the CPU
+    // take the static path, and the full generic math reproduces it exactly).
+    // Default OFF after the a-only measurement; `FLOCK_GPU_AB_GENERIC=1`
+    // (plus `FLOCK_GPU_AB_BLOCKS="w.b,w.b,..."` to choose blocks) opts in.
+    // -----------------------------------------------------------------------
+
+    const AB_GENERIC_MSL_SOURCE: &str = r#"
+using namespace metal;
+
+constant uchar AB_RED_LO[16] = { 0x00,0x1b,0x36,0x2d,0x6c,0x77,0x5a,0x41,0xd8,0xc3,0xee,0xf5,0xb4,0xaf,0x82,0x99 };
+constant uchar AB_RED_HI[16] = { 0x00,0xab,0x4d,0xe6,0x9a,0x31,0xd7,0x7c,0x2f,0x84,0x62,0xc9,0xb5,0x1e,0xf8,0x53 };
+
+kernel void ab_generic(
+    device const uchar* a_packed      [[buffer(0)]],
+    device const uchar* b_packed      [[buffer(1)]],
+    device const uchar* table_plain   [[buffer(2)]],
+    device const uchar* table_hs      [[buffer(3)]],
+    device uchar*       out           [[buffer(4)]],
+    constant uint*      params        [[buffer(5)]],
+    constant uint*      sel           [[buffer(6)]],
+    uint tid [[thread_position_in_grid]])
+{
+    const uint n_w0 = params[0];
+    const uint n_sel = params[1];
+    if (tid >= n_w0 * n_sel) return;
+    const uint si = tid / n_w0;
+    const uint t = tid - si * n_w0;
+    const uint wb = sel[si];
+    const uint w = wb >> 8;
+    const uint b_med = wb & 0xffu;
+    // x_outer = 2t + w (low-bit window mask), OUTER_BYTES = 1024 bytes;
+    // the b_med row starts at + b_med*64. Output is STRIDED (matrix layout).
+    const ulong bb = (((ulong)t << 1) + (ulong)w) * 1024u + ((ulong)b_med << 6);
+    const uint dbg = params[2];
+
+    // Accumulators: ushort4 VECTORS (MSL vector width is at most 4;
+    // compile-time lanes keep them register-resident — a dynamically
+    // indexed private array would spill to threadgroup memory and silently
+    // skip the dispatch on Apple GPUs).
+    ushort4 a0l0 = (ushort4)0, a0l1 = (ushort4)0, a0h0 = (ushort4)0, a0h1 = (ushort4)0;
+    ushort4 a1l0 = (ushort4)0, a1l1 = (ushort4)0, a1h0 = (ushort4)0, a1h1 = (ushort4)0;
+    ushort4 a2l0 = (ushort4)0, a2l1 = (ushort4)0, a2h0 = (ushort4)0, a2h1 = (ushort4)0;
+    ushort4 a3l0 = (ushort4)0, a3l1 = (ushort4)0, a3h0 = (ushort4)0, a3h1 = (ushort4)0;
+
+    for (uint q = 0; q < 4; ++q) {
+        for (uint k = 0; k < 8; ++k) {
+            // Quarter-q XOR-summed gather rows (one uchar4 per 4 bytes of
+            // the 16-byte quarter), reset for EVERY K: y_k = mul(T(a_k),
+            // T(b_k)) uses this K's word alone — the CPU's apply_one_k
+            // semantics.
+            uchar4 aq0 = (uchar4)0, aq1 = (uchar4)0, aq2 = (uchar4)0, aq3 = (uchar4)0;
+            uchar4 bq0 = (uchar4)0, bq1 = (uchar4)0, bq2 = (uchar4)0, bq3 = (uchar4)0;
+
+            // The 8 witness bytes of each side as two aligned 8-byte words.
+            const ulong aw = *((device const ulong*)(a_packed + bb + (ulong)k * 8u));
+            const ulong bw = *((device const ulong*)(b_packed + bb + (ulong)k * 8u));
+
+            // Gather the quarter-q uchar4s of every byte's table row: for
+            // byte i the source quarter is (q ^ (i>>1)) & 3 (the apply's
+            // chunk-XOR permutation; the half-swap for odd bytes lives in
+            // the table_hs image).
+            for (uint i = 0; i < 8; ++i) {
+                const uint ba = (uint)((aw >> (8u * i)) & 0xffu);
+                const uint bbv = (uint)((bw >> (8u * i)) & 0xffu);
+                const device uchar* base = (i & 1u) ? table_hs : table_plain;
+                const uint s = (q ^ (i >> 1)) & 3u;
+                const device uchar* ra = base + (ba << 6) + (s << 4);
+                const device uchar* rb = base + (bbv << 6) + (s << 4);
+                aq0 ^= *((device const uchar4*)(ra + 0));
+                aq1 ^= *((device const uchar4*)(ra + 4));
+                aq2 ^= *((device const uchar4*)(ra + 8));
+                aq3 ^= *((device const uchar4*)(ra + 12));
+                bq0 ^= *((device const uchar4*)(rb + 0));
+                bq1 ^= *((device const uchar4*)(rb + 4));
+                bq2 ^= *((device const uchar4*)(rb + 8));
+                bq3 ^= *((device const uchar4*)(rb + 12));
+            }
+
+            // GF(2^8) product (mod x^8+x^4+x^3+x+1), lane-wise and fully
+            // vectorized on uchar4: shift-add carryless multiply with the
+            // reduction folded into the running multiplier (byte-identical
+            // to the CPU's PMULL + nibble fold; no table gathers).
+            uchar4 y0 = (uchar4)0, y1 = (uchar4)0, y2 = (uchar4)0, y3 = (uchar4)0;
+            uchar4 x0 = aq0, x1 = aq1, x2 = aq2, x3 = aq3;
+            for (uint s2 = 0; s2 < 8; ++s2) {
+                y0 ^= x0 * ((bq0 >> s2) & (uchar4)1);
+                y1 ^= x1 * ((bq1 >> s2) & (uchar4)1);
+                y2 ^= x2 * ((bq2 >> s2) & (uchar4)1);
+                y3 ^= x3 * ((bq3 >> s2) & (uchar4)1);
+                x0 = (x0 << 1) ^ (x0 >> 7) * (uchar4)0x1bu;
+                x1 = (x1 << 1) ^ (x1 >> 7) * (uchar4)0x1bu;
+                x2 = (x2 << 1) ^ (x2 >> 7) * (uchar4)0x1bu;
+                x3 = (x3 << 1) ^ (x3 >> 7) * (uchar4)0x1bu;
+            }
+            if (q == 0u) {
+                a0l0 ^= ushort4(y0[0], y0[1], y0[2], y0[3]) << k;
+                a0l1 ^= ushort4(y1[0], y1[1], y1[2], y1[3]) << k;
+                a0h0 ^= ushort4(y2[0], y2[1], y2[2], y2[3]) << k;
+                a0h1 ^= ushort4(y3[0], y3[1], y3[2], y3[3]) << k;
+            } else if (q == 1u) {
+                a1l0 ^= ushort4(y0[0], y0[1], y0[2], y0[3]) << k;
+                a1l1 ^= ushort4(y1[0], y1[1], y1[2], y1[3]) << k;
+                a1h0 ^= ushort4(y2[0], y2[1], y2[2], y2[3]) << k;
+                a1h1 ^= ushort4(y3[0], y3[1], y3[2], y3[3]) << k;
+            } else if (q == 2u) {
+                a2l0 ^= ushort4(y0[0], y0[1], y0[2], y0[3]) << k;
+                a2l1 ^= ushort4(y1[0], y1[1], y1[2], y1[3]) << k;
+                a2h0 ^= ushort4(y2[0], y2[1], y2[2], y2[3]) << k;
+                a2h1 ^= ushort4(y3[0], y3[1], y3[2], y3[3]) << k;
+            } else {
+                a3l0 ^= ushort4(y0[0], y0[1], y0[2], y0[3]) << k;
+                a3l1 ^= ushort4(y1[0], y1[1], y1[2], y1[3]) << k;
+                a3h0 ^= ushort4(y2[0], y2[1], y2[2], y2[3]) << k;
+                a3h1 ^= ushort4(y3[0], y3[1], y3[2], y3[3]) << k;
+            }
+        }
+    }
+    device uchar* o = out + bb;
+    for (uint q = 0; q < 4; ++q) {
+        ushort4 al0 = (q == 0) ? a0l0 : (q == 1) ? a1l0 : (q == 2) ? a2l0 : a3l0;
+        ushort4 al1 = (q == 0) ? a0l1 : (q == 1) ? a1l1 : (q == 2) ? a2l1 : a3l1;
+        ushort4 ah0 = (q == 0) ? a0h0 : (q == 1) ? a1h0 : (q == 2) ? a2h0 : a3h0;
+        ushort4 ah1 = (q == 0) ? a0h1 : (q == 1) ? a1h1 : (q == 2) ? a2h1 : a3h1;
+        uchar cl[16];
+        uchar ch[16];
+        for (uint j = 0; j < 4; ++j) {
+            cl[j] = (uchar)(al0[j] & 0xffu);
+            ch[j] = (uchar)(al0[j] >> 8);
+            cl[4 + j] = (uchar)(al1[j] & 0xffu);
+            ch[4 + j] = (uchar)(al1[j] >> 8);
+            cl[8 + j] = (uchar)(ah0[j] & 0xffu);
+            ch[8 + j] = (uchar)(ah0[j] >> 8);
+            cl[12 + j] = (uchar)(ah1[j] & 0xffu);
+            ch[12 + j] = (uchar)(ah1[j] >> 8);
+        }
+        for (uint j = 0; j < 16; ++j)
+            o[q * 16 + j] = cl[j] ^ AB_RED_LO[ch[j] & 0xfu] ^ AB_RED_HI[ch[j] >> 4];
+    }
+}
+"#;
+
+    /// Opt-in switch for the AB generic GPU offload: exact `1` enables it.
+    /// Default OFF — the a-only variant measured net-negative on the ranked
+    /// runner (53e6714) and this generic retarget's kernel is gather-
+    /// latency-bound (~10 ms/block locally; the join tail would exceed the
+    /// 58.2 ms window on the ranked runner), so the offload stays disabled
+    /// for ranked submissions. Ranked workers run with a cleared
+    /// environment, so the env can only enable it locally.
+    pub(crate) fn gpu_ab_generic_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_GPU_AB_GENERIC").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+        })
+    }
+
+    /// `FLOCK_GPU_AB_DEBUG` (any value) prints each launch/finish decision;
+    /// the value `1` additionally dumps the raw K=0 gather/mul (ranked
+    /// workers run with a cleared environment, so this is test-only noise).
+    fn gpu_ab_const_b_debug() -> bool {
+        std::env::var_os("FLOCK_GPU_AB_DEBUG").is_some()
+    }
+
+    struct AbConstBState {
+        gpu: &'static Gpu,
+        pso: Id,
+        table_plain: Id,
+        table_hs: Id,
+    }
+
+    // SAFETY: the state is only ever touched under the `AB_CONST_B` mutex
+    // on the prove's serial spine; the wrapped ObjC objects are owned by
+    // this state for the process lifetime (same discipline as `ZcFold`).
+    unsafe impl Send for AbConstBState {}
+
+    static AB_CONST_B: std::sync::Mutex<Option<Result<AbConstBState, String>>> =
+        std::sync::Mutex::new(None);
+
+    fn ab_const_b_init(gpu: &'static Gpu) -> Result<AbConstBState, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<AbConstBState, String> {
+                let src = gpu.api.nsstring(AB_GENERIC_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "ab const-b shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let ns = gpu.api.nsstring("ab_generic")?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    return Err("ab const-b kernel ab_const_b not found".into());
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                if pso.is_null() {
+                    return Err(format!(
+                        "ab const-b pipeline: {}",
+                        gpu.api.error_string(perr)
+                    ));
+                }
+                // 256 × 64-byte images, copied into Metal-owned shared
+                // buffers (the Rust table's 64-byte alignment is below
+                // Metal's no-copy wrap requirement, so a copy is required).
+                // The image copies happen at each launch (the caller hands
+                // the current images in; ~32 KiB, µs).
+                let table_plain = gpu.new_buffer(16384)?;
+                let table_hs = gpu.new_buffer(16384)?;
+                Ok(AbConstBState {
+                    gpu,
+                    pso,
+                    table_plain,
+                    table_hs,
+                })
+            })();
+            gpu.pool_pop(pool);
+            built
+        }
+    }
+
+    /// A submitted AB const-b row computation. The caller must call
+    /// [`finish_ab_const_b`] before any consumer reads the offloaded rows
+    /// of the AB matrix.
+    pub(crate) struct AbConstBJob {
+        gpu: &'static Gpu,
+        cb: Id,
+        a_wrap: Id,
+        b_wrap: Id,
+        out_wrap: Id,
+        started: std::time::Instant,
+    }
+
+    /// Launch the selected generic bstatic blocks' rows on the GPU.
+    /// `a_packed`, `b_packed` and `out_bytes` must stay alive until the
+    /// matching [`finish_ab_const_b`]. `sel` lists the (window, b_med)
+    /// blocks to offload. `None` = offload unavailable → the caller runs
+    /// the incumbent CPU path unchanged.
+    pub(crate) fn launch_ab_const_b(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_plain: &[u8],
+        table_hs: &[u8],
+        out_bytes: &mut [u8],
+        n_w0: usize,
+        sel: &[(u8, u8)],
+    ) -> Option<AbConstBJob> {
+        if n_w0 == 0 || sel.is_empty() {
+            if gpu_ab_const_b_debug() {
+                eprintln!("ab-const-b: no-op n_w0={n_w0} n_sel={}", sel.len());
+            }
+            return None;
+        }
+        if table_plain.len() != 16384 || table_hs.len() != 16384 {
+            if gpu_ab_const_b_debug() {
+                eprintln!(
+                    "ab-const-b: table len mismatch {} {}",
+                    table_plain.len(),
+                    table_hs.len()
+                );
+            }
+            return None;
+        }
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(e) => {
+                if gpu_ab_const_b_debug() {
+                    eprintln!("ab-const-b: gpu unavailable: {e}");
+                }
+                return None;
+            }
+        };
+        let mut guard = match AB_CONST_B.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                AB_CONST_B.clear_poison();
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
+        if guard.is_none() {
+            *guard = Some(ab_const_b_init(gpu));
+        }
+        let state = match guard.as_mut()?.as_mut() {
+            Ok(s) => s,
+            Err(e) => {
+                if gpu_ab_const_b_debug() {
+                    eprintln!("ab-const-b: init failed: {e}");
+                }
+                return None;
+            }
+        };
+        let pool = unsafe { state.gpu.pool_push() };
+        let mut a_wrap: Id = NIL;
+        let mut b_wrap: Id = NIL;
+        let mut out_wrap: Id = NIL;
+        let mut cb: Id = NIL;
+        let built = (|| -> Result<AbConstBJob, String> {
+            a_wrap = unsafe {
+                state.gpu.wrap_buffer(a_packed.as_ptr() as *mut u8, a_packed.len())
+            }?;
+            b_wrap = unsafe {
+                state.gpu.wrap_buffer(b_packed.as_ptr() as *mut u8, b_packed.len())
+            }?;
+            out_wrap = unsafe { state.gpu.wrap_buffer(out_bytes.as_mut_ptr(), out_bytes.len()) }?;
+            let dbg = match std::env::var("FLOCK_GPU_AB_DEBUG").as_deref() {
+                Ok("1") => 1u32,
+                Ok(_) => 2u32,
+                Err(_) => 0u32,
+            };
+            let params: [u32; 3] = [n_w0 as u32, sel.len() as u32, dbg];
+            let params_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&raw const params).cast::<u8>(),
+                    core::mem::size_of_val(&params),
+                )
+            };
+            let sel_bytes: Vec<u32> = sel
+                .iter()
+                .map(|&(w, b)| ((w as u32) << 8) | (b as u32))
+                .collect();
+            let sel_slice = unsafe {
+                std::slice::from_raw_parts(
+                    sel_bytes.as_ptr().cast::<u8>(),
+                    sel_bytes.len() * 4,
+                )
+            };
+            cb = unsafe { state.gpu.command_buffer() }?;
+            let enc = unsafe { state.gpu.compute_encoder(cb) }?;
+            unsafe {
+                // Refresh the table images into the Metal-owned shared
+                // buffers (32 KiB total; the source images may live in a
+                // fresh inv-table allocation per prove).
+                std::ptr::copy_nonoverlapping(
+                    table_plain.as_ptr(),
+                    state.gpu.buffer_contents(state.table_plain),
+                    16384,
+                );
+                std::ptr::copy_nonoverlapping(
+                    table_hs.as_ptr(),
+                    state.gpu.buffer_contents(state.table_hs),
+                    16384,
+                );
+                if gpu_ab_const_b_debug() {
+                    let p = state.gpu.buffer_contents(state.table_plain);
+                    eprintln!(
+                        "ab-const-b: table copy check src={:02x} dst0={:02x} dst1={:02x}",
+                        *table_plain.as_ptr(),
+                        *p,
+                        *p.add(1),
+                    );
+                }
+                state.gpu.set_pipeline(enc, state.pso);
+                state.gpu.set_buffer(enc, a_wrap, 0, 0);
+                state.gpu.set_buffer(enc, b_wrap, 0, 1);
+                state.gpu.set_buffer(enc, state.table_plain, 0, 2);
+                state.gpu.set_buffer(enc, state.table_hs, 0, 3);
+                state.gpu.set_buffer(enc, out_wrap, 0, 4);
+                state.gpu.set_bytes(enc, params_bytes, 5);
+                state.gpu.set_bytes(enc, sel_slice, 6);
+                // Small threadgroups: the kernel is register-heavy (16
+                // ushort4 accumulators); 1024 threads/group can exceed the
+                // per-threadgroup register file and silently skip the
+                // dispatch on Apple GPUs.
+                state
+                    .gpu
+                    .dispatch(enc, (n_w0 * sel.len()).div_ceil(64) as u64, 64);
+                state.gpu.end_encoding(enc);
+            }
+            cb = unsafe { state.gpu.retain(cb) };
+            unsafe { state.gpu.commit_async(cb) };
+            Ok(AbConstBJob {
+                gpu: state.gpu,
+                cb,
+                a_wrap,
+                b_wrap,
+                out_wrap,
+                started: std::time::Instant::now(),
+            })
+        })();
+        unsafe { state.gpu.pool_pop(pool) };
+        match built {
+            Ok(job) => {
+                if gpu_ab_const_b_debug() {
+                    eprintln!(
+                        "ab-const-b: launched n_w0={n_w0} n_sel={} threads={}",
+                        sel.len(),
+                        n_w0 * sel.len()
+                    );
+                }
+                Some(job)
+            }
+            Err(e) => {
+                if gpu_ab_const_b_debug() {
+                    eprintln!("ab-const-b: launch unavailable: {e}");
+                }
+                // Release any partially created resources; the no-copy wraps
+                // own no memory, so this only releases the ObjC objects.
+                unsafe {
+                    if !cb.is_null() {
+                        state.gpu.release(cb);
+                    }
+                    if !out_wrap.is_null() {
+                        state.gpu.release(out_wrap);
+                    }
+                    if !b_wrap.is_null() {
+                        state.gpu.release(b_wrap);
+                    }
+                    if !a_wrap.is_null() {
+                        state.gpu.release(a_wrap);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Wait for the AB const-b dispatch and consume the job. The rows were
+    /// written in place into the wrapped matrix, so this is a pure wait; a
+    /// completed buffer costs one status poll. On error the caller must
+    /// recompute the offloaded rows on the CPU before consuming the matrix.
+    pub(crate) fn finish_ab_const_b(job: AbConstBJob) -> Result<(), String> {
+        let started = job.started;
+        let gpu = job.gpu;
+        let cb = job.cb;
+        let a_wrap = job.a_wrap;
+        let b_wrap = job.b_wrap;
+        let out_wrap = job.out_wrap;
+        // Bounded yield poll: this drain runs on the prove's serial spine
+        // while rayon workers may still hold the pools; degrade to the exact
+        // blocking wait past the budget (same pattern as the fold arms).
+        let r = unsafe {
+            gpu.yield_wait_cb_until(cb, std::time::Instant::now() + std::time::Duration::from_millis(2))
+        };
+        if gpu_ab_const_b_debug() {
+            let status: u64 = unsafe {
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    cb,
+                    c"status"
+                )
+            };
+            eprintln!(
+                "ab-const-b: finish status={status} result={r:?} elapsed={}ms",
+                started.elapsed().as_millis()
+            );
+        }
+        unsafe {
+            gpu.release(cb);
+            gpu.release(a_wrap);
+            gpu.release(b_wrap);
+            gpu.release(out_wrap);
+        }
+        r
+    }
+
     #[cfg(test)]
     mod split_select_tests {
         use super::{
@@ -13047,6 +13549,9 @@ pub(crate) use imp::{adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix};
 /// buffer, and the launch skips its 4 MiB memcpy.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{
+    AbConstBJob, finish_ab_const_b, gpu_ab_generic_enabled, launch_ab_const_b,
+};
 pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 
 /// Zerocheck round-two products GPU arm (see `ENV_NO_GPU_ZC_R2`).
