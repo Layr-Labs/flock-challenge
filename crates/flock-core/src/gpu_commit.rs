@@ -505,140 +505,6 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
     *ON
 }
 
-/// Kill switch for the L1 recursive-commit NTT/Merkle-leaf overlap
-/// (`FLOCK_NO_L1_MERKLE_OVERLAP=1`): instead of hashing each finalized NTT
-/// chunk's 128-byte leaves on the GPU while the CPU transform is still
-/// producing the remaining chunks, the commit runs the incumbent strictly
-/// serial NTT-then-whole-tree path. Leaf outputs are disjoint tree ranges of
-/// the same `leaf_hash128` kernel over the same wrapped matrix — bit-identical
-/// bytes either way; the switch (and any begin/submit/drain failure) only
-/// changes when the GPU work is issued.
-pub const ENV_NO_L1_MERKLE_OVERLAP: &str = "FLOCK_NO_L1_MERKLE_OVERLAP";
-
-pub(crate) fn gpu_l1_merkle_overlap_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_L1_MERKLE_OVERLAP).is_none());
-    *ON
-}
-
-/// Admission latch for the L1 overlap: the first eligible L1 commit in the
-/// process (the warmup prove — the L1 shape is FS-serial, so there is exactly
-/// one first) dual-runs overlapped-then-incumbent, byte-compares the trees,
-/// and latches the faster arm (the same warmup A/B-race pattern as the ranked
-/// commit's cpu-vs-gpu latch, chosen over a ratio gate because the fused3
-/// transform fully rewrites the codeword from the message, making the exact
-/// dual-run free of merge math). A byte mismatch or any incumbent-GPU absence
-/// poisons the latch Off for the process: every later prove runs the exact
-/// incumbent path.
-const L1_OVERLAP_UNMEASURED: u8 = 0;
-const L1_OVERLAP_ON: u8 = 1;
-const L1_OVERLAP_OFF: u8 = 2;
-static L1_OVERLAP_LATCH: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(L1_OVERLAP_UNMEASURED);
-
-/// Latch margin for the warmup race. The race necessarily runs the arms
-/// back-to-back on a hot GPU/SLC — a regime that can only SHRINK the
-/// incumbent's GPU-bound merkle segment relative to the timed prove (its
-/// in-race whole-tree pass measures ~0.65 ms against a steady 1.40–1.45 ms
-/// across every timed sample on the reference machine), while the overlapped
-/// arm's wall is NTT-bound and barely benefits. A one-sided 10% allowance
-/// (~0.3 ms here, well under the ~0.7 ms measured bias) compensates that
-/// distortion; an overlap slower than the incumbent by MORE than the
-/// allowance even in this incumbent-flattering regime latches Off.
-const L1_OVERLAP_LATCH_MARGIN: f64 = 1.10;
-
-pub(crate) fn l1_overlap_latch_state() -> u8 {
-    L1_OVERLAP_LATCH.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Publish the warmup race outcome. `equal` is `None` when either arm failed
-/// to produce a GPU tree (no oracle possible — latch Off).
-pub(crate) fn l1_overlap_report(overlap_wall_ms: f64, incumbent_wall_ms: f64, equal: Option<bool>) {
-    let decision = match equal {
-        Some(true) if overlap_wall_ms <= incumbent_wall_ms * L1_OVERLAP_LATCH_MARGIN => {
-            L1_OVERLAP_ON
-        }
-        Some(true) => L1_OVERLAP_OFF,
-        Some(false) => {
-            if gpu_zc_r2_debug() {
-                eprintln!(
-                    "[l1-overlap] MISMATCH: overlapped tree diverges from incumbent — \
-                     poisoned off for the process"
-                );
-            }
-            L1_OVERLAP_OFF
-        }
-        None => L1_OVERLAP_OFF,
-    };
-    L1_OVERLAP_LATCH.store(decision, std::sync::atomic::Ordering::Relaxed);
-    if gpu_zc_r2_debug() {
-        eprintln!(
-            "[l1-overlap] warmup race: overlapped {overlap_wall_ms:.2} ms vs incumbent \
-             {incumbent_wall_ms:.2} ms, trees_equal={equal:?} -> latch {}",
-            match decision {
-                L1_OVERLAP_ON => "ON",
-                _ => "OFF",
-            }
-        );
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn l1_overlap_latch_force(state: u8) {
-    L1_OVERLAP_LATCH.store(state, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// One in-flight L1 overlap session: leaf dispatches are submitted per
-/// finalized NTT chunk while the transform still runs; `finish` drains them,
-/// encodes the internal levels exactly as the incumbent does, and copies the
-/// flat tree out. Any failure at any point returns `None` from `finish` and
-/// the caller runs the incumbent whole-tree path (exact same bytes).
-pub(crate) struct L1MerkleOverlap {
-    inner: imp::L1MerkleOverlapSession,
-    measuring: bool,
-}
-
-/// Open an overlap session for one eligible L1 commit, or `None` whenever the
-/// arm must stay on the incumbent path (kill switches, latch Off, non-L1
-/// shape, Metal init/wrap failure). All init and wrap-cache costs are paid
-/// here, before the caller starts its race clocks.
-pub(crate) fn gpu_l1_merkle_overlap_begin(
-    data_ptr: *const u8,
-    data_len: usize,
-    num_leaves: usize,
-) -> Option<L1MerkleOverlap> {
-    if !gpu_l1_merkle_overlap_enabled() || !gpu_recursive_merkle_enabled() {
-        return None;
-    }
-    let latch = l1_overlap_latch_state();
-    if latch == L1_OVERLAP_OFF {
-        return None;
-    }
-    imp::l1_merkle_overlap_begin(data_ptr, data_len, num_leaves).map(|inner| L1MerkleOverlap {
-        inner,
-        measuring: latch == L1_OVERLAP_UNMEASURED,
-    })
-}
-
-impl L1MerkleOverlap {
-    /// Whether this session is the process's warmup race (latch unmeasured).
-    pub(crate) fn measuring(&self) -> bool {
-        self.measuring
-    }
-
-    /// NTT `finish_chunk` callback target: submit the chunk's leaf range.
-    /// Safe to call concurrently from the transform's workers (both pools).
-    pub(crate) fn chunk_ready(&self, offset_elems: usize, len_elems: usize) {
-        self.inner.chunk_ready(offset_elems, len_elems);
-    }
-
-    /// Drain the leaf command buffers, run the internal levels, copy the
-    /// flat tree out. `None` on any failure (caller runs the incumbent).
-    pub(crate) fn finish(self) -> Option<Vec<crate::merkle::Hash>> {
-        self.inner.finish()
-    }
-}
-
 /// Kill switch for the zerocheck C-fold-window GPU idle fill
 /// (`FLOCK_NO_ZC_IDLE_FILL=1`, exact): the ranked ZC byte-B4 fold drains in
 /// ~5.5 ms under a ~9.7 ms CPU AB head, leaving ~4 ms of GPU idle inside the
@@ -6350,15 +6216,15 @@ kernel void blake3_pow_scan(
         Some(chosen)
     }
 
-    /// Candidate set inside the historical flat basin [0..5]. Trimmed from
-    /// the older [0,2,3,4,5,6,7,8] after the broad-set justification (one
-    /// calibration process publishing through the warmup cache) died on the
-    /// ranked runner. With F2 graph-arm scoring the mid-basin point k=2 is
-    /// informative again — it was invisible when join-max scoring collapsed
-    /// AB-dominated samples — so it re-enters between pure-GPU and k=3.
-    /// Four candidates × 2 reverse-order samples is still well inside the
-    /// 10-minute job wall at ~120 workers.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 4] = [0, 2, 3, 5];
+    /// Candidate set inside the historical flat basin [0..5]. k=2 already
+    /// re-entered after F2 graph-arm scoring made mid-basin points visible
+    /// again. k=1 is the remaining hole between pure-GPU and k=2 — one
+    /// sixteenth of the position range on CPU, the smallest non-zero hybrid
+    /// share. Do not pin k=0 (H1 lost −22.5%). Five candidates × 2
+    /// reverse-order samples is still well inside the 10-minute job wall.
+    /// `FLOCK_HYBRID_CPU_BLOCKS` / `FLOCK_NO_HYBRID_AUTOTUNE` pin or keep
+    /// `DEFAULT_HYBRID_K=5`.
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 5] = [0, 1, 2, 3, 5];
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
@@ -9525,10 +9391,14 @@ kernel void lc_fold_stripes_factored_b4(
     /// measured under transient load — uncapped, an optimistic ratio makes
     /// that GPU kernel the timed straggler, which costs wall directly
     /// (measured balance basin on the ranked shape: 39–40 of 64 claims).
-    /// The supplemental factored B4 PSO has a separately measured basin at
-    /// 48 claims and therefore uses a `3n/4` cap, but only when that PSO was
-    /// actually selected. Exact rollback or supplemental init failure selects
-    /// the incumbent PSO and its unchanged `5n/8` cap.
+    /// The supplemental factored B4 PSO is faster per claim than incumbent
+    /// B4, so its overshoot guard sits at `7n/8` = 56 of 64 claims (was
+    /// `3n/4` = 48). Lincheck's fold window has no AB head, so this is not
+    /// an H1-style full-GPU pin — the formula still chooses less than the
+    /// cap when the measured ratio does not support it, and
+    /// `FLOCK_LINCHECK_GPU_CLAIMS` pins an exact share (including 48) for
+    /// same-binary comparison. Exact rollback or supplemental init failure
+    /// selects the incumbent PSO and its unchanged `5n/8` cap.
     /// `FLOCK_LINCHECK_GPU_LEGACY_SPLIT` selects the previous
     /// `floor(0.9·n/(1+ratio))`-clamped-to-`n/2` policy for same-binary
     /// causal comparison.
@@ -9550,7 +9420,7 @@ kernel void lc_fold_stripes_factored_b4(
         }
         let share = (n_claims as f64 / (1.0 + ratio)).round();
         let cap = if factored_b4 {
-            n_claims * 3 / 4
+            n_claims * 7 / 8
         } else {
             n_claims * 5 / 8
         };
@@ -10221,7 +10091,7 @@ kernel void lc_fold_stripes_factored_b4(
             DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k,
             collect_ranked_exact_samples, mean_ranked_exact_samples,
         };
-        const C: [usize; 4] = [0, 2, 3, 5];
+        const C: [usize; 5] = [0, 1, 2, 3, 5];
 
         #[test]
         fn trimmed_candidate_set_is_stable() {
@@ -10242,13 +10112,13 @@ kernel void lc_fold_stripes_factored_b4(
                 },
             )
             .unwrap();
-            // Forward 0,2,3,5 then reverse 5,3,2,0 — each preceded by reprime.
+            // Forward 0,1,2,3,5 then reverse 5,3,2,1,0 — each preceded by reprime.
             assert_eq!(
                 *events.borrow(),
-                [-1, 0, -1, 2, -1, 3, -1, 5, -1, 5, -1, 3, -1, 2, -1, 0]
+                [-1, 0, -1, 1, -1, 2, -1, 3, -1, 5, -1, 5, -1, 3, -1, 2, -1, 1, -1, 0]
             );
             assert_eq!(samples[0], [0.0, 0.0]);
-            assert_eq!(samples[3], [5.0, 5.0]);
+            assert_eq!(samples[4], [5.0, 5.0]);
         }
 
         #[test]
@@ -10263,20 +10133,21 @@ kernel void lc_fold_stripes_factored_b4(
         #[test]
         fn smallest_share_within_band_wins() {
             // k=2 fastest; default k=5 far off → smallest in band.
-            let ms = [200.0, 100.0, 150.0, 160.0];
+            // C = [0, 1, 2, 3, 5]; k=1 sits outside the 2% band.
+            let ms = [200.0, 180.0, 100.0, 150.0, 160.0];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(2));
         }
 
         #[test]
         fn near_tie_prefers_smaller_share_not_default() {
             // k=3 fastest; default k=5 within 2% band but larger share → k=3.
-            let ms = [200.0, 150.0, 100.0, 101.5];
+            let ms = [200.0, 180.0, 150.0, 100.0, 101.5];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(3));
         }
 
         #[test]
         fn keep_default_band_env_restores_incumbent() {
-            let ms = [200.0, 150.0, 100.0, 101.5];
+            let ms = [200.0, 180.0, 150.0, 100.0, 101.5];
             if std::env::var_os("FLOCK_HYBRID_KEEP_DEFAULT_BAND").is_some() {
                 assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
             } else {
@@ -10287,28 +10158,36 @@ kernel void lc_fold_stripes_factored_b4(
         #[test]
         fn mid_basin_k2_is_reachable() {
             // k=2 decisively fastest → selected under the expanded set.
-            let ms = [200.0, 100.0, 130.0, 140.0];
+            let ms = [200.0, 180.0, 100.0, 130.0, 140.0];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(2));
+        }
+
+        #[test]
+        fn k1_is_reachable() {
+            // k=1 is the new hole between pure-GPU and k=2.
+            let ms = [200.0, 100.0, 150.0, 160.0, 170.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(1));
         }
 
         #[test]
         fn marginal_pure_gpu_is_rejected() {
             // k=0 fastest but beats the default by < 4% → default retained.
-            let ms = [100.0, 130.0, 125.0, 103.0];
+            // default k=5 is index 4 of C.
+            let ms = [100.0, 130.0, 128.0, 125.0, 103.0];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
         }
 
         #[test]
         fn decisive_pure_gpu_wins() {
             // k=0 beats the default by > 4% and nothing else is in band.
-            let ms = [100.0, 130.0, 125.0, 120.0];
+            let ms = [100.0, 130.0, 125.0, 122.0, 120.0];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(0));
         }
 
         #[test]
         fn largest_share_is_reachable() {
             // Largest share wins decisively → the sweep can choose it.
-            let ms = [200.0, 180.0, 170.0, 100.0];
+            let ms = [200.0, 180.0, 170.0, 160.0, 100.0];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
         }
 
@@ -10776,420 +10655,6 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             );
         }
         Some(tree)
-    }
-
-    // -----------------------------------------------------------------------
-    // L1 recursive-commit NTT/Merkle-leaf overlap (see
-    // `ENV_NO_L1_MERKLE_OVERLAP`). The CPU NTT already fires a per-finalized-
-    // chunk callback with a never-touched-again guarantee; each callback
-    // submits a `leaf_hash128` dispatch over that chunk's disjoint leaf range
-    // of the persistent tree buffer, so the leaf pass runs while the
-    // transform is still producing the remaining chunks. `finish` drains the
-    // leaf command buffers, then runs the internal levels and copy-out
-    // exactly as the incumbent whole-tree offload does — same kernels, same
-    // wrapped matrix, same tree buffer, bit-identical bytes.
-    // -----------------------------------------------------------------------
-
-    /// The ids below are copied out of the REC_MERKLE state under its lock in
-    /// `begin` and stay valid for the process: the pipelines/tree/wrap
-    /// objects are never released (even the poison path only overwrites the
-    /// state, leaking the retained Metal objects). The lock is NOT held for
-    /// the session's lifetime — the warmup race interleaves this session with
-    /// the incumbent `gpu_recursive_merkle_blake3` (which takes the same
-    /// lock), and the L1 commit is FS-serial, so the shared tree buffer is
-    /// never written by two paths at once.
-    pub(crate) struct L1MerkleOverlapSession {
-        gpu: &'static Gpu,
-        pso_leaf128: Id,
-        pso_parent: Id,
-        data_buf: Id,
-        tree_buf: Id,
-        num_leaves: usize,
-        started: std::time::Instant,
-        state: Mutex<L1OverlapInner>,
-        failed: std::sync::atomic::AtomicBool,
-    }
-
-    #[derive(Default)]
-    struct L1OverlapInner {
-        /// Ranges accepted but not yet encoded, as `(leaf_start, n_leaves)`.
-        pending: Vec<(usize, usize)>,
-        pending_leaves: usize,
-        /// Every accepted range, for the exact-cover check.
-        ranges: Vec<(usize, usize)>,
-        /// Total leaves accepted so far (cover-completion trigger).
-        covered_leaves: usize,
-        /// Retained, committed leaf command buffers awaiting the drain.
-        cbs: Vec<Id>,
-        batches: usize,
-        /// The internal levels were encoded behind the final leaf batch in
-        /// the same command buffer (the incumbent's own encoder shape — leaf
-        /// dispatches then parent dispatches against the tracked tree
-        /// buffer), so `finish` needs no parent round trip of its own.
-        parents_encoded: bool,
-    }
-
-    /// `true` iff the sorted `ranges` tile `[0, num_leaves)` exactly.
-    fn l1_ranges_cover_exactly(ranges: &mut [(usize, usize)], num_leaves: usize) -> bool {
-        ranges.sort_unstable();
-        let mut next = 0usize;
-        for &(s, n) in ranges.iter() {
-            if s != next {
-                return false;
-            }
-            next = s + n;
-        }
-        next == num_leaves
-    }
-
-    // SAFETY: the captured Metal objects are process-persistent and Metal
-    // command queues/buffers are thread-safe. All session-mutable state is
-    // behind `state`/`failed`; NTT workers reach the session exclusively
-    // through `chunk_ready`.
-    unsafe impl Sync for L1MerkleOverlapSession {}
-
-    pub(crate) fn l1_merkle_overlap_begin(
-        data_ptr: *const u8,
-        data_len: usize,
-        num_leaves: usize,
-    ) -> Option<L1MerkleOverlapSession> {
-        if !REC_MERKLE_SHAPES.contains(&num_leaves) || data_len != num_leaves * 128 {
-            return None;
-        }
-        let gpu = gpu().ok()?;
-        let mut guard = match REC_MERKLE.lock() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                REC_MERKLE.clear_poison();
-                note_poisoned_lock("rec-merkle", true);
-                let mut g = poisoned.into_inner();
-                *g = None;
-                g
-            }
-        };
-        if guard.is_none() {
-            *guard = Some(rec_merkle_init(gpu));
-        }
-        let (pso_leaf128, pso_parent, data_buf, tree_buf) = match guard.as_mut() {
-            Some(Ok(state)) => {
-                let data_addr = data_ptr as usize;
-                let cached = state
-                    .wraps
-                    .iter()
-                    .find(|(p, l, _)| *p == data_addr && *l == data_len)
-                    .map(|&(_, _, buf)| buf);
-                let data_buf = match cached {
-                    Some(buf) => {
-                        state.hits += 1;
-                        buf
-                    }
-                    // The wrap API takes `*mut` (Metal buffers are generically
-                    // writable); this kernel chain only ever reads the matrix.
-                    None => match unsafe { gpu.wrap_buffer(data_ptr.cast_mut(), data_len) } {
-                        Ok(buf) => {
-                            state.misses += 1;
-                            state.wraps.push((data_addr, data_len, buf));
-                            buf
-                        }
-                        Err(e) => {
-                            if super::gpu_zc_r2_debug() {
-                                eprintln!("[l1-overlap] wrap failed ({e})");
-                            }
-                            return None;
-                        }
-                    },
-                };
-                let &(_, tree_buf) = state
-                    .tree_bufs
-                    .iter()
-                    .find(|(n, _)| *n == num_leaves)
-                    .expect("shape checked above");
-                (state.pso_leaf128, state.pso_parent, data_buf, tree_buf)
-            }
-            Some(Err(e)) => {
-                if super::gpu_zc_r2_debug() {
-                    eprintln!("[l1-overlap] rec-merkle unavailable ({e})");
-                }
-                return None;
-            }
-            None => unreachable!("initialized above"),
-        };
-        drop(guard);
-        Some(L1MerkleOverlapSession {
-            gpu,
-            pso_leaf128,
-            pso_parent,
-            data_buf,
-            tree_buf,
-            num_leaves,
-            started: std::time::Instant::now(),
-            state: Mutex::new(L1OverlapInner::default()),
-            failed: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    impl L1MerkleOverlapSession {
-        /// 128-byte leaf = 8 F128 elements.
-        const LEAF_ELEMS: usize = 8;
-
-        /// Coalesce leaf submissions to ~8 command buffers per commit: each
-        /// batch covers ⅛ of the tree (four finalized 1 MiB epool
-        /// sub-transforms at the L1 shape, or 2–4 Rayon cache chunks).
-        fn batch_leaves(&self) -> usize {
-            (self.num_leaves / 8).max(256)
-        }
-
-        fn fail(&self, msg: &str) {
-            self.failed
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            if super::gpu_zc_r2_debug() {
-                eprintln!("[l1-overlap] {msg} — falling back to incumbent");
-            }
-        }
-
-        /// NTT `finish_chunk` target; safe to call concurrently from the
-        /// transform's workers (main Rayon pool or the P+E helper pool).
-        /// `offset_elems`/`len_elems` are in F128 elements from the start of
-        /// the wrapped matrix.
-        pub(crate) fn chunk_ready(&self, offset_elems: usize, len_elems: usize) {
-            if self.failed.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            if offset_elems % Self::LEAF_ELEMS != 0 || len_elems % Self::LEAF_ELEMS != 0 {
-                self.fail(&format!(
-                    "misaligned chunk (offset {offset_elems}, len {len_elems})"
-                ));
-                return;
-            }
-            let leaf_start = offset_elems / Self::LEAF_ELEMS;
-            let n = len_elems / Self::LEAF_ELEMS;
-            // The leaf kernel runs bounds-check-free 256-thread groups,
-            // exactly like the incumbent whole-tree dispatch; refuse any
-            // geometry that would need a partial group.
-            if n == 0 || !n.is_multiple_of(256) || leaf_start + n > self.num_leaves {
-                self.fail(&format!("bad chunk geometry (start {leaf_start}, n {n})"));
-                return;
-            }
-            let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            inner.ranges.push((leaf_start, n));
-            inner.pending.push((leaf_start, n));
-            inner.pending_leaves += n;
-            inner.covered_leaves += n;
-            // Submit on a full batch, and always on cover completion: the
-            // final batch (with the internal levels encoded behind it) then
-            // enters the queue from inside the transform's own parallel
-            // region, before the NTT join returns.
-            if inner.pending_leaves >= self.batch_leaves()
-                || inner.covered_leaves == self.num_leaves
-            {
-                self.submit_pending(&mut inner);
-            }
-        }
-
-        /// Encode and commit one command buffer covering every pending range
-        /// (caller holds the state lock). Adjacent ranges coalesce into one
-        /// dispatch; the buffer is retained across its short-lived pool and
-        /// drained in `finish` (the from-z first-pass stream idiom).
-        fn submit_pending(&self, inner: &mut L1OverlapInner) {
-            if inner.pending.is_empty() || self.failed.load(std::sync::atomic::Ordering::Relaxed)
-            {
-                return;
-            }
-            // Publish every pending chunk's CPU stores to the encode below.
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            inner.pending.sort_unstable();
-            let mut coalesced: Vec<(usize, usize)> = Vec::with_capacity(inner.pending.len());
-            for &(s, n) in inner.pending.iter() {
-                match coalesced.last_mut() {
-                    Some((cs, cn)) if *cs + *cn == s => *cn += n,
-                    _ => coalesced.push((s, n)),
-                }
-            }
-            inner.pending.clear();
-            inner.pending_leaves = 0;
-            // When this batch completes an exact cover, append the internal
-            // levels to the same encoder: within-encoder and cross-buffer
-            // hazard tracking on the tree buffer orders them after every leaf
-            // write (the incumbent's single-encoder shape and the from-z
-            // stream's behind-the-final-tile idiom, both in production).
-            let encode_parents = inner.covered_leaves == self.num_leaves
-                && l1_ranges_cover_exactly(&mut inner.ranges, self.num_leaves);
-            let result = unsafe {
-                let pool = self.gpu.pool_push();
-                let result = (|| -> Result<Id, String> {
-                    let cb = self.gpu.command_buffer()?;
-                    let enc = self.gpu.compute_encoder(cb)?;
-                    self.gpu.set_pipeline(enc, self.pso_leaf128);
-                    for &(leaf_start, n) in &coalesced {
-                        // Offsetting both bindings makes local id map to
-                        // global leaf `leaf_start + id` in the proven kernel.
-                        self.gpu.set_buffer(enc, self.data_buf, leaf_start * 128, 0);
-                        self.gpu.set_buffer(enc, self.tree_buf, leaf_start * 32, 1);
-                        self.gpu.dispatch(enc, (n / 256) as u64, 256);
-                    }
-                    if encode_parents {
-                        self.gpu.set_pipeline(enc, self.pso_parent);
-                        let mut read_start = 0usize;
-                        let mut read_len = self.num_leaves;
-                        while read_len > 1 {
-                            let write_start = read_start + read_len;
-                            let n_out = read_len / 2;
-                            self.gpu.set_buffer(enc, self.tree_buf, read_start * 32, 0);
-                            self.gpu.set_buffer(enc, self.tree_buf, write_start * 32, 1);
-                            let tpg = 256u64.min(n_out as u64);
-                            self.gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                            read_start = write_start;
-                            read_len = n_out;
-                        }
-                    }
-                    self.gpu.end_encoding(enc);
-                    // `commandBuffer` is autoreleased; retain across this
-                    // short-lived pool — completion is drained in `finish`.
-                    let cb = self.gpu.retain(cb);
-                    self.gpu.commit_async(cb);
-                    Ok(cb)
-                })();
-                self.gpu.pool_pop(pool);
-                result
-            };
-            match result {
-                Ok(cb) => {
-                    inner.cbs.push(cb);
-                    inner.batches += 1;
-                    inner.parents_encoded = encode_parents;
-                }
-                Err(e) => self.fail(&format!("leaf submit failed ({e})")),
-            }
-        }
-
-        /// Drain the leaf command buffers, verify the accepted ranges tile
-        /// the tree exactly, run the internal levels, and copy the flat tree
-        /// out. `None` on any failure — the caller then runs the incumbent
-        /// whole-tree path (exact same bytes).
-        pub(crate) fn finish(self) -> Option<Vec<Hash>> {
-            let debug = super::gpu_zc_r2_debug();
-            let ntt_wall_ms = self.started.elapsed().as_secs_f64() * 1e3;
-            let mut inner = {
-                let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                self.submit_pending(&mut g);
-                core::mem::take(&mut *g)
-            };
-            // Drain every committed buffer even on failure: nothing may stay
-            // in flight against the shared tree buffer when the caller falls
-            // back to the incumbent offload. The bounded spin consumes the
-            // usually-already-complete buffers without Metal's fixed park +
-            // wake cost (same control as the incumbent's drain:
-            // `FLOCK_NO_RECMERKLE_SPIN=1` restores the blocking wait).
-            let mut drain_err: Option<String> = None;
-            let spin_deadline = rec_merkle_spin_enabled()
-                .then(|| std::time::Instant::now() + std::time::Duration::from_millis(4));
-            for cb in inner.cbs.drain(..) {
-                let waited = match spin_deadline {
-                    Some(deadline) => unsafe { self.gpu.yield_wait_cb_until(cb, deadline) },
-                    None => unsafe { self.gpu.wait_cb(cb) },
-                };
-                unsafe { self.gpu.release(cb) };
-                if let Err(e) = waited
-                    && drain_err.is_none()
-                {
-                    drain_err = Some(e);
-                }
-            }
-            if let Some(e) = drain_err {
-                self.fail(&format!("leaf drain failed ({e})"));
-            }
-            if self.failed.load(std::sync::atomic::Ordering::Relaxed) {
-                return None;
-            }
-            // Exact-cover check: the accepted ranges must tile
-            // `[0, num_leaves)` with no gap or overlap — anything else means
-            // the transform's chunk contract changed and the incumbent must
-            // build the tree. (Already verified at parent-encode time when
-            // `parents_encoded` is set; re-checking is cheap and keeps the
-            // oracle in one place.)
-            if !l1_ranges_cover_exactly(&mut inner.ranges, self.num_leaves) {
-                self.fail(&format!(
-                    "chunk cover broken ({} ranges, {} leaves)",
-                    inner.ranges.len(),
-                    inner.covered_leaves
-                ));
-                return None;
-            }
-            // Internal levels: normally already encoded behind the final
-            // leaf batch and drained above; encode them here only if that
-            // batch's cover check could not run (exactly the incumbent's
-            // parent chain either way).
-            if !inner.parents_encoded {
-                let run = unsafe {
-                    let pool = self.gpu.pool_push();
-                    let run = (|| -> Result<(), String> {
-                        let cb = self.gpu.command_buffer()?;
-                        let enc = self.gpu.compute_encoder(cb)?;
-                        self.gpu.set_pipeline(enc, self.pso_parent);
-                        let mut read_start = 0usize;
-                        let mut read_len = self.num_leaves;
-                        while read_len > 1 {
-                            let write_start = read_start + read_len;
-                            let n_out = read_len / 2;
-                            self.gpu.set_buffer(enc, self.tree_buf, read_start * 32, 0);
-                            self.gpu.set_buffer(enc, self.tree_buf, write_start * 32, 1);
-                            let tpg = 256u64.min(n_out as u64);
-                            self.gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                            read_start = write_start;
-                            read_len = n_out;
-                        }
-                        self.gpu.end_encoding(enc);
-                        if rec_merkle_spin_enabled() {
-                            self.gpu.commit_and_spin(cb, 4.0)
-                        } else {
-                            self.gpu.commit_and_wait(cb)
-                        }
-                    })();
-                    self.gpu.pool_pop(pool);
-                    run
-                };
-                if let Err(e) = run {
-                    self.fail(&format!("parent submit failed ({e})"));
-                    return None;
-                }
-            }
-            let total_nodes = 2 * self.num_leaves - 1;
-            let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
-            unsafe {
-                let dst = core::slice::from_raw_parts_mut(
-                    tree.as_mut_ptr().cast::<u8>(),
-                    total_nodes * 32,
-                );
-                copy_bytes_parallel(self.gpu.buffer_contents(self.tree_buf), dst);
-            }
-            if debug {
-                // "since-begin" ≈ the NTT wall for latched sessions (begin
-                // directly precedes the transform); warmup-race sessions
-                // include the race's primer/settle time here — read the
-                // race's own wall line for those.
-                eprintln!(
-                    "[l1-overlap] streamed {} ranges in {} batches; since-begin {ntt_wall_ms:.2} \
-                     ms, drain+parents+copy {:.2} ms",
-                    inner.ranges.len(),
-                    inner.batches,
-                    self.started.elapsed().as_secs_f64() * 1e3 - ntt_wall_ms,
-                );
-            }
-            Some(tree)
-        }
-    }
-
-    impl Drop for L1MerkleOverlapSession {
-        fn drop(&mut self) {
-            // A session abandoned without `finish` (panic unwind, race error)
-            // must still drain its in-flight leaf buffers before the shared
-            // tree buffer can be reused.
-            let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            for cb in inner.cbs.drain(..) {
-                let _ = unsafe { self.gpu.wait_cb(cb) };
-                unsafe { self.gpu.release(cb) };
-            }
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -13634,25 +13099,6 @@ mod imp {
         pub(crate) fn submit_ready_range(&mut self, _r_start: usize, _r_count: usize) {}
     }
 
-    /// L1 NTT/Merkle-leaf overlap (non-Metal stub): never engages.
-    pub(crate) struct L1MerkleOverlapSession;
-
-    impl L1MerkleOverlapSession {
-        pub(crate) fn chunk_ready(&self, _offset_elems: usize, _len_elems: usize) {}
-
-        pub(crate) fn finish(self) -> Option<Vec<crate::merkle::Hash>> {
-            None
-        }
-    }
-
-    pub(crate) fn l1_merkle_overlap_begin(
-        _data_ptr: *const u8,
-        _data_len: usize,
-        _num_leaves: usize,
-    ) -> Option<L1MerkleOverlapSession> {
-        None
-    }
-
     pub(crate) unsafe fn begin_from_z_first_pass_stream(
         _z_ptr: *mut F128,
         _z_len: usize,
@@ -15575,9 +15021,13 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // Fast GPU: actual factored-PSO selection widens only the cap. The
         // ratio math is unchanged (round(64 / 1.1) = 58 before clamping).
         assert_eq!(lincheck_gate_share_balanced(0.1, 64, false), 40);
-        assert_eq!(lincheck_gate_share_balanced(0.1, 64, true), 48);
+        assert_eq!(lincheck_gate_share_balanced(0.1, 64, true), 56);
+        // Share between the old 48 cap and the new 56 cap is now live on
+        // factored B4; incumbent stays clamped at 5n/8 = 40.
+        assert_eq!(lincheck_gate_share_balanced(0.23, 64, false), 40);
+        assert_eq!(lincheck_gate_share_balanced(0.23, 64, true), 52);
         // At an observed factored ratio the natural share, not the cap,
-        // remains authoritative.
+        // remains authoritative (round(64/1.33) = 48, still under 56).
         assert_eq!(lincheck_gate_share_balanced(0.33, 64, false), 40);
         assert_eq!(lincheck_gate_share_balanced(0.33, 64, true), 48);
         assert_eq!(lincheck_gate_share_balanced(0.5, 64, false), 40);
@@ -15596,7 +15046,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(lincheck_gate_share_balanced(1.0, 16, true), 8);
         // Fallback retains the old proportional ceiling on small shapes too.
         assert_eq!(lincheck_gate_share_balanced(0.1, 16, false), 10);
-        assert_eq!(lincheck_gate_share_balanced(0.1, 16, true), 12);
+        assert_eq!(lincheck_gate_share_balanced(0.1, 16, true), 14);
         // The legacy policy is preserved exactly for causal comparison.
         assert_eq!(lincheck_gate_share_legacy(1.0, 64), 28);
         assert_eq!(lincheck_gate_share_legacy(1.52, 64), 22);
@@ -15928,60 +15378,6 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             _ => panic!("timed drain must return prefix partials"),
         }
         imp::zc_r2_test_reset();
-    }
-
-    /// The L1 NTT/Merkle-leaf overlap must reproduce the incumbent commit
-    /// byte-for-byte on the real L1 shape: same codeword matrix, same flat
-    /// tree, same root. Drives the full production path (`ligero_commit`
-    /// with the fused3 transform's per-chunk callback) with the admission
-    /// latch forced to each arm; the latch is process-global, hence the
-    /// serial lock and the reset at the end.
-    #[test]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_l1_merkle_overlap_matches_sync() {
-        static L1_OVERLAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = L1_OVERLAP_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = imp::gpu() {
-            eprintln!("skipping GPU test: {e}");
-            return;
-        }
-        let mut rng = Rng::new(0x4C31);
-        // L1 shape: log_msg_cols=16, 8 interleaved lanes, rate 1/4 —
-        // 2^18 leaves of 128 bytes.
-        let poly = rng.vec(8 << 16);
-        let ntt = crate::ntt::AdditiveNttF128::standard(18);
-
-        super::l1_overlap_latch_force(super::L1_OVERLAP_ON);
-        let w_overlap = crate::pcs::ligerito::ligero_commit(
-            &poly,
-            16,
-            3,
-            2,
-            &ntt,
-            crate::merkle::HashKind::Blake3,
-        );
-        super::l1_overlap_latch_force(super::L1_OVERLAP_OFF);
-        let w_sync = crate::pcs::ligerito::ligero_commit(
-            &poly,
-            16,
-            3,
-            2,
-            &ntt,
-            crate::merkle::HashKind::Blake3,
-        );
-        super::l1_overlap_latch_force(super::L1_OVERLAP_UNMEASURED);
-
-        assert!(
-            w_overlap.mat == w_sync.mat,
-            "L1 overlap codeword diverges from the sync path"
-        );
-        assert!(
-            w_overlap.tree == w_sync.tree,
-            "L1 overlap tree diverges from the sync path"
-        );
-        assert_eq!(w_overlap.root(), w_sync.root());
     }
 
     /// T3 products arm oracle: the GPU's per-chunk reduced partials must
