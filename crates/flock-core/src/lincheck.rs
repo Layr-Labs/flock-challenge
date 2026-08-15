@@ -1433,7 +1433,7 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        ZVecCapture::None,
         challenger,
     );
     (proof, claim)
@@ -1466,14 +1466,62 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        ZVecCapture::PreSumcheck,
         challenger,
     );
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured.expect("pre-sumcheck capture must produce z_vec"),
     )
+}
+
+/// Variant of [`prove_padded_capture_z_vec`] that captures `z_vec` immediately
+/// after LINCheck's first top-coordinate bind. The first sumcheck challenge is
+/// the last element of the returned claim's LSB-first `r_inner_rest`; therefore
+/// this vector is exactly the ranked DirectFold8 sufficient statistic that
+/// [`crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec`] would otherwise derive
+/// in a separate pass from the pre-sumcheck capture.
+///
+/// This is only meaningful when at least two inner-rest rounds remain: round 0
+/// must take the fused bind-and-next-message path so the capture adds no pass.
+pub fn prove_padded_capture_z_vec_after_first_bind<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    assert!(
+        k_log >= k_skip + 2,
+        "post-round-0 capture requires at least two inner-rest rounds"
+    );
+    let (proof, claim, captured) = prove_padded_inner(
+        z_packed,
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        ZVecCapture::AfterFirstBind,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("post-round-0 capture must produce z_vec"),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ZVecCapture {
+    None,
+    PreSumcheck,
+    AfterFirstBind,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1485,7 +1533,7 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture_z_vec: ZVecCapture,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
     let k = 1usize << k_log;
@@ -1580,7 +1628,7 @@ fn prove_padded_inner<Ch: Challenger>(
     // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
     //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
     //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
+    let mut captured_z_vec: Option<Vec<F128>> = if capture_z_vec == ZVecCapture::PreSumcheck {
         Some(z_vec.clone())
     } else {
         None
@@ -1612,6 +1660,9 @@ fn prove_padded_inner<Ch: Challenger>(
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
                 let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
+                if t == 0 && capture_z_vec == ZVecCapture::AfterFirstBind {
+                    captured_z_vec = Some(z_vec.clone());
+                }
                 e1 = ne1;
                 einf = neinf;
             } else {
@@ -2503,6 +2554,21 @@ mod tests {
                 "verify did not reject {label}: got {res:?}"
             );
         }
+    }
+
+    #[test]
+    fn post_first_bind_is_direct_fold8_statistic() {
+        let mut rng = Rng::new(0xF018_C4A7);
+        let mut z_vec = rng.f128_vec(1 << 14);
+        let tail = rng.f128_vec(7);
+        let expected = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&z_vec, &tail);
+
+        // Round 0 binds the top remaining inner-rest coordinate. After the
+        // claim reverses transcript challenges to LSB-first order, this is
+        // exactly inner_rest_tail[6], which DirectFold8 folds separately.
+        sumcheck_bind_top_in_place_par(&mut z_vec, tail[6]);
+        assert_eq!(z_vec, expected);
+        assert_eq!(z_vec.len(), 64 * (1usize << crate::pcs::LOG_PACKING));
     }
 
     /// Verify must reject shape errors.

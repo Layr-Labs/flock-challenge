@@ -3348,6 +3348,9 @@ pub(crate) fn ligero_commit(
     let level_opt_out = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
         (16, 3, 2) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1"),
         (13, 3, 3) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2"),
+        // Ranked L3: 2^10 cols × 8 lanes × rate 1/16 = 2 MiB codeword.
+        // Same fused3 kernel as L1/L2 (`start_layer + 3 <= log_d`).
+        (10, 3, 4) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L3"),
         _ => None,
     };
     let recursive_from_message_shape = kind == HashKind::Blake3 && level_opt_out.is_some();
@@ -3462,6 +3465,7 @@ fn ligero_commit_impl(
         let level = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
             (16, 3, 2) => Some("L1"),
             (13, 3, 3) => Some("L2"),
+            (10, 3, 4) => Some("L3"),
             _ => None,
         };
         if let Some(level) = level {
@@ -8579,6 +8583,7 @@ mod tests {
         for (log_msg_cols, log_inv_rate, seed) in [
             (16usize, 2usize, 0xF14C_0002_u64),
             (13usize, 3usize, 0xF14C_0003_u64),
+            (10usize, 4usize, 0xF14C_0004_u64),
         ] {
             let log_num_interleaved = 3usize;
             let mut rng = crate::challenger::RandomChallenger::new(seed);

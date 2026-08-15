@@ -68,6 +68,15 @@ fn ranked_direct_fold8_precompute_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.k_log >= r1cs.k_skip + 7
 }
 
+/// Capture LINCheck's already-bound round-0 vector as the ranked DirectFold8
+/// AB statistic. The kill switch restores the exact incumbent pre-sumcheck
+/// capture plus deferred Fold8 pass for same-binary proof/output comparison.
+#[inline]
+fn ranked_lincheck_fold8_capture_enabled(r1cs: &BlockR1cs) -> bool {
+    ranked_direct_fold8_precompute_enabled(r1cs)
+        && std::env::var_os("FLOCK_NO_LINCHECK_FOLD8_CAPTURE").is_none()
+}
+
 /// Exact-shape gate for deriving identity C from the already-materialized
 /// lincheck stripe. Keep this narrower than the generic DirectFold4 gate:
 /// the shortcut relies on ranked BLAKE3's block geometry and honest padding,
@@ -108,6 +117,67 @@ fn precompute_ab_s_hat_v(
         Some(pcs::ring_switch::s_hat_v_from_z_vec(z_vec, inner_rest_tail))
     } else {
         None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_lincheck_with_ab_capture<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    z_packed_lincheck: &[u8],
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (
+    lincheck::LincheckProof,
+    lincheck::LincheckClaim,
+    Vec<F128>,
+    bool,
+) {
+    let captured_after_first_bind = ranked_lincheck_fold8_capture_enabled(r1cs);
+    let (proof, claim, captured) = if captured_after_first_bind {
+        lincheck::prove_padded_capture_z_vec_after_first_bind(
+            z_packed_lincheck,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            x_ab,
+            challenger,
+        )
+    } else {
+        lincheck::prove_padded_capture_z_vec(
+            z_packed_lincheck,
+            r1cs.m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_bits,
+            lincheck_circuit,
+            x_ab,
+            challenger,
+        )
+    };
+    (proof, claim, captured, captured_after_first_bind)
+}
+
+fn finish_ab_s_hat_v(
+    r1cs: &BlockR1cs,
+    captured_z_vec: Vec<F128>,
+    claim: &lincheck::LincheckClaim,
+    captured_after_first_bind: bool,
+) -> Option<Vec<F128>> {
+    if captured_after_first_bind {
+        debug_assert_eq!(
+            captured_z_vec.len(),
+            64 * (1usize << pcs::LOG_PACKING),
+            "ranked post-round-0 capture must be the DirectFold8 tensor"
+        );
+        Some(captured_z_vec)
+    } else {
+        let s_hat_v =
+            precompute_ab_s_hat_v(r1cs, &captured_z_vec, &claim.r_inner_rest[1..]);
+        flock_core::scratch::give_f128(captured_z_vec);
+        s_hat_v
     }
 }
 
@@ -243,16 +313,14 @@ pub fn prove_ligerito<Ch: Challenger>(
 
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        &lc_circuit,
-        &x_ab,
-        challenger,
-    );
+    let (lc_proof, lc_claim, z_vec_capture, captured_after_first_bind) =
+        prove_lincheck_with_ab_capture(
+            r1cs,
+            &z_packed_lincheck,
+            &lc_circuit,
+            &x_ab,
+            challenger,
+        );
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -263,9 +331,8 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
-    let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-    // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-    flock_core::scratch::give_f128(z_vec_pre);
+    let s_hat_v_ab =
+        finish_ab_s_hat_v(r1cs, z_vec_capture, &lc_claim, captured_after_first_bind);
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(
@@ -1174,18 +1241,17 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let t_lc = std::time::Instant::now();
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
-    // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
-    // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
+    // Capture LINCheck's AB opening statistic. Ranked DirectFold8 reuses the
+    // post-round-0 vector directly; every fallback keeps the incumbent
+    // pre-sumcheck capture and deferred fold.
+    let (lc_proof, lc_claim, z_vec_capture, captured_after_first_bind) =
+        prove_lincheck_with_ab_capture(
+            r1cs,
+            &z_packed_lincheck,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        );
     // The lincheck stripe copy of z is dead from here on; return it to the
     // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
     // m = 32) so the next prove reuses its resident pages.
@@ -1200,13 +1266,10 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
-    // Strided fold of z_vec_pre against the AB-claim suffix's inner-rest tail
-    // (everything past prefix0). Byte-identical to `fold_1b_rows` on the AB
-    // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
-    // (only test setups; real R1CS has k_log >= 16).
-    let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-    // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-    flock_core::scratch::give_f128(z_vec_pre);
+    // The ranked DirectFold8 capture is already the final 64-bank statistic.
+    // Fallback captures take the incumbent suffix fold before recycling.
+    let s_hat_v_ab =
+        finish_ab_s_hat_v(r1cs, z_vec_capture, &lc_claim, captured_after_first_bind);
     if phase_timing {
         let wall = t_lc.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_lc0.unwrap_or(0.0);
@@ -1404,16 +1467,14 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
 
     // --- lincheck + base-claim / s_hat_v setup ---
     let t0 = Instant::now();
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
-        &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
-        lincheck_circuit,
-        &x_ab,
-        challenger,
-    );
+    let (lc_proof, lc_claim, z_vec_capture, captured_after_first_bind) =
+        prove_lincheck_with_ab_capture(
+            r1cs,
+            &z_packed_lincheck,
+            lincheck_circuit,
+            &x_ab,
+            challenger,
+        );
     flock_core::scratch::give_u8(z_packed_lincheck);
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -1423,9 +1484,8 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
-    let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-    // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-    flock_core::scratch::give_f128(z_vec_pre);
+    let s_hat_v_ab =
+        finish_ab_s_hat_v(r1cs, z_vec_capture, &lc_claim, captured_after_first_bind);
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---
