@@ -2124,6 +2124,16 @@ pub fn fold_b128_elems_split(eq_lo: &[F128], eq_hi: &[F128], eq_r_dprime: &[F128
     fold_b128_from_table(eq_lo, eq_hi, &tables)
 }
 
+/// Kill switch for the ring-switch dense `fold_b128_from_table` E-core drain.
+/// `FLOCK_NO_RS_FOLD_HETERO=1` (exactly `"1"`) restores the incumbent
+/// rayon-only path.
+fn rs_fold_hetero_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("FLOCK_NO_RS_FOLD_HETERO").is_ok_and(|v| v == "1")
+    })
+}
+
 /// Materialize a split-tensor fold from a prebuilt byte `tables`
 /// (`build_fold_byte_table` output). Block-parallel over `eq_hi`: each rayon
 /// task sweeps one `e_hi` over all of `eq_lo` (so `e_hi` is hoisted once per
@@ -2132,8 +2142,42 @@ pub fn fold_b128_elems_split(eq_lo: &[F128], eq_hi: &[F128], eq_r_dprime: &[F128
 pub(crate) fn fold_b128_from_table(eq_lo: &[F128], eq_hi: &[F128], tables: &[F128]) -> Vec<F128> {
     use rayon::prelude::*;
     let b = eq_lo.len();
+    let n = eq_hi.len();
     // Each slot is written exactly once (`*slot = acc`) before any read.
-    let mut out = crate::scratch::take_f128(b * eq_hi.len());
+    let mut out = crate::scratch::take_f128(b * n);
+
+    // E-core hetero drain: each `eq_hi` block owns a disjoint `[ci*b,
+    // (ci+1)*b)` chunk of `out`. Same per-slot arithmetic, same output order,
+    // same read-only `tables`/`eq_lo`/`eq_hi` — only which pool claims each
+    // block differs. Skip small calls; the queue kickoff cost and E-core tail
+    // dominate when there are few blocks. M3 Max draws with the previous
+    // `n>=16, b*n>=4096` floor showed median tail from small ring-switch folds,
+    // so we raise the floor to keep the helper pool busy only when the work
+    // easily absorbs the four E-cores.
+    if n >= 64
+        && b * n >= 64 * 256
+        && rs_fold_hetero_enabled()
+        && crate::epool::epool().is_some()
+    {
+        let out_base = crate::epool::SyncPtr(out.as_mut_ptr());
+        crate::epool::run_hetero_chunks(n, |ci| {
+            let e_hi = eq_hi[ci];
+            // SAFETY: the queue claims each `ci` exactly once, so this block is
+            // disjoint; `out` has length `b*n` and `tables`/`eq_lo` are
+            // read-only for the whole drain.
+            unsafe {
+                let lo = eq_lo.as_ptr();
+                let out_block = out_base.ptr().add(ci * b);
+                for i in 0..b {
+                    out_block
+                        .add(i)
+                        .write(fold_one_slot(*lo.add(i) * e_hi, tables));
+                }
+            }
+        });
+        return out;
+    }
+
     out.par_chunks_mut(b)
         .zip(eq_hi.par_iter())
         .for_each(|(out_block, &e_hi)| {
