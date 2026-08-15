@@ -216,7 +216,10 @@
 //! 64 SoA lanes, `log_d = 20`) and hashes it into a BLAKE3 Merkle tree. Both
 //! stages are memory-bandwidth-bound on the CPU and challenge-independent, so
 //! they can run on the Apple-silicon GPU (unified memory, no PCIe copies)
-//! while the P-cores run the compute-bound round-1 AB precompute.
+//! while the P-cores run the compute-bound round-1 AB precompute. The L0
+//! hybrid CPU share defaults to k=0 so that suffix NTT+Merkle does not
+//! steal those P-cores from AB; `FLOCK_HYBRID_AUTOTUNE=1` restores the
+//! isolated-graph sweep.
 //!
 //! Design rules (each one a lesson from prior attempts):
 //! - **One command buffer** for the whole commit graph — fused multi-layer
@@ -247,6 +250,19 @@ use crate::ntt::AdditiveNttF128;
 /// Env var that disables the GPU commit path entirely.
 pub const ENV_NO_GPU_COMMIT: &str = "FLOCK_NO_GPU_COMMIT";
 
+/// Exact-`"1"` restore of the isolated-graph hybrid autotune
+/// (`DEFAULT_HYBRID_K = 5` plus the warmup sweep). The timed prove's binder
+/// is the round-1 AB `rayon::join`, not the isolated commit-graph wall:
+/// `k > 0` runs a CPU suffix NTT+Merkle on the same rayon pool AB needs, so
+/// the ranked default is `k = 0` (full GPU prefix). Only exact `"1"` restores
+/// the old tuner; any other value is ignored.
+pub const ENV_HYBRID_AUTOTUNE: &str = "FLOCK_HYBRID_AUTOTUNE";
+
+/// Pin the L0 hybrid CPU share in sixteenths (`0..=15`), or `auto` to restore
+/// the isolated-graph autotune. A numeric value also skips the warmup sweep
+/// (same role as `FLOCK_HYBRID_CPU_BLOCKS`). Unset -> `k = 0`.
+pub const ENV_HYBRID_K: &str = "FLOCK_HYBRID_K";
+
 /// Same-binary control that preserves the CPU codeword allocation/prefault
 /// even after the ranked GPU commit has latched on.
 pub const ENV_NO_LAZY_GPU_CODEWORD: &str = "FLOCK_NO_LAZY_GPU_CODEWORD";
@@ -265,6 +281,58 @@ pub const ENV_NO_GPU_METALLIB: &str = "FLOCK_NO_GPU_METALLIB";
 pub(crate) fn gpu_metallib_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_METALLIB).is_none())
+}
+
+/// `FLOCK_HYBRID_AUTOTUNE=1` or `FLOCK_HYBRID_K=auto` restores the isolated
+/// commit-graph autotune. Pure so tests do not touch process env.
+fn hybrid_autotune_restored_from(autotune: Option<&str>, hybrid_k: Option<&str>) -> bool {
+    autotune == Some("1") || hybrid_k == Some("auto")
+}
+
+/// Numeric `FLOCK_HYBRID_K` pin (`0..=15`). `"auto"` is not a pin.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn hybrid_k_pin_from(value: Option<&str>) -> Option<usize> {
+    value.and_then(|v| v.parse().ok()).filter(|k| *k < 16)
+}
+
+fn hybrid_autotune_restored() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        hybrid_autotune_restored_from(
+            std::env::var(ENV_HYBRID_AUTOTUNE).ok().as_deref(),
+            std::env::var(ENV_HYBRID_K).ok().as_deref(),
+        )
+    })
+}
+
+/// Timed-path L0 hybrid CPU share in sixteenths of the position range.
+/// Override wins; otherwise `k = 0` (full GPU prefix) unless the isolated
+/// graph autotune is explicitly restored. Scheduling only: every `k` emits
+/// the same codeword and Merkle tree.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn resolve_e2e_hybrid_k(
+    override_k: Option<usize>,
+    autotune_restored: bool,
+    tuned: usize,
+    default_k: usize,
+) -> usize {
+    if let Some(k) = override_k {
+        return k;
+    }
+    if !autotune_restored {
+        return 0;
+    }
+    if tuned == usize::MAX {
+        default_k
+    } else {
+        tuned
+    }
 }
 
 /// Kill switch for the zerocheck round-one C-fold GPU arm:
@@ -1554,6 +1622,11 @@ fn satisfy_ranked_exact_tune_in(state: &std::sync::atomic::AtomicU8) -> bool {
 #[doc(hidden)]
 pub fn request_ranked_exact_contention_tune() -> bool {
     if std::env::var_os("FLOCK_NO_HYBRID_TUNE_CANONICAL_REPRIME").is_some() {
+        return false;
+    }
+    // Default k=0 does not need the post-join AB replay sweep. Restore
+    // `FLOCK_HYBRID_AUTOTUNE=1` (or `FLOCK_HYBRID_K=auto`) to request it.
+    if !hybrid_autotune_restored() {
         return false;
     }
     request_ranked_exact_tune_in(&RANKED_EXACT_TUNE_STATE)
@@ -6116,23 +6189,24 @@ kernel void blake3_pow_scan(
     }
 
     /// CPU share of the hybrid commit in sixteenths of the position range.
-    /// 0 disables (pure-GPU graph). Default 5 is the conservative midpoint of
-    /// the cache-local suffix plateau: it retains most of the measured gain on
-    /// a 10P/4E M4 Pro without assuming the benchmark's larger M3 Max GPU has
-    /// the same CPU/GPU balance. `FLOCK_HYBRID_CPU_BLOCKS` remains the exact
-    /// split-point override.
+    /// 0 is the pure-GPU graph. The timed binder is the round-1 AB join:
+    /// a non-zero share runs suffix NTT+Merkle on the same rayon pool AB
+    /// uses, so the ranked default is 0. Isolated-graph autotune (and its
+    /// fallback of 5) is restored by `FLOCK_HYBRID_AUTOTUNE=1` /
+    /// `FLOCK_HYBRID_K=auto`. `FLOCK_HYBRID_K=<n>` and
+    /// `FLOCK_HYBRID_CPU_BLOCKS` remain exact split-point overrides.
     fn hybrid_cpu_sixteenths() -> usize {
-        if let Some(k) = hybrid_cpu_split_override() {
-            return k;
-        }
-        match TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed) {
-            usize::MAX => DEFAULT_HYBRID_K,
-            k => k,
-        }
+        super::resolve_e2e_hybrid_k(
+            hybrid_cpu_split_override(),
+            super::hybrid_autotune_restored(),
+            TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed),
+            DEFAULT_HYBRID_K,
+        )
     }
 
-    /// Promoted fixed default, used when the warmup sweep is disabled or has
-    /// not published a winner.
+    /// Isolated-graph autotune fallback, used only when that tuner is
+    /// restored and has not yet published a winner. Not the timed-path
+    /// default (that is k=0).
     const DEFAULT_HYBRID_K: usize = 5;
 
     /// Warmup-sweep-published CPU share (sentinel `usize::MAX` = not tuned).
@@ -6146,14 +6220,20 @@ kernel void blake3_pow_scan(
         std::sync::atomic::AtomicU64::new(0);
 
     /// Exact override / kill-switch resolution. `FLOCK_NO_HYBRID_COMMIT`
-    /// forces the pure-GPU graph; `FLOCK_HYBRID_CPU_BLOCKS` pins an exact
-    /// split. Either also disables the warmup sweep.
+    /// forces the pure-GPU graph; `FLOCK_HYBRID_K=<n>` and
+    /// `FLOCK_HYBRID_CPU_BLOCKS` pin an exact split. Any of these also
+    /// disables the warmup sweep. `FLOCK_HYBRID_K=auto` is not a pin.
     fn hybrid_cpu_split_override() -> Option<usize> {
         use std::sync::OnceLock;
         static K: OnceLock<Option<usize>> = OnceLock::new();
         *K.get_or_init(|| {
             if std::env::var_os("FLOCK_NO_HYBRID_COMMIT").is_some() {
                 return Some(0);
+            }
+            if let Some(k) =
+                super::hybrid_k_pin_from(std::env::var(super::ENV_HYBRID_K).ok().as_deref())
+            {
+                return Some(k);
             }
             std::env::var("FLOCK_HYBRID_CPU_BLOCKS")
                 .ok()
@@ -6166,6 +6246,7 @@ kernel void blake3_pow_scan(
         super::is_ranked_gpu_shape(params)
             && hybrid_cpu_split_override().is_none()
             && std::env::var_os("FLOCK_NO_HYBRID_AUTOTUNE").is_none()
+            && super::hybrid_autotune_restored()
             && hybrid_tune_canonical_reprime_enabled()
     }
 
@@ -6286,6 +6367,7 @@ kernel void blake3_pow_scan(
     ) {
         if hybrid_cpu_split_override().is_some()
             || std::env::var_os("FLOCK_NO_HYBRID_AUTOTUNE").is_some()
+            || !super::hybrid_autotune_restored()
         {
             return;
         }
@@ -13177,6 +13259,35 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 mod tests {
     use super::*;
     use crate::field::F128;
+
+    #[test]
+    fn e2e_hybrid_k_defaults_to_full_gpu_prefix() {
+        // No override, autotune not restored -> k=0 regardless of tuned/default.
+        assert_eq!(resolve_e2e_hybrid_k(None, false, usize::MAX, 5), 0);
+        assert_eq!(resolve_e2e_hybrid_k(None, false, 3, 5), 0);
+        // Restored autotune uses the published winner, else DEFAULT_HYBRID_K.
+        assert_eq!(resolve_e2e_hybrid_k(None, true, usize::MAX, 5), 5);
+        assert_eq!(resolve_e2e_hybrid_k(None, true, 2, 5), 2);
+        // Numeric override always wins (including pinning the old k=5).
+        assert_eq!(resolve_e2e_hybrid_k(Some(5), false, usize::MAX, 5), 5);
+        assert_eq!(resolve_e2e_hybrid_k(Some(0), true, 3, 5), 0);
+    }
+
+    #[test]
+    fn hybrid_autotune_restore_is_exact_one_or_auto() {
+        assert!(!hybrid_autotune_restored_from(None, None));
+        assert!(!hybrid_autotune_restored_from(Some("true"), None));
+        assert!(!hybrid_autotune_restored_from(Some("1 "), None));
+        assert!(hybrid_autotune_restored_from(Some("1"), None));
+        assert!(hybrid_autotune_restored_from(None, Some("auto")));
+        assert!(!hybrid_autotune_restored_from(None, Some("5")));
+        assert_eq!(hybrid_k_pin_from(Some("0")), Some(0));
+        assert_eq!(hybrid_k_pin_from(Some("5")), Some(5));
+        assert_eq!(hybrid_k_pin_from(Some("15")), Some(15));
+        assert_eq!(hybrid_k_pin_from(Some("16")), None);
+        assert_eq!(hybrid_k_pin_from(Some("auto")), None);
+        assert_eq!(hybrid_k_pin_from(None), None);
+    }
 
     /// GPU idle-decay probe at ranked size: full commit graph wall
     /// back-to-back vs after idle gaps. Ignored; run with --ignored --nocapture.
