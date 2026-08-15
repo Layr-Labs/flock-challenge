@@ -12,6 +12,7 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+// r1323-hotlane-1786754644-4283218-9ce1bf1-recovered
 pub use flock_core::*;
 
 pub mod chain;
