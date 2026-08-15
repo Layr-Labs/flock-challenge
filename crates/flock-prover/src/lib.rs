@@ -28,6 +28,7 @@ pub mod seed_pipe;
 #[global_allocator]
 static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 
+// r1326: recursive L3 from-message (skip 2 MiB replica fill)
 // dispersion-resample marker 172525636-o
 
 // keepalive-resample marker 2325618933
