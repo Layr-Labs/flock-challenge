@@ -227,6 +227,20 @@ pub struct DenseClaim {
     pub alpha: F128,
 }
 
+/// E-core hetero scheduling for `generate_f_and_claim`.
+///
+/// Each chunk writes a disjoint slice of `b` and accumulates its own partial
+/// `acc`. The partials are XOR-merged (GF(2^128) addition is associative +
+/// commutative), so the merge order cannot change bytes.
+/// `FLOCK_NO_JAGGED_GEN_HETERO=1` (exactly `"1"`) restores the incumbent
+/// rayon-only path as the same-binary A/B control.
+fn jagged_gen_hetero_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("FLOCK_NO_JAGGED_GEN_HETERO").is_ok_and(|v| v == "1")
+    })
+}
+
 /// Generate the second sumcheck multilinear `B[i] = eq(row_t(i), z_row) ·
 /// eq(col_t(i), z_col)` over the boolean cube (zero past `area`), together with
 /// the claim `v = Σ_i q(i)·B(i) = p̂(z_row, z_col)` — fused into one parallel
@@ -242,7 +256,6 @@ fn generate_f_and_claim(
     z_row: &[F128],
     z_col: &[F128],
 ) -> (Vec<F128>, F128) {
-    use rayon::prelude::*;
     let len = 1usize << params.m;
     let area = params.area() as usize;
     let eq_row = build_eq_table(z_row);
@@ -252,6 +265,63 @@ fn generate_f_and_claim(
 
     // ~1 MB chunks: one binary search amortized over 64K elements.
     const CHUNK: usize = 1 << 16;
+
+    // Hetero E-core drain: each chunk writes a disjoint slice of `b` and
+    // accumulates its own partial `acc`. The partials are XOR-merged
+    // (GF(2^128) addition is associative + commutative), so the merge order
+    // cannot change the result. Same per-element arithmetic, same output
+    // vector — only which pool claims a chunk differs.
+    // `FLOCK_NO_JAGGED_GEN_HETERO=1` (exactly `"1"`) restores the incumbent
+    // rayon-only path.
+    if len >= 16 * CHUNK
+        && len % CHUNK == 0
+        && jagged_gen_hetero_enabled()
+        && crate::epool::epool().is_some()
+    {
+        let n_chunks = len / CHUNK;
+        let mut partials = vec![F128::ZERO; n_chunks];
+        let b_base = crate::epool::SyncPtr(b.as_mut_ptr());
+        let p_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        let eq_row_base = crate::epool::SyncPtr(eq_row.as_ptr() as *mut F128);
+        let eq_col_base = crate::epool::SyncPtr(eq_col.as_ptr() as *mut F128);
+        let q_base = crate::epool::SyncPtr(q.as_ptr() as *mut F128);
+        let prefix_base = crate::epool::SyncPtr(prefix.as_ptr() as *mut u64);
+        let n_prefix = prefix.len();
+        crate::epool::run_hetero_chunks(n_chunks, |ci| {
+            let g0 = ci * CHUNK;
+            // SAFETY: the queue claims each `ci` exactly once; chunk `ci`
+            // exclusively owns b[ci*CHUNK..(ci+1)*CHUNK] and partials[ci].
+            // The two-pool join publishes every write before the fold below.
+            unsafe {
+                let b_chunk = std::slice::from_raw_parts_mut(b_base.ptr().add(g0), CHUNK);
+                let q_chunk = std::slice::from_raw_parts(q_base.ptr().add(g0), CHUNK);
+                // Binary search for the starting column (same as rayon path)
+                let mut col = std::slice::from_raw_parts(prefix_base.ptr(), n_prefix)
+                    .partition_point(|&t| t <= g0 as u64)
+                    .saturating_sub(1);
+                let mut acc = F128::ZERO;
+                for (local, slot) in b_chunk.iter_mut().enumerate() {
+                    let i = g0 + local;
+                    if i >= area {
+                        *slot = F128::ZERO;
+                        continue;
+                    }
+                    while (i as u64) >= *prefix_base.ptr().add(col + 1) {
+                        col += 1;
+                    }
+                    let row = i - *prefix_base.ptr().add(col) as usize;
+                    let bi = *eq_row_base.ptr().add(row) * *eq_col_base.ptr().add(col);
+                    *slot = bi;
+                    acc += *q_chunk.get_unchecked(local) * bi;
+                }
+                p_base.ptr().add(ci).write(acc);
+            }
+        });
+        let v = partials.iter().fold(F128::ZERO, |a, &p| a + p);
+        return (b, v);
+    }
+
+    use rayon::prelude::*;
     let v = b
         .par_chunks_mut(CHUNK)
         .enumerate()
