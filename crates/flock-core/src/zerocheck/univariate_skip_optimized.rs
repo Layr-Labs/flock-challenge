@@ -574,7 +574,7 @@ pub struct Round1AbInner {
 
 impl Round1AbInner {
     #[inline]
-    fn as_bytes(&self) -> &[u8] {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
         unsafe {
             core::slice::from_raw_parts(
                 self.storage.as_ptr() as *const u8,
@@ -701,7 +701,7 @@ pub fn precompute_round1_ab_inner_packed_padded(
 /// choices, tests compare arms byte-for-byte in one process. `nt` selects the
 /// non-temporal drain vs the incumbent cached store; `compact` selects the
 /// QS3 tail-skip vs the incumbent zero-fill of the dead skipped-`b_med` rows.
-fn precompute_round1_ab_inner_packed_padded_with_flavor(
+pub(crate) fn precompute_round1_ab_inner_packed_padded_with_flavor(
     a_packed: &[u8],
     b_packed: &[u8],
     m: usize,
@@ -751,6 +751,42 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
     if zc_ab_pre_hetero_enabled() {
+        // gpu_ab_pre (see `gpu_commit::ENV_NO_GPU_AB_PRE`): hand a calibrated
+        // SUFFIX `[n_chunks - g, n_chunks)` of this queue's range to a
+        // supplemental GPU kernel. The launch here only PREPARES the job;
+        // the commit arm submits it at graph completion (the start of the
+        // GPU idle tail), so the suffix never steals GPU time from the
+        // graph. The CPU queue below drains only the front
+        // `[0, n_chunks - g)`; the join below polls the command buffer —
+        // never submitted or still in flight ⇒ the suffix is redone on the
+        // CPU (race-free: the GPU only writes a shadow buffer), a Metal
+        // failure poisons the arm. Share 0, the kill switch, or any launch
+        // decline leaves `gpu_job = None` and the exact incumbent path
+        // (full-range queue, no Metal state touched).
+        let n_chunks = total_bytes / OUTER_BYTES;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let gpu_job = crate::gpu_commit::launch_gpu_ab_pre(
+            a_packed,
+            b_packed,
+            out_bytes,
+            within_outer_mask,
+            &b_med_counts,
+            inv_table,
+            compact,
+        );
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let gpu_job: Option<core::convert::Infallible> = None;
+        let cpu_chunks = {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                n_chunks - gpu_job.as_ref().map_or(0, |j| j.cpu_excluded())
+            }
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            {
+                n_chunks
+            }
+        };
+        let t_arm = gpu_job.as_ref().map(|_| std::time::Instant::now());
         // QS5 hetero drain: feed the precompute through the shared two-pool
         // chunk queue instead of a main-pool-only `par_chunks_mut`. The
         // E-side of this queue is a broadcast on the SAME helper pool that is
@@ -768,7 +804,6 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
         // raising the dominant arm). Chunk-claim order is nondeterministic
         // but each chunk writes only its own disjoint 1 KiB, so the output
         // bytes are identical to the incumbent path.
-        let n_chunks = total_bytes / OUTER_BYTES;
         let ranked_fast_policy = ranked_ab_pre_fast_policy_hoist_shape(
             m,
             k_skip,
@@ -797,6 +832,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     nt,
                     compact,
                     n_chunks,
+                    cpu_chunks,
                     out_bytes,
                 );
             } else {
@@ -811,6 +847,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                     nt,
                     compact,
                     n_chunks,
+                    cpu_chunks,
                     out_bytes,
                 );
             }
@@ -826,9 +863,61 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
                 nt,
                 compact,
                 n_chunks,
+                cpu_chunks,
                 out_bytes,
             );
         }
+        // Join the GPU suffix before the storage is handed to any consumer.
+        // Calibration (untimed warmup): the CPU ran the FULL range above,
+        // so the probe compare + share solve see authoritative bytes and
+        // the true per-chunk CPU cost of this drain. Timed: the suffix
+        // bytes land in place; a Metal failure poisons the arm and the
+        // suffix is redone here on the CPU (bit-identical kernel body).
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(job) = gpu_job {
+            use rayon::prelude::*;
+            let cpu_wall_ms = t_arm.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3);
+            let redo_start = job.start_chunk;
+            let redo_len = job.cpu_excluded();
+            match crate::gpu_commit::gpu_ab_pre_wait(job, out_bytes, cpu_wall_ms) {
+                crate::gpu_commit::GpuAbPreResult::Done
+                | crate::gpu_commit::GpuAbPreResult::Calibrated => {}
+                // Failed poisons; Abandoned zeroes the share (late GPU on a
+                // graph-bound host — the shadow keeps the redo race-free).
+                crate::gpu_commit::GpuAbPreResult::Failed
+                | crate::gpu_commit::GpuAbPreResult::Abandoned => {
+                    if redo_len > 0 {
+                        out_bytes[redo_start * OUTER_BYTES..(redo_start + redo_len) * OUTER_BYTES]
+                            .par_chunks_mut(OUTER_BYTES)
+                            .enumerate()
+                            .for_each_init(
+                                || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+                                |(a_col, b_col), (i, out_outer)| {
+                                    precompute_ab_one_chunk::<
+                                        { kernels::AB_FAST_POLICY_PROCESS },
+                                        false,
+                                    >(
+                                        a_packed,
+                                        b_packed,
+                                        inv_table,
+                                        within_outer_mask,
+                                        &b_med_counts,
+                                        blake3_static_layout,
+                                        static_b_context,
+                                        nt,
+                                        compact,
+                                        redo_start + i,
+                                        out_outer,
+                                        a_col,
+                                        b_col,
+                                    );
+                                },
+                            );
+                    }
+                }
+            }
+        }
+        let _ = t_arm;
         return Round1AbInner { storage };
     }
 
@@ -936,6 +1025,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     nt: bool,
     compact: bool,
     n_chunks: usize,
+    cpu_chunks: usize,
     out_bytes: &mut [u8],
 ) {
     // This is a private specialization contract, but keep it checked in
@@ -949,18 +1039,21 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     }
 
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    debug_assert!(cpu_chunks <= n_chunks);
     // Process each queue-owned slab monotonically. This removes permutation
     // generation and maximizes spatial locality; queue-level heterogeneity still
-    // distributes independent slabs dynamically.
+    // distributes independent slabs dynamically. The job size derives from the
+    // FULL chunk range so a gpu_ab_pre suffix carve-out (`cpu_chunks <
+    // n_chunks`) shortens the queue without changing per-job geometry.
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
-    let n_jobs = n_chunks.div_ceil(chunks_per_job);
+    let n_jobs = cpu_chunks.div_ceil(chunks_per_job);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
             let chunk_start = job * chunks_per_job;
-            let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
+            let chunk_end = (chunk_start + chunks_per_job).min(cpu_chunks);
             let slab_len = chunk_end - chunk_start;
             for offset in 0..slab_len {
                 let x_outer = chunk_start + offset;

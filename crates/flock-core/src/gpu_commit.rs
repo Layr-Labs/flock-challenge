@@ -588,6 +588,74 @@ pub(crate) fn l1_overlap_latch_force(state: u8) {
     L1_OVERLAP_LATCH.store(state, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Kill switch for the L2 tail overlap (`FLOCK_NO_L2_TAIL_OVERLAP=1`, exact
+/// value): restores the incumbent CPU merkle for the second recursive
+/// commitment. Independent of the L1 switch — the two levels latch, race,
+/// and roll back separately. Only the exact `"1"` disables the path.
+pub const ENV_NO_L2_TAIL_OVERLAP: &str = "FLOCK_NO_L2_TAIL_OVERLAP";
+
+pub(crate) fn gpu_l2_tail_overlap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var(ENV_NO_L2_TAIL_OVERLAP).ok().as_deref() != Some("1")
+    });
+    *ON
+}
+
+/// Admission latch for the L2 tail overlap, mirroring the L1 latch: the
+/// first eligible L2 commit of the process dual-runs overlapped-then-
+/// incumbent (three samples per arm, minima race), byte-compares the trees,
+/// and latches the faster arm. The incumbent here is the CPU merkle builder
+/// (the sync GPU offload rejects the 2^16 shape — measured net negative
+/// cold), so the back-to-back race regime is OVERLAP-flattering: the
+/// overlapped arm's GPU work rides in-race hot clocks the timed prove may
+/// not see, while the CPU incumbent gains nothing. The margin is therefore
+/// 1.0 — the overlap must strictly win its race on minima — where the L1
+/// latch (GPU-vs-GPU arms, incumbent-flattering regime) allows 10%.
+static L2_OVERLAP_LATCH: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(L1_OVERLAP_UNMEASURED);
+const L2_OVERLAP_LATCH_MARGIN: f64 = 1.0;
+
+pub(crate) fn l2_overlap_latch_state() -> u8 {
+    L2_OVERLAP_LATCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Publish the L2 warmup race outcome. `equal` is `None` when either arm
+/// failed to produce a tree (no oracle possible — latch Off).
+pub(crate) fn l2_overlap_report(overlap_wall_ms: f64, incumbent_wall_ms: f64, equal: Option<bool>) {
+    let decision = match equal {
+        Some(true) if overlap_wall_ms <= incumbent_wall_ms * L2_OVERLAP_LATCH_MARGIN => {
+            L1_OVERLAP_ON
+        }
+        Some(true) => L1_OVERLAP_OFF,
+        Some(false) => {
+            if gpu_zc_r2_debug() {
+                eprintln!(
+                    "[l2-overlap] MISMATCH: overlapped tree diverges from incumbent — \
+                     poisoned off for the process"
+                );
+            }
+            L1_OVERLAP_OFF
+        }
+        None => L1_OVERLAP_OFF,
+    };
+    L2_OVERLAP_LATCH.store(decision, std::sync::atomic::Ordering::Relaxed);
+    if gpu_zc_r2_debug() {
+        eprintln!(
+            "[l2-overlap] warmup race: overlapped {overlap_wall_ms:.2} ms vs incumbent \
+             {incumbent_wall_ms:.2} ms, trees_equal={equal:?} -> latch {}",
+            match decision {
+                L1_OVERLAP_ON => "ON",
+                _ => "OFF",
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn l2_overlap_latch_force(state: u8) {
+    L2_OVERLAP_LATCH.store(state, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// One in-flight L1 overlap session: leaf dispatches are submitted per
 /// finalized NTT chunk while the transform still runs; `finish` drains them,
 /// encodes the internal levels exactly as the incumbent does, and copies the
@@ -607,10 +675,24 @@ pub(crate) fn gpu_l1_merkle_overlap_begin(
     data_len: usize,
     num_leaves: usize,
 ) -> Option<L1MerkleOverlap> {
-    if !gpu_l1_merkle_overlap_enabled() || !gpu_recursive_merkle_enabled() {
+    if !gpu_recursive_merkle_enabled() {
         return None;
     }
-    let latch = l1_overlap_latch_state();
+    // Per-shape gates: each level has its own kill switch and its own
+    // process latch (independent warmup races against different incumbents).
+    let latch = if num_leaves == 1 << 18 {
+        if !gpu_l1_merkle_overlap_enabled() {
+            return None;
+        }
+        l1_overlap_latch_state()
+    } else if num_leaves == 1 << 16 {
+        if !gpu_l2_tail_overlap_enabled() {
+            return None;
+        }
+        l2_overlap_latch_state()
+    } else {
+        return None;
+    };
     if latch == L1_OVERLAP_OFF {
         return None;
     }
@@ -683,6 +765,38 @@ pub const ENV_NO_COMMIT_TAIL_FILL: &str = "FLOCK_NO_COMMIT_TAIL_FILL";
 /// Read per prove (uncached) so same-process A/B tests can toggle it.
 pub fn commit_tail_fill_enabled() -> bool {
     !std::env::var(ENV_NO_COMMIT_TAIL_FILL).is_ok_and(|v| v == "1")
+}
+
+/// Kill switch for the commit-window AB-precompute GPU suffix arm
+/// (`FLOCK_NO_GPU_AB_PRE=1`, exact): on the ranked shape the commit window
+/// is bound by the CPU AB-precompute arm while the GPU graph finishes
+/// early and idles for the arm's tail. The arm hands a calibrated SUFFIX
+/// of the precompute chunk range to a supplemental kernel: the launch only
+/// PREPARES the job at arm start; the streamed commit submits it the
+/// moment the graph's last dispatch retires (root final — the exact start
+/// of the idle tail), so the suffix never contends with the graph, and
+/// the CPU queue drains the front exactly as today. If the CPU queue
+/// finishes while the graph still runs (no idle tail this prove), the
+/// drain cancels the never-submitted job and redoes it on the CPU under
+/// the still-running graph — worst case is the incumbent wall. The kernel
+/// is the same F2-linear inv-NTT byte-table gather family as the CPU
+/// kernel (bit-exact by construction; the warmup probe enforces it at
+/// runtime before any share is admitted).
+pub const ENV_NO_GPU_AB_PRE: &str = "FLOCK_NO_GPU_AB_PRE";
+
+pub(crate) fn gpu_ab_pre_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_GPU_AB_PRE).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Diagnostic trace for the AB-precompute suffix arm
+/// (`FLOCK_AB_PRE_GPU_DEBUG=1`).
+pub(crate) fn gpu_ab_pre_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_AB_PRE_GPU_DEBUG").is_some());
+    *ON
 }
 
 /// Kill switch for the zerocheck first-tail-round (T3 compact reconstruction)
@@ -4554,6 +4668,40 @@ kernel void blake3_pow_scan(
             }
         }
 
+        /// Non-blocking bounded status poll: `Ok(true)` when the buffer
+        /// completed inside the budget, `Ok(false)` when it is still in
+        /// flight (the caller keeps the handle and moves on — the abandon
+        /// path of the AB-precompute suffix drain), `Err` on a real command
+        /// buffer failure. Never falls back to the blocking wait.
+        pub(crate) unsafe fn poll_cb_within(&self, cb: Id, budget_ms: f64) -> Result<bool, String> {
+            unsafe {
+                let start = std::time::Instant::now();
+                loop {
+                    let status: u64 = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        cb,
+                        c"status"
+                    );
+                    if status >= 4 {
+                        if status == 4 {
+                            return Ok(true);
+                        }
+                        let err: Id =
+                            send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
+                        return Err(format!(
+                            "command buffer status {status}: {}",
+                            self.api.error_string(err)
+                        ));
+                    }
+                    if start.elapsed().as_secs_f64() * 1e3 > budget_ms {
+                        return Ok(false);
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+
         /// Bounded status spin on an already-committed command buffer: the
         /// same park-latency dodge as `commit_and_spin`, for drain sites
         /// where the submit happened earlier (zc-r2 join). If the buffer is
@@ -6730,6 +6878,13 @@ kernel void blake3_pow_scan(
             return;
         }
 
+        // The AB replays below run against the 16-graph timing sweep — an
+        // environment no timed prove ever sees. Suppress the AB-precompute
+        // GPU suffix for the duration: its launches would both pollute the
+        // sweep's graph walls and get abandoned by the drain's poll (which
+        // would zero the share a representative calibration just solved).
+        let _ab_pre_off = AbPreSuppressGuard::engage();
+
         let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
         let latch = latch_lock();
         let LatchState::On(latched) = &*latch else {
@@ -7919,6 +8074,11 @@ kernel void blake3_pow_scan(
             let tree = cpu(&mut codeword);
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
+
+        // The graph's last dispatch has retired and the root is final: the
+        // GPU idle tail starts here. Submit the deferred AB-precompute
+        // suffix, if one is armed (one relaxed load when it is not).
+        ab_pre_graph_idle_submit();
 
         let total_nodes = 2 * stream.n_leaves - 1;
         let codeword_len = params.codeword_len_f128();
@@ -10482,11 +10642,20 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 }
 "#;
 
-    /// The exact recursive shapes worth offloading. L1 (2^18 leaves) wins
-    /// ~0.9 ms per timed prove; L2 (2^16 leaves) was measured NET NEGATIVE
-    /// (GPU 1.06 ms vs CPU 0.81 ms — the fixed wrap/submit/wait roundtrip
-    /// dominates at 16 MiB) and is deliberately excluded.
-    const REC_MERKLE_SHAPES: [usize; 1] = [1usize << 18];
+    /// The recursive shapes the Merkle state carries buffers for. Slot 0
+    /// MUST stay the L1 shape (2^18 leaves): the pinned-seed pre-wrap below
+    /// indexes it. The L2 shape (2^16 leaves) is overlap-only — see
+    /// `REC_MERKLE_SYNC_SHAPES`.
+    const REC_MERKLE_SHAPES: [usize; 2] = [1usize << 18, 1usize << 16];
+
+    /// Shapes eligible for the SYNC whole-tree offload. L1 wins ~0.9 ms per
+    /// timed prove; a sync L2 offload was measured NET NEGATIVE (GPU 1.06 ms
+    /// vs CPU 0.81 ms — the fixed cold submit/wait roundtrip dominates at
+    /// 8 MiB) and stays excluded. L2 is reachable only through the overlap
+    /// session, where the queue is warm from L1's work and the leaf passes
+    /// hide under the still-running NTT (probe: warm roundtrip 0.013 ms,
+    /// exposed drain+copy ~0.45 ms vs 0.77 ms CPU window).
+    const REC_MERKLE_SYNC_SHAPES: [usize; 1] = [1usize << 18];
 
     /// Process-lifetime Metal state for the recursive Merkle offload.
     struct RecMerkle {
@@ -10627,7 +10796,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 
     pub(crate) fn gpu_recursive_merkle_blake3(data: &[u8], num_leaves: usize) -> Option<Vec<Hash>> {
         if !super::gpu_recursive_merkle_enabled()
-            || !REC_MERKLE_SHAPES.contains(&num_leaves)
+            || !REC_MERKLE_SYNC_SHAPES.contains(&num_leaves)
             || data.len() != num_leaves * 128
         {
             return None;
@@ -10939,11 +11108,20 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             (self.num_leaves / 8).max(256)
         }
 
+        /// Debug tag by shape (one session type serves both levels).
+        fn tag(&self) -> &'static str {
+            if self.num_leaves == 1 << 18 {
+                "l1-overlap"
+            } else {
+                "l2-overlap"
+            }
+        }
+
         fn fail(&self, msg: &str) {
             self.failed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             if super::gpu_zc_r2_debug() {
-                eprintln!("[l1-overlap] {msg} — falling back to incumbent");
+                eprintln!("[{}] {msg} — falling back to incumbent", self.tag());
             }
         }
 
@@ -11168,8 +11346,9 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 // include the race's primer/settle time here — read the
                 // race's own wall line for those.
                 eprintln!(
-                    "[l1-overlap] streamed {} ranges in {} batches; since-begin {ntt_wall_ms:.2} \
+                    "[{}] streamed {} ranges in {} batches; since-begin {ntt_wall_ms:.2} \
                      ms, drain+parents+copy {:.2} ms",
+                    self.tag(),
                     inner.ranges.len(),
                     inner.batches,
                     self.started.elapsed().as_secs_f64() * 1e3 - ntt_wall_ms,
@@ -11190,6 +11369,203 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 unsafe { self.gpu.release(cb) };
             }
         }
+    }
+
+    /// Pre-registered l2_tail_overlap probe (test-only): price the warm-queue
+    /// batch submit/drain machinery at the L2 shape (2^16 leaves, 8 MiB)
+    /// BEFORE building the overlap, against the CPU merkle it would replace.
+    /// The lig_mat8 kill mode was a fixed Metal scheduling price larger than
+    /// the window; this measures that price with the queue warm (the L2
+    /// commit directly follows L1's offload in the timed prove).
+    #[cfg(test)]
+    pub(crate) fn rec_merkle_l2_warm_probe() -> Result<String, String> {
+        let gpu = gpu()?;
+        let n: usize = 1 << 16;
+        let total_nodes = 2 * n - 1;
+        let mut out = String::new();
+        unsafe {
+            let pool = gpu.pool_push();
+            let result = (|| -> Result<(), String> {
+                let pso_leaf =
+                    compile_supplemental_pipeline(gpu, REC_MERKLE_MSL_SOURCE, "leaf_hash128")?;
+                let pso_parent =
+                    compile_supplemental_pipeline(gpu, REC_MERKLE_MSL_SOURCE, "rec_parent_hash")?;
+                // 8 MiB codeword-like matrix, deterministic bytes.
+                let mut data: Vec<F128> = crate::alloc_uninit_vec(n * 8);
+                let mut s = 0x243F6A8885A308D3u64;
+                for x in data.iter_mut() {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let lo = s;
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    *x = F128 { lo, hi: s };
+                }
+                let data_bytes = core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), n * 128);
+                let data_buf = gpu.wrap_buffer(data.as_ptr().cast_mut().cast::<u8>(), n * 128)?;
+                let tree_buf = gpu.new_buffer(total_nodes * 32)?;
+
+                let encode_leaves = |enc: Id, leaf_start: usize, count: usize| {
+                    gpu.set_pipeline(enc, pso_leaf);
+                    gpu.set_buffer(enc, data_buf, leaf_start * 128, 0);
+                    gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
+                    gpu.dispatch(enc, (count / 256) as u64, 256);
+                };
+                let encode_parents = |enc: Id| {
+                    gpu.set_pipeline(enc, pso_parent);
+                    let mut read_start = 0usize;
+                    let mut read_len = n;
+                    while read_len > 1 {
+                        let write_start = read_start + read_len;
+                        let n_out = read_len / 2;
+                        gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                        gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
+                        let tpg = 256u64.min(n_out as u64);
+                        gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                        read_start = write_start;
+                        read_len = n_out;
+                    }
+                };
+
+                // Warm: two full chains (page wiring + queue + clock ramp).
+                for _ in 0..2 {
+                    let cb = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb)?;
+                    encode_leaves(enc, 0, n);
+                    encode_parents(enc);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb)?;
+                }
+
+                let min_of = |mut f: Box<dyn FnMut() -> Result<f64, String>>,
+                              reps: usize|
+                 -> Result<f64, String> {
+                    let mut best = f64::INFINITY;
+                    for _ in 0..reps {
+                        best = best.min(f()?);
+                    }
+                    Ok(best)
+                };
+
+                // A: empty-cb submit->complete roundtrip (fixed price floor).
+                let a = min_of(
+                    Box::new(|| {
+                        let t = std::time::Instant::now();
+                        let cb = gpu.command_buffer()?;
+                        let enc = gpu.compute_encoder(cb)?;
+                        gpu.end_encoding(enc);
+                        gpu.commit_and_spin(cb, 8.0)?;
+                        Ok(t.elapsed().as_secs_f64() * 1e3)
+                    }),
+                    10,
+                )?;
+
+                // B: single-cb full chain (leaf + parents) submit->complete.
+                let b = min_of(
+                    Box::new(|| {
+                        let t = std::time::Instant::now();
+                        let cb = gpu.command_buffer()?;
+                        let enc = gpu.compute_encoder(cb)?;
+                        encode_leaves(enc, 0, n);
+                        encode_parents(enc);
+                        gpu.end_encoding(enc);
+                        gpu.commit_and_spin(cb, 8.0)?;
+                        Ok(t.elapsed().as_secs_f64() * 1e3)
+                    }),
+                    10,
+                )?;
+
+                // C: overlap-shaped arrival — 8 leaf batches (n/8 each)
+                // submitted at ~75 us spacing (the local L2 NTT produces its
+                // 32 claims over ~0.6 ms), parents encoded behind the last
+                // batch. Report the EXPOSED price: last-submit -> drained,
+                // plus per-batch CPU encode+submit cost (that work happens
+                // inside NTT worker callbacks in the real overlap).
+                let mut c_exposed = f64::INFINITY;
+                let mut c_encode_total = f64::INFINITY;
+                for _ in 0..8 {
+                    let mut cbs: Vec<Id> = Vec::with_capacity(8);
+                    let mut encode_ms = 0.0f64;
+                    let mut last_submit = std::time::Instant::now();
+                    for batch in 0..8 {
+                        let te = std::time::Instant::now();
+                        let cb = gpu.command_buffer()?;
+                        let enc = gpu.compute_encoder(cb)?;
+                        encode_leaves(enc, batch * (n / 8), n / 8);
+                        if batch == 7 {
+                            encode_parents(enc);
+                        }
+                        gpu.end_encoding(enc);
+                        let cb = gpu.retain(cb);
+                        gpu.commit_async(cb);
+                        last_submit = std::time::Instant::now();
+                        encode_ms += last_submit.duration_since(te).as_secs_f64() * 1e3;
+                        cbs.push(cb);
+                        if batch < 7 {
+                            std::thread::sleep(std::time::Duration::from_micros(75));
+                        }
+                    }
+                    let mut err = None;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(8);
+                    for cb in cbs {
+                        if let Err(e) = gpu.yield_wait_cb_until(cb, deadline) {
+                            err.get_or_insert(e);
+                        }
+                        gpu.release(cb);
+                    }
+                    if let Some(e) = err {
+                        return Err(e);
+                    }
+                    c_exposed = c_exposed.min(last_submit.elapsed().as_secs_f64() * 1e3);
+                    c_encode_total = c_encode_total.min(encode_ms);
+                }
+
+                // Copy-out price (drain-side, exposed).
+                let copy = min_of(
+                    Box::new(|| {
+                        let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
+                        let t = std::time::Instant::now();
+                        let dst = core::slice::from_raw_parts_mut(
+                            tree.as_mut_ptr().cast::<u8>(),
+                            total_nodes * 32,
+                        );
+                        copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
+                        let ms = t.elapsed().as_secs_f64() * 1e3;
+                        crate::scratch::give_hash_tree(tree);
+                        Ok(ms)
+                    }),
+                    5,
+                )?;
+
+                // CPU reference: the production pooled merkle at the L2 shape.
+                let mut cpu = f64::INFINITY;
+                for _ in 0..10 {
+                    let storage = crate::scratch::take_hash_tree(total_nodes);
+                    let t = std::time::Instant::now();
+                    let tree = crate::merkle::merkle_tree_into(
+                        storage,
+                        data_bytes,
+                        n,
+                        crate::merkle::HashKind::Blake3,
+                    );
+                    cpu = cpu.min(t.elapsed().as_secs_f64() * 1e3);
+                    crate::scratch::give_hash_tree(tree);
+                }
+
+                out = format!(
+                    "[l2-probe] empty-cb roundtrip {a:.3} ms | single-cb chain {b:.3} ms | \
+                     batched exposed-after-last-submit {c_exposed:.3} ms (encode+submit CPU \
+                     {c_encode_total:.3} ms over 8 batches) | copy-out {copy:.3} ms | \
+                     CPU merkle window {cpu:.3} ms"
+                );
+                gpu.release(tree_buf);
+                gpu.release(data_buf);
+                gpu.release(pso_leaf);
+                gpu.release(pso_parent);
+                Ok(())
+            })();
+            gpu.pool_pop(pool);
+            result?;
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -12190,6 +12566,1061 @@ kernel void zc_r2_products(
             };
             ZC_R2_TUNED.store(share, Ordering::Relaxed);
             ZcR2Result::Calibrated
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Commit-window AB-precompute GPU suffix arm (see `ENV_NO_GPU_AB_PRE`).
+    //
+    // The commit window is `rayon::join(GPU graph ‖ CPU AB precompute)`. On
+    // the ranked steady path every graph command buffer (streamed witness
+    // tiles + the early hybrid prefix cb2) is already committed to the
+    // serial queue before the window opens, so a command buffer submitted
+    // at AB-arm start executes exactly in the graph-tail idle: no host
+    // round-trip, no mid-graph preemption. The kernel mirrors the scalar
+    // reference `shift_reduce_inner_ab_scalar` byte-for-byte: per 1 KiB
+    // chunk row, eight inv-NTT byte-table applies per operand (F2-linear
+    // XOR gathers out of the same 16 KiB `InvNttTableByteSingleGf8` base
+    // image the CPU uses), a carry-less GF(2^8) lane product reduced mod
+    // the AES polynomial, an `acc ^= y << k` shift accumulate, and a final
+    // reduce. Store contract: live rows `[0, n_b_med)` only; the dead tail
+    // rows are zero-filled only in the `FLOCK_NO_AB_COMPACT_STORE` control
+    // flavor — exactly the CPU's flavor-latched output bytes.
+    //
+    // Calibration (untimed warmup, zc-r2 pattern): the CPU drains the FULL
+    // range; the GPU runs a fixed probe suffix into a poison-prefilled
+    // scratch buffer; every live byte is compared against the CPU's own
+    // output and every dead byte checked for the flavor contract before
+    // any share is admitted. Pricing replays the probe to a wall plateau.
+    // The share solve is tail-bounded: the GPU only becomes free at the
+    // graph floor, so the absorbable work is the idle tail I, and
+    // `g = I / (c + u)` chunks (c/u = CPU/GPU ms per chunk) is the point
+    // where the shortened CPU arm meets the GPU's finish. I is the
+    // conservative `AB_PRE_TAIL_BUDGET_MS` (below the measured 5–17 ms
+    // ranked anchor band), which also BOUNDS the worst-case straggle at
+    // `I - I_true ≤ I` even if today's true tail were zero. Cap n/4
+    // (pre-registered), ratio ≥ 8 ⇒ share 0 (the lig_mat8 outcome), any
+    // failure after admission ⇒ poison + CPU redo of the suffix.
+    // -----------------------------------------------------------------------
+
+    const AB_PRE_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// Reduce a carry-less polynomial of degree <= 14 modulo
+// x^8 + x^4 + x^3 + x + 1 (mirror of the CPU's `gf8_reduce`).
+static inline uint gf8_reduce15(uint p) {
+    uint h = p >> 8;
+    uint t = (p & 0xffu) ^ h ^ (h << 1) ^ (h << 3) ^ (h << 4);
+    uint h2 = t >> 8;
+    return ((t & 0xffu) ^ h2 ^ (h2 << 1) ^ (h2 << 3) ^ (h2 << 4)) & 0xffu;
+}
+
+struct AbPreParams {
+    uint start_chunk;    // first absolute x_outer of the GPU suffix
+    uint n_chunks;       // suffix length in chunks
+    uint mask;           // within_outer_mask (< 16)
+    uint zero_tail;      // 1 = zero-fill dead rows (FLOCK_NO_AB_COMPACT_STORE)
+    uint out_base_chunk; // out byte base = (x_outer - out_base_chunk) * 1024
+    uint counts_a;       // b_med_counts[0..4], one byte per window
+    uint counts_b;       // b_med_counts[4..8]
+    uint counts_c;       // b_med_counts[8..12]
+    uint counts_d;       // b_med_counts[12..16]
+};
+
+// One threadgroup covers four 1 KiB chunks (256 threads = 4 x 64 lanes).
+// Per (chunk, lane): for each live b_med row, eight K positions, each an
+// 8-byte inv-NTT table apply for a and b (out[i] ^= T[byte*64 + (i ^ 8b)]),
+// a GF(2^8) carry-less product reduced mod the AES polynomial, and the
+// CPU kernel's exact shift accumulate. All 64 lanes of a chunk read the
+// same 16 input bytes per (row, K) — broadcast loads out of two uints.
+kernel void ab_pre_suffix(
+    device const uchar* a_in  [[buffer(0)]],
+    device const uchar* b_in  [[buffer(1)]],
+    device const uint4* tab_in [[buffer(2)]],
+    device uchar*       out   [[buffer(3)]],
+    constant AbPreParams& p   [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    // 16 KiB base-image table, staged once per threadgroup.
+    threadgroup uint4 tab4[1024];
+    for (uint i = lid; i < 1024u; i += 256u) { tab4[i] = tab_in[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup const uchar* tab = (threadgroup const uchar*)tab4;
+
+    uint local_chunk = tgid * 4u + (lid >> 6u);
+    if (local_chunk >= p.n_chunks) { return; }
+    uint lane = lid & 63u;
+    uint x_outer = p.start_chunk + local_chunk;
+    uint w = x_outer & p.mask;
+    uint cw;
+    switch (w >> 2u) {
+        case 0u: cw = p.counts_a; break;
+        case 1u: cw = p.counts_b; break;
+        case 2u: cw = p.counts_c; break;
+        default: cw = p.counts_d; break;
+    }
+    uint n_b_med = (cw >> ((w & 3u) * 8u)) & 0xffu;
+    ulong in_base = ulong(x_outer) * 1024ul;
+    ulong out_base = ulong(x_outer - p.out_base_chunk) * 1024ul;
+    for (uint bm = 0u; bm < 16u; bm++) {
+        if (bm >= n_b_med) {
+            if (p.zero_tail != 0u) {
+                out[out_base + ulong(bm) * 64ul + ulong(lane)] = uchar(0);
+            }
+            continue;
+        }
+        ulong row = in_base + ulong(bm) * 64ul;
+        uint acc = 0u;
+        for (uint k = 0u; k < 8u; k++) {
+            // The row's 8 input bytes per operand, 8-byte aligned.
+            ulong off = row + ulong(k) * 8ul;
+            uint a_lo = *(device const uint*)(a_in + off);
+            uint a_hi = *(device const uint*)(a_in + off + 4ul);
+            uint b_lo = *(device const uint*)(b_in + off);
+            uint b_hi = *(device const uint*)(b_in + off + 4ul);
+            uint av = 0u, bv = 0u;
+            for (uint bb = 0u; bb < 8u; bb++) {
+                uint a_byte = ((bb < 4u ? a_lo : a_hi) >> ((bb & 3u) * 8u)) & 0xffu;
+                uint b_byte = ((bb < 4u ? b_lo : b_hi) >> ((bb & 3u) * 8u)) & 0xffu;
+                uint idx = lane ^ (8u * bb);
+                av ^= uint(tab[(a_byte << 6u) + idx]);
+                bv ^= uint(tab[(b_byte << 6u) + idx]);
+            }
+            // clmul8 + reduce, then the CPU kernel's `acc ^= y << k`.
+            uint prod = 0u;
+            for (uint i = 0u; i < 8u; i++) {
+                prod ^= ((av >> i) & 1u) * (bv << i);
+            }
+            acc ^= gf8_reduce15(prod) << k;
+        }
+        out[out_base + ulong(bm) * 64ul + ulong(lane)] = uchar(gf8_reduce15(acc));
+    }
+}
+"#;
+
+    /// Process-lifetime Metal state for the AB-precompute suffix arm.
+    struct AbPre {
+        pso: Id,
+        /// 16 KiB inv-NTT base-image table (`cached_standard_k6` — static
+        /// per process); uploaded on first launch, reused forever.
+        tab_buf: Id,
+        tab_ready: bool,
+        /// Poison-prefilled probe destination for the warmup calibration.
+        probe_buf: Id,
+        probe_cap: usize,
+        /// Timed-path GPU destination. The kernel never writes the arm's
+        /// real output storage: the drain POLLS the command buffer and
+        /// copies the shadow's live rows out only on completion, so a late
+        /// GPU (graph-bound host) is simply abandoned — the CPU redoes the
+        /// suffix race-free and the wall reverts to exactly the incumbent.
+        shadow_buf: Id,
+        shadow_cap: usize,
+        /// Abandoned in-flight suffix command buffer; `NIL` when none.
+        /// Drained (wait + release) before the shadow is rewritten — the
+        /// next launch, which in the benchmark's one-timed-prove processes
+        /// never comes (share is zeroed on abandonment).
+        pending_cb: Id,
+    }
+
+    // SAFETY: the Metal handles are only touched under the state mutex;
+    // Metal objects themselves are thread-safe.
+    unsafe impl Send for AbPre {}
+
+    static AB_PRE_STATE: std::sync::OnceLock<Option<std::sync::Mutex<AbPre>>> =
+        std::sync::OnceLock::new();
+    /// True while the hybrid retune's contention sweep replays the AB arm;
+    /// launches decline so the sweep stays clean (see the guard's site).
+    static AB_PRE_SUPPRESSED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// A timed suffix prepared by the launch but not yet submitted: every
+    /// buffer and parameter is ready, only the encode+commit is deferred to
+    /// graph completion (see [`ab_pre_graph_idle_submit`]). Submitting at
+    /// arm start was measured ON-adverse on a graph-bound host (12-pair
+    /// ABAB, median +4.0 ms): Metal runs hazard-free command buffers from
+    /// the same queue concurrently, so an early suffix steals GPU slices
+    /// from a binding graph. Deferred submission makes the contention
+    /// structurally zero — nothing is on the GPU until the graph's last
+    /// dispatch retired, and if the CPU queue finishes first (no idle tail
+    /// exists this prove) the drain cancels the never-submitted job and
+    /// redoes it on the CPU while the graph is still running.
+    struct AbPrePrepared {
+        a_buf: Id,
+        b_buf: Id,
+        out_buf: Id,
+        start_chunk: usize,
+        chunks: usize,
+        mask: usize,
+        counts: [u8; 16],
+        zero_tail: bool,
+        out_base_chunk: usize,
+    }
+
+    // SAFETY: plain Metal handles + POD; transitions serialized by the slot
+    // mutex.
+    unsafe impl Send for AbPrePrepared {}
+
+    enum AbPreSlot {
+        Empty,
+        Prepared(AbPrePrepared),
+        Submitted(Id, std::time::Instant),
+    }
+
+    // SAFETY: as `AbPrePrepared`.
+    unsafe impl Send for AbPreSlot {}
+
+    static AB_PRE_SLOT: std::sync::Mutex<AbPreSlot> = std::sync::Mutex::new(AbPreSlot::Empty);
+    /// Fast-path gate so the graph-completion hook costs one relaxed load
+    /// per commit when the arm is off/share 0 (the share-0 freeness
+    /// contract).
+    static AB_PRE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Graph-completion hook: submit the prepared timed suffix, if any.
+    /// Called on the commit arm right after the streamed graph's last
+    /// dispatch retired (root final) — the exact start of the GPU idle
+    /// tail. Lock order here and in the drain: slot, then state.
+    pub(crate) fn ab_pre_graph_idle_submit() {
+        use std::sync::atomic::Ordering;
+        if !AB_PRE_ARMED.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(mut slot) = AB_PRE_SLOT.lock() else {
+            return;
+        };
+        let AbPreSlot::Prepared(_) = &*slot else {
+            return;
+        };
+        let AbPreSlot::Prepared(p) = std::mem::replace(&mut *slot, AbPreSlot::Empty) else {
+            unreachable!();
+        };
+        let Ok(gpu) = gpu() else { return };
+        let Some(state_mutex) = ab_pre_state() else {
+            return;
+        };
+        let Ok(state) = state_mutex.lock() else {
+            return;
+        };
+        unsafe {
+            match ab_pre_submit(
+                gpu,
+                &state,
+                p.a_buf,
+                p.b_buf,
+                p.out_buf,
+                p.start_chunk,
+                p.chunks,
+                p.mask,
+                &p.counts,
+                p.zero_tail,
+                p.out_base_chunk,
+            ) {
+                Ok(cb) => *slot = AbPreSlot::Submitted(cb, std::time::Instant::now()),
+                Err(e) => {
+                    if super::gpu_ab_pre_debug() {
+                        eprintln!("[gpu-ab-pre] idle submit failed ({e}) — drain will CPU-redo");
+                    }
+                }
+            }
+        }
+    }
+
+    /// RAII engage/clear of [`AB_PRE_SUPPRESSED`], panic-safe via Drop.
+    struct AbPreSuppressGuard;
+
+    impl AbPreSuppressGuard {
+        fn engage() -> Self {
+            AB_PRE_SUPPRESSED.store(true, std::sync::atomic::Ordering::Relaxed);
+            AbPreSuppressGuard
+        }
+    }
+
+    impl Drop for AbPreSuppressGuard {
+        fn drop(&mut self) {
+            AB_PRE_SUPPRESSED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    /// Published GPU suffix share in chunks. `usize::MAX` = uncalibrated
+    /// (warmup calibrates), `0` = arm off for this process.
+    static AB_PRE_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static AB_PRE_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    pub(crate) fn ab_pre_test_reset() {
+        use std::sync::atomic::Ordering;
+        AB_PRE_TUNED.store(usize::MAX, Ordering::Relaxed);
+        AB_PRE_POISONED.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ab_pre_test_state() -> (usize, bool) {
+        use std::sync::atomic::Ordering;
+        (
+            AB_PRE_TUNED.load(Ordering::Relaxed),
+            AB_PRE_POISONED.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ab_pre_test_set_share(share: usize) {
+        AB_PRE_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test-only: block until the slot's submitted command buffer
+    /// completes, so the drain's poll models the production timing (the
+    /// CPU queue drains ~90 ms of work between submit and drain; the test
+    /// has none).
+    #[cfg(test)]
+    pub(crate) fn ab_pre_test_block(_job: &GpuAbPreJob) {
+        let Ok(slot) = AB_PRE_SLOT.lock() else { return };
+        if let AbPreSlot::Submitted(cb, _) = &*slot {
+            if let Ok(gpu) = gpu() {
+                unsafe {
+                    let _ = gpu.wait_cb(*cb);
+                }
+            }
+        }
+    }
+
+    /// Ratio-gate override (`FLOCK_AB_PRE_FORCE_RATIO=<f64>`, test/AB tool).
+    fn ab_pre_forced_ratio() -> Option<f64> {
+        static V: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_AB_PRE_FORCE_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+        *V
+    }
+
+    /// Idle-tail budget the share solve is allowed to absorb, in ms.
+    /// Default 4.0 sits below the measured 5–17 ms ranked anchor band
+    /// (in-source, 2026-08-05) and bounds the worst-case straggle at
+    /// `budget − true_tail ≤ 4 ms` even if the tail has since collapsed.
+    /// Override: `FLOCK_AB_PRE_TAIL_MS=<f64>`.
+    const AB_PRE_TAIL_BUDGET_MS: f64 = 4.0;
+
+    fn ab_pre_tail_budget_ms() -> f64 {
+        static V: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_AB_PRE_TAIL_MS")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(AB_PRE_TAIL_BUDGET_MS)
+        });
+        *V
+    }
+
+    /// Past this warmup GPU/CPU per-chunk cost ratio the arm is not worth
+    /// its try cost (the lig_mat8 outcome): share 0 = exact incumbent.
+    const AB_PRE_MAX_RATIO: f64 = 8.0;
+
+    /// Tail-bounded balanced solve: with the GPU free only from the graph
+    /// floor, absorbing `g` chunks shortens the CPU arm by `g·c` until the
+    /// arm meets the floor, and the GPU finishes at `floor + g·u`; both
+    /// constraints meet at `g = tail / (c + u)`. Cap n/4 (pre-registered
+    /// overshoot guard).
+    pub(crate) fn ab_pre_gate_share(
+        ratio: f64,
+        cpu_ms_per_chunk: f64,
+        n_chunks: usize,
+        tail_ms: f64,
+    ) -> usize {
+        if !ratio.is_finite()
+            || ratio <= 0.0
+            || !cpu_ms_per_chunk.is_finite()
+            || cpu_ms_per_chunk <= 0.0
+            || !tail_ms.is_finite()
+            || tail_ms <= 0.0
+        {
+            return 0;
+        }
+        if ratio >= AB_PRE_MAX_RATIO {
+            return 0;
+        }
+        let g = tail_ms / (cpu_ms_per_chunk * (1.0 + ratio));
+        (g as usize).min(n_chunks / 4)
+    }
+
+    fn ab_pre_init(gpu: &'static Gpu) -> Result<AbPre, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<Id, String> {
+                let src = gpu.api.nsstring(AB_PRE_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "ab-pre shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let ns = gpu.api.nsstring("ab_pre_suffix")?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
+                    return Err("ab_pre_suffix kernel not found".into());
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    library,
+                    c"release"
+                );
+                if pso.is_null() {
+                    return Err(format!(
+                        "ab_pre_suffix pipeline: {}",
+                        gpu.api.error_string(perr)
+                    ));
+                }
+                Ok(pso)
+            })();
+            gpu.pool_pop(pool);
+            let pso = built?;
+            let tab_buf = gpu.new_buffer(256 * 64)?;
+            Ok(AbPre {
+                pso,
+                tab_buf,
+                tab_ready: false,
+                probe_buf: NIL,
+                probe_cap: 0,
+                shadow_buf: NIL,
+                shadow_cap: 0,
+                pending_cb: NIL,
+            })
+        }
+    }
+
+    /// Drain a stashed abandoned suffix command buffer: wait (long complete
+    /// in any realistic schedule), release. Called before anything rewrites
+    /// the shadow buffer it binds.
+    unsafe fn ab_pre_drain_pending(gpu: &Gpu, state: &mut AbPre) {
+        if state.pending_cb.is_null() {
+            return;
+        }
+        let cb = state.pending_cb;
+        state.pending_cb = NIL;
+        unsafe {
+            let _ = gpu.wait_cb(cb);
+            gpu.release(cb);
+        }
+    }
+
+    fn ab_pre_state() -> Option<&'static std::sync::Mutex<AbPre>> {
+        AB_PRE_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match ab_pre_init(gpu) {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if super::gpu_ab_pre_debug() {
+                            eprintln!("[gpu-ab-pre] init failed: {e}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    pub(crate) struct GpuAbPreJob {
+        cb: Id,
+        /// First absolute chunk index of the GPU suffix.
+        pub(crate) start_chunk: usize,
+        pub(crate) chunks: usize,
+        calibration: bool,
+        n_chunks: usize,
+        mask: usize,
+        counts: [u8; 16],
+        compact: bool,
+        /// Process-lifetime input wraps (shared with zc-r2; NOT owned).
+        a_buf: Id,
+        b_buf: Id,
+        submitted: std::time::Instant,
+    }
+
+    // SAFETY: the command buffer handle is only waited/released from the
+    // draining thread; Metal command buffers are themselves thread-safe.
+    unsafe impl Send for GpuAbPreJob {}
+
+    impl GpuAbPreJob {
+        /// How many trailing chunks the CPU queue must NOT drain. Zero
+        /// during calibration: the CPU runs the full range and the GPU
+        /// probe is compared against its bytes, then discarded.
+        pub(crate) fn cpu_excluded(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    /// Result of draining the AB-precompute suffix arm.
+    pub(crate) enum GpuAbPreResult {
+        /// Warmup calibration completed (share published, probe discarded);
+        /// the caller's CPU output is authoritative.
+        Calibrated,
+        /// Timed suffix landed in the output storage, bit-exact.
+        Done,
+        /// Metal failed after admission; the caller must CPU-redo the
+        /// suffix chunks. The arm is poisoned for the process.
+        Failed,
+        /// The suffix was still in flight at the drain's poll deadline
+        /// (graph-bound host): the command buffer is stashed, the share
+        /// zeroed for the process, and the caller must CPU-redo the suffix
+        /// — race-free because the GPU only ever writes the shadow buffer.
+        /// Costs exactly the skipped work: the wall reverts to incumbent.
+        Abandoned,
+    }
+
+    /// How long the timed drain will spin for a nearly-done suffix before
+    /// abandoning it. The balanced solve targets simultaneous finish, so
+    /// solve noise puts the GPU slightly past the CPU about half the time;
+    /// this grace captures those, while bounding the stall a pathological
+    /// (graph-bound) host can inflict.
+    const AB_PRE_DRAIN_GRACE_MS: f64 = 1.0;
+
+    /// Fixed warmup probe size: large enough for stable per-chunk pricing
+    /// (2 MiB of output, ~500 threadgroups), ~0.4% of the ranked range.
+    const AB_PRE_PROBE_CHUNKS: usize = 2048;
+    const AB_PRE_POISON: u8 = 0xA5;
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn ab_pre_submit(
+        gpu: &Gpu,
+        state: &AbPre,
+        a_buf: Id,
+        b_buf: Id,
+        out_buf: Id,
+        start_chunk: usize,
+        chunks: usize,
+        mask: usize,
+        counts: &[u8; 16],
+        zero_tail: bool,
+        out_base_chunk: usize,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                start_chunk: u32,
+                n_chunks: u32,
+                mask: u32,
+                zero_tail: u32,
+                out_base_chunk: u32,
+                counts_a: u32,
+                counts_b: u32,
+                counts_c: u32,
+                counts_d: u32,
+            }
+            let word = |i: usize| -> u32 { u32::from_le_bytes(counts[i..i + 4].try_into().unwrap()) };
+            let params = P {
+                start_chunk: start_chunk as u32,
+                n_chunks: chunks as u32,
+                mask: mask as u32,
+                zero_tail: u32::from(zero_tail),
+                out_base_chunk: out_base_chunk as u32,
+                counts_a: word(0),
+                counts_b: word(4),
+                counts_c: word(8),
+                counts_d: word(12),
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, a_buf, 0, 0);
+            gpu.set_buffer(enc, b_buf, 0, 1);
+            gpu.set_buffer(enc, state.tab_buf, 0, 2);
+            gpu.set_buffer(enc, out_buf, 0, 3);
+            gpu.set_bytes(enc, pb, 4);
+            gpu.dispatch(enc, chunks.div_ceil(4) as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// Launch the AB-precompute suffix. `None` = the whole range stays on
+    /// the exact incumbent CPU queue (kill switch, poisoned, share 0,
+    /// undersized/unsupported shape, no Metal, or wrap failure).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_gpu_ab_pre(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        out_bytes: &[u8],
+        within_outer_mask: usize,
+        b_med_counts: &[u8],
+        inv_table: &crate::ntt::InvNttTableByteSingleGf8,
+        compact: bool,
+    ) -> Option<GpuAbPreJob> {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_ab_pre_enabled()
+            || AB_PRE_POISONED.load(Ordering::Relaxed)
+            || AB_PRE_SUPPRESSED.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        let tuned = AB_PRE_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        let n_chunks = out_bytes.len() / 1024;
+        if inv_table.k != 6
+            || inv_table.ell != 64
+            || a_packed.len() != out_bytes.len()
+            || b_packed.len() != out_bytes.len()
+            || !out_bytes.len().is_multiple_of(1024)
+            || within_outer_mask >= 16
+            || b_med_counts.len() != within_outer_mask + 1
+            || n_chunks < 16 * AB_PRE_PROBE_CHUNKS
+            || n_chunks > u32::MAX as usize
+        {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let chunks = if calibration {
+            AB_PRE_PROBE_CHUNKS
+        } else {
+            tuned.min(n_chunks / 4)
+        };
+        if chunks == 0 {
+            return None;
+        }
+        let start_chunk = n_chunks - chunks;
+        let gpu = gpu().ok()?;
+        // Clear any stale deferred job (aborted prove): a submitted one
+        // must complete before its shadow destination is reused below.
+        {
+            let Ok(mut slot) = AB_PRE_SLOT.lock() else {
+                note_poisoned_lock("ab-pre slot", false);
+                return None;
+            };
+            AB_PRE_ARMED.store(false, Ordering::Relaxed);
+            if let AbPreSlot::Submitted(cb, _) = std::mem::replace(&mut *slot, AbPreSlot::Empty) {
+                unsafe {
+                    let _ = gpu.wait_cb(cb);
+                    gpu.release(cb);
+                }
+            }
+        }
+        let state_mutex = ab_pre_state()?;
+        // Same poison discipline as zc-r2: the grow sequences are not
+        // unwind-atomic, so decline rather than recover.
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("ab-pre launch", false);
+                return None;
+            }
+        };
+        let mut counts = [0u8; 16];
+        counts[..b_med_counts.len()].copy_from_slice(b_med_counts);
+        unsafe {
+            if !state.tab_ready {
+                std::ptr::copy_nonoverlapping(
+                    inv_table.data_ptr(),
+                    gpu.buffer_contents(state.tab_buf),
+                    256 * 64,
+                );
+                state.tab_ready = true;
+            }
+            // a/b input views: REUSE the zc-r2 process-lifetime wrap cache
+            // (one no-copy view per allocation; a second overlapping view of
+            // the same pages is the 0734e04f failure mode). Lock order is
+            // always ab-pre -> zc-r2, and zc-r2 never takes the ab-pre lock.
+            let zc_state_mutex = zc_r2_state()?;
+            let (a_buf, b_buf) = {
+                let mut zc = match zc_state_mutex.lock() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        note_poisoned_lock("ab-pre wrap", false);
+                        return None;
+                    }
+                };
+                let a = zc_r2_wrap(&mut zc, gpu, a_packed).ok()?;
+                let b = zc_r2_wrap(&mut zc, gpu, b_packed).ok()?;
+                (a, b)
+            };
+            // A previously abandoned suffix must complete before its
+            // destination buffer is rewritten below.
+            ab_pre_drain_pending(gpu, &mut state);
+            let (out_buf, out_base_chunk) = if calibration {
+                let need = chunks * 1024;
+                if state.probe_cap < need {
+                    if state.probe_cap > 0 {
+                        gpu.release(state.probe_buf);
+                    }
+                    state.probe_buf = gpu.new_buffer(need).ok()?;
+                    state.probe_cap = need;
+                }
+                // Poisoned destination: the compare below also proves the
+                // kernel never touches a byte outside the flavor's contract.
+                std::ptr::write_bytes(gpu.buffer_contents(state.probe_buf), AB_PRE_POISON, need);
+                (state.probe_buf, start_chunk)
+            } else {
+                // Timed suffix lands in a shadow buffer, never the real
+                // output storage: the drain's poll-and-copy keeps a late
+                // GPU abandonable with a race-free CPU redo.
+                let need = chunks * 1024;
+                if state.shadow_cap < need {
+                    if state.shadow_cap > 0 {
+                        gpu.release(state.shadow_buf);
+                    }
+                    state.shadow_buf = gpu.new_buffer(need).ok()?;
+                    state.shadow_cap = need;
+                }
+                (state.shadow_buf, start_chunk)
+            };
+            let cb = if calibration {
+                // The probe submits immediately: the warmup is untimed and
+                // the replay pricing takes plateau minima anyway.
+                ab_pre_submit(
+                    gpu,
+                    &state,
+                    a_buf,
+                    b_buf,
+                    out_buf,
+                    start_chunk,
+                    chunks,
+                    within_outer_mask,
+                    &counts,
+                    !compact,
+                    out_base_chunk,
+                )
+                .ok()?
+            } else {
+                // Timed suffix: defer the submit to graph completion (see
+                // `ab_pre_graph_idle_submit`) so nothing contends with the
+                // graph. Drop the state lock before taking the slot lock —
+                // the hook and the drain lock slot-then-state.
+                drop(state);
+                let Ok(mut slot) = AB_PRE_SLOT.lock() else {
+                    note_poisoned_lock("ab-pre slot", false);
+                    return None;
+                };
+                *slot = AbPreSlot::Prepared(AbPrePrepared {
+                    a_buf,
+                    b_buf,
+                    out_buf,
+                    start_chunk,
+                    chunks,
+                    mask: within_outer_mask,
+                    counts,
+                    zero_tail: !compact,
+                    out_base_chunk,
+                });
+                AB_PRE_ARMED.store(true, Ordering::Relaxed);
+                NIL
+            };
+            Some(GpuAbPreJob {
+                cb,
+                start_chunk,
+                chunks,
+                calibration,
+                n_chunks,
+                mask: within_outer_mask,
+                counts,
+                compact,
+                a_buf,
+                b_buf,
+                submitted: std::time::Instant::now(),
+            })
+        }
+    }
+
+    /// Drain the arm. Timed path: non-blocking poll of the suffix command
+    /// buffer — complete inside the grace ⇒ copy the shadow's live rows
+    /// into `out_bytes`; still in flight ⇒ abandon (stash the cb, zero the
+    /// share, caller redoes the suffix on the CPU). During calibration
+    /// `out_bytes` must hold the CPU's full output (the CPU ran every
+    /// chunk) and `cpu_wall_ms` the wall of that full CPU drain (per-chunk
+    /// cost denominator).
+    pub(crate) fn gpu_ab_pre_wait(
+        job: GpuAbPreJob,
+        out_bytes: &mut [u8],
+        cpu_wall_ms: f64,
+    ) -> GpuAbPreResult {
+        use std::sync::atomic::Ordering;
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return GpuAbPreResult::Failed,
+        };
+        let poison = |cb: Id| {
+            AB_PRE_POISONED.store(true, Ordering::Relaxed);
+            AB_PRE_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            GpuAbPreResult::Failed
+        };
+        unsafe {
+            if !job.calibration {
+                use rayon::prelude::*;
+                AB_PRE_ARMED.store(false, Ordering::Relaxed);
+                let taken = {
+                    let Ok(mut slot) = AB_PRE_SLOT.lock() else {
+                        note_poisoned_lock("ab-pre drain slot", false);
+                        AB_PRE_TUNED.store(0, Ordering::Relaxed);
+                        return GpuAbPreResult::Abandoned;
+                    };
+                    std::mem::replace(&mut *slot, AbPreSlot::Empty)
+                };
+                let (cb, submitted_at) = match taken {
+                    AbPreSlot::Prepared(_) | AbPreSlot::Empty => {
+                        // The graph outlived the CPU queue this prove (or
+                        // the commit path never reached the idle hook): no
+                        // idle tail exists, the suffix was never submitted
+                        // (zero GPU contention paid), and the redo below
+                        // runs while the graph is still the binder. Zero
+                        // the share — the premise failed on this host.
+                        AB_PRE_TUNED.store(0, Ordering::Relaxed);
+                        if super::gpu_ab_pre_debug() {
+                            eprintln!(
+                                "[gpu-ab-pre] timed suffix NEVER SUBMITTED \
+                                 ({}/{} chunks, launch-to-drain={:.2}ms) — CPU redo, share 0",
+                                job.chunks,
+                                job.n_chunks,
+                                job.submitted.elapsed().as_secs_f64() * 1e3,
+                            );
+                        }
+                        return GpuAbPreResult::Abandoned;
+                    }
+                    AbPreSlot::Submitted(cb, t) => (cb, t),
+                };
+                let state_mutex = match ab_pre_state() {
+                    Some(s) => s,
+                    None => return poison(cb),
+                };
+                let mut state = match state_mutex.lock() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        note_poisoned_lock("ab-pre drain", false);
+                        return poison(cb);
+                    }
+                };
+                match gpu.poll_cb_within(cb, AB_PRE_DRAIN_GRACE_MS) {
+                    Err(e) => {
+                        if super::gpu_ab_pre_debug() {
+                            eprintln!("[gpu-ab-pre] timed suffix failed ({e}) — poisoned");
+                        }
+                        drop(state);
+                        return poison(cb);
+                    }
+                    Ok(false) => {
+                        // Still in flight past the grace (the solve
+                        // overshot the true tail). Abandon — the cb keeps
+                        // writing only the shadow buffer and is drained
+                        // before the shadow's next reuse; the share is
+                        // zeroed so no later prove in this process
+                        // retries.
+                        ab_pre_drain_pending(gpu, &mut state);
+                        state.pending_cb = cb;
+                        AB_PRE_TUNED.store(0, Ordering::Relaxed);
+                        if super::gpu_ab_pre_debug() {
+                            eprintln!(
+                                "[gpu-ab-pre] timed suffix ABANDONED at drain \
+                                 ({}/{} chunks, idle-to-drain={:.2}ms) — CPU redo, share 0",
+                                job.chunks,
+                                job.n_chunks,
+                                submitted_at.elapsed().as_secs_f64() * 1e3,
+                            );
+                        }
+                        return GpuAbPreResult::Abandoned;
+                    }
+                    Ok(true) => {}
+                }
+                let first_wall = zc_fold_gpu_wall_ms(gpu, cb);
+                // Copy the shadow's live rows into the real output. Compact
+                // flavor copies exactly the rows the kernel wrote, so the
+                // dead tail bytes of the output storage stay untouched (the
+                // incumbent compact contract); the control flavor's dead
+                // rows were zero-filled by the kernel and copy over as the
+                // incumbent zero fill.
+                let shadow = std::slice::from_raw_parts(
+                    gpu.buffer_contents(state.shadow_buf) as *const u8,
+                    job.chunks * 1024,
+                );
+                let out_suffix =
+                    &mut out_bytes[job.start_chunk * 1024..(job.start_chunk + job.chunks) * 1024];
+                out_suffix
+                    .par_chunks_mut(1024)
+                    .enumerate()
+                    .for_each(|(c, dst)| {
+                        let x = job.start_chunk + c;
+                        let n = if job.compact {
+                            job.counts[x & job.mask] as usize * 64
+                        } else {
+                            1024
+                        };
+                        dst[..n].copy_from_slice(&shadow[c * 1024..c * 1024 + n]);
+                    });
+                drop(state);
+                gpu.release(cb);
+                if super::gpu_ab_pre_debug() {
+                    eprintln!(
+                        "[gpu-ab-pre] timed suffix {}/{} chunks: gpu={first_wall:.2}ms \
+                         idle-to-drain={:.2}ms launch-to-drain={:.2}ms",
+                        job.chunks,
+                        job.n_chunks,
+                        submitted_at.elapsed().as_secs_f64() * 1e3,
+                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                return GpuAbPreResult::Done;
+            }
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+                return poison(job.cb);
+            }
+            let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+
+            // ---- Calibration (untimed warmup prove, once per process) ----
+            if out_bytes.len() != job.n_chunks * 1024 {
+                return poison(job.cb);
+            }
+            let state_mutex = match ab_pre_state() {
+                Some(s) => s,
+                None => return poison(job.cb),
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    note_poisoned_lock("ab-pre wait", false);
+                    return poison(job.cb);
+                }
+            };
+            // Target-machine equality oracle before anything else: every
+            // live byte must equal the CPU's own output bit-for-bit, and
+            // every dead byte must honor the latched store flavor (compact:
+            // untouched poison; control: zero-filled).
+            let probe =
+                std::slice::from_raw_parts(gpu.buffer_contents(state.probe_buf), job.chunks * 1024);
+            for c in 0..job.chunks {
+                let x = job.start_chunk + c;
+                let live = job.counts[x & job.mask] as usize * 64;
+                let gpu_chunk = &probe[c * 1024..(c + 1) * 1024];
+                let cpu_chunk = &out_bytes[x * 1024..(x + 1) * 1024];
+                let live_ok = gpu_chunk[..live] == cpu_chunk[..live];
+                let tail_ok = if job.compact {
+                    gpu_chunk[live..].iter().all(|&b| b == AB_PRE_POISON)
+                } else {
+                    gpu_chunk[live..].iter().all(|&b| b == 0)
+                };
+                if !live_ok || !tail_ok {
+                    if super::gpu_ab_pre_debug() {
+                        eprintln!(
+                            "[gpu-ab-pre] CALIBRATION MISMATCH at chunk {x} \
+                             (live_ok={live_ok} tail_ok={tail_ok}) — poisoned",
+                        );
+                    }
+                    drop(state);
+                    return poison(job.cb);
+                }
+            }
+            // Ramp-robust GPU pricing: replay the probe back-to-back to a
+            // plateau (>= 3 replays, stop when a replay stops improving the
+            // best seen by > 5%), price from the minimum wall (zc-r2
+            // pattern; the replays rewrite only the probe buffer).
+            let mut walls = [0.0f64; 5];
+            walls[0] = first_wall.max(0.0);
+            let mut n_walls = usize::from(walls[0] > 0.0);
+            let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
+            gpu.release(job.cb);
+            while n_walls < walls.len() {
+                let Ok(cb2) = ab_pre_submit(
+                    gpu,
+                    &state,
+                    job.a_buf,
+                    job.b_buf,
+                    state.probe_buf,
+                    job.start_chunk,
+                    job.chunks,
+                    job.mask,
+                    &job.counts,
+                    !job.compact,
+                    job.start_chunk,
+                ) else {
+                    break;
+                };
+                let w = if gpu.wait_cb(cb2).is_ok() {
+                    zc_fold_gpu_wall_ms(gpu, cb2)
+                } else {
+                    0.0
+                };
+                gpu.release(cb2);
+                if w <= 0.0 {
+                    break;
+                }
+                walls[n_walls] = w;
+                n_walls += 1;
+                let prev_min = w_min;
+                w_min = w_min.min(w);
+                if n_walls >= 3 && w > 0.95 * prev_min {
+                    break;
+                }
+            }
+            drop(state);
+            let u_gpu = if n_walls > 0 && w_min < f64::MAX {
+                w_min / job.chunks as f64
+            } else {
+                f64::INFINITY
+            };
+            let u_cpu = cpu_wall_ms / job.n_chunks.max(1) as f64;
+            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+                let measured = u_gpu / u_cpu;
+                let ratio = ab_pre_forced_ratio().unwrap_or(measured);
+                let g = ab_pre_gate_share(ratio, u_cpu, job.n_chunks, ab_pre_tail_budget_ms());
+                if super::gpu_ab_pre_debug() {
+                    eprintln!("[gpu-ab-pre] gate replay walls: {:?}", &walls[..n_walls]);
+                    eprintln!(
+                        "[gpu-ab-pre] gate u_gpu={:.6}ms/chunk u_cpu={:.6}ms/chunk \
+                         ratio={:.3} tail={:.1}ms -> share {g}/{}",
+                        u_gpu,
+                        u_cpu,
+                        measured,
+                        ab_pre_tail_budget_ms(),
+                        job.n_chunks,
+                    );
+                }
+                g
+            } else {
+                0
+            };
+            AB_PRE_TUNED.store(share, Ordering::Relaxed);
+            GpuAbPreResult::Calibrated
         }
     }
 
@@ -13606,6 +15037,11 @@ pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{stage_zc_r2_idle_fill, zc_r2_idle_fill_viable};
+
+/// Commit-window AB-precompute GPU suffix arm (see `ENV_NO_GPU_AB_PRE`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{GpuAbPreJob, GpuAbPreResult, gpu_ab_pre_wait, launch_gpu_ab_pre};
 
 /// Zerocheck first-tail-round products GPU arm (see `ENV_NO_GPU_ZC_T3`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -15930,6 +17366,238 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         imp::zc_r2_test_reset();
     }
 
+    /// Tail-bounded balanced solve for the AB-precompute suffix share:
+    /// `g = tail / (c (1 + r))`, cap n/4, ratio-cliff and degenerate-input
+    /// zeros (pure policy, no Metal).
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn ab_pre_gate_share_policy() {
+        let n = 1usize << 19;
+        // The ranked anchor: 58 ms arm over 2^19 chunks.
+        let c = 58.0 / n as f64;
+        let g = imp::ab_pre_gate_share(2.0, c, n, 4.0);
+        assert_eq!(g, (4.0 / (c * 3.0)) as usize);
+        assert!(g > 0 && g < n / 4);
+        // A free-looking GPU is still capped at the pre-registered n/4.
+        assert_eq!(imp::ab_pre_gate_share(0.001, c / 100.0, n, 4.0), n / 4);
+        // Ratio cliff (the lig_mat8 outcome) and degenerate inputs.
+        assert_eq!(imp::ab_pre_gate_share(8.0, c, n, 4.0), 0);
+        assert_eq!(imp::ab_pre_gate_share(20.0, c, n, 4.0), 0);
+        assert_eq!(imp::ab_pre_gate_share(f64::INFINITY, c, n, 4.0), 0);
+        assert_eq!(imp::ab_pre_gate_share(-1.0, c, n, 4.0), 0);
+        assert_eq!(imp::ab_pre_gate_share(2.0, 0.0, n, 4.0), 0);
+        assert_eq!(imp::ab_pre_gate_share(2.0, c, n, 0.0), 0);
+    }
+
+    /// The AB-precompute GPU suffix must reproduce the production CPU drain
+    /// byte-for-byte on the ranked shape (m=32, k_log=14, useful 15,409),
+    /// for BOTH store flavors (compact tail-skip and the zero-fill
+    /// control), into a poisoned destination that proves the kernel never
+    /// writes a byte outside its assigned suffix or the flavor's row
+    /// contract. Also drives the production calibration probe path
+    /// (internal equality oracle + share publication).
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_ab_pre_matches_cpu_oracle() {
+        use crate::zerocheck::PaddingSpec;
+        use crate::zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_with_flavor as cpu_flavor;
+
+        const M: usize = 32;
+        const K_SKIP: usize = 6;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        // Ranked-shape padding pattern (see `build_b_med_counts`): two
+        // 8192-bit windows per block; window 0 fully live, window 1 keeps
+        // 15 of its 16 b_med rows.
+        let mask = 1usize;
+        let counts = [16u8, 15];
+        let inv_table = crate::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
+        let total_bytes = (1usize << M) / 8;
+        let n_chunks = total_bytes / 1024;
+        let n_f128 = total_bytes / 16;
+
+        let mut rng = Rng::new(0xAB135_7E1);
+        let mut a_vec = crate::scratch::take_f128(n_f128);
+        let mut b_vec = crate::scratch::take_f128(n_f128);
+        for v in [&mut a_vec, &mut b_vec] {
+            for x in v.iter_mut() {
+                *x = rng.f128();
+            }
+        }
+        let as_bytes = |v: &[F128]| unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+
+        for &compact in &[true, false] {
+            // Incumbent CPU reference at this store flavor (share 0 keeps
+            // the production drain's own launch off the GPU).
+            imp::ab_pre_test_reset();
+            imp::ab_pre_test_set_share(0);
+            let cpu_ref = cpu_flavor(
+                as_bytes(&a_vec),
+                as_bytes(&b_vec),
+                M,
+                K_SKIP,
+                inv_table,
+                &padding,
+                true,
+                compact,
+            );
+            let cpu_bytes = cpu_ref.as_bytes();
+
+            // Never-submitted cancel: the launch only PREPARES the timed
+            // suffix; without the graph-completion hook firing (a
+            // graph-bound prove) the drain must cancel it — the real
+            // output stays fully poisoned (nothing ever reached the GPU)
+            // and the share zeroes, all without touching Metal.
+            let mut out_vec = crate::scratch::take_f128(n_f128);
+            let out_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(out_vec.as_mut_ptr().cast::<u8>(), total_bytes)
+            };
+            out_bytes.fill(0xA5);
+            imp::ab_pre_test_set_share(65536);
+            let job = imp::launch_gpu_ab_pre(
+                as_bytes(&a_vec),
+                as_bytes(&b_vec),
+                out_bytes,
+                mask,
+                &counts,
+                inv_table,
+                compact,
+            )
+            .expect("deferred launch must succeed on real Metal");
+            assert!(matches!(
+                imp::gpu_ab_pre_wait(job, out_bytes, 0.0),
+                imp::GpuAbPreResult::Abandoned
+            ));
+            let (tuned, poisoned) = imp::ab_pre_test_state();
+            assert_eq!(tuned, 0, "cancellation must zero the share");
+            assert!(!poisoned, "cancellation is not a failure");
+            assert!(
+                out_bytes.iter().all(|&b| b == 0xA5),
+                "never-submitted suffix must leave the output storage untouched"
+            );
+
+            // In-flight abandon: submit via the graph-completion hook, then
+            // poll immediately — a large suffix cannot finish inside the
+            // drain grace and must be abandoned, output still untouched.
+            imp::ab_pre_test_set_share(65536);
+            let job = imp::launch_gpu_ab_pre(
+                as_bytes(&a_vec),
+                as_bytes(&b_vec),
+                out_bytes,
+                mask,
+                &counts,
+                inv_table,
+                compact,
+            )
+            .expect("abandon-path launch must succeed on real Metal");
+            imp::ab_pre_graph_idle_submit();
+            assert!(matches!(
+                imp::gpu_ab_pre_wait(job, out_bytes, 0.0),
+                imp::GpuAbPreResult::Abandoned
+            ));
+            let (tuned, poisoned) = imp::ab_pre_test_state();
+            assert_eq!(tuned, 0, "abandonment must zero the share");
+            assert!(!poisoned, "abandonment is not a failure");
+            assert!(
+                out_bytes.iter().all(|&b| b == 0xA5),
+                "abandoned suffix must leave the output storage untouched"
+            );
+
+            // Timed path at a forced share, fully poisoned destination.
+            // (The launch also drains the abandoned command buffer above.)
+            let share = 8192usize;
+            imp::ab_pre_test_set_share(share);
+            let job = imp::launch_gpu_ab_pre(
+                as_bytes(&a_vec),
+                as_bytes(&b_vec),
+                out_bytes,
+                mask,
+                &counts,
+                inv_table,
+                compact,
+            )
+            .expect("timed launch must succeed on real Metal");
+            assert!(!job.is_calibration());
+            assert_eq!(job.cpu_excluded(), share);
+            let start = job.start_chunk;
+            assert_eq!(start, n_chunks - share);
+            // Model production timing: the graph-completion hook submits,
+            // then the CPU queue drains ~90 ms before the join polls, so
+            // the suffix is long complete.
+            imp::ab_pre_graph_idle_submit();
+            imp::ab_pre_test_block(&job);
+            assert!(matches!(
+                imp::gpu_ab_pre_wait(job, out_bytes, 0.0),
+                imp::GpuAbPreResult::Done
+            ));
+            // Poisoned destination: the prefix the CPU queue would own is
+            // untouched.
+            assert!(
+                out_bytes[..start * 1024].iter().all(|&b| b == 0xA5),
+                "prefix poison intact (compact={compact})"
+            );
+            // Suffix: live rows byte-exact vs the production CPU output;
+            // dead rows honor the latched flavor contract.
+            for c in 0..share {
+                let x = start + c;
+                let live = counts[x & mask] as usize * 64;
+                let g = &out_bytes[x * 1024..(x + 1) * 1024];
+                let r = &cpu_bytes[x * 1024..(x + 1) * 1024];
+                assert_eq!(
+                    &g[..live],
+                    &r[..live],
+                    "live rows chunk {x} (compact={compact})"
+                );
+                if compact {
+                    assert!(
+                        g[live..].iter().all(|&b| b == 0xA5),
+                        "compact dead tail must stay poisoned (chunk {x})"
+                    );
+                } else {
+                    assert!(
+                        g[live..].iter().all(|&b| b == 0),
+                        "control dead tail must be zero-filled (chunk {x})"
+                    );
+                }
+            }
+
+            // Production calibration probe path: probe suffix vs the CPU's
+            // own output, then share publication.
+            imp::ab_pre_test_reset();
+            out_bytes.copy_from_slice(cpu_bytes);
+            let job2 = imp::launch_gpu_ab_pre(
+                as_bytes(&a_vec),
+                as_bytes(&b_vec),
+                out_bytes,
+                mask,
+                &counts,
+                inv_table,
+                compact,
+            )
+            .expect("calibration launch must succeed on real Metal");
+            assert!(job2.is_calibration());
+            assert_eq!(job2.cpu_excluded(), 0);
+            assert!(matches!(
+                imp::gpu_ab_pre_wait(job2, out_bytes, 50.0),
+                imp::GpuAbPreResult::Calibrated
+            ));
+            let (tuned, poisoned) = imp::ab_pre_test_state();
+            assert!(!poisoned, "probe bytes must equal CPU bytes bit-for-bit");
+            assert_ne!(tuned, usize::MAX, "calibration must publish a share");
+            crate::scratch::give_f128(out_vec);
+        }
+        // Leave the arm share-0 for the rest of the suite (other tests run
+        // full proves; bytes are identical either way, this just keeps
+        // their timing free of probe replays).
+        imp::ab_pre_test_set_share(0);
+        crate::scratch::give_f128(a_vec);
+        crate::scratch::give_f128(b_vec);
+    }
+
     /// The L1 NTT/Merkle-leaf overlap must reproduce the incumbent commit
     /// byte-for-byte on the real L1 shape: same codeword matrix, same flat
     /// tree, same root. Drives the full production path (`ligero_commit`
@@ -15982,6 +17650,77 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             "L1 overlap tree diverges from the sync path"
         );
         assert_eq!(w_overlap.root(), w_sync.root());
+    }
+
+    /// The L2 tail overlap must reproduce the incumbent commit byte-for-byte
+    /// on the real L2 shape (log_msg_cols=13, 8 lanes, rate 1/8 — 2^16
+    /// leaves of 128 bytes): same codeword matrix, same flat tree, same
+    /// root. Drives the full production path (`ligero_commit` with the
+    /// fused3 transform's per-chunk callback) with the L2 admission latch
+    /// forced to each arm; the incumbent at this shape is the pooled CPU
+    /// merkle (the sync GPU offload rejects 2^16 by design).
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_l2_tail_overlap_matches_sync() {
+        static L2_OVERLAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = L2_OVERLAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = imp::gpu() {
+            eprintln!("skipping GPU test: {e}");
+            return;
+        }
+        let mut rng = Rng::new(0x4C32);
+        let poly = rng.vec(8 << 13);
+        let ntt = crate::ntt::AdditiveNttF128::standard(16);
+
+        super::l2_overlap_latch_force(super::L1_OVERLAP_ON);
+        let w_overlap = crate::pcs::ligerito::ligero_commit(
+            &poly,
+            13,
+            3,
+            3,
+            &ntt,
+            crate::merkle::HashKind::Blake3,
+        );
+        super::l2_overlap_latch_force(super::L1_OVERLAP_OFF);
+        let w_sync = crate::pcs::ligerito::ligero_commit(
+            &poly,
+            13,
+            3,
+            3,
+            &ntt,
+            crate::merkle::HashKind::Blake3,
+        );
+        super::l2_overlap_latch_force(super::L1_OVERLAP_UNMEASURED);
+
+        assert!(
+            w_overlap.mat == w_sync.mat,
+            "L2 overlap codeword diverges from the sync path"
+        );
+        assert!(
+            w_overlap.tree == w_sync.tree,
+            "L2 overlap tree diverges from the sync path"
+        );
+        assert_eq!(w_overlap.root(), w_sync.root());
+    }
+
+    /// Pre-registered l2_tail_overlap price probe (diagnostic; see
+    /// `imp::rec_merkle_l2_warm_probe`). Prints the warm-queue submit/drain
+    /// prices at the 2^16 shape against the CPU merkle window — the
+    /// SHIP/KILL input for the overlap build. Never fails on price; only on
+    /// Metal errors.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn l2_tail_overlap_warm_price_probe() {
+        if let Err(e) = imp::gpu() {
+            eprintln!("skipping GPU probe: {e}");
+            return;
+        }
+        match imp::rec_merkle_l2_warm_probe() {
+            Ok(report) => eprintln!("{report}"),
+            Err(e) => panic!("probe failed on real Metal: {e}"),
+        }
     }
 
     /// T3 products arm oracle: the GPU's per-chunk reduced partials must

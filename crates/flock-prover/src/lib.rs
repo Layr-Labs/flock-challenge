@@ -75,6 +75,5 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker fable5-s32-stock-1786662240-18063
 // dispersion-resample marker fable5-s33-stock-1786662839-16995
 // dispersion-resample marker fable5-s34-stock-1786663417-1627
-// dispersion-resample marker sample-141-20260815-1806
 
-// dispersion-resample marker 65865230
+// welttowelt disambiguation ticket r5 — 2026-08-15T22:20:21Z
