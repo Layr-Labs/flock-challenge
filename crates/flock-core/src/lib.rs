@@ -77,11 +77,21 @@ pub fn micro_stack_enabled() -> bool {
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // r1459 (REAL code delta, mechanism trial): raise the pool to at least
+    // 12 worker threads (10 P-cores + 2 E-cores on the 14-core M3 Max
+    // runner pool). The board's cap8 trial (8 threads, our 15:23/15:52Z
+    // rows) measured +6.4% SLOWER than the natural 10-thread pool, opposite
+    // to the stale calibration note above, so the marginal thread is
+    // positive in the current GPU-hybrid program. This trial asks whether
+    // the two unused E-cores add throughput or become barrier stragglers.
+    // Binds only when the natural pool size is below 12 (no-op on 12+
+    // P-core chips); pure pool-geometry change, zero semantic proof impact.
     let n = std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(perf_core_count);
+        .unwrap_or_else(perf_core_count)
+        .max(12);
     // The main/calling thread runs *all* sequential work (seed expansion,
     // Fiat-Shamir observe/sample, proof serialization, multi-proof extract)
     // but rayon's start_handler only tags the pool workers. On Apple Silicon
