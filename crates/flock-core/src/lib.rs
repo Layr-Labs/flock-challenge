@@ -77,11 +77,21 @@ pub fn micro_stack_enabled() -> bool {
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // r1469 (REAL code delta, not a marker): cap the pool at 8 worker
+    // threads. The calibration note two paragraphs below records
+    // "Empirically, 8 threads beats 10 by ~10-20% on pcs::commit and
+    // similar parallel-NTT workloads" (M-series P-cores), yet the ranked
+    // harness exports RAYON_NUM_THREADS = hw.perflevel0.physicalcpu (10 on
+    // the M4-Pro runner pool), which silently defeats that calibration.
+    // The cap binds only when the natural pool size exceeds 8 (no-op on
+    // 4/6/8-P-core chips) and is a pure pool-geometry change: zero
+    // semantic effect on the proof, revertible by marker-only trees.
     let n = std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(perf_core_count);
+        .unwrap_or_else(perf_core_count)
+        .min(8);
     // The main/calling thread runs *all* sequential work (seed expansion,
     // Fiat-Shamir observe/sample, proof serialization, multi-proof extract)
     // but rayon's start_handler only tags the pool workers. On Apple Silicon
