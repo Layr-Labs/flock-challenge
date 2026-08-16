@@ -588,6 +588,78 @@ pub(crate) fn l1_overlap_latch_force(state: u8) {
     L1_OVERLAP_LATCH.store(state, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Kill switch for the L2 tail overlap (`FLOCK_NO_L2_TAIL_OVERLAP=1`, exact
+/// value): restores the incumbent CPU merkle for the second recursive
+/// commitment. Independent of the L1 switch — the two levels latch, race,
+/// and roll back separately. Only the exact `"1"` disables the path.
+pub const ENV_NO_L2_TAIL_OVERLAP: &str = "FLOCK_NO_L2_TAIL_OVERLAP";
+
+pub(crate) fn gpu_l2_tail_overlap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var(ENV_NO_L2_TAIL_OVERLAP).ok().as_deref() != Some("1")
+    });
+    *ON
+}
+
+/// Admission latch for the L2 tail overlap, mirroring the L1 latch: the
+/// first eligible L2 commit of the process dual-runs overlapped-then-
+/// incumbent (three samples per arm, minima race), byte-compares the trees,
+/// and latches the faster arm. The incumbent here is the CPU merkle builder
+/// (the sync GPU offload rejects the 2^16 shape — measured net negative
+/// cold), so the back-to-back race regime is OVERLAP-flattering: the
+/// overlapped arm's GPU work rides in-race hot clocks the timed prove may
+/// not see, while the CPU incumbent gains nothing. The allowance therefore
+/// mirrors the L1 latch's one-sided 10% but sided in the INCUMBENT's favor:
+/// the overlap must beat the incumbent by more than 10% on minima to latch
+/// On. A margin-1.0 strict race proved insufficient on the ranked box
+/// (falsification ca3636fb: both pre-registered draws ≈ −2σ) — at margin
+/// 1.0 warmup noise admits the arm in exactly the proves where it nets
+/// negative, so ties and marginal races must latch Off.
+static L2_OVERLAP_LATCH: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(L1_OVERLAP_UNMEASURED);
+const L2_OVERLAP_LATCH_ALLOWANCE: f64 = 1.10;
+
+pub(crate) fn l2_overlap_latch_state() -> u8 {
+    L2_OVERLAP_LATCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Publish the L2 warmup race outcome. `equal` is `None` when either arm
+/// failed to produce a tree (no oracle possible — latch Off).
+pub(crate) fn l2_overlap_report(overlap_wall_ms: f64, incumbent_wall_ms: f64, equal: Option<bool>) {
+    let decision = match equal {
+        Some(true) if overlap_wall_ms * L2_OVERLAP_LATCH_ALLOWANCE <= incumbent_wall_ms => {
+            L1_OVERLAP_ON
+        }
+        Some(true) => L1_OVERLAP_OFF,
+        Some(false) => {
+            if gpu_zc_r2_debug() {
+                eprintln!(
+                    "[l2-overlap] MISMATCH: overlapped tree diverges from incumbent — \
+                     poisoned off for the process"
+                );
+            }
+            L1_OVERLAP_OFF
+        }
+        None => L1_OVERLAP_OFF,
+    };
+    L2_OVERLAP_LATCH.store(decision, std::sync::atomic::Ordering::Relaxed);
+    if gpu_zc_r2_debug() {
+        eprintln!(
+            "[l2-overlap] warmup race: overlapped {overlap_wall_ms:.2} ms vs incumbent \
+             {incumbent_wall_ms:.2} ms, trees_equal={equal:?} -> latch {}",
+            match decision {
+                L1_OVERLAP_ON => "ON",
+                _ => "OFF",
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn l2_overlap_latch_force(state: u8) {
+    L2_OVERLAP_LATCH.store(state, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// One in-flight L1 overlap session: leaf dispatches are submitted per
 /// finalized NTT chunk while the transform still runs; `finish` drains them,
 /// encodes the internal levels exactly as the incumbent does, and copies the
@@ -607,10 +679,24 @@ pub(crate) fn gpu_l1_merkle_overlap_begin(
     data_len: usize,
     num_leaves: usize,
 ) -> Option<L1MerkleOverlap> {
-    if !gpu_l1_merkle_overlap_enabled() || !gpu_recursive_merkle_enabled() {
+    if !gpu_recursive_merkle_enabled() {
         return None;
     }
-    let latch = l1_overlap_latch_state();
+    // Per-shape gates: each level has its own kill switch and its own
+    // process latch (independent warmup races against different incumbents).
+    let latch = if num_leaves == 1 << 18 {
+        if !gpu_l1_merkle_overlap_enabled() {
+            return None;
+        }
+        l1_overlap_latch_state()
+    } else if num_leaves == 1 << 16 {
+        if !gpu_l2_tail_overlap_enabled() {
+            return None;
+        }
+        l2_overlap_latch_state()
+    } else {
+        return None;
+    };
     if latch == L1_OVERLAP_OFF {
         return None;
     }
@@ -10482,11 +10568,20 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 }
 "#;
 
-    /// The exact recursive shapes worth offloading. L1 (2^18 leaves) wins
-    /// ~0.9 ms per timed prove; L2 (2^16 leaves) was measured NET NEGATIVE
-    /// (GPU 1.06 ms vs CPU 0.81 ms — the fixed wrap/submit/wait roundtrip
-    /// dominates at 16 MiB) and is deliberately excluded.
-    const REC_MERKLE_SHAPES: [usize; 1] = [1usize << 18];
+    /// The recursive shapes the Merkle state carries buffers for. Slot 0
+    /// MUST stay the L1 shape (2^18 leaves): the pinned-seed pre-wrap below
+    /// indexes it. The L2 shape (2^16 leaves) is overlap-only — see
+    /// `REC_MERKLE_SYNC_SHAPES`.
+    const REC_MERKLE_SHAPES: [usize; 2] = [1usize << 18, 1usize << 16];
+
+    /// Shapes eligible for the SYNC whole-tree offload. L1 wins ~0.9 ms per
+    /// timed prove; a sync L2 offload was measured NET NEGATIVE (GPU 1.06 ms
+    /// vs CPU 0.81 ms — the fixed cold submit/wait roundtrip dominates at
+    /// 8 MiB) and stays excluded. L2 is reachable only through the overlap
+    /// session, where the queue is warm from L1's work and the leaf passes
+    /// hide under the still-running NTT (probe: warm roundtrip 0.013 ms,
+    /// exposed drain+copy ~0.45 ms vs 0.77 ms CPU window).
+    const REC_MERKLE_SYNC_SHAPES: [usize; 1] = [1usize << 18];
 
     /// Process-lifetime Metal state for the recursive Merkle offload.
     struct RecMerkle {
@@ -10627,7 +10722,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 
     pub(crate) fn gpu_recursive_merkle_blake3(data: &[u8], num_leaves: usize) -> Option<Vec<Hash>> {
         if !super::gpu_recursive_merkle_enabled()
-            || !REC_MERKLE_SHAPES.contains(&num_leaves)
+            || !REC_MERKLE_SYNC_SHAPES.contains(&num_leaves)
             || data.len() != num_leaves * 128
         {
             return None;
@@ -10939,11 +11034,20 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             (self.num_leaves / 8).max(256)
         }
 
+        /// Debug tag by shape (one session type serves both levels).
+        fn tag(&self) -> &'static str {
+            if self.num_leaves == 1 << 18 {
+                "l1-overlap"
+            } else {
+                "l2-overlap"
+            }
+        }
+
         fn fail(&self, msg: &str) {
             self.failed
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             if super::gpu_zc_r2_debug() {
-                eprintln!("[l1-overlap] {msg} — falling back to incumbent");
+                eprintln!("[{}] {msg} — falling back to incumbent", self.tag());
             }
         }
 
@@ -11168,8 +11272,9 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 // include the race's primer/settle time here — read the
                 // race's own wall line for those.
                 eprintln!(
-                    "[l1-overlap] streamed {} ranges in {} batches; since-begin {ntt_wall_ms:.2} \
+                    "[{}] streamed {} ranges in {} batches; since-begin {ntt_wall_ms:.2} \
                      ms, drain+parents+copy {:.2} ms",
+                    self.tag(),
                     inner.ranges.len(),
                     inner.batches,
                     self.started.elapsed().as_secs_f64() * 1e3 - ntt_wall_ms,
@@ -11190,6 +11295,203 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 unsafe { self.gpu.release(cb) };
             }
         }
+    }
+
+    /// Pre-registered l2_tail_overlap probe (test-only): price the warm-queue
+    /// batch submit/drain machinery at the L2 shape (2^16 leaves, 8 MiB)
+    /// BEFORE building the overlap, against the CPU merkle it would replace.
+    /// The lig_mat8 kill mode was a fixed Metal scheduling price larger than
+    /// the window; this measures that price with the queue warm (the L2
+    /// commit directly follows L1's offload in the timed prove).
+    #[cfg(test)]
+    pub(crate) fn rec_merkle_l2_warm_probe() -> Result<String, String> {
+        let gpu = gpu()?;
+        let n: usize = 1 << 16;
+        let total_nodes = 2 * n - 1;
+        let mut out = String::new();
+        unsafe {
+            let pool = gpu.pool_push();
+            let result = (|| -> Result<(), String> {
+                let pso_leaf =
+                    compile_supplemental_pipeline(gpu, REC_MERKLE_MSL_SOURCE, "leaf_hash128")?;
+                let pso_parent =
+                    compile_supplemental_pipeline(gpu, REC_MERKLE_MSL_SOURCE, "rec_parent_hash")?;
+                // 8 MiB codeword-like matrix, deterministic bytes.
+                let mut data: Vec<F128> = crate::alloc_uninit_vec(n * 8);
+                let mut s = 0x243F6A8885A308D3u64;
+                for x in data.iter_mut() {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let lo = s;
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    *x = F128 { lo, hi: s };
+                }
+                let data_bytes = core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), n * 128);
+                let data_buf = gpu.wrap_buffer(data.as_ptr().cast_mut().cast::<u8>(), n * 128)?;
+                let tree_buf = gpu.new_buffer(total_nodes * 32)?;
+
+                let encode_leaves = |enc: Id, leaf_start: usize, count: usize| {
+                    gpu.set_pipeline(enc, pso_leaf);
+                    gpu.set_buffer(enc, data_buf, leaf_start * 128, 0);
+                    gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
+                    gpu.dispatch(enc, (count / 256) as u64, 256);
+                };
+                let encode_parents = |enc: Id| {
+                    gpu.set_pipeline(enc, pso_parent);
+                    let mut read_start = 0usize;
+                    let mut read_len = n;
+                    while read_len > 1 {
+                        let write_start = read_start + read_len;
+                        let n_out = read_len / 2;
+                        gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                        gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
+                        let tpg = 256u64.min(n_out as u64);
+                        gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                        read_start = write_start;
+                        read_len = n_out;
+                    }
+                };
+
+                // Warm: two full chains (page wiring + queue + clock ramp).
+                for _ in 0..2 {
+                    let cb = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb)?;
+                    encode_leaves(enc, 0, n);
+                    encode_parents(enc);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb)?;
+                }
+
+                let min_of = |mut f: Box<dyn FnMut() -> Result<f64, String>>,
+                              reps: usize|
+                 -> Result<f64, String> {
+                    let mut best = f64::INFINITY;
+                    for _ in 0..reps {
+                        best = best.min(f()?);
+                    }
+                    Ok(best)
+                };
+
+                // A: empty-cb submit->complete roundtrip (fixed price floor).
+                let a = min_of(
+                    Box::new(|| {
+                        let t = std::time::Instant::now();
+                        let cb = gpu.command_buffer()?;
+                        let enc = gpu.compute_encoder(cb)?;
+                        gpu.end_encoding(enc);
+                        gpu.commit_and_spin(cb, 8.0)?;
+                        Ok(t.elapsed().as_secs_f64() * 1e3)
+                    }),
+                    10,
+                )?;
+
+                // B: single-cb full chain (leaf + parents) submit->complete.
+                let b = min_of(
+                    Box::new(|| {
+                        let t = std::time::Instant::now();
+                        let cb = gpu.command_buffer()?;
+                        let enc = gpu.compute_encoder(cb)?;
+                        encode_leaves(enc, 0, n);
+                        encode_parents(enc);
+                        gpu.end_encoding(enc);
+                        gpu.commit_and_spin(cb, 8.0)?;
+                        Ok(t.elapsed().as_secs_f64() * 1e3)
+                    }),
+                    10,
+                )?;
+
+                // C: overlap-shaped arrival — 8 leaf batches (n/8 each)
+                // submitted at ~75 us spacing (the local L2 NTT produces its
+                // 32 claims over ~0.6 ms), parents encoded behind the last
+                // batch. Report the EXPOSED price: last-submit -> drained,
+                // plus per-batch CPU encode+submit cost (that work happens
+                // inside NTT worker callbacks in the real overlap).
+                let mut c_exposed = f64::INFINITY;
+                let mut c_encode_total = f64::INFINITY;
+                for _ in 0..8 {
+                    let mut cbs: Vec<Id> = Vec::with_capacity(8);
+                    let mut encode_ms = 0.0f64;
+                    let mut last_submit = std::time::Instant::now();
+                    for batch in 0..8 {
+                        let te = std::time::Instant::now();
+                        let cb = gpu.command_buffer()?;
+                        let enc = gpu.compute_encoder(cb)?;
+                        encode_leaves(enc, batch * (n / 8), n / 8);
+                        if batch == 7 {
+                            encode_parents(enc);
+                        }
+                        gpu.end_encoding(enc);
+                        let cb = gpu.retain(cb);
+                        gpu.commit_async(cb);
+                        last_submit = std::time::Instant::now();
+                        encode_ms += last_submit.duration_since(te).as_secs_f64() * 1e3;
+                        cbs.push(cb);
+                        if batch < 7 {
+                            std::thread::sleep(std::time::Duration::from_micros(75));
+                        }
+                    }
+                    let mut err = None;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(8);
+                    for cb in cbs {
+                        if let Err(e) = gpu.yield_wait_cb_until(cb, deadline) {
+                            err.get_or_insert(e);
+                        }
+                        gpu.release(cb);
+                    }
+                    if let Some(e) = err {
+                        return Err(e);
+                    }
+                    c_exposed = c_exposed.min(last_submit.elapsed().as_secs_f64() * 1e3);
+                    c_encode_total = c_encode_total.min(encode_ms);
+                }
+
+                // Copy-out price (drain-side, exposed).
+                let copy = min_of(
+                    Box::new(|| {
+                        let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
+                        let t = std::time::Instant::now();
+                        let dst = core::slice::from_raw_parts_mut(
+                            tree.as_mut_ptr().cast::<u8>(),
+                            total_nodes * 32,
+                        );
+                        copy_bytes_parallel(gpu.buffer_contents(tree_buf), dst);
+                        let ms = t.elapsed().as_secs_f64() * 1e3;
+                        crate::scratch::give_hash_tree(tree);
+                        Ok(ms)
+                    }),
+                    5,
+                )?;
+
+                // CPU reference: the production pooled merkle at the L2 shape.
+                let mut cpu = f64::INFINITY;
+                for _ in 0..10 {
+                    let storage = crate::scratch::take_hash_tree(total_nodes);
+                    let t = std::time::Instant::now();
+                    let tree = crate::merkle::merkle_tree_into(
+                        storage,
+                        data_bytes,
+                        n,
+                        crate::merkle::HashKind::Blake3,
+                    );
+                    cpu = cpu.min(t.elapsed().as_secs_f64() * 1e3);
+                    crate::scratch::give_hash_tree(tree);
+                }
+
+                out = format!(
+                    "[l2-probe] empty-cb roundtrip {a:.3} ms | single-cb chain {b:.3} ms | \
+                     batched exposed-after-last-submit {c_exposed:.3} ms (encode+submit CPU \
+                     {c_encode_total:.3} ms over 8 batches) | copy-out {copy:.3} ms | \
+                     CPU merkle window {cpu:.3} ms"
+                );
+                gpu.release(tree_buf);
+                gpu.release(data_buf);
+                gpu.release(pso_leaf);
+                gpu.release(pso_parent);
+                Ok(())
+            })();
+            gpu.pool_pop(pool);
+            result?;
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -15982,6 +16284,77 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             "L1 overlap tree diverges from the sync path"
         );
         assert_eq!(w_overlap.root(), w_sync.root());
+    }
+
+    /// The L2 tail overlap must reproduce the incumbent commit byte-for-byte
+    /// on the real L2 shape (log_msg_cols=13, 8 lanes, rate 1/8 — 2^16
+    /// leaves of 128 bytes): same codeword matrix, same flat tree, same
+    /// root. Drives the full production path (`ligero_commit` with the
+    /// fused3 transform's per-chunk callback) with the L2 admission latch
+    /// forced to each arm; the incumbent at this shape is the pooled CPU
+    /// merkle (the sync GPU offload rejects 2^16 by design).
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_l2_tail_overlap_matches_sync() {
+        static L2_OVERLAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = L2_OVERLAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = imp::gpu() {
+            eprintln!("skipping GPU test: {e}");
+            return;
+        }
+        let mut rng = Rng::new(0x4C32);
+        let poly = rng.vec(8 << 13);
+        let ntt = crate::ntt::AdditiveNttF128::standard(16);
+
+        super::l2_overlap_latch_force(super::L1_OVERLAP_ON);
+        let w_overlap = crate::pcs::ligerito::ligero_commit(
+            &poly,
+            13,
+            3,
+            3,
+            &ntt,
+            crate::merkle::HashKind::Blake3,
+        );
+        super::l2_overlap_latch_force(super::L1_OVERLAP_OFF);
+        let w_sync = crate::pcs::ligerito::ligero_commit(
+            &poly,
+            13,
+            3,
+            3,
+            &ntt,
+            crate::merkle::HashKind::Blake3,
+        );
+        super::l2_overlap_latch_force(super::L1_OVERLAP_UNMEASURED);
+
+        assert!(
+            w_overlap.mat == w_sync.mat,
+            "L2 overlap codeword diverges from the sync path"
+        );
+        assert!(
+            w_overlap.tree == w_sync.tree,
+            "L2 overlap tree diverges from the sync path"
+        );
+        assert_eq!(w_overlap.root(), w_sync.root());
+    }
+
+    /// Pre-registered l2_tail_overlap price probe (diagnostic; see
+    /// `imp::rec_merkle_l2_warm_probe`). Prints the warm-queue submit/drain
+    /// prices at the 2^16 shape against the CPU merkle window — the
+    /// SHIP/KILL input for the overlap build. Never fails on price; only on
+    /// Metal errors.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn l2_tail_overlap_warm_price_probe() {
+        if let Err(e) = imp::gpu() {
+            eprintln!("skipping GPU probe: {e}");
+            return;
+        }
+        match imp::rec_merkle_l2_warm_probe() {
+            Ok(report) => eprintln!("{report}"),
+            Err(e) => panic!("probe failed on real Metal: {e}"),
+        }
     }
 
     /// T3 products arm oracle: the GPU's per-chunk reduced partials must
