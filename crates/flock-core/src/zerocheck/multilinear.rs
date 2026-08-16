@@ -48,6 +48,8 @@ mod kernels;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use kernels::aarch64::fold_compact_chunk_neon_reconstruct_only_8;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use kernels::aarch64::fold2_compact_and_round45_chunk_neon_reconstruct_only_8;
 #[cfg(all(target_arch = "aarch64", test))]
 use kernels::aarch64::fold_one_row_neon_unchecked_8;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2246,7 +2248,10 @@ pub(crate) fn fold2_compact_and_round45_into(
     r_next4: &[F128],
     a_out: &mut [F128],
     b_out: &mut [F128],
+    padding: Option<&PaddingSpec>,
 ) -> (F128, F128, Round3Lookahead) {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = padding;
     let n_pairs = compact.len();
     let n_groups = n_pairs / 2;
     assert!(n_groups >= 4 && n_groups.is_power_of_two());
@@ -2285,9 +2290,41 @@ pub(crate) fn fold2_compact_and_round45_into(
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
 
+    // GPU K-pass products arm (see `ENV_NO_GPU_ZC_KPASS`): binds r2's
+    // already-cached packed a/b Metal views — never wrap_buffer — and
+    // computes the eight per-chunk message/lookahead slots for a measured
+    // prefix while the CPU writes those chunks' composed outputs through
+    // the reconstruct-only sibling. `None` = exact incumbent CPU path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = padding.and_then(|pad| {
+        let (mask, useful) = round2_pair_skip(pad, 6);
+        crate::gpu_commit::launch_zc_kpass_products(
+            &table.data,
+            rho1,
+            rho2,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            mask,
+            useful,
+        )
+    });
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_cpu_sweep = std::time::Instant::now();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let calib = gpu_job.as_ref().is_some_and(|j| j.is_calibration());
+
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     // [p1_odd, pinf_odd, W0', W3', W4', W5'], eq_hi-weighted, one per chunk.
     let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
+    // Eight-slot CPU oracle for K-pass GPU calibration (eq_hi-weighted outv).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let mut slot_partials: Vec<[F128; 8]> = vec![[F128::ZERO; 8]; hi_size];
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let slot_base = crate::epool::SyncPtr(slot_partials.as_mut_ptr());
     let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
     let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -2302,8 +2339,28 @@ pub(crate) fn fold2_compact_and_round45_into(
             )
         };
         // Each output chunk covers `out_chunk` groups = 2·out_chunk pairs.
+        #[cfg(target_arch = "aarch64")]
         let pair_base = 2 * x_hi * out_chunk;
         let mut outv = [F128::ZERO; 8];
+
+        // GPU-covered prefix: write identical composed outputs, skip products.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if x_hi < gpu_prefix {
+            unsafe {
+                fold2_compact_and_round45_chunk_neon_reconstruct_only_8(
+                    table_l1.as_ptr().cast::<u8>(),
+                    table_l3.as_ptr().cast::<u8>(),
+                    rho2,
+                    compact.anchors.as_ptr().add(2 * pair_base),
+                    compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2),
+                    a_ptr,
+                    b_ptr,
+                    lo_size,
+                    degen,
+                );
+            }
+            return;
+        }
 
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -2347,8 +2404,82 @@ pub(crate) fn fold2_compact_and_round45_into(
                 eq_h * outv[6],
                 eq_h * outv[7],
             ];
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if calib {
+                *slot_base.ptr().add(x_hi) = [
+                    eq_h * outv[0],
+                    eq_h * outv[1],
+                    eq_h * outv[2],
+                    eq_h * outv[3],
+                    eq_h * outv[4],
+                    eq_h * outv[5],
+                    eq_h * outv[6],
+                    eq_h * outv[7],
+                ];
+            }
         }
     });
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        let calib = job.is_calibration();
+        let prefix = job.cpu_split();
+        let res = crate::gpu_commit::zc_kpass_wait(
+            job,
+            if calib {
+                Some(slot_partials.as_slice())
+            } else {
+                None
+            },
+            cpu_wall_ms,
+            hi_size,
+        );
+        match res {
+            crate::gpu_commit::ZcKpassResult::Calibrated => {}
+            crate::gpu_commit::ZcKpassResult::Prefix(vals) => {
+                for (x_hi, v) in vals.iter().enumerate() {
+                    let p1 = kappa * v[0] + v[2];
+                    let pinf = kappa * v[1] + v[3];
+                    partials[x_hi] = (p1, pinf);
+                    la_partials[x_hi] = [v[2], v[3], v[4], v[5], v[6], v[7]];
+                }
+            }
+            crate::gpu_commit::ZcKpassResult::Failed => {
+                for x_hi in 0..prefix {
+                    let pair_base = 2 * x_hi * out_chunk;
+                    let mut outv = [F128::ZERO; 8];
+                    unsafe {
+                        fold2_compact_and_round45_chunk_neon_8(
+                            table_l1.as_ptr().cast::<u8>(),
+                            table_l3.as_ptr().cast::<u8>(),
+                            rho2,
+                            compact.anchors.as_ptr().add(2 * pair_base),
+                            compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2),
+                            a_out.as_mut_ptr().wrapping_add(x_hi * out_chunk),
+                            b_out.as_mut_ptr().wrapping_add(x_hi * out_chunk),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            degen,
+                            outv.as_mut_ptr(),
+                        );
+                    }
+                    let eq_h = eq_hi[x_hi];
+                    let p1 = kappa * outv[0] + outv[2];
+                    let pinf = kappa * outv[1] + outv[3];
+                    partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                    la_partials[x_hi] = [
+                        eq_h * outv[2],
+                        eq_h * outv[3],
+                        eq_h * outv[4],
+                        eq_h * outv[5],
+                        eq_h * outv[6],
+                        eq_h * outv[7],
+                    ];
+                }
+            }
+        }
+    }
 
     let (sum1, sum_inf) = partials
         .iter()
@@ -4786,7 +4917,7 @@ mod tests {
                     a_n.fill(LA_POISON);
                     b_n.fill(LA_POISON);
                     let (m4_1, m4_inf, la5) = fold2_compact_and_round45_into(
-                        &compact, &f.table, rho1, rho2, &r_next4, &mut a_n, &mut b_n,
+                        &compact, &f.table, rho1, rho2, &r_next4, &mut a_n, &mut b_n, None,
                     );
                     assert_eq!(
                         (m4_1, m4_inf),
@@ -4897,6 +5028,7 @@ mod tests {
             &r_next4,
             &mut a_out,
             &mut b_out,
+            None,
         );
     }
 

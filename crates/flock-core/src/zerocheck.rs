@@ -935,6 +935,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r_next4,
                 &mut a_out,
                 &mut b_out,
+                Some(&padding),
             );
             if tail_round_timing {
                 eprintln!(

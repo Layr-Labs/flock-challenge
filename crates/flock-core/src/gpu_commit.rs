@@ -505,140 +505,6 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
     *ON
 }
 
-/// Kill switch for the L1 recursive-commit NTT/Merkle-leaf overlap
-/// (`FLOCK_NO_L1_MERKLE_OVERLAP=1`): instead of hashing each finalized NTT
-/// chunk's 128-byte leaves on the GPU while the CPU transform is still
-/// producing the remaining chunks, the commit runs the incumbent strictly
-/// serial NTT-then-whole-tree path. Leaf outputs are disjoint tree ranges of
-/// the same `leaf_hash128` kernel over the same wrapped matrix — bit-identical
-/// bytes either way; the switch (and any begin/submit/drain failure) only
-/// changes when the GPU work is issued.
-pub const ENV_NO_L1_MERKLE_OVERLAP: &str = "FLOCK_NO_L1_MERKLE_OVERLAP";
-
-pub(crate) fn gpu_l1_merkle_overlap_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_L1_MERKLE_OVERLAP).is_none());
-    *ON
-}
-
-/// Admission latch for the L1 overlap: the first eligible L1 commit in the
-/// process (the warmup prove — the L1 shape is FS-serial, so there is exactly
-/// one first) dual-runs overlapped-then-incumbent, byte-compares the trees,
-/// and latches the faster arm (the same warmup A/B-race pattern as the ranked
-/// commit's cpu-vs-gpu latch, chosen over a ratio gate because the fused3
-/// transform fully rewrites the codeword from the message, making the exact
-/// dual-run free of merge math). A byte mismatch or any incumbent-GPU absence
-/// poisons the latch Off for the process: every later prove runs the exact
-/// incumbent path.
-const L1_OVERLAP_UNMEASURED: u8 = 0;
-const L1_OVERLAP_ON: u8 = 1;
-const L1_OVERLAP_OFF: u8 = 2;
-static L1_OVERLAP_LATCH: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(L1_OVERLAP_UNMEASURED);
-
-/// Latch margin for the warmup race. The race necessarily runs the arms
-/// back-to-back on a hot GPU/SLC — a regime that can only SHRINK the
-/// incumbent's GPU-bound merkle segment relative to the timed prove (its
-/// in-race whole-tree pass measures ~0.65 ms against a steady 1.40–1.45 ms
-/// across every timed sample on the reference machine), while the overlapped
-/// arm's wall is NTT-bound and barely benefits. A one-sided 10% allowance
-/// (~0.3 ms here, well under the ~0.7 ms measured bias) compensates that
-/// distortion; an overlap slower than the incumbent by MORE than the
-/// allowance even in this incumbent-flattering regime latches Off.
-const L1_OVERLAP_LATCH_MARGIN: f64 = 1.10;
-
-pub(crate) fn l1_overlap_latch_state() -> u8 {
-    L1_OVERLAP_LATCH.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Publish the warmup race outcome. `equal` is `None` when either arm failed
-/// to produce a GPU tree (no oracle possible — latch Off).
-pub(crate) fn l1_overlap_report(overlap_wall_ms: f64, incumbent_wall_ms: f64, equal: Option<bool>) {
-    let decision = match equal {
-        Some(true) if overlap_wall_ms <= incumbent_wall_ms * L1_OVERLAP_LATCH_MARGIN => {
-            L1_OVERLAP_ON
-        }
-        Some(true) => L1_OVERLAP_OFF,
-        Some(false) => {
-            if gpu_zc_r2_debug() {
-                eprintln!(
-                    "[l1-overlap] MISMATCH: overlapped tree diverges from incumbent — \
-                     poisoned off for the process"
-                );
-            }
-            L1_OVERLAP_OFF
-        }
-        None => L1_OVERLAP_OFF,
-    };
-    L1_OVERLAP_LATCH.store(decision, std::sync::atomic::Ordering::Relaxed);
-    if gpu_zc_r2_debug() {
-        eprintln!(
-            "[l1-overlap] warmup race: overlapped {overlap_wall_ms:.2} ms vs incumbent \
-             {incumbent_wall_ms:.2} ms, trees_equal={equal:?} -> latch {}",
-            match decision {
-                L1_OVERLAP_ON => "ON",
-                _ => "OFF",
-            }
-        );
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn l1_overlap_latch_force(state: u8) {
-    L1_OVERLAP_LATCH.store(state, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// One in-flight L1 overlap session: leaf dispatches are submitted per
-/// finalized NTT chunk while the transform still runs; `finish` drains them,
-/// encodes the internal levels exactly as the incumbent does, and copies the
-/// flat tree out. Any failure at any point returns `None` from `finish` and
-/// the caller runs the incumbent whole-tree path (exact same bytes).
-pub(crate) struct L1MerkleOverlap {
-    inner: imp::L1MerkleOverlapSession,
-    measuring: bool,
-}
-
-/// Open an overlap session for one eligible L1 commit, or `None` whenever the
-/// arm must stay on the incumbent path (kill switches, latch Off, non-L1
-/// shape, Metal init/wrap failure). All init and wrap-cache costs are paid
-/// here, before the caller starts its race clocks.
-pub(crate) fn gpu_l1_merkle_overlap_begin(
-    data_ptr: *const u8,
-    data_len: usize,
-    num_leaves: usize,
-) -> Option<L1MerkleOverlap> {
-    if !gpu_l1_merkle_overlap_enabled() || !gpu_recursive_merkle_enabled() {
-        return None;
-    }
-    let latch = l1_overlap_latch_state();
-    if latch == L1_OVERLAP_OFF {
-        return None;
-    }
-    imp::l1_merkle_overlap_begin(data_ptr, data_len, num_leaves).map(|inner| L1MerkleOverlap {
-        inner,
-        measuring: latch == L1_OVERLAP_UNMEASURED,
-    })
-}
-
-impl L1MerkleOverlap {
-    /// Whether this session is the process's warmup race (latch unmeasured).
-    pub(crate) fn measuring(&self) -> bool {
-        self.measuring
-    }
-
-    /// NTT `finish_chunk` callback target: submit the chunk's leaf range.
-    /// Safe to call concurrently from the transform's workers (both pools).
-    pub(crate) fn chunk_ready(&self, offset_elems: usize, len_elems: usize) {
-        self.inner.chunk_ready(offset_elems, len_elems);
-    }
-
-    /// Drain the leaf command buffers, run the internal levels, copy the
-    /// flat tree out. `None` on any failure (caller runs the incumbent).
-    pub(crate) fn finish(self) -> Option<Vec<crate::merkle::Hash>> {
-        self.inner.finish()
-    }
-}
-
 /// Kill switch for the zerocheck C-fold-window GPU idle fill
 /// (`FLOCK_NO_ZC_IDLE_FILL=1`, exact): the ranked ZC byte-B4 fold drains in
 /// ~5.5 ms under a ~9.7 ms CPU AB head, leaving ~4 ms of GPU idle inside the
@@ -699,6 +565,27 @@ pub(crate) fn gpu_zc_t3_enabled() -> bool {
 pub(crate) fn gpu_zc_t3_debug() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_T3_GPU_DEBUG").is_some());
+    *ON
+}
+
+/// Kill switch for the zerocheck cascade K-pass products GPU arm:
+/// `FLOCK_NO_GPU_ZC_KPASS=1` (exact string `"1"`) restores the incumbent
+/// all-CPU K-pass. Default ON: the arm binds r2's already-cached packed a/b
+/// Metal views and never calls `wrap_buffer`, so it does not grow the
+/// process wrap surface past r2's proven 1 GiB budget (the T3 park reason).
+pub const ENV_NO_GPU_ZC_KPASS: &str = "FLOCK_NO_GPU_ZC_KPASS";
+
+pub(crate) fn gpu_zc_kpass_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var(ENV_NO_GPU_ZC_KPASS).is_ok_and(|v| v == "1")
+    });
+    *ON
+}
+
+/// Diagnostic trace for the K-pass products arm (`FLOCK_ZC_KPASS_GPU_DEBUG=1`).
+pub(crate) fn gpu_zc_kpass_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_KPASS_GPU_DEBUG").is_some());
     *ON
 }
 
@@ -9525,10 +9412,14 @@ kernel void lc_fold_stripes_factored_b4(
     /// measured under transient load — uncapped, an optimistic ratio makes
     /// that GPU kernel the timed straggler, which costs wall directly
     /// (measured balance basin on the ranked shape: 39–40 of 64 claims).
-    /// The supplemental factored B4 PSO has a separately measured basin at
-    /// 48 claims and therefore uses a `3n/4` cap, but only when that PSO was
-    /// actually selected. Exact rollback or supplemental init failure selects
-    /// the incumbent PSO and its unchanged `5n/8` cap.
+    /// The supplemental factored B4 PSO is faster per claim than incumbent
+    /// B4, so its overshoot guard sits at `7n/8` = 56 of 64 claims (was
+    /// `3n/4` = 48). Lincheck's fold window has no AB head, so this is not
+    /// an H1-style full-GPU pin — the formula still chooses less than the
+    /// cap when the measured ratio does not support it, and
+    /// `FLOCK_LINCHECK_GPU_CLAIMS` pins an exact share (including 48) for
+    /// same-binary comparison. Exact rollback or supplemental init failure
+    /// selects the incumbent PSO and its unchanged `5n/8` cap.
     /// `FLOCK_LINCHECK_GPU_LEGACY_SPLIT` selects the previous
     /// `floor(0.9·n/(1+ratio))`-clamped-to-`n/2` policy for same-binary
     /// causal comparison.
@@ -9550,7 +9441,7 @@ kernel void lc_fold_stripes_factored_b4(
         }
         let share = (n_claims as f64 / (1.0 + ratio)).round();
         let cap = if factored_b4 {
-            n_claims * 3 / 4
+            n_claims * 7 / 8
         } else {
             n_claims * 5 / 8
         };
@@ -10779,420 +10670,6 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     }
 
     // -----------------------------------------------------------------------
-    // L1 recursive-commit NTT/Merkle-leaf overlap (see
-    // `ENV_NO_L1_MERKLE_OVERLAP`). The CPU NTT already fires a per-finalized-
-    // chunk callback with a never-touched-again guarantee; each callback
-    // submits a `leaf_hash128` dispatch over that chunk's disjoint leaf range
-    // of the persistent tree buffer, so the leaf pass runs while the
-    // transform is still producing the remaining chunks. `finish` drains the
-    // leaf command buffers, then runs the internal levels and copy-out
-    // exactly as the incumbent whole-tree offload does — same kernels, same
-    // wrapped matrix, same tree buffer, bit-identical bytes.
-    // -----------------------------------------------------------------------
-
-    /// The ids below are copied out of the REC_MERKLE state under its lock in
-    /// `begin` and stay valid for the process: the pipelines/tree/wrap
-    /// objects are never released (even the poison path only overwrites the
-    /// state, leaking the retained Metal objects). The lock is NOT held for
-    /// the session's lifetime — the warmup race interleaves this session with
-    /// the incumbent `gpu_recursive_merkle_blake3` (which takes the same
-    /// lock), and the L1 commit is FS-serial, so the shared tree buffer is
-    /// never written by two paths at once.
-    pub(crate) struct L1MerkleOverlapSession {
-        gpu: &'static Gpu,
-        pso_leaf128: Id,
-        pso_parent: Id,
-        data_buf: Id,
-        tree_buf: Id,
-        num_leaves: usize,
-        started: std::time::Instant,
-        state: Mutex<L1OverlapInner>,
-        failed: std::sync::atomic::AtomicBool,
-    }
-
-    #[derive(Default)]
-    struct L1OverlapInner {
-        /// Ranges accepted but not yet encoded, as `(leaf_start, n_leaves)`.
-        pending: Vec<(usize, usize)>,
-        pending_leaves: usize,
-        /// Every accepted range, for the exact-cover check.
-        ranges: Vec<(usize, usize)>,
-        /// Total leaves accepted so far (cover-completion trigger).
-        covered_leaves: usize,
-        /// Retained, committed leaf command buffers awaiting the drain.
-        cbs: Vec<Id>,
-        batches: usize,
-        /// The internal levels were encoded behind the final leaf batch in
-        /// the same command buffer (the incumbent's own encoder shape — leaf
-        /// dispatches then parent dispatches against the tracked tree
-        /// buffer), so `finish` needs no parent round trip of its own.
-        parents_encoded: bool,
-    }
-
-    /// `true` iff the sorted `ranges` tile `[0, num_leaves)` exactly.
-    fn l1_ranges_cover_exactly(ranges: &mut [(usize, usize)], num_leaves: usize) -> bool {
-        ranges.sort_unstable();
-        let mut next = 0usize;
-        for &(s, n) in ranges.iter() {
-            if s != next {
-                return false;
-            }
-            next = s + n;
-        }
-        next == num_leaves
-    }
-
-    // SAFETY: the captured Metal objects are process-persistent and Metal
-    // command queues/buffers are thread-safe. All session-mutable state is
-    // behind `state`/`failed`; NTT workers reach the session exclusively
-    // through `chunk_ready`.
-    unsafe impl Sync for L1MerkleOverlapSession {}
-
-    pub(crate) fn l1_merkle_overlap_begin(
-        data_ptr: *const u8,
-        data_len: usize,
-        num_leaves: usize,
-    ) -> Option<L1MerkleOverlapSession> {
-        if !REC_MERKLE_SHAPES.contains(&num_leaves) || data_len != num_leaves * 128 {
-            return None;
-        }
-        let gpu = gpu().ok()?;
-        let mut guard = match REC_MERKLE.lock() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                REC_MERKLE.clear_poison();
-                note_poisoned_lock("rec-merkle", true);
-                let mut g = poisoned.into_inner();
-                *g = None;
-                g
-            }
-        };
-        if guard.is_none() {
-            *guard = Some(rec_merkle_init(gpu));
-        }
-        let (pso_leaf128, pso_parent, data_buf, tree_buf) = match guard.as_mut() {
-            Some(Ok(state)) => {
-                let data_addr = data_ptr as usize;
-                let cached = state
-                    .wraps
-                    .iter()
-                    .find(|(p, l, _)| *p == data_addr && *l == data_len)
-                    .map(|&(_, _, buf)| buf);
-                let data_buf = match cached {
-                    Some(buf) => {
-                        state.hits += 1;
-                        buf
-                    }
-                    // The wrap API takes `*mut` (Metal buffers are generically
-                    // writable); this kernel chain only ever reads the matrix.
-                    None => match unsafe { gpu.wrap_buffer(data_ptr.cast_mut(), data_len) } {
-                        Ok(buf) => {
-                            state.misses += 1;
-                            state.wraps.push((data_addr, data_len, buf));
-                            buf
-                        }
-                        Err(e) => {
-                            if super::gpu_zc_r2_debug() {
-                                eprintln!("[l1-overlap] wrap failed ({e})");
-                            }
-                            return None;
-                        }
-                    },
-                };
-                let &(_, tree_buf) = state
-                    .tree_bufs
-                    .iter()
-                    .find(|(n, _)| *n == num_leaves)
-                    .expect("shape checked above");
-                (state.pso_leaf128, state.pso_parent, data_buf, tree_buf)
-            }
-            Some(Err(e)) => {
-                if super::gpu_zc_r2_debug() {
-                    eprintln!("[l1-overlap] rec-merkle unavailable ({e})");
-                }
-                return None;
-            }
-            None => unreachable!("initialized above"),
-        };
-        drop(guard);
-        Some(L1MerkleOverlapSession {
-            gpu,
-            pso_leaf128,
-            pso_parent,
-            data_buf,
-            tree_buf,
-            num_leaves,
-            started: std::time::Instant::now(),
-            state: Mutex::new(L1OverlapInner::default()),
-            failed: std::sync::atomic::AtomicBool::new(false),
-        })
-    }
-
-    impl L1MerkleOverlapSession {
-        /// 128-byte leaf = 8 F128 elements.
-        const LEAF_ELEMS: usize = 8;
-
-        /// Coalesce leaf submissions to ~8 command buffers per commit: each
-        /// batch covers ⅛ of the tree (four finalized 1 MiB epool
-        /// sub-transforms at the L1 shape, or 2–4 Rayon cache chunks).
-        fn batch_leaves(&self) -> usize {
-            (self.num_leaves / 8).max(256)
-        }
-
-        fn fail(&self, msg: &str) {
-            self.failed
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            if super::gpu_zc_r2_debug() {
-                eprintln!("[l1-overlap] {msg} — falling back to incumbent");
-            }
-        }
-
-        /// NTT `finish_chunk` target; safe to call concurrently from the
-        /// transform's workers (main Rayon pool or the P+E helper pool).
-        /// `offset_elems`/`len_elems` are in F128 elements from the start of
-        /// the wrapped matrix.
-        pub(crate) fn chunk_ready(&self, offset_elems: usize, len_elems: usize) {
-            if self.failed.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            if offset_elems % Self::LEAF_ELEMS != 0 || len_elems % Self::LEAF_ELEMS != 0 {
-                self.fail(&format!(
-                    "misaligned chunk (offset {offset_elems}, len {len_elems})"
-                ));
-                return;
-            }
-            let leaf_start = offset_elems / Self::LEAF_ELEMS;
-            let n = len_elems / Self::LEAF_ELEMS;
-            // The leaf kernel runs bounds-check-free 256-thread groups,
-            // exactly like the incumbent whole-tree dispatch; refuse any
-            // geometry that would need a partial group.
-            if n == 0 || !n.is_multiple_of(256) || leaf_start + n > self.num_leaves {
-                self.fail(&format!("bad chunk geometry (start {leaf_start}, n {n})"));
-                return;
-            }
-            let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            inner.ranges.push((leaf_start, n));
-            inner.pending.push((leaf_start, n));
-            inner.pending_leaves += n;
-            inner.covered_leaves += n;
-            // Submit on a full batch, and always on cover completion: the
-            // final batch (with the internal levels encoded behind it) then
-            // enters the queue from inside the transform's own parallel
-            // region, before the NTT join returns.
-            if inner.pending_leaves >= self.batch_leaves()
-                || inner.covered_leaves == self.num_leaves
-            {
-                self.submit_pending(&mut inner);
-            }
-        }
-
-        /// Encode and commit one command buffer covering every pending range
-        /// (caller holds the state lock). Adjacent ranges coalesce into one
-        /// dispatch; the buffer is retained across its short-lived pool and
-        /// drained in `finish` (the from-z first-pass stream idiom).
-        fn submit_pending(&self, inner: &mut L1OverlapInner) {
-            if inner.pending.is_empty() || self.failed.load(std::sync::atomic::Ordering::Relaxed)
-            {
-                return;
-            }
-            // Publish every pending chunk's CPU stores to the encode below.
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            inner.pending.sort_unstable();
-            let mut coalesced: Vec<(usize, usize)> = Vec::with_capacity(inner.pending.len());
-            for &(s, n) in inner.pending.iter() {
-                match coalesced.last_mut() {
-                    Some((cs, cn)) if *cs + *cn == s => *cn += n,
-                    _ => coalesced.push((s, n)),
-                }
-            }
-            inner.pending.clear();
-            inner.pending_leaves = 0;
-            // When this batch completes an exact cover, append the internal
-            // levels to the same encoder: within-encoder and cross-buffer
-            // hazard tracking on the tree buffer orders them after every leaf
-            // write (the incumbent's single-encoder shape and the from-z
-            // stream's behind-the-final-tile idiom, both in production).
-            let encode_parents = inner.covered_leaves == self.num_leaves
-                && l1_ranges_cover_exactly(&mut inner.ranges, self.num_leaves);
-            let result = unsafe {
-                let pool = self.gpu.pool_push();
-                let result = (|| -> Result<Id, String> {
-                    let cb = self.gpu.command_buffer()?;
-                    let enc = self.gpu.compute_encoder(cb)?;
-                    self.gpu.set_pipeline(enc, self.pso_leaf128);
-                    for &(leaf_start, n) in &coalesced {
-                        // Offsetting both bindings makes local id map to
-                        // global leaf `leaf_start + id` in the proven kernel.
-                        self.gpu.set_buffer(enc, self.data_buf, leaf_start * 128, 0);
-                        self.gpu.set_buffer(enc, self.tree_buf, leaf_start * 32, 1);
-                        self.gpu.dispatch(enc, (n / 256) as u64, 256);
-                    }
-                    if encode_parents {
-                        self.gpu.set_pipeline(enc, self.pso_parent);
-                        let mut read_start = 0usize;
-                        let mut read_len = self.num_leaves;
-                        while read_len > 1 {
-                            let write_start = read_start + read_len;
-                            let n_out = read_len / 2;
-                            self.gpu.set_buffer(enc, self.tree_buf, read_start * 32, 0);
-                            self.gpu.set_buffer(enc, self.tree_buf, write_start * 32, 1);
-                            let tpg = 256u64.min(n_out as u64);
-                            self.gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                            read_start = write_start;
-                            read_len = n_out;
-                        }
-                    }
-                    self.gpu.end_encoding(enc);
-                    // `commandBuffer` is autoreleased; retain across this
-                    // short-lived pool — completion is drained in `finish`.
-                    let cb = self.gpu.retain(cb);
-                    self.gpu.commit_async(cb);
-                    Ok(cb)
-                })();
-                self.gpu.pool_pop(pool);
-                result
-            };
-            match result {
-                Ok(cb) => {
-                    inner.cbs.push(cb);
-                    inner.batches += 1;
-                    inner.parents_encoded = encode_parents;
-                }
-                Err(e) => self.fail(&format!("leaf submit failed ({e})")),
-            }
-        }
-
-        /// Drain the leaf command buffers, verify the accepted ranges tile
-        /// the tree exactly, run the internal levels, and copy the flat tree
-        /// out. `None` on any failure — the caller then runs the incumbent
-        /// whole-tree path (exact same bytes).
-        pub(crate) fn finish(self) -> Option<Vec<Hash>> {
-            let debug = super::gpu_zc_r2_debug();
-            let ntt_wall_ms = self.started.elapsed().as_secs_f64() * 1e3;
-            let mut inner = {
-                let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                self.submit_pending(&mut g);
-                core::mem::take(&mut *g)
-            };
-            // Drain every committed buffer even on failure: nothing may stay
-            // in flight against the shared tree buffer when the caller falls
-            // back to the incumbent offload. The bounded spin consumes the
-            // usually-already-complete buffers without Metal's fixed park +
-            // wake cost (same control as the incumbent's drain:
-            // `FLOCK_NO_RECMERKLE_SPIN=1` restores the blocking wait).
-            let mut drain_err: Option<String> = None;
-            let spin_deadline = rec_merkle_spin_enabled()
-                .then(|| std::time::Instant::now() + std::time::Duration::from_millis(4));
-            for cb in inner.cbs.drain(..) {
-                let waited = match spin_deadline {
-                    Some(deadline) => unsafe { self.gpu.yield_wait_cb_until(cb, deadline) },
-                    None => unsafe { self.gpu.wait_cb(cb) },
-                };
-                unsafe { self.gpu.release(cb) };
-                if let Err(e) = waited
-                    && drain_err.is_none()
-                {
-                    drain_err = Some(e);
-                }
-            }
-            if let Some(e) = drain_err {
-                self.fail(&format!("leaf drain failed ({e})"));
-            }
-            if self.failed.load(std::sync::atomic::Ordering::Relaxed) {
-                return None;
-            }
-            // Exact-cover check: the accepted ranges must tile
-            // `[0, num_leaves)` with no gap or overlap — anything else means
-            // the transform's chunk contract changed and the incumbent must
-            // build the tree. (Already verified at parent-encode time when
-            // `parents_encoded` is set; re-checking is cheap and keeps the
-            // oracle in one place.)
-            if !l1_ranges_cover_exactly(&mut inner.ranges, self.num_leaves) {
-                self.fail(&format!(
-                    "chunk cover broken ({} ranges, {} leaves)",
-                    inner.ranges.len(),
-                    inner.covered_leaves
-                ));
-                return None;
-            }
-            // Internal levels: normally already encoded behind the final
-            // leaf batch and drained above; encode them here only if that
-            // batch's cover check could not run (exactly the incumbent's
-            // parent chain either way).
-            if !inner.parents_encoded {
-                let run = unsafe {
-                    let pool = self.gpu.pool_push();
-                    let run = (|| -> Result<(), String> {
-                        let cb = self.gpu.command_buffer()?;
-                        let enc = self.gpu.compute_encoder(cb)?;
-                        self.gpu.set_pipeline(enc, self.pso_parent);
-                        let mut read_start = 0usize;
-                        let mut read_len = self.num_leaves;
-                        while read_len > 1 {
-                            let write_start = read_start + read_len;
-                            let n_out = read_len / 2;
-                            self.gpu.set_buffer(enc, self.tree_buf, read_start * 32, 0);
-                            self.gpu.set_buffer(enc, self.tree_buf, write_start * 32, 1);
-                            let tpg = 256u64.min(n_out as u64);
-                            self.gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                            read_start = write_start;
-                            read_len = n_out;
-                        }
-                        self.gpu.end_encoding(enc);
-                        if rec_merkle_spin_enabled() {
-                            self.gpu.commit_and_spin(cb, 4.0)
-                        } else {
-                            self.gpu.commit_and_wait(cb)
-                        }
-                    })();
-                    self.gpu.pool_pop(pool);
-                    run
-                };
-                if let Err(e) = run {
-                    self.fail(&format!("parent submit failed ({e})"));
-                    return None;
-                }
-            }
-            let total_nodes = 2 * self.num_leaves - 1;
-            let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
-            unsafe {
-                let dst = core::slice::from_raw_parts_mut(
-                    tree.as_mut_ptr().cast::<u8>(),
-                    total_nodes * 32,
-                );
-                copy_bytes_parallel(self.gpu.buffer_contents(self.tree_buf), dst);
-            }
-            if debug {
-                // "since-begin" ≈ the NTT wall for latched sessions (begin
-                // directly precedes the transform); warmup-race sessions
-                // include the race's primer/settle time here — read the
-                // race's own wall line for those.
-                eprintln!(
-                    "[l1-overlap] streamed {} ranges in {} batches; since-begin {ntt_wall_ms:.2} \
-                     ms, drain+parents+copy {:.2} ms",
-                    inner.ranges.len(),
-                    inner.batches,
-                    self.started.elapsed().as_secs_f64() * 1e3 - ntt_wall_ms,
-                );
-            }
-            Some(tree)
-        }
-    }
-
-    impl Drop for L1MerkleOverlapSession {
-        fn drop(&mut self) {
-            // A session abandoned without `finish` (panic unwind, race error)
-            // must still drain its in-flight leaf buffers before the shared
-            // tree buffer can be reused.
-            let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            for cb in inner.cbs.drain(..) {
-                let _ = unsafe { self.gpu.wait_cb(cb) };
-                unsafe { self.gpu.release(cb) };
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Zerocheck round-two PRODUCTS GPU arm (see `ENV_NO_GPU_ZC_R2`).
     //
     // The round-two fused fold sweeps 2^25 packed row pairs: per pair, four
@@ -11694,6 +11171,16 @@ kernel void zc_r2_products(
         let buf = unsafe { gpu.wrap_buffer(data.as_ptr().cast_mut(), len)? };
         state.wraps.push((ptr, len, buf));
         Ok(buf)
+    }
+
+    /// Process-lifetime a/b packed Metal views created by the round-two
+    /// products arm. `None` if r2 never wrapped this process (kill switch,
+    /// init failure, or not yet launched). NEVER calls `wrap_buffer`.
+    fn zc_r2_existing_ab_wraps() -> Option<(Id, Id)> {
+        let state = zc_r2_state()?.lock().ok()?;
+        let a = state.wraps.first().map(|&(_, _, b)| b)?;
+        let b = state.wraps.get(1).map(|&(_, _, b)| b)?;
+        Some((a, b))
     }
 
     // -------------------------------------------------------------------
@@ -12883,6 +12370,718 @@ kernel void zc_t3_products(
     }
 
     // -----------------------------------------------------------------------
+    // Zerocheck cascade K-pass products GPU arm (see `ENV_NO_GPU_ZC_KPASS`).
+    //
+    // After `zc_r2_wait`, the GPU is idle ~8–15 ms during
+    // `fold2_compact_and_round45_into` until `launch_lincheck_fold`. T3 is
+    // PARKED because wrapping compact anchors+deltas adds +1.5 GiB on top of
+    // r2's live 1 GiB a/b wraps — the largest proven-survivable budget.
+    // This arm binds those EXISTING r2 wraps (packed a/b) and never calls
+    // `wrap_buffer`. The GPU re-folds packed rows through the z-table and
+    // composes ρ₁, ρ₂; the CPU still writes every reconstructed group from
+    // compact. Products-only prefix, same split style as r2.
+    // -----------------------------------------------------------------------
+
+    const ZC_KPASS_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline ulong clmul32(uint a, uint b) {
+    const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
+                M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
+    ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
+          a2 = a & 0x44444444u, a3 = a & 0x88888888u;
+    ulong b0 = b & 0x11111111u, b1 = b & 0x22222222u,
+          b2 = b & 0x44444444u, b3 = b & 0x88888888u;
+    ulong r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
+    ulong r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
+    ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
+    ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
+    return r0 | r1 | r2 | r3;
+}
+
+struct U128k { ulong lo; ulong hi; };
+struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+
+static inline U128k clmul64(ulong a, ulong b) {
+    uint al = uint(a), ah = uint(a >> 32);
+    uint bl = uint(b), bh = uint(b >> 32);
+    ulong p_lo = clmul32(al, bl);
+    ulong p_hi = clmul32(ah, bh);
+    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
+    U128k r;
+    r.lo = p_lo ^ (p_mid << 32);
+    r.hi = p_hi ^ (p_mid >> 32);
+    return r;
+}
+
+static inline U256k clmul128(uint4 a, uint4 b) {
+    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
+    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
+    U128k p0 = clmul64(al, bl);
+    U128k p2 = clmul64(ah, bh);
+    U128k pm = clmul64(al ^ ah, bl ^ bh);
+    pm.lo ^= p0.lo ^ p2.lo;
+    pm.hi ^= p0.hi ^ p2.hi;
+    U256k r;
+    r.r0 = p0.lo;
+    r.r1 = p0.hi ^ pm.lo;
+    r.r2 = p2.lo ^ pm.hi;
+    r.r3 = p2.hi;
+    return r;
+}
+
+static inline uint4 gf_reduce(U256k p) {
+    ulong h0 = p.r2, h1 = p.r3;
+    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
+    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+}
+
+static inline uint4 zc_kpass_fold8(uint lo, uint hi, threadgroup const uint4* nib) {
+    uint4 acc = uint4(0u);
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (lo >> (8u * j)) & 0xffu;
+        acc ^= nib[j * 32u + (b & 15u)] ^ nib[j * 32u + 16u + (b >> 4u)];
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (hi >> (8u * j)) & 0xffu;
+        acc ^= nib[(j + 4u) * 32u + (b & 15u)] ^ nib[(j + 4u) * 32u + 16u + (b >> 4u)];
+    }
+    return acc;
+}
+
+static inline uint4 kpass_compose_group(
+    device const uint4* packed,
+    threadgroup const uint4* nib,
+    uint4 rho1, uint4 rho2,
+    uint g, uint mask, uint useful)
+{
+    uint pair0 = 2u * g;
+    uint pair1 = pair0 + 1u;
+    uint4 a0z = uint4(0u), a1z = uint4(0u), a2z = uint4(0u), a3z = uint4(0u);
+    if ((pair0 & mask) < useful) {
+        uint4 ar = packed[pair0];
+        a0z = zc_kpass_fold8(ar.x, ar.y, nib);
+        a1z = zc_kpass_fold8(ar.z, ar.w, nib);
+    }
+    if ((pair1 & mask) < useful) {
+        uint4 ar = packed[pair1];
+        a2z = zc_kpass_fold8(ar.x, ar.y, nib);
+        a3z = zc_kpass_fold8(ar.z, ar.w, nib);
+    }
+    uint4 p0 = a0z ^ gf_reduce(clmul128(rho1, a0z ^ a1z));
+    uint4 p1 = a2z ^ gf_reduce(clmul128(rho1, a2z ^ a3z));
+    return p0 ^ gf_reduce(clmul128(rho2, p0 ^ p1));
+}
+
+struct ZcKpassParams {
+    uint4 rho1;
+    uint4 rho2;
+    uint lo_size;
+    uint xpt;
+    uint mask;
+    uint useful;
+};
+
+// One threadgroup per hi-chunk (256 threads, xpt = (lo_size/2)/256
+// round-five groups per thread). Each group of four composed outputs is
+// one round-five y': products match the CPU K-pass slot order
+// [p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5'] all
+// eq_lo-odd-weighted, then eq_hi-weighted and reduced by thread 0.
+// Binds r2's packed a/b wraps — no new wrap_buffer.
+kernel void zc_kpass_products(
+    device const uint4* a_in  [[buffer(0)]],
+    device const uint4* b_in  [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       partials    [[buffer(5)]],
+    constant ZcKpassParams& p       [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 nib[256];
+    threadgroup ulong4 red[256];
+    nib[lid] = nib_tab_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    ulong4 acc[8];
+    for (uint i = 0u; i < 8u; i++) acc[i] = ulong4(0ul);
+
+    uint out_chunk = p.lo_size * 2u;
+    for (uint k = 0u; k < p.xpt; k++) {
+        uint t = k * 256u + lid;
+        uint g0 = tgid * out_chunk + 4u * t;
+        uint4 av[4];
+        uint4 bv[4];
+        for (uint lane = 0u; lane < 4u; lane++) {
+            uint g = g0 + lane;
+            av[lane] = kpass_compose_group(a_in, nib, p.rho1, p.rho2, g, p.mask, p.useful);
+            bv[lane] = kpass_compose_group(b_in, nib, p.rho1, p.rho2, g, p.mask, p.useful);
+        }
+        uint4 w = eq_lo[2u * t + 1u];
+        uint4 a0w = gf_reduce(clmul128(w, av[0]));
+        uint4 a1w = gf_reduce(clmul128(w, av[1]));
+        uint4 a2w = gf_reduce(clmul128(w, av[2]));
+        uint4 a3w = gf_reduce(clmul128(w, av[3]));
+        U256k m;
+        m = clmul128(a1w, bv[1]);
+        acc[0] ^= ulong4(m.r0, m.r1, m.r2, m.r3);
+        m = clmul128(a0w ^ a1w, bv[0] ^ bv[1]);
+        acc[1] ^= ulong4(m.r0, m.r1, m.r2, m.r3);
+        m = clmul128(a3w, bv[3]);
+        acc[2] ^= ulong4(m.r0, m.r1, m.r2, m.r3);
+        m = clmul128(a2w ^ a3w, bv[2] ^ bv[3]);
+        acc[3] ^= ulong4(m.r0, m.r1, m.r2, m.r3);
+        m = clmul128(a2w, bv[2]);
+        acc[4] ^= ulong4(m.r0, m.r1, m.r2, m.r3);
+        m = clmul128(a0w ^ a2w, bv[0] ^ bv[2]);
+        acc[5] ^= ulong4(m.r0, m.r1, m.r2, m.r3);
+        m = clmul128(a1w ^ a3w, bv[1] ^ bv[3]);
+        acc[6] ^= ulong4(m.r0, m.r1, m.r2, m.r3);
+        m = clmul128(a0w ^ a1w ^ a2w ^ a3w, bv[0] ^ bv[1] ^ bv[2] ^ bv[3]);
+        acc[7] ^= ulong4(m.r0, m.r1, m.r2, m.r3);
+    }
+
+    uint4 e = eq_hi[tgid];
+    for (uint i = 0u; i < 8u; i++) {
+        red[lid] = acc[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (lid < s) { red[lid] ^= red[lid + s]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lid == 0u) {
+            ulong4 chunk = red[0];
+            U256k u;
+            u.r0 = chunk.x; u.r1 = chunk.y; u.r2 = chunk.z; u.r3 = chunk.w;
+            partials[tgid * 8u + i] = gf_reduce(clmul128(e, gf_reduce(u)));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+"#;
+
+    struct ZcKpass {
+        pso: Id,
+        nib_buf: Id,
+        eq_lo_buf: Id,
+        eq_lo_cap: usize,
+        eq_hi_buf: Id,
+        eq_hi_cap: usize,
+        part_buf: Id,
+        part_cap: usize,
+    }
+
+    unsafe impl Send for ZcKpass {}
+
+    static ZC_KPASS_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcKpass>>> =
+        std::sync::OnceLock::new();
+    static ZC_KPASS_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static ZC_KPASS_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    pub(crate) fn zc_kpass_test_reset() {
+        use std::sync::atomic::Ordering;
+        ZC_KPASS_TUNED.store(usize::MAX, Ordering::Relaxed);
+        ZC_KPASS_POISONED.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_kpass_test_state() -> (usize, bool) {
+        use std::sync::atomic::Ordering;
+        (
+            ZC_KPASS_TUNED.load(Ordering::Relaxed),
+            ZC_KPASS_POISONED.load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_kpass_test_set_share(share: usize) {
+        ZC_KPASS_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn zc_kpass_forced_ratio() -> Option<f64> {
+        static V: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_ZC_KPASS_GPU_FORCE_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+        *V
+    }
+
+    /// Reconstruct-only CPU work keeps the compact double-fold and the
+    /// output stores and drops the eight products per round-five group, so
+    /// ALPHA = 0.70. Balanced `g* = hi/(ratio + 0.30)`; 7·hi/8 overshoot
+    /// cap; hi/8 admission floor for ratios in (2, 8); ≥ 8 disable.
+    const ZC_KPASS_ALPHA: f64 = 0.70;
+    const ZC_KPASS_MAX_RATIO: f64 = 2.0;
+    const ZC_KPASS_FLOOR_MAX_RATIO: f64 = 8.0;
+
+    pub(crate) fn zc_kpass_gate_share(ratio: f64, hi_size: usize) -> usize {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return 0;
+        }
+        if ratio > ZC_KPASS_MAX_RATIO {
+            if ratio < ZC_KPASS_FLOOR_MAX_RATIO {
+                return hi_size / 8;
+            }
+            return 0;
+        }
+        let g = (hi_size as f64 / (ratio + (1.0 - ZC_KPASS_ALPHA))).round();
+        (g as usize).min(hi_size * 7 / 8)
+    }
+
+    fn zc_kpass_init(gpu: &'static Gpu) -> Result<ZcKpass, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<Id, String> {
+                let src = gpu.api.nsstring(ZC_KPASS_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "zc-kpass shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let ns = gpu.api.nsstring("zc_kpass_products")?;
+                let f: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        library,
+                        c"release"
+                    );
+                    return Err("zc_kpass_products kernel not found".into());
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    library,
+                    c"release"
+                );
+                if pso.is_null() {
+                    return Err(format!(
+                        "zc_kpass_products pipeline: {}",
+                        gpu.api.error_string(perr)
+                    ));
+                }
+                Ok(pso)
+            })();
+            gpu.pool_pop(pool);
+            let pso = built?;
+            let nib_buf = gpu.new_buffer(256 * 16)?;
+            Ok(ZcKpass {
+                pso,
+                nib_buf,
+                eq_lo_buf: NIL,
+                eq_lo_cap: 0,
+                eq_hi_buf: NIL,
+                eq_hi_cap: 0,
+                part_buf: NIL,
+                part_cap: 0,
+            })
+        }
+    }
+
+    fn zc_kpass_state() -> Option<&'static std::sync::Mutex<ZcKpass>> {
+        ZC_KPASS_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match zc_kpass_init(gpu) {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if super::gpu_zc_kpass_debug() {
+                            eprintln!("[zc-kpass] init failed: {e}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    pub(crate) struct ZcKpassJob {
+        cb: Id,
+        pub chunks: usize,
+        calibration: bool,
+        lo_size: usize,
+        mask: u32,
+        useful: u32,
+        rho1: F128,
+        rho2: F128,
+        a_buf: Id,
+        b_buf: Id,
+        submitted: std::time::Instant,
+    }
+
+    unsafe impl Send for ZcKpassJob {}
+
+    impl ZcKpassJob {
+        pub(crate) fn cpu_split(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    pub(crate) enum ZcKpassResult {
+        Calibrated,
+        /// Timed-prove prefix partials: 8 eq_hi-weighted reduced slots per
+        /// chunk, matching the CPU `outv` order
+        /// `[p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5']`.
+        Prefix(Vec<[F128; 8]>),
+        Failed,
+    }
+
+    unsafe fn zc_kpass_submit(
+        gpu: &Gpu,
+        state: &ZcKpass,
+        a_buf: Id,
+        b_buf: Id,
+        chunks: usize,
+        lo_size: usize,
+        mask: u32,
+        useful: u32,
+        rho1: F128,
+        rho2: F128,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                rho1: F128,
+                rho2: F128,
+                lo_size: u32,
+                xpt: u32,
+                mask: u32,
+                useful: u32,
+            }
+            let params = P {
+                rho1,
+                rho2,
+                lo_size: lo_size as u32,
+                xpt: (lo_size / 512) as u32,
+                mask,
+                useful,
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, a_buf, 0, 0);
+            gpu.set_buffer(enc, b_buf, 0, 1);
+            gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
+            gpu.set_buffer(enc, state.eq_hi_buf, 0, 3);
+            gpu.set_buffer(enc, state.nib_buf, 0, 4);
+            gpu.set_buffer(enc, state.part_buf, 0, 5);
+            gpu.set_bytes(enc, pb, 6);
+            gpu.dispatch(enc, chunks as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// Launch the K-pass products prefix. Binds r2's cached packed a/b
+    /// wraps — returns `None` (exact incumbent CPU path) if those views
+    /// do not already exist. NEVER calls `wrap_buffer`.
+    pub(crate) fn launch_zc_kpass_products(
+        table_data: &[F128],
+        rho1: F128,
+        rho2: F128,
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+    ) -> Option<ZcKpassJob> {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_zc_kpass_enabled() || ZC_KPASS_POISONED.load(Ordering::Relaxed) {
+            return None;
+        }
+        if table_data.len() != 8 * 256
+            || lo_size < 512
+            || !lo_size.is_multiple_of(512)
+            || hi_size < 8
+            || pair_in_block_mask > u32::MAX as usize
+        {
+            return None;
+        }
+        let useful_u32 = useful_pairs_inclusive.min(u32::MAX as usize) as u32;
+        let tuned = ZC_KPASS_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        // Bind existing r2 wraps or decline — never a second wrap.
+        let (a_buf, b_buf) = zc_r2_existing_ab_wraps()?;
+        let calibration = tuned == usize::MAX;
+        let chunks = if calibration {
+            (hi_size / 32).clamp(8, 64)
+        } else {
+            tuned.min(hi_size * 7 / 8)
+        };
+        if chunks == 0 {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_kpass_state()?;
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("zc-kpass launch", false);
+                return None;
+            }
+        };
+        unsafe {
+            let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
+            for j in 0..8 {
+                for n in 0..16 {
+                    *nib.add(j * 32 + n) = table_data[j * 256 + n];
+                    *nib.add(j * 32 + 16 + n) = table_data[j * 256 + (n << 4)];
+                }
+            }
+            let need_lo = lo_size * 16;
+            if state.eq_lo_cap < need_lo {
+                if state.eq_lo_cap > 0 {
+                    gpu.release(state.eq_lo_buf);
+                }
+                state.eq_lo_buf = gpu.new_buffer(need_lo).ok()?;
+                state.eq_lo_cap = need_lo;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_lo.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_lo_buf),
+                need_lo,
+            );
+            let need_hi = hi_size * 16;
+            if state.eq_hi_cap < need_hi {
+                if state.eq_hi_cap > 0 {
+                    gpu.release(state.eq_hi_buf);
+                }
+                state.eq_hi_buf = gpu.new_buffer(need_hi).ok()?;
+                state.eq_hi_cap = need_hi;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_hi.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_hi_buf),
+                need_hi,
+            );
+            let need_part = hi_size * 128;
+            if state.part_cap < need_part {
+                if state.part_cap > 0 {
+                    gpu.release(state.part_buf);
+                }
+                state.part_buf = gpu.new_buffer(need_part).ok()?;
+                state.part_cap = need_part;
+            }
+            let cb = zc_kpass_submit(
+                gpu,
+                &state,
+                a_buf,
+                b_buf,
+                chunks,
+                lo_size,
+                pair_in_block_mask as u32,
+                useful_u32,
+                rho1,
+                rho2,
+            )
+            .ok()?;
+            Some(ZcKpassJob {
+                cb,
+                chunks,
+                calibration,
+                lo_size,
+                mask: pair_in_block_mask as u32,
+                useful: useful_u32,
+                rho1,
+                rho2,
+                a_buf,
+                b_buf,
+                submitted: std::time::Instant::now(),
+            })
+        }
+    }
+
+    pub(crate) fn zc_kpass_wait(
+        job: ZcKpassJob,
+        cpu_partials: Option<&[[F128; 8]]>,
+        cpu_wall_ms: f64,
+        hi_size: usize,
+    ) -> ZcKpassResult {
+        use std::sync::atomic::Ordering;
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return ZcKpassResult::Failed,
+        };
+        let poison = |cb: Id| {
+            ZC_KPASS_POISONED.store(true, Ordering::Relaxed);
+            ZC_KPASS_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            ZcKpassResult::Failed
+        };
+        unsafe {
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+                return poison(job.cb);
+            }
+            let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+            let state_mutex = match zc_kpass_state() {
+                Some(s) => s,
+                None => return poison(job.cb),
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    note_poisoned_lock("zc-kpass wait", false);
+                    return poison(job.cb);
+                }
+            };
+            let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
+            let mut out: Vec<[F128; 8]> = Vec::with_capacity(job.chunks);
+            for c in 0..job.chunks {
+                let mut slot = [F128::ZERO; 8];
+                for i in 0..8 {
+                    slot[i] = *parts.add(c * 8 + i);
+                }
+                out.push(slot);
+            }
+            if !job.calibration {
+                gpu.release(job.cb);
+                if super::gpu_zc_kpass_debug() {
+                    eprintln!(
+                        "[zc-kpass] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
+                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms",
+                        job.chunks,
+                        hi_size,
+                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                return ZcKpassResult::Prefix(out);
+            }
+
+            let Some(cpu_all) = cpu_partials else {
+                return poison(job.cb);
+            };
+            for c in 0..job.chunks {
+                if out[c] != cpu_all[c] {
+                    if super::gpu_zc_kpass_debug() {
+                        eprintln!(
+                            "[zc-kpass] CALIBRATION MISMATCH at chunk {c}: gpu={:?} cpu={:?} — poisoned",
+                            out[c], cpu_all[c]
+                        );
+                    }
+                    return poison(job.cb);
+                }
+            }
+            let mut walls = [0.0f64; 3];
+            walls[0] = first_wall.max(0.0);
+            let mut n_walls = usize::from(walls[0] > 0.0);
+            let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
+            gpu.release(job.cb);
+            {
+                while n_walls < walls.len() {
+                    let Ok(cb2) = zc_kpass_submit(
+                        gpu,
+                        &state,
+                        job.a_buf,
+                        job.b_buf,
+                        job.chunks,
+                        job.lo_size,
+                        job.mask,
+                        job.useful,
+                        job.rho1,
+                        job.rho2,
+                    ) else {
+                        break;
+                    };
+                    let w = if gpu.wait_cb(cb2).is_ok() {
+                        zc_fold_gpu_wall_ms(gpu, cb2)
+                    } else {
+                        0.0
+                    };
+                    gpu.release(cb2);
+                    if w <= 0.0 {
+                        break;
+                    }
+                    walls[n_walls] = w;
+                    n_walls += 1;
+                    let prev_min = w_min;
+                    w_min = w_min.min(w);
+                    if n_walls >= 2 && w > 0.95 * prev_min {
+                        break;
+                    }
+                }
+            }
+            drop(state);
+            let u_gpu = if n_walls > 0 && w_min < f64::MAX {
+                w_min / job.chunks as f64
+            } else {
+                f64::INFINITY
+            };
+            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+                let measured = u_gpu / u_cpu;
+                let ratio = zc_kpass_forced_ratio().unwrap_or(measured);
+                let g = zc_kpass_gate_share(ratio, hi_size);
+                if super::gpu_zc_kpass_debug() {
+                    eprintln!("[zc-kpass] gate replay walls: {:?}", &walls[..n_walls]);
+                    eprintln!(
+                        "[zc-kpass] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
+                         ratio={:.3} -> share {g}/{hi_size}",
+                        u_gpu / u_cpu,
+                    );
+                }
+                g
+            } else {
+                0
+            };
+            ZC_KPASS_TUNED.store(share, Ordering::Relaxed);
+            ZcKpassResult::Calibrated
+        }
+    }
+
+
+    // -----------------------------------------------------------------------
     // Zerocheck large tail LOOP round products GPU arm
     // (see `ENV_NO_GPU_ZC_LOOP`).
     //
@@ -13612,6 +13811,11 @@ pub(crate) use imp::{stage_zc_r2_idle_fill, zc_r2_idle_fill_viable};
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcT3Job, ZcT3Result, launch_zc_t3_products, zc_t3_wait};
 
+/// Zerocheck cascade K-pass products GPU arm (see `ENV_NO_GPU_ZC_KPASS`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{ZcKpassJob, ZcKpassResult, launch_zc_kpass_products, zc_kpass_wait};
+
 /// Zerocheck large tail loop-round products GPU arm (see `ENV_NO_GPU_ZC_LOOP`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
@@ -13632,25 +13836,6 @@ mod imp {
 
     impl FromZFirstPassStream {
         pub(crate) fn submit_ready_range(&mut self, _r_start: usize, _r_count: usize) {}
-    }
-
-    /// L1 NTT/Merkle-leaf overlap (non-Metal stub): never engages.
-    pub(crate) struct L1MerkleOverlapSession;
-
-    impl L1MerkleOverlapSession {
-        pub(crate) fn chunk_ready(&self, _offset_elems: usize, _len_elems: usize) {}
-
-        pub(crate) fn finish(self) -> Option<Vec<crate::merkle::Hash>> {
-            None
-        }
-    }
-
-    pub(crate) fn l1_merkle_overlap_begin(
-        _data_ptr: *const u8,
-        _data_len: usize,
-        _num_leaves: usize,
-    ) -> Option<L1MerkleOverlapSession> {
-        None
     }
 
     pub(crate) unsafe fn begin_from_z_first_pass_stream(
@@ -15575,9 +15760,13 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // Fast GPU: actual factored-PSO selection widens only the cap. The
         // ratio math is unchanged (round(64 / 1.1) = 58 before clamping).
         assert_eq!(lincheck_gate_share_balanced(0.1, 64, false), 40);
-        assert_eq!(lincheck_gate_share_balanced(0.1, 64, true), 48);
+        assert_eq!(lincheck_gate_share_balanced(0.1, 64, true), 56);
+        // Share between the old 48 cap and the new 56 cap is now live on
+        // factored B4; incumbent stays clamped at 5n/8 = 40.
+        assert_eq!(lincheck_gate_share_balanced(0.23, 64, false), 40);
+        assert_eq!(lincheck_gate_share_balanced(0.23, 64, true), 52);
         // At an observed factored ratio the natural share, not the cap,
-        // remains authoritative.
+        // remains authoritative (round(64/1.33) = 48, still under 56).
         assert_eq!(lincheck_gate_share_balanced(0.33, 64, false), 40);
         assert_eq!(lincheck_gate_share_balanced(0.33, 64, true), 48);
         assert_eq!(lincheck_gate_share_balanced(0.5, 64, false), 40);
@@ -15596,7 +15785,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(lincheck_gate_share_balanced(1.0, 16, true), 8);
         // Fallback retains the old proportional ceiling on small shapes too.
         assert_eq!(lincheck_gate_share_balanced(0.1, 16, false), 10);
-        assert_eq!(lincheck_gate_share_balanced(0.1, 16, true), 12);
+        assert_eq!(lincheck_gate_share_balanced(0.1, 16, true), 14);
         // The legacy policy is preserved exactly for causal comparison.
         assert_eq!(lincheck_gate_share_legacy(1.0, 64), 28);
         assert_eq!(lincheck_gate_share_legacy(1.52, 64), 22);
@@ -15930,60 +16119,6 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         imp::zc_r2_test_reset();
     }
 
-    /// The L1 NTT/Merkle-leaf overlap must reproduce the incumbent commit
-    /// byte-for-byte on the real L1 shape: same codeword matrix, same flat
-    /// tree, same root. Drives the full production path (`ligero_commit`
-    /// with the fused3 transform's per-chunk callback) with the admission
-    /// latch forced to each arm; the latch is process-global, hence the
-    /// serial lock and the reset at the end.
-    #[test]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_l1_merkle_overlap_matches_sync() {
-        static L1_OVERLAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = L1_OVERLAP_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = imp::gpu() {
-            eprintln!("skipping GPU test: {e}");
-            return;
-        }
-        let mut rng = Rng::new(0x4C31);
-        // L1 shape: log_msg_cols=16, 8 interleaved lanes, rate 1/4 —
-        // 2^18 leaves of 128 bytes.
-        let poly = rng.vec(8 << 16);
-        let ntt = crate::ntt::AdditiveNttF128::standard(18);
-
-        super::l1_overlap_latch_force(super::L1_OVERLAP_ON);
-        let w_overlap = crate::pcs::ligerito::ligero_commit(
-            &poly,
-            16,
-            3,
-            2,
-            &ntt,
-            crate::merkle::HashKind::Blake3,
-        );
-        super::l1_overlap_latch_force(super::L1_OVERLAP_OFF);
-        let w_sync = crate::pcs::ligerito::ligero_commit(
-            &poly,
-            16,
-            3,
-            2,
-            &ntt,
-            crate::merkle::HashKind::Blake3,
-        );
-        super::l1_overlap_latch_force(super::L1_OVERLAP_UNMEASURED);
-
-        assert!(
-            w_overlap.mat == w_sync.mat,
-            "L1 overlap codeword diverges from the sync path"
-        );
-        assert!(
-            w_overlap.tree == w_sync.tree,
-            "L1 overlap tree diverges from the sync path"
-        );
-        assert_eq!(w_overlap.root(), w_sync.root());
-    }
-
     /// T3 products arm oracle: the GPU's per-chunk reduced partials must
     /// equal the CPU's `(eq_hi · p1, eq_hi · pinf)` bit-for-bit on the
     /// anchors+deltas compact representation with an F2-linear scaled
@@ -16117,6 +16252,231 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             _ => panic!("timed drain must return prefix partials"),
         }
         imp::zc_t3_test_reset();
+    }
+
+    #[test]
+    fn kpass_kill_switch_is_exact_one() {
+        fn enabled(v: Option<&str>) -> bool {
+            !v.is_some_and(|s| s == "1")
+        }
+        assert!(enabled(None));
+        assert!(enabled(Some("")));
+        assert!(enabled(Some("0")));
+        assert!(enabled(Some("01")));
+        assert!(enabled(Some("true")));
+        assert!(!enabled(Some("1")));
+        assert_eq!(ENV_NO_GPU_ZC_KPASS, "FLOCK_NO_GPU_ZC_KPASS");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_kpass_gate_share_policy() {
+        use imp::zc_kpass_gate_share;
+        // Balance point hi/(ratio+0.30); 7/8 cap.
+        assert_eq!(zc_kpass_gate_share(0.20, 2048), 1792); // cap 7/8
+        assert_eq!(zc_kpass_gate_share(1.0, 2048), 1575); // 2048/1.30
+        assert_eq!(zc_kpass_gate_share(2.0, 2048), 890); // 2048/2.30
+        assert_eq!(zc_kpass_gate_share(2.01, 2048), 256);
+        assert_eq!(zc_kpass_gate_share(7.9, 2048), 256);
+        assert_eq!(zc_kpass_gate_share(8.0, 2048), 0);
+        assert_eq!(zc_kpass_gate_share(f64::NAN, 2048), 0);
+        assert_eq!(zc_kpass_gate_share(0.0, 2048), 0);
+        assert_eq!(zc_kpass_gate_share(-1.0, 2048), 0);
+    }
+
+    /// Declining when r2 has not wrapped is the wrap-budget invariant:
+    /// K-pass must not call wrap_buffer on compact (or anything else).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn kpass_launch_without_r2_wraps_is_none() {
+        let table = vec![F128::ZERO; 8 * 256];
+        let eq_lo = vec![F128::ZERO; 512];
+        let eq_hi = vec![F128::ZERO; 64];
+        let job = imp::launch_zc_kpass_products(
+            &table,
+            F128::ONE,
+            F128::ONE,
+            &eq_lo,
+            &eq_hi,
+            512,
+            64,
+            0,
+            usize::MAX,
+        );
+        assert!(
+            job.is_none(),
+            "K-pass must refuse to launch without r2's cached a/b wraps"
+        );
+    }
+
+    /// K-pass products arm oracle: GPU composed-from-packed partials must
+    /// equal the CPU's eight eq_hi-weighted outv slots. Requires r2 to have
+    /// wrapped the same packed a/b (the wrap-budget solution). Exercises
+    /// calibration and the timed prefix.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_zc_kpass_products_match_cpu_oracle() {
+        use crate::field::F256Unreduced;
+        fn xs(rng: &mut u64) -> u64 {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            *rng
+        }
+        fn rand_f128(rng: &mut u64) -> F128 {
+            F128 {
+                lo: xs(rng),
+                hi: xs(rng),
+            }
+        }
+        let mut rng = 0xD1B54A32D192ED03u64;
+
+        let mut table_data = vec![F128::ZERO; 8 * 256];
+        for j in 0..8 {
+            let basis: Vec<F128> = (0..8).map(|_| rand_f128(&mut rng)).collect();
+            for v in 1usize..256 {
+                let mut acc = F128::ZERO;
+                for b in 0..8 {
+                    if v & (1 << b) != 0 {
+                        acc += basis[b];
+                    }
+                }
+                table_data[j * 256 + v] = acc;
+            }
+        }
+        let fold_row = |code: u64| -> F128 {
+            let mut acc = F128::ZERO;
+            for j in 0..8 {
+                acc += table_data[j * 256 + ((code >> (8 * j)) & 0xff) as usize];
+            }
+            acc
+        };
+
+        let lo_size = 512usize;
+        let hi_size = 64usize;
+        let n_groups = lo_size * hi_size * 2;
+        let n_r2_pairs = 2 * n_groups;
+        let rho1 = rand_f128(&mut rng);
+        let rho2 = rand_f128(&mut rng);
+
+        let a_packed = leak_page_aligned(n_r2_pairs * 16);
+        let b_packed = leak_page_aligned(n_r2_pairs * 16);
+        for byte in a_packed.iter_mut() {
+            *byte = (xs(&mut rng) & 0xff) as u8;
+        }
+        for byte in b_packed.iter_mut() {
+            *byte = (xs(&mut rng) & 0xff) as u8;
+        }
+        let eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
+        let eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
+
+        let compose = |packed: &[u8], g: usize| -> F128 {
+            let read = |row: usize| -> u64 {
+                u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
+            };
+            let a0z = fold_row(read(4 * g));
+            let a1z = fold_row(read(4 * g + 1));
+            let a2z = fold_row(read(4 * g + 2));
+            let a3z = fold_row(read(4 * g + 3));
+            let p0 = a0z + rho1 * (a0z + a1z);
+            let p1 = a2z + rho1 * (a2z + a3z);
+            p0 + rho2 * (p0 + p1)
+        };
+
+        let mut cpu_slots: Vec<[F128; 8]> = Vec::with_capacity(hi_size);
+        for x_hi in 0..hi_size {
+            let mut acc = [F256Unreduced::ZERO; 8];
+            let n5 = lo_size / 2;
+            for t in 0..n5 {
+                let g0 = x_hi * 2 * lo_size + 4 * t;
+                let av: [F128; 4] = std::array::from_fn(|lane| compose(a_packed, g0 + lane));
+                let bv: [F128; 4] = std::array::from_fn(|lane| compose(b_packed, g0 + lane));
+                let w = eq_lo[2 * t + 1];
+                let a0w = w * av[0];
+                let a1w = w * av[1];
+                let a2w = w * av[2];
+                let a3w = w * av[3];
+                acc[0] ^= a1w.mul_unreduced(bv[1]);
+                acc[1] ^= (a0w + a1w).mul_unreduced(bv[0] + bv[1]);
+                acc[2] ^= a3w.mul_unreduced(bv[3]);
+                acc[3] ^= (a2w + a3w).mul_unreduced(bv[2] + bv[3]);
+                acc[4] ^= a2w.mul_unreduced(bv[2]);
+                acc[5] ^= (a0w + a2w).mul_unreduced(bv[0] + bv[2]);
+                acc[6] ^= (a1w + a3w).mul_unreduced(bv[1] + bv[3]);
+                acc[7] ^= (a0w + a1w + a2w + a3w)
+                    .mul_unreduced(bv[0] + bv[1] + bv[2] + bv[3]);
+            }
+            let eq_h = eq_hi[x_hi];
+            cpu_slots.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
+        }
+
+        // Populate r2 wraps on the same packed buffers (no extra wrap).
+        // Force a timed share so wait(None) is not the calibration poison path.
+        imp::zc_r2_test_reset();
+        imp::zc_r2_test_set_share(8);
+        imp::zc_kpass_test_reset();
+        let r2_eq_lo: Vec<F128> = (0..512).map(|_| rand_f128(&mut rng)).collect();
+        let r2_eq_hi: Vec<F128> = (0..256).map(|_| rand_f128(&mut rng)).collect();
+        let r2_job = imp::launch_zc_r2_products(
+            a_packed,
+            b_packed,
+            &table_data,
+            &r2_eq_lo,
+            &r2_eq_hi,
+            512,
+            256,
+            0,
+            usize::MAX,
+        );
+        let Some(r2_job) = r2_job else {
+            return; // no Metal
+        };
+        let _ = imp::zc_r2_wait(r2_job, None, None, 0.0, 256);
+
+        let job = imp::launch_zc_kpass_products(
+            &table_data,
+            rho1,
+            rho2,
+            &eq_lo,
+            &eq_hi,
+            lo_size,
+            hi_size,
+            0,
+            usize::MAX,
+        )
+        .expect("calibration launch must succeed once r2 wraps exist");
+        assert!(job.is_calibration());
+        let res = imp::zc_kpass_wait(job, Some(&cpu_slots), 50.0, hi_size);
+        assert!(matches!(res, imp::ZcKpassResult::Calibrated));
+        let (tuned, poisoned) = imp::zc_kpass_test_state();
+        assert!(!poisoned, "probe partials must equal CPU slots bit-for-bit");
+        assert_ne!(tuned, usize::MAX, "calibration must publish a share");
+
+        imp::zc_kpass_test_set_share(hi_size / 2);
+        let job2 = imp::launch_zc_kpass_products(
+            &table_data,
+            rho1,
+            rho2,
+            &eq_lo,
+            &eq_hi,
+            lo_size,
+            hi_size,
+            0,
+            usize::MAX,
+        )
+        .expect("timed launch must succeed");
+        assert!(!job2.is_calibration());
+        let prefix = job2.cpu_split();
+        assert_eq!(prefix, hi_size / 2);
+        match imp::zc_kpass_wait(job2, None, 0.0, hi_size) {
+            imp::ZcKpassResult::Prefix(vals) => {
+                assert_eq!(vals.len(), prefix);
+                assert_eq!(&vals[..], &cpu_slots[..prefix], "prefix slots bit-exact");
+            }
+            _ => panic!("timed drain must return prefix partials"),
+        }
+        imp::zc_kpass_test_reset();
+        imp::zc_r2_test_reset();
     }
 
     /// Loop-round products arm oracle: the GPU's ρ-nibble-table fold plus
