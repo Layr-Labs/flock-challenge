@@ -1452,3 +1452,18 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
     let claim = R1csClaim { ab, c };
     (proof, commitment, claim, t)
 }
+// dispersion-resample marker ds4pro-pv-1-1786815029-30556
+// dispersion-resample marker ds4pro-pv-2-1786815029-14458
+// dispersion-resample marker ds4pro-pv-3-1786815029-31386
+// dispersion-resample marker ds4pro-pv-4-1786815029-18702
+// dispersion-resample marker ds4pro-pv-5-1786815029-29266
+// dispersion-resample marker ds4pro-pv-6-1786815029-16070
+// dispersion-resample marker ds4pro-pv-7-1786815029-16920
+// dispersion-resample marker ds4pro-pv-8-1786815029-23049
+// dispersion-resample marker ds4pro-pv-9-1786815029-27113
+// dispersion-resample marker ds4pro-pv-10-1786815029-11190
+// dispersion-resample marker ds4pro-pv-11-1786815029-26053
+// dispersion-resample marker ds4pro-pv-12-1786815029-19668
+// dispersion-resample marker ds4pro-pv-13-1786815029-22306
+// dispersion-resample marker ds4pro-pv-14-1786815029-1453
+// dispersion-resample marker ds4pro-pv-15-1786815029-27873

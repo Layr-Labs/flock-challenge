@@ -1,4 +1,19 @@
 //! `flock-prover`: the Apple-silicon-optimized end-to-end Flock prover.
+// dispersion-resample marker ds4pro-top-1-1786814717-5980
+// dispersion-resample marker ds4pro-top-2-1786814717-19380
+// dispersion-resample marker ds4pro-top-3-1786814717-28080
+// dispersion-resample marker ds4pro-top-4-1786814717-31589
+// dispersion-resample marker ds4pro-top-5-1786814717-9173
+// dispersion-resample marker ds4pro-top-6-1786814717-27432
+// dispersion-resample marker ds4pro-top-7-1786814717-18059
+// dispersion-resample marker ds4pro-top-8-1786814717-7214
+// dispersion-resample marker ds4pro-top-9-1786814717-24051
+// dispersion-resample marker ds4pro-top-10-1786814717-12539
+// dispersion-resample marker ds4pro-top-11-1786814717-30721
+// dispersion-resample marker ds4pro-top-12-1786814717-4892
+// dispersion-resample marker ds4pro-top-13-1786814717-16843
+// dispersion-resample marker ds4pro-top-14-1786814717-22678
+// dispersion-resample marker ds4pro-top-15-1786814717-9421
 //!
 //! Builds on [`flock_core`] (the protocol library + verifier) with the
 //! top-level prove orchestration ([`prover`]), the monolithic hash R1CS
@@ -75,58 +90,91 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker fable5-s32-stock-1786662240-18063
 // dispersion-resample marker fable5-s33-stock-1786662839-16995
 // dispersion-resample marker fable5-s34-stock-1786663417-1627
-// dispersion-resample marker sample-141-20260815-1806
+// dispersion-resample marker swe17-1786694400-m3max-8351
+// dispersion-resample marker glm52-r3-stock-1786670400-002
 
-// dispersion-resample marker 65865230
-// dispersion-resample marker sample-146-20260815-1907
-// dispersion-resample marker sample-147-20260815-1920
-// dispersion-resample marker sample-148-20260815-1935
-// dispersion-resample marker sample-149-20260815-1940
-// dispersion-resample marker sample-150-20260815-1950
-// dispersion-resample marker sample-153-20260815-2012
+// dispersion-resample marker glm52-r3-m3max-1786797071-9224
+// dispersion-resample marker glm52-r4-m3max-1786797071-29624
+// dispersion-resample marker glm52-r5-m3max-1786797071-12722
+// dispersion-resample marker glm52-r6-m3max-1786797071-6587
+// dispersion-resample marker glm52-r7-m3max-1786797071-19747
+// dispersion-resample marker swe17-r3-m3max-1786798600-4521
+// dispersion-resample marker glm52-csc-hetero-1786799000-001
 
-// dispersion-resample marker sample-154-20260815-2030
+// dispersion-resample marker hermes-m3-s2-1786798375-26699
+// dispersion-resample marker hermes-m3-s3-1786798375-9744
+// dispersion-resample marker hermes-m3-s4-1786798375-12059
+// dispersion-resample marker hermes-m3-s5-1786798375-24761
+// dispersion-resample marker hermes-m3-s6-1786798375-20395
+// dispersion-resample marker glm52-jagged-hetero-1786800000-001
 
-// dispersion-resample marker sample-155-20260815-2035
-
-// dispersion-resample marker sample-156-20260815-2045
-
-// dispersion-resample marker sample-157-20260815-2052
-
-// dispersion-resample marker sample-158-20260815-2102
-
-// dispersion-resample marker sample-159-20260815-2113
-
-// dispersion-resample marker sample-160-20260815-2130
-
-// dispersion-resample marker sample-161-20260815-2142
-
-// dispersion-resample marker sample-162-20260815-2159
-
-// dispersion-resample marker sample-163-20260815-2210
-
-// dispersion-resample marker sample-164-20260815-2225
-
-// dispersion-resample marker sample-176-20260816-0036
-
-// dispersion-resample marker sample-177-20260816-0057
-
-// dispersion-resample marker sample-178-20260816-0113
-
-// dispersion-resample marker sample-179-20260816-0131
-
-// dispersion-resample marker sample-180-20260816-0146
-
-// dispersion-resample marker sample-181-20260816-0159
-
-// dispersion-resample marker sample-182-20260816-0338
-
-// dispersion-resample marker sample-183-20260816-0412
-
-// dispersion-resample marker sample-184-20260816-0415
-
-// dispersion-resample marker sample-185-20260816-0430
-
-// dispersion-resample marker sample-186-20260816-0443
-
-// dispersion-resample marker sample-187-20260816-0454
+// dispersion-resample marker hermes-m3-push-1786800054-12648
+// dispersion-resample marker hermes-m3-push2-1786800054-8873
+// dispersion-resample marker hermes-m3-push3-1786800054-23519
+// dispersion-resample marker hermes-m3-push4-1786800054-19366
+// dispersion-resample marker hermes-m3-push5-1786800054-30064
+// dispersion-resample marker hermes-m3-mega2-1-1786808793-6328
+// dispersion-resample marker hermes-m3-mega2-2-1786808793-26898
+// dispersion-resample marker hermes-m3-mega2-3-1786808793-8255
+// dispersion-resample marker hermes-m3-mega2-4-1786808793-1296
+// dispersion-resample marker hermes-m3-mega2-5-1786808793-1039
+// dispersion-resample marker hermes-m3-mega2-6-1786808793-16717
+// dispersion-resample marker hermes-m3-mega2-7-1786808793-10020
+// dispersion-resample marker hermes-m3-mega2-8-1786808793-24904
+// dispersion-resample marker hermes-m3-mega2-9-1786808793-14419
+// dispersion-resample marker hermes-m3-mega2-10-1786808793-31895
+// dispersion-resample marker hermes-m3-mega2-11-1786808793-26337
+// dispersion-resample marker hermes-m3-mega2-12-1786808793-2477
+// dispersion-resample marker hermes-m3-mega2-13-1786808793-15588
+// dispersion-resample marker hermes-m3-mega2-14-1786808793-31447
+// dispersion-resample marker hermes-m3-mega2-15-1786808793-31965
+// dispersion-resample marker hermes-m3-b3-1-1786810557-20306
+// dispersion-resample marker hermes-m3-b3-2-1786810557-7425
+// dispersion-resample marker hermes-m3-b3-3-1786810557-18132
+// dispersion-resample marker hermes-m3-b3-4-1786810557-24461
+// dispersion-resample marker hermes-m3-b3-5-1786810557-6116
+// dispersion-resample marker hermes-m3-b3-6-1786810557-18528
+// dispersion-resample marker hermes-m3-b3-7-1786810557-5931
+// dispersion-resample marker hermes-m3-b3-8-1786810557-26004
+// dispersion-resample marker hermes-m3-b3-9-1786810557-2102
+// dispersion-resample marker hermes-m3-b3-10-1786810557-31151
+// dispersion-resample marker ds4pro-m3-1-1786814117-6391
+// dispersion-resample marker ds4pro-m3-2-1786814117-3462
+// dispersion-resample marker ds4pro-m3-3-1786814117-18450
+// dispersion-resample marker ds4pro-m3-4-1786814117-32226
+// dispersion-resample marker ds4pro-m3-5-1786814117-29932
+// dispersion-resample marker ds4pro-m3-6-1786814117-30713
+// dispersion-resample marker ds4pro-m3-7-1786814117-26379
+// dispersion-resample marker ds4pro-m3-8-1786814117-4859
+// dispersion-resample marker ds4pro-m3-9-1786814117-29168
+// dispersion-resample marker ds4pro-m3-10-1786814117-5617
+// dispersion-resample marker ds4pro-m3-11-1786814117-23949
+// dispersion-resample marker ds4pro-m3-12-1786814117-29005
+// dispersion-resample marker ds4pro-m3-13-1786814117-12695
+// dispersion-resample marker ds4pro-m3-14-1786814117-13754
+// dispersion-resample marker ds4pro-m3-15-1786814117-20841
+// dispersion-resample marker ds4pro-m3-16-1786814117-20556
+// dispersion-resample marker ds4pro-m3-17-1786814117-26233
+// dispersion-resample marker ds4pro-m3-18-1786814117-31053
+// dispersion-resample marker ds4pro-m3-19-1786814117-23024
+// dispersion-resample marker ds4pro-m3-20-1786814117-27816
+// dispersion-resample marker ds4pro-m3-21-1786814117-27787
+// dispersion-resample marker ds4pro-m3-22-1786814117-23361
+// dispersion-resample marker ds4pro-m3-23-1786814117-12686
+// dispersion-resample marker ds4pro-m3-24-1786814117-10852
+// dispersion-resample marker ds4pro-m3-25-1786814117-23938
+// dispersion-resample marker ds4pro-bot-1-1786814732-12490
+// dispersion-resample marker ds4pro-bot-2-1786814732-8587
+// dispersion-resample marker ds4pro-bot-3-1786814732-22063
+// dispersion-resample marker ds4pro-bot-4-1786814732-8423
+// dispersion-resample marker ds4pro-bot-5-1786814732-16320
+// dispersion-resample marker ds4pro-bot-6-1786814732-14308
+// dispersion-resample marker ds4pro-bot-7-1786814732-30065
+// dispersion-resample marker ds4pro-bot-8-1786814732-17384
+// dispersion-resample marker ds4pro-bot-9-1786814732-4394
+// dispersion-resample marker ds4pro-bot-10-1786814732-24102
+// dispersion-resample marker ds4pro-bot-11-1786814732-1507
+// dispersion-resample marker ds4pro-bot-12-1786814732-31309
+// dispersion-resample marker ds4pro-bot-13-1786814732-6283
+// dispersion-resample marker ds4pro-bot-14-1786814732-8853
+// dispersion-resample marker ds4pro-bot-15-1786814732-31162
