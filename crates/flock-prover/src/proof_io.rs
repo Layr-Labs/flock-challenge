@@ -196,6 +196,31 @@ impl R1csProofBundleLigerito {
         }
         out
     }
+    /// Single-pass publish: stream the stashed prefix (header ‖ commitment ‖
+    /// zerocheck ‖ lincheck, pre-encoded on the efficiency-core helper while
+    /// the PCS open ran) and then the flat `pcs_open` encode directly into
+    /// `w` — no ~437 kB intermediate bundle Vec and no second copy inside
+    /// `fs::write`. Output is byte-identical to [`Self::to_bytes`] (same
+    /// prefix, same flat encoder), so the trusted harness's post-timing
+    /// verification is unaffected; any divergence would fail loudly there.
+    ///
+    /// The remaining tail work is then: write prefix (~4.3 kB), write the
+    /// flat pcs_open (~433 kB) through the writer's buffer, flush, rename —
+    /// instead of encode-into-Vec + full-bundle `fs::write` copy.
+    pub fn write_into<W: std::io::Write>(&self, mut w: W) -> std::io::Result<()> {
+        if let Some(prefix) = take_matching_pre_encoded(self) {
+            w.write_all(&prefix)?;
+            encode_pcs_open_into(&mut w, &self.proof.pcs_open);
+            return Ok(());
+        }
+        // Stash miss (kill switch / staleness fingerprint): single-shot
+        // bincode, still streaming straight into the writer (header first —
+        // to_bytes' fallback writes it too).
+        let mut header = Vec::with_capacity(HEADER_LEN);
+        write_header(&mut header, FLAVOR_R1CS_LIGERITO);
+        w.write_all(&header)?;
+        bincode::serialize_into(&mut w, self).map_err(std::io::Error::other)
+    }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
         let payload = parse_header(bytes, FLAVOR_R1CS_LIGERITO)?;
         Ok(bincode::deserialize(payload)?)
@@ -354,7 +379,7 @@ fn fast_pcs_open_encode_enabled() -> bool {
 /// Append the bincode-fixint encoding of `p` to `out`. Byte-identical to
 /// `bincode::serialize_into(out, p)` (falls back to exactly that when the
 /// fast path is disabled).
-fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
+fn encode_pcs_open_into<W: std::io::Write>(out: &mut W, p: &BatchOpeningProofLigerito) {
     if !fast_pcs_open_encode_enabled() {
         bincode::serialize_into(&mut *out, p).expect("bincode serialize pcs_open");
         return;
@@ -379,7 +404,7 @@ fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
         ood_values,
         fold_grinding_nonces,
     } = ligerito;
-    out.extend_from_slice(initial_root);
+    out.write_all(initial_root).expect("encode write");
     put_recursive_proof(out, initial_proof);
     put_hash_vec(out, recursive_roots);
     put_u64(out, recursive_proofs.len() as u64);
@@ -405,7 +430,7 @@ fn encode_pcs_open_into(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
     put_u64_vec(out, fold_grinding_nonces);
 }
 
-fn put_recursive_proof(out: &mut Vec<u8>, rp: &RecursiveProof) {
+fn put_recursive_proof<W: std::io::Write>(out: &mut W, rp: &RecursiveProof) {
     let RecursiveProof {
         opened_rows,
         merkle_proof,
@@ -415,18 +440,18 @@ fn put_recursive_proof(out: &mut Vec<u8>, rp: &RecursiveProof) {
 }
 
 #[inline]
-fn put_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
+fn put_u64<W: std::io::Write>(out: &mut W, v: u64) {
+    out.write_all(&v.to_le_bytes()).expect("encode write");
 }
 
 #[inline]
-fn put_f128(out: &mut Vec<u8>, v: F128) {
+fn put_f128<W: std::io::Write>(out: &mut W, v: F128) {
     put_u64(out, v.lo);
     put_u64(out, v.hi);
 }
 
 #[inline]
-fn put_f128_vec(out: &mut Vec<u8>, v: &[F128]) {
+fn put_f128_vec<W: std::io::Write>(out: &mut W, v: &[F128]) {
     put_u64(out, v.len() as u64);
     // SAFETY: `F128` is `repr(C, align(16))` with exactly two `u64` fields
     // (size 16, no padding), so on a little-endian target the in-memory bytes
@@ -434,24 +459,24 @@ fn put_f128_vec(out: &mut Vec<u8>, v: &[F128]) {
     // The fast path is compile-time gated to little-endian above.
     let bytes =
         unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) };
-    out.extend_from_slice(bytes);
+    out.write_all(bytes).expect("encode write");
 }
 
 #[inline]
-fn put_hash_vec(out: &mut Vec<u8>, v: &[MerkleHash]) {
+fn put_hash_vec<W: std::io::Write>(out: &mut W, v: &[MerkleHash]) {
     put_u64(out, v.len() as u64);
-    out.extend_from_slice(v.as_flattened());
+    out.write_all(v.as_flattened()).expect("encode write");
 }
 
 #[inline]
-fn put_u64_vec(out: &mut Vec<u8>, v: &[u64]) {
+fn put_u64_vec<W: std::io::Write>(out: &mut W, v: &[u64]) {
     put_u64(out, v.len() as u64);
     for &x in v {
         put_u64(out, x);
     }
 }
 
-fn put_rows(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
+fn put_rows<W: std::io::Write>(out: &mut W, rows: &[Vec<F128>]) {
     put_u64(out, rows.len() as u64);
     for row in rows {
         put_f128_vec(out, row);
