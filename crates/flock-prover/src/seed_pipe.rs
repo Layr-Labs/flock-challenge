@@ -643,7 +643,16 @@ pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compre
 /// `Blake3Setup` reference; keeping that unsafety at the call site lets this
 /// module stay free of prover types.
 pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compression]) -> ProveOut) {
-    if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() || !is_ranked_worker() {
+    // Ranked default is DISARMED. Local A/B (2026-08-18, x86, 8 trials/arm):
+    // pipe-on median 2.5862s vs pipe-off 2.5104s — the concurrent speculative
+    // full prove costs ~2.9% of the scored interval, more than the expansion
+    // head-start it buys back, on a pool with no spare cores to hide it.
+    // `FLOCK_ARM_SEED_PIPE=1` re-arms for a platform A/B; `FLOCK_NO_SEED_PIPE=1`
+    // remains the explicit kill switch.
+    if std::env::var_os("FLOCK_ARM_SEED_PIPE").is_none()
+        || std::env::var_os("FLOCK_NO_SEED_PIPE").is_some()
+        || !is_ranked_worker()
+    {
         return;
     }
     if ARMED.swap(true, Ordering::SeqCst) {
