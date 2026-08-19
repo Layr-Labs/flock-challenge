@@ -1476,6 +1476,28 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     )
 }
 
+fn lincheck_trace_enabled() -> bool {
+    let read = || std::env::var("LINCHECK_TRACE").is_ok();
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("LINCHECK_TRACE").is_ok());
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn lincheck_join_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_none();
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_none());
+        *RANKED
+    } else {
+        read()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_padded_inner<Ch: Challenger>(
     z_packed: &[u8],
@@ -1499,7 +1521,7 @@ fn prove_padded_inner<Ch: Challenger>(
     assert_eq!(x_ab.x_outer.len(), n_log);
 
     challenger.observe_label(b"flock-lincheck-v0");
-    let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    let trace = lincheck_trace_enabled();
 
     // 1. Sample α (matches verifier's order). Used to batch the two scalar
     //    consistency checks v_a, v_b into a single sumcheck.
@@ -1572,10 +1594,10 @@ fn prove_padded_inner<Ch: Challenger>(
         }
         z_vec
     };
-    let (mut comb_vec, mut z_vec) = if std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some() {
-        (comb_branch(), z_branch())
-    } else {
+    let (mut comb_vec, mut z_vec) = if lincheck_join_enabled() {
         rayon::join(comb_branch, z_branch)
+    } else {
+        (comb_branch(), z_branch())
     };
     // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
     //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
