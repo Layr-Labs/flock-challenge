@@ -88,7 +88,7 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
-use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
+use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup, xor_dedup_3sorted};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -389,11 +389,14 @@ impl Word {
     /// Bitwise XOR, no dedup. Caller calls `dedup()` after a chain if it
     /// wants canonical rows.
     fn xor(&self, other: &Word) -> Word {
-        let mut out = self.clone();
-        for i in 0..WORD_BITS {
-            out.bits[i].extend(&other.bits[i]);
+        Word {
+            bits: std::array::from_fn(|i| {
+                let mut bits = Vec::with_capacity(self.bits[i].len() + other.bits[i].len());
+                bits.extend_from_slice(&self.bits[i]);
+                bits.extend_from_slice(&other.bits[i]);
+                bits
+            }),
         }
-        out
     }
     /// `rotr(n)` — pure index permutation; doesn't touch slot lists.
     fn rotr(&self, n: usize) -> Word {
@@ -414,15 +417,13 @@ impl Word {
     ///   sum[i] = x[i] ⊕ y[i] ⊕ ⊕_{j<i} carry_aux[j]
     fn add_sum(x: &Word, y: &Word, carry_base: usize) -> Word {
         let mut out = Word::zero();
+        let carry: Vec<usize> = (0..WORD_BITS - 1)
+            .map(|j| carry_base + j)
+            .collect();
         for i in 0..WORD_BITS {
-            let mut v = x.bits[i].clone();
-            v.extend(&y.bits[i]);
-            for j in 0..i {
-                v.push(carry_base + j);
-            }
-            out.bits[i] = v;
+            out.bits[i] = xor_dedup_3sorted(&x.bits[i], &y.bits[i], &carry[..i]);
         }
-        out.dedup()
+        out
     }
 }
 
