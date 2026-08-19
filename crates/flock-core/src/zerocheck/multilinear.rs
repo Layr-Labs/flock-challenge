@@ -1437,7 +1437,7 @@ pub fn fold_compact_and_compute_round_pair(
     // this arm — the static warmup latch frees minutes of wall and both
     // arms' once-per-process costs fit in a fraction of it.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    const ZC_T3_INTEGRATION_PARKED: bool = true;
+    const ZC_T3_INTEGRATION_PARKED: bool = false;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_job = if ZC_T3_INTEGRATION_PARKED {
         None
