@@ -1797,7 +1797,8 @@ pub(crate) fn flat_twiddle_table(ntt: &AdditiveNttF128, log_d: usize) -> Vec<F12
 /// layers each. Each pass is one GPU dispatch; a pass of `f` layers does one
 /// full read+write of the buffer for `f` butterfly layers.
 pub(crate) fn plan_passes(log_d: usize, start_layer: usize) -> Vec<(usize, usize)> {
-    let mut passes = Vec::new();
+    let pass_count = log_d.saturating_sub(start_layer).div_ceil(4);
+    let mut passes = Vec::with_capacity(pass_count);
     let mut l = start_layer;
     while l < log_d {
         let f = (log_d - l).min(4);
@@ -12728,14 +12729,24 @@ kernel void zc_t3_products(
                 state.part_buf = gpu.new_buffer(need_part).ok()?;
                 state.part_cap = need_part;
             }
+            // CHUNKED WRAP (K-audit): the kernel only reads the first
+            // `chunks` hi-chunks (pair_idx = tgid·lo_size + x_lo with
+            // tgid < chunks), so wrap only their byte ranges instead of
+            // the full 1.5 GiB anchors+deltas surface. The live no-copy
+            // wrap surface now scales with the gated GPU share
+            // (anchors 64 B/pair, deltas 32 B/pair) instead of pricing a
+            // full-buffer wrap every prove — under the r2 arm's proven
+            // 1 GiB ceiling at the admission share.
+            let anchor_bytes = chunks * lo_size * 4 * 16;
+            let delta_bytes = chunks * lo_size * 2 * 16;
             let anchors_buf = zc_t3_wrap(
                 &mut state,
                 gpu,
                 anchors.as_ptr().cast::<u8>(),
-                anchors.len() * 16,
+                anchor_bytes,
             )
             .ok()?;
-            let deltas_buf = zc_t3_wrap(&mut state, gpu, deltas.as_ptr(), deltas.len()).ok()?;
+            let deltas_buf = zc_t3_wrap(&mut state, gpu, deltas.as_ptr(), delta_bytes).ok()?;
             let cb = zc_t3_submit(gpu, &state, anchors_buf, deltas_buf, chunks, lo_size).ok()?;
             Some(ZcT3Job {
                 cb,

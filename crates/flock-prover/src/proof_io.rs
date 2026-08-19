@@ -485,7 +485,10 @@ fn put_rows<W: std::io::Write>(out: &mut W, rows: &[Vec<F128>]) {
 
 impl ChainProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        // Chain proofs carry the same dominant Ligerito opening as R1CS
+        // bundles. Reserve the ranked-proof envelope up front rather than
+        // repeatedly doubling from 1 KiB while publishing the proof.
+        let mut out = Vec::with_capacity(HEADER_LEN + 450_000);
         write_header(&mut out, FLAVOR_CHAIN_LIGERITO);
         bincode::serialize_into(&mut out, self)
             .expect("bincode serialize ChainProofBundleLigerito");
