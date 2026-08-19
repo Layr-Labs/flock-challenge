@@ -22,3 +22,20 @@
 //!
 //! Lane mandate: never sit empty. This is occupancy + floor re-sample after
 //! def1bbf (−0.18% real / −0.55% printed).
+//! gin-resample-01: bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-02: second bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-03: third bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-04: fourth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-05: fifth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-06: sixth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-07: seventh bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-08: eighth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-09: ninth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-10: tenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-11: eleventh bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-12: twelfth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-13: thirteenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-14: fourteenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-15: fifteenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-16: sixteenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-17: seventeenth bytecode-identical distribution sample of the optimized tree.
