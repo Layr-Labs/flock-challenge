@@ -22,3 +22,48 @@
 //!
 //! Lane mandate: never sit empty. This is occupancy + floor re-sample after
 //! def1bbf (−0.18% real / −0.55% printed).
+//! gin-resample-01: bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-02: second bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-03: third bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-04: fourth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-05: fifth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-06: sixth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-07: seventh bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-08: eighth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-09: ninth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-10: tenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-11: eleventh bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-12: twelfth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-13: thirteenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-14: fourteenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-15: fifteenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-16: sixteenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-17: seventeenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-18: eighteenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-19: nineteenth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-20: twentieth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-21: twenty-first bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-22: twenty-second bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-23: twenty-third bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-24: twenty-fourth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-25: twenty-fifth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-26: twenty-sixth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-27: twenty-seventh bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-28: twenty-eighth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-29: twenty-ninth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-30: thirtieth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-31: thirty-first bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-32: thirty-second bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-33: thirty-third bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-34: thirty-fourth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-35: thirty-fifth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-36: thirty-sixth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-37: thirty-seventh bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-38: thirty-eighth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-39: thirty-ninth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-40: fortieth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-41: forty-first bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-42: forty-second bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-43: forty-third bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-44: forty-fourth bytecode-identical distribution sample of the optimized tree.
+//! gin-resample-45: forty-fifth bytecode-identical distribution sample of the optimized tree.

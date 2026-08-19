@@ -2476,6 +2476,46 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+#[derive(Clone, Copy)]
+struct LigeritoControls {
+    induce_truncated_ntt: bool,
+    induce_fused_msg: bool,
+    fold2: bool,
+    direct_ab_hetero: bool,
+    direct_fold8_pair: bool,
+    lazy_ood_eq: bool,
+    trace: bool,
+}
+
+fn ligerito_controls() -> LigeritoControls {
+    let read = || LigeritoControls {
+        induce_truncated_ntt: std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none(),
+        induce_fused_msg: std::env::var_os("FLOCK_NO_LIG_INDUCE_FUSED_MSG").is_none(),
+        fold2: std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none(),
+        direct_ab_hetero: std::env::var_os("FLOCK_NO_DIRECT_AB_HETERO_MATERIALIZE").is_none(),
+        direct_fold8_pair: std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none(),
+        lazy_ood_eq: std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_none(),
+        trace: std::env::var("LIGERITO_TRACE").is_ok(),
+    };
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<LigeritoControls> =
+            std::sync::LazyLock::new(|| LigeritoControls {
+                induce_truncated_ntt: std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT")
+                    .is_none(),
+                induce_fused_msg: std::env::var_os("FLOCK_NO_LIG_INDUCE_FUSED_MSG").is_none(),
+                fold2: std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none(),
+                direct_ab_hetero: std::env::var_os("FLOCK_NO_DIRECT_AB_HETERO_MATERIALIZE")
+                    .is_none(),
+                direct_fold8_pair: std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none(),
+                lazy_ood_eq: std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_none(),
+                trace: std::env::var("LIGERITO_TRACE").is_ok(),
+            });
+        *RANKED
+    } else {
+        read()
+    }
+}
+
 #[inline]
 fn use_ranked_induce_truncated_final_ntt(
     log_msg_cols: usize,
@@ -2497,7 +2537,7 @@ fn use_ranked_induce_truncated_final_ntt(
             n_queries,
             alpha_len,
         )
-        && std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none()
+        && ligerito_controls().induce_truncated_ntt
 }
 
 /// Enable the fused final-transpose/ordinary-message pass only at the exact
@@ -2526,7 +2566,7 @@ fn use_ranked_induce_fused_msg(
             n_queries,
             alpha_len,
         )
-        && std::env::var_os("FLOCK_NO_LIG_INDUCE_FUSED_MSG").is_none()
+        && ligerito_controls().induce_fused_msg
 }
 
 #[cfg(test)]
@@ -3328,6 +3368,48 @@ impl LigeroWitness {
     }
 }
 
+fn recursive_from_message_enabled(level_opt_out: Option<&str>) -> bool {
+    let read = || {
+        level_opt_out.is_some_and(|name| std::env::var_os(name).is_none())
+            && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none()
+    };
+    if crate::is_ranked_worker_process() {
+        static ALL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none()
+        });
+        static L1: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1").is_none()
+        });
+        static L2: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2").is_none()
+        });
+        *ALL
+            && match level_opt_out {
+                Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1") => *L1,
+                Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2") => *L2,
+                _ => false,
+            }
+    } else {
+        read()
+    }
+}
+
+fn ligero_prove_timing_enabled() -> bool {
+    let read = || {
+        std::env::var_os("LIG_PROVE_TRACE").is_some()
+            || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+    };
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("LIG_PROVE_TRACE").is_some()
+                || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+        });
+        *RANKED
+    } else {
+        read()
+    }
+}
+
 /// Reshape `poly` (length `num_interleaved · msg_cols`) into a
 /// `block_len × num_interleaved` SoA matrix, RS-encode each lane via the
 /// LCH additive NTT (non-systematic: pad message with zeros to `block_len`,
@@ -3351,14 +3433,13 @@ pub(crate) fn ligero_commit(
         _ => None,
     };
     let recursive_from_message_shape = kind == HashKind::Blake3 && level_opt_out.is_some();
-    let level_enabled = level_opt_out.is_some_and(|name| std::env::var_os(name).is_none());
+    let level_enabled = recursive_from_message_enabled(level_opt_out);
     let fuse_from_message = cfg!(all(
         target_os = "macos",
         target_arch = "aarch64",
         target_feature = "aes"
     )) && recursive_from_message_shape
-        && level_enabled
-        && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none();
+        && level_enabled;
     ligero_commit_impl(
         poly,
         log_msg_cols,
@@ -3389,8 +3470,7 @@ fn ligero_commit_impl(
     assert_eq!(poly.len(), num_interleaved * msg_cols);
     assert!(log_block_len <= ntt.log_domain_size());
 
-    let timing = std::env::var_os("LIG_PROVE_TRACE").is_some()
-        || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let timing = ligero_prove_timing_enabled();
     let total_start = timing.then(std::time::Instant::now);
 
     // LSB-lane layout: input matches `data[pos * num_interleaved + lane]`.
@@ -3668,6 +3748,7 @@ fn l1_overlap_warmup_race(
 //     running := running + α·to_glue. New sum-claim becomes T_r + α·h.
 
 /// (u_0, u_2) per round — what the prover sends.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SumcheckMessage {
     pub u_0: F128,
@@ -3714,7 +3795,7 @@ pub(crate) fn ranked_fold2_enabled(poly_len: usize, initial_k: usize) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && poly_len == (1usize << 25)
         && initial_k == 6
-        && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
+        && ligerito_controls().fold2
 }
 
 /// Compute `(u_0, u_2)` for `u(X) = Σ_x f(X, x) · b(X, x)` where `X` is the
@@ -4717,7 +4798,7 @@ fn use_ranked_direct_ab_hetero_materialize(
             claim_count,
             has_ordinary,
         )
-        && std::env::var_os("FLOCK_NO_DIRECT_AB_HETERO_MATERIALIZE").is_none()
+        && ligerito_controls().direct_ab_hetero
         && crate::epool::epool().is_some()
 }
 
@@ -5117,7 +5198,7 @@ fn materialize_direct_fold8(
     // The rollback retains the incumbent two single-slot calls for A/B.
     let pair_fold64 = deferred_reduce
         && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
-        && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none();
+        && ligerito_controls().direct_fold8_pair;
 
     // One shared per-block body for both drains below, so the scheduling
     // choice cannot drift from the value computation. For block `i` it fully
@@ -5307,7 +5388,7 @@ fn ranked_l1_lazy_ood_eq_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some(),
+        !ligerito_controls().lazy_ood_eq,
     )
 }
 
@@ -5873,7 +5954,7 @@ pub fn recursive_prover<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = std::env::var("LIGERITO_TRACE").is_ok();
+    let trace = ligerito_controls().trace;
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
@@ -5950,7 +6031,7 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = std::env::var("LIGERITO_TRACE").is_ok();
+    let trace = ligerito_controls().trace;
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
