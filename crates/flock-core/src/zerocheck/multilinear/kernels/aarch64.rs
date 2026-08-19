@@ -1291,25 +1291,73 @@ unsafe fn lookup_lanes_q<const L: usize>(
     use core::arch::aarch64::*;
     unsafe {
         const STRIDE: usize = 256 * 16;
-        let load = |j: usize| {
-            let lane = lane0 + j;
+        #[inline(always)]
+        unsafe fn load1(table_data: *const u8, code: u64, lane: usize) -> uint64x2_t {
             let index = ((code >> (8 * lane)) & 0xff) as usize;
             vld1q_u64(
                 table_data
                     .add(lane * STRIDE + index * core::mem::size_of::<F128>())
                     .cast::<u64>(),
             )
-        };
-        let mut acc = load(0);
-        let mut j = 1;
-        while j + 1 < L {
-            acc = xor3_u64(acc, load(j), load(j + 1));
-            j += 2;
         }
-        if j < L {
-            acc = veorq_u64(acc, load(j));
+        // Balanced XOR tree instead of the old serial accumulator chain: for
+        // L = 8 the dependency depth drops from 7 eors to 3 and the four
+        // first-level pairs are independent, so the four 16 B load streams
+        // issue in parallel instead of serializing on one accumulator. Pure
+        // XOR reassociation — outputs bit-identical to the old chain.
+        #[inline(always)]
+        unsafe fn load_tree<const N: usize>(
+            table_data: *const u8,
+            code: u64,
+            lane0: usize,
+            base: usize,
+        ) -> uint64x2_t {
+            if N == 1 {
+                load1(table_data, code, lane0 + base)
+            } else if N == 2 {
+                veorq_u64(
+                    load1(table_data, code, lane0 + base),
+                    load1(table_data, code, lane0 + base + 1),
+                )
+            } else if N == 4 {
+                veorq_u64(
+                    veorq_u64(
+                        load1(table_data, code, lane0 + base),
+                        load1(table_data, code, lane0 + base + 1),
+                    ),
+                    veorq_u64(
+                        load1(table_data, code, lane0 + base + 2),
+                        load1(table_data, code, lane0 + base + 3),
+                    ),
+                )
+            } else if N == 8 {
+                veorq_u64(
+                    veorq_u64(
+                        veorq_u64(
+                            load1(table_data, code, lane0 + base),
+                            load1(table_data, code, lane0 + base + 1),
+                        ),
+                        veorq_u64(
+                            load1(table_data, code, lane0 + base + 2),
+                            load1(table_data, code, lane0 + base + 3),
+                        ),
+                    ),
+                    veorq_u64(
+                        veorq_u64(
+                            load1(table_data, code, lane0 + base + 4),
+                            load1(table_data, code, lane0 + base + 5),
+                        ),
+                        veorq_u64(
+                            load1(table_data, code, lane0 + base + 6),
+                            load1(table_data, code, lane0 + base + 7),
+                        ),
+                    ),
+                )
+            } else {
+                unreachable!("lookup_lanes_q: L must be in {{1,2,4,8}}")
+            }
         }
-        acc
+        load_tree::<L>(table_data, code, lane0, 0)
     }
 }
 
