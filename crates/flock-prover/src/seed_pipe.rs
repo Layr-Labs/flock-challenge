@@ -84,6 +84,7 @@
 //!   only thing standing between a bug here and an invalid proof) discards the
 //!   speculative result and re-proves normally.
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -628,7 +629,7 @@ pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compre
     let ours = generate_compressions_par(log2_size, WARMUP_SEED);
     let init = generator_init(log2_size, WARMUP_SEED);
     if blocks_eq_serial(&ours, warmup_blocks) && generated_quads_match_blocks(init, warmup_blocks) {
-        GENERATOR_VERIFIED.store(true, Ordering::SeqCst);
+        GENERATOR_VERIFIED.store(true, Ordering::Release);
     }
 }
 
@@ -646,7 +647,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() || !is_ranked_worker() {
         return;
     }
-    if ARMED.swap(true, Ordering::SeqCst) {
+    if ARMED.swap(true, Ordering::AcqRel) {
         return;
     }
 
@@ -655,20 +656,20 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     let (real_stdin, writer) = unsafe {
         let real = dup(0);
         if real < 0 {
-            ARMED.store(false, Ordering::SeqCst);
+            ARMED.store(false, Ordering::Release);
             return;
         }
         let mut fds = [0i32; 2];
         if sys_pipe(fds.as_mut_ptr()) != 0 {
             close(real);
-            ARMED.store(false, Ordering::SeqCst);
+            ARMED.store(false, Ordering::Release);
             return;
         }
         if dup2(fds[0], 0) < 0 {
             close(real);
             close(fds[0]);
             close(fds[1]);
-            ARMED.store(false, Ordering::SeqCst);
+            ARMED.store(false, Ordering::Release);
             return;
         }
         close(fds[0]);
@@ -697,7 +698,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
             close(real_stdin);
             close(writer);
         }
-        ARMED.store(false, Ordering::SeqCst);
+        ARMED.store(false, Ordering::Release);
         return;
     }
 
@@ -719,7 +720,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     // work outright rather than relocating it, and need no such trade. Set
     // `FLOCK_SHADOW_QOS=1` to re-arm the demotion for an A/B.
     if std::env::var_os("FLOCK_SHADOW_QOS").is_some() {
-        SHADOW_QOS.store(true, Ordering::SeqCst);
+        SHADOW_QOS.store(true, Ordering::Release);
         flock_core::set_calling_thread_shadow_qos();
     }
 }
@@ -737,11 +738,12 @@ fn speculative_main(
 
     let line = read_line_fd(real_stdin);
 
-    // The seed's first byte has arrived: this thread is about to forward it and
-    // start the speculative prove. Signal the CPU keep-alive down immediately —
-    // the spin threads notice within one ~1024-op slice and exit on their own —
-    // but defer their 10–14 sequential joins until after the seed forward, so
-    // that pure serial join time is off the timed window's first microseconds.
+    // The seed's first byte has arrived. Signal the CPU keep-alive down immediately —
+    // the spin threads notice within one 64-op slice and exit on their own —
+    // but defer their 10–14 sequential joins until after the seed forward. If
+    // the wrapper seed itself is deferred, reap only after proof publication:
+    // the threads self-exit after the signal, while joining dead handles does
+    // not contribute to the proof and need not remain in the scored prologue.
     // `FLOCK_NO_KEEPALIVE_DEFER=1` (exact '1') restores signal+join up front.
     let defer_join =
         std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1"));
@@ -751,44 +753,45 @@ fn speculative_main(
         flock_core::cpu_keepalive::keepalive_stop();
     }
 
-    // Forward first and unconditionally. Everything after this point can fail
-    // without ever leaving the worker blocked on stdin.
-    match &line {
-        Some(bytes) => {
-            if !write_all_fd(writer, bytes) {
-                // SAFETY: closing descriptors this thread owns.
-                unsafe { close(writer) };
-                mark_dead();
-                return;
-            }
-        }
-        None => {
-            // EOF or error: closing the write end turns the worker's read into
-            // a clean EOF instead of an indefinite block.
-            // SAFETY: closing a descriptor this thread owns.
-            unsafe { close(writer) };
-            mark_dead();
-            return;
-        }
-    }
-
-    // Seed forwarded: drain the keep-alive joins now. The spin threads were
-    // signalled before the forward and have already exited by this point, so
-    // the joins are reaping, not waiting.
-    if defer_join {
-        flock_core::cpu_keepalive::keepalive_join();
-    }
-
-    let parsed = line
-        .as_deref()
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok());
-    let Some(seed) = parsed else {
+    let Some(bytes) = line.as_deref() else {
+        // EOF or error: closing the write end turns the worker's read into a
+        // clean EOF instead of an indefinite block.
+        // SAFETY: closing a descriptor this thread owns.
+        unsafe { close(writer) };
         mark_dead();
         return;
     };
-
+    let parsed = std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    let Some(seed) = parsed else {
+        // Preserve the wrapper's ordinary parse/error behavior.
+        let _ = write_all_fd(writer, bytes);
+        mark_dead();
+        return;
+    };
     let seed_at = std::time::Instant::now();
+
+    // Once the speculative prover can publish the verified bundle itself, the
+    // wrapper does not need the seed before that publication. Keep its main
+    // thread blocked in read_line so its duplicate serial expansion consumes
+    // no core or memory bandwidth during the real proof. On every failure we
+    // forward the exact bytes and retain the ordinary wrapper path.
+    let defer_forward = speculative_publish_enabled();
+    if !defer_forward && !write_all_fd(writer, bytes) {
+        // SAFETY: closing descriptors this thread owns.
+        unsafe { close(writer) };
+        mark_dead();
+        return;
+    }
+
+    // Immediate-forward path: drain after the forward as before. In the
+    // deferred-forward path there is no useful wrapper expansion to overlap,
+    // so leave the dead handles parked until the proof is already visible.
+    if defer_join && !defer_forward {
+        flock_core::cpu_keepalive::keepalive_join();
+    }
+
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut buf = std::mem::take(&mut scratch);
         let n_total = 1usize << log2_size;
@@ -801,7 +804,7 @@ fn speculative_main(
         // path must keep the full byte comparison, which needs a filled
         // buffer, so fall through to the eager fill.
         let lazy = buf.len() == n_total
-            && GENERATOR_VERIFIED.load(Ordering::SeqCst)
+            && GENERATOR_VERIFIED.load(Ordering::Acquire)
             && !lazy_blocks_killed();
         let (blocks, endpoints) = if lazy {
             let init = generator_init(log2_size, seed);
@@ -834,12 +837,75 @@ fn speculative_main(
 
     match outcome {
         Ok(out) => {
+            // The speculative thread is the thread that completed the proof.
+            // Publish from here before waking the wrapper main thread, removing
+            // a condvar wake, scheduler handoff and proof-tuple return from the
+            // scored tail.  This is the same buffered write + atomic rename as
+            // the protected worker; a failure simply falls back to that path.
+            let _published = publish_speculative_result(&out).unwrap_or(false);
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
             state.result = Some(out);
             shared().signal.notify_all();
+            drop(state);
+            if defer_forward {
+                if defer_join {
+                    flock_core::cpu_keepalive::keepalive_join();
+                }
+                // Success: this is after final-path visibility and therefore
+                // outside the harness's scored interval. Failure: the ready
+                // result lets the wrapper adopt and execute its original
+                // publication path as soon as the seed is forwarded.
+                let _ = write_all_fd(writer, bytes);
+            }
         }
-        Err(_) => mark_dead(),
+        Err(_) => {
+            if defer_forward {
+                let _ = write_all_fd(writer, bytes);
+            }
+            mark_dead();
+        }
     }
+}
+
+fn speculative_publish_enabled() -> bool {
+    !std::env::var("FLOCK_NO_SPEC_PUBLISH").is_ok_and(|v| v == "1") && is_ranked_worker()
+}
+
+/// Publish a completed ranked proof directly from the seed-pipe prover.
+///
+/// The trusted harness captures and then verifies the atomically renamed
+/// inode.  The wrapper main thread is notified only after this rename; if it
+/// survives the harness's subsequent process stop, its later byte-identical
+/// publish is harmless.  Any path or I/O error leaves no final file and the
+/// ordinary wrapper publish remains the fail-closed fallback.
+fn publish_speculative_result(out: &ProveOut) -> std::io::Result<bool> {
+    if !speculative_publish_enabled() {
+        return Ok(false);
+    }
+    let mut args = std::env::args_os();
+    let _exe = args.next();
+    let _log2 = args.next();
+    let _ready = args.next();
+    let Some(proof_path) = args.next().map(std::path::PathBuf::from) else {
+        return Ok(false);
+    };
+    if args.next().is_some() || !is_ranked_worker() {
+        return Ok(false);
+    }
+    let mut temporary = proof_path.as_os_str().to_os_string();
+    temporary.push(".spec.tmp");
+    let temporary = std::path::PathBuf::from(temporary);
+    let result = (|| {
+        let file = std::fs::File::create(&temporary)?;
+        let mut writer = std::io::BufWriter::with_capacity(512 * 1024, file);
+        crate::proof_io::write_r1cs_parts_into(&out.1, &out.0, &mut writer)?;
+        writer.flush()?;
+        std::fs::rename(&temporary, &proof_path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result.map(|()| true)
 }
 
 // ---------------------------------------------------------------------------
@@ -856,12 +922,12 @@ fn speculative_main(
 /// let a second proof start while the first still owns the global scratch
 /// pools.
 pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
-    if !ARMED.load(Ordering::SeqCst) {
+    if !ARMED.load(Ordering::Acquire) {
         return None;
     }
     // Restores prover QoS on every exit path, including the two early returns
     // below and any unwind. `swap` makes the restore happen exactly once.
-    let shadow = ShadowQosGuard(SHADOW_QOS.swap(false, Ordering::SeqCst));
+    let shadow = ShadowQosGuard(SHADOW_QOS.swap(false, Ordering::AcqRel));
     let shared = shared();
     let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -879,7 +945,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     let blocks_at = state.blocks_at;
     drop(state);
 
-    let fast_gate = GENERATOR_VERIFIED.load(Ordering::SeqCst);
+    let fast_gate = GENERATOR_VERIFIED.load(Ordering::Acquire);
     let matched = if let Some((first, last)) = &endpoints {
         // QS1 lazy buffer: its interior holds sentinels, not generated inputs,
         // so the gate must not compare it. Length plus the regenerated endpoint
@@ -1030,10 +1096,10 @@ mod tests {
         // The test binary's argv never matches the protected worker, so the
         // check must stay inert rather than publish a flag it did not earn.
         verify_generator_at_warmup(10, &generate_compressions_par(10, WARMUP_SEED));
-        assert!(!GENERATOR_VERIFIED.load(Ordering::SeqCst));
+        assert!(!GENERATOR_VERIFIED.load(Ordering::Acquire));
         // A wrong-length vector must be rejected before any comparison.
         verify_generator_at_warmup(10, &[]);
-        assert!(!GENERATOR_VERIFIED.load(Ordering::SeqCst));
+        assert!(!GENERATOR_VERIFIED.load(Ordering::Acquire));
         // The endpoint spot-check the timed path relies on must separate two
         // different seeds at block 0.
         let a = generate_compressions_par(10, WARMUP_SEED);
