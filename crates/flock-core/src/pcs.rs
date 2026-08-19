@@ -99,6 +99,66 @@ pub struct PackedDirectClaim {
     pub eq_ind: DirectEqInd,
 }
 
+fn open_trace_enabled() -> bool {
+    let read =
+        || std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("PCS_TRACE").is_ok()
+                || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+        });
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn hetero_open_combine_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none();
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none()
+        });
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn open_mat_hetero_enabled() -> bool {
+    let read = || !std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1");
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            !std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1")
+        });
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn direct_ab_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none());
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn deferred_c_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none();
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none());
+        *RANKED
+    } else {
+        read()
+    }
+}
+
 /// Mixed-claim batched open: supports both **ring-switched** claims (bit-MLE
 /// openings reduced via `ring_switch::prove_batched`, with optional per-claim
 /// precomputed `s_hat_v`) and **packed-direct** claims (packed-MLE openings
@@ -120,9 +180,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
-    let trace =
-        std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
-    let t_total = std::time::Instant::now();
+    let trace = open_trace_enabled();
+    let t_total = trace.then(std::time::Instant::now);
 
     assert_eq!(
         lig_config.initial_k, commitment.params.log_batch_size,
@@ -215,7 +274,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         );
         eprintln!(
             "  [open_batch] TOTAL: {:6.2} ms",
-            t_total.elapsed().as_secs_f64() * 1e3
+            t_total.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 
@@ -738,7 +797,7 @@ fn is_ranked_direct_fold2_lookahead_shape(
 fn use_ranked_hetero_open_combine(l: usize, b: usize, n_rs: usize, n_pd: usize) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd)
-        && std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none()
+        && hetero_open_combine_enabled()
         && crate::epool::epool().is_some()
 }
 
@@ -782,7 +841,7 @@ pub(crate) fn use_open_mat_hetero(
 ) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && is_ranked_open_mat_hetero_shape(packed_len, block_len, claim_count, has_ordinary)
-        && !std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1")
+        && open_mat_hetero_enabled()
         && crate::epool::epool().is_some()
 }
 
@@ -1103,7 +1162,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && l == (1usize << 25)
         && n_rs == 2
         && n_pd == 0
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+        && direct_ab_enabled();
     let use_direct_fold8 = direct_common
         && ranked_direct_fold8_enabled()
         && direct_fold8_all_claim_mix_supported(&rs_results);
@@ -1187,7 +1246,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // the completed path, which needs no sweep at all.
     let mut deferred_c_candidate = if use_direct_ab
         && !use_direct_all
-        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none()
+        && deferred_c_enabled()
     {
         rs_results[1].1.deferred_c_fold2.take()
     } else {
