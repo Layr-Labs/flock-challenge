@@ -310,7 +310,6 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, CscRowIndices) {
     for c in 0..m.num_cols {
         col_ptr[c + 1] += col_ptr[c];
     }
-    let mut next = col_ptr.clone();
     let nnz = *col_ptr.last().unwrap() as usize;
     let compact =
         m.num_rows <= (u16::MAX as usize + 1) && std::env::var_os("FLOCK_CSC_U32").is_none();
@@ -318,8 +317,8 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, CscRowIndices) {
         let mut rows_flat = vec![0u16; nnz];
         for (r, row) in m.rows.iter().enumerate() {
             for &c in row {
-                rows_flat[next[c] as usize] = r as u16;
-                next[c] += 1;
+                rows_flat[col_ptr[c] as usize] = r as u16;
+                col_ptr[c] += 1;
             }
         }
         CscRowIndices::U16(rows_flat)
@@ -327,12 +326,16 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, CscRowIndices) {
         let mut rows_flat = vec![0u32; nnz];
         for (r, row) in m.rows.iter().enumerate() {
             for &c in row {
-                rows_flat[next[c] as usize] = r as u32;
-                next[c] += 1;
+                rows_flat[col_ptr[c] as usize] = r as u32;
+                col_ptr[c] += 1;
             }
         }
         CscRowIndices::U32(rows_flat)
     };
+    // Filling advanced each column start to that column's end. Those ends are
+    // exactly the next prefix pointers, so shift them right to restore starts.
+    col_ptr.copy_within(..m.num_cols, 1);
+    col_ptr[0] = 0;
     (col_ptr, rows_flat)
 }
 
@@ -1597,7 +1600,8 @@ fn prove_padded_inner<Ch: Challenger>(
     //    tables collapse to length `2^k_skip`. Per-round work is parallel via
     //    rayon when the residual table is large enough.
     let mut rounds = Vec::with_capacity(inner_rest_len);
-    let mut r_rounds = Vec::with_capacity(inner_rest_len);
+    // One challenge is sampled before the loop and one after every round.
+    let mut r_rounds = Vec::with_capacity(inner_rest_len + 1);
     if inner_rest_len > 0 {
         // Round 0's message is the only standalone evaluation pass; every later
         // round's message falls out of binding the previous round (fold +
@@ -1615,8 +1619,9 @@ fn prove_padded_inner<Ch: Challenger>(
                 e1 = ne1;
                 einf = neinf;
             } else {
-                // Final round: just fold; z_vec collapses to z_partial.
-                sumcheck_bind_top_in_place_par(&mut comb_vec, r);
+                // Final round: only z_vec is needed after the round, where it
+                // becomes z_partial. The final comb_vec evaluation is already
+                // committed in (e1, einf), so folding comb_vec here is dead work.
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
         }
@@ -1630,8 +1635,7 @@ fn prove_padded_inner<Ch: Challenger>(
     }
 
     // 6. Send `z_partial` (the post-sumcheck collapsed z_vec). Length 2^k_skip.
-    let z_partial = z_vec.clone();
-    challenger.observe_f128_slice(&z_partial);
+    challenger.observe_f128_slice(&z_vec);
 
     // 7. Sample fresh z_skip AFTER observing z_partial — gives Schwartz-Zippel
     //    soundness on the φ8 (univariate-skip) dim.
@@ -1641,7 +1645,7 @@ fn prove_padded_inner<Ch: Challenger>(
     //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest; the
     //    PCS catches mismatches downstream.
     let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
-    let w = inner_product(&lambda, &z_partial);
+    let w = inner_product(&lambda, &z_vec);
 
     // 9. Convert sumcheck challenges to LSB-first `x_inner_rest` order. The
     //    loop binds the TOP bit each round, so r_rounds[0] bound bit
@@ -1651,7 +1655,10 @@ fn prove_padded_inner<Ch: Challenger>(
     let mut r_inner_rest = r_rounds;
     r_inner_rest.reverse();
 
-    let proof = LincheckProof { rounds, z_partial };
+    let proof = LincheckProof {
+        rounds,
+        z_partial: z_vec,
+    };
     let claim = LincheckClaim {
         r_inner_skip,
         r_inner_rest,
@@ -1769,7 +1776,8 @@ pub fn verify<Ch: Challenger>(
         target += beta;
     }
     let mut running = target;
-    let mut r_rounds = Vec::with_capacity(inner_rest_len);
+    // One challenge is sampled before the loop and one after every round.
+    let mut r_rounds = Vec::with_capacity(inner_rest_len + 1);
     for &(e1, einf) in &proof.rounds {
         challenger.observe_f128(e1);
         challenger.observe_f128(einf);
