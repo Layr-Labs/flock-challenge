@@ -2873,12 +2873,12 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         Sparse(usize),
     }
     let mut kinds: Vec<Kind> = Vec::with_capacity(n);
-    let mut dense_suffixes: Vec<&[F128]> = Vec::new();
-    let mut sparse_suffixes: Vec<&[F128]> = Vec::new();
+    let mut dense_suffixes: Vec<&[F128]> = Vec::with_capacity(n);
+    let mut sparse_suffixes: Vec<&[F128]> = Vec::with_capacity(n);
     // Map dense/sparse claim index back to the original `x_outers` index — used
     // to look up precomputed slots without recomputing the classification.
-    let mut dense_to_orig: Vec<usize> = Vec::new();
-    let mut sparse_to_orig: Vec<usize> = Vec::new();
+    let mut dense_to_orig: Vec<usize> = Vec::with_capacity(n);
+    let mut sparse_to_orig: Vec<usize> = Vec::with_capacity(n);
     for (orig, x) in x_outers.iter().enumerate() {
         let suffix = &x[1..];
         let n_zeros = suffix.iter().filter(|&&c| c == F128::ZERO).count();
@@ -3037,8 +3037,8 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             .map(|&d| dense_tensors[d].as_slice())
             .collect();
         let out = fold_1b_rows_multi_padded(packed_witness, &dense_refs, padding);
-        for (i, &d) in dense_needs_fold.iter().enumerate() {
-            dense_s_hat_v[d] = out[i].clone();
+        for (d, folded) in dense_needs_fold.iter().copied().zip(out) {
+            dense_s_hat_v[d] = folded;
         }
     }
     for &s in &sparse_needs_fold {
