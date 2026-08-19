@@ -211,16 +211,15 @@ pub fn prove_chain_shift<Ch: Challenger>(
         r_pts.push(r);
     }
 
-    // After n+1 folds, g[0] = g(τ', s₀*) — the single opening value. Build the
-    // claim point identically to the verifier: full[d-1-k] = r_pts[k] (bit d-1
-    // = s₀, the HIGH bit); τ' = full[..n], s₀* = full[n].
-    let mut full = vec![F128::ZERO; d];
-    for (k, &r) in r_pts.iter().enumerate() {
-        full[d - 1 - k] = r;
-    }
+    // After n+1 folds, g[0] = g(τ', s₀*) — the single opening value. Since
+    // r_pts[k] binds bit d-1-k, s₀* is first and reversing the remainder gives τ'.
+    // Reuse the challenge allocation now that sumcheck folding is complete:
+    // reversing all entries puts s₀ last, so popping it leaves τ' in order.
+    r_pts.reverse();
+    let sel0 = r_pts.pop().expect("sumcheck has selector round");
     let claims = ChainClaims {
-        instance_point: full[..n].to_vec(),
-        sel0: full[n],
+        instance_point: r_pts,
+        sel0,
         value: g[0],
     };
     (
@@ -268,20 +267,18 @@ pub fn verify_chain_shift<Ch: Challenger>(
         r_pts.push(r);
     }
 
-    // Full point LSB-first (bit d−1 = s₀, the HIGH bit): r_pts[k] bound bit d−1−k.
-    let mut full = vec![F128::ZERO; d];
-    for (k, &r) in r_pts.iter().enumerate() {
-        full[d - 1 - k] = r;
-    }
-    let taup: Vec<F128> = full[..n].to_vec(); // τ' (instance coords)
-    let s0 = full[n]; // s₀*
+    // LSB-first point: r_pts[0] binds the high selector bit; reversing the
+    // remaining challenges gives the n instance coordinates directly.
+    let taup: Vec<F128> = r_pts[1..].iter().rev().copied().collect();
+    let s0 = r_pts[0]; // s₀*
 
     // Final weight W(τ', s₀*) (verifier-computed):
     //   shift(τ,τ')·(1+s₀) + eq(τ,τ')·s₀ + α·eq(τ',0ⁿ)·(1+s₀).
     let s = shift_mle(&tau, &taup);
     let eq_tt = eq_eval(&tau, &taup);
-    let zero_n = vec![F128::ZERO; n];
-    let eq_t0 = eq_eval(&taup, &zero_n); // eq(τ', 0ⁿ) = Π_j (1+τ'_j)
+    let eq_t0 = taup
+        .iter()
+        .fold(F128::ONE, |acc, &x| acc * (F128::ONE + x)); // eq(τ', 0ⁿ)
     let one_plus_s0 = F128::ONE + s0;
     let w_final = s * one_plus_s0 + eq_tt * s0 + alpha * eq_t0 * one_plus_s0;
 
