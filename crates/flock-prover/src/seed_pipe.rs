@@ -84,7 +84,10 @@
 //!   only thing standing between a bug here and an invalid proof) discards the
 //!   speculative result and re-proves normally.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::io::{self, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use flock_core::pcs::Commitment;
@@ -96,6 +99,148 @@ use crate::r1cs_hashes::blake3::Compression;
 /// What `Blake3Setup::prove_fast` returns and what a speculative run hands
 /// back to it.
 pub type ProveOut = (R1csProofLigerito, Commitment, R1csClaim);
+
+/// Proof file and prefaulted full-capacity buffer prepared during the untimed
+/// warm-up and handed to the speculative prover. Keeping both live removes
+/// create/truncate/path-lookup, allocation, and first-write page faults from
+/// the publication tail; the final rename remains atomic.
+struct SpecPublishTarget {
+    writer: MappedProofWriter,
+    temporary: PathBuf,
+    proof_path: PathBuf,
+}
+
+/// Ranked feature decisions resolved before the worker publishes readiness.
+/// The challenge never mutates its environment between warm-up and seed, so
+/// carrying these bits removes repeated getenv/argv scans from the trial.
+#[derive(Clone, Copy)]
+struct RankedOptions {
+    debug_timing: bool,
+    defer_join: bool,
+    defer_forward: bool,
+    lazy_blocks: bool,
+    gen_ilp: bool,
+    n_total: usize,
+    generator_mask: u64,
+}
+
+const SPEC_PUBLISH_CAPACITY: usize = 512 * 1024;
+
+/// Shared file mapping whose backing pages are dirtied during warm-up.
+///
+/// Encoding directly into the mapped private proof file removes both first
+/// touch faults and the final ~438 KiB user-to-kernel `write` copy. `flush`
+/// trims the pre-sized private inode to the exact proof length before rename.
+/// Proofs larger than the reviewed capacity spill to a growable vector and
+/// use the ordinary write path; correctness never depends on the size bound.
+struct MappedProofWriter {
+    file: std::fs::File,
+    mapping: *mut u8,
+    capacity: usize,
+    len: usize,
+    overflow: Option<Vec<u8>>,
+    finalized: bool,
+}
+
+// SAFETY: the mapping and file are exclusively owned by this value. Moving it
+// to the seed-pipe thread transfers that ownership; no alias is retained.
+unsafe impl Send for MappedProofWriter {}
+
+impl MappedProofWriter {
+    fn new(file: std::fs::File) -> io::Result<Self> {
+        file.set_len(SPEC_PUBLISH_CAPACITY as u64)?;
+        // SAFETY: the file is live and sized for the complete mapping. The
+        // returned region is checked against MAP_FAILED and exclusively owned.
+        let mapping = unsafe {
+            sys_mmap(
+                std::ptr::null_mut(),
+                SPEC_PUBLISH_CAPACITY,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if mapping as isize == -1 {
+            let error = io::Error::last_os_error();
+            let _ = file.set_len(0);
+            return Err(error);
+        }
+        let mapping = mapping.cast::<u8>();
+        // SAFETY: `mapping` names SPEC_PUBLISH_CAPACITY writable bytes. The
+        // nonzero fill forces every shared page resident before worker ready.
+        unsafe { std::ptr::write_bytes(mapping, 0xA5, SPEC_PUBLISH_CAPACITY) };
+        std::hint::black_box(mapping);
+        Ok(Self {
+            file,
+            mapping,
+            capacity: SPEC_PUBLISH_CAPACITY,
+            len: 0,
+            overflow: None,
+            finalized: false,
+        })
+    }
+
+    fn mapped_prefix(&self) -> &[u8] {
+        // SAFETY: `len <= capacity` whenever `overflow` is None, and the
+        // mapping remains live until Drop.
+        unsafe { std::slice::from_raw_parts(self.mapping, self.len) }
+    }
+}
+
+impl Write for MappedProofWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let end = self
+            .len
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("proof buffer length overflow"))?;
+        if let Some(overflow) = self.overflow.as_mut() {
+            overflow.extend_from_slice(bytes);
+        } else if !self.finalized && end <= self.capacity {
+            // SAFETY: the destination range lies inside the exclusive mapping
+            // and cannot overlap the caller's proof data.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    self.mapping.add(self.len),
+                    bytes.len(),
+                )
+            };
+        } else {
+            let mut overflow = Vec::with_capacity(end);
+            overflow.extend_from_slice(self.mapped_prefix());
+            overflow.extend_from_slice(bytes);
+            self.overflow = Some(overflow);
+        }
+        self.len = end;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(overflow) = self.overflow.as_ref() {
+            self.file.set_len(0)?;
+            self.file.seek(SeekFrom::Start(0))?;
+            self.file.write_all(overflow)?;
+            self.file.flush()?;
+        } else {
+            // MAP_SHARED stores already live in the unified file page cache;
+            // trimming the private inode establishes the exact visible length.
+            self.file.set_len(self.len as u64)?;
+            self.file.flush()?;
+        }
+        self.finalized = true;
+        Ok(())
+    }
+}
+
+impl Drop for MappedProofWriter {
+    fn drop(&mut self) {
+        // SAFETY: this value owns the complete region and drops it exactly once.
+        unsafe {
+            sys_munmap(self.mapping.cast(), self.capacity);
+        }
+    }
+}
 
 /// Fiat–Shamir domain the protected worker uses
 /// (`flock_benchmark_common::DOMAIN`). Duplicated here because the benchmark
@@ -192,13 +337,22 @@ pub(crate) fn gen_block(init: u64, block: usize) -> Compression {
     gen_block_with(init, block, !gen_block_ilp_killed())
 }
 
-/// Exact-`1` kill for the ILP-unrolled [`gen_block`]; anything else leaves
-/// it on. Deliberately UNCACHED (one getenv per call) so same-process A/B
-/// tests can toggle it: the hot paths (the lazy witgen quad synth and the
-/// eager parallel fill) resolve it once per prove/fill and pass the bool
-/// down via [`gen_block_with`]; only cold callers pay the per-call read.
-pub(crate) fn gen_block_ilp_killed() -> bool {
+/// Ranked workers cache this immutable choice during warm-up. Other binaries
+/// retain the live getenv behavior so same-process A/B tests can toggle it.
+static RANKED_GEN_BLOCK_ILP: AtomicU8 = AtomicU8::new(0);
+
+fn gen_block_ilp_env_killed() -> bool {
     std::env::var("FLOCK_NO_GEN_BLOCK_SIMD").is_ok_and(|v| v == "1")
+}
+
+/// Exact-`1` kill for the ILP-unrolled [`gen_block`]; anything else leaves it
+/// on. `0` means uncached, `1` means killed, and `2` means enabled.
+pub(crate) fn gen_block_ilp_killed() -> bool {
+    match RANKED_GEN_BLOCK_ILP.load(Ordering::Acquire) {
+        1 => true,
+        2 => false,
+        _ => gen_block_ilp_env_killed(),
+    }
 }
 
 /// [`gen_block`] with the ILP/scalar choice resolved by the caller (hot
@@ -541,30 +695,90 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
     fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    #[link_name = "mmap"]
+    fn sys_mmap(
+        addr: *mut std::ffi::c_void,
+        length: usize,
+        prot: i32,
+        flags: i32,
+        fd: i32,
+        offset: isize,
+    ) -> *mut std::ffi::c_void;
+    #[link_name = "munmap"]
+    fn sys_munmap(addr: *mut std::ffi::c_void, length: usize) -> i32;
 }
+
+const PROT_READ: i32 = 0x1;
+const PROT_WRITE: i32 = 0x2;
+const MAP_SHARED: i32 = 0x1;
 
 /// Blocking read of one newline-terminated line. Returns `None` on EOF or a
 /// hard error.
 /// Reads in 64-byte gulps rather than byte at a time: the harness writes the
 /// whole `"<seed>\n"` in one go, so this is a single syscall on the critical
-/// path instead of ~21 of them.
-fn read_line_fd(fd: i32) -> Option<Vec<u8>> {
-    let mut line = Vec::with_capacity(64);
-    let mut chunk = [0u8; 64];
+/// path instead of ~21 of them. Keep the protocol's reviewed 256-byte cap on
+/// the stack so receiving the measured seed performs no heap allocation.
+struct SeedLine {
+    bytes: [std::mem::MaybeUninit<u8>; 256],
+    len: usize,
+}
+
+impl SeedLine {
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `len` advances only by bytes successfully initialized by
+        // `read`; the returned slice never includes the uninitialized tail.
+        unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().cast::<u8>(), self.len) }
+    }
+}
+
+/// Parse the harness's canonical ASCII decimal request without UTF-8 and
+/// Unicode-trim scans. Noncanonical input retains the original parser so all
+/// protected-wrapper fallback behavior stays compatible.
+fn parse_seed(bytes: &[u8]) -> Option<u64> {
+    let digits = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let digits = digits.strip_suffix(b"\r").unwrap_or(digits);
+    if !digits.is_empty() {
+        let mut value = 0u64;
+        let mut canonical = true;
+        for &digit in digits {
+            if !digit.is_ascii_digit() {
+                canonical = false;
+                break;
+            }
+            value = value
+                .checked_mul(10)?
+                .checked_add(u64::from(digit - b'0'))?;
+        }
+        if canonical {
+            return Some(value);
+        }
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
+fn read_line_fd(fd: i32) -> Option<SeedLine> {
+    let mut line = SeedLine {
+        bytes: [std::mem::MaybeUninit::uninit(); 256],
+        len: 0,
+    };
     loop {
+        let chunk_len = 64.min(line.bytes.len() - line.len);
+        let chunk = &mut line.bytes[line.len..line.len + chunk_len];
         // SAFETY: `fd` is a live descriptor owned by this thread and `chunk`
-        // is a valid writable buffer of the stated length.
-        let n = unsafe { read(fd, chunk.as_mut_ptr(), chunk.len()) };
+        // is a valid writable uninitialized slice of the stated length.
+        let n = unsafe { read(fd, chunk.as_mut_ptr().cast::<u8>(), chunk.len()) };
         match n {
             n if n > 0 => {
-                line.extend_from_slice(&chunk[..n as usize]);
+                line.len += n as usize;
                 // Forward everything consumed, so a trailing byte past the
                 // newline can never be stranded on our side of the splice.
-                if line.contains(&b'\n') || line.len() >= 256 {
+                if line.as_slice().contains(&b'\n') || line.len == line.bytes.len() {
                     return Some(line);
                 }
             }
-            0 => return (!line.is_empty()).then_some(line),
+            0 => return (line.len != 0).then_some(line),
             _ => return None,
         }
     }
@@ -628,7 +842,7 @@ pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compre
     let ours = generate_compressions_par(log2_size, WARMUP_SEED);
     let init = generator_init(log2_size, WARMUP_SEED);
     if blocks_eq_serial(&ours, warmup_blocks) && generated_quads_match_blocks(init, warmup_blocks) {
-        GENERATOR_VERIFIED.store(true, Ordering::SeqCst);
+        GENERATOR_VERIFIED.store(true, Ordering::Release);
     }
 }
 
@@ -646,7 +860,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() || !is_ranked_worker() {
         return;
     }
-    if ARMED.swap(true, Ordering::SeqCst) {
+    if ARMED.swap(true, Ordering::AcqRel) {
         return;
     }
 
@@ -655,20 +869,20 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     let (real_stdin, writer) = unsafe {
         let real = dup(0);
         if real < 0 {
-            ARMED.store(false, Ordering::SeqCst);
+            ARMED.store(false, Ordering::Release);
             return;
         }
         let mut fds = [0i32; 2];
         if sys_pipe(fds.as_mut_ptr()) != 0 {
             close(real);
-            ARMED.store(false, Ordering::SeqCst);
+            ARMED.store(false, Ordering::Release);
             return;
         }
         if dup2(fds[0], 0) < 0 {
             close(real);
             close(fds[0]);
             close(fds[1]);
-            ARMED.store(false, Ordering::SeqCst);
+            ARMED.store(false, Ordering::Release);
             return;
         }
         close(fds[0]);
@@ -678,6 +892,33 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     let _ = shared();
     // Committed here, in the warm-up, so the timed expansion never faults.
     let scratch = prefaulted_blocks(1usize << log2_size);
+    // Shape and stable-buffer length are known before readiness. `SPEC_BASE`
+    // stays zero until the seed-specific init is ready, so this length is
+    // unobservable until the later release store publishes the identity.
+    SPEC_LEN.store(scratch.len(), Ordering::Relaxed);
+    // Resolve every immutable ranked mode switch before the worker publishes
+    // readiness. The measured path then pays neither getenv nor argv scans.
+    let publish_paths = speculative_publish_paths();
+    let gen_ilp = !gen_block_ilp_env_killed();
+    RANKED_GEN_BLOCK_ILP.store(if gen_ilp { 2 } else { 1 }, Ordering::Release);
+    let options = RankedOptions {
+        debug_timing: std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some(),
+        defer_join: std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref()
+            != Some(std::ffi::OsStr::new("1")),
+        defer_forward: publish_paths.is_some(),
+        lazy_blocks: !lazy_blocks_killed(),
+        gen_ilp,
+        n_total: scratch.len(),
+        generator_mask: u64::from(log2_size).rotate_left(29),
+    };
+    // Also remove proof-file creation plus allocation and first-touch of the
+    // 512 KiB writer from the scored publication tail. This runs before the
+    // worker publishes ready, and failure leaves the cached paths available
+    // to the existing create-at-publish fallback.
+    let publish_target = prepare_speculative_publish_target(publish_paths.as_ref());
+    let failed_spawn_temporary = publish_target
+        .as_ref()
+        .map(|target| target.temporary.clone());
     let spawned = std::thread::Builder::new()
         .name("flock-seed-pipe".into())
         // This thread runs the whole proof, which the wrapper otherwise runs on
@@ -686,7 +927,19 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
         // the process and costs the trial. Reservation is lazily committed, so
         // the untouched pages cost nothing.
         .stack_size(32 << 20)
-        .spawn(move || speculative_main(real_stdin, writer, log2_size, setup_addr, run, scratch));
+        .spawn(move || {
+            speculative_main(
+                real_stdin,
+                writer,
+                log2_size,
+                setup_addr,
+                run,
+                scratch,
+                publish_target,
+                publish_paths,
+                options,
+            )
+        });
 
     if spawned.is_err() {
         // Nobody will ever forward the seed, so hand the real stdin straight
@@ -697,7 +950,10 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
             close(real_stdin);
             close(writer);
         }
-        ARMED.store(false, Ordering::SeqCst);
+        if let Some(temporary) = failed_spawn_temporary {
+            let _ = std::fs::remove_file(temporary);
+        }
+        ARMED.store(false, Ordering::Release);
         return;
     }
 
@@ -719,7 +975,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     // work outright rather than relocating it, and need no such trade. Set
     // `FLOCK_SHADOW_QOS=1` to re-arm the demotion for an A/B.
     if std::env::var_os("FLOCK_SHADOW_QOS").is_some() {
-        SHADOW_QOS.store(true, Ordering::SeqCst);
+        SHADOW_QOS.store(true, Ordering::Release);
         flock_core::set_calling_thread_shadow_qos();
     }
 }
@@ -731,67 +987,64 @@ fn speculative_main(
     setup_addr: usize,
     run: fn(usize, &[Compression]) -> ProveOut,
     scratch: Vec<Compression>,
+    publish_target: Option<SpecPublishTarget>,
+    publish_paths: Option<(PathBuf, PathBuf)>,
+    options: RankedOptions,
 ) {
     flock_core::set_calling_thread_prover_qos();
-    let mut scratch = scratch;
 
     let line = read_line_fd(real_stdin);
 
-    // The seed's first byte has arrived: this thread is about to forward it and
-    // start the speculative prove. Signal the CPU keep-alive down immediately —
-    // the spin threads notice within one ~1024-op slice and exit on their own —
-    // but defer their 10–14 sequential joins until after the seed forward, so
-    // that pure serial join time is off the timed window's first microseconds.
+    // The seed's first byte has arrived. Signal the CPU keep-alive down immediately —
+    // the spin threads notice within one 64-op slice and exit on their own —
+    // but defer their 10–14 sequential joins until after the seed forward. If
+    // the wrapper seed itself is deferred, reap only after proof publication:
+    // the threads self-exit after the signal, while joining dead handles does
+    // not contribute to the proof and need not remain in the scored prologue.
     // `FLOCK_NO_KEEPALIVE_DEFER=1` (exact '1') restores signal+join up front.
-    let defer_join =
-        std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1"));
-    if defer_join {
+    if options.defer_join {
         flock_core::cpu_keepalive::keepalive_signal();
     } else {
         flock_core::cpu_keepalive::keepalive_stop();
     }
 
-    // Forward first and unconditionally. Everything after this point can fail
-    // without ever leaving the worker blocked on stdin.
-    match &line {
-        Some(bytes) => {
-            if !write_all_fd(writer, bytes) {
-                // SAFETY: closing descriptors this thread owns.
-                unsafe { close(writer) };
-                mark_dead();
-                return;
-            }
-        }
-        None => {
-            // EOF or error: closing the write end turns the worker's read into
-            // a clean EOF instead of an indefinite block.
-            // SAFETY: closing a descriptor this thread owns.
-            unsafe { close(writer) };
-            mark_dead();
-            return;
-        }
-    }
-
-    // Seed forwarded: drain the keep-alive joins now. The spin threads were
-    // signalled before the forward and have already exited by this point, so
-    // the joins are reaping, not waiting.
-    if defer_join {
-        flock_core::cpu_keepalive::keepalive_join();
-    }
-
-    let parsed = line
-        .as_deref()
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok());
-    let Some(seed) = parsed else {
+    let Some(bytes) = line.as_ref().map(SeedLine::as_slice) else {
+        // EOF or error: closing the write end turns the worker's read into a
+        // clean EOF instead of an indefinite block.
+        // SAFETY: closing a descriptor this thread owns.
+        unsafe { close(writer) };
         mark_dead();
         return;
     };
+    let Some(seed) = parse_seed(bytes) else {
+        // Preserve the wrapper's ordinary parse/error behavior.
+        let _ = write_all_fd(writer, bytes);
+        mark_dead();
+        return;
+    };
+    let seed_at = options.debug_timing.then(std::time::Instant::now);
 
-    let seed_at = std::time::Instant::now();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut buf = std::mem::take(&mut scratch);
-        let n_total = 1usize << log2_size;
+    // Once the speculative prover can publish the verified bundle itself, the
+    // wrapper does not need the seed before that publication. Keep its main
+    // thread blocked in read_line so its duplicate serial expansion consumes
+    // no core or memory bandwidth during the real proof. On every failure we
+    // forward the exact bytes and retain the ordinary wrapper path.
+    if !options.defer_forward && !write_all_fd(writer, bytes) {
+        // SAFETY: closing descriptors this thread owns.
+        unsafe { close(writer) };
+        mark_dead();
+        return;
+    }
+
+    // Immediate-forward path: drain after the forward as before. In the
+    // deferred-forward path there is no useful wrapper expansion to overlap,
+    // so leave the dead handles parked until the proof is already visible.
+    if options.defer_join && !options.defer_forward {
+        flock_core::cpu_keepalive::keepalive_join();
+    }
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let mut buf = scratch;
         // QS1 lazy mode: skip the eager fill barrier entirely. The prove
         // starts right now; witgen regenerates blocks into local SIMD values
         // or builds an owned input vector (scalar paths, via
@@ -800,46 +1053,221 @@ fn speculative_main(
         // trustworthy as `gen_block` itself — without that proof the timed
         // path must keep the full byte comparison, which needs a filled
         // buffer, so fall through to the eager fill.
-        let lazy = buf.len() == n_total
-            && GENERATOR_VERIFIED.load(Ordering::SeqCst)
-            && !lazy_blocks_killed();
-        let (blocks, endpoints) = if lazy {
-            let init = generator_init(log2_size, seed);
-            let endpoints = (gen_block(init, 0), gen_block(init, n_total - 1));
+        let lazy = buf.len() == options.n_total
+            && GENERATOR_VERIFIED.load(Ordering::Acquire)
+            && options.lazy_blocks;
+        let (blocks, endpoints, deferred_endpoint_init) = if lazy {
+            let init = seed ^ options.generator_mask;
             // Read-only identity; the allocation address is stable across the
             // move into the Arc.
             let base = buf.as_ptr() as usize;
             SPEC_INIT.store(init, Ordering::Relaxed);
-            SPEC_LEN.store(buf.len(), Ordering::Relaxed);
             SPEC_BASE.store(base, Ordering::Release);
-            (Arc::new(buf), Some(endpoints))
-        } else if buf.len() == n_total {
+            if options.defer_forward {
+                // No wrapper can inspect the adoption gate until after final
+                // publication, so regenerate its endpoint witnesses then.
+                (buf, None, Some(init))
+            } else {
+                let endpoints = (
+                    gen_block_with(init, 0, options.gen_ilp),
+                    gen_block_with(init, options.n_total - 1, options.gen_ilp),
+                );
+                (buf, Some(endpoints), None)
+            }
+        } else if buf.len() == options.n_total {
             fill_compressions_par(&mut buf, log2_size, seed);
-            (Arc::new(buf), None)
+            (buf, None, None)
         } else {
             // Pre-faulting failed or the shape moved; the allocating path is
             // still exactly correct, just slower.
-            (Arc::new(generate_compressions_par(log2_size, seed)), None)
+            (generate_compressions_par(log2_size, seed), None, None)
         };
-        {
+        let blocks_at = options.debug_timing.then(std::time::Instant::now);
+        if options.defer_forward {
+            // The wrapper cannot consume these blocks until after publication,
+            // so prove from the owned Vec and defer the Arc control-block
+            // allocation along with the rest of adoption state.
+            let out = run(setup_addr, &blocks);
+            (
+                out,
+                Some((blocks, endpoints, deferred_endpoint_init, blocks_at)),
+            )
+        } else {
+            let blocks = Arc::new(blocks);
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
-            state.seed_at = Some(seed_at);
-            state.blocks_at = Some(std::time::Instant::now());
+            state.seed_at = seed_at;
+            state.blocks_at = blocks_at;
             state.endpoints = endpoints;
             state.blocks = Some(Arc::clone(&blocks));
             shared().signal.notify_all();
+            drop(state);
+            let out = run(setup_addr, &blocks);
+            (out, None)
         }
-        run(setup_addr, &blocks)
     }));
 
     match outcome {
-        Ok(out) => {
+        Ok((out, deferred_adoption)) => {
+            // The speculative thread is the thread that completed the proof.
+            // Publish from here before waking the wrapper main thread, removing
+            // a condvar wake, scheduler handoff and proof-tuple return from the
+            // scored tail.  This is the same buffered write + atomic rename as
+            // the protected worker; a failure simply falls back to that path.
+            let _published =
+                publish_speculative_result(&out, publish_target, publish_paths).unwrap_or(false);
+            let deferred_adoption =
+                if let Some((blocks, mut endpoints, deferred_endpoint_init, blocks_at)) =
+                    deferred_adoption
+                {
+                    // The wrapper remained blocked on stdin throughout the proof,
+                    // so nobody could observe adoption state before publication.
+                    // Regenerate lazy endpoint witnesses now, before taking the
+                    // adoption mutex, then install everything together below.
+                    if let Some(init) = deferred_endpoint_init {
+                        endpoints =
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                Some((
+                                    gen_block_with(init, 0, options.gen_ilp),
+                                    gen_block_with(init, options.n_total - 1, options.gen_ilp),
+                                ))
+                            })) {
+                                Ok(endpoints) => endpoints,
+                                Err(_) => {
+                                    // Preserve fail-closed behavior even though this
+                                    // calculation occurs after successful publication.
+                                    let _ = write_all_fd(writer, bytes);
+                                    mark_dead();
+                                    return;
+                                }
+                            };
+                    }
+                    Some((blocks, endpoints, blocks_at))
+                } else {
+                    None
+                };
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((blocks, endpoints, blocks_at)) = deferred_adoption {
+                // Install post-publication fallback/adoption state, removing
+                // its lock, Arc allocation and notification from the score.
+                state.seed_at = seed_at;
+                state.blocks_at = blocks_at;
+                state.endpoints = endpoints;
+                state.blocks = Some(Arc::new(blocks));
+            }
             state.result = Some(out);
             shared().signal.notify_all();
+            drop(state);
+            if options.defer_forward {
+                if options.defer_join {
+                    flock_core::cpu_keepalive::keepalive_join();
+                }
+                // Success: this is after final-path visibility and therefore
+                // outside the harness's scored interval. Failure: the ready
+                // result lets the wrapper adopt and execute its original
+                // publication path as soon as the seed is forwarded.
+                let _ = write_all_fd(writer, bytes);
+            }
         }
-        Err(_) => mark_dead(),
+        Err(_) => {
+            if options.defer_forward {
+                let _ = write_all_fd(writer, bytes);
+            }
+            mark_dead();
+        }
     }
+}
+
+fn speculative_publish_enabled() -> bool {
+    !std::env::var("FLOCK_NO_SPEC_PUBLISH").is_ok_and(|v| v == "1") && is_ranked_worker()
+}
+
+/// Resolve and open the ranked proof's private temporary file, allocate its
+/// full-capacity buffer, and dirty every backing page during the untimed
+/// warm-up. Failed preparation is not fatal: publication falls back to the
+/// original timed setup path.
+fn prepare_speculative_publish_target(
+    paths: Option<&(PathBuf, PathBuf)>,
+) -> Option<SpecPublishTarget> {
+    let (proof_path, temporary) = paths?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(temporary)
+        .ok()?;
+    let writer = MappedProofWriter::new(file).ok()?;
+    Some(SpecPublishTarget {
+        writer,
+        temporary: temporary.clone(),
+        proof_path: proof_path.clone(),
+    })
+}
+
+fn speculative_publish_paths() -> Option<(PathBuf, PathBuf)> {
+    if !speculative_publish_enabled() {
+        return None;
+    }
+    let mut args = std::env::args_os();
+    let _exe = args.next();
+    let _log2 = args.next();
+    let _ready = args.next();
+    let proof_path = args.next().map(PathBuf::from)?;
+    if args.next().is_some() || !is_ranked_worker() {
+        return None;
+    }
+    let mut temporary = proof_path.as_os_str().to_os_string();
+    temporary.push(".spec.tmp");
+    Some((proof_path, PathBuf::from(temporary)))
+}
+
+/// Publish a completed ranked proof directly from the seed-pipe prover.
+///
+/// The trusted harness captures and then verifies the atomically renamed
+/// inode.  The wrapper main thread is notified only after this rename; if it
+/// survives the harness's subsequent process stop, its later byte-identical
+/// publish is harmless.  Any path or I/O error leaves no final file and the
+/// ordinary wrapper publish remains the fail-closed fallback.
+fn publish_speculative_result(
+    out: &ProveOut,
+    prepared: Option<SpecPublishTarget>,
+    paths: Option<(PathBuf, PathBuf)>,
+) -> std::io::Result<bool> {
+    let (temporary, result) = match prepared {
+        Some(mut target) => {
+            let result = publish_to_writer(
+                out,
+                &mut target.writer,
+                &target.temporary,
+                &target.proof_path,
+            );
+            (target.temporary, result)
+        }
+        None => {
+            let Some((proof_path, temporary)) = paths else {
+                return Ok(false);
+            };
+            let file = std::fs::File::create(&temporary)?;
+            let mut writer = std::io::BufWriter::with_capacity(SPEC_PUBLISH_CAPACITY, file);
+            let result = publish_to_writer(out, &mut writer, &temporary, &proof_path);
+            (temporary, result)
+        }
+    };
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result.map(|()| true)
+}
+
+fn publish_to_writer<W: Write>(
+    out: &ProveOut,
+    writer: &mut W,
+    temporary: &std::path::Path,
+    proof_path: &std::path::Path,
+) -> io::Result<()> {
+    crate::proof_io::write_r1cs_parts_into(&out.1, &out.0, &mut *writer)?;
+    writer.flush()?;
+    std::fs::rename(temporary, proof_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -856,12 +1284,12 @@ fn speculative_main(
 /// let a second proof start while the first still owns the global scratch
 /// pools.
 pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
-    if !ARMED.load(Ordering::SeqCst) {
+    if !ARMED.load(Ordering::Acquire) {
         return None;
     }
     // Restores prover QoS on every exit path, including the two early returns
     // below and any unwind. `swap` makes the restore happen exactly once.
-    let shadow = ShadowQosGuard(SHADOW_QOS.swap(false, Ordering::SeqCst));
+    let shadow = ShadowQosGuard(SHADOW_QOS.swap(false, Ordering::AcqRel));
     let shared = shared();
     let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -879,7 +1307,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     let blocks_at = state.blocks_at;
     drop(state);
 
-    let fast_gate = GENERATOR_VERIFIED.load(Ordering::SeqCst);
+    let fast_gate = GENERATOR_VERIFIED.load(Ordering::Acquire);
     let matched = if let Some((first, last)) = &endpoints {
         // QS1 lazy buffer: its interior holds sentinels, not generated inputs,
         // so the gate must not compare it. Length plus the regenerated endpoint
@@ -951,6 +1379,116 @@ mod tests {
             SPEC_BASE.store(0, Ordering::Release);
             SPEC_LEN.store(0, Ordering::Relaxed);
             SPEC_INIT.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn publish_writer_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "flock-mapped-writer-{label}-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn mapped_proof_writer_flushes_incrementally_without_duplication() {
+        let path = publish_writer_path("incremental");
+        let _ = std::fs::remove_file(&path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let mut writer = MappedProofWriter::new(file).unwrap();
+        assert_eq!(writer.capacity, SPEC_PUBLISH_CAPACITY);
+        // SAFETY: the writer owns a live mapping of exactly `capacity` bytes.
+        let mapped = unsafe { std::slice::from_raw_parts(writer.mapping, writer.capacity) };
+        assert!(mapped.iter().step_by(4096).all(|&byte| byte == 0xA5));
+        writer.write_all(b"abc").unwrap();
+        writer.flush().unwrap();
+        writer.flush().unwrap();
+        writer.write_all(b"def").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcdef");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mapped_proof_writer_spills_safely_past_reviewed_capacity() {
+        let path = publish_writer_path("overflow");
+        let _ = std::fs::remove_file(&path);
+        let bytes = vec![0x3C; SPEC_PUBLISH_CAPACITY + 123];
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let mut writer = MappedProofWriter::new(file).unwrap();
+        writer.write_all(&bytes).unwrap();
+        assert_eq!(writer.len, bytes.len());
+        assert_eq!(writer.overflow.as_ref().unwrap(), &bytes);
+        writer.flush().unwrap();
+        drop(writer);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn read_test_line(input: &[u8]) -> Option<SeedLine> {
+        let mut fds = [0i32; 2];
+        // SAFETY: the test owns both returned descriptors and closes them on
+        // every ordinary path below.
+        assert_eq!(unsafe { sys_pipe(fds.as_mut_ptr()) }, 0);
+        assert!(write_all_fd(fds[1], input));
+        // SAFETY: close the test's write end so a partial line terminates at
+        // EOF, matching a real harness that closes stdin.
+        unsafe { close(fds[1]) };
+        let line = read_line_fd(fds[0]);
+        // SAFETY: the test still owns the read end.
+        unsafe { close(fds[0]) };
+        line
+    }
+
+    #[test]
+    fn stack_seed_line_preserves_protocol_boundaries() {
+        let line = read_test_line(b"12345\ntrailing").unwrap();
+        assert_eq!(line.as_slice(), b"12345\ntrailing");
+
+        let partial = read_test_line(b"12345").unwrap();
+        assert_eq!(partial.as_slice(), b"12345");
+
+        assert!(read_test_line(b"").is_none());
+
+        let oversized = [b'x'; 300];
+        let capped = read_test_line(&oversized).unwrap();
+        assert_eq!(capped.len, 256);
+        assert_eq!(capped.as_slice(), &oversized[..256]);
+    }
+
+    #[test]
+    fn fast_seed_parser_matches_the_original_contract() {
+        let cases: &[&[u8]] = &[
+            b"0\n",
+            b"1\n",
+            b"18446744073709551615\n",
+            b"18446744073709551616\n",
+            b"42",
+            b"42\r\n",
+            b" 42 \n",
+            b"+42\n",
+            b"-1\n",
+            b"\n",
+            b"not-a-seed\n",
+            &[0xff, b'1', b'\n'],
+        ];
+        for &bytes in cases {
+            let original = std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            assert_eq!(parse_seed(bytes), original, "input={bytes:?}");
         }
     }
 
@@ -1030,10 +1568,10 @@ mod tests {
         // The test binary's argv never matches the protected worker, so the
         // check must stay inert rather than publish a flag it did not earn.
         verify_generator_at_warmup(10, &generate_compressions_par(10, WARMUP_SEED));
-        assert!(!GENERATOR_VERIFIED.load(Ordering::SeqCst));
+        assert!(!GENERATOR_VERIFIED.load(Ordering::Acquire));
         // A wrong-length vector must be rejected before any comparison.
         verify_generator_at_warmup(10, &[]);
-        assert!(!GENERATOR_VERIFIED.load(Ordering::SeqCst));
+        assert!(!GENERATOR_VERIFIED.load(Ordering::Acquire));
         // The endpoint spot-check the timed path relies on must separate two
         // different seeds at block 0.
         let a = generate_compressions_par(10, WARMUP_SEED);
