@@ -103,10 +103,12 @@ pub(crate) fn add_carry_parts(x: u32, y: u32) -> (u32, u32, u32, u32) {
 /// K × K sparse matrix with no nonzero entries. Used as an `a_0`/`b_0` stub
 /// when the constraint definition lives in a `LincheckCircuit` walker.
 pub(crate) fn empty_matrix(k: usize) -> SparseBinaryMatrix {
+    let mut rows = Vec::with_capacity(k);
+    rows.resize_with(k, Vec::new);
     SparseBinaryMatrix {
         num_rows: k,
         num_cols: k,
-        rows: vec![Vec::new(); k],
+        rows,
     }
 }
 
@@ -765,22 +767,83 @@ mod streamed_first_pass_tests {
 
 /// Sort `v` and remove pairs of duplicates (GF(2) cancellation). Keeps R1CS
 /// rows in canonical (sorted, square-free) form.
-pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
-    v.sort();
-    let mut out = Vec::with_capacity(v.len());
-    let mut i = 0;
-    while i < v.len() {
-        let val = v[i];
-        let mut count = 0;
-        while i < v.len() && v[i] == val {
-            count += 1;
-            i += 1;
+/// Merge three individually sorted runs with XOR-pair parity cancellation
+/// (`add_sum`'s bit vectors: x-bits, y-bits, and the carry-aux run are each
+/// sorted, but not mutually ordered). O(n) — the generic
+/// [`xor_dedup`] sorts the concatenation instead. The emitted run is sorted
+/// and holds exactly the values with odd total count, so it is bit-identical
+/// to `xor_dedup(x ++ y ++ c)`.
+pub(crate) fn xor_dedup_3sorted(x: &[usize], y: &[usize], c: &[usize]) -> Vec<usize> {
+    let total = x.len() + y.len() + c.len();
+    let mut out = Vec::with_capacity(total);
+    let (mut i, mut j, mut k) = (0usize, 0usize, 0usize);
+    let (xl, yl, cl) = (x.len(), y.len(), c.len());
+    let mut pending: Option<(usize, bool)> = None;
+    loop {
+        let mut v = usize::MAX;
+        if i < xl && x[i] < v {
+            v = x[i];
         }
-        if count % 2 == 1 {
-            out.push(val);
+        if j < yl && y[j] < v {
+            v = y[j];
+        }
+        if k < cl && c[k] < v {
+            v = c[k];
+        }
+        if v == usize::MAX {
+            break;
+        }
+        let mut n_occ = 0;
+        if i < xl && x[i] == v {
+            i += 1;
+            n_occ += 1;
+        }
+        if j < yl && y[j] == v {
+            j += 1;
+            n_occ += 1;
+        }
+        if k < cl && c[k] == v {
+            k += 1;
+            n_occ += 1;
+        }
+        let mut odd = n_occ % 2 == 1;
+        if let Some((pv, po)) = pending {
+            if pv == v {
+                odd = po ^ odd;
+            } else {
+                if po {
+                    out.push(pv);
+                }
+            }
+        }
+        pending = Some((v, odd));
+    }
+    if let Some((pv, odd)) = pending {
+        if odd {
+            out.push(pv);
         }
     }
     out
+}
+
+pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
+    v.sort_unstable();
+    let mut read = 0;
+    let mut write = 0;
+    while read < v.len() {
+        let val = v[read];
+        let mut count = 0;
+        while read < v.len() && v[read] == val {
+            count += 1;
+            read += 1;
+        }
+        if count % 2 == 1 {
+            v[write] = val;
+            write += 1;
+        }
+    }
+    v.truncate(write);
+    v
 }
 
 // ---------------------------------------------------------------------------
