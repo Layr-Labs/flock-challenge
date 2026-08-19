@@ -2832,8 +2832,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
-    let trace =
-        std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let trace = super::open_trace_enabled();
     let n = x_outers.len();
     let l = packed_witness.len();
     for x in x_outers {
@@ -2901,7 +2900,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    `fold_1b_rows_split`). Tiny test sizes (len not divisible by 16) fall
     //    back to the materialized tensor + the legacy multi-fold.
     let use_split = l.is_multiple_of(16);
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
             .iter()
@@ -2933,7 +2932,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             dense_suffixes.len(),
             if use_split { "split" } else { "full" },
             sparse_supports.len(),
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 
@@ -2951,7 +2950,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
         .filter(|&s| !has_precomputed(sparse_to_orig[s]))
         .collect();
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
     // Fill precomputed slots first.
@@ -3049,7 +3048,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
             "    [rs::prove_batched] fold_1b_rows dense(k={})+sparse(k={}): {:6.2} ms",
             dense_s_hat_v.len(),
             sparse_s_hat_v.len(),
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 
@@ -3059,7 +3058,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    (b) Sample γ_rs after all observations (Schwartz-Zippel-sound).
     //    (c) Per claim: bake γ_k into eq_r_dprime, fold. Output rs_eq_ind
     //        already has γ_k baked in — pcs combine just adds.
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
 
     struct ClaimWork {
         s_hat_v: Vec<F128>,
@@ -3125,7 +3124,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         && use_split
         && has_quad[0]
         && !has_quad[1]
-        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none();
+        && super::deferred_c_enabled();
 
     // Per-opening tails are independent once every γ_rs is sampled (the
     // transcript work above is complete), so run the two openings' table and
@@ -3325,7 +3324,7 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
         eprintln!(
             "    [rs::prove_batched] per-opening tail ×{}: {:6.2} ms",
             n,
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 
