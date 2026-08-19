@@ -522,6 +522,15 @@ pub fn min_n_keccaks_log(n_keccaks: usize) -> usize {
 pub(crate) fn apply_phi_t(v: &[F128]) -> Vec<F128> {
     debug_assert_eq!(v.len(), STATE_BITS);
     let mut out = vec![F128::ZERO; STATE_BITS];
+    apply_phi_t_into(v, &mut out);
+    out
+}
+
+/// Allocation-free form of [`apply_phi_t`] for recurrence loops.
+pub(crate) fn apply_phi_t_into(v: &[F128], out: &mut [F128]) {
+    debug_assert_eq!(v.len(), STATE_BITS);
+    debug_assert_eq!(out.len(), STATE_BITS);
+    out.fill(F128::ZERO);
     for s_out in 0..STATE_BITS {
         let z_p = s_out / N_LANES;
         let xy = s_out % N_LANES;
@@ -533,7 +542,6 @@ pub(crate) fn apply_phi_t(v: &[F128]) -> Vec<F128> {
             out[s_in] += val;
         }
     }
-    out
 }
 
 /// Forward-apply φ on a `bool` state — tracks the round-constant accumulator
@@ -680,6 +688,12 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
 
 pub struct KeccakLincheckCircuit;
 
+thread_local! {
+    static KA_SCRATCH: std::cell::RefCell<Vec<F128>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
 impl LincheckCircuit for KeccakLincheckCircuit {
     fn n_cols(&self) -> usize {
         K
@@ -692,7 +706,7 @@ impl LincheckCircuit for KeccakLincheckCircuit {
         Some(Z_CONST)
     }
 
-    fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
         let mut comb = vec![F128::ZERO; K];
 
@@ -720,27 +734,42 @@ impl LincheckCircuit for KeccakLincheckCircuit {
         }
         comb[Z_CONST] += sum_eq_pin; // B-side from pin's B = [Z_CONST]
 
-        // ---- t-AND rows: build per-round χ marginals on state_r positions.
-        let mut chi_a: Vec<Vec<F128>> = (0..N_T).map(|_| vec![F128::ZERO; STATE_BITS]).collect();
-        let mut chi_b: Vec<Vec<F128>> = (0..N_T).map(|_| vec![F128::ZERO; STATE_BITS]).collect();
-        let mut sum_eq_t = F128::ZERO;
-
-        for r in 0..N_T {
-            for zpos in 0..64 {
-                for y in 0..5 {
-                    for x in 0..5 {
-                        let row = z_pos_t(r, state_idx(x, y, zpos));
-                        let e = eq_inner[row];
-                        sum_eq_t += e;
-                        for &s in theta_rho_pi_preimage((x + 1) % 5, y, zpos).iter() {
-                            chi_a[r][s] += e;
-                        }
-                        for &s in theta_rho_pi_preimage((x + 2) % 5, y, zpos).iter() {
-                            chi_b[r][s] += e;
+        // ---- t-AND rows: per-round χ marginals on state_r positions.
+        // Rounds are independent (each writes only its own chi row); F128
+        // addition is XOR (exactly associative/commutative), so the parallel
+        // reduction is bit-identical to the serial loop.
+        use rayon::prelude::*;
+        let chi: Vec<(Vec<F128>, Vec<F128>, F128)> = (0..N_T)
+            .into_par_iter()
+            .map(|r| {
+                let mut ca = vec![F128::ZERO; STATE_BITS];
+                let mut cb = vec![F128::ZERO; STATE_BITS];
+                let mut se = F128::ZERO;
+                for zpos in 0..64 {
+                    for y in 0..5 {
+                        for x in 0..5 {
+                            let row = z_pos_t(r, state_idx(x, y, zpos));
+                            let e = eq_inner[row];
+                            se += e;
+                            for &s in theta_rho_pi_preimage((x + 1) % 5, y, zpos).iter() {
+                                ca[s] += e;
+                            }
+                            for &s in theta_rho_pi_preimage((x + 2) % 5, y, zpos).iter() {
+                                cb[s] += e;
+                            }
                         }
                     }
                 }
-            }
+                (ca, cb, se)
+            })
+            .collect();
+        let mut chi_a: Vec<Vec<F128>> = Vec::with_capacity(N_T);
+        let mut chi_b: Vec<Vec<F128>> = Vec::with_capacity(N_T);
+        let mut sum_eq_t = F128::ZERO;
+        for (ca, cb, se) in chi {
+            chi_a.push(ca);
+            chi_b.push(cb);
+            sum_eq_t += se;
         }
         comb[Z_CONST] += alpha * sum_eq_t;
 
@@ -781,7 +810,17 @@ impl LincheckCircuit for KeccakLincheckCircuit {
             comb[pos] += alpha * vec_pin[s];
         }
         // Step 2: K^A_23 = φᵀ(K^A_24) ⊕ χ_{23,A}.
-        let mut k_a = apply_phi_t(&vec_pin);
+        // `vec_pin` is dead after this transform. Reuse its allocation as the
+        // recurrence scratch instead of allocating both an owned transform
+        // result and a second 1,600-element buffer.
+        let mut k_a = KA_SCRATCH.with(|s| {
+            let mut buf = s.borrow_mut();
+            buf.clear();
+            buf.resize(STATE_BITS, F128::ZERO);
+            std::mem::take(&mut *buf)
+        });
+        apply_phi_t_into(&vec_pin, &mut k_a);
+        let mut phi_scratch = vec_pin;
         for s in 0..STATE_BITS {
             k_a[s] += chi_a[N_T - 1][s];
         }
@@ -792,11 +831,11 @@ impl LincheckCircuit for KeccakLincheckCircuit {
                 let pos = (t_base + s % N_LANES) * LANE_BITS + (s / N_LANES);
                 comb[pos] += alpha * k_a[s];
             }
-            let mut new_k = apply_phi_t(&k_a);
+            apply_phi_t_into(&k_a, &mut phi_scratch);
             for s in 0..STATE_BITS {
-                new_k[s] += chi_a[r - 1][s];
+                phi_scratch[s] += chi_a[r - 1][s];
             }
-            k_a = new_k;
+            std::mem::swap(&mut k_a, &mut phi_scratch);
         }
         let s0_base = state_u64_base(0);
         for s in 0..STATE_BITS {
@@ -807,18 +846,18 @@ impl LincheckCircuit for KeccakLincheckCircuit {
         // ---- Transpose recurrence, B side. K^B_24 = 0, so K^B_23 = χ_{23,B}
         // — same starting point as `keccak`. Pin row doesn't contribute to
         // t_23 col on B side.
-        let mut k_b = chi_b[N_T - 1].clone();
+        let mut k_b = chi_b.pop().expect("Keccak has at least one round");
         for r in (1..N_T).rev() {
             let t_base = t_u64_base(r - 1);
             for s in 0..STATE_BITS {
                 let pos = (t_base + s % N_LANES) * LANE_BITS + (s / N_LANES);
                 comb[pos] += k_b[s];
             }
-            let mut new_k = apply_phi_t(&k_b);
+            apply_phi_t_into(&k_b, &mut phi_scratch);
             for s in 0..STATE_BITS {
-                new_k[s] += chi_b[r - 1][s];
+                phi_scratch[s] += chi_b[r - 1][s];
             }
-            k_b = new_k;
+            std::mem::swap(&mut k_b, &mut phi_scratch);
         }
         for s in 0..STATE_BITS {
             let pos = (s0_base + s % N_LANES) * LANE_BITS + (s / N_LANES);
