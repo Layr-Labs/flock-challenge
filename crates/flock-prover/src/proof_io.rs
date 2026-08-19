@@ -213,13 +213,26 @@ impl R1csProofBundleLigerito {
             encode_pcs_open_into(&mut w, &self.proof.pcs_open);
             return Ok(());
         }
-        // Stash miss (kill switch / staleness fingerprint): single-shot
-        // bincode, still streaming straight into the writer (header first —
-        // to_bytes' fallback writes it too).
-        let mut header = Vec::with_capacity(HEADER_LEN);
-        write_header(&mut header, FLAVOR_R1CS_LIGERITO);
-        w.write_all(&header)?;
-        bincode::serialize_into(&mut w, self).map_err(std::io::Error::other)
+        // Stash miss (kill switch / staleness fingerprint): retain the
+        // streaming path's flat PCS-open encoder.  The prior fallback sent
+        // the whole ~437 kB bundle through bincode's element-at-a-time
+        // serializer, even though its final `pcs_open` field has the same
+        // byte-compatible bulk encoder used by `to_bytes`.  This matters on
+        // a helper-pool miss, where publishing remains in the scored tail.
+        w.write_all(&MAGIC)?;
+        w.write_all(&[VERSION, FLAVOR_R1CS_LIGERITO])?;
+        if fast_pcs_open_encode_enabled() {
+            bincode::serialize_into(&mut w, &self.commitment)
+                .map_err(std::io::Error::other)?;
+            bincode::serialize_into(&mut w, &self.proof.zerocheck)
+                .map_err(std::io::Error::other)?;
+            bincode::serialize_into(&mut w, &self.proof.lincheck)
+                .map_err(std::io::Error::other)?;
+            encode_pcs_open_into(&mut w, &self.proof.pcs_open);
+            Ok(())
+        } else {
+            bincode::serialize_into(&mut w, self).map_err(std::io::Error::other)
+        }
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
         let payload = parse_header(bytes, FLAVOR_R1CS_LIGERITO)?;
@@ -485,7 +498,10 @@ fn put_rows<W: std::io::Write>(out: &mut W, rows: &[Vec<F128>]) {
 
 impl ChainProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        // Chain proofs carry the same dominant Ligerito opening as R1CS
+        // bundles. Reserve the ranked-proof envelope up front rather than
+        // repeatedly doubling from 1 KiB while publishing the proof.
+        let mut out = Vec::with_capacity(HEADER_LEN + 450_000);
         write_header(&mut out, FLAVOR_CHAIN_LIGERITO);
         bincode::serialize_into(&mut out, self)
             .expect("bincode serialize ChainProofBundleLigerito");
@@ -637,6 +653,29 @@ mod tests {
 
     /// Default Ligerito bundle roundtrip, byte-flip rejection, and file
     /// roundtrip. Requires m ≥ 21 — use n_blocks=256 (m=22 with K_LOG=14).
+    #[test]
+    #[ignore] // Heavier — validates the ranked writer's no-stash fallback bytes.
+    fn r1cs_write_into_fallback_matches_to_bytes() {
+        // Disable the helper-pool prefix stash so `write_into` takes the
+        // fallback changed above; `to_bytes` remains the byte oracle.
+        // SAFETY: this ignored test sets the process-global switch before it
+        // starts any prover work, and the test invocation is single-purpose.
+        unsafe { std::env::set_var("FLOCK_NO_PRE_ENCODE", "1") };
+        let setup = Blake3Setup::new(256);
+        let (blocks, _, _) = honest_chain(256, 0xFA11_BACC);
+        let mut ch = FsChallenger::new(b"flock-proofio-write-fallback");
+        let (proof, commitment, _claim) = setup.prove_fast(&blocks, &mut ch);
+        let bundle = R1csProofBundleLigerito { commitment, proof };
+
+        let expected = bundle.to_bytes();
+        let mut got = Vec::with_capacity(expected.len());
+        bundle.write_into(&mut got).unwrap();
+        assert_eq!(got, expected);
+
+        // The once-initialized switch is intentionally process-global; this
+        // ignored test runs in its own invocation in the validation recipe.
+    }
+
     #[test]
     #[ignore] // Heavier — run with `cargo test r1cs_bundle_roundtrip -- --ignored --nocapture`
     fn r1cs_bundle_roundtrip() {
