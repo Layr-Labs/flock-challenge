@@ -66,14 +66,16 @@ pub fn verify_ligerito<Ch: Challenger>(
         lincheck_circuit,
         challenger,
     )?;
+    let claims = [ab, c];
     verify_claims_ligerito(
         commitment,
-        &[ab.clone(), c.clone()],
+        &claims,
         &proof.pcs_open,
         pcs_params,
         challenger,
     )
     .map_err(VerifyError::PcsAb)?;
+    let [ab, c] = claims;
     Ok(R1csClaim { ab, c })
 }
 
@@ -101,12 +103,15 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<(), pcs::VerifyError> {
-    let z_skips: Vec<F128> = claims.iter().map(|c| c.point.z_skip).collect();
-    let values: Vec<F128> = claims.iter().map(|c| c.value).collect();
+    let (z_skips, values): (Vec<F128>, Vec<F128>) = claims
+        .iter()
+        .map(|claim| (claim.point.z_skip, claim.value))
+        .unzip();
     let x_fulls: Vec<Vec<F128>> = claims
         .iter()
         .map(|c| {
-            let mut v = c.point.x_inner_rest.clone();
+            let mut v = Vec::with_capacity(c.point.x_inner_rest.len() + c.point.x_outer.len());
+            v.extend_from_slice(&c.point.x_inner_rest);
             v.extend_from_slice(&c.point.x_outer);
             v
         })
