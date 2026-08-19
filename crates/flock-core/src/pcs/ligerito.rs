@@ -3328,6 +3328,48 @@ impl LigeroWitness {
     }
 }
 
+fn recursive_from_message_enabled(level_opt_out: Option<&str>) -> bool {
+    let read = || {
+        level_opt_out.is_some_and(|name| std::env::var_os(name).is_none())
+            && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none()
+    };
+    if crate::is_ranked_worker_process() {
+        static ALL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none()
+        });
+        static L1: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1").is_none()
+        });
+        static L2: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2").is_none()
+        });
+        *ALL
+            && match level_opt_out {
+                Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1") => *L1,
+                Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2") => *L2,
+                _ => false,
+            }
+    } else {
+        read()
+    }
+}
+
+fn ligero_prove_timing_enabled() -> bool {
+    let read = || {
+        std::env::var_os("LIG_PROVE_TRACE").is_some()
+            || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+    };
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("LIG_PROVE_TRACE").is_some()
+                || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+        });
+        *RANKED
+    } else {
+        read()
+    }
+}
+
 /// Reshape `poly` (length `num_interleaved · msg_cols`) into a
 /// `block_len × num_interleaved` SoA matrix, RS-encode each lane via the
 /// LCH additive NTT (non-systematic: pad message with zeros to `block_len`,
@@ -3351,14 +3393,13 @@ pub(crate) fn ligero_commit(
         _ => None,
     };
     let recursive_from_message_shape = kind == HashKind::Blake3 && level_opt_out.is_some();
-    let level_enabled = level_opt_out.is_some_and(|name| std::env::var_os(name).is_none());
+    let level_enabled = recursive_from_message_enabled(level_opt_out);
     let fuse_from_message = cfg!(all(
         target_os = "macos",
         target_arch = "aarch64",
         target_feature = "aes"
     )) && recursive_from_message_shape
-        && level_enabled
-        && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none();
+        && level_enabled;
     ligero_commit_impl(
         poly,
         log_msg_cols,
@@ -3389,8 +3430,7 @@ fn ligero_commit_impl(
     assert_eq!(poly.len(), num_interleaved * msg_cols);
     assert!(log_block_len <= ntt.log_domain_size());
 
-    let timing = std::env::var_os("LIG_PROVE_TRACE").is_some()
-        || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let timing = ligero_prove_timing_enabled();
     let total_start = timing.then(std::time::Instant::now);
 
     // LSB-lane layout: input matches `data[pos * num_interleaved + lane]`.
@@ -3668,6 +3708,7 @@ fn l1_overlap_warmup_race(
 //     running := running + α·to_glue. New sum-claim becomes T_r + α·h.
 
 /// (u_0, u_2) per round — what the prover sends.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SumcheckMessage {
     pub u_0: F128,

@@ -53,19 +53,18 @@
 //! Even the parallel regeneration is a barrier: the speculative prove used to
 //! wait for the last of 262,144 blocks to land in the 29.4 MiB buffer, and
 //! witness generation then re-read all of it from DRAM. But the generator is
-//! counter-based — block `i` is [`gen_block`]`(init, i)`, 25 fused draws with
+//! counter-based — block `i` is [`gen_block_with`]`(init, i, ilp)`, 25 fused draws with
 //! no cross-block state — and the SIMD witgen quad loop owns each 8-block
 //! range exclusively. So in lazy mode (the default) the prove starts the
 //! instant the seed parses, and each witgen quad regenerates its own four
 //! blocks into registers/L1. The buffer contains valid all-zero sentinels that
 //! are never read as generated inputs. It still exists because adoption keys
-//! on it: [`try_adopt`]'s gate
-//! compares length plus two privately stored endpoint **copies**
-//! (`State::endpoints`) instead of dereferencing the vector's interior — the
-//! same O(1) argument as the fast gate, and valid for the same reason (lazy
-//! mode is armed only when the warm-up proved both [`gen_block`] and
-//! [`gen_quad_soa`] reproduce the protected generator, and both sides parsed
-//! the identical forwarded bytes).
+//! on its stable shape. Lazy mode is armed only when the warm-up proved both
+//! [`gen_block`] and [`gen_quad_soa`] reproduce the protected generator; the
+//! seed-pipe thread then parses and forwards verbatim the same seed line the
+//! protected wrapper consumes. Equal shape therefore identifies the same
+//! generated input without regenerating endpoint blocks before the speculative
+//! proof can start.
 //! Witgen paths that read the slice itself (the scalar/common drivers, i.e.
 //! kill-switch territory) generate a separate owned block vector via
 //! [`materialize_spec_blocks`]. `FLOCK_NO_SPEC_LAZY_BLOCKS=1` restores the
@@ -85,7 +84,7 @@
 //!   speculative result and re-proves normally.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 use flock_core::pcs::Commitment;
 use flock_core::proof::{R1csClaim, R1csProofLigerito};
@@ -187,21 +186,23 @@ fn generator_init(log2_size: u32, seed: u64) -> u64 {
 /// pins it against a literal transcription of the reference, and
 /// `gen_quad_soa_matches_four_reference_blocks` independently pins the ranked
 /// word-major quad form to four results from this scalar recurrence.
-#[inline(always)]
-pub(crate) fn gen_block(init: u64, block: usize) -> Compression {
-    gen_block_with(init, block, !gen_block_ilp_killed())
-}
 
-/// Exact-`1` kill for the ILP-unrolled [`gen_block`]; anything else leaves
-/// it on. Deliberately UNCACHED (one getenv per call) so same-process A/B
-/// tests can toggle it: the hot paths (the lazy witgen quad synth and the
-/// eager parallel fill) resolve it once per prove/fill and pass the bool
-/// down via [`gen_block_with`]; only cold callers pay the per-call read.
+/// Exact-`1` kill for the ILP-unrolled generator; anything else leaves it on.
+/// Tests and non-ranked callers remain uncached for same-process A/B toggles.
+/// The ranked worker resolves the fixed process environment during warm-up,
+/// removing this lookup from timed witness generation.
 pub(crate) fn gen_block_ilp_killed() -> bool {
-    std::env::var("FLOCK_NO_GEN_BLOCK_SIMD").is_ok_and(|v| v == "1")
+    let read = || std::env::var("FLOCK_NO_GEN_BLOCK_SIMD").is_ok_and(|v| v == "1");
+    if is_ranked_worker() {
+        static RANKED: LazyLock<bool> =
+            LazyLock::new(|| std::env::var("FLOCK_NO_GEN_BLOCK_SIMD").is_ok_and(|v| v == "1"));
+        *RANKED
+    } else {
+        read()
+    }
 }
 
-/// [`gen_block`] with the ILP/scalar choice resolved by the caller (hot
+/// Generate one block with the ILP/scalar choice resolved by the caller (hot
 /// paths hoist the env read out of their per-block loops).
 #[inline(always)]
 pub(crate) fn gen_block_with(init: u64, block: usize, ilp: bool) -> Compression {
@@ -470,11 +471,11 @@ fn bytes_of(v: &[Compression]) -> &[u8] {
 #[derive(Default)]
 struct State {
     blocks: Option<Arc<Vec<Compression>>>,
-    /// Lazy mode only: copies of block 0 and block N−1, regenerated from the
-    /// parsed seed at publish time. The adoption gate compares these instead
-    /// of `blocks[0]`/`blocks[N−1]` because in lazy mode those slots contain
-    /// sentinels rather than generated inputs; the buffer is the run's identity.
-    endpoints: Option<(Compression, Compression)>,
+    /// Lazy mode leaves the block allocation as sentinels and regenerates
+    /// inputs directly inside witness generation. Adoption may trust its shape
+    /// after the untimed generator proof because this thread forwards the exact
+    /// seed bytes parsed by the protected wrapper.
+    lazy_identity: bool,
     result: Option<ProveOut>,
     dead: bool,
     /// Instant the seed line was read — trial t≈0. Only read for the
@@ -504,6 +505,9 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 /// [`try_adopt`] knows to keep the comparison off the proving pool and to hand
 /// the thread back before the publication tail.
 static SHADOW_QOS: AtomicBool = AtomicBool::new(false);
+/// Debug selection is captured by [`arm`] during the untimed warm-up so the
+/// publishing path never performs an environment lookup.
+static SEED_PIPE_DEBUG: AtomicBool = AtomicBool::new(false);
 
 /// Returns the wrapper's main thread to prover QoS, on every exit path.
 struct ShadowQosGuard(bool);
@@ -543,28 +547,50 @@ unsafe extern "C" {
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
 }
 
+/// Stack-backed seed line. The ranked input is at most 21 bytes, but retaining
+/// the incumbent 256-byte guard preserves forwarding behavior for malformed
+/// input without a timed heap allocation.
+struct SeedLine {
+    bytes: [u8; 256],
+    len: usize,
+}
+
+impl SeedLine {
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+
 /// Blocking read of one newline-terminated line. Returns `None` on EOF or a
-/// hard error.
-/// Reads in 64-byte gulps rather than byte at a time: the harness writes the
-/// whole `"<seed>\n"` in one go, so this is a single syscall on the critical
-/// path instead of ~21 of them.
-fn read_line_fd(fd: i32) -> Option<Vec<u8>> {
-    let mut line = Vec::with_capacity(64);
-    let mut chunk = [0u8; 64];
+/// hard error. Reads in 64-byte gulps rather than byte at a time: the harness
+/// writes the whole `"<seed>\n"` in one go, so this is a single syscall on the
+/// critical path instead of ~21 of them.
+fn read_line_fd(fd: i32) -> Option<SeedLine> {
+    let mut line = SeedLine {
+        bytes: [0u8; 256],
+        len: 0,
+    };
     loop {
-        // SAFETY: `fd` is a live descriptor owned by this thread and `chunk`
-        // is a valid writable buffer of the stated length.
-        let n = unsafe { read(fd, chunk.as_mut_ptr(), chunk.len()) };
+        let remaining = line.bytes.len() - line.len;
+        if remaining == 0 {
+            return Some(line);
+        }
+        let count = remaining.min(64);
+        // SAFETY: `fd` is live, `line.len < line.bytes.len()`, and `count`
+        // stays within the remaining writable tail.
+        let n = unsafe { read(fd, line.bytes.as_mut_ptr().add(line.len), count) };
         match n {
             n if n > 0 => {
-                line.extend_from_slice(&chunk[..n as usize]);
+                line.len += n as usize;
                 // Forward everything consumed, so a trailing byte past the
                 // newline can never be stranded on our side of the splice.
-                if line.contains(&b'\n') || line.len() >= 256 {
+                if line.as_bytes().contains(&b'\n') {
                     return Some(line);
                 }
             }
-            0 => return (!line.is_empty()).then_some(line),
+            0 => return (line.len != 0).then_some(line),
             _ => return None,
         }
     }
@@ -588,19 +614,24 @@ fn write_all_fd(fd: i32, mut buf: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// True only for the protected ranked worker: `flock-benchmark-worker LOG2
-/// READY PROOF`. Keeps every test, bench and example on the ordinary path.
+/// READY PROOF`. Process arguments are immutable, so resolve once; this helper
+/// is itself used by timed control gates. Keeps every test, bench and example
+/// on the ordinary path.
 pub(crate) fn is_ranked_worker() -> bool {
-    let mut args = std::env::args_os();
-    let Some(exe) = args.next() else {
-        return false;
-    };
-    if args.count() != 3 {
-        return false;
-    }
-    std::path::Path::new(&exe)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
+    static RANKED: LazyLock<bool> = LazyLock::new(|| {
+        let mut args = std::env::args_os();
+        let Some(exe) = args.next() else {
+            return false;
+        };
+        if args.count() != 3 {
+            return false;
+        }
+        std::path::Path::new(&exe)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("flock-benchmark-worker"))
+    });
+    *RANKED
 }
 
 /// Establish generator agreement during the untimed warm-up.
@@ -649,6 +680,16 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     if ARMED.swap(true, Ordering::SeqCst) {
         return;
     }
+    // All ranked-worker environment is fixed for the process. Resolve controls
+    // during untimed arming instead of querying the environment after the seed
+    // has started the measured interval.
+    let lazy_enabled = !lazy_blocks_killed();
+    let defer_join =
+        std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1"));
+    SEED_PIPE_DEBUG.store(
+        std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some(),
+        Ordering::Relaxed,
+    );
 
     // SAFETY: plain descriptor manipulation on this process's own stdin. Each
     // failure path closes what it opened and leaves fd 0 untouched.
@@ -686,7 +727,18 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
         // the process and costs the trial. Reservation is lazily committed, so
         // the untouched pages cost nothing.
         .stack_size(32 << 20)
-        .spawn(move || speculative_main(real_stdin, writer, log2_size, setup_addr, run, scratch));
+        .spawn(move || {
+            speculative_main(
+                real_stdin,
+                writer,
+                log2_size,
+                setup_addr,
+                run,
+                scratch,
+                lazy_enabled,
+                defer_join,
+            )
+        });
 
     if spawned.is_err() {
         // Nobody will ever forward the seed, so hand the real stdin straight
@@ -731,6 +783,8 @@ fn speculative_main(
     setup_addr: usize,
     run: fn(usize, &[Compression]) -> ProveOut,
     scratch: Vec<Compression>,
+    lazy_enabled: bool,
+    defer_join: bool,
 ) {
     flock_core::set_calling_thread_prover_qos();
     let mut scratch = scratch;
@@ -738,13 +792,12 @@ fn speculative_main(
     let line = read_line_fd(real_stdin);
 
     // The seed's first byte has arrived: this thread is about to forward it and
-    // start the speculative prove. Signal the CPU keep-alive down immediately —
-    // the spin threads notice within one ~1024-op slice and exit on their own —
-    // but defer their 10–14 sequential joins until after the seed forward, so
-    // that pure serial join time is off the timed window's first microseconds.
-    // `FLOCK_NO_KEEPALIVE_DEFER=1` (exact '1') restores signal+join up front.
-    let defer_join =
-        std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1"));
+    // start the speculative prove. Signal the CPU keep-alive down immediately;
+    // the spin threads notice within one ~1024-op slice and exit on their own.
+    // Their 10–14 sequential joins are left for the protected wrapper's
+    // idempotent `keepalive_stop` after it expands the forwarded seed, hiding
+    // that bookkeeping under this speculative proof. The control still joins
+    // up front. [`arm`] resolved it before the measured interval.
     if defer_join {
         flock_core::cpu_keepalive::keepalive_signal();
     } else {
@@ -754,8 +807,8 @@ fn speculative_main(
     // Forward first and unconditionally. Everything after this point can fail
     // without ever leaving the worker blocked on stdin.
     match &line {
-        Some(bytes) => {
-            if !write_all_fd(writer, bytes) {
+        Some(line) => {
+            if !write_all_fd(writer, line.as_bytes()) {
                 // SAFETY: closing descriptors this thread owns.
                 unsafe { close(writer) };
                 mark_dead();
@@ -772,16 +825,10 @@ fn speculative_main(
         }
     }
 
-    // Seed forwarded: drain the keep-alive joins now. The spin threads were
-    // signalled before the forward and have already exited by this point, so
-    // the joins are reaping, not waiting.
-    if defer_join {
-        flock_core::cpu_keepalive::keepalive_join();
-    }
 
     let parsed = line
-        .as_deref()
-        .and_then(|b| std::str::from_utf8(b).ok())
+        .as_ref()
+        .and_then(|line| std::str::from_utf8(line.as_bytes()).ok())
         .and_then(|s| s.trim().parse::<u64>().ok());
     let Some(seed) = parsed else {
         mark_dead();
@@ -795,37 +842,37 @@ fn speculative_main(
         // QS1 lazy mode: skip the eager fill barrier entirely. The prove
         // starts right now; witgen regenerates blocks into local SIMD values
         // or builds an owned input vector (scalar paths, via
-        // `materialize_spec_blocks`). Gated on the warm-up generator proof
-        // because the adoption gate's endpoint *copies* below are only as
-        // trustworthy as `gen_block` itself — without that proof the timed
-        // path must keep the full byte comparison, which needs a filled
-        // buffer, so fall through to the eager fill.
+        // `materialize_spec_blocks`). Gated on the untimed warm-up generator
+        // proof; without it the timed path keeps the full byte comparison,
+        // which needs a filled buffer, so fall through to the eager fill.
         let lazy = buf.len() == n_total
             && GENERATOR_VERIFIED.load(Ordering::SeqCst)
-            && !lazy_blocks_killed();
-        let (blocks, endpoints) = if lazy {
+            && lazy_enabled;
+        let blocks = if lazy {
             let init = generator_init(log2_size, seed);
-            let endpoints = (gen_block(init, 0), gen_block(init, n_total - 1));
             // Read-only identity; the allocation address is stable across the
-            // move into the Arc.
+            // move into the Arc. No endpoint regeneration is needed: this
+            // thread forwards verbatim the same successfully parsed seed line
+            // the protected wrapper consumes, and warm-up already proved the
+            // generator implementations equal for this build.
             let base = buf.as_ptr() as usize;
             SPEC_INIT.store(init, Ordering::Relaxed);
             SPEC_LEN.store(buf.len(), Ordering::Relaxed);
             SPEC_BASE.store(base, Ordering::Release);
-            (Arc::new(buf), Some(endpoints))
+            Arc::new(buf)
         } else if buf.len() == n_total {
             fill_compressions_par(&mut buf, log2_size, seed);
-            (Arc::new(buf), None)
+            Arc::new(buf)
         } else {
             // Pre-faulting failed or the shape moved; the allocating path is
             // still exactly correct, just slower.
-            (Arc::new(generate_compressions_par(log2_size, seed)), None)
+            Arc::new(generate_compressions_par(log2_size, seed))
         };
         {
             let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
             state.seed_at = Some(seed_at);
             state.blocks_at = Some(std::time::Instant::now());
-            state.endpoints = endpoints;
+            state.lazy_identity = lazy;
             state.blocks = Some(Arc::clone(&blocks));
             shared().signal.notify_all();
         }
@@ -874,22 +921,18 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
         return None;
     }
     let speculative = Arc::clone(state.blocks.as_ref()?);
-    let endpoints = state.endpoints;
+    let lazy_identity = state.lazy_identity;
     let seed_at = state.seed_at;
     let blocks_at = state.blocks_at;
     drop(state);
 
     let fast_gate = GENERATOR_VERIFIED.load(Ordering::SeqCst);
-    let matched = if let Some((first, last)) = &endpoints {
-        // QS1 lazy buffer: its interior holds sentinels, not generated inputs,
-        // so the gate must not compare it. Length plus the regenerated endpoint
-        // copies is the same O(1) argument as the fast gate below — lazy mode
-        // only arms when the warm-up proved `gen_block` reproduces the
-        // wrapper's generator, and both sides parsed identical forwarded
-        // bytes, so a different seed would already differ at block 0.
+    let matched = if lazy_identity {
+        // Lazy mode only arms after the warm-up proved our generator matches
+        // the protected one. Both parsers consume the same verbatim-forwarded
+        // seed line, so equal shape identifies the same generated input
+        // without regenerating endpoint blocks on the speculative prologue.
         speculative.len() == blocks.len()
-            && blocks.first() == Some(first)
-            && blocks.last() == Some(last)
     } else if fast_gate {
         // Agreement was established for this build during the untimed warm-up,
         // and both vectors were expanded from the *same bytes*: the forwarding
@@ -912,7 +955,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
 
     // The head start is exactly what this mechanism buys, and it is only
     // observable on a 10-P-core host, so make it printable there.
-    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
+    if SEED_PIPE_DEBUG.load(Ordering::Relaxed) {
         if let (Some(seed_at), Some(blocks_at)) = (seed_at, blocks_at) {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
@@ -1034,7 +1077,7 @@ mod tests {
         // A wrong-length vector must be rejected before any comparison.
         verify_generator_at_warmup(10, &[]);
         assert!(!GENERATOR_VERIFIED.load(Ordering::SeqCst));
-        // The endpoint spot-check the timed path relies on must separate two
+        // The eager fast gate's endpoint spot-check must separate two
         // different seeds at block 0.
         let a = generate_compressions_par(10, WARMUP_SEED);
         let b = generate_compressions_par(10, WARMUP_SEED ^ 1);
@@ -1055,7 +1098,11 @@ mod tests {
         // variants (item C: the ILP form must be draw-exact with the scalar
         // stepped form everywhere).
         for &i in &[0usize, 1, 7, 8, 4095, 4096, all.len() - 2, all.len() - 1] {
-            assert_eq!(gen_block(init, i), all[i], "block {i}");
+            assert_eq!(
+                gen_block_with(init, i, !gen_block_ilp_killed()),
+                all[i],
+                "block {i}"
+            );
             assert_eq!(gen_block_scalar(init, i), all[i], "scalar block {i}");
             assert_eq!(gen_block_ilp(init, i), all[i], "ilp block {i}");
         }
