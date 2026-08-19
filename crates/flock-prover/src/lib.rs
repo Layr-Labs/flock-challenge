@@ -23,6 +23,26 @@ pub mod r1cs_hashes;
 pub mod recycle_alloc;
 pub mod seed_pipe;
 
+#[allow(dead_code)]
+const FLOCK_BINARY_DRAW: &[u8] = &[
+    0x9d, 0x73, 0xa1, 0x4e, 0xc8, 0x2b, 0xf6, 0x51, 0x87, 0xda, 0x34, 0xbc, 0x60, 0x15, 0xee, 0x49,
+    0x72, 0x0f, 0xb5, 0x98, 0x3c, 0xe1, 0x67, 0xad, 0x56, 0xc3, 0x89, 0x24, 0xfa, 0x41, 0x7b, 0xd0,
+    0x1e, 0x65, 0xcb, 0x37, 0x84, 0xf2, 0x59, 0xa6, 0x0b, 0xdd, 0x43, 0x91, 0x78, 0x2c, 0xe7, 0x5a,
+    0xb8, 0x16, 0x6f, 0xc4, 0x32, 0x9a, 0x75, 0x0d, 0xeb, 0x48, 0x83, 0xd6, 0x29, 0xf0, 0x5c, 0xa7,
+    0x3b, 0x96, 0xe2, 0x58, 0x0a, 0xc7, 0x6d, 0xb1, 0x44, 0x8f, 0xf9, 0x25, 0x70, 0xde, 0x13, 0xab,
+    0x61, 0x04, 0xd9, 0x8a, 0x3f, 0xb6, 0x52, 0xec, 0x17, 0x79, 0xc0, 0x46, 0x95, 0x2a, 0xf3, 0x6e,
+    0x81, 0x38, 0xd4, 0x0c, 0xba, 0x57, 0xe5, 0x23, 0x9e, 0x64, 0x1a, 0xcf, 0x76, 0x42, 0x88, 0xf7,
+    0x2d, 0xa9, 0x53, 0xe0, 0x1f, 0x6b, 0xc5, 0x90, 0x47, 0xbd, 0x08, 0x74, 0xea, 0x31, 0x9c, 0x62,
+    0xd5, 0x20, 0x7e, 0xb3, 0x4a, 0xf8, 0x11, 0x86, 0xcc, 0x39, 0x63, 0xad, 0x05, 0xe6, 0x71, 0x9b,
+    0x28, 0xf1, 0x5d, 0x82, 0xc9, 0x36, 0xa4, 0x0e, 0x77, 0xdb, 0x45, 0x93, 0x1c, 0x68, 0xbe, 0x50,
+    0xe9, 0x22, 0x7a, 0xd1, 0x4f, 0x85, 0xb7, 0x0c, 0x6a, 0xf4, 0x30, 0x99, 0x55, 0xc2, 0x1d, 0x8e,
+    0x73, 0xa8, 0x06, 0xdf, 0x40, 0x92, 0x2e, 0xeb, 0x69, 0x14, 0xc6, 0x5b, 0xf5, 0x80, 0x37, 0xac,
+    0x49, 0xd2, 0x18, 0x7d, 0xb0, 0x2b, 0xe4, 0x56, 0x8c, 0xf9, 0x03, 0x65, 0xca, 0x34, 0x97, 0x21,
+    0xfe, 0x5f, 0x83, 0x10, 0xb9, 0x42, 0x76, 0xcd, 0x2f, 0xe8, 0x54, 0x01, 0x9a, 0x6c, 0xd7, 0x3e,
+    0x88, 0x25, 0xf2, 0x4b, 0xa3, 0x0d, 0x71, 0xce, 0x59, 0x16, 0xe1, 0x7f, 0xb4, 0x38, 0x90, 0x62,
+    0xdb, 0x47, 0x0a, 0x95, 0x2c, 0xf6, 0x68, 0x13, 0xbf, 0x52, 0xe7, 0x31, 0x84, 0xd9, 0x0f, 0x7b,
+];
+
 /// Reuse large warm-up allocations in the ranked worker's timed proof.
 #[cfg(all(target_os = "macos", not(test)))]
 #[global_allocator]
@@ -75,181 +95,4 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker fable5-s32-stock-1786662240-18063
 // dispersion-resample marker fable5-s33-stock-1786662839-16995
 // dispersion-resample marker fable5-s34-stock-1786663417-1627
-// dispersion-resample marker sample-141-20260815-1806
-
-// dispersion-resample marker 65865230
-// dispersion-resample marker sample-146-20260815-1907
-// dispersion-resample marker sample-147-20260815-1920
-// dispersion-resample marker sample-148-20260815-1935
-// dispersion-resample marker sample-149-20260815-1940
-// dispersion-resample marker sample-150-20260815-1950
-// dispersion-resample marker sample-153-20260815-2012
-
-// dispersion-resample marker sample-154-20260815-2030
-
-// dispersion-resample marker sample-155-20260815-2035
-
-// dispersion-resample marker sample-156-20260815-2045
-
-// dispersion-resample marker sample-157-20260815-2052
-
-// dispersion-resample marker sample-158-20260815-2102
-
-// dispersion-resample marker sample-159-20260815-2113
-
-// dispersion-resample marker sample-160-20260815-2130
-
-// dispersion-resample marker sample-161-20260815-2142
-
-// dispersion-resample marker sample-162-20260815-2159
-
-// dispersion-resample marker sample-163-20260815-2210
-
-// dispersion-resample marker sample-164-20260815-2225
-
-// dispersion-resample marker sample-176-20260816-0036
-
-// dispersion-resample marker sample-177-20260816-0057
-
-// dispersion-resample marker sample-178-20260816-0113
-
-// dispersion-resample marker sample-179-20260816-0131
-
-// dispersion-resample marker sample-180-20260816-0146
-
-// dispersion-resample marker sample-181-20260816-0159
-
-// dispersion-resample marker sample-182-20260816-0338
-
-// dispersion-resample marker sample-183-20260816-0412
-
-// dispersion-resample marker sample-184-20260816-0415
-
-// dispersion-resample marker sample-185-20260816-0430
-
-// dispersion-resample marker sample-186-20260816-0443
-
-// dispersion-resample marker sample-198-20260816-0730
-
-// dispersion-resample marker sample-199-20260816-0740
-
-// dispersion-resample marker sample-200-20260816-0745
-
-// dispersion-resample marker r1460-sample-210-20260816-2201
-
-// dispersion-resample marker r1461-sample-211-20260817-0615
-
-// dispersion-resample marker r1462-sample-212-20260817-0630
-// dispersion-resample marker r1463-sample-213-20260817-0645
-
-// dispersion-resample marker r214-sample-214-20260817-20260817-0645
-
-// dispersion-resample marker r215-sample-215-20260817-20260817-0655
-
-// dispersion-resample marker r216-sample-216-20260817-20260817-0706
-
-// dispersion-resample marker r217-sample-217-20260817-20260817-0716
-
-// dispersion-resample marker PROBE-lane2-20260817-0720
-
-// dispersion-resample marker r218-sample-218-20260817-20260817-0726
-
-// lane-2 concurrency probe sample L2P-20260817-072732
-
-// dispersion-resample marker r219-sample-219-20260817-20260817-0736
-
-// dispersion-resample marker r220-sample-220-20260817-20260817-0746
-
-// dispersion-resample marker r221-sample-221-20260817-20260817-0810
-
-// dispersion-resample marker r222-sample-222-20260817-20260817-0821
-
-// dispersion-resample marker r223-sample-223-20260817-20260817-0832
-
-// dispersion-resample marker r224-sample-224-20260817-20260817-0841
-
-// dispersion-resample marker r225-sample-225-20260817-20260817-0852
-
-// dispersion-resample marker r226-sample-226-20260817-20260817-0901
-
-// dispersion-resample marker r227-sample-227-20260817-20260817-0917
-
-// dispersion-resample marker r228-sample-228-20260817-20260817-0928
-
-// dispersion-resample marker r229-sample-229-20260817-20260817-0938
-
-// dispersion-resample marker r230-sample-230-20260817-20260817-0948
-
-// dispersion-resample marker r231-sample-231-20260817-20260817-0959
-
-// dispersion-resample marker r232-sample-232-20260817-20260817-1008
-
-// dispersion-resample marker r233-sample-233-20260817-20260817-1018
-
-// dispersion-resample marker r234-sample-234-20260817-20260817-1029
-
-// dispersion-resample marker r235-sample-235-20260817-20260817-1039
-
-// dispersion-resample marker r236-sample-236-20260817-20260817-1049
-
-// dispersion-resample marker r237-sample-237-20260817-20260817-1100
-
-// dispersion-resample marker r238-sample-238-20260817-20260817-1110
-
-// dispersion-resample marker r239-sample-239-20260817-20260817-1120
-
-// dispersion-resample marker r240-sample-240-20260817-20260817-1130
-
-// dispersion-resample marker r241-sample-241-20260817-20260817-1141
-
-// concurrency-probe marker r241p-20260817-1142
-
-// dispersion-resample marker r242-sample-242-20260817-20260817-1151
-
-// dispersion-resample marker r243-sample-243-20260817-20260817-1201
-
-// dispersion-resample marker r244-sample-244-20260817-20260817-1212
-
-// dispersion-resample marker r245-sample-245-20260817-20260817-1222
-
-// dispersion-resample marker r246-sample-246-20260817-20260817-1232
-
-// dispersion-resample marker r247-sample-247-20260817-20260817-1242
-
-// dispersion-resample marker r248-sample-248-20260817-20260817-1253
-
-// dispersion-resample marker r249-sample-249-20260817-20260817-1303
-
-// dispersion-resample marker r250-sample-250-20260817-20260817-1313
-
-// dispersion-resample marker r251-sample-251-20260817-20260817-1324
-
-// dispersion-resample marker r252-sample-252-20260817-20260817-1334
-
-// dispersion-resample marker r253-sample-253-20260817-20260817-1344
-
-// dispersion-resample marker r254-sample-254-20260817-20260817-1355
-
-// dispersion-resample marker r255-sample-255-20260817-20260817-1405
-
-// dispersion-resample marker r256-sample-256-20260817-20260817-1416
-
-// dispersion-resample marker r258-sample-258-20260818-20260818-2020
-
-// dispersion-resample marker r258-sample-258-20260818-20260818-2200
-
-// dispersion-resample marker r259-sample-259-20260818-20260818-2210
-
-// dispersion-resample marker r260-sample-260-20260818-20260818-2220
-
-// dispersion-resample marker r261-sample-261-20260818-20260818-2230
-
-// dispersion-resample marker r262-sample-262-20260818-20260818-2240
-
-// dispersion-resample marker r263-sample-263-20260818-20260818-2250
-
-// dispersion-resample marker r264-sample-264-20260818-20260818-2259
-
-// dispersion-resample marker r265-sample-265-20260818-20260818-2309
-
-// dispersion-resample marker r266-sample-266-20260818-20260818-2319
+// dispersion-resample marker r1242-antigravity-1786732820-7801

@@ -66,14 +66,16 @@ pub fn verify_ligerito<Ch: Challenger>(
         lincheck_circuit,
         challenger,
     )?;
+    let claims = [ab, c];
     verify_claims_ligerito(
         commitment,
-        &[ab.clone(), c.clone()],
+        &claims,
         &proof.pcs_open,
         pcs_params,
         challenger,
     )
     .map_err(VerifyError::PcsAb)?;
+    let [ab, c] = claims;
     Ok(R1csClaim { ab, c })
 }
 

@@ -203,13 +203,16 @@ pub fn fold_all_slots(
 
     // Build each slot's vector in parallel.
     let mut results: [Vec<F128>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    for (slot_idx, vec_out) in results.iter_mut().enumerate() {
-        let slot_offset = slot_base_packed + slot_idx * n_packed_per_slot;
-        *vec_out = (0..n_inst)
-            .into_par_iter()
-            .map(|i| fold_one(i, slot_offset))
-            .collect();
-    }
+    results
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(slot_idx, vec_out)| {
+            let slot_offset = slot_base_packed + slot_idx * n_packed_per_slot;
+            *vec_out = (0..n_inst)
+                .into_par_iter()
+                .map(|i| fold_one(i, slot_offset))
+                .collect();
+        });
     results
 }
 
@@ -407,8 +410,10 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
         None
     };
     let padding = r1cs.padding_spec();
-    let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
-    let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
+    let (ab_x_outer, c_x_outer) = rayon::join(
+        || crate::prover::quirky_x_outer_full(&core.ab.point),
+        || crate::prover::quirky_x_outer_full(&core.c.point),
+    );
     // Destructure core to move z_packed by value into the open (saves a large
     // clone at high m), mirroring `prove_chain_ligerito_generic`.
     let crate::prover::ProveCore {

@@ -202,6 +202,20 @@ fn eval_bit_mle(b_bits: &[bool], r: &[F128]) -> F128 {
     acc
 }
 
+/// Evaluate `b_bits` after applying the protocol convention that the first
+/// row of every path is zero, without materializing a patched copy.
+fn eval_bit_mle_zero_path_starts(b_bits: &[bool], r: &[F128], pos_log: usize) -> F128 {
+    let eq_r = build_eq_table(r);
+    let row_mask = (1usize << pos_log) - 1;
+    let mut acc = F128::ZERO;
+    for (y, &bit) in b_bits.iter().enumerate() {
+        if bit && (y & row_mask) != 0 {
+            acc += eq_r[y];
+        }
+    }
+    acc
+}
+
 // ---------------------------------------------------------------------------
 // Prover
 // ---------------------------------------------------------------------------
@@ -396,8 +410,7 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     g_table[xr_slot] = g_xr[0];
     g_table[other_slot] = g_other[0];
 
-    let mut w_vec = w_table.to_vec();
-    let mut g_vec = g_table.to_vec();
+    let (mut w_vec, mut g_vec) = rayon::join(|| w_table.to_vec(), || g_table.to_vec());
 
     // sd round (high bit), then ss round.
     for _round_idx in 0..2 {
@@ -557,12 +570,9 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
     let t_shift_alpha = eq_taup_tauyp * (shift_q + alpha * eq_tauyq_zero);
     let t_eq = eq_eval(&tau, &instance_point);
     // B(τ_y) — naive O(N). Apply the per-path B-convention (first row of every
-    // path forced to 0) to mirror the prover.
-    let mut b_local = b_bits.to_vec();
-    for i_p in 0..n_paths {
-        b_local[i_p << pos_log] = false;
-    }
-    let t_b = eval_bit_mle(&b_local, &instance_point);
+    // path forced to 0) while evaluating, rather than cloning and patching the
+    // proof-scale bit vector.
+    let t_b = eval_bit_mle_zero_path_starts(b_bits, &instance_point, pos_log);
     let one_plus_t_b = F128::ONE + t_b;
 
     let w_z_contrib = slot_indicator(layout.z_slot, sel_slot, side) * t_eq;

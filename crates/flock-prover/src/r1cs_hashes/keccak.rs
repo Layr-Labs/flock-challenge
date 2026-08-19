@@ -807,7 +807,7 @@ impl LincheckCircuit for KeccakLincheckCircuit {
         // ---- Transpose recurrence, B side. K^B_24 = 0, so K^B_23 = χ_{23,B}
         // — same starting point as `keccak`. Pin row doesn't contribute to
         // t_23 col on B side.
-        let mut k_b = chi_b[N_T - 1].clone();
+        let mut k_b = chi_b.pop().expect("Keccak has at least one round");
         for r in (1..N_T).rev() {
             let t_base = t_u64_base(r - 1);
             for s in 0..STATE_BITS {

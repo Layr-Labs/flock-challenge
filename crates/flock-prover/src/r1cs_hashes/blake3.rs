@@ -99,6 +99,14 @@ use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use flock_core::verifier;
 
+// x86_64 SSE2 port of the aarch64 NEON quad witgen builder (W-H2). The
+// correctness-critical full-write kernel lives in this sibling module; the
+// witgen driver wiring comes behind the same `enabled()` gate once the kernel
+// is pinned bit-exact (see `x86_quad_witness_matches_scalar_stream_builder`).
+#[cfg(target_arch = "x86_64")]
+#[path = "blake3_witgen_simd_x86.rs"]
+pub(crate) mod witgen_simd_x86;
+
 // ---------------------------------------------------------------------------
 // Public constants
 // ---------------------------------------------------------------------------
@@ -389,11 +397,14 @@ impl Word {
     /// Bitwise XOR, no dedup. Caller calls `dedup()` after a chain if it
     /// wants canonical rows.
     fn xor(&self, other: &Word) -> Word {
-        let mut out = self.clone();
-        for i in 0..WORD_BITS {
-            out.bits[i].extend(&other.bits[i]);
+        Word {
+            bits: std::array::from_fn(|i| {
+                let mut bits = Vec::with_capacity(self.bits[i].len() + other.bits[i].len());
+                bits.extend_from_slice(&self.bits[i]);
+                bits.extend_from_slice(&other.bits[i]);
+                bits
+            }),
         }
-        out
     }
     /// `rotr(n)` — pure index permutation; doesn't touch slot lists.
     fn rotr(&self, n: usize) -> Word {
@@ -3064,21 +3075,43 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
             // W-H2: SIMD-lockstep quad builder (notes/witgen-simd.md).
             // Bit-exact with the scalar driver; the rate-2 codeword arm
             // above stays scalar (A/B fallback path).
+            let t_wit = std::time::Instant::now();
+            let witgen_phase_trace = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
             #[cfg(target_arch = "aarch64")]
             if witgen_simd::enabled() {
                 return witgen_simd::generate(blocks, n_blocks_log);
             }
+            // x86_64: SSE2 quad kernel, bit-exact twin of the scalar driver
+            // (same kill switch: `FLOCK_NO_WITGEN_SIMD=1`).
+            #[cfg(target_arch = "x86_64")]
+            if witgen_simd_x86::enabled() {
+                let out = witgen_simd_x86::generate(blocks, n_blocks_log);
+                if witgen_phase_trace {
+                    eprintln!(
+                        "[phase-timing] witgen (x86-sse2): {:.2} ms",
+                        t_wit.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                return out;
+            }
             // Scalar fallback reads a generated owned slice in lazy mode.
             let generated = crate::seed_pipe::materialize_spec_blocks(blocks);
             let blocks = generated.as_deref().unwrap_or(blocks);
-            super::common::drive_witness_packed_and_lincheck_full_write(
+            let out = super::common::drive_witness_packed_and_lincheck_full_write(
                 blocks,
                 &padding,
                 n_blocks_log,
                 K_LOG,
                 stripe_useful_bits,
                 per_block,
-            )
+            );
+            if witgen_phase_trace {
+                eprintln!(
+                    "[phase-timing] witgen (scalar): {:.2} ms",
+                    t_wit.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            out
         }
     }
 }

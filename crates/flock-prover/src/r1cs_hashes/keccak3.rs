@@ -413,7 +413,7 @@ fn accumulate_subkeccak(i: usize, alpha: F128, eq_inner: &[F128], comb: &mut [F1
     }
 
     // ---- Transpose recurrence, B side. K^B_24 = 0.
-    let mut k_b = chi_b[N_T - 1].clone();
+    let mut k_b = chi_b.pop().expect("Keccak has at least one round");
     for r in (1..N_T).rev() {
         let t_base = t_u64_base(i, r - 1);
         for s in 0..STATE_BITS {
