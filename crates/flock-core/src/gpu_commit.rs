@@ -12728,14 +12728,24 @@ kernel void zc_t3_products(
                 state.part_buf = gpu.new_buffer(need_part).ok()?;
                 state.part_cap = need_part;
             }
+            // CHUNKED WRAP (K-audit): the kernel only reads the first
+            // `chunks` hi-chunks (pair_idx = tgid·lo_size + x_lo with
+            // tgid < chunks), so wrap only their byte ranges instead of
+            // the full 1.5 GiB anchors+deltas surface. The live no-copy
+            // wrap surface now scales with the gated GPU share
+            // (anchors 64 B/pair, deltas 32 B/pair) instead of pricing a
+            // full-buffer wrap every prove — under the r2 arm's proven
+            // 1 GiB ceiling at the admission share.
+            let anchor_bytes = chunks * lo_size * 4 * 16;
+            let delta_bytes = chunks * lo_size * 2 * 16;
             let anchors_buf = zc_t3_wrap(
                 &mut state,
                 gpu,
                 anchors.as_ptr().cast::<u8>(),
-                anchors.len() * 16,
+                anchor_bytes,
             )
             .ok()?;
-            let deltas_buf = zc_t3_wrap(&mut state, gpu, deltas.as_ptr(), deltas.len()).ok()?;
+            let deltas_buf = zc_t3_wrap(&mut state, gpu, deltas.as_ptr(), delta_bytes).ok()?;
             let cb = zc_t3_submit(gpu, &state, anchors_buf, deltas_buf, chunks, lo_size).ok()?;
             Some(ZcT3Job {
                 cb,
