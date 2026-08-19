@@ -4247,6 +4247,69 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_bit_transpose_matches_scalar() {
+        use kernels::x86_64::bit_transpose_64bytes_avx2;
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return; // not on an AVX2 CPU; nothing to compare
+        }
+        let mut rng = Rng::new(0x4B17_BB17);
+        for _ in 0..10_000 {
+            let mut input = [0u8; 64];
+            for byte in input.iter_mut() {
+                *byte = (rng.next_u64() & 0xff) as u8;
+            }
+            let mut out_scalar = [0u8; 64];
+            let mut out_avx2 = [0u8; 64];
+            bit_transpose_64bytes_scalar(&input, &mut out_scalar);
+            // SAFETY: guarded by the avx2 feature check above.
+            unsafe { bit_transpose_64bytes_avx2(&input, &mut out_avx2) };
+            assert_eq!(
+                out_scalar, out_avx2,
+                "avx2 bit_transpose disagreement (round-trips through the dispatch too)"
+            );
+            // Also exercise the wired dispatch path itself.
+            let mut out_dispatch = [0u8; 64];
+            bit_transpose_64bytes(&input, &mut out_dispatch);
+            assert_eq!(out_scalar, out_dispatch, "dispatch disagreement");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_bit_transpose_bench() {
+        use kernels::x86_64::bit_transpose_64bytes_avx2;
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut rng = Rng::new(0xBEEF_CAFE);
+        let mut blocks = [[0u8; 64]; 1024];
+        for block in blocks.iter_mut() {
+            for byte in block.iter_mut() {
+                *byte = (rng.next_u64() & 0xff) as u8;
+            }
+        }
+        let n = 8_000_000usize;
+        let mut out = [0u8; 64];
+        let t0 = std::time::Instant::now();
+        for i in 0..n {
+            bit_transpose_64bytes_scalar(&blocks[i & 1023], &mut out);
+        }
+        let t_scalar = t0.elapsed().as_nanos() as f64 / n as f64;
+        let t1 = std::time::Instant::now();
+        for i in 0..n {
+            // SAFETY: guarded by the avx2 feature check above.
+            unsafe { bit_transpose_64bytes_avx2(&blocks[i & 1023], &mut out) };
+        }
+        let t_avx2 = t1.elapsed().as_nanos() as f64 / n as f64;
+        std::hint::black_box(&out);
+        println!(
+            "bit_transpose: scalar {t_scalar:.2} ns/call, avx2 {t_avx2:.2} ns/call, speedup {:.1}x",
+            t_scalar / t_avx2
+        );
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_fused_inner_matches_scalar_inner() {

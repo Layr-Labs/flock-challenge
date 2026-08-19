@@ -151,15 +151,15 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
 /// NTT objects are constructed repeatedly by the recursive PCS, and rebuilding
 /// these rows otherwise repeats field inversions and multiplications even when
 /// the large twiddle table is already resident from the untimed warm proof.
-/// Clone into the original nested-`Vec` representation so transform object
-/// layout and hot-loop dereferencing remain unchanged.
-fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
-    static TABLES: OnceLock<[OnceLock<Vec<Vec<F128>>>; 65]> = OnceLock::new();
+/// Share the immutable cached triangle so repeated construction only clones an
+/// `Arc`, matching the already-shared twiddle-table lifetime.
+fn cached_standard_evals(dim: usize) -> Arc<[Vec<F128>]> {
+    static TABLES: OnceLock<[OnceLock<Arc<[Vec<F128>]>>; 65]> = OnceLock::new();
     let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
     tables[dim]
         .get_or_init(|| {
             let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-            generate_evals_from_subspace(&basis)
+            Arc::from(generate_evals_from_subspace(&basis))
         })
         .clone()
 }
@@ -493,7 +493,7 @@ const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
-    evals: Vec<Vec<F128>>,
+    evals: Arc<[Vec<F128>]>,
     /// Breadth-first table: layer `l` starts at `2^l - 1`.
     precomputed_twiddles: Option<Arc<[F128]>>,
 }
@@ -501,7 +501,7 @@ pub struct AdditiveNttF128 {
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
-        let evals = generate_evals_from_subspace(basis);
+        let evals: Arc<[Vec<F128>]> = Arc::from(generate_evals_from_subspace(basis));
         let precomputed_twiddles = precompute_twiddles(&evals).map(Arc::from);
         Self {
             evals,
@@ -713,49 +713,19 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         start_layer: usize,
     ) {
-        self.forward_transform_interleaved_from_message_fused3_and_then(
-            msg,
-            data,
-            num_ntts,
-            start_layer,
-            |_, _| {},
-        );
-    }
-
-    /// Variant of [`Self::forward_transform_interleaved_from_message_fused3`]
-    /// that forwards `finish_chunk` to the in-place tail transform (see
-    /// [`Self::forward_transform_interleaved_from_layer_and_then`] for the
-    /// exact per-chunk guarantee). The fused radix-8 head only initializes
-    /// `data`; every chunk is still finalized — and its callback fired —
-    /// inside the tail transform, so the callback contract is identical on
-    /// both tails: the recursive P+E helper queue fires it per claimed
-    /// sub-transform (each claim exclusively owns its disjoint range and runs
-    /// every remaining layer inside it before the callback), and the ordinary
-    /// Rayon tail fires it per finalized cache chunk as before.
-    pub(crate) fn forward_transform_interleaved_from_message_fused3_and_then<F>(
-        &self,
-        msg: &[F128],
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-        finish_chunk: F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
         let log_d = log2_pow2(data.len() / num_ntts);
         let recursive_l1_helper = if use_recursive_ntt_epool(log_d, num_ntts, start_layer) {
             crate::epool::helper_pool()
         } else {
             None
         };
-        self.forward_transform_interleaved_from_message_fused3_with_helper_and_then(
+        self.forward_transform_interleaved_from_message_fused3_with_helper(
             msg,
             data,
             num_ntts,
             start_layer,
             log_d,
             recursive_l1_helper,
-            finish_chunk,
         );
     }
 
@@ -768,29 +738,6 @@ impl AdditiveNttF128 {
         log_d: usize,
         recursive_l1_helper: Option<&rayon::ThreadPool>,
     ) {
-        self.forward_transform_interleaved_from_message_fused3_with_helper_and_then(
-            msg,
-            data,
-            num_ntts,
-            start_layer,
-            log_d,
-            recursive_l1_helper,
-            |_, _| {},
-        );
-    }
-
-    fn forward_transform_interleaved_from_message_fused3_with_helper_and_then<F>(
-        &self,
-        msg: &[F128],
-        data: &mut [F128],
-        num_ntts: usize,
-        start_layer: usize,
-        log_d: usize,
-        recursive_l1_helper: Option<&rayon::ThreadPool>,
-        finish_chunk: F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
         use rayon::prelude::*;
 
         let trace = is_recursive_ntt_epool_shape(log_d, num_ntts, start_layer)
@@ -904,20 +851,14 @@ impl AdditiveNttF128 {
             )
         });
         if let Some(helper) = recursive_l1_helper {
-            self.forward_transform_interleaved_recursive_deep_with_helper_and_then(
+            self.forward_transform_interleaved_recursive_deep_with_helper(
                 data,
                 num_ntts,
                 start_layer + 3,
                 helper,
-                &finish_chunk,
             );
         } else {
-            self.forward_transform_interleaved_from_layer_and_then(
-                data,
-                num_ntts,
-                start_layer + 3,
-                finish_chunk,
-            );
+            self.forward_transform_interleaved_from_layer(data, num_ntts, start_layer + 3);
         }
         if let (Some((top_ms, top_claims, top_broadcasts)), Some((started, claims, broadcasts))) =
             (top_trace, deep_trace)
@@ -1594,16 +1535,13 @@ impl AdditiveNttF128 {
     /// (32 x 256 KiB at log_d 16) — partition into 32 independent
     /// cache-resident sub-transforms; each sub runs the identical
     /// single-layer subtree loop, so this changes ownership/scheduling only.
-    fn forward_transform_interleaved_recursive_deep_with_helper_and_then<F>(
+    fn forward_transform_interleaved_recursive_deep_with_helper(
         &self,
         data: &mut [F128],
         num_ntts: usize,
         start_layer: usize,
         helper: &rayon::ThreadPool,
-        finish_chunk: &F,
-    ) where
-        F: Fn(usize, &[F128]) + Sync + Send,
-    {
+    ) {
         const N_TOP: usize = 5;
 
         let log_d = log2_pow2(data.len() / num_ntts);
@@ -1632,13 +1570,6 @@ impl AdditiveNttF128 {
                 log_d,
                 sub_idx,
             );
-            // Per-claim finalized-chunk callback: this claim exclusively
-            // owned its `sub_bytes` range and has just run every remaining
-            // layer inside it, so the transform never reads or writes the
-            // range again — the same never-touched-again contract as the
-            // Rayon tail's per-chunk callback in
-            // `forward_transform_interleaved_deep_from_layer_and_then`.
-            finish_chunk(sub_idx * sub_bytes, sub_data);
         };
         crate::epool::run_chunks_with_helper(num_subs, &run_sub, Some(helper));
     }
@@ -3148,14 +3079,8 @@ mod tests {
         assert!(l2_recursive_ntt_epool_killed_by(Some("1")));
 
         // The union gate matches each shape exactly, independent of env.
-        assert_eq!(
-            is_recursive_ntt_epool_shape(18, 8, 2),
-            enabled_here
-        );
-        assert_eq!(
-            is_recursive_ntt_epool_shape(16, 8, 3),
-            enabled_here
-        );
+        assert_eq!(is_recursive_ntt_epool_shape(18, 8, 2), enabled_here);
+        assert_eq!(is_recursive_ntt_epool_shape(16, 8, 3), enabled_here);
         assert!(!is_recursive_ntt_epool_shape(17, 8, 2));
         assert!(!is_recursive_ntt_epool_shape(16, 8, 2));
     }
