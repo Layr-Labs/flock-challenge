@@ -1465,7 +1465,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 _ => None,
             })
             .collect();
-        let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
+        let mut rs_dense_all: Vec<&[F128]> = Vec::with_capacity(n_rs);
+        rs_dense_all.extend_from_slice(&rs_baked);
         rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
         let prime = b_combined
             .par_chunks_mut(2)

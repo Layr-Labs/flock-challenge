@@ -1615,8 +1615,9 @@ fn prove_padded_inner<Ch: Challenger>(
                 e1 = ne1;
                 einf = neinf;
             } else {
-                // Final round: just fold; z_vec collapses to z_partial.
-                sumcheck_bind_top_in_place_par(&mut comb_vec, r);
+                // Final round: only z_vec is needed after the round, where it
+                // becomes z_partial. The final comb_vec evaluation is already
+                // committed in (e1, einf), so folding comb_vec here is dead work.
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
         }
@@ -1630,8 +1631,7 @@ fn prove_padded_inner<Ch: Challenger>(
     }
 
     // 6. Send `z_partial` (the post-sumcheck collapsed z_vec). Length 2^k_skip.
-    let z_partial = z_vec.clone();
-    challenger.observe_f128_slice(&z_partial);
+    challenger.observe_f128_slice(&z_vec);
 
     // 7. Sample fresh z_skip AFTER observing z_partial — gives Schwartz-Zippel
     //    soundness on the φ8 (univariate-skip) dim.
@@ -1641,7 +1641,7 @@ fn prove_padded_inner<Ch: Challenger>(
     //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest; the
     //    PCS catches mismatches downstream.
     let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
-    let w = inner_product(&lambda, &z_partial);
+    let w = inner_product(&lambda, &z_vec);
 
     // 9. Convert sumcheck challenges to LSB-first `x_inner_rest` order. The
     //    loop binds the TOP bit each round, so r_rounds[0] bound bit
@@ -1651,7 +1651,10 @@ fn prove_padded_inner<Ch: Challenger>(
     let mut r_inner_rest = r_rounds;
     r_inner_rest.reverse();
 
-    let proof = LincheckProof { rounds, z_partial };
+    let proof = LincheckProof {
+        rounds,
+        z_partial: z_vec,
+    };
     let claim = LincheckClaim {
         r_inner_skip,
         r_inner_rest,

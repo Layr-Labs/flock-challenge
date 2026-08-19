@@ -135,27 +135,25 @@ pub enum VerifyError {
 /// parallelizes across chunks at the cost of one extra inversion per chunk
 /// (negligible: ~N/CHUNK inversions total). Panics (debug) on a zero input —
 /// `q(x) = 0` happens with probability `2⁻¹²⁸` per `x` for random `β, γ`.
-fn batch_inverse(values: &[F128]) -> Vec<F128> {
+fn batch_inverse_in_place(values: &mut [F128]) {
     // Chunk large enough that the per-chunk extra inversion is in the noise, yet
     // small enough to give rayon plenty of tasks for load balancing.
     const CHUNK: usize = 1 << 14;
-    let mut out = vec![F128::ZERO; values.len()];
-    out.par_chunks_mut(CHUNK)
-        .zip(values.par_chunks(CHUNK))
-        .for_each(|(out_c, val_c)| {
-            let mut acc = F128::ONE;
-            for (o, v) in out_c.iter_mut().zip(val_c) {
-                debug_assert!(!v.is_zero(), "batch_inverse: zero input");
-                *o = acc; // prefix product within this chunk
-                acc *= *v;
-            }
-            acc = acc.inv(); // (∏ chunk)⁻¹
-            for (o, v) in out_c.iter_mut().zip(val_c).rev() {
-                *o *= acc;
-                acc *= *v;
-            }
-        });
-    out
+    values.par_chunks_mut(CHUNK).for_each(|chunk| {
+        // Bounded per-chunk scratch replaces a second full-N output vector.
+        let original = chunk.to_vec();
+        let mut acc = F128::ONE;
+        for (o, v) in chunk.iter_mut().zip(&original) {
+            debug_assert!(!v.is_zero(), "batch_inverse: zero input");
+            *o = acc; // prefix product within this chunk
+            acc *= *v;
+        }
+        acc = acc.inv(); // (∏ chunk)⁻¹
+        for (o, v) in chunk.iter_mut().zip(&original).rev() {
+            *o *= acc;
+            acc *= *v;
+        }
+    });
 }
 
 /// Basis for the identity tag `s_id`: `basis[i]` is the field element with bit
@@ -230,6 +228,36 @@ fn build_grand_product(h: &[F128]) -> Vec<F128> {
         size = half;
     }
     // v[2n-1] remains ZERO (padding).
+    v
+}
+
+/// Build the tree directly from numerator and inverse-denominator vectors,
+/// avoiding a separate full-size leaf allocation on the proving path.
+fn build_grand_product_ratios(p: &[F128], q_inv: &[F128]) -> Vec<F128> {
+    assert_eq!(p.len(), q_inv.len());
+    let n = p.len();
+    assert!(n.is_power_of_two() && n >= 2);
+    let mut v = vec![F128::ZERO; 2 * n];
+    v[..n]
+        .par_iter_mut()
+        .zip(p)
+        .zip(q_inv)
+        .for_each(|((leaf, px), qx)| *leaf = *px * *qx);
+    let mut read = 0;
+    let mut size = n;
+    let mut write = n;
+    while size > 1 {
+        let half = size / 2;
+        let (done, rest) = v.split_at_mut(write);
+        let src = &done[read..read + size];
+        rest[..half]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(j, d)| *d = src[2 * j] * src[2 * j + 1]);
+        read = write;
+        write += half;
+        size = half;
+    }
     v
 }
 
@@ -518,22 +546,27 @@ pub fn prove<C: Challenger>(
         }
     }
     let s_sig_vec: Vec<F128> = sigma.par_iter().map(|&sx| s_id_vec[sx]).collect();
-    let p: Vec<F128> = f
-        .par_iter()
-        .zip(&s_id_vec)
-        .map(|(fx, sx)| *fx + beta * *sx + gamma)
-        .collect();
-    let q: Vec<F128> = g
-        .par_iter()
-        .zip(&s_sig_vec)
-        .map(|(gx, sx)| *gx + beta * *sx + gamma)
-        .collect();
-    let q_inv = batch_inverse(&q);
-    let leaves: Vec<F128> = p.par_iter().zip(&q_inv).map(|(px, qx)| *px * *qx).collect();
+    // These two witness polynomials are independent; construct them concurrently
+    // before the denominator is consumed by in-place batch inversion.
+    let (p, mut q): (Vec<F128>, Vec<F128>) = rayon::join(
+        || {
+            f.par_iter()
+                .zip(&s_id_vec)
+                .map(|(fx, sx)| *fx + beta * *sx + gamma)
+                .collect()
+        },
+        || {
+            g.par_iter()
+                .zip(&s_sig_vec)
+                .map(|(gx, sx)| *gx + beta * *sx + gamma)
+                .collect()
+        },
+    );
+    batch_inverse_in_place(&mut q);
 
-    // Grand-product tree over the leaves and its derived views. The first half
-    // of `v` IS the leaves (`v(0,x) = ℓ(x)`), so no separate `h` is committed.
-    let v = build_grand_product(&leaves);
+    // The first half of `v` IS the ratio leaves (`v(0,x) = ℓ(x)`), so write
+    // them directly into their committed destination instead of staging them.
+    let v = build_grand_product_ratios(&p, &q);
     let a: Vec<F128> = (0..n).into_par_iter().map(|i| v[2 * i]).collect();
     let b: Vec<F128> = (0..n).into_par_iter().map(|i| v[2 * i + 1]).collect();
     let c: Vec<F128> = v[n..2 * n].to_vec(); // c[i] = v[n+i]
@@ -860,9 +893,9 @@ mod tests {
         let s_id_vec: Vec<F128> = (0..n).map(|x| s_id_value(x, &basis)).collect();
         let s_sig_vec: Vec<F128> = (0..n).map(|x| s_id_value(sigma[x], &basis)).collect();
         let p: Vec<F128> = (0..n).map(|x| f[x] + beta * s_id_vec[x] + gamma).collect();
-        let q: Vec<F128> = (0..n).map(|x| g[x] + beta * s_sig_vec[x] + gamma).collect();
-        let q_inv = batch_inverse(&q);
-        let leaves: Vec<F128> = (0..n).map(|x| p[x] * q_inv[x]).collect();
+        let mut q: Vec<F128> = (0..n).map(|x| g[x] + beta * s_sig_vec[x] + gamma).collect();
+        batch_inverse_in_place(&mut q);
+        let leaves: Vec<F128> = (0..n).map(|x| p[x] * q[x]).collect();
         let v = build_grand_product(&leaves);
 
         let rho = &claim.rho;

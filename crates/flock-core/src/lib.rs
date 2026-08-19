@@ -77,6 +77,17 @@ pub fn micro_stack_enabled() -> bool {
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // 2026-08-18 (r1476+): the 8-thread cap is REVOKED. The board's own
+    // interleaved pool-geometry curve (note-r1476) measured 10 threads
+    // (natural pool) as the champion: cap8 was +9.15 ms (+6.43%) SLOWER and
+    // cap12 +6.00 ms (+4.24%) slower on the ranked shape. The r1469
+    // "8 beats 10 on pcs::commit" note predates the current phase mix
+    // (seed pipe + r2 idle-fill + zerocheck-heavy); a fresh local interleaved
+    // A/B on this tree (8 trials) confirms cap10 > cap8 by ~8% window
+    // (1143 vs 1246 ms median; zerocheck 341 vs 384 ms). The firing worktree
+    // has always been uncapped (natural RAYON_NUM_THREADS=10 pool) — this
+    // file only aligns the dev tree with the champion geometry so a future
+    // cherry-pick cannot accidentally reintroduce the +6.4% regression.
     let n = std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
