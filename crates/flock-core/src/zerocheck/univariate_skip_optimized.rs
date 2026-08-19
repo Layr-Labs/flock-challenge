@@ -898,8 +898,19 @@ fn ranked_ab_pre_fast_policy_hoist_shape(
 pub const ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST: &str = "FLOCK_NO_ZC_AB_PRE_FAST_POLICY_HOIST";
 
 fn zc_ab_pre_fast_policy_hoist_enabled() -> bool {
-    std::env::var_os(ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST).as_deref()
-        != Some(std::ffi::OsStr::new("1"))
+    let read = || {
+        std::env::var_os(ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST).as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    };
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os(ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST).as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+        });
+        *RANKED
+    } else {
+        read()
+    }
 }
 
 /// Compile-time default for the QS5 hetero AB-precompute drain (the ranked
