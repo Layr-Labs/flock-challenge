@@ -2132,10 +2132,7 @@ pub(crate) fn induce_sumcheck_poly(
             .map(|s| s.expect("hetero queue ran every chunk"))
             .collect()
     } else {
-        (0..n_threads)
-            .into_par_iter()
-            .map(chunk_partial)
-            .collect()
+        (0..n_threads).into_par_iter().map(chunk_partial).collect()
     };
 
     // Reduce across threads: seed with the first non-empty partial (a move —
@@ -3402,74 +3399,23 @@ fn ligero_commit_impl(
     let mut mat = crate::scratch::take_f128(codeword_len);
     let alloc_elapsed = alloc_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     let mut fill_elapsed = std::time::Duration::ZERO;
-    // L1 NTT/Merkle-leaf overlap: the transform fires a per-finalized-chunk
-    // callback with a never-touched-again guarantee, so each chunk's disjoint
-    // leaf range is hashed on the otherwise idle GPU while the CPU is still
-    // producing the remaining chunks. Transcript-legal (no observe/sample
-    // between NTT start and the root observe); `begin` pays every init/wrap
-    // cost before the race clocks below and returns `None` whenever the
-    // incumbent must run instead (kill switch `FLOCK_NO_L1_MERKLE_OVERLAP=1`,
-    // `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, latch Off, non-L1 shape, any Metal
-    // failure).
-    let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
-    let overlap = if fuse_from_message && kind == HashKind::Blake3 && leaf_size_bytes == 128 {
-        crate::gpu_commit::gpu_l1_merkle_overlap_begin(
-            mat.as_ptr().cast::<u8>(),
-            codeword_len * core::mem::size_of::<F128>(),
-            block_len,
-        )
-    } else {
-        None
-    };
     let ntt_start = timing.then(std::time::Instant::now);
-    let mut raced_tree: Option<Vec<Hash>> = None;
-    let mut race_ran = false;
-    let mut overlap_session: Option<crate::gpu_commit::L1MerkleOverlap> = None;
-    match overlap {
-        // First eligible L1 commit of the process (the warmup prove):
-        // dual-run overlapped-then-incumbent and latch the faster arm. The
-        // race's tree (the incumbent arm's) lands in `raced_tree`; `None`
-        // there means the CPU builder below, exactly the incumbent fallback.
-        Some(session) if session.measuring() => {
-            raced_tree = l1_overlap_warmup_race(
-                session,
-                poly,
-                &mut mat,
-                num_interleaved,
-                log_inv_rate,
-                ntt,
-                block_len,
-            );
-            race_ran = true;
-        }
-        Some(session) => {
-            ntt.forward_transform_interleaved_from_message_fused3_and_then(
-                poly,
-                &mut mat,
-                num_interleaved,
-                log_inv_rate,
-                |offset, chunk| session.chunk_ready(offset, chunk.len()),
-            );
-            overlap_session = Some(session);
-        }
-        None if fuse_from_message => {
-            // Write the first nontrivial radix-8 result straight from the
-            // compact message into stale codeword storage. This deletes the
-            // full replica fill and the first pass's destination reads/RFOs.
-            ntt.forward_transform_interleaved_from_message_fused3(
-                poly,
-                &mut mat,
-                num_interleaved,
-                log_inv_rate,
-            );
-        }
-        None => {
-            let fill_start = timing.then(std::time::Instant::now);
-            super::commit::replicate_message_fill(&mut mat, poly);
-            fill_elapsed = fill_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
-            // RS-encode every lane in one call (each lane is one independent NTT).
-            ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
-        }
+    if fuse_from_message {
+        // Write the first nontrivial radix-8 result straight from the compact
+        // message into stale codeword storage. This deletes the full replica
+        // fill and the first pass's destination reads/RFOs.
+        ntt.forward_transform_interleaved_from_message_fused3(
+            poly,
+            &mut mat,
+            num_interleaved,
+            log_inv_rate,
+        );
+    } else {
+        let fill_start = timing.then(std::time::Instant::now);
+        super::commit::replicate_message_fill(&mut mat, poly);
+        fill_elapsed = fill_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+        // RS-encode every lane in one call (each lane is one independent NTT).
+        ntt.forward_transform_interleaved_from_layer(&mut mat, num_interleaved, log_inv_rate);
     }
     let ntt_elapsed = ntt_start
         .map_or(std::time::Duration::ZERO, |t| t.elapsed())
@@ -3477,6 +3423,7 @@ fn ligero_commit_impl(
 
     // Merkle over rows. One leaf = `num_interleaved` consecutive F128 = 16·num_interleaved bytes.
     let merkle_start = timing.then(std::time::Instant::now);
+    let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
     let data_bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(
             mat.as_ptr() as *const u8,
@@ -3489,16 +3436,7 @@ fn ligero_commit_impl(
     // returns the bit-identical flat tree or `None` for the exact CPU path
     // (kill switch `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, non-Blake3 hashes,
     // other shapes, and every GPU failure).
-    let gpu_tree = if race_ran {
-        raced_tree
-    } else if let Some(session) = overlap_session {
-        // Drain the overlapped leaf pass; any failure falls back to the
-        // incumbent whole-tree offload (then the CPU builder) — exact same
-        // bytes either way.
-        session
-            .finish()
-            .or_else(|| crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len))
-    } else if matches!(kind, HashKind::Blake3) && leaf_size_bytes == 128 {
+    let gpu_tree = if matches!(kind, HashKind::Blake3) && leaf_size_bytes == 128 {
         crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
     } else {
         None
@@ -3542,109 +3480,6 @@ fn ligero_commit_impl(
         block_len,
         num_interleaved,
     }
-}
-
-/// L1 overlap warmup race (see `gpu_commit::l1_overlap_report`): decide the
-/// process latch by racing the overlapped commit arm against the incumbent
-/// over the same message and codeword storage — the fused3 transform rewrites
-/// every codeword element from `poly`, so re-running is byte-idempotent. An
-/// untimed incumbent PRIMER first brings the codeword, wrap and GPU to the
-/// stationary hot state the timed prove sees (without it the first arm eats
-/// the cold-clock/cold-cache bias alone); each arm then runs three times and
-/// the per-arm MINIMUM walls race, damping scheduler noise. Every overlapped
-/// tree is byte-compared against the incumbent's; any mismatch or failure
-/// latches Off. Returns an INCUMBENT-arm GPU tree (`None` → the caller's CPU
-/// builder), so the warmup prove's bytes never depend on the overlapped arm.
-fn l1_overlap_warmup_race(
-    session: crate::gpu_commit::L1MerkleOverlap,
-    poly: &[F128],
-    mat: &mut [F128],
-    num_interleaved: usize,
-    log_inv_rate: usize,
-    ntt: &AdditiveNttF128,
-    block_len: usize,
-) -> Option<Vec<Hash>> {
-    let run_incumbent = |mat: &mut [F128]| -> (Option<Vec<Hash>>, f64) {
-        let t = std::time::Instant::now();
-        ntt.forward_transform_interleaved_from_message_fused3(
-            poly,
-            mat,
-            num_interleaved,
-            log_inv_rate,
-        );
-        let data_bytes: &[u8] = unsafe {
-            core::slice::from_raw_parts(mat.as_ptr().cast::<u8>(), core::mem::size_of_val(mat))
-        };
-        let tree = crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len);
-        (tree, t.elapsed().as_secs_f64() * 1e3)
-    };
-
-    // Primer (untimed).
-    let (primer_tree, _) = run_incumbent(mat);
-    let Some(mut incumbent_tree) = primer_tree else {
-        // No incumbent GPU tree — nothing to overlap with; latch Off.
-        crate::gpu_commit::l1_overlap_report(f64::INFINITY, 0.0, None);
-        return None;
-    };
-
-    // In the timed prove the L1 commit follows 10+ ms of CPU-only sumcheck
-    // folds, so its GPU dispatches run on idle-decayed clocks — the exact
-    // regime the overlap hides under the NTT. Racing the arms back-to-back
-    // instead lets the second arm reap the first arm's clock ramp (measured:
-    // the incumbent's whole-tree pass drops from its steady ~1.4 ms timed
-    // wall to ~0.6 ms in-race, flip-flopping the latch). Re-create the timed
-    // approach with a short GPU-idle settle before each timed arm.
-    let settle = || std::thread::sleep(std::time::Duration::from_millis(12));
-
-    let mut next_session = Some(session);
-    let mut wall_a = f64::INFINITY;
-    let mut wall_b = f64::INFINITY;
-    let mut equal = true;
-    // Three samples per arm, racing the minima: single warmup-prove samples
-    // of either arm swing by >1.5 ms with pcs-open context noise (measured),
-    // and the latch must not go Off on one unlucky overlapped sample.
-    for _round in 0..3 {
-        // Overlapped arm.
-        let Some(s) = next_session.take().or_else(|| {
-            crate::gpu_commit::gpu_l1_merkle_overlap_begin(
-                mat.as_ptr().cast::<u8>(),
-                core::mem::size_of_val(&*mat),
-                block_len,
-            )
-        }) else {
-            crate::gpu_commit::l1_overlap_report(f64::INFINITY, wall_b, None);
-            return Some(incumbent_tree);
-        };
-        settle();
-        let t = std::time::Instant::now();
-        ntt.forward_transform_interleaved_from_message_fused3_and_then(
-            poly,
-            mat,
-            num_interleaved,
-            log_inv_rate,
-            |offset, chunk| s.chunk_ready(offset, chunk.len()),
-        );
-        let tree_a = s.finish();
-        wall_a = wall_a.min(t.elapsed().as_secs_f64() * 1e3);
-        let Some(tree_a) = tree_a else {
-            crate::gpu_commit::l1_overlap_report(f64::INFINITY, wall_b, None);
-            return Some(incumbent_tree);
-        };
-        equal &= tree_a == incumbent_tree;
-        crate::scratch::give_hash_tree(tree_a);
-
-        // Incumbent arm.
-        settle();
-        let (tree_b, round_wall_b) = run_incumbent(mat);
-        let Some(tree_b) = tree_b else {
-            crate::gpu_commit::l1_overlap_report(wall_a, f64::INFINITY, None);
-            return Some(incumbent_tree);
-        };
-        wall_b = wall_b.min(round_wall_b);
-        crate::scratch::give_hash_tree(std::mem::replace(&mut incumbent_tree, tree_b));
-    }
-    crate::gpu_commit::l1_overlap_report(wall_a, wall_b, Some(equal));
-    Some(incumbent_tree)
 }
 
 // ===================================================================
@@ -3921,9 +3756,7 @@ fn partial_eval_lsb_one(evals: &mut Vec<F128>, r: F128) {
 /// rayon-only passes as the same-binary A/B control.
 fn lig_fold_hetero_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !std::env::var("FLOCK_NO_LIG_FOLD_HETERO").is_ok_and(|v| v == "1")
-    })
+    *ON.get_or_init(|| !std::env::var("FLOCK_NO_LIG_FOLD_HETERO").is_ok_and(|v| v == "1"))
 }
 
 /// Same contract for the dense recursive-commit basis induction sweep:
@@ -3931,9 +3764,7 @@ fn lig_fold_hetero_enabled() -> bool {
 /// main-pool-only per-worker query split.
 fn lig_induce_hetero_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !std::env::var("FLOCK_NO_LIG_INDUCE_HETERO").is_ok_and(|v| v == "1")
-    })
+    *ON.get_or_init(|| !std::env::var("FLOCK_NO_LIG_INDUCE_HETERO").is_ok_and(|v| v == "1"))
 }
 
 /// Fused fold + next-round message in a SINGLE parallel pass.
@@ -4318,8 +4149,7 @@ fn fold2_and_msgs_lsb(
             }
         }
     };
-    let merge = |(a0, a2, ac): (F128, F128, [F128; 6]),
-                 (b0, b2, bc): (F128, F128, [F128; 6])| {
+    let merge = |(a0, a2, ac): (F128, F128, [F128; 6]), (b0, b2, bc): (F128, F128, [F128; 6])| {
         let mut c = ac;
         for (x, y) in c.iter_mut().zip(bc.iter()) {
             *x += *y;
@@ -4328,34 +4158,32 @@ fn fold2_and_msgs_lsb(
     };
     // Hetero queue over the identical chunk grid: same bases, same kernel,
     // XOR-merged partials — bytes unchanged, only chunk ownership differs.
-    let acc = if quarter >= 16 * CHUNK
-        && lig_fold_hetero_enabled()
-        && crate::epool::epool().is_some()
-    {
-        let n_chunks = quarter / CHUNK;
-        let mut partials = vec![(F128::ZERO, F128::ZERO, [F128::ZERO; 6]); n_chunks];
-        let f_base = crate::epool::SyncPtr(wf.as_mut_ptr());
-        let b_base = crate::epool::SyncPtr(wb.as_mut_ptr());
-        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_hetero_chunks(n_chunks, |ci| {
-            // SAFETY: each `ci` claimed exactly once; disjoint output ranges
-            // and partial slot per chunk, published by the two-pool join.
-            unsafe {
-                let wfc = core::slice::from_raw_parts_mut(f_base.ptr().add(ci * CHUNK), CHUNK);
-                let wbc = core::slice::from_raw_parts_mut(b_base.ptr().add(ci * CHUNK), CHUNK);
-                partials_base.ptr().add(ci).write(chunk_body(ci, wfc, wbc));
-            }
-        });
-        partials
-            .into_iter()
-            .fold((F128::ZERO, F128::ZERO, [F128::ZERO; 6]), merge)
-    } else {
-        wf.par_chunks_mut(CHUNK)
-            .zip(wb.par_chunks_mut(CHUNK))
-            .enumerate()
-            .map(|(ci, (wfc, wbc))| chunk_body(ci, wfc, wbc))
-            .reduce(|| (F128::ZERO, F128::ZERO, [F128::ZERO; 6]), merge)
-    };
+    let acc =
+        if quarter >= 16 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
+            let n_chunks = quarter / CHUNK;
+            let mut partials = vec![(F128::ZERO, F128::ZERO, [F128::ZERO; 6]); n_chunks];
+            let f_base = crate::epool::SyncPtr(wf.as_mut_ptr());
+            let b_base = crate::epool::SyncPtr(wb.as_mut_ptr());
+            let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+            crate::epool::run_hetero_chunks(n_chunks, |ci| {
+                // SAFETY: each `ci` claimed exactly once; disjoint output ranges
+                // and partial slot per chunk, published by the two-pool join.
+                unsafe {
+                    let wfc = core::slice::from_raw_parts_mut(f_base.ptr().add(ci * CHUNK), CHUNK);
+                    let wbc = core::slice::from_raw_parts_mut(b_base.ptr().add(ci * CHUNK), CHUNK);
+                    partials_base.ptr().add(ci).write(chunk_body(ci, wfc, wbc));
+                }
+            });
+            partials
+                .into_iter()
+                .fold((F128::ZERO, F128::ZERO, [F128::ZERO; 6]), merge)
+        } else {
+            wf.par_chunks_mut(CHUNK)
+                .zip(wb.par_chunks_mut(CHUNK))
+                .enumerate()
+                .map(|(ci, (wfc, wbc))| chunk_body(ci, wfc, wbc))
+                .reduce(|| (F128::ZERO, F128::ZERO, [F128::ZERO; 6]), merge)
+        };
     (
         SumcheckMessage {
             u_0: acc.0,
