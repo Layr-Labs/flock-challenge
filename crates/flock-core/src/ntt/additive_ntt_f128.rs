@@ -153,13 +153,13 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
 /// the large twiddle table is already resident from the untimed warm proof.
 /// Clone into the original nested-`Vec` representation so transform object
 /// layout and hot-loop dereferencing remain unchanged.
-fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
-    static TABLES: OnceLock<[OnceLock<Vec<Vec<F128>>>; 65]> = OnceLock::new();
+fn cached_standard_evals(dim: usize) -> Arc<[Vec<F128>]> {
+    static TABLES: OnceLock<[OnceLock<Arc<[Vec<F128>]>>; 65]> = OnceLock::new();
     let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
     tables[dim]
         .get_or_init(|| {
             let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-            generate_evals_from_subspace(&basis)
+            Arc::from(generate_evals_from_subspace(&basis))
         })
         .clone()
 }
@@ -493,7 +493,7 @@ const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
-    evals: Vec<Vec<F128>>,
+    evals: Arc<[Vec<F128>]>,
     /// Breadth-first table: layer `l` starts at `2^l - 1`.
     precomputed_twiddles: Option<Arc<[F128]>>,
 }
@@ -501,7 +501,7 @@ pub struct AdditiveNttF128 {
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
-        let evals = generate_evals_from_subspace(basis);
+        let evals: Arc<[Vec<F128>]> = Arc::from(generate_evals_from_subspace(basis));
         let precomputed_twiddles = precompute_twiddles(&evals).map(Arc::from);
         Self {
             evals,
@@ -513,7 +513,7 @@ impl AdditiveNttF128 {
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
-        let evals = cached_standard_evals(dim);
+        let evals: Arc<[Vec<F128>]> = cached_standard_evals(dim);
         let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
         Self {
             evals,
