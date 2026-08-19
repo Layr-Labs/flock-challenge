@@ -32,6 +32,17 @@ use flock_core::pcs::{self, Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
+
+fn phase_timing_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    if crate::seed_pipe::is_ranked_worker() {
+        static RANKED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_PHASE_TIMING").is_some());
+        *RANKED
+    } else {
+        read()
+    }
+}
 #[inline]
 fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
@@ -452,7 +463,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = phase_timing_enabled();
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
     // Publish-prefix pre-encode: `commitment` / `zc_proof` / `lc_proof` are
@@ -862,7 +873,7 @@ fn commit_with_round1_ab_precompute(
             // from this arm's measured wall (an Instant read is free; the
             // store is one relaxed atomic per prove).
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
-            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            if phase_timing_enabled() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
             r
@@ -955,7 +966,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = phase_timing_enabled();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>| {
         let cpu0 = phase_timing.then(process_cpu_ms);
         let t_commit = std::time::Instant::now();

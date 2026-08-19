@@ -1576,6 +1576,117 @@ fn build_block_witness_ab_stream_into(
     }
 }
 
+/// Ranked-worker controls are fixed for the process and first queried by the
+/// untimed warm-up. Non-ranked callers remain uncached for same-process tests.
+fn full_stripe_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_FULL_STRIPE").is_some();
+    if crate::seed_pipe::is_ranked_worker() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_FULL_STRIPE").is_some()
+        });
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn deferred_lincheck_stripe_disabled() -> bool {
+    let read = || std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some();
+    if crate::seed_pipe::is_ranked_worker() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some()
+        });
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn phase_timing_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    if crate::seed_pipe::is_ranked_worker() {
+        static RANKED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_PHASE_TIMING").is_some());
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn hot_codeword_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none();
+    if crate::seed_pipe::is_ranked_worker() {
+        static RANKED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none());
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn reverse_lincheck_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none();
+    if crate::seed_pipe::is_ranked_worker() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
+        });
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+const WITGEN_STREAM_SEGMENTS: usize = 8;
+const WITGEN_STREAM_GROUPS_PER_SEGMENT: usize = 4096;
+const WITGEN_STREAM_SLAB: usize = super::common::WITGEN_HETERO_SLAB;
+const WITGEN_STREAM_MAX_BANDS: usize = 9;
+const WITGEN_UNIFORM_SCHEDULE: [usize; 8] = [512; 8];
+const WITGEN_TAPERED_SCHEDULE: [usize; 9] = [512, 512, 512, 512, 512, 512, 512, 448, 64];
+
+struct WitgenContinuousPlan {
+    band_offset: [usize; WITGEN_STREAM_MAX_BANDS],
+    slab_band: Box<[u32]>,
+    slab_g0: Box<[u32]>,
+}
+
+fn build_witgen_continuous_plan(schedule: &[usize]) -> WitgenContinuousPlan {
+    debug_assert!(schedule.len() <= WITGEN_STREAM_MAX_BANDS);
+    debug_assert_eq!(
+        schedule.iter().sum::<usize>(),
+        WITGEN_STREAM_GROUPS_PER_SEGMENT
+    );
+    let mut band_offset = [0usize; WITGEN_STREAM_MAX_BANDS];
+    let mut next_offset = 0usize;
+    for (i, &groups) in schedule.iter().enumerate() {
+        band_offset[i] = next_offset;
+        next_offset += groups;
+    }
+
+    let slab_count =
+        WITGEN_STREAM_SEGMENTS * WITGEN_STREAM_GROUPS_PER_SEGMENT / WITGEN_STREAM_SLAB;
+    let mut slab_band = Vec::with_capacity(slab_count);
+    let mut slab_g0 = Vec::with_capacity(slab_count);
+    for (band, &groups) in schedule.iter().enumerate() {
+        debug_assert!(groups.is_multiple_of(WITGEN_STREAM_SLAB));
+        for segment in 0..WITGEN_STREAM_SEGMENTS {
+            for local in (0..groups).step_by(WITGEN_STREAM_SLAB) {
+                slab_band.push(band as u32);
+                slab_g0.push(
+                    (segment * WITGEN_STREAM_GROUPS_PER_SEGMENT
+                        + band_offset[band]
+                        + local) as u32,
+                );
+            }
+        }
+    }
+    debug_assert_eq!(slab_band.len(), slab_count);
+    WitgenContinuousPlan {
+        band_offset,
+        slab_band: slab_band.into_boxed_slice(),
+        slab_g0: slab_g0.into_boxed_slice(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // W-H2: SIMD-lockstep witness materialization (aarch64). Derivation and
 // pricing: notes/witgen-simd.md. Four compressions run in u32-lane lockstep
@@ -1689,10 +1800,18 @@ pub(crate) mod witgen_simd {
     }
 
     /// Exact-`1` kill switch for the constant-region elision (item B).
-    /// Read per witgen call (uncached) so same-process A/B tests can
-    /// toggle it.
+    /// Non-ranked callers remain uncached for same-process A/B tests. The
+    /// ranked worker resolves its fixed environment during untimed warm-up.
     fn const_elide_killed() -> bool {
-        std::env::var("FLOCK_NO_SCRATCH_CONST_ELIDE").is_ok_and(|v| v == "1")
+        let read = || std::env::var("FLOCK_NO_SCRATCH_CONST_ELIDE").is_ok_and(|v| v == "1");
+        if crate::seed_pipe::is_ranked_worker() {
+            static RANKED: LazyLock<bool> = LazyLock::new(|| {
+                std::env::var("FLOCK_NO_SCRATCH_CONST_ELIDE").is_ok_and(|v| v == "1")
+            });
+            *RANKED
+        } else {
+            read()
+        }
     }
 
     /// Bitmask of token hits (bit0 z, bit1 a, bit2 b) of the most recent
@@ -1806,6 +1925,30 @@ pub(crate) mod witgen_simd {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_SIMD").is_none());
         *ON
+    }
+
+    fn stream_taper_enabled() -> bool {
+        let read = || std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
+        if crate::seed_pipe::is_ranked_worker() {
+            static RANKED: LazyLock<bool> =
+                LazyLock::new(|| std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none());
+            *RANKED
+        } else {
+            read()
+        }
+    }
+
+    fn continuous_queue_enabled() -> bool {
+        let read =
+            || !std::env::var("FLOCK_NO_WITGEN_CONT_QUEUE").is_ok_and(|v| v == "1");
+        if crate::seed_pipe::is_ranked_worker() {
+            static RANKED: LazyLock<bool> = LazyLock::new(|| {
+                !std::env::var("FLOCK_NO_WITGEN_CONT_QUEUE").is_ok_and(|v| v == "1")
+            });
+            *RANKED
+        } else {
+            read()
+        }
     }
 
     fn nt_enabled() -> bool {
@@ -2447,7 +2590,7 @@ pub(crate) mod witgen_simd {
             n_total >= 8 && n_total.is_multiple_of(8),
             "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
         );
-        let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+        let stripe_useful_bits = if super::full_stripe_enabled() {
             K
         } else {
             USEFUL_BITS
@@ -2652,9 +2795,9 @@ pub(crate) mod witgen_simd {
         let claimed_before = super::super::common::witgen_hetero_trace()
             .then(flock_core::epool::helper_chunks_claimed);
         if let Some(stream) = &mut stream {
-            const SEGMENTS: usize = 8;
+            const SEGMENTS: usize = super::WITGEN_STREAM_SEGMENTS;
             let groups_per_segment = n_groups / SEGMENTS;
-            debug_assert_eq!(groups_per_segment, 4096);
+            debug_assert_eq!(groups_per_segment, super::WITGEN_STREAM_GROUPS_PER_SEGMENT);
             // Band schedule in groups-per-segment units (each unit maps to 16
             // streamed r tiles across all 8 segments). The GPU consumes the
             // first NTT pass at witness-production pace with zero inter-band
@@ -2666,17 +2809,14 @@ pub(crate) mod witgen_simd {
             // A/B (`FLOCK_NO_STREAM_TAPER=1`).
             // Tail band of 64 gps keeps 8 hetero slabs (WITGEN_HETERO_SLAB =
             // 64 jobs) so its drain still parallelizes across the pool.
-            const UNIFORM_SCHEDULE: &[usize] = &[512; 8];
-            const TAPERED_SCHEDULE: &[usize] = &[512, 512, 512, 512, 512, 512, 512, 448, 64];
             // A/B-CONTROL: set to `false` for the official-harness control
             // build. The env kill switch exists for same-binary diagnostics.
             const STREAM_TAPER_DEFAULT: bool = true;
-            let tapered =
-                STREAM_TAPER_DEFAULT && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
-            let schedule = if tapered {
-                TAPERED_SCHEDULE
+            let tapered = STREAM_TAPER_DEFAULT && stream_taper_enabled();
+            let schedule: &[usize] = if tapered {
+                &super::WITGEN_TAPERED_SCHEDULE
             } else {
-                UNIFORM_SCHEDULE
+                &super::WITGEN_UNIFORM_SCHEDULE
             };
             debug_assert_eq!(schedule.iter().sum::<usize>(), groups_per_segment);
             // Item A (continuous claim queue): replace the 8–9 per-band full
@@ -2691,44 +2831,41 @@ pub(crate) mod witgen_simd {
             // worker-thread submission needs no extra pool handling.
             // `FLOCK_NO_WITGEN_CONT_QUEUE=1` restores the incumbent band
             // loop exactly.
-            let cont_queue = !std::env::var("FLOCK_NO_WITGEN_CONT_QUEUE").is_ok_and(|v| v == "1");
+            let cont_queue = continuous_queue_enabled();
             if cont_queue {
                 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-                const SLAB: usize = super::super::common::WITGEN_HETERO_SLAB;
+                const SLAB: usize = super::WITGEN_STREAM_SLAB;
+                const MAX_BANDS: usize = super::WITGEN_STREAM_MAX_BANDS;
+                static TAPERED_PLAN: LazyLock<super::WitgenContinuousPlan> = LazyLock::new(|| {
+                    super::build_witgen_continuous_plan(&super::WITGEN_TAPERED_SCHEDULE)
+                });
+                static UNIFORM_PLAN: LazyLock<super::WitgenContinuousPlan> = LazyLock::new(|| {
+                    super::build_witgen_continuous_plan(&super::WITGEN_UNIFORM_SCHEDULE)
+                });
+                let plan = if tapered {
+                    &*TAPERED_PLAN
+                } else {
+                    &*UNIFORM_PLAN
+                };
+                let band_offset = &plan.band_offset;
+                let slab_band = &plan.slab_band;
+                let slab_g0 = &plan.slab_g0;
                 let n_bands = schedule.len();
-                let band_offset: Vec<usize> = schedule
-                    .iter()
-                    .scan(0usize, |o, &gps| {
-                        let cur = *o;
-                        *o += gps;
-                        Some(cur)
+                let remaining: [AtomicUsize; MAX_BANDS] = std::array::from_fn(|i| {
+                    AtomicUsize::new(if i < n_bands {
+                        SEGMENTS * schedule[i] / SLAB
+                    } else {
+                        0
                     })
-                    .collect();
-                // Slab table in band-major order (band, then segment, then
-                // local) — the incumbent's claim order, minus its joins. A
-                // slab never straddles a segment or a band: every schedule
-                // entry is a multiple of the 64-group slab.
-                let mut slab_band: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
-                let mut slab_g0: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
-                for (i, &gps) in schedule.iter().enumerate() {
-                    debug_assert!(gps.is_multiple_of(SLAB));
-                    for seg in 0..SEGMENTS {
-                        for l in (0..gps).step_by(SLAB) {
-                            slab_band.push(i as u32);
-                            slab_g0.push((seg * groups_per_segment + band_offset[i] + l) as u32);
-                        }
-                    }
-                }
-                debug_assert_eq!(slab_band.len(), n_groups / SLAB);
-                let remaining: Vec<AtomicUsize> = schedule
-                    .iter()
-                    .map(|&gps| AtomicUsize::new(SEGMENTS * gps / SLAB))
-                    .collect();
-                let done: Vec<AtomicBool> = (0..n_bands).map(|_| AtomicBool::new(false)).collect();
-                let timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
-                let t0 = std::time::Instant::now();
-                let done_ns: Vec<AtomicU64> = (0..n_bands).map(|_| AtomicU64::new(0)).collect();
-                let submit_ns: Vec<AtomicU64> = (0..n_bands).map(|_| AtomicU64::new(0)).collect();
+                });
+                let done: [AtomicBool; MAX_BANDS] =
+                    std::array::from_fn(|_| AtomicBool::new(false));
+                let timing = super::phase_timing_enabled();
+                let t0 = timing.then(std::time::Instant::now);
+                let done_ns: [AtomicU64; MAX_BANDS] =
+                    std::array::from_fn(|_| AtomicU64::new(0));
+                let submit_ns: [AtomicU64; MAX_BANDS] =
+                    std::array::from_fn(|_| AtomicU64::new(0));
                 struct SubmitSeq<'a> {
                     next: usize,
                     stream: &'a mut flock_core::gpu_commit::FromZFirstPassStream,
@@ -2744,7 +2881,10 @@ pub(crate) mod witgen_simd {
                     // stores for this band before publishing/submitting it.
                     if remaining[band].fetch_sub(1, Ordering::AcqRel) == 1 {
                         if timing {
-                            done_ns[band].store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            done_ns[band].store(
+                                t0.as_ref().unwrap().elapsed().as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
                         }
                         done[band].store(true, Ordering::Release);
                         // Blocking lock (never try_lock): the current holder
@@ -2762,8 +2902,10 @@ pub(crate) mod witgen_simd {
                                 .submit_ready_range(band_offset[b] * 16, schedule[b] * 16);
                             seq.next += 1;
                             if timing {
-                                submit_ns[b]
-                                    .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                submit_ns[b].store(
+                                    t0.as_ref().unwrap().elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
                             }
                         }
                     }
@@ -2802,7 +2944,7 @@ pub(crate) mod witgen_simd {
                 // join − last_claim is the per-band join-barrier bubble (the
                 // stretch where at most one worker is still finishing its final
                 // slab while every other core waits at the band join).
-                let band_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+                let band_timing = super::phase_timing_enabled();
                 let t_bands = std::time::Instant::now();
                 let mut offset = 0usize;
                 for (band_i, &band_gps) in schedule.iter().enumerate() {
@@ -3033,7 +3175,7 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+    let stripe_useful_bits = if full_stripe_enabled() {
         K
     } else {
         USEFUL_BITS
@@ -3116,8 +3258,8 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
         pcs_params,
         cfg!(all(target_os = "macos", target_arch = "aarch64")),
         flock_core::epool::helper_pool_available(),
-        std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some(),
-        std::env::var_os("FLOCK_FULL_STRIPE").is_some(),
+        deferred_lincheck_stripe_disabled(),
+        full_stripe_enabled(),
     )
 }
 
@@ -3138,7 +3280,7 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
     Option<flock_core::gpu_commit::FromZFirstPassStream>,
 ) {
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+    let stripe_useful_bits = if full_stripe_enabled() {
         K
     } else {
         USEFUL_BITS
@@ -3241,7 +3383,7 @@ impl Blake3Setup {
             && self.pcs_params.log_batch_size == 6
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && self.pcs_params.merkle_hash == HashKind::Blake3
-            && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
+            && hot_codeword_enabled()
     }
 
     /// Select the reverse transpose only for the promoted benchmark geometry.
@@ -3262,7 +3404,7 @@ impl Blake3Setup {
             && self.pcs_params.log_inv_rate == 1
             && self.pcs_params.log_batch_size == 6
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
-            && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
+            && reverse_lincheck_enabled()
     }
 
     #[inline]
@@ -3518,7 +3660,7 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+        let phase_timing = phase_timing_enabled();
         if self.use_ranked_rate2_hot_codeword() {
             // From-message commit: the layer-1 NTT pass synthesizes both
             // rate-1/2 replicas straight from z_packed, so the witness
@@ -4021,6 +4163,39 @@ pub fn generate_witness_batch_major(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_witgen_continuous_plans_match_band_geometry() {
+        for schedule in [
+            WITGEN_UNIFORM_SCHEDULE.as_slice(),
+            WITGEN_TAPERED_SCHEDULE.as_slice(),
+        ] {
+            let plan = build_witgen_continuous_plan(schedule);
+            let expected_slabs = WITGEN_STREAM_SEGMENTS * WITGEN_STREAM_GROUPS_PER_SEGMENT
+                / WITGEN_STREAM_SLAB;
+            assert_eq!(plan.slab_band.len(), expected_slabs);
+            assert_eq!(plan.slab_g0.len(), expected_slabs);
+
+            let mut slab = 0;
+            let mut offset = 0;
+            for (band, &groups) in schedule.iter().enumerate() {
+                assert_eq!(plan.band_offset[band], offset);
+                for segment in 0..WITGEN_STREAM_SEGMENTS {
+                    for local in (0..groups).step_by(WITGEN_STREAM_SLAB) {
+                        assert_eq!(plan.slab_band[slab], band as u32);
+                        assert_eq!(
+                            plan.slab_g0[slab] as usize,
+                            segment * WITGEN_STREAM_GROUPS_PER_SEGMENT + offset + local
+                        );
+                        slab += 1;
+                    }
+                }
+                offset += groups;
+            }
+            assert_eq!(slab, expected_slabs);
+            assert_eq!(offset, WITGEN_STREAM_GROUPS_PER_SEGMENT);
+        }
+    }
 
     /// SplitMix64.
     struct Rng(u64);
