@@ -22,3 +22,4 @@
 //!
 //! Lane mandate: never sit empty. This is occupancy + floor re-sample after
 //! def1bbf (−0.18% real / −0.55% printed).
+//! gin-resample-01: bytecode-identical distribution sample of the optimized tree.
