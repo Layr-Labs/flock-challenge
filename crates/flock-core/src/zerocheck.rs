@@ -54,7 +54,13 @@ fn lookahead_off() -> bool {
     if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
+    if crate::is_ranked_worker_process() {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some());
+        *OFF
+    } else {
+        std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
+    }
 }
 
 /// Test-only forced-off latch for the second-level cascade (rounds 5+6),
@@ -75,7 +81,14 @@ fn cascade2_off() -> bool {
     if ZC_CASCADE2_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1")
+    if crate::is_ranked_worker_process() {
+        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1")
+        });
+        *OFF
+    } else {
+        std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1")
+    }
 }
 
 /// Test-only forced-off latch for the third-level cascade (rounds 7+8),
@@ -142,6 +155,41 @@ fn cascade5_off() -> bool {
     }
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some_and(|v| v == *"1"))
+}
+
+fn zc_timing_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_TIMING").is_some());
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn tail_round_timing_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some();
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some()
+        });
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn tail_hetero_trace_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some()
+        });
+        *RANKED
+    } else {
+        read()
+    }
 }
 
 /// Number of variables folded in round 1 via the additive-NTT univariate skip.
@@ -442,7 +490,8 @@ pub fn stage_commit_tail_fill<C: Challenger>(
         if m < k_skip + N_INNER {
             return;
         }
-        let t_stage = std::time::Instant::now();
+        let timing = zc_timing_enabled();
+        let t_stage = timing.then(std::time::Instant::now);
         crate::proof::bind_statement(&mut forked, r1cs, commitment);
         forked.observe_label(b"flock-zerocheck-v0");
         // Mirror of the sampling block in `prove_packed_padded_inner`
@@ -465,10 +514,10 @@ pub fn stage_commit_tail_fill<C: Challenger>(
             padding.useful_bits_per_block,
             &r,
         );
-        if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+        if timing {
             eprintln!(
                 "[commit-tail-fill] stage at graph completion: staged={staged} {:.2} ms",
-                t_stage.elapsed().as_secs_f64() * 1e3
+                t_stage.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
             );
         }
     }
@@ -533,9 +582,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
-    let cpu_r1 = crate::pcs::commit::commit_cpu_ms();
-    let t_round1 = std::time::Instant::now();
+    let zc_timing = zc_timing_enabled();
+    let cpu_r1 = zc_timing.then(crate::pcs::commit::commit_cpu_ms);
+    let t_round1 = zc_timing.then(std::time::Instant::now);
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_ref() {
@@ -580,8 +629,8 @@ fn prove_packed_padded_inner<C: Challenger>(
                     a_packed, b_packed, m, k_skip, &r, padding,
                 );
             }
-            let cpu_ab = crate::pcs::commit::commit_cpu_ms();
-            let t_ab = std::time::Instant::now();
+            let cpu_ab = zc_timing.then(crate::pcs::commit::commit_cpu_ms);
+            let t_ab = zc_timing.then(std::time::Instant::now);
             let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
                 ab_inner,
                 m,
@@ -592,12 +641,12 @@ fn prove_packed_padded_inner<C: Challenger>(
             if zc_timing {
                 eprintln!(
                     "[zc-timing] round1 AB completion: {:.2} ms cpu={:.1}",
-                    t_ab.elapsed().as_secs_f64() * 1e3,
-                    crate::pcs::commit::commit_cpu_ms() - cpu_ab,
+                    t_ab.as_ref().unwrap().elapsed().as_secs_f64() * 1e3,
+                    crate::pcs::commit::commit_cpu_ms() - cpu_ab.unwrap(),
                 );
             }
-            let cpu_c = crate::pcs::commit::commit_cpu_ms();
-            let t_c = std::time::Instant::now();
+            let cpu_c = zc_timing.then(crate::pcs::commit::commit_cpu_ms);
+            let t_c = zc_timing.then(std::time::Instant::now);
             if crate::pcs::ranked_direct_fold8_enabled() {
                 let (c, s_hat_v_c, quad, fold8) =
                     crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
@@ -613,8 +662,8 @@ fn prove_packed_padded_inner<C: Challenger>(
                 if zc_timing {
                     eprintln!(
                         "[zc-timing] round1 lincheck-stripe C (fold8): {:.2} ms cpu={:.1}",
-                        t_c.elapsed().as_secs_f64() * 1e3,
-                        crate::pcs::commit::commit_cpu_ms() - cpu_c,
+                        t_c.as_ref().unwrap().elapsed().as_secs_f64() * 1e3,
+                        crate::pcs::commit::commit_cpu_ms() - cpu_c.unwrap(),
                     );
                 }
                 (
@@ -642,8 +691,8 @@ fn prove_packed_padded_inner<C: Challenger>(
                 if zc_timing {
                     eprintln!(
                         "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",
-                        t_c.elapsed().as_secs_f64() * 1e3,
-                        crate::pcs::commit::commit_cpu_ms() - cpu_c,
+                        t_c.as_ref().unwrap().elapsed().as_secs_f64() * 1e3,
+                        crate::pcs::commit::commit_cpu_ms() - cpu_c.unwrap(),
                     );
                 }
                 (
@@ -739,8 +788,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     if zc_timing {
         eprintln!(
             "[zc-timing] round1 URM: {:.2} ms cpu={:.1}",
-            t_round1.elapsed().as_secs_f64() * 1e3,
-            crate::pcs::commit::commit_cpu_ms() - cpu_r1
+            t_round1.as_ref().unwrap().elapsed().as_secs_f64() * 1e3,
+            crate::pcs::commit::commit_cpu_ms() - cpu_r1.unwrap()
         );
     }
 
@@ -763,8 +812,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Convention A wrapping: pass `mlv_arg[0] = ONE` so the function's output
     // `mlv_arg[0] · G(1)` becomes the bare `G(1)` we send on the wire. The
     // verifier samples ρ_1 after observing this message.
-    let cpu_r2 = crate::pcs::commit::commit_cpu_ms();
-    let t_round2 = std::time::Instant::now();
+    let cpu_r2 = zc_timing.then(crate::pcs::commit::commit_cpu_ms);
+    let t_round2 = zc_timing.then(std::time::Instant::now);
     let fold_table = UniSkipFoldTable::new(k_skip, z);
     let mut mlv_arg = vec![F128::ONE; n_mlv];
     mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
@@ -811,12 +860,12 @@ fn prove_packed_padded_inner<C: Challenger>(
     if zc_timing {
         eprintln!(
             "[zc-timing] round2 fused fold: {:.2} ms cpu={:.1}",
-            t_round2.elapsed().as_secs_f64() * 1e3,
-            crate::pcs::commit::commit_cpu_ms() - cpu_r2
+            t_round2.as_ref().unwrap().elapsed().as_secs_f64() * 1e3,
+            crate::pcs::commit::commit_cpu_ms() - cpu_r2.unwrap()
         );
     }
-    let cpu_tail = crate::pcs::commit::commit_cpu_ms();
-    let t_tail = std::time::Instant::now();
+    let cpu_tail = zc_timing.then(crate::pcs::commit::commit_cpu_ms);
+    let t_tail = zc_timing.then(std::time::Instant::now);
     let mut multilinear_msgs = Vec::with_capacity(n_mlv);
     multilinear_msgs.push((msg_1, msg_inf));
     challenger.observe_f128(msg_1);
@@ -838,7 +887,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // table removes the two field multiplications per output that the generic
     // pair fold would require, while materializing exactly the ordinary
     // post-fold tables expected by all subsequent rounds.
-    let tail_round_timing = std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some();
+    let tail_round_timing = tail_round_timing_enabled();
 
     // Cascade the lookahead one level deeper (rounds 5+6, see
     // `fold2_compact_and_round45_into`): the K pass materializes each round-4
@@ -917,7 +966,7 @@ fn prove_packed_padded_inner<C: Challenger>(
 
         // Rounds three and four now fold together in one pass over the compact
         // state, replacing the T3 reconstruction *and* tail iteration i = 1.
-        let t_k = std::time::Instant::now();
+        let t_k = tail_round_timing.then(std::time::Instant::now);
         let n_groups = compact_mlv.len() / 2;
         let mut r_next4 = vec![F128::ONE; n_mlv - 2];
         r_next4[1..].copy_from_slice(&r[k_skip + 3..]);
@@ -939,7 +988,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             if tail_round_timing {
                 eprintln!(
                     "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}): {:.2} ms",
-                    t_k.elapsed().as_secs_f64() * 1e3
+                    t_k.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
                 );
             }
             compact_mlv.recycle();
@@ -959,7 +1008,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             // pass (ρ₃ and ρ₄ at once), replacing tail iterations i = 2 and
             // i = 3: their 512 MiB + 256 MiB reads and 256 MiB + 128 MiB
             // writes become one 512 MiB read + 128 MiB write.
-            let t_c = std::time::Instant::now();
+            let t_c = tail_round_timing.then(std::time::Instant::now);
             let quarter = n_groups / 4;
             let mut r_next6 = vec![F128::ONE; n_mlv - 4];
             r_next6[1..].copy_from_slice(&r[k_skip + 5..]);
@@ -981,7 +1030,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 if tail_round_timing {
                     eprintln!(
                         "[zc-tail-rounds] composed rounds 5+6 fold (cascade +W'', out n={quarter}): {:.2} ms",
-                        t_c.elapsed().as_secs_f64() * 1e3
+                        t_c.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
                     );
                 }
                 crate::scratch::give_f128(a_out);
@@ -1005,7 +1054,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 // 32 MiB write. Under cascade4 the same pass additionally
                 // carries the deferred round-nine quadratic — zero extra
                 // traversals.
-                let t_c3 = std::time::Instant::now();
+                let t_c3 = tail_round_timing.then(std::time::Instant::now);
                 let sixteenth = n_groups / 16;
                 let mut r_next8 = vec![F128::ONE; n_mlv - 6];
                 r_next8[1..].copy_from_slice(&r[k_skip + 7..]);
@@ -1039,7 +1088,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     eprintln!(
                         "[zc-tail-rounds] composed rounds 7+8 fold (out n={sixteenth}, cascade4={}): {:.2} ms",
                         la9.is_some(),
-                        t_c3.elapsed().as_secs_f64() * 1e3
+                        t_c3.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
                     );
                 }
                 crate::scratch::give_f128(a2_out);
@@ -1061,7 +1110,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     // composed pass (ρ₇ and ρ₈ at once), replacing tail
                     // iterations i = 6 and i = 7. Under cascade5 this pass
                     // also carries round eleven's deferred quadratic.
-                    let t_c4 = std::time::Instant::now();
+                    let t_c4 = tail_round_timing.then(std::time::Instant::now);
                     let sixtyfourth = n_groups / 64;
                     let mut r_next10 = vec![F128::ONE; n_mlv - 8];
                     r_next10[1..].copy_from_slice(&r[k_skip + 9..]);
@@ -1095,7 +1144,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         eprintln!(
                             "[zc-tail-rounds] composed rounds 9+10 fold (out n={sixtyfourth}, cascade5={}): {:.2} ms",
                             la11.is_some(),
-                            t_c4.elapsed().as_secs_f64() * 1e3
+                            t_c4.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
                         );
                     }
                     crate::scratch::give_f128(a3_out);
@@ -1115,7 +1164,7 @@ fn prove_packed_padded_inner<C: Challenger>(
 
                         // Bind ρ₉ and ρ₁₀ together and emit round twelve,
                         // replacing tail iterations i = 8 and i = 9.
-                        let t_c5 = std::time::Instant::now();
+                        let t_c5 = tail_round_timing.then(std::time::Instant::now);
                         let twofiftysixth = n_groups / 256;
                         let mut r_next12 = vec![F128::ONE; n_mlv - 10];
                         r_next12[1..].copy_from_slice(&r[k_skip + 11..]);
@@ -1133,7 +1182,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         if tail_round_timing {
                             eprintln!(
                                 "[zc-tail-rounds] composed rounds 11+12 fold (out n={twofiftysixth}): {:.2} ms",
-                                t_c5.elapsed().as_secs_f64() * 1e3
+                                t_c5.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
                             );
                         }
                         crate::scratch::give_f128(a4_out);
@@ -1162,7 +1211,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 if tail_round_timing {
                     eprintln!(
                         "[zc-tail-rounds] composed rounds 5+6 fold (out n={quarter}): {:.2} ms",
-                        t_c.elapsed().as_secs_f64() * 1e3
+                        t_c.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
                     );
                 }
                 crate::scratch::give_f128(a_out);
@@ -1186,7 +1235,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             if tail_round_timing {
                 eprintln!(
                     "[zc-tail-rounds] K double fold + round4 (out n={n_groups}): {:.2} ms",
-                    t_k.elapsed().as_secs_f64() * 1e3
+                    t_k.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
                 );
             }
             compact_mlv.recycle();
@@ -1197,7 +1246,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             (a_out, b_out, 2usize)
         }
     } else {
-        let t_t3 = std::time::Instant::now();
+        let t_t3 = tail_round_timing.then(std::time::Instant::now);
         let mut first_r_next = vec![F128::ONE; n_mlv - 1];
         first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
         let (a_mlv, b_mlv, first_m1, first_mi) = fold_compact_and_compute_round_pair(
@@ -1210,7 +1259,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             eprintln!(
                 "[zc-tail-rounds] T3 compact fold (out n={}): {:.2} ms",
                 a_mlv.len(),
-                t_t3.elapsed().as_secs_f64() * 1e3
+                t_t3.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
             );
         }
         compact_mlv.recycle();
@@ -1239,10 +1288,10 @@ fn prove_packed_padded_inner<C: Challenger>(
 
     // H2 engagement evidence: E-core chunks claimed across the loop rounds
     // (T3's hetero drain is already behind us, so the delta is loop-only).
-    let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
-    let hetero_claimed_before = crate::epool::helper_chunks_claimed();
+    let hetero_trace = tail_hetero_trace_enabled();
+    let hetero_claimed_before = hetero_trace.then(crate::epool::helper_chunks_claimed);
     for i in loop_start..(n_mlv - 1) {
-        let t_round_i = std::time::Instant::now();
+        let t_round_i = tail_round_timing.then(std::time::Instant::now);
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
 
@@ -1283,7 +1332,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         if tail_round_timing {
             eprintln!(
                 "[zc-tail-rounds] loop i={i} (log_n {log_n_before}): {:.2} ms",
-                t_round_i.elapsed().as_secs_f64() * 1e3
+                t_round_i.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
             );
         }
     }
@@ -1291,7 +1340,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     if hetero_trace {
         eprintln!(
             "[zc-tail] hetero loop rounds: {} chunks claimed by E-cores",
-            crate::epool::helper_chunks_claimed() - hetero_claimed_before
+            crate::epool::helper_chunks_claimed() - hetero_claimed_before.unwrap()
         );
     }
 
@@ -1328,8 +1377,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     if zc_timing {
         eprintln!(
             "[zc-timing] rounds 3+ tail: {:.2} ms cpu={:.1}",
-            t_tail.elapsed().as_secs_f64() * 1e3,
-            crate::pcs::commit::commit_cpu_ms() - cpu_tail
+            t_tail.as_ref().unwrap().elapsed().as_secs_f64() * 1e3,
+            crate::pcs::commit::commit_cpu_ms() - cpu_tail.unwrap()
         );
     }
 
