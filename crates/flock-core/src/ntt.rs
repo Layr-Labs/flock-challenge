@@ -38,14 +38,17 @@ pub fn compute_twiddles(k: usize, beta: F8) -> Vec<F8> {
     let mut twiddles = vec![F8::ZERO; n - 1];
 
     // Layer 0: 2^{k-1} points beta + {0, 2, 4, ..., 2(len-1)}.
+    // Written directly into the table (s_at_root = 1 ⇒ no scaling needed);
+    // the recurrence layers below still use the intermediate `layer` Vec,
+    // which holds the RAW (unscaled) subspace values.
     let mut len = 1usize << (k - 1);
-    let mut layer: Vec<F8> = (0..len).map(|i| beta + F8((2 * i) as u8)).collect();
+    let mut layer: Vec<F8> = Vec::with_capacity(len);
     let mut s_at_root = F8::ONE;
-
-    // Write layer 0 directly (s_at_root = 1 ⇒ no scaling needed).
     let mut write_at = len;
     for i in 0..len {
-        twiddles[write_at - 1 + i] = layer[i];
+        let v = beta + F8((2 * i) as u8);
+        twiddles[write_at - 1 + i] = v;
+        layer.push(v);
     }
 
     // Subsequent layers: halve the size, advance the recurrence, scale by s⁻¹.

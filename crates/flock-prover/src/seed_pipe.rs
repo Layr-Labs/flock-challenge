@@ -628,7 +628,7 @@ pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compre
     let ours = generate_compressions_par(log2_size, WARMUP_SEED);
     let init = generator_init(log2_size, WARMUP_SEED);
     if blocks_eq_serial(&ours, warmup_blocks) && generated_quads_match_blocks(init, warmup_blocks) {
-        GENERATOR_VERIFIED.store(true, Ordering::SeqCst);
+        GENERATOR_VERIFIED.store(true, Ordering::Release);
     }
 }
 
@@ -646,7 +646,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() || !is_ranked_worker() {
         return;
     }
-    if ARMED.swap(true, Ordering::SeqCst) {
+    if ARMED.swap(true, Ordering::AcqRel) {
         return;
     }
 
@@ -655,20 +655,20 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     let (real_stdin, writer) = unsafe {
         let real = dup(0);
         if real < 0 {
-            ARMED.store(false, Ordering::SeqCst);
+            ARMED.store(false, Ordering::Release);
             return;
         }
         let mut fds = [0i32; 2];
         if sys_pipe(fds.as_mut_ptr()) != 0 {
             close(real);
-            ARMED.store(false, Ordering::SeqCst);
+            ARMED.store(false, Ordering::Release);
             return;
         }
         if dup2(fds[0], 0) < 0 {
             close(real);
             close(fds[0]);
             close(fds[1]);
-            ARMED.store(false, Ordering::SeqCst);
+            ARMED.store(false, Ordering::Release);
             return;
         }
         close(fds[0]);
@@ -697,7 +697,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
             close(real_stdin);
             close(writer);
         }
-        ARMED.store(false, Ordering::SeqCst);
+        ARMED.store(false, Ordering::Release);
         return;
     }
 
@@ -719,7 +719,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     // work outright rather than relocating it, and need no such trade. Set
     // `FLOCK_SHADOW_QOS=1` to re-arm the demotion for an A/B.
     if std::env::var_os("FLOCK_SHADOW_QOS").is_some() {
-        SHADOW_QOS.store(true, Ordering::SeqCst);
+        SHADOW_QOS.store(true, Ordering::Release);
         flock_core::set_calling_thread_shadow_qos();
     }
 }
@@ -789,6 +789,7 @@ fn speculative_main(
     };
 
     let seed_at = std::time::Instant::now();
+    crate::telemetry::mark_seed(seed_at);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut buf = std::mem::take(&mut scratch);
         let n_total = 1usize << log2_size;
@@ -801,7 +802,7 @@ fn speculative_main(
         // path must keep the full byte comparison, which needs a filled
         // buffer, so fall through to the eager fill.
         let lazy = buf.len() == n_total
-            && GENERATOR_VERIFIED.load(Ordering::SeqCst)
+            && GENERATOR_VERIFIED.load(Ordering::Acquire)
             && !lazy_blocks_killed();
         let (blocks, endpoints) = if lazy {
             let init = generator_init(log2_size, seed);
@@ -829,7 +830,9 @@ fn speculative_main(
             state.blocks = Some(Arc::clone(&blocks));
             shared().signal.notify_all();
         }
-        run(setup_addr, &blocks)
+        let out = run(setup_addr, &blocks);
+        crate::telemetry::record_since_seed(crate::telemetry::SLOT_SPEC_TOTAL);
+        out
     }));
 
     match outcome {
@@ -856,12 +859,12 @@ fn speculative_main(
 /// let a second proof start while the first still owns the global scratch
 /// pools.
 pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
-    if !ARMED.load(Ordering::SeqCst) {
+    if !ARMED.load(Ordering::Acquire) {
         return None;
     }
     // Restores prover QoS on every exit path, including the two early returns
     // below and any unwind. `swap` makes the restore happen exactly once.
-    let shadow = ShadowQosGuard(SHADOW_QOS.swap(false, Ordering::SeqCst));
+    let shadow = ShadowQosGuard(SHADOW_QOS.swap(false, Ordering::AcqRel));
     let shared = shared();
     let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -879,7 +882,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
     let blocks_at = state.blocks_at;
     drop(state);
 
-    let fast_gate = GENERATOR_VERIFIED.load(Ordering::SeqCst);
+    let fast_gate = GENERATOR_VERIFIED.load(Ordering::Acquire);
     let matched = if let Some((first, last)) = &endpoints {
         // QS1 lazy buffer: its interior holds sentinels, not generated inputs,
         // so the gate must not compare it. Length plus the regenerated endpoint
@@ -1030,10 +1033,10 @@ mod tests {
         // The test binary's argv never matches the protected worker, so the
         // check must stay inert rather than publish a flag it did not earn.
         verify_generator_at_warmup(10, &generate_compressions_par(10, WARMUP_SEED));
-        assert!(!GENERATOR_VERIFIED.load(Ordering::SeqCst));
+        assert!(!GENERATOR_VERIFIED.load(Ordering::Acquire));
         // A wrong-length vector must be rejected before any comparison.
         verify_generator_at_warmup(10, &[]);
-        assert!(!GENERATOR_VERIFIED.load(Ordering::SeqCst));
+        assert!(!GENERATOR_VERIFIED.load(Ordering::Acquire));
         // The endpoint spot-check the timed path relies on must separate two
         // different seeds at block 0.
         let a = generate_compressions_par(10, WARMUP_SEED);

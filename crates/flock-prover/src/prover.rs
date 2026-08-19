@@ -158,17 +158,21 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
     z_packed: Vec<F128>,
     prover_data: &pcs::ProverData,
     commitment: &Commitment,
-    claims: &[ZClaim],
+    claims: &[&ZClaim],
     precomputed_s_hat_v: &[Option<&[F128]>],
     padding: &zerocheck::PaddingSpec,
     lig_config: &pcs::ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> pcs::BatchOpeningProofLigerito {
-    let x_fulls: Vec<Vec<F128>> = claims
-        .iter()
-        .map(|c| quirky_x_outer_full(&c.point))
-        .collect();
-    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    // The ranked batch always opens AB and C together. Reserve the exact
+    // outer vector capacity so this timed-path setup cannot grow from zero.
+    let mut x_fulls = Vec::with_capacity(claims.len());
+    x_fulls.extend(claims.iter().map(|c| quirky_x_outer_full(&c.point)));
+    // This proving path has exactly the AB and C claims. Keep their borrowed
+    // point views on the stack instead of allocating a second tiny Vec in the
+    // timed PCS-opening setup.
+    assert_eq!(x_fulls.len(), 2, "ranked Ligerito opening expects AB and C");
+    let x_refs = [x_fulls[0].as_slice(), x_fulls[1].as_slice()];
     pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         prover_data,
@@ -215,13 +219,29 @@ pub fn prove_ligerito<Ch: Challenger>(
     bind_statement(challenger, r1cs, &commitment);
 
     // a = A·z, b = B·z; for the C = I convention c aliases z.
-    let a_packed_f128 = r1cs.apply_a_packed(&z_packed);
-    let b_packed_f128 = r1cs.apply_b_packed(&z_packed);
-    let c_packed_f128: Vec<F128> = if r1cs.c0_is_identity() {
-        Vec::new()
-    } else {
-        r1cs.apply_c_packed(&z_packed)
-    };
+    // The lincheck witness repack is independent of both matrix applications.
+    // Run it beside their existing join so its full witness scan leaves the
+    // serial pre-zerocheck critical path without creating an OS thread.
+    let (((a_packed_f128, b_packed_f128), c_packed_f128), z_packed_lincheck) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    rayon::join(
+                        || r1cs.apply_a_packed(&z_packed),
+                        || r1cs.apply_b_packed(&z_packed),
+                    )
+                },
+                || {
+                    if r1cs.c0_is_identity() {
+                        Vec::new()
+                    } else {
+                        r1cs.apply_c_packed(&z_packed)
+                    }
+                },
+            )
+        },
+        || pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log),
+    );
     let cast = |v: &[F128]| -> &[u8] {
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
@@ -232,7 +252,6 @@ pub fn prove_ligerito<Ch: Challenger>(
     } else {
         cast(&c_packed_f128)
     };
-    let z_packed_lincheck = pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log);
 
     let padding = r1cs.padding_spec();
     let (zc_proof, zc_claim, s_hat_v_c) = zerocheck::prove_packed_padded_capture_s_hat_v_c(
@@ -272,7 +291,7 @@ pub fn prove_ligerito<Ch: Challenger>(
         z_packed,
         &prover_data,
         &commitment,
-        &[ab.clone(), c.clone()],
+        &[&ab, &c],
         &[pre_ab, pre_c],
         &padding,
         &lig_config,
@@ -480,7 +499,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
                 z_packed,
                 &prover_data,
                 &commitment,
-                &[ab.clone(), c.clone()],
+                &[&ab, &c],
                 &[pre_ab, pre_c],
                 &padding,
                 &lig_config,
@@ -491,13 +510,17 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             z_packed,
             &prover_data,
             &commitment,
-            &[ab.clone(), c.clone()],
+            &[&ab, &c],
             &[pre_ab, pre_c],
             &padding,
             &lig_config,
             challenger,
         ),
     };
+    crate::telemetry::record_ms(
+        crate::telemetry::SLOT_OPEN,
+        t_open.elapsed().as_secs_f64() * 1e3,
+    );
     if phase_timing {
         let wall = t_open.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_open0.unwrap_or(0.0);
@@ -958,7 +981,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>| {
         let cpu0 = phase_timing.then(process_cpu_ms);
-        let t_commit = std::time::Instant::now();
+        let t_commit = Some(std::time::Instant::now());
         let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
             &z_packed,
             &a_packed_f128,
@@ -968,8 +991,16 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             commit_codeword,
             tail_fill,
         );
+        crate::telemetry::record_ms(
+            crate::telemetry::SLOT_COMMIT,
+            t_commit.expect("phase timer is present").elapsed().as_secs_f64() * 1e3,
+        );
         if phase_timing {
-            let wall = t_commit.elapsed().as_secs_f64() * 1e3;
+            let wall = t_commit
+                .expect("phase timer is present")
+                .elapsed()
+                .as_secs_f64()
+                * 1e3;
             let cpu = process_cpu_ms() - cpu0.unwrap_or(0.0);
             eprintln!(
                 "[phase-timing] commit+ab-precompute: {wall:.2} ms cpu={cpu:.1} util={:.1}",
@@ -1042,7 +1073,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             let pre = std::thread::scope(|scope| {
                 let stripe_ready = &stripe_ready;
                 let stripe_job = scope.spawn(|| {
-                    let started = std::time::Instant::now();
+                    let started = phase_timing.then(std::time::Instant::now);
                     let filled_on_epool = fill_deferred_lincheck_stripe_with_dispatch(
                         &z_packed,
                         &mut stripe,
@@ -1068,7 +1099,11 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     if phase_timing {
                         eprintln!(
                             "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={}",
-                            started.elapsed().as_secs_f64() * 1e3,
+                            started
+                                .expect("phase timer is present")
+                                .elapsed()
+                                .as_secs_f64()
+                                * 1e3,
                             if filled_on_epool {
                                 "epool"
                             } else {
@@ -1095,7 +1130,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 // the join consumes the same completed thread.
                 if !stripe_job.is_finished() {
                     let spin_deadline =
-                        std::time::Instant::now() + std::time::Duration::from_millis(2);
+                        std::time::Instant::now() + std::time::Duration::from_millis(4);
                     while !stripe_job.is_finished() && std::time::Instant::now() < spin_deadline {
                         std::thread::yield_now();
                     }
@@ -1156,6 +1191,10 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             )
         }
     };
+    crate::telemetry::record_ms(
+        crate::telemetry::SLOT_ZEROCHECK,
+        t_zc.elapsed().as_secs_f64() * 1e3,
+    );
     if phase_timing {
         let wall = t_zc.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_zc0.unwrap_or(0.0);
@@ -1207,6 +1246,10 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
     // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
     flock_core::scratch::give_f128(z_vec_pre);
+    crate::telemetry::record_ms(
+        crate::telemetry::SLOT_LINCHECK,
+        t_lc.elapsed().as_secs_f64() * 1e3,
+    );
     if phase_timing {
         let wall = t_lc.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_lc0.unwrap_or(0.0);
@@ -1436,7 +1479,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         z_packed,
         &prover_data,
         &commitment,
-        &[ab.clone(), c.clone()],
+        &[&ab, &c],
         &[pre_ab, pre_c],
         &padding,
         &lig_config,

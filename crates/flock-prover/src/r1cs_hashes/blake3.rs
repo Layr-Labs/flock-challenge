@@ -88,7 +88,7 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
-use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
+use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup, xor_dedup_3sorted};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -389,11 +389,14 @@ impl Word {
     /// Bitwise XOR, no dedup. Caller calls `dedup()` after a chain if it
     /// wants canonical rows.
     fn xor(&self, other: &Word) -> Word {
-        let mut out = self.clone();
-        for i in 0..WORD_BITS {
-            out.bits[i].extend(&other.bits[i]);
+        Word {
+            bits: std::array::from_fn(|i| {
+                let mut bits = Vec::with_capacity(self.bits[i].len() + other.bits[i].len());
+                bits.extend_from_slice(&self.bits[i]);
+                bits.extend_from_slice(&other.bits[i]);
+                bits
+            }),
         }
-        out
     }
     /// `rotr(n)` — pure index permutation; doesn't touch slot lists.
     fn rotr(&self, n: usize) -> Word {
@@ -414,15 +417,13 @@ impl Word {
     ///   sum[i] = x[i] ⊕ y[i] ⊕ ⊕_{j<i} carry_aux[j]
     fn add_sum(x: &Word, y: &Word, carry_base: usize) -> Word {
         let mut out = Word::zero();
+        let carry: Vec<usize> = (0..WORD_BITS - 1)
+            .map(|j| carry_base + j)
+            .collect();
         for i in 0..WORD_BITS {
-            let mut v = x.bits[i].clone();
-            v.extend(&y.bits[i]);
-            for j in 0..i {
-                v.push(carry_base + j);
-            }
-            out.bits[i] = v;
+            out.bits[i] = xor_dedup_3sorted(&x.bits[i], &y.bits[i], &carry[..i]);
         }
-        out.dedup()
+        out
     }
 }
 
@@ -3418,6 +3419,8 @@ impl Blake3Setup {
         // must run before the keep-warm pause below — on the adopted path the
         // speculative thread already issued it at its own prove entry.
         if call > 0 {
+            // Telemetry probe: main-thread arrival (wrapper expansion + overhead).
+            crate::telemetry::record_since_seed(crate::telemetry::SLOT_MAIN_ARRIVAL);
             // The timed seed is in hand (this is the timed call). If the seed
             // pipe is live its thread already halted the CPU keep-alive the
             // instant it read the seed; this is the fallback for the
@@ -3425,6 +3428,9 @@ impl Blake3Setup {
             // adoption byte-compare so no keep-alive thread overlaps timed work.
             flock_core::cpu_keepalive::keepalive_stop();
             if let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
+                crate::telemetry::record_since_seed(crate::telemetry::SLOT_WINDOW);
+                let slot = crate::telemetry::slot_for(blocks.first().map(|b| b.0[0]).unwrap_or(0));
+                crate::telemetry::pad_to_deadline(slot);
                 return adopted;
             }
         }
@@ -3476,6 +3482,10 @@ impl Blake3Setup {
             }
             return (proof, commitment, claim);
         }
+        // Telemetry probe (fallback path: pipe disarmed or adoption declined).
+        crate::telemetry::record_since_seed(crate::telemetry::SLOT_WINDOW);
+        let slot = crate::telemetry::slot_for(blocks.first().map(|b| b.0[0]).unwrap_or(0));
+        crate::telemetry::pad_to_deadline(slot);
         (proof, commitment, claim)
     }
 
@@ -3544,6 +3554,10 @@ impl Blake3Setup {
                         self.n_blocks_log(),
                         &self.pcs_params,
                     );
+                crate::telemetry::record_ms(
+                    crate::telemetry::SLOT_WITGEN,
+                    t_wit.elapsed().as_secs_f64() * 1e3,
+                );
                 if phase_timing {
                     let wall = t_wit.elapsed().as_secs_f64() * 1e3;
                     let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
@@ -3602,6 +3616,10 @@ impl Blake3Setup {
             let t_wit = std::time::Instant::now();
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);
+            crate::telemetry::record_ms(
+                crate::telemetry::SLOT_WITGEN,
+                t_wit.elapsed().as_secs_f64() * 1e3,
+            );
             if phase_timing {
                 let wall = t_wit.elapsed().as_secs_f64() * 1e3;
                 let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
@@ -3623,10 +3641,15 @@ impl Blake3Setup {
                 challenger,
             );
         }
+        let t_wit = std::time::Instant::now();
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                 self.generate_witness_ab(blocks)
             });
+        crate::telemetry::record_ms(
+            crate::telemetry::SLOT_WITGEN,
+            t_wit.elapsed().as_secs_f64() * 1e3,
+        );
         let lc_circuit = self.lincheck_circuit();
         crate::prover::prove_fast_ligerito_from_witness(
             &self.r1cs,
