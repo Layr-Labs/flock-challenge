@@ -389,11 +389,14 @@ impl Word {
     /// Bitwise XOR, no dedup. Caller calls `dedup()` after a chain if it
     /// wants canonical rows.
     fn xor(&self, other: &Word) -> Word {
-        let mut out = self.clone();
-        for i in 0..WORD_BITS {
-            out.bits[i].extend(&other.bits[i]);
+        Word {
+            bits: std::array::from_fn(|i| {
+                let mut bits = Vec::with_capacity(self.bits[i].len() + other.bits[i].len());
+                bits.extend_from_slice(&self.bits[i]);
+                bits.extend_from_slice(&other.bits[i]);
+                bits
+            }),
         }
-        out
     }
     /// `rotr(n)` — pure index permutation; doesn't touch slot lists.
     fn rotr(&self, n: usize) -> Word {
