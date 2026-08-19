@@ -257,10 +257,13 @@ const ZC_TAIL_HETERO_LOW_FLOOR: usize = 1 << 17;
 #[cfg(target_arch = "aarch64")]
 fn zc_tail_hetero_low_floor() -> usize {
     use std::sync::LazyLock;
-    static LOW: LazyLock<bool> = LazyLock::new(|| {
-        !std::env::var("FLOCK_NO_ZC_TAIL_HETERO_LOW").is_ok_and(|v| v == "1")
-    });
-    if *LOW { ZC_TAIL_HETERO_LOW_FLOOR } else { 1 << 19 }
+    static LOW: LazyLock<bool> =
+        LazyLock::new(|| !std::env::var("FLOCK_NO_ZC_TAIL_HETERO_LOW").is_ok_and(|v| v == "1"));
+    if *LOW {
+        ZC_TAIL_HETERO_LOW_FLOOR
+    } else {
+        1 << 19
+    }
 }
 
 /// Give the three largest ordinary tail rounds 2,048 independent chunks.
@@ -1437,7 +1440,7 @@ pub fn fold_compact_and_compute_round_pair(
     // this arm — the static warmup latch frees minutes of wall and both
     // arms' once-per-process costs fit in a fraction of it.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    const ZC_T3_INTEGRATION_PARKED: bool = true;
+    const ZC_T3_INTEGRATION_PARKED: bool = false;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_job = if ZC_T3_INTEGRATION_PARKED {
         None
