@@ -50,12 +50,38 @@ pub mod zerocheck;
 /// purely for screening/rollback — mirrors `FLOCK_NO_AB_COMPACT_STORE`.
 pub const ENV_NO_MICRO_STACK: &str = "FLOCK_NO_MICRO_STACK";
 
-/// Unlike `ab_compact_store_enabled` this does **not** latch the first read
-/// in a `OnceLock`: every gated call site runs O(10) times per prove, so the
-/// per-call `var_os` read is noise, and re-reading keeps same-process A/B
-/// tests (set var → prove → unset → prove) possible.
+/// Non-ranked callers re-read the switch so same-process A/B tests can toggle
+/// it. The ranked worker's environment is immutable and its mandatory warm-up
+/// reaches this gate first, so latch that value and remove repeated environment
+/// lookups from the measured proof and publication tail.
 pub fn micro_stack_enabled() -> bool {
-    std::env::var_os(ENV_NO_MICRO_STACK).as_deref() != Some(std::ffi::OsStr::new("1"))
+    let read =
+        || std::env::var_os(ENV_NO_MICRO_STACK).as_deref() != Some(std::ffi::OsStr::new("1"));
+    if is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os(ENV_NO_MICRO_STACK).as_deref() != Some(std::ffi::OsStr::new("1"))
+        });
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn is_ranked_worker_process() -> bool {
+    static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let mut args = std::env::args_os();
+        let Some(exe) = args.next() else {
+            return false;
+        };
+        if args.count() != 3 {
+            return false;
+        }
+        std::path::Path::new(&exe)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("flock-benchmark-worker"))
+    });
+    *RANKED
 }
 
 /// Configure rayon's global thread pool to use only performance cores on

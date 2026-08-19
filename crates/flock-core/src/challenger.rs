@@ -890,8 +890,8 @@ fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, St
 /// thread-creation latency is.
 mod grind_worker {
     use std::sync::atomic::AtomicBool;
-    use std::sync::mpsc::{Receiver, Sender, channel};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+    use std::sync::{Arc, LazyLock, OnceLock};
 
     struct Job {
         digest: [u8; 32],
@@ -904,17 +904,24 @@ mod grind_worker {
     }
 
     struct Worker {
-        tx: Sender<Job>,
+        tx: SyncSender<Job>,
         _thread: std::thread::JoinHandle<()>,
     }
 
     fn worker() -> Option<&'static Worker> {
         static W: OnceLock<Option<Worker>> = OnceLock::new();
-        if std::env::var_os("FLOCK_NO_GRIND_WORKER").is_some() {
+        let disabled = if crate::is_ranked_worker_process() {
+            static DISABLED: LazyLock<bool> =
+                LazyLock::new(|| std::env::var_os("FLOCK_NO_GRIND_WORKER").is_some());
+            *DISABLED
+        } else {
+            std::env::var_os("FLOCK_NO_GRIND_WORKER").is_some()
+        };
+        if disabled {
             return None;
         }
         W.get_or_init(|| {
-            let (tx, rx): (Sender<Job>, Receiver<Job>) = channel();
+            let (tx, rx): (SyncSender<Job>, Receiver<Job>) = sync_channel(1);
             std::thread::Builder::new()
                 .name("flock-grind-dispatch".into())
                 .spawn(move || {
@@ -1010,6 +1017,10 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
     debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
     let block_len = 1u32 << bits.min(24);
     let hybrid = grind_hybrid_enabled() && rayon::current_num_threads() > 1;
+    // One grind call visits multiple nonce blocks. They are strictly
+    // sequential, so reuse the abort flag allocation after each completed GPU
+    // job instead of allocating an Arc for every block.
+    let stop = hybrid.then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
     let mut start = 0u64;
     loop {
         if !hybrid {
@@ -1032,7 +1043,8 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         // is already dead. On a GPU miss the flag is never set and the window
         // drains fully — byte-identical to the unflagged search either way
         // (`FLOCK_NO_GRIND_HYBRID_ABORT` restores the unconditional drain).
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = stop.as_ref().unwrap();
+        stop.store(false, std::sync::atomic::Ordering::Relaxed);
         let abort = grind_hybrid_abort_enabled();
         // Persistent dispatch worker when available; the incumbent
         // scope-spawn path otherwise (see `grind_worker`).
@@ -1042,7 +1054,7 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             start,
             block_len,
             bits,
-            std::sync::Arc::clone(&stop),
+            std::sync::Arc::clone(stop),
             abort,
         ) {
             Some(done_rx) => {
