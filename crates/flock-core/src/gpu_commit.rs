@@ -505,6 +505,34 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
     *ON
 }
 
+
+/// Kill switch for the zerocheck round-one AB-completion GPU arm
+/// (`FLOCK_NO_GPU_ZC_AB=1`, exact). The ranked round-1 window is bound by
+/// the CPU AB completion (~9.7 ms) while the GPU C-fold runs under it.
+/// This arm folds precomputed AB inner through F2-linear convert tables
+/// (nibble gather, XOR-only). Warmup calibration byte-compares GPU band
+/// partials against the CPU and also requires the Metal GPU wall, scaled
+/// to 96 bands, to beat 8 ms — r1162 (1d91c8e8, −1.82%) latched on
+/// equality alone. Any failure, mismatch, slow wall, or kill switch keeps
+/// the exact incumbent CPU completion.
+pub const ENV_NO_GPU_ZC_AB: &str = "FLOCK_NO_GPU_ZC_AB";
+
+/// Opt-in for the round-one AB-completion GPU arm. Ranked workers
+/// `env_clear()`, so this is OFF on the board unless a follow-up
+/// explicitly opts in. b61b7f22 (2026-08-20) verified the arm at
+/// −1.63% uniform (p10 +1.96 ms, median +2.36 ms, spread 0.79%) —
+/// the 32-band linear speed gate under-estimated 96-band cost.
+/// `s = 5` CPU completion stays default-on and is bit-identical.
+pub const ENV_GPU_ZC_AB: &str = "FLOCK_GPU_ZC_AB";
+
+pub(crate) fn zc_ab_gpu_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(ENV_NO_GPU_ZC_AB).as_deref() != Some(std::ffi::OsStr::new("1"))
+            && std::env::var_os(ENV_GPU_ZC_AB).as_deref() == Some(std::ffi::OsStr::new("1"))
+    });
+    *ON
+}
+
 /// Kill switch for the L1 recursive-commit NTT/Merkle-leaf overlap
 /// (`FLOCK_NO_L1_MERKLE_OVERLAP=1`): instead of hashing each finalized NTT
 /// chunk's 128-byte leaves on the GPU while the CPU transform is still
@@ -11696,6 +11724,641 @@ kernel void zc_r2_products(
         Ok(buf)
     }
 
+    // -----------------------------------------------------------------------
+    // Zerocheck round-one AB-completion GPU arm (see `ENV_NO_GPU_ZC_AB`).
+    //
+    // The round-1 AB completion folds each 1 KiB `x_outer_lo` chunk of the
+    // precomputed AB inner state (16 rows x 64 lanes) through the convert
+    // table and eq_lo weights into 64 lane-claims per `x_hi` band; on the
+    // ranked board it is the round-1 critical path (the ~9.7 ms "AB head")
+    // while the GPU C-fold runs under it. This arm mirrors the C-fold's
+    // portability argument: the pre-scaled convert tables `T_w` are F2-linear
+    // in the byte index (exhaustively tested), so the kernel keeps 32-entry
+    // nibble tables per row (8 KiB threadgroup memory, 0.0625x table traffic)
+    // and the whole gather is XOR-only — Metal needs no PMULL.
+    //
+    // Geometry (ranked: n_lo = 12, s = 5): a threadgroup owns a full
+    // (band, w) block (1024 threads = 32 u x 32 lanes, two lane passes), and
+    // each thread accumulates its u's `chunks_per_u` chunks (u, u+32, ...)
+    // in registers before writing its per-(band, w, u, lane) partial slot
+    // exactly once — no atomics. A second kernel XOR-reduces the 32 w
+    // partials of each bank slot (each bank accumulates one chunk per w
+    // block). The host then applies the deferred `eq_bot[u]` and
+    // `eq_hi[band]` folds.
+    //
+    // Bit-exactness: F2-linear nibble fold + warmup equality oracle. A share
+    // is published only when the probe is byte-identical AND the Metal GPU
+    // wall scaled to 96 bands is < 8 ms (the CPU AB head is ~9.7 ms). r1162
+    // (1d91c8e8, −1.82%) latched on equality alone and the reduce kernel was
+    // dispatched 256× too wide. Both are fixed here. Ranked compact-store
+    // tails (n_b_med=15 on odd x_outer) are skipped so uninit rows are never
+    // gathered. Fail-closed: mismatch, slow wall, init failure, or kill
+    // switch keeps the exact incumbent CPU completion.
+    // -----------------------------------------------------------------------
+
+    const ZC_AB_FOLD_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct ZcAbParams {
+    uint n_tables;         // 2^(n_lo - s)
+    uint band_split;       // GPU bands
+    uint band_stride;      // bytes per band (chunks_per_band * 1024)
+    uint banks;            // 2^s
+    uint chunks_per_table; // 2^(n_lo - s)
+    uint chunks_per_u;     // chunks_per_table / banks
+};
+
+// Round-one AB-completion gather: one threadgroup per (band, w) block; each
+// thread owns bank slot (u = lid & 31, lane = (lid >> 5) + {0,32}) and
+// accumulates its u's chunks_per_u chunks (x_lo = w*block + u + c*banks) in
+// registers, then writes its per-(band,w,u,lane) partial slot exactly once.
+kernel void zc_ab_fold(
+    device const uchar*  ab       [[buffer(0)]],
+    device const uint4*  tables   [[buffer(1)]],
+    device uint4*        partials [[buffer(2)]],
+    constant ZcAbParams& p        [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]])
+{
+    threadgroup uint4 tab[512];
+
+    uint band = tgid / p.n_tables;
+    uint w    = tgid - band * p.n_tables;
+
+    // Cooperative nibble-table build for T_w (512 uint4 = 16 rows x 32):
+    // T_w[row*256 + v] == tab[row*32 + (v & 15)] ^ tab[row*32 + 16 + (v >> 4)]
+    // by F2-linearity, so two lookups stand in for each 256-entry row.
+    uint tbase = w * 4096u;
+    if (lid < 512u) {
+        uint r = lid >> 5u, s = lid & 31u;
+        tab[lid] = tables[tbase + r * 256u + ((s < 16u) ? s : ((s - 16u) << 4u))];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (band >= p.band_split) { return; }
+
+    uint u  = lid & 31u;
+    uint l0 = lid >> 5u;                  // 0..31
+    uint x_lo = w * p.chunks_per_table + u;
+    uint byte_base = band * p.band_stride + (x_lo << 10u);
+    uint out_base = ((band * p.n_tables + w) * p.banks + u) * 64u + l0;
+
+    uint4 acc0 = uint4(0u);
+    for (uint c = 0u; c < p.chunks_per_u; ++c) {
+        uint cb = byte_base + c * p.banks * 1024u;
+        uint x_outer0 = (x_lo + c * p.banks) | (band << 12u);
+        uint nbm0 = (x_outer0 & 1u) == 0u ? 16u : 15u;
+        for (uint r = 0u; r < nbm0; ++r) {
+            uchar b = ab[cb + (r << 6u) + l0];
+            acc0 ^= tab[(r << 5u) + (b & 15u)];
+            acc0 ^= tab[(r << 5u) + 16u + (b >> 4u)];
+        }
+    }
+    uint4 acc1 = uint4(0u);
+    uint l1 = l0 + 32u;
+    for (uint c = 0u; c < p.chunks_per_u; ++c) {
+        uint cb = byte_base + c * p.banks * 1024u;
+        uint x_outer1 = (x_lo + c * p.banks) | (band << 12u);
+        uint nbm1 = (x_outer1 & 1u) == 0u ? 16u : 15u;
+        for (uint r = 0u; r < nbm1; ++r) {
+            uchar b = ab[cb + (r << 6u) + l1];
+            acc1 ^= tab[(r << 5u) + (b & 15u)];
+            acc1 ^= tab[(r << 5u) + 16u + (b >> 4u)];
+        }
+    }
+    partials[out_base] = acc0;
+    partials[out_base + 32u] = acc1;
+}
+
+struct ZcAbReduceParams {
+    uint n_tables;   // 2^(n_lo - s)
+    uint band_split; // GPU bands
+    uint banks;      // 2^s
+};
+
+// XOR-reduce the 32 w partials of each bank slot into the per-band banks.
+// One thread per (band, u, lane); each slot written exactly once.
+kernel void zc_ab_reduce(
+    device const uint4*      partials [[buffer(0)]],
+    device uint4*            banks    [[buffer(1)]],
+    constant ZcAbReduceParams& p      [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint lanes = p.banks * 64u;
+    uint n = p.band_split * lanes;
+    if (gid >= n) { return; }
+    uint band = gid / lanes;
+    uint r    = gid - band * lanes;
+    uint u    = r >> 6u;
+    uint lane = r & 63u;
+    uint4 acc = uint4(0u);
+    for (uint w = 0u; w < p.n_tables; ++w) {
+        acc ^= partials[((band * p.n_tables + w) * p.banks + u) * 64u + lane];
+    }
+    banks[(band * p.banks + u) * 64u + lane] = acc;
+}
+"#;
+
+    /// Process-lifetime Metal state for the round-one AB-completion arm.
+    struct ZcAb {
+        pso: Id,
+        pso_reduce: Id,
+        /// Persistent small buffers: pre-scaled convert tables
+        /// (n_tables x 64 KiB), per-(band,w,u,lane) gather partials
+        /// (hi_size x n_tables x banks x 64 lanes x 16 B), and per-band
+        /// banks (hi_size x banks x 64 lanes x 16 B).
+        tables_buf: Id,
+        tables_cap: usize,
+        part_buf: Id,
+        part_cap: usize,
+        banks_buf: Id,
+        banks_cap: usize,
+        /// Cached no-copy wraps of caller AB inner buffers.
+        wraps: Vec<(usize, usize, Id)>,
+    }
+    unsafe impl Send for ZcAb {}
+
+    static ZC_AB_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcAb>>> =
+        std::sync::OnceLock::new();
+    /// Published GPU band share. `usize::MAX` = uncalibrated (the first
+    /// ranked prove calibrates and byte-compares), `0` = arm off for this
+    /// process (calibration mismatch or init failure).
+    static ZC_AB_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static ZC_AB_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Bands probed during the warmup calibration (untimed).
+    const ZC_AB_CALIB_BANDS: usize = 32;
+    /// Published GPU band share: a fixed 3/4 of the ranked hi_size (96 of
+    /// 128 bands). The CPU suffix (32 bands) and the C-fold suffix overlap
+    /// the GPU's AB + C-fold queue.
+    const ZC_AB_TUNED_BANDS: usize = 96;
+
+    #[cfg(test)]
+    pub(crate) fn zc_ab_test_reset() {
+        use std::sync::atomic::Ordering;
+        ZC_AB_TUNED.store(usize::MAX, Ordering::Relaxed);
+        ZC_AB_POISONED.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_ab_test_state() -> (usize, bool) {
+        use std::sync::atomic::Ordering;
+        (
+            ZC_AB_TUNED.load(Ordering::Relaxed),
+            ZC_AB_POISONED.load(Ordering::Relaxed),
+        )
+    }
+
+    unsafe fn zc_ab_init(gpu: &'static Gpu) -> Result<ZcAb, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<(Id, Id), String> {
+                let src = gpu.api.nsstring(ZC_AB_FOLD_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "AB fold shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let build = |name: &str| -> Result<Id, String> {
+                    let ns = gpu.api.nsstring(name)?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err(format!("AB fold kernel {name} not found"));
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    if pso.is_null() {
+                        Err(format!(
+                            "AB fold pipeline {name}: {}",
+                            gpu.api.error_string(perr)
+                        ))
+                    } else {
+                        Ok(pso)
+                    }
+                };
+                let pso = build("zc_ab_fold")?;
+                let pso_reduce = match build("zc_ab_reduce") {
+                    Ok(r) => r,
+                    Err(e) => {
+                        gpu.release(pso);
+                        send!(
+                            gpu.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
+                        return Err(e);
+                    }
+                };
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    library,
+                    c"release"
+                );
+                Ok((pso, pso_reduce))
+            })();
+            gpu.pool_pop(pool);
+            let (pso, pso_reduce) = built?;
+            Ok(ZcAb {
+                pso,
+                pso_reduce,
+                tables_buf: NIL,
+                tables_cap: 0,
+                part_buf: NIL,
+                part_cap: 0,
+                banks_buf: NIL,
+                banks_cap: 0,
+                wraps: Vec::new(),
+            })
+        }
+    }
+
+    fn zc_ab_state() -> Option<&'static std::sync::Mutex<ZcAb>> {
+        ZC_AB_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match unsafe { zc_ab_init(gpu) } {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(_) => {
+                        ZC_AB_TUNED.store(0, std::sync::atomic::Ordering::Relaxed);
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// A submitted round-one AB-completion prefix.
+    pub(crate) struct ZcAbJob {
+        cb: Id,
+        calibration: bool,
+        /// GPU bands for this prove (probe bands during calibration).
+        pub bands: usize,
+        banks: usize,
+        submitted: std::time::Instant,
+    }
+    // SAFETY: the command buffer handle is only waited/released from the
+    // launching thread; Metal command buffers are themselves thread-safe.
+    unsafe impl Send for ZcAbJob {}
+
+    impl ZcAbJob {
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+
+        /// CPU's leading-skip count: the caller drains bands `[bands, hi)`.
+        pub(crate) fn cpu_split(&self) -> usize {
+            if self.calibration { 0 } else { self.bands }
+        }
+    }
+
+    /// Result of draining the round-one AB-completion arm.
+    pub(crate) enum ZcAbResult {
+        /// Warmup calibration completed (share published — or the arm
+        /// disabled on mismatch — and GPU values discarded); the caller's
+        /// CPU band partials are authoritative.
+        Calibrated,
+        /// Timed-prove prefix band partials, bit-exact per band
+        /// (eq_bot- and eq_hi-weighted, 64 lanes each).
+        Prefix(Vec<[F128; 64]>),
+        /// Metal failed after admission; the caller must CPU-redo the
+        /// prefix bands. The arm is poisoned for the process.
+        Failed,
+    }
+
+    unsafe fn zc_ab_submit(
+        gpu: &Gpu,
+        state: &ZcAb,
+        ab_buf: Id,
+        bands: usize,
+        n_lo: usize,
+        n_tables: usize,
+        banks: usize,
+        bank_bits: usize,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                n_tables: u32,
+                band_split: u32,
+                band_stride: u32,
+                banks: u32,
+                chunks_per_table: u32,
+                chunks_per_u: u32,
+            }
+            let chunks_per_table = 1usize << (n_lo - bank_bits);
+            let params = P {
+                n_tables: n_tables as u32,
+                band_split: bands as u32,
+                band_stride: (1u64 << (n_lo + 10)) as u32,
+                banks: banks as u32,
+                chunks_per_table: chunks_per_table as u32,
+                chunks_per_u: (chunks_per_table / banks) as u32,
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            #[repr(C)]
+            struct R {
+                n_tables: u32,
+                band_split: u32,
+                banks: u32,
+            }
+            let rp = R {
+                n_tables: n_tables as u32,
+                band_split: bands as u32,
+                banks: banks as u32,
+            };
+            let rb = std::slice::from_raw_parts(
+                (&raw const rp).cast::<u8>(),
+                core::mem::size_of::<R>(),
+            );
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, ab_buf, 0, 0);
+            gpu.set_buffer(enc, state.tables_buf, 0, 1);
+            gpu.set_buffer(enc, state.part_buf, 0, 2);
+            gpu.set_bytes(enc, pb, 3);
+            gpu.dispatch(enc, (bands * n_tables) as u64, 1024);
+            gpu.set_pipeline(enc, state.pso_reduce);
+            gpu.set_buffer(enc, state.part_buf, 0, 0);
+            gpu.set_buffer(enc, state.banks_buf, 0, 1);
+            gpu.set_bytes(enc, rb, 2);
+            gpu.dispatch(
+                enc,
+                (bands * banks * 64).div_ceil(256) as u64,
+                256,
+            );
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    unsafe fn zc_ab_wrap(state: &mut ZcAb, gpu: &Gpu, data: &[u8]) -> Result<Id, String> {
+        let ptr = data.as_ptr() as usize;
+        let len = data.len();
+        if let Some(&(_, _, buf)) = state.wraps.iter().find(|&&(p, l, _)| p == ptr && l == len) {
+            return Ok(buf);
+        }
+        let buf = unsafe { gpu.wrap_buffer(data.as_ptr().cast_mut(), len)? };
+        state.wraps.push((ptr, len, buf));
+        Ok(buf)
+    }
+
+    /// Launch the round-one AB-completion GPU prefix. `None` = the whole
+    /// completion stays on the exact incumbent CPU path (kill switch,
+    /// non-ranked shape, no Metal device, or a wrap/allocation failure).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_ab_fold(
+        ab_inner: &[u8],
+        tables: &[F128],
+        eq_bot: &[F128],
+        eq_hi: &[F128],
+        n_lo: usize,
+        hi_size: usize,
+        bank_bits: usize,
+    ) -> Option<ZcAbJob> {
+        use std::sync::atomic::Ordering;
+        if !super::zc_ab_gpu_enabled() || ZC_AB_POISONED.load(Ordering::Relaxed) {
+            return None;
+        }
+        // Fixed-shape gates (ranked geometry). `bank_bits` must satisfy
+        // 2*s <= n_lo so every bank's chunks fit inside one table block
+        // (chunks_per_u >= 1), and banks must be a multiple of 4 for the
+        // u-quad threadgroup mapping.
+        if n_lo != 12
+            || hi_size != 128
+            || bank_bits == 0
+            || bank_bits > 6
+            || (bank_bits * 2) > n_lo
+        {
+            return None;
+        }
+        let n_tables = 1usize << (n_lo - bank_bits);
+        let banks = 1usize << bank_bits;
+        if banks % 4 != 0
+            || tables.len() != n_tables * 4096
+            || eq_bot.len() != banks
+            || eq_hi.len() != hi_size
+            || ab_inner.len() != hi_size * 4096 * 1024
+        {
+            return None;
+        }
+        let tuned = ZC_AB_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let bands = if calibration {
+            ZC_AB_CALIB_BANDS
+        } else {
+            tuned.min(hi_size)
+        };
+        if bands == 0 {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let Some(state_mutex) = zc_ab_state() else {
+            return None;
+        };
+        // Deliberately NOT poison-tolerant: the grow sequences below
+        // (release -> new_buffer -> cap update) are not unwind-atomic, so a
+        // guard recovered after a caught panic could observe a released
+        // buffer behind a stale cap. Declining keeps the incumbent
+        // fail-safe (arm off for the process) but makes it observable.
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("zc-ab launch", false);
+                return None;
+            }
+        };
+        unsafe {
+            let built = (|| -> Result<Id, String> {
+                let need_tables = n_tables * 4096 * 16;
+                if state.tables_cap < need_tables {
+                    if state.tables_cap > 0 {
+                        gpu.release(state.tables_buf);
+                    }
+                    state.tables_buf = gpu.new_buffer(need_tables)?;
+                    state.tables_cap = need_tables;
+                }
+                std::ptr::copy_nonoverlapping(
+                    tables.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(state.tables_buf),
+                    need_tables,
+                );
+                let need_part = hi_size * n_tables * banks * 64 * 16;
+                if state.part_cap < need_part {
+                    if state.part_cap > 0 {
+                        gpu.release(state.part_buf);
+                    }
+                    state.part_buf = gpu.new_buffer(need_part)?;
+                    state.part_cap = need_part;
+                }
+                let need_banks = hi_size * banks * 64 * 16;
+                if state.banks_cap < need_banks {
+                    if state.banks_cap > 0 {
+                        gpu.release(state.banks_buf);
+                    }
+                    state.banks_buf = gpu.new_buffer(need_banks)?;
+                    state.banks_cap = need_banks;
+                }
+                let ab_buf = zc_ab_wrap(&mut state, gpu, ab_inner)?;
+                zc_ab_submit(gpu, &state, ab_buf, bands, n_lo, n_tables, banks, bank_bits)
+            })();
+            match built {
+                Ok(cb) => Some(ZcAbJob {
+                    cb,
+                    calibration,
+                    bands,
+                    banks,
+                    submitted: std::time::Instant::now(),
+                }),
+                Err(_) => None,
+            }
+        }
+    }
+
+    /// Drain the arm. During calibration `cpu_band_partials` must hold the
+    /// CPU's full per-band partial vector (bands x 64 lanes, eq_hi-weighted);
+    /// the probe bands are byte-compared and the share published only on a
+    /// full match. `eq_bot`/`eq_hi` are the same arrays the caller's drain
+    /// uses, so the GPU-derived band values fold identically.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn zc_ab_wait(
+        job: ZcAbJob,
+        eq_bot: &[F128],
+        eq_hi: &[F128],
+        cpu_band_partials: Option<&[[F128; 64]]>,
+        hi_size: usize,
+    ) -> ZcAbResult {
+        use std::sync::atomic::Ordering;
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return ZcAbResult::Failed,
+        };
+        let poison = |cb: Id| {
+            ZC_AB_POISONED.store(true, Ordering::Relaxed);
+            ZC_AB_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            ZcAbResult::Failed
+        };
+        unsafe {
+            if gpu.wait_cb(job.cb).is_err() {
+                return poison(job.cb);
+            }
+            let gpu_wall_ms = zc_fold_gpu_wall_ms(gpu, job.cb);
+            if std::env::var_os("FLOCK_ZC_AB_GPU_DEBUG").is_some() {
+                eprintln!(
+                    "[zc-ab] bands={} gpu_wall={:.3}ms submit-to-drain={:.2}ms",
+                    job.bands,
+                    gpu_wall_ms,
+                    job.submitted.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            gpu.release(job.cb);
+            let Some(state_mutex) = zc_ab_state() else {
+                return ZcAbResult::Failed;
+            };
+            let Ok(state) = state_mutex.lock() else {
+                return ZcAbResult::Failed;
+            };
+            let banks_ptr = gpu.buffer_contents(state.banks_buf).cast::<F128>();
+            let mut out: Vec<[F128; 64]> = Vec::with_capacity(job.bands);
+            for band in 0..job.bands {
+                let mut partial = [F128::ZERO; 64];
+                for u in 0..job.banks {
+                    let row = std::slice::from_raw_parts(
+                        banks_ptr.add((band * job.banks + u) * 64),
+                        64,
+                    );
+                    for lane in 0..64 {
+                        partial[lane] += eq_bot[u] * row[lane];
+                    }
+                }
+                for lane in 0..64 {
+                    partial[lane] *= eq_hi[band];
+                }
+                out.push(partial);
+            }
+            drop(state);
+            if job.calibration {
+                let Some(cpu_all) = cpu_band_partials else {
+                    // Protocol violation (caller ran the CPU on all bands or
+                    // passed the partials); fail closed without re-releasing
+                    // the already-released command buffer.
+                    ZC_AB_POISONED.store(true, Ordering::Relaxed);
+                    ZC_AB_TUNED.store(0, Ordering::Relaxed);
+                    return ZcAbResult::Failed;
+                };
+                if cpu_all.len() != hi_size {
+                    ZC_AB_POISONED.store(true, Ordering::Relaxed);
+                    ZC_AB_TUNED.store(0, Ordering::Relaxed);
+                    return ZcAbResult::Failed;
+                }
+                let ok = (0..job.bands).all(|b| out[b] == cpu_all[b]);
+                // r1162 latched ON on bit-match alone and lost 1.82%
+                // (1d91c8e8, 2026-08-13): the 256x reduce overdispatch plus
+                // the missing speed gate queued GPU AB behind C-fold. Only
+                // publish a share when the Metal GPU wall, scaled to 96
+                // bands, still beats the ~9.7 ms CPU AB head.
+                let gpu_ms = gpu_wall_ms;
+                let est_96 = if job.bands > 0 && gpu_ms > 0.0 {
+                    gpu_ms * (ZC_AB_TUNED_BANDS as f64 / job.bands as f64)
+                } else {
+                    f64::INFINITY
+                };
+                if ok && est_96 < 8.0 {
+                    ZC_AB_TUNED.store(ZC_AB_TUNED_BANDS, Ordering::Relaxed);
+                } else {
+                    ZC_AB_TUNED.store(0, Ordering::Relaxed);
+                }
+                if std::env::var_os("FLOCK_ZC_AB_GPU_DEBUG").is_some() {
+                    eprintln!(
+                        "[zc-ab] calib match={ok} gpu_ms={gpu_ms:.3} est96={est_96:.3} -> tuned={}",
+                        ZC_AB_TUNED.load(Ordering::Relaxed)
+                    );
+                }
+                ZcAbResult::Calibrated
+            } else {
+                ZcAbResult::Prefix(out)
+            }
+        }
+    }
+
     // -------------------------------------------------------------------
     // ZC-window idle fill (see `super::ENV_NO_ZC_IDLE_FILL`).
     // -------------------------------------------------------------------
@@ -13601,6 +14264,11 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+
+/// Zerocheck round-one AB-completion GPU arm (see `ENV_NO_GPU_ZC_AB`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_fold, zc_ab_wait};
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

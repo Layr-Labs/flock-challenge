@@ -1801,7 +1801,9 @@ pub const ENV_NO_ZC_AB_EQ_FOLD: &str = "FLOCK_NO_ZC_AB_EQ_FOLD";
 pub const ENV_ZC_AB_EQ_FOLD_S: &str = "FLOCK_ZC_AB_EQ_FOLD_S";
 
 /// `x_lo` bits kept in the pre-scaled table index; the rest select the bank.
-const AB_EQ_FOLD_TABLE_BITS: usize = 5;
+/// Default 7 (s = 5) is the mul-optimal split and the geometry the GPU AB
+/// arm is built for (banks = 32, chunks_per_u = 4).
+const AB_EQ_FOLD_TABLE_BITS: usize = 7;
 
 /// Fold policy for [`round1_shift_reduce_ab_packed_padded_with_precomputed`].
 /// Threaded as an argument rather than read from the environment inside the
@@ -2023,8 +2025,24 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
             let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
             let tables = build_ab_eq_fold_tables(&eq_top_scaled, convert);
             let bank_len = eq_bot.len() * ELL;
-            crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-                let mut partial = [F128::ZERO; ELL];
+
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let gpu_job = crate::gpu_commit::launch_zc_ab_fold(
+                ab_inner_bytes,
+                &tables,
+                &eq_bot,
+                &eq.hi,
+                eq.n_lo,
+                hi_size,
+                bank_bits,
+            );
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let gpu_bands = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let gpu_bands = 0usize;
+
+            let band_work = |x_hi: usize, partial: &mut [F128; ELL]| {
+                partial.fill(F128::ZERO);
                 AB_EQ_FOLD_BANKS.with(|cell| {
                     let mut banks = cell.borrow_mut();
                     if banks.len() != bank_len {
@@ -2043,14 +2061,48 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                         &tables,
                         bank_bits,
                         &mut banks,
-                        &mut partial,
+                        partial,
                     );
                 });
+            };
+
+            crate::epool::run_hetero_chunks(hi_size - gpu_bands, |i| {
+                let x_hi = i + gpu_bands;
+                let mut partial = [F128::ZERO; ELL];
+                band_work(x_hi, &mut partial);
                 // SAFETY: each queue index owns one disjoint output slot and
                 // the synchronous queue join publishes all writes before
                 // reduction.
                 unsafe { *partials_base.ptr().add(x_hi) = partial };
             });
+
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if let Some(job) = gpu_job {
+                let calib = job.is_calibration();
+                let bands = job.bands;
+                let cpu_partials = if calib {
+                    Some(unsafe { std::slice::from_raw_parts(partials_base.ptr(), hi_size) })
+                } else {
+                    None
+                };
+                match crate::gpu_commit::zc_ab_wait(job, &eq_bot, &eq.hi, cpu_partials, hi_size)
+                {
+                    crate::gpu_commit::ZcAbResult::Calibrated => {}
+                    crate::gpu_commit::ZcAbResult::Prefix(vals) => {
+                        debug_assert_eq!(vals.len(), bands);
+                        for (dst, src) in partials.iter_mut().take(bands).zip(vals) {
+                            *dst = src;
+                        }
+                    }
+                    crate::gpu_commit::ZcAbResult::Failed => {
+                        crate::epool::run_hetero_chunks(bands, |x_hi| {
+                            let mut partial = [F128::ZERO; ELL];
+                            band_work(x_hi, &mut partial);
+                            unsafe { *partials_base.ptr().add(x_hi) = partial };
+                        });
+                    }
+                }
+            }
             crate::scratch::give_f128(tables);
         }
     }
