@@ -543,7 +543,10 @@ pub fn prewarm_prover(m: usize) {
     let large = 1usize << (m - 6);
     let ping_pong = small / 2;
     let stripe_bytes = 1usize << (m - 3);
-    let mut bufs: Vec<Vec<F128>> = Vec::new();
+    // Two large, six small, and (when nonzero) two ping-pong slots are
+    // installed below; reserve that exact metadata capacity.
+    let slot_count = 8 + usize::from(ping_pong != 0) * 2;
+    let mut bufs: Vec<Vec<F128>> = Vec::with_capacity(slot_count);
     for _ in 0..2 {
         bufs.push(take_f128(large));
     }
