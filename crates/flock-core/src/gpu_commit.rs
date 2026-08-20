@@ -4378,6 +4378,54 @@ kernel void blake3_pow_scan(
             }
         }
 
+        /// Allocate a CPU-signallable Metal shared event. The streamed
+        /// first-pass path uses one event to publish witness bands into a
+        /// single pre-committed command buffer, avoiding one command-buffer
+        /// allocation/commit per band while preserving the same GPU order.
+        pub(crate) unsafe fn shared_event(&self) -> Result<Id, String> {
+            unsafe {
+                let event: Id = send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    self.device,
+                    c"newSharedEvent"
+                );
+                if event.is_null() {
+                    Err("newSharedEvent failed".into())
+                } else {
+                    Ok(event)
+                }
+            }
+        }
+
+        /// Make commands encoded after this point wait until the CPU has
+        /// published at least `value` through `signal_shared_event`.
+        pub(crate) unsafe fn encode_wait_for_event(&self, cb: Id, event: Id, value: u64) {
+            unsafe {
+                send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel, Id, u64),
+                    cb,
+                    c"encodeWaitForEvent:value:",
+                    event,
+                    value
+                );
+            }
+        }
+
+        /// Publish CPU writes to a shared-event-gated command buffer.
+        pub(crate) unsafe fn signal_shared_event(&self, event: Id, value: u64) {
+            unsafe {
+                send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel, u64),
+                    event,
+                    c"setSignaledValue:",
+                    value
+                );
+            }
+        }
+
         pub(crate) unsafe fn compute_encoder(&self, cb: Id) -> Result<Id, String> {
             unsafe {
                 let e: Id = send!(
@@ -5317,6 +5365,11 @@ kernel void blake3_pow_scan(
         log_d: usize,
         n_leaves: usize,
         next_r: usize,
+        /// Non-nil when the nine ranked ranges were pre-encoded into one
+        /// command buffer. CPU band completion advances this shared event to
+        /// the published r-end; the ordinary per-band buffers remain the
+        /// exact fallback when event construction is unavailable.
+        publish_event: Id,
         pending: Vec<Id>,
         failed: Option<String>,
         owns_lease: bool,
@@ -5355,43 +5408,55 @@ kernel void blake3_pow_scan(
                 return;
             }
 
-            // A position contains 64 F128 lanes = 1 KiB. Offsetting both the
-            // z and staging bindings makes local kernel r map to global
-            // r_start+r without modifying the proven full-range kernel.
-            let byte_offset = r_start * 64 * core::mem::size_of::<F128>();
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            let result = unsafe {
-                let pool = self.gpu.pool_push();
-                let result = (|| -> Result<Id, String> {
-                    let cb = self.gpu.command_buffer()?;
-                    let enc = self.gpu.compute_encoder(cb)?;
-                    FromZFirstPassPlan::new(self.log_d).encode_range(
-                        self.gpu,
-                        enc,
-                        self.staging,
-                        self.tw_buf,
-                        self.z_buf,
-                        self.log_d,
-                        byte_offset,
-                        r_count,
-                    );
-                    self.gpu.end_encoding(enc);
-                    // `commandBuffer` is autoreleased. Retain it before
-                    // popping this short-lived pool because completion is
-                    // deliberately deferred until witness generation ends.
-                    let cb = self.gpu.retain(cb);
-                    self.gpu.commit_async(cb);
-                    Ok(cb)
-                })();
-                self.gpu.pool_pop(pool);
-                result
-            };
-            match result {
-                Ok(cb) => {
-                    self.pending.push(cb);
-                    self.next_r += r_count;
+            if !self.publish_event.is_null() {
+                // The wait values are cumulative r-ends, so both production
+                // schedules are supported by one pre-encoded graph: tapered
+                // publishes 64,512 then 65,536; the eight-band control jumps
+                // directly to 65,536 and releases both final waits only after
+                // its entire last band is initialized.
+                unsafe {
+                    self.gpu
+                        .signal_shared_event(self.publish_event, (r_start + r_count) as u64);
                 }
-                Err(e) => self.failed = Some(e),
+                self.next_r += r_count;
+            } else {
+                // A position contains 64 F128 lanes = 1 KiB. Offsetting both
+                // bindings makes local kernel r map to global r_start+r.
+                let byte_offset = r_start * 64 * core::mem::size_of::<F128>();
+                let result = unsafe {
+                    let pool = self.gpu.pool_push();
+                    let result = (|| -> Result<Id, String> {
+                        let cb = self.gpu.command_buffer()?;
+                        let enc = self.gpu.compute_encoder(cb)?;
+                        FromZFirstPassPlan::new(self.log_d).encode_range(
+                            self.gpu,
+                            enc,
+                            self.staging,
+                            self.tw_buf,
+                            self.z_buf,
+                            self.log_d,
+                            byte_offset,
+                            r_count,
+                        );
+                        self.gpu.end_encoding(enc);
+                        // `commandBuffer` is autoreleased. Retain it before
+                        // popping this short-lived pool because completion is
+                        // deliberately deferred until witness generation ends.
+                        let cb = self.gpu.retain(cb);
+                        self.gpu.commit_async(cb);
+                        Ok(cb)
+                    })();
+                    self.gpu.pool_pop(pool);
+                    result
+                };
+                match result {
+                    Ok(cb) => {
+                        self.pending.push(cb);
+                        self.next_r += r_count;
+                    }
+                    Err(e) => self.failed = Some(e),
+                }
             }
 
             // Final tile queued: encode the hybrid GPU prefix now and commit
@@ -5451,6 +5516,20 @@ kernel void blake3_pow_scan(
         }
 
         fn wait_pending(&mut self) -> Result<(), String> {
+            // A pre-committed event graph may still be parked on a range if
+            // its producer unwound or rejected a malformed publication.
+            // Release the remaining waits before draining so Drop can never
+            // deadlock; the recorded failure still forces the established
+            // CPU fallback and prevents these staging bytes from escaping.
+            if !self.publish_event.is_null() {
+                let total_r = 1usize << (self.log_d - 4);
+                if self.next_r < total_r {
+                    unsafe {
+                        self.gpu
+                            .signal_shared_event(self.publish_event, total_r as u64);
+                    }
+                }
+            }
             let mut result = self.failed.take().map_or(Ok(()), Err);
             let trace = window_trace_enabled();
             let host_at_entry = self.started.elapsed().as_secs_f64() * 1e3;
@@ -5493,6 +5572,10 @@ kernel void blake3_pow_scan(
                 if result.is_ok() {
                     result = waited;
                 }
+            }
+            if !self.publish_event.is_null() {
+                unsafe { self.gpu.release(self.publish_event) };
+                self.publish_event = NIL;
             }
             if trace && prev_end.is_some() {
                 eprintln!(
@@ -5581,6 +5664,75 @@ kernel void blake3_pow_scan(
                 _ => 0,
             }
         };
+
+        // The production tapered schedule is seven 8,192-r bands followed
+        // by 7,168 and 1,024; the exact uniform control is eight 8,192-r
+        // bands. Cumulative waits make this one graph correct for both: a
+        // uniform final publication advances past both trailing waits.
+        // Failure is deliberately local — retain the incumbent per-band
+        // command-buffer stream instead of disabling the GPU commit.
+        let shared_stream = if std::env::var_os("FLOCK_NO_STREAM_SHARED_EVENT").is_none() {
+            unsafe {
+                let pool = gpu.pool_push();
+                let built = (|| -> Result<(Id, Id), String> {
+                    let event = gpu.shared_event()?;
+                    let result = (|| -> Result<Id, String> {
+                        let cb = gpu.command_buffer()?;
+                        const RANGES: [usize; 9] =
+                            [8192, 8192, 8192, 8192, 8192, 8192, 8192, 7168, 1024];
+                        let mut r_start = 0usize;
+                        for r_count in RANGES {
+                            let r_end = r_start + r_count;
+                            gpu.encode_wait_for_event(cb, event, r_end as u64);
+                            let enc = gpu.compute_encoder(cb)?;
+                            FromZFirstPassPlan::new(params.k_code()).encode_range(
+                                gpu,
+                                enc,
+                                state.staging,
+                                state.tw_buf,
+                                z_buf,
+                                params.k_code(),
+                                r_start * 64 * core::mem::size_of::<F128>(),
+                                r_count,
+                            );
+                            gpu.end_encoding(enc);
+                            r_start = r_end;
+                        }
+                        debug_assert_eq!(r_start, 1usize << (params.k_code() - 4));
+                        // `commandBuffer` is autoreleased; retain it across
+                        // this short-lived pool until wait_pending drains it.
+                        let cb = gpu.retain(cb);
+                        gpu.commit_async(cb);
+                        Ok(cb)
+                    })();
+                    match result {
+                        Ok(cb) => Ok((event, cb)),
+                        Err(e) => {
+                            gpu.release(event);
+                            Err(e)
+                        }
+                    }
+                })();
+                gpu.pool_pop(pool);
+                built
+            }
+        } else {
+            Err("shared-event stream disabled".into())
+        };
+        let (publish_event, pending) = match shared_stream {
+            Ok((event, cb)) => {
+                if debug_enabled() {
+                    eprintln!("[gpu-commit] one-CB shared-event first-pass stream armed");
+                }
+                (event, vec![cb])
+            }
+            Err(e) => {
+                if debug_enabled() {
+                    eprintln!("[gpu-commit] shared-event stream unavailable ({e})");
+                }
+                (NIL, Vec::with_capacity(8))
+            }
+        };
         Some(FromZFirstPassStream {
             gpu,
             z_buf,
@@ -5590,7 +5742,8 @@ kernel void blake3_pow_scan(
             log_d: params.k_code(),
             n_leaves: params.n_leaves(),
             next_r: 0,
-            pending: Vec::with_capacity(8),
+            publish_event,
+            pending,
             failed: None,
             owns_lease: true,
             started: std::time::Instant::now(),
