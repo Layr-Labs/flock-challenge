@@ -661,9 +661,18 @@ impl L1MerkleOverlap {
 /// complete.
 pub const ENV_NO_ZC_IDLE_FILL: &str = "FLOCK_NO_ZC_IDLE_FILL";
 
-/// Read per prove (uncached) so same-process A/B tests can toggle it.
+/// Non-ranked callers remain uncached for same-process A/B tests; the ranked
+/// worker resolves its fixed value during untimed warm-up.
 pub(crate) fn zc_idle_fill_enabled() -> bool {
-    !std::env::var(ENV_NO_ZC_IDLE_FILL).is_ok_and(|v| v == "1")
+    let read = || !std::env::var(ENV_NO_ZC_IDLE_FILL).is_ok_and(|v| v == "1");
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            !std::env::var(ENV_NO_ZC_IDLE_FILL).is_ok_and(|v| v == "1")
+        });
+        *RANKED
+    } else {
+        read()
+    }
 }
 
 /// Kill switch for the commit-tail fill (`FLOCK_NO_COMMIT_TAIL_FILL=1`,
@@ -680,9 +689,18 @@ pub(crate) fn zc_idle_fill_enabled() -> bool {
 /// after the real challenger reproduces byte-identical challenges.
 pub const ENV_NO_COMMIT_TAIL_FILL: &str = "FLOCK_NO_COMMIT_TAIL_FILL";
 
-/// Read per prove (uncached) so same-process A/B tests can toggle it.
+/// Non-ranked callers remain uncached for same-process A/B tests; the ranked
+/// worker resolves its fixed value during untimed warm-up.
 pub fn commit_tail_fill_enabled() -> bool {
-    !std::env::var(ENV_NO_COMMIT_TAIL_FILL).is_ok_and(|v| v == "1")
+    let read = || !std::env::var(ENV_NO_COMMIT_TAIL_FILL).is_ok_and(|v| v == "1");
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            !std::env::var(ENV_NO_COMMIT_TAIL_FILL).is_ok_and(|v| v == "1")
+        });
+        *RANKED
+    } else {
+        read()
+    }
 }
 
 /// Kill switch for the zerocheck first-tail-round (T3 compact reconstruction)
