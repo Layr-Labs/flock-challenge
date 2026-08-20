@@ -253,3 +253,25 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker r265-sample-265-20260818-20260818-2309
 
 // dispersion-resample marker r266-sample-266-20260818-20260818-2319
+
+// gin-tree adoption marker steer-1 (base a37d86b2, validated 142.174 draw)
+
+// dispersion-resample marker steerloop-10
+
+// dispersion-resample marker steerloop-11
+
+// dispersion-resample marker steerloop-12
+
+// dispersion-resample marker steerloop-12
+
+// dispersion-resample marker steerloop-13
+
+// dispersion-resample marker steerloop-14
+
+// dispersion-resample marker steerloop-15
+
+// dispersion-resample marker steerloop-16
+
+// dispersion-resample marker steerloop-17
+
+// dispersion-resample marker steerloop-18
