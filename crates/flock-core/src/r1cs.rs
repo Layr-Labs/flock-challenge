@@ -793,16 +793,15 @@ fn set_bit_packed(z_packed: &mut [crate::field::F128], global_bit: usize) {
 /// `out[i] = ⊕_{j: M[i, j] = 1} z[j]` (over GF(2)).
 fn matrix_vector_product(m: &SparseBinaryMatrix, z: &[bool]) -> Vec<bool> {
     assert_eq!(z.len(), m.num_cols);
-    m.rows
-        .iter()
-        .map(|row| {
+    let mut out = Vec::with_capacity(m.num_rows);
+    out.extend(m.rows.iter().map(|row| {
             let mut acc = false;
             for &col in row {
                 acc ^= z[col];
             }
             acc
-        })
-        .collect()
+        }));
+    out
 }
 
 #[cfg(test)]
