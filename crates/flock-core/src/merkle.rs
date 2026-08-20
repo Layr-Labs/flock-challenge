@@ -889,12 +889,18 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     active.dedup();
     debug_assert!(active.iter().all(|&p| p < num_leaves));
 
-    let mut proof = Vec::new();
+    // At most one sibling is emitted per active query at each tree level.
+    // Reserve that independent-path upper bound so proof construction does not
+    // geometrically grow its output allocation during the tree walk.
+    let mut proof = Vec::with_capacity(active.len() * num_leaves.ilog2() as usize);
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
+    // Ping-pong frontier storage between levels. Each next frontier is at most
+    // half as large, so no new allocation is needed during the tree walk.
+    let mut next = Vec::with_capacity(active.len().div_ceil(2));
 
     while level_len > 1 {
-        let mut next = Vec::with_capacity(active.len());
+        next.clear();
         let mut i = 0;
         while i < active.len() {
             let p = active[i];
@@ -913,7 +919,7 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
         // `next` is sorted-unique by construction: the input was sorted-unique;
         // consecutive sibling pairs (handled above) collapse to one; otherwise
         // p >> 1 preserves strict ordering.
-        active = next;
+        std::mem::swap(&mut active, &mut next);
         level_start += level_len;
         level_len >>= 1;
     }
