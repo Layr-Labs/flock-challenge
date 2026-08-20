@@ -678,7 +678,9 @@ pub fn round1_shift_reduce_extract_z_packed_deg4(
     let eq_outer_scaled: Vec<F128> = eq_outer.iter().map(|v| *v * d_inv_val).collect();
     let big_outer_size = 1usize << n_outer;
 
-    let mut res_abcd = [F128::ZERO; LAMBDA4_SIZE];
+    // This is the final returned buffer: accumulate into its exact-size heap
+    // allocation rather than copying a completed stack array into a new Vec.
+    let mut res_abcd = vec![F128::ZERO; LAMBDA4_SIZE];
     // z is **linear**: accumulate on S (64 lanes), extend once at end-of-call.
     let mut res_z_on_s = [F128::ZERO; S_SIZE];
 
@@ -779,7 +781,7 @@ pub fn round1_shift_reduce_extract_z_packed_deg4(
 
     // ----- End-of-call: extend res_z_on_s from S to Λ₄ via F128 NTT -----
     let res_z_lifted = ntt_extend_f128_vec_ghash_deg4(&res_z_on_s, table);
-    (res_abcd.to_vec(), res_z_lifted)
+    (res_abcd, res_z_lifted)
 }
 
 // ---------------------------------------------------------------------------
