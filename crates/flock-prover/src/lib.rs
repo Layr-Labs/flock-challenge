@@ -253,3 +253,27 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker r265-sample-265-20260818-20260818-2309
 
 // dispersion-resample marker r266-sample-266-20260818-20260818-2319
+
+// dispersion-resample marker crown-redraw-20260820-0410
+
+// dispersion-resample marker crown-redraw-steer-20260820-0507
+
+// dispersion-resample marker crown-redraw-steer2-20260820-0522
+
+// dispersion-resample marker steer3 (m1-window crown-tree redraw)
+
+// dispersion-resample marker steer4 (next m1-window crown-tree redraw)
+
+// dispersion-resample marker steerloop-1
+
+// dispersion-resample marker steerloop-2
+
+// dispersion-resample marker steerloop-3
+
+// dispersion-resample marker steerloop-4
+
+// dispersion-resample marker steerloop-5
+
+// dispersion-resample marker steerloop-5
+
+// dispersion-resample marker steerloop-6
