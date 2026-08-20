@@ -35,12 +35,12 @@
 //!
 //! # Handoff
 //!
-//! The seed-pipe thread calls [`keepalive_stop`] the instant its stdin `read()`
-//! returns — before it forwards the seed byte or starts the speculative prove —
-//! and the timed `prove_fast` call also calls it (idempotently) as a fallback
-//! when the seed pipe is disabled. Stop signals the spin threads and joins
-//! them, so the timed path never shares a core with a keep-alive thread and the
-//! keep-alive never steals a cycle from real proving.
+//! The seed-pipe thread signals the keep-alive down the instant its stdin
+//! `read()` returns, before forwarding the seed or starting the speculative
+//! prove. The protected wrapper's timed `prove_fast` call joins those already
+//! stopped threads after its own seed expansion, while the speculative proof is
+//! in flight. The seed-pipe-disabled fallback still stops and joins directly,
+//! so real proving never shares a core with a keep-alive thread.
 //!
 //! # Safety net
 //!
@@ -68,10 +68,10 @@ pub fn keepalive_start() {
 }
 
 /// Stop the keep-alive: signal the spin threads and join them. Idempotent and
-/// safe to call from any thread. Called by the seed-pipe thread the instant its
-/// stdin `read()` returns (before forwarding the seed or starting the
-/// speculative prove), and by the timed `prove_fast` call as a fallback when the
-/// seed pipe is disabled.
+/// safe to call from any thread. The timed protected-wrapper `prove_fast` call
+/// uses it after seed expansion to reap threads already signalled by the
+/// seed-pipe, or to perform the complete stop when seed-pipe speculation is
+/// disabled.
 pub fn keepalive_stop() {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     imp::stop();
@@ -79,21 +79,15 @@ pub fn keepalive_stop() {
 
 /// Signal-only half of [`keepalive_stop`]: clear the run flag so every spin
 /// thread starts exiting (they notice within one ~1024-op spin slice), but do
-/// not join them. The seed-pipe thread uses this so the 10–14 sequential
-/// thread joins — pure serial time at the very front of the timed window —
-/// happen after the seed is forwarded instead of before it. Pair with
-/// [`keepalive_join`]; calling [`keepalive_stop`] later is also safe.
+/// not join them. The seed-pipe thread uses this before forwarding the seed;
+/// the wrapper's later [`keepalive_stop`] drains the handles while the
+/// speculative proof is already in flight. Calling [`keepalive_stop`] directly
+/// remains safe.
 pub fn keepalive_signal() {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     imp::signal();
 }
 
-/// Join-only half of [`keepalive_stop`]: drain and join any spin threads that
-/// have been signalled. Idempotent; a no-op when nothing was started.
-pub fn keepalive_join() {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    imp::join_all();
-}
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod imp {
@@ -187,10 +181,8 @@ mod imp {
         RUNNING.swap(false, Ordering::SeqCst);
     }
 
-    /// Drain and join every parked handle. Runs after the seed forward on
-    /// the deferred path, so the sequential joins are off the timed
-    /// window's serial prologue. Idempotent: an empty handle list is a
-    /// no-op, and `start` refuses to run while `RUNNING` is still set.
+    /// Drain and join every parked handle. Idempotent: an empty handle list is
+    /// a no-op, and `start` refuses to run while `RUNNING` is still set.
     pub(super) fn join_all() {
         let drained: Vec<JoinHandle<()>> = {
             let mut handles = HANDLES.lock().unwrap_or_else(|e| e.into_inner());
