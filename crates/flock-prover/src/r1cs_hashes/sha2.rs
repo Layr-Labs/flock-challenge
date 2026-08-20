@@ -212,43 +212,65 @@ fn xor_sup(a: &Sup, b: &Sup) -> Sup {
 }
 
 fn xor3(a: &Sup, b: &Sup, c: &Sup) -> Sup {
-    xor_sup(&xor_sup(a, b), c)
+    // Merge the three sorted, duplicate-free supports directly.  An index
+    // survives iff it occurs in an odd number of inputs.
+    let mut out = Vec::with_capacity(a.len() + b.len() + c.len());
+    let (mut i, mut j, mut k) = (0, 0, 0);
+    while i < a.len() || j < b.len() || k < c.len() {
+        let next = [a.get(i), b.get(j), c.get(k)]
+            .into_iter()
+            .flatten()
+            .copied()
+            .min()
+            .expect("at least one support remains");
+        let mut parity = false;
+        if a.get(i) == Some(&next) {
+            i += 1;
+            parity = !parity;
+        }
+        if b.get(j) == Some(&next) {
+            j += 1;
+            parity = !parity;
+        }
+        if c.get(k) == Some(&next) {
+            k += 1;
+            parity = !parity;
+        }
+        if parity {
+            out.push(next);
+        }
+    }
+    out
 }
 
 fn xor_words(x: &Word, y: &Word) -> Word {
     (0..WORD_BITS).map(|i| xor_sup(&x[i], &y[i])).collect()
 }
 
-fn rotr(w: &Word, n: usize) -> Word {
-    (0..WORD_BITS)
-        .map(|i| w[(i + n) % WORD_BITS].clone())
-        .collect()
-}
-
-fn shr(w: &Word, n: usize) -> Word {
+fn rot_xor3(w: &Word, r1: usize, r2: usize, r3: usize) -> Word {
     (0..WORD_BITS)
         .map(|i| {
-            if i + n < WORD_BITS {
-                w[i + n].clone()
-            } else {
-                Sup::new()
-            }
+            xor3(
+                &w[(i + r1) % WORD_BITS],
+                &w[(i + r2) % WORD_BITS],
+                &w[(i + r3) % WORD_BITS],
+            )
         })
         .collect()
 }
 
-fn rot_xor3(w: &Word, r1: usize, r2: usize, r3: usize) -> Word {
-    let a = rotr(w, r1);
-    let b = rotr(w, r2);
-    let c = rotr(w, r3);
-    (0..WORD_BITS).map(|i| xor3(&a[i], &b[i], &c[i])).collect()
-}
-
 fn sigma_xor(w: &Word, r1: usize, r2: usize, sh: usize) -> Word {
-    let a = rotr(w, r1);
-    let b = rotr(w, r2);
-    let s = shr(w, sh);
-    (0..WORD_BITS).map(|i| xor3(&a[i], &b[i], &s[i])).collect()
+    (0..WORD_BITS)
+        .map(|i| {
+            let a = &w[(i + r1) % WORD_BITS];
+            let b = &w[(i + r2) % WORD_BITS];
+            if i + sh < WORD_BITS {
+                xor3(a, b, &w[i + sh])
+            } else {
+                xor_sup(a, b)
+            }
+        })
+        .collect()
 }
 
 #[inline]
@@ -400,14 +422,7 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     ];
 
     for r in 0..N_ROUNDS {
-        let a = state[0].clone();
-        let bb = state[1].clone();
-        let c = state[2].clone();
-        let d = state[3].clone();
-        let e = state[4].clone();
-        let f = state[5].clone();
-        let g = state[6].clone();
-        let h_var = state[7].clone();
+        let [a, bb, c, d, e, f, g, h_var] = std::mem::take(&mut state);
 
         // ch_and[r][bit] = e[bit] · (f[bit] ⊕ g[bit])
         let mut ch_and = zero_word();
@@ -738,7 +753,11 @@ impl flock_core::lincheck::LincheckCircuit for Sha2LincheckCircuit {
         }
 
         let h_in: Vec<Word> = (0..H_WORDS).map(|w| wire_word(|b| h_bit(w, b))).collect();
-        let mut w_arr: Vec<Word> = (0..M_WORDS).map(|i| wire_word(|b| m_bit(i, b))).collect();
+        let mut w_arr: Vec<Word> = {
+            let mut v = Vec::with_capacity(16 + N_SCHED);
+            v.extend((0..M_WORDS).map(|i| wire_word(|b| m_bit(i, b))));
+            v
+        };
 
         for t in 16..(16 + N_SCHED) {
             let s1 = sigma_1(&w_arr[t - 2]);
@@ -785,14 +804,7 @@ impl flock_core::lincheck::LincheckCircuit for Sha2LincheckCircuit {
         ];
 
         for r in 0..N_ROUNDS {
-            let a = state[0].clone();
-            let bb = state[1].clone();
-            let c = state[2].clone();
-            let d = state[3].clone();
-            let e = state[4].clone();
-            let f = state[5].clone();
-            let g = state[6].clone();
-            let h_var = state[7].clone();
+            let [a, bb, c, d, e, f, g, h_var] = std::mem::take(&mut state);
 
             let mut ch_and = zero_word();
             for bit in 0..WORD_BITS {
