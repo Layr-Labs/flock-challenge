@@ -32,6 +32,17 @@ use flock_core::pcs::{self, Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
+
+fn phase_timing_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    if crate::seed_pipe::is_ranked_worker() {
+        static RANKED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_PHASE_TIMING").is_some());
+        *RANKED
+    } else {
+        read()
+    }
+}
 #[inline]
 fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
@@ -452,9 +463,9 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = phase_timing_enabled();
     let cpu_open0 = phase_timing.then(process_cpu_ms);
-    let t_open = std::time::Instant::now();
+    let t_open = phase_timing.then(std::time::Instant::now);
     // Publish-prefix pre-encode: `commitment` / `zc_proof` / `lc_proof` are
     // transcript-final here — the open below only produces `pcs_open` — so
     // the publish-tail's 450 kB output allocation and ~4.3 kB prefix encode
@@ -499,7 +510,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         ),
     };
     if phase_timing {
-        let wall = t_open.elapsed().as_secs_f64() * 1e3;
+        let wall = t_open.as_ref().unwrap().elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_open0.unwrap_or(0.0);
         eprintln!(
             "[phase-timing] pcs-open: {wall:.2} ms cpu={cpu:.1} util={:.1}",
@@ -862,7 +873,7 @@ fn commit_with_round1_ab_precompute(
             // from this arm's measured wall (an Instant read is free; the
             // store is one relaxed atomic per prove).
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
-            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            if phase_timing_enabled() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
             r
@@ -955,10 +966,10 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = phase_timing_enabled();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>| {
         let cpu0 = phase_timing.then(process_cpu_ms);
-        let t_commit = std::time::Instant::now();
+        let t_commit = phase_timing.then(std::time::Instant::now);
         let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
             &z_packed,
             &a_packed_f128,
@@ -969,7 +980,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             tail_fill,
         );
         if phase_timing {
-            let wall = t_commit.elapsed().as_secs_f64() * 1e3;
+            let wall = t_commit.as_ref().unwrap().elapsed().as_secs_f64() * 1e3;
             let cpu = process_cpu_ms() - cpu0.unwrap_or(0.0);
             eprintln!(
                 "[phase-timing] commit+ab-precompute: {wall:.2} ms cpu={cpu:.1} util={:.1}",
@@ -1117,7 +1128,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let (commitment, prover_data, ab_inner) = pre_zerocheck;
     bind_statement(challenger, r1cs, &commitment);
     let cpu_zc0 = phase_timing.then(process_cpu_ms);
-    let t_zc = std::time::Instant::now();
+    let t_zc = phase_timing.then(std::time::Instant::now);
 
     let (zc_proof, zc_claim, s_hat_v_c) = {
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
@@ -1157,7 +1168,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         }
     };
     if phase_timing {
-        let wall = t_zc.elapsed().as_secs_f64() * 1e3;
+        let wall = t_zc.as_ref().unwrap().elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_zc0.unwrap_or(0.0);
         eprintln!(
             "[phase-timing] zerocheck: {wall:.2} ms cpu={cpu:.1} util={:.1}",
@@ -1171,7 +1182,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     flock_core::scratch::give_f128(b_packed_f128);
 
     let cpu_lc0 = phase_timing.then(process_cpu_ms);
-    let t_lc = std::time::Instant::now();
+    let t_lc = phase_timing.then(std::time::Instant::now);
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
@@ -1208,7 +1219,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
     flock_core::scratch::give_f128(z_vec_pre);
     if phase_timing {
-        let wall = t_lc.elapsed().as_secs_f64() * 1e3;
+        let wall = t_lc.as_ref().unwrap().elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_lc0.unwrap_or(0.0);
         eprintln!(
             "[phase-timing] lincheck+s_hat_v: {wall:.2} ms cpu={cpu:.1} util={:.1}",
