@@ -1433,22 +1433,22 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        None,
         challenger,
     );
     (proof, claim)
 }
 
-/// Variant of [`prove_padded`] that also returns the **pre-sumcheck** z_vec
-/// (`output[i_inner] = ẑ(i_inner, x_ab.x_outer)`, length `2^k_log`). The
-/// downstream PCS reuses this vector to compute the AB-claim's ring-switch
-/// `s_hat_v` via [`crate::pcs::ring_switch::s_hat_v_from_z_vec`], skipping a
-/// `fold_1b_rows` pass at open time.
+/// Variant of [`prove_padded`] that captures the in-place `z_vec` after a
+/// caller-selected number of top-variable sumcheck folds.
 ///
-/// Pays one extra `2^k_log` F128 clone (~2 MB at k_log=17) before the
-/// sumcheck loop; callers that don't need the reuse should keep using
-/// [`prove_padded`] to avoid that clone.
-pub fn prove_padded_capture_z_vec<Ch: Challenger>(
+/// A value of zero captures the pre-sumcheck vector. A value of one captures
+/// the vector immediately after binding the first (highest) `i_rest` bit, and
+/// so on. This lets downstream protocols reuse an intermediate the lincheck
+/// already computes instead of cloning the full vector and folding it again.
+///
+/// Panics when `capture_after_top_folds > k_log - k_skip`.
+pub fn prove_padded_capture_z_vec_after_top_folds<Ch: Challenger>(
     z_packed: &[u8],
     m: usize,
     k_log: usize,
@@ -1456,6 +1456,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
+    capture_after_top_folds: usize,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
     let (proof, claim, captured) = prove_padded_inner(
@@ -1466,14 +1467,36 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        Some(capture_after_top_folds),
         challenger,
     );
     (
         proof,
         claim,
-        captured.expect("capture=true must produce z_vec"),
+        captured.expect("requested z_vec capture must be produced"),
     )
+}
+
+fn lincheck_trace_enabled() -> bool {
+    let read = || std::env::var("LINCHECK_TRACE").is_ok();
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("LINCHECK_TRACE").is_ok());
+        *RANKED
+    } else {
+        read()
+    }
+}
+
+fn lincheck_join_enabled() -> bool {
+    let read = || std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_none();
+    if crate::is_ranked_worker_process() {
+        static RANKED: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_none());
+        *RANKED
+    } else {
+        read()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1485,7 +1508,7 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture_after_top_folds: Option<usize>,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
     let k = 1usize << k_log;
@@ -1494,12 +1517,18 @@ fn prove_padded_inner<Ch: Challenger>(
     assert!(k_skip <= k_log, "k_skip must be ≤ k_log");
     assert!(useful_bits <= k, "useful_bits ({useful_bits}) > k ({k})");
     let inner_rest_len = k_log - k_skip;
+    if let Some(folds) = capture_after_top_folds {
+        assert!(
+            folds <= inner_rest_len,
+            "capture fold count ({folds}) exceeds lincheck rounds ({inner_rest_len})"
+        );
+    }
     assert_eq!(circuit.n_cols(), k);
     assert_eq!(x_ab.x_inner_rest.len(), inner_rest_len);
     assert_eq!(x_ab.x_outer.len(), n_log);
 
     challenger.observe_label(b"flock-lincheck-v0");
-    let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    let trace = lincheck_trace_enabled();
 
     // 1. Sample α (matches verifier's order). Used to batch the two scalar
     //    consistency checks v_a, v_b into a single sumcheck.
@@ -1572,19 +1601,17 @@ fn prove_padded_inner<Ch: Challenger>(
         }
         z_vec
     };
-    let (mut comb_vec, mut z_vec) = if std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some() {
-        (comb_branch(), z_branch())
-    } else {
+    let (mut comb_vec, mut z_vec) = if lincheck_join_enabled() {
         rayon::join(comb_branch, z_branch)
-    };
-    // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
-    //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
-    //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
-        Some(z_vec.clone())
     } else {
-        None
+        (comb_branch(), z_branch())
     };
+    // Optional downstream capture. Capturing after a fold reuses the exact
+    // in-place intermediate produced by the sumcheck instead of re-folding a
+    // pre-sumcheck clone later.
+    let mut captured_z_vec = capture_after_top_folds
+        .filter(|&folds| folds == 0)
+        .map(|_| z_vec.clone());
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -1618,6 +1645,10 @@ fn prove_padded_inner<Ch: Challenger>(
                 // Final round: just fold; z_vec collapses to z_partial.
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
+            }
+            if capture_after_top_folds == Some(t + 1) {
+                debug_assert!(captured_z_vec.is_none());
+                captured_z_vec = Some(z_vec.clone());
             }
         }
     }
