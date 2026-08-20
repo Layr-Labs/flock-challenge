@@ -543,10 +543,10 @@ fn direct_fold4_message_coefficients(h: &[F128; 256], round: usize) -> (Vec<F128
         }
     }
 
-    let (u0, u2) = endpoints.split_at_mut(grid_len);
-    tensor_quadratic_coefficients(u0, round);
-    tensor_quadratic_coefficients(u2, round);
-    (u0.to_vec(), u2.to_vec())
+    let mut u2 = endpoints.split_off(grid_len);
+    tensor_quadratic_coefficients(&mut endpoints, round);
+    tensor_quadratic_coefficients(&mut u2, round);
+    (endpoints, u2)
 }
 
 /// Derive the first four transcript messages from sixteen-bank direct
@@ -640,10 +640,10 @@ fn direct_fold8_message_coefficients(h: &[F128; 4096], round: usize) -> (Vec<F12
         }
     }
 
-    let (u0, u2) = endpoints.split_at_mut(grid_len);
-    tensor_quadratic_coefficients(u0, round);
-    tensor_quadratic_coefficients(u2, round);
-    (u0.to_vec(), u2.to_vec())
+    let mut u2 = endpoints.split_off(grid_len);
+    tensor_quadratic_coefficients(&mut endpoints, round);
+    tensor_quadratic_coefficients(&mut u2, round);
+    (endpoints, u2)
 }
 
 /// Derive the first six transcript messages from sixty-four-bank direct
@@ -1465,7 +1465,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 _ => None,
             })
             .collect();
-        let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
+        let mut rs_dense_all: Vec<&[F128]> = Vec::with_capacity(n_rs);
+        rs_dense_all.extend_from_slice(&rs_baked);
         rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
         let prime = b_combined
             .par_chunks_mut(2)

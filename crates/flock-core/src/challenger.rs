@@ -1161,7 +1161,9 @@ fn grind_relay_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         GRIND_RELAY_DEFAULT
-            && std::env::var(ENV_NO_GRIND_RELAY).map(|v| v != "1").unwrap_or(true)
+            && std::env::var(ENV_NO_GRIND_RELAY)
+                .map(|v| v != "1")
+                .unwrap_or(true)
     })
 }
 
