@@ -202,6 +202,20 @@ fn eval_bit_mle(b_bits: &[bool], r: &[F128]) -> F128 {
     acc
 }
 
+/// Evaluate `b_bits` after applying the protocol convention that the first
+/// row of every path is zero, without materializing a patched copy.
+fn eval_bit_mle_zero_path_starts(b_bits: &[bool], r: &[F128], pos_log: usize) -> F128 {
+    let eq_r = build_eq_table(r);
+    let row_mask = (1usize << pos_log) - 1;
+    let mut acc = F128::ZERO;
+    for (y, &bit) in b_bits.iter().enumerate() {
+        if bit && (y & row_mask) != 0 {
+            acc += eq_r[y];
+        }
+    }
+    acc
+}
+
 // ---------------------------------------------------------------------------
 // Prover
 // ---------------------------------------------------------------------------
@@ -254,7 +268,7 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     let tau_q = &tau[..pos_log];
     let tau_p = &tau[pos_log..n];
 
-    let eq_tau = build_eq_table(&tau); // eq(τ, y) for boolean y — size N
+    let mut eq_tau = build_eq_table(&tau); // eq(τ, y) for boolean y — size N
     let eq_tau_p = build_eq_table(tau_p); // eq(τ_p, i_p) — size P
     let eq_tau_q = build_eq_table(tau_q); // eq(τ_q, i_q) — size L
 
@@ -264,21 +278,16 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     // where shift_q(0) = 0 and shift_q(i_q) = eq(τ_q, i_q - 1) for i_q ≥ 1.
     // For path_log=0: eq_tau_p[0] = 1 and this reduces to
     //   shift(τ, y) + α · δ(y = 0) — the single-path formula.
-    let mut t_shift_alpha = vec![F128::ZERO; n_total];
-    for i_p in 0..n_paths {
-        let weight_p = eq_tau_p[i_p];
-        let row_base = i_p << pos_log;
-        for i_q in 0..n_pos {
-            let shift_iq = if i_q == 0 {
-                F128::ZERO
-            } else {
-                eq_tau_q[i_q - 1]
-            };
-            let leaf_iq = if i_q == 0 { alpha } else { F128::ZERO };
-            t_shift_alpha[row_base | i_q] = weight_p * (shift_iq + leaf_iq);
-        }
+    // Build one position row then scale-copy it for each path. The old
+    // nested loop recomputed the same shift/leaf expression for every path;
+    // path identity affects it only through the single `eq_tau_p` scale.
+    let mut shift_row = Vec::with_capacity(n_pos);
+    shift_row.push(alpha);
+    shift_row.extend_from_slice(&eq_tau_q[..n_pos - 1]);
+    let mut t_shift_alpha = Vec::with_capacity(n_total);
+    for &weight_p in &eq_tau_p {
+        t_shift_alpha.extend(shift_row.iter().map(|&value| weight_p * value));
     }
-    let mut t_eq = eq_tau.clone();
     let mut t_b: Vec<F128> = b_bits
         .iter()
         .map(|&b| if b { F128::ONE } else { F128::ZERO })
@@ -320,7 +329,7 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
             let mut acc = F128::ZERO;
             for i in 0..half {
                 let ta = t_shift_alpha[i] + xx * (t_shift_alpha[i + half] + t_shift_alpha[i]);
-                let te = t_eq[i] + xx * (t_eq[i + half] + t_eq[i]);
+                let te = eq_tau[i] + xx * (eq_tau[i + half] + eq_tau[i]);
                 let tb = t_b[i] + xx * (t_b[i + half] + t_b[i]);
                 let one_plus_tb = F128::ONE + tb;
 
@@ -348,7 +357,7 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
         // Fold all 4-or-more tables by r.
         for i in 0..half {
             t_shift_alpha[i] = t_shift_alpha[i] + r * (t_shift_alpha[i + half] + t_shift_alpha[i]);
-            t_eq[i] = t_eq[i] + r * (t_eq[i + half] + t_eq[i]);
+            eq_tau[i] = eq_tau[i] + r * (eq_tau[i + half] + eq_tau[i]);
             t_b[i] = t_b[i] + r * (t_b[i + half] + t_b[i]);
             g_z[i] = g_z[i] + r * (g_z[i + half] + g_z[i]);
             g_xl[i] = g_xl[i] + r * (g_xl[i + half] + g_xl[i]);
@@ -356,7 +365,7 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
             g_other[i] = g_other[i] + r * (g_other[i + half] + g_other[i]);
         }
         t_shift_alpha.truncate(half);
-        t_eq.truncate(half);
+        eq_tau.truncate(half);
         t_b.truncate(half);
         g_z.truncate(half);
         g_xl.truncate(half);
@@ -366,7 +375,7 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
 
     // After n y-rounds, each table is a single scalar at τ_y.
     let ta = t_shift_alpha[0];
-    let te = t_eq[0];
+    let te = eq_tau[0];
     let tb = t_b[0];
     let one_plus_tb = F128::ONE + tb;
 
@@ -396,8 +405,7 @@ pub fn prove_merkle_path_shift<Ch: Challenger>(
     g_table[xr_slot] = g_xr[0];
     g_table[other_slot] = g_other[0];
 
-    let mut w_vec = w_table.to_vec();
-    let mut g_vec = g_table.to_vec();
+    let (mut w_vec, mut g_vec) = rayon::join(|| w_table.to_vec(), || g_table.to_vec());
 
     // sd round (high bit), then ss round.
     for _round_idx in 0..2 {
@@ -557,12 +565,9 @@ pub fn verify_merkle_path_shift<Ch: Challenger>(
     let t_shift_alpha = eq_taup_tauyp * (shift_q + alpha * eq_tauyq_zero);
     let t_eq = eq_eval(&tau, &instance_point);
     // B(τ_y) — naive O(N). Apply the per-path B-convention (first row of every
-    // path forced to 0) to mirror the prover.
-    let mut b_local = b_bits.to_vec();
-    for i_p in 0..n_paths {
-        b_local[i_p << pos_log] = false;
-    }
-    let t_b = eval_bit_mle(&b_local, &instance_point);
+    // path forced to 0) while evaluating, rather than cloning and patching the
+    // proof-scale bit vector.
+    let t_b = eval_bit_mle_zero_path_starts(b_bits, &instance_point, pos_log);
     let one_plus_t_b = F128::ONE + t_b;
 
     let w_z_contrib = slot_indicator(layout.z_slot, sel_slot, side) * t_eq;
