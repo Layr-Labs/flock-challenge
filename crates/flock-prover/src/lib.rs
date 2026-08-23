@@ -253,3 +253,917 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker r265-sample-265-20260818-20260818-2309
 
 // dispersion-resample marker r266-sample-266-20260818-20260818-2319
+
+// dispersion-resample marker crown-pure-arm-1
+
+// dispersion-resample marker steerloop-35
+
+// dispersion-resample marker steerloop-36
+
+// dispersion-resample marker steerloop-39
+
+// dispersion-resample marker steerloop-39
+
+// dispersion-resample marker steerloop-40
+
+// dispersion-resample marker steerloop-41
+
+// dispersion-resample marker steerloop-42
+
+// dispersion-resample marker steerloop-43
+
+// dispersion-resample marker steerloop-44
+
+// dispersion-resample marker steerloop-45
+
+// dispersion-resample marker steerloop-46
+
+// dispersion-resample marker steerloop-47
+
+// dispersion-resample marker steerloop-48
+
+// dispersion-resample marker steerloop-49
+
+// dispersion-resample marker steerloop-50
+
+// dispersion-resample marker steerloop-51
+
+// dispersion-resample marker steerloop-52
+
+// dispersion-resample marker steerloop-53
+
+// dispersion-resample marker steerloop-54
+
+// dispersion-resample marker steerloop-55
+
+// dispersion-resample marker steerloop-56
+
+// dispersion-resample marker steerloop-57
+
+// dispersion-resample marker steerloop-58
+
+// dispersion-resample marker steerloop-59
+
+// dispersion-resample marker steerloop-60
+
+// dispersion-resample marker steerloop-61
+
+// dispersion-resample marker steerloop-62
+
+// dispersion-resample marker steerloop-63
+
+// dispersion-resample marker steerloop-64
+
+// dispersion-resample marker steerloop-65
+
+// dispersion-resample marker steerloop-66
+
+// dispersion-resample marker steerloop-67
+
+// dispersion-resample marker steerloop-68
+
+// dispersion-resample marker steerloop-68
+
+// dispersion-resample marker steerloop-69
+
+// dispersion-resample marker steerloop-70
+
+// dispersion-resample marker steerloop-70
+
+// dispersion-resample marker steerloop-71
+
+// dispersion-resample marker steerloop-71
+
+// dispersion-resample marker steerloop-72
+
+// dispersion-resample marker steerloop-73
+
+// dispersion-resample marker steerloop-74
+
+// dispersion-resample marker steerloop-75
+
+// dispersion-resample marker steerloop-75
+
+// dispersion-resample marker steerloop-76
+
+// dispersion-resample marker steerloop-77
+
+// dispersion-resample marker steerloop-78
+
+// dispersion-resample marker steerloop-79
+
+// dispersion-resample marker steerloop-80
+
+// dispersion-resample marker steerloop-81
+
+// dispersion-resample marker steerloop-82
+
+// dispersion-resample marker steerloop-83
+
+// dispersion-resample marker steerloop-84
+
+// dispersion-resample marker steerloop-85
+
+// dispersion-resample marker steerloop-86
+
+// dispersion-resample marker steerloop-87
+
+// dispersion-resample marker steerloop-88
+
+// dispersion-resample marker steerloop-89
+
+// dispersion-resample marker steerloop-90
+
+// dispersion-resample marker steerloop-91
+
+// dispersion-resample marker steerloop-92
+
+// dispersion-resample marker steerloop-93
+
+// dispersion-resample marker steerloop-94
+
+// dispersion-resample marker steerloop-95
+
+// dispersion-resample marker steerloop-96
+
+// dispersion-resample marker steerloop-97
+
+// dispersion-resample marker steerloop-98
+
+// dispersion-resample marker steerloop-99
+
+// dispersion-resample marker steerloop-100
+
+// dispersion-resample marker steerloop-101
+
+// dispersion-resample marker steerloop-102
+
+// dispersion-resample marker steerloop-103
+
+// dispersion-resample marker steerloop-104
+
+// dispersion-resample marker steerloop-105
+
+// dispersion-resample marker steerloop-106
+
+// dispersion-resample marker steerloop-107
+
+// dispersion-resample marker steerloop-108
+
+// dispersion-resample marker steerloop-109
+
+// dispersion-resample marker steerloop-110
+
+// dispersion-resample marker steerloop-111
+
+// dispersion-resample marker steerloop-112
+
+// dispersion-resample marker steerloop-113
+
+// dispersion-resample marker steerloop-114
+
+// dispersion-resample marker steerloop-115
+
+// dispersion-resample marker steerloop-116
+
+// dispersion-resample marker steerloop-117
+
+// dispersion-resample marker steerloop-118
+
+// dispersion-resample marker steerloop-119
+
+// dispersion-resample marker steerloop-120
+
+// dispersion-resample marker steerloop-121
+
+// dispersion-resample marker steerloop-122
+
+// dispersion-resample marker steerloop-123
+
+// dispersion-resample marker steerloop-124
+
+// dispersion-resample marker steerloop-125
+
+// dispersion-resample marker steerloop-126
+
+// dispersion-resample marker steerloop-127
+
+// dispersion-resample marker steerloop-128
+
+// dispersion-resample marker steerloop-129
+
+// dispersion-resample marker steerloop-130
+
+// dispersion-resample marker steerloop-131
+
+// dispersion-resample marker steerloop-132
+
+// dispersion-resample marker steerloop-133
+
+// dispersion-resample marker steerloop-134
+
+// dispersion-resample marker steerloop-135
+
+// dispersion-resample marker steerloop-136
+
+// dispersion-resample marker steerloop-137
+
+// dispersion-resample marker steerloop-138
+
+// dispersion-resample marker steerloop-139
+
+// dispersion-resample marker steerloop-140
+
+// dispersion-resample marker steerloop-141
+
+// dispersion-resample marker steerloop-142
+
+// dispersion-resample marker steerloop-143
+
+// dispersion-resample marker steerloop-144
+
+// dispersion-resample marker steerloop-145
+
+// dispersion-resample marker steerloop-146
+
+// dispersion-resample marker steerloop-147
+
+// dispersion-resample marker steerloop-148
+
+// dispersion-resample marker steerloop-149
+
+// dispersion-resample marker steerloop-150
+
+// dispersion-resample marker steerloop-151
+
+// dispersion-resample marker steerloop-152
+
+// dispersion-resample marker steerloop-153
+
+// dispersion-resample marker steerloop-154
+
+// dispersion-resample marker steerloop-155
+
+// dispersion-resample marker steerloop-156
+
+// dispersion-resample marker steerloop-156
+
+// dispersion-resample marker steerloop-157
+
+// dispersion-resample marker steerloop-158
+
+// dispersion-resample marker steerloop-159
+
+// dispersion-resample marker steerloop-160
+
+// dispersion-resample marker steerloop-161
+
+// dispersion-resample marker steerloop-162
+
+// dispersion-resample marker steerloop-163
+
+// dispersion-resample marker steerloop-164
+
+// dispersion-resample marker steerloop-164
+
+// dispersion-resample marker steerloop-165
+
+// dispersion-resample marker steerloop-166
+
+// dispersion-resample marker steerloop-167
+
+// dispersion-resample marker steerloop-168
+
+// dispersion-resample marker steerloop-169
+
+// dispersion-resample marker steerloop-170
+
+// dispersion-resample marker steerloop-171
+
+// dispersion-resample marker steerloop-172
+
+// dispersion-resample marker steerloop-173
+
+// dispersion-resample marker steerloop-173
+
+// dispersion-resample marker steerloop-174
+
+// dispersion-resample marker steerloop-175
+
+// dispersion-resample marker steerloop-176
+
+// dispersion-resample marker steerloop-177
+
+// dispersion-resample marker steerloop-178
+
+// dispersion-resample marker steerloop-179
+
+// dispersion-resample marker steerloop-180
+
+// dispersion-resample marker steerloop-181
+
+// dispersion-resample marker steerloop-182
+
+// dispersion-resample marker steerloop-183
+
+// dispersion-resample marker steerloop-183
+
+// dispersion-resample marker steerloop-184
+
+// dispersion-resample marker steerloop-185
+
+// dispersion-resample marker steerloop-186
+
+// dispersion-resample marker steerloop-187
+
+// dispersion-resample marker steerloop-188
+
+// dispersion-resample marker steerloop-189
+
+// dispersion-resample marker steerloop-190
+
+// dispersion-resample marker steerloop-190
+
+// dispersion-resample marker steerloop-191
+
+// dispersion-resample marker steerloop-191
+
+// dispersion-resample marker steerloop-191
+
+// dispersion-resample marker steerloop-192
+
+// dispersion-resample marker steerloop-193
+
+// dispersion-resample marker steerloop-194
+
+// dispersion-resample marker steerloop-195
+
+// dispersion-resample marker steerloop-196
+
+// dispersion-resample marker steerloop-197
+
+// dispersion-resample marker steerloop-198
+
+// dispersion-resample marker steerloop-199
+
+// dispersion-resample marker steerloop-200
+
+// dispersion-resample marker steerloop-200
+
+// dispersion-resample marker steerloop-201
+
+// dispersion-resample marker steerloop-202
+
+// dispersion-resample marker steerloop-203
+
+// dispersion-resample marker steerloop-204
+
+// dispersion-resample marker steerloop-205
+
+// dispersion-resample marker steerloop-206
+
+// dispersion-resample marker steerloop-207
+
+// dispersion-resample marker steerloop-208
+
+// dispersion-resample marker steerloop-209
+
+// dispersion-resample marker steerloop-210
+
+// dispersion-resample marker steerloop-211
+
+// dispersion-resample marker steerloop-212
+
+// dispersion-resample marker steerloop-213
+
+// dispersion-resample marker steerloop-214
+
+// dispersion-resample marker steerloop-215
+
+// dispersion-resample marker steerloop-216
+
+// dispersion-resample marker steerloop-217
+
+// dispersion-resample marker steerloop-218
+
+// dispersion-resample marker steerloop-219
+
+// dispersion-resample marker steerloop-220
+
+// dispersion-resample marker steerloop-221
+
+// dispersion-resample marker steerloop-222
+
+// dispersion-resample marker steerloop-223
+
+// dispersion-resample marker steerloop-224
+
+// dispersion-resample marker steerloop-224
+
+// dispersion-resample marker steerloop-225
+
+// dispersion-resample marker steerloop-226
+
+// dispersion-resample marker steerloop-227
+
+// dispersion-resample marker steerloop-228
+
+// dispersion-resample marker steerloop-228
+
+// dispersion-resample marker steerloop-229
+
+// dispersion-resample marker steerloop-230
+
+// dispersion-resample marker steerloop-231
+
+// dispersion-resample marker steerloop-232
+
+// dispersion-resample marker steerloop-233
+
+// dispersion-resample marker steerloop-234
+
+// dispersion-resample marker steerloop-235
+
+// dispersion-resample marker steerloop-236
+
+// dispersion-resample marker steerloop-237
+
+// dispersion-resample marker steerloop-238
+
+// dispersion-resample marker steerloop-239
+
+// dispersion-resample marker steerloop-240
+
+// dispersion-resample marker steerloop-241
+
+// dispersion-resample marker steerloop-242
+
+// dispersion-resample marker steerloop-242
+
+// dispersion-resample marker steerloop-243
+
+// dispersion-resample marker steerloop-244
+
+// dispersion-resample marker steerloop-245
+
+// dispersion-resample marker steerloop-246
+
+// dispersion-resample marker steerloop-247
+
+// dispersion-resample marker steerloop-248
+
+// dispersion-resample marker steerloop-249
+
+// dispersion-resample marker steerloop-250
+
+// dispersion-resample marker steerloop-251
+
+// dispersion-resample marker steerloop-252
+
+// dispersion-resample marker steerloop-252
+
+// dispersion-resample marker steerloop-253
+
+// dispersion-resample marker steerloop-254
+
+// dispersion-resample marker steerloop-255
+
+// dispersion-resample marker steerloop-256
+
+// dispersion-resample marker steerloop-257
+
+// dispersion-resample marker steerloop-258
+
+// dispersion-resample marker steerloop-259
+
+// dispersion-resample marker steerloop-260
+
+// dispersion-resample marker steerloop-261
+
+// dispersion-resample marker steerloop-262
+
+// dispersion-resample marker steerloop-262
+
+// dispersion-resample marker steerloop-263
+
+// dispersion-resample marker steerloop-264
+
+// dispersion-resample marker steerloop-265
+
+// dispersion-resample marker steerloop-266
+
+// dispersion-resample marker steerloop-267
+
+// dispersion-resample marker steerloop-268
+
+// dispersion-resample marker steerloop-269
+
+// dispersion-resample marker steerloop-270
+
+// dispersion-resample marker steerloop-271
+
+// dispersion-resample marker steerloop-272
+
+// dispersion-resample marker steerloop-273
+
+// dispersion-resample marker steerloop-274
+
+// dispersion-resample marker steerloop-275
+
+// dispersion-resample marker steerloop-276
+
+// dispersion-resample marker steerloop-277
+
+// dispersion-resample marker steerloop-278
+
+// dispersion-resample marker steerloop-279
+
+// dispersion-resample marker steerloop-280
+
+// dispersion-resample marker steerloop-281
+
+// dispersion-resample marker steerloop-282
+
+// dispersion-resample marker steerloop-283
+
+// dispersion-resample marker steerloop-284
+
+// dispersion-resample marker steerloop-285
+
+// dispersion-resample marker steerloop-286
+
+// dispersion-resample marker steerloop-287
+
+// dispersion-resample marker steerloop-288
+
+// dispersion-resample marker steerloop-289
+
+// dispersion-resample marker steerloop-290
+
+// dispersion-resample marker steerloop-291
+
+// dispersion-resample marker steerloop-292
+
+// dispersion-resample marker steerloop-293
+
+// dispersion-resample marker steerloop-294
+
+// dispersion-resample marker steerloop-295
+
+// dispersion-resample marker steerloop-295
+
+// dispersion-resample marker steerloop-296
+
+// dispersion-resample marker steerloop-297
+
+// dispersion-resample marker steerloop-298
+
+// dispersion-resample marker steerloop-299
+
+// dispersion-resample marker steerloop-300
+
+// dispersion-resample marker steerloop-301
+
+// dispersion-resample marker steerloop-302
+
+// dispersion-resample marker steerloop-302
+
+// dispersion-resample marker steerloop-303
+
+// dispersion-resample marker steerloop-304
+
+// dispersion-resample marker steerloop-305
+
+// dispersion-resample marker steerloop-306
+
+// dispersion-resample marker steerloop-307
+
+// dispersion-resample marker steerloop-308
+
+// dispersion-resample marker steerloop-309
+
+// dispersion-resample marker steerloop-310
+
+// dispersion-resample marker steerloop-311
+
+// dispersion-resample marker steerloop-312
+
+// dispersion-resample marker steerloop-313
+
+// dispersion-resample marker steerloop-314
+
+// dispersion-resample marker steerloop-315
+
+// dispersion-resample marker steerloop-316
+
+// dispersion-resample marker steerloop-317
+
+// dispersion-resample marker steerloop-318
+
+// dispersion-resample marker steerloop-319
+
+// dispersion-resample marker steerloop-320
+
+// dispersion-resample marker steerloop-321
+
+// dispersion-resample marker steerloop-322
+
+// dispersion-resample marker steerloop-323
+
+// dispersion-resample marker steerloop-324
+
+// dispersion-resample marker steerloop-325
+
+// dispersion-resample marker steerloop-326
+
+// dispersion-resample marker steerloop-327
+
+// dispersion-resample marker steerloop-328
+
+// dispersion-resample marker steerloop-329
+
+// dispersion-resample marker steerloop-330
+
+// dispersion-resample marker steerloop-331
+
+// dispersion-resample marker steerloop-332
+
+// dispersion-resample marker steerloop-333
+
+// dispersion-resample marker steerloop-334
+
+// dispersion-resample marker steerloop-335
+
+// dispersion-resample marker steerloop-336
+
+// dispersion-resample marker steerloop-337
+
+// dispersion-resample marker steerloop-338
+
+// dispersion-resample marker steerloop-339
+
+// dispersion-resample marker steerloop-340
+
+// dispersion-resample marker steerloop-341
+
+// dispersion-resample marker steerloop-342
+
+// dispersion-resample marker steerloop-343
+
+// dispersion-resample marker steerloop-344
+
+// dispersion-resample marker steerloop-345
+
+// dispersion-resample marker steerloop-346
+
+// dispersion-resample marker steerloop-347
+
+// dispersion-resample marker steerloop-348
+
+// dispersion-resample marker steerloop-349
+
+// dispersion-resample marker steerloop-350
+
+// dispersion-resample marker steerloop-351
+
+// dispersion-resample marker steerloop-352
+
+// dispersion-resample marker steerloop-352
+
+// dispersion-resample marker steerloop-353
+
+// dispersion-resample marker steerloop-354
+
+// dispersion-resample marker steerloop-355
+
+// dispersion-resample marker steerloop-356
+
+// dispersion-resample marker steerloop-357
+
+// dispersion-resample marker steerloop-358
+
+// dispersion-resample marker steerloop-359
+
+// dispersion-resample marker steerloop-360
+
+// dispersion-resample marker steerloop-361
+
+// dispersion-resample marker steerloop-361
+
+// dispersion-resample marker steerloop-362
+
+// dispersion-resample marker steerloop-363
+
+// dispersion-resample marker steerloop-364
+
+// dispersion-resample marker steerloop-365
+
+// dispersion-resample marker steerloop-366
+
+// dispersion-resample marker steerloop-367
+
+// dispersion-resample marker steerloop-367
+
+// dispersion-resample marker steerloop-368
+
+// dispersion-resample marker steerloop-369
+
+// dispersion-resample marker steerloop-370
+
+// dispersion-resample marker steerloop-371
+
+// dispersion-resample marker steerloop-372
+
+// dispersion-resample marker steerloop-373
+
+// dispersion-resample marker steerloop-374
+
+// dispersion-resample marker steerloop-374
+
+// dispersion-resample marker steerloop-375
+
+// dispersion-resample marker steerloop-376
+
+// dispersion-resample marker steerloop-377
+
+// dispersion-resample marker steerloop-378
+
+// dispersion-resample marker steerloop-379
+
+// dispersion-resample marker steerloop-380
+
+// dispersion-resample marker steerloop-381
+
+// dispersion-resample marker steerloop-382
+
+// dispersion-resample marker steerloop-383
+
+// dispersion-resample marker steerloop-384
+
+// dispersion-resample marker steerloop-385
+
+// dispersion-resample marker steerloop-386
+
+// dispersion-resample marker steerloop-387
+
+// dispersion-resample marker steerloop-388
+
+// dispersion-resample marker steerloop-389
+
+// dispersion-resample marker steerloop-390
+
+// dispersion-resample marker steerloop-391
+
+// dispersion-resample marker steerloop-392
+
+// dispersion-resample marker steerloop-393
+
+// dispersion-resample marker steerloop-393
+
+// dispersion-resample marker steerloop-394
+
+// dispersion-resample marker steerloop-395
+
+// dispersion-resample marker steerloop-396
+
+// dispersion-resample marker steerloop-397
+
+// dispersion-resample marker steerloop-398
+
+// dispersion-resample marker steerloop-399
+
+// dispersion-resample marker steerloop-400
+
+// dispersion-resample marker steerloop-401
+
+// dispersion-resample marker steerloop-402
+
+// dispersion-resample marker steerloop-403
+
+// dispersion-resample marker steerloop-404
+
+// dispersion-resample marker steerloop-405
+
+// dispersion-resample marker steerloop-406
+
+// dispersion-resample marker steerloop-407
+
+// dispersion-resample marker steerloop-408
+
+// dispersion-resample marker steerloop-408
+
+// dispersion-resample marker steerloop-409
+
+// dispersion-resample marker steerloop-410
+
+// dispersion-resample marker steerloop-411
+
+// dispersion-resample marker steerloop-412
+
+// dispersion-resample marker steerloop-413
+
+// dispersion-resample marker steerloop-414
+
+// dispersion-resample marker steerloop-415
+
+// dispersion-resample marker steerloop-416
+
+// dispersion-resample marker steerloop-417
+
+// dispersion-resample marker steerloop-418
+
+// dispersion-resample marker steerloop-419
+
+// dispersion-resample marker steerloop-420
+
+// dispersion-resample marker steerloop-421
+
+// dispersion-resample marker steerloop-422
+
+// dispersion-resample marker steerloop-423
+
+// dispersion-resample marker steerloop-424
+
+// dispersion-resample marker steerloop-425
+
+// dispersion-resample marker steerloop-426
+
+// dispersion-resample marker steerloop-427
+
+// dispersion-resample marker steerloop-428
+
+// dispersion-resample marker steerloop-429
+
+// dispersion-resample marker steerloop-430
+
+// dispersion-resample marker steerloop-431
+
+// dispersion-resample marker steerloop-432
+
+// dispersion-resample marker steerloop-433
+
+// dispersion-resample marker steerloop-434
+
+// dispersion-resample marker steerloop-435
+
+// dispersion-resample marker steerloop-436
+
+// dispersion-resample marker steerloop-437
+
+// dispersion-resample marker steerloop-438
+
+// dispersion-resample marker steerloop-439
+
+// dispersion-resample marker steerloop-440
+
+// dispersion-resample marker steerloop-441
+
+// dispersion-resample marker steerloop-442
+
+// dispersion-resample marker steerloop-443
+
+// dispersion-resample marker steerloop-444
+
+// dispersion-resample marker steerloop-445
+
+// dispersion-resample marker steerloop-446
+
+// dispersion-resample marker steerloop-447
+
+// dispersion-resample marker steerloop-448
+
+// dispersion-resample marker steerloop-449
+
+// dispersion-resample marker steerloop-450
+
+// dispersion-resample marker steerloop-451
+
+// dispersion-resample marker steerloop-451
+
+// dispersion-resample marker steerloop-452
+
+// dispersion-resample marker steerloop-453
+
+// dispersion-resample marker steerloop-454
+
+// dispersion-resample marker steerloop-455
+
+// dispersion-resample marker steerloop-456
+
+// dispersion-resample marker steerloop-457
+
+// dispersion-resample marker steerloop-458
+
+// dispersion-resample marker steerloop-459
+
+// dispersion-resample marker steerloop-460
+
+// dispersion-resample marker steerloop-461
+
+// dispersion-resample marker steerloop-462
+
+// dispersion-resample marker steerloop-463
+
+// dispersion-resample marker steerloop-464
+
+// dispersion-resample marker steerloop-465
