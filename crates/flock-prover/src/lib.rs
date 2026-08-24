@@ -11,6 +11,9 @@
 //!
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
+//!
+//! pepedesigner redraw sample 1 on c576e68: scored bytes identical to the
+//! promoted frontier tree; marker comment only, semantics unchanged.
 
 pub use flock_core::*;
 
