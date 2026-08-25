@@ -621,6 +621,18 @@ pub fn partial_fold_packed_z_neon_oblock16_padded(
 /// arm can express its stripe prefix in the same units the CPU claims use.
 pub(crate) const OBLOCK_TILES_PER_CLAIM: usize = 64;
 
+/// Ranked default: retain one lookup table and output partial per participating
+/// P/E queue drainer instead of allocating both per claim. The kill switch
+/// provides a same-binary control for performance experiments; both paths
+/// perform the same GF(2^128) operations.
+fn oblock_worker_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_LINCHECK_WORKER_REUSE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 /// Number of oblock tile claims for `(m, k_log)` at the default tile factor.
 pub(crate) fn oblock_claim_count(m: usize, k_log: usize) -> usize {
     let n_stripes = (1usize << (m - k_log)) / 8;
@@ -754,10 +766,7 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     // of join-tail latency, and there is exactly one join per prove. Each
     // claim owns a contiguous tile band, builds each of its tile tables
     // exactly once (the property that makes oblock beat iblock), and
-    // accumulates into its own private length-k partial. The partial backing
-    // is allocated uninitialized: every claim zeroes exactly its own slot
-    // before its first accumulate, so there is no up-front 16 MiB fault pass
-    // and first-touch lands on whichever core does the work.
+    // accumulates into a private length-k partial.
     const TILES_PER_CLAIM: usize = OBLOCK_TILES_PER_CLAIM;
     let n_claims_total = n_tiles.div_ceil(TILES_PER_CLAIM);
     let claim_hi = claim_hi.min(n_claims_total);
@@ -766,40 +775,41 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     if n_claims == 0 {
         return vec![F128::ZERO; k];
     }
-    let mut partials = crate::alloc_uninit_f128_vec(n_claims * k);
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(n_claims, |c| {
-        let claim = c + claim_lo;
-        let tile_lo = claim * TILES_PER_CLAIM;
-        let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
-        // SAFETY: the queue hands out each claim index exactly once; claim
-        // `c` exclusively owns `partials[c·k .. (c+1)·k]`, which it fully
-        // zero-initializes below before any read. The queue join publishes
-        // all writes before the reduction reads them.
-        let partial = unsafe { std::slice::from_raw_parts_mut(partials_base.ptr().add(c * k), k) };
-        // SAFETY: F128 is Copy and all-zero bytes are valid F128::ZERO.
-        unsafe {
-            std::ptr::write_bytes(partial.as_mut_ptr(), 0, k);
-        }
-        // TILE_T × 256 F128 tables, L1-resident, built once per tile.
-        let mut tables = vec![F128::ZERO; TILE_T * 256];
-        for tile in tile_lo..tile_hi {
-            let stripe_base = tile * TILE_T;
-            for t in 0..TILE_T {
-                let eq_off = 8 * (stripe_base + t);
-                build_sum_table(
-                    &eq_outer[eq_off..eq_off + 8],
-                    &mut tables[t * 256..(t + 1) * 256],
-                );
-            }
-            let tables_ptr = tables.as_ptr() as *const u8;
-            let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
-            let mut bs = 0usize;
-            #[cfg(target_feature = "sha3")]
-            if block16 {
-                while bs + 16 <= useful {
+    let accumulate_tiles =
+        |tables: &mut [F128], partial: &mut [F128], tile_lo: usize, tile_hi: usize| {
+            // TILE_T × 256 F128 tables, L1-resident, built once per tile.
+            for tile in tile_lo..tile_hi {
+                let stripe_base = tile * TILE_T;
+                for t in 0..TILE_T {
+                    let eq_off = 8 * (stripe_base + t);
+                    build_sum_table(
+                        &eq_outer[eq_off..eq_off + 8],
+                        &mut tables[t * 256..(t + 1) * 256],
+                    );
+                }
+                let tables_ptr = tables.as_ptr() as *const u8;
+                let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
+                let mut bs = 0usize;
+                #[cfg(target_feature = "sha3")]
+                if block16 {
+                    while bs + 16 <= useful {
+                        unsafe {
+                            process_block16_neon_single_sha3(
+                                z_base,
+                                k,
+                                bs,
+                                tables_ptr,
+                                partial.as_mut_ptr().add(bs),
+                            );
+                        }
+                        bs += 16;
+                    }
+                }
+                #[cfg(not(target_feature = "sha3"))]
+                let _ = block16;
+                while bs < useful {
                     unsafe {
-                        process_block16_neon_single_sha3(
+                        process_block_neon_single::<TILE_T>(
                             z_base,
                             k,
                             bs,
@@ -807,43 +817,75 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
                             partial.as_mut_ptr().add(bs),
                         );
                     }
-                    bs += 16;
+                    bs += BLOCK_K;
                 }
             }
-            #[cfg(not(target_feature = "sha3"))]
-            let _ = block16;
-            while bs < useful {
-                unsafe {
-                    process_block_neon_single::<TILE_T>(
-                        z_base,
-                        k,
-                        bs,
-                        tables_ptr,
-                        partial.as_mut_ptr().add(bs),
-                    );
-                }
-                bs += BLOCK_K;
-            }
-        }
-    });
-    let n_workers = n_claims;
+        };
+    enum PrivatePartials {
+        Workers(Vec<Vec<F128>>),
+        Claims(Vec<F128>),
+    }
 
-    // XOR-reduce the per-worker partials in ONE parallel pass over column bands:
-    // each worker owns a band of the output and XORs it across all `n_workers`
-    // partials, so the band lands in registers/L1 once and is written once.
+    // Keep both the TILE_T x 256 lookup table and the length-k accumulator
+    // worker-local across claims. `build_sum_table` overwrites every table
+    // entry, while F128 addition is XOR, so arbitrary queue grouping is exact.
+    // At the ranked shape this replaces up to 64 x 256 KiB claim partials plus
+    // 64 table allocations with one pair per participating queue drainer.
+    let private_partials = if oblock_worker_reuse_enabled() {
+        let partials: Vec<Vec<F128>> = crate::epool::run_hetero_chunks_stateful_collect(
+            n_claims,
+            || (vec![F128::ZERO; TILE_T * 256], vec![F128::ZERO; k]),
+            |(tables, partial), c| {
+                let claim = c + claim_lo;
+                let tile_lo = claim * TILES_PER_CLAIM;
+                let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
+                accumulate_tiles(tables, partial, tile_lo, tile_hi);
+            },
+            |(tables, partial)| {
+                drop(tables);
+                partial
+            },
+        );
+        PrivatePartials::Workers(partials)
+    } else {
+        let mut partials = crate::alloc_uninit_f128_vec(n_claims * k);
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(n_claims, |c| {
+            // SAFETY: each queue index owns one disjoint claim partial, which
+            // is fully zeroed before the first accumulation.
+            let partial =
+                unsafe { std::slice::from_raw_parts_mut(partials_base.ptr().add(c * k), k) };
+            // SAFETY: F128 is Copy and all-zero bytes are valid F128::ZERO.
+            unsafe { std::ptr::write_bytes(partial.as_mut_ptr(), 0, k) };
+            let mut tables = vec![F128::ZERO; TILE_T * 256];
+            let claim = c + claim_lo;
+            let tile_lo = claim * TILES_PER_CLAIM;
+            let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
+            accumulate_tiles(&mut tables, partial, tile_lo, tile_hi);
+        });
+        PrivatePartials::Claims(partials)
+    };
+    let partial_refs: Vec<&[F128]> = match &private_partials {
+        PrivatePartials::Workers(partials) => partials.iter().map(Vec::as_slice).collect(),
+        PrivatePartials::Claims(partials) => partials.chunks_exact(k).collect(),
+    };
+    let n_partials = partial_refs.len();
+
+    // XOR-reduce the private partials in ONE parallel pass over column bands:
+    // each worker owns a band of the output and XORs it across all
+    // `n_partials`, so the band lands in registers/L1 once and is written once.
     //
     // The obvious alternative — fold one partial at a time with a parallel
-    // `zip` per partial — costs `n_workers - 1` separate parallel regions, each
+    // `zip` per partial — costs `n_partials - 1` separate parallel regions, each
     // a full read-modify-write of the 256 KB accumulator plus a rayon barrier.
-    // That is `n_workers - 1` accumulator reads and writes (≈2.5× the traffic
-    // here) and 9 barriers instead of 1 at `n_workers = 10`; measured ≈0.7 ms
-    // of the fold at m=32, k_log=14.
+    // That adds one barrier and a full accumulator read/write per partial.
+    debug_assert!(n_partials > 0);
     let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
     let mut out = vec![F128::ZERO; k];
     out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
         let lo = bi * band;
-        for w in 0..n_workers {
-            let src = &partials[w * k + lo..w * k + lo + dst.len()];
+        for partial in &partial_refs {
+            let src = &partial[lo..lo + dst.len()];
             for (o, s) in dst.iter_mut().zip(src.iter()) {
                 *o += *s;
             }

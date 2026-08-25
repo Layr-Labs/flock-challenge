@@ -541,6 +541,26 @@ where
     run_chunks_with_helper_stateful(n_chunks, &init, &f, epool());
 }
 
+/// Stateful queue drain that returns one finalized result for every worker that
+/// claimed at least one chunk. Finalization happens on the participating worker
+/// after its last chunk, so callers can discard scratch before collection and
+/// accumulate without allocating one full partial per chunk. Returned result
+/// order is nondeterministic.
+pub(crate) fn run_hetero_chunks_stateful_collect<S, R, I, F, C>(
+    n_chunks: usize,
+    init: I,
+    f: F,
+    finalize: C,
+) -> Vec<R>
+where
+    R: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+    C: Fn(S) -> R + Sync,
+{
+    run_chunks_with_helper_stateful_collect(n_chunks, &init, &f, &finalize, epool())
+}
+
 /// [`run_hetero_chunks`] with an explicit helper pool, so tests can exercise
 /// the two-pool queue on hosts without efficiency cores.
 pub fn run_chunks_with_helper<F>(n_chunks: usize, f: &F, helper: Option<&rayon::ThreadPool>)
@@ -623,20 +643,57 @@ pub(crate) fn run_chunks_with_helper_stateful<S, I, F>(
     I: Fn() -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
 {
-    run_chunks_with_helper_stateful_relay(n_chunks, init, f, helper, relay_enabled());
+    run_chunks_with_helper_stateful_relay(n_chunks, init, f, helper, &|_: S| {}, relay_enabled());
+}
+
+/// [`run_hetero_chunks_stateful_collect`] with an explicit helper pool, so
+/// tests can exercise collection on hosts without efficiency cores.
+pub(crate) fn run_chunks_with_helper_stateful_collect<S, R, I, F, C>(
+    n_chunks: usize,
+    init: &I,
+    f: &F,
+    finalize: &C,
+    helper: Option<&rayon::ThreadPool>,
+) -> Vec<R>
+where
+    R: Send,
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+    C: Fn(S) -> R + Sync,
+{
+    let results = std::sync::Mutex::new(Vec::new());
+    run_chunks_with_helper_stateful_relay(
+        n_chunks,
+        &|| None,
+        &|state: &mut Option<S>, i| f(state.get_or_insert_with(|| init()), i),
+        helper,
+        &|state| {
+            if let Some(state) = state {
+                let result = finalize(state);
+                results
+                    .lock()
+                    .expect("state collector poisoned")
+                    .push(result);
+            }
+        },
+        relay_enabled(),
+    );
+    results.into_inner().expect("state collector poisoned")
 }
 
 /// [`run_chunks_with_helper_stateful`] with the relay choice forced, so tests
 /// can cover both arms in one process.
-fn run_chunks_with_helper_stateful_relay<S, I, F>(
+fn run_chunks_with_helper_stateful_relay<S, I, F, G>(
     n_chunks: usize,
     init: &I,
     f: &F,
     helper: Option<&rayon::ThreadPool>,
+    finish: &G,
     use_relay: bool,
 ) where
     I: Fn() -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
+    G: Fn(S) + Sync,
 {
     if n_chunks == 0 {
         return;
@@ -647,17 +704,23 @@ fn run_chunks_with_helper_stateful_relay<S, I, F>(
         for i in 0..n_chunks {
             f(&mut state, i);
         }
+        finish(state);
         return;
     }
     let next = AtomicUsize::new(0);
     let worker = || {
         let mut state = init();
+        let mut used = false;
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n_chunks {
                 break;
             }
+            used = true;
             f(&mut state, i);
+        }
+        if used {
+            finish(state);
         }
     };
     let drain_main = || {
@@ -672,13 +735,18 @@ fn run_chunks_with_helper_stateful_relay<S, I, F>(
             let broadcast = || {
                 ep.broadcast(|_| {
                     let mut state = init();
+                    let mut used = false;
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= n_chunks {
                             break;
                         }
+                        used = true;
                         EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
                         f(&mut state, i);
+                    }
+                    if used {
+                        finish(state);
                     }
                 });
             };
@@ -858,6 +926,35 @@ mod tests {
         assert!(uses.into_iter().any(|n_uses| n_uses > 1));
     }
 
+    /// Collection returns exactly one nonempty final state per participating
+    /// worker, and those states jointly contain every claimed chunk once.
+    #[test]
+    fn stateful_collect_returns_used_worker_states() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let n = 1000;
+        let init_count = AtomicUsize::new(0);
+        let states = run_chunks_with_helper_stateful_collect(
+            n,
+            &|| {
+                init_count.fetch_add(1, Ordering::Relaxed);
+                Vec::<usize>::new()
+            },
+            &|state, i| state.push(i),
+            &|state| state,
+            Some(&helper),
+        );
+        assert!(!states.is_empty());
+        assert!(states.len() < n, "state must be per worker, not per chunk");
+        assert_eq!(init_count.load(Ordering::Relaxed), states.len());
+        assert!(states.iter().all(|state| !state.is_empty()));
+        let mut claimed: Vec<usize> = states.into_iter().flatten().collect();
+        claimed.sort_unstable();
+        assert_eq!(claimed, (0..n).collect::<Vec<_>>());
+    }
+
     /// Both kickoff arms — the persistent relay and the per-drain spawn the
     /// kill switch restores — execute every chunk exactly once. Running many
     /// drains through one relay also proves it is reusable: a per-drain thread
@@ -907,6 +1004,7 @@ mod tests {
                     counts[i].fetch_add(1, Ordering::Relaxed);
                 },
                 Some(&helper),
+                &|_| {},
                 use_relay,
             );
             assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));

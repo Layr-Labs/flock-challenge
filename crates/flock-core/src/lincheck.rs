@@ -2189,6 +2189,7 @@ mod tests {
             (18, 10, 1 << 10), // dense
             (20, 10, 597),     // padded, non-byte-aligned
             (22, 14, 15_409),  // padded, non-byte-aligned (k=16384)
+            (20, 4, 13),       // padded, 16 claims exercises worker grouping
         ];
         for &(m, k_log, useful_bits) in cases {
             assert!(
