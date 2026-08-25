@@ -41,7 +41,7 @@
 //! any drain that finds the relay already carrying a concurrent one.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
 
 use rayon::prelude::*;
 
@@ -96,6 +96,61 @@ fn ecore_count() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0)
+}
+
+/// Physical performance-core count on Apple Silicon macOS, else 0.
+///
+/// Same `sysctlbyname` *syscall* contract as [`ecore_count`]: the ranked
+/// Seatbelt profile denies `process-fork`, so a spawned `sysctl` (as in
+/// `crate::perf_core_count`) fails there and degrades to the all-core
+/// `available_parallelism()` count. Any error degrades to 0, i.e. "topology
+/// unknown", never to a failure.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn pcore_count() -> usize {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const core::ffi::c_char,
+            oldp: *mut core::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *mut core::ffi::c_void,
+            newlen: usize,
+        ) -> core::ffi::c_int;
+    }
+    let mut n: i32 = 0;
+    let mut len = core::mem::size_of::<i32>();
+    let rc = unsafe {
+        sysctlbyname(
+            c"hw.perflevel0.physicalcpu".as_ptr(),
+            (&raw mut n).cast(),
+            &raw mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && len == core::mem::size_of::<i32>() && n > 0 {
+        n as usize
+    } else {
+        0
+    }
+}
+
+/// Off-target hosts report no P-core topology; the hoist selector is compiled
+/// off there anyway, so 0 ("unknown") can never enable it by accident.
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+fn pcore_count() -> usize {
+    0
+}
+
+/// Cached [`pcore_count`].
+pub(crate) fn pcore_count_cached() -> usize {
+    static N: LazyLock<usize> = LazyLock::new(pcore_count);
+    *N
+}
+
+/// Cached [`ecore_count`].
+pub(crate) fn ecore_count_cached() -> usize {
+    static N: LazyLock<usize> = LazyLock::new(ecore_count);
+    *N
 }
 
 /// Tag the current thread `QOS_CLASS_UTILITY` (Darwin value `0x11`). Utility

@@ -777,6 +777,8 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
             padding.useful_bits_per_block,
             rayon::current_num_threads(),
             crate::epool::helper_pool().map_or(0, rayon::ThreadPool::current_num_threads),
+            crate::epool::pcore_count_cached(),
+            crate::epool::ecore_count_cached(),
             kernels::static_b_context_is_prepared(static_b_context),
             zc_ab_pre_fast_policy_hoist_enabled(),
         ) && kernels::fast_shift_reduce_enabled();
@@ -859,17 +861,49 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     Round1AbInner { storage }
 }
 
-/// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
-/// shape exposes roughly sixty-four scheduling waves on the ten-thread worker.
-#[inline]
-fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
-    n_chunks.div_ceil(640).max(1)
+/// Wave depth per main-pool thread for the sequential block-cyclic AB queue.
+/// `10 × 64 = 640` reproduces the historical ranked job count exactly, so the
+/// M3 Max shape is unchanged; deriving the divisor from the live pool width
+/// gives a differently provisioned host the same waves-per-thread instead of
+/// the M3 Max's absolute job count.
+const AB_PRE_WAVES_PER_THREAD: usize = 64;
+
+/// Local sweep dial for [`AB_PRE_WAVES_PER_THREAD`]. The ranked worker runs
+/// with a cleared environment (the harness passes only `RAYON_NUM_THREADS`
+/// and `TMPDIR`), so this can never move the ranked score; it exists to sweep
+/// wave depth on development hosts.
+pub const ENV_AB_PRE_WAVES_PER_THREAD: &str = "FLOCK_AB_PRE_WAVES_PER_THREAD";
+
+fn ab_pre_waves_per_thread() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var(ENV_AB_PRE_WAVES_PER_THREAD)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(AB_PRE_WAVES_PER_THREAD)
+    });
+    *N
 }
 
-/// Ranked-shape selector for resolving the process-wide Horner policy once
-/// before the AB queue starts. Every other shape retains the incumbent
-/// per-row policy lookup so this codegen specialization cannot perturb
-/// library callers or differently provisioned workers.
+/// Use a deeper queue for the sequential block-cyclic scheduler so every host
+/// exposes roughly `waves_per_thread` scheduling waves per main-pool thread.
+#[inline]
+fn ab_pre_chunks_per_job(n_chunks: usize, main_threads: usize, waves_per_thread: usize) -> usize {
+    n_chunks
+        .div_ceil((main_threads.max(1) * waves_per_thread.max(1)).max(1))
+        .max(1)
+}
+
+/// Canonical-shape selector for resolving the process-wide Horner policy once
+/// before the AB queue starts. The shape conditions are the ranked workload
+/// (m, k_skip, n_chunks, BLAKE3 padding, prepared static-B); the hardware
+/// condition is that the main pool is exactly this host's P-cluster and the
+/// helper pool exactly its E-cluster. On the 10 P-core / 4 E-core ranked
+/// runner that is the same `(10, 4)` shape this gate has always selected; on
+/// other Apple Silicon topologies it now selects their equivalent shape
+/// instead of leaving the specialization dead. Any other provisioning (a
+/// narrowed `RAYON_NUM_THREADS`, an absent helper pool, failed detection)
+/// retains the incumbent per-row policy lookup.
 #[allow(clippy::too_many_arguments)]
 fn ranked_ab_pre_fast_policy_hoist_shape(
     m: usize,
@@ -879,6 +913,8 @@ fn ranked_ab_pre_fast_policy_hoist_shape(
     useful_bits_per_block: usize,
     main_threads: usize,
     helper_threads: usize,
+    pcore_count: usize,
+    ecore_count: usize,
     prepared_static_b: bool,
     enabled: bool,
 ) -> bool {
@@ -889,8 +925,10 @@ fn ranked_ab_pre_fast_policy_hoist_shape(
         && n_chunks == (1 << 19)
         && k_log == 14
         && useful_bits_per_block == 15_409
-        && main_threads == 10
-        && helper_threads == 4
+        && pcore_count > 0
+        && ecore_count > 0
+        && main_threads == pcore_count
+        && helper_threads == ecore_count
         && prepared_static_b
 }
 
@@ -952,7 +990,11 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // Process each queue-owned slab monotonically. This removes permutation
     // generation and maximizes spatial locality; queue-level heterogeneity still
     // distributes independent slabs dynamically.
-    let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
+    let chunks_per_job = ab_pre_chunks_per_job(
+        n_chunks,
+        rayon::current_num_threads(),
+        ab_pre_waves_per_thread(),
+    );
     let n_jobs = n_chunks.div_ceil(chunks_per_job);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
@@ -3608,106 +3650,73 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn ranked_ab_pre_fast_policy_hoist_selector_is_exact() {
-        let selected = |m, k_skip, n_chunks, k_log, useful, main, helper, prepared, enabled| {
-            ranked_ab_pre_fast_policy_hoist_shape(
-                m, k_skip, n_chunks, k_log, useful, main, helper, prepared, enabled,
-            )
-        };
-        let ranked = (32, K_SKIP, 1 << 19, 14, 15_409, 10, 4, true, true);
-        assert!(selected(
-            ranked.0, ranked.1, ranked.2, ranked.3, ranked.4, ranked.5, ranked.6, ranked.7,
-            ranked.8,
-        ));
+        // (m, k_skip, n_chunks, k_log, useful, main, helper, pcores, ecores,
+        // prepared, enabled)
+        let selected =
+            |m, k_skip, n_chunks, k_log, useful, main, helper, pc, ec, prepared, enabled| {
+                ranked_ab_pre_fast_policy_hoist_shape(
+                    m, k_skip, n_chunks, k_log, useful, main, helper, pc, ec, prepared, enabled,
+                )
+            };
 
-        assert!(!selected(
-            31,
-            K_SKIP,
-            1 << 19,
-            14,
-            15_409,
-            10,
-            4,
-            true,
-            true
+        // Canonical full-machine shape selects, on both known topologies.
+        assert!(selected(32, K_SKIP, 1 << 19, 14, 15_409, 10, 4, 10, 4, true, true));
+        assert!(selected(32, K_SKIP, 1 << 19, 14, 15_409, 4, 6, 4, 6, true, true));
+
+        // Workload/protocol conditions.
+        assert!(!selected(31, K_SKIP, 1 << 19, 14, 15_409, 10, 4, 10, 4, true, true));
+        assert!(!selected(32, K_SKIP + 1, 1 << 19, 14, 15_409, 10, 4, 10, 4, true, true));
+        assert!(!selected(32, K_SKIP, (1 << 19) - 1, 14, 15_409, 10, 4, 10, 4, true, true));
+        assert!(!selected(32, K_SKIP, 1 << 19, 15, 15_409, 10, 4, 10, 4, true, true));
+        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_408, 10, 4, 10, 4, true, true));
+        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 10, 4, 10, 4, false, true));
+        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 10, 4, 10, 4, true, false));
+
+        // Hardware conditions: narrowed main pool, narrowed/absent helper pool,
+        // oversubscribed main pool, failed detection.
+        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 9, 4, 10, 4, true, true));
+        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 10, 3, 10, 4, true, true));
+        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 4, 0, 4, 6, true, true));
+        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 10, 4, 4, 6, true, true));
+        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 0, 0, 0, 0, true, true));
+    }
+
+    /// The canonical full-machine shape must select the hoist on this host —
+    /// this is what makes the specialization measurable off the ranked runner.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn hoist_selector_engages_on_this_host() {
+        let pcores = crate::epool::pcore_count_cached();
+        let ecores = crate::epool::ecore_count_cached();
+        println!("host topology: pcores={pcores} ecores={ecores}");
+        if pcores == 0 || ecores == 0 {
+            return; // topology unavailable: selector stays off by design
+        }
+        assert!(ranked_ab_pre_fast_policy_hoist_shape(
+            32, K_SKIP, 1 << 19, 14, 15_409, pcores, ecores, pcores, ecores, true, true,
         ));
-        assert!(!selected(
-            32,
-            K_SKIP + 1,
-            1 << 19,
-            14,
-            15_409,
-            10,
-            4,
-            true,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            (1 << 19) - 1,
-            14,
-            15_409,
-            10,
-            4,
-            true,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            1 << 19,
-            15,
-            15_409,
-            10,
-            4,
-            true,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            1 << 19,
-            14,
-            15_408,
-            10,
-            4,
-            true,
-            true
-        ));
-        assert!(!selected(32, K_SKIP, 1 << 19, 14, 15_409, 9, 4, true, true));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            1 << 19,
-            14,
-            15_409,
-            10,
-            3,
-            true,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            1 << 19,
-            14,
-            15_409,
-            10,
-            4,
-            false,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            1 << 19,
-            14,
-            15_409,
-            10,
-            4,
-            true,
-            false
-        ));
+    }
+
+    #[test]
+    fn ab_pre_chunks_per_job_preserves_ranked_job_count() {
+        // Ranked: 10 main threads × 64 waves == the historical divisor 640.
+        assert_eq!(
+            ab_pre_chunks_per_job(1 << 19, 10, 64),
+            (1usize << 19).div_ceil(640)
+        );
+        assert_eq!(ab_pre_chunks_per_job(1 << 19, 10, 64), 820);
+        // 4 main threads on this host: 256 jobs of 2048 chunks.
+        assert_eq!(ab_pre_chunks_per_job(1 << 19, 4, 64), 2048);
+        // Degenerate inputs never divide by zero and never return 0. Neither
+        // is reachable through the live callsite (`current_num_threads() >= 1`
+        // and the env dial rejects 0); these pin the defensive clamps: each
+        // zeroed factor collapses to 1, leaving the other as the sole divisor.
+        assert_eq!(ab_pre_chunks_per_job(1 << 19, 0, 64), 8192);
+        assert_eq!(
+            ab_pre_chunks_per_job(1 << 19, 10, 0),
+            (1usize << 19).div_ceil(10)
+        );
+        assert_eq!(ab_pre_chunks_per_job(0, 10, 64), 1);
     }
 
     #[test]
