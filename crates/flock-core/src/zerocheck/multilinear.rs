@@ -101,6 +101,16 @@ fn r2_periodic_padding_enabled() -> bool {
     std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
 }
 
+/// Kill switch for the ranked BLAKE3 periodic-padding schedule in the
+/// cascaded K pass. `FLOCK_NO_ZC_K_PERIODIC_PADDING=1` restores the generic
+/// four-output-group loop exactly; other values leave the specialization on.
+/// The specialized arm is admitted only for the exact ranked geometry and
+/// only for chunks whose output range starts and ends on a 64-value block.
+#[cfg(target_arch = "aarch64")]
+fn zc_k_periodic_padding_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_ZC_K_PERIODIC_PADDING").is_none_or(|v| v != *"1")
+}
+
 /// Kill switch for adopting the round-two GPU arm's odd-parity products as the
 /// round-three lookahead's `W1`/`W2`: `FLOCK_NO_ZC_R2_ODD_OFFLOAD=1` makes the
 /// CPU recompute the odd pair on offloaded chunks, which is the incumbent
@@ -2244,6 +2254,7 @@ pub(crate) fn fold2_compact_and_round45_into(
     rho1: F128,
     rho2: F128,
     r_next4: &[F128],
+    padding: &PaddingSpec,
     a_out: &mut [F128],
     b_out: &mut [F128],
 ) -> (F128, F128, Round3Lookahead) {
@@ -2284,6 +2295,14 @@ pub(crate) fn fold2_compact_and_round45_into(
     let out_chunk = 2 * lo_size;
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    #[cfg(target_arch = "aarch64")]
+    let ranked_periodic_padding = zc_k_periodic_padding_enabled()
+        && n_groups == (1usize << 24)
+        && r_next4.len() == 24
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409;
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = padding;
 
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     // [p1_odd, pinf_odd, W0', W3', W4', W5'], eq_hi-weighted, one per chunk.
@@ -2307,6 +2326,10 @@ pub(crate) fn fold2_compact_and_round45_into(
 
         #[cfg(target_arch = "aarch64")]
         unsafe {
+            let output_base = x_hi * out_chunk;
+            let periodic_padding = ranked_periodic_padding
+                && output_base.is_multiple_of(64)
+                && out_chunk.is_multiple_of(64);
             fold2_compact_and_round45_chunk_neon_8(
                 table_l1.as_ptr().cast::<u8>(),
                 table_l3.as_ptr().cast::<u8>(),
@@ -2318,6 +2341,7 @@ pub(crate) fn fold2_compact_and_round45_into(
                 eq_lo.as_ptr(),
                 lo_size,
                 degen,
+                periodic_padding,
                 outv.as_mut_ptr(),
             );
         }
@@ -4786,7 +4810,7 @@ mod tests {
                     a_n.fill(LA_POISON);
                     b_n.fill(LA_POISON);
                     let (m4_1, m4_inf, la5) = fold2_compact_and_round45_into(
-                        &compact, &f.table, rho1, rho2, &r_next4, &mut a_n, &mut b_n,
+                        &compact, &f.table, rho1, rho2, &r_next4, &f.padding, &mut a_n, &mut b_n,
                     );
                     assert_eq!(
                         (m4_1, m4_inf),
@@ -4817,6 +4841,86 @@ mod tests {
                 crate::scratch::clear();
             });
         }
+    }
+
+    /// The ranked padding pattern survives k_skip=6 and the K double fold as
+    /// 61 live-or-boundary outputs followed by three forced zeros per block.
+    /// Build a real m=14 compact state (one complete ranked block), then call
+    /// the NEON chunk directly so this small oracle exercises the periodic
+    /// arm even though the production dispatcher admits only m=32.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn cascade_k_periodic_padding_m14_matches_generic_chunk() {
+        let f = la_fixture(14, 0x0CA5_5041, true);
+        assert_eq!(f.padding.k_log, 14);
+        assert_eq!(f.padding.useful_bits_per_block, 15_409);
+        let r_next4 = la_r_next4(&f);
+        let rho1 = f.rho_grid[3];
+        let rho2 = f.rho_grid[2];
+
+        crate::scratch::clear();
+        let (compact, _, _) = uni_skip_fold_and_round_pair_compact_padded(
+            &f.a_packed,
+            &f.b_packed,
+            f.m,
+            6,
+            &f.table,
+            &f.mlv,
+            &f.padding,
+        );
+        assert_eq!(compact.len(), 128);
+
+        let lambda1 = rho1 * (F128::ONE + rho2);
+        let lambda3 = rho1 * rho2;
+        let table_l1 = f.table.scaled_linear(lambda1);
+        let table_l3 = f.table.scaled_linear(lambda3);
+        let eq_lo = build_eq(&r_next4[1..]);
+        assert_eq!(eq_lo.len(), 32);
+
+        for degen in [false, true] {
+            let run = |periodic_padding: bool| {
+                let mut a_out = vec![LA_POISON; 64];
+                let mut b_out = vec![LA_POISON; 64];
+                let mut out = [LA_POISON; 8];
+                unsafe {
+                    fold2_compact_and_round45_chunk_neon_8(
+                        table_l1.as_ptr().cast::<u8>(),
+                        table_l3.as_ptr().cast::<u8>(),
+                        rho2,
+                        compact.anchors.as_ptr(),
+                        compact.deltas.as_ptr(),
+                        a_out.as_mut_ptr(),
+                        b_out.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        32,
+                        degen,
+                        periodic_padding,
+                        out.as_mut_ptr(),
+                    );
+                }
+                (a_out, b_out, out)
+            };
+
+            let generic = run(false);
+            let periodic = run(true);
+            assert_eq!(periodic.0, generic.0, "A output mismatch, degen={degen}");
+            assert_eq!(periodic.1, generic.1, "B output mismatch, degen={degen}");
+            assert_eq!(
+                periodic.2, generic.2,
+                "eight aggregate mismatch, degen={degen}"
+            );
+            assert_eq!(periodic.0[61..], [F128::ZERO; 3], "A padding tail");
+            assert_eq!(periodic.1[61..], [F128::ZERO; 3], "B padding tail");
+            // Slots 1/5/7 are precisely the boundary lane's live
+            // pinf_even/W3/W5 chains; the all-eight comparison above protects
+            // them together with the remaining round-four/lookahead sums.
+            assert_eq!(periodic.2[1], generic.2[1], "pinf_even boundary");
+            assert_eq!(periodic.2[5], generic.2[5], "W3 boundary");
+            assert_eq!(periodic.2[7], generic.2[7], "W5 boundary");
+        }
+
+        compact.recycle();
+        crate::scratch::clear();
     }
 
     /// C2 — the composed rounds-5/6 double-fold oracle. For a 4×4 (ρ₃, ρ₄)
@@ -4895,6 +4999,7 @@ mod tests {
             f.rho_grid[3],
             f.rho_grid[2],
             &r_next4,
+            &f.padding,
             &mut a_out,
             &mut b_out,
         );
