@@ -149,6 +149,42 @@ pub(crate) fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+/// Fold four adjacent banked output slots while loading each shared weight
+/// once. Each output remains an independent deferred-reduction sum, so the
+/// returned values are bit-identical to four [`fold_banked_slot`] calls.
+#[inline]
+pub(crate) fn fold_banked_slots4<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    input: &[F128],
+) -> [F128; 4] {
+    debug_assert!(input.len() >= 4 * BANKS);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the cfg gate supplies PMULL through `aes`; the caller's
+        // sub-slice guarantees four complete adjacent banked slots.
+        unsafe { aarch64::fold_banked_slots4::<BANKS>(weight, input) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let mut first = super::F256Unreduced::ZERO;
+        let mut second = super::F256Unreduced::ZERO;
+        let mut third = super::F256Unreduced::ZERO;
+        let mut fourth = super::F256Unreduced::ZERO;
+        for (bank, w) in weight.iter().enumerate() {
+            first ^= w.mul_unreduced(input[bank]);
+            second ^= w.mul_unreduced(input[BANKS + bank]);
+            third ^= w.mul_unreduced(input[2 * BANKS + bank]);
+            fourth ^= w.mul_unreduced(input[3 * BANKS + bank]);
+        }
+        [
+            first.reduce(),
+            second.reduce(),
+            third.reduce(),
+            fourth.reduce(),
+        ]
+    }
+}
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -962,7 +998,7 @@ mod tests {
             let w6: [F128; 6] = std::array::from_fn(|_| F128::new(next(), next()));
             // Slot windows are read out of a longer buffer, exactly as the
             // materializers slice `input[64 * slot..]`.
-            let buf: Vec<F128> = (0..256).map(|_| F128::new(next(), next())).collect();
+            let buf: Vec<F128> = (0..512).map(|_| F128::new(next(), next())).collect();
             let off16 = 16 * (trial % 8);
             let off64 = 64 * (trial % 3);
             let off6 = trial % 11;
@@ -1005,6 +1041,36 @@ mod tests {
                     oracle(&w6, &buf[off6 + 6..off6 + 12]),
                 ],
                 "pair banks=6 trial={trial}"
+            );
+            assert_eq!(
+                fold_banked_slots4::<16>(&w16, &buf[off16..off16 + 64]),
+                [
+                    oracle(&w16, &buf[off16..off16 + 16]),
+                    oracle(&w16, &buf[off16 + 16..off16 + 32]),
+                    oracle(&w16, &buf[off16 + 32..off16 + 48]),
+                    oracle(&w16, &buf[off16 + 48..off16 + 64]),
+                ],
+                "quad banks=16 trial={trial}"
+            );
+            assert_eq!(
+                fold_banked_slots4::<64>(&w64, &buf[off64..off64 + 256]),
+                [
+                    oracle(&w64, &buf[off64..off64 + 64]),
+                    oracle(&w64, &buf[off64 + 64..off64 + 128]),
+                    oracle(&w64, &buf[off64 + 128..off64 + 192]),
+                    oracle(&w64, &buf[off64 + 192..off64 + 256]),
+                ],
+                "quad banks=64 trial={trial}"
+            );
+            assert_eq!(
+                fold_banked_slots4::<6>(&w6, &buf[off6..off6 + 24]),
+                [
+                    oracle(&w6, &buf[off6..off6 + 6]),
+                    oracle(&w6, &buf[off6 + 6..off6 + 12]),
+                    oracle(&w6, &buf[off6 + 12..off6 + 18]),
+                    oracle(&w6, &buf[off6 + 18..off6 + 24]),
+                ],
+                "quad banks=6 trial={trial}"
             );
         }
     }
