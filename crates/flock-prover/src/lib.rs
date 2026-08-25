@@ -11,6 +11,9 @@
 //!
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
+//!
+//! pepedesigner redraw sample 12 on c576e68 + detached-keepalive handoff
+//! (cpu_keepalive.rs): marker comment only, semantics unchanged.
 
 pub use flock_core::*;
 
