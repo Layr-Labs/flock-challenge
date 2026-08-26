@@ -1800,6 +1800,12 @@ pub const ENV_NO_ZC_AB_EQ_FOLD: &str = "FLOCK_NO_ZC_AB_EQ_FOLD";
 /// accepting a typo would make component profiles incomparable.
 pub const ENV_ZC_AB_EQ_FOLD_S: &str = "FLOCK_ZC_AB_EQ_FOLD_S";
 
+/// Exact same-binary rollback for the ranked bank-major deferred reduction:
+/// only literal `FLOCK_NO_ZC_AB_BANK_DEFERRED=1` restores the scalar bank by
+/// lane collapse. The surrounding tensor fold and final `eq_hi` multiply are
+/// unchanged.
+pub const ENV_NO_ZC_AB_BANK_DEFERRED: &str = "FLOCK_NO_ZC_AB_BANK_DEFERRED";
+
 /// `x_lo` bits kept in the pre-scaled table index; the rest select the bank.
 const AB_EQ_FOLD_TABLE_BITS: usize = 5;
 
@@ -1843,6 +1849,47 @@ fn ab_eq_fold_from_env() -> AbEqFold {
                 .expect("FLOCK_ZC_AB_EQ_FOLD_S must be an integer in 0..=16")
         }))
     })
+}
+
+fn zc_ab_bank_deferred_enabled() -> bool {
+    zc_ab_bank_deferred_enabled_from_value(std::env::var_os(ENV_NO_ZC_AB_BANK_DEFERRED).as_deref())
+}
+
+fn zc_ab_bank_deferred_enabled_from_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+/// Restrict the fixed architecture kernel to the one geometry it was built
+/// for. Shape and provisioning are explicit inputs so selector tests can
+/// reject each near miss without mutating process-global state.
+#[allow(clippy::too_many_arguments)]
+fn ranked_ab_bank_deferred_shape(
+    m: usize,
+    k_skip: usize,
+    n_hi: usize,
+    n_lo: usize,
+    bank_bits: usize,
+    bank_len: usize,
+    k_log: usize,
+    useful_bits_per_block: usize,
+    main_threads: usize,
+    enabled: bool,
+) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && enabled
+        && m == 32
+        && k_skip == K_SKIP
+        && n_hi == 7
+        && n_lo == 12
+        && bank_bits == 7
+        && bank_len == 128 * ELL
+        && ELL == 64
+        && k_log == 14
+        && useful_bits_per_block == 15_409
+        && main_threads == 10
 }
 
 std::thread_local! {
@@ -1906,6 +1953,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     eq_hi_val: F128,
     tables: &[F128],
     bank_bits: usize,
+    bank_deferred: bool,
     banks: &mut [F128],
     partial_ab: &mut [F128; ELL],
 ) {
@@ -1936,10 +1984,31 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
         );
     }
 
-    partial_ab.fill(F128::ZERO);
-    for (bank, eq_bot_val) in banks.chunks_exact(ELL).zip(eq_bot) {
-        for (out, value) in partial_ab.iter_mut().zip(bank) {
-            *out += *eq_bot_val * *value;
+    finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks, bank_deferred, partial_ab);
+}
+
+/// Collapse the bank-major tensor-fold scratch and apply the unchanged high
+/// equality factor. Kept as one helper so tests can force both same-shape
+/// implementations without satisfying or bypassing the production selector.
+fn finish_ab_eq_fold_banks(
+    eq_bot: &[F128],
+    eq_hi_val: F128,
+    banks: &[F128],
+    bank_deferred: bool,
+    partial_ab: &mut [F128; ELL],
+) {
+    debug_assert_eq!(banks.len(), eq_bot.len() * ELL);
+    if bank_deferred {
+        let weights: &[F128; 128] = eq_bot
+            .try_into()
+            .expect("ranked deferred fold has exactly 128 weights");
+        crate::field::f128_slice::fold_bank_major_128x64_rows2(weights, banks, partial_ab);
+    } else {
+        partial_ab.fill(F128::ZERO);
+        for (bank, eq_bot_val) in banks.chunks_exact(ELL).zip(eq_bot) {
+            for (out, value) in partial_ab.iter_mut().zip(bank) {
+                *out += *eq_bot_val * *value;
+            }
         }
     }
     for value in partial_ab {
@@ -2023,6 +2092,18 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
             let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
             let tables = build_ab_eq_fold_tables(&eq_top_scaled, convert);
             let bank_len = eq_bot.len() * ELL;
+            let bank_deferred = ranked_ab_bank_deferred_shape(
+                m,
+                k_skip,
+                eq.n_hi,
+                eq.n_lo,
+                bank_bits,
+                bank_len,
+                padding.k_log,
+                padding.useful_bits_per_block,
+                rayon::current_num_threads(),
+                zc_ab_bank_deferred_enabled(),
+            );
             crate::epool::run_hetero_chunks(hi_size, |x_hi| {
                 let mut partial = [F128::ZERO; ELL];
                 AB_EQ_FOLD_BANKS.with(|cell| {
@@ -2042,6 +2123,7 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                         eq.hi[x_hi],
                         &tables,
                         bank_bits,
+                        bank_deferred,
                         &mut banks,
                         &mut partial,
                     );
@@ -5172,6 +5254,185 @@ mod tests {
                     "eq_lo tensor factorization at x={x}, s={bank_bits}"
                 );
             }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn ranked_ab_bank_deferred_selector_is_exact() {
+        let selected =
+            |m, k_skip, n_hi, n_lo, bank_bits, bank_len, k_log, useful, threads, enabled| {
+                ranked_ab_bank_deferred_shape(
+                    m, k_skip, n_hi, n_lo, bank_bits, bank_len, k_log, useful, threads, enabled,
+                )
+            };
+        let ranked = (32, K_SKIP, 7, 12, 7, 128 * ELL, 14, 15_409, 10, true);
+        assert!(selected(
+            ranked.0, ranked.1, ranked.2, ranked.3, ranked.4, ranked.5, ranked.6, ranked.7,
+            ranked.8, ranked.9,
+        ));
+
+        assert!(!selected(
+            31,
+            K_SKIP,
+            7,
+            12,
+            7,
+            128 * ELL,
+            14,
+            15_409,
+            10,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP + 1,
+            7,
+            12,
+            7,
+            128 * ELL,
+            14,
+            15_409,
+            10,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            6,
+            12,
+            7,
+            128 * ELL,
+            14,
+            15_409,
+            10,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            7,
+            11,
+            7,
+            128 * ELL,
+            14,
+            15_409,
+            10,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            7,
+            12,
+            6,
+            128 * ELL,
+            14,
+            15_409,
+            10,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            7,
+            12,
+            7,
+            64 * ELL,
+            14,
+            15_409,
+            10,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            7,
+            12,
+            7,
+            128 * ELL,
+            13,
+            15_409,
+            10,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            7,
+            12,
+            7,
+            128 * ELL,
+            14,
+            15_408,
+            10,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            7,
+            12,
+            7,
+            128 * ELL,
+            14,
+            15_409,
+            9,
+            true
+        ));
+        assert!(!selected(
+            32,
+            K_SKIP,
+            7,
+            12,
+            7,
+            128 * ELL,
+            14,
+            15_409,
+            10,
+            false
+        ));
+    }
+
+    #[test]
+    fn ab_bank_deferred_kill_is_literal_one_only() {
+        use std::ffi::OsStr;
+
+        for enabled in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("01"),
+            Some("true"),
+            Some(" 1"),
+        ] {
+            assert!(
+                zc_ab_bank_deferred_enabled_from_value(enabled.map(OsStr::new)),
+                "value {enabled:?} must keep the candidate enabled"
+            );
+        }
+        assert!(!zc_ab_bank_deferred_enabled_from_value(Some(OsStr::new(
+            "1"
+        ))));
+    }
+
+    /// Force both production collapse arms at the candidate's exact 128x64
+    /// geometry. This zerocheck-layer differential also covers the final
+    /// `eq_hi` multiplication that intentionally remains outside the field
+    /// kernel.
+    #[test]
+    fn ab_bank_deferred_finish_matches_scalar_collapse() {
+        let mut rng = Rng::new(0xABBA_1280_0064);
+        for trial in 0..16 {
+            let eq_bot = rng.f128_vec(128);
+            let banks = rng.f128_vec(128 * ELL);
+            let eq_hi = if trial == 0 { F128::ZERO } else { rng.f128() };
+            let sentinel = F128::new(0xdead_beef_dead_beef, 0xfeed_face_feed_face);
+            let mut scalar = [sentinel; ELL];
+            let mut deferred = [sentinel; ELL];
+            finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, false, &mut scalar);
+            finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, true, &mut deferred);
+            assert_eq!(deferred, scalar, "trial={trial}");
         }
     }
 
