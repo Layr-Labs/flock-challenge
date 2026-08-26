@@ -376,6 +376,14 @@ fn fast_pcs_open_encode_enabled() -> bool {
     cfg!(target_endian = "little") && flock_core::micro_stack_enabled()
 }
 
+/// `FLOCK_NO_FLAT_TAIL_BULK=1` restores the element-at-a-time flat encoding
+/// of sumcheck messages and nonce vectors. Other values keep the ranked
+/// publication-tail bulk copies enabled.
+fn flat_tail_bulk_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLOCK_NO_FLAT_TAIL_BULK").map_or(true, |v| v != "1"))
+}
+
 /// Append the bincode-fixint encoding of `p` to `out`. Byte-identical to
 /// `bincode::serialize_into(out, p)` (falls back to exactly that when the
 /// fast path is disabled).
@@ -419,12 +427,7 @@ fn encode_pcs_open_into<W: std::io::Write>(out: &mut W, p: &BatchOpeningProofLig
     put_f128_vec(out, yr);
     put_rows(out, opened_rows);
     put_hash_vec(out, merkle_proof);
-    put_u64(out, sumcheck_transcript.len() as u64);
-    for m in sumcheck_transcript {
-        let SumcheckMessage { u_0, u_2 } = m;
-        put_f128(out, *u_0);
-        put_f128(out, *u_2);
-    }
+    put_sumcheck_vec(out, sumcheck_transcript);
     put_u64_vec(out, grinding_nonces);
     put_f128_vec(out, ood_values);
     put_u64_vec(out, fold_grinding_nonces);
@@ -469,10 +472,49 @@ fn put_hash_vec<W: std::io::Write>(out: &mut W, v: &[MerkleHash]) {
 }
 
 #[inline]
+fn put_sumcheck_vec<W: std::io::Write>(out: &mut W, v: &[SumcheckMessage]) {
+    put_u64(out, v.len() as u64);
+    if flat_tail_bulk_enabled() {
+        const {
+            assert!(std::mem::size_of::<SumcheckMessage>() == 2 * std::mem::size_of::<F128>());
+            assert!(std::mem::align_of::<SumcheckMessage>() == std::mem::align_of::<F128>());
+            assert!(std::mem::offset_of!(SumcheckMessage, u_0) == 0);
+            assert!(
+                std::mem::offset_of!(SumcheckMessage, u_2) == std::mem::size_of::<F128>()
+            );
+        }
+        // SAFETY: `SumcheckMessage` is `repr(C)` with two adjacent `F128`
+        // fields, and `F128` is two adjacent `u64`s. The enclosing flat
+        // encoder is admitted only on little-endian targets, so these bytes
+        // are exactly bincode's fixed-integer field-concatenation encoding.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        out.write_all(bytes).expect("encode write");
+    } else {
+        for m in v {
+            let SumcheckMessage { u_0, u_2 } = m;
+            put_f128(out, *u_0);
+            put_f128(out, *u_2);
+        }
+    }
+}
+
+#[inline]
 fn put_u64_vec<W: std::io::Write>(out: &mut W, v: &[u64]) {
     put_u64(out, v.len() as u64);
-    for &x in v {
-        put_u64(out, x);
+    if flat_tail_bulk_enabled() {
+        // SAFETY: a `u64` slice has no padding, and this helper is reached
+        // only from the little-endian flat encoder, so its memory bytes are
+        // exactly bincode's fixed-width little-endian element encoding.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        };
+        out.write_all(bytes).expect("encode write");
+    } else {
+        for &x in v {
+            put_u64(out, x);
+        }
     }
 }
 
