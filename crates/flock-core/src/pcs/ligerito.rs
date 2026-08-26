@@ -3668,6 +3668,7 @@ fn l1_overlap_warmup_race(
 //     running := running + α·to_glue. New sum-claim becomes T_r + α·h.
 
 /// (u_0, u_2) per round — what the prover sends.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SumcheckMessage {
     pub u_0: F128,
@@ -5346,6 +5347,132 @@ fn ranked_l1_lazy_ood_eq_selected(
         && config.merkle_hash == HashKind::Blake3
 }
 
+const ENV_NO_LIG_L2_LAZY_OOD: &str = "FLOCK_NO_LIG_L2_LAZY_OOD";
+
+/// The L2 rollback is intentionally literal: inherited diagnostics such as
+/// `FLOCK_NO_LIG_L2_LAZY_OOD=0` must not silently select the control arm.
+#[inline]
+fn ranked_l2_lazy_ood_eq_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Small-domain proof oracle policy. Production still goes through the
+    /// exact ranked selector below; this override only chooses the two
+    /// algebraically identical arms without mutating process-global env.
+    static TEST_L2_LAZY_OOD_EQ_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_L2_LAZY_OOD_EQ_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Enable the factorized/lazy equality representation only for the L2 commit
+/// reached by the first recursive iteration of ranked M32 Fast. The prior L1
+/// opening is the 106-query, rate-two opening; every later level and every
+/// non-DirectFold8 entry retains the dense incumbent.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn ranked_l2_lazy_ood_eq_enabled(
+    config: &ProverConfig,
+    log_n: usize,
+    recursive_index: usize,
+    n_next: usize,
+    l2_ood_count: usize,
+    current_len: usize,
+    prior_queries: usize,
+    prior_log_inv_rate: usize,
+    direct_fold8_mode: bool,
+) -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_L2_LAZY_OOD_EQ_OVERRIDE.with(|slot| slot.get()) {
+        let selected = enabled && recursive_index == 0 && l2_ood_count == 1;
+        if selected {
+            TEST_L2_LAZY_OOD_EQ_HITS.with(|hits| hits.set(hits.get() + 1));
+        }
+        return selected;
+    }
+
+    ranked_l2_lazy_ood_eq_selected(
+        config,
+        log_n,
+        recursive_index,
+        n_next,
+        l2_ood_count,
+        current_len,
+        prior_queries,
+        prior_log_inv_rate,
+        direct_fold8_mode,
+        cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        )),
+        ranked_l2_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L2_LAZY_OOD).as_deref()),
+    )
+}
+
+/// Pure selector for the exact production fingerprint. Keeping every dynamic
+/// shape input explicit makes one-field mutation and rollback tests cheap and
+/// prevents this L2-only optimization from widening as configs evolve.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn ranked_l2_lazy_ood_eq_selected(
+    config: &ProverConfig,
+    log_n: usize,
+    recursive_index: usize,
+    n_next: usize,
+    l2_ood_count: usize,
+    current_len: usize,
+    prior_queries: usize,
+    prior_log_inv_rate: usize,
+    direct_fold8_mode: bool,
+    platform_supported: bool,
+    disabled: bool,
+) -> bool {
+    platform_supported
+        && !disabled
+        && direct_fold8_mode
+        && log_n == 25
+        && recursive_index == 0
+        && n_next == 16
+        && current_len == (1usize << 16)
+        && l2_ood_count == 1
+        && prior_queries == 106
+        && prior_log_inv_rate == 2
+        && config.initial_log_msg_cols == 19
+        && config.initial_log_num_interleaved == 6
+        && config.initial_k == 6
+        && config.recursive_steps == 5
+        && config.recursive_log_msg_cols.as_slice() == [16, 13, 10, 7, 4]
+        && config.recursive_ks.as_slice() == [3, 3, 3, 3, 3]
+        && config.log_inv_rates.as_slice() == [1, 2, 3, 4, 5, 6]
+        && config.queries.as_slice() == [218, 106, 71, 53, 43, 36]
+        && config.grinding_bits.as_slice() == [0, 0, 0, 0, 0, 0]
+        && config.fold_grinding_bits.as_slice() == [19, 14, 11, 8, 6, 4]
+        && config.ood_samples.as_slice() == [0, 1, 1, 1, 1, 1]
+        && config.merkle_hash == HashKind::Blake3
+}
+
+#[cfg(test)]
+fn with_l2_lazy_ood_eq_override<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    TEST_L2_LAZY_OOD_EQ_OVERRIDE.with(|slot| {
+        struct Reset<'a> {
+            slot: &'a std::cell::Cell<Option<bool>>,
+            previous: Option<bool>,
+        }
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.previous);
+            }
+        }
+
+        let previous = slot.replace(Some(enabled));
+        let _reset = Reset { slot, previous };
+        f()
+    })
+}
+
 /// Factorized explicit-OOD state. `Introduced` spans only the transcript
 /// observe/sample boundary; `Glued` remains separate from ordinary
 /// `pending_glue` until the next fold consumes it.
@@ -6854,27 +6981,52 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         recursive_roots.push(root_next);
 
         // OOD binding for the L_{i+2} commit (same as the L1 block above).
+        // Only ranked L2 keeps this equality factorized across the prior L1
+        // opening and lets the next recursive fold consume it. L3+ and every
+        // unsupported/rollback shape stay on the materialized incumbent.
+        let use_lazy_l2_ood = ranked_l2_lazy_ood_eq_enabled(
+            config,
+            log_n,
+            i,
+            n_next,
+            ood_count(i + 2),
+            sc_prover.f().len(),
+            config.queries[i + 1],
+            config.log_inv_rates[i + 1],
+            direct_fold8_mode,
+        );
         {
             let _t = std::time::Instant::now();
             for _ in 0..ood_count(i + 2) {
                 let z = challenger.sample_f128_vec(n_next);
-                // Micro-stack: the PMULL two-lane kernel builder is an exact
-                // drop-in for the generic one (byte-equality proven by
-                // `lincheck::tests::optimized_eq_table_matches_generic_bytes`,
-                // which covers these dims — ranked n_next = 16/13/10/7).
-                // FLOCK_NO_MICRO_STACK=1 restores the generic builder.
-                let eq_z = if crate::micro_stack_enabled() {
-                    crate::lincheck::build_eq_table_optimized(&z)
+                let (intro, y, factorized) = if use_lazy_l2_ood {
+                    let (intro, y) = sc_prover
+                        .introduce_new_ood_factorized(&z)
+                        .expect("ranked L2 lazy OOD preconditions changed after exact gate");
+                    (intro, y, true)
                 } else {
-                    build_eq_table(&z)
+                    // Micro-stack: the PMULL two-lane kernel builder is an
+                    // exact drop-in for the generic one (byte-equality proven
+                    // by `optimized_eq_table_matches_generic_bytes`).
+                    // FLOCK_NO_MICRO_STACK=1 restores the generic builder.
+                    let eq_z = if crate::micro_stack_enabled() {
+                        crate::lincheck::build_eq_table_optimized(&z)
+                    } else {
+                        build_eq_table(&z)
+                    };
+                    let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
+                    (intro, y, false)
                 };
-                let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
                 challenger.observe_f128(y);
                 ood_values.push(y);
                 challenger.observe_f128(intro.u_0);
                 challenger.observe_f128(intro.u_2);
                 let beta = challenger.sample_f128();
-                sc_prover.glue(beta);
+                if factorized {
+                    sc_prover.glue_factorized_ood(beta);
+                } else {
+                    sc_prover.glue(beta);
+                }
             }
             if trace {
                 t_ood += _t.elapsed();
@@ -6957,7 +7109,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
-        sc_prover.glue(beta_i);
+        if use_lazy_l2_ood {
+            sc_prover.glue_deferred_into_lazy_ood_fold(beta_i);
+        } else {
+            sc_prover.glue(beta_i);
+        }
         if trace {
             t_intro_glue += _t.elapsed();
         }
@@ -9326,6 +9482,144 @@ mod tests {
         ));
     }
 
+    /// L2 is deliberately narrower than the reusable factorized algebra: it
+    /// is selected only after the first recursive fold group of the exact
+    /// ranked M32 Fast DirectFold8 route. Every adjacent level/shape and the
+    /// literal rollback return to the dense incumbent.
+    #[test]
+    fn factorized_ood_l2_ranked_gate_and_literal_kill_are_exact() {
+        let mut config =
+            prover_config_for(25, 6, LigeritoProfile::Fast).expect("embedded M32 Fast config");
+        config.merkle_hash = HashKind::Blake3;
+        let selected = |cfg: &ProverConfig,
+                        log_n: usize,
+                        recursive_index: usize,
+                        n_next: usize,
+                        count: usize,
+                        len: usize,
+                        queries: usize,
+                        rate: usize,
+                        direct8: bool,
+                        platform: bool,
+                        disabled: bool| {
+            ranked_l2_lazy_ood_eq_selected(
+                cfg,
+                log_n,
+                recursive_index,
+                n_next,
+                count,
+                len,
+                queries,
+                rate,
+                direct8,
+                platform,
+                disabled,
+            )
+        };
+
+        assert!(selected(
+            &config,
+            25,
+            0,
+            16,
+            1,
+            1 << 16,
+            106,
+            2,
+            true,
+            true,
+            false,
+        ));
+        for (log_n, recursive_index, n_next, count, len, queries, rate) in [
+            (24, 0, 16, 1, 1 << 16, 106, 2),
+            (25, 1, 16, 1, 1 << 16, 106, 2),
+            (25, 0, 15, 1, 1 << 16, 106, 2),
+            (25, 0, 16, 0, 1 << 16, 106, 2),
+            (25, 0, 16, 2, 1 << 16, 106, 2),
+            (25, 0, 16, 1, 1 << 15, 106, 2),
+            (25, 0, 16, 1, 1 << 16, 105, 2),
+            (25, 0, 16, 1, 1 << 16, 106, 1),
+        ] {
+            assert!(!selected(
+                &config,
+                log_n,
+                recursive_index,
+                n_next,
+                count,
+                len,
+                queries,
+                rate,
+                true,
+                true,
+                false,
+            ));
+        }
+        assert!(!selected(
+            &config,
+            25,
+            0,
+            16,
+            1,
+            1 << 16,
+            106,
+            2,
+            false,
+            true,
+            false,
+        ));
+        assert!(!selected(
+            &config,
+            25,
+            0,
+            16,
+            1,
+            1 << 16,
+            106,
+            2,
+            true,
+            false,
+            false,
+        ));
+        assert!(!selected(
+            &config,
+            25,
+            0,
+            16,
+            1,
+            1 << 16,
+            106,
+            2,
+            true,
+            true,
+            true,
+        ));
+
+        let mut wrong_profile = config.clone();
+        wrong_profile.recursive_log_msg_cols[0] -= 1;
+        assert!(!selected(
+            &wrong_profile,
+            25,
+            0,
+            16,
+            1,
+            1 << 16,
+            106,
+            2,
+            true,
+            true,
+            false,
+        ));
+
+        use std::ffi::OsStr;
+        assert!(!ranked_l2_lazy_ood_eq_disabled_value(None));
+        for value in ["", "0", "01", "true", "yes"] {
+            assert!(!ranked_l2_lazy_ood_eq_disabled_value(Some(OsStr::new(
+                value
+            ))));
+        }
+        assert!(ranked_l2_lazy_ood_eq_disabled_value(Some(OsStr::new("1"))));
+    }
+
     /// The ranked lazy OOD representation must be a protocol-transparent
     /// replacement for materializing `eq(z)`: claimed value, intro message,
     /// intervening ordinary introduce/glue, next folded state, and every
@@ -9471,6 +9765,151 @@ mod tests {
                 assert_eq!(lazy.transcript(), full.transcript());
                 assert_eq!(deferred.transcript(), full.transcript());
             }
+        }
+    }
+
+    /// Exact L2 state-machine oracle for the ranked post-fold geometry. The
+    /// dense and 11+4 factorized representations must agree at introduction,
+    /// OOD glue, ordinary deferred glue, the consuming first fold, and a
+    /// second fold after both pending slots have been cleared. The first 16
+    /// cases cover zero/one boundaries; the remainder are pseudorandom.
+    #[test]
+    fn factorized_ood_l2_n16_state_and_two_folds_match_dense() {
+        const LOG_N: usize = 16;
+        const LEN: usize = 1 << LOG_N;
+
+        let mut state = 0x4C32_5F4C_415A_5932u64;
+        let mut rnd = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(state, state.rotate_left(17) ^ 0x4F4F_445F_4E31_365F)
+        };
+
+        let f: Vec<F128> = (0..LEN).map(|_| rnd()).collect();
+        let initial_basis: Vec<F128> = (0..LEN).map(|_| rnd()).collect();
+        let ordinary_basis: Vec<F128> = (0..LEN).map(|_| rnd()).collect();
+        let h_initial = f
+            .iter()
+            .zip(initial_basis.iter())
+            .map(|(&x, &b)| x * b)
+            .fold(F128::ZERO, |acc, value| acc + value);
+        let h_ordinary = f
+            .iter()
+            .zip(ordinary_basis.iter())
+            .map(|(&x, &b)| x * b)
+            .fold(F128::ZERO, |acc, value| acc + value);
+        let first_msg = round_msg_lsb(&f, &initial_basis);
+
+        for case in 0..20usize {
+            let (z, beta, alpha, r_first, r_second) = if case < 16 {
+                let bit = |mask: usize| {
+                    if case & mask == 0 {
+                        F128::ZERO
+                    } else {
+                        F128::ONE
+                    }
+                };
+                (
+                    vec![bit(1); LOG_N],
+                    bit(2),
+                    bit(4),
+                    bit(8),
+                    if case & 8 == 0 { F128::ONE } else { F128::ZERO },
+                )
+            } else {
+                (
+                    (0..LOG_N).map(|_| rnd()).collect(),
+                    rnd(),
+                    rnd(),
+                    rnd(),
+                    rnd(),
+                )
+            };
+
+            let (mut dense, dense_first) = SumcheckProver::new_with_first_msg(
+                f.clone(),
+                initial_basis.clone(),
+                h_initial,
+                first_msg,
+            );
+            let (mut factorized, factorized_first) = SumcheckProver::new_with_first_msg(
+                f.clone(),
+                initial_basis.clone(),
+                h_initial,
+                first_msg,
+            );
+            assert_eq!(factorized_first, dense_first, "case={case}");
+
+            let (dense_intro, dense_y) = dense.introduce_new_with_eval(build_eq_table(&z));
+            let (factorized_intro, factorized_y) = factorized
+                .introduce_new_ood_factorized(&z)
+                .expect("n=16 factorized OOD geometry");
+            assert_eq!(
+                (factorized_intro, factorized_y),
+                (dense_intro, dense_y),
+                "introduction differs, case={case}"
+            );
+            match factorized
+                .pending_ood_eq
+                .as_ref()
+                .expect("factorized OOD must remain pending")
+            {
+                PendingOodEq::Introduced { eq_lo, eq_hi, .. } => {
+                    assert_eq!(eq_lo.len(), 1 << 11);
+                    assert_eq!(eq_hi.len(), 1 << 4);
+                    assert_eq!(eq_lo.len() * eq_hi.len(), 1 << (LOG_N - 1));
+                    assert_eq!(eq_lo.len() + eq_hi.len(), 2064);
+                }
+                PendingOodEq::Glued { .. } => panic!("OOD glued before challenge"),
+            }
+
+            dense.glue(beta);
+            factorized.glue_factorized_ood(beta);
+            assert_eq!(factorized.t_r, dense.t_r, "OOD target, case={case}");
+            assert_eq!(factorized.transcript(), dense.transcript());
+            assert!(matches!(
+                factorized.pending_ood_eq.as_ref(),
+                Some(PendingOodEq::Glued { .. })
+            ));
+
+            let dense_ordinary = dense.introduce_new(ordinary_basis.clone(), h_ordinary);
+            let factorized_ordinary = factorized.introduce_new(ordinary_basis.clone(), h_ordinary);
+            assert_eq!(factorized_ordinary, dense_ordinary, "case={case}");
+            dense.glue(alpha);
+            factorized.glue_deferred_into_lazy_ood_fold(alpha);
+            assert_eq!(factorized.t_r, dense.t_r, "ordinary target, case={case}");
+            assert_eq!(factorized.transcript(), dense.transcript());
+            assert!(factorized.pending_glue.is_none());
+            assert!(factorized.pending_fold_basis.is_some());
+
+            let dense_fold_1 = dense.fold(r_first);
+            let factorized_fold_1 = factorized.fold(r_first);
+            assert_eq!(factorized_fold_1, dense_fold_1, "first fold, case={case}");
+            assert_eq!(factorized.f, dense.f, "first f state, case={case}");
+            assert_eq!(
+                factorized.combined_basis, dense.combined_basis,
+                "first basis state, case={case}"
+            );
+            assert_eq!(factorized.t_r, dense.t_r, "first target, case={case}");
+            assert_eq!(factorized.transcript(), dense.transcript());
+            assert!(factorized.pending_ood_eq.is_none());
+            assert!(factorized.pending_fold_basis.is_none());
+            assert!(factorized.pending_glue.is_none());
+
+            let dense_fold_2 = dense.fold(r_second);
+            let factorized_fold_2 = factorized.fold(r_second);
+            assert_eq!(factorized_fold_2, dense_fold_2, "second fold, case={case}");
+            assert_eq!(factorized.f, dense.f, "second f state, case={case}");
+            assert_eq!(
+                factorized.combined_basis, dense.combined_basis,
+                "second basis state, case={case}"
+            );
+            assert_eq!(factorized.t_r, dense.t_r, "second target, case={case}");
+            assert_eq!(factorized.transcript(), dense.transcript());
+            assert!(factorized.pending_ood_eq.is_none());
+            assert!(factorized.pending_fold_basis.is_none());
+            assert!(factorized.pending_glue.is_none());
         }
     }
 
@@ -13102,6 +13541,92 @@ mod tests {
             merkle_hash: Default::default(),
         };
         (p, v)
+    }
+
+    /// Full-prover oracle for the L2-only integration. A thread-local policy
+    /// selects candidate versus the exact kill/control arm on a small domain;
+    /// the protocol ordering is otherwise identical to production: L2 OOD,
+    /// prior-level opening induction, deferred glue, then next-level fold.
+    /// Proof/claim bytes must match and the unmodified verifier must accept
+    /// both arms.
+    #[test]
+    fn factorized_ood_l2_full_proof_claim_and_kill_match() {
+        use crate::challenger::Challenger;
+
+        let log_n = 12;
+        let initial_k = 2;
+        let ks = [2usize, 2];
+        let (prover_config, verifier_config) =
+            ood_test_configs(log_n, initial_k, &ks, vec![0, 0, 1], vec![0, 0, 0]);
+        let mut rng = crate::challenger::RandomChallenger::new(0x4C32_F00D_CAFE_0016);
+        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let point: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let basis = build_eq_table(&point);
+        let target = poly
+            .iter()
+            .zip(basis.iter())
+            .map(|(&f, &b)| f * b)
+            .fold(F128::ZERO, |acc, value| acc + value);
+
+        let ntt_0 = AdditiveNttF128::standard(
+            prover_config.initial_log_msg_cols + prover_config.log_inv_rates[0],
+        );
+        let wtns_0 = ligero_commit(
+            &poly,
+            prover_config.initial_log_msg_cols,
+            initial_k,
+            prover_config.log_inv_rates[0],
+            &ntt_0,
+            prover_config.merkle_hash,
+        );
+        let initial_root = wtns_0.root();
+
+        let prove = |candidate: bool| {
+            with_l2_lazy_ood_eq_override(candidate, || {
+                TEST_L2_LAZY_OOD_EQ_HITS.with(|hits| hits.set(0));
+                let mut challenger =
+                    crate::challenger::FsChallenger::new(b"l2-lazy-ood-full-proof-oracle");
+                let proof = recursive_prover_with_basis(
+                    &prover_config,
+                    poly.clone(),
+                    basis.clone(),
+                    target,
+                    &wtns_0.mat,
+                    &wtns_0.tree,
+                    &mut challenger,
+                );
+                let hits = TEST_L2_LAZY_OOD_EQ_HITS.with(|hits| hits.get());
+                (proof, hits)
+            })
+        };
+
+        let (kill, kill_hits) = prove(false);
+        let (candidate, candidate_hits) = prove(true);
+        assert_eq!(kill_hits, 0);
+        assert_eq!(candidate_hits, 1, "candidate must select L2 exactly once");
+        assert_eq!(candidate.ood_values.len(), 1);
+        assert_eq!(candidate, kill);
+        assert_eq!(
+            bincode::serialize(&(candidate.clone(), target))
+                .expect("serialize candidate proof/claim"),
+            bincode::serialize(&(kill.clone(), target)).expect("serialize kill proof/claim"),
+        );
+
+        for (label, proof) in [("candidate", &candidate), ("kill", &kill)] {
+            let mut challenger =
+                crate::challenger::FsChallenger::new(b"l2-lazy-ood-full-proof-oracle");
+            assert!(
+                recursive_verifier_with_basis(
+                    &verifier_config,
+                    proof,
+                    &basis,
+                    target,
+                    &initial_root,
+                    &mut challenger,
+                ),
+                "verifier rejected {label} arm"
+            );
+        }
     }
 
     /// End-to-end OOD binding + fold-challenge grinding: a JohnsonOod-shaped
