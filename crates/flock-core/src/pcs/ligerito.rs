@@ -1850,6 +1850,165 @@ fn evaluate_scaled_basis_inplace(
     }
 }
 
+/// Add one scaled novel-basis vector to `accum_basis` without materializing
+/// the final doubling's upper half. `lower_basis` is exactly half the output
+/// length: it owns all levels before the last one, whose live lower values are
+/// consumed once to update both accumulator halves directly.
+fn evaluate_scaled_basis_add_final_direct(
+    sks_at_x: &mut [F128],
+    lower_basis: &mut [F128],
+    accum_basis: &mut [F128],
+    sks_vks: &[F128],
+    inv_sks_vks: &[F128],
+    x: F128,
+    alpha: F128,
+) {
+    let log_n = accum_basis.len().trailing_zeros() as usize;
+    debug_assert_eq!(accum_basis.len(), 1 << log_n);
+    debug_assert!(sks_at_x.len() >= log_n);
+    debug_assert!(inv_sks_vks.len() > log_n);
+
+    if log_n == 0 {
+        debug_assert!(lower_basis.is_empty());
+        accum_basis[0] += alpha;
+        return;
+    }
+    let half = accum_basis.len() / 2;
+    debug_assert_eq!(lower_basis.len(), half);
+
+    sks_at_x[0] = x;
+    for i in 1..log_n {
+        sks_at_x[i] = next_s(sks_at_x[i - 1], sks_vks[i - 1]);
+    }
+    for i in 0..log_n {
+        sks_at_x[i] *= inv_sks_vks[i];
+    }
+
+    lower_basis[0] = alpha;
+    for k in 0..log_n - 1 {
+        let s_at_x = sks_at_x[k];
+        let current_len = 1 << k;
+        for i in 0..current_len {
+            lower_basis[i + current_len] = s_at_x * lower_basis[i];
+        }
+    }
+
+    let final_s_at_x = sks_at_x[log_n - 1];
+    let (accum_low, accum_high) = accum_basis.split_at_mut(half);
+    for ((accum_low, accum_high), &value) in accum_low
+        .iter_mut()
+        .zip(accum_high.iter_mut())
+        .zip(lower_basis.iter())
+    {
+        *accum_low += value;
+        *accum_high += final_s_at_x * value;
+    }
+}
+
+const ENV_NO_LIG_DENSE_FINAL_DIRECT: &str = "FLOCK_NO_LIG_DENSE_FINAL_DIRECT";
+
+#[inline]
+fn ranked_dense_final_direct_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+/// The three material dense recursive induction shapes in ranked M32 Fast.
+/// L0 and L1 use the sparse-NTT path; the remaining 16-entry tail is kept on
+/// the incumbent because this transformation would delete only a few KiB.
+#[inline]
+fn is_ranked_dense_final_direct_shape(
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+) -> bool {
+    log_num_interleaved == 3
+        && matches!(
+            (log_msg_cols, n_queries, alpha_len),
+            (13, 71, 7) | (10, 53, 6) | (7, 43, 6)
+        )
+}
+
+#[inline]
+fn ranked_dense_final_direct_selected(
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+    platform_supported: bool,
+    disabled: bool,
+) -> bool {
+    platform_supported
+        && !disabled
+        && is_ranked_dense_final_direct_shape(
+            log_msg_cols,
+            log_num_interleaved,
+            n_queries,
+            alpha_len,
+        )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_DENSE_FINAL_DIRECT_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_DENSE_FINAL_DIRECT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Select only the three cache-resident dense induction levels on Apple
+/// AArch64. Exactly `FLOCK_NO_LIG_DENSE_FINAL_DIRECT=1` restores the full
+/// local-basis materialization for a same-binary official control.
+#[inline]
+fn ranked_dense_final_direct_enabled(
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+) -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_DENSE_FINAL_DIRECT_OVERRIDE.with(|slot| slot.get()) {
+        if enabled {
+            TEST_DENSE_FINAL_DIRECT_HITS.with(|hits| hits.set(hits.get() + 1));
+        }
+        return enabled;
+    }
+
+    ranked_dense_final_direct_selected(
+        log_msg_cols,
+        log_num_interleaved,
+        n_queries,
+        alpha_len,
+        cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        )),
+        ranked_dense_final_direct_disabled_value(
+            std::env::var_os(ENV_NO_LIG_DENSE_FINAL_DIRECT).as_deref(),
+        ),
+    )
+}
+
+#[cfg(test)]
+fn with_dense_final_direct_override<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    TEST_DENSE_FINAL_DIRECT_OVERRIDE.with(|slot| {
+        struct Reset<'a> {
+            slot: &'a std::cell::Cell<Option<bool>>,
+            previous: Option<bool>,
+        }
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.previous);
+            }
+        }
+
+        let previous = slot.replace(Some(enabled));
+        let _reset = Reset { slot, previous };
+        f()
+    })
+}
+
 // ===================================================================
 // induce_sumcheck_poly — the per-level basis-poly builder.
 // ===================================================================
@@ -2065,6 +2224,12 @@ pub(crate) fn induce_sumcheck_poly(
 
     // Precompute inv_sks_vks once across all queries and threads.
     let inv_sks_vks = batch_inverse_or_zero(sks_vks);
+    let use_dense_final_direct = ranked_dense_final_direct_enabled(
+        log_msg_cols,
+        v_challenges.len(),
+        n_queries,
+        alpha.len(),
+    );
 
     // Per-worker chunked accumulation: each worker accumulates a partial
     // basis_poly (length n) and a partial enforced_sum, then we reduce.
@@ -2081,9 +2246,9 @@ pub(crate) fn induce_sumcheck_poly(
     } else {
         0
     };
-    // 16 chunks when hetero: the queue's engagement floor (EPOOL_MIN_CHUNKS),
-    // and enough claims that the four helpers stay fed without inflating the
-    // serial partial reduce below by more than two extra length-n passes.
+    // Keep 16 induction chunks independently of the generic epool engagement
+    // floor: enough claims for four helpers without inflating the serial
+    // partial reduce below by more than two extra length-n passes.
     let n_threads = if helper_threads > 0 {
         (rayon::current_num_threads().max(1) + helper_threads).max(16)
     } else {
@@ -2102,15 +2267,21 @@ pub(crate) fn induce_sumcheck_poly(
                 return (Vec::new(), F128::ZERO);
             }
             // Both per-thread buffers are uninit-sound: `local_basis` is
-            // fully written by `evaluate_scaled_basis_inplace` before any
-            // read (`basis[0] = alpha`, then each doubling level writes
-            // `[2^k, 2^{k+1})` from the already-written lower half), and
+            // fully written before any read. The control writes all `n`
+            // slots; final-direct writes its allocated lower `n/2` slots and
+            // consumes them while updating both accumulator halves. In both
+            // cases `basis[0] = alpha`, then each doubling level writes
+            // `[2^k, 2^{k+1})` from the already-written lower half. Likewise,
             // `accum_basis` is seeded by a full `copy_from_slice` of the
             // chunk's FIRST query before any accumulation — algebraically
             // identical to zero-init + XOR-add (x ⊕ 0 = x), deleting one
             // length-n memset and one full-buffer RMW pass per worker.
             let mut accum_basis = crate::alloc_uninit_f128_vec(n);
-            let mut local_basis = crate::alloc_uninit_f128_vec(n);
+            let mut local_basis = crate::alloc_uninit_f128_vec(if use_dense_final_direct {
+                n / 2
+            } else {
+                n
+            });
             let mut sks_at_x = vec![F128::ZERO; log_msg_cols.max(1)];
             let mut local_sum = F128::ZERO;
 
@@ -2138,16 +2309,28 @@ pub(crate) fn induce_sumcheck_poly(
                     );
                     continue;
                 }
-                evaluate_scaled_basis_inplace(
-                    &mut sks_at_x,
-                    &mut local_basis,
-                    sks_vks,
-                    &inv_sks_vks,
-                    q_field,
-                    ap,
-                );
-                for (acc, &v) in accum_basis.iter_mut().zip(local_basis.iter()) {
-                    *acc += v;
+                if use_dense_final_direct {
+                    evaluate_scaled_basis_add_final_direct(
+                        &mut sks_at_x,
+                        &mut local_basis,
+                        &mut accum_basis,
+                        sks_vks,
+                        &inv_sks_vks,
+                        q_field,
+                        ap,
+                    );
+                } else {
+                    evaluate_scaled_basis_inplace(
+                        &mut sks_at_x,
+                        &mut local_basis,
+                        sks_vks,
+                        &inv_sks_vks,
+                        q_field,
+                        ap,
+                    );
+                    for (acc, &v) in accum_basis.iter_mut().zip(local_basis.iter()) {
+                        *acc += v;
+                    }
                 }
             }
             (accum_basis, local_sum)
@@ -11595,6 +11778,119 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dense_final_direct_helper_matches_full_materialize_then_add() {
+        use crate::challenger::Challenger;
+
+        let mut rng = crate::challenger::RandomChallenger::new(0xD3E5_EF1A_1D1E_C7A5);
+        for log_n in 0..=10usize {
+            let n = 1usize << log_n;
+            let sks_vks = eval_sk_at_vks_uncached(log_n);
+            let inv_sks_vks = batch_inverse_or_zero(&sks_vks);
+            for case in 0..5usize {
+                let x = rng.sample_f128();
+                let alpha = if case == 0 {
+                    F128::ZERO
+                } else {
+                    rng.sample_f128()
+                };
+                let initial = rng.sample_f128_vec(n);
+
+                let mut expected = initial.clone();
+                let mut full_basis = vec![F128::ZERO; n];
+                let mut full_scratch = vec![F128::ZERO; log_n.max(1)];
+                evaluate_scaled_basis_inplace(
+                    &mut full_scratch,
+                    &mut full_basis,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    x,
+                    alpha,
+                );
+                for (accum, &value) in expected.iter_mut().zip(full_basis.iter()) {
+                    *accum += value;
+                }
+
+                let mut actual = initial;
+                let mut lower_basis = vec![F128::ZERO; n / 2];
+                let mut direct_scratch = vec![F128::ZERO; log_n.max(1)];
+                evaluate_scaled_basis_add_final_direct(
+                    &mut direct_scratch,
+                    &mut lower_basis,
+                    &mut actual,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    x,
+                    alpha,
+                );
+                assert_eq!(actual, expected, "log_n={log_n}, case={case}");
+            }
+        }
+    }
+
+    #[test]
+    fn ranked_dense_final_direct_selector_hits_exact_three_and_kill_is_literal() {
+        let exact = [(13usize, 71usize, 7usize), (10, 53, 6), (7, 43, 6)];
+        for &(log_msg_cols, n_queries, alpha_len) in &exact {
+            assert!(is_ranked_dense_final_direct_shape(
+                log_msg_cols,
+                3,
+                n_queries,
+                alpha_len,
+            ));
+            assert!(ranked_dense_final_direct_selected(
+                log_msg_cols,
+                3,
+                n_queries,
+                alpha_len,
+                true,
+                false,
+            ));
+            assert!(!ranked_dense_final_direct_selected(
+                log_msg_cols,
+                3,
+                n_queries,
+                alpha_len,
+                true,
+                true,
+            ));
+            assert!(!ranked_dense_final_direct_selected(
+                log_msg_cols,
+                3,
+                n_queries,
+                alpha_len,
+                false,
+                false,
+            ));
+        }
+
+        for &(log_msg_cols, log_num_interleaved, n_queries, alpha_len) in &[
+            (12usize, 3usize, 71usize, 7usize),
+            (13, 2, 71, 7),
+            (13, 3, 70, 7),
+            (13, 3, 71, 6),
+            (4, 3, 36, 6),
+        ] {
+            assert!(!is_ranked_dense_final_direct_shape(
+                log_msg_cols,
+                log_num_interleaved,
+                n_queries,
+                alpha_len,
+            ));
+        }
+
+        assert!(!ranked_dense_final_direct_disabled_value(None));
+        assert!(!ranked_dense_final_direct_disabled_value(Some(
+            std::ffi::OsStr::new("0")
+        )));
+        assert!(!ranked_dense_final_direct_disabled_value(Some(
+            std::ffi::OsStr::new("true")
+        )));
+        assert!(ranked_dense_final_direct_disabled_value(Some(
+            std::ffi::OsStr::new("1")
+        )));
+    }
+
     /// `induce_sumcheck_poly_via_ntt` must be byte-identical to dense across
     /// shapes incl. the real m30_fast level dims.
     #[test]
@@ -14086,6 +14382,89 @@ mod tests {
             merkle_hash: Default::default(),
         };
         (p, v)
+    }
+
+    /// Full-prover oracle for the non-first-query final-doubling integration.
+    /// A thread-local policy reaches the same call site on a compact domain;
+    /// candidate and exact kill/control must emit identical proof/claim bytes,
+    /// and the ordinary verifier must accept both without the override.
+    #[test]
+    fn dense_final_direct_full_proof_claim_and_kill_match() {
+        use crate::challenger::Challenger;
+
+        let log_n = 11;
+        let initial_k = 2;
+        let ks = [2usize, 2];
+        let (prover_config, verifier_config) =
+            ood_test_configs(log_n, initial_k, &ks, vec![0; 3], vec![0; 3]);
+        let mut rng = crate::challenger::RandomChallenger::new(0xD3E5_EF1A_F011_BA5E);
+        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let point: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let basis = build_eq_table(&point);
+        let target = poly
+            .iter()
+            .zip(basis.iter())
+            .map(|(&f, &b)| f * b)
+            .fold(F128::ZERO, |acc, value| acc + value);
+
+        let ntt_0 = AdditiveNttF128::standard(
+            prover_config.initial_log_msg_cols + prover_config.log_inv_rates[0],
+        );
+        let wtns_0 = ligero_commit(
+            &poly,
+            prover_config.initial_log_msg_cols,
+            initial_k,
+            prover_config.log_inv_rates[0],
+            &ntt_0,
+            prover_config.merkle_hash,
+        );
+        let initial_root = wtns_0.root();
+
+        let prove = |candidate: bool| {
+            with_dense_final_direct_override(candidate, || {
+                TEST_DENSE_FINAL_DIRECT_HITS.with(|hits| hits.set(0));
+                let mut challenger =
+                    crate::challenger::FsChallenger::new(b"dense-final-direct-proof-oracle");
+                let proof = recursive_prover_with_basis(
+                    &prover_config,
+                    poly.clone(),
+                    basis.clone(),
+                    target,
+                    &wtns_0.mat,
+                    &wtns_0.tree,
+                    &mut challenger,
+                );
+                let hits = TEST_DENSE_FINAL_DIRECT_HITS.with(|hits| hits.get());
+                (proof, hits)
+            })
+        };
+
+        let (kill, kill_hits) = prove(false);
+        let (candidate, candidate_hits) = prove(true);
+        assert_eq!(kill_hits, 0);
+        assert!(candidate_hits > 0, "candidate override never reached induction");
+        assert_eq!(candidate, kill);
+        assert_eq!(
+            bincode::serialize(&(candidate.clone(), target))
+                .expect("serialize candidate proof/claim"),
+            bincode::serialize(&(kill.clone(), target)).expect("serialize kill proof/claim"),
+        );
+
+        for (label, proof) in [("candidate", &candidate), ("kill", &kill)] {
+            let mut challenger =
+                crate::challenger::FsChallenger::new(b"dense-final-direct-proof-oracle");
+            assert!(
+                recursive_verifier_with_basis(
+                    &verifier_config,
+                    proof,
+                    &basis,
+                    target,
+                    &initial_root,
+                    &mut challenger,
+                ),
+                "verifier rejected {label} arm"
+            );
+        }
     }
 
     /// Full-prover oracle for the L2-only integration. A thread-local policy
