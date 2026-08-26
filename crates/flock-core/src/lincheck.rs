@@ -125,6 +125,8 @@ use std::sync::atomic::AtomicBool;
 
 mod kernels;
 
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) use kernels::partial_fold_packed_z_neon_oblock16_first_tile_init_padded;
 #[cfg(target_arch = "x86_64")]
 pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 #[cfg(target_arch = "aarch64")]
@@ -1425,7 +1427,7 @@ pub fn prove_padded<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
-    let (proof, claim, _) = prove_padded_inner(
+    let (proof, claim, _) = prove_padded_inner::<false, _>(
         z_packed,
         m,
         k_log,
@@ -1458,7 +1460,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_padded_inner(
+    let (proof, claim, captured) = prove_padded_inner::<false, _>(
         z_packed,
         m,
         k_log,
@@ -1477,7 +1479,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prove_padded_inner<Ch: Challenger>(
+fn prove_padded_inner<const FORCE_FIRST_TILE_INIT: bool, Ch: Challenger>(
     z_packed: &[u8],
     m: usize,
     k_log: usize,
@@ -1556,13 +1558,30 @@ fn prove_padded_inner<Ch: Challenger>(
             None
         };
         let eq_x_outer = build_z_fold_eq_table(m, k_log, k_skip, useful_bits, &x_ab.x_outer);
-        let z_vec = partial_fold_packed_z_best_gpu_split(
-            z_packed,
-            m,
-            k_log,
-            useful_bits,
-            eq_x_outer.as_slice(),
-        );
+        let z_vec = if FORCE_FIRST_TILE_INIT {
+            #[cfg(test)]
+            {
+                partial_fold_packed_z_neon_oblock16_first_tile_init_padded(
+                    z_packed,
+                    m,
+                    k_log,
+                    useful_bits,
+                    eq_x_outer.as_slice(),
+                )
+            }
+            #[cfg(not(test))]
+            {
+                unreachable!("first-tile proof oracle is test-only")
+            }
+        } else {
+            partial_fold_packed_z_best_gpu_split(
+                z_packed,
+                m,
+                k_log,
+                useful_bits,
+                eq_x_outer.as_slice(),
+            )
+        };
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",
@@ -2172,6 +2191,131 @@ mod tests {
                 "m={m}, k_log={k_log}, useful={useful_bits}"
             );
         }
+    }
+
+    /// The ranked first-tile schedule changes only how each claim obtains its
+    /// additive identity: the first tile writes the useful prefix instead of
+    /// XORing into an eagerly-zeroed one. Exercise multiple claims, a residual
+    /// Block8 tail, and honest zero padding against both the literal incumbent
+    /// Block16 driver and the independently partitioned iblock fold.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    #[test]
+    fn partial_fold_first_tile_init_matches_incumbent_and_iblock() {
+        let (m, k_log, useful_bits) = (21usize, 8usize, 241usize);
+        assert_eq!(oblock_claim_count(m, k_log), 2, "oracle must span claims");
+
+        let k = 1usize << k_log;
+        let n_log = m - k_log;
+        let mut rng = Rng::new(7_161_241);
+        let mut z = rng.bits(1 << m);
+        for block in 0..(1usize << n_log) {
+            z[block * k + useful_bits..(block + 1) * k].fill(false);
+        }
+        let z_packed = pack_z_lincheck(&z, m, k_log);
+        let eq = build_eq_table(&rng.f128_vec(n_log));
+
+        let incumbent =
+            partial_fold_packed_z_neon_oblock16_padded(&z_packed, m, k_log, useful_bits, &eq);
+        let candidate = partial_fold_packed_z_neon_oblock16_first_tile_init_padded(
+            &z_packed,
+            m,
+            k_log,
+            useful_bits,
+            &eq,
+        );
+        let iblock =
+            partial_fold_packed_z_neon_iblock_padded(&z_packed, m, k_log, useful_bits, &eq);
+
+        assert_eq!(candidate, incumbent, "INIT differs from zero + accumulate");
+        assert_eq!(candidate, iblock, "INIT differs from independent iblock");
+        let useful = useful_bits.next_multiple_of(8);
+        assert!(
+            candidate[useful..].iter().all(|&x| x == F128::ZERO),
+            "unreduced partial tail leaked into the public vector"
+        );
+    }
+
+    /// Carry the INIT fold through the complete lincheck transcript. This is
+    /// a compact proof-byte oracle, not merely a vector equality check: the
+    /// same honest padded witness is proved once through the normal dispatch
+    /// and once with the test-only INIT fold injected before sumcheck. Every
+    /// serialized proof byte and the derived claim must match, and the normal
+    /// verifier must accept the INIT-produced proof.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    #[test]
+    fn first_tile_init_lincheck_proof_is_byte_identical_and_verifies() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .expect("oracle pool");
+        pool.install(|| {
+            let (m, k_log, k_skip, useful_bits) = (21usize, 8usize, 6usize, 241usize);
+            let k = 1usize << k_log;
+            let mut rng = Rng::new(7_161_242);
+            let a_0 = random_sparse_matrix(k, 2 * k, &mut rng);
+            let b_0 = random_sparse_matrix(k, 2 * k, &mut rng);
+
+            let mut z = rng.bits(1 << m);
+            for block in 0..(1usize << (m - k_log)) {
+                z[block * k + useful_bits..(block + 1) * k].fill(false);
+            }
+            let a = apply_block_diag(&a_0, &z, k_log);
+            let b = apply_block_diag(&b_0, &z, k_log);
+            let z_packed = pack_z_lincheck(&z, m, k_log);
+            let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
+            let v_a = mle_eval_bool_quirky(&a, m, k_log, k_skip, &x_ab);
+            let v_b = mle_eval_bool_quirky(&b, m, k_log, k_skip, &x_ab);
+            let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
+
+            let mut incumbent_ch = FsChallenger::new(b"flock-first-tile-init-proof-v0");
+            let (incumbent_proof, incumbent_claim) = prove_padded(
+                &z_packed,
+                m,
+                k_log,
+                k_skip,
+                useful_bits,
+                &circuit,
+                &x_ab,
+                &mut incumbent_ch,
+            );
+
+            let mut init_ch = FsChallenger::new(b"flock-first-tile-init-proof-v0");
+            let (init_proof, init_claim, _) = prove_padded_inner::<true, _>(
+                &z_packed,
+                m,
+                k_log,
+                k_skip,
+                useful_bits,
+                &circuit,
+                &x_ab,
+                false,
+                &mut init_ch,
+            );
+
+            assert_eq!(init_claim, incumbent_claim, "INIT changed derived claim");
+            assert_eq!(
+                bincode::serialize(&init_proof).expect("serialize INIT proof"),
+                bincode::serialize(&incumbent_proof).expect("serialize incumbent proof"),
+                "INIT changed lincheck proof bytes"
+            );
+
+            let mut verifier = FsChallenger::new(b"flock-first-tile-init-proof-v0");
+            assert_eq!(
+                verify(
+                    m,
+                    k_log,
+                    k_skip,
+                    &circuit,
+                    &x_ab,
+                    v_a,
+                    v_b,
+                    &init_proof,
+                    &mut verifier,
+                ),
+                Ok(init_claim),
+                "verifier rejected INIT-produced proof"
+            );
+        });
     }
 
     /// The default outer(tile)-partitioned fold is **bit-identical** to the legacy
