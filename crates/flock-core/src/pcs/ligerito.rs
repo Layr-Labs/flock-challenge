@@ -35,6 +35,7 @@ use crate::field::F128;
 use crate::lincheck::build_eq_table;
 use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
+use crate::zerocheck::PaddingSpec;
 use serde::{Deserialize, Serialize};
 
 // ===================================================================
@@ -5099,6 +5100,127 @@ fn materialize_direct_fold4(
     )
 }
 
+const ENV_NO_DIRECT_FOLD8_PAD57: &str = "FLOCK_NO_DIRECT_FOLD8_PAD57";
+
+/// Only the literal value `1` selects the full-64 control arm. Diagnostic
+/// values such as `0` and `true` must not accidentally disable the candidate.
+#[inline]
+fn ranked_direct_fold8_pad57_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_DIRECT_FOLD8_PAD57_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_DIRECT_FOLD8_PAD57_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn ranked_direct_fold8_pad57_enabled(
+    config: &ProverConfig,
+    padding: &PaddingSpec,
+    packed_len: usize,
+    claim_count: usize,
+    has_ordinary: bool,
+    block_len: usize,
+    out_len: usize,
+    eq_hi_len: usize,
+    pair_fold64: bool,
+) -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_DIRECT_FOLD8_PAD57_OVERRIDE.with(|slot| slot.get()) {
+        if enabled {
+            TEST_DIRECT_FOLD8_PAD57_HITS.with(|hits| hits.set(hits.get() + 1));
+        }
+        return enabled;
+    }
+
+    ranked_direct_fold8_pad57_selected(
+        config,
+        padding,
+        packed_len,
+        claim_count,
+        has_ordinary,
+        block_len,
+        out_len,
+        eq_hi_len,
+        pair_fold64,
+        cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        )),
+        ranked_direct_fold8_pad57_disabled_value(
+            std::env::var_os(ENV_NO_DIRECT_FOLD8_PAD57).as_deref(),
+        ),
+    )
+}
+
+/// Exact production selector. The padding descriptor is a semantic input:
+/// lengths alone are insufficient to prove that odd-slot banks 57..63 are
+/// zero. Every adjacent shape or configuration fails closed to the full fold.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn ranked_direct_fold8_pad57_selected(
+    config: &ProverConfig,
+    padding: &PaddingSpec,
+    packed_len: usize,
+    claim_count: usize,
+    has_ordinary: bool,
+    block_len: usize,
+    out_len: usize,
+    eq_hi_len: usize,
+    pair_fold64: bool,
+    platform_supported: bool,
+    disabled: bool,
+) -> bool {
+    platform_supported
+        && !disabled
+        && pair_fold64
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+        && packed_len == (1usize << 25)
+        && claim_count == 2
+        && !has_ordinary
+        && block_len == (1usize << 11)
+        && out_len == (1usize << 19)
+        && eq_hi_len == (1usize << 8)
+        && config.initial_log_msg_cols == 19
+        && config.initial_log_num_interleaved == 6
+        && config.initial_k == 6
+        && config.recursive_steps == 5
+        && config.recursive_log_msg_cols.as_slice() == [16, 13, 10, 7, 4]
+        && config.recursive_ks.as_slice() == [3, 3, 3, 3, 3]
+        && config.log_inv_rates.as_slice() == [1, 2, 3, 4, 5, 6]
+        && config.queries.as_slice() == [218, 106, 71, 53, 43, 36]
+        && config.grinding_bits.as_slice() == [0, 0, 0, 0, 0, 0]
+        && config.fold_grinding_bits.as_slice() == [19, 14, 11, 8, 6, 4]
+        && config.ood_samples.as_slice() == [0, 1, 1, 1, 1, 1]
+        && config.merkle_hash == HashKind::Blake3
+}
+
+#[cfg(test)]
+fn with_direct_fold8_pad57_override<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    TEST_DIRECT_FOLD8_PAD57_OVERRIDE.with(|slot| {
+        struct Reset<'a> {
+            slot: &'a std::cell::Cell<Option<bool>>,
+            previous: Option<bool>,
+        }
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.previous);
+            }
+        }
+
+        let previous = slot.replace(Some(enabled));
+        let _reset = Reset { slot, previous };
+        f()
+    })
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from the direct
 /// factor state before this function binds the witness and combined basis in
 /// one N→N/64 pass. It emits M6 — the round message of the folded
@@ -5110,6 +5232,8 @@ fn materialize_direct_fold8(
     ordinary_basis: Vec<F128>,
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
+    padding: &PaddingSpec,
+    config: &ProverConfig,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
 
@@ -5151,6 +5275,17 @@ fn materialize_direct_fold8(
     let pair_fold64 = deferred_reduce
         && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
         && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none();
+    let pair_fold64_pad57 = ranked_direct_fold8_pad57_enabled(
+        config,
+        padding,
+        packed_witness.len(),
+        claims.len(),
+        has_ordinary,
+        block_len,
+        out_len,
+        claims[0].eq_hi.len(),
+        pair_fold64,
+    );
 
     // One shared per-block body for both drains below, so the scheduling
     // choice cannot drift from the value computation. For block `i` it fully
@@ -5193,7 +5328,41 @@ fn materialize_direct_fold8(
             scratch,
         );
         let mut slot = 0usize;
-        if pair_fold64 {
+        if pair_fold64_pad57 {
+            while slot + 1 < block_len {
+                let base = 64 * slot;
+                debug_assert!(
+                    f_in[base + 121..base + 128]
+                        .iter()
+                        .all(|value| value.is_zero())
+                );
+                let folded_f = crate::field::f128_slice::fold_banked_slots2_64_57(
+                    &fold_weight,
+                    &f_in[base..base + 121],
+                );
+                f_out[slot] = folded_f[0];
+                f_out[slot + 1] = folded_f[1];
+
+                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                let direct1 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
+                // Pad57 never changes the ordinary-basis contract. Production
+                // selects this arm only when it is empty; the literal full64
+                // path remains here for fail-closed test overrides.
+                if has_ordinary {
+                    let folded_b = crate::field::f128_slice::fold_banked_slots2::<64>(
+                        &fold_weight,
+                        &b_in[base..base + 128],
+                    );
+                    b_out[slot] = direct0 + folded_b[0];
+                    b_out[slot + 1] = direct1 + folded_b[1];
+                } else {
+                    b_out[slot] = direct0;
+                    b_out[slot + 1] = direct1;
+                }
+                slot += 2;
+            }
+        } else if pair_fold64 {
             while slot + 1 < block_len {
                 let base = 64 * slot;
                 let folded_f = crate::field::f128_slice::fold_banked_slots2::<64>(
@@ -6346,6 +6515,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         None,
         None,
         None,
+        None,
         challenger,
     )
 }
@@ -6379,6 +6549,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
             u_2: round0_uv.1,
         }),
         round1_lookahead,
+        None,
         None,
         None,
         None,
@@ -6422,6 +6593,7 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
         None,
         None,
         Some(direct),
+        None,
         None,
         None,
         challenger,
@@ -6469,6 +6641,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
         None,
         Some(direct),
         None,
+        None,
         challenger,
     )
 }
@@ -6487,6 +6660,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
     l0_codeword: &[F128],
     l0_tree: &[Hash],
     round0_uv: (F128, F128),
+    padding: &PaddingSpec,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     assert_eq!(
@@ -6512,6 +6686,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
         None,
         None,
         Some(direct),
+        Some(*padding),
         challenger,
     )
 }
@@ -6532,6 +6707,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     direct_fold2: Option<Vec<super::ring_switch::DirectFold2Factors>>,
     direct_fold4: Option<Vec<super::ring_switch::DirectFold4Factors>>,
     direct_fold8: Option<Vec<super::ring_switch::DirectFold8Factors>>,
+    direct_fold8_padding: Option<PaddingSpec>,
     challenger: &mut Ch,
 ) -> LigeritoProof {
     let log_n = packed_witness.len().trailing_zeros() as usize;
@@ -6546,6 +6722,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     assert!(
         direct_fold4.is_none() || direct_fold8.is_none(),
         "direct-fold4 and direct-fold8 modes are mutually exclusive"
+    );
+    assert_eq!(
+        direct_fold8.is_some(),
+        direct_fold8_padding.is_some(),
+        "direct-fold8 padding metadata must accompany direct-fold8 factors"
     );
     // Direct mode may carry every claim in its factor bundle, in which case
     // there is no materialized basis at all.
@@ -6714,6 +6895,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                             fold4_challenges[4],
                             r,
                         ],
+                        direct_fold8_padding
+                            .as_ref()
+                            .expect("direct-fold8 padding metadata"),
+                        config,
                     );
                     if let Some(before) = helper_before {
                         eprintln!(
@@ -9603,6 +9788,184 @@ mod tests {
             .map(|(&e, &q)| e * q)
             .fold(F128::ZERO, |a, v| a + v);
         assert_eq!(dot, full);
+    }
+
+    /// Pad57 is valid only for the exact ranked witness layout and M32 Fast
+    /// DirectFold8 materializer. Mutating any semantic geometry/config input,
+    /// or selecting the literal rollback, must retain the full-64 fold.
+    #[test]
+    fn direct_fold8_pad57_ranked_gate_and_literal_kill_are_exact() {
+        let mut config =
+            prover_config_for(25, 6, LigeritoProfile::Fast).expect("embedded M32 Fast config");
+        config.merkle_hash = HashKind::Blake3;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let selected = |cfg: &ProverConfig,
+                        pad: &PaddingSpec,
+                        packed_len: usize,
+                        claims: usize,
+                        ordinary: bool,
+                        block_len: usize,
+                        out_len: usize,
+                        eq_hi_len: usize,
+                        pair: bool,
+                        platform: bool,
+                        disabled: bool| {
+            ranked_direct_fold8_pad57_selected(
+                cfg, pad, packed_len, claims, ordinary, block_len, out_len, eq_hi_len, pair,
+                platform, disabled,
+            )
+        };
+        let exact = |cfg: &ProverConfig, pad: &PaddingSpec| {
+            selected(
+                cfg,
+                pad,
+                1 << 25,
+                2,
+                false,
+                1 << 11,
+                1 << 19,
+                1 << 8,
+                true,
+                true,
+                false,
+            )
+        };
+        assert!(exact(&config, &padding));
+
+        let wrong_padding = [
+            PaddingSpec {
+                k_log: 13,
+                ..padding
+            },
+            PaddingSpec {
+                useful_bits_per_block: 15_408,
+                ..padding
+            },
+        ];
+        for pad in &wrong_padding {
+            assert!(!exact(&config, pad));
+        }
+        for (packed_len, claims, ordinary, block_len, out_len, eq_hi_len) in [
+            (1 << 24, 2, false, 1 << 11, 1 << 19, 1 << 8),
+            (1 << 25, 1, false, 1 << 11, 1 << 19, 1 << 8),
+            (1 << 25, 2, true, 1 << 11, 1 << 19, 1 << 8),
+            (1 << 25, 2, false, 1 << 10, 1 << 19, 1 << 8),
+            (1 << 25, 2, false, 1 << 11, 1 << 18, 1 << 8),
+            (1 << 25, 2, false, 1 << 11, 1 << 19, 1 << 7),
+        ] {
+            assert!(!selected(
+                &config, &padding, packed_len, claims, ordinary, block_len, out_len, eq_hi_len,
+                true, true, false,
+            ));
+        }
+        assert!(!selected(
+            &config,
+            &padding,
+            1 << 25,
+            2,
+            false,
+            1 << 11,
+            1 << 19,
+            1 << 8,
+            false,
+            true,
+            false,
+        ));
+        assert!(!selected(
+            &config,
+            &padding,
+            1 << 25,
+            2,
+            false,
+            1 << 11,
+            1 << 19,
+            1 << 8,
+            true,
+            false,
+            false,
+        ));
+        assert!(!selected(
+            &config,
+            &padding,
+            1 << 25,
+            2,
+            false,
+            1 << 11,
+            1 << 19,
+            1 << 8,
+            true,
+            true,
+            true,
+        ));
+
+        let mut scalar_mutations = Vec::new();
+        let mut wrong = config.clone();
+        wrong.initial_log_msg_cols += 1;
+        scalar_mutations.push(wrong);
+        let mut wrong = config.clone();
+        wrong.initial_log_num_interleaved += 1;
+        scalar_mutations.push(wrong);
+        let mut wrong = config.clone();
+        wrong.initial_k += 1;
+        scalar_mutations.push(wrong);
+        let mut wrong = config.clone();
+        wrong.recursive_steps += 1;
+        scalar_mutations.push(wrong);
+        let mut wrong = config.clone();
+        wrong.merkle_hash = HashKind::Sha256;
+        scalar_mutations.push(wrong);
+        for wrong in &scalar_mutations {
+            assert!(!exact(wrong, &padding));
+        }
+        for index in 0..config.recursive_log_msg_cols.len() {
+            let mut wrong = config.clone();
+            wrong.recursive_log_msg_cols[index] += 1;
+            assert!(!exact(&wrong, &padding));
+        }
+        for index in 0..config.recursive_ks.len() {
+            let mut wrong = config.clone();
+            wrong.recursive_ks[index] += 1;
+            assert!(!exact(&wrong, &padding));
+        }
+        for index in 0..config.log_inv_rates.len() {
+            let mut wrong = config.clone();
+            wrong.log_inv_rates[index] += 1;
+            assert!(!exact(&wrong, &padding));
+        }
+        for index in 0..config.queries.len() {
+            let mut wrong = config.clone();
+            wrong.queries[index] += 1;
+            assert!(!exact(&wrong, &padding));
+        }
+        for index in 0..config.grinding_bits.len() {
+            let mut wrong = config.clone();
+            wrong.grinding_bits[index] += 1;
+            assert!(!exact(&wrong, &padding));
+        }
+        for index in 0..config.fold_grinding_bits.len() {
+            let mut wrong = config.clone();
+            wrong.fold_grinding_bits[index] += 1;
+            assert!(!exact(&wrong, &padding));
+        }
+        for index in 0..config.ood_samples.len() {
+            let mut wrong = config.clone();
+            wrong.ood_samples[index] += 1;
+            assert!(!exact(&wrong, &padding));
+        }
+
+        use std::ffi::OsStr;
+        assert!(!ranked_direct_fold8_pad57_disabled_value(None));
+        for value in ["", "0", "01", "true", "yes"] {
+            assert!(!ranked_direct_fold8_pad57_disabled_value(Some(OsStr::new(
+                value
+            ))));
+        }
+        assert!(ranked_direct_fold8_pad57_disabled_value(Some(OsStr::new(
+            "1"
+        ))));
     }
 
     /// The production selector is deliberately narrower than the algebraic
@@ -13588,7 +13951,15 @@ mod tests {
         let k_0 = 2;
         let log_inv_rate = 3;
         let mut rng = crate::challenger::RandomChallenger::new(0xD1CE_F008);
-        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let mut poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        for block in poly.chunks_exact_mut(128) {
+            block[120] = F128::new(block[120].lo & ((1u64 << 49) - 1), 0);
+            block[121..].fill(F128::ZERO);
+        }
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
         let suffix: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
         let scaled_rdp: Vec<F128> = build_eq_table(
             &(0..crate::pcs::LOG_PACKING)
@@ -13723,23 +14094,45 @@ mod tests {
             Some(round1),
             &mut ordinary_challenger,
         );
-        let mut direct_challenger =
-            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
-        let got = recursive_prover_with_basis_direct_fold8(
-            &cfg,
-            poly,
-            Vec::new(),
-            direct,
-            target,
-            &wtns_0.mat,
-            &wtns_0.tree,
-            round0,
-            &mut direct_challenger,
-        );
-
-        assert_eq!(got, ordinary);
+        let prove_direct = |candidate: bool| {
+            with_direct_fold8_pad57_override(candidate, || {
+                TEST_DIRECT_FOLD8_PAD57_HITS.with(|hits| hits.set(0));
+                let mut challenger =
+                    crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+                let proof = recursive_prover_with_basis_direct_fold8(
+                    &cfg,
+                    poly.clone(),
+                    Vec::new(),
+                    direct.clone(),
+                    target,
+                    &wtns_0.mat,
+                    &wtns_0.tree,
+                    round0,
+                    &padding,
+                    &mut challenger,
+                );
+                let hits = TEST_DIRECT_FOLD8_PAD57_HITS.with(|hits| hits.get());
+                (proof, hits)
+            })
+        };
+        let (control, control_hits) = prove_direct(false);
+        let (candidate, candidate_hits) = prove_direct(true);
+        assert_eq!(control_hits, 0);
         assert_eq!(
-            bincode::serialize(&(got.clone(), target)).expect("serialize direct-fold8 proof/claim"),
+            candidate_hits, 1,
+            "pad57 candidate must select exactly once"
+        );
+        assert_eq!(candidate, control);
+        assert_eq!(candidate, ordinary);
+        assert_eq!(
+            bincode::serialize(&(candidate.clone(), target))
+                .expect("serialize pad57 direct-fold8 proof/claim"),
+            bincode::serialize(&(control.clone(), target))
+                .expect("serialize full64 direct-fold8 proof/claim"),
+        );
+        assert_eq!(
+            bincode::serialize(&(candidate.clone(), target))
+                .expect("serialize direct-fold8 proof/claim"),
             bincode::serialize(&(ordinary, target)).expect("serialize ordinary proof/claim"),
         );
 
@@ -13760,16 +14153,21 @@ mod tests {
             ood_samples: vec![0; 2],
             merkle_hash: Default::default(),
         };
-        let mut verifier_challenger =
-            crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
-        assert!(recursive_verifier_with_basis(
-            &v_cfg,
-            &got,
-            &combined_basis,
-            target,
-            &wtns_0.root(),
-            &mut verifier_challenger,
-        ));
+        for (label, proof) in [("pad57", &candidate), ("full64", &control)] {
+            let mut verifier_challenger =
+                crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+            assert!(
+                recursive_verifier_with_basis(
+                    &v_cfg,
+                    proof,
+                    &combined_basis,
+                    target,
+                    &wtns_0.root(),
+                    &mut verifier_challenger,
+                ),
+                "verifier rejected {label} arm"
+            );
+        }
     }
 
     /// `induce_sumcheck_evaluate_at_residual` matches dense

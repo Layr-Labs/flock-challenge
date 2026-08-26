@@ -149,6 +149,38 @@ pub(crate) fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+/// Fold one complete 64-bank slot followed by a 57-bank prefix of the next
+/// slot. This fixed shape is the ranked padded-witness geometry: the omitted
+/// seven inputs of the odd slot are structurally zero.
+///
+/// The two sums retain independent deferred-reduction accumulators, so this
+/// is bit-identical to [`fold_banked_slots2::<64>`] whenever odd-slot banks
+/// 57..64 are zero. The shortened contract also makes those seven loads
+/// impossible in the architecture kernel.
+#[inline]
+pub(crate) fn fold_banked_slots2_64_57(weight: &[F128; 64], input: &[F128]) -> [F128; 2] {
+    debug_assert!(input.len() >= 64 + 57);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the cfg gate supplies PMULL through `aes`; the caller's
+        // sub-slice contains the complete 64-value first slot and 57-value
+        // live prefix of the second slot.
+        unsafe { aarch64::fold_banked_slots2_64_57(weight, input) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let mut first = super::F256Unreduced::ZERO;
+        let mut second = super::F256Unreduced::ZERO;
+        for (bank, w) in weight.iter().enumerate() {
+            first ^= w.mul_unreduced(input[bank]);
+            if bank < 57 {
+                second ^= w.mul_unreduced(input[64 + bank]);
+            }
+        }
+        [first.reduce(), second.reduce()]
+    }
+}
+
 /// Fold the ranked zerocheck AB bank matrix, laid out bank-major, into its
 /// 64 lane sums. Two adjacent lanes share each of the 128 weight loads, and
 /// each lane's complete product sum is reduced only once.
@@ -991,6 +1023,14 @@ mod tests {
             value
         }
 
+        fn oracle_prefix(weight: &[F128; 64], input: &[F128], banks: usize) -> F128 {
+            let mut value = F128::ZERO;
+            for bank in 0..banks {
+                value += weight[bank] * input[bank];
+            }
+            value
+        }
+
         for trial in 0..64 {
             // Production bank counts, plus a non-multiple-of-4 width to
             // exercise the kernel's scalar tail.
@@ -1034,6 +1074,14 @@ mod tests {
                     oracle(&w64, &buf[off64 + 64..off64 + 128]),
                 ],
                 "pair banks=64 trial={trial}"
+            );
+            assert_eq!(
+                fold_banked_slots2_64_57(&w64, &buf[off64..off64 + 128]),
+                [
+                    oracle(&w64, &buf[off64..off64 + 64]),
+                    oracle_prefix(&w64, &buf[off64 + 64..off64 + 128], 57),
+                ],
+                "pair banks=64+57 trial={trial}"
             );
             assert_eq!(
                 fold_banked_slots2::<6>(&w6, &buf[off6..off6 + 12]),

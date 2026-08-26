@@ -226,6 +226,35 @@ unsafe fn xor_karatsuba_const_pair(
     }
 }
 
+/// XOR one constant product into raw Karatsuba-component accumulators. This
+/// is the single-slot tail of the ranked 64+57 fold: unlike the paired helper
+/// it emits no work or load for the structurally-zero odd input.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn xor_karatsuba_const_single(
+    acc: &mut KaratsubaNeon,
+    input: uint64x2_t,
+    weight: uint64x2_t,
+) {
+    unsafe {
+        let weight_mid = veorq_u64(weight, vextq_u64::<1>(weight, weight));
+        let input_mid = veorq_u64(input, vextq_u64::<1>(input, input));
+        let weight_p = vreinterpretq_p64_u64(weight);
+
+        let ll = pmull(vgetq_lane_u64::<0>(input), vgetq_lane_u64::<0>(weight));
+        let hh =
+            transmute::<u128, uint64x2_t>(vmull_high_p64(vreinterpretq_p64_u64(input), weight_p));
+        let mm = pmull(
+            vgetq_lane_u64::<0>(input_mid),
+            vgetq_lane_u64::<0>(weight_mid),
+        );
+
+        acc.ll = veorq_u64(acc.ll, ll);
+        acc.hh = veorq_u64(acc.hh, hh);
+        acc.mm = veorq_u64(acc.mm, mm);
+    }
+}
+
 #[inline(always)]
 unsafe fn karatsuba_to_wide(value: KaratsubaNeon) -> WideNeon {
     unsafe {
@@ -498,6 +527,68 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
             let first_x = vld1q_u64(x0.add(bank).cast::<u64>());
             let second_x = vld1q_u64(x1.add(bank).cast::<u64>());
             xor_karatsuba_const_pair(&mut first, &mut second, first_x, second_x, wk);
+        }
+
+        let reduced = reduce_wide_pair(karatsuba_to_wide(first), karatsuba_to_wide(second));
+        [
+            transmute::<uint64x2_t, F128>(reduced[0]),
+            transmute::<uint64x2_t, F128>(reduced[1]),
+        ]
+    }
+}
+
+/// Fixed ranked padded-witness fold: the first slot has all 64 banks, while
+/// only banks 0..56 of the adjacent odd slot are live. Six raw Karatsuba
+/// accumulator vectors remain live throughout; banks 57..63 issue only the
+/// first-slot product, followed by one paired reduction.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `input` must hold at least 121
+/// elements: 64 for the first slot and 57 for the second-slot prefix.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_slots2_64_57(weight: &[F128; 64], input: &[F128]) -> [F128; 2] {
+    unsafe {
+        debug_assert!(input.len() >= 64 + 57);
+        let zero = vdupq_n_u64(0);
+        let mut first = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut second = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+
+        let w = weight.as_ptr();
+        let x0 = input.as_ptr();
+        let x1 = input.as_ptr().add(64);
+        let mut bank = 0usize;
+        while bank < 56 {
+            let w0 = vld1q_u64(w.add(bank).cast::<u64>());
+            let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
+            let x00 = vld1q_u64(x0.add(bank).cast::<u64>());
+            let x10 = vld1q_u64(x1.add(bank).cast::<u64>());
+            let x01 = vld1q_u64(x0.add(bank + 1).cast::<u64>());
+            let x11 = vld1q_u64(x1.add(bank + 1).cast::<u64>());
+            xor_karatsuba_const_pair(&mut first, &mut second, x00, x10, w0);
+            xor_karatsuba_const_pair(&mut first, &mut second, x01, x11, w1);
+            bank += 2;
+        }
+
+        let w56 = vld1q_u64(w.add(56).cast::<u64>());
+        let x056 = vld1q_u64(x0.add(56).cast::<u64>());
+        let x156 = vld1q_u64(x1.add(56).cast::<u64>());
+        xor_karatsuba_const_pair(&mut first, &mut second, x056, x156, w56);
+
+        bank = 57;
+        while bank < 64 {
+            let wk = vld1q_u64(w.add(bank).cast::<u64>());
+            let first_x = vld1q_u64(x0.add(bank).cast::<u64>());
+            xor_karatsuba_const_single(&mut first, first_x, wk);
+            bank += 1;
         }
 
         let reduced = reduce_wide_pair(karatsuba_to_wide(first), karatsuba_to_wide(second));

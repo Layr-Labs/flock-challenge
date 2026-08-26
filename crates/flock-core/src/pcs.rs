@@ -157,6 +157,7 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             &prover_data.codeword,
             &*prover_data.merkle_tree,
             combined.round0_prime,
+            padding,
             challenger,
         )
     } else if let Some(direct) = combined.direct_fold4 {
