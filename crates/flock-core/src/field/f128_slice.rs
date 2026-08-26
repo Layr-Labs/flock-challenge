@@ -149,43 +149,6 @@ pub(crate) fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
-/// Fold the ranked zerocheck AB bank matrix, laid out bank-major, into its
-/// 64 lane sums. Two adjacent lanes share each of the 128 weight loads, and
-/// each lane's complete product sum is reduced only once.
-///
-/// The fixed-shape wrapper deliberately stays specific to the ranked kernel;
-/// the caller retains its scalar loop for every other geometry.
-#[inline]
-pub(crate) fn fold_bank_major_128x64_rows2(
-    weight: &[F128; 128],
-    input: &[F128],
-    output: &mut [F128; 64],
-) {
-    assert_eq!(
-        input.len(),
-        128 * 64,
-        "ranked AB bank fold requires exactly 128 banks by 64 lanes"
-    );
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: the cfg gate supplies PMULL through `aes`; the exact input and
-    // output shapes are established by the types and assertion above.
-    unsafe {
-        aarch64::fold_bank_major_128x64_rows2(weight, input, output)
-    }
-
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-    {
-        for lane in 0..64 {
-            let mut value = F128::ZERO;
-            for bank in 0..128 {
-                value += weight[bank] * input[bank * 64 + lane];
-            }
-            output[lane] = value;
-        }
-    }
-}
-
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -1043,95 +1006,6 @@ mod tests {
                 ],
                 "pair banks=6 trial={trial}"
             );
-        }
-    }
-
-    /// Fixed ranked bank-major geometry: cover structured edge cases and
-    /// random matrices against an independent fully-reduced scalar oracle.
-    #[test]
-    fn bank_major_128x64_rows2_matches_fully_reduced_oracle() {
-        fn oracle(weight: &[F128; 128], input: &[F128]) -> [F128; 64] {
-            assert_eq!(input.len(), 128 * 64);
-            std::array::from_fn(|lane| {
-                let mut value = F128::ZERO;
-                for bank in 0..128 {
-                    value += weight[bank] * input[bank * 64 + lane];
-                }
-                value
-            })
-        }
-
-        fn check(label: &str, weight: &[F128; 128], input: &[F128]) {
-            let expected = oracle(weight, input);
-            let sentinel = F128::new(0xdead_beef_dead_beef, 0xfeed_face_feed_face);
-            let mut actual = [sentinel; 64];
-            fold_bank_major_128x64_rows2(weight, input, &mut actual);
-            assert_eq!(actual, expected, "case={label}");
-        }
-
-        let zero_w = [F128::ZERO; 128];
-        let zero_x = vec![F128::ZERO; 128 * 64];
-        check("zero", &zero_w, &zero_x);
-
-        let one_w = [F128::ONE; 128];
-        let mut one_x = vec![F128::ZERO; 128 * 64];
-        one_x.fill(F128::ONE);
-        check("one", &one_w, &one_x);
-
-        let all1 = F128::new(u64::MAX, u64::MAX);
-        let all1_w = [all1; 128];
-        let all1_x = vec![all1; 128 * 64];
-        check("all1", &all1_w, &all1_x);
-
-        let mut sparse_w = [F128::ZERO; 128];
-        let mut sparse_x = vec![F128::ZERO; 128 * 64];
-        sparse_w[127] = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
-        sparse_x[127 * 64 + 63] = F128::new(0x1357_9bdf_2468_ace0, 0x0f1e_2d3c_4b5a_6978);
-        check("sparse-last", &sparse_w, &sparse_x);
-
-        let basis_w: [F128; 128] = std::array::from_fn(|bank| {
-            if bank < 64 {
-                F128::new(1u64 << bank, 0)
-            } else {
-                F128::new(0, 1u64 << (bank - 64))
-            }
-        });
-        let basis_x: Vec<F128> = (0..128 * 64)
-            .map(|index| {
-                let bit = (index * 29 + 7) & 127;
-                if bit < 64 {
-                    F128::new(1u64 << bit, 0)
-                } else {
-                    F128::new(0, 1u64 << (bit - 64))
-                }
-            })
-            .collect();
-        check("basis", &basis_w, &basis_x);
-
-        let mut edge_w = [F128::ZERO; 128];
-        let mut edge_x = vec![F128::ZERO; 128 * 64];
-        for (i, bank) in [0usize, 1, 126, 127].into_iter().enumerate() {
-            edge_w[bank] = F128::new(0x9e37_79b9_7f4a_7c15 ^ i as u64, 1u64 << (i * 17));
-            for lane in [0usize, 1, 62, 63] {
-                edge_x[bank * 64 + lane] = F128::new(
-                    (bank as u64).wrapping_mul(0x1000_0000_01b3) ^ lane as u64,
-                    1u64 << ((bank + lane) & 63),
-                );
-            }
-        }
-        check("bank-and-lane-boundaries", &edge_w, &edge_x);
-
-        let mut state = 0xa409_3822_299f_31d0_u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for trial in 0..4 {
-            let random_w: [F128; 128] = std::array::from_fn(|_| F128::new(next(), next()));
-            let random_x: Vec<F128> = (0..128 * 64).map(|_| F128::new(next(), next())).collect();
-            check(&format!("random-{trial}"), &random_w, &random_x);
         }
     }
 
