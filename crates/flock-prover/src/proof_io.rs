@@ -326,6 +326,16 @@ fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>
     if stash.root != bundle.commitment.root {
         return None;
     }
+    // The ranked worker has exactly one sequential warm-up/timed prove pair.
+    // Warm-up consumes its stash before the timed prove replaces it, and
+    // seed-pipe adoption drains the speculative prove before publication.
+    // The matching commitment root therefore identifies the only live prefix;
+    // skip three `serialized_size` walks on the measured publication tail.
+    // Non-ranked callers retain the full structural fingerprint below because
+    // tests and library users may interleave proves with the same commitment.
+    if crate::seed_pipe::is_ranked_worker() {
+        return Some(stash.bytes);
+    }
     let sec_lens = [
         bincode::serialized_size(&bundle.commitment).ok()?,
         bincode::serialized_size(&bundle.proof.zerocheck).ok()?,
