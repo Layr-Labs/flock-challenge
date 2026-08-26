@@ -78,7 +78,7 @@ pub fn keepalive_stop() {
 }
 
 /// Signal-only half of [`keepalive_stop`]: clear the run flag so every spin
-/// thread starts exiting (they notice within one ~1024-op spin slice), but do
+/// thread starts exiting (they notice within one ~64-op spin slice), but do
 /// not join them. The seed-pipe thread uses this so the 10–14 sequential
 /// thread joins — pure serial time at the very front of the timed window —
 /// happen after the seed is forwarded instead of before it. Pair with
@@ -132,7 +132,7 @@ mod imp {
             // A batch of cheap scalar ops between flag checks: frequent enough
             // that stop latency is sub-microsecond, coarse enough that the
             // check itself costs nothing measurable.
-            for _ in 0..1024 {
+            for _ in 0..64 {
                 x = x
                     .wrapping_mul(0x2545_F491_4F6C_DD1D)
                     .wrapping_add(0x9E37_79B9_7F4A_7C15);
