@@ -561,6 +561,23 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     kernels::bit_transpose_64bytes(input, output);
 }
 
+/// Provenance class for the large compact-AB backing after round two has
+/// overwritten every byte and its final reader immediately recycles it. The
+/// tag vouches only for full object initialization, never for byte values.
+const AB_COMPACT_R2_FULL_INIT_TAG: u64 = 0xA8F1_2002_0000_0001;
+static AB_COMPACT_BACKING_TOKEN_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static AB_COMPACT_BACKING_TOKEN_MISSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Monotonic receipt for same-process warmup→timed provenance reuse.
+pub fn ab_compact_backing_token_counts() -> (usize, usize) {
+    (
+        AB_COMPACT_BACKING_TOKEN_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        AB_COMPACT_BACKING_TOKEN_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Challenge-independent AB half of the optimized round-1 kernel.
 ///
 /// The storage has exactly the same byte length and block layout as either
@@ -591,7 +608,15 @@ impl Round1AbInner {
     /// Donate the now-dead transform to a byte-oriented scratch consumer
     /// without changing the allocation's element type or deallocation layout.
     pub(crate) fn into_scratch_bytes(mut self) -> crate::scratch::ScratchBytes {
-        crate::scratch::ScratchBytes::from_initialized_f128(core::mem::take(&mut self.storage))
+        // Round1's backing is fully initialized: a cold provenance miss was
+        // raw-zeroed before any slice existed, while a hit names this exact
+        // allocation after a prior full R2 overwrite. R2 may read slices on
+        // portable targets, but cannot mint the next token until its complete
+        // overwrite has joined and called `mark_fully_initialized`.
+        crate::scratch::ScratchBytes::from_initialized_f128_for_full_overwrite(
+            core::mem::take(&mut self.storage),
+            AB_COMPACT_R2_FULL_INIT_TAG,
+        )
     }
 }
 
@@ -697,6 +722,30 @@ pub fn precompute_round1_ab_inner_packed_padded(
     )
 }
 
+/// Full-write scratch arm for the untimed exact-contention replay. It never
+/// consumes or advances compact-backing provenance, so the production arm is
+/// the sole owner of the warmup→timed token lifecycle.
+pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_body(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        false,
+        false,
+    )
+}
+
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
 /// choices, tests compare arms byte-for-byte in one process. `nt` selects the
 /// non-temporal drain vs the incumbent cached store; `compact` selects the
@@ -710,6 +759,23 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     padding: &PaddingSpec,
     nt: bool,
     compact: bool,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_body(
+        a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn precompute_round1_ab_inner_packed_padded_body(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    nt: bool,
+    compact: bool,
+    use_provenance: bool,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -736,17 +802,33 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
-    // Reuse an A-sized resident F128 allocation from the prover scratch pool.
-    // Treating it as bytes is valid under the read contract every consumer
-    // honors: each LIVE byte — rows `[0, n_b_med)` of every `x_outer` chunk —
-    // is written below before it is read. With the QS3 compacted store the
-    // dead tail rows `[n_b_med, 16)` are left recycled/uninitialized; this is
-    // sound because NO consumer ever reads them (all bound their per-`b_med`
-    // reads by the same `n_b_med`, derived from the same `padding`), and round
-    // two rewrites the whole donated buffer before use. The kill switch
-    // `FLOCK_NO_AB_COMPACT_STORE=1` restores the historical invariant "every
-    // byte written below (explicit zero fills for the skipped-b_med holes)".
-    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
+    // Compact stores leave dead tail rows unwritten, yet the completion path
+    // forms ordinary block references spanning those rows. Admit sparse
+    // writes only on an exact allocation returned from a prior full R2
+    // overwrite. A cold miss still has scratch's uninitialized contract, so
+    // raw-zero the complete allocation before constructing any reference and
+    // force the historical full-store arm for that warmup/fail-safe proof.
+    let storage_len = total_bytes / core::mem::size_of::<F128>();
+    let (mut storage, token_hit) = if use_provenance {
+        crate::scratch::take_f128_with_token(storage_len, AB_COMPACT_R2_FULL_INIT_TAG)
+    } else {
+        (crate::scratch::take_f128(storage_len), false)
+    };
+    if use_provenance && token_hit {
+        AB_COMPACT_BACKING_TOKEN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else if use_provenance {
+        AB_COMPACT_BACKING_TOKEN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if !token_hit {
+        // SAFETY: `storage` is exclusively owned and exposes exactly
+        // `total_bytes`; zero is a valid object representation for F128.
+        unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
+    }
+    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+        let (hits, misses) = ab_compact_backing_token_counts();
+        eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
+    }
+    let compact = compact && token_hit;
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 

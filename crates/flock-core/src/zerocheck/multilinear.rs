@@ -891,7 +891,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     assert_eq!(mlv_challenges.len(), m - k_skip);
 
     let deltas_len = 2 * n_pairs * n_chunks;
-    let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take(deltas_len));
+    let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take_full_overwrite(deltas_len));
     assert_eq!(
         deltas.len(),
         deltas_len,
@@ -945,25 +945,20 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     // the rayon map-reduce.
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
-    let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
+    let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and partials[x_hi]. The
         // queue's completion join publishes the writes before the reduction
         // below reads them.
-        let (anchors, deltas) = unsafe {
-            (
-                std::slice::from_raw_parts_mut(
-                    anchors_base.ptr().add(x_hi * anchor_chunk_size),
-                    anchor_chunk_size,
-                ),
-                std::slice::from_raw_parts_mut(
-                    deltas_base.ptr().add(x_hi * delta_chunk_size),
-                    delta_chunk_size,
-                ),
+        let anchors = unsafe {
+            std::slice::from_raw_parts_mut(
+                anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                anchor_chunk_size,
             )
         };
+        let deltas = unsafe { deltas_base.ptr().add(x_hi * delta_chunk_size) };
         {
             let pair_idx_base = x_hi * lo_size;
             let row_base = pair_idx_base * 2;
@@ -979,7 +974,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                         a_packed.as_ptr().add(row_base * n_chunks),
                         b_packed.as_ptr().add(row_base * n_chunks),
                         anchors.as_mut_ptr(),
-                        deltas.as_mut_ptr(),
+                        deltas,
                         lo_size,
                         pair_idx_base,
                         pair_in_block_mask,
@@ -996,7 +991,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                     a_packed.as_ptr().add(row_base * n_chunks),
                     b_packed.as_ptr().add(row_base * n_chunks),
                     anchors.as_mut_ptr(),
-                    deltas.as_mut_ptr(),
+                    deltas,
                     eq_lo.as_ptr(),
                     lo_size,
                     pair_idx_base,
@@ -1008,13 +1003,20 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
 
             #[cfg(not(target_arch = "aarch64"))]
             let (p1, pinf) = {
+                // Keep the uninitialized destination outside Rust's slice
+                // model until every chunk has joined. This worker owns the
+                // exact `delta_chunk_size` raw range for `x_hi`.
                 let mut p1_acc = F256Unreduced::ZERO;
                 let mut pinf_acc = F256Unreduced::ZERO;
                 for x_lo in 0..lo_size {
                     if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
                         anchors[2 * x_lo] = F128::ZERO;
                         anchors[2 * x_lo + 1] = F128::ZERO;
-                        deltas[2 * x_lo * n_chunks..2 * (x_lo + 1) * n_chunks].fill(0);
+                        // SAFETY: this pair owns two complete n_chunks rows
+                        // inside the worker's disjoint raw destination.
+                        unsafe {
+                            core::ptr::write_bytes(deltas.add(2 * x_lo * n_chunks), 0, 2 * n_chunks)
+                        };
                         continue;
                     }
 
@@ -1031,8 +1033,17 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                     anchors[2 * x_lo] = a0;
                     anchors[2 * x_lo + 1] = b0;
                     for j in 0..n_chunks {
-                        deltas[2 * x_lo * n_chunks + j] = a0_bytes[j] ^ a1_bytes[j];
-                        deltas[(2 * x_lo + 1) * n_chunks + j] = b0_bytes[j] ^ b1_bytes[j];
+                        // SAFETY: the queue grants this worker exclusive
+                        // ownership of the chunk and each indexed byte is
+                        // written exactly once before publication.
+                        unsafe {
+                            deltas
+                                .add(2 * x_lo * n_chunks + j)
+                                .write(a0_bytes[j] ^ a1_bytes[j]);
+                            deltas
+                                .add((2 * x_lo + 1) * n_chunks + j)
+                                .write(b0_bytes[j] ^ b1_bytes[j]);
+                        }
                     }
                     let eq_l = eq_lo[x_lo];
                     p1_acc ^= eq_l.mul_unreduced(a1 * b1);
@@ -1109,6 +1120,13 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         }
     }
 
+    // Every x_hi chunk has joined, including GPU-prefix anchor/delta writers.
+    // Publish full coverage before the compact object can expose byte slices.
+    // SAFETY: the hetero queue and optional GPU-prefix fallback above have
+    // joined; their pairwise-disjoint x_hi ranges cover exactly
+    // `0..compact.deltas.len()`, including padding rows.
+    unsafe { compact.deltas.mark_fully_initialized() };
+
     let (sum1, sum_inf) = partials
         .iter()
         .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
@@ -1162,7 +1180,7 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
 
         let mut compact = UniSkipCompactFold {
             anchors: crate::scratch::take_f128(2 * n_pairs),
-            deltas: ScratchBytes::take(2 * n_pairs * n_chunks),
+            deltas: ScratchBytes::take_full_overwrite(2 * n_pairs * n_chunks),
         };
 
         let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -1177,7 +1195,7 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
 
         let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
         let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
-        let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
+        let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
         crate::epool::run_hetero_chunks(hi_size, |x_hi| {
             // SAFETY: same exclusive per-chunk ownership contract as
@@ -1251,6 +1269,10 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
                 *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
             }
         });
+        // SAFETY: every hetero job above owns a disjoint x_hi byte range;
+        // together they cover the full destination and the synchronous join
+        // publishes all writes before the compact state can expose a slice.
+        unsafe { compact.deltas.mark_fully_initialized() };
         let (sum1, sum_inf) = partials
             .iter()
             .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
@@ -1689,7 +1711,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
 
     let deltas_len = 2 * n_pairs * n_chunks;
-    let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take(deltas_len));
+    let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take_full_overwrite(deltas_len));
     assert_eq!(
         deltas.len(),
         deltas_len,
@@ -1754,7 +1776,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     // [p1_odd, pinf_odd, W0, W3, W4, W5], eq_hi-weighted, one slot per chunk.
     let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
     let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
-    let deltas_base = crate::epool::SyncPtr(compact.deltas.as_mut_ptr());
+    let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
@@ -1835,7 +1857,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         #[cfg(not(target_arch = "aarch64"))]
         {
             let anchors = unsafe { std::slice::from_raw_parts_mut(anchors, anchor_chunk_size) };
-            let deltas = unsafe { std::slice::from_raw_parts_mut(deltas, delta_chunk_size) };
             out = round2_lookahead_chunk_scalar(
                 a_packed,
                 b_packed,
@@ -1949,6 +1970,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         }
     }
 
+    // Both the standard and lookahead round-two producers promise identical
+    // full delta coverage. Only after the CPU/GPU writers join may the compact
+    // reconstruction expose the byte backing to its readers.
+    // SAFETY: the lookahead writer has the same complete delta-store contract
+    // as the standard writer. All hetero workers and the optional GPU-prefix
+    // fallback have joined, covering every byte including padding rows.
+    unsafe { compact.deltas.mark_fully_initialized() };
+
     let (sum1, sum_inf) = partials
         .iter()
         .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
@@ -1984,7 +2013,7 @@ fn round2_lookahead_chunk_scalar(
     b_packed: &[u8],
     table: &UniSkipFoldTable,
     anchors: &mut [F128],
-    deltas: &mut [u8],
+    deltas: *mut u8,
     eq_lo: &[F128],
     lo_size: usize,
     row_base: usize,
@@ -1999,11 +2028,13 @@ fn round2_lookahead_chunk_scalar(
     let mut pinf_odd = F256Unreduced::ZERO;
     let mut w = [F256Unreduced::ZERO; 4];
 
-    let mut fold_pair = |x_lo: usize, anchors: &mut [F128], deltas: &mut [u8]| {
+    let fold_pair = |x_lo: usize, anchors: &mut [F128]| {
         if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
             anchors[2 * x_lo] = F128::ZERO;
             anchors[2 * x_lo + 1] = F128::ZERO;
-            deltas[2 * x_lo * n_chunks..2 * (x_lo + 1) * n_chunks].fill(0);
+            // SAFETY: the caller passes the unique raw destination for this
+            // x_hi chunk; this pair owns two complete n_chunks rows.
+            unsafe { core::ptr::write_bytes(deltas.add(2 * x_lo * n_chunks), 0, 2 * n_chunks) };
             return None;
         }
         let x0g = row_base + 2 * x_lo;
@@ -2019,15 +2050,23 @@ fn round2_lookahead_chunk_scalar(
         anchors[2 * x_lo] = a0;
         anchors[2 * x_lo + 1] = b0;
         for j in 0..n_chunks {
-            deltas[2 * x_lo * n_chunks + j] = a0_bytes[j] ^ a1_bytes[j];
-            deltas[(2 * x_lo + 1) * n_chunks + j] = b0_bytes[j] ^ b1_bytes[j];
+            // SAFETY: each indexed byte belongs to this chunk/pair and is
+            // written exactly once before the outer join publishes it.
+            unsafe {
+                deltas
+                    .add(2 * x_lo * n_chunks + j)
+                    .write(a0_bytes[j] ^ a1_bytes[j]);
+                deltas
+                    .add((2 * x_lo + 1) * n_chunks + j)
+                    .write(b0_bytes[j] ^ b1_bytes[j]);
+            }
         }
         Some((a0, a1, b0, b1))
     };
 
     for u in 0..lo_size / 2 {
-        let even = fold_pair(2 * u, anchors, deltas);
-        let odd = fold_pair(2 * u + 1, anchors, deltas);
+        let even = fold_pair(2 * u, anchors);
+        let odd = fold_pair(2 * u + 1, anchors);
         if even.is_none() && odd.is_none() {
             continue;
         }
@@ -4506,6 +4545,94 @@ mod tests {
             std::env::remove_var("FLOCK_NO_R2_DEGEN");
             std::env::remove_var("FLOCK_NO_ZC_R2_PERIODIC");
         }
+    }
+
+    /// Production donation oracle: both full-coverage R2 writers must accept
+    /// a backing that exposes no slice initially, publish it only after every
+    /// writer joins, and mint the exact provenance token on final recycle.
+    #[test]
+    fn standard_and_lookahead_r2_publish_full_overwrite_backing() {
+        const STANDARD_TAG: u64 = 0xA8F1_2002_0000_1001;
+        const LOOKAHEAD_TAG: u64 = 0xA8F1_2002_0000_1002;
+        let f = la_fixture(16, 0xF011_C0DE_2002, true);
+        let deltas_len = (1usize << (f.m - 6)) * f.table.n_chunks;
+        let deltas_f128 = deltas_len / core::mem::size_of::<F128>();
+        crate::scratch::clear();
+
+        let (standard_expected, expected_m1, expected_mi) =
+            uni_skip_fold_and_round_pair_compact_padded(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                6,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+            );
+        let standard_donor =
+            ScratchBytes::from_f128_full_overwrite(vec![LA_POISON; deltas_f128], STANDARD_TAG);
+        let (standard_got, got_m1, got_mi) =
+            uni_skip_fold_and_round_pair_compact_padded_with_deltas(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                6,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+                Some(standard_donor),
+            );
+        assert_eq!((got_m1, got_mi), (expected_m1, expected_mi));
+        assert_eq!(standard_got.anchors, standard_expected.anchors);
+        assert_eq!(&standard_got.deltas[..], &standard_expected.deltas[..]);
+        standard_expected.recycle();
+        standard_got.recycle();
+        let (standard_held, standard_hit) =
+            crate::scratch::take_f128_with_token(deltas_f128, STANDARD_TAG);
+        assert!(standard_hit, "standard R2 must stage its completed backing");
+
+        let (lookahead_expected, expected_m1, expected_mi, expected_la) =
+            uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                6,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+                None,
+            );
+        let lookahead_donor =
+            ScratchBytes::from_f128_full_overwrite(vec![LA_POISON; deltas_f128], LOOKAHEAD_TAG);
+        let (lookahead_got, got_m1, got_mi, got_la) =
+            uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                6,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+                Some(lookahead_donor),
+            );
+        assert_eq!(
+            (got_m1, got_mi, got_la),
+            (expected_m1, expected_mi, expected_la)
+        );
+        assert_eq!(lookahead_got.anchors, lookahead_expected.anchors);
+        assert_eq!(&lookahead_got.deltas[..], &lookahead_expected.deltas[..]);
+        lookahead_expected.recycle();
+        lookahead_got.recycle();
+        let (lookahead_held, lookahead_hit) =
+            crate::scratch::take_f128_with_token(deltas_f128, LOOKAHEAD_TAG);
+        assert!(
+            lookahead_hit,
+            "lookahead R2 must stage its completed backing"
+        );
+
+        crate::scratch::give_f128(standard_held);
+        crate::scratch::give_f128(lookahead_held);
+        crate::scratch::clear();
     }
 
     /// T1 — the core oracle. Round-two message identical, and the deferred
