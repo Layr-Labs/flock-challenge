@@ -1850,6 +1850,378 @@ fn evaluate_scaled_basis_inplace(
     }
 }
 
+/// Add one scaled novel-basis vector to `accum_basis` without materializing
+/// the final doubling's upper half. `lower_basis` is exactly half the output
+/// length: it owns all levels before the last one, whose live lower values are
+/// consumed once to update both accumulator halves directly.
+fn evaluate_scaled_basis_add_final_direct(
+    sks_at_x: &mut [F128],
+    lower_basis: &mut [F128],
+    accum_basis: &mut [F128],
+    sks_vks: &[F128],
+    inv_sks_vks: &[F128],
+    x: F128,
+    alpha: F128,
+) {
+    let log_n = accum_basis.len().trailing_zeros() as usize;
+    debug_assert_eq!(accum_basis.len(), 1 << log_n);
+    debug_assert!(sks_at_x.len() >= log_n);
+    debug_assert!(inv_sks_vks.len() > log_n);
+
+    if log_n == 0 {
+        debug_assert!(lower_basis.is_empty());
+        accum_basis[0] += alpha;
+        return;
+    }
+    let half = accum_basis.len() / 2;
+    debug_assert_eq!(lower_basis.len(), half);
+
+    sks_at_x[0] = x;
+    for i in 1..log_n {
+        sks_at_x[i] = next_s(sks_at_x[i - 1], sks_vks[i - 1]);
+    }
+    for i in 0..log_n {
+        sks_at_x[i] *= inv_sks_vks[i];
+    }
+
+    lower_basis[0] = alpha;
+    for k in 0..log_n - 1 {
+        let s_at_x = sks_at_x[k];
+        let current_len = 1 << k;
+        for i in 0..current_len {
+            lower_basis[i + current_len] = s_at_x * lower_basis[i];
+        }
+    }
+
+    let final_s_at_x = sks_at_x[log_n - 1];
+    let (accum_low, accum_high) = accum_basis.split_at_mut(half);
+    for ((accum_low, accum_high), &value) in accum_low
+        .iter_mut()
+        .zip(accum_high.iter_mut())
+        .zip(lower_basis.iter())
+    {
+        *accum_low += value;
+        *accum_high += final_s_at_x * value;
+    }
+}
+
+/// Return the exact live prefix length of a normalized LCH novel-basis vector
+/// at a standard-basis point in the message domain. For `0 < q < n`, write
+/// `h = bit_length(q)` and `m = 2^h`. Then `q = v_{h-1} + u` for
+/// `u in span(v_0, ..., v_{h-2})`, so the normalized top factor is exactly one,
+/// every factor above it is zero, and the vector is supported on `[0, m)`.
+/// At zero only the constant basis element is live.
+#[inline]
+fn low_domain_basis_active_len(q: usize, n: usize) -> Option<usize> {
+    debug_assert!(n.is_power_of_two());
+    if q >= n {
+        return None;
+    }
+    if q == 0 {
+        return Some(1);
+    }
+    let h = usize::BITS as usize - q.leading_zeros() as usize;
+    Some(1usize << h)
+}
+
+/// Build the lower half of a low-domain basis vector. The omitted next factor
+/// is exactly one; callers either copy this lower half into the active upper
+/// half or XOR it into both active accumulator halves. No element at or above
+/// `active_len / 2` is read or written here.
+fn evaluate_scaled_basis_low_domain_lower(
+    sks_at_x: &mut [F128],
+    lower_basis: &mut [F128],
+    sks_vks: &[F128],
+    inv_sks_vks: &[F128],
+    q: usize,
+    active_len: usize,
+    alpha: F128,
+) {
+    debug_assert!(q > 0);
+    debug_assert!(active_len.is_power_of_two());
+    debug_assert!(active_len >= 2);
+    let lower_len = active_len / 2;
+    debug_assert!(lower_basis.len() >= lower_len);
+    let lower_log = lower_len.trailing_zeros() as usize;
+    debug_assert!(sks_at_x.len() >= lower_log);
+    debug_assert!(inv_sks_vks.len() >= lower_log);
+
+    if lower_log > 0 {
+        debug_assert!(q <= u64::MAX as usize);
+        sks_at_x[0] = F128::new(q as u64, 0);
+        for i in 1..lower_log {
+            sks_at_x[i] = next_s(sks_at_x[i - 1], sks_vks[i - 1]);
+        }
+        for i in 0..lower_log {
+            sks_at_x[i] *= inv_sks_vks[i];
+        }
+    }
+
+    lower_basis[0] = alpha;
+    for k in 0..lower_log {
+        let factor = sks_at_x[k];
+        let current_len = 1usize << k;
+        for i in 0..current_len {
+            lower_basis[i + current_len] = factor * lower_basis[i];
+        }
+    }
+}
+
+/// Fully initialize a first-query accumulator from a low-domain query. The
+/// active upper half is an exact copy because its normalized LCH factor is one;
+/// the dead tail is explicitly zeroed because production passes an uninitialized
+/// allocation here.
+fn evaluate_scaled_basis_low_domain_inplace(
+    sks_at_x: &mut [F128],
+    basis: &mut [F128],
+    sks_vks: &[F128],
+    inv_sks_vks: &[F128],
+    q: usize,
+    alpha: F128,
+) {
+    let n = basis.len();
+    let active_len = low_domain_basis_active_len(q, n)
+        .expect("low-domain basis helper requires q < basis.len()");
+    if active_len == 1 {
+        basis[0] = alpha;
+        basis[1..].fill(F128::ZERO);
+        return;
+    }
+
+    let lower_len = active_len / 2;
+    evaluate_scaled_basis_low_domain_lower(
+        sks_at_x,
+        basis,
+        sks_vks,
+        inv_sks_vks,
+        q,
+        active_len,
+        alpha,
+    );
+    basis.copy_within(0..lower_len, lower_len);
+    basis[active_len..].fill(F128::ZERO);
+}
+
+/// Add a non-first low-domain basis vector directly into its exact active
+/// accumulator prefix. `lower_basis` remains allocated at the retained
+/// dense-final size, but only `[0, active_len / 2)` is initialized or read.
+fn evaluate_scaled_basis_add_low_domain_truncated(
+    sks_at_x: &mut [F128],
+    lower_basis: &mut [F128],
+    accum_basis: &mut [F128],
+    sks_vks: &[F128],
+    inv_sks_vks: &[F128],
+    q: usize,
+    alpha: F128,
+) {
+    let n = accum_basis.len();
+    let active_len = low_domain_basis_active_len(q, n)
+        .expect("low-domain basis helper requires q < accum_basis.len()");
+    if active_len == 1 {
+        accum_basis[0] += alpha;
+        return;
+    }
+
+    let lower_len = active_len / 2;
+    debug_assert!(lower_basis.len() >= lower_len);
+    evaluate_scaled_basis_low_domain_lower(
+        sks_at_x,
+        lower_basis,
+        sks_vks,
+        inv_sks_vks,
+        q,
+        active_len,
+        alpha,
+    );
+
+    // The upper half starts at the dynamic `lower_len`, not at the full
+    // accumulator's `n / 2`. Everything at `active_len..n` stays untouched.
+    let (active_accum, _) = accum_basis.split_at_mut(active_len);
+    let (accum_low, accum_high) = active_accum.split_at_mut(lower_len);
+    for ((accum_low, accum_high), &value) in accum_low
+        .iter_mut()
+        .zip(accum_high.iter_mut())
+        .zip(lower_basis[..lower_len].iter())
+    {
+        *accum_low += value;
+        *accum_high += value;
+    }
+}
+
+const ENV_NO_LIG_DENSE_FINAL_DIRECT: &str = "FLOCK_NO_LIG_DENSE_FINAL_DIRECT";
+
+#[inline]
+fn ranked_dense_final_direct_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+/// The three material dense recursive induction shapes in ranked M32 Fast.
+/// L0 and L1 use the sparse-NTT path; the remaining 16-entry tail is kept on
+/// the incumbent because this transformation would delete only a few KiB.
+#[inline]
+fn is_ranked_dense_final_direct_shape(
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+) -> bool {
+    log_num_interleaved == 3
+        && matches!(
+            (log_msg_cols, n_queries, alpha_len),
+            (13, 71, 7) | (10, 53, 6) | (7, 43, 6)
+        )
+}
+
+#[inline]
+fn ranked_dense_final_direct_selected(
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+    platform_supported: bool,
+    disabled: bool,
+) -> bool {
+    platform_supported
+        && !disabled
+        && is_ranked_dense_final_direct_shape(
+            log_msg_cols,
+            log_num_interleaved,
+            n_queries,
+            alpha_len,
+        )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_DENSE_FINAL_DIRECT_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_DENSE_FINAL_DIRECT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Select only the three cache-resident dense induction levels on Apple
+/// AArch64. Exactly `FLOCK_NO_LIG_DENSE_FINAL_DIRECT=1` restores the full
+/// local-basis materialization for a same-binary official control.
+#[inline]
+fn ranked_dense_final_direct_enabled(
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    n_queries: usize,
+    alpha_len: usize,
+) -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_DENSE_FINAL_DIRECT_OVERRIDE.with(|slot| slot.get()) {
+        if enabled {
+            TEST_DENSE_FINAL_DIRECT_HITS.with(|hits| hits.set(hits.get() + 1));
+        }
+        return enabled;
+    }
+
+    ranked_dense_final_direct_selected(
+        log_msg_cols,
+        log_num_interleaved,
+        n_queries,
+        alpha_len,
+        cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        )),
+        ranked_dense_final_direct_disabled_value(
+            std::env::var_os(ENV_NO_LIG_DENSE_FINAL_DIRECT).as_deref(),
+        ),
+    )
+}
+
+#[cfg(test)]
+fn with_dense_final_direct_override<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    TEST_DENSE_FINAL_DIRECT_OVERRIDE.with(|slot| {
+        struct Reset<'a> {
+            slot: &'a std::cell::Cell<Option<bool>>,
+            previous: Option<bool>,
+        }
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.previous);
+            }
+        }
+
+        let previous = slot.replace(Some(enabled));
+        let _reset = Reset { slot, previous };
+        f()
+    })
+}
+
+const ENV_NO_LIG_DENSE_LOW_DOMAIN_TRUNC: &str = "FLOCK_NO_LIG_DENSE_LOW_DOMAIN_TRUNC";
+
+#[inline]
+fn ranked_dense_low_domain_trunc_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+/// This optimization is a strict child of dense-final-direct: disabling or
+/// missing that exact Apple/ranked selector also disables this policy. Its own
+/// kill restores dense-final-direct rather than the older full materialization.
+#[inline]
+fn ranked_dense_low_domain_trunc_policy_selected(
+    use_dense_final_direct: bool,
+    disabled: bool,
+) -> bool {
+    use_dense_final_direct && !disabled
+}
+
+#[inline]
+fn ranked_dense_low_domain_trunc_query_selected(policy: bool, q: usize, n: usize) -> bool {
+    policy && q < n
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_DENSE_LOW_DOMAIN_TRUNC_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+static TEST_DENSE_LOW_DOMAIN_TRUNC_FIRST_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_DENSE_LOW_DOMAIN_TRUNC_ADD_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn ranked_dense_low_domain_trunc_enabled(use_dense_final_direct: bool) -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_DENSE_LOW_DOMAIN_TRUNC_OVERRIDE.with(|slot| slot.get()) {
+        return ranked_dense_low_domain_trunc_policy_selected(use_dense_final_direct, !enabled);
+    }
+
+    ranked_dense_low_domain_trunc_policy_selected(
+        use_dense_final_direct,
+        ranked_dense_low_domain_trunc_disabled_value(
+            std::env::var_os(ENV_NO_LIG_DENSE_LOW_DOMAIN_TRUNC).as_deref(),
+        ),
+    )
+}
+
+#[cfg(test)]
+fn with_dense_low_domain_trunc_override<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    TEST_DENSE_LOW_DOMAIN_TRUNC_OVERRIDE.with(|slot| {
+        struct Reset<'a> {
+            slot: &'a std::cell::Cell<Option<bool>>,
+            previous: Option<bool>,
+        }
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.previous);
+            }
+        }
+
+        let previous = slot.replace(Some(enabled));
+        let _reset = Reset { slot, previous };
+        f()
+    })
+}
+
 // ===================================================================
 // induce_sumcheck_poly — the per-level basis-poly builder.
 // ===================================================================
@@ -2065,6 +2437,9 @@ pub(crate) fn induce_sumcheck_poly(
 
     // Precompute inv_sks_vks once across all queries and threads.
     let inv_sks_vks = batch_inverse_or_zero(sks_vks);
+    let use_dense_final_direct =
+        ranked_dense_final_direct_enabled(log_msg_cols, v_challenges.len(), n_queries, alpha.len());
+    let use_dense_low_domain_trunc = ranked_dense_low_domain_trunc_enabled(use_dense_final_direct);
 
     // Per-worker chunked accumulation: each worker accumulates a partial
     // basis_poly (length n) and a partial enforced_sum, then we reduce.
@@ -2081,9 +2456,9 @@ pub(crate) fn induce_sumcheck_poly(
     } else {
         0
     };
-    // 16 chunks when hetero: the queue's engagement floor (EPOOL_MIN_CHUNKS),
-    // and enough claims that the four helpers stay fed without inflating the
-    // serial partial reduce below by more than two extra length-n passes.
+    // Keep 16 induction chunks independently of the generic epool engagement
+    // floor: enough claims for four helpers without inflating the serial
+    // partial reduce below by more than two extra length-n passes.
     let n_threads = if helper_threads > 0 {
         (rayon::current_num_threads().max(1) + helper_threads).max(16)
     } else {
@@ -2101,16 +2476,18 @@ pub(crate) fn induce_sumcheck_poly(
                 // filled, and XOR-added for no effect).
                 return (Vec::new(), F128::ZERO);
             }
-            // Both per-thread buffers are uninit-sound: `local_basis` is
-            // fully written by `evaluate_scaled_basis_inplace` before any
-            // read (`basis[0] = alpha`, then each doubling level writes
-            // `[2^k, 2^{k+1})` from the already-written lower half), and
-            // `accum_basis` is seeded by a full `copy_from_slice` of the
-            // chunk's FIRST query before any accumulation — algebraically
-            // identical to zero-init + XOR-add (x ⊕ 0 = x), deleting one
-            // length-n memset and one full-buffer RMW pass per worker.
+            // Both per-thread buffers are uninit-sound. The control writes all
+            // `n` local slots; final-direct writes its allocated lower `n/2`
+            // slots before reading them; low-domain truncation writes and reads
+            // only its exact local prefix. `accum_basis` is fully initialized
+            // by the chunk's FIRST query: the control writes every doubling,
+            // while low-domain truncation writes its active prefix then zeroes
+            // the dead tail. Later queries only update initialized accumulator
+            // slots. Seeding this way is algebraically identical to zero-init +
+            // XOR-add and deletes one full-buffer RMW pass per worker.
             let mut accum_basis = crate::alloc_uninit_f128_vec(n);
-            let mut local_basis = crate::alloc_uninit_f128_vec(n);
+            let mut local_basis =
+                crate::alloc_uninit_f128_vec(if use_dense_final_direct { n / 2 } else { n });
             let mut sks_at_x = vec![F128::ZERO; log_msg_cols.max(1)];
             let mut local_sum = F128::ZERO;
 
@@ -2127,27 +2504,70 @@ pub(crate) fn induce_sumcheck_poly(
                 local_sum += dot * ap;
 
                 let q_field = F128::new(q as u64, 0);
+                let truncate_low_domain =
+                    ranked_dense_low_domain_trunc_query_selected(use_dense_low_domain_trunc, q, n);
                 if i == start {
+                    if truncate_low_domain {
+                        #[cfg(test)]
+                        TEST_DENSE_LOW_DOMAIN_TRUNC_FIRST_HITS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        evaluate_scaled_basis_low_domain_inplace(
+                            &mut sks_at_x,
+                            &mut accum_basis,
+                            sks_vks,
+                            &inv_sks_vks,
+                            q,
+                            ap,
+                        );
+                    } else {
+                        evaluate_scaled_basis_inplace(
+                            &mut sks_at_x,
+                            &mut accum_basis,
+                            sks_vks,
+                            &inv_sks_vks,
+                            q_field,
+                            ap,
+                        );
+                    }
+                    continue;
+                }
+                if use_dense_final_direct {
+                    if truncate_low_domain {
+                        #[cfg(test)]
+                        TEST_DENSE_LOW_DOMAIN_TRUNC_ADD_HITS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        evaluate_scaled_basis_add_low_domain_truncated(
+                            &mut sks_at_x,
+                            &mut local_basis,
+                            &mut accum_basis,
+                            sks_vks,
+                            &inv_sks_vks,
+                            q,
+                            ap,
+                        );
+                    } else {
+                        evaluate_scaled_basis_add_final_direct(
+                            &mut sks_at_x,
+                            &mut local_basis,
+                            &mut accum_basis,
+                            sks_vks,
+                            &inv_sks_vks,
+                            q_field,
+                            ap,
+                        );
+                    }
+                } else {
                     evaluate_scaled_basis_inplace(
                         &mut sks_at_x,
-                        &mut accum_basis,
+                        &mut local_basis,
                         sks_vks,
                         &inv_sks_vks,
                         q_field,
                         ap,
                     );
-                    continue;
-                }
-                evaluate_scaled_basis_inplace(
-                    &mut sks_at_x,
-                    &mut local_basis,
-                    sks_vks,
-                    &inv_sks_vks,
-                    q_field,
-                    ap,
-                );
-                for (acc, &v) in accum_basis.iter_mut().zip(local_basis.iter()) {
-                    *acc += v;
+                    for (acc, &v) in accum_basis.iter_mut().zip(local_basis.iter()) {
+                        *acc += v;
+                    }
                 }
             }
             (accum_basis, local_sum)
@@ -3851,9 +4271,17 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
 
 /// Default low-factor width for retained lazy-OOD equalities. Ranked L1/L2
 /// retain the original 11-bit low factor (11+7 and 11+4); L3 explicitly asks
-/// for 10+2. Shorter tails fit entirely in the low factor and retain a
-/// one-entry high identity table.
+/// for 10+2 and L4 for 8+1. Shorter tails fit entirely in the low factor and
+/// retain a one-entry high identity table.
 const LAZY_OOD_EQ_SPLIT_LOW_LOG_MAX: usize = 11;
+
+/// The ranked L4 equality has exactly two 256-output high chunks. Keeping
+/// this predicate literal ensures the serial consumer cannot alter L1-L3 or
+/// any future factorization that happens to use a small high table.
+#[inline]
+fn ranked_l4_factorized_serial_shape(f_len: usize, eq_lo_len: usize, eq_hi_len: usize) -> bool {
+    f_len == (1usize << 10) && eq_lo_len == (1usize << 8) && eq_hi_len == 2
+}
 
 /// Factorized equivalent of [`round_msg_and_eval_lsb`] that keeps
 /// `b = eq_table([z_0, z_tail...])` as an exact low/high tensor product.
@@ -3869,8 +4297,10 @@ const LAZY_OOD_EQ_SPLIT_LOW_LOG_MAX: usize = 11;
 /// The inner scan computes `a = sum f_0 w` and `s = sum (f_0 + f_1) w`
 /// against the shared low table. Only those two chunk partials are scaled by
 /// `eq_hi[h]`, yielding `u_0 = (1 + z_0)a`, `u_2 = s`, and `y = a + z_0 s`.
-/// At ranked L1/L2 the low table has 2,048 entries; ranked L3 has 1,024. No
-/// dense equality tail is built.
+/// At ranked L1/L2 the low table has 2,048 entries; ranked L3 has 1,024 and
+/// ranked L4 has 256. No dense equality tail is built. The exact L4 8+1
+/// shape consumes its two chunks serially, avoiding a Rayon launch at 1,024
+/// inputs without widening scheduling changes to any other geometry.
 fn round_msg_and_eval_lsb_factorized_eq_split(
     f: &[F128],
     eq_lo: &[F128],
@@ -3893,17 +4323,32 @@ fn round_msg_and_eval_lsb_factorized_eq_split(
         "split OOD low factor width changed"
     );
 
-    let (a, s) = f
-        .par_chunks(2 * eq_lo.len())
-        .zip(eq_hi.par_iter())
-        .map(|(f_chunk, &hi_weight)| {
-            let (a_chunk, s_chunk) = crate::field::f128_slice::round0_factorized_eq(f_chunk, eq_lo);
-            (a_chunk * hi_weight, s_chunk * hi_weight)
-        })
-        .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a_0, s_0), (a_1, s_1)| (a_0 + a_1, s_0 + s_1),
-        );
+    let (a, s) = if ranked_l4_factorized_serial_shape(f.len(), eq_lo.len(), eq_hi.len()) {
+        let chunk_len = 2 * eq_lo.len();
+        let mut a = F128::ZERO;
+        let mut s = F128::ZERO;
+        for high_index in 0..2 {
+            let start = high_index * chunk_len;
+            let (a_chunk, s_chunk) =
+                crate::field::f128_slice::round0_factorized_eq(&f[start..start + chunk_len], eq_lo);
+            let hi_weight = eq_hi[high_index];
+            a += a_chunk * hi_weight;
+            s += s_chunk * hi_weight;
+        }
+        (a, s)
+    } else {
+        f.par_chunks(2 * eq_lo.len())
+            .zip(eq_hi.par_iter())
+            .map(|(f_chunk, &hi_weight)| {
+                let (a_chunk, s_chunk) =
+                    crate::field::f128_slice::round0_factorized_eq(f_chunk, eq_lo);
+                (a_chunk * hi_weight, s_chunk * hi_weight)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a_0, s_0), (a_1, s_1)| (a_0 + a_1, s_0 + s_1),
+            )
+    };
 
     (
         SumcheckMessage {
@@ -4108,8 +4553,8 @@ fn fold_and_msg_lsb_into(
 ///
 /// Each low-factor-sized output chunk reuses `eq_lo`; its complete correction
 /// scale is `beta * (1 + z_0 + r) * eq_hi[h]`. Ranked L1/L2 use 2,048-output
-/// chunks (128 and 16 respectively); L3 uses four 1,024-output chunks. All
-/// avoid materializing `eq(z_tail)`.
+/// chunks (128 and 16 respectively); L3 uses four 1,024-output chunks, and L4
+/// uses exactly two 256-output chunks. All avoid materializing `eq(z_tail)`.
 fn fold_and_msg_lsb_into_with_lazy_ood_eq(
     f: &[F128],
     b: &[F128],
@@ -4189,11 +4634,23 @@ fn fold_and_msg_lsb_into_with_lazy_ood_eq(
             ),
         }
     };
+    let chunk_w = eq_lo.len();
+    if ranked_l4_factorized_serial_shape(f.len(), eq_lo.len(), eq_hi.len()) {
+        let (nf_0, nf_1) = nf.split_at_mut(chunk_w);
+        let (nb_0, nb_1) = nb.split_at_mut(chunk_w);
+        let (u0_0, u2_0) = chunk_body(0, nf_0, nb_0);
+        let (u0_1, u2_1) = chunk_body(1, nf_1, nb_1);
+        return SumcheckMessage {
+            u_0: u0_0 + u0_1,
+            u_2: u2_0 + u2_1,
+        };
+    }
+
     // Hetero queue over the same per-`high_index` chunk grid (chunk width =
     // `eq_lo.len()`, one chunk per `eq_hi` entry — 128 × 2,048 at L1,
     // 16 × 2,048 at L2, and 4 × 1,024 at L3). Identical kernels and chunk
-    // bases, so bytes are unchanged.
-    let chunk_w = eq_lo.len();
+    // bases, so bytes are unchanged. The exact two-chunk L4 shape returned
+    // through the serial arm above.
     if eq_hi.len() >= 16 && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
         let n_chunks = eq_hi.len();
         let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
@@ -4269,11 +4726,11 @@ fn fold2_and_msgs_lsb(
     //   u2_D likewise over sums-of-adjacent-x, which reduce to the same three
     //   bilinear forms on (wf0+wf2.., wf1+wf3..) groupings handled below.
     const CHUNK: usize = 2048; // outputs per chunk; 8 inputs per output pair
-                               // Fold pairs whose w outputs are past LLC size write ping-pong state not
-                               // read until the next fold pair's barrier; `stnp` elides the
-                               // write-allocate RFO reads there (same driver-decided policy as the
-                               // zerocheck tail's NT rounds). 2^21 F128 = 32 MiB per polynomial (both
-                               // polynomials together exceed LLC).
+    // Fold pairs whose w outputs are past LLC size write ping-pong state not
+    // read until the next fold pair's barrier; `stnp` elides the
+    // write-allocate RFO reads there (same driver-decided policy as the
+    // zerocheck tail's NT rounds). 2^21 F128 = 32 MiB per polynomial (both
+    // polynomials together exceed LLC).
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     let nt_stores = {
         use std::sync::OnceLock;
@@ -4962,8 +5419,8 @@ fn materialize_direct_ab_fold2_with_helper(
         folded_f,
         folded_b,
         SumcheckMessage {
-            u_0: stats.0 .0,
-            u_2: stats.0 .1,
+            u_0: stats.0.0,
+            u_2: stats.0.1,
         },
         stats.1,
     )
@@ -5092,8 +5549,8 @@ fn materialize_direct_fold4(
         folded_f,
         folded_b,
         SumcheckMessage {
-            u_0: stats.0 .0,
-            u_2: stats.0 .1,
+            u_0: stats.0.0,
+            u_2: stats.0.1,
         },
         stats.1,
     )
@@ -5526,7 +5983,8 @@ std::thread_local! {
 
 /// Enable the 10+2 factorized equality only for the ranked L3 commit reached
 /// by recursive iteration one. Its prior L2 opening uses 71 queries at rate
-/// three; L4+ and every non-DirectFold8 shape retain the dense incumbent.
+/// three; later levels and every non-DirectFold8 shape retain their own exact
+/// selector or the dense incumbent.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn ranked_l3_lazy_ood_eq_enabled(
@@ -5613,6 +6071,130 @@ fn ranked_l3_lazy_ood_eq_selected(
 #[cfg(test)]
 fn with_l3_lazy_ood_eq_override<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
     TEST_L3_LAZY_OOD_EQ_OVERRIDE.with(|slot| {
+        struct Reset<'a> {
+            slot: &'a std::cell::Cell<Option<bool>>,
+            previous: Option<bool>,
+        }
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.slot.set(self.previous);
+            }
+        }
+
+        let previous = slot.replace(Some(enabled));
+        let _reset = Reset { slot, previous };
+        f()
+    })
+}
+
+const ENV_NO_LIG_L4_LAZY_OOD: &str = "FLOCK_NO_LIG_L4_LAZY_OOD";
+
+/// The L4 rollback is independent and literal: only exact `1` restores the
+/// dense L4 arm, while inherited values such as `0` or `true` are inert.
+#[inline]
+fn ranked_l4_lazy_ood_eq_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Small-domain proof oracle policy for the L4 integration. Production
+    /// remains guarded by the complete ranked fingerprint below.
+    static TEST_L4_LAZY_OOD_EQ_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_L4_LAZY_OOD_EQ_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Enable the 8+1 factorized equality only for ranked M32 Fast L4, reached by
+/// recursive iteration two. The preceding L3 opening has 53 queries at rate
+/// four; adjacent levels and all non-DirectFold8 paths stay dense.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn ranked_l4_lazy_ood_eq_enabled(
+    config: &ProverConfig,
+    log_n: usize,
+    recursive_index: usize,
+    n_next: usize,
+    l4_ood_count: usize,
+    current_len: usize,
+    prior_queries: usize,
+    prior_log_inv_rate: usize,
+    direct_fold8_mode: bool,
+) -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_L4_LAZY_OOD_EQ_OVERRIDE.with(|slot| slot.get()) {
+        let selected = enabled && recursive_index == 2 && l4_ood_count == 1;
+        if selected {
+            TEST_L4_LAZY_OOD_EQ_HITS.with(|hits| hits.set(hits.get() + 1));
+        }
+        return selected;
+    }
+
+    ranked_l4_lazy_ood_eq_selected(
+        config,
+        log_n,
+        recursive_index,
+        n_next,
+        l4_ood_count,
+        current_len,
+        prior_queries,
+        prior_log_inv_rate,
+        direct_fold8_mode,
+        cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        )),
+        ranked_l4_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L4_LAZY_OOD).as_deref()),
+    )
+}
+
+/// Pure selector for the exact ranked L4 fingerprint. Every shape argument
+/// and configuration field is closed over explicitly so a neighboring level
+/// or future profile edit cannot inherit the 8+1 representation accidentally.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn ranked_l4_lazy_ood_eq_selected(
+    config: &ProverConfig,
+    log_n: usize,
+    recursive_index: usize,
+    n_next: usize,
+    l4_ood_count: usize,
+    current_len: usize,
+    prior_queries: usize,
+    prior_log_inv_rate: usize,
+    direct_fold8_mode: bool,
+    platform_supported: bool,
+    disabled: bool,
+) -> bool {
+    platform_supported
+        && !disabled
+        && direct_fold8_mode
+        && log_n == 25
+        && recursive_index == 2
+        && n_next == 10
+        && current_len == (1usize << 10)
+        && l4_ood_count == 1
+        && prior_queries == 53
+        && prior_log_inv_rate == 4
+        && config.initial_log_msg_cols == 19
+        && config.initial_log_num_interleaved == 6
+        && config.initial_k == 6
+        && config.recursive_steps == 5
+        && config.recursive_log_msg_cols.as_slice() == [16, 13, 10, 7, 4]
+        && config.recursive_ks.as_slice() == [3, 3, 3, 3, 3]
+        && config.log_inv_rates.as_slice() == [1, 2, 3, 4, 5, 6]
+        && config.queries.as_slice() == [218, 106, 71, 53, 43, 36]
+        && config.grinding_bits.as_slice() == [0, 0, 0, 0, 0, 0]
+        && config.fold_grinding_bits.as_slice() == [19, 14, 11, 8, 6, 4]
+        && config.ood_samples.as_slice() == [0, 1, 1, 1, 1, 1]
+        && config.merkle_hash == HashKind::Blake3
+}
+
+#[cfg(test)]
+fn with_l4_lazy_ood_eq_override<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    TEST_L4_LAZY_OOD_EQ_OVERRIDE.with(|slot| {
         struct Reset<'a> {
             slot: &'a std::cell::Cell<Option<bool>>,
             previous: Option<bool>,
@@ -5983,9 +6565,9 @@ impl SumcheckProver {
         self.introduce_new_ood_factorized_with_low_bits(z, LAZY_OOD_EQ_SPLIT_LOW_LOG_MAX)
     }
 
-    /// Explicit-width variant used by the ranked L3 geometry. The incumbent
-    /// wrapper above always requests the original 11-bit low factor, keeping
-    /// L1 at 11+7 and L2 at 11+4; L3 alone requests 10+2.
+    /// Explicit-width variant used by ranked L3/L4. The incumbent wrapper
+    /// above always requests the original 11-bit low factor, keeping L1 at
+    /// 11+7 and L2 at 11+4; L3 requests 10+2 and L4 requests 8+1.
     fn introduce_new_ood_factorized_with_low_bits(
         &mut self,
         z: &[F128],
@@ -7151,10 +7733,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         recursive_roots.push(root_next);
 
         // OOD binding for the L_{i+2} commit (same as the L1 block above).
-        // Ranked L2/L3 keep this equality factorized across the prior-level
+        // Ranked L2/L3/L4 keep this equality factorized across the prior-level
         // opening and let the next recursive fold consume it. L2 retains the
-        // original 11+4 split; L3 alone uses 10+2. L4+ and every unsupported
-        // or rollback shape stay on the materialized incumbent.
+        // original 11+4 split, L3 uses 10+2, and exact L4 uses 8+1 plus a
+        // two-chunk serial consumer. Later, unsupported, and rollback shapes
+        // stay on the materialized incumbent.
         let use_lazy_l2_ood = ranked_l2_lazy_ood_eq_enabled(
             config,
             log_n,
@@ -7177,7 +7760,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             config.log_inv_rates[i + 1],
             direct_fold8_mode,
         );
-        debug_assert!(!(use_lazy_l2_ood && use_lazy_l3_ood));
+        let use_lazy_l4_ood = ranked_l4_lazy_ood_eq_enabled(
+            config,
+            log_n,
+            i,
+            n_next,
+            ood_count(i + 2),
+            sc_prover.f().len(),
+            config.queries[i + 1],
+            config.log_inv_rates[i + 1],
+            direct_fold8_mode,
+        );
+        debug_assert!((use_lazy_l2_ood as u8 + use_lazy_l3_ood as u8 + use_lazy_l4_ood as u8) <= 1);
         {
             let _t = std::time::Instant::now();
             for _ in 0..ood_count(i + 2) {
@@ -7191,6 +7785,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     let (intro, y) = sc_prover
                         .introduce_new_ood_factorized_with_low_bits(&z, 10)
                         .expect("ranked L3 lazy OOD preconditions changed after exact gate");
+                    (intro, y, true)
+                } else if use_lazy_l4_ood {
+                    let (intro, y) = sc_prover
+                        .introduce_new_ood_factorized_with_low_bits(&z, 8)
+                        .expect("ranked L4 lazy OOD preconditions changed after exact gate");
                     (intro, y, true)
                 } else {
                     // Micro-stack: the PMULL two-lane kernel builder is an
@@ -7297,7 +7896,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
-        if use_lazy_l2_ood || use_lazy_l3_ood {
+        if use_lazy_l2_ood || use_lazy_l3_ood || use_lazy_l4_ood {
             sc_prover.glue_deferred_into_lazy_ood_fold(beta_i);
         } else {
             sc_prover.glue(beta_i);
@@ -9972,6 +10571,188 @@ mod tests {
         assert!(ranked_l3_lazy_ood_eq_disabled_value(Some(OsStr::new("1"))));
     }
 
+    /// L4 is selected only at recursive index two of the complete ranked M32
+    /// Fast route. Every dynamic or configured field fails closed on a
+    /// one-field mutation, and its rollback accepts only literal `1`.
+    #[test]
+    fn factorized_ood_l4_ranked_gate_fields_and_literal_kill_are_exact() {
+        let mut config =
+            prover_config_for(25, 6, LigeritoProfile::Fast).expect("embedded M32 Fast config");
+        config.merkle_hash = HashKind::Blake3;
+        let selected = |cfg: &ProverConfig,
+                        log_n: usize,
+                        recursive_index: usize,
+                        n_next: usize,
+                        count: usize,
+                        len: usize,
+                        queries: usize,
+                        rate: usize,
+                        direct8: bool,
+                        platform: bool,
+                        disabled: bool| {
+            ranked_l4_lazy_ood_eq_selected(
+                cfg,
+                log_n,
+                recursive_index,
+                n_next,
+                count,
+                len,
+                queries,
+                rate,
+                direct8,
+                platform,
+                disabled,
+            )
+        };
+        let exact =
+            |cfg: &ProverConfig| selected(cfg, 25, 2, 10, 1, 1 << 10, 53, 4, true, true, false);
+
+        assert!(exact(&config));
+        for (log_n, recursive_index, n_next, count, len, queries, rate) in [
+            (24, 2, 10, 1, 1 << 10, 53, 4),
+            (26, 2, 10, 1, 1 << 10, 53, 4),
+            (25, 0, 10, 1, 1 << 10, 53, 4),
+            (25, 1, 10, 1, 1 << 10, 53, 4),
+            (25, 3, 10, 1, 1 << 10, 53, 4),
+            (25, 2, 9, 1, 1 << 10, 53, 4),
+            (25, 2, 11, 1, 1 << 10, 53, 4),
+            (25, 2, 10, 0, 1 << 10, 53, 4),
+            (25, 2, 10, 2, 1 << 10, 53, 4),
+            (25, 2, 10, 1, 1 << 9, 53, 4),
+            (25, 2, 10, 1, 1 << 11, 53, 4),
+            (25, 2, 10, 1, 1 << 10, 52, 4),
+            (25, 2, 10, 1, 1 << 10, 54, 4),
+            (25, 2, 10, 1, 1 << 10, 53, 3),
+            (25, 2, 10, 1, 1 << 10, 53, 5),
+        ] {
+            assert!(!selected(
+                &config,
+                log_n,
+                recursive_index,
+                n_next,
+                count,
+                len,
+                queries,
+                rate,
+                true,
+                true,
+                false,
+            ));
+        }
+        assert!(!selected(
+            &config,
+            25,
+            2,
+            10,
+            1,
+            1 << 10,
+            53,
+            4,
+            false,
+            true,
+            false,
+        ));
+        assert!(!selected(
+            &config,
+            25,
+            2,
+            10,
+            1,
+            1 << 10,
+            53,
+            4,
+            true,
+            false,
+            false,
+        ));
+        assert!(!selected(
+            &config,
+            25,
+            2,
+            10,
+            1,
+            1 << 10,
+            53,
+            4,
+            true,
+            true,
+            true,
+        ));
+
+        let mut wrong = config.clone();
+        wrong.initial_log_msg_cols += 1;
+        assert!(!exact(&wrong));
+        let mut wrong = config.clone();
+        wrong.initial_log_num_interleaved += 1;
+        assert!(!exact(&wrong));
+        let mut wrong = config.clone();
+        wrong.initial_k += 1;
+        assert!(!exact(&wrong));
+        let mut wrong = config.clone();
+        wrong.recursive_steps += 1;
+        assert!(!exact(&wrong));
+
+        for index in 0..config.recursive_log_msg_cols.len() {
+            let mut wrong = config.clone();
+            wrong.recursive_log_msg_cols[index] += 1;
+            assert!(!exact(&wrong), "recursive_log_msg_cols[{index}]");
+        }
+        for index in 0..config.recursive_ks.len() {
+            let mut wrong = config.clone();
+            wrong.recursive_ks[index] += 1;
+            assert!(!exact(&wrong), "recursive_ks[{index}]");
+        }
+        for index in 0..config.log_inv_rates.len() {
+            let mut wrong = config.clone();
+            wrong.log_inv_rates[index] += 1;
+            assert!(!exact(&wrong), "log_inv_rates[{index}]");
+        }
+        for index in 0..config.queries.len() {
+            let mut wrong = config.clone();
+            wrong.queries[index] += 1;
+            assert!(!exact(&wrong), "queries[{index}]");
+        }
+        for index in 0..config.grinding_bits.len() {
+            let mut wrong = config.clone();
+            wrong.grinding_bits[index] += 1;
+            assert!(!exact(&wrong), "grinding_bits[{index}]");
+        }
+        for index in 0..config.fold_grinding_bits.len() {
+            let mut wrong = config.clone();
+            wrong.fold_grinding_bits[index] += 1;
+            assert!(!exact(&wrong), "fold_grinding_bits[{index}]");
+        }
+        for index in 0..config.ood_samples.len() {
+            let mut wrong = config.clone();
+            wrong.ood_samples[index] += 1;
+            assert!(!exact(&wrong), "ood_samples[{index}]");
+        }
+        let mut wrong = config.clone();
+        wrong.merkle_hash = HashKind::Sha256;
+        assert!(!exact(&wrong));
+
+        assert!(ranked_l4_factorized_serial_shape(1 << 10, 1 << 8, 2));
+        for (f_len, lo_len, hi_len) in [
+            ((1 << 10) - 1, 1 << 8, 2),
+            ((1 << 10) + 1, 1 << 8, 2),
+            (1 << 10, (1 << 8) - 1, 2),
+            (1 << 10, (1 << 8) + 1, 2),
+            (1 << 10, 1 << 8, 1),
+            (1 << 10, 1 << 8, 4),
+        ] {
+            assert!(!ranked_l4_factorized_serial_shape(f_len, lo_len, hi_len));
+        }
+
+        use std::ffi::OsStr;
+        assert!(!ranked_l4_lazy_ood_eq_disabled_value(None));
+        for value in ["", "0", "01", "true", "yes"] {
+            assert!(!ranked_l4_lazy_ood_eq_disabled_value(Some(OsStr::new(
+                value
+            ))));
+        }
+        assert!(ranked_l4_lazy_ood_eq_disabled_value(Some(OsStr::new("1"))));
+    }
+
     /// The ranked lazy OOD representation must be a protocol-transparent
     /// replacement for materializing `eq(z)`: claimed value, intro message,
     /// intervening ordinary introduce/glue, next folded state, and every
@@ -10356,6 +11137,155 @@ mod tests {
                     assert_eq!(eq_hi.len(), 1 << 2);
                     assert_eq!(eq_lo.len() * eq_hi.len(), 1 << (LOG_N - 1));
                     assert_eq!(eq_lo.len() + eq_hi.len(), 1028);
+                }
+                PendingOodEq::Glued { .. } => panic!("OOD glued before challenge"),
+            }
+
+            dense.glue(beta);
+            factorized.glue_factorized_ood(beta);
+            assert_eq!(factorized.t_r, dense.t_r, "OOD target, case={case}");
+            assert_eq!(factorized.transcript(), dense.transcript());
+            assert!(matches!(
+                factorized.pending_ood_eq.as_ref(),
+                Some(PendingOodEq::Glued { .. })
+            ));
+
+            let dense_ordinary = dense.introduce_new(ordinary_basis.clone(), h_ordinary);
+            let factorized_ordinary = factorized.introduce_new(ordinary_basis.clone(), h_ordinary);
+            assert_eq!(factorized_ordinary, dense_ordinary, "case={case}");
+            dense.glue(alpha);
+            factorized.glue_deferred_into_lazy_ood_fold(alpha);
+            assert_eq!(factorized.t_r, dense.t_r, "ordinary target, case={case}");
+            assert_eq!(factorized.transcript(), dense.transcript());
+            assert!(factorized.pending_glue.is_none());
+            assert!(factorized.pending_fold_basis.is_some());
+
+            let dense_fold_1 = dense.fold(r_first);
+            let factorized_fold_1 = factorized.fold(r_first);
+            assert_eq!(factorized_fold_1, dense_fold_1, "first fold, case={case}");
+            assert_eq!(factorized.f, dense.f, "first f state, case={case}");
+            assert_eq!(
+                factorized.combined_basis, dense.combined_basis,
+                "first basis state, case={case}"
+            );
+            assert_eq!(factorized.t_r, dense.t_r, "first target, case={case}");
+            assert_eq!(factorized.transcript(), dense.transcript());
+            assert!(factorized.pending_ood_eq.is_none());
+            assert!(factorized.pending_fold_basis.is_none());
+            assert!(factorized.pending_glue.is_none());
+
+            let dense_fold_2 = dense.fold(r_second);
+            let factorized_fold_2 = factorized.fold(r_second);
+            assert_eq!(factorized_fold_2, dense_fold_2, "second fold, case={case}");
+            assert_eq!(factorized.f, dense.f, "second f state, case={case}");
+            assert_eq!(
+                factorized.combined_basis, dense.combined_basis,
+                "second basis state, case={case}"
+            );
+            assert_eq!(factorized.t_r, dense.t_r, "second target, case={case}");
+            assert_eq!(factorized.transcript(), dense.transcript());
+            assert!(factorized.pending_ood_eq.is_none());
+            assert!(factorized.pending_fold_basis.is_none());
+            assert!(factorized.pending_glue.is_none());
+        }
+    }
+
+    /// Exact ranked L4 geometry: a ten-dimensional OOD point retains its
+    /// nine-bit tail as 8+1 factors (256 + 2 entries). This exact 1,024-input
+    /// shape also exercises both serial two-chunk consumers before comparing
+    /// the first two folded states and transcripts to the dense incumbent.
+    #[test]
+    fn factorized_ood_l4_n10_8_1_state_and_two_folds_match_dense() {
+        const LOG_N: usize = 10;
+        const LEN: usize = 1 << LOG_N;
+
+        let mut state = 0x4C34_5F38_2B31_5F32u64;
+        let mut rnd = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(state, state.rotate_left(17) ^ 0x4F4F_445F_4C34_3831)
+        };
+
+        let f: Vec<F128> = (0..LEN).map(|_| rnd()).collect();
+        let initial_basis: Vec<F128> = (0..LEN).map(|_| rnd()).collect();
+        let ordinary_basis: Vec<F128> = (0..LEN).map(|_| rnd()).collect();
+        let h_initial = f
+            .iter()
+            .zip(initial_basis.iter())
+            .map(|(&x, &b)| x * b)
+            .fold(F128::ZERO, |acc, value| acc + value);
+        let h_ordinary = f
+            .iter()
+            .zip(ordinary_basis.iter())
+            .map(|(&x, &b)| x * b)
+            .fold(F128::ZERO, |acc, value| acc + value);
+        let first_msg = round_msg_lsb(&f, &initial_basis);
+
+        for case in 0..20usize {
+            let (z, beta, alpha, r_first, r_second) = if case < 16 {
+                let bit = |mask: usize| {
+                    if case & mask == 0 {
+                        F128::ZERO
+                    } else {
+                        F128::ONE
+                    }
+                };
+                (
+                    vec![bit(1); LOG_N],
+                    bit(2),
+                    bit(4),
+                    bit(8),
+                    if case & 8 == 0 { F128::ONE } else { F128::ZERO },
+                )
+            } else {
+                (
+                    (0..LOG_N).map(|_| rnd()).collect(),
+                    rnd(),
+                    rnd(),
+                    rnd(),
+                    rnd(),
+                )
+            };
+
+            let (mut dense, dense_first) = SumcheckProver::new_with_first_msg(
+                f.clone(),
+                initial_basis.clone(),
+                h_initial,
+                first_msg,
+            );
+            let (mut factorized, factorized_first) = SumcheckProver::new_with_first_msg(
+                f.clone(),
+                initial_basis.clone(),
+                h_initial,
+                first_msg,
+            );
+            assert_eq!(factorized_first, dense_first, "case={case}");
+
+            let (dense_intro, dense_y) = dense.introduce_new_with_eval(build_eq_table(&z));
+            let (factorized_intro, factorized_y) = factorized
+                .introduce_new_ood_factorized_with_low_bits(&z, 8)
+                .expect("n=10 factorized OOD geometry");
+            assert_eq!(
+                (factorized_intro, factorized_y),
+                (dense_intro, dense_y),
+                "introduction differs, case={case}"
+            );
+            match factorized
+                .pending_ood_eq
+                .as_ref()
+                .expect("factorized OOD must remain pending")
+            {
+                PendingOodEq::Introduced { eq_lo, eq_hi, .. } => {
+                    assert_eq!(eq_lo.len(), 1 << 8);
+                    assert_eq!(eq_hi.len(), 1 << 1);
+                    assert_eq!(eq_lo.len() * eq_hi.len(), 1 << (LOG_N - 1));
+                    assert_eq!(eq_lo.len() + eq_hi.len(), 258);
+                    assert!(ranked_l4_factorized_serial_shape(
+                        LEN,
+                        eq_lo.len(),
+                        eq_hi.len()
+                    ));
                 }
                 PendingOodEq::Glued { .. } => panic!("OOD glued before challenge"),
             }
@@ -11425,7 +12355,7 @@ mod tests {
         let q0 = RoundQuad::from_msg(msgs[0], t_r);
         assert_eq!(q0.eval(F128::ZERO) + q0.eval(F128::ONE), t_r);
         t_r = q0.eval(r0); // fold(r0)
-                           // fold msg (idx 1)
+        // fold msg (idx 1)
         let q1 = RoundQuad::from_msg(msgs[1], t_r);
         assert_eq!(q1.eval(F128::ZERO) + q1.eval(F128::ONE), t_r);
         // introduce_new msg (idx 2): claim is h2_folded, not T_r
@@ -11593,6 +12523,323 @@ mod tests {
             assert!(sks_vks.iter().all(|v| !v.is_zero()), "log_n={log_n}");
             assert_matches(&sks_vks);
         }
+    }
+
+    #[test]
+    fn dense_final_direct_helper_matches_full_materialize_then_add() {
+        use crate::challenger::Challenger;
+
+        let mut rng = crate::challenger::RandomChallenger::new(0xD3E5_EF1A_1D1E_C7A5);
+        for log_n in 0..=10usize {
+            let n = 1usize << log_n;
+            let sks_vks = eval_sk_at_vks_uncached(log_n);
+            let inv_sks_vks = batch_inverse_or_zero(&sks_vks);
+            for case in 0..5usize {
+                let x = rng.sample_f128();
+                let alpha = if case == 0 {
+                    F128::ZERO
+                } else {
+                    rng.sample_f128()
+                };
+                let initial = rng.sample_f128_vec(n);
+
+                let mut expected = initial.clone();
+                let mut full_basis = vec![F128::ZERO; n];
+                let mut full_scratch = vec![F128::ZERO; log_n.max(1)];
+                evaluate_scaled_basis_inplace(
+                    &mut full_scratch,
+                    &mut full_basis,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    x,
+                    alpha,
+                );
+                for (accum, &value) in expected.iter_mut().zip(full_basis.iter()) {
+                    *accum += value;
+                }
+
+                let mut actual = initial;
+                let mut lower_basis = vec![F128::ZERO; n / 2];
+                let mut direct_scratch = vec![F128::ZERO; log_n.max(1)];
+                evaluate_scaled_basis_add_final_direct(
+                    &mut direct_scratch,
+                    &mut lower_basis,
+                    &mut actual,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    x,
+                    alpha,
+                );
+                assert_eq!(actual, expected, "log_n={log_n}, case={case}");
+            }
+        }
+    }
+
+    #[test]
+    fn dense_low_domain_trunc_helpers_match_full_exhaustive() {
+        use crate::challenger::Challenger;
+
+        let mut rng = crate::challenger::RandomChallenger::new(0x10D0_D0A1_7E5A_C7ED);
+        for log_n in 1..=10usize {
+            let n = 1usize << log_n;
+            let sks_vks = eval_sk_at_vks_uncached(log_n);
+            let inv_sks_vks = batch_inverse_or_zero(&sks_vks);
+
+            for q in 0..n {
+                let alpha = if q % 17 == 0 {
+                    F128::ZERO
+                } else {
+                    rng.sample_f128()
+                };
+                let active_len = low_domain_basis_active_len(q, n).expect("q is low-domain");
+
+                let mut expected_basis = vec![F128::ZERO; n];
+                let mut expected_scratch = vec![F128::ZERO; log_n.max(1)];
+                evaluate_scaled_basis_inplace(
+                    &mut expected_scratch,
+                    &mut expected_basis,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    F128::new(q as u64, 0),
+                    alpha,
+                );
+
+                // Start from nonzero sentinels: equality proves the first-query
+                // helper overwrites both its active prefix and its dead tail.
+                let mut actual_first = rng.sample_f128_vec(n);
+                let mut actual_first_scratch = vec![F128::ZERO; log_n.max(1)];
+                evaluate_scaled_basis_low_domain_inplace(
+                    &mut actual_first_scratch,
+                    &mut actual_first,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    q,
+                    alpha,
+                );
+                assert_eq!(actual_first, expected_basis, "first log_n={log_n} q={q}");
+                assert!(actual_first[active_len..].iter().all(|&v| v == F128::ZERO));
+                if active_len > 1 {
+                    let half = active_len / 2;
+                    assert_eq!(&actual_first[..half], &actual_first[half..active_len]);
+                }
+
+                let initial = rng.sample_f128_vec(n);
+                let mut expected_add = initial.clone();
+                for (accum, &value) in expected_add.iter_mut().zip(expected_basis.iter()) {
+                    *accum += value;
+                }
+                let mut actual_add = initial.clone();
+                let mut lower_basis = rng.sample_f128_vec(n / 2);
+                let mut actual_add_scratch = vec![F128::ZERO; log_n.max(1)];
+                evaluate_scaled_basis_add_low_domain_truncated(
+                    &mut actual_add_scratch,
+                    &mut lower_basis,
+                    &mut actual_add,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    q,
+                    alpha,
+                );
+                assert_eq!(actual_add, expected_add, "add log_n={log_n} q={q}");
+                assert_eq!(
+                    &actual_add[active_len..],
+                    &initial[active_len..],
+                    "dead accumulator tail changed at log_n={log_n} q={q}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_low_domain_trunc_production_depth_boundaries_match_full() {
+        use crate::challenger::Challenger;
+
+        let mut rng = crate::challenger::RandomChallenger::new(0xD11D_13B0_A1DA_7E57);
+        for log_n in 11..=13usize {
+            let n = 1usize << log_n;
+            let sks_vks = eval_sk_at_vks_uncached(log_n);
+            let inv_sks_vks = batch_inverse_or_zero(&sks_vks);
+            let mut queries = vec![0usize, 1, n - 1];
+            for k in 0..log_n {
+                let power = 1usize << k;
+                queries.push(power - 1);
+                queries.push(power);
+            }
+            for _ in 0..24 {
+                queries.push((rng.sample_f128().lo as usize) % n);
+            }
+            queries.sort_unstable();
+            queries.dedup();
+
+            for q in queries {
+                let alpha = rng.sample_f128();
+                let active_len = low_domain_basis_active_len(q, n).expect("q is low-domain");
+                let mut expected_basis = vec![F128::ZERO; n];
+                let mut expected_scratch = vec![F128::ZERO; log_n];
+                evaluate_scaled_basis_inplace(
+                    &mut expected_scratch,
+                    &mut expected_basis,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    F128::new(q as u64, 0),
+                    alpha,
+                );
+
+                let mut actual_first = rng.sample_f128_vec(n);
+                let mut first_scratch = vec![F128::ZERO; log_n];
+                evaluate_scaled_basis_low_domain_inplace(
+                    &mut first_scratch,
+                    &mut actual_first,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    q,
+                    alpha,
+                );
+                assert_eq!(
+                    actual_first, expected_basis,
+                    "production first log_n={log_n} q={q}"
+                );
+                assert!(actual_first[active_len..].iter().all(|&v| v == F128::ZERO));
+                if active_len > 1 {
+                    let half = active_len / 2;
+                    assert_eq!(&actual_first[..half], &actual_first[half..active_len]);
+                }
+
+                let initial = rng.sample_f128_vec(n);
+                let mut expected_add = initial.clone();
+                for (accum, &value) in expected_add.iter_mut().zip(expected_basis.iter()) {
+                    *accum += value;
+                }
+                let mut actual_add = initial.clone();
+                let mut lower_basis = rng.sample_f128_vec(n / 2);
+                let mut add_scratch = vec![F128::ZERO; log_n];
+                evaluate_scaled_basis_add_low_domain_truncated(
+                    &mut add_scratch,
+                    &mut lower_basis,
+                    &mut actual_add,
+                    &sks_vks,
+                    &inv_sks_vks,
+                    q,
+                    alpha,
+                );
+                assert_eq!(
+                    actual_add, expected_add,
+                    "production add log_n={log_n} q={q}"
+                );
+                assert_eq!(
+                    &actual_add[active_len..],
+                    &initial[active_len..],
+                    "production dead tail changed at log_n={log_n} q={q}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ranked_dense_low_domain_trunc_selector_and_kill_are_exact() {
+        for &(log_msg_cols, n_queries, alpha_len) in
+            &[(13usize, 71usize, 7usize), (10, 53, 6), (7, 43, 6)]
+        {
+            let n = 1usize << log_msg_cols;
+            let dense = ranked_dense_final_direct_selected(
+                log_msg_cols,
+                3,
+                n_queries,
+                alpha_len,
+                true,
+                false,
+            );
+            assert!(dense);
+            let policy = ranked_dense_low_domain_trunc_policy_selected(dense, false);
+            assert!(ranked_dense_low_domain_trunc_query_selected(policy, 0, n));
+            assert!(ranked_dense_low_domain_trunc_query_selected(policy, 1, n));
+            assert!(ranked_dense_low_domain_trunc_query_selected(
+                policy,
+                n - 1,
+                n
+            ));
+            assert!(!ranked_dense_low_domain_trunc_query_selected(policy, n, n));
+            assert!(!ranked_dense_low_domain_trunc_query_selected(
+                policy,
+                n + 1,
+                n
+            ));
+        }
+
+        assert!(!ranked_dense_low_domain_trunc_policy_selected(false, false));
+        assert!(!ranked_dense_low_domain_trunc_policy_selected(true, true));
+        assert!(!ranked_dense_low_domain_trunc_disabled_value(None));
+        for value in ["", "0", "01", "true", "TRUE"] {
+            assert!(!ranked_dense_low_domain_trunc_disabled_value(Some(
+                std::ffi::OsStr::new(value)
+            )));
+        }
+        assert!(ranked_dense_low_domain_trunc_disabled_value(Some(
+            std::ffi::OsStr::new("1")
+        )));
+    }
+
+    #[test]
+    fn ranked_dense_final_direct_selector_hits_exact_three_and_kill_is_literal() {
+        let exact = [(13usize, 71usize, 7usize), (10, 53, 6), (7, 43, 6)];
+        for &(log_msg_cols, n_queries, alpha_len) in &exact {
+            assert!(is_ranked_dense_final_direct_shape(
+                log_msg_cols,
+                3,
+                n_queries,
+                alpha_len,
+            ));
+            assert!(ranked_dense_final_direct_selected(
+                log_msg_cols,
+                3,
+                n_queries,
+                alpha_len,
+                true,
+                false,
+            ));
+            assert!(!ranked_dense_final_direct_selected(
+                log_msg_cols,
+                3,
+                n_queries,
+                alpha_len,
+                true,
+                true,
+            ));
+            assert!(!ranked_dense_final_direct_selected(
+                log_msg_cols,
+                3,
+                n_queries,
+                alpha_len,
+                false,
+                false,
+            ));
+        }
+
+        for &(log_msg_cols, log_num_interleaved, n_queries, alpha_len) in &[
+            (12usize, 3usize, 71usize, 7usize),
+            (13, 2, 71, 7),
+            (13, 3, 70, 7),
+            (13, 3, 71, 6),
+            (4, 3, 36, 6),
+        ] {
+            assert!(!is_ranked_dense_final_direct_shape(
+                log_msg_cols,
+                log_num_interleaved,
+                n_queries,
+                alpha_len,
+            ));
+        }
+
+        assert!(!ranked_dense_final_direct_disabled_value(None));
+        assert!(!ranked_dense_final_direct_disabled_value(Some(
+            std::ffi::OsStr::new("0")
+        )));
+        assert!(!ranked_dense_final_direct_disabled_value(Some(
+            std::ffi::OsStr::new("true")
+        )));
+        assert!(ranked_dense_final_direct_disabled_value(Some(
+            std::ffi::OsStr::new("1")
+        )));
     }
 
     /// `induce_sumcheck_poly_via_ntt` must be byte-identical to dense across
@@ -14088,6 +15335,120 @@ mod tests {
         (p, v)
     }
 
+    /// Full-prover oracle for dense-final-direct and its low-domain child. Test
+    /// policies reach the production call site on a compact domain. Full
+    /// materialization, retained dense-final with the child killed, and the
+    /// child candidate must emit identical proof/claim bytes; the ordinary
+    /// verifier accepts all three without either override.
+    #[test]
+    fn dense_final_direct_full_proof_claim_and_kill_match() {
+        use crate::challenger::Challenger;
+
+        let log_n = 11;
+        let initial_k = 2;
+        let ks = [2usize, 2];
+        let (prover_config, verifier_config) =
+            ood_test_configs(log_n, initial_k, &ks, vec![0; 3], vec![0; 3]);
+        let mut rng = crate::challenger::RandomChallenger::new(0xD3E5_EF1A_F011_BA5E);
+        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let point: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let basis = build_eq_table(&point);
+        let target = poly
+            .iter()
+            .zip(basis.iter())
+            .map(|(&f, &b)| f * b)
+            .fold(F128::ZERO, |acc, value| acc + value);
+
+        let ntt_0 = AdditiveNttF128::standard(
+            prover_config.initial_log_msg_cols + prover_config.log_inv_rates[0],
+        );
+        let wtns_0 = ligero_commit(
+            &poly,
+            prover_config.initial_log_msg_cols,
+            initial_k,
+            prover_config.log_inv_rates[0],
+            &ntt_0,
+            prover_config.merkle_hash,
+        );
+        let initial_root = wtns_0.root();
+
+        let prove = |dense_final: bool, low_domain_trunc: bool| {
+            with_dense_final_direct_override(dense_final, || {
+                with_dense_low_domain_trunc_override(low_domain_trunc, || {
+                    TEST_DENSE_FINAL_DIRECT_HITS.with(|hits| hits.set(0));
+                    TEST_DENSE_LOW_DOMAIN_TRUNC_FIRST_HITS
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    TEST_DENSE_LOW_DOMAIN_TRUNC_ADD_HITS
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    let mut challenger =
+                        crate::challenger::FsChallenger::new(b"dense-final-direct-proof-oracle");
+                    let proof = recursive_prover_with_basis(
+                        &prover_config,
+                        poly.clone(),
+                        basis.clone(),
+                        target,
+                        &wtns_0.mat,
+                        &wtns_0.tree,
+                        &mut challenger,
+                    );
+                    let dense_hits = TEST_DENSE_FINAL_DIRECT_HITS.with(|hits| hits.get());
+                    let first_hits = TEST_DENSE_LOW_DOMAIN_TRUNC_FIRST_HITS
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let add_hits = TEST_DENSE_LOW_DOMAIN_TRUNC_ADD_HITS
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    (proof, dense_hits, first_hits, add_hits)
+                })
+            })
+        };
+
+        let (materialized, materialized_dense_hits, materialized_first_hits, materialized_add_hits) =
+            prove(false, false);
+        let (dense_kill, dense_kill_hits, dense_kill_first_hits, dense_kill_add_hits) =
+            prove(true, false);
+        let (candidate, candidate_dense_hits, candidate_first_hits, candidate_add_hits) =
+            prove(true, true);
+        assert_eq!(materialized_dense_hits, 0);
+        assert_eq!((materialized_first_hits, materialized_add_hits), (0, 0));
+        assert!(dense_kill_hits > 0, "dense-final kill arm missed induction");
+        assert_eq!((dense_kill_first_hits, dense_kill_add_hits), (0, 0));
+        assert!(candidate_dense_hits > 0, "candidate missed dense induction");
+        assert!(
+            candidate_first_hits > 0,
+            "candidate missed first-query path"
+        );
+        assert!(
+            candidate_add_hits > 0,
+            "candidate missed non-first-query path"
+        );
+        assert_eq!(candidate, dense_kill);
+        assert_eq!(candidate, materialized);
+        assert_eq!(
+            bincode::serialize(&(candidate.clone(), target))
+                .expect("serialize candidate proof/claim"),
+            bincode::serialize(&(dense_kill.clone(), target)).expect("serialize kill proof/claim"),
+        );
+
+        for (label, proof) in [
+            ("candidate", &candidate),
+            ("dense-kill", &dense_kill),
+            ("materialized", &materialized),
+        ] {
+            let mut challenger =
+                crate::challenger::FsChallenger::new(b"dense-final-direct-proof-oracle");
+            assert!(
+                recursive_verifier_with_basis(
+                    &verifier_config,
+                    proof,
+                    &basis,
+                    target,
+                    &initial_root,
+                    &mut challenger,
+                ),
+                "verifier rejected {label} arm"
+            );
+        }
+    }
+
     /// Full-prover oracle for the L2-only integration. A thread-local policy
     /// selects candidate versus the exact kill/control arm on a small domain;
     /// the protocol ordering is otherwise identical to production: L2 OOD,
@@ -14244,6 +15605,95 @@ mod tests {
         for (label, proof) in [("candidate", &candidate), ("kill", &kill)] {
             let mut challenger =
                 crate::challenger::FsChallenger::new(b"l3-lazy-ood-full-proof-oracle");
+            assert!(
+                recursive_verifier_with_basis(
+                    &verifier_config,
+                    proof,
+                    &basis,
+                    target,
+                    &initial_root,
+                    &mut challenger,
+                ),
+                "verifier rejected {label} arm"
+            );
+        }
+    }
+
+    /// Full-prover oracle for the L4-only integration. The compact config
+    /// reaches an OOD sample at recursive index two and leaves one recursive
+    /// fold group to consume it. Candidate and literal-kill arms must emit
+    /// identical proof/claim bytes, hit exactly once, and both verify.
+    #[test]
+    fn factorized_ood_l4_full_proof_claim_and_kill_match() {
+        use crate::challenger::Challenger;
+
+        let log_n = 14;
+        let initial_k = 2;
+        let ks = [2usize, 2, 2, 2];
+        let (prover_config, verifier_config) = ood_test_configs(
+            log_n,
+            initial_k,
+            &ks,
+            vec![0, 0, 0, 0, 1],
+            vec![0, 0, 0, 0, 0],
+        );
+        let mut rng = crate::challenger::RandomChallenger::new(0x4C34_F00D_CAFE_0010);
+        let poly: Vec<F128> = (0..(1usize << log_n)).map(|_| rng.sample_f128()).collect();
+        let point: Vec<F128> = (0..log_n).map(|_| rng.sample_f128()).collect();
+        let basis = build_eq_table(&point);
+        let target = poly
+            .iter()
+            .zip(basis.iter())
+            .map(|(&f, &b)| f * b)
+            .fold(F128::ZERO, |acc, value| acc + value);
+
+        let ntt_0 = AdditiveNttF128::standard(
+            prover_config.initial_log_msg_cols + prover_config.log_inv_rates[0],
+        );
+        let wtns_0 = ligero_commit(
+            &poly,
+            prover_config.initial_log_msg_cols,
+            initial_k,
+            prover_config.log_inv_rates[0],
+            &ntt_0,
+            prover_config.merkle_hash,
+        );
+        let initial_root = wtns_0.root();
+
+        let prove = |candidate: bool| {
+            with_l4_lazy_ood_eq_override(candidate, || {
+                TEST_L4_LAZY_OOD_EQ_HITS.with(|hits| hits.set(0));
+                let mut challenger =
+                    crate::challenger::FsChallenger::new(b"l4-lazy-ood-full-proof-oracle");
+                let proof = recursive_prover_with_basis(
+                    &prover_config,
+                    poly.clone(),
+                    basis.clone(),
+                    target,
+                    &wtns_0.mat,
+                    &wtns_0.tree,
+                    &mut challenger,
+                );
+                let hits = TEST_L4_LAZY_OOD_EQ_HITS.with(|hits| hits.get());
+                (proof, hits)
+            })
+        };
+
+        let (kill, kill_hits) = prove(false);
+        let (candidate, candidate_hits) = prove(true);
+        assert_eq!(kill_hits, 0);
+        assert_eq!(candidate_hits, 1, "candidate must select L4 exactly once");
+        assert_eq!(candidate.ood_values.len(), 1);
+        assert_eq!(candidate, kill);
+        assert_eq!(
+            bincode::serialize(&(candidate.clone(), target))
+                .expect("serialize candidate proof/claim"),
+            bincode::serialize(&(kill.clone(), target)).expect("serialize kill proof/claim"),
+        );
+
+        for (label, proof) in [("candidate", &candidate), ("kill", &kill)] {
+            let mut challenger =
+                crate::challenger::FsChallenger::new(b"l4-lazy-ood-full-proof-oracle");
             assert!(
                 recursive_verifier_with_basis(
                     &verifier_config,
