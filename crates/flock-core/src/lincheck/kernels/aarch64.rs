@@ -1,5 +1,53 @@
 use super::super::{F128, NEON_TILE_T, build_sum_table};
 
+/// Exact rollback for the ranked first-tile accumulator initialization.
+/// Only the literal value `1` restores the incumbent full-partial zero fill
+/// followed by an accumulating first tile.
+pub(crate) const ENV_NO_LINCHECK_FIRST_TILE_INIT: &str = "FLOCK_NO_LINCHECK_FIRST_TILE_INIT";
+
+#[inline]
+fn first_tile_init_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[inline]
+fn first_tile_init_shape_enabled(
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    block16: bool,
+    threads: usize,
+    rollback_value: Option<&std::ffi::OsStr>,
+) -> bool {
+    cfg!(target_os = "macos")
+        && cfg!(target_feature = "sha3")
+        && m == 32
+        && k_log == 14
+        && useful_bits == 15_409
+        && block16
+        && threads == 10
+        && first_tile_init_value_enabled(rollback_value)
+}
+
+#[inline]
+fn ranked_first_tile_init_enabled(
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    block16: bool,
+) -> bool {
+    static ROLLBACK: std::sync::LazyLock<Option<std::ffi::OsString>> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_LINCHECK_FIRST_TILE_INIT));
+    first_tile_init_shape_enabled(
+        m,
+        k_log,
+        useful_bits,
+        block16,
+        rayon::current_num_threads(),
+        ROLLBACK.as_deref(),
+    )
+}
+
 // The SHA3 extension includes EOR3; retain the two-EOR form for generic
 // AArch64 builds that do not enable it.
 #[cfg(target_feature = "sha3")]
@@ -168,20 +216,101 @@ unsafe fn process_block_neon_single<const TILE_T: usize>(
     tables_ptr: *const u8,
     out_ptr: *mut F128,
 ) {
+    process_block_neon_single_core::<TILE_T, false>(row_ptr, row_stride, bs, tables_ptr, out_ptr);
+}
+
+/// First-contribution sibling of [`process_block_neon_single`]. The first
+/// stripe pair seeds every accumulator directly from its two table entries,
+/// so `out_ptr` is write-only and may point at uninitialized storage.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn process_block_neon_single_init<const TILE_T: usize>(
+    row_ptr: *const u8,
+    row_stride: usize,
+    bs: usize,
+    tables_ptr: *const u8,
+    out_ptr: *mut F128,
+) {
+    process_block_neon_single_core::<TILE_T, true>(row_ptr, row_stride, bs, tables_ptr, out_ptr);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn process_block_neon_single_core<const TILE_T: usize, const INIT: bool>(
+    row_ptr: *const u8,
+    row_stride: usize,
+    bs: usize,
+    tables_ptr: *const u8,
+    out_ptr: *mut F128,
+) {
     use std::arch::aarch64::*;
 
     let o = out_ptr as *mut u8;
+    let mut a0;
+    let mut a1;
+    let mut a2;
+    let mut a3;
+    let mut a4;
+    let mut a5;
+    let mut a6;
+    let mut a7;
+    let mut t;
 
-    let mut a0 = vld1q_u8(o);
-    let mut a1 = vld1q_u8(o.add(16));
-    let mut a2 = vld1q_u8(o.add(32));
-    let mut a3 = vld1q_u8(o.add(48));
-    let mut a4 = vld1q_u8(o.add(64));
-    let mut a5 = vld1q_u8(o.add(80));
-    let mut a6 = vld1q_u8(o.add(96));
-    let mut a7 = vld1q_u8(o.add(112));
+    if INIT {
+        debug_assert!(TILE_T >= 2, "INIT needs one complete stripe pair");
+        let stripe0 = row_ptr.add(bs);
+        let stripe1 = row_ptr.add(row_stride + bs);
+        let table0 = tables_ptr;
+        let table1 = tables_ptr.add(256 * 16);
+        let w0 = (stripe0 as *const u64).read_unaligned();
+        let w1 = (stripe1 as *const u64).read_unaligned();
 
-    let mut t = 0;
+        a0 = veorq_u8(
+            vld1q_u8(table0.add((w0 & 0xff) as usize * 16)),
+            vld1q_u8(table1.add((w1 & 0xff) as usize * 16)),
+        );
+        a1 = veorq_u8(
+            vld1q_u8(table0.add(((w0 >> 8) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 8) & 0xff) as usize * 16)),
+        );
+        a2 = veorq_u8(
+            vld1q_u8(table0.add(((w0 >> 16) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 16) & 0xff) as usize * 16)),
+        );
+        a3 = veorq_u8(
+            vld1q_u8(table0.add(((w0 >> 24) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 24) & 0xff) as usize * 16)),
+        );
+        a4 = veorq_u8(
+            vld1q_u8(table0.add(((w0 >> 32) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 32) & 0xff) as usize * 16)),
+        );
+        a5 = veorq_u8(
+            vld1q_u8(table0.add(((w0 >> 40) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 40) & 0xff) as usize * 16)),
+        );
+        a6 = veorq_u8(
+            vld1q_u8(table0.add(((w0 >> 48) & 0xff) as usize * 16)),
+            vld1q_u8(table1.add(((w1 >> 48) & 0xff) as usize * 16)),
+        );
+        a7 = veorq_u8(
+            vld1q_u8(table0.add((w0 >> 56) as usize * 16)),
+            vld1q_u8(table1.add((w1 >> 56) as usize * 16)),
+        );
+        t = 2;
+    } else {
+        a0 = vld1q_u8(o);
+        a1 = vld1q_u8(o.add(16));
+        a2 = vld1q_u8(o.add(32));
+        a3 = vld1q_u8(o.add(48));
+        a4 = vld1q_u8(o.add(64));
+        a5 = vld1q_u8(o.add(80));
+        a6 = vld1q_u8(o.add(96));
+        a7 = vld1q_u8(o.add(112));
+        t = 0;
+    }
     while t + 1 < TILE_T {
         let stripe0 = row_ptr.add(t * row_stride + bs);
         let stripe1 = row_ptr.add((t + 1) * row_stride + bs);
@@ -285,6 +414,285 @@ unsafe fn process_block16_neon_single_sha3(
         "add x8, {row}, {block_start}",
         "lsl x9, {stride}, #1",
         "mov x10, #4",
+        "2:",
+        "ldp x11, x12, [x8]",
+        "add x15, x8, {stride}",
+        "ldp x13, x14, [x15]",
+        "add x15, {table}, #4096",
+
+        "and x16, x11, #0xff",
+        "and x17, x13, #0xff",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v0, v0, v24, v25",
+
+        "ubfx x16, x11, #8, #8",
+        "ubfx x17, x13, #8, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v1, v1, v24, v25",
+
+        "ubfx x16, x11, #16, #8",
+        "ubfx x17, x13, #16, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v2, v2, v24, v25",
+
+        "ubfx x16, x11, #24, #8",
+        "ubfx x17, x13, #24, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v3, v3, v24, v25",
+
+        "ubfx x16, x11, #32, #8",
+        "ubfx x17, x13, #32, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v4, v4, v24, v25",
+
+        "ubfx x16, x11, #40, #8",
+        "ubfx x17, x13, #40, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v5, v5, v24, v25",
+
+        "ubfx x16, x11, #48, #8",
+        "ubfx x17, x13, #48, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v6, v6, v24, v25",
+
+        "lsr x16, x11, #56",
+        "lsr x17, x13, #56",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v7, v7, v24, v25",
+
+        "and x16, x12, #0xff",
+        "and x17, x14, #0xff",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v16, v16, v24, v25",
+
+        "ubfx x16, x12, #8, #8",
+        "ubfx x17, x14, #8, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v17, v17, v24, v25",
+
+        "ubfx x16, x12, #16, #8",
+        "ubfx x17, x14, #16, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v18, v18, v24, v25",
+
+        "ubfx x16, x12, #24, #8",
+        "ubfx x17, x14, #24, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v19, v19, v24, v25",
+
+        "ubfx x16, x12, #32, #8",
+        "ubfx x17, x14, #32, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v20, v20, v24, v25",
+
+        "ubfx x16, x12, #40, #8",
+        "ubfx x17, x14, #40, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v21, v21, v24, v25",
+
+        "ubfx x16, x12, #48, #8",
+        "ubfx x17, x14, #48, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v22, v22, v24, v25",
+
+        "lsr x16, x12, #56",
+        "lsr x17, x14, #56",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor3.16b v23, v23, v24, v25",
+
+        "add x8, x8, x9",
+        "add {table}, {table}, #8192",
+        "subs x10, x10, #1",
+        "b.ne 2b",
+
+        "stp q0, q1, [{dst}]",
+        "stp q2, q3, [{dst}, #32]",
+        "stp q4, q5, [{dst}, #64]",
+        "stp q6, q7, [{dst}, #96]",
+        "stp q16, q17, [{dst}, #128]",
+        "stp q18, q19, [{dst}, #160]",
+        "stp q20, q21, [{dst}, #192]",
+        "stp q22, q23, [{dst}, #224]",
+        row = in(reg) row_ptr,
+        stride = in(reg) row_stride,
+        block_start = in(reg) bs,
+        table = inout(reg) tables_ptr => _,
+        dst = in(reg) out_ptr,
+        out("x8") _,
+        out("x9") _,
+        out("x10") _,
+        out("x11") _,
+        out("x12") _,
+        out("x13") _,
+        out("x14") _,
+        out("x15") _,
+        out("x16") _,
+        out("x17") _,
+        out("v0") _,
+        out("v1") _,
+        out("v2") _,
+        out("v3") _,
+        out("v4") _,
+        out("v5") _,
+        out("v6") _,
+        out("v7") _,
+        out("v16") _,
+        out("v17") _,
+        out("v18") _,
+        out("v19") _,
+        out("v20") _,
+        out("v21") _,
+        out("v22") _,
+        out("v23") _,
+        out("v24") _,
+        out("v25") _,
+        options(nostack),
+    );
+}
+
+/// Write-only first-contribution twin of
+/// [`process_block16_neon_single_sha3`]. The first stripe pair seeds the
+/// sixteen accumulators from its two selected table entries; the remaining
+/// three pairs use the incumbent EOR3 schedule. No destination byte is read.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(never)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn process_block16_neon_single_sha3_init(
+    row_ptr: *const u8,
+    row_stride: usize,
+    bs: usize,
+    tables_ptr: *const u8,
+    out_ptr: *mut F128,
+) {
+    use std::arch::asm;
+
+    asm!(
+        // Seed q0-q7 and q16-q23 from stripe pair (0, 1). Loading table 0
+        // directly into the accumulator leaves only one ordinary EOR with
+        // table 1; this is the same XOR as incumbent EOR3 with a zero dst.
+        "add x8, {row}, {block_start}",
+        "ldp x11, x12, [x8]",
+        "add x15, x8, {stride}",
+        "ldp x13, x14, [x15]",
+        "add x15, {table}, #4096",
+
+        "and x16, x11, #0xff",
+        "and x17, x13, #0xff",
+        "ldr q0, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v0.16b, v0.16b, v24.16b",
+
+        "ubfx x16, x11, #8, #8",
+        "ubfx x17, x13, #8, #8",
+        "ldr q1, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v1.16b, v1.16b, v24.16b",
+
+        "ubfx x16, x11, #16, #8",
+        "ubfx x17, x13, #16, #8",
+        "ldr q2, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v2.16b, v2.16b, v24.16b",
+
+        "ubfx x16, x11, #24, #8",
+        "ubfx x17, x13, #24, #8",
+        "ldr q3, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v3.16b, v3.16b, v24.16b",
+
+        "ubfx x16, x11, #32, #8",
+        "ubfx x17, x13, #32, #8",
+        "ldr q4, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v4.16b, v4.16b, v24.16b",
+
+        "ubfx x16, x11, #40, #8",
+        "ubfx x17, x13, #40, #8",
+        "ldr q5, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v5.16b, v5.16b, v24.16b",
+
+        "ubfx x16, x11, #48, #8",
+        "ubfx x17, x13, #48, #8",
+        "ldr q6, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v6.16b, v6.16b, v24.16b",
+
+        "lsr x16, x11, #56",
+        "lsr x17, x13, #56",
+        "ldr q7, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v7.16b, v7.16b, v24.16b",
+
+        "and x16, x12, #0xff",
+        "and x17, x14, #0xff",
+        "ldr q16, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v16.16b, v16.16b, v24.16b",
+
+        "ubfx x16, x12, #8, #8",
+        "ubfx x17, x14, #8, #8",
+        "ldr q17, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v17.16b, v17.16b, v24.16b",
+
+        "ubfx x16, x12, #16, #8",
+        "ubfx x17, x14, #16, #8",
+        "ldr q18, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v18.16b, v18.16b, v24.16b",
+
+        "ubfx x16, x12, #24, #8",
+        "ubfx x17, x14, #24, #8",
+        "ldr q19, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v19.16b, v19.16b, v24.16b",
+
+        "ubfx x16, x12, #32, #8",
+        "ubfx x17, x14, #32, #8",
+        "ldr q20, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v20.16b, v20.16b, v24.16b",
+
+        "ubfx x16, x12, #40, #8",
+        "ubfx x17, x14, #40, #8",
+        "ldr q21, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v21.16b, v21.16b, v24.16b",
+
+        "ubfx x16, x12, #48, #8",
+        "ubfx x17, x14, #48, #8",
+        "ldr q22, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v22.16b, v22.16b, v24.16b",
+
+        "lsr x16, x12, #56",
+        "lsr x17, x14, #56",
+        "ldr q23, [{table}, x16, lsl #4]",
+        "ldr q24, [x15, x17, lsl #4]",
+        "eor v23.16b, v23.16b, v24.16b",
+
+        // Continue with the unchanged paired accumulator for stripes 2..7.
+        "lsl x9, {stride}, #1",
+        "add x8, x8, x9",
+        "add {table}, {table}, #8192",
+        "mov x10, #3",
         "2:",
         "ldp x11, x12, [x8]",
         "add x15, x8, {stride}",
@@ -614,6 +1022,32 @@ pub fn partial_fold_packed_z_neon_oblock16_padded(
         0,
         usize::MAX,
         true,
+        false,
+    )
+}
+
+/// Compact correctness entry point for the first-tile initializer. Unlike
+/// production, this deliberately accepts small shapes so the INIT schedule
+/// can be compared with the incumbent and independent iblock oracle without
+/// allocating the ranked 512 MiB stripe.
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) fn partial_fold_packed_z_neon_oblock16_first_tile_init_padded(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    oblock_padded_tiled_impl::<NEON_TILE_T>(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        eq_outer,
+        0,
+        usize::MAX,
+        true,
+        true,
     )
 }
 
@@ -696,6 +1130,7 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
         && k_log == 14
         && useful_bits == 15_409
         && std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none();
+    let first_tile_init = ranked_first_tile_init_enabled(m, k_log, useful_bits, block16);
     oblock_padded_tiled_impl::<TILE_T>(
         z_packed,
         m,
@@ -705,6 +1140,7 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
         claim_lo,
         claim_hi,
         block16,
+        first_tile_init,
     )
 }
 
@@ -718,6 +1154,7 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     claim_lo: usize,
     claim_hi: usize,
     block16: bool,
+    first_tile_init: bool,
 ) -> Vec<F128> {
     use rayon::prelude::*;
 
@@ -740,7 +1177,8 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     let n_tiles = n_stripes / TILE_T;
 
     // Only i_inner < useful_bits can be nonzero (padded rows fold to 0). Rounded
-    // up to BLOCK_K; columns [useful, k) stay zero from the partial init.
+    // up to BLOCK_K. With first-tile initialization the useful prefix is
+    // written directly and only columns [useful, k) need explicit zeroing.
     let useful = (useful_bits.div_ceil(BLOCK_K) * BLOCK_K).min(k);
     if useful == 0 {
         return vec![F128::ZERO; k];
@@ -755,9 +1193,10 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     // claim owns a contiguous tile band, builds each of its tile tables
     // exactly once (the property that makes oblock beat iblock), and
     // accumulates into its own private length-k partial. The partial backing
-    // is allocated uninitialized: every claim zeroes exactly its own slot
-    // before its first accumulate, so there is no up-front 16 MiB fault pass
-    // and first-touch lands on whichever core does the work.
+    // is allocated uninitialized. The incumbent zeroes every claim before its
+    // first accumulate. At the exact ranked INIT shape, the first tile writes
+    // the complete useful prefix and only the permanently-zero tail is
+    // cleared; first-touch still lands on the worker that owns the claim.
     const TILES_PER_CLAIM: usize = OBLOCK_TILES_PER_CLAIM;
     let n_claims_total = n_tiles.div_ceil(TILES_PER_CLAIM);
     let claim_hi = claim_hi.min(n_claims_total);
@@ -773,13 +1212,18 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
         let tile_lo = claim * TILES_PER_CLAIM;
         let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
         // SAFETY: the queue hands out each claim index exactly once; claim
-        // `c` exclusively owns `partials[c·k .. (c+1)·k]`, which it fully
-        // zero-initializes below before any read. The queue join publishes
-        // all writes before the reduction reads them.
+        // `c` exclusively owns `partials[c·k .. (c+1)·k]`. The incumbent
+        // zeroes it below; INIT writes every useful slot from the first tile
+        // and zeroes the disjoint tail. The queue join publishes all writes
+        // before the reduction reads them.
         let partial = unsafe { std::slice::from_raw_parts_mut(partials_base.ptr().add(c * k), k) };
         // SAFETY: F128 is Copy and all-zero bytes are valid F128::ZERO.
         unsafe {
-            std::ptr::write_bytes(partial.as_mut_ptr(), 0, k);
+            if first_tile_init {
+                std::ptr::write_bytes(partial.as_mut_ptr().add(useful), 0, k - useful);
+            } else {
+                std::ptr::write_bytes(partial.as_mut_ptr(), 0, k);
+            }
         }
         // TILE_T × 256 F128 tables, L1-resident, built once per tile.
         let mut tables = vec![F128::ZERO; TILE_T * 256];
@@ -794,6 +1238,41 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
             }
             let tables_ptr = tables.as_ptr() as *const u8;
             let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
+
+            if first_tile_init && tile == tile_lo {
+                let mut bs = 0usize;
+                #[cfg(target_feature = "sha3")]
+                if block16 {
+                    while bs + 16 <= useful {
+                        unsafe {
+                            process_block16_neon_single_sha3_init(
+                                z_base,
+                                k,
+                                bs,
+                                tables_ptr,
+                                partial.as_mut_ptr().add(bs),
+                            );
+                        }
+                        bs += 16;
+                    }
+                }
+                #[cfg(not(target_feature = "sha3"))]
+                let _ = block16;
+                while bs < useful {
+                    unsafe {
+                        process_block_neon_single_init::<TILE_T>(
+                            z_base,
+                            k,
+                            bs,
+                            tables_ptr,
+                            partial.as_mut_ptr().add(bs),
+                        );
+                    }
+                    bs += BLOCK_K;
+                }
+                continue;
+            }
+
             let mut bs = 0usize;
             #[cfg(target_feature = "sha3")]
             if block16 {
@@ -840,14 +1319,53 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     // of the fold at m=32, k_log=14.
     let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
     let mut out = vec![F128::ZERO; k];
-    out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
-        let lo = bi * band;
-        for w in 0..n_workers {
-            let src = &partials[w * k + lo..w * k + lo + dst.len()];
-            for (o, s) in dst.iter_mut().zip(src.iter()) {
-                *o += *s;
+    let reduce_len = if first_tile_init { useful } else { k };
+    out[..reduce_len]
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(bi, dst)| {
+            let lo = bi * band;
+            for w in 0..n_workers {
+                let src = &partials[w * k + lo..w * k + lo + dst.len()];
+                for (o, s) in dst.iter_mut().zip(src.iter()) {
+                    *o += *s;
+                }
             }
-        }
-    });
+        });
     out
+}
+
+#[cfg(test)]
+mod first_tile_init_gate_tests {
+    use super::*;
+
+    #[test]
+    fn exact_value_and_ranked_shape_gate() {
+        use std::ffi::OsStr;
+
+        assert!(first_tile_init_value_enabled(None));
+        for value in ["", "0", "01", "true", " 1"] {
+            assert!(first_tile_init_value_enabled(Some(OsStr::new(value))));
+        }
+        assert!(!first_tile_init_value_enabled(Some(OsStr::new("1"))));
+
+        let on = |m, k_log, useful_bits, block16, threads, value: Option<&str>| {
+            first_tile_init_shape_enabled(
+                m,
+                k_log,
+                useful_bits,
+                block16,
+                threads,
+                value.map(OsStr::new),
+            )
+        };
+        let expected = cfg!(target_os = "macos") && cfg!(target_feature = "sha3");
+        assert_eq!(on(32, 14, 15_409, true, 10, None), expected);
+        assert!(!on(31, 14, 15_409, true, 10, None));
+        assert!(!on(32, 13, 15_409, true, 10, None));
+        assert!(!on(32, 14, 15_408, true, 10, None));
+        assert!(!on(32, 14, 15_409, false, 10, None));
+        assert!(!on(32, 14, 15_409, true, 9, None));
+        assert!(!on(32, 14, 15_409, true, 10, Some("1")));
+    }
 }
