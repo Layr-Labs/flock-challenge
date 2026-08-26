@@ -508,6 +508,60 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+/// Fixed 128-bank by 64-lane bank-major fold for the ranked zerocheck AB
+/// completion. Adjacent lanes share a weight load; six raw Karatsuba
+/// components stay live across the complete bank scan, followed by one
+/// paired reduction and two write-only output stores.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `input` must contain exactly
+/// 128 consecutive rows of 64 [`F128`] values.
+#[inline(never)]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_bank_major_128x64_rows2(
+    weight: &[F128; 128],
+    input: &[F128],
+    output: &mut [F128; 64],
+) {
+    unsafe {
+        debug_assert_eq!(input.len(), 128 * 64);
+        let zero = vdupq_n_u64(0);
+        let wp = weight.as_ptr();
+        let xp = input.as_ptr();
+        let out = output.as_mut_ptr();
+
+        let mut lane = 0usize;
+        while lane < 64 {
+            let mut first = KaratsubaNeon {
+                ll: zero,
+                hh: zero,
+                mm: zero,
+            };
+            let mut second = KaratsubaNeon {
+                ll: zero,
+                hh: zero,
+                mm: zero,
+            };
+
+            let mut bank = 0usize;
+            let mut row = xp.add(lane);
+            while bank < 128 {
+                let wk = vld1q_u64(wp.add(bank).cast::<u64>());
+                let first_x = vld1q_u64(row.cast::<u64>());
+                let second_x = vld1q_u64(row.add(1).cast::<u64>());
+                xor_karatsuba_const_pair(&mut first, &mut second, first_x, second_x, wk);
+                bank += 1;
+                row = row.add(64);
+            }
+
+            let reduced = reduce_wide_pair(karatsuba_to_wide(first), karatsuba_to_wide(second));
+            vst1q_u64(out.add(lane).cast::<u64>(), reduced[0]);
+            vst1q_u64(out.add(lane + 1).cast::<u64>(), reduced[1]);
+            lane += 2;
+        }
+    }
+}
+
 /// Deferred-reduction round-zero message `(u_0, u_2)` over paired slots.
 ///
 /// Bitwise-identical to the scalar pair loop: both accumulate
