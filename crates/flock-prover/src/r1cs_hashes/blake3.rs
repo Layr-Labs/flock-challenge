@@ -4904,7 +4904,9 @@ mod tests {
         );
     }
 
-    /// One-proof ranked canary without the benchmark's timing loops.
+    /// Two-proof ranked canary without the benchmark's timing loops. The
+    /// first proof establishes compact-AB backing provenance; the second must
+    /// consume that exact token while preserving the full bundle and claim.
     #[test]
     #[ignore = "ranked canary constructs and verifies one full m=32 proof"]
     fn ranked_blake3_proof_canary() {
@@ -4917,6 +4919,11 @@ mod tests {
         assert!(
             setup.use_ranked_rate2_hot_codeword(),
             "canary must exercise the ranked hot-codeword gate"
+        );
+        assert_eq!(
+            flock_core::zerocheck::univariate_skip_optimized::ab_compact_backing_token_counts(),
+            (0, 0),
+            "filtered canary must start in a fresh process"
         );
 
         // Match `benches/blake3_proof.rs`'s deterministic run-0 input exactly.
@@ -4951,6 +4958,11 @@ mod tests {
             .verify(&commitment, &proof, &mut verifier)
             .expect("ranked preinitialized-codeword proof must verify");
         assert_eq!(verified, claim);
+        assert_eq!(
+            flock_core::zerocheck::univariate_skip_optimized::ab_compact_backing_token_counts(),
+            (0, 1),
+            "warm proof must safely initialize and stage one compact-AB backing"
+        );
 
         // --- Item B (constant-region elision) release-mode canary A/B ---
         // A second identical prove takes the witness allocations back
@@ -4963,14 +4975,25 @@ mod tests {
         let mut prover2 = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
         let (proof2, commitment2, claim2) = setup.prove_fast(&blocks, &mut prover2);
         let proof2_bytes = crate::proof_io::R1csProofBundleLigerito {
-            commitment: commitment2,
-            proof: proof2,
+            commitment: commitment2.clone(),
+            proof: proof2.clone(),
         }
         .to_bytes();
         assert_eq!(claim2, claim);
+        assert_eq!(commitment2.root, commitment.root, "commitment root changed");
         assert_eq!(
             proof_bytes, proof2_bytes,
             "second (token-hit) ranked prove diverged from the first"
+        );
+        let mut verifier2 = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+        let verified2 = setup
+            .verify(&commitment2, &proof2, &mut verifier2)
+            .expect("token-hit ranked proof must verify");
+        assert_eq!(verified2, claim2);
+        assert_eq!(
+            flock_core::zerocheck::univariate_skip_optimized::ab_compact_backing_token_counts(),
+            (1, 1),
+            "timed-shape proof must consume exactly one compact-AB token"
         );
         #[cfg(target_arch = "aarch64")]
         {
