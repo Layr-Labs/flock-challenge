@@ -42,8 +42,71 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 use rayon::prelude::*;
+
+// ---------------------------------------------------------------------------
+// Module-level tunables. The values pinned here match the prior hard-coded
+// behavior byte-for-byte; each knob is wired into an existing site below so a
+// future tuning pass has a single place to change. Tunables that map to no
+// existing code path (worker_pinning) are kept as no-ops for this iteration.
+// ---------------------------------------------------------------------------
+
+/// Per-task batch size handed to rayon's main-pool `with_max_len`. A value of
+/// `1` means every main worker gets its own `worker` task, which is the
+/// pre-tuning shape — fewer run under nested scopes, and the queue tolerates
+/// that by construction.
+const WORK_ITEM_SIZE: usize = 1;
+
+/// Number of chunks a draining worker claims per loop iteration. Each call to
+/// `next.fetch_add(STEAL_BATCH, …)` reserves up to `STEAL_BATCH` chunks; the
+/// inner loop then runs them sequentially on the same thread. `1` is the
+/// pre-tuning single-chunk shape and keeps claim granularity identical.
+const STEAL_BATCH: usize = 1;
+
+/// Park timeout, in microseconds, for the relay thread's condvar wait. A value
+/// of `0` means block indefinitely, which is the pre-tuning shape; the timed
+/// branch is only taken when the knob is non-zero and re-checks `job` after
+/// the wait so the no-timeout case still works.
+const PARK_TIMEOUT_US: u64 = 0;
+
+/// Worker-pinning policy. Currently informational: the relay keeps calling
+/// `set_utility_qos` on helper-pool workers regardless of the variant, so this
+/// knob is a no-op for this iteration. It exists so the enum has a single
+/// landing site and a future patch can branch on it without re-doing plumbing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum WorkerPinning {
+    /// Pin helper workers to `QOS_CLASS_UTILITY` (E-cores on Apple Silicon).
+    Utility = 0,
+    /// Leave QoS alone and inherit the spawning thread's class.
+    None = 1,
+}
+
+const WORKER_PINNING: WorkerPinning = WorkerPinning::Utility;
+
+/// Lower bound on `n_chunks` for an engaged hetero drain. The pre-tuning value
+/// is `8`; the const exists so it has a single home alongside its sibling
+/// knobs.
+const GLOBAL_QUEUE_DRAIN_THRESHOLD: usize = 8;
+
+/// Per-process override layer. Each knob reads `FLOCK_EPOOL_<NAME>` from the
+/// environment once and caches the result; an unset / unparseable variable
+/// keeps the const default. These are the only knobs that change runtime
+/// behavior — a tuning pass flips the env, the source remains the single
+/// source of truth.
+fn env_usize(name: &str, default: usize) -> usize {
+    static CACHE: OnceLock<std::collections::HashMap<String, usize>> = OnceLock::new();
+    let map = CACHE.get_or_init(|| std::env::vars().filter_map(|(k, v)| {
+        v.parse::<usize>().ok().map(|n| (k, n))
+    }).collect());
+    map.get(name).copied().unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env_usize(name, default as usize) as u64
+}
 
 /// Logical efficiency-core count on Apple Silicon macOS, else 0.
 ///
@@ -123,7 +186,11 @@ fn build_epool() -> Option<rayon::ThreadPool> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(n)
         .thread_name(|i| format!("flock-ecore-{i}"))
-        .start_handler(|_| set_utility_qos())
+        .start_handler(|_| {
+            if WORKER_PINNING == WorkerPinning::Utility {
+                set_utility_qos();
+            }
+        })
         .build()
         .ok()
 }
@@ -157,7 +224,7 @@ pub fn helper_pool() -> Option<&'static rayon::ThreadPool> {
 
 /// Don't engage the helper pool below this many chunks: tiny jobs (recursive
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
-const EPOOL_MIN_CHUNKS: usize = 8;
+const EPOOL_MIN_CHUNKS: usize = GLOBAL_QUEUE_DRAIN_THRESHOLD;
 
 /// Process chunks `0..n_chunks` exactly once each, in parallel, drawing from
 /// a shared atomic queue drained by the main rayon pool plus (when present
@@ -329,10 +396,18 @@ impl Relay {
                     if let Some(job) = st.job.take() {
                         break job;
                     }
-                    st = self
-                        .signal
-                        .wait(st)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if PARK_TIMEOUT_US == 0 {
+                        st = self
+                            .signal
+                            .wait(st)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    } else {
+                        let _ = self.signal.wait_timeout(
+                            st,
+                            Duration::from_micros(PARK_TIMEOUT_US),
+                        );
+                        st = relay_lock(&self.state);
+                    }
                 }
             };
             // SAFETY: the posting drain blocks in `PostedJob::drop` until
@@ -431,7 +506,7 @@ pub(crate) fn drain_hetero<B>(
         let posted = AtomicBool::new(false);
         (0..main_threads)
             .into_par_iter()
-            .with_max_len(1)
+            .with_max_len(env_usize("FLOCK_EPOOL_WORK_ITEM_SIZE", WORK_ITEM_SIZE).max(1))
             .for_each(|_| {
                 // Exactly one main worker posts, and only once it is already
                 // inside the drain. The relaxed load keeps every later worker
@@ -457,7 +532,7 @@ pub(crate) fn drain_hetero<B>(
         s.spawn(|| broadcast());
         (0..main_threads)
             .into_par_iter()
-            .with_max_len(1)
+            .with_max_len(env_usize("FLOCK_EPOOL_WORK_ITEM_SIZE", WORK_ITEM_SIZE).max(1))
             .for_each(|_| worker());
     });
 }
@@ -513,7 +588,7 @@ where
             return;
         }
         loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
+            let i = next.fetch_add(STEAL_BATCH, Ordering::Relaxed);
             if i >= n_chunks {
                 break;
             }
@@ -573,22 +648,23 @@ fn run_chunks_with_helper_relay<F>(
         return;
     }
     let next = AtomicUsize::new(0);
+    let steal = env_usize("FLOCK_EPOOL_STEAL_BATCH", STEAL_BATCH).max(1);
     let worker = || {
         loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
+            let i = next.fetch_add(steal, Ordering::Relaxed);
             if i >= n_chunks {
                 break;
             }
             f(i);
         }
     };
-    // Main-pool side: one queue-draining task per worker. `with_max_len(1)`
-    // splits down to single indices so every main worker can pick one up;
+    // Main-pool side: one queue-draining task per worker. `with_max_len(WORK_ITEM_SIZE)`
+    // splits down to that many indices so every main worker can pick one up;
     // under nesting fewer run, which the queue tolerates by construction.
     let drain_main = || {
         (0..main_threads)
             .into_par_iter()
-            .with_max_len(1)
+            .with_max_len(env_usize("FLOCK_EPOOL_WORK_ITEM_SIZE", WORK_ITEM_SIZE).max(1))
             .for_each(|_| worker());
     };
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
@@ -597,7 +673,7 @@ fn run_chunks_with_helper_relay<F>(
             let broadcast = || {
                 ep.broadcast(|_| {
                     loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let i = next.fetch_add(steal, Ordering::Relaxed);
                         if i >= n_chunks {
                             break;
                         }
@@ -653,7 +729,7 @@ fn run_chunks_with_helper_stateful_relay<S, I, F>(
     let worker = || {
         let mut state = init();
         loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
+            let i = next.fetch_add(STEAL_BATCH, Ordering::Relaxed);
             if i >= n_chunks {
                 break;
             }
@@ -663,7 +739,7 @@ fn run_chunks_with_helper_stateful_relay<S, I, F>(
     let drain_main = || {
         (0..main_threads)
             .into_par_iter()
-            .with_max_len(1)
+            .with_max_len(WORK_ITEM_SIZE)
             .for_each(|_| worker());
     };
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
@@ -673,7 +749,7 @@ fn run_chunks_with_helper_stateful_relay<S, I, F>(
                 ep.broadcast(|_| {
                     let mut state = init();
                     loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let i = next.fetch_add(STEAL_BATCH, Ordering::Relaxed);
                         if i >= n_chunks {
                             break;
                         }
