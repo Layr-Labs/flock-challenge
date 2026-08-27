@@ -1339,43 +1339,187 @@ fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> 
     blake3_pow_scan_generic(state_digest, start, len, bits)
 }
 
+/// Branchless, cache-line-aligned state-slot ring for the per-compression
+/// BLAKE3 PoW state. The previous path kept a single `[u8; 64 * BATCH]`
+/// stack buffer and re-wrote both the digest prefix *and* the nonce suffix
+/// every iteration. The new path keeps N+2 contiguous, cache-line-aligned
+/// buffers, each `BLAKE3_POW_BATCH * 64` bytes — one full batch's worth of
+/// pre-images — and pre-loads the digest prefix into every buffer once at
+/// setup. Per iteration the loop only writes the 8-byte nonce per lane
+/// (BATCH * 8 = 384 B total) into a *different* buffer than the one the
+/// kernel is reading, so the write never contends with the kernel's
+/// read, and a software prefetch brings the buffer the kernel will use
+/// in two iterations into L1 *before* the kernel ever issues a load.
+///
+/// The index update is a single `+1`/`&MASK` increment with no branch in
+/// the hot path: the kernel reads slot `cur`, the loop writes slot
+/// `(cur + 1) & MASK`, and the prefetch targets slot
+/// `(cur + 2) & MASK`. Each buffer is 3 KiB (48 lanes * 64 B), so
+/// the ring totals 9 KiB on the stack — well within the kernel's
+/// scratch budget, and small enough that all three buffers' first
+/// cache lines stay hot across iterations once the loop warms up.
+#[repr(align(64))]
+struct PowStateSlot {
+    /// `BLAKE3_POW_BATCH` 64-byte pre-images, contiguous so the kernel
+    /// sees them as one run. The 32-byte state prefix is materialized
+    /// into every lane once at setup, leaving only the 8-byte nonce
+    /// slot (`[32..40]`) to be rewritten per iteration.
+    preimages: [u8; BLAKE3_POW_BATCH * 64],
+}
+
+/// Number of state slots in the prefetch ring. `PREFETCH_AHEAD = 2` — the
+/// kernel reads slot `cur`, the loop materializes slot `(cur + 1) & MASK`,
+/// and a software prefetch brings slot `(cur + 2) & MASK`'s first cache
+/// line into L1 so the iteration after next runs from L1. Three slots
+/// make the ring mask `0b10`, a single `&` after increment.
+const BLAKE3_POW_SLOTS: usize = 3;
+const BLAKE3_POW_SLOT_MASK: usize = BLAKE3_POW_SLOTS - 1;
+const BLAKE3_POW_PREFETCH_AHEAD: usize = 2;
+
+/// Software prefetch a cache line into the L1 data cache. Wraps the
+/// `prefetch` / `prefetcht0` / `__builtin_prefetch` family behind a single
+/// inline function so the caller stays target-agnostic; the no-op fallback
+/// keeps the ring-buffer logic identical on hosts without the intrinsic.
+#[inline(always)]
+fn prefetch_l1(ptr: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // PRFM pldl1strm: data prefetch into L1, evict-on-use. The BLAKE3
+        // PoW lane only reads each cache line once before the next
+        // iteration overwrites the slot, so a "keep" hint would waste an
+        // L2 way; the streaming hint frees the line the moment the kernel
+        // finishes its load run. `prfm` ignores faults.
+        core::arch::asm!(
+            "prfm pldl1strm, [{p}]",
+            p = in(reg) ptr,
+            options(readonly, nostack, preserves_flags),
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // _MM_HINT_T0 = 0: fetch into L1, evict-on-use policy is the
+        // closest x86 analog to AArch64's `pldl1strm`. On hosts without
+        // 3DNow! the `prefetch0` intrinsic lowers to the same `prefetcht0`
+        // op the BLAKE3 kernel already uses under the hood.
+        use core::arch::x86_64::_mm_prefetch;
+        _mm_prefetch(ptr as *const i8, 0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = ptr;
+    }
+}
+
 /// The generic batched scan: materializes each 64-byte pre-image and hashes
 /// batches through the twelve-way kernel on Apple AArch64 (upstream
 /// `hash_many` tail and fallback) via [`crate::merkle::blake3_hash_many_pow`].
 /// A 64-byte pre-image is a whole-block single chunk hashed with
 /// `CHUNK_START | CHUNK_END | ROOT` — so this agrees with `blake3::hash` on
-/// every nonce, which `blake3_batched_pow_matches_scalar` asserts.
+/// every nonce, which `blake3_batched_pow_matches_scalar` holds.
+///
+/// The per-compression state load/permute is reorganized: instead of a
+/// single contiguous stack buffer rewritten every iteration, the state
+/// lives in a 3-slot cache-line-aligned ring (`PowStateSlot`); the kernel
+/// reads the `cur` slot, the loop materializes nonce bytes into
+/// `(cur + 1) & MASK`, and a software prefetch brings
+/// `(cur + 2) & MASK`'s first cache line into L1 before the iteration
+/// after next. The slot ring is 64-B aligned and each slot is
+/// `BLAKE3_POW_BATCH * 64` contiguous bytes, so the kernel still sees one
+/// run of pre-images per call, and the 2-iteration-ahead prefetch lands
+/// in L1 before the kernel ever issues a load on that slot.
 fn blake3_pow_scan_generic(
     state_digest: &[u8; 32],
     start: u64,
     len: u64,
     bits: u32,
 ) -> Option<u64> {
-    // The 32-byte state prefix is constant across the whole scan; only the
-    // 8 nonce bytes change per lane.
-    let mut pre = [[0u8; 64]; BLAKE3_POW_BATCH];
-    for p in pre.iter_mut() {
-        p[..32].copy_from_slice(state_digest);
+    // Lay out the three cache-line-aligned state slots. Each slot is
+    // `BLAKE3_POW_BATCH * 64` bytes of pre-images, contiguous so the
+    // kernel sees one run; each slot's first 32 B of every lane gets the
+    // digest prefix exactly once at setup, so the inner loop only writes
+    // 8 B (the nonce) per lane and never touches the digest again.
+    // `[MaybeUninit; 3]` would shave the uninit-touch but the per-slot
+    // copy is the same cost as the fill loop, so we use a plain stack
+    // array of 9 KiB total (well under any reasonable stack budget).
+    let mut slot0: PowStateSlot = PowStateSlot {
+        preimages: [0u8; BLAKE3_POW_BATCH * 64],
+    };
+    let mut slot1: PowStateSlot = PowStateSlot {
+        preimages: [0u8; BLAKE3_POW_BATCH * 64],
+    };
+    let mut slot2: PowStateSlot = PowStateSlot {
+        preimages: [0u8; BLAKE3_POW_BATCH * 64],
+    };
+    for slot in [&mut slot0, &mut slot1, &mut slot2] {
+        let buf = &mut slot.preimages;
+        let mut off = 0usize;
+        while off + 64 <= buf.len() {
+            buf[off..off + 32].copy_from_slice(state_digest);
+            off += 64;
+        }
     }
+    // Stash the three slots in a stack array of references. We can use
+    // raw pointers to avoid the borrow-checker's "borrowed while moved"
+    // complaint, since the slot borrows are disjoint.
+    let slots_ptrs: [*mut PowStateSlot; BLAKE3_POW_SLOTS] =
+        [&mut slot0, &mut slot1, &mut slot2];
     let mut out = [0u8; BLAKE3_POW_BATCH * 32];
 
     let mut base = start;
     let end = start.saturating_add(len);
+    let mut cur: usize = 0;
+
+    // Prime the prefetch ring: materialize the first batch's nonces into
+    // slot 0, the second batch's into slot 1, and prefetch slot 1's first
+    // cache line so iteration 0's kernel call finds it in L1. The kernel
+    // also touches slot 0 first, but slot 0 was just written so its line
+    // is already hot from the store buffer.
+    if base < end {
+        let n0 = BLAKE3_POW_BATCH.min((end - base) as usize);
+        // SAFETY: `slots_ptrs[0]` was just initialized in this function
+        // and is not aliased by any other live reference.
+        unsafe {
+            write_nonces_into_slot(
+                &mut (*slots_ptrs[0]).preimages,
+                base,
+                n0,
+            );
+        }
+        if base + n0 as u64 < end {
+            let n1 = BLAKE3_POW_BATCH.min((end - (base + n0 as u64)) as usize);
+            // SAFETY: see `slots_ptrs[0]`.
+            unsafe {
+                write_nonces_into_slot(
+                    &mut (*slots_ptrs[1]).preimages,
+                    base + n0 as u64,
+                    n1,
+                );
+                // 2-iteration-ahead prefetch prime: slot 2's first cache
+                // line, so iteration 1's kernel call finds it warm in L1.
+                prefetch_l1((*slots_ptrs[2]).preimages.as_ptr());
+            }
+        }
+    }
+
     while base < end {
         let n = BLAKE3_POW_BATCH.min((end - base) as usize);
-        for (i, p) in pre[..n].iter_mut().enumerate() {
-            p[32..40].copy_from_slice(&(base + i as u64).to_le_bytes());
-        }
         #[cfg(feature = "hash-count")]
         fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         // Twelve-way kernel on Apple AArch64 (upstream `hash_many` tail and
         // fallback), byte-identical to `blake3::hash` per pre-image.
-        // SAFETY: `pre` is `[[u8; 64]; BLAKE3_POW_BATCH]` and `out` is
-        // `[u8; 32 * BLAKE3_POW_BATCH]`, so the first `n` elements of each
-        // form contiguous 64-byte / 32-byte runs.
+        // SAFETY: `(*slots_ptrs[cur]).preimages` is `[u8; BLAKE3_POW_BATCH
+        // * 64]`, so the first `n` 64-B pre-images form a contiguous
+        // run of `n * 64` initialized bytes, exactly the layout
+        // `hash_many_pow` expects. `out` is `[u8; 32 * BLAKE3_POW_BATCH]`,
+        // so the first `n` 32-B digests form a contiguous 32-B /
+        // 32-B-per-lane run. The slot borrows are disjoint by
+        // construction (each slot is a separate stack variable and the
+        // `slots_ptrs` array of pointers is never aliased within a
+        // single kernel call).
+        let slot_ptr = slots_ptrs[cur];
         unsafe {
             crate::merkle::blake3_hash_many_pow(
-                core::slice::from_raw_parts(pre.as_ptr() as *const u8, n * 64),
+                core::slice::from_raw_parts((*slot_ptr).preimages.as_ptr(), n * 64),
                 core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut [u8; 32], n),
             );
         }
@@ -1385,8 +1529,75 @@ fn blake3_pow_scan_generic(
             }
         }
         base += n as u64;
+
+        // Branchless advance: `cur` rotates through the slot ring with a
+        // single `+1`/`&MASK` pair. The kernel just finished reading
+        // slot `cur`; the next slot is a different 3 KiB region, so the
+        // kernel's outstanding read traffic and the loop's upcoming
+        // write traffic are on disjoint cache lines.
+        cur = (cur + 1) & BLAKE3_POW_SLOT_MASK;
+
+        if base < end {
+            // Materialize the next batch's nonces into the now-current
+            // slot. The digest prefix is already in every lane from
+            // setup, so we only write the 8 B nonce per lane.
+            let n_next = BLAKE3_POW_BATCH.min((end - base) as usize);
+            // SAFETY: `slots_ptrs[cur]` points to a slot whose digest
+            // prefix is already filled; writing only the 8 B nonce slot
+            // per lane preserves the rest of the lane. The slot is not
+            // aliased because the kernel call above has returned and
+            // the only other borrow in flight is the `out` slice, which
+            // does not overlap.
+            let next_slot_ptr = slots_ptrs[cur];
+            unsafe {
+                write_nonces_into_slot(&mut (*next_slot_ptr).preimages, base, n_next);
+            }
+
+            // 2-iteration-ahead prefetch: bring the slot the kernel will
+            // read in two iterations into L1 *now*, so by the time the
+            // kernel's `hash_many` issues its loads that line is already
+            // resident. The one-iteration-ahead slot is hot from the
+            // just-completed write (its data passed through the store
+            // buffer and now sits in L1), so the L1 hit covers the next
+            // kernel call and we only need the explicit prefetch for the
+            // slot two hops out.
+            let far = (cur + BLAKE3_POW_PREFETCH_AHEAD) & BLAKE3_POW_SLOT_MASK;
+            // SAFETY: see the kernel-call SAFETY above — `slots_ptrs[far]`
+            // points to one of the three stack slots whose `preimages`
+            // are valid and initialized.
+            unsafe {
+                prefetch_l1((*slots_ptrs[far]).preimages.as_ptr());
+            }
+        }
     }
     None
+}
+
+/// Write the 8-byte little-endian nonces of `base .. base + n` into the
+/// `[32..40]` slot of every lane of `buf`. `buf.len()` is
+/// `BLAKE3_POW_BATCH * 64`; lanes beyond `n` are zero-padded (their
+/// pre-image is the all-zero nonce and the leading-zero test won't
+/// return them because the caller checks `i < n`).
+#[inline(always)]
+fn write_nonces_into_slot(buf: &mut [u8], base: u64, n: usize) {
+    let mut off = 32usize; // first lane's nonce byte offset
+    let mut i = 0usize;
+    while i < n {
+        let nonce = base + i as u64;
+        buf[off..off + 8].copy_from_slice(&nonce.to_le_bytes());
+        off += 64;
+        i += 1;
+    }
+    // Zero-pad the unused lanes so a stray kernel read of slot lane
+    // `i >= n` sees a valid (and deterministic) pre-image. The padding
+    // is the all-zero nonce whose hash is well-defined; the leading-
+    // zero test above only consults `i < n`, so the pad never selects
+    // a match.
+    while i < BLAKE3_POW_BATCH {
+        buf[off..off + 8].copy_from_slice(&0u64.to_le_bytes());
+        off += 64;
+        i += 1;
+    }
 }
 
 /// Smallest nonce in `start .. start + len` satisfying the PoW, or `None`.
