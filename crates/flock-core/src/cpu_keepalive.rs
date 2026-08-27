@@ -38,9 +38,17 @@
 //! The seed-pipe thread calls [`keepalive_stop`] the instant its stdin `read()`
 //! returns — before it forwards the seed byte or starts the speculative prove —
 //! and the timed `prove_fast` call also calls it (idempotently) as a fallback
-//! when the seed pipe is disabled. Stop signals the spin threads and joins
-//! them, so the timed path never shares a core with a keep-alive thread and the
-//! keep-alive never steals a cycle from real proving.
+//! when the seed pipe is disabled. Stop signals the spin threads and waits for
+//! them to finish, so the timed path never shares a core with a keep-alive
+//! thread and the keep-alive never steals a cycle from real proving.
+//!
+//! The wait is **not** a pthread join. Every spin thread is spawned detached
+//! and reaps itself; completion is tracked by a plain atomic live-count that
+//! each thread decrements as its last action. Waiting therefore costs a single
+//! relaxed-load-and-return in the common case (the threads exited while the
+//! seed was being forwarded), instead of the 10–14 sequential `pthread_join`
+//! reaps — tens of microseconds of pure serial time — that a handle-based
+//! design pays inside the front of the timed window.
 //!
 //! # Safety net
 //!
@@ -88,8 +96,9 @@ pub fn keepalive_signal() {
     imp::signal();
 }
 
-/// Join-only half of [`keepalive_stop`]: drain and join any spin threads that
-/// have been signalled. Idempotent; a no-op when nothing was started.
+/// Join-only half of [`keepalive_stop`]: wait until every spin thread has
+/// finished (spawned-detached threads are awaited through the live-count, not
+/// joined). Idempotent; a no-op when nothing was started.
 pub fn keepalive_join() {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     imp::join_all();
@@ -97,9 +106,7 @@ pub fn keepalive_join() {
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod imp {
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::thread::JoinHandle;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     /// Upper bound on how long the keep-alive spins before self-terminating,
@@ -112,10 +119,20 @@ mod imp {
     /// each thread also self-exits past `MAX_KEEPALIVE`.
     static RUNNING: AtomicBool = AtomicBool::new(false);
 
-    /// Join handles for the spawned spin threads. Guarded so `start` (main
-    /// thread) and `stop` (seed-pipe thread and/or timed `prove_fast`) never
-    /// race on it.
-    static HANDLES: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+    /// Spin threads spawned but not yet finished. [`start`] increments before
+    /// each spawn (and re-decrements if the spawn fails); each thread
+    /// decrements itself as its very last action. This replaces handle-based
+    /// joining on the timed path: awaiting quiet costs one load in the common
+    /// case instead of 10–14 sequential `pthread_join` reaps.
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+    /// How long [`join_all`] may wait for the spin threads to notice the stop
+    /// signal before giving up and letting the prove proceed anyway. The
+    /// threads exit within one ~1024-op slice (<1 µs) of the signal; the cap
+    /// only matters if a thread is descheduled at the worst moment, and even
+    /// then the residual overlap risk is identical to a design that never
+    /// waits at all.
+    const QUIET_TIMEOUT: Duration = Duration::from_micros(250);
 
     /// The per-core spin body: proof-irrelevant scalar-integer churn that keeps
     /// the core retiring instructions (so its DVFS clock request stays high)
@@ -144,6 +161,10 @@ mod imp {
             }
         }
         std::hint::black_box(x);
+        // Detached: this thread reaps itself. Dropping the live count as the
+        // last action lets an awaiter observe quiet only after the spin state
+        // is fully abandoned.
+        LIVE.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub(super) fn start() {
@@ -160,83 +181,112 @@ mod imp {
         // Seatbelt profile).
         let n_cores = rayon::current_num_threads().max(1);
         let deadline = Instant::now() + MAX_KEEPALIVE;
-        let mut handles = HANDLES.lock().unwrap_or_else(|e| e.into_inner());
         for i in 0..n_cores {
+            LIVE.fetch_add(1, Ordering::SeqCst);
             match std::thread::Builder::new()
                 .name(format!("flock-keepalive-{i}"))
                 .stack_size(64 * 1024)
                 .spawn(move || spin_until_stopped(deadline))
             {
-                Ok(h) => handles.push(h),
-                Err(_) => break,
+                // Detached on purpose: dropping the join handle frees the
+                // timed path from ever paying a pthread_join. Lifetime is
+                // governed by RUNNING / MAX_KEEPALIVE, and quiet by LIVE.
+                Ok(_) => {}
+                Err(_) => {
+                    LIVE.fetch_sub(1, Ordering::SeqCst);
+                    break;
+                }
             }
         }
     }
 
     pub(super) fn stop() {
-        // Signal first so the threads start winding down before we take the
-        // lock to join them.
+        // Signal first so the threads start winding down before we wait.
         signal();
         join_all();
     }
 
-    /// Clear the run flag without joining. Threads notice within one spin
-    /// slice and exit on their own; the handles stay parked until
-    /// [`join_all`] (or a later [`stop`]) drains them.
+    /// Clear the run flag without waiting. Threads notice within one spin
+    /// slice and exit on their own.
     pub(super) fn signal() {
         RUNNING.swap(false, Ordering::SeqCst);
     }
 
-    /// Drain and join every parked handle. Runs after the seed forward on
-    /// the deferred path, so the sequential joins are off the timed
-    /// window's serial prologue. Idempotent: an empty handle list is a
-    /// no-op, and `start` refuses to run while `RUNNING` is still set.
+    /// Wait until every spin thread has finished. All spin threads are
+    /// spawned detached, so this is an atomic live-count check, not a join:
+    /// on the deferred seed-pipe path the threads have always exited during
+    /// the seed forward, making this a single load-and-return where the old
+    /// handle-drain paid 10–14 sequential joins inside the timed window's
+    /// serial prologue. Bounded by [`QUIET_TIMEOUT`] so a pathologically
+    /// descheduled thread can never stall the prove.
     pub(super) fn join_all() {
-        let drained: Vec<JoinHandle<()>> = {
-            let mut handles = HANDLES.lock().unwrap_or_else(|e| e.into_inner());
-            handles.drain(..).collect()
-        };
-        for h in drained {
-            let _ = h.join();
+        let give_up_at = Instant::now() + QUIET_TIMEOUT;
+        while LIVE.load(Ordering::SeqCst) != 0 {
+            if Instant::now() >= give_up_at {
+                return;
+            }
+            std::hint::spin_loop();
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::sync::Mutex;
 
-        /// start → stop leaves nothing running and no dangling handles.
+        // The module under test is a pair of process-global atomics, so the
+        // tests must not interleave even when `cargo test` runs its default
+        // parallel harness.
+        static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+        /// start → stop leaves nothing running and no live spin threads.
         #[test]
         fn start_then_stop_is_clean() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             start();
             stop();
             assert!(!RUNNING.load(Ordering::SeqCst));
-            assert!(HANDLES.lock().unwrap().is_empty());
+            assert_eq!(LIVE.load(Ordering::SeqCst), 0);
         }
 
         /// stop with nothing running is inert, and a redundant second stop is
         /// likewise inert (idempotent).
         #[test]
         fn stop_without_start_is_noop() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             stop();
             stop();
             assert!(!RUNNING.load(Ordering::SeqCst));
-            assert!(HANDLES.lock().unwrap().is_empty());
+            assert_eq!(LIVE.load(Ordering::SeqCst), 0);
         }
 
         /// The kill switch prevents any thread from being spawned.
         #[test]
         fn kill_switch_spawns_nothing() {
-            // SAFETY: the harness runs these with `--test-threads=1`, so no
-            // other thread reads the env concurrently. Restored before return.
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: serialized by TEST_LOCK, so no other keep-alive test
+            // touches the env concurrently. Restored before return.
             unsafe { std::env::set_var("FLOCK_NO_CPU_KEEPALIVE", "1") };
             start();
-            let empty = HANDLES.lock().unwrap().is_empty();
+            let empty = LIVE.load(Ordering::SeqCst) == 0;
             let stopped = !RUNNING.load(Ordering::SeqCst);
             unsafe { std::env::remove_var("FLOCK_NO_CPU_KEEPALIVE") };
             stop();
             assert!(empty, "kill switch must spawn no keep-alive threads");
             assert!(stopped, "kill switch must leave the run flag clear");
+        }
+
+        /// A start/stop cycle followed by a second start works: detached
+        /// generations are independent, and quiet is observed after each stop.
+        #[test]
+        fn restart_after_stop_is_clean() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            start();
+            stop();
+            start();
+            stop();
+            assert!(!RUNNING.load(Ordering::SeqCst));
+            assert_eq!(LIVE.load(Ordering::SeqCst), 0);
         }
     }
 }
