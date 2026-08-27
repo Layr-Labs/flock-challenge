@@ -2596,10 +2596,13 @@ pub enum RsEqInd {
     /// straight into `b_combined` — avoiding a 2^(m-7) materialize + readback
     /// per claim. `value(j) = deferred_dense_value(eq_lo, eq_hi, table, log2(B), j)`,
     /// `B = eq_lo.len()`; byte-identical to `Dense(fold_b128_elems_split(..))`.
+    /// When a caller-proved direct route makes both factors dead, they may be
+    /// empty and `logical_len` alone preserves the downstream shape contract.
     DeferredDense {
         eq_lo: Vec<F128>,
         eq_hi: Vec<F128>,
         table: Vec<F128>,
+        logical_len: usize,
     },
     Sparse {
         len: usize,
@@ -2621,7 +2624,7 @@ impl RsEqInd {
     pub fn len(&self) -> usize {
         match self {
             Self::Dense(v) => v.len(),
-            Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
+            Self::DeferredDense { logical_len, .. } => *logical_len,
             Self::Sparse { len, .. } => *len,
         }
     }
@@ -2644,6 +2647,7 @@ impl RsEqInd {
                 eq_lo,
                 eq_hi,
                 table,
+                ..
             } => {
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 for (j, o) in out.iter_mut().enumerate() {
@@ -2666,6 +2670,7 @@ impl RsEqInd {
                 eq_lo,
                 eq_hi,
                 table,
+                ..
             } => {
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 let l = eq_lo.len() * eq_hi.len();
@@ -3348,22 +3353,27 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             // bit representation.
                             let suffix = dense_suffixes[d];
                             let n_lo = deferred_split_n_lo(suffix.len());
-                            let (eq_lo, eq_hi) = if elide_basis {
-                                // Only the logical length is observed on the
-                                // direct-fold8 route.  Preserve it exactly
-                                // without evaluating either dead tensor
-                                // factor.
-                                (
-                                    vec![F128::ZERO; 1usize << n_lo],
-                                    vec![F128::ZERO; 1usize << (suffix.len() - n_lo)],
-                                )
+                            if elide_basis {
+                                // Only `len()` is observed on the proven
+                                // all-direct route. Preserve that logical
+                                // shape without allocating or zero-filling
+                                // either dead tensor factor.
+                                RsEqInd::DeferredDense {
+                                    eq_lo: Vec::new(),
+                                    eq_hi: Vec::new(),
+                                    table,
+                                    logical_len: (1usize << n_lo)
+                                        * (1usize << (suffix.len() - n_lo)),
+                                }
                             } else {
-                                build_eq_split(suffix, n_lo)
-                            };
-                            RsEqInd::DeferredDense {
-                                eq_lo,
-                                eq_hi,
-                                table,
+                                let (eq_lo, eq_hi) = build_eq_split(suffix, n_lo);
+                                let logical_len = eq_lo.len() * eq_hi.len();
+                                RsEqInd::DeferredDense {
+                                    eq_lo,
+                                    eq_hi,
+                                    table,
+                                    logical_len,
+                                }
                             }
                         } else {
                             RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
@@ -4585,6 +4595,7 @@ mod tests {
                     eq_lo,
                     eq_hi,
                     table,
+                    ..
                 } => (eq_lo, eq_hi, table),
                 _ => panic!("control claim must be deferred dense"),
             };
@@ -4594,13 +4605,14 @@ mod tests {
                     eq_lo,
                     eq_hi,
                     table,
+                    ..
                 } => (eq_lo, eq_hi, table),
                 _ => panic!("candidate claim must be deferred dense"),
             };
-            assert_eq!(candidate_lo.len(), control_lo.len());
-            assert_eq!(candidate_hi.len(), control_hi.len());
-            assert!(candidate_lo.iter().all(|&value| value == F128::ZERO));
-            assert!(candidate_hi.iter().all(|&value| value == F128::ZERO));
+            assert!(!control_lo.is_empty());
+            assert!(!control_hi.is_empty());
+            assert!(candidate_lo.is_empty());
+            assert!(candidate_hi.is_empty());
             assert_eq!(candidate_table, control_table);
 
             let control_direct = control[claim]
