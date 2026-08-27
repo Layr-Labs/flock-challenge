@@ -2607,6 +2607,15 @@ pub enum RsEqInd {
     },
 }
 
+/// Whether a caller-proved dead deferred basis may skip its factor build.
+/// Read once per process and outside every fold loop.
+#[inline]
+fn rs_elide_dead_basis_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_ELIDE_DEAD_BASIS").is_none());
+    *ON
+}
+
 impl RsEqInd {
     /// Logical length of the underlying vector.
     pub fn len(&self) -> usize {
@@ -2831,6 +2840,38 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     padding: &PaddingSpec,
     challenger: &mut Ch,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
+    prove_batched_padded_with_precomputed_elidable(
+        packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        padding,
+        challenger,
+        false,
+    )
+}
+
+/// As [`prove_batched_padded_with_precomputed`], plus the caller's promise
+/// about how it will consume the result.
+///
+/// `basis_elidable` is a capability, not a shape guess: the caller promises
+/// that, if every claim carries a direct-fold8 bundle and a deferred-dense
+/// `rs_eq_ind`, it will take the direct-fold8 route and never read either
+/// equality factor.  This function independently proves that antecedent from
+/// its own inputs before eliding any work.  Every miss retains the ordinary
+/// factor construction.
+///
+/// When the contract holds, length-correct zero factors replace the unused
+/// `build_eq_split` outputs.  `RsEqInd::len()` therefore remains unchanged;
+/// the direct-fold8 consumer filters every claim before any factor value can
+/// be observed.  `FLOCK_NO_RS_ELIDE_DEAD_BASIS=1` restores the full build.
+pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    padding: &PaddingSpec,
+    challenger: &mut Ch,
+    basis_elidable: bool,
+) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
     let trace =
         std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
@@ -2901,6 +2942,31 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    `fold_1b_rows_split`). Tiny test sizes (len not divisible by 16) fall
     //    back to the materialized tensor + the legacy multi-fold.
     let use_split = l.is_multiple_of(16);
+    // Hoisted above the basis build because the elision proof depends on
+    // whether any claim still needs the ordinary fold.
+    let dense_needs_fold: Vec<usize> = (0..dense_suffixes.len())
+        .filter(|&d| !has_precomputed(dense_to_orig[d]))
+        .collect();
+    let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
+        .filter(|&s| !has_precomputed(sparse_to_orig[s]))
+        .collect();
+    let all_claims_yield_fold8 = use_split
+        && !x_outers.is_empty()
+        && kinds.iter().all(|kind| matches!(kind, Kind::Dense(_)))
+        && dense_suffixes.iter().all(|suffix| suffix.len() >= 6)
+        && (0..n).all(|i| {
+            precomputed_s_hat_v
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|precomputed| precomputed.len() == 64 * n_packed)
+        });
+    let elide_basis = basis_elidable
+        && all_claims_yield_fold8
+        && dense_needs_fold.is_empty()
+        && sparse_needs_fold.is_empty()
+        && crate::pcs::ranked_direct_fold8_enabled()
+        && rs_elide_dead_basis_enabled();
     let t = std::time::Instant::now();
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
@@ -2945,12 +3011,6 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
     //    supplied by the caller. dense_s_hat_v/sparse_s_hat_v are still
     //    indexed by classify-time index `d` / `s`; we splice precomputed
     //    values in at those slots and run the kernel only on the others.
-    let dense_needs_fold: Vec<usize> = (0..dense_suffixes.len())
-        .filter(|&d| !has_precomputed(dense_to_orig[d]))
-        .collect();
-    let sparse_needs_fold: Vec<usize> = (0..sparse_suffixes.len())
-        .filter(|&s| !has_precomputed(sparse_to_orig[s]))
-        .collect();
     let t = std::time::Instant::now();
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
@@ -3287,8 +3347,19 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
                             // `build_eq_split`), and field elements have a unique
                             // bit representation.
                             let suffix = dense_suffixes[d];
-                            let (eq_lo, eq_hi) =
-                                build_eq_split(suffix, deferred_split_n_lo(suffix.len()));
+                            let n_lo = deferred_split_n_lo(suffix.len());
+                            let (eq_lo, eq_hi) = if elide_basis {
+                                // Only the logical length is observed on the
+                                // direct-fold8 route.  Preserve it exactly
+                                // without evaluating either dead tensor
+                                // factor.
+                                (
+                                    vec![F128::ZERO; 1usize << n_lo],
+                                    vec![F128::ZERO; 1usize << (suffix.len() - n_lo)],
+                                )
+                            } else {
+                                build_eq_split(suffix, n_lo)
+                            };
                             RsEqInd::DeferredDense {
                                 eq_lo,
                                 eq_hi,
@@ -4425,6 +4496,129 @@ mod tests {
             }
         }
         assert_eq!(factored, product_oracle);
+    }
+
+    /// A caller-proved dead basis may replace only the unobserved equality
+    /// factors.  The transcript-visible ring messages, gammas, targets, byte
+    /// maps, and direct-fold8 factor states must remain bit-identical, while
+    /// the replacement retains the exact logical basis length.
+    #[test]
+    fn fold8_dead_basis_elision_preserves_live_output_and_length() {
+        use crate::challenger::FsChallenger;
+
+        const M: usize = 17;
+        let mut rng = Rng::new(0xE11D_E8A5_8008);
+        let packed = pack_witness(&rng.bits(1 << M), M);
+        let mut points = [
+            (0..(M - 6)).map(|_| rng.f128()).collect::<Vec<_>>(),
+            (0..(M - 6)).map(|_| rng.f128()).collect::<Vec<_>>(),
+        ];
+        for point in &mut points {
+            for coordinate in point {
+                if *coordinate == F128::ZERO {
+                    *coordinate = F128::ONE;
+                }
+            }
+        }
+
+        let make_fold8 = |point: &[F128]| {
+            let suffix = &point[1..];
+            let eq_tail = build_eq(&suffix[6..]);
+            assert_eq!(64 * eq_tail.len(), packed.len());
+            let n_packed = 1usize << LOG_PACKING;
+            let mut out = vec![F128::ZERO; 64 * n_packed];
+            for (high, &weight) in eq_tail.iter().enumerate() {
+                for bank in 0..64 {
+                    let word = packed[64 * high + bank];
+                    for bit in 0..n_packed {
+                        let live = if bit < 64 {
+                            (word.lo >> bit) & 1
+                        } else {
+                            (word.hi >> (bit - 64)) & 1
+                        };
+                        if live != 0 {
+                            out[bank * n_packed + bit] += weight;
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let fold8 = [make_fold8(&points[0]), make_fold8(&points[1])];
+        let point_refs = [&points[0][..], &points[1][..]];
+        let precomputed = [Some(&fold8[0][..]), Some(&fold8[1][..])];
+        let padding = PaddingSpec::dense(M);
+
+        let mut control_challenger = FsChallenger::new(b"fold8-dead-basis-control");
+        let (control, control_gammas) = prove_batched_padded_with_precomputed_elidable(
+            &packed,
+            &point_refs,
+            &precomputed,
+            &padding,
+            &mut control_challenger,
+            false,
+        );
+        let mut candidate_challenger = FsChallenger::new(b"fold8-dead-basis-control");
+        let (candidate, candidate_gammas) = prove_batched_padded_with_precomputed_elidable(
+            &packed,
+            &point_refs,
+            &precomputed,
+            &padding,
+            &mut candidate_challenger,
+            true,
+        );
+
+        assert_eq!(candidate_gammas, control_gammas);
+        for claim in 0..2 {
+            assert_eq!(candidate[claim].0, control[claim].0);
+            assert_eq!(
+                candidate[claim].1.sumcheck_claim,
+                control[claim].1.sumcheck_claim
+            );
+            assert_eq!(
+                candidate[claim].1.rs_eq_ind.len(),
+                control[claim].1.rs_eq_ind.len()
+            );
+
+            let (control_lo, control_hi, control_table) = match &control[claim].1.rs_eq_ind {
+                RsEqInd::DeferredDense {
+                    eq_lo,
+                    eq_hi,
+                    table,
+                } => (eq_lo, eq_hi, table),
+                _ => panic!("control claim must be deferred dense"),
+            };
+            let (candidate_lo, candidate_hi, candidate_table) = match &candidate[claim].1.rs_eq_ind
+            {
+                RsEqInd::DeferredDense {
+                    eq_lo,
+                    eq_hi,
+                    table,
+                } => (eq_lo, eq_hi, table),
+                _ => panic!("candidate claim must be deferred dense"),
+            };
+            assert_eq!(candidate_lo.len(), control_lo.len());
+            assert_eq!(candidate_hi.len(), control_hi.len());
+            assert!(candidate_lo.iter().all(|&value| value == F128::ZERO));
+            assert!(candidate_hi.iter().all(|&value| value == F128::ZERO));
+            assert_eq!(candidate_table, control_table);
+
+            let control_direct = control[claim]
+                .1
+                .direct_fold8
+                .as_ref()
+                .expect("control fold8 factors");
+            let candidate_direct = candidate[claim]
+                .1
+                .direct_fold8
+                .as_ref()
+                .expect("candidate fold8 factors");
+            assert_eq!(candidate_direct.eq_lo, control_direct.eq_lo);
+            assert_eq!(candidate_direct.eq_hi, control_direct.eq_hi);
+            assert_eq!(candidate_direct.a_state, control_direct.a_state);
+            assert_eq!(candidate_direct.w_state, control_direct.w_state);
+            assert_eq!(candidate_direct.round0, control_direct.round0);
+        }
     }
 
     #[test]

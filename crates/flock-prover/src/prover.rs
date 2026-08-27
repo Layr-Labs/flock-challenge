@@ -812,6 +812,16 @@ fn commit_with_round1_ab_precompute(
             padding,
         )
     };
+    let precompute_ab_replay = || {
+        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune(
+            a_packed,
+            b_packed,
+            pcs_params.m,
+            k_skip,
+            inv_table,
+            padding,
+        )
+    };
     // `Blake3Setup::prove_fast` issues this ticket before call-zero witness
     // generation. A valid cache hit may satisfy it inside the commit arm;
     // otherwise the post-join callback claims it and replays this exact A/B
@@ -875,7 +885,7 @@ fn commit_with_round1_ab_precompute(
             &result.0.1.codeword,
             &result.0.1.merkle_tree,
             || {
-                let replayed = precompute_ab();
+                let replayed = precompute_ab_replay();
                 std::hint::black_box(&replayed);
             },
         );

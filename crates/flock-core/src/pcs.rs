@@ -1045,16 +1045,29 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // 1. Ring-switching for all x_outers.
     let t = std::time::Instant::now();
+    // Consumer-side capability for eliding ring-switch basis factors.  This
+    // is the `direct_common` predicate below, restricted to the ranked Apple
+    // lane and evaluated before ring_switch builds any suffix factors.  The
+    // producer still proves the other half of the contract itself: every
+    // claim must actually yield a direct-fold8 bundle and no ordinary fold may
+    // need the factors.  On any miss it builds the ordinary factors unchanged.
+    let basis_elidable = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && enable_fold2
+        && n_rs == 2
+        && n_pd == 0
+        && packed_witness.len() == (1usize << 25)
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
     let (mut rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
     ) = if n_rs > 0 {
-        ring_switch::prove_batched_padded_with_precomputed(
+        ring_switch::prove_batched_padded_with_precomputed_elidable(
             packed_witness,
             x_outers,
             precomputed_s_hat_v,
             padding,
             challenger,
+            basis_elidable,
         )
     } else {
         (Vec::new(), Vec::new())

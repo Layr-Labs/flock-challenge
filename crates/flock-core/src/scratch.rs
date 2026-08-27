@@ -743,6 +743,21 @@ pub(crate) fn give_hash_tree(v: Vec<crate::merkle::Hash>) {
 /// [`Self::recycle`].
 pub struct ScratchBytes {
     backing: ScratchBytesBacking,
+    /// Whether callers may construct ordinary byte slices over the backing.
+    /// `false` is used when a producer donates a fully allocated F128 region
+    /// to a phase that promises to overwrite every byte: until that producer
+    /// calls [`Self::mark_fully_initialized`], only the raw write pointer is
+    /// available.  This keeps sparse/current-generation holes out of Rust
+    /// references even when a provenance token proves the allocation held
+    /// initialized bytes in an earlier generation.
+    fully_initialized: bool,
+    /// Optional provenance tag attached only after the full-overwrite phase
+    /// has completed and the last reader immediately recycles the backing.
+    release_tag: Option<u64>,
+    /// Separate from byte initialization: a previously initialized Round1
+    /// backing may be read immediately, but it must not mint the R2 token
+    /// until this generation's full R2 overwrite has joined.
+    release_ready: bool,
 }
 
 enum ScratchBytesBacking {
@@ -755,6 +770,22 @@ impl ScratchBytes {
     pub fn take(n: usize) -> Self {
         Self {
             backing: ScratchBytesBacking::U8(take_u8(n)),
+            fully_initialized: true,
+            release_tag: None,
+            release_ready: false,
+        }
+    }
+
+    /// Take byte storage for a producer that will overwrite the complete
+    /// allocation through [`Self::full_overwrite_ptr`]. No ordinary slice may
+    /// be constructed until the producer joins and calls
+    /// [`Self::mark_fully_initialized`].
+    pub(crate) fn take_full_overwrite(n: usize) -> Self {
+        Self {
+            backing: ScratchBytesBacking::U8(take_u8(n)),
+            fully_initialized: false,
+            release_tag: None,
+            release_ready: false,
         }
     }
 
@@ -764,6 +795,44 @@ impl ScratchBytes {
     pub(crate) fn from_initialized_f128(storage: Vec<F128>) -> Self {
         Self {
             backing: ScratchBytesBacking::F128(storage),
+            fully_initialized: true,
+            release_tag: None,
+            release_ready: false,
+        }
+    }
+
+    /// Donate an already initialized F128 backing to a full-overwrite phase.
+    /// Unlike [`Self::from_f128_full_overwrite`], readers may use slices
+    /// immediately (portable R2 therefore needs no pre-clear), while the
+    /// release tag remains unmintable until [`Self::mark_fully_initialized`]
+    /// proves this generation's complete overwrite.
+    pub(crate) fn from_initialized_f128_for_full_overwrite(
+        storage: Vec<F128>,
+        release_tag: u64,
+    ) -> Self {
+        Self {
+            backing: ScratchBytesBacking::F128(storage),
+            fully_initialized: true,
+            release_tag: Some(release_tag),
+            release_ready: false,
+        }
+    }
+
+    /// Donate F128 storage to a byte producer that will overwrite the whole
+    /// allocation before any byte is read.  Unlike
+    /// [`Self::from_initialized_f128`], this constructor deliberately does
+    /// not expose a slice: current-generation sparse holes remain outside the
+    /// reference model until [`Self::mark_fully_initialized`] is called.
+    ///
+    /// `release_tag` is staged only by [`Self::recycle`] and only after the
+    /// full-overwrite transition, so a partial or panicking producer cannot
+    /// mint a false provenance hit.
+    pub(crate) fn from_f128_full_overwrite(storage: Vec<F128>, release_tag: u64) -> Self {
+        Self {
+            backing: ScratchBytesBacking::F128(storage),
+            fully_initialized: false,
+            release_tag: Some(release_tag),
+            release_ready: false,
         }
     }
 
@@ -780,11 +849,69 @@ impl ScratchBytes {
         self.len() == 0
     }
 
+    /// Raw destination for a producer that owns pairwise-disjoint ranges and
+    /// will write all `len()` bytes.  No reference is constructed while the
+    /// backing is in the full-overwrite state.
+    #[inline]
+    pub(crate) fn full_overwrite_ptr(&mut self) -> *mut u8 {
+        match &mut self.backing {
+            ScratchBytesBacking::U8(v) => v.as_mut_ptr(),
+            ScratchBytesBacking::F128(v) => v.as_mut_ptr().cast::<u8>(),
+        }
+    }
+
+    /// Publish completion of the promised full overwrite.
+    ///
+    /// # Safety
+    /// Every one of the allocation's `len()` bytes must have been written
+    /// with a valid object representation, and every concurrent writer must
+    /// have joined with a happens-before edge to this call.
+    #[inline]
+    pub(crate) unsafe fn mark_fully_initialized(&mut self) {
+        self.fully_initialized = true;
+        self.release_ready = true;
+    }
+
+    #[inline]
+    pub(crate) fn is_fully_initialized(&self) -> bool {
+        self.fully_initialized
+    }
+
+    /// Off-target/reference fallback: initialize every byte through the raw
+    /// pointer so scalar code may subsequently use ordinary slices. Ranked
+    /// Apple writers never call this; their kernels already accept raw,
+    /// pairwise-disjoint destinations.
+    pub(crate) fn initialize_zeroed_for_scalar_fallback(&mut self) {
+        if self.fully_initialized || self.is_empty() {
+            return;
+        }
+        // SAFETY: `full_overwrite_ptr` names an allocation of `self.len()`
+        // bytes owned exclusively by `self`; byte zero is a valid F128 object
+        // representation and initializes every byte before any slice exists.
+        unsafe { core::ptr::write_bytes(self.full_overwrite_ptr(), 0, self.len()) };
+        // This only establishes slice validity for the upcoming scalar R2
+        // writer. `release_ready` stays false until that writer fully covers
+        // the allocation and the producer calls `mark_fully_initialized`.
+        self.fully_initialized = true;
+    }
+
     /// Return the allocation to the pool matching its original layout.
-    pub fn recycle(self) {
+    pub fn recycle(mut self) {
+        let release_tag = self.release_tag.take();
         match self.backing {
             ScratchBytesBacking::U8(v) => give_u8(v),
-            ScratchBytesBacking::F128(v) => give_f128(v),
+            ScratchBytesBacking::F128(v) => {
+                if self.fully_initialized
+                    && self.release_ready
+                    && let Some(tag) = release_tag
+                {
+                    // Staging is deliberately adjacent to `give_f128`: no
+                    // code can read or mutate the allocation between the
+                    // full-overwrite consumer's final use and pool custody.
+                    stage_f128_release_token(&v, tag, Vec::new());
+                }
+                give_f128(v)
+            }
         }
     }
 }
@@ -793,6 +920,10 @@ impl Deref for ScratchBytes {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
+        assert!(
+            self.fully_initialized,
+            "ScratchBytes full-overwrite backing read before initialization"
+        );
         match &self.backing {
             ScratchBytesBacking::U8(v) => v,
             ScratchBytesBacking::F128(v) => {
@@ -812,6 +943,10 @@ impl Deref for ScratchBytes {
 
 impl DerefMut for ScratchBytes {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        assert!(
+            self.fully_initialized,
+            "ScratchBytes full-overwrite backing borrowed before initialization"
+        );
         match &mut self.backing {
             ScratchBytesBacking::U8(v) => v,
             ScratchBytesBacking::F128(v) => {
@@ -1018,6 +1153,134 @@ mod tests {
         let (v4, hit) = take_f128_with_token(N / 2, TAG);
         assert!(!hit, "length mismatch must miss");
         give_f128(v4);
+        clear();
+    }
+
+    /// A fresh U8 backing must stay outside the slice model until its raw
+    /// full-range writer has joined and explicitly publishes coverage.
+    #[test]
+    fn fresh_byte_full_overwrite_publishes_only_after_mark() {
+        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
+        const N: usize = 2053;
+        clear();
+
+        let mut bytes = ScratchBytes::take_full_overwrite(N);
+        assert!(!bytes.is_fully_initialized());
+        // SAFETY: one exclusive raw write covers every byte before publish.
+        unsafe {
+            core::ptr::write_bytes(bytes.full_overwrite_ptr(), 0xA5, bytes.len());
+            bytes.mark_fully_initialized();
+        }
+        assert!(bytes.is_fully_initialized());
+        assert!(bytes.iter().all(|&byte| byte == 0xA5));
+        bytes.recycle();
+        clear();
+    }
+
+    /// Paired warmup/timed oracle for the full-overwrite donation seam used by
+    /// round-one AB -> compact round two. The first take misses, the simulated
+    /// R2 writer covers every byte and marks only after its join, recycle
+    /// stages the tag adjacent to give, and the next exact take hits the same
+    /// allocation exactly once.
+    #[test]
+    fn full_overwrite_warm_miss_then_timed_exact_hit() {
+        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
+        const N: usize = 2048;
+        const TAG: u64 = 0xA8F1_2002_7E57_0001;
+        clear();
+
+        let (warm, hit) = take_f128_with_token(N, TAG);
+        assert!(!hit, "cold/warmup allocation must miss provenance");
+        let ptr = warm.as_ptr();
+        let mut r2 = ScratchBytes::from_f128_full_overwrite(warm, TAG);
+        // SAFETY: simulate the two joined R2 writers with one exclusive raw
+        // full-range write; every byte receives a valid F128 representation.
+        unsafe {
+            core::ptr::write_bytes(r2.full_overwrite_ptr(), 0xA5, r2.len());
+            r2.mark_fully_initialized();
+        }
+        // The compact state's final reader would call this immediately after
+        // its last access.
+        r2.recycle();
+
+        let (timed, hit) = take_f128_with_token(N, TAG);
+        assert!(hit, "same-process timed take must observe the R2 token");
+        assert_eq!(timed.as_ptr(), ptr);
+        give_f128(timed);
+        let (consumed, hit) = take_f128_with_token(N, TAG);
+        assert!(!hit, "the timed take consumes the token exactly once");
+        give_f128(consumed);
+        clear();
+    }
+
+    /// An ordinary fully initialized Round1 donation may expose slices on
+    /// portable targets, but it still cannot mint the R2 provenance token
+    /// until the full-overwrite producer explicitly publishes its join.
+    #[test]
+    fn initialized_donation_keeps_release_pending_until_r2_mark() {
+        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
+        const N: usize = 2053;
+        const TAG: u64 = 0xA8F1_2002_7E57_0003;
+        clear();
+
+        let mut pending =
+            ScratchBytes::from_initialized_f128_for_full_overwrite(vec![F128::ONE; N], TAG);
+        assert_eq!(pending.len(), N * core::mem::size_of::<F128>());
+        assert_eq!(
+            pending[0], 1,
+            "initialized donation is immediately readable"
+        );
+        let before = pending[..32].to_vec();
+        pending.initialize_zeroed_for_scalar_fallback();
+        assert_eq!(
+            &pending[..32],
+            before,
+            "portable fallback must not clear it"
+        );
+        pending.recycle();
+        let (same, hit) = take_f128_with_token(N, TAG);
+        assert!(!hit, "slice validity alone must not mint an R2 token");
+
+        let mut completed = ScratchBytes::from_initialized_f128_for_full_overwrite(same, TAG);
+        // SAFETY: model the joined R2 writers with one exclusive full-range
+        // raw write, then publish only after every byte has been covered.
+        unsafe {
+            core::ptr::write_bytes(completed.full_overwrite_ptr(), 0x5A, completed.len());
+            completed.mark_fully_initialized();
+        }
+        completed.recycle();
+        let (timed, hit) = take_f128_with_token(N, TAG);
+        assert!(hit, "only the post-R2 mark may stage provenance");
+        give_f128(timed);
+        clear();
+    }
+
+    /// A false/aborted full-overwrite state must never mint provenance. This
+    /// covers both explicit recycle without `mark` and ordinary unwinding
+    /// (Drop deallocates rather than parking/staging the donation).
+    #[test]
+    fn incomplete_or_panicking_full_overwrite_never_hits() {
+        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
+        const N: usize = 2051;
+        const TAG: u64 = 0xA8F1_2002_7E57_0002;
+        clear();
+
+        let v = vec![F128::ZERO; N];
+        let incomplete = ScratchBytes::from_f128_full_overwrite(v, TAG);
+        incomplete.recycle();
+        let (after_false_recycle, hit) = take_f128_with_token(N, TAG);
+        assert!(!hit, "unmarked recycle must return an untagged allocation");
+        give_f128(after_false_recycle);
+
+        let result = std::panic::catch_unwind(|| {
+            let v = vec![F128::ZERO; N];
+            let _aborted = ScratchBytes::from_f128_full_overwrite(v, TAG);
+            panic!("simulated R2 abort before full coverage");
+        });
+        assert!(result.is_err());
+        let (after_panic, hit) = take_f128_with_token(N, TAG);
+        assert!(!hit, "unwinding before recycle must not stage provenance");
+        give_f128(after_panic);
         clear();
     }
 

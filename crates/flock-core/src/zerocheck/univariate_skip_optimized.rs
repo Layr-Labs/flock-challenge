@@ -105,6 +105,69 @@ pub const SMALL_CHAL_F8: [u8; 3] = [0xF7, 0x53, 0xB5];
 /// `C_s` as an F_8 value. Verified empirically by the C++ project.
 pub const C_S_F8: u8 = 0x1C;
 
+/// Pure selector shared by the two Apple/AES fixed-inverse micro-candidates.
+/// Only a literal `"1"` disables the selected arm.
+#[inline(always)]
+fn apple_inverse_literal_selected(platform_supported: bool, kill: Option<&str>) -> bool {
+    platform_supported && kill != Some("1")
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn medium_challenge_literals_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let kill = std::env::var("FLOCK_NO_ZC_MEDIUM_CONST_LITERALS").ok();
+        apple_inverse_literal_selected(true, kill.as_deref())
+    });
+    *ENABLED
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn medium_challenge_literals_enabled() -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn c_s_inverse_literal_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let kill = std::env::var("FLOCK_NO_ZC_C_S_INV_LITERAL").ok();
+        apple_inverse_literal_selected(true, kill.as_deref())
+    });
+    *ENABLED
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn c_s_inverse_literal_enabled() -> bool {
+    false
+}
+
+const MEDIUM_CHALLENGES_GHASH_LITERAL: [F128; 4] = [
+    F128 {
+        lo: 0xffff_ffff_ffff_ff83,
+        hi: 0xffff_ffff_ffff_ffff,
+    },
+    F128 {
+        lo: 0x5555_5555_5555_557f,
+        hi: 0x5555_5555_5555_5555,
+    },
+    F128 {
+        lo: 0xeeee_eeee_eeee_ee9a,
+        hi: 0xeeee_eeee_eeee_eeee,
+    },
+    F128 {
+        lo: 0xd3d3_d3d3_d3d3_d3b9,
+        hi: 0xd3d3_d3d3_d3d3_d3d3,
+    },
+];
+
+const C_S_INV_GHASH_LITERAL: F128 = F128 {
+    lo: 0x9904_8380_6bff_be0d,
+    hi: 0x71af_641f_08db_d1a0,
+};
+
 /// The constant `C_s = φ_8(0x1C) ∈ F_{2^128}` — the relative scaling factor
 /// between this optimized output and the naive output.
 pub fn c_s_f128() -> F128 {
@@ -125,7 +188,7 @@ pub fn small_challenges_ghash() -> [F128; 3] {
 /// The four F_128 medium challenges `β_i = γ^{2^{i-1}} / (1 + γ^{2^{i-1}})`.
 /// Caller must place these at `r[k_skip+3..k_skip+7]` for the naive
 /// cross-check.
-pub fn medium_challenges_ghash() -> [F128; 4] {
+fn medium_challenges_ghash_reference() -> [F128; 4] {
     let g1 = F128 {
         lo: 1u64 << 1,
         hi: 0,
@@ -148,6 +211,23 @@ pub fn medium_challenges_ghash() -> [F128; 4] {
         g4 * (F128::ONE + g4).inv(),
         g8 * (F128::ONE + g8).inv(),
     ]
+}
+
+pub fn medium_challenges_ghash() -> [F128; 4] {
+    if medium_challenge_literals_enabled() {
+        MEDIUM_CHALLENGES_GHASH_LITERAL
+    } else {
+        medium_challenges_ghash_reference()
+    }
+}
+
+#[inline]
+fn c_s_inv_f128() -> F128 {
+    if c_s_inverse_literal_enabled() {
+        C_S_INV_GHASH_LITERAL
+    } else {
+        c_s_f128().inv()
+    }
 }
 
 /// `C_2 = (1+r_2)(1+r_3)` where `r_2 = φ_8(0x53)` (= `α^2/(1+α^2)`),
@@ -561,6 +641,23 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     kernels::bit_transpose_64bytes(input, output);
 }
 
+/// Provenance class for the large compact-AB backing after round two has
+/// overwritten every byte and its final reader immediately recycles it. The
+/// tag vouches only for full object initialization, never for byte values.
+const AB_COMPACT_R2_FULL_INIT_TAG: u64 = 0xA8F1_2002_0000_0001;
+static AB_COMPACT_BACKING_TOKEN_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static AB_COMPACT_BACKING_TOKEN_MISSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Monotonic receipt for same-process warmup→timed provenance reuse.
+pub fn ab_compact_backing_token_counts() -> (usize, usize) {
+    (
+        AB_COMPACT_BACKING_TOKEN_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        AB_COMPACT_BACKING_TOKEN_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Challenge-independent AB half of the optimized round-1 kernel.
 ///
 /// The storage has exactly the same byte length and block layout as either
@@ -591,7 +688,15 @@ impl Round1AbInner {
     /// Donate the now-dead transform to a byte-oriented scratch consumer
     /// without changing the allocation's element type or deallocation layout.
     pub(crate) fn into_scratch_bytes(mut self) -> crate::scratch::ScratchBytes {
-        crate::scratch::ScratchBytes::from_initialized_f128(core::mem::take(&mut self.storage))
+        // Round1's backing is fully initialized: a cold provenance miss was
+        // raw-zeroed before any slice existed, while a hit names this exact
+        // allocation after a prior full R2 overwrite. R2 may read slices on
+        // portable targets, but cannot mint the next token until its complete
+        // overwrite has joined and called `mark_fully_initialized`.
+        crate::scratch::ScratchBytes::from_initialized_f128_for_full_overwrite(
+            core::mem::take(&mut self.storage),
+            AB_COMPACT_R2_FULL_INIT_TAG,
+        )
     }
 }
 
@@ -697,6 +802,30 @@ pub fn precompute_round1_ab_inner_packed_padded(
     )
 }
 
+/// Full-write scratch arm for the untimed exact-contention replay. It never
+/// consumes or advances compact-backing provenance, so the production arm is
+/// the sole owner of the warmup→timed token lifecycle.
+pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_body(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        false,
+        false,
+    )
+}
+
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
 /// choices, tests compare arms byte-for-byte in one process. `nt` selects the
 /// non-temporal drain vs the incumbent cached store; `compact` selects the
@@ -710,6 +839,23 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     padding: &PaddingSpec,
     nt: bool,
     compact: bool,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_body(
+        a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn precompute_round1_ab_inner_packed_padded_body(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    nt: bool,
+    compact: bool,
+    use_provenance: bool,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -736,17 +882,33 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
-    // Reuse an A-sized resident F128 allocation from the prover scratch pool.
-    // Treating it as bytes is valid under the read contract every consumer
-    // honors: each LIVE byte — rows `[0, n_b_med)` of every `x_outer` chunk —
-    // is written below before it is read. With the QS3 compacted store the
-    // dead tail rows `[n_b_med, 16)` are left recycled/uninitialized; this is
-    // sound because NO consumer ever reads them (all bound their per-`b_med`
-    // reads by the same `n_b_med`, derived from the same `padding`), and round
-    // two rewrites the whole donated buffer before use. The kill switch
-    // `FLOCK_NO_AB_COMPACT_STORE=1` restores the historical invariant "every
-    // byte written below (explicit zero fills for the skipped-b_med holes)".
-    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
+    // Compact stores leave dead tail rows unwritten, yet the completion path
+    // forms ordinary block references spanning those rows. Admit sparse
+    // writes only on an exact allocation returned from a prior full R2
+    // overwrite. A cold miss still has scratch's uninitialized contract, so
+    // raw-zero the complete allocation before constructing any reference and
+    // force the historical full-store arm for that warmup/fail-safe proof.
+    let storage_len = total_bytes / core::mem::size_of::<F128>();
+    let (mut storage, token_hit) = if use_provenance {
+        crate::scratch::take_f128_with_token(storage_len, AB_COMPACT_R2_FULL_INIT_TAG)
+    } else {
+        (crate::scratch::take_f128(storage_len), false)
+    };
+    if use_provenance && token_hit {
+        AB_COMPACT_BACKING_TOKEN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else if use_provenance {
+        AB_COMPACT_BACKING_TOKEN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if !token_hit {
+        // SAFETY: `storage` is exclusively owned and exposes exactly
+        // `total_bytes`; zero is a valid object representation for F128.
+        unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
+    }
+    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+        let (hits, misses) = ab_compact_backing_token_counts();
+        eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
+    }
+    let compact = compact && token_hit;
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
@@ -2412,7 +2574,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     // it before placing the message on the transcript.
     let prefix = r[k_skip];
     let mut res_c_s = [F128::ZERO; ELL];
-    let c_s_inv = c_s_f128().inv();
+    let c_s_inv = c_s_inv_f128();
     for lane in 0..ELL {
         let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
         res_c_s[lane] = c_s_inv * naive;
@@ -2472,7 +2634,7 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     // it before placing the message on the transcript.
     let prefix = r[k_skip];
     let mut res_c_s = [F128::ZERO; ELL];
-    let c_s_inv = c_s_f128().inv();
+    let c_s_inv = c_s_inv_f128();
     for lane in 0..ELL {
         let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
         res_c_s[lane] = c_s_inv * naive;
@@ -3574,6 +3736,40 @@ mod tests {
     use super::*;
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
+
+    #[test]
+    fn apple_fixed_inverse_selectors_are_literal_and_fail_closed() {
+        assert!(apple_inverse_literal_selected(true, None));
+        assert!(apple_inverse_literal_selected(true, Some("0")));
+        assert!(apple_inverse_literal_selected(true, Some("true")));
+        assert!(!apple_inverse_literal_selected(true, Some("1")));
+        assert!(!apple_inverse_literal_selected(false, None));
+        assert!(!apple_inverse_literal_selected(false, Some("0")));
+    }
+
+    #[test]
+    fn apple_fixed_inverse_literals_match_runtime_field_oracles() {
+        let reference_medium = medium_challenges_ghash_reference();
+        assert_eq!(MEDIUM_CHALLENGES_GHASH_LITERAL, reference_medium);
+        assert_eq!(medium_challenges_ghash(), reference_medium);
+
+        for (i, (&beta, shift)) in reference_medium.iter().zip([1u32, 2, 4, 8]).enumerate() {
+            let gamma_power = F128 {
+                lo: 1u64 << shift,
+                hi: 0,
+            };
+            assert_eq!(
+                beta * (F128::ONE + gamma_power),
+                gamma_power,
+                "medium literal {i} must equal gamma^2^i/(1+gamma^2^i)"
+            );
+        }
+
+        let reference_c_s_inv = c_s_f128().inv();
+        assert_eq!(C_S_INV_GHASH_LITERAL, reference_c_s_inv);
+        assert_eq!(c_s_inv_f128(), reference_c_s_inv);
+        assert_eq!(C_S_INV_GHASH_LITERAL * c_s_f128(), F128::ONE);
+    }
 
     /// **Soundness assumption.** Zerocheck and the Ligerito PCS opening at
     /// L0 both depend on the seven "friendly" constants — three small
