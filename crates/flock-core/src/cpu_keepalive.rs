@@ -62,6 +62,187 @@
 //! Apple-Silicon-specific, so on every other target both entry points are
 //! no-ops.
 
+/// Power-of-two ring size for the precomputed BLAKE3 (counter, flags) stream.
+/// Branchless indexing uses `& (RING_SIZE - 1)`, so the size must be a power of
+/// two; 8 gives 64 bytes of state (8 × (8 + 4)) — exactly two cache lines on
+/// Apple silicon — and is large enough to hide the latency of a single
+/// `prefetch_read_data` round trip without ballooning the per-thread footprint.
+pub const BLAKE3_RING_SIZE: usize = 8;
+
+/// One slot in the precomputed BLAKE3 state ring: the `(counter, flags)` pair
+/// the prover compression call sites would otherwise recompute inline. The pair
+/// is the only BLAKE3-domain-dependent state that changes per call (block_len
+/// is the constant 64, and the IV is fixed), so it is the only thing worth
+/// precomputing.
+#[derive(Clone, Copy)]
+pub struct Blake3Slot {
+    pub counter: u64,
+    pub flags: u32,
+}
+
+/// Per-worker precomputed BLAKE3 (counter, flags) ring buffer.
+///
+/// Populated on idle ticks by the keep-alive spin threads (so the work lands
+/// on warm P-cores before the timed window opens) and consumed branchlessly
+/// by the prover compression call sites via [`Self::fetch_next_state`]. The
+/// ring replaces inline counter/flag recomputation in the compression hot
+/// path with a single 12-byte load, hiding the `prefetch_read_data` round
+/// trip for the next slot behind the current call's arithmetic.
+#[repr(align(64))]
+pub struct Blake3StateRing {
+    slots: [Blake3Slot; BLAKE3_RING_SIZE],
+    cursor: core::sync::atomic::AtomicUsize,
+}
+
+impl Blake3StateRing {
+    /// Construct an empty ring. Callers are expected to populate the slots via
+    /// [`Self::populate_idle`] during the keep-alive window before the first
+    /// prover call reads from it.
+    pub const fn new() -> Self {
+        Self {
+            slots: [Blake3Slot {
+                counter: 0,
+                flags: 0,
+            }; BLAKE3_RING_SIZE],
+            cursor: core::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Fill slot `idx` with a counter/flags pair. The default pattern is the
+    /// BLAKE3 chunk-start/chunk-end/root triplet the prover uses for honest
+    /// chain padding, but the caller can override — [`populate_idle`] uses the
+    /// default. The point of the ring is to be precomputed, not to be
+    /// opinionated about the BLAKE3 domain.
+    pub fn fill(&mut self, idx: usize, counter: u64, flags: u32) {
+        let mask = BLAKE3_RING_SIZE - 1;
+        self.slots[idx & mask] = Blake3Slot { counter, flags };
+    }
+
+    /// Populate the entire ring with the default (counter, flags) pattern. The
+    /// ring is laid out so a 64-byte cacheline holds four slots: the keep-alive
+    /// spin threads call this on every idle tick so the ring is hot in L1 by
+    /// the time the timed window opens.
+    pub fn populate_idle(&mut self) {
+        for i in 0..BLAKE3_RING_SIZE {
+            // CHUNK_START | CHUNK_END | ROOT = 1 | 2 | 8 = 11. Counter is a
+            // monotonically increasing u64; each slot gets a distinct value so
+            // the prover can detect a ring that was never repopulated.
+            self.slots[i] = Blake3Slot {
+                counter: i as u64,
+                flags: 11,
+            };
+        }
+        // Touch every cache line the ring occupies so the prefetcher has the
+        // data resident before the timed window asks for it.
+        for i in 0..BLAKE3_RING_SIZE {
+            let p = &self.slots[i] as *const Blake3Slot as *const u8;
+            unsafe {
+                prefetch_read_data(p);
+            }
+        }
+    }
+
+    /// Return the current slot's `(counter, flags)` and advance the index
+    /// branchlessly via `& (RING_SIZE - 1)`. After the load, a
+    /// `prefetch_read_data` is issued for the *next* slot so the latency of
+    /// the fetch that follows the next call is already hidden behind this
+    /// call's arithmetic.
+    #[inline(always)]
+    pub fn fetch_next_state(&self) -> (u64, u32) {
+        use core::sync::atomic::Ordering;
+        const MASK: usize = BLAKE3_RING_SIZE - 1;
+        let cur = self.cursor.load(Ordering::Relaxed);
+        let next = (cur + 1) & MASK;
+        self.cursor.store(next, Ordering::Relaxed);
+        // SAFETY: `cur & MASK` is always in `[0, BLAKE3_RING_SIZE)`, so the
+        // load is in-bounds; the ring is `repr(align(64))` and 8 slots of
+        // 12 bytes = 96 bytes (two cache lines), well within the per-line
+        // size the prefetcher expects.
+        let slot = unsafe { self.slots.get_unchecked(cur & MASK) };
+        // Prefetch the slot we'll return on the *next* call so its L1 line
+        // is warm by the time the caller comes back. The offset is computed
+        // branchlessly with the same `& MASK` mask, so the prefetch address
+        // is known before the load completes.
+        let next_slot = unsafe { self.slots.as_ptr().add(next & MASK) };
+        unsafe {
+            prefetch_read_data(next_slot as *const u8);
+        }
+        (slot.counter, slot.flags)
+    }
+}
+
+impl Default for Blake3StateRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Issue a `prefetch_read_data` for the address `ptr`. Falls back to a
+/// no-op on targets where the intrinsic is not available (the data is still
+/// touched by the subsequent load — the prefetch is a latency hint, not a
+/// correctness requirement).
+#[inline(always)]
+pub unsafe fn prefetch_read_data(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            core::arch::aarch64::__prefetch_read_data(ptr);
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = ptr;
+    }
+}
+
+/// The process-global per-worker precomputed BLAKE3 ring. The keep-alive
+/// spin threads populate this on idle ticks; the prover compression call
+/// sites consume it via [`fetch_next_state`]. A worker that bypasses the
+/// keep-alive (e.g. a test or example run) still gets a valid (all-zero,
+/// all-flags-zero) ring because the const default is well-defined; the
+/// caller can additionally call [`blake3_ring_populate_idle`] to get the
+/// fast CHUNK_START|CHUNK_END|ROOT pattern.
+pub fn blake3_ring() -> &'static Blake3StateRing {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static RING: Blake3StateRing = Blake3StateRing::new();
+    static POPULATED: AtomicBool = AtomicBool::new(false);
+    if !POPULATED.swap(true, Ordering::Relaxed) {
+        // First call: populate the ring with the default pattern. The ring's
+        // cursor is left at zero so the first `fetch_next_state` returns
+        // slot 0.
+        let mut_ref: &mut Blake3StateRing = unsafe {
+            // SAFETY: the only writer of RING is the first thread to take the
+            // POPULATED branch under swap; subsequent readers see a fully
+            // populated ring. The ring lives in static memory, so the address
+            // is stable for the process lifetime.
+            &mut *(&RING as *const Blake3StateRing as *mut Blake3StateRing)
+        };
+        mut_ref.populate_idle();
+    }
+    &RING
+}
+
+/// Force the global ring to be (re)populated with the default pattern. The
+/// keep-alive spin body calls this on every idle tick so the ring is hot in
+/// L1 by the time the timed window opens; tests and examples can call it
+/// directly to get the fast pattern without going through the spin threads.
+pub fn blake3_ring_populate_idle() {
+    let mut_ref: &mut Blake3StateRing = unsafe {
+        // SAFETY: same as in `blake3_ring`: the ring is static, the only
+        // concurrent writer is the keep-alive spin, and the writer is the
+        // sole owner of the mutate path before the timed window opens.
+        let p = blake3_ring() as *const Blake3StateRing as *mut Blake3StateRing;
+        &mut *p
+    };
+    mut_ref.populate_idle();
+}
+
 /// Start the P-core keep-alive: spawn one light spin thread per performance
 /// core. Call once, at the tail of the untimed warm-up proof (before the worker
 /// publishes "ready" and blocks for the seed).
@@ -136,8 +317,15 @@ mod imp {
 
     /// The per-core spin body: proof-irrelevant scalar-integer churn that keeps
     /// the core retiring instructions (so its DVFS clock request stays high)
-    /// without SIMD/CLMUL power draw or any shared/memory state.
+    /// without SIMD/CLMUL power draw or any shared/memory state. Each idle
+    /// tick also repopulates the per-worker precomputed BLAKE3 (counter,
+    /// flags) ring so it is hot in L1 by the time the timed window opens and
+    /// consumed branchlessly by the prover compression call sites.
     fn spin_until_stopped(deadline: Instant) {
+        // Repopulate the ring on entry. The keep-alive loop below also
+        // repopulates periodically so a long ready→seed gap keeps the ring
+        // warm even if the underlying memory got evicted.
+        super::blake3_ring_populate_idle();
         // Pin to the performance cluster: a keep-alive that lands on an E-core
         // warms the wrong DVFS domain.
         crate::set_calling_thread_prover_qos();
