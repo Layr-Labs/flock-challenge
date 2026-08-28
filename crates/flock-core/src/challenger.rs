@@ -27,6 +27,70 @@ use crate::field::F128;
 use crate::hash::HashKind;
 use sha2::{Digest, Sha256};
 
+/// Period (in calls) at which the BLAKE3 header counter wraps back to the
+/// challenger's logical base. Matches BLAKE3's 1024-byte chunk boundary so the
+/// pre-computed header never drifts far from the live state.
+const FLUSH_EVERY: u64 = 1024;
+
+/// Per-thread BLAKE3 header counter, aligned to a full cache line so adjacent
+/// epool lanes don't share the line and bounce it on every increment. The
+/// alignment is platform-specific: 64 B on x86_64 (one cache line), 128 B on
+/// aarch64 (Apple Silicon uses 128-byte cache lines on the performance
+/// cluster). `#[repr(align)]` on a `u64` rounds the slot up to that many
+/// bytes; the extra space is wasted on purpose.
+#[cfg(target_arch = "x86_64")]
+#[repr(align(64))]
+struct BlsCounter {
+    value: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(align(128))]
+struct BlsCounter {
+    value: u64,
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[repr(align(64))]
+struct BlsCounter {
+    value: u64,
+}
+
+impl BlsCounter {
+    const fn new() -> Self {
+        Self { value: 0 }
+    }
+}
+
+// Thread-local counter slot, lazily initialised so the first call from each
+// epool lane starts from zero without a global atomic. `OnceCell` is fine
+// here: it's only touched on lane entry (once per thread), and the counter
+// itself is plain `u64` reads/writes thereafter.
+thread_local! {
+    static BLS_COUNTER: std::cell::OnceCell<BlsCounter> = const { std::cell::OnceCell::new() };
+}
+
+/// Read the current thread-local counter value without incrementing.
+#[inline]
+fn bls_counter_get() -> u64 {
+    BLS_COUNTER.with(|cell| {
+        cell.get_or_init(BlsCounter::new).value
+    })
+}
+
+/// Reset the thread-local counter to `base`. Called every `FLUSH_EVERY`
+/// increments so the pre-computed header can't drift unboundedly from the
+/// challenger's logical state.
+#[inline]
+fn bls_counter_reset(base: u64) {
+    BLS_COUNTER.with(|cell| {
+        let slot = cell.get_or_init(BlsCounter::new);
+        // SAFETY: `slot` is a `&mut` to a thread-local `u64`; no other thread
+        // can observe it, so a plain store is the correct synchronisation.
+        slot.value = base;
+    });
+}
+
 // `Send` supertrait: the verifier runs its PIOP/PCS replay inside a dedicated
 // single-thread rayon pool (see `verifier::verifier_pool`), so the challenger
 // it threads through must be able to cross into that pool. Both concrete
