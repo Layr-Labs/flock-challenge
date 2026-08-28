@@ -94,7 +94,9 @@ impl Mul for F128 {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
             // SAFETY: aes target feature is enabled at compile time.
-            unsafe { aarch64::ghash_mul_binius(self, rhs) }
+            // Four independent PMULLs feed the branchless xor-fold reduction;
+            // hard-stack probe of the PR 1686 port-pressure tradeoff.
+            unsafe { aarch64::ghash_mul_schoolbook(self, rhs) }
         }
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {

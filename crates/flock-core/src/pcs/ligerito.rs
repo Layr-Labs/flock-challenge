@@ -3327,8 +3327,7 @@ fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
     assert!(eighth.is_multiple_of(2));
 
     let layer_1_twiddles = [ntt.twiddle(1, 0), ntt.twiddle(1, 1)];
-    let layer_2_twiddles: [F128; 4] =
-        core::array::from_fn(|block| ntt.twiddle(2, block));
+    let layer_2_twiddles: [F128; 4] = core::array::from_fn(|block| ntt.twiddle(2, block));
     assert_eq!(layer_1_twiddles[0], F128::ZERO);
     assert_eq!(layer_2_twiddles[0], F128::ZERO);
     assert_eq!(
@@ -4449,83 +4448,78 @@ fn transpose_forward_ntt_final_5layer_low_eighth_direct(
     assert_eq!(quarter, 2048);
     assert!(quarter.is_multiple_of(ROW_TILE));
 
-    let layer4_twiddles: [F128; 16] =
-        core::array::from_fn(|block| ntt.twiddle(4, block));
-    let layer3_twiddles: [F128; 8] =
-        core::array::from_fn(|block| ntt.twiddle(3, block));
+    let layer4_twiddles: [F128; 16] = core::array::from_fn(|block| ntt.twiddle(4, block));
+    let layer3_twiddles: [F128; 8] = core::array::from_fn(|block| ntt.twiddle(3, block));
     let data_ptr = data.as_ptr() as usize;
     let mut retained = Vec::<F128>::with_capacity(eighth);
     let retained_ptr = retained.as_mut_ptr() as usize;
 
-    (0..quarter / ROW_TILE)
-        .into_par_iter()
-        .for_each(|tile| {
-            let row_start = tile * ROW_TILE;
-            // Keep one 4 KiB tile-local accumulator. `coset` is deliberately
-            // outside `row`: each arithmetic pass then has four sequential
-            // input streams plus this accumulator, instead of interleaving 32
-            // power-of-two-strided streams that alias the same L1D sets.
-            let mut outputs =
-                [core::mem::MaybeUninit::<[F128; QUARTERS]>::uninit(); ROW_TILE];
-            for coset in 0..COSETS {
-                for local_row in 0..ROW_TILE {
-                    let row = row_start + local_row;
-                    let base = coset * eighth + row;
-                    // SAFETY: `coset < 8`, `quarter = N/32`, and `row < quarter`,
-                    // so all four quarter loads lie in the immutable `N`-field
-                    // input. No output aliases this separately allocated vector.
-                    let (x0, x1, x2, x3) = unsafe {
-                        let ptr = data_ptr as *const F128;
-                        (
-                            *ptr.add(base),
-                            *ptr.add(base + quarter),
-                            *ptr.add(base + 2 * quarter),
-                            *ptr.add(base + 3 * quarter),
-                        )
-                    };
-
-                    let top01 = x0 + x1;
-                    let bottom01 = layer4_twiddles[2 * coset] * top01 + x1;
-                    let top23 = x2 + x3;
-                    let bottom23 = layer4_twiddles[2 * coset + 1] * top23 + x3;
-                    let top0 = top01 + top23;
-                    let top1 = bottom01 + bottom23;
-                    let values = [
-                        top0,
-                        top1,
-                        layer3_twiddles[coset] * top0 + top23,
-                        layer3_twiddles[coset] * top1 + bottom23,
-                    ];
-                    if coset == 0 {
-                        outputs[local_row].write(values);
-                    } else {
-                        // SAFETY: the complete `coset == 0` row pass finishes
-                        // before any later coset begins, initializing every
-                        // tile-local accumulator exactly once.
-                        let row_outputs = unsafe { outputs[local_row].assume_init_mut() };
-                        for output in 0..QUARTERS {
-                            row_outputs[output] += values[output];
-                        }
-                    }
-                }
-            }
-
-            for (local_row, row_outputs) in outputs.iter().enumerate() {
+    (0..quarter / ROW_TILE).into_par_iter().for_each(|tile| {
+        let row_start = tile * ROW_TILE;
+        // Keep one 4 KiB tile-local accumulator. `coset` is deliberately
+        // outside `row`: each arithmetic pass then has four sequential
+        // input streams plus this accumulator, instead of interleaving 32
+        // power-of-two-strided streams that alias the same L1D sets.
+        let mut outputs = [core::mem::MaybeUninit::<[F128; QUARTERS]>::uninit(); ROW_TILE];
+        for coset in 0..COSETS {
+            for local_row in 0..ROW_TILE {
                 let row = row_start + local_row;
-                // SAFETY: all eight coset passes joined in this thread and the
-                // first pass initialized every row before this readback loop.
-                let row_outputs = unsafe { row_outputs.assume_init_ref() };
-                // SAFETY: each tile owns the same disjoint `ROW_TILE` rows in
-                // all four output quarters. The parallel join completes every
-                // write before the vector length becomes observable below.
-                unsafe {
-                    let ptr = retained_ptr as *mut F128;
+                let base = coset * eighth + row;
+                // SAFETY: `coset < 8`, `quarter = N/32`, and `row < quarter`,
+                // so all four quarter loads lie in the immutable `N`-field
+                // input. No output aliases this separately allocated vector.
+                let (x0, x1, x2, x3) = unsafe {
+                    let ptr = data_ptr as *const F128;
+                    (
+                        *ptr.add(base),
+                        *ptr.add(base + quarter),
+                        *ptr.add(base + 2 * quarter),
+                        *ptr.add(base + 3 * quarter),
+                    )
+                };
+
+                let top01 = x0 + x1;
+                let bottom01 = layer4_twiddles[2 * coset] * top01 + x1;
+                let top23 = x2 + x3;
+                let bottom23 = layer4_twiddles[2 * coset + 1] * top23 + x3;
+                let top0 = top01 + top23;
+                let top1 = bottom01 + bottom23;
+                let values = [
+                    top0,
+                    top1,
+                    layer3_twiddles[coset] * top0 + top23,
+                    layer3_twiddles[coset] * top1 + bottom23,
+                ];
+                if coset == 0 {
+                    outputs[local_row].write(values);
+                } else {
+                    // SAFETY: the complete `coset == 0` row pass finishes
+                    // before any later coset begins, initializing every
+                    // tile-local accumulator exactly once.
+                    let row_outputs = unsafe { outputs[local_row].assume_init_mut() };
                     for output in 0..QUARTERS {
-                        ptr.add(output * quarter + row).write(row_outputs[output]);
+                        row_outputs[output] += values[output];
                     }
                 }
             }
-        });
+        }
+
+        for (local_row, row_outputs) in outputs.iter().enumerate() {
+            let row = row_start + local_row;
+            // SAFETY: all eight coset passes joined in this thread and the
+            // first pass initialized every row before this readback loop.
+            let row_outputs = unsafe { row_outputs.assume_init_ref() };
+            // SAFETY: each tile owns the same disjoint `ROW_TILE` rows in
+            // all four output quarters. The parallel join completes every
+            // write before the vector length becomes observable below.
+            unsafe {
+                let ptr = retained_ptr as *mut F128;
+                for output in 0..QUARTERS {
+                    ptr.add(output * quarter + row).write(row_outputs[output]);
+                }
+            }
+        }
+    });
 
     // SAFETY: 32 disjoint tiles initialize all four 2,048-field quarters.
     unsafe { retained.set_len(eighth) };
@@ -4589,9 +4583,7 @@ fn l2_factored_first_moments(values: [F128; 8]) -> (F128, [F128; 3]) {
 /// Total, first-order, and degree-two Boolean moments of the eight `P_c`
 /// values. Pair order is `(0,1), (0,2), (1,2)`.
 #[inline(always)]
-fn l2_factored_second_moments(
-    values: [F128; 8],
-) -> (F128, [F128; 3], [F128; 3]) {
+fn l2_factored_second_moments(values: [F128; 8]) -> (F128, [F128; 3], [F128; 3]) {
     let s01 = values[0] + values[1];
     let s23 = values[2] + values[3];
     let s45 = values[4] + values[5];
@@ -4603,11 +4595,7 @@ fn l2_factored_second_moments(
     let bit0 = (values[1] + values[3]) + odd_hi;
     let bit1 = s23 + s67;
     let pair01 = values[3] + values[7];
-    (
-        total,
-        [bit0, bit1, upper],
-        [pair01, odd_hi, s67],
-    )
+    (total, [bit0, bit1, upper], [pair01, odd_hi, s67])
 }
 
 #[inline(always)]
@@ -4635,10 +4623,8 @@ fn transpose_forward_ntt_final_5layer_factored_tile(
     quarter: usize,
     constants: &L2FactoredFinal5Constants,
 ) {
-    let mut staged = [[[core::mem::MaybeUninit::<F128>::uninit();
-        L2_FACTORED_FINAL5_CHANNELS];
-        L2_FACTORED_FINAL5_ROW_TILE];
-        L2_FACTORED_FINAL5_COSETS];
+    let mut staged = [[[core::mem::MaybeUninit::<F128>::uninit(); L2_FACTORED_FINAL5_CHANNELS];
+        L2_FACTORED_FINAL5_ROW_TILE]; L2_FACTORED_FINAL5_COSETS];
 
     // Coset-major gathering retains the direct parent's four sequential input
     // streams. The four staged channels are P_c, R_c, D_c, and B_{c,1}.
@@ -4681,24 +4667,12 @@ fn transpose_forward_ntt_final_5layer_factored_tile(
 
         let delta_r = constants.delta * r;
 
-        let ap = constants.a[0] * p_i[0]
-            + constants.a[1] * p_i[1]
-            + constants.a[2] * p_i[2];
-        let bp = constants.b[0] * p_i[0]
-            + constants.b[1] * p_i[1]
-            + constants.b[2] * p_i[2];
-        let gp = constants.g[0] * p_i[0]
-            + constants.g[1] * p_i[1]
-            + constants.g[2] * p_i[2];
-        let er = constants.e[0] * r_i[0]
-            + constants.e[1] * r_i[1]
-            + constants.e[2] * r_i[2];
-        let bd = constants.b[0] * d_i[0]
-            + constants.b[1] * d_i[1]
-            + constants.b[2] * d_i[2];
-        let hp = constants.h[0] * p_ij[0]
-            + constants.h[1] * p_ij[1]
-            + constants.h[2] * p_ij[2];
+        let ap = constants.a[0] * p_i[0] + constants.a[1] * p_i[1] + constants.a[2] * p_i[2];
+        let bp = constants.b[0] * p_i[0] + constants.b[1] * p_i[1] + constants.b[2] * p_i[2];
+        let gp = constants.g[0] * p_i[0] + constants.g[1] * p_i[1] + constants.g[2] * p_i[2];
+        let er = constants.e[0] * r_i[0] + constants.e[1] * r_i[1] + constants.e[2] * r_i[2];
+        let bd = constants.b[0] * d_i[0] + constants.b[1] * d_i[1] + constants.b[2] * d_i[2];
+        let hp = constants.h[0] * p_ij[0] + constants.h[1] * p_ij[1] + constants.h[2] * p_ij[2];
 
         let values = [
             p,
@@ -14454,9 +14428,7 @@ mod tests {
                 value
             ))));
         }
-        assert!(ranked_l2_fused_final5_disabled_value(Some(OsStr::new(
-            "1"
-        ))));
+        assert!(ranked_l2_fused_final5_disabled_value(Some(OsStr::new("1"))));
 
         TEST_L2_FUSED_FINAL5_OVERRIDE.with(|slot| assert_eq!(slot.get(), None));
         TEST_L2_FUSED_FINAL5_HITS.with(|hits| hits.set(0));
@@ -14518,13 +14490,13 @@ mod tests {
         use std::ffi::OsStr;
         assert!(!ranked_l2_factored_final5_disabled_value(None));
         for value in ["", "0", "01", "true", "yes"] {
-            assert!(!ranked_l2_factored_final5_disabled_value(Some(
-                OsStr::new(value)
-            )));
+            assert!(!ranked_l2_factored_final5_disabled_value(Some(OsStr::new(
+                value
+            ))));
         }
-        assert!(ranked_l2_factored_final5_disabled_value(Some(
-            OsStr::new("1")
-        )));
+        assert!(ranked_l2_factored_final5_disabled_value(Some(OsStr::new(
+            "1"
+        ))));
 
         TEST_L2_FACTORED_FINAL5_OVERRIDE.with(|slot| assert_eq!(slot.get(), None));
         TEST_L2_FACTORED_FINAL5_HITS.with(|hits| hits.set(0));
@@ -14815,11 +14787,7 @@ mod tests {
 
         for coset in 0..8usize {
             for d in 0..2usize {
-                let mut expanded = if d == 0 {
-                    F128::ZERO
-                } else {
-                    constants.delta
-                };
+                let mut expanded = if d == 0 { F128::ZERO } else { constants.delta };
                 for bit in 0..3 {
                     if ((coset >> bit) & 1) != 0 {
                         expanded += constants.a[bit];
@@ -14900,11 +14868,7 @@ mod tests {
         const EIGHTH: usize = N >> 3;
         const QUARTER: usize = EIGHTH >> 2;
 
-        fn apply_single_layer_reference(
-            ntt: &AdditiveNttF128,
-            data: &mut [F128],
-            layer: usize,
-        ) {
+        fn apply_single_layer_reference(ntt: &AdditiveNttF128, data: &mut [F128], layer: usize) {
             let log_d = data.len().ilog2() as usize;
             let num_blocks = 1usize << layer;
             let block_size = 1usize << (log_d - layer);
@@ -14931,8 +14895,7 @@ mod tests {
                 apply_single_layer_reference(&ntt, &mut expected, layer);
             }
             expected.truncate(EIGHTH);
-            let direct =
-                transpose_forward_ntt_final_5layer_low_eighth_direct(&ntt, &input, LOG_D);
+            let direct = transpose_forward_ntt_final_5layer_low_eighth_direct(&ntt, &input, LOG_D);
             let factored =
                 transpose_forward_ntt_final_5layer_low_eighth_factored(&ntt, &input, LOG_D);
             assert_eq!(factored, expected, "{label}: full-tail oracle mismatch");
@@ -14940,8 +14903,7 @@ mod tests {
             assert_eq!(input, untouched, "{label}: read-only input changed");
         };
 
-        let mut rng =
-            crate::challenger::RandomChallenger::new(0x19A1_5EED_F15E_0071);
+        let mut rng = crate::challenger::RandomChallenger::new(0x19A1_5EED_F15E_0071);
         check(rng.sample_f128_vec(N), "random production domain");
 
         let mut markers = vec![F128::ZERO; N];
@@ -14976,11 +14938,7 @@ mod tests {
         const EIGHTH: usize = N >> 3;
         const QUARTER: usize = EIGHTH >> 2;
 
-        fn apply_single_layer_reference(
-            ntt: &AdditiveNttF128,
-            data: &mut [F128],
-            layer: usize,
-        ) {
+        fn apply_single_layer_reference(ntt: &AdditiveNttF128, data: &mut [F128], layer: usize) {
             let log_d = data.len().ilog2() as usize;
             let num_blocks = 1usize << layer;
             let block_size = 1usize << (log_d - layer);
@@ -15007,14 +14965,12 @@ mod tests {
                 apply_single_layer_reference(&ntt, &mut expected, layer);
             }
             expected.truncate(EIGHTH);
-            let actual =
-                transpose_forward_ntt_final_5layer_low_eighth_direct(&ntt, &input, LOG_D);
+            let actual = transpose_forward_ntt_final_5layer_low_eighth_direct(&ntt, &input, LOG_D);
             assert_eq!(actual, expected, "{label}: direct five-layer tail changed");
             assert_eq!(input, untouched, "{label}: read-only input changed");
         };
 
-        let mut rng =
-            crate::challenger::RandomChallenger::new(0xF15E_5A11_12A8_0071);
+        let mut rng = crate::challenger::RandomChallenger::new(0xF15E_5A11_12A8_0071);
         check(rng.sample_f128_vec(N), "random production domain");
 
         // Exercise every layer-3 coset, every layer-4 quarter, both boundary
@@ -15428,8 +15384,7 @@ mod tests {
             (true, false, true, true),
             (true, true, false, true),
             (true, true, true, false),
-        ]
-        {
+        ] {
             assert!(!select_ranked_l0_factored_final3(
                 exact.0,
                 exact.1,
@@ -15518,7 +15473,11 @@ mod tests {
 
             let mut scalar = values.to_vec();
             transpose_forward_ntt_fused_final_3layer_low_half(&ntt, &mut scalar, 3);
-            assert_eq!(actual.as_slice(), &scalar[..4], "scalar mismatch case={case}");
+            assert_eq!(
+                actual.as_slice(),
+                &scalar[..4],
+                "scalar mismatch case={case}"
+            );
             assert_eq!(&scalar[4..], &values[4..], "dead-half write case={case}");
         }
     }
@@ -15611,7 +15570,10 @@ mod tests {
                     );
 
                 assert_eq!(actual_msg, expected_msg, "log_d={log_d}, case={case}");
-                assert_eq!(factored_msg, expected_msg, "factored msg log_d={log_d}, case={case}");
+                assert_eq!(
+                    factored_msg, expected_msg,
+                    "factored msg log_d={log_d}, case={case}"
+                );
                 assert_eq!(
                     &actual[..n >> 1],
                     &expected[..n >> 1],
@@ -15622,7 +15584,10 @@ mod tests {
                     &before[n >> 1..],
                     "discarded-half write at log_d={log_d}, case={case}",
                 );
-                assert_eq!(factored, actual, "factored bytes log_d={log_d}, case={case}");
+                assert_eq!(
+                    factored, actual,
+                    "factored bytes log_d={log_d}, case={case}"
+                );
             }
         }
 
@@ -15656,20 +15621,18 @@ mod tests {
             let mut control = vec![F128::ZERO; n];
             control[index] = F128::ONE;
             let mut candidate = control.clone();
-            let control_msg =
-                transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
-                    &ntt,
-                    &mut control,
-                    log_d,
-                    &f,
-                );
-            let candidate_msg =
-                transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
-                    &ntt,
-                    &mut candidate,
-                    log_d,
-                    &f,
-                );
+            let control_msg = transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
+                &ntt,
+                &mut control,
+                log_d,
+                &f,
+            );
+            let candidate_msg = transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
+                &ntt,
+                &mut candidate,
+                log_d,
+                &f,
+            );
             assert_eq!(candidate_msg, control_msg, "basis message index={index}");
             assert_eq!(candidate, control, "basis bytes index={index}");
         }
@@ -15682,8 +15645,7 @@ mod tests {
         let log_d = 14usize;
         let n = 1usize << log_d;
         let ntt = AdditiveNttF128::standard(log_d);
-        let mut challenger =
-            crate::challenger::RandomChallenger::new(0x10_FA_C7ED_BACC_E11D);
+        let mut challenger = crate::challenger::RandomChallenger::new(0x10_FA_C7ED_BACC_E11D);
         let mut positions: Vec<usize> = (0..73)
             .map(|i| (i * 197 + i * i * 13 + 17) & (n - 1))
             .collect();
@@ -15745,8 +15707,7 @@ mod tests {
         const N_QUERIES: usize = 218;
         const ALPHA_LEN: usize = 8;
         let block_len = 1usize << (LOG_MSG_COLS + LOG_INV_RATE);
-        let mut challenger =
-            crate::challenger::RandomChallenger::new(0x10_FA_C7ED_5A1E_0001);
+        let mut challenger = crate::challenger::RandomChallenger::new(0x10_FA_C7ED_5A1E_0001);
         let mut queries: Vec<usize> = (0..N_QUERIES)
             .map(|i| (i * 4_801 + i * i * 17 + 29) & (block_len - 1))
             .collect();
@@ -16826,11 +16787,17 @@ mod tests {
         let (candidate, candidate_followup, candidate_parent_hits, candidate_child_hits) =
             prove(true);
         assert_eq!(kill_parent_hits, 1, "kill missed fused-message parent");
-        assert_eq!(candidate_parent_hits, 1, "candidate missed fused-message parent");
+        assert_eq!(
+            candidate_parent_hits, 1,
+            "candidate missed fused-message parent"
+        );
         assert_eq!(kill_child_hits, 0, "kill unexpectedly selected child");
         assert_eq!(candidate_child_hits, 1, "candidate child must run once");
         assert_eq!(candidate, kill, "proof object changed");
-        assert_eq!(candidate_followup, kill_followup, "challenger state changed");
+        assert_eq!(
+            candidate_followup, kill_followup,
+            "challenger state changed"
+        );
         assert_eq!(
             bincode::serialize(&(&candidate, target, initial_root))
                 .expect("serialize candidate proof bundle/claim/root"),
@@ -16843,8 +16810,7 @@ mod tests {
         TEST_L0_FACTORED_FINAL3_OVERRIDE.with(|slot| assert_eq!(slot.get(), None));
 
         for (label, proof) in [("candidate", &candidate), ("child-kill", &kill)] {
-            let mut challenger =
-                crate::challenger::FsChallenger::new(b"l0-factored-final3-proof");
+            let mut challenger = crate::challenger::FsChallenger::new(b"l0-factored-final3-proof");
             assert!(
                 recursive_verifier_with_basis(
                     &verifier_config,
@@ -18280,8 +18246,7 @@ mod tests {
                                     TEST_L2_PRUNED_SPARSE_NTT_HITS.with(|hits| hits.get());
                                 let densify_hits =
                                     TEST_L2_FUSED_DENSIFY_HITS.with(|hits| hits.get());
-                                let child_hits =
-                                    TEST_L2_FUSED_FINAL5_HITS.with(|hits| hits.get());
+                                let child_hits = TEST_L2_FUSED_FINAL5_HITS.with(|hits| hits.get());
                                 (proof, pruned_hits, densify_hits, child_hits)
                             })
                         })
@@ -18309,7 +18274,10 @@ mod tests {
                 .expect("serialize direct-tail-kill proof/claim"),
         );
 
-        for (label, proof) in [("candidate", &candidate), ("fused-densify-child-kill", &kill)] {
+        for (label, proof) in [
+            ("candidate", &candidate),
+            ("fused-densify-child-kill", &kill),
+        ] {
             let mut challenger =
                 crate::challenger::FsChallenger::new(b"l2-fused-final5-full-proof-oracle");
             assert!(
@@ -18386,8 +18354,8 @@ mod tests {
                                         &wtns_0.tree,
                                         &mut challenger,
                                     );
-                                    let pruned_hits = TEST_L2_PRUNED_SPARSE_NTT_HITS
-                                        .with(|hits| hits.get());
+                                    let pruned_hits =
+                                        TEST_L2_PRUNED_SPARSE_NTT_HITS.with(|hits| hits.get());
                                     let densify_hits =
                                         TEST_L2_FUSED_DENSIFY_HITS.with(|hits| hits.get());
                                     let direct_hits =
@@ -18414,10 +18382,7 @@ mod tests {
             "candidate missed fused-densify parent"
         );
         assert_eq!(kill_direct, 1, "kill arm must retain direct-final5 parent");
-        assert_eq!(
-            candidate_direct, 1,
-            "candidate missed direct-final5 parent"
-        );
+        assert_eq!(candidate_direct, 1, "candidate missed direct-final5 parent");
         assert_eq!(kill_child, 0, "factored-tail kill unexpectedly selected");
         assert_eq!(candidate_child, 1, "factored-tail child must select once");
         assert_eq!(candidate, kill);
