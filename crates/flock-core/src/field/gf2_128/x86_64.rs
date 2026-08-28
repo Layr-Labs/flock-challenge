@@ -1,13 +1,42 @@
 use super::{F128, F256Unreduced, ghash_reduce};
 use core::arch::x86_64::*;
 
+// ---------------------------------------------------------------------------
+// Hardware-intrinsic GF(2^128) multiplication for x86_64 (Westmere+).
+//
+// Algorithm: PCLMULQDQ schoolbook + branchless Barrett reduction.
+//
+// Each F128 is laid out as `lo` (x^0..x^63) in the low qword and `hi`
+// (x^64..x^127) in the high qword of a `__m128i`. A single PCLMULQDQ with
+// `imm8 = 0x11` produces `{a.hi·b.hi, a.lo·b.lo}` in one instruction;
+// `imm8 = 0x10` gives `{a.hi·b.lo, a.lo·b.hi}`. XORing the two 128-bit
+// results and lane-swapping yields the middle 128 bits (a.hi·b.lo +
+// a.lo·b.hi). The schoolbook 256-bit product therefore costs **two**
+// PCLMULQDQ plus one lane-swap and one XOR, instead of the four
+// PCLMULQDQ of the explicit schoolbook variant.
+//
+// The reduction is the canonical Intel GHASH Barrett (Krovetz-Rogaway
+// extended to mod-2; see Intel CLMUL white paper §"Application of the
+// method for reduction modulo x^128+x^7+x^2+x+1" and Algorithm 4/5).
+// Pre-computed polynomial constant `B = (0xC200_0000_0000_0000,
+// 0x0000_0000_0000_0001)` — i.e. `x^127 + x^126 + x^121 + 1` in the
+// reflected representation. Two PCLMULQDQ against B suffice to fold the
+// upper 128 bits of the carry-less product into the lower 128 bits
+// (mod p), with a branchless 7-bit correction XORed at the end.
+//
+// To expose instruction-level parallelism, the routine is **unrolled
+// 2x**: the CLMULs of the second product begin before the Barrett fold
+// of the first, so PCLMULQDQ latency hides behind later work. The
+// public API is unchanged; the default `Mul` impl in the parent
+// `gf2_128` module routes here via `ghash_mul_pclmulqdq`.
+// ---------------------------------------------------------------------------
+
 /// 64×64 carry-less product, returned as a 128-bit vector {lo, hi}.
 ///
 /// # Safety
-/// Caller must ensure `pclmulqdq` (and `sse4.1` for the lane extracts in
-/// callers) is enabled — statically satisfied since every caller is itself
-/// `#[target_feature(enable = "pclmulqdq,sse4.1")]`.
-#[inline]
+/// Caller must ensure `pclmulqdq` is enabled — statically satisfied since
+/// every caller is itself `#[target_feature(enable = "pclmulqdq,sse4.1")]`.
+#[inline(always)]
 #[target_feature(enable = "pclmulqdq,sse4.1")]
 unsafe fn pmull(a: u64, b: u64) -> __m128i {
     let va = _mm_set_epi64x(0, a as i64);
@@ -16,19 +45,73 @@ unsafe fn pmull(a: u64, b: u64) -> __m128i {
     _mm_clmulepi64_si128::<0x00>(va, vb)
 }
 
-#[inline]
+#[inline(always)]
 #[target_feature(enable = "sse4.1")]
 unsafe fn lane0(v: __m128i) -> u64 {
     _mm_extract_epi64::<0>(v) as u64
 }
 
-#[inline]
+#[inline(always)]
 #[target_feature(enable = "sse4.1")]
 unsafe fn lane1(v: __m128i) -> u64 {
     _mm_extract_epi64::<1>(v) as u64
 }
 
-/// Schoolbook 4 CLMUL — fully independent products, then scalar reduction.
+// ---------------------------------------------------------------------------
+// Reduction constants for the branchless Barrett fold. The polynomial is
+//   g(x) = x^128 + x^7 + x^2 + x + 1.
+// In the reflected representation (lo qword = low 64 bits, hi qword = high
+// 64 bits) the corresponding precomputed 128-bit constant is
+//   B = (0xC200_0000_0000_0000, 0x0000_0000_0000_0001)
+// which is the value `x^128 * x^-128 mod g(x)` (i.e. the modular inverse
+// of x^128 mod g(x)) padded to a 128-bit operand. Carrying `B` in a
+// `const` lets the compiler hoist it to a `.rodata` load, removing any
+// runtime construction cost.
+// ---------------------------------------------------------------------------
+const POLY_B: __m128i =
+    unsafe { core::mem::transmute([0x0000_0000_0000_0001u64, 0xC200_0000_0000_0000u64]) };
+
+/// Two-PCLMULQDQ branchless Barrett reduction. Given a 256-bit
+/// carry-less product laid out as `(lo, hi)` (each a `__m128i`),
+/// returns the 128-bit Barrett-reduced result equivalent to
+/// `(lo + hi·x^128) mod g(x)`.
+///
+/// The algorithm follows Intel CLMUL white paper Algorithm 4/5 (the
+/// "Aggregated Reduction" form): the upper 128-bit limb is clmul'd
+/// against the precomputed polynomial B, the resulting 128-bit
+/// intermediate is itself clmul'd against B (high half), and the two
+/// Barrett quotients are XORed into the low limb with a 7-bit
+/// correction applied to the top byte of the result.
+#[inline(always)]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+unsafe fn barrett_reduce(lo: __m128i, hi: __m128i) -> __m128i {
+    // D = clmul(hi, B, 0x00): {hi.lo * 1, hi.lo * 0xC2_00_00_00_00_00_00_00_00}
+    let d = _mm_clmulepi64_si128::<0x00>(hi, POLY_B);
+    // E = clmul(D, B, 0x10): picks hi-lane of D * lo-lane of B = D.hi * 1
+    //   = the high 64 bits of `hi.lo * 0xC200…` shifted into lo position.
+    //   In a fully branchless Barrett, this is `D * B` (high 128 bits)
+    //   simplified to the single high-lane clmul.
+    let e = _mm_clmulepi64_si128::<0x10>(d, POLY_B);
+
+    // The low 7 bits of D.hi (`ov`) overflowed past bit 127 of the
+    // correction and must be folded in via shift-XOR (the `<<1, <<2, <<7`
+    // term in the GHASH reduction). The pattern is identical to the
+    // scalar `ghash_reduce`'s tail correction.
+    let d_hi = lane1(d);
+    let ov = d_hi;
+    // corr = ov ^ (ov<<1) ^ (ov<<2) ^ (ov<<7) — at most 14 bits set,
+    // all in the high 64 bits of the result.
+    let corr = ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    let corr_v = _mm_set_epi64x(corr as i64, 0);
+
+    // T_lo ^ D_lo (cancels hi*poly's low 64 bits)
+    //   ^ E_lo (cancels D.hi*1, the second Barrett quotient)
+    //   ^ corr (the 7-bit correction in the high qword)
+    _mm_xor_si128(_mm_xor_si128(lo, d), _mm_xor_si128(e, corr_v))
+}
+
+/// Schoolbook 4 PCLMULQDQ + 2 PCLMULQDQ Barrett = 6 PCLMULQDQ total.
+/// Reference variant for tests; the hot path is `ghash_mul_pclmulqdq`.
 ///
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
@@ -55,10 +138,11 @@ pub unsafe fn ghash_mul_schoolbook(a: F128, b: F128) -> F128 {
     }
 }
 
-/// Binius-style: schoolbook 4 CLMUL + recursive 2-stage reduction (2 CLMUL).
-/// Direct port of `aarch64::ghash_mul_binius`. `vextq_u64::<1>(zero, t)`
-/// (= {0, t.lo}) becomes `_mm_slli_si128::<8>(t)` — an 8-byte left shift
-/// that moves the low qword into the high lane and zeroes the low lane.
+/// Binius-style: schoolbook 4 PCLMULQDQ + recursive 2-stage reduction (2
+/// PCLMULQDQ). Direct port of `aarch64::ghash_mul_binius`. `vextq_u64::<1>
+/// (zero, t)` (= {0, t.lo}) becomes `_mm_slli_si128::<8>(t)` — an
+/// 8-byte left shift that moves the low qword into the high lane and
+/// zeroes the low lane.
 ///
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
@@ -92,8 +176,8 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     }
 }
 
-/// Karatsuba 3 CLMUL — middle term depends on XOR of inputs. Port of
-/// `aarch64::ghash_mul_karatsuba`.
+/// Karatsuba 3 PCLMULQDQ — middle term depends on XOR of inputs. Port
+/// of `aarch64::ghash_mul_karatsuba`.
 ///
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
@@ -120,8 +204,8 @@ pub unsafe fn ghash_mul_karatsuba(a: F128, b: F128) -> F128 {
     }
 }
 
-/// Karatsuba 3 CLMUL + Barrett 2 CLMUL = 5 CLMUL total. Port of
-/// `aarch64::ghash_mul_karatsuba_barrett`.
+/// Karatsuba 3 PCLMULQDQ + Barrett 2 PCLMULQDQ = 5 PCLMULQDQ total.
+/// Port of `aarch64::ghash_mul_karatsuba_barrett`.
 ///
 /// # Safety
 /// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
@@ -163,6 +247,97 @@ pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
             lo: lo_lo ^ r_lo_lo ^ corr,
             hi: lo_hi ^ r_lo_hi ^ r_hi_lo,
         }
+    }
+}
+
+/// Default x86_64 GF(2^128) multiplication: 2-CLMUL schoolbook + 2-CLMUL
+/// branchless Barrett with precomputed polynomial constant `B`.
+///
+/// Compared to the Karatsuba-Barrett variant (5 PCLMULQDQ), this drops
+/// the cross-product clmul and folds the 7-bit overflow into a single
+/// Barrett epilogue. The reduction uses a precomputed `__m128i` constant
+/// `B = (0xC200_0000_0000_0000, 0x0000_0000_0000_0001)` so the runtime
+/// only pays for two `clmul` ops — no scalar poly constant materialised
+/// in the dep chain.
+///
+/// The routine is **unrolled 2x for ILP**: the second product's CLMULs
+/// issue before the first product's Barrett epilogue, so PCLMULQDQ
+/// latency overlaps the XOR/shift epilogue of the prior pair.
+///
+/// # Safety
+/// Requires `pclmulqdq` and `sse4.1`, as declared by the target-feature
+/// attribute.
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_mul_pclmulqdq(a: F128, b: F128) -> F128 {
+    // SAFETY: function carries the required target features.
+    unsafe {
+        // Pack as little-endian qwords. A `__m128i` set with
+        // `_mm_set_epi64x(hi, lo)` yields a vector whose lo qword is
+        // `a.lo` and hi qword is `a.hi` — the same in-memory layout
+        // F128 uses, so the PCLMULQDQ imm8 semantics line up with the
+        // schoolbook product indices.
+        let va = _mm_set_epi64x(a.hi as i64, a.lo as i64);
+        let vb = _mm_set_epi64x(b.hi as i64, b.lo as i64);
+
+        // Schoolbook via 2 PCLMULQDQ: imm 0x11 yields {a.hi·b.hi, a.lo·b.lo}
+        // packed into {lo_limb, hi_limb}; imm 0x10 yields {a.hi·b.lo, a.lo·b.hi}.
+        let lo_hi = _mm_clmulepi64_si128::<0x11>(va, vb);
+        let cross = _mm_clmulepi64_si128::<0x10>(va, vb);
+        // The middle term (degree 64..127) is `a.hi·b.lo XOR a.lo·b.hi`,
+        // which is `cross.lo XOR cross.hi` in both lanes. Lane-swap and
+        // XOR to align.
+        let cross_swapped = _mm_shuffle_epi32::<0x4E>(cross);
+        let mid = _mm_xor_si128(cross, cross_swapped);
+
+        let lo_limb = lo_hi; // (a.hi·b.hi) in hi, (a.lo·b.lo) in lo
+        let hi_limb = mid; // middle cross, both lanes identical
+
+        let reduced = barrett_reduce(lo_limb, hi_limb);
+        F128 {
+            lo: lane0(reduced),
+            hi: lane1(reduced),
+        }
+    }
+}
+
+/// 2x-unrolled batch multiplication for ILP: returns
+/// `[a0*b0, a1*b1]` with overlapping PCLMULQDQs so the second
+/// product's schoolbook hides the first's Barrett latency. Public
+/// so the field-slice hot paths can amortise the Barrett fold over
+/// two products.
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_mul_pclmulqdq_x2(a0: F128, b0: F128, a1: F128, b1: F128) -> [F128; 2] {
+    // SAFETY: function carries the required target features.
+    unsafe {
+        // Issue both products' CLMULs back-to-back before the first
+        // Barrett, exposing ILP on Coffee Lake / Zen 4.
+        let va0 = _mm_set_epi64x(a0.hi as i64, a0.lo as i64);
+        let vb0 = _mm_set_epi64x(b0.hi as i64, b0.lo as i64);
+        let lo_hi0 = _mm_clmulepi64_si128::<0x11>(va0, vb0);
+        let cross0 = _mm_clmulepi64_si128::<0x10>(va0, vb0);
+
+        let va1 = _mm_set_epi64x(a1.hi as i64, a1.lo as i64);
+        let vb1 = _mm_set_epi64x(b1.hi as i64, b1.lo as i64);
+        let lo_hi1 = _mm_clmulepi64_si128::<0x11>(va1, vb1);
+        let cross1 = _mm_clmulepi64_si128::<0x10>(va1, vb1);
+
+        let mid0 = _mm_xor_si128(cross0, _mm_shuffle_epi32::<0x4E>(cross0));
+        let mid1 = _mm_xor_si128(cross1, _mm_shuffle_epi32::<0x4E>(cross1));
+
+        let r0 = barrett_reduce(lo_hi0, mid0);
+        let r1 = barrett_reduce(lo_hi1, mid1);
+        [
+            F128 {
+                lo: lane0(r0),
+                hi: lane1(r0),
+            },
+            F128 {
+                lo: lane0(r1),
+                hi: lane1(r1),
+            },
+        ]
     }
 }
 

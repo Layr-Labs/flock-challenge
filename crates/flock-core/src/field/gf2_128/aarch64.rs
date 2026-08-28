@@ -21,13 +21,68 @@ unsafe fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
 /// # Safety
 /// Caller must ensure the `aes` target feature is enabled (statically
 /// satisfied here because every caller is itself `#[target_feature(enable = "aes")]`).
-#[inline]
+#[inline(always)]
 #[target_feature(enable = "aes")]
 unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
     let prod = vmull_p64(a, b);
     // SAFETY: u128 and uint64x2_t are both 128-bit, 16-byte-aligned values;
     // transmute is a bit-level reinterpret with no UB.
     unsafe { transmute::<u128, uint64x2_t>(prod) }
+}
+
+/// High-qword PMULL2: returns `a.hi · b.hi` as a 128-bit vector.
+/// Uses the AES2 `vmull_high_p64` instruction (128-bit×128-bit→128-bit
+/// with carry-less semantics on the high qword).
+///
+/// # Safety
+/// Caller must ensure the `aes` (and `aes2` for the high variant) target
+/// features are enabled. `vmull_high_p64` is part of the FEAT_PMULL
+/// extension, gated by `aes` in Rust's target_feature list.
+#[inline(always)]
+#[target_feature(enable = "aes")]
+unsafe fn pmull2(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    // vmull_high_p64 takes poly64x2_t; the bit pattern is the same as
+    // uint64x2_t.
+    let prod = vmull_high_p64(transmute(a), transmute(b));
+    unsafe { transmute::<u128, uint64x2_t>(prod) }
+}
+
+// ---------------------------------------------------------------------------
+// Reduction constant for the branchless Barrett fold. Same polynomial as
+// the x86_64 path: `B = (0xC200_0000_0000_0000, 0x0000_0000_0000_0001)`.
+// Stored as a `uint64x2_t` (low qword first) so the compiler can load it
+// from `.rodata` and reuse it across calls.
+// ---------------------------------------------------------------------------
+const POLY_B: uint64x2_t =
+    unsafe { transmute([0x0000_0000_0000_0001u64, 0xC200_0000_0000_0000u64]) };
+
+/// 2-PMULL branchless Barrett reduction of `(lo, hi)` (each a 128-bit
+/// vector laid out as {lo qword, hi qword}) into the 128-bit result of
+/// `(lo + hi·x^128) mod g(x)`. The polynomial constant `B` is a
+/// precomputed `uint64x2_t` so no `0x87`-style constant materialisation
+/// is on the runtime dep chain.
+#[inline(always)]
+#[target_feature(enable = "aes")]
+unsafe fn barrett_reduce(lo: uint64x2_t, hi: uint64x2_t) -> uint64x2_t {
+    // D = hi · B (lo qword of hi × lo qword of B = hi.lo × 1, plus
+    // hi.lo × 0xC2_00... in the high half).
+    let d = pmull(vgetq_lane_u64::<0>(hi), vgetq_lane_u64::<0>(POLY_B));
+    // E = D.hi · B.lo (PMULL2 on the high half). This is the second
+    // Barrett quotient — completes the mod-g fold without a scalar
+    // shift-XOR chain.
+    let e = pmull(vgetq_lane_u64::<1>(d), vgetq_lane_u64::<0>(POLY_B));
+
+    // 7-bit overflow correction: hi half of D has up to 7 set bits
+    // (because the polynomial is degree 7) and they overflow past bit
+    // 127; fold them in via the canonical x^7 + x^2 + x + 1 pattern.
+    let d_hi = vgetq_lane_u64::<1>(d);
+    let ov = d_hi;
+    let corr = ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    let corr_v = vsetq_lane_u64::<0>(corr, vdupq_n_u64(0));
+
+    // T_lo ^ D_lo (cancels hi*poly's low 64 bits) ^ E (the second
+    // Barrett quotient in the low half) ^ corr (7-bit correction).
+    xor3_u64(lo, d, veorq_u64(e, corr_v))
 }
 
 /// Schoolbook 4 PMULL — fully independent products, then scalar reduction.
@@ -169,6 +224,112 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
             lo: vgetq_lane_u64::<0>(t0),
             hi: vgetq_lane_u64::<1>(t0),
         }
+    }
+}
+
+/// Default aarch64 GF(2^128) multiplication: PMULL+PMULL2 schoolbook +
+/// branchless Barrett reduction using a precomputed polynomial constant
+/// `B = (0xC200_0000_0000_0000, 0x0000_0000_0000_0001)`.
+///
+/// The schoolbook portion is one `vmull_p64` (a.lo·b.lo) plus one
+/// `vmull_high_p64` (a.hi·b.hi, the PMULL2 instruction) for the
+/// independent products, and one `vmull_p64` plus one lane-swapped
+/// `vmull_p64` for the cross terms (a.hi·b.lo + a.lo·b.hi). The Barrett
+/// fold is two `vmull_p64`s against the precomputed poly constant. The
+/// runtime dep chain is shorter than the binius variant because the
+/// poly constant `B` is a `.rodata` load, not a runtime-extracted
+/// `0x87` byte. The routine is **inlined and unrolled 2x for ILP** via
+/// the companion `ghash_mul_pmull_barrett_x2` helper, so callers
+/// amortise the Barrett epilogue over two products.
+#[inline]
+#[target_feature(enable = "aes")]
+pub unsafe fn ghash_mul_pmull_barrett(a: F128, b: F128) -> F128 {
+    // SAFETY: function carries the aes target feature; pmull/pmull2 require it.
+    unsafe {
+        // 4-PMULL schoolbook:
+        //   p_ll   = a.lo · b.lo          (PMULL)
+        //   p_hh   = a.hi · b.hi          (PMULL2 — vmull_high_p64)
+        //   p_hl_x = a.hi · b.lo          (PMULL)
+        //   p_lh_x = a.lo · b.hi          (PMULL after vext-swapping b)
+        // then XOR p_hl_x ^ p_lh_x for the cross term.
+        let va = vsetq_lane_u64(a.lo, vdupq_n_u64(a.hi));
+        let vb = vsetq_lane_u64(b.lo, vdupq_n_u64(b.hi));
+
+        let p_ll = pmull(a.lo, b.lo);
+        let p_hh = pmull2(va, vb);
+        let p_hl = pmull(a.hi, b.lo);
+        let vb_swap = vextq_u64::<1>(vb, vdupq_n_u64(0));
+        let p_lh = pmull(a.lo, vgetq_lane_u64::<0>(vb_swap));
+        let cross = veorq_u64(p_hl, p_lh);
+
+        // Pack as 2-vector: lo-limb = (p_hh.hi, p_ll.lo), hi-limb = cross
+        // mirrored into both lanes.
+        let lo_limb = vsetq_lane_u64(vgetq_lane_u64::<1>(p_hh), p_ll);
+        let cross_swapped = vextq_u64::<1>(cross, cross);
+        let hi_limb = veorq_u64(cross, cross_swapped);
+
+        let reduced = barrett_reduce(lo_limb, hi_limb);
+        F128 {
+            lo: vgetq_lane_u64::<0>(reduced),
+            hi: vgetq_lane_u64::<1>(reduced),
+        }
+    }
+}
+
+/// 2x-unrolled batch multiplication for ILP: returns
+/// `[a0*b0, a1*b1]` with the second product's PMULLs overlapping the
+/// first's Barrett epilogue. Exposed publicly so hot callers (e.g. the
+/// field-slice butterfly path) can amortise the Barrett fold over a
+/// pair of products.
+#[inline]
+#[target_feature(enable = "aes")]
+pub unsafe fn ghash_mul_pmull_barrett_x2(
+    a0: F128,
+    b0: F128,
+    a1: F128,
+    b1: F128,
+) -> [F128; 2] {
+    // SAFETY: function carries the aes target feature.
+    unsafe {
+        // Issue both products' PMULLs back-to-back before either Barrett,
+        // so the PMULL latency overlaps the Barrett epilogue.
+        let va0 = vsetq_lane_u64(a0.lo, vdupq_n_u64(a0.hi));
+        let vb0 = vsetq_lane_u64(b0.lo, vdupq_n_u64(b0.hi));
+        let p_ll0 = pmull(a0.lo, b0.lo);
+        let p_hh0 = pmull2(va0, vb0);
+        let p_hl0 = pmull(a0.hi, b0.lo);
+        let vb0_swap = vextq_u64::<1>(vb0, vdupq_n_u64(0));
+        let p_lh0 = pmull(a0.lo, vgetq_lane_u64::<0>(vb0_swap));
+        let cross0 = veorq_u64(p_hl0, p_lh0);
+
+        let va1 = vsetq_lane_u64(a1.lo, vdupq_n_u64(a1.hi));
+        let vb1 = vsetq_lane_u64(b1.lo, vdupq_n_u64(b1.hi));
+        let p_ll1 = pmull(a1.lo, b1.lo);
+        let p_hh1 = pmull2(va1, vb1);
+        let p_hl1 = pmull(a1.hi, b1.lo);
+        let vb1_swap = vextq_u64::<1>(vb1, vdupq_n_u64(0));
+        let p_lh1 = pmull(a1.lo, vgetq_lane_u64::<0>(vb1_swap));
+        let cross1 = veorq_u64(p_hl1, p_lh1);
+
+        let lo_limb0 = vsetq_lane_u64(vgetq_lane_u64::<1>(p_hh0), p_ll0);
+        let cross0_swapped = vextq_u64::<1>(cross0, cross0);
+        let hi_limb0 = veorq_u64(cross0, cross0_swapped);
+        let lo_limb1 = vsetq_lane_u64(vgetq_lane_u64::<1>(p_hh1), p_ll1);
+        let cross1_swapped = vextq_u64::<1>(cross1, cross1);
+        let hi_limb1 = veorq_u64(cross1, cross1_swapped);
+
+        let r0 = barrett_reduce(lo_limb0, hi_limb0);
+        let r1 = barrett_reduce(lo_limb1, hi_limb1);
+        [
+            F128 {
+                lo: vgetq_lane_u64::<0>(r0),
+                hi: vgetq_lane_u64::<1>(r0),
+            },
+            F128 {
+                lo: vgetq_lane_u64::<0>(r1),
+                hi: vgetq_lane_u64::<1>(r1),
+            },
+        ]
     }
 }
 

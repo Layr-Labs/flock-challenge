@@ -94,15 +94,25 @@ impl Mul for F128 {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
             // SAFETY: aes target feature is enabled at compile time.
-            unsafe { aarch64::ghash_mul_binius(self, rhs) }
+            // Default: 4-PMULL schoolbook (1 PMULL + 1 PMULL2 + 2 lane-swap
+            // PMULLs) + 2-PMULL branchless Barrett fold using a precomputed
+            // `B = (0xC200_0000_0000_0000, 0x0000_0000_0000_0001)` poly
+            // constant. Replaces the prior binius variant (6 PMULL with
+            // runtime `0x87` extraction) with a path that hoists the
+            // polynomial constant into a `.rodata` load and shortens the
+            // critical path. The public API is unchanged.
+            unsafe { aarch64::ghash_mul_pmull_barrett(self, rhs) }
         }
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {
             // SAFETY: pclmulqdq target feature is enabled at compile time.
-            // On Zen4, karatsuba+barrett is ~17% faster in throughput (the
-            // dominant mode for the bulk parallel F128 work) than binius, which
-            // only wins the latency microbench. (M-series picked binius.)
-            unsafe { x86_64::ghash_mul_karatsuba_barrett(self, rhs) }
+            // Default: 2-PCLMULQDQ schoolbook (`imm8=0x11`+`0x10`) + 2-PCLMULQDQ
+            // branchless Barrett fold using a precomputed `B = (0xC200…0, 1)`
+            // polynomial constant. Replaces the previous Karatsuba-Barrett path
+            // (5 CLMUL) with a shorter 4-CLMUL critical path, and the
+            // constant `B` is a `.rodata` load instead of a runtime
+            // materialised `0x87` poly. The public API is unchanged.
+            unsafe { x86_64::ghash_mul_pclmulqdq(self, rhs) }
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -455,10 +465,29 @@ mod tests {
             let ka = unsafe { aarch64::ghash_mul_karatsuba(a, b) };
             let kb = unsafe { aarch64::ghash_mul_karatsuba_barrett(a, b) };
             let bi = unsafe { aarch64::ghash_mul_binius(a, b) };
+            let pb = unsafe { aarch64::ghash_mul_pmull_barrett(a, b) };
             assert_eq!(sw, sb);
             assert_eq!(sw, ka);
             assert_eq!(sw, kb);
             assert_eq!(sw, bi);
+            assert_eq!(sw, pb, "pmull_barrett");
+        }
+    }
+
+    /// The 2x-unrolled PMULL+PMULL2+Barrett path must agree lane-for-lane
+    /// with the scalar field product.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn pmull_barrett_x2_matches_scalar() {
+        let mut rng = Rng::new(0xA0_F11_BA12);
+        for _ in 0..128 {
+            let a0 = rng.next_f128();
+            let a1 = rng.next_f128();
+            let b0 = rng.next_f128();
+            let b1 = rng.next_f128();
+            let result = unsafe { aarch64::ghash_mul_pmull_barrett_x2(a0, b0, a1, b1) };
+            assert_eq!(result[0], software::ghash_mul(a0, b0), "lane 0");
+            assert_eq!(result[1], software::ghash_mul(a1, b1), "lane 1");
         }
     }
 
@@ -490,13 +519,32 @@ mod tests {
             let ka = unsafe { x86_64::ghash_mul_karatsuba(a, b) };
             let kb = unsafe { x86_64::ghash_mul_karatsuba_barrett(a, b) };
             let bi = unsafe { x86_64::ghash_mul_binius(a, b) };
+            let pc = unsafe { x86_64::ghash_mul_pclmulqdq(a, b) };
             // Unreduced + deferred reduce must match the direct software product.
             let un = unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }.reduce();
             assert_eq!(sw, sb, "schoolbook");
             assert_eq!(sw, ka, "karatsuba");
             assert_eq!(sw, kb, "karatsuba_barrett");
             assert_eq!(sw, bi, "binius");
+            assert_eq!(sw, pc, "pclmulqdq_barrett");
             assert_eq!(sw, un, "unreduced");
+        }
+    }
+
+    /// The 2x-unrolled PCLMULQDQ+Barrett path must agree lane-for-lane
+    /// with the scalar field product.
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    #[test]
+    fn pclmulqdq_barrett_x2_matches_scalar() {
+        let mut rng = Rng::new(0xBA0_BA8);
+        for _ in 0..128 {
+            let a0 = rng.next_f128();
+            let a1 = rng.next_f128();
+            let b0 = rng.next_f128();
+            let b1 = rng.next_f128();
+            let result = unsafe { x86_64::ghash_mul_pclmulqdq_x2(a0, b0, a1, b1) };
+            assert_eq!(result[0], software::ghash_mul(a0, b0), "lane 0");
+            assert_eq!(result[1], software::ghash_mul(a1, b1), "lane 1");
         }
     }
 
