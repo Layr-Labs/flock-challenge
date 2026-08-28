@@ -2102,19 +2102,17 @@ pub(crate) mod witgen_simd {
     /// Callers may only pass `true` for destinations whose skipped bytes
     /// are token-verified to already hold those constants.
     #[inline(always)]
-    unsafe fn dump_elide<const NT: bool>(
+    unsafe fn dump_elide<const NT: bool, const ELIDE_TAIL: bool, const ELIDE_PREFIX: bool>(
         stage: *const V4,
         dst: *mut u32,
-        elide_tail: bool,
-        elide_prefix: bool,
         tail_chunk: usize,
     ) {
-        let g0 = if elide_prefix {
+        let g0 = if ELIDE_PREFIX {
             ELIDE_B_PREFIX_CHUNKS
         } else {
             0
         };
-        let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
+        let g1 = if ELIDE_TAIL { tail_chunk } else { DUMP_CHUNKS };
         unsafe { dump_range::<NT>(stage, dst, g0, g1) }
     }
 
@@ -2132,6 +2130,43 @@ pub(crate) mod witgen_simd {
         z_nt: bool,
         ab_nt: bool,
         elide: [bool; 3],
+    ) {
+        macro_rules! dispatch {
+            ($ez:literal, $ea:literal, $eb:literal) => {{
+                unsafe {
+                    build_quad_witness_ab_stream_neon_mode::<$ez, $ea, $eb>(
+                        inputs, z, a, b, z_nt, ab_nt,
+                    )
+                }
+            }};
+        }
+        match elide {
+            [false, false, false] => dispatch!(false, false, false),
+            [false, false, true] => dispatch!(false, false, true),
+            [false, true, false] => dispatch!(false, true, false),
+            [false, true, true] => dispatch!(false, true, true),
+            [true, false, false] => dispatch!(true, false, false),
+            [true, false, true] => dispatch!(true, false, true),
+            [true, true, false] => dispatch!(true, true, false),
+            [true, true, true] => dispatch!(true, true, true),
+        }
+    }
+
+    /// Const-specialized cold/warm drain selected from scratch provenance
+    /// before entering the BLAKE3 body. Every publication boundary is a
+    /// compile-time constant in the ranked steady-state instantiation.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn build_quad_witness_ab_stream_neon_mode<
+        const ELIDE_Z: bool,
+        const ELIDE_A: bool,
+        const ELIDE_B: bool,
+    >(
+        inputs: QuadInput<'_>,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        z_nt: bool,
+        ab_nt: bool,
     ) {
         unsafe {
             let (cv_v, m, tlo, thi, blen, flags) = match inputs {
@@ -2394,16 +2429,16 @@ pub(crate) mod witgen_simd {
 
             // ---- drain stages: per-block 2 KiB ascending bursts ----
             if z_nt {
-                dump_elide::<true>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
+                dump_elide::<true, ELIDE_Z, false>(zs, z, ELIDE_ZERO_CHUNK);
             } else {
-                dump_elide::<false>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
+                dump_elide::<false, ELIDE_Z, false>(zs, z, ELIDE_ZERO_CHUNK);
             }
             if ab_nt {
-                dump_elide::<true>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
-                dump_elide::<true>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+                dump_elide::<true, ELIDE_A, false>(ast, a, ELIDE_ZERO_CHUNK);
+                dump_elide::<true, ELIDE_B, ELIDE_B>(bs, b, ELIDE_B_TAIL_CHUNK);
             } else {
-                dump_elide::<false>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
-                dump_elide::<false>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+                dump_elide::<false, ELIDE_A, false>(ast, a, ELIDE_ZERO_CHUNK);
+                dump_elide::<false, ELIDE_B, ELIDE_B>(bs, b, ELIDE_B_TAIL_CHUNK);
             }
         }
     }
@@ -4599,28 +4634,46 @@ mod tests {
                         }
                     }
                 };
-                let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
-                let mut ae = ze;
-                let mut be = ze;
-                seed_consts(&mut ze, false);
-                seed_consts(&mut ae, false);
-                seed_consts(&mut be, true);
-                unsafe {
-                    witgen_simd::build_quad_witness_ab_stream_neon_elide(
-                        witgen_simd::QuadInput::Blocks([
-                            &inputs[0], &inputs[1], &inputs[2], &inputs[3],
-                        ]),
-                        ze.as_mut_ptr() as *mut u32,
-                        ae.as_mut_ptr() as *mut u32,
-                        be.as_mut_ptr() as *mut u32,
-                        z_nt,
-                        ab_nt,
-                        [true; 3],
+                for mask in 0u8..8 {
+                    let elide = [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0];
+                    let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
+                    let mut ae = ze;
+                    let mut be = ze;
+                    if elide[0] {
+                        seed_consts(&mut ze, false);
+                    }
+                    if elide[1] {
+                        seed_consts(&mut ae, false);
+                    }
+                    if elide[2] {
+                        seed_consts(&mut be, true);
+                    }
+                    unsafe {
+                        witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                            witgen_simd::QuadInput::Blocks([
+                                &inputs[0], &inputs[1], &inputs[2], &inputs[3],
+                            ]),
+                            ze.as_mut_ptr() as *mut u32,
+                            ae.as_mut_ptr() as *mut u32,
+                            be.as_mut_ptr() as *mut u32,
+                            z_nt,
+                            ab_nt,
+                            elide,
+                        );
+                    }
+                    assert_eq!(
+                        ze, zq,
+                        "elided z diverged mask={mask:#05b} z_nt={z_nt} ab_nt={ab_nt}"
+                    );
+                    assert_eq!(
+                        ae, aq,
+                        "elided a diverged mask={mask:#05b} z_nt={z_nt} ab_nt={ab_nt}"
+                    );
+                    assert_eq!(
+                        be, bq,
+                        "elided b diverged mask={mask:#05b} z_nt={z_nt} ab_nt={ab_nt}"
                     );
                 }
-                assert_eq!(ze, zq, "elided z diverged z_nt={z_nt} ab_nt={ab_nt}");
-                assert_eq!(ae, aq, "elided a diverged z_nt={z_nt} ab_nt={ab_nt}");
-                assert_eq!(be, bq, "elided b diverged z_nt={z_nt} ab_nt={ab_nt}");
             }
         }
         // Driver equality incl. padding slots and the stripe.
