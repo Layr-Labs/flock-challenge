@@ -556,6 +556,40 @@ pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
     assert!(batched, "ranked 1 KiB leaves must use the batched kernel");
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub(crate) fn hash_ranked_blake3_leaf_chunk_with_first_parents(
+    data: &[u8],
+    out: &mut [Hash],
+    parents: &mut [Hash],
+) {
+    const LEAF_SIZE: usize = 1024;
+    assert_eq!(data.len(), out.len() * LEAF_SIZE);
+    assert_eq!(out.len() & 7, 0);
+    assert_eq!(parents.len(), out.len() / 2);
+    #[cfg(feature = "hash-count")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
+        hash_count::LEAF_COMPRESSIONS.fetch_add(
+            out.len() as u64 * hash_count::blocks(HashKind::Blake3, LEAF_SIZE),
+            Relaxed,
+        );
+        hash_count::PAIR_CALLS.fetch_add(parents.len() as u64, Relaxed);
+    }
+    let done = blake3_neon_apple::hash_complete_groups_with_parents(data, out, parents);
+    assert_eq!(done, out.len());
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+pub(crate) fn hash_ranked_blake3_leaf_chunk_with_first_parents(
+    data: &[u8],
+    out: &mut [Hash],
+    parents: &mut [Hash],
+) {
+    hash_ranked_blake3_leaf_chunk(data, out);
+    hash_ranked_blake3_parent_chunk(out, parents);
+}
+
 /// Hash one scheduling-free run of BLAKE3 parent nodes. Ranked NTT completion
 /// jobs use this after hashing their cache-hot leaves; the run is deliberately
 /// capped at the serial cutoff so it cannot open a nested Rayon/E-core region.
@@ -1447,12 +1481,19 @@ mod tests {
         let data = random_data(N_LEAVES, LEAF_SIZE, 0xCA5E_10CA_1B1A_0E03);
         let expect = merkle_tree(&data, N_LEAVES, HashKind::Blake3);
         let mut got: Vec<Hash> = crate::alloc_uninit_vec(2 * N_LEAVES - 1);
-        for (input, output) in data
+        let (leaves, rest) = got.split_at_mut(N_LEAVES);
+        let first_parents = &mut rest[..N_LEAVES / 2];
+        for ((input, output), parents) in data
             .chunks(CHUNK_LEAVES * LEAF_SIZE)
-            .zip(got[..N_LEAVES].chunks_mut(CHUNK_LEAVES))
+            .zip(leaves.chunks_mut(CHUNK_LEAVES))
+            .zip(first_parents.chunks_mut(CHUNK_LEAVES / 2))
         {
-            hash_ranked_blake3_leaf_chunk(input, output);
+            hash_ranked_blake3_leaf_chunk_with_first_parents(input, output, parents);
         }
+        assert_eq!(
+            &got[..N_LEAVES + N_LEAVES / 2],
+            &expect[..N_LEAVES + N_LEAVES / 2]
+        );
         let got = merkle_tree_from_prehashed_leaves(got, N_LEAVES, HashKind::Blake3);
         assert_eq!(got, expect);
     }

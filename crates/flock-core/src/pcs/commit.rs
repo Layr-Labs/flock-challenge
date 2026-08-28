@@ -552,16 +552,31 @@ fn ranked_ntt_with_pipelined_leaves(
                 core::mem::size_of_val(elems),
             );
             let outs = core::slice::from_raw_parts_mut(tree_base.ptr().add(leaf_start), leaf_len);
-            merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
+            let (mut read_level_start, mut read_level_len, mut local_start, mut local_len, skip) =
+                if local_parent_levels == 0 {
+                    merkle::hash_ranked_blake3_leaf_chunk(bytes, outs);
+                    (0usize, num_leaves, leaf_start, leaf_len, 0usize)
+                } else {
+                    let first_start = num_leaves + (leaf_start >> 1);
+                    let first_len = leaf_len >> 1;
+                    let first = core::slice::from_raw_parts_mut(
+                        tree_base.ptr().add(first_start),
+                        first_len,
+                    );
+                    merkle::hash_ranked_blake3_leaf_chunk_with_first_parents(bytes, outs, first);
+                    (
+                        num_leaves,
+                        num_leaves >> 1,
+                        leaf_start >> 1,
+                        first_len,
+                        1usize,
+                    )
+                };
 
-            // Build the aligned local subtree while its leaf range is still
-            // hot. At every level, different jobs own disjoint read and write
-            // ranges. Only the small shared top remains after the job barrier.
-            let mut read_level_start = 0usize;
-            let mut read_level_len = num_leaves;
-            let mut local_start = leaf_start;
-            let mut local_len = leaf_len;
-            for _ in 0..local_parent_levels {
+            // Build the remaining aligned local subtree while its first parent
+            // range is still hot. The fused Apple leaf kernel already emitted
+            // level one directly from its live NEON CV vectors.
+            for _ in skip..local_parent_levels {
                 let write_level_start = read_level_start + read_level_len;
                 let write_start = write_level_start + (local_start >> 1);
                 let write_len = local_len >> 1;

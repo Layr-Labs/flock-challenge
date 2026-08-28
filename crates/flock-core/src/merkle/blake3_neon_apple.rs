@@ -18,6 +18,12 @@ core::arch::global_asm!(include_str!("blake3_neon8_macos.S"), options(raw));
 
 unsafe extern "C" {
     fn flock_blake3_hash8_neon_1024(data: *const u8, out: *mut u8, groups: usize);
+    fn flock_blake3_hash8_neon_1024_parent1(
+        data: *const u8,
+        out: *mut u8,
+        parents: *mut u8,
+        groups: usize,
+    );
 }
 
 /// Hash as many complete groups of eight 1 KiB leaves as fit in `out`.
@@ -40,6 +46,29 @@ pub(super) fn hash_complete_groups(data: &[u8], out: &mut [[u8; 32]]) -> usize {
     // where NEON is mandatory.
     unsafe {
         flock_blake3_hash8_neon_1024(data.as_ptr(), out.as_mut_ptr().cast(), groups);
+    }
+    groups * 8
+}
+
+#[inline]
+pub(super) fn hash_complete_groups_with_parents(
+    data: &[u8],
+    out: &mut [[u8; 32]],
+    parents: &mut [[u8; 32]],
+) -> usize {
+    debug_assert_eq!(data.len(), out.len() * 1024);
+    let groups = out.len() / 8;
+    assert!(parents.len() >= groups * 4);
+    if groups == 0 {
+        return 0;
+    }
+    unsafe {
+        flock_blake3_hash8_neon_1024_parent1(
+            data.as_ptr(),
+            out.as_mut_ptr().cast(),
+            parents.as_mut_ptr().cast(),
+            groups,
+        );
     }
     groups * 8
 }

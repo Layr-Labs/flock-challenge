@@ -36,9 +36,7 @@ static inline uint32x4_t rot12(uint32x4_t x) {
 }
 
 static inline uint32x4_t rot8(uint32x4_t x) {
-  return vreinterpretq_u32_u8(__builtin_shufflevector(
-      vreinterpretq_u8_u32(x), vreinterpretq_u8_u32(x),
-      1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12));
+  return vsriq_n_u32(vshlq_n_u32(x, 24), x, 8);
 }
 
 static inline uint32x4_t rot7(uint32x4_t x) {
@@ -109,6 +107,33 @@ round2(uint32x4_t v0[16], uint32x4_t v1[16],
 
 #undef G2
 
+#define G1(a, b, c, d, x, y)                                                \
+  do {                                                                        \
+    v[a] = vaddq_u32(vaddq_u32(v[a], v[b]), m[x]);                            \
+    v[d] = rot16(veorq_u32(v[d], v[a]));                                     \
+    v[c] = vaddq_u32(v[c], v[d]);                                            \
+    v[b] = rot12(veorq_u32(v[b], v[c]));                                     \
+    v[a] = vaddq_u32(vaddq_u32(v[a], v[b]), m[y]);                            \
+    v[d] = rot8(veorq_u32(v[d], v[a]));                                      \
+    v[c] = vaddq_u32(v[c], v[d]);                                            \
+    v[b] = rot7(veorq_u32(v[b], v[c]));                                      \
+  } while (0)
+
+static __attribute__((always_inline)) inline void
+round1(uint32x4_t v[16], const uint32x4_t m[16], size_t round) {
+  const uint8_t *s = MSG_SCHEDULE[round];
+  G1(0, 4, 8, 12, s[0], s[1]);
+  G1(1, 5, 9, 13, s[2], s[3]);
+  G1(2, 6, 10, 14, s[4], s[5]);
+  G1(3, 7, 11, 15, s[6], s[7]);
+  G1(0, 5, 10, 15, s[8], s[9]);
+  G1(1, 6, 11, 12, s[10], s[11]);
+  G1(2, 7, 8, 13, s[12], s[13]);
+  G1(3, 4, 9, 14, s[14], s[15]);
+}
+
+#undef G1
+
 static inline void init_state(uint32x4_t v[16], const uint32x4_t h[8],
                               uint32_t flags) {
   for (size_t i = 0; i < 8; i++) {
@@ -143,43 +168,67 @@ static inline void store_cv4(uint32x4_t h[8], uint8_t *out) {
   vst1q_u8(out + 112, vreinterpretq_u8_u32(h[7]));
 }
 
+static inline __attribute__((always_inline))
+void hash4_1024(const uint8_t *input, uint32x4_t h[8]) {
+  for (size_t i = 0; i < 8; i++) {
+    h[i] = vdupq_n_u32(IV[i]);
+  }
+  for (size_t block = 0; block < 16; block++) {
+    const size_t block_offset = block * 64;
+    uint32x4_t m[16], v[16];
+    transpose_block4(input + 0 * 1024, input + 1 * 1024,
+                     input + 2 * 1024, input + 3 * 1024,
+                     block_offset, m);
+    uint32_t flags = (block == 0 ? 1 : 0) | (block == 15 ? 2 : 0);
+    init_state(v, h, flags);
+    round1(v, m, 0);
+    round1(v, m, 1);
+    round1(v, m, 2);
+    round1(v, m, 3);
+    round1(v, m, 4);
+    round1(v, m, 5);
+    round1(v, m, 6);
+    finish_block(h, v);
+  }
+}
+
 __attribute__((visibility("hidden")))
 void flock_blake3_hash8_neon_1024(const uint8_t *data, uint8_t *out,
                                   size_t groups) {
   for (size_t group = 0; group < groups; group++) {
-    const uint8_t *input = data + group * 8 * 1024;
-    uint32x4_t h0[8], h1[8];
+    for (size_t half = 0; half < 2; half++) {
+      const uint8_t *input = data + group * 8 * 1024 + half * 4 * 1024;
+      uint32x4_t h[8];
+      hash4_1024(input, h);
+      store_cv4(h, out + group * 8 * 32 + half * 4 * 32);
+    }
+  }
+}
+
+__attribute__((visibility("hidden")))
+void flock_blake3_hash8_neon_1024_parent1(const uint8_t *data, uint8_t *out,
+                                          uint8_t *parents, size_t groups) {
+  for (size_t group = 0; group < groups; group++) {
+    uint32x4_t hh[2][8];
+    hash4_1024(data + group * 8 * 1024, hh[0]);
+    hash4_1024(data + group * 8 * 1024 + 4 * 1024, hh[1]);
+    uint32x4_t m[16], v[16], ph[8];
     for (size_t i = 0; i < 8; i++) {
-      h0[i] = h1[i] = vdupq_n_u32(IV[i]);
+      m[i] = vuzp1q_u32(hh[0][i], hh[1][i]);
+      m[i + 8] = vuzp2q_u32(hh[0][i], hh[1][i]);
+      ph[i] = vdupq_n_u32(IV[i]);
     }
-
-    for (size_t block = 0; block < 16; block++) {
-      const size_t block_offset = block * 64;
-      uint32x4_t m0[16], m1[16];
-      uint32x4_t v0[16], v1[16];
-      transpose_block4(input + 0 * 1024, input + 1 * 1024,
-                       input + 2 * 1024, input + 3 * 1024,
-                       block_offset, m0);
-      transpose_block4(input + 4 * 1024, input + 5 * 1024,
-                       input + 6 * 1024, input + 7 * 1024,
-                       block_offset, m1);
-      uint32_t flags = (block == 0 ? 1 : 0) | (block == 15 ? 2 : 0);
-      init_state(v0, h0, flags);
-      init_state(v1, h1, flags);
-
-      round2(v0, v1, m0, m1, 0);
-      round2(v0, v1, m0, m1, 1);
-      round2(v0, v1, m0, m1, 2);
-      round2(v0, v1, m0, m1, 3);
-      round2(v0, v1, m0, m1, 4);
-      round2(v0, v1, m0, m1, 5);
-      round2(v0, v1, m0, m1, 6);
-
-      finish_block(h0, v0);
-      finish_block(h1, v1);
-    }
-
-    store_cv4(h0, out + group * 8 * 32 + 0 * 4 * 32);
-    store_cv4(h1, out + group * 8 * 32 + 1 * 4 * 32);
+    init_state(v, ph, 4);
+    round1(v, m, 0);
+    round1(v, m, 1);
+    round1(v, m, 2);
+    round1(v, m, 3);
+    round1(v, m, 4);
+    round1(v, m, 5);
+    round1(v, m, 6);
+    finish_block(ph, v);
+    store_cv4(ph, parents + group * 4 * 32);
+    store_cv4(hh[0], out + group * 8 * 32);
+    store_cv4(hh[1], out + group * 8 * 32 + 4 * 32);
   }
 }

@@ -5805,13 +5805,23 @@ kernel void blake3_pow_scan(
 
         unsafe {
             let leaves = core::slice::from_raw_parts_mut(tree_base.ptr().add(leaf_start), leaf_len);
-            crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, leaves);
-
-            let mut read_level_start = 0usize;
-            let mut read_level_len = n_leaves;
-            let mut local_start = leaf_start;
-            let mut local_len = leaf_len;
-            for _ in 0..local_parent_levels {
+            let (mut read_level_start, mut read_level_len, mut local_start, mut local_len, skip) =
+                if local_parent_levels == 0 {
+                    crate::merkle::hash_ranked_blake3_leaf_chunk(bytes, leaves);
+                    (0usize, n_leaves, leaf_start, leaf_len, 0usize)
+                } else {
+                    let first_start = n_leaves + (leaf_start >> 1);
+                    let first_len = leaf_len >> 1;
+                    let first = core::slice::from_raw_parts_mut(
+                        tree_base.ptr().add(first_start),
+                        first_len,
+                    );
+                    crate::merkle::hash_ranked_blake3_leaf_chunk_with_first_parents(
+                        bytes, leaves, first,
+                    );
+                    (n_leaves, n_leaves >> 1, leaf_start >> 1, first_len, 1usize)
+                };
+            for _ in skip..local_parent_levels {
                 let write_level_start = read_level_start + read_level_len;
                 let write_start = write_level_start + (local_start >> 1);
                 let write_len = local_len >> 1;
