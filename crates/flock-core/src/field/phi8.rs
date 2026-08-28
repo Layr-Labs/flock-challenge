@@ -1048,6 +1048,146 @@ pub fn phi8(a: F8) -> F128 {
     PHI_8_TABLE[a.0 as usize]
 }
 
+// ---------------------------------------------------------------------------
+// Const-N unrolled lookup paths.
+//
+// The byte-by-nibble / byte-by-byte `phi8` call sites in the zerocheck inner
+// kernel go through one table load per F8 byte and return a single 128-bit
+// F128 element, which is then handed to F128 multiplication / squaring.  The
+// loop iterator keeps loading the table one byte at a time, with a single
+// `(lo, hi)` pair going into the SIMD register file per step.
+//
+// The const-N unrolled paths below issue N independent table loads whose
+// `lo` and `hi` 64-bit limbs are written straight into N pre-allocated stack
+// slots.  With N=4 the body returns eight `u64` limbs (two F128s' worth of
+// `lo`/`hi` pairs is `4*2=8` limbs; the 4-F128 form below returns eight `u64`
+// limbs across four F128s — see the doc on each fn).  With N=8 the body
+// returns sixteen `u64` limbs (eight F128s' worth).  Each output limb is
+// the un-lifted 64-bit half of a `phi8(byte)`, ready to be assembled into
+// the wider `F128` accumulator by the caller without going through a stack
+// temporary for the per-byte F128.
+//
+// The functions are `#[inline(always)]` + the `bytes` parameter is fixed
+// size + the table index is a `usize` load with a known bound, so LLVM fully
+// unrolls the loop and the four (or eight) PHI_8_TABLE loads can be in
+// flight in parallel through the load/store unit.  This is the
+// "pre-lifted 64-bit limb" shape the gf2_128 mul/square stage wants: 4 or 8
+// output limbs per loop iteration instead of 1.
+// ---------------------------------------------------------------------------
+
+/// Lift 4 F8 bytes through φ_8 in a single fully-unrolled step, returning
+/// 4 F128 elements as 8 pre-lifted `u64` limbs in `[lo0, hi0, lo1, hi1,
+/// lo2, hi2, lo3, hi3]` order.
+///
+/// Each input byte becomes one F128 (16 bytes = 2 u64 limbs).  The output
+/// is laid out as a `[u64; 8]` so the caller can grab `lo`/`hi` pairs
+/// without re-touching a stack F128.
+#[inline(always)]
+pub fn phi8_lift_x4(bytes: [u8; 4]) -> [u64; 8] {
+    // Four independent PHI_8_TABLE[byte] loads.  Each table entry is
+    // `{ lo: u64, hi: u64 }` and the output is the flattened `lo|hi`
+    // stream so the caller can pack them into 4×F128 without an extra
+    // temporary.
+    let r0 = &PHI_8_TABLE[bytes[0] as usize];
+    let r1 = &PHI_8_TABLE[bytes[1] as usize];
+    let r2 = &PHI_8_TABLE[bytes[2] as usize];
+    let r3 = &PHI_8_TABLE[bytes[3] as usize];
+    [r0.lo, r0.hi, r1.lo, r1.hi, r2.lo, r2.hi, r3.lo, r3.hi]
+}
+
+/// Lift 8 F8 bytes through φ_8 in a single fully-unrolled step, returning
+/// 8 F128 elements as 16 pre-lifted `u64` limbs.
+///
+/// Identical semantics to [`phi8_lift_x4`], widened to 8 bytes per
+/// iteration so the wider inner loop amortizes the table-load latency
+/// across more bits per loop step.  Output layout is the natural
+/// `[lo_i, hi_i]` interleaving for `i = 0..8`.
+#[inline(always)]
+pub fn phi8_lift_x8(bytes: [u8; 8]) -> [u64; 16] {
+    let r0 = &PHI_8_TABLE[bytes[0] as usize];
+    let r1 = &PHI_8_TABLE[bytes[1] as usize];
+    let r2 = &PHI_8_TABLE[bytes[2] as usize];
+    let r3 = &PHI_8_TABLE[bytes[3] as usize];
+    let r4 = &PHI_8_TABLE[bytes[4] as usize];
+    let r5 = &PHI_8_TABLE[bytes[5] as usize];
+    let r6 = &PHI_8_TABLE[bytes[6] as usize];
+    let r7 = &PHI_8_TABLE[bytes[7] as usize];
+    [
+        r0.lo, r0.hi, r1.lo, r1.hi, r2.lo, r2.hi, r3.lo, r3.hi, r4.lo, r4.hi, r5.lo, r5.hi, r6.lo,
+        r6.hi, r7.lo, r7.hi,
+    ]
+}
+
+/// Lift a slice of F8 bytes through φ_8 in chunks of 4, returning a
+/// `Vec<F128>`.  The tail (if `len % 4 != 0`) is processed with the scalar
+/// `phi8` one byte at a time.  Used by the byte-level fold-down path in
+/// the gf2_8 reduction stage, which already knows its input length is a
+/// multiple of the chunk size and only needs the body.
+#[inline]
+pub fn phi8_lift_chunk4(bytes: &[u8]) -> Vec<F128> {
+    let n = bytes.len();
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0;
+    while i + 4 <= n {
+        let limbs = phi8_lift_x4([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        out.push(F128 {
+            lo: limbs[0],
+            hi: limbs[1],
+        });
+        out.push(F128 {
+            lo: limbs[2],
+            hi: limbs[3],
+        });
+        out.push(F128 {
+            lo: limbs[4],
+            hi: limbs[5],
+        });
+        out.push(F128 {
+            lo: limbs[6],
+            hi: limbs[7],
+        });
+        i += 4;
+    }
+    while i < n {
+        out.push(phi8(F8(bytes[i])));
+        i += 1;
+    }
+    out
+}
+
+/// Lift a slice of F8 bytes through φ_8 in chunks of 8.  Same tail policy
+/// as [`phi8_lift_chunk4`].
+#[inline]
+pub fn phi8_lift_chunk8(bytes: &[u8]) -> Vec<F128> {
+    let n = bytes.len();
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0;
+    while i + 8 <= n {
+        let limbs = phi8_lift_x8([
+            bytes[i],
+            bytes[i + 1],
+            bytes[i + 2],
+            bytes[i + 3],
+            bytes[i + 4],
+            bytes[i + 5],
+            bytes[i + 6],
+            bytes[i + 7],
+        ]);
+        for k in 0..4 {
+            out.push(F128 {
+                lo: limbs[2 * k],
+                hi: limbs[2 * k + 1],
+            });
+        }
+        i += 8;
+    }
+    while i < n {
+        out.push(phi8(F8(bytes[i])));
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,6 +1196,71 @@ mod tests {
     fn zero_and_one_map_correctly() {
         assert_eq!(phi8(F8::ZERO), F128::ZERO);
         assert_eq!(phi8(F8::ONE), F128::ONE);
+    }
+
+    #[test]
+    fn lift_x4_matches_scalar() {
+        for &b0 in &[0u8, 1, 0x57, 0xFF] {
+            for &b1 in &[0u8, 1, 0x83, 0xC1] {
+                for &b2 in &[0u8, 2, 0xAA, 0x55] {
+                    for &b3 in &[0u8, 3, 0xDE, 0xAD] {
+                        let limbs = phi8_lift_x4([b0, b1, b2, b3]);
+                        let expected0 = phi8(F8(b0));
+                        let expected1 = phi8(F8(b1));
+                        let expected2 = phi8(F8(b2));
+                        let expected3 = phi8(F8(b3));
+                        assert_eq!(&limbs[0..2], &[expected0.lo, expected0.hi][..], "byte0={b0:02x}");
+                        assert_eq!(&limbs[2..4], &[expected1.lo, expected1.hi][..], "byte1={b1:02x}");
+                        assert_eq!(&limbs[4..6], &[expected2.lo, expected2.hi][..], "byte2={b2:02x}");
+                        assert_eq!(&limbs[6..8], &[expected3.lo, expected3.hi][..], "byte3={b3:02x}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lift_x8_matches_scalar() {
+        let bytes: [u8; 8] = [0, 1, 0x02, 0x57, 0x83, 0xAA, 0xDE, 0xFF];
+        let limbs = phi8_lift_x8(bytes);
+        for (k, &b) in bytes.iter().enumerate() {
+            let expected = phi8(F8(b));
+            assert_eq!(limbs[2 * k], expected.lo, "byte{k} lo");
+            assert_eq!(limbs[2 * k + 1], expected.hi, "byte{k} hi");
+        }
+    }
+
+    #[test]
+    fn lift_chunk4_aligned_matches_scalar() {
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let lifted = phi8_lift_chunk4(&bytes);
+        assert_eq!(lifted.len(), bytes.len());
+        for (i, &b) in bytes.iter().enumerate() {
+            assert_eq!(lifted[i], phi8(F8(b)), "mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn lift_chunk8_aligned_matches_scalar() {
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let lifted = phi8_lift_chunk8(&bytes);
+        assert_eq!(lifted.len(), bytes.len());
+        for (i, &b) in bytes.iter().enumerate() {
+            assert_eq!(lifted[i], phi8(F8(b)), "mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn lift_chunk_handles_tail() {
+        let bytes = vec![0u8, 1, 0x57, 0x83, 0xAA];
+        let lifted4 = phi8_lift_chunk4(&bytes);
+        let lifted8 = phi8_lift_chunk8(&bytes);
+        assert_eq!(lifted4.len(), 5);
+        assert_eq!(lifted8.len(), 5);
+        for (i, &b) in bytes.iter().enumerate() {
+            assert_eq!(lifted4[i], phi8(F8(b)), "chunk4 tail {i}");
+            assert_eq!(lifted8[i], phi8(F8(b)), "chunk8 tail {i}");
+        }
     }
 
     #[test]
