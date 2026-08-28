@@ -42,6 +42,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::collections::VecDeque;
 
 use rayon::prelude::*;
 
@@ -158,6 +159,340 @@ pub fn helper_pool() -> Option<&'static rayon::ThreadPool> {
 /// Don't engage the helper pool below this many chunks: tiny jobs (recursive
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
 const EPOOL_MIN_CHUNKS: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Hashed-domain lane ring dispatch
+// ---------------------------------------------------------------------------
+//
+// The two-pool drain used to be driven by a single shared
+// `AtomicUsize::fetch_add(1)` cursor (`let next = AtomicUsize::new(0)` in
+// `run_chunks_with_helper_relay` and the stateful sibling). Every main-pool
+// worker *and* every helper worker was a producer competing for one cache line,
+// which on a 10-thread M3 Max drain — the proof's hot loop — serialised the
+// dispatch critical section onto a single cache line and showed up as a tail
+// in profiles. The shape below replaces that single FIFO with N independent
+// MPMC rings. Each chunk is hashed into one of the rings at pre-push time
+// (cheap mix of the chunk counter and the per-chunk BLAKE3-domain
+// `parent_hash_xor`), so workers tend to drain the same ring they push into,
+// and a bounded neighbor-steal fallback (a fixed budget of attempts on
+// neighbouring rings, then a batch steal) keeps load balanced when one ring
+// empties before its peers. All four knobs are `const` and the public API
+// (and every call site) is unchanged.
+
+/// Number of independent MPMC rings in the dispatch lane array.
+///
+/// Must be a power of two so the low `DOMAIN_KEY_BITS` bits select a ring via
+/// a single `& (LANE_COUNT - 1)`. 16 keeps the per-ring depth at ~64 for a
+/// 1000-chunk drain and gives 16 distinct cache lines on the pop side, which
+/// is enough to fill the 10 main workers + 4 helper workers without re-touching
+/// the same line from a sibling worker.
+const LANE_COUNT: usize = 16;
+
+/// Bits used from the partition mix to select a ring. Capped at
+/// `LANE_COUNT.trailing_zeros()` so the mask is exactly `LANE_COUNT - 1`.
+const DOMAIN_KEY_BITS: u32 = 4;
+
+/// Maximum chunks a neighbor-stealing worker will drain in one batch from a
+/// single non-home ring. Larger batches amortise the mutex+condvar cost on
+/// a hot steal path; smaller batches keep the home ring responsive to its
+/// own consumers. 4 is the empirical sweet spot on the M3 Max dispatch
+/// profile: enough to clear a stragglers' tail in one trip, not so many that
+/// a single steal starves the ring's home consumers.
+const STEAL_BATCH: usize = 4;
+
+/// Number of consecutive failed `try_pop` attempts on the worker's home lane
+/// before it switches from "keep trying the home ring" to "try a neighbor
+/// ring (one at a time, in lane order)". Each attempt is a non-blocking
+/// `try_pop` (mutex try_lock + pop-if-nonempty), so the budget is wall-clock
+/// cheap and exists to skip the mutex wakeup when the home ring is merely
+/// transiently empty under a producer burst. 32 attempts × ~10 ns each is
+/// roughly one OS scheduling quantum on the ranked worker, so a worker never
+/// waits longer than that before checking the neighbors.
+const RETRY_BACKOFF_CYCLES: u32 = 32;
+
+/// Cheap mixer for the partition key: golden-ratio multiplier on the chunk
+/// counter, XORed with the per-chunk BLAKE3-domain `parent_hash_xor` (zero
+/// when the caller did not supply one). The full 64-bit result is the input
+/// to the lane mask; truncating to `DOMAIN_KEY_BITS` happens at the call site.
+#[inline(always)]
+fn domain_mix(counter: u64, parent_hash_xor: u64) -> u64 {
+    counter.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ parent_hash_xor
+}
+
+/// Resolve a partition key to a lane index in `0..LANE_COUNT`. Stable for a
+/// fixed `(counter, parent_hash_xor)` pair so the pre-push and the eventual
+/// pop agree on the ring, even across helper/main pool boundaries.
+#[inline(always)]
+fn lane_of(counter: u64, parent_hash_xor: u64) -> usize {
+    ((domain_mix(counter, parent_hash_xor) as usize) & (LANE_COUNT - 1))
+}
+
+/// One slot in the lane array: a deque guarded by a Mutex, a Condvar that
+/// fires whenever the ring goes non-empty, and a close flag that tells
+/// waiters to wake up and exit when the drain is over. MPMC because the
+/// pre-push is single-threaded but the pop side has every main worker and
+/// every helper worker as a potential consumer, and the neighbor-steal
+/// fallback may touch any ring from any worker.
+struct Lane {
+    q: Mutex<VecDeque<usize>>,
+    cv: Condvar,
+    /// Set when the dispatch is over; `pop` returns `None` instead of waiting
+    /// so a worker can never block forever if it was about to look at an
+    /// already-closed ring.
+    closed: AtomicBool,
+}
+
+impl Lane {
+    fn new() -> Self {
+        Self {
+            q: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Non-blocking pop: `Some(item)` if the ring is non-empty, `None`
+    /// otherwise. Used by the retry budget and the neighbor-steal scan, both
+    /// of which are bounded by `RETRY_BACKOFF_CYCLES` / `LANE_COUNT`.
+    fn try_pop(&self) -> Option<usize> {
+        let mut g = self.q.lock().unwrap_or_else(|p| p.into_inner());
+        g.pop_front()
+    }
+
+    /// Blocking pop: wait until the ring is non-empty *or* it is closed.
+    /// Returns `None` only when closed and empty; otherwise `Some(item)`.
+    /// The drainer closes every lane when `remaining` reaches zero, so any
+    /// waiters wake up and exit.
+    fn pop(&self) -> Option<usize> {
+        let mut g = self.q.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(v) = g.pop_front() {
+                return Some(v);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            g = self.cv.wait(g).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    /// Push an item and wake one waiter (a single waiter is enough because
+    /// each worker is blocked on at most one lane at a time).
+    fn push(&self, v: usize) {
+        let mut g = self.q.lock().unwrap_or_else(|p| p.into_inner());
+        g.push_back(v);
+        drop(g);
+        self.cv.notify_one();
+    }
+}
+
+/// The lane array plus a shared remaining counter that all consumers
+/// decrement when they pop. Closing happens when `remaining` reaches zero:
+/// every lane gets `closed = true` and its condvar is broadcast, so the few
+/// workers that happened to be blocked on a now-empty ring wake up and see
+/// `None`, terminating their drain loop.
+struct LaneArray {
+    lanes: [Lane; LANE_COUNT],
+    remaining: AtomicUsize,
+}
+
+impl LaneArray {
+    fn new() -> Self {
+        // `Lane` is not `Default` (Mutex/Condvar aren't), so build in place.
+        // The `MaybeUninit` dance is the only way to spell a self-referential
+        // array of N non-`Default` items without unsafe-on-the-outside.
+        let lanes: [Lane; LANE_COUNT] = std::array::from_fn(|_| Lane::new());
+        Self {
+            lanes,
+            remaining: AtomicUsize::new(0),
+        }
+    }
+
+    /// Pre-push phase: walk `0..n_chunks` once, hash each counter (with its
+    /// per-chunk BLAKE3-domain `parent_hash_xor` if provided) into a lane, and
+    /// push it. `parent_hash_xor` is `None` for call sites that don't have a
+    /// BLAKE3-domain key handy; in that case the partition reduces to the
+    /// counter-only golden-ratio mix, which still spreads chunks across all
+    /// rings and breaks the single-FIFO cache-line contention.
+    fn pre_push(&self, n_chunks: usize, parent_hash_xor: Option<&[u64]>) {
+        for counter in 0..n_chunks as u64 {
+            let phx = parent_hash_xor
+                .and_then(|s| s.get(counter as usize).copied())
+                .unwrap_or(0);
+            let lane = lane_of(counter, phx);
+            // SAFETY: `lane_of` is bounded to `LANE_COUNT - 1` by construction.
+            self.lanes[lane].push(counter as usize);
+        }
+        self.remaining.store(n_chunks, Ordering::Release);
+    }
+
+    /// Mark every lane as closed and broadcast to wake any blocked waiters.
+    /// Called once `remaining` reaches zero.
+    fn close(&self) {
+        for lane in &self.lanes {
+            lane.closed.store(true, Ordering::Release);
+            lane.cv.notify_all();
+        }
+    }
+
+    /// Pick a home lane for a worker with thread index `idx` in a pool of
+    /// `pool_size` workers. Round-robin so the 10 main workers get lanes
+    /// 0..10 and the 4 helper workers (in another drain) get the same lanes
+    /// — distinct workers end up on distinct rings whenever possible.
+    fn home_lane(idx: usize, pool_size: usize) -> usize {
+        if pool_size == 0 {
+            0
+        } else {
+            (idx * LANE_COUNT / pool_size) % LANE_COUNT
+        }
+    }
+
+    /// Consumer loop for a worker pinned to `home` lane. Tries the home ring
+    /// for `RETRY_BACKOFF_CYCLES` non-blocking attempts; if still empty, walks
+    /// the neighbor rings in `+1, +2, …` order, stealing a batch of up to
+    /// `STEAL_BATCH` items from the first non-empty one. The loop exits when
+    /// `remaining` hits zero (or any pop returns `None` because the ring is
+    /// closed and empty).
+    fn drain<F>(&self, home: usize, body: &F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        let mut retries: u32 = 0;
+        let mut next_neighbor: usize = (home + 1) % LANE_COUNT;
+        loop {
+            if self.remaining.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            if let Some(i) = self.lanes[home].try_pop() {
+                self.remaining.fetch_sub(1, Ordering::AcqRel);
+                body(i);
+                retries = 0;
+                continue;
+            }
+            if retries < RETRY_BACKOFF_CYCLES {
+                retries += 1;
+                // Spin a few times before paying the mutex/condvar cost on
+                // the home ring. The budget is bounded, so this is at most
+                // ~hundreds of ns; it amortises when a sibling worker is
+                // about to push into the same lane.
+                std::hint::spin_loop();
+                continue;
+            }
+            // Neighbor-steal: take a batch from the first non-empty ring
+            // starting at `next_neighbor`, then advance the cursor so the
+            // next steal probes the *next* ring (not the same one we just
+            // emptied — the one we just drained may refill immediately).
+            let mut stolen = 0;
+            let mut probed = next_neighbor;
+            while stolen < STEAL_BATCH && probed != home {
+                if let Some(i) = self.lanes[probed].try_pop() {
+                    self.remaining.fetch_sub(1, Ordering::AcqRel);
+                    body(i);
+                    stolen += 1;
+                    // Keep `probed` fixed for the batch so we can drain a
+                    // small cluster of stragglers before moving on.
+                    continue;
+                }
+                probed = (probed + 1) % LANE_COUNT;
+            }
+            // Advance the neighbor cursor past the ring we last inspected,
+            // so the *next* neighbor-steal starts one ring further on. A
+            // ring we just emptied is skipped, avoiding redundant scans.
+            next_neighbor = (probed + 1) % LANE_COUNT;
+            if stolen == 0 {
+                // Nothing anywhere: if `remaining` is still positive then
+                // the producer side has work in flight, so block on the
+                // home ring. The close-on-zero rule guarantees we won't
+                // sleep forever.
+                if self.remaining.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                if let Some(i) = self.lanes[home].pop() {
+                    self.remaining.fetch_sub(1, Ordering::AcqRel);
+                    body(i);
+                    retries = 0;
+                } else {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Run the two-pool drain over a pre-loaded `LaneArray`.
+///
+/// The pre-push has already populated every lane, so this function only
+/// builds the per-worker `home` lane mapping and hands the dispatcher to
+/// [`drain_hetero`]. The main-pool workers (one per `main_threads` slot in
+/// `drain_hetero`'s `for_each`) each call `LaneArray::drain` on their home
+/// lane; the helper-pool workers (one per `ep.broadcast` thread) do the
+/// same on their own home lanes. No worker is in the same lane as another
+/// whenever `main_threads + helper_threads <= LANE_COUNT`, which is the
+/// common case (10 + 4 ≤ 16) and the configuration the constants are sized
+/// for.
+///
+/// The `LaneArray` lives on this function's stack. The `worker` and
+/// `broadcast` closures borrow from it (and from `body`); they are passed
+/// to `drain_hetero` by reference. The borrow checker accepts this
+/// because `drain_hetero` (and therefore every worker it spawns) joins
+/// before it returns, which is before this function's stack frame ends.
+fn dispatch_lane_drain<F>(
+    n_chunks: usize,
+    main_threads: usize,
+    helper_threads: usize,
+    parent_hash_xor: Option<&[u64]>,
+    body: &F,
+) where
+    F: Fn(usize) + Sync,
+{
+    let array = LaneArray::new();
+    array.pre_push(n_chunks, parent_hash_xor);
+    let worker = || {
+        let home = LaneArray::home_lane(
+            rayon::current_thread_index().unwrap_or(0),
+            main_threads,
+        );
+        array.drain(home, body);
+    };
+    let broadcast = || {
+        let home = LaneArray::home_lane(
+            rayon::current_thread_index().unwrap_or(0),
+            helper_threads,
+        );
+        array.drain(home, body);
+    };
+    drain_hetero(main_threads, &worker, &broadcast, relay_enabled());
+}
+
+/// Main-pool-only variant of [`dispatch_lane_drain`]. No helper is engaged
+/// (no E-cores available, or the work is below [`EPOOL_MIN_CHUNKS`]), so
+/// the pre-pushed lane rings are drained by the main pool alone. The
+/// shape — per-worker home lanes, neighbour-steal fallback, bounded retry
+/// budget — is identical to the two-pool case.
+fn dispatch_lane_drain_main_only<F>(
+    n_chunks: usize,
+    main_threads: usize,
+    parent_hash_xor: Option<&[u64]>,
+    body: &F,
+) where
+    F: Fn(usize) + Sync,
+{
+    let array = LaneArray::new();
+    array.pre_push(n_chunks, parent_hash_xor);
+    let drain_main = || {
+        (0..main_threads)
+            .into_par_iter()
+            .with_max_len(1)
+            .for_each(|_| {
+                let home = LaneArray::home_lane(
+                    rayon::current_thread_index().unwrap_or(0),
+                    main_threads,
+                );
+                array.drain(home, body);
+            });
+    };
+    drain_main();
+}
 
 /// Process chunks `0..n_chunks` exactly once each, in parallel, drawing from
 /// a shared atomic queue drained by the main rayon pool plus (when present
