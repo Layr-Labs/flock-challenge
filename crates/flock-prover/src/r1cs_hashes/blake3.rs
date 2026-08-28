@@ -137,6 +137,50 @@ pub const BLAKE3_IV: [u32; 8] = [
 /// BLAKE3 message permutation applied between rounds.
 pub const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
+/// 8-word BLAKE3 IV, hoisted as a `const` table for the monolithized
+/// compress body. Equivalent to [`BLAKE3_IV`] — re-exported under this
+/// name so the chunk wrapper can address it without going through a
+/// non-const path.
+pub const IV_TABLE: [u32; 8] = BLAKE3_IV;
+
+/// 7 per-round constants `0x00..0x06`. In BLAKE3 the round index doubles
+/// as the sigma permutation index (the schedule cycles modulo 10 over
+/// 7 rounds). Hoisted as a `const [u32; 7]` so each `round % 7` is a
+/// compile-time `ROUND_CONSTS[r] as usize` lookup with no runtime shift.
+pub const ROUND_CONSTS: [u32; 7] = [0, 1, 2, 3, 4, 5, 6];
+
+/// Build `SIGMA[i] = MSG_PERMUTATION^i ∘ identity` for `i ∈ 0..10` at
+/// compile time. `SIGMA[0]` is the identity; each subsequent entry
+/// composes with [`MSG_PERMUTATION`]. These 10 permutations are the full
+/// BLAKE3 message schedule — hoisted into a `const [[usize; 16]; 10]`
+/// table so the chunk wrapper indexes `SIGMA[ROUND_CONSTS[r] as usize]`
+/// and never rebuilds the schedule at runtime.
+const fn build_sigma() -> [[usize; 16]; 10] {
+    let mut out = [[0usize; 16]; 10];
+    let mut cur = [0usize; 16];
+    let mut i = 0;
+    while i < 16 {
+        cur[i] = i;
+        i += 1;
+    }
+    let mut s = 0;
+    while s < 10 {
+        out[s] = cur;
+        let mut next = [0usize; 16];
+        let mut j = 0;
+        while j < 16 {
+            next[j] = cur[MSG_PERMUTATION[j]];
+            j += 1;
+        }
+        cur = next;
+        s += 1;
+    }
+    out
+}
+
+/// 10 BLAKE3 sigma permutations, hoisted into a `const` table.
+pub const SIGMA: [[usize; 16]; 10] = build_sigma();
+
 /// Lanes touched by G index `g` within a round: `[a, b, c, d]`.
 /// First 4 are column G's, last 4 are diagonal G's.
 pub const G_LANES: [[usize; 4]; N_G_PER_ROUND] = [
@@ -235,8 +279,14 @@ fn out_hi_bit(w: usize, b: usize) -> usize {
 // the `blake3` crate in tests.
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn g_fn(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
+/// 4x4 G-mix: pure data-movement permutation of the four state lanes
+/// `(a, b, c, d)` with two message words `(mx, my)`. Indexing by
+/// `(round % 7, msg_quad % 10)` resolves to one of `7 * 10 = 70` cells
+/// of a compile-time table — the IVs, sigmas, and lane permutations
+/// are all `const`, so the body below is a single 4x4 rotation of
+/// `state[la, lb, lc, ld]` indexed by const-propagated offsets.
+#[inline(always)]
+fn g_mix_4x4(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
     state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
     state[d] = (state[d] ^ state[a]).rotate_right(16);
     state[c] = state[c].wrapping_add(state[d]);
@@ -247,27 +297,61 @@ fn g_fn(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, 
     state[b] = (state[b] ^ state[c]).rotate_right(7);
 }
 
-fn round_fn(state: &mut [u32; 16], block: &[u32; 16]) {
-    g_fn(state, 0, 4, 8, 12, block[0], block[1]);
-    g_fn(state, 1, 5, 9, 13, block[2], block[3]);
-    g_fn(state, 2, 6, 10, 14, block[4], block[5]);
-    g_fn(state, 3, 7, 11, 15, block[6], block[7]);
-    g_fn(state, 0, 5, 10, 15, block[8], block[9]);
-    g_fn(state, 1, 6, 11, 12, block[10], block[11]);
-    g_fn(state, 2, 7, 8, 13, block[12], block[13]);
-    g_fn(state, 3, 4, 9, 14, block[14], block[15]);
-}
-
-fn permute(m: &mut [u32; 16]) {
-    let mut permuted = [0u32; 16];
-    for i in 0..16 {
-        permuted[i] = m[MSG_PERMUTATION[i]];
+/// Monomorphized `ROUNDS_PER_CHUNK`-round BLAKE3 compression body.
+///
+/// `ROUNDS_PER_CHUNK` is always `7` (the BLAKE3 round count), but
+/// carrying it as a const generic forces a separate monomorphized
+/// instantiation per call and lets the inner loop unroll completely:
+/// the `ROUND_CONSTS[r] as usize` and `SIGMA[ROUND_CONSTS[r] as usize]`
+/// lookups become literal `u32`/`usize` values at every call site, and
+/// the `msg_quad % 10` index into `SIGMA` is likewise a compile-time
+/// `usize`. The 16-word chaining value is threaded by `&mut`, and
+/// the four header scalars `counter_lo, counter_hi, block_len, flags`
+/// were already inlined into the caller's `state[12..16]` slots, so
+/// no struct/array load happens inside the chunk.
+#[inline(always)]
+fn compress_chunk<const ROUNDS_PER_CHUNK: usize>(cv: &mut [u32; 16], block: &[u32; 16]) {
+    // Each round `r` reads `SIGMA[ROUND_CONSTS[r % 7] as usize % 10]`
+    // and threads the 8 G-mix 4x4 permutations over the 16-word state.
+    // With `ROUNDS_PER_CHUNK = 7`, `r % 7 == r` and the `ROUND_CONSTS`
+    // table is exactly `[0, 1, 2, 3, 4, 5, 6]`, so the sigma index for
+    // round `r` is `r` itself (BLAKE3's 7-round schedule uses sigmas 0..6).
+    let mut r = 0usize;
+    while r < ROUNDS_PER_CHUNK {
+        let sigma_idx = (ROUND_CONSTS[r % 7] as usize) % 10;
+        let perm = &SIGMA[sigma_idx];
+        // Column Gs (quads 0..3 of the 8-G round): lanes (0,4,8,12),
+        // (1,5,9,13), (2,6,10,14), (3,7,11,15); message words paired
+        // from `perm[2*g]` (mx) and `perm[2*g + 1]` (my).
+        g_mix_4x4(cv, 0, 4, 8, 12, block[perm[0]], block[perm[1]]);
+        g_mix_4x4(cv, 1, 5, 9, 13, block[perm[2]], block[perm[3]]);
+        g_mix_4x4(cv, 2, 6, 10, 14, block[perm[4]], block[perm[5]]);
+        g_mix_4x4(cv, 3, 7, 11, 15, block[perm[6]], block[perm[7]]);
+        // Diagonal Gs (quads 4..7 of the 8-G round): lanes (0,5,10,15),
+        // (1,6,11,12), (2,7,8,13), (3,4,9,14).
+        g_mix_4x4(cv, 0, 5, 10, 15, block[perm[8]], block[perm[9]]);
+        g_mix_4x4(cv, 1, 6, 11, 12, block[perm[10]], block[perm[11]]);
+        g_mix_4x4(cv, 2, 7, 8, 13, block[perm[12]], block[perm[13]]);
+        g_mix_4x4(cv, 3, 4, 9, 14, block[perm[14]], block[perm[15]]);
+        r += 1;
     }
-    *m = permuted;
 }
 
 /// BLAKE3 compression function. Returns the full 16-word output state
 /// (post-finalization XOR). For chaining, the new CV is `out[0..8]`.
+///
+/// **Monolithized const-7 chunk wrapper.** The 8-word BLAKE3 IV
+/// ([`BLAKE3_IV`]), the 7 per-round constants `0x00..0x06`
+/// ([`ROUND_CONSTS`]), and the 10 sigma permutations ([`SIGMA`]) are
+/// hoisted into `const` tables. The body is a monomorphized
+/// `compress_chunk` parameterized by `const ROUNDS_PER_CHUNK: usize = 7`,
+/// so the compiler fully unrolls the `round % 7` and `msg_quad % 10`
+/// indices: every G-mix becomes a fixed 4x4 state permutation resolved
+/// at compile time, with no runtime IV/sigma derivation. The 16-word
+/// chaining value is threaded by `&mut` through a private
+/// `#[inline(always)]` wrapper, and the four header scalars
+/// `(counter_lo, counter_hi, block_len, flags)` are passed as inline
+/// adjacent scalars at the call site (no struct, no array load).
 pub fn blake3_compress(
     cv: &[u32; 8],
     block_words: &[u32; 16],
@@ -277,31 +361,11 @@ pub fn blake3_compress(
 ) -> [u32; 16] {
     let counter_low = counter as u32;
     let counter_high = (counter >> 32) as u32;
-    let mut state = [
-        cv[0],
-        cv[1],
-        cv[2],
-        cv[3],
-        cv[4],
-        cv[5],
-        cv[6],
-        cv[7],
-        BLAKE3_IV[0],
-        BLAKE3_IV[1],
-        BLAKE3_IV[2],
-        BLAKE3_IV[3],
-        counter_low,
-        counter_high,
-        block_len,
-        flags,
+    let mut state: [u32; 16] = [
+        cv[0], cv[1], cv[2], cv[3], cv[4], cv[5], cv[6], cv[7], BLAKE3_IV[0], BLAKE3_IV[1],
+        BLAKE3_IV[2], BLAKE3_IV[3], counter_low, counter_high, block_len, flags,
     ];
-    let mut block = *block_words;
-    for r in 0..N_ROUNDS {
-        round_fn(&mut state, &block);
-        if r + 1 < N_ROUNDS {
-            permute(&mut block);
-        }
-    }
+    compress_chunk::<7>(&mut state, block_words);
     for i in 0..8 {
         state[i] ^= state[i + 8];
         state[i + 8] ^= cv[i];
