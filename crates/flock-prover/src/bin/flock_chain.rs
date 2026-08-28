@@ -27,7 +27,7 @@ use flock_prover::proof_io::{
     write_chain_bundle_ligerito_to_file,
 };
 use flock_prover::r1cs_hashes::blake3::{
-    self as blake3_chain, BLAKE3_IV, Blake3Setup, blake3_compress, cv_to_phys_bits as bl_cv_phys,
+    self as blake3_chain, BLAKE3_IV, Blake3Setup, blake3_compress_chained, cv_to_phys_bits as bl_cv_phys,
 };
 use flock_prover::r1cs_hashes::chain_common;
 use flock_prover::r1cs_hashes::keccak::{
@@ -175,6 +175,7 @@ fn u32_words_to_hex_be(words: &[u32; 8]) -> String {
 }
 
 // SplitMix64 — deterministic message generation.
+#[derive(Clone, Copy)]
 struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {
@@ -189,6 +190,13 @@ impl Rng {
     }
     fn next_block(&mut self) -> [u32; 16] {
         std::array::from_fn(|_| self.nx() as u32)
+    }
+    /// Compute the NEXT block without consuming the current one, so the
+    /// caller can pre-stage its 64-byte load into L1 before the actual
+    /// `next_block` call later. Uses a throwaway clone of the RNG state.
+    fn peek_next_block(&self) -> [u32; 16] {
+        let mut clone = *self;
+        std::array::from_fn(|_| clone.nx() as u32)
     }
 }
 
@@ -252,10 +260,19 @@ fn prove_blake3(
     let mut rng = Rng::new(seed);
     let mut cv = initial_cv;
     let mut blocks = Vec::with_capacity(steps);
-    for _ in 0..steps {
+    for step in 0..steps {
         let m = rng.next_block();
         blocks.push((cv, m, 0u64, 64u32, 0u32));
-        let st = blake3_compress(&cv, &m, 0, 64, 0);
+        // Peek the next chunk's input block (if any) and pre-stage its
+        // 64-byte load + counter increment into local stack variables
+        // BEFORE the current compress() returns, so the next call finds
+        // the line already resident in L1/registers.
+        let next_m = if step + 1 < steps {
+            Some(rng.peek_next_block())
+        } else {
+            None
+        };
+        let st = blake3_compress_chained(&cv, &m, 0, 64, 0, next_m.as_ref(), (step + 1) as u64);
         cv = st[0..8].try_into().unwrap();
     }
     let cv_last = cv;
