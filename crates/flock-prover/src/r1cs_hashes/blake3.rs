@@ -1821,6 +1821,16 @@ pub(crate) mod witgen_simd {
         *ON
     }
 
+    /// Ranked warm-pool seam for A's last live dump chunk.  Only words
+    /// 480/481 are dynamic; the final six words are constructed as zero in
+    /// registers instead of round-tripping through the lane-major stage.
+    /// Keep a same-binary kill switch for remote attribution.
+    fn a_sparse_tail_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_A_SPARSE_TAIL").is_none());
+        *ON
+    }
+
     #[inline(always)]
     pub(super) const fn select_z_nt(
         nt_enabled: bool,
@@ -1916,12 +1926,26 @@ pub(crate) mod witgen_simd {
     struct W32 {
         pending: V4,
         stage: *mut V4, // 512 block-lane words for this buffer's quad
+        skip_static_tail: bool,
     }
 
     impl W32 {
         #[inline(always)]
         fn at(stage: *mut V4, pending: V4) -> Self {
-            Self { pending, stage }
+            Self {
+                pending,
+                stage,
+                skip_static_tail: false,
+            }
+        }
+
+        #[inline(always)]
+        fn at_static_tail(stage: *mut V4, pending: V4) -> Self {
+            Self {
+                pending,
+                stage,
+                skip_static_tail: true,
+            }
         }
 
         /// Push the low WIDTH bits of `v` at stream offset ≡ USED (mod 32).
@@ -1955,7 +1979,9 @@ pub(crate) mod witgen_simd {
                 // the next `vsli #31` overwrites it exactly.
                 if USED == 0 {
                     if WIDTH == 32 {
-                        vst1q_u32(self.stage.add(WORD) as *mut u32, v);
+                        if WORD < ELIDE_B_TAIL_CHUNK * 8 || !self.skip_static_tail {
+                            vst1q_u32(self.stage.add(WORD) as *mut u32, v);
+                        }
                         self.pending = vdupq_n_u32(0);
                     } else {
                         self.pending = v;
@@ -1964,7 +1990,9 @@ pub(crate) mod witgen_simd {
                     self.pending = vsliq_n_u32::<USED>(self.pending, v);
                 } else {
                     let out = vsliq_n_u32::<USED>(self.pending, v);
-                    vst1q_u32(self.stage.add(WORD) as *mut u32, out);
+                    if WORD < ELIDE_B_TAIL_CHUNK * 8 || !self.skip_static_tail {
+                        vst1q_u32(self.stage.add(WORD) as *mut u32, out);
+                    }
                     if USED + WIDTH == 32 {
                         self.pending = vdupq_n_u32(0);
                     } else {
@@ -1979,7 +2007,9 @@ pub(crate) mod witgen_simd {
         #[inline(always)]
         unsafe fn finish(&mut self) {
             unsafe {
-                vst1q_u32(self.stage.add(LAST_WORD) as *mut u32, self.pending);
+                if !self.skip_static_tail {
+                    vst1q_u32(self.stage.add(LAST_WORD) as *mut u32, self.pending);
+                }
             }
         }
     }
@@ -2020,6 +2050,42 @@ pub(crate) mod witgen_simd {
                     vst1q_u32(p2.add(4), y.2);
                     vst1q_u32(p3, x.3);
                     vst1q_u32(p3.add(4), y.3);
+                }
+            }
+        }
+    }
+
+    /// Publish A's two live blk30 words from the lane-major quad stage.
+    /// `zip1/zip2` form `(w480, w481)` pairs for blocks 0..3 and zeros are
+    /// supplied directly in registers.  This retains the full 32-byte
+    /// overwrite required before A's zero-token boundary, while removing six
+    /// stage-zero writes per block and the generic tail `ld4` transpose.
+    #[inline(always)]
+    unsafe fn dump_a_sparse_tail<const NT: bool>(stage: *const V4, dst: *mut u32) {
+        unsafe {
+            const W: usize = (ELIDE_ZERO_CHUNK - 1) * 8;
+            const {
+                assert!(W == 480);
+                assert!(LAST_WORD == W + 1);
+            }
+            let x = vld1q_u32(stage.add(W) as *const u32);
+            let y = vld1q_u32(stage.add(W + 1) as *const u32);
+            let lo = vzip1q_u32(x, y);
+            let hi = vzip2q_u32(x, y);
+            let z = vdupq_n_u32(0);
+            let rows = [
+                vcombine_u32(vget_low_u32(lo), vget_low_u32(z)),
+                vcombine_u32(vget_high_u32(lo), vget_low_u32(z)),
+                vcombine_u32(vget_low_u32(hi), vget_low_u32(z)),
+                vcombine_u32(vget_high_u32(hi), vget_low_u32(z)),
+            ];
+            for (block, row) in rows.into_iter().enumerate() {
+                let p = dst.add(block * U32_PER_BLOCK + W);
+                if NT {
+                    store_nt_pair(row, z, p);
+                } else {
+                    vst1q_u32(p, row);
+                    vst1q_u32(p.add(4), z);
                 }
             }
         }
@@ -2118,6 +2184,75 @@ pub(crate) mod witgen_simd {
         unsafe { dump_range::<NT>(stage, dst, g0, g1) }
     }
 
+    /// Shared cold/mixed provenance drain. Kept out of the already large NEON
+    /// compression body; all partial-hit states use this one copy.
+    #[inline(never)]
+    unsafe fn dump_provenance_fallback(
+        zs: *const V4,
+        ast: *const V4,
+        bs: *const V4,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        z_nt: bool,
+        ab_nt: bool,
+        elide: [bool; 3],
+    ) {
+        unsafe {
+            if z_nt {
+                dump_elide::<true>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
+            } else {
+                dump_elide::<false>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
+            }
+            if ab_nt {
+                dump_elide::<true>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
+                dump_elide::<true>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+            } else {
+                dump_elide::<false>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
+                dump_elide::<false>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+            }
+        }
+    }
+
+    /// Tiny ranked measured-trial seam: fixed all-provenance-hit ranges only.
+    /// This specializes the publisher without cloning the NEON compression.
+    #[inline(always)]
+    unsafe fn dump_all_provenance_hit(
+        zs: *const V4,
+        ast: *const V4,
+        bs: *const V4,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        z_nt: bool,
+        ab_nt: bool,
+    ) {
+        unsafe {
+            if z_nt {
+                dump_range::<true>(zs, z, 0, ELIDE_ZERO_CHUNK);
+            } else {
+                dump_range::<false>(zs, z, 0, ELIDE_ZERO_CHUNK);
+            }
+            if ab_nt {
+                if a_sparse_tail_enabled() {
+                    dump_range::<true>(ast, a, 0, ELIDE_ZERO_CHUNK - 1);
+                    dump_a_sparse_tail::<true>(ast, a);
+                } else {
+                    dump_range::<true>(ast, a, 0, ELIDE_ZERO_CHUNK);
+                }
+                dump_range::<true>(bs, b, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK);
+            } else {
+                if a_sparse_tail_enabled() {
+                    dump_range::<false>(ast, a, 0, ELIDE_ZERO_CHUNK - 1);
+                    dump_a_sparse_tail::<false>(ast, a);
+                } else {
+                    dump_range::<false>(ast, a, 0, ELIDE_ZERO_CHUNK);
+                }
+                dump_range::<false>(bs, b, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK);
+            }
+        }
+    }
+
     /// [`build_quad_witness_ab_stream_neon`] with per-buffer constant-region
     /// elision flags `[z, a, b]` (item B). With all flags false this is the
     /// incumbent full write; with a flag true the corresponding buffer's
@@ -2134,6 +2269,7 @@ pub(crate) mod witgen_simd {
         elide: [bool; 3],
     ) {
         unsafe {
+            let all_hit = elide == [true; 3];
             let (cv_v, m, tlo, thi, blen, flags) = match inputs {
                 QuadInput::Blocks(inputs) => {
                     // Ordinary callers retain the incumbent AoS gather and
@@ -2251,7 +2387,12 @@ pub(crate) mod witgen_simd {
             let maxv = vdupq_n_u32(u32::MAX);
             // b prefix words 0..36 = MAX (the out_lo slot is MAX too — the
             // scalar writes MAX over MAX, so b needs no out_lo pass).
-            for w in 0..36usize {
+            for w in if all_hit {
+                ELIDE_B_PREFIX_CHUNKS * 8
+            } else {
+                0
+            }..36usize
+            {
                 vst1q_u32(bs.add(w) as *mut u32, maxv);
             }
             // Message region words 16..36: word16 = 1|m0<<1, then
@@ -2282,7 +2423,11 @@ pub(crate) mod witgen_simd {
             let pending_bit = vshrq_n_u32::<31>(flags);
             let mut wz = W32::at(zs, pending_bit);
             let mut wa = W32::at(ast, pending_bit);
-            let mut wb = W32::at(bs, one);
+            let mut wb = if all_hit {
+                W32::at_static_tail(bs, one)
+            } else {
+                W32::at(bs, one)
+            };
 
             macro_rules! g {
                 ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -2379,10 +2524,28 @@ pub(crate) mod witgen_simd {
             const {
                 assert!(U32_PER_BLOCK - ZF == 30);
             }
-            for w in 0..30usize {
-                vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
+            let z_zero_end = if all_hit {
+                ELIDE_ZERO_CHUNK * 8
+            } else {
+                U32_PER_BLOCK
+            };
+            let a_zero_end = if all_hit && a_sparse_tail_enabled() {
+                LAST_WORD + 1
+            } else if all_hit {
+                ELIDE_ZERO_CHUNK * 8
+            } else {
+                U32_PER_BLOCK
+            };
+            for w in ZF..z_zero_end {
+                vst1q_u32(zs.add(w) as *mut u32, zero);
+            }
+            for w in ZF..a_zero_end {
+                vst1q_u32(ast.add(w) as *mut u32, zero);
+            }
+            if !all_hit {
+                for w in ZF..U32_PER_BLOCK {
+                    vst1q_u32(bs.add(w) as *mut u32, zero);
+                }
             }
 
             // ---- out_lo slot, words 8..16 (z/a only) ----
@@ -2393,17 +2556,10 @@ pub(crate) mod witgen_simd {
             }
 
             // ---- drain stages: per-block 2 KiB ascending bursts ----
-            if z_nt {
-                dump_elide::<true>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
+            if all_hit {
+                dump_all_provenance_hit(zs, ast, bs, z, a, b, z_nt, ab_nt);
             } else {
-                dump_elide::<false>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
-            }
-            if ab_nt {
-                dump_elide::<true>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
-                dump_elide::<true>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
-            } else {
-                dump_elide::<false>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
-                dump_elide::<false>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+                dump_provenance_fallback(zs, ast, bs, z, a, b, z_nt, ab_nt, elide);
             }
         }
     }
@@ -4599,28 +4755,46 @@ mod tests {
                         }
                     }
                 };
-                let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
-                let mut ae = ze;
-                let mut be = ze;
-                seed_consts(&mut ze, false);
-                seed_consts(&mut ae, false);
-                seed_consts(&mut be, true);
-                unsafe {
-                    witgen_simd::build_quad_witness_ab_stream_neon_elide(
-                        witgen_simd::QuadInput::Blocks([
-                            &inputs[0], &inputs[1], &inputs[2], &inputs[3],
-                        ]),
-                        ze.as_mut_ptr() as *mut u32,
-                        ae.as_mut_ptr() as *mut u32,
-                        be.as_mut_ptr() as *mut u32,
-                        z_nt,
-                        ab_nt,
-                        [true; 3],
+                for mask in 0u8..8 {
+                    let elide = [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0];
+                    let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
+                    let mut ae = ze;
+                    let mut be = ze;
+                    if elide[0] {
+                        seed_consts(&mut ze, false);
+                    }
+                    if elide[1] {
+                        seed_consts(&mut ae, false);
+                    }
+                    if elide[2] {
+                        seed_consts(&mut be, true);
+                    }
+                    unsafe {
+                        witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                            witgen_simd::QuadInput::Blocks([
+                                &inputs[0], &inputs[1], &inputs[2], &inputs[3],
+                            ]),
+                            ze.as_mut_ptr() as *mut u32,
+                            ae.as_mut_ptr() as *mut u32,
+                            be.as_mut_ptr() as *mut u32,
+                            z_nt,
+                            ab_nt,
+                            elide,
+                        );
+                    }
+                    assert_eq!(
+                        ze, zq,
+                        "elided z diverged mask={mask:#05b} z_nt={z_nt} ab_nt={ab_nt}"
+                    );
+                    assert_eq!(
+                        ae, aq,
+                        "elided a diverged mask={mask:#05b} z_nt={z_nt} ab_nt={ab_nt}"
+                    );
+                    assert_eq!(
+                        be, bq,
+                        "elided b diverged mask={mask:#05b} z_nt={z_nt} ab_nt={ab_nt}"
                     );
                 }
-                assert_eq!(ze, zq, "elided z diverged z_nt={z_nt} ab_nt={ab_nt}");
-                assert_eq!(ae, aq, "elided a diverged z_nt={z_nt} ab_nt={ab_nt}");
-                assert_eq!(be, bq, "elided b diverged z_nt={z_nt} ab_nt={ab_nt}");
             }
         }
         // Driver equality incl. padding slots and the stripe.
