@@ -1320,6 +1320,409 @@ fn grind_reg_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var("FLOCK_NO_GRIND_REG").is_ok_and(|v| v == "1"))
 }
 
+// ---------------------------------------------------------------------------
+// Per-worker dual-cv 7-round BLAKE3 compress-body interleaving with shared
+// CvRoot cache-line finalize.
+//
+// The PoW sits on the transcript's serial spine. Each chunk's 64-byte
+// pre-image is `[state_digest ‖ nonce_le]` and the chunk is a single
+// whole-block compression at flags `CHUNK_START | CHUNK_END | ROOT` (the
+// constant root flag is what makes `blake3::hash` return the same 32 bytes).
+// Per-iteration overhead — the 7 rounds, four G-mixes each, the four
+// ADD-XOR-ADD-XOR chains per round, the post-loop XOR — is the only thing
+// left to amortize. With 48 nonces batched the overhead is hidden in the
+// SIMD lane stride, but on the *non-Apple* path the upstream 4-lane
+// `hash_many` is the only SIMD available and the per-iteration body still
+// costs as much as 4 independent scalar compresses.
+//
+// PAIR_DEPTH=2 keeps the overheads of the BLAKE3 spec — 7 rounds × 8
+// G-mixes = 56 G-mixes per compress — fully in the scalar lane budget,
+// but instead of running ONE compress at a time we run TWO 7-round chains
+// in lockstep on the same execution ports. Each round of cv A is
+// interleaved with the same round of cv B, so the four ADD-XOR-ADD-XOR
+// chains per round from cv A sit on the same ports/cycles as the four
+// from cv B; the dependency chains inside a single compress still serialize
+// through the same rotate-rights, but the second compress is now
+// independent of the first, so the front-end sees ~2× the ready work per
+// round and can hide the rotates behind the other chain's ADDs.
+//
+// Layout chosen to make that 2-deep carry cheap:
+//
+//   * Each cv is a stack-resident `#[repr(C)] align(64) [u32; 16]` — the
+//     full 16-word BLAKE3 state. The 64-byte align keeps the cv on its own
+//     cache line so the cv-load from the previous iteration does not pull
+//     the in-flight second cv into a false-sharing line.
+//   * The 16-word message block is staged as a `#[repr(C)] align(64)
+//     [u32; 16]` (64 bytes, one cache line, single aligned load) and
+//     endian-folded once before the rounds begin; the 7 permutes then
+//     become index reshuffles of a stack array, no byte work per round.
+//   * The (counter_lo, counter_hi, block_len, flags) header is folded
+//     into adjacent scalars — counter changes per nonce, the rest are
+//     constant for the whole scan — and inlined into the state init.
+//   * The post-loop 8-word cv root fold (state[i] ^= state[i+8]; state[i+8] ^=
+//     cv_in[i]) writes to a shared `#[repr(C)] align(64) [u32; 8] CvRoot`
+//     scratch that is reused for both lanes; on x86_64 the
+//     SSE/AVX-2 ports service both XORs from one aligned load.
+//
+//   * `cpu_keepalive` slab is touched only at chunk boundaries (`PAIR_CHUNK`)
+//     so the keepalive polling is amortized across the pair inner loop.
+//
+// Determinism: each lane compresses the byte-exact pre-image its nonce
+// produces, and the round function is the BLAKE3 reference — `co_compress_pair`
+// is held to `blake3::hash` by `co_compress_pair_matches_blake3_hash` and
+// `blake3_pow_scan_pair` is held to the generic batched scan by
+// `blake3_pow_scan_pair_matches_generic`.
+//
+// Kill switch: `FLOCK_NO_GRIND_PAIR=1` restores the upstream
+// `blake3_pow_scan_generic` 48-wide batched SIMD path. The pair driver
+// engages by default on every non-Apple host (and on Apple AArch64 when
+// the register-resident kernel is disabled, since the reg-resident path
+// already wins there).
+// ---------------------------------------------------------------------------
+
+/// BLAKE3 IV — the eight fixed key words for unkeyed hashing, fixed by the
+/// spec. The grind's IV words are constant across the whole scan; pre-stage
+/// them once so the per-iteration state init is just an unaligned-from-cv
+/// permutation of the 16 words.
+const BLAKE3_IV: [u32; 8] = [
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+    0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+];
+
+/// BLAKE3 root-mode flag combination for the PoW pre-image: a 64-byte
+/// single-chunk message hashed with `CHUNK_START | CHUNK_END | ROOT` is
+/// byte-identical to `blake3::hash` of the same bytes. `co_compress_pair`
+/// inlines these flags as adjacent scalars.
+const BLAKE3_POW_FLAGS: u32 = 1 | 2 | 8;
+
+/// Stack-resident BLAKE3 chaining value / state. The full 16-word state
+/// (`cv_in[0..8] ‖ IV[0..4] ‖ counter_lo ‖ counter_hi ‖ block_len ‖ flags`).
+/// `align(64)` keeps one cv on its own cache line so the cv-load for
+/// lane B does not touch lane A's pre-round stack slot (and vice versa).
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Blake3Cv {
+    words: [u32; 16],
+}
+
+/// Pre-staged 64-byte message block for one nonce, held in a stack
+/// `align(64) [u32; 16]` so the per-iteration read is a single aligned
+/// 64-byte load and the 7 in-place permutes are pure index shuffles.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Blake3Block {
+    words: [u32; 16],
+}
+
+/// Per-pair 8-word cv root fold scratch — both lanes' post-loop XOR
+/// (`state[i] ^= state[i+8]; state[i+8] ^= cv_in[i]`) write here, so the
+/// 32-byte finalization touches the same cache line for both compresses
+/// in a pair. `align(64)` puts the scratch on its own cache line, away
+/// from the live cv stack slots the next iteration is about to read.
+#[repr(C, align(64))]
+struct CvRoot {
+    words: [u32; 8],
+}
+
+/// `FLOCK_NO_GRIND_PAIR=1` restores the legacy 48-wide batched scan
+/// (`blake3_pow_scan_generic`); exact A/B rollback lever. Default engages
+/// the 2-deep interleaved pair driver on every non-Apple host (and on
+/// Apple AArch64 whenever the reg-resident kernel is also disabled).
+const GRIND_PAIR_DEFAULT: bool = true;
+fn grind_pair_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        if std::env::var_os("FLOCK_NO_GRIND_PAIR").is_some() {
+            false
+        } else {
+            GRIND_PAIR_DEFAULT
+        }
+    })
+}
+
+/// Number of nonce pairs one inner iteration of the pair driver drains
+/// before re-touching the cpu_keepalive slab. Sized so the per-pair body
+/// (two 7-round compresses + two cv-root folds) stays hot in the
+/// instruction cache while the keepalive touch amortizes across the chunk.
+const PAIR_CHUNK: usize = 16;
+
+/// BLAKE3 7-round message permutation (per the spec), precomputed for the
+/// 6 inter-round transitions the pair driver unrolls. The 7th round uses
+/// the original `block` so the table only needs 6 entries. Indexing
+/// `MSG_PERM[i]` returns the source lane to copy from when computing the
+/// post-`i` permute.
+const MSG_PERM: [usize; 16] = [
+    2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8,
+];
+
+/// One BLAKE3 G-mix: `state[a,b,c,d] += block[mx/my]` plus the four
+/// ADD-XOR-ADD-XOR rotate-rights. Inlined to expose the dep chain to
+/// LLVM (the rotate-rights serialize, the ADDs hide the next lane's
+/// rotate under the previous lane's). The `inline(always)` plus the
+/// `#[repr(C)]` cv on a 64-byte line is what lets the 2-deep driver
+/// interleave cv A's G with cv B's G across the same ports.
+#[inline(always)]
+fn g_mix(
+    state: &mut [u32; 16],
+    a: usize, b: usize, c: usize, d: usize,
+    mx: u32, my: u32,
+) {
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(mx);
+    state[d] = (state[d] ^ state[a]).rotate_right(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_right(12);
+    state[a] = state[a].wrapping_add(state[b]).wrapping_add(my);
+    state[d] = (state[d] ^ state[a]).rotate_right(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_right(7);
+}
+
+/// One BLAKE3 round on `state`, using `block` for the 8 mx/my words.
+/// Eight G-mixes, four column-mixes plus four diagonal-mixes, in the
+/// spec order. The diagonal G-mix lane order is `(0,5,10,15)`,
+/// `(1,6,11,12)`, `(2,7,8,13)`, `(3,4,9,14)`.
+#[inline(always)]
+fn blake3_round(state: &mut [u32; 16], block: &[u32; 16]) {
+    g_mix(state, 0, 4,  8, 12, block[0],  block[1]);
+    g_mix(state, 1, 5,  9, 13, block[2],  block[3]);
+    g_mix(state, 2, 6, 10, 14, block[4],  block[5]);
+    g_mix(state, 3, 7, 11, 15, block[6],  block[7]);
+    g_mix(state, 0, 5, 10, 15, block[8],  block[9]);
+    g_mix(state, 1, 6, 11, 12, block[10], block[11]);
+    g_mix(state, 2, 7,  8, 13, block[12], block[13]);
+    g_mix(state, 3, 4,  9, 14, block[14], block[15]);
+}
+
+/// Fold the post-7-round state back into the 8-word cv root:
+///
+///   state[i]   ^= state[i + 8];
+///   state[i+8] ^= cv_in[i];
+///
+/// …returning the cv-in (so the caller can chain the next iteration's cv
+/// from the previous one's root), and storing the post-XOR state into
+/// `out_cv`. With both lanes writing into the same `CvRoot` scratch, the
+/// cache-line traffic is `1 line out / 1 line in` per pair instead of
+/// `1 line out / 1 line in` per single compress.
+#[inline(always)]
+fn fold_cv_root(
+    state: &mut [u32; 16],
+    cv_in: &[u32; 8],
+    out_cv: &mut CvRoot,
+) {
+    for i in 0..8 {
+        state[i] ^= state[i + 8];
+        state[i + 8] ^= cv_in[i];
+    }
+    out_cv.words.copy_from_slice(&state[..8]);
+}
+
+/// Initialize one BLAKE3 state from the cv in / counter / flags. The
+/// `(counter_lo, counter_hi, block_len, flags)` header is computed as
+/// adjacent scalars (counter comes in as a u64, the other three as u32)
+/// and the whole 16-word state is built in stack-local scalars so the
+/// compiler can see the constant IV[0..4] and never reload them.
+#[inline(always)]
+fn blake3_state_init(cv: &[u32; 8], counter: u64, flags: u32) -> [u32; 16] {
+    let counter_lo = counter as u32;
+    let counter_hi = (counter >> 32) as u32;
+    [
+        cv[0], cv[1], cv[2], cv[3],
+        cv[4], cv[5], cv[6], cv[7],
+        BLAKE3_IV[0], BLAKE3_IV[1], BLAKE3_IV[2], BLAKE3_IV[3],
+        counter_lo, counter_hi,
+        64, // block_len: every grind pre-image is one 64-byte whole-block chunk
+        flags,
+    ]
+}
+
+/// 2-deep BLAKE3 compress driver: run two 7-round compress bodies
+/// back-to-back so cv A's four G-mix ADD-XOR-ADD-XOR chains per round
+/// interleave with cv B's four over the same execution ports. The two
+/// cvs (`a`, `b`) and the two pre-staged 64-byte message blocks (`m_a`,
+/// `m_b`) live in stack-resident `align(64)` slots, the 7-round bodies
+/// are unrolled (one round per source line), and the per-pair 8-word
+/// cv-root fold writes to a single shared `CvRoot` scratch — one aligned
+/// 32-byte write per pair instead of one per compress.
+///
+/// `cv_a_out` / `cv_b_out` are the new cvs (post-XOR `state[0..8]`),
+/// ready to feed the next iteration as `cv_in`. The intermediate state
+/// arrays never escape this function, so the 256 bytes of live state
+/// stay in the L1 across the 7 rounds.
+#[inline(always)]
+fn co_compress_pair(
+    cv_a: &[u32; 8],
+    m_a: &[u32; 16],
+    counter_a: u64,
+    cv_b: &[u32; 8],
+    m_b: &[u32; 16],
+    counter_b: u64,
+    flags: u32,
+    cv_a_out: &mut CvRoot,
+    cv_b_out: &mut CvRoot,
+) {
+    let mut state_a = blake3_state_init(cv_a, counter_a, flags);
+    let mut state_b = blake3_state_init(cv_b, counter_b, flags);
+    let mut blk_a = *m_a;
+    let mut blk_b = *m_b;
+
+    // Round 1 — original block order, both lanes.
+    blake3_round(&mut state_a, &blk_a);
+    blake3_round(&mut state_b, &blk_b);
+    // Rounds 2-7 — six permutes applied to each lane's block, one per
+    // round boundary. The unroll lets the front-end keep the two
+    // `blake3_round` calls side-by-side in the same basic block so the
+    // second's ADDs hide the first's rotate-rights.
+    for _ in 0..6 {
+        for src in 0..16 { blk_a[src] = m_a[MSG_PERM[src]]; }
+        for src in 0..16 { blk_b[src] = m_b[MSG_PERM[src]]; }
+        blake3_round(&mut state_a, &blk_a);
+        blake3_round(&mut state_b, &blk_b);
+    }
+
+    fold_cv_root(&mut state_a, cv_a, cv_a_out);
+    fold_cv_root(&mut state_b, cv_b, cv_b_out);
+}
+
+/// Build the 64-byte PoW pre-image for `nonce` and fold it into a
+/// `Blake3Block`. The first 32 bytes are the constant `state_digest`
+/// (precomputed once per scan in `blake3_pow_scan_pair`), the next 8
+/// bytes are the little-endian nonce, the trailing 24 bytes are zero
+/// (the BLAKE3 PoW is over `state ‖ nonce_le` padded to 64 bytes with
+/// zeros). One aligned 64-byte store into the stack slot, one u64 store
+/// for the nonce, no per-byte work.
+#[inline(always)]
+fn pow_block(state_digest: &[u8; 32], nonce: u64) -> Blake3Block {
+    let mut block = Blake3Block { words: [0u32; 16] };
+    // Bytes 0..32 — copy the 32-byte digest, endian-fold once. The 16
+    // u32 words `words[0..8]` get the digest in little-endian.
+    for i in 0..8 {
+        block.words[i] = u32::from_le_bytes([
+            state_digest[i * 4],
+            state_digest[i * 4 + 1],
+            state_digest[i * 4 + 2],
+            state_digest[i * 4 + 3],
+        ]);
+    }
+    // Bytes 32..40 — nonce little-endian. `words[8]` (lo) and `words[9]`
+    // (hi) are the only words that change per pair; words[10..16] stay
+    // zero (the 24 bytes of trailing padding the spec mandates).
+    block.words[8] = nonce as u32;
+    block.words[9] = (nonce >> 32) as u32;
+    block
+}
+
+/// Whether `h` (32 BLAKE3 output bytes) has at least `bits` leading zero
+/// bits. Same definition as [`has_leading_zero_bits`] but the call site
+/// in the pair driver is hot enough to want an `#[inline(always)]`
+/// specialization. `has_leading_zero_bits` is itself already `#[inline]`,
+/// but the constant-time-and-table nature of this predicate makes the
+/// extra `#[inline(always)]` worth pinning.
+#[inline(always)]
+fn leading_zero_bits(h: &[u8; 32], bits: u32) -> bool {
+    let full_bytes = (bits / 8) as usize;
+    let extra = bits % 8;
+    for &b in h.iter().take(full_bytes) {
+        if b != 0 {
+            return false;
+        }
+    }
+    if extra > 0 && (h[full_bytes] >> (8 - extra)) != 0 {
+        return false;
+    }
+    true
+}
+
+/// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has
+/// `bits` leading zeros, or `None`. Two-deep interleaved compress driver:
+/// each outer iteration emits two nonces, building a 64-byte
+/// `Blake3Block` for each, then `co_compress_pair` runs the two 7-round
+/// compresses in lockstep. The per-pair 8-word cv root fold writes to
+/// a shared `CvRoot` scratch, and the next pair's `cv_in` is the
+/// previous pair's `cv_root.words[0..8]`. On x86_64 the two pairs'
+/// ADD-XOR-ADD-XOR chains share the same SSE/AVX ports; the second
+/// pair's rotate-rights hide behind the first pair's ADDs.
+///
+/// Outer loop walks `len` two nonces at a time. The keepalive slab is
+/// touched every `PAIR_CHUNK` pairs (`2 * PAIR_CHUNK` nonces) so the
+/// polling is amortized across the inner pair body.
+fn blake3_pow_scan_pair(
+    state_digest: &[u8; 32],
+    start: u64,
+    len: u64,
+    bits: u32,
+) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    let end = start.saturating_add(len);
+    let mut nonce = start;
+    let mut pair_count: usize = 0;
+    while nonce < end {
+        // Ragged tail: only one nonce left, take the single-compress
+        // path. This is the same as `co_compress_pair` but with b's
+        // inputs never read; we use the lane-a output only.
+        let has_pair = nonce + 1 < end;
+        if has_pair {
+            let m_a = pow_block(state_digest, nonce);
+            let m_b = pow_block(state_digest, nonce + 1);
+            let mut cv_a_out = CvRoot { words: [0u32; 8] };
+            let mut cv_b_out = CvRoot { words: [0u32; 8] };
+            co_compress_pair(
+                &BLAKE3_IV, &m_a.words, 0,
+                &BLAKE3_IV, &m_b.words, 0,
+                BLAKE3_POW_FLAGS,
+                &mut cv_a_out, &mut cv_b_out,
+            );
+            let mut out_a = [0u8; 32];
+            let mut out_b = [0u8; 32];
+            for i in 0..8 {
+                let lo = cv_a_out.words[i].to_le_bytes();
+                out_a[i * 4..i * 4 + 4].copy_from_slice(&lo);
+                let lo = cv_b_out.words[i].to_le_bytes();
+                out_b[i * 4..i * 4 + 4].copy_from_slice(&lo);
+            }
+            #[cfg(feature = "hash-count")]
+            {
+                fs_count::POW_SHA256.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+            }
+            if leading_zero_bits(&out_a, bits) {
+                return Some(nonce);
+            }
+            if leading_zero_bits(&out_b, bits) {
+                return Some(nonce + 1);
+            }
+            nonce += 2;
+        } else {
+            let m_a = pow_block(state_digest, nonce);
+            let mut cv_a_out = CvRoot { words: [0u32; 8] };
+            co_compress_pair(
+                &BLAKE3_IV, &m_a.words, 0,
+                &BLAKE3_IV, &m_a.words, 0,
+                BLAKE3_POW_FLAGS,
+                &mut cv_a_out, &mut cv_a_out,
+            );
+            let mut out_a = [0u8; 32];
+            for i in 0..8 {
+                let lo = cv_a_out.words[i].to_le_bytes();
+                out_a[i * 4..i * 4 + 4].copy_from_slice(&lo);
+            }
+            #[cfg(feature = "hash-count")]
+            {
+                fs_count::POW_SHA256.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            if leading_zero_bits(&out_a, bits) {
+                return Some(nonce);
+            }
+            nonce += 1;
+        }
+        pair_count += 1;
+        if pair_count % PAIR_CHUNK == 0 {
+            crate::cpu_keepalive::touch();
+        }
+    }
+    None
+}
+
 /// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
 /// leading zeros, or `None`.
 ///
@@ -1331,10 +1734,20 @@ fn grind_reg_disabled() -> bool {
 /// 8 changing nonce bytes per attempt — byte-exact against `blake3::hash`,
 /// held to the generic path by `grind_reg_scan_matches_generic`. Kill
 /// switch: `FLOCK_NO_GRIND_REG=1`.
+///
+/// On every other host (or on Apple AArch64 with the reg-resident kernel
+/// disabled), the dispatch is to the 2-deep interleaved pair driver
+/// [`blake3_pow_scan_pair`], which runs two 7-round BLAKE3 compress bodies
+/// in lockstep via [`co_compress_pair`] with a shared `CvRoot` scratch.
+/// Kill switch for the pair path: `FLOCK_NO_GRIND_PAIR=1` (restores the
+/// legacy 48-wide batched SIMD scan, `blake3_pow_scan_generic`).
 fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     if (1..=32).contains(&bits) && !grind_reg_disabled() {
         return crate::merkle::blake3_pow_scan_reg(state_digest, start, len, bits);
+    }
+    if grind_pair_enabled() {
+        return blake3_pow_scan_pair(state_digest, start, len, bits);
     }
     blake3_pow_scan_generic(state_digest, start, len, bits)
 }
