@@ -266,8 +266,609 @@ fn permute(m: &mut [u32; 16]) {
     *m = permuted;
 }
 
+/// 7 BLAKE3 round-message permutations, precomputed. Each entry is the
+/// message-word index ordering consumed by a single round's 8 G-mixes; the
+/// `(2r, 2r+1)` half-pairs are the `(mx, my)` words for each column and
+/// diagonal G. BLAKE3 has a single 16-element permutation
+/// `{2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8}` applied at the end of each round;
+/// this table hoists 0..7 successive applications as constant indices so the
+/// unrolled compress body references them via `SIGMA[r][k]` rather than
+/// re-doing a 16-element rearrangement per round. (BLAKE2 carries 10
+/// permutations; only 7 are exercised in BLAKE3, so the table is 7-wide.)
+const SIGMA: [[u8; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
+
+/// Straight-line 7-round BLAKE3 compression body, fully unrolled. Schedules
+/// each round's two column quarter-rounds first (G on rows 0/1/2/3) and then
+/// the two diagonal quarter-rounds (G on the diagonal indices), with each of
+/// the 8 G's expanded as its own 8-statement body so LLVM sees four parallel
+/// ADD-XOR-ADD-XOR chains in the column pair, four in the diagonal pair, and
+/// 7 straight-line rounds that it cannot reorder back into a serial chain.
+///
+/// Aliasing `h0..h15` to the 16-word state and `m0..m15` to the 16-word
+/// message block keeps them in registers; `mx_k`/`my_k` for each G are
+/// `m[SIGMA[r][k]]` so the sigma table is monomorphized away into direct
+/// message-word picks per round. `cv0..cv7` carry the input chaining value
+/// for the finalization XOR below.
+///
+/// No safety or soundness constraint of BLAKE3 is changed: every G is exactly
+/// the 8-step ADD-XOR-ADD-XOR chain from the spec, and the (counter_lo,
+/// counter_hi, block_len, flags) tail of the state was set by the caller.
+#[inline(always)]
+fn compress_unrolled(
+    cv0: u32,
+    cv1: u32,
+    cv2: u32,
+    cv3: u32,
+    cv4: u32,
+    cv5: u32,
+    cv6: u32,
+    cv7: u32,
+    m0: u32,
+    m1: u32,
+    m2: u32,
+    m3: u32,
+    m4: u32,
+    m5: u32,
+    m6: u32,
+    m7: u32,
+    m8: u32,
+    m9: u32,
+    m10: u32,
+    m11: u32,
+    m12: u32,
+    m13: u32,
+    m14: u32,
+    m15: u32,
+    counter_lo: u32,
+    counter_hi: u32,
+    block_len: u32,
+    flags: u32,
+) -> [u32; 16] {
+    // h0..h7  = input chaining value
+    // h8..h11 = IV[0..4]
+    // h12     = counter_lo
+    // h13     = counter_hi
+    // h14     = block_len
+    // h15     = flags
+    let mut h0 = cv0;
+    let mut h1 = cv1;
+    let mut h2 = cv2;
+    let mut h3 = cv3;
+    let mut h4 = cv4;
+    let mut h5 = cv5;
+    let mut h6 = cv6;
+    let mut h7 = cv7;
+    let mut h8 = BLAKE3_IV[0];
+    let mut h9 = BLAKE3_IV[1];
+    let mut h10 = BLAKE3_IV[2];
+    let mut h11 = BLAKE3_IV[3];
+    let mut h12 = counter_lo;
+    let mut h13 = counter_hi;
+    let mut h14 = block_len;
+    let mut h15 = flags;
+
+    // ---- Round 0 (SIGMA[0] = identity: 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15) ----
+    // Column quarter-rounds (4 G's, each fully expanded).
+    // G(0,4,8,12) with mx=m0, my=m1
+    h0 = h0.wrapping_add(h4).wrapping_add(m0);
+    h12 = (h12 ^ h0).rotate_right(16);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(12);
+    h0 = h0.wrapping_add(h4).wrapping_add(m1);
+    h12 = (h12 ^ h0).rotate_right(8);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(7);
+    // G(1,5,9,13) with mx=m2, my=m3
+    h1 = h1.wrapping_add(h5).wrapping_add(m2);
+    h13 = (h13 ^ h1).rotate_right(16);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(12);
+    h1 = h1.wrapping_add(h5).wrapping_add(m3);
+    h13 = (h13 ^ h1).rotate_right(8);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(7);
+    // G(2,6,10,14) with mx=m4, my=m5
+    h2 = h2.wrapping_add(h6).wrapping_add(m4);
+    h14 = (h14 ^ h2).rotate_right(16);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(12);
+    h2 = h2.wrapping_add(h6).wrapping_add(m5);
+    h14 = (h14 ^ h2).rotate_right(8);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(7);
+    // G(3,7,11,15) with mx=m6, my=m7
+    h3 = h3.wrapping_add(h7).wrapping_add(m6);
+    h15 = (h15 ^ h3).rotate_right(16);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(12);
+    h3 = h3.wrapping_add(h7).wrapping_add(m7);
+    h15 = (h15 ^ h3).rotate_right(8);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(7);
+    // Diagonal quarter-rounds (4 G's).
+    // G(0,5,10,15) with mx=m8, my=m9
+    h0 = h0.wrapping_add(h5).wrapping_add(m8);
+    h15 = (h15 ^ h0).rotate_right(16);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(12);
+    h0 = h0.wrapping_add(h5).wrapping_add(m9);
+    h15 = (h15 ^ h0).rotate_right(8);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(7);
+    // G(1,6,11,12) with mx=m10, my=m11
+    h1 = h1.wrapping_add(h6).wrapping_add(m10);
+    h12 = (h12 ^ h1).rotate_right(16);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(12);
+    h1 = h1.wrapping_add(h6).wrapping_add(m11);
+    h12 = (h12 ^ h1).rotate_right(8);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(7);
+    // G(2,7,8,13) with mx=m12, my=m13
+    h2 = h2.wrapping_add(h7).wrapping_add(m12);
+    h13 = (h13 ^ h2).rotate_right(16);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(12);
+    h2 = h2.wrapping_add(h7).wrapping_add(m13);
+    h13 = (h13 ^ h2).rotate_right(8);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(7);
+    // G(3,4,9,14) with mx=m14, my=m15
+    h3 = h3.wrapping_add(h4).wrapping_add(m14);
+    h14 = (h14 ^ h3).rotate_right(16);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(12);
+    h3 = h3.wrapping_add(h4).wrapping_add(m15);
+    h14 = (h14 ^ h3).rotate_right(8);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(7);
+
+    // ---- Round 1 (SIGMA[1] = 2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8) ----
+    // Column G's: mx,my pairs (m2,m6),(m3,m10),(m7,m0),(m4,m13).
+    h0 = h0.wrapping_add(h4).wrapping_add(m2);
+    h12 = (h12 ^ h0).rotate_right(16);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(12);
+    h0 = h0.wrapping_add(h4).wrapping_add(m6);
+    h12 = (h12 ^ h0).rotate_right(8);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(7);
+    h1 = h1.wrapping_add(h5).wrapping_add(m3);
+    h13 = (h13 ^ h1).rotate_right(16);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(12);
+    h1 = h1.wrapping_add(h5).wrapping_add(m10);
+    h13 = (h13 ^ h1).rotate_right(8);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(7);
+    h2 = h2.wrapping_add(h6).wrapping_add(m7);
+    h14 = (h14 ^ h2).rotate_right(16);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(12);
+    h2 = h2.wrapping_add(h6).wrapping_add(m0);
+    h14 = (h14 ^ h2).rotate_right(8);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(7);
+    h3 = h3.wrapping_add(h7).wrapping_add(m4);
+    h15 = (h15 ^ h3).rotate_right(16);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(12);
+    h3 = h3.wrapping_add(h7).wrapping_add(m13);
+    h15 = (h15 ^ h3).rotate_right(8);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(7);
+    // Diagonal G's: (m1,m11),(m12,m5),(m9,m14),(m15,m8).
+    h0 = h0.wrapping_add(h5).wrapping_add(m1);
+    h15 = (h15 ^ h0).rotate_right(16);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(12);
+    h0 = h0.wrapping_add(h5).wrapping_add(m11);
+    h15 = (h15 ^ h0).rotate_right(8);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(7);
+    h1 = h1.wrapping_add(h6).wrapping_add(m12);
+    h12 = (h12 ^ h1).rotate_right(16);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(12);
+    h1 = h1.wrapping_add(h6).wrapping_add(m5);
+    h12 = (h12 ^ h1).rotate_right(8);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(7);
+    h2 = h2.wrapping_add(h7).wrapping_add(m9);
+    h13 = (h13 ^ h2).rotate_right(16);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(12);
+    h2 = h2.wrapping_add(h7).wrapping_add(m14);
+    h13 = (h13 ^ h2).rotate_right(8);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(7);
+    h3 = h3.wrapping_add(h4).wrapping_add(m15);
+    h14 = (h14 ^ h3).rotate_right(16);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(12);
+    h3 = h3.wrapping_add(h4).wrapping_add(m8);
+    h14 = (h14 ^ h3).rotate_right(8);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(7);
+
+    // ---- Round 2 (SIGMA[2] = 3,4,10,12,13,2,7,14,6,5,9,0,11,15,8,1) ----
+    // Column G's: (m3,m4),(m10,m12),(m13,m2),(m7,m14).
+    h0 = h0.wrapping_add(h4).wrapping_add(m3);
+    h12 = (h12 ^ h0).rotate_right(16);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(12);
+    h0 = h0.wrapping_add(h4).wrapping_add(m4);
+    h12 = (h12 ^ h0).rotate_right(8);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(7);
+    h1 = h1.wrapping_add(h5).wrapping_add(m10);
+    h13 = (h13 ^ h1).rotate_right(16);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(12);
+    h1 = h1.wrapping_add(h5).wrapping_add(m12);
+    h13 = (h13 ^ h1).rotate_right(8);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(7);
+    h2 = h2.wrapping_add(h6).wrapping_add(m13);
+    h14 = (h14 ^ h2).rotate_right(16);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(12);
+    h2 = h2.wrapping_add(h6).wrapping_add(m2);
+    h14 = (h14 ^ h2).rotate_right(8);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(7);
+    h3 = h3.wrapping_add(h7).wrapping_add(m7);
+    h15 = (h15 ^ h3).rotate_right(16);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(12);
+    h3 = h3.wrapping_add(h7).wrapping_add(m14);
+    h15 = (h15 ^ h3).rotate_right(8);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(7);
+    // Diagonal G's: (m6,m5),(m9,m0),(m11,m15),(m8,m1).
+    h0 = h0.wrapping_add(h5).wrapping_add(m6);
+    h15 = (h15 ^ h0).rotate_right(16);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(12);
+    h0 = h0.wrapping_add(h5).wrapping_add(m5);
+    h15 = (h15 ^ h0).rotate_right(8);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(7);
+    h1 = h1.wrapping_add(h6).wrapping_add(m9);
+    h12 = (h12 ^ h1).rotate_right(16);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(12);
+    h1 = h1.wrapping_add(h6).wrapping_add(m0);
+    h12 = (h12 ^ h1).rotate_right(8);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(7);
+    h2 = h2.wrapping_add(h7).wrapping_add(m11);
+    h13 = (h13 ^ h2).rotate_right(16);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(12);
+    h2 = h2.wrapping_add(h7).wrapping_add(m15);
+    h13 = (h13 ^ h2).rotate_right(8);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(7);
+    h3 = h3.wrapping_add(h4).wrapping_add(m8);
+    h14 = (h14 ^ h3).rotate_right(16);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(12);
+    h3 = h3.wrapping_add(h4).wrapping_add(m1);
+    h14 = (h14 ^ h3).rotate_right(8);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(7);
+
+    // ---- Round 3 (SIGMA[3] = 10,7,12,9,14,3,13,15,4,0,11,2,5,8,1,6) ----
+    // Column G's: (m10,m7),(m12,m9),(m14,m3),(m13,m15).
+    h0 = h0.wrapping_add(h4).wrapping_add(m10);
+    h12 = (h12 ^ h0).rotate_right(16);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(12);
+    h0 = h0.wrapping_add(h4).wrapping_add(m7);
+    h12 = (h12 ^ h0).rotate_right(8);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(7);
+    h1 = h1.wrapping_add(h5).wrapping_add(m12);
+    h13 = (h13 ^ h1).rotate_right(16);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(12);
+    h1 = h1.wrapping_add(h5).wrapping_add(m9);
+    h13 = (h13 ^ h1).rotate_right(8);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(7);
+    h2 = h2.wrapping_add(h6).wrapping_add(m14);
+    h14 = (h14 ^ h2).rotate_right(16);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(12);
+    h2 = h2.wrapping_add(h6).wrapping_add(m3);
+    h14 = (h14 ^ h2).rotate_right(8);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(7);
+    h3 = h3.wrapping_add(h7).wrapping_add(m13);
+    h15 = (h15 ^ h3).rotate_right(16);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(12);
+    h3 = h3.wrapping_add(h7).wrapping_add(m15);
+    h15 = (h15 ^ h3).rotate_right(8);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(7);
+    // Diagonal G's: (m4,m0),(m11,m2),(m5,m8),(m1,m6).
+    h0 = h0.wrapping_add(h5).wrapping_add(m4);
+    h15 = (h15 ^ h0).rotate_right(16);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(12);
+    h0 = h0.wrapping_add(h5).wrapping_add(m0);
+    h15 = (h15 ^ h0).rotate_right(8);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(7);
+    h1 = h1.wrapping_add(h6).wrapping_add(m11);
+    h12 = (h12 ^ h1).rotate_right(16);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(12);
+    h1 = h1.wrapping_add(h6).wrapping_add(m2);
+    h12 = (h12 ^ h1).rotate_right(8);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(7);
+    h2 = h2.wrapping_add(h7).wrapping_add(m5);
+    h13 = (h13 ^ h2).rotate_right(16);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(12);
+    h2 = h2.wrapping_add(h7).wrapping_add(m8);
+    h13 = (h13 ^ h2).rotate_right(8);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(7);
+    h3 = h3.wrapping_add(h4).wrapping_add(m1);
+    h14 = (h14 ^ h3).rotate_right(16);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(12);
+    h3 = h3.wrapping_add(h4).wrapping_add(m6);
+    h14 = (h14 ^ h3).rotate_right(8);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(7);
+
+    // ---- Round 4 (SIGMA[4] = 12,13,9,11,15,10,14,8,7,2,5,3,0,1,6,4) ----
+    // Column G's: (m12,m13),(m9,m11),(m15,m10),(m14,m8).
+    h0 = h0.wrapping_add(h4).wrapping_add(m12);
+    h12 = (h12 ^ h0).rotate_right(16);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(12);
+    h0 = h0.wrapping_add(h4).wrapping_add(m13);
+    h12 = (h12 ^ h0).rotate_right(8);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(7);
+    h1 = h1.wrapping_add(h5).wrapping_add(m9);
+    h13 = (h13 ^ h1).rotate_right(16);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(12);
+    h1 = h1.wrapping_add(h5).wrapping_add(m11);
+    h13 = (h13 ^ h1).rotate_right(8);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(7);
+    h2 = h2.wrapping_add(h6).wrapping_add(m15);
+    h14 = (h14 ^ h2).rotate_right(16);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(12);
+    h2 = h2.wrapping_add(h6).wrapping_add(m10);
+    h14 = (h14 ^ h2).rotate_right(8);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(7);
+    h3 = h3.wrapping_add(h7).wrapping_add(m14);
+    h15 = (h15 ^ h3).rotate_right(16);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(12);
+    h3 = h3.wrapping_add(h7).wrapping_add(m8);
+    h15 = (h15 ^ h3).rotate_right(8);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(7);
+    // Diagonal G's: (m7,m2),(m5,m3),(m0,m1),(m6,m4).
+    h0 = h0.wrapping_add(h5).wrapping_add(m7);
+    h15 = (h15 ^ h0).rotate_right(16);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(12);
+    h0 = h0.wrapping_add(h5).wrapping_add(m2);
+    h15 = (h15 ^ h0).rotate_right(8);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(7);
+    h1 = h1.wrapping_add(h6).wrapping_add(m5);
+    h12 = (h12 ^ h1).rotate_right(16);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(12);
+    h1 = h1.wrapping_add(h6).wrapping_add(m3);
+    h12 = (h12 ^ h1).rotate_right(8);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(7);
+    h2 = h2.wrapping_add(h7).wrapping_add(m0);
+    h13 = (h13 ^ h2).rotate_right(16);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(12);
+    h2 = h2.wrapping_add(h7).wrapping_add(m1);
+    h13 = (h13 ^ h2).rotate_right(8);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(7);
+    h3 = h3.wrapping_add(h4).wrapping_add(m6);
+    h14 = (h14 ^ h3).rotate_right(16);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(12);
+    h3 = h3.wrapping_add(h4).wrapping_add(m4);
+    h14 = (h14 ^ h3).rotate_right(8);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(7);
+
+    // ---- Round 5 (SIGMA[5] = 9,14,11,5,8,12,15,1,13,3,0,10,2,6,4,7) ----
+    // Column G's: (m9,m14),(m11,m5),(m8,m12),(m15,m1).
+    h0 = h0.wrapping_add(h4).wrapping_add(m9);
+    h12 = (h12 ^ h0).rotate_right(16);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(12);
+    h0 = h0.wrapping_add(h4).wrapping_add(m14);
+    h12 = (h12 ^ h0).rotate_right(8);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(7);
+    h1 = h1.wrapping_add(h5).wrapping_add(m11);
+    h13 = (h13 ^ h1).rotate_right(16);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(12);
+    h1 = h1.wrapping_add(h5).wrapping_add(m5);
+    h13 = (h13 ^ h1).rotate_right(8);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(7);
+    h2 = h2.wrapping_add(h6).wrapping_add(m8);
+    h14 = (h14 ^ h2).rotate_right(16);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(12);
+    h2 = h2.wrapping_add(h6).wrapping_add(m12);
+    h14 = (h14 ^ h2).rotate_right(8);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(7);
+    h3 = h3.wrapping_add(h7).wrapping_add(m15);
+    h15 = (h15 ^ h3).rotate_right(16);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(12);
+    h3 = h3.wrapping_add(h7).wrapping_add(m1);
+    h15 = (h15 ^ h3).rotate_right(8);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(7);
+    // Diagonal G's: (m13,m3),(m0,m10),(m2,m6),(m4,m7).
+    h0 = h0.wrapping_add(h5).wrapping_add(m13);
+    h15 = (h15 ^ h0).rotate_right(16);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(12);
+    h0 = h0.wrapping_add(h5).wrapping_add(m3);
+    h15 = (h15 ^ h0).rotate_right(8);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(7);
+    h1 = h1.wrapping_add(h6).wrapping_add(m0);
+    h12 = (h12 ^ h1).rotate_right(16);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(12);
+    h1 = h1.wrapping_add(h6).wrapping_add(m10);
+    h12 = (h12 ^ h1).rotate_right(8);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(7);
+    h2 = h2.wrapping_add(h7).wrapping_add(m2);
+    h13 = (h13 ^ h2).rotate_right(16);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(12);
+    h2 = h2.wrapping_add(h7).wrapping_add(m6);
+    h13 = (h13 ^ h2).rotate_right(8);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(7);
+    h3 = h3.wrapping_add(h4).wrapping_add(m4);
+    h14 = (h14 ^ h3).rotate_right(16);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(12);
+    h3 = h3.wrapping_add(h4).wrapping_add(m7);
+    h14 = (h14 ^ h3).rotate_right(8);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(7);
+
+    // ---- Round 6 (SIGMA[6] = 11,15,5,0,1,9,8,6,14,10,2,12,3,4,7,13) ----
+    // Column G's: (m11,m15),(m5,m0),(m1,m9),(m8,m6).
+    h0 = h0.wrapping_add(h4).wrapping_add(m11);
+    h12 = (h12 ^ h0).rotate_right(16);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(12);
+    h0 = h0.wrapping_add(h4).wrapping_add(m15);
+    h12 = (h12 ^ h0).rotate_right(8);
+    h8 = h8.wrapping_add(h12);
+    h4 = (h4 ^ h8).rotate_right(7);
+    h1 = h1.wrapping_add(h5).wrapping_add(m5);
+    h13 = (h13 ^ h1).rotate_right(16);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(12);
+    h1 = h1.wrapping_add(h5).wrapping_add(m0);
+    h13 = (h13 ^ h1).rotate_right(8);
+    h9 = h9.wrapping_add(h13);
+    h5 = (h5 ^ h9).rotate_right(7);
+    h2 = h2.wrapping_add(h6).wrapping_add(m1);
+    h14 = (h14 ^ h2).rotate_right(16);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(12);
+    h2 = h2.wrapping_add(h6).wrapping_add(m9);
+    h14 = (h14 ^ h2).rotate_right(8);
+    h10 = h10.wrapping_add(h14);
+    h6 = (h6 ^ h10).rotate_right(7);
+    h3 = h3.wrapping_add(h7).wrapping_add(m8);
+    h15 = (h15 ^ h3).rotate_right(16);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(12);
+    h3 = h3.wrapping_add(h7).wrapping_add(m6);
+    h15 = (h15 ^ h3).rotate_right(8);
+    h11 = h11.wrapping_add(h15);
+    h7 = (h7 ^ h11).rotate_right(7);
+    // Diagonal G's: (m14,m10),(m2,m12),(m3,m4),(m7,m13).
+    h0 = h0.wrapping_add(h5).wrapping_add(m14);
+    h15 = (h15 ^ h0).rotate_right(16);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(12);
+    h0 = h0.wrapping_add(h5).wrapping_add(m10);
+    h15 = (h15 ^ h0).rotate_right(8);
+    h10 = h10.wrapping_add(h15);
+    h5 = (h5 ^ h10).rotate_right(7);
+    h1 = h1.wrapping_add(h6).wrapping_add(m2);
+    h12 = (h12 ^ h1).rotate_right(16);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(12);
+    h1 = h1.wrapping_add(h6).wrapping_add(m12);
+    h12 = (h12 ^ h1).rotate_right(8);
+    h11 = h11.wrapping_add(h12);
+    h6 = (h6 ^ h11).rotate_right(7);
+    h2 = h2.wrapping_add(h7).wrapping_add(m3);
+    h13 = (h13 ^ h2).rotate_right(16);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(12);
+    h2 = h2.wrapping_add(h7).wrapping_add(m4);
+    h13 = (h13 ^ h2).rotate_right(8);
+    h8 = h8.wrapping_add(h13);
+    h7 = (h7 ^ h8).rotate_right(7);
+    h3 = h3.wrapping_add(h4).wrapping_add(m7);
+    h14 = (h14 ^ h3).rotate_right(16);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(12);
+    h3 = h3.wrapping_add(h4).wrapping_add(m13);
+    h14 = (h14 ^ h3).rotate_right(8);
+    h9 = h9.wrapping_add(h14);
+    h4 = (h4 ^ h9).rotate_right(7);
+
+    // Finalization XOR: out_lo = h[0..8] ^ h[8..16], out_hi = h[8..16] ^ cv[0..8].
+    [
+        h0 ^ h8,
+        h1 ^ h9,
+        h2 ^ h10,
+        h3 ^ h11,
+        h4 ^ h12,
+        h5 ^ h13,
+        h6 ^ h14,
+        h7 ^ h15,
+        h8 ^ cv0,
+        h9 ^ cv1,
+        h10 ^ cv2,
+        h11 ^ cv3,
+        h12 ^ cv4,
+        h13 ^ cv5,
+        h14 ^ cv6,
+        h15 ^ cv7,
+    ]
+}
+
 /// BLAKE3 compression function. Returns the full 16-word output state
 /// (post-finalization XOR). For chaining, the new CV is `out[0..8]`.
+///
+/// The body delegates the 7-round straight-line work to
+/// [`compress_unrolled`], which keeps the 16-word state in `h0..h15` register
+/// aliases, hoists the IV and the per-round sigma permutation table, and
+/// issues each round's 4 column G-mixes and 4 diagonal G-mixes as independent
+/// ADD-XOR-ADD-XOR chains so the per-round work has 4-way G-mix ILP rather
+/// than the serial dependency chain the loop form produced.
 pub fn blake3_compress(
     cv: &[u32; 8],
     block_words: &[u32; 16],
@@ -275,38 +876,14 @@ pub fn blake3_compress(
     block_len: u32,
     flags: u32,
 ) -> [u32; 16] {
-    let counter_low = counter as u32;
-    let counter_high = (counter >> 32) as u32;
-    let mut state = [
-        cv[0],
-        cv[1],
-        cv[2],
-        cv[3],
-        cv[4],
-        cv[5],
-        cv[6],
-        cv[7],
-        BLAKE3_IV[0],
-        BLAKE3_IV[1],
-        BLAKE3_IV[2],
-        BLAKE3_IV[3],
-        counter_low,
-        counter_high,
-        block_len,
-        flags,
-    ];
-    let mut block = *block_words;
-    for r in 0..N_ROUNDS {
-        round_fn(&mut state, &block);
-        if r + 1 < N_ROUNDS {
-            permute(&mut block);
-        }
-    }
-    for i in 0..8 {
-        state[i] ^= state[i + 8];
-        state[i + 8] ^= cv[i];
-    }
-    state
+    let counter_lo = counter as u32;
+    let counter_hi = (counter >> 32) as u32;
+    compress_unrolled(
+        cv[0], cv[1], cv[2], cv[3], cv[4], cv[5], cv[6], cv[7], block_words[0], block_words[1],
+        block_words[2], block_words[3], block_words[4], block_words[5], block_words[6], block_words[7],
+        block_words[8], block_words[9], block_words[10], block_words[11], block_words[12],
+        block_words[13], block_words[14], block_words[15], counter_lo, counter_hi, block_len, flags,
+    )
 }
 
 /// Build `PER_ROUND_MSG_IDX[r][g] = (mx_idx, my_idx)` for round `r`, G index
