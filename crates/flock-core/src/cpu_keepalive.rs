@@ -104,6 +104,22 @@ pub fn keepalive_join() {
     imp::join_all();
 }
 
+/// Chunk-boundary touch of the cpu_keepalive slab. Used by callers that
+/// batch work into chunks of K iterations and want a single visibility
+/// point against the keep-alive spin's run flag per chunk — rather than
+/// one touch per inner iteration, which would defeat the timing
+/// side of the optimization.
+///
+/// The body is a single `Ordering::Relaxed` load of the `RUNNING`
+/// flag, wrapped in `black_box` so the compiler cannot fold it across
+/// chunk boundaries. On non-Apple-Silicon targets the load is a no-op
+/// (the underlying static does not exist), and the call compiles to a
+/// single instruction.
+pub fn keepalive_touch() {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    imp::touch();
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod imp {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -227,6 +243,18 @@ mod imp {
             }
             std::hint::spin_loop();
         }
+    }
+
+    /// Single relaxed load of `RUNNING`, wrapped in `black_box` so the
+    /// optimizer cannot fold it across chunk boundaries. This is the
+    /// per-chunk visibility touch for the batched BLAKE3 compress loop
+    /// in the prover's compression chain: the inner K calls do not
+    /// touch the slab, only `refresh_msg_ring` does, once per K
+    /// compressions.
+    #[inline(always)]
+    pub(super) fn touch() {
+        let v = RUNNING.load(Ordering::Relaxed);
+        std::hint::black_box(v);
     }
 
     #[cfg(test)]
