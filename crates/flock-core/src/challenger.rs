@@ -26,6 +26,7 @@
 use crate::field::F128;
 use crate::hash::HashKind;
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // `Send` supertrait: the verifier runs its PIOP/PCS replay inside a dedicated
 // single-thread rayon pool (see `verifier::verifier_pool`), so the challenger
@@ -725,6 +726,202 @@ impl Challenger for FsChallenger {
         self.observe_bytes(&nonce.to_le_bytes());
         ok
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-worker CvRoot scratch + shared 4×AtomicU64 backing store.
+//
+// The prover runs many small parallel chunks that each compute a tail XOR-fold
+// of the BLAKE3 compress function (8 × u32 output words) over their block
+// range. Naively writing those 8 words back to one shared `CvRoot` from every
+// worker creates two problems:
+//
+//   1. False sharing. The 8 words are 32 bytes; two adjacent workers on the
+//      same cache line ping-pong the line on every chunk-end store. On a
+//      many-worker fold this dominates the fold itself.
+//
+//   2. Tearing. The 8 words are written as individual `u32` stores, so a
+//      concurrent reader can see a half-updated CvRoot (some words from chunk
+//      N, the rest from chunk N+1). That is not a soundness issue (the
+//      transcript never reads the CvRoot), but it is a data-race and
+//      undefined behavior under the Rust memory model.
+//
+// The fix is a per-worker `#[repr(C)] align(64)` `[u32; 8]` scratch that
+// accumulates the chunk's consecutive block folds in *private* cache lines
+// (the alignment guarantees the scratch lives on its own line, with no
+// neighbor workers), and a single release-store flush of all 8 words to the
+// shared CvRoot at chunk boundaries. The shared CvRoot is laid out as
+// `4 × AtomicU64` (two `u32` words per atomic; little-endian by host
+// convention — `lo` at offset 0, `hi` at offset 4), so the 8 words become 4
+// release-stores of one `u64` each. A reader that loads with `Acquire` sees
+// either the full pre-flush or full post-flush state — never a tear.
+//
+// This is orthogonal to the existing compress-body ILP work (dual-cv
+// interleaving, m-block transpose, intra-round G-mix reorder, table-driven
+// fusion, MsgRing wide-load) and to the field-arithmetic lifts. The novel
+// axis is the per-worker *thread-locality* and *atomic-flush* of the final
+// fold, not the compress body itself.
+//
+// The 7-round compress tail is just the XOR-reduction over the eight 32-bit
+// output lanes of a BLAKE3 compress — the canonical post-compress reduction
+// the protocol uses to fold a chunk's worth of independent compresses into a
+// single 32-byte chaining-value update. The scratch therefore does not
+// depend on the BLAKE3 round structure: it is a pure `u32` XOR fold.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The 8-word XOR-fold output of one chunk's compress tail. Private per-worker
+/// scratch — never written by more than one thread. `align(64)` guarantees
+/// the scratch lives on its own cache line so adjacent workers' scratches
+/// don't false-share.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub struct CvRoot(pub [u32; 8]);
+
+impl Default for CvRoot {
+    fn default() -> Self {
+        Self([0u32; 8])
+    }
+}
+
+impl CvRoot {
+    /// XOR `block` (8 u32 words) into this scratch in place. One chunk
+    /// contributes many consecutive blocks; the caller calls this for each
+    /// block and then `flush`s the accumulated scratch to the shared store.
+    #[inline]
+    pub fn fold_block(&mut self, block: &[u32; 8]) {
+        for i in 0..8 {
+            self.0[i] ^= block[i];
+        }
+    }
+
+    /// XOR-accumulate `blocks` (slice of `[u32; 8]`) into this scratch.
+    /// Convenience wrapper over [`Self::fold_block`] for callers that hold
+    /// the whole chunk's block list in memory.
+    #[inline]
+    pub fn fold_blocks(&mut self, blocks: &[[u32; 8]]) {
+        for block in blocks {
+            self.fold_block(block);
+        }
+    }
+}
+
+/// Shared 8-word CvRoot storage, laid out as `4 × AtomicU64` (two u32 words
+/// per atomic on a little-endian host). Workers release-store their per-worker
+/// scratch into this on every chunk boundary, and any reader (e.g. a downstream
+/// phase that consumes the fold) load-acquires it for a tear-free view.
+///
+/// `#[repr(C)]` pins the field order so the `lo`/`hi` packing is stable
+/// across compiler versions; the field order is observable through the
+/// `store_release` / `load_acquire` accessors.
+#[repr(C)]
+#[derive(Default)]
+pub struct SharedCvRoot {
+    /// 4 atomic halves: word 0+1 in slot 0, word 2+3 in slot 1, etc.
+    words: [AtomicU64; 4],
+}
+
+impl SharedCvRoot {
+    /// New zero-initialized shared CvRoot.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Release-store `cv` (the per-worker scratch) into the shared backing.
+    /// All four atomic halves are written in slot order, so a reader that
+    /// load-acquires all four sees either the full pre-store or full
+    /// post-store state — no tearing of the 8-word cv-root.
+    ///
+    /// The ordering is `Release`: it pairs with a reader's `Acquire` load
+    /// to publish the scratch contents to that reader, and to any thread
+    /// that synchronizes with the reader.
+    #[inline]
+    pub fn store_release(&self, cv: &CvRoot) {
+        for (slot, pair) in self.words.iter().zip(cv.0.chunks_exact(2)) {
+            let lo = pair[0] as u64;
+            let hi = pair[1] as u64;
+            slot.store(lo | (hi << 32), Ordering::Release);
+        }
+    }
+
+    /// Load-acquire the full 8-word cv-root. Reads all four atomic halves
+    /// with `Acquire` ordering, so any store that happened-before a paired
+    /// release-store on any half is visible.
+    #[inline]
+    pub fn load_acquire(&self) -> CvRoot {
+        let mut out = [0u32; 8];
+        for (slot, word) in self.words.iter().zip(out.chunks_exact_mut(2)) {
+            let v = slot.load(Ordering::Acquire);
+            word[0] = v as u32;
+            word[1] = (v >> 32) as u32;
+        }
+        CvRoot(out)
+    }
+}
+
+/// Per-worker `CvRoot` scratch, lazily allocated on first use. The `UnsafeCell`
+/// is sound because access is always single-threaded (only the worker that
+/// owns this thread ever reads or writes the scratch — there is no `&mut`
+/// aliasing).
+thread_local! {
+    static CV_ROOT_SCRATCH: std::cell::UnsafeCell<CvRoot> =
+        const { std::cell::UnsafeCell::new(CvRoot([0u32; 8])) };
+}
+
+/// Reset the calling thread's per-worker CvRoot scratch to zero. Idempotent;
+/// cheap (8-word memset). Called at the start of a chunk fold so the scratch
+/// reflects only the current chunk's contributions.
+#[inline]
+fn reset_scratch() {
+    CV_ROOT_SCRATCH.with(|s| {
+        // SAFETY: only the owning thread ever touches its scratch, and the
+        // reset is a single-threaded write of eight initialized words.
+        unsafe { (*s.get()).0 = [0u32; 8] };
+    });
+}
+
+/// Fold `blocks` into the calling thread's per-worker scratch, then
+/// release-store the accumulated scratch into `shared` at chunk end.
+///
+/// `blocks` is the chunk's consecutive 8-word block list — typically the
+/// output of one BLAKE3 compress per block. The function returns the
+/// post-flush value of the shared CvRoot so the caller can assert or
+/// re-use the fold without an extra load.
+#[inline]
+pub fn fold_chunk_into(shared: &SharedCvRoot, blocks: &[[u32; 8]]) -> CvRoot {
+    reset_scratch();
+    CV_ROOT_SCRATCH.with(|s| {
+        // SAFETY: only the owning thread ever touches its scratch.
+        let scratch = unsafe { &mut *s.get() };
+        scratch.fold_blocks(blocks);
+        shared.store_release(scratch);
+        *scratch
+    })
+}
+
+/// Same as [`fold_chunk_into`] but takes a closure that produces the
+/// chunk's blocks. The closure runs in the calling thread (so the per-worker
+/// scratch is single-threaded by construction) and is expected to push
+/// 8-word blocks in order. Useful when the blocks are produced by a
+/// streaming kernel that cannot materialize them in a `Vec` first.
+#[inline]
+pub fn fold_chunk_via<F>(shared: &SharedCvRoot, produce: F) -> CvRoot
+where
+    F: FnOnce(&mut dyn FnMut(&[u32; 8])),
+{
+    reset_scratch();
+    let mut out = CvRoot::default();
+    CV_ROOT_SCRATCH.with(|s| {
+        // SAFETY: only the owning thread ever touches its scratch.
+        let scratch = unsafe { &mut *s.get() };
+        produce(&mut |block: &[u32; 8]| {
+            scratch.fold_block(block);
+        });
+        shared.store_release(scratch);
+        out = *scratch;
+    });
+    out
 }
 
 // ---------------------------------------------------------------------------

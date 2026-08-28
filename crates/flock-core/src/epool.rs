@@ -115,6 +115,122 @@ fn set_utility_qos() {
 #[cfg(not(target_os = "macos"))]
 fn set_utility_qos() {}
 
+/// Number of NUMA nodes on this Linux host, derived from
+/// `/sys/devices/system/node/nodeN` directory entries. Returns 1 when the
+/// topology cannot be read (single-node, non-Linux, or unreadable) so callers
+/// degrade to a no-op affinity assignment rather than a wrong one.
+#[cfg(target_os = "linux")]
+fn numa_node_count() -> usize {
+    use std::sync::OnceLock;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        let Ok(entries) = std::fs::read_dir("/sys/devices/system/node") else {
+            return 1;
+        };
+        let mut max_node: usize = 0;
+        let mut any = false;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(rest) = name.strip_prefix("node") else { continue };
+            if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            if let Ok(n) = rest.parse::<usize>() {
+                any = true;
+                if n > max_node {
+                    max_node = n;
+                }
+            }
+        }
+        if any { max_node + 1 } else { 1 }
+    })
+}
+
+/// CPU list for a given NUMA node, parsed from
+/// `/sys/devices/system/node/nodeN/cpulist`. Returns `None` when the file
+/// cannot be read or the list is empty.
+#[cfg(target_os = "linux")]
+fn cpus_for_node(node: usize) -> Option<Vec<usize>> {
+    let path = format!("/sys/devices/system/node/node{node}/cpulist");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut cpus = Vec::new();
+    for part in text.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = part.split_once('-') {
+            let lo: usize = lo.parse().ok()?;
+            let hi: usize = hi.parse().ok()?;
+            if hi < lo {
+                return None;
+            }
+            cpus.extend(lo..=hi);
+        } else {
+            cpus.push(part.parse().ok()?);
+        }
+    }
+    if cpus.is_empty() { None } else { Some(cpus) }
+}
+
+/// Pin the calling thread to a single NUMA node derived from
+/// `worker_id % num_numa_nodes`. On Linux this is the only way to keep a
+/// worker's hot scratchpad (e.g. the per-worker `CvRoot` accumulator) in
+/// that node's memory domain — without affinity, the kernel may schedule a
+/// worker onto a different node's cores than the one whose memory it has
+/// been touching, paying a cross-node latency every access. On a single-node
+/// host the call is a no-op (the only node holds every CPU).
+///
+/// On non-Linux targets (Apple Silicon, Windows, etc.) this is a no-op: NUMA
+/// doesn't exist on those platforms and the per-worker scratchpad is
+/// implicitly node-local.
+///
+/// Errors from `sched_setaffinity` are intentionally ignored: a failed pin
+/// means the worker runs unconstrained, which is no worse than the
+/// pre-affinity behavior.
+#[cfg(target_os = "linux")]
+fn set_numa_affinity(worker_id: usize) {
+    unsafe extern "C" {
+        fn sched_setaffinity(
+            pid: core::ffi::c_int,
+            cpusetsize: usize,
+            mask: *const core::ffi::c_void,
+        ) -> core::ffi::c_int;
+    }
+    // `cpu_set_t` is opaque to us; we treat it as a byte array of the
+    // platform-published size and use the libc `CPU_SET` macro inline. 1024
+    // bytes (128 × u64 → CPUs 0..1023) is well over the practical maximum
+    // (Linux caps at 1024 today; documented to grow, but the syscall fails
+    // cleanly past that and we ignore the error).
+    const SET_BYTES: usize = 1024;
+    let n_nodes = numa_node_count();
+    let node = worker_id % n_nodes;
+    let Some(cpus) = cpus_for_node(node) else { return };
+
+    let mut set = [0u8; SET_BYTES];
+    // The `cpu_set_t` bit for CPU `c` lives at byte `c / 8`, bit `c % 8`. We
+    // mirror the libc `CPU_SET(c, &set)` macro so the layout matches what
+    // glibc / musl pass to the syscall on every Linux we ship to.
+    for &cpu in &cpus {
+        let cpu = cpu as usize;
+        if cpu / 8 >= SET_BYTES {
+            continue;
+        }
+        set[cpu / 8] |= 1u8 << (cpu % 8);
+    }
+    unsafe {
+        let _ = sched_setaffinity(
+            0,
+            SET_BYTES,
+            set.as_ptr().cast::<core::ffi::c_void>(),
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_numa_affinity(_worker_id: usize) {}
+
 fn build_epool() -> Option<rayon::ThreadPool> {
     let n = ecore_count();
     if n == 0 {
@@ -123,7 +239,17 @@ fn build_epool() -> Option<rayon::ThreadPool> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(n)
         .thread_name(|i| format!("flock-ecore-{i}"))
-        .start_handler(|_| set_utility_qos())
+        .start_handler(|i| {
+            set_utility_qos();
+            // Per-worker NUMA shard: each helper thread is pinned to a single
+            // NUMA node derived from its index, so the per-worker CvRoot
+            // scratch (allocated on first use) lives in that node's memory
+            // domain and the worker only ever reads/writes it from a core
+            // local to that domain. On a single-node host the affinity call
+            // is a no-op (the only node owns every CPU); on non-Linux hosts
+            // the function itself is a no-op.
+            set_numa_affinity(i);
+        })
         .build()
         .ok()
 }
