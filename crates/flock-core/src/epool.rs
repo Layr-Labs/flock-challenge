@@ -206,6 +206,23 @@ fn relay_killed_by(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+/// Per-worker scratch context threaded through every hetero-drain job. Each
+/// Rayon/E-core worker that drains a chunk gets a private `WorkerCtx` on its
+/// own stack; the witness builder in `flock-prover` keeps a counter in here
+/// so the const-64 specialized BLAKE3 compress in the hot loop never has to
+/// touch a thread-local or atomic. The struct is `Copy` so the closure can
+/// hand a duplicate to each job without a `Cell`, and is read-only past
+/// construction on the hot path: the builder bumps the counter in registers
+/// via a working copy in its own scope and only re-stores the result at
+/// chunk boundaries.
+#[derive(Clone, Copy, Default)]
+pub struct WorkerCtx {
+    /// Next block counter to feed into the const-64 specialized BLAKE3
+    /// compress call. Bumped by the witness builder on the hot path; any
+    /// other reader must be tolerant of the relaxed (atomic-less) writes.
+    pub next_counter: u64,
+}
+
 /// Type-erased pointer to a broadcast closure living on a drain's stack frame:
 /// a thin data pointer plus the monomorphized thunk that restores its type. A
 /// thunk rather than `dyn Fn` because the closure's lifetime is the drain's,
@@ -469,6 +486,18 @@ where
     run_chunks_with_helper(n_chunks, &f, epool());
 }
 
+/// Run `n_chunks` chunks of work in parallel, where every closure invocation
+/// receives its own [`WorkerCtx`] as a second argument. The witness builder
+/// in `flock-prover` uses this to thread a per-worker block counter into the
+/// const-64 specialized BLAKE3 compress in the hot loop without going through
+/// a thread-local or a shared atomic.
+pub fn run_hetero_chunks_with_ctx<F>(n_chunks: usize, f: F)
+where
+    F: Fn(usize, &WorkerCtx) + Sync,
+{
+    run_chunks_with_helper_ctx(n_chunks, &f, epool());
+}
+
 /// Try to process chunks exclusively on the efficiency-core helper pool.
 ///
 /// Unlike [`run_hetero_chunks`], the calling thread and the main Rayon pool do
@@ -550,6 +579,19 @@ where
     run_chunks_with_helper_relay(n_chunks, f, helper, relay_enabled());
 }
 
+/// [`run_hetero_chunks_with_ctx`] with an explicit helper pool. Every closure
+/// invocation receives a per-worker `&WorkerCtx` so the hot path can keep
+/// per-worker state on the stack.
+pub fn run_chunks_with_helper_ctx<F>(
+    n_chunks: usize,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+) where
+    F: Fn(usize, &WorkerCtx) + Sync,
+{
+    run_chunks_with_helper_relay_ctx(n_chunks, f, helper, relay_enabled());
+}
+
 /// [`run_chunks_with_helper`] with the relay choice forced, so tests can cover
 /// both the persistent-relay and the per-drain-spawn arm in one process.
 fn run_chunks_with_helper_relay<F>(
@@ -603,6 +645,69 @@ fn run_chunks_with_helper_relay<F>(
                         }
                         EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
                         f(i);
+                    }
+                });
+            };
+            drain_hetero(main_threads, &worker, &broadcast, use_relay);
+        }
+        None => drain_main(),
+    }
+}
+
+/// Per-worker-`WorkerCtx` sibling of [`run_chunks_with_helper_relay`]. Each
+/// pool worker that claims a chunk runs `f(i, &WorkerCtx)` with a private
+/// `WorkerCtx` on its own stack — the ctx is the home of the const-64
+/// specialized BLAKE3 compress's running block counter, so neither a
+/// thread-local nor a shared atomic is consulted on the hot path.
+fn run_chunks_with_helper_relay_ctx<F>(
+    n_chunks: usize,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+    use_relay: bool,
+) where
+    F: Fn(usize, &WorkerCtx) + Sync,
+{
+    if n_chunks == 0 {
+        return;
+    }
+    let main_threads = rayon::current_num_threads();
+    if main_threads <= 1 {
+        for i in 0..n_chunks {
+            let mut ctx = WorkerCtx::default();
+            f(i, &mut ctx);
+        }
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    let worker = || {
+        let mut ctx = WorkerCtx::default();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n_chunks {
+                break;
+            }
+            f(i, &mut ctx);
+        }
+    };
+    let drain_main = || {
+        (0..main_threads)
+            .into_par_iter()
+            .with_max_len(1)
+            .for_each(|_| worker());
+    };
+    match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
+        Some(ep) => {
+            EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
+            let broadcast = || {
+                ep.broadcast(|_| {
+                    let mut ctx = WorkerCtx::default();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n_chunks {
+                            break;
+                        }
+                        EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+                        f(i, &mut ctx);
                     }
                 });
             };

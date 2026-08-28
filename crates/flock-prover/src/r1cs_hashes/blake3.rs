@@ -134,6 +134,24 @@ pub const BLAKE3_IV: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
+/// BLAKE3 chunk-flag bits. The chain caller (each `Compression` block in the
+/// ranked prove) is always a single full 64-byte chunk that is both the first
+/// and last of the tree and is being treated as the root — so `block_len = 64`
+/// and `flags = CHUNK_START | CHUNK_END | ROOT = 0b1011 = 11`. The witness
+/// builder hard-codes these so the const-64 specialized compress call emits
+/// them as adjacent scalar arguments into the same register file as
+/// `counter_lo`/`counter_hi`, with no stack reload between the four.
+pub const CHUNK_START: u32 = 0b0001;
+pub const CHUNK_END: u32 = 0b0010;
+pub const ROOT: u32 = 0b1000;
+/// Const-64 chain flags: every ranked chain block is a self-contained 64-byte
+/// root chunk.
+pub const CHAIN_FLAGS: u32 = CHUNK_START | CHUNK_END | ROOT;
+/// Const-64 block length: every ranked chain block is a full 64-byte BLAKE3
+/// chunk — the block-length register is a compile-time constant, not a
+/// runtime parameter, on the hot path.
+pub const CHAIN_BLOCK_LEN: u32 = 64;
+
 /// BLAKE3 message permutation applied between rounds.
 pub const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
@@ -307,6 +325,120 @@ pub fn blake3_compress(
         state[i + 8] ^= cv[i];
     }
     state
+}
+
+/// Const-64 specialized BLAKE3 compression for the ranked chain witness
+/// builder. The 16-word chaining state is **passed by value** from the
+/// previous compress output (filled into a stack-local `[u32; 16]` by the
+/// caller), and the four chunk-header scalars `(counter_lo, counter_hi,
+/// block_len, flags)` are computed inline from the inputs and emitted as
+/// **adjacent register/slot arguments** — `BLOCK_LEN = 64` and
+/// `FLAGS = CHUNK_START | CHUNK_END | ROOT` are compile-time constants so
+/// the AArch64 backend materializes them as immediate moves, and the
+/// counter is split into its two u32 halves in the same instruction group
+/// that fixes the chaining state. No global, thread-local, or atomic is
+/// consulted: the caller's `WorkerCtx` (held in
+/// `flock_core::epool::WorkerCtx`) owns the running counter on the worker's
+/// own stack and is bumped in registers.
+///
+/// `state_in` is the BLAKE3 chaining value produced by the previous call
+/// (`blake3_compress_const_64`'s return value, or the IV-init value for the
+/// first block in a chain). `cv` is the input chaining value passed
+/// alongside `m` for this block. `counter` is the chunk counter; the
+/// function splits it into `counter_lo`/`counter_hi` without going through
+/// the heap or a stack reload. Returns the new 16-word state (post-
+/// finalization XOR): `out[0..8]` is the new CV, `out[8..16]` is the
+/// second half of the output.
+#[inline(always)]
+pub fn blake3_compress_const_64(
+    state_in: [u32; 16],
+    cv: &[u32; 8],
+    block_words: &[u32; 16],
+    counter: u64,
+) -> [u32; 16] {
+    // Compute the four chunk-header scalars inline as adjacent locals so the
+    // backend can keep them in the same register group as the state init
+    // below. `CHAIN_BLOCK_LEN` (64) and `CHAIN_FLAGS` (11) are const, so the
+    // stores fold into immediate moves; `counter` is split into lo/hi by a
+    // single shift pair.
+    const BLOCK_LEN: u32 = CHAIN_BLOCK_LEN;
+    const FLAGS: u32 = CHAIN_FLAGS;
+    let counter_lo = counter as u32;
+    let counter_hi = (counter >> 32) as u32;
+
+    // The 16-word state is the previous compress's output. For the first
+    // call in a chain the caller passes the BLAKE3 IV-init state, so this
+    // function never needs to know which block it is in.
+    let mut state = state_in;
+    // Re-stamp the BLAKE3 init lanes. Lanes 0..7 of the previous compress's
+    // output are this block's input CV (already), and lanes 8..11 / 12..15
+    // need the standard IV-init and per-block counter/length/flags. The
+    // four counter/length/flags are computed inline at the top of the
+    // function and emitted as adjacent register/slot arguments; the
+    // BLAKE3_IV lanes 8..11 are immediate moves from the const table.
+    state[0] = cv[0];
+    state[1] = cv[1];
+    state[2] = cv[2];
+    state[3] = cv[3];
+    state[4] = cv[4];
+    state[5] = cv[5];
+    state[6] = cv[6];
+    state[7] = cv[7];
+    state[8] = BLAKE3_IV[0];
+    state[9] = BLAKE3_IV[1];
+    state[10] = BLAKE3_IV[2];
+    state[11] = BLAKE3_IV[3];
+    state[12] = counter_lo;
+    state[13] = counter_hi;
+    state[14] = BLOCK_LEN;
+    state[15] = FLAGS;
+
+    let mut block = *block_words;
+    for r in 0..N_ROUNDS {
+        round_fn(&mut state, &block);
+        if r + 1 < N_ROUNDS {
+            permute(&mut block);
+        }
+    }
+    for i in 0..8 {
+        state[i] ^= state[i + 8];
+        state[i + 8] ^= cv[i];
+    }
+    state
+}
+
+/// IV-init value for the first compress in a chain. The lanes 0..7 of this
+/// value are the BLAKE3 IV (the standard "null" chaining value for the first
+/// block in a chain), and lanes 8..15 carry the IV's `BLAKE3_IV[0..4]` plus
+/// the first block's counter/block_len/flags once the caller overwrites
+/// lanes 12..15. Returning it from a `const fn` keeps the per-chain prologue
+/// in registers, never on the heap.
+#[inline(always)]
+pub const fn blake3_const_64_init_state() -> [u32; 16] {
+    [
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        BLAKE3_IV[4],
+        BLAKE3_IV[5],
+        BLAKE3_IV[6],
+        BLAKE3_IV[7],
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        BLAKE3_IV[2],
+        BLAKE3_IV[3],
+        // Lanes 12..15 are filled by `blake3_compress_const_64` from
+        // the per-block counter, the const-64 block length, and the
+        // const chain flags. Initializing them with the IV-init values
+        // means the caller can pass the return value straight in and
+        // let the specialized compress overwrite lanes 12..15 in the
+        // same register group.
+        BLAKE3_IV[0],
+        BLAKE3_IV[1],
+        CHAIN_BLOCK_LEN,
+        CHAIN_FLAGS,
+    ]
 }
 
 /// Build `PER_ROUND_MSG_IDX[r][g] = (mx_idx, my_idx)` for round `r`, G index
@@ -4386,6 +4518,52 @@ mod tests {
         }
         let expected = *::blake3::hash(&bytes).as_bytes();
         assert_eq!(got, expected);
+    }
+
+    /// The const-64 specialized compress is bit-exact with [`blake3_compress`]
+    /// for every (cv, m, counter) input it accepts: it rebuilds the same
+    /// BLAKE3 init state from the carried 16-word chaining slot, then runs
+    /// the same round loop, so the (counter_lo, counter_hi, block_len=64,
+    /// flags=11) header emitted as adjacent scalar arguments cannot drift.
+    /// The 16-word `state_in` is filled by the previous call's output for
+    /// chains, and by [`blake3_const_64_init_state`] for the first call.
+    #[test]
+    fn const_64_compress_matches_blake3_compress() {
+        let mut rng = Rng::new(0xC0DE_BABE_DEAD_BEEF);
+        // First-call path: state_in is the IV-init value. cv is the IV
+        // itself (the "null" chaining value for a chain's first block).
+        let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+        let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+        let counter: u64 = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+        let state_in = blake3_const_64_init_state();
+        let const_out =
+            blake3_compress_const_64(state_in, &cv, &m, counter);
+        let expected = blake3_compress(&cv, &m, counter, CHAIN_BLOCK_LEN, CHAIN_FLAGS);
+        assert_eq!(const_out, expected, "first-call path");
+    }
+
+    /// Chaining path: the 16-word state_in comes from a previous
+    /// `blake3_compress_const_64` call (or, equivalently, from
+    /// `blake3_compress` with the matching block_len=64, flags=11). The
+    /// const-64 variant must reproduce the next call's output bit-for-bit.
+    #[test]
+    fn const_64_compress_chains_match_blake3_compress() {
+        let mut rng = Rng::new(0xBEEF_C0DE_1234_5678);
+        let cv0: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+        let m0: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+        let ctr0: u64 = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+        // Step 1 via the const-64 variant: produces a 16-word state_out that
+        // the next call receives as state_in.
+        let s0 = blake3_compress_const_64(blake3_const_64_init_state(), &cv0, &m0, ctr0);
+        // Step 2: a fresh cv (= out[0..8] of step 1), message, counter. The
+        // const-64 chained call must match blake3_compress on the same
+        // inputs.
+        let cv1: [u32; 8] = std::array::from_fn(|i| s0[i]);
+        let m1: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+        let ctr1: u64 = ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64);
+        let chained = blake3_compress_const_64(s0, &cv1, &m1, ctr1);
+        let expected = blake3_compress(&cv1, &m1, ctr1, CHAIN_BLOCK_LEN, CHAIN_FLAGS);
+        assert_eq!(chained, expected, "chained second call");
     }
 
     /// Witness's out_lo / out_hi slots equal the BLAKE3 finalization XORs.
