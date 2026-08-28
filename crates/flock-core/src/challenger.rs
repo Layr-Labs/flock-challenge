@@ -1339,6 +1339,49 @@ fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> 
     blake3_pow_scan_generic(state_digest, start, len, bits)
 }
 
+/// `FLOCK_NO_CHUNK_PREFETCH=1` disables the L1 prefetch of the next
+/// 64-byte BLAKE3 message block at the top of the per-batch loop in
+/// [`blake3_pow_scan_generic`]. Compile-time default ON; the env var is the
+/// exact rollback lever for same-binary A/B comparison.
+fn chunk_prefetch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_CHUNK_PREFETCH").is_none())
+}
+
+/// Issue a software L1 prefetch hint for the 64-byte BLAKE3 message block at
+/// `ptr`. On aarch64 the `PRFM PLDL1KEEP` (prefetch for load, L1, keep —
+/// temporal, low-pollution) hint is emitted via inline asm; on x86_64 the
+/// `_mm_prefetch(..., _MM_HINT_T0)` intrinsic is the equivalent (T0 = L1
+/// temporal). Other targets fall through to a no-op so the wrapper still
+/// type-checks. The pointer need not be dereferenceable; the hint is a
+/// non-faulting advisory, matching the architecture's documented semantics.
+#[inline(always)]
+fn prefetch_next_message_block(ptr: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // PRFM <prfop>, [<Xn|SP>, #0] where prfop is the 12-bit hint
+        // immediate encoded as prfop[11:8] = 0b1100, prfop[7:5] = 000,
+        // prfop[4] = L (0=load), prfop[3:2] = target (00=L1), prfop[1:0]
+        // = policy (00=KEEP). PLDL1KEEP = 0b1100_000_0_00_00 = 0xC00.
+        const PRFM_PLDL1KEEP: i32 = 0xC00;
+        core::arch::asm!(
+            "prfm {hint}, [{ptr}]",
+            hint = in(imm) PRFM_PLDL1KEEP,
+            ptr = in(reg) ptr,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::_mm_prefetch;
+        _mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = ptr;
+    }
+}
+
 /// The generic batched scan: materializes each 64-byte pre-image and hashes
 /// batches through the twelve-way kernel on Apple AArch64 (upstream
 /// `hash_many` tail and fallback) via [`crate::merkle::blake3_hash_many_pow`].
@@ -1359,10 +1402,28 @@ fn blake3_pow_scan_generic(
     }
     let mut out = [0u8; BLAKE3_POW_BATCH * 32];
 
+    // Pipelined L1 prefetch of the next 64-byte BLAKE3 message block (one
+    // batch ahead, the 64-byte size of one message block). The reused `pre`
+    // buffer is `BLAKE3_POW_BATCH * 64` bytes; the next iteration's first
+    // message block lives at the same offset 0, so the address we hint the
+    // cache for is `pre.as_ptr()` — its cache line may have been evicted
+    // during the long kernel call that just ran, and the L1 hint lets the
+    // hardware overlap that reload with the nonce-byte writes that follow.
+    // Skipped on the final block (no next iteration to feed) so we never
+    // prefetch past `end`. A/B kill switch: `FLOCK_NO_CHUNK_PREFETCH=1`.
+    const PREFETCH_DISTANCE: usize = 1;
+    let prefetch_enabled = chunk_prefetch_enabled();
     let mut base = start;
     let end = start.saturating_add(len);
     while base < end {
         let n = BLAKE3_POW_BATCH.min((end - base) as usize);
+        if prefetch_enabled && PREFETCH_DISTANCE == 1 && base.saturating_add(n as u64) < end {
+            // Not the final block: prefetch the first 64-byte message block of
+            // the next batch. The hint covers exactly one 64-byte cache line,
+            // matching the size of one BLAKE3 message block.
+            let next_block_ptr = pre.as_ptr() as *const u8;
+            prefetch_next_message_block(next_block_ptr);
+        }
         for (i, p) in pre[..n].iter_mut().enumerate() {
             p[32..40].copy_from_slice(&(base + i as u64).to_le_bytes());
         }
