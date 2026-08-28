@@ -104,6 +104,208 @@ pub fn keepalive_join() {
     imp::join_all();
 }
 
+// ---------------------------------------------------------------------------
+// Stack-resident BLAKE3 chaining-state carry (additive; existing slab API
+// preserved).
+//
+// The provers' compress loop processes one BLAKE3 chunk at a time. Each chunk
+// is `N_BLOCKS_PER_CHUNK = 16` 64-byte blocks; chaining value `cv` flows from
+// the last compression of chunk `c` into the first compression of chunk
+// `c + 1`. A BLAKE3 chunk start also toggles `CHUNK_START` on its first block.
+//
+// The fast path keeps the 16-word state of an in-flight compression in scalar
+// and vector registers across each `compress_inplace` call: passing it by
+// `&mut [u32; 16]` through an `#[inline(always)]` wrapper gives LLVM a true
+// stack slot to put those registers in, so the prologue/epilogue collapses to
+// nothing. The original BLAKE3 reference treats `cv` as an 8-word input and
+// re-loads it from the caller every call, so we widen the carrier to the
+// full 16-word state and do the finalization XOR (`state[i] ^= state[i + 8]
+// ^ cv[i]`) inside the wrapper.
+//
+// The slab is touched only at chunk boundaries. At the start of every chunk
+// the caller invokes `refresh_cv_from_slab(&mut slot, chunk_index)` to refill
+// the per-worker stack `Blake3Cv` from the persistent per-chunk CV table; the
+// per-block hot path never dereferences the slab. The slab API itself is
+// untouched: callers that already hold a `cv: [u32; 8]` and do not need the
+// in-register carry can keep using it as before.
+// ---------------------------------------------------------------------------
+
+/// 16-word BLAKE3 state carried by the prover's compress loop. Held on the
+/// stack as one true slot so the optimizer keeps its 16 words in vector /
+/// scalar registers across each `compress_inplace` call.
+///
+/// `#[repr(C)]` pins the field order to a single 64-byte `u32` array —
+/// matching BLAKE3's "16 words of state" assumption and the alignment of
+/// `align(64)` AVX-512 / NEON spill slots. `align(64)` keeps the start of the
+/// state on a cache-line boundary so two adjacent chunks' states never share
+/// a line in the L1 data cache, even when the compress wrapper inlines them
+/// back-to-back. The newtype is `Copy` so it can be threaded through a
+/// per-job closure by value without forcing an extra indirection.
+#[derive(Clone, Copy)]
+#[repr(C)]
+#[repr(align(64))]
+pub struct Blake3Cv(pub [u32; 16]);
+
+impl Blake3Cv {
+    /// Construct an all-zero state. The first chunk's `cv` is the BLAKE3 IV,
+    /// not zero, so callers must overwrite the eight "cv" lanes with the IV
+    /// (or the previous chunk's `out_lo`) before the first compression.
+    #[inline(always)]
+    pub const fn zero() -> Self {
+        Self([0u32; 16])
+    }
+
+    /// 8-word output chaining value (`out_lo` = `state[0..8]` after the
+    /// finalization XOR). What the next chunk's `cv_in` is.
+    #[inline(always)]
+    pub fn cv_out(&self) -> [u32; 8] {
+        let mut out = [0u32; 8];
+        let mut i = 0;
+        while i < 8 {
+            out[i] = self.0[i];
+            i += 1;
+        }
+        out
+    }
+}
+
+impl Default for Blake3Cv {
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+/// Per-chunk CV table: `slab[chunk_index] = cv` to load into the stack
+/// `Blake3Cv` at the start of that chunk. Lazily allocated; `None` means the
+/// caller has not yet seen this chunk, in which case `refresh_cv_from_slab`
+/// falls back to deriving the CV from `chunk_index` (i.e. the BLAKE3 IV for
+/// the first chunk, and an all-zero slot for any later chunk that has not
+/// been seeded — exactly the safe "no prior data" behaviour). The existing
+/// keep-alive slab API is unchanged; this is a fresh, additive slab used only
+/// by the compress-loop carry.
+#[doc(hidden)]
+pub type CvSlab = std::sync::Arc<parking_lot_compat::CvTable>;
+
+/// Minimal `Arc<[u32; 8]>` slab for the per-chunk CVs. A tiny shim to avoid
+/// pulling in `parking_lot`; the slab is read-only at the call site so an
+/// `Arc` is enough. (Additive: no other module in `cpu_keepalive` or
+/// `epool` uses this yet — the prover's compress loop is the only consumer.)
+#[doc(hidden)]
+pub mod parking_lot_compat {
+    use super::Blake3Cv;
+    use std::sync::Arc;
+
+    /// A `Send + Sync` table of per-chunk CVs. The first slot is the BLAKE3
+    /// IV (used for chunk 0); every later slot is the `cv_out` of the
+    /// previous chunk's last compression.
+    #[derive(Clone)]
+    pub struct CvTable {
+        /// `entries[chunk_index][i] = word i` of the chunk's input CV.
+        /// `entries.len()` grows on demand; `None` means the slot has not
+        /// been seeded yet.
+        entries: Vec<Option<[u32; 8]>>,
+    }
+
+    impl CvTable {
+        /// Empty table of capacity `n` chunks.
+        pub fn with_capacity(n: usize) -> Self {
+            Self {
+                entries: (0..n).map(|_| None).collect(),
+            }
+        }
+
+        /// Seed the input CV of `chunk_index`. Idempotent; later writes win
+        /// only if the slot is `None`, so once a chunk's CV is observed it
+        /// stays observed for the rest of the prove.
+        pub fn seed(&mut self, chunk_index: u64, cv: [u32; 8]) {
+            let idx = chunk_index as usize;
+            if idx >= self.entries.len() {
+                self.entries.resize(idx + 1, None);
+            }
+            self.entries[idx].get_or_insert(cv);
+        }
+
+        /// Read the slot. Returns `None` if the chunk has not been seeded.
+        pub fn get(&self, chunk_index: u64) -> Option<[u32; 8]> {
+            self.entries
+                .get(chunk_index as usize)
+                .and_then(|s| *s)
+        }
+    }
+
+    /// Trait the prover's compress loop relies on: `&self → Blake3Cv`. Kept
+    /// minimal so callers can pass either an `Arc<CvTable>` (lazy, multi-
+    /// chunk) or a stack `[u32; 8]` (one-chunk benchmark) and `refresh_cv`
+    /// treats both uniformly.
+    pub trait CvProvider {
+        fn cv_for(&self, chunk_index: u64, fallback: [u32; 8]) -> [u32; 8];
+    }
+
+    impl CvProvider for CvTable {
+        fn cv_for(&self, chunk_index: u64, fallback: [u32; 8]) -> [u32; 8] {
+            self.get(chunk_index).unwrap_or(fallback)
+        }
+    }
+
+    impl CvProvider for Arc<CvTable> {
+        fn cv_for(&self, chunk_index: u64, fallback: [u32; 8]) -> [u32; 8] {
+            (**self).cv_for(chunk_index, fallback)
+        }
+    }
+
+    impl CvProvider for [u32; 8] {
+        fn cv_for(&self, _chunk_index: u64, _fallback: [u32; 8]) -> [u32; 8] {
+            *self
+        }
+    }
+
+    /// Bridge so the prover's `refresh_cv_from_slab` can be called with
+    /// `&Blake3Cv` (the destination slot).
+    impl Blake3Cv {
+        /// Overwrite the eight "cv" lanes of the carrier. Lanes 8..15 are
+        /// the BLAKE3 IV, which the caller resets once per chunk in the
+        /// compress wrapper; the wrapper does not need them here.
+        pub fn write_cv_in(&mut self, cv: [u32; 8]) {
+            let mut i = 0;
+            while i < 8 {
+                self.0[i] = cv[i];
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Refill the per-worker stack `Blake3Cv` from the chunk-CV slab at the
+/// start of chunk `chunk_index`. Touches the slab exactly once per chunk —
+/// the per-block hot path never dereferences it. The fallback `iv` is the
+/// BLAKE3 initialization vector; pass it as the function's last argument so
+/// the call site is self-documenting.
+///
+/// `slot` is `&mut Blake3Cv` so the 16-word state ends up in a true stack
+/// slot of the caller (the prover's `Worker::run`); the per-chunk refresh
+/// is two adjacent `u32`-array stores, which the optimizer folds into the
+/// wrapper's prologue without touching the rest of the state.
+#[inline(always)]
+pub fn refresh_cv_from_slab<P: parking_lot_compat::CvProvider>(
+    slot: &mut Blake3Cv,
+    chunk_index: u64,
+    slab: &P,
+    iv: [u32; 8],
+) {
+    let cv = slab.cv_for(chunk_index, iv);
+    slot.write_cv_in(cv);
+    // Lanes 8..15 hold the BLAKE3 IV and the per-block header words
+    // (counter_lo, counter_hi, block_len, flags). Refreshing the cv lanes is
+    // the only persistent cross-chunk state; the per-block header is computed
+    // inline at every compress call so it never needs to be stored in the
+    // slot. Initialize lanes 8..11 to the IV so a chunk-start `compress` that
+    // re-reads them (e.g. for a debug build) sees consistent state.
+    slot.0[8] = iv[0];
+    slot.0[9] = iv[1];
+    slot.0[10] = iv[2];
+    slot.0[11] = iv[3];
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod imp {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

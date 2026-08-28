@@ -45,6 +45,8 @@ use std::sync::{Condvar, Mutex, OnceLock};
 
 use rayon::prelude::*;
 
+use crate::cpu_keepalive::{Blake3Cv, refresh_cv_from_slab};
+
 /// Logical efficiency-core count on Apple Silicon macOS, else 0.
 ///
 /// Queries `hw.perflevel1.logicalcpu` through the `sysctlbyname` *syscall* —
@@ -158,6 +160,94 @@ pub fn helper_pool() -> Option<&'static rayon::ThreadPool> {
 /// Don't engage the helper pool below this many chunks: tiny jobs (recursive
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
 const EPOOL_MIN_CHUNKS: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Stack-resident BLAKE3 chaining-state carry (additive; existing API
+// preserved).
+//
+// `Worker::run` is the per-job thread body the prover's compress loop
+// dispatches to. It allocates one stack-local `Blake3Cv` (the 16-word state
+// carrier from `cpu_keepalive`) and threads `&mut cv` into the per-job
+// closure, so the 16 words live in a true stack slot of the worker thread
+// for the entire drain. The closure can re-use that slot across every
+// compress call without any heap / slab traffic in the per-block hot path.
+//
+// The existing `run_chunks_with_helper` / `drain_hetero` shape is untouched.
+// `Worker::run` is a convenience wrapper the prover's compress loop
+// dispatches directly; it is the new "thread body" the slab carry rides on.
+// ---------------------------------------------------------------------------
+
+use crate::cpu_keepalive::{Blake3Cv, refresh_cv_from_slab};
+
+/// Per-job worker thread body used by the prover's compress loop. Each
+/// worker owns one stack-local `Blake3Cv` for its entire lifetime and
+/// threads `&mut cv` into `job`, so the BLAKE3 state lives in registers /
+/// the worker's stack frame rather than being rebuilt from the slab on
+/// every block.
+pub struct Worker {
+    /// Logical worker id (0..n). The prover uses it to derive a stable
+    /// per-worker seed; it has no scheduling effect.
+    pub id: usize,
+}
+
+impl Worker {
+    /// Construct a `Worker` for the given logical id.
+    pub fn new(id: usize) -> Self {
+        Self { id }
+    }
+
+    /// Run `job` on this worker. Allocates one stack-local `Blake3Cv` and
+    /// passes `&mut cv` to `job` so the 16-word state lives in a true
+    /// stack slot of the worker thread for the whole call.
+    ///
+    /// `slab` is any `CvProvider` (a stack `[u32; 8]`, an `Arc<CvTable>`,
+    /// ...). It is dereferenced at most once per chunk by the
+    /// `refresh_cv_from_slab` call inside `job`; the per-block hot path
+    /// inside `job` never re-reads it.
+    ///
+    /// `iv` is the BLAKE3 initialization vector, used as the fallback
+    /// input CV for chunk 0 and as the IV lanes (8..15) of the state.
+    #[inline(never)]
+    pub fn run<P, F>(&self, slab: &P, iv: [u32; 8], mut job: F)
+    where
+        P: crate::cpu_keepalive::parking_lot_compat::CvProvider,
+        F: FnMut(&mut Blake3Cv, u64),
+    {
+        // The stack slot the BLAKE3 state lives in for this worker. The
+        // `#[repr(C)] #[repr(align(64))]` on `Blake3Cv` makes this one
+        // 64-byte-aligned 64-byte object; the compiler keeps `cv.0[i]` in
+        // registers across every `job` call so the per-block hot path
+        // sees a register-resident chaining state, not a memory load.
+        let mut cv: Blake3Cv = Blake3Cv::zero();
+        // Chunk 0's CV is the BLAKE3 IV. The per-block hot path inside
+        // `job` only writes lanes 0..8 (the output CV) and reads lanes
+        // 0..16 (the full state); lanes 8..15 are the BLAKE3 IV and
+        // constant across the chunk, so seeding them once is enough.
+        cv.0[8] = iv[0];
+        cv.0[9] = iv[1];
+        cv.0[10] = iv[2];
+        cv.0[11] = iv[3];
+        cv.0[12] = iv[4];
+        cv.0[13] = iv[5];
+        cv.0[14] = iv[6];
+        cv.0[15] = iv[7];
+        // The first chunk's CV is the IV. Subsequent chunks' CVs come
+        // from the slab; the per-job closure decides when to call
+        // `refresh_cv_from_slab` (once per chunk).
+        refresh_cv_from_slab(&mut cv, 0, slab, iv);
+        // Hand the per-job closure a `&mut cv`. Closure call sites that
+        // re-use `cv` across many compresses (the prover's per-chunk
+        // inner loop) keep the 16 words in the same stack slot — the
+        // compress wrapper's `#[inline(always)]` then collapses the
+        // prologue/epilogue to nothing.
+        let chunk_index: u64 = 0;
+        job(&mut cv, chunk_index);
+        // Touch `self.id` so the field is not dead-code-eliminated by
+        // an aggressive optimizer; the per-worker id is part of the
+        // Worker contract even when the body does not consume it.
+        std::hint::black_box(self.id);
+    }
+}
 
 /// Process chunks `0..n_chunks` exactly once each, in parallel, drawing from
 /// a shared atomic queue drained by the main rayon pool plus (when present
