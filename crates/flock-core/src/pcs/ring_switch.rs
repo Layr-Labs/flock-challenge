@@ -2616,6 +2616,26 @@ fn rs_elide_dead_basis_enabled() -> bool {
     *ON
 }
 
+/// Whether the caller-proved all-direct route may discard the byte table
+/// after DirectFold8 has consumed it.
+#[inline]
+fn rs_elide_dead_table_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_RS_ELIDE_DEAD_TABLE").is_none()
+    });
+    *ON
+}
+
+/// Whether an owned Fold8 intake may become the final A-factor allocation
+/// after every bank transpose has retired.
+#[inline]
+fn rs_reuse_fold8_a_state_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_RS_REUSE_FOLD8_A_STATE").is_none()
+    });
+    *ON
+}
+
 impl RsEqInd {
     /// Logical length of the underlying vector.
     pub fn len(&self) -> usize {
@@ -3186,6 +3206,8 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         && has_quad[0]
         && !has_quad[1]
         && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none();
+    let reuse_fold8_a_state = elide_basis && rs_reuse_fold8_a_state_enabled();
+    let elide_dead_table = elide_basis && rs_elide_dead_table_enabled();
 
     // Per-opening tails are independent once every γ_rs is sampled (the
     // transcript work above is complete), so run the two openings' table and
@@ -3196,7 +3218,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         work.into_par_iter()
             .zip(gammas_rs.par_iter())
             .enumerate()
-            .map(|(i, (w, &g))| {
+            .map(|(i, (mut w, &g))| {
                 let scaled_eq_r_dprime: Vec<F128> =
                     w.eq_r_dprime.iter().map(|value| g * *value).collect();
                 let table = build_fold_byte_table(&scaled_eq_r_dprime);
@@ -3262,7 +3284,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                     }
                     _ => None,
                 };
-                let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.as_deref()) {
+                let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.take()) {
                     (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
                         let suffix = dense_suffixes[d];
                         let low_eq: [F128; 64] = build_eq(&suffix[..6])
@@ -3285,14 +3307,35 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                                 w_state[bit * 64 + d_low] = fold_one_slot(basis_product, &table);
                             }
                         }
-                        let mut a_state = vec![F128::ZERO; 64 * n_packed];
-                        for e in 0..64 {
-                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-                            let transposed = tensor_algebra_transpose(bank);
-                            for (bit, value) in transposed.into_iter().enumerate() {
-                                a_state[bit * 64 + e] = value;
+                        let a_state = if reuse_fold8_a_state {
+                            // Preserve all reads of the bank-major intake,
+                            // then overwrite its dead backing allocation with
+                            // the bit-major factor state.
+                            let a_rows: Vec<Vec<F128>> = (0..64)
+                                .map(|e| {
+                                    tensor_algebra_transpose(
+                                        &fold8[e * n_packed..(e + 1) * n_packed],
+                                    )
+                                })
+                                .collect();
+                            let mut a_state = fold8;
+                            for (e, row) in a_rows.into_iter().enumerate() {
+                                for (bit, value) in row.into_iter().enumerate() {
+                                    a_state[bit * 64 + e] = value;
+                                }
                             }
-                        }
+                            a_state
+                        } else {
+                            let mut a_state = vec![F128::ZERO; 64 * n_packed];
+                            for e in 0..64 {
+                                let bank = &fold8[e * n_packed..(e + 1) * n_packed];
+                                let transposed = tensor_algebra_transpose(bank);
+                                for (bit, value) in transposed.into_iter().enumerate() {
+                                    a_state[bit * 64 + e] = value;
+                                }
+                            }
+                            a_state
+                        };
                         let round0 = super::round0_deferred(&a_state, &w_state);
                         let tail = &suffix[6..];
                         let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
@@ -3363,7 +3406,11 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             RsEqInd::DeferredDense {
                                 eq_lo,
                                 eq_hi,
-                                table,
+                                table: if elide_dead_table {
+                                    Vec::new()
+                                } else {
+                                    table
+                                },
                             }
                         } else {
                             RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
@@ -4601,7 +4648,8 @@ mod tests {
             assert_eq!(candidate_hi.len(), control_hi.len());
             assert!(candidate_lo.iter().all(|&value| value == F128::ZERO));
             assert!(candidate_hi.iter().all(|&value| value == F128::ZERO));
-            assert_eq!(candidate_table, control_table);
+            assert!(candidate_table.is_empty());
+            assert_eq!(control_table.len(), FOLD_TABLE_TOTAL);
 
             let control_direct = control[claim]
                 .1
