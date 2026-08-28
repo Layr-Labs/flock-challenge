@@ -1250,6 +1250,210 @@ fn blake3_pow_preimage(state_digest: &[u8; 32], nonce: u64) -> [u8; 64] {
     pre
 }
 
+// --- Pre-staged BLAKE3 message-block ingest + compress -------------------------
+//
+// The spec PoW pre-image is one whole 64-byte block; the natural compress call
+// site is therefore `blake3::hash(&pre)`, which goes through the portable
+// `compress_pre` body that *also* does the bytes-to-words LE fold (`read_unaligned`
+// + 16 `u32::from_le_bytes` per call). Pre-staging the 16-word message block in
+// the caller collapses that work to a single 64-byte aligned load followed by one
+// straight-line endian-fold driven by [`MSG_OFFSET_TABLE`], and the wrapper below
+// runs the 7-round G-mix body directly on the staged `m` — same byte output as
+// `blake3::hash`, by construction (`MSG_OFFSET_TABLE` is the BLAKE3 word layout
+// and the 7-round body is the BLAKE3 compress body). The wrapper is
+// `#[inline(always)]` so the fold and the body fuse into one straight-line
+// sequence at every call site.
+
+const BLAKE3_POW_IV: [u32; 8] = [
+    0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+];
+
+/// Byte offsets within a 64-byte BLAKE3 block where each of the 16 little-endian
+/// message words begins. Drives the per-block endian-fold in
+/// [`ingest_block`]: word `i` is read as `u32::from_le_bytes(src[MSG_OFFSET_TABLE[i]..])`.
+const MSG_OFFSET_TABLE: [usize; 16] = [
+    0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
+];
+
+/// BLAKE3 7-round message schedule. Row `r` selects which of the 16 pre-staged
+/// message words supplies each of the 16 mix slots for round `r`. Round 0 is
+/// the identity (each mix slot takes its own word); the rest are the iterated
+/// permutation. Baked in as a `const` so it lives in `.rodata` and indexes
+/// resolve at codegen time, leaving the G-mix body fully unrolled.
+const BLAKE3_MSG_SCHEDULE: [[usize; 16]; 7] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+    [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+    [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+    [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+    [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+    [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+];
+
+/// One 64-byte BLAKE3 block ingest. Performs a single 64-byte load and a
+/// straight-line 16-word little-endian fold, writing the decoded message words
+/// into `out_m` in the BLAKE3 spec's word order. The fold is unrolled across
+/// [`MSG_OFFSET_TABLE`] (a `const [usize; 16]`), so each `u32::from_le_bytes`
+/// reads from a known offset and the optimizer never re-derives an index.
+///
+/// `src` must point to at least 64 readable bytes. The load uses
+/// `read_unaligned` so the pointer does not have to be 8-byte aligned; the LE
+/// fold itself is alignment-insensitive. Marked `#[inline(always)]` so the
+/// load and the 16 reads fuse with the consumer's G-mix body.
+#[inline(always)]
+fn ingest_block(out_m: &mut [u32; 16], src: *const u8) {
+    // SAFETY: caller guarantees `src` is a valid 64-byte block. `read_unaligned`
+    // sidesteps any alignment requirement, matching the BLAKE3 portable path.
+    let block: [u8; 64] = unsafe { core::ptr::read_unaligned(src.cast::<[u8; 64]>()) };
+    // Straight-line endian-fold: 16 fixed offsets, 16 stores. The table
+    // lives in `.rodata` and the indices are integer literals after the
+    // table lookup, so the codegen is a flat sequence of moves.
+    out_m[0] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[0]..MSG_OFFSET_TABLE[0] + 4].try_into().unwrap());
+    out_m[1] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[1]..MSG_OFFSET_TABLE[1] + 4].try_into().unwrap());
+    out_m[2] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[2]..MSG_OFFSET_TABLE[2] + 4].try_into().unwrap());
+    out_m[3] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[3]..MSG_OFFSET_TABLE[3] + 4].try_into().unwrap());
+    out_m[4] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[4]..MSG_OFFSET_TABLE[4] + 4].try_into().unwrap());
+    out_m[5] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[5]..MSG_OFFSET_TABLE[5] + 4].try_into().unwrap());
+    out_m[6] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[6]..MSG_OFFSET_TABLE[6] + 4].try_into().unwrap());
+    out_m[7] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[7]..MSG_OFFSET_TABLE[7] + 4].try_into().unwrap());
+    out_m[8] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[8]..MSG_OFFSET_TABLE[8] + 4].try_into().unwrap());
+    out_m[9] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[9]..MSG_OFFSET_TABLE[9] + 4].try_into().unwrap());
+    out_m[10] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[10]..MSG_OFFSET_TABLE[10] + 4].try_into().unwrap());
+    out_m[11] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[11]..MSG_OFFSET_TABLE[11] + 4].try_into().unwrap());
+    out_m[12] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[12]..MSG_OFFSET_TABLE[12] + 4].try_into().unwrap());
+    out_m[13] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[13]..MSG_OFFSET_TABLE[13] + 4].try_into().unwrap());
+    out_m[14] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[14]..MSG_OFFSET_TABLE[14] + 4].try_into().unwrap());
+    out_m[15] = u32::from_le_bytes(block[MSG_OFFSET_TABLE[15]..MSG_OFFSET_TABLE[15] + 4].try_into().unwrap());
+}
+
+/// Run the 7-round BLAKE3 G-mix compress body on a pre-staged 16-word message
+/// block. Mirrors the BLAKE3 portable `compress_in_place` (`compress_pre`
+/// followed by the post-XOR) byte-for-byte: the state is
+/// `[cv0..cv7, IV0..IV3, counter_lo, counter_hi, block_len, flags]`, seven
+/// rounds of column+diagonal mixing are applied, and the final 16-word state
+/// is returned so the caller can both fold the new chaining value (`state[i]
+/// ^= state[i+8]` for i in 0..8, written back into `cv`) and emit the root
+/// hash bytes (the first 8 state words, little-endian).
+///
+/// `m_block` is consumed by value so the 7 mixing passes can index the local
+/// stack-resident message words through [`BLAKE3_MSG_SCHEDULE`] without any
+/// aliasing concern; combined with `#[inline(always)]` this leaves the entire
+/// compress body as one straight-line sequence at the call site.
+#[inline(always)]
+fn compress_in_place(
+    cv: &mut [u32; 8],
+    m_block: [u32; 16],
+    ctr: u64,
+    block_len: u32,
+    flags: u32,
+) -> [u32; 16] {
+    let m = m_block;
+    let counter_low = ctr as u32;
+    let counter_high = (ctr >> 32) as u32;
+    let iv = BLAKE3_POW_IV;
+    let mut state: [u32; 16] = [
+        cv[0], cv[1], cv[2], cv[3], cv[4], cv[5], cv[6], cv[7],
+        iv[0], iv[1], iv[2], iv[3], counter_low, counter_high, block_len, flags,
+    ];
+
+    // G-mix: each round consumes 16 message words (selected by the schedule)
+    // and updates the 16-word state through 8 G applications (4 columns +
+    // 4 diagonals). Inlined so the seven rounds and the 56 G applications
+    // are visible to the optimizer as a single straight-line block.
+    macro_rules! g {
+        ($state:expr, $a:expr, $b:expr, $c:expr, $d:expr, $x:expr, $y:expr) => {{
+            $state[$a] = $state[$a].wrapping_add($state[$b]).wrapping_add($x);
+            $state[$d] = ($state[$d] ^ $state[$a]).rotate_right(16);
+            $state[$c] = $state[$c].wrapping_add($state[$d]);
+            $state[$b] = ($state[$b] ^ $state[$c]).rotate_right(12);
+            $state[$a] = $state[$a].wrapping_add($state[$b]).wrapping_add($y);
+            $state[$d] = ($state[$d] ^ $state[$a]).rotate_right(8);
+            $state[$c] = $state[$c].wrapping_add($state[$d]);
+            $state[$b] = ($state[$b] ^ $state[$c]).rotate_right(7);
+        }};
+    }
+    macro_rules! round {
+        ($r:expr) => {{
+            let s = &BLAKE3_MSG_SCHEDULE[$r];
+            // Columns.
+            g!(state, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+            g!(state, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+            g!(state, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+            g!(state, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+            // Diagonals.
+            g!(state, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+            g!(state, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+            g!(state, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+            g!(state, 3, 4, 9, 14, m[s[14]], m[s[15]]);
+        }};
+    }
+    round!(0);
+    round!(1);
+    round!(2);
+    round!(3);
+    round!(4);
+    round!(5);
+    round!(6);
+
+    // Post-XOR — mirror `Platform::compress_in_place`: cv[i] = state[i] ^ state[i+8].
+    cv[0] = state[0] ^ state[8];
+    cv[1] = state[1] ^ state[9];
+    cv[2] = state[2] ^ state[10];
+    cv[3] = state[3] ^ state[11];
+    cv[4] = state[4] ^ state[12];
+    cv[5] = state[5] ^ state[13];
+    cv[6] = state[6] ^ state[14];
+    cv[7] = state[7] ^ state[15];
+
+    state
+}
+
+/// Hash a single 64-byte BLAKE3 block as the root node (CHUNK_START |
+/// CHUNK_END | ROOT flags, counter = 0, block_len = 64). Returns the 32-byte
+/// digest in BLAKE3's canonical little-endian layout — exactly what
+/// `blake3::hash(&pre)` returns for a one-block input.
+///
+/// Wires [`ingest_block`] (one aligned 64-byte load + one straight-line
+/// 16-word LE fold driven by [`MSG_OFFSET_TABLE`]) and [`compress_in_place`]
+/// (the 7-round G-mix body consuming the staged message block) so the entire
+/// one-block path collapses to a single wide load plus one straight-line
+/// fold — the existing compress call site for the BLAKE3 PoW.
+#[inline]
+fn blake3_pow_hash_root(pre: &[u8; 64]) -> [u8; 32] {
+    let mut cv: [u32; 8] = BLAKE3_POW_IV;
+    let mut m = [0u32; 16];
+    ingest_block(&mut m, pre.as_ptr());
+    // `compress_in_place` mirrors the portable `Platform::compress_in_place`
+    // post-XOR — `cv[i] = state[i] ^ state[i+8]` for i in 0..8 — which is
+    // exactly what `Output::root_hash` (a `Platform::compress_in_place` +
+    // `le_bytes_from_words_32(&cv)` pair) emits.
+    let _state = compress_in_place(
+        &mut cv,
+        m,
+        0,
+        64,
+        (1u32 << 0) | (1u32 << 1) | (1u32 << 3),
+    );
+    let mut out = [0u8; 32];
+    let l0 = cv[0].to_le_bytes();
+    let l1 = cv[1].to_le_bytes();
+    let l2 = cv[2].to_le_bytes();
+    let l3 = cv[3].to_le_bytes();
+    let l4 = cv[4].to_le_bytes();
+    let l5 = cv[5].to_le_bytes();
+    let l6 = cv[6].to_le_bytes();
+    let l7 = cv[7].to_le_bytes();
+    out[0..4].copy_from_slice(&l0);
+    out[4..8].copy_from_slice(&l1);
+    out[8..12].copy_from_slice(&l2);
+    out[12..16].copy_from_slice(&l3);
+    out[16..20].copy_from_slice(&l4);
+    out[20..24].copy_from_slice(&l5);
+    out[24..28].copy_from_slice(&l6);
+    out[28..32].copy_from_slice(&l7);
+    out
+}
+
 /// Whether `h` has at least `bits` leading zero bits.
 #[inline]
 fn has_leading_zero_bits(h: &[u8], bits: u32) -> bool {
@@ -1291,8 +1495,15 @@ fn pow_has_leading_zero_bits(
             has_leading_zero_bits(&h, bits)
         }
         HashKind::Blake3 => {
-            let h = blake3::hash(&blake3_pow_preimage(state_digest, nonce));
-            has_leading_zero_bits(h.as_bytes(), bits)
+            // Pre-staged ingest: one 64-byte load + 16-word LE fold via
+            // `MSG_OFFSET_TABLE`, then the 7-round compress body in
+            // `compress_in_place`. Replaces `blake3::hash(&pre)` — same byte
+            // output by construction (IV + CHUNK_START|CHUNK_END|ROOT
+            // flags + the staged message block), tighter code path (no
+            // internal `Hasher`, no `Output` allocation, no second
+            // `le_bytes_from_words_32` pass over the IV).
+            let h = blake3_pow_hash_root(&blake3_pow_preimage(state_digest, nonce));
+            has_leading_zero_bits(&h, bits)
         }
     }
 }
