@@ -120,7 +120,7 @@ fn single_padded_tiled<const TILE_T: usize>(
                     for block_idx in 0..n_blocks {
                         let bs = block_idx * BLOCK_K;
                         unsafe {
-                            process_block_neon_single::<TILE_T>(
+                            process_block_neon_single::<TILE_T, false>(
                                 tile_bytes_ptr,
                                 k,
                                 bs,
@@ -158,10 +158,14 @@ fn single_padded_tiled<const TILE_T: usize>(
 /// - `row_ptr` must point to at least `(TILE_T - 1) * row_stride + bs + 8` bytes.
 /// - `tables_ptr` must point to at least `TILE_T * 256 * 16` bytes.
 /// - `out_ptr` must point to at least 8 F128 (128 bytes) of mutable storage.
+/// - With `SEED_ZERO = false`, those 128 bytes must be initialized. With
+///   `SEED_ZERO = true`, `TILE_T >= 2` and the bytes may be uninitialized:
+///   the first stripe pair seeds all eight accumulators before the full output
+///   block is stored.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn process_block_neon_single<const TILE_T: usize>(
+unsafe fn process_block_neon_single<const TILE_T: usize, const SEED_ZERO: bool>(
     row_ptr: *const u8,
     row_stride: usize,
     bs: usize,
@@ -172,16 +176,62 @@ unsafe fn process_block_neon_single<const TILE_T: usize>(
 
     let o = out_ptr as *mut u8;
 
-    let mut a0 = vld1q_u8(o);
-    let mut a1 = vld1q_u8(o.add(16));
-    let mut a2 = vld1q_u8(o.add(32));
-    let mut a3 = vld1q_u8(o.add(48));
-    let mut a4 = vld1q_u8(o.add(64));
-    let mut a5 = vld1q_u8(o.add(80));
-    let mut a6 = vld1q_u8(o.add(96));
-    let mut a7 = vld1q_u8(o.add(112));
-
-    let mut t = 0;
+    let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7, mut t) = if SEED_ZERO {
+        assert!(TILE_T >= 2);
+        let stripe0 = row_ptr.add(bs);
+        let stripe1 = row_ptr.add(row_stride + bs);
+        let table0 = tables_ptr;
+        let table1 = tables_ptr.add(256 * 16);
+        let w0 = (stripe0 as *const u64).read_unaligned();
+        let w1 = (stripe1 as *const u64).read_unaligned();
+        (
+            veorq_u8(
+                vld1q_u8(table0.add((w0 & 0xff) as usize * 16)),
+                vld1q_u8(table1.add((w1 & 0xff) as usize * 16)),
+            ),
+            veorq_u8(
+                vld1q_u8(table0.add(((w0 >> 8) & 0xff) as usize * 16)),
+                vld1q_u8(table1.add(((w1 >> 8) & 0xff) as usize * 16)),
+            ),
+            veorq_u8(
+                vld1q_u8(table0.add(((w0 >> 16) & 0xff) as usize * 16)),
+                vld1q_u8(table1.add(((w1 >> 16) & 0xff) as usize * 16)),
+            ),
+            veorq_u8(
+                vld1q_u8(table0.add(((w0 >> 24) & 0xff) as usize * 16)),
+                vld1q_u8(table1.add(((w1 >> 24) & 0xff) as usize * 16)),
+            ),
+            veorq_u8(
+                vld1q_u8(table0.add(((w0 >> 32) & 0xff) as usize * 16)),
+                vld1q_u8(table1.add(((w1 >> 32) & 0xff) as usize * 16)),
+            ),
+            veorq_u8(
+                vld1q_u8(table0.add(((w0 >> 40) & 0xff) as usize * 16)),
+                vld1q_u8(table1.add(((w1 >> 40) & 0xff) as usize * 16)),
+            ),
+            veorq_u8(
+                vld1q_u8(table0.add(((w0 >> 48) & 0xff) as usize * 16)),
+                vld1q_u8(table1.add(((w1 >> 48) & 0xff) as usize * 16)),
+            ),
+            veorq_u8(
+                vld1q_u8(table0.add((w0 >> 56) as usize * 16)),
+                vld1q_u8(table1.add((w1 >> 56) as usize * 16)),
+            ),
+            2,
+        )
+    } else {
+        (
+            vld1q_u8(o),
+            vld1q_u8(o.add(16)),
+            vld1q_u8(o.add(32)),
+            vld1q_u8(o.add(48)),
+            vld1q_u8(o.add(64)),
+            vld1q_u8(o.add(80)),
+            vld1q_u8(o.add(96)),
+            vld1q_u8(o.add(112)),
+            0,
+        )
+    };
     while t + 1 < TILE_T {
         let stripe0 = row_ptr.add(t * row_stride + bs);
         let stripe1 = row_ptr.add((t + 1) * row_stride + bs);
@@ -264,7 +314,7 @@ unsafe fn process_block_neon_single<const TILE_T: usize>(
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[inline(never)]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn process_block16_neon_single_sha3(
+unsafe fn process_block16_neon_single_sha3<const SEED_ZERO: bool>(
     row_ptr: *const u8,
     row_stride: usize,
     bs: usize,
@@ -274,6 +324,116 @@ unsafe fn process_block16_neon_single_sha3(
     use std::arch::asm;
 
     asm!(
+        ".if {seed_zero}",
+        // Seed directly from stripe pair 0/1: no destination loads, zero
+        // idioms, or EOR3 dependency on an artificial accumulator.
+        "add x8, {row}, {block_start}",
+        "ldp x11, x12, [x8]",
+        "add x15, x8, {stride}",
+        "ldp x13, x14, [x15]",
+        "add x15, {table}, #4096",
+
+        "and x16, x11, #0xff",
+        "and x17, x13, #0xff",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v0, v24, v25",
+
+        "ubfx x16, x11, #8, #8",
+        "ubfx x17, x13, #8, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v1, v24, v25",
+
+        "ubfx x16, x11, #16, #8",
+        "ubfx x17, x13, #16, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v2, v24, v25",
+
+        "ubfx x16, x11, #24, #8",
+        "ubfx x17, x13, #24, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v3, v24, v25",
+
+        "ubfx x16, x11, #32, #8",
+        "ubfx x17, x13, #32, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v4, v24, v25",
+
+        "ubfx x16, x11, #40, #8",
+        "ubfx x17, x13, #40, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v5, v24, v25",
+
+        "ubfx x16, x11, #48, #8",
+        "ubfx x17, x13, #48, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v6, v24, v25",
+
+        "lsr x16, x11, #56",
+        "lsr x17, x13, #56",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v7, v24, v25",
+
+        "and x16, x12, #0xff",
+        "and x17, x14, #0xff",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v16, v24, v25",
+
+        "ubfx x16, x12, #8, #8",
+        "ubfx x17, x14, #8, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v17, v24, v25",
+
+        "ubfx x16, x12, #16, #8",
+        "ubfx x17, x14, #16, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v18, v24, v25",
+
+        "ubfx x16, x12, #24, #8",
+        "ubfx x17, x14, #24, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v19, v24, v25",
+
+        "ubfx x16, x12, #32, #8",
+        "ubfx x17, x14, #32, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v20, v24, v25",
+
+        "ubfx x16, x12, #40, #8",
+        "ubfx x17, x14, #40, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v21, v24, v25",
+
+        "ubfx x16, x12, #48, #8",
+        "ubfx x17, x14, #48, #8",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v22, v24, v25",
+
+        "lsr x16, x12, #56",
+        "lsr x17, x14, #56",
+        "ldr q24, [{table}, x16, lsl #4]",
+        "ldr q25, [x15, x17, lsl #4]",
+        "eor.16b v23, v24, v25",
+
+        "lsl x9, {stride}, #1",
+        "add x8, x8, x9",
+        "add {table}, {table}, #8192",
+        "mov x10, #3",
+        ".else",
         "ldp q0, q1, [{dst}]",
         "ldp q2, q3, [{dst}, #32]",
         "ldp q4, q5, [{dst}, #64]",
@@ -285,6 +445,7 @@ unsafe fn process_block16_neon_single_sha3(
         "add x8, {row}, {block_start}",
         "lsl x9, {stride}, #1",
         "mov x10, #4",
+        ".endif",
         "2:",
         "ldp x11, x12, [x8]",
         "add x15, x8, {stride}",
@@ -405,6 +566,7 @@ unsafe fn process_block16_neon_single_sha3(
         block_start = in(reg) bs,
         table = inout(reg) tables_ptr => _,
         dst = in(reg) out_ptr,
+        seed_zero = const SEED_ZERO as usize,
         out("x8") _,
         out("x9") _,
         out("x10") _,
@@ -434,6 +596,76 @@ unsafe fn process_block16_neon_single_sha3(
         out("v24") _,
         out("v25") _,
         options(nostack),
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn process_oblock_tile<const TILE_T: usize, const SEED_ZERO: bool>(
+    z_base: *const u8,
+    row_stride: usize,
+    tables_ptr: *const u8,
+    partial: *mut F128,
+    useful: usize,
+    block16: bool,
+) {
+    let mut bs = 0usize;
+    #[cfg(target_feature = "sha3")]
+    if block16 {
+        while bs + 16 <= useful {
+            process_block16_neon_single_sha3::<SEED_ZERO>(
+                z_base,
+                row_stride,
+                bs,
+                tables_ptr,
+                partial.add(bs),
+            );
+            bs += 16;
+        }
+    }
+    #[cfg(not(target_feature = "sha3"))]
+    let _ = block16;
+    while bs < useful {
+        process_block_neon_single::<TILE_T, SEED_ZERO>(
+            z_base,
+            row_stride,
+            bs,
+            tables_ptr,
+            partial.add(bs),
+        );
+        bs += 8;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn process_oblock_one_tile<const TILE_T: usize, const SEED_ZERO: bool>(
+    z_packed: &[u8],
+    eq_outer: &[F128],
+    k: usize,
+    tile: usize,
+    tables: &mut [F128],
+    partial: *mut F128,
+    useful: usize,
+    block16: bool,
+) {
+    let stripe_base = tile * TILE_T;
+    for t in 0..TILE_T {
+        let eq_off = 8 * (stripe_base + t);
+        build_sum_table(
+            &eq_outer[eq_off..eq_off + 8],
+            &mut tables[t * 256..(t + 1) * 256],
+        );
+    }
+    process_oblock_tile::<TILE_T, SEED_ZERO>(
+        z_packed.as_ptr().add(stripe_base * k),
+        k,
+        tables.as_ptr().cast::<u8>(),
+        partial,
+        useful,
+        block16,
     );
 }
 
@@ -547,7 +779,7 @@ fn iblock_padded_tiled<const TILE_T: usize>(
                 for b in 0..n_block {
                     let i = b * BLOCK_K;
                     unsafe {
-                        process_block_neon_single::<TILE_T>(
+                        process_block_neon_single::<TILE_T, false>(
                             z_base,
                             k,
                             i,
@@ -740,7 +972,8 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     let n_tiles = n_stripes / TILE_T;
 
     // Only i_inner < useful_bits can be nonzero (padded rows fold to 0). Rounded
-    // up to BLOCK_K; columns [useful, k) stay zero from the partial init.
+    // up to BLOCK_K; columns [useful, k) are never read from the uninitialized
+    // partials and stay zero in the initialized final output.
     let useful = (useful_bits.div_ceil(BLOCK_K) * BLOCK_K).min(k);
     if useful == 0 {
         return vec![F128::ZERO; k];
@@ -755,9 +988,9 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     // claim owns a contiguous tile band, builds each of its tile tables
     // exactly once (the property that makes oblock beat iblock), and
     // accumulates into its own private length-k partial. The partial backing
-    // is allocated uninitialized: every claim zeroes exactly its own slot
-    // before its first accumulate, so there is no up-front 16 MiB fault pass
-    // and first-touch lands on whichever core does the work.
+    // is allocated uninitialized; every claim's first tile overwrites its
+    // useful prefix from register/table values, so neither an up-front nor a
+    // per-claim zero pass touches the ranked path's 16 MiB arena.
     const TILES_PER_CLAIM: usize = OBLOCK_TILES_PER_CLAIM;
     let n_claims_total = n_tiles.div_ceil(TILES_PER_CLAIM);
     let claim_hi = claim_hi.min(n_claims_total);
@@ -766,63 +999,44 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     if n_claims == 0 {
         return vec![F128::ZERO; k];
     }
-    let mut partials = crate::alloc_uninit_f128_vec(n_claims * k);
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    let mut partials = crate::alloc_uninit_vec::<core::mem::MaybeUninit<F128>>(n_claims * k);
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr().cast::<F128>());
     crate::epool::run_hetero_chunks(n_claims, |c| {
         let claim = c + claim_lo;
         let tile_lo = claim * TILES_PER_CLAIM;
         let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
-        // SAFETY: the queue hands out each claim index exactly once; claim
-        // `c` exclusively owns `partials[c·k .. (c+1)·k]`, which it fully
-        // zero-initializes below before any read. The queue join publishes
-        // all writes before the reduction reads them.
-        let partial = unsafe { std::slice::from_raw_parts_mut(partials_base.ptr().add(c * k), k) };
-        // SAFETY: F128 is Copy and all-zero bytes are valid F128::ZERO.
-        unsafe {
-            std::ptr::write_bytes(partial.as_mut_ptr(), 0, k);
-        }
+        // Keep the uninitialized allocation raw until the first tile has
+        // overwritten the useful prefix; forming an F128 reference earlier
+        // would itself violate the type's initialization invariant.
+        let partial = unsafe { partials_base.ptr().add(c * k) };
         // TILE_T × 256 F128 tables, L1-resident, built once per tile.
         let mut tables = vec![F128::ZERO; TILE_T * 256];
-        for tile in tile_lo..tile_hi {
-            let stripe_base = tile * TILE_T;
-            for t in 0..TILE_T {
-                let eq_off = 8 * (stripe_base + t);
-                build_sum_table(
-                    &eq_outer[eq_off..eq_off + 8],
-                    &mut tables[t * 256..(t + 1) * 256],
+        // Every non-empty claim owns at least `tile_lo`; the compile-time true
+        // specialization writes the complete useful prefix without loading it.
+        unsafe {
+            process_oblock_one_tile::<TILE_T, true>(
+                z_packed,
+                eq_outer,
+                k,
+                tile_lo,
+                &mut tables,
+                partial,
+                useful,
+                block16,
+            );
+        }
+        for tile in tile_lo + 1..tile_hi {
+            unsafe {
+                process_oblock_one_tile::<TILE_T, false>(
+                    z_packed,
+                    eq_outer,
+                    k,
+                    tile,
+                    &mut tables,
+                    partial,
+                    useful,
+                    block16,
                 );
-            }
-            let tables_ptr = tables.as_ptr() as *const u8;
-            let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
-            let mut bs = 0usize;
-            #[cfg(target_feature = "sha3")]
-            if block16 {
-                while bs + 16 <= useful {
-                    unsafe {
-                        process_block16_neon_single_sha3(
-                            z_base,
-                            k,
-                            bs,
-                            tables_ptr,
-                            partial.as_mut_ptr().add(bs),
-                        );
-                    }
-                    bs += 16;
-                }
-            }
-            #[cfg(not(target_feature = "sha3"))]
-            let _ = block16;
-            while bs < useful {
-                unsafe {
-                    process_block_neon_single::<TILE_T>(
-                        z_base,
-                        k,
-                        bs,
-                        tables_ptr,
-                        partial.as_mut_ptr().add(bs),
-                    );
-                }
-                bs += BLOCK_K;
             }
         }
     });
@@ -838,16 +1052,30 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     // That is `n_workers - 1` accumulator reads and writes (≈2.5× the traffic
     // here) and 9 barriers instead of 1 at `n_workers = 10`; measured ≈0.7 ms
     // of the fold at m=32, k_log=14.
-    let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
+    let band = useful
+        .div_ceil(rayon::current_num_threads().max(1))
+        .max(1024);
     let mut out = vec![F128::ZERO; k];
-    out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
-        let lo = bi * band;
-        for w in 0..n_workers {
-            let src = &partials[w * k + lo..w * k + lo + dst.len()];
-            for (o, s) in dst.iter_mut().zip(src.iter()) {
-                *o += *s;
+    out[..useful]
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(bi, dst)| {
+            let lo = bi * band;
+            for w in 0..n_workers {
+                // SAFETY: the producer join above completed each claim's
+                // `[0, useful)` prefix before reduction; this band is wholly
+                // inside that initialized prefix. The padding suffix is never
+                // reinterpreted as F128.
+                let src = unsafe {
+                    std::slice::from_raw_parts(
+                        partials.as_ptr().cast::<F128>().add(w * k + lo),
+                        dst.len(),
+                    )
+                };
+                for (o, s) in dst.iter_mut().zip(src.iter()) {
+                    *o += *s;
+                }
             }
-        }
-    });
+        });
     out
 }
