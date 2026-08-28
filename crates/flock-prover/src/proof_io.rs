@@ -542,9 +542,7 @@ fn put_sumcheck_vec<W: std::io::Write>(out: &mut W, v: &[SumcheckMessage]) {
             assert!(std::mem::size_of::<SumcheckMessage>() == 2 * std::mem::size_of::<F128>());
             assert!(std::mem::align_of::<SumcheckMessage>() == std::mem::align_of::<F128>());
             assert!(std::mem::offset_of!(SumcheckMessage, u_0) == 0);
-            assert!(
-                std::mem::offset_of!(SumcheckMessage, u_2) == std::mem::size_of::<F128>()
-            );
+            assert!(std::mem::offset_of!(SumcheckMessage, u_2) == std::mem::size_of::<F128>());
         }
         // SAFETY: `SumcheckMessage` is `repr(C)` with two adjacent `F128`
         // fields, and `F128` is two adjacent `u64`s. The enclosing flat

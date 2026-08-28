@@ -11,9 +11,6 @@
 //!
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
-//!
-//! pepedesigner sample 64 on frontier `e0afcac` + detached-keepalive
-//! (cpu_keepalive.rs): marker comment only, semantics unchanged.
 
 pub use flock_core::*;
 
@@ -256,3 +253,5 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker r265-sample-265-20260818-20260818-2309
 
 // dispersion-resample marker r266-sample-266-20260818-20260818-2319
+
+// exact-4ee-redraw marker 20260828

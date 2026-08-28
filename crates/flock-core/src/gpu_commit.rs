@@ -10991,8 +10991,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         /// dispatch; the buffer is retained across its short-lived pool and
         /// drained in `finish` (the from-z first-pass stream idiom).
         fn submit_pending(&self, inner: &mut L1OverlapInner) {
-            if inner.pending.is_empty() || self.failed.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if inner.pending.is_empty() || self.failed.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
             // Publish every pending chunk's CPU stores to the encode below.
