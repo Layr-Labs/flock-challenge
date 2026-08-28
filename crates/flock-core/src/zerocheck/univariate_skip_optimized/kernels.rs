@@ -224,6 +224,54 @@ pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
     }
 }
 
+/// Ranked BLAKE3 trusted-static seam. Returns true only for the five
+/// structurally constant rows handled without re-sniffing B; heavy NEON
+/// kernels remain shared with the checked dispatcher.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub(super) fn shift_reduce_inner_ab_ranked_trusted_static(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    within_hash_outer: usize,
+    out: &mut [u8; 64],
+    static_b_context: StaticBContext,
+    nt_store: bool,
+) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::shift_reduce_inner_ab_ranked_trusted_static(
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            within_hash_outer,
+            out,
+            static_b_context,
+            nt_store,
+        )
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            b_med,
+            within_hash_outer,
+            out,
+            static_b_context,
+            nt_store,
+        );
+        false
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn accumulate_convert(

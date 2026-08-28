@@ -3235,3 +3235,99 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         );
     }
 }
+
+/// Trusted ranked BLAKE3 dispatcher for the five constant-B rows. The caller
+/// has established the exact ranked layout and prepared static context once at
+/// queue entry, so repeating B-word sniffs in every outer chunk is redundant.
+/// All arithmetic bodies are the same functions used by the checked path.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shift_reduce_inner_ab_ranked_trusted_static(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    within_hash_outer: usize,
+    out: &mut [u8; 64],
+    context: StaticBContext,
+    nt_store: bool,
+) -> bool {
+    let byte_base = chunk_byte_base + b_med * N_CHUNKS * 8;
+    match (within_hash_outer, b_med) {
+        (0, 0 | 1) => {
+            shift_reduce_inner_a_only_const_b(a_packed, inv_table, byte_base, out, nt_store);
+            true
+        }
+        (0, 2) => {
+            let a_k0 = u64::from_le(unsafe {
+                core::ptr::read_unaligned(a_packed.as_ptr().add(byte_base).cast::<u64>())
+            });
+            let a_k1 = u64::from_le(unsafe {
+                core::ptr::read_unaligned(a_packed.as_ptr().add(byte_base + N_CHUNKS).cast::<u64>())
+            });
+            if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
+                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03>(
+                    a_packed, b_packed, inv_table, byte_base, None, out, nt_store,
+                );
+            } else {
+                const STATIC_A_K1: u64 = 0x0000_0016_0000_0080;
+                const STATIC_A_K0_TOP3_MASK: u64 = 0xffff_ff00_0000_0000;
+                if a_k1 == STATIC_A_K1 && a_k0 & STATIC_A_K0_TOP3_MASK == 0 {
+                    let static_a_k1 = match context {
+                        StaticBContext::Prepared { static_a_k1, .. } => static_a_k1,
+                        StaticBContext::LegacyPerCall => static_a_k1_partial(inv_table),
+                    };
+                    shift_reduce_inner_mixed_const_b_h4::<0x03, true, 0>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base,
+                        Some(static_a_k1),
+                        out,
+                        nt_store,
+                    );
+                } else {
+                    shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0>(
+                        a_packed, b_packed, inv_table, byte_base, None, out, nt_store,
+                    );
+                }
+            }
+            true
+        }
+        (1, 13) => {
+            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0>(
+                a_packed, b_packed, inv_table, byte_base, None, out, nt_store,
+            );
+            true
+        }
+        (1, 14) => {
+            let partials = match context {
+                StaticBContext::Prepared { partials, .. } => partials,
+                StaticBContext::LegacyPerCall => bstatic_partials(inv_table),
+            };
+            let a_word = u64::from_le(unsafe {
+                core::ptr::read_unaligned(a_packed.as_ptr().add(byte_base).cast::<u64>())
+            });
+            if a_word & 0xff00_0000_0000_0000 == 0 {
+                shift_reduce_inner_single_k0_static_b::<true>(
+                    a_word,
+                    inv_table,
+                    &partials[30 * 8],
+                    out,
+                    nt_store,
+                );
+            } else {
+                shift_reduce_inner_single_k0_static_b::<false>(
+                    a_word,
+                    inv_table,
+                    &partials[30 * 8],
+                    out,
+                    nt_store,
+                );
+            }
+            true
+        }
+        _ => false,
+    }
+}

@@ -876,8 +876,9 @@ fn speculative_main(
     // The seed's first byte has arrived: this thread is about to forward it and
     // start the speculative prove. Signal the CPU keep-alive down immediately —
     // the spin threads notice within one ~64-op slice and exit on their own —
-    // but defer their 10–14 sequential joins until after the seed forward, so
-    // that pure serial join time is off the timed window's first microseconds.
+    // A shared active counter proves every spinner has actually exited before
+    // proof work begins. OS-handle joins are deferred until after publication,
+    // avoiding a serial join convoy when a stopped thread was descheduled.
     // `FLOCK_NO_KEEPALIVE_DEFER=1` (exact '1') restores signal+join up front.
     let defer_join =
         std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1"));
@@ -921,11 +922,11 @@ fn speculative_main(
     };
 
     let seed_at = std::time::Instant::now();
-    // On the direct-publication arm, parse and timestamp first, then reap the
-    // already-signalled keep-alive threads. This is the remote candidate's
-    // measured ordering; the literal kill branch above remains incumbent.
+    // On the direct-publication arm, parse and timestamp first, then wait on a
+    // single parallel-exit barrier. This proves the proof cannot share a P-core
+    // with a spinner without paying ten sequential OS-thread joins here.
     if defer_forward && defer_join {
-        flock_core::cpu_keepalive::keepalive_join();
+        flock_core::cpu_keepalive::keepalive_quiesce();
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut buf = std::mem::take(&mut scratch);
@@ -996,6 +997,11 @@ fn speculative_main(
                 return;
             }
             seed_forward.complete();
+            if defer_join {
+                // Spinner execution ended before the proof. Reap only the
+                // inert handles after result publication/forwarding.
+                flock_core::cpu_keepalive::keepalive_join();
+            }
         }
         Err(_) => {
             if defer_forward {
@@ -1003,6 +1009,9 @@ fn speculative_main(
             }
             mark_dead();
             seed_forward.complete();
+            if defer_join {
+                flock_core::cpu_keepalive::keepalive_join();
+            }
         }
     }
 }
