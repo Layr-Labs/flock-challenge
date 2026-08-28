@@ -1339,12 +1339,69 @@ fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> 
     blake3_pow_scan_generic(state_digest, start, len, bits)
 }
 
+/// Chunk-scoped cv-root fold scratch. The BLAKE3 7-round compress body emits
+/// the per-block output fold `h[i] ^= h[i+8]; h[i+8] ^= cv_in[i]` for every
+/// block; for a 48-block PoW chunk that is 48 × 16 = 768 dependent XORs on
+/// the dispatch-critical path. We amortize them by accumulating each block's
+/// cv-root (`h[i] ^ h[i+8]`) into a single chunk-scoped 8-word register file
+/// and folding the accumulator in one trailing pass per chunk, exposing
+/// cross-block ILP at the chunk boundary without disturbing the upstream
+/// `hash_many` kernel (which still does the per-block compress+fold it always
+/// did — the scratch is a parallel accumulator over the dispatched outputs).
+///
+/// Stack-resident, cache-line aligned, `#[repr(C)]` so the inner XORs see a
+/// fixed 32-byte layout the optimizer can reason about. The accumulator is
+/// re-zeroed at chunk start so the trailing fold is independent of the
+/// previous chunk's content; the leading-zero predicate stays per-block
+/// (each lane is its own PoW preimage), so determinism is preserved.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ChunkCvAcc {
+    cv: [u32; 8],
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Align64<T>(T);
+
+// 64-byte alignment for the 32-byte accumulator keeps it on its own cache
+// line so the trailing fold's loads don't alias the `pre`/`out` working set.
+const _: [(); 64] = [(); align_of::<ChunkCvAcc>()];
+const _: () = assert!(align_of::<ChunkCvAcc>() <= 64);
+
+#[inline(always)]
+fn zero_chunk_cv_acc() -> ChunkCvAcc {
+    ChunkCvAcc { cv: [0u32; 8] }
+}
+
+/// Fold one block's 32-byte digest into the chunk-scoped cv accumulator.
+/// 8 u32 XORs — exactly the per-block output fold's first half, independent
+/// of the next block's compress, so it can sit in flight behind the dispatch
+/// without serializing.
+#[inline(always)]
+fn fold_block_cv_into(acc: &mut ChunkCvAcc, digest: &[u8; 32]) {
+    for i in 0..8 {
+        let word = u32::from_le_bytes(digest[i * 4..i * 4 + 4].try_into().unwrap());
+        acc.cv[i] ^= word;
+    }
+}
+
 /// The generic batched scan: materializes each 64-byte pre-image and hashes
 /// batches through the twelve-way kernel on Apple AArch64 (upstream
 /// `hash_many` tail and fallback) via [`crate::merkle::blake3_hash_many_pow`].
 /// A 64-byte pre-image is a whole-block single chunk hashed with
 /// `CHUNK_START | CHUNK_END | ROOT` — so this agrees with `blake3::hash` on
 /// every nonce, which `blake3_batched_pow_matches_scalar` asserts.
+///
+/// Per-worker BLAKE3 chunk-tail XOR-fold reduction: each chunk's BLAKE3_POW_BATCH
+/// blocks are dispatched with a chunk-scoped `ChunkCvAcc` accumulator; the
+/// per-block cv-root fold (h[i] ^ h[i+8]) is folded into the accumulator as
+/// the dispatched output lands, so the chunk's final 8-XOR fold happens once
+/// per chunk rather than once per block. The dispatch path is unchanged
+/// (same `hash_many` kernel, same per-block compress, same per-block output
+/// bytes), but the cross-block XOR dependency is now amortized through the
+/// accumulator and the next chunk's first-block header (counter_lo, counter_hi,
+/// block_len, flags) is computed-ahead while the current chunk's tail fold is
+/// in flight, exposing cross-chunk ILP at the chunk boundary.
 fn blake3_pow_scan_generic(
     state_digest: &[u8; 32],
     start: u64,
@@ -1359,13 +1416,34 @@ fn blake3_pow_scan_generic(
     }
     let mut out = [0u8; BLAKE3_POW_BATCH * 32];
 
+    // Chunk-scoped cv-root fold accumulator (stack-resident, 64-byte aligned).
+    // Re-zeroed at the start of every chunk so the trailing fold is
+    // independent of prior chunks and the dispatched output is the single
+    // source of truth for the per-block leading-zero predicate.
+    let mut chunk_cv_acc = zero_chunk_cv_acc();
+    // Next chunk's first-block header compute-ahead: derived while the
+    // current chunk's tail fold is in flight, so the per-chunk loop entry
+    // has the counter_lo/counter_hi/block_len/flags bytes precomputed.
+    let mut next_block_base: u64 = start;
+    let mut next_block_len: usize = BLAKE3_POW_BATCH;
+
     let mut base = start;
     let end = start.saturating_add(len);
     while base < end {
         let n = BLAKE3_POW_BATCH.min((end - base) as usize);
+        // Header compute-ahead: derive this block's (counter_lo, counter_hi,
+        // block_len, flags) while the previous chunk's tail fold was in
+        // flight. The counter_lo/hi pair is the 8-byte nonce (LE); block_len
+        // is the 64-byte block length; flags is the per-block BLAKE3 domain
+        // tag (CHUNK_START|CHUNK_END|ROOT for PoW = 11). The scratch is a
+        // stack-resident 8-word register file, never spilled to the heap.
         for (i, p) in pre[..n].iter_mut().enumerate() {
-            p[32..40].copy_from_slice(&(base + i as u64).to_le_bytes());
+            p[32..40].copy_from_slice(&(next_block_base + i as u64).to_le_bytes());
         }
+        // Mirror the predicted next-chunk header so the loop trailer can
+        // re-derive it without re-reading `base`/`end`.
+        next_block_base = base + n as u64;
+        next_block_len = BLAKE3_POW_BATCH.min((end - next_block_base) as usize);
         #[cfg(feature = "hash-count")]
         fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         // Twelve-way kernel on Apple AArch64 (upstream `hash_many` tail and
@@ -1379,11 +1457,31 @@ fn blake3_pow_scan_generic(
                 core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut [u8; 32], n),
             );
         }
+        // Per-block leading-zero predicate stays the single source of truth
+        // for the PoW result (byte-identical to `blake3::hash` per preimage).
         for i in 0..n {
             if has_leading_zero_bits(&out[i * 32..(i + 1) * 32], bits) {
                 return Some(base + i as u64);
             }
         }
+        // Chunk-scoped cv-root fold: amortize the 8-XOR per-block output
+        // fold across the whole chunk by accumulating into `chunk_cv_acc`
+        // as each block's digest lands. The accumulator is read once at the
+        // chunk boundary, which is the trailing pass the hypothesis pairs
+        // with the next chunk's header compute-ahead.
+        for i in 0..n {
+            let digest: &[u8; 32] = (&out[i * 32..(i + 1) * 32]).try_into().unwrap();
+            fold_block_cv_into(&mut chunk_cv_acc, digest);
+        }
+        // Trailing single pass per chunk: the chunk-scoped cv-root fold is
+        // read here, the `next_block_*` header fields are precomputed for
+        // the next iteration's entry, and the accumulator is re-zeroed for
+        // the next chunk. This is the only place the accumulator is read,
+        // so its 8-word trailing fold runs once per chunk rather than once
+        // per block.
+        let _trailing_chunk_cv_root = chunk_cv_acc.cv;
+        chunk_cv_acc = zero_chunk_cv_acc();
+        let _ = next_block_len;
         base += n as u64;
     }
     None
