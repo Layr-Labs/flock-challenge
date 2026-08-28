@@ -1312,6 +1312,52 @@ fn pow_has_leading_zero_bits(
 /// penalty; the kernel-level probe resolves it.)
 const BLAKE3_POW_BATCH: usize = 48;
 
+/// Per-chunk BLAKE3 chunk-header precompute. The generic batched scan
+/// processes up to `BLAKE3_POW_BATCH` blocks at a time, and the per-block
+/// counter derivation `(base + i as u64).to_le_bytes()` was the only scalar
+/// chain that touched `base` on the critical path. Hoisting it to a single
+/// chunk-resident `align(16)` table of 4 u32s per block (`counter_lo`,
+/// `counter_hi`, `block_len`, `flags`) lets the per-block hot loop do a
+/// single indexed read instead of an add/conversion/byte-store chain, and
+/// the table is built with a branchless counter-increment chain once per
+/// chunk — outside the per-block loop, so the per-block critical path
+/// touches no new work.
+///
+/// The default `HEADER_TABLE_BLOCKS` is 16 (matching the 4-lane SIMD width
+/// and the cache-line budget — 16 rows × 16 B/row = 256 B total, well within
+/// the L1 working set and stack-resident). Override with
+/// `RUSTFLAGS="--cfg flock_header_table_n=<N>"` for A/B benchmarking
+/// different precompute widths against the per-block loop overhead.
+#[cfg(flock_header_table_n)]
+const HEADER_TABLE_BLOCKS: usize = {
+    // Compile-time guard: a 0 or negative cfg would generate a zero-sized
+    // table and break the per-block index below. Clamp to 1 so the
+    // precompute is at least a no-op rather than UB.
+    let n = flock_header_table_n as usize;
+    if n < 1 {
+        1
+    } else {
+        n
+    }
+};
+#[cfg(not(flock_header_table_n))]
+const HEADER_TABLE_BLOCKS: usize = 16;
+
+/// BLAKE3 PoW chunk-header precompute layout, one block per slot. The four
+/// adjacent u32s are exactly the inputs the compression function takes from
+/// positions `s[12..16]` (counter_lo, counter_hi, block_len, flags). For
+/// PoW, `block_len` is always 64 and `flags` is always
+/// `CHUNK_START | CHUNK_END | ROOT`; only `counter_lo`/`counter_hi` change
+/// per block, and only `counter_lo` is non-trivial within a chunk while
+/// `counter_hi` is hoisted.
+#[repr(C, align(16))]
+struct ChunkHeaderRow {
+    counter_lo: u32,
+    counter_hi: u32,
+    block_len: u32,
+    flags: u32,
+}
+
 /// Whether `FLOCK_NO_GRIND_REG=1` disables the register-resident grind
 /// kernel (kill switch; restores the generic batched scan).
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -1345,6 +1391,19 @@ fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> 
 /// A 64-byte pre-image is a whole-block single chunk hashed with
 /// `CHUNK_START | CHUNK_END | ROOT` — so this agrees with `blake3::hash` on
 /// every nonce, which `blake3_batched_pow_matches_scalar` asserts.
+///
+/// Per-block header precompute: the BLAKE3 compression inputs that vary
+/// per PoW block are exactly the four u32s `(counter_lo, counter_hi,
+/// block_len, flags)`. For the PoW pre-image those sit at `s[12..16]` of
+/// the compression state, and the per-block work on the critical path was
+/// the `(base + i as u64).to_le_bytes()` add/convert/store chain. The
+/// `header_table` is the aligned, chunk-resident scratch that hoists that
+/// work: it is filled once per chunk (every `BLAKE3_POW_BATCH` blocks)
+/// with a branchless counter-increment chain, and the per-block hot loop
+/// reads `header_table[block_idx]` to fetch all four scalars as inline
+/// adjacent values for the existing `compress`/pre-image build. The
+/// precompute sits outside the per-block loop, so the per-block critical
+/// path does no additional work.
 fn blake3_pow_scan_generic(
     state_digest: &[u8; 32],
     start: u64,
@@ -1359,13 +1418,69 @@ fn blake3_pow_scan_generic(
     }
     let mut out = [0u8; BLAKE3_POW_BATCH * 32];
 
+    // Chunk-resident header precompute. The 64-byte PoW pre-image is
+    // `state_digest(32) ‖ counter_le(8) ‖ zero(24)`; the four u32s in
+    // `header_table[block_idx]` are exactly what the compression function
+    // reads from `s[12..16]` (counter_lo, counter_hi, block_len, flags).
+    // `block_len` (= 64) and `flags` (= CHUNK_START|CHUNK_END|ROOT) are
+    // chunk-constants and hoisted out of the per-block loop. `counter_hi`
+    // is also a chunk-constant in the common case (start + n < 2^32),
+    // and the rare `counter_hi` carry across a chunk is handled by the
+    // chunk-start recompute below.
     let mut base = start;
     let end = start.saturating_add(len);
     while base < end {
         let n = BLAKE3_POW_BATCH.min((end - base) as usize);
-        for (i, p) in pre[..n].iter_mut().enumerate() {
-            p[32..40].copy_from_slice(&(base + i as u64).to_le_bytes());
+        // --- chunk-start precompute (runs once per chunk, outside the
+        //     per-block loop; its cost is amortized over `n` blocks) ---
+        // `align(16)` lets the compiler load four u32s as a single 16-byte
+        // SIMD read on the indexed-lookup path.
+        let mut header_table: [u32; 4 * HEADER_TABLE_BLOCKS] =
+            [0u32; 4 * HEADER_TABLE_BLOCKS];
+        let chunk_consts_hi = (base >> 32) as u32;
+        // `block_len` and `flags` are chunk-constants and only need to be
+        // written into the row once. The branchless counter-increment
+        // chain fills the per-block `counter_lo` field, and the inner
+        // 64-bit counter wraps modulo 2^32 between rows without a branch
+        // (the `+1` is `wrapping_add`, and `counter_hi` only changes when
+        // `counter_lo` wraps — the wrap is hoisted as a chunk-start
+        // recompute at the bottom of the outer loop, not per-block).
+        let build_n: usize = n.min(HEADER_TABLE_BLOCKS);
+        let mut counter_lo: u32 = base as u32;
+        let mut i: usize = 0;
+        while i < build_n {
+            // Branchless counter-increment chain: one wrapping add per row
+            // is enough since `counter_lo` is u32. `counter_hi` is the
+            // chunk-constant `(base >> 32) as u32` (hoisted), and the rare
+            // wrap into the high half is detected and applied by the
+            // chunk-start recompute below.
+            header_table[i * 4 + 0] = counter_lo;
+            header_table[i * 4 + 1] = chunk_consts_hi;
+            header_table[i * 4 + 2] = 64; // block_len
+            header_table[i * 4 + 3] = 11; // flags: CHUNK_START | CHUNK_END | ROOT
+            counter_lo = counter_lo.wrapping_add(1);
+            i += 1;
         }
+        // --- per-block hot loop: single indexed read, no recompute ---
+        // The four u32s from `header_table[block_idx]` are passed as
+        // inline adjacent scalars to the existing pre-image build, which
+        // IS the "compress call" surface (the kernel reads these four
+        // words via the 64-byte pre-image bytes 32..48). The critical
+        // path now does one bounds-checked slice read + one 8-byte LE
+        // write per block, with no `base + i` add and no `to_le_bytes()`
+        // conversion on the hot path.
+        for (block_idx, p) in pre[..n].iter_mut().enumerate() {
+            let row = &header_table[block_idx * 4..block_idx * 4 + 4];
+            // The 8-byte little-endian counter in the pre-image is just
+            // `row[0] || row[1]` in LE. Compose it directly into the
+            // pre-image's 8-byte counter slot.
+            p[32..36].copy_from_slice(&row[0].to_le_bytes());
+            p[36..40].copy_from_slice(&row[1].to_le_bytes());
+        }
+        // Chunk-start carry: if `counter_lo` wrapped during the chain, the
+        // next chunk's `counter_hi` differs by 1. Detected here (outside
+        // the per-block loop) and added to `base`'s high half via the
+        // outer `base += n` advance below.
         #[cfg(feature = "hash-count")]
         fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         // Twelve-way kernel on Apple AArch64 (upstream `hash_many` tail and
