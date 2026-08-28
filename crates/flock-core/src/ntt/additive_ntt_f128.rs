@@ -3148,14 +3148,8 @@ mod tests {
         assert!(l2_recursive_ntt_epool_killed_by(Some("1")));
 
         // The union gate matches each shape exactly, independent of env.
-        assert_eq!(
-            is_recursive_ntt_epool_shape(18, 8, 2),
-            enabled_here
-        );
-        assert_eq!(
-            is_recursive_ntt_epool_shape(16, 8, 3),
-            enabled_here
-        );
+        assert_eq!(is_recursive_ntt_epool_shape(18, 8, 2), enabled_here);
+        assert_eq!(is_recursive_ntt_epool_shape(16, 8, 3), enabled_here);
         assert!(!is_recursive_ntt_epool_shape(17, 8, 2));
         assert!(!is_recursive_ntt_epool_shape(16, 8, 2));
     }
