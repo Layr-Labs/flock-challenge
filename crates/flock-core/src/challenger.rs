@@ -1312,6 +1312,14 @@ fn pow_has_leading_zero_bits(
 /// penalty; the kernel-level probe resolves it.)
 const BLAKE3_POW_BATCH: usize = 48;
 
+/// BLAKE3 flags for a PoW single-chunk pre-image: `CHUNK_START | CHUNK_END |
+/// ROOT`. Matches the flag the `blake3_hash_many_pow` path passes to
+/// upstream `hash_many`, and the `POW_FLAGS` constant in
+/// `merkle/blake3_neon_apple.rs`. Hoisted into the per-chunk header so the
+/// per-block prologue reads it from a 16-byte slot alongside the live
+/// counter instead of recomputing it per block.
+const POW_SCAN_FLAGS: u32 = 1 | 2 | 8;
+
 /// Whether `FLOCK_NO_GRIND_REG=1` disables the register-resident grind
 /// kernel (kill switch; restores the generic batched scan).
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -1363,8 +1371,22 @@ fn blake3_pow_scan_generic(
     let end = start.saturating_add(len);
     while base < end {
         let n = BLAKE3_POW_BATCH.min((end - base) as usize);
-        for (i, p) in pre[..n].iter_mut().enumerate() {
-            p[32..40].copy_from_slice(&(base + i as u64).to_le_bytes());
+        // Per-chunk stack-resident counter/flags scratchpad: a single
+        // 16-byte `[u32; 4]` header holds the chunk's base counter
+        // (u64 LE) and the accumulated BLAKE3 flags byte, hoisted once
+        // per chunk and consumed by all K per-block nonce writes below
+        // as one aligned read plus a single add-immediate on the low
+        // LE u32. Replaces the prior per-block `base + i as u64`
+        // recompute with a 64-bit live counter kept in registers
+        // across the inner block loop.
+        let mut header = [0u32; 4];
+        header[0] = base as u32;
+        header[1] = (base >> 32) as u32;
+        header[3] = POW_SCAN_FLAGS;
+        for p in pre[..n].iter_mut() {
+            let counter = u64::from(header[0]) | (u64::from(header[1]) << 32);
+            p[32..40].copy_from_slice(&counter.to_le_bytes());
+            header[0] = header[0].wrapping_add(1);
         }
         #[cfg(feature = "hash-count")]
         fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
