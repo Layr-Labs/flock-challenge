@@ -354,8 +354,9 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v16, v20, v27
 	add.4s	v20, v16, v13
 	eor.16b	v16, v20, v30
-	ldp	q6, q3, [sp, #832]              ; 32-byte Folded Reload
-	tbl.16b	v30, { v16 }, v3
+	ldr	q6, [sp, #832]                  ; 16-byte Folded Reload
+	shl.4s	v30, v16, #24
+	sri.4s	v30, v16, #8
 	add.4s	v3, v31, v30
 	eor.16b	v25, v3, v13
 	shl.4s	v16, v25, #25
@@ -363,8 +364,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v1, v6
 	add.4s	v25, v1, v23
 	eor.16b	v1, v25, v29
-	ldr	q6, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v13, { v1 }, v6
+	shl.4s	v13, v1, #24
+	sri.4s	v13, v1, #8
 	add.4s	v15, v15, v13
 	eor.16b	v1, v15, v23
 	shl.4s	v29, v1, #25
@@ -373,8 +374,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v21, v1
 	add.4s	v31, v1, v22
 	eor.16b	v1, v31, v2
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v2, { v1 }, v2
+	shl.4s	v2, v1, #24
+	sri.4s	v2, v1, #8
 	add.4s	v6, v0, v2
 	eor.16b	v0, v6, v22
 	shl.4s	v23, v0, #25
@@ -442,8 +443,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v4, v4, v7
 	add.4s	v21, v4, v2
 	eor.16b	v7, v21, v22
-	ldr	q4, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v4, { v7 }, v4
+	shl.4s	v4, v7, #24
+	sri.4s	v4, v7, #8
 	str	q4, [sp, #240]                  ; 16-byte Folded Spill
 	add.4s	v3, v3, v4
 	str	q3, [sp, #160]                  ; 16-byte Folded Spill
@@ -465,8 +466,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v0, v0, v18
 	str	q0, [sp, #128]                  ; 16-byte Folded Spill
 	eor.16b	v0, v0, v5
-	ldr	q4, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v4, { v0 }, v4
+	shl.4s	v4, v0, #24
+	sri.4s	v4, v0, #8
 	add.4s	v16, v6, v4
 	eor.16b	v5, v16, v18
 	shl.4s	v23, v5, #25
@@ -476,8 +477,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v0, v3, v22
 	str	q0, [sp, #144]                  ; 16-byte Folded Spill
 	eor.16b	v3, v0, v7
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v9, { v3 }, v0
+	shl.4s	v9, v3, #24
+	sri.4s	v9, v3, #8
 	add.4s	v20, v20, v9
 	eor.16b	v3, v20, v22
 	shl.4s	v29, v3, #25
@@ -507,8 +508,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v6, v11, v6
 	add.4s	v30, v6, v15
 	eor.16b	v6, v30, v12
-	ldr	q22, [sp, #848]                 ; 16-byte Folded Reload
-	tbl.16b	v11, { v6 }, v22
+	shl.4s	v11, v6, #24
+	sri.4s	v11, v6, #8
 	add.4s	v31, v13, v11
 	eor.16b	v10, v31, v15
 	shl.4s	v6, v10, #25
@@ -517,8 +518,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v3, v3, v22
 	add.4s	v15, v3, v18
 	eor.16b	v3, v15, v5
-	ldr	q5, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v22, { v3 }, v5
+	shl.4s	v22, v3, #24
+	sri.4s	v22, v3, #8
 	add.4s	v10, v7, v22
 	eor.16b	v3, v10, v18
 	shl.4s	v18, v3, #25
@@ -527,8 +528,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v3, v19, v3
 	add.4s	v19, v3, v0
 	eor.16b	v3, v19, v25
-	ldr	q5, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v7, { v3 }, v5
+	shl.4s	v7, v3, #24
+	sri.4s	v7, v3, #8
 	add.4s	v27, v27, v7
 	eor.16b	v0, v27, v0
 	shl.4s	v12, v0, #25
@@ -537,8 +538,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v0, v26, v0
 	add.4s	v13, v0, v1
 	eor.16b	v0, v13, v8
-	ldr	q3, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v3, { v0 }, v3
+	shl.4s	v3, v0, #24
+	sri.4s	v3, v0, #8
 	add.4s	v25, v24, v3
 	eor.16b	v0, v25, v1
 	shl.4s	v1, v0, #25
@@ -594,8 +595,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v2, v5
 	add.4s	v9, v26, v2
 	eor.16b	v2, v9, v24
-	ldr	q3, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v24, { v2 }, v3
+	shl.4s	v24, v2, #24
+	sri.4s	v24, v2, #8
 	add.4s	v30, v16, v24
 	eor.16b	v2, v30, v26
 	shl.4s	v3, v2, #25
@@ -604,8 +605,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v28, v2
 	add.4s	v27, v2, v0
 	eor.16b	v4, v27, v12
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v2, { v4 }, v2
+	shl.4s	v2, v4, #24
+	sri.4s	v2, v4, #8
 	str	q2, [sp, #192]                  ; 16-byte Folded Spill
 	add.4s	v2, v13, v2
 	stp	q3, q2, [sp, #256]              ; 32-byte Folded Spill
@@ -627,8 +628,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v4, v2, v21
 	add.4s	v12, v11, v4
 	eor.16b	v4, v12, v8
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v18, { v4 }, v2
+	shl.4s	v18, v4, #24
+	sri.4s	v18, v4, #8
 	add.4s	v28, v20, v18
 	eor.16b	v4, v28, v11
 	shl.4s	v14, v4, #25
@@ -690,8 +691,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v5, v5, v3
 	add.4s	v6, v5, v20
 	eor.16b	v7, v6, v7
-	ldr	q3, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v29, { v7 }, v3
+	shl.4s	v29, v7, #24
+	sri.4s	v29, v7, #8
 	add.4s	v4, v4, v29
 	eor.16b	v20, v4, v20
 	shl.4s	v7, v20, #25
@@ -700,8 +701,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v20, v13, v3
 	add.4s	v25, v20, v0
 	eor.16b	v20, v25, v22
-	ldr	q3, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v22, { v20 }, v3
+	shl.4s	v22, v20, #24
+	sri.4s	v22, v20, #8
 	add.4s	v19, v19, v22
 	eor.16b	v0, v19, v0
 	shl.4s	v20, v0, #25
@@ -746,8 +747,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v7, v11, v2
 	add.4s	v26, v7, v1
 	eor.16b	v5, v26, v5
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v2, { v5 }, v2
+	shl.4s	v2, v5, #24
+	sri.4s	v2, v5, #8
 	str	q2, [sp, #320]                  ; 16-byte Folded Spill
 	add.4s	v2, v3, v2
 	str	q2, [sp, #224]                  ; 16-byte Folded Spill
@@ -779,8 +780,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v17, v15
 	str	q2, [sp, #208]                  ; 16-byte Folded Spill
 	eor.16b	v19, v2, v9
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v2, { v19 }, v2
+	shl.4s	v2, v19, #24
+	sri.4s	v2, v19, #8
 	str	q2, [sp, #240]                  ; 16-byte Folded Spill
 	add.4s	v2, v31, v2
 	str	q2, [sp, #144]                  ; 16-byte Folded Spill
@@ -791,8 +792,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v1, v2
 	add.4s	v15, v1, v23
 	eor.16b	v1, v15, v3
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v30, { v1 }, v2
+	shl.4s	v30, v1, #24
+	sri.4s	v30, v1, #8
 	add.4s	v8, v5, v30
 	eor.16b	v1, v8, v23
 	shl.4s	v23, v1, #25
@@ -801,8 +802,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v6, v1
 	add.4s	v31, v1, v11
 	eor.16b	v1, v31, v18
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v9, { v1 }, v2
+	shl.4s	v9, v1, #24
+	sri.4s	v9, v1, #8
 	add.4s	v28, v27, v9
 	eor.16b	v1, v28, v11
 	shl.4s	v27, v1, #25
@@ -811,8 +812,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v13, v1
 	add.4s	v13, v1, v0
 	eor.16b	v1, v13, v4
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v6, { v1 }, v2
+	shl.4s	v6, v1, #24
+	sri.4s	v6, v1, #8
 	add.4s	v1, v24, v6
 	str	q1, [sp, #176]                  ; 16-byte Folded Spill
 	eor.16b	v0, v1, v0
@@ -857,8 +858,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v3, v3, v1
 	str	q3, [sp, #128]                  ; 16-byte Folded Spill
 	eor.16b	v3, v3, v18
-	ldr	q16, [sp, #848]                 ; 16-byte Folded Reload
-	tbl.16b	v25, { v3 }, v16
+	shl.4s	v25, v3, #24
+	sri.4s	v25, v3, #8
 	add.4s	v12, v11, v25
 	eor.16b	v1, v12, v1
 	shl.4s	v22, v1, #25
@@ -867,8 +868,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v5, v1
 	add.4s	v14, v1, v0
 	eor.16b	v1, v14, v2
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v11, { v1 }, v2
+	shl.4s	v11, v1, #24
+	sri.4s	v11, v1, #8
 	add.4s	v2, v4, v11
 	eor.16b	v0, v2, v0
 	shl.4s	v18, v0, #25
@@ -938,8 +939,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v0, v19
 	add.4s	v18, v22, v2
 	eor.16b	v2, v18, v16
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v30, { v2 }, v0
+	shl.4s	v30, v2, #24
+	sri.4s	v30, v2, #8
 	add.4s	v0, v21, v30
 	str	q0, [sp, #160]                  ; 16-byte Folded Spill
 	eor.16b	v2, v0, v22
@@ -969,8 +970,9 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v0, v1
 	add.4s	v24, v10, v1
 	eor.16b	v1, v24, v3
-	ldp	q0, q4, [sp, #832]              ; 32-byte Folded Reload
-	tbl.16b	v17, { v1 }, v4
+	ldr	q0, [sp, #832]                  ; 16-byte Folded Reload
+	shl.4s	v17, v1, #24
+	sri.4s	v17, v1, #8
 	add.4s	v8, v28, v17
 	eor.16b	v3, v8, v10
 	shl.4s	v22, v3, #25
@@ -1011,8 +1013,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v3, v3, v1
 	add.4s	v4, v3, v23
 	eor.16b	v3, v4, v7
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v15, { v3 }, v1
+	shl.4s	v15, v3, #24
+	sri.4s	v15, v3, #8
 	add.4s	v7, v19, v15
 	eor.16b	v3, v7, v23
 	shl.4s	v19, v3, #25
@@ -1022,8 +1024,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v3, v14
 	str	q1, [sp, #112]                  ; 16-byte Folded Spill
 	eor.16b	v3, v1, v10
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v28, { v3 }, v1
+	shl.4s	v28, v3, #24
+	sri.4s	v28, v3, #8
 	add.4s	v10, v0, v28
 	eor.16b	v0, v10, v14
 	shl.4s	v23, v0, #25
@@ -1032,8 +1034,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v0, v16, v0
 	add.4s	v16, v0, v31
 	eor.16b	v0, v16, v26
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v3, { v0 }, v1
+	shl.4s	v3, v0, #24
+	sri.4s	v3, v0, #8
 	add.4s	v0, v6, v3
 	eor.16b	v6, v0, v31
 	shl.4s	v26, v6, #25
@@ -1090,8 +1092,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v6, v20, v5
 	add.4s	v17, v6, v1
 	eor.16b	v6, v17, v28
-	ldr	q5, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v5, { v6 }, v5
+	shl.4s	v5, v6, #24
+	sri.4s	v5, v6, #8
 	str	q5, [sp, #288]                  ; 16-byte Folded Spill
 	add.4s	v5, v15, v5
 	str	q5, [sp, #224]                  ; 16-byte Folded Spill
@@ -1123,8 +1125,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v1, v5
 	add.4s	v15, v1, v27
 	eor.16b	v1, v15, v6
-	ldr	q5, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v13, { v1 }, v5
+	shl.4s	v13, v1, #24
+	sri.4s	v13, v1, #8
 	add.4s	v5, v18, v13
 	eor.16b	v6, v5, v27
 	shl.4s	v1, v6, #25
@@ -1135,8 +1137,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v6, v8
 	str	q1, [sp, #144]                  ; 16-byte Folded Spill
 	eor.16b	v16, v1, v19
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v30, { v16 }, v1
+	shl.4s	v30, v16, #24
+	sri.4s	v30, v16, #8
 	add.4s	v6, v28, v30
 	eor.16b	v18, v6, v8
 	shl.4s	v28, v18, #25
@@ -1155,8 +1157,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v0, v0, v1
 	add.4s	v25, v0, v24
 	eor.16b	v2, v25, v12
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v12, { v2 }, v0
+	shl.4s	v12, v2, #24
+	sri.4s	v12, v2, #8
 	add.4s	v0, v14, v12
 	str	q0, [sp, #128]                  ; 16-byte Folded Spill
 	eor.16b	v21, v0, v24
@@ -1177,8 +1179,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v4, v4, v0
 	add.4s	v21, v4, v23
 	eor.16b	v4, v21, v18
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v8, { v4 }, v0
+	shl.4s	v8, v4, #24
+	sri.4s	v8, v4, #8
 	add.4s	v4, v19, v8
 	eor.16b	v18, v4, v23
 	shl.4s	v0, v18, #25
@@ -1197,8 +1199,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v19, v24, v2
 	add.4s	v19, v19, v22
 	eor.16b	v3, v19, v3
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v11, { v3 }, v2
+	shl.4s	v11, v3, #24
+	sri.4s	v11, v3, #8
 	add.4s	v9, v1, v11
 	eor.16b	v3, v9, v22
 	shl.4s	v22, v3, #25
@@ -1239,11 +1241,12 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	eor.16b	v4, v2, v10
 	shl.4s	v10, v4, #20
 	sri.4s	v10, v4, #12
-	ldp	q5, q3, [sp, #832]              ; 32-byte Folded Reload
+	ldr	q5, [sp, #832]                  ; 16-byte Folded Reload
 	add.4s	v4, v5, v24
 	add.4s	v9, v12, v4
 	eor.16b	v4, v9, v26
-	tbl.16b	v3, { v4 }, v3
+	shl.4s	v3, v4, #24
+	sri.4s	v3, v4, #8
 	str	q3, [sp, #112]                  ; 16-byte Folded Spill
 	add.4s	v3, v31, v3
 	str	q3, [sp, #208]                  ; 16-byte Folded Spill
@@ -1266,8 +1269,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v23, v0
 	add.4s	v12, v1, v10
 	eor.16b	v1, v12, v30
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v0, { v1 }, v0
+	shl.4s	v0, v1, #24
+	sri.4s	v0, v1, #8
 	str	q0, [sp, #192]                  ; 16-byte Folded Spill
 	add.4s	v0, v2, v0
 	str	q0, [sp, #272]                  ; 16-byte Folded Spill
@@ -1278,8 +1281,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v0, v16
 	add.4s	v24, v22, v2
 	eor.16b	v2, v24, v17
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v10, { v2 }, v0
+	shl.4s	v10, v2, #24
+	sri.4s	v10, v2, #8
 	add.4s	v30, v7, v10
 	eor.16b	v2, v30, v22
 	shl.4s	v31, v2, #25
@@ -1309,8 +1312,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v2, v1
 	add.4s	v17, v2, v23
 	eor.16b	v2, v17, v6
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v1, { v2 }, v1
+	shl.4s	v1, v2, #24
+	sri.4s	v1, v2, #8
 	str	q1, [sp, #144]                  ; 16-byte Folded Spill
 	add.4s	v6, v16, v1
 	eor.16b	v2, v6, v23
@@ -1342,8 +1345,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v16, v25, v4
 	add.4s	v27, v16, v0
 	eor.16b	v16, v27, v8
-	ldr	q4, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v11, { v16 }, v4
+	shl.4s	v11, v16, #24
+	sri.4s	v11, v16, #8
 	add.4s	v15, v15, v11
 	eor.16b	v0, v15, v0
 	shl.4s	v16, v0, #25
@@ -1400,8 +1403,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v4, v9, v1
 	add.4s	v9, v4, v5
 	eor.16b	v4, v9, v28
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v1, { v4 }, v1
+	shl.4s	v1, v4, #24
+	sri.4s	v1, v4, #8
 	str	q1, [sp, #320]                  ; 16-byte Folded Spill
 	add.4s	v1, v6, v1
 	str	q1, [sp, #224]                  ; 16-byte Folded Spill
@@ -1432,8 +1435,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v16, v24, v1
 	add.4s	v24, v16, v0
 	eor.16b	v16, v24, v13
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v1, { v16 }, v1
+	shl.4s	v1, v16, #24
+	sri.4s	v1, v16, #8
 	str	q1, [sp, #240]                  ; 16-byte Folded Spill
 	add.4s	v1, v7, v1
 	str	q1, [sp, #208]                  ; 16-byte Folded Spill
@@ -1454,8 +1457,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v6, v1
 	add.4s	v13, v2, v29
 	eor.16b	v2, v13, v17
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v16, { v2 }, v1
+	shl.4s	v16, v2, #24
+	sri.4s	v16, v2, #8
 	add.4s	v5, v28, v16
 	eor.16b	v6, v5, v29
 	shl.4s	v28, v6, #25
@@ -1465,8 +1468,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v0, v0, v12
 	str	q0, [sp, #128]                  ; 16-byte Folded Spill
 	eor.16b	v0, v0, v27
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v29, { v0 }, v1
+	shl.4s	v29, v0, #24
+	sri.4s	v29, v0, #8
 	add.4s	v30, v30, v29
 	eor.16b	v0, v30, v12
 	shl.4s	v15, v0, #25
@@ -1496,8 +1499,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v17, v20, v2
 	add.4s	v20, v17, v3
 	eor.16b	v17, v20, v22
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v31, { v17 }, v2
+	shl.4s	v31, v17, #24
+	sri.4s	v31, v17, #8
 	add.4s	v2, v14, v31
 	str	q2, [sp, #144]                  ; 16-byte Folded Spill
 	eor.16b	v3, v2, v3
@@ -1507,8 +1510,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v1, v2
 	add.4s	v14, v1, v26
 	eor.16b	v1, v14, v6
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v27, { v1 }, v2
+	shl.4s	v27, v1, #24
+	sri.4s	v27, v1, #8
 	add.4s	v22, v23, v27
 	eor.16b	v1, v22, v26
 	shl.4s	v2, v1, #25
@@ -1517,8 +1520,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v7, v1
 	add.4s	v12, v1, v0
 	eor.16b	v1, v12, v25
-	ldr	q3, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v26, { v1 }, v3
+	shl.4s	v26, v1, #24
+	sri.4s	v26, v1, #8
 	add.4s	v6, v11, v26
 	eor.16b	v0, v6, v0
 	shl.4s	v23, v0, #25
@@ -1527,8 +1530,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v0, v18, v0
 	add.4s	v11, v0, v4
 	eor.16b	v0, v11, v10
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v10, { v0 }, v1
+	shl.4s	v10, v0, #24
+	sri.4s	v10, v0, #8
 	add.4s	v25, v8, v10
 	eor.16b	v1, v25, v4
 	shl.4s	v3, v1, #25
@@ -1572,8 +1575,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v2, v0
 	add.4s	v30, v2, v31
 	eor.16b	v2, v30, v16
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v0, { v2 }, v0
+	shl.4s	v0, v2, #24
+	sri.4s	v0, v2, #8
 	str	q0, [sp, #192]                  ; 16-byte Folded Spill
 	add.4s	v0, v20, v0
 	str	q0, [sp, #288]                  ; 16-byte Folded Spill
@@ -1584,8 +1587,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v0, v1
 	add.4s	v6, v18, v1
 	eor.16b	v2, v6, v4
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v7, { v2 }, v0
+	shl.4s	v7, v2, #24
+	sri.4s	v7, v2, #8
 	add.4s	v0, v5, v7
 	str	q0, [sp, #160]                  ; 16-byte Folded Spill
 	eor.16b	v2, v0, v18
@@ -1596,8 +1599,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v8, v0
 	add.4s	v22, v2, v19
 	eor.16b	v2, v22, v29
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v0, { v2 }, v0
+	shl.4s	v0, v2, #24
+	sri.4s	v0, v2, #8
 	str	q0, [sp, #176]                  ; 16-byte Folded Spill
 	add.4s	v0, v11, v0
 	str	q0, [sp, #272]                  ; 16-byte Folded Spill
@@ -1618,8 +1621,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v1, v21
 	add.4s	v9, v23, v2
 	eor.16b	v2, v9, v10
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v17, { v2 }, v1
+	shl.4s	v17, v2, #24
+	sri.4s	v17, v2, #8
 	add.4s	v1, v24, v17
 	str	q1, [sp, #224]                  ; 16-byte Folded Spill
 	eor.16b	v2, v1, v23
@@ -1651,8 +1654,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v16, v16, v3
 	add.4s	v28, v16, v31
 	eor.16b	v16, v28, v19
-	ldr	q3, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v11, { v16 }, v3
+	shl.4s	v11, v16, #24
+	sri.4s	v11, v16, #8
 	add.4s	v3, v0, v11
 	eor.16b	v19, v3, v31
 	shl.4s	v16, v19, #25
@@ -1671,8 +1674,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v19, v23, v4
 	add.4s	v10, v19, v13
 	eor.16b	v23, v10, v24
-	ldr	q4, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v24, { v23 }, v4
+	shl.4s	v24, v23, #24
+	sri.4s	v24, v23, #8
 	add.4s	v23, v26, v24
 	eor.16b	v25, v23, v13
 	shl.4s	v26, v25, #25
@@ -1681,8 +1684,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v25, v27, v4
 	add.4s	v25, v25, v1
 	eor.16b	v5, v25, v5
-	ldr	q4, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v31, { v5 }, v4
+	shl.4s	v31, v5, #24
+	sri.4s	v31, v5, #8
 	add.4s	v2, v2, v31
 	eor.16b	v1, v2, v1
 	shl.4s	v13, v1, #25
@@ -1737,8 +1740,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v4, v4, v0
 	add.4s	v4, v4, v14
 	eor.16b	v17, v4, v24
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v0, { v17 }, v0
+	shl.4s	v0, v17, #24
+	sri.4s	v0, v17, #8
 	str	q0, [sp, #320]                  ; 16-byte Folded Spill
 	add.4s	v0, v12, v0
 	str	q0, [sp, #208]                  ; 16-byte Folded Spill
@@ -1784,8 +1787,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v1, v30
 	str	q1, [sp, #112]                  ; 16-byte Folded Spill
 	eor.16b	v3, v1, v24
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v24, { v3 }, v1
+	shl.4s	v24, v3, #24
+	sri.4s	v24, v3, #8
 	add.4s	v22, v28, v24
 	eor.16b	v3, v22, v30
 	shl.4s	v27, v3, #25
@@ -1795,8 +1798,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v3, v0
 	str	q1, [sp, #128]                  ; 16-byte Folded Spill
 	eor.16b	v3, v1, v12
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v30, { v3 }, v1
+	shl.4s	v30, v3, #24
+	sri.4s	v30, v3, #8
 	add.4s	v3, v26, v30
 	eor.16b	v0, v3, v0
 	shl.4s	v28, v0, #25
@@ -1805,8 +1808,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v0, v2, v0
 	add.4s	v1, v0, v16
 	eor.16b	v2, v1, v6
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v26, { v2 }, v0
+	shl.4s	v26, v2, #24
+	sri.4s	v26, v2, #8
 	add.4s	v0, v15, v26
 	str	q0, [sp, #160]                  ; 16-byte Folded Spill
 	eor.16b	v2, v0, v16
@@ -1847,8 +1850,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v2, v0
 	add.4s	v8, v2, v11
 	eor.16b	v16, v8, v16
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v9, { v16 }, v0
+	shl.4s	v9, v16, #24
+	sri.4s	v9, v16, #8
 	add.4s	v10, v10, v9
 	eor.16b	v16, v10, v11
 	shl.4s	v0, v16, #25
@@ -1857,8 +1860,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v16, v19, v2
 	add.4s	v13, v16, v21
 	eor.16b	v16, v13, v31
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v11, { v16 }, v2
+	shl.4s	v11, v16, #24
+	sri.4s	v11, v16, #8
 	add.4s	v31, v12, v11
 	eor.16b	v16, v31, v21
 	shl.4s	v19, v16, #25
@@ -1925,8 +1928,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v1, v4
 	add.4s	v12, v22, v1
 	eor.16b	v1, v12, v16
-	ldr	q4, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v24, { v1 }, v4
+	shl.4s	v24, v1, #24
+	sri.4s	v24, v1, #8
 	add.4s	v31, v21, v24
 	eor.16b	v1, v31, v22
 	shl.4s	v19, v1, #25
@@ -1957,8 +1960,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v1, v2
 	add.4s	v2, v0, v2
 	eor.16b	v5, v2, v20
-	ldr	q1, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v11, { v5 }, v1
+	shl.4s	v11, v5, #24
+	sri.4s	v11, v5, #8
 	add.4s	v30, v3, v11
 	eor.16b	v0, v30, v0
 	shl.4s	v23, v0, #25
@@ -2019,8 +2022,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v0, v16, v0
 	add.4s	v13, v0, v29
 	eor.16b	v0, v13, v9
-	ldr	q3, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v16, { v0 }, v3
+	shl.4s	v16, v0, #24
+	sri.4s	v16, v0, #8
 	add.4s	v0, v18, v16
 	eor.16b	v18, v0, v29
 	shl.4s	v9, v18, #25
@@ -2110,8 +2113,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v2, v5
 	add.4s	v22, v2, v20
 	eor.16b	v2, v22, v3
-	ldr	q3, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v13, { v2 }, v3
+	shl.4s	v13, v2, #24
+	sri.4s	v13, v2, #8
 	add.4s	v30, v7, v13
 	eor.16b	v2, v30, v20
 	shl.4s	v27, v2, #25
@@ -2120,8 +2123,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v25, v2
 	add.4s	v25, v2, v8
 	eor.16b	v2, v25, v28
-	ldr	q3, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v31, { v2 }, v3
+	shl.4s	v31, v2, #24
+	sri.4s	v31, v2, #8
 	add.4s	v21, v9, v31
 	eor.16b	v2, v21, v8
 	shl.4s	v28, v2, #25
@@ -2158,12 +2161,12 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	eor.16b	v19, v24, v23
 	shl.4s	v15, v19, #20
 	sri.4s	v15, v19, #12
-	ldp	q7, q4, [sp, #832]              ; 32-byte Folded Reload
+	ldr	q7, [sp, #832]                  ; 16-byte Folded Reload
 	add.4s	v2, v2, v7
 	add.4s	v23, v2, v9
 	eor.16b	v2, v23, v3
-	ldr	q3, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v8, { v2 }, v3
+	shl.4s	v8, v2, #24
+	sri.4s	v8, v2, #8
 	add.4s	v19, v20, v8
 	eor.16b	v2, v19, v9
 	shl.4s	v3, v2, #25
@@ -2172,7 +2175,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v2, v10, v2
 	add.4s	v2, v2, v12
 	eor.16b	v20, v2, v11
-	tbl.16b	v4, { v20 }, v4
+	shl.4s	v4, v20, #24
+	sri.4s	v4, v20, #8
 	add.4s	v7, v18, v4
 	str	q7, [sp, #272]                  ; 16-byte Folded Spill
 	eor.16b	v20, v7, v12
@@ -2182,8 +2186,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v0, v0, v7
 	add.4s	v10, v0, v15
 	eor.16b	v0, v10, v16
-	ldr	q7, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v11, { v0 }, v7
+	shl.4s	v11, v0, #24
+	sri.4s	v11, v0, #8
 	add.4s	v20, v24, v11
 	eor.16b	v0, v20, v15
 	shl.4s	v16, v0, #25
@@ -2256,8 +2260,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v3, v2, v22
 	add.4s	v12, v0, v7
 	eor.16b	v2, v12, v6
-	ldr	q5, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v20, { v2 }, v5
+	shl.4s	v20, v2, #24
+	sri.4s	v20, v2, #8
 	add.4s	v2, v15, v20
 	str	q2, [sp, #448]                  ; 16-byte Folded Spill
 	eor.16b	v0, v2, v0
@@ -2287,8 +2291,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v11, v7, v2
 	add.4s	v14, v1, v18
 	eor.16b	v3, v14, v4
-	ldr	q2, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v22, { v3 }, v2
+	shl.4s	v22, v3, #24
+	sri.4s	v22, v3, #8
 	add.4s	v3, v21, v22
 	eor.16b	v1, v3, v1
 	shl.4s	v6, v1, #25
@@ -2401,8 +2405,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v7, v25, v0
 	add.4s	v26, v14, v30
 	eor.16b	v1, v26, v1
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v0, { v1 }, v0
+	shl.4s	v0, v1, #24
+	sri.4s	v0, v1, #8
 	str	q0, [sp, #768]                  ; 16-byte Folded Spill
 	add.4s	v29, v2, v0
 	eor.16b	v1, v29, v30
@@ -2433,24 +2437,24 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	add.4s	v1, v1, v2
 	add.4s	v20, v10, v4
 	eor.16b	v2, v20, v17
-	ldr	q7, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v25, { v2 }, v7
+	shl.4s	v25, v2, #24
+	sri.4s	v25, v2, #8
 	add.4s	v17, v15, v25
 	eor.16b	v4, v17, v4
 	shl.4s	v16, v4, #25
 	sri.4s	v16, v4, #7
 	add.4s	v7, v0, v14
 	eor.16b	v4, v7, v12
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v15, { v4 }, v0
+	shl.4s	v15, v4, #24
+	sri.4s	v15, v4, #8
 	add.4s	v4, v13, v15
 	eor.16b	v10, v4, v14
 	shl.4s	v14, v10, #25
 	sri.4s	v14, v10, #7
 	add.4s	v13, v1, v28
 	eor.16b	v1, v13, v27
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v10, { v1 }, v0
+	shl.4s	v10, v1, #24
+	sri.4s	v10, v1, #8
 	add.4s	v2, v3, v10
 	eor.16b	v3, v2, v28
 	shl.4s	v12, v3, #25
@@ -2470,8 +2474,8 @@ LBB0_3:                                 ;   Parent Loop BB0_2 Depth=1
 	sri.4s	v28, v19, #12
 	add.4s	v11, v11, v9
 	eor.16b	v19, v11, v31
-	ldr	q0, [sp, #848]                  ; 16-byte Folded Reload
-	tbl.16b	v31, { v19 }, v0
+	shl.4s	v31, v19, #24
+	sri.4s	v31, v19, #8
 	add.4s	v8, v8, v31
 	eor.16b	v19, v8, v9
 	shl.4s	v9, v19, #25
