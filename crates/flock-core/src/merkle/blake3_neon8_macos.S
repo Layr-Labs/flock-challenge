@@ -81,6 +81,26 @@ Lloh1:
 	str	q0, [sp, #96]                   ; 16-byte Folded Spill
 LBB0_2:                                 ; =>This Loop Header: Depth=1
                                         ;     Child Loop BB0_3 Depth 2
+	add	x11, x8, #1
+	cmp	x11, x2
+	b.eq	Lflock_blake3_no_next_group
+	prfm	pldl1keep, [x0, #8192]
+	prfm	pldl1keep, [x0, #8256]
+	prfm	pldl1keep, [x0, #9216]
+	prfm	pldl1keep, [x0, #9280]
+	prfm	pldl1keep, [x0, #10240]
+	prfm	pldl1keep, [x0, #10304]
+	prfm	pldl1keep, [x0, #11264]
+	prfm	pldl1keep, [x0, #11328]
+	prfm	pldl1keep, [x0, #12288]
+	prfm	pldl1keep, [x0, #12352]
+	prfm	pldl1keep, [x0, #13312]
+	prfm	pldl1keep, [x0, #13376]
+	prfm	pldl1keep, [x0, #14336]
+	prfm	pldl1keep, [x0, #14400]
+	prfm	pldl1keep, [x0, #15360]
+	prfm	pldl1keep, [x0, #15424]
+Lflock_blake3_no_next_group:
 	mov	x10, x0
 	mov	w12, #16                        ; =0x10
 	mov.16b	v26, v24
