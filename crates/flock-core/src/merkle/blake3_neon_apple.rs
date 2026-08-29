@@ -70,11 +70,7 @@ unsafe fn rotate12(x: uint32x4_t) -> uint32x4_t {
 
 #[inline(always)]
 unsafe fn rotate8(x: uint32x4_t) -> uint32x4_t {
-    const ROTATE: [u8; 16] = [1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12];
-    unsafe {
-        let table = vld1q_u8(ROTATE.as_ptr());
-        vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(x), table))
-    }
+    unsafe { vsriq_n_u32(vshlq_n_u32::<24>(x), x, 8) }
 }
 
 #[inline(always)]

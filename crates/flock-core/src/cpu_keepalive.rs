@@ -239,12 +239,20 @@ mod imp {
         // parallel harness.
         static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+        fn wait_for_quiet() {
+            let deadline = Instant::now() + Duration::from_millis(50);
+            while LIVE.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        }
+
         /// start → stop leaves nothing running and no live spin threads.
         #[test]
         fn start_then_stop_is_clean() {
             let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             start();
             stop();
+            wait_for_quiet();
             assert!(!RUNNING.load(Ordering::SeqCst));
             assert_eq!(LIVE.load(Ordering::SeqCst), 0);
         }
@@ -256,6 +264,7 @@ mod imp {
             let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             stop();
             stop();
+            wait_for_quiet();
             assert!(!RUNNING.load(Ordering::SeqCst));
             assert_eq!(LIVE.load(Ordering::SeqCst), 0);
         }
@@ -272,6 +281,7 @@ mod imp {
             let stopped = !RUNNING.load(Ordering::SeqCst);
             unsafe { std::env::remove_var("FLOCK_NO_CPU_KEEPALIVE") };
             stop();
+            wait_for_quiet();
             assert!(empty, "kill switch must spawn no keep-alive threads");
             assert!(stopped, "kill switch must leave the run flag clear");
         }
@@ -283,8 +293,10 @@ mod imp {
             let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             start();
             stop();
+            wait_for_quiet();
             start();
             stop();
+            wait_for_quiet();
             assert!(!RUNNING.load(Ordering::SeqCst));
             assert_eq!(LIVE.load(Ordering::SeqCst), 0);
         }

@@ -546,12 +546,16 @@ pub(super) unsafe fn fold_bank_major_128x64_rows2(
             let mut bank = 0usize;
             let mut row = xp.add(lane);
             while bank < 128 {
-                let wk = vld1q_u64(wp.add(bank).cast::<u64>());
-                let first_x = vld1q_u64(row.cast::<u64>());
-                let second_x = vld1q_u64(row.add(1).cast::<u64>());
-                xor_karatsuba_const_pair(&mut first, &mut second, first_x, second_x, wk);
-                bank += 1;
-                row = row.add(64);
+                let wk0 = vld1q_u64(wp.add(bank).cast::<u64>());
+                let wk1 = vld1q_u64(wp.add(bank + 1).cast::<u64>());
+                let first_x0 = vld1q_u64(row.cast::<u64>());
+                let second_x0 = vld1q_u64(row.add(1).cast::<u64>());
+                let first_x1 = vld1q_u64(row.add(64).cast::<u64>());
+                let second_x1 = vld1q_u64(row.add(65).cast::<u64>());
+                xor_karatsuba_const_pair(&mut first, &mut second, first_x0, second_x0, wk0);
+                xor_karatsuba_const_pair(&mut first, &mut second, first_x1, second_x1, wk1);
+                bank += 2;
+                row = row.add(128);
             }
 
             let reduced = reduce_wide_pair(karatsuba_to_wide(first), karatsuba_to_wide(second));

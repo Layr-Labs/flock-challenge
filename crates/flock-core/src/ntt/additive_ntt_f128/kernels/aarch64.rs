@@ -153,9 +153,59 @@ unsafe fn butterfly_fused_3layer_row_with_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        for lane in 0..lanes {
+        let mut lane = 0;
+        let step = eighth * num_ntts;
+        while lane + 1 < lanes {
+            let base0 = ptr.add(r * num_ntts + lane);
+            let base1 = ptr.add(r * num_ntts + lane + 1);
+
+            let mut v0: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(base0.add(i * step).cast::<u64>()));
+            let mut v1: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(base1.add(i * step).cast::<u64>()));
+
+            // Layer L: stride 4, shared twiddle t[0].
+            for i in 0..4 {
+                let (a0, b0) = butterfly_q(v0[i], v0[i + 4], t[0]);
+                let (a1, b1) = butterfly_q(v1[i], v1[i + 4], t[0]);
+                v0[i] = a0;
+                v0[i + 4] = b0;
+                v1[i] = a1;
+                v1[i + 4] = b1;
+            }
+            // Layer L+1: stride 2, twiddles t[1], t[2] per half.
+            for s in 0..2 {
+                for i in 0..2 {
+                    let (u, w) = (4 * s + i, 4 * s + i + 2);
+                    let (a0, b0) = butterfly_q(v0[u], v0[w], t[1 + s]);
+                    let (a1, b1) = butterfly_q(v1[u], v1[w], t[1 + s]);
+                    v0[u] = a0;
+                    v0[w] = b0;
+                    v1[u] = a1;
+                    v1[w] = b1;
+                }
+            }
+            // Layer L+2: stride 1, twiddles t[3..7] per quarter.
+            for s in 0..4 {
+                let (a0, b0) = butterfly_q(v0[2 * s], v0[2 * s + 1], t[3 + s]);
+                let (a1, b1) = butterfly_q(v1[2 * s], v1[2 * s + 1], t[3 + s]);
+                v0[2 * s] = a0;
+                v0[2 * s + 1] = b0;
+                v1[2 * s] = a1;
+                v1[2 * s + 1] = b1;
+            }
+
+            for (i, value) in v0.iter().enumerate() {
+                vst1q_u64(base0.add(i * step).cast::<u64>(), *value);
+            }
+            for (i, value) in v1.iter().enumerate() {
+                vst1q_u64(base1.add(i * step).cast::<u64>(), *value);
+            }
+
+            lane += 2;
+        }
+        while lane < lanes {
             let base = ptr.add(r * num_ntts + lane);
-            let step = eighth * num_ntts;
 
             let mut v: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
@@ -185,6 +235,7 @@ unsafe fn butterfly_fused_3layer_row_with_q(
             for (i, value) in v.iter().enumerate() {
                 vst1q_u64(base.add(i * step).cast::<u64>(), *value);
             }
+            lane += 1;
         }
     }
 }
@@ -269,13 +320,132 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
         // killswitch once per row group rather than re-reading the OnceLock
         // for every destination pair in the burst loop below.
         let use_nt_bursts = nt_bursts();
-        for lane in 0..num_ntts {
+        let mut lane = 0;
+        while lane + 1 < num_ntts {
+            let src_base0 = src.add(off + lane);
+            let src_base1 = src.add(off + lane + 1);
+            let loaded0: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(src_base0.add(i * step).cast::<u64>()));
+            let loaded1: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(src_base1.add(i * step).cast::<u64>()));
+
+            // Block 0: zero-root chain
+            {
+                let mut v0 = loaded0;
+                let mut v1 = loaded1;
+                for i in 0..4 {
+                    v0[i + 4] = butterfly_zero_q(v0[i], v0[i + 4]);
+                    v1[i + 4] = butterfly_zero_q(v1[i], v1[i + 4]);
+                }
+                for i in 0..2 {
+                    v0[i + 2] = butterfly_zero_q(v0[i], v0[i + 2]);
+                    v1[i + 2] = butterfly_zero_q(v1[i], v1[i + 2]);
+                }
+                let (a0, b0) = butterfly_q(v0[4], v0[6], z2);
+                let (a1, b1) = butterfly_q(v1[4], v1[6], z2);
+                v0[4] = a0;
+                v0[6] = b0;
+                v1[4] = a1;
+                v1[6] = b1;
+
+                let (a0, b0) = butterfly_q(v0[5], v0[7], z2);
+                let (a1, b1) = butterfly_q(v1[5], v1[7], z2);
+                v0[5] = a0;
+                v0[7] = b0;
+                v1[5] = a1;
+                v1[7] = b1;
+
+                v0[1] = butterfly_zero_q(v0[0], v0[1]);
+                v1[1] = butterfly_zero_q(v1[0], v1[1]);
+
+                let (a0, b0) = butterfly_q(v0[2], v0[3], z4);
+                let (a1, b1) = butterfly_q(v1[2], v1[3], z4);
+                v0[2] = a0;
+                v0[3] = b0;
+                v1[2] = a1;
+                v1[3] = b1;
+
+                let (a0, b0) = butterfly_q(v0[4], v0[5], z5);
+                let (a1, b1) = butterfly_q(v1[4], v1[5], z5);
+                v0[4] = a0;
+                v0[5] = b0;
+                v1[4] = a1;
+                v1[5] = b1;
+
+                let (a0, b0) = butterfly_q(v0[6], v0[7], z6);
+                let (a1, b1) = butterfly_q(v1[6], v1[7], z6);
+                v0[6] = a0;
+                v0[7] = b0;
+                v1[6] = a1;
+                v1[7] = b1;
+
+                for (i, value) in v0.iter().enumerate() {
+                    vst1q_u64(
+                        stage0.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
+                        *value,
+                    );
+                }
+                for (i, value) in v1.iter().enumerate() {
+                    vst1q_u64(
+                        stage0.as_mut_ptr().add(i * num_ntts + lane + 1).cast::<u64>(),
+                        *value,
+                    );
+                }
+            }
+
+            // Block 1: general chain
+            {
+                let mut v0 = loaded0;
+                let mut v1 = loaded1;
+                for i in 0..4 {
+                    let (a0, b0) = butterfly_q(v0[i], v0[i + 4], g[0]);
+                    let (a1, b1) = butterfly_q(v1[i], v1[i + 4], g[0]);
+                    v0[i] = a0;
+                    v0[i + 4] = b0;
+                    v1[i] = a1;
+                    v1[i + 4] = b1;
+                }
+                for s in 0..2 {
+                    for i in 0..2 {
+                        let (u, w) = (4 * s + i, 4 * s + i + 2);
+                        let (a0, b0) = butterfly_q(v0[u], v0[w], g[1 + s]);
+                        let (a1, b1) = butterfly_q(v1[u], v1[w], g[1 + s]);
+                        v0[u] = a0;
+                        v0[w] = b0;
+                        v1[u] = a1;
+                        v1[w] = b1;
+                    }
+                }
+                for s in 0..4 {
+                    let (a0, b0) = butterfly_q(v0[2 * s], v0[2 * s + 1], g[3 + s]);
+                    let (a1, b1) = butterfly_q(v1[2 * s], v1[2 * s + 1], g[3 + s]);
+                    v0[2 * s] = a0;
+                    v0[2 * s + 1] = b0;
+                    v1[2 * s] = a1;
+                    v1[2 * s + 1] = b1;
+                }
+                for (i, value) in v0.iter().enumerate() {
+                    vst1q_u64(
+                        stage1.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
+                        *value,
+                    );
+                }
+                for (i, value) in v1.iter().enumerate() {
+                    vst1q_u64(
+                        stage1.as_mut_ptr().add(i * num_ntts + lane + 1).cast::<u64>(),
+                        *value,
+                    );
+                }
+            }
+
+            lane += 2;
+        }
+        while lane < num_ntts {
             let src_base = src.add(off + lane);
             let loaded: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
 
-            // Block 0: zero-root chain (mirrors
-            // `butterfly_fused_3layer_zero_root_row`, but keeps v[0]).
+            // Block 0: zero-root chain
             {
                 let mut v = loaded;
                 for i in 0..4 {
@@ -308,7 +478,7 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
                 }
             }
 
-            // Block 1: general chain (mirrors `butterfly_fused_3layer_row`).
+            // Block 1: general chain
             {
                 let mut v = loaded;
                 for i in 0..4 {
@@ -336,6 +506,7 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
                     );
                 }
             }
+            lane += 1;
         }
 
         // Emit each destination row's full lane run as one sequential
@@ -409,7 +580,107 @@ unsafe fn butterfly_fused_3layer_from_src_row_impl<const ZERO_ROOT: bool>(
         let off = r * num_ntts;
         let step = eighth * num_ntts;
 
-        for lane in 0..num_ntts {
+        let mut lane = 0;
+        while lane + 1 < num_ntts {
+            let src_base0 = src.add(off + lane);
+            let src_base1 = src.add(off + lane + 1);
+            let mut v0: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(src_base0.add(i * step).cast::<u64>()));
+            let mut v1: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(src_base1.add(i * step).cast::<u64>()));
+
+            if ZERO_ROOT {
+                for i in 0..4 {
+                    v0[i + 4] = butterfly_zero_q(v0[i], v0[i + 4]);
+                    v1[i + 4] = butterfly_zero_q(v1[i], v1[i + 4]);
+                }
+                for i in 0..2 {
+                    v0[i + 2] = butterfly_zero_q(v0[i], v0[i + 2]);
+                    v1[i + 2] = butterfly_zero_q(v1[i], v1[i + 2]);
+                }
+                let (a0, b0) = butterfly_q(v0[4], v0[6], t[2]);
+                let (a1, b1) = butterfly_q(v1[4], v1[6], t[2]);
+                v0[4] = a0;
+                v0[6] = b0;
+                v1[4] = a1;
+                v1[6] = b1;
+
+                let (a0, b0) = butterfly_q(v0[5], v0[7], t[2]);
+                let (a1, b1) = butterfly_q(v1[5], v1[7], t[2]);
+                v0[5] = a0;
+                v0[7] = b0;
+                v1[5] = a1;
+                v1[7] = b1;
+
+                v0[1] = butterfly_zero_q(v0[0], v0[1]);
+                v1[1] = butterfly_zero_q(v1[0], v1[1]);
+
+                let (a0, b0) = butterfly_q(v0[2], v0[3], t[4]);
+                let (a1, b1) = butterfly_q(v1[2], v1[3], t[4]);
+                v0[2] = a0;
+                v0[3] = b0;
+                v1[2] = a1;
+                v1[3] = b1;
+
+                let (a0, b0) = butterfly_q(v0[4], v0[5], t[5]);
+                let (a1, b1) = butterfly_q(v1[4], v1[5], t[5]);
+                v0[4] = a0;
+                v0[5] = b0;
+                v1[4] = a1;
+                v1[5] = b1;
+
+                let (a0, b0) = butterfly_q(v0[6], v0[7], t[6]);
+                let (a1, b1) = butterfly_q(v1[6], v1[7], t[6]);
+                v0[6] = a0;
+                v0[7] = b0;
+                v1[6] = a1;
+                v1[7] = b1;
+            } else {
+                for i in 0..4 {
+                    let (a0, b0) = butterfly_q(v0[i], v0[i + 4], t[0]);
+                    let (a1, b1) = butterfly_q(v1[i], v1[i + 4], t[0]);
+                    v0[i] = a0;
+                    v0[i + 4] = b0;
+                    v1[i] = a1;
+                    v1[i + 4] = b1;
+                }
+                for s in 0..2 {
+                    for i in 0..2 {
+                        let (u, w) = (4 * s + i, 4 * s + i + 2);
+                        let (a0, b0) = butterfly_q(v0[u], v0[w], t[1 + s]);
+                        let (a1, b1) = butterfly_q(v1[u], v1[w], t[1 + s]);
+                        v0[u] = a0;
+                        v0[w] = b0;
+                        v1[u] = a1;
+                        v1[w] = b1;
+                    }
+                }
+                for s in 0..4 {
+                    let (a0, b0) = butterfly_q(v0[2 * s], v0[2 * s + 1], t[3 + s]);
+                    let (a1, b1) = butterfly_q(v1[2 * s], v1[2 * s + 1], t[3 + s]);
+                    v0[2 * s] = a0;
+                    v0[2 * s + 1] = b0;
+                    v1[2 * s] = a1;
+                    v1[2 * s + 1] = b1;
+                }
+            }
+
+            for (i, value) in v0.iter().enumerate() {
+                vst1q_u64(
+                    stage.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
+                    *value,
+                );
+            }
+            for (i, value) in v1.iter().enumerate() {
+                vst1q_u64(
+                    stage.as_mut_ptr().add(i * num_ntts + lane + 1).cast::<u64>(),
+                    *value,
+                );
+            }
+
+            lane += 2;
+        }
+        while lane < num_ntts {
             let src_base = src.add(off + lane);
             let mut v: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
@@ -464,6 +735,7 @@ unsafe fn butterfly_fused_3layer_from_src_row_impl<const ZERO_ROOT: bool>(
                     *value,
                 );
             }
+            lane += 1;
         }
 
         // Every destination row is a short contiguous burst (128 B for the
@@ -576,9 +848,77 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        for lane in 0..lanes {
+        let mut lane = 0;
+        let step = eighth * num_ntts;
+        while lane + 1 < lanes {
+            let base0 = ptr.add(r * num_ntts + lane);
+            let base1 = ptr.add(r * num_ntts + lane + 1);
+
+            let mut v0: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(base0.add(i * step).cast::<u64>()));
+            let mut v1: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(base1.add(i * step).cast::<u64>()));
+
+            // Layer L, t[0] = 0: four XOR-only butterflies.
+            for i in 0..4 {
+                v0[i + 4] = butterfly_zero_q(v0[i], v0[i + 4]);
+                v1[i + 4] = butterfly_zero_q(v1[i], v1[i + 4]);
+            }
+            // Layer L+1: top half t[1] = 0, bottom half t[2] general.
+            for i in 0..2 {
+                v0[i + 2] = butterfly_zero_q(v0[i], v0[i + 2]);
+                v1[i + 2] = butterfly_zero_q(v1[i], v1[i + 2]);
+            }
+            let (a0, b0) = butterfly_q(v0[4], v0[6], t2);
+            let (a1, b1) = butterfly_q(v1[4], v1[6], t2);
+            v0[4] = a0;
+            v0[6] = b0;
+            v1[4] = a1;
+            v1[6] = b1;
+
+            let (a0, b0) = butterfly_q(v0[5], v0[7], t2);
+            let (a1, b1) = butterfly_q(v1[5], v1[7], t2);
+            v0[5] = a0;
+            v0[7] = b0;
+            v1[5] = a1;
+            v1[7] = b1;
+
+            // Layer L+2: first quarter t[3] = 0.
+            v0[1] = butterfly_zero_q(v0[0], v0[1]);
+            v1[1] = butterfly_zero_q(v1[0], v1[1]);
+
+            let (a0, b0) = butterfly_q(v0[2], v0[3], t4);
+            let (a1, b1) = butterfly_q(v1[2], v1[3], t4);
+            v0[2] = a0;
+            v0[3] = b0;
+            v1[2] = a1;
+            v1[3] = b1;
+
+            let (a0, b0) = butterfly_q(v0[4], v0[5], t5);
+            let (a1, b1) = butterfly_q(v1[4], v1[5], t5);
+            v0[4] = a0;
+            v0[5] = b0;
+            v1[4] = a1;
+            v1[5] = b1;
+
+            let (a0, b0) = butterfly_q(v0[6], v0[7], t6);
+            let (a1, b1) = butterfly_q(v1[6], v1[7], t6);
+            v0[6] = a0;
+            v0[7] = b0;
+            v1[6] = a1;
+            v1[7] = b1;
+
+            for (i, value) in v0.iter().enumerate().skip(1) {
+                vst1q_u64(base0.add(i * step).cast::<u64>(), *value);
+            }
+            for (i, value) in v1.iter().enumerate().skip(1) {
+                vst1q_u64(base1.add(i * step).cast::<u64>(), *value);
+            }
+
+            lane += 2;
+        }
+        while lane < lanes {
             let base = ptr.add(r * num_ntts + lane);
-            let step = eighth * num_ntts;
 
             let mut v: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
@@ -613,6 +953,7 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
             for (i, value) in v.iter().enumerate().skip(1) {
                 vst1q_u64(base.add(i * step).cast::<u64>(), *value);
             }
+            lane += 1;
         }
     }
 }
@@ -796,42 +1137,37 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
 /// Requires the `aes` target feature.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: usize) {
-    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+    use core::arch::aarch64::*;
+    unsafe {
+        debug_assert!(half >= 2);
+        debug_assert_eq!(chunk.len(), 2 * half);
+        let chunk_ptr = chunk.as_mut_ptr();
+        let twiddle_q = vld1q_u64((&twiddle as *const F128).cast::<u64>());
+        let mut idx0 = 0;
+        while idx0 + 1 < half {
+            let idx1 = idx0 + half;
+            let u0 = vld1q_u64(chunk_ptr.add(idx0).cast::<u64>());
+            let u1 = vld1q_u64(chunk_ptr.add(idx0 + 1).cast::<u64>());
+            let v0 = vld1q_u64(chunk_ptr.add(idx1).cast::<u64>());
+            let v1 = vld1q_u64(chunk_ptr.add(idx1 + 1).cast::<u64>());
 
-    debug_assert!(half >= 2);
-    debug_assert_eq!(chunk.len(), 2 * half);
-    let mut idx0 = 0;
-    while idx0 < half {
-        let idx1 = idx0 + half;
-        let u_a = chunk[idx0];
-        let v_a = chunk[idx1];
-        let u_b = chunk[idx0 + 1];
-        let v_b = chunk[idx1 + 1];
+            let (new_u0, new_v0) = butterfly_q(u0, v0, twiddle_q);
+            let (new_u1, new_v1) = butterfly_q(u1, v1, twiddle_q);
 
-        // SAFETY: caller guarantees the aes target feature.
-        let product = unsafe { ghash_mul_vec2_neon([twiddle, twiddle], [v_a, v_b]) };
-        let new_u_a = F128 {
-            lo: u_a.lo ^ product[0].lo,
-            hi: u_a.hi ^ product[0].hi,
-        };
-        let new_u_b = F128 {
-            lo: u_b.lo ^ product[1].lo,
-            hi: u_b.hi ^ product[1].hi,
-        };
-        let new_v_a = F128 {
-            lo: v_a.lo ^ new_u_a.lo,
-            hi: v_a.hi ^ new_u_a.hi,
-        };
-        let new_v_b = F128 {
-            lo: v_b.lo ^ new_u_b.lo,
-            hi: v_b.hi ^ new_u_b.hi,
-        };
-
-        chunk[idx0] = new_u_a;
-        chunk[idx1] = new_v_a;
-        chunk[idx0 + 1] = new_u_b;
-        chunk[idx1 + 1] = new_v_b;
-        idx0 += 2;
+            vst1q_u64(chunk_ptr.add(idx0).cast::<u64>(), new_u0);
+            vst1q_u64(chunk_ptr.add(idx0 + 1).cast::<u64>(), new_u1);
+            vst1q_u64(chunk_ptr.add(idx1).cast::<u64>(), new_v0);
+            vst1q_u64(chunk_ptr.add(idx1 + 1).cast::<u64>(), new_v1);
+            idx0 += 2;
+        }
+        if idx0 < half {
+            let idx1 = idx0 + half;
+            let u0 = vld1q_u64(chunk_ptr.add(idx0).cast::<u64>());
+            let v0 = vld1q_u64(chunk_ptr.add(idx1).cast::<u64>());
+            let (new_u0, new_v0) = butterfly_q(u0, v0, twiddle_q);
+            vst1q_u64(chunk_ptr.add(idx0).cast::<u64>(), new_u0);
+            vst1q_u64(chunk_ptr.add(idx1).cast::<u64>(), new_v0);
+        }
     }
 }
 
@@ -842,37 +1178,25 @@ pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: us
 /// Requires the `aes` target feature.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn butterfly_block_pair(chunk: &mut [F128], t_a: F128, t_b: F128) {
-    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+    use core::arch::aarch64::*;
+    unsafe {
+        debug_assert_eq!(chunk.len(), 4);
+        let chunk_ptr = chunk.as_mut_ptr();
+        let ta_q = vld1q_u64((&t_a as *const F128).cast::<u64>());
+        let tb_q = vld1q_u64((&t_b as *const F128).cast::<u64>());
+        let u_a = vld1q_u64(chunk_ptr.cast::<u64>());
+        let v_a = vld1q_u64(chunk_ptr.add(1).cast::<u64>());
+        let u_b = vld1q_u64(chunk_ptr.add(2).cast::<u64>());
+        let v_b = vld1q_u64(chunk_ptr.add(3).cast::<u64>());
 
-    debug_assert_eq!(chunk.len(), 4);
-    let u_a = chunk[0];
-    let v_a = chunk[1];
-    let u_b = chunk[2];
-    let v_b = chunk[3];
+        let (new_u_a, new_v_a) = butterfly_q(u_a, v_a, ta_q);
+        let (new_u_b, new_v_b) = butterfly_q(u_b, v_b, tb_q);
 
-    // SAFETY: caller guarantees the aes target feature.
-    let product = unsafe { ghash_mul_vec2_neon([t_a, t_b], [v_a, v_b]) };
-    let new_u_a = F128 {
-        lo: u_a.lo ^ product[0].lo,
-        hi: u_a.hi ^ product[0].hi,
-    };
-    let new_u_b = F128 {
-        lo: u_b.lo ^ product[1].lo,
-        hi: u_b.hi ^ product[1].hi,
-    };
-    let new_v_a = F128 {
-        lo: v_a.lo ^ new_u_a.lo,
-        hi: v_a.hi ^ new_u_a.hi,
-    };
-    let new_v_b = F128 {
-        lo: v_b.lo ^ new_u_b.lo,
-        hi: v_b.hi ^ new_u_b.hi,
-    };
-
-    chunk[0] = new_u_a;
-    chunk[1] = new_v_a;
-    chunk[2] = new_u_b;
-    chunk[3] = new_v_b;
+        vst1q_u64(chunk_ptr.cast::<u64>(), new_u_a);
+        vst1q_u64(chunk_ptr.add(1).cast::<u64>(), new_v_a);
+        vst1q_u64(chunk_ptr.add(2).cast::<u64>(), new_u_b);
+        vst1q_u64(chunk_ptr.add(3).cast::<u64>(), new_v_b);
+    }
 }
 
 /// Vector-resident twin of `portable::butterfly_fused_2layer` — the deep
@@ -903,16 +1227,49 @@ unsafe fn butterfly_fused_2layer_row_with_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        for lane in 0..a.len() {
+        let len = a.len();
+        let mut lane = 0;
+        while lane + 1 < len {
+            let xa0 = vld1q_u64((&raw const a[lane]).cast::<u64>());
+            let xa1 = vld1q_u64((&raw const a[lane + 1]).cast::<u64>());
+            let xb0 = vld1q_u64((&raw const b[lane]).cast::<u64>());
+            let xb1 = vld1q_u64((&raw const b[lane + 1]).cast::<u64>());
+            let xc0 = vld1q_u64((&raw const c[lane]).cast::<u64>());
+            let xc1 = vld1q_u64((&raw const c[lane + 1]).cast::<u64>());
+            let xd0 = vld1q_u64((&raw const d[lane]).cast::<u64>());
+            let xd1 = vld1q_u64((&raw const d[lane + 1]).cast::<u64>());
+
+            // Layer L: (a,c) and (b,d) share t_outer.
+            let (na0, nc0) = butterfly_q(xa0, xc0, to);
+            let (na1, nc1) = butterfly_q(xa1, xc1, to);
+            let (nb0, nd0) = butterfly_q(xb0, xd0, to);
+            let (nb1, nd1) = butterfly_q(xb1, xd1, to);
+
+            // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
+            let (fa0, fb0) = butterfly_q(na0, nb0, ta);
+            let (fa1, fb1) = butterfly_q(na1, nb1, ta);
+            let (fc0, fd0) = butterfly_q(nc0, nd0, tb);
+            let (fc1, fd1) = butterfly_q(nc1, nd1, tb);
+
+            vst1q_u64((&raw mut a[lane]).cast::<u64>(), fa0);
+            vst1q_u64((&raw mut a[lane + 1]).cast::<u64>(), fa1);
+            vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb0);
+            vst1q_u64((&raw mut b[lane + 1]).cast::<u64>(), fb1);
+            vst1q_u64((&raw mut c[lane]).cast::<u64>(), fc0);
+            vst1q_u64((&raw mut c[lane + 1]).cast::<u64>(), fc1);
+            vst1q_u64((&raw mut d[lane]).cast::<u64>(), fd0);
+            vst1q_u64((&raw mut d[lane + 1]).cast::<u64>(), fd1);
+
+            lane += 2;
+        }
+        while lane < len {
             let xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
             let xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
             let xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
             let xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
 
-            // Layer L: (a,c) and (b,d) share t_outer.
             let (na, nc) = butterfly_q(xa, xc, to);
             let (nb, nd) = butterfly_q(xb, xd, to);
-            // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
             let (fa, fb) = butterfly_q(na, nb, ta);
             let (fc, fd) = butterfly_q(nc, nd, tb);
 
@@ -920,6 +1277,7 @@ unsafe fn butterfly_fused_2layer_row_with_q(
             vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb);
             vst1q_u64((&raw mut c[lane]).cast::<u64>(), fc);
             vst1q_u64((&raw mut d[lane]).cast::<u64>(), fd);
+            lane += 1;
         }
     }
 }
