@@ -688,6 +688,90 @@ pub(super) unsafe fn round0_factorized_eq(f: &[F128], eq_tail: &[F128]) -> (F128
     }
 }
 
+/// Fused AB-pair tail round: bind the low index bit of `(a, b)` at `r_fold`
+/// in place (both halved) and accumulate the next round's raw message
+/// `(G(1), G(∞))` over the folded tables, weighted by the precomputed remaining
+/// equality table `eq_rem`:
+///
+/// ```text
+/// G(1) = Σ_x eq_rem[x] · fa[2x+1] · fb[2x+1]
+/// G(∞) = Σ_x eq_rem[x] · (fa[2x] + fa[2x+1]) · (fb[2x] + fb[2x+1])
+/// ```
+///
+/// where `fa[x] = a[2x] + r_fold·(a[2x] + a[2x+1])` (same for `fb`). The folded
+/// tables overwrite the first `a.len()/2` slots of `a` and `b`; the caller
+/// truncates. The read of source group `4x..4x+4` always precedes the compacted
+/// write to `2x, 2x+1` (`2x + 1 < 4x` for `x ≥ 1`; the `x = 0` loads all finish
+/// before its stores), so the in-place rewrite is hazard-free.
+///
+/// Each field product's 256-bit form is reduced once; the two eq-weighted
+/// message sums stay in the unreduced `WideNeon` domain until a single final
+/// reduce. Reduction is F2-linear and field multiplication is associative, so
+/// the result is bit-identical to `fold_in_place_pair` followed by
+/// `round_pair_naive` (see the `fold_and_round_pair_in_place_matches_scalar`
+/// oracle test).
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `a.len() == b.len()`, a power of
+/// two `≥ 4`, and `eq_rem.len() == a.len() / 4`.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_pair_and_round(
+    a: &mut [F128],
+    b: &mut [F128],
+    r_fold: F128,
+    eq_rem: &[F128],
+) -> (F128, F128) {
+    unsafe {
+        let n = a.len();
+        debug_assert_eq!(b.len(), n);
+        debug_assert!(n.is_power_of_two() && n >= 4);
+        debug_assert_eq!(eq_rem.len(), n / 4);
+
+        let zero = vdupq_n_u64(0);
+        let rf = vld1q_u64((&r_fold as *const F128).cast::<u64>());
+        let mut acc_one = WideNeon { lo: zero, hi: zero };
+        let mut acc_inf = WideNeon { lo: zero, hi: zero };
+
+        let ap = a.as_mut_ptr();
+        let bp = b.as_mut_ptr();
+        let ep = eq_rem.as_ptr();
+
+        for x in 0..(n / 4) {
+            let a0 = vld1q_u64(ap.add(4 * x).cast::<u64>());
+            let a1 = vld1q_u64(ap.add(4 * x + 1).cast::<u64>());
+            let a2 = vld1q_u64(ap.add(4 * x + 2).cast::<u64>());
+            let a3 = vld1q_u64(ap.add(4 * x + 3).cast::<u64>());
+            let b0 = vld1q_u64(bp.add(4 * x).cast::<u64>());
+            let b1 = vld1q_u64(bp.add(4 * x + 1).cast::<u64>());
+            let b2 = vld1q_u64(bp.add(4 * x + 2).cast::<u64>());
+            let b3 = vld1q_u64(bp.add(4 * x + 3).cast::<u64>());
+
+            // Bind the low bit: f[x] = f0 + r_fold·(f0 + f1).
+            let fa0 = veorq_u64(a0, reduce_wide(mul_unreduced(rf, veorq_u64(a0, a1))));
+            let fa1 = veorq_u64(a2, reduce_wide(mul_unreduced(rf, veorq_u64(a2, a3))));
+            let fb0 = veorq_u64(b0, reduce_wide(mul_unreduced(rf, veorq_u64(b0, b1))));
+            let fb1 = veorq_u64(b2, reduce_wide(mul_unreduced(rf, veorq_u64(b2, b3))));
+
+            // Compact the folded pair back in place.
+            vst1q_u64(ap.add(2 * x).cast::<u64>(), fa0);
+            vst1q_u64(ap.add(2 * x + 1).cast::<u64>(), fa1);
+            vst1q_u64(bp.add(2 * x).cast::<u64>(), fb0);
+            vst1q_u64(bp.add(2 * x + 1).cast::<u64>(), fb1);
+
+            // Reduced pair products, then eq-weighted deferred accumulation.
+            let p_one = reduce_wide(mul_unreduced(fa1, fb1));
+            let p_inf =
+                reduce_wide(mul_unreduced(veorq_u64(fa0, fa1), veorq_u64(fb0, fb1)));
+            let eq = vld1q_u64(ep.add(x).cast::<u64>());
+            xor_wide(&mut acc_one, mul_unreduced(eq, p_one));
+            xor_wide(&mut acc_inf, mul_unreduced(eq, p_inf));
+        }
+
+        let red = |value: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(value));
+        (red(acc_one), red(acc_inf))
+    }
+}
+
 /// Expand one equality-table level with a shared multiplier `r`.
 ///
 /// For every old value `v = lo[i]`, writes `hi[i] = v * r` and

@@ -44,6 +44,28 @@ pub(crate) fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     unsafe { aarch64::round0(witness, basis) }
 }
 
+/// Fused AB-pair multilinear tail round: bind the low index bit of `(a, b)` at
+/// `r_fold` in place (both halved) and return the next round's raw
+/// `(G(1), G(∞))` message over `eq_rem`. Deferred reduction; bit-identical to
+/// scalar `fold_in_place_pair` followed by the product loop of
+/// `round_pair_naive`. The folded tables occupy the first `a.len()/2` slots;
+/// the caller truncates.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(crate) fn fold_pair_and_round(
+    a: &mut [F128],
+    b: &mut [F128],
+    r_fold: F128,
+    eq_rem: &[F128],
+) -> (F128, F128) {
+    assert_eq!(a.len(), b.len());
+    assert!(a.len().is_power_of_two() && a.len() >= 4);
+    assert_eq!(eq_rem.len(), a.len() / 4);
+    // SAFETY: the cfg gate supplies PMULL through `aes`; the checks above are
+    // the complete slice-shape contract of the architecture kernel.
+    unsafe { aarch64::fold_pair_and_round(a, b, r_fold, eq_rem) }
+}
+
 /// Accumulate the two sufficient statistics for a factorized LSB equality
 /// basis:
 ///

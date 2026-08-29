@@ -28,9 +28,10 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into,
-    fold_compact_and_compute_round_pair, fold_in_place_pair, fold2_compact_and_round4_into,
+    fold_and_round_pair_in_place, fold_compact_and_compute_round_pair, fold_in_place_pair,
+    fold2_compact_and_round4_into,
     fold2_compact_and_round45_into, fold2_plain_and_round6_into, fold2_plain_and_round67_into,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    interpolate_at_z_combined, interpolate_at_z_on_lambda,
     uni_skip_fold_and_round_pair_compact_padded_lookahead,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
@@ -1272,8 +1273,10 @@ fn prove_packed_padded_inner<C: Challenger>(
             b_mlv.truncate(half);
             (m1, mi)
         } else {
-            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-            round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            // NEON deferred-reduction fused fold + round (bit-identical to the
+            // scalar `fold_in_place_pair` + `round_pair_naive`); folds a_mlv,
+            // b_mlv in place to half size and returns this round's message.
+            fold_and_round_pair_in_place(&mut a_mlv, &mut b_mlv, rho_prev, &r_next)
         };
 
         multilinear_msgs.push((m1, mi));

@@ -1227,12 +1227,25 @@ fn sparse_row_fold_alpha_batched(
         })
         .collect();
 
+    // Column-wise parallel reduction of the per-chunk partial accumulators.
+    // The serial `for acc { for i { out[i] += acc[i] } }` form is
+    // O(n_chunks × n_cols) of purely serial XOR work (≈ 4·threads partials of
+    // 2^14 cols) that Amdahl-caps the fold's parallel speedup. GF(2^128) add is
+    // XOR — associative and commutative — so summing each disjoint column band
+    // across all partials in parallel is bit-identical to the serial order.
     let mut out = vec![F128::ZERO; n_cols];
-    for acc in &partials {
-        for i in 0..n_cols {
-            out[i] += acc[i];
+    // ~4 bands per worker for work-stealing balance, with a floor so per-band
+    // dispatch overhead stays amortized against its XOR body.
+    let band = (n_cols.div_ceil(p * 4)).max(1024);
+    out.par_chunks_mut(band).enumerate().for_each(|(bi, out_band)| {
+        let col0 = bi * band;
+        let col1 = col0 + out_band.len();
+        for acc in &partials {
+            for (o, a) in out_band.iter_mut().zip(&acc[col0..col1]) {
+                *o += *a;
+            }
         }
-    }
+    });
     out
 }
 

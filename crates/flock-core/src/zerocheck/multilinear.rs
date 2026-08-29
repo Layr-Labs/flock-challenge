@@ -3302,6 +3302,51 @@ pub fn fold_in_place_pair(a: &mut Vec<F128>, b: &mut Vec<F128>, challenge: F128)
     b.truncate(half);
 }
 
+/// Fused tail round: bind one variable at `r_fold` in place (halving `a`, `b`)
+/// AND return `(r_next[0] · G(1), G(∞))` for the next round — the fused
+/// equivalent of `fold_in_place_pair` followed by `round_pair_naive`, but with
+/// a single deferred reduction per output field element.
+///
+/// On AArch64 (with PMULL) this drives the NEON deferred-reduction kernel,
+/// replacing the fully-reduced per-element scalar tail. It is bit-identical to
+/// the scalar pair — reduction is F2-linear and field multiplication is
+/// associative — and cross-checked by the `fold_and_round_pair_in_place_matches_scalar`
+/// oracle test. Other targets keep the scalar sequence.
+///
+/// Requires `a.len() = b.len()`, a power of two `≥ 4` (so the folded table has
+/// at least one message pair). The final `n = 2` bind keeps `fold_in_place_pair`.
+pub fn fold_and_round_pair_in_place(
+    a: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    r_fold: F128,
+    r_next: &[F128],
+) -> (F128, F128) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 4);
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r_next.len(), log_n - 1);
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        let half = n / 2;
+        // Same remaining-equality table `round_pair_naive` builds from r_next[1..].
+        let eq_rem = build_eq(&r_next[1..]);
+        debug_assert_eq!(eq_rem.len(), half / 2);
+        let (g_one, g_inf) =
+            crate::field::f128_slice::fold_pair_and_round(a.as_mut_slice(), b.as_mut_slice(), r_fold, &eq_rem);
+        a.truncate(half);
+        b.truncate(half);
+        (r_next[0] * g_one, g_inf)
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        fold_in_place_pair(a, b, r_fold);
+        round_pair_naive(a, b, r_next)
+    }
+}
+
 /// Fused: bind one variable at `r_fold` AND compute the *next* round's prover
 /// message. Returns the new (folded) `a, b` vectors (half the input size) and
 /// `(r_next[0] · G(1), G(∞))` for the next round.
@@ -4329,6 +4374,38 @@ mod tests {
             assert_eq!(b_fused, b_unf, "b mismatch at log_n={log_n}");
             assert_eq!(m1_fused, m1_unf, "msg_1 mismatch at log_n={log_n}");
             assert_eq!(minf_fused, minf_unf, "msg_inf mismatch at log_n={log_n}");
+        }
+    }
+
+    /// Oracle: the NEON deferred-reduction tail round
+    /// `fold_and_round_pair_in_place` is bit-identical to the scalar
+    /// `fold_in_place_pair` → `round_pair_naive` it replaces — both the folded
+    /// tables and the wire message must match exactly, across every tail size
+    /// (n ≥ 4, i.e. log_n from 2 up to the fused threshold).
+    #[test]
+    fn fold_and_round_pair_in_place_matches_scalar() {
+        let mut rng = Rng::new(0xF01D_ABCD_u64.wrapping_mul(0x9E37));
+        for log_n in 2..=14usize {
+            let n = 1usize << log_n;
+            let a: Vec<F128> = rng.f128_vec(n);
+            let b: Vec<F128> = rng.f128_vec(n);
+            let r_fold = rng.f128();
+            let r_next = rng.f128_vec(log_n - 1);
+
+            // Scalar reference: in-place fold, then naive message.
+            let mut a_ref = a.clone();
+            let mut b_ref = b.clone();
+            fold_in_place_pair(&mut a_ref, &mut b_ref, r_fold);
+            let msg_ref = round_pair_naive(&a_ref, &b_ref, &r_next);
+
+            // Candidate: fused NEON path (falls back to scalar off-AArch64).
+            let mut a_neon = a.clone();
+            let mut b_neon = b.clone();
+            let msg_neon = fold_and_round_pair_in_place(&mut a_neon, &mut b_neon, r_fold, &r_next);
+
+            assert_eq!(a_neon, a_ref, "folded a mismatch at log_n={log_n}");
+            assert_eq!(b_neon, b_ref, "folded b mismatch at log_n={log_n}");
+            assert_eq!(msg_neon, msg_ref, "message mismatch at log_n={log_n}");
         }
     }
 
