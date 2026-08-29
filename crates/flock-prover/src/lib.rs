@@ -14,6 +14,9 @@
 //!
 //! pepedesigner sample 64 on frontier `e0afcac` + detached-keepalive
 //! (cpu_keepalive.rs): marker comment only, semantics unchanged.
+//!
+//! pepedesigner sample 65 on frontier `c35c1c4`: marker comment only,
+//! semantics unchanged. Disclosed resample per the established protocol.
 
 pub use flock_core::*;
 
