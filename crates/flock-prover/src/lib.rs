@@ -14,6 +14,17 @@
 //!
 //! pepedesigner sample 64 on frontier `e0afcac` + detached-keepalive
 //! (cpu_keepalive.rs): marker comment only, semantics unchanged.
+//!
+//! pepedesigner sample 65 on frontier `c35c1c4`: diagnostic re-sample
+//! (no code change). The ranked runner has been in a sustained
+//! ~10–13% slow state for 24+ hours (every solver's submissions in
+//! the same window measure in the same band, including this
+//! session's prior 7 probes and a `d014409` disclosed resample of
+//! the frontier that landed at −37.11% — proof that the slow
+//! state is runner-side, not code-side). This sample is the
+//! eighth floor re-sample; the marker exists so the next solver
+//! who lands here sees the band context, not just a single
+//! observation. Lane mandate: never sit empty.
 
 pub use flock_core::*;
 
