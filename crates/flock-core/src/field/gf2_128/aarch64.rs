@@ -172,15 +172,14 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     }
 }
 
-/// Batch multiply 2× F128 in parallel.
+/// Batch multiply 2× F128 in parallel via Karatsuba 6-PMULL.
 ///
-/// Strategy: 8 schoolbook PMULLs (4 per mul, all independent), repack the
-/// four unreduced 64-bit words `(r0, r1, r2, r3)` of each product into
-/// lane-paired `uint64x2_t` registers, then run the GHASH shift-XOR
-/// reduction once with each NEON op handling both muls' lanes. Trades
-/// the binius variant's 4 reduction-stage PMULLs (2 per mul × 2 muls)
-/// for a vectorised XOR-based reduction. Worth it because PMULL is the
-/// scarce resource on M-class (2 units, 1/cycle each).
+/// Strategy: 6 Karatsuba PMULLs (3 per product: ll, hh, and (a_lo^a_hi)·(b_lo^b_hi)),
+/// cross-terms c = mm ^ ll ^ hh via `xor3_u64`, repack the four unreduced 64-bit
+/// words `(r0, r1, r2, r3)` of each product into lane-paired `uint64x2_t` registers,
+/// then run the GHASH shift-XOR reduction once with each NEON op handling both
+/// muls' lanes. Drops PMULL count from 8 to 6, conserving the scarce PMULL units
+/// on M-class (2 units, 1/cycle each).
 ///
 /// # Safety
 /// Requires the `aes` target feature (compiles to PMULL); only call where
@@ -189,20 +188,17 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
 pub unsafe fn ghash_mul_vec2_neon(a: [F128; 2], b: [F128; 2]) -> [F128; 2] {
     // SAFETY: function carries the aes target feature; pmull requires it.
     unsafe {
-        // 8 independent schoolbook PMULLs.
+        // 6 Karatsuba PMULLs (3 per product).
         let p0_ll = pmull(a[0].lo, b[0].lo);
-        let p0_lh = pmull(a[0].lo, b[0].hi);
-        let p0_hl = pmull(a[0].hi, b[0].lo);
         let p0_hh = pmull(a[0].hi, b[0].hi);
+        let p0_mm = pmull(a[0].lo ^ a[0].hi, b[0].lo ^ b[0].hi);
         let p1_ll = pmull(a[1].lo, b[1].lo);
-        let p1_lh = pmull(a[1].lo, b[1].hi);
-        let p1_hl = pmull(a[1].hi, b[1].lo);
         let p1_hh = pmull(a[1].hi, b[1].hi);
+        let p1_mm = pmull(a[1].lo ^ a[1].hi, b[1].lo ^ b[1].hi);
 
-        // Per-mul cross terms (lh + hl).
-        let c0 = veorq_u64(p0_lh, p0_hl);
-        let c1 = veorq_u64(p1_lh, p1_hl);
-
+        // Per-mul cross terms mm ^ ll ^ hh.
+        let c0 = xor3_u64(p0_mm, p0_ll, p0_hh);
+        let c1 = xor3_u64(p1_mm, p1_ll, p1_hh);
         // Lane-paired (mul0, mul1) layout for each word position.
         //   r0 = ll_lo
         //   r1 = ll_hi ^ cross_lo

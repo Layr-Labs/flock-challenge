@@ -698,6 +698,7 @@ struct ReverseTranspose<'a> {
     ops: Vec<ReverseWordOp>,
     adjoints: Vec<[F128; WORD_BITS]>,
     comb: Vec<F128>,
+    z_const_acc: F128,
 }
 
 impl<'a> ReverseTranspose<'a> {
@@ -708,6 +709,7 @@ impl<'a> ReverseTranspose<'a> {
             ops: Vec::with_capacity(32 + 12 * N_G + 16),
             adjoints: Vec::with_capacity(32 + 12 * N_G + 16),
             comb: vec![F128::ZERO; K],
+            z_const_acc: F128::ZERO,
         }
     }
 
@@ -781,7 +783,7 @@ impl<'a> ReverseTranspose<'a> {
     fn seed_lin_row(&mut self, value: usize, bit: usize, row: usize) {
         let e = self.eq_inner[row];
         self.adjoints[value][bit] += self.alpha * e;
-        self.comb[Z_CONST_POS] += e;
+        self.z_const_acc += e;
     }
 
     /// Attach two independent lin-id rows while sharing their A-side scale.
@@ -799,9 +801,8 @@ impl<'a> ReverseTranspose<'a> {
         let [first_alpha_e, second_alpha_e] = mul_alpha_pair(self.alpha, [first_e, second_e]);
 
         self.adjoints[first_value][bit] += first_alpha_e;
-        self.comb[Z_CONST_POS] += first_e;
         self.adjoints[second_value][bit] += second_alpha_e;
-        self.comb[Z_CONST_POS] += second_e;
+        self.z_const_acc += first_e + second_e;
     }
 
     fn finish(mut self) -> Vec<F128> {
@@ -816,11 +817,13 @@ impl<'a> ReverseTranspose<'a> {
                     }
                 }
                 ReverseWordOp::Constant(value) => {
+                    let mut const_weight = F128::ZERO;
                     for (i, weight) in q.into_iter().enumerate() {
                         if (value >> i) & 1 == 1 {
-                            self.comb[Z_CONST_POS] += weight;
+                            const_weight += weight;
                         }
                     }
+                    self.z_const_acc += const_weight;
                 }
                 ReverseWordOp::XorRot { x, y, rotation } => {
                     for (i, weight) in q.into_iter().enumerate() {
@@ -845,6 +848,7 @@ impl<'a> ReverseTranspose<'a> {
                 }
             }
         }
+        self.comb[Z_CONST_POS] += self.z_const_acc;
         self.comb
     }
 }
@@ -862,13 +866,26 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
 
         // Rows whose A side is the input itself and whose B side is one.
         let e0 = eq_inner[Z_CONST_POS];
-        reverse.comb[Z_CONST_POS] += alpha * e0 + e0;
+        reverse.z_const_acc += alpha * e0 + e0;
         let input_emit = |reverse: &mut ReverseTranspose<'_>, base: usize, len: usize| {
-            for s in base..base + len {
+            let mut s = base;
+            let end = base + len;
+            let mut z_acc = F128::ZERO;
+            while s + 1 < end {
+                let e_0 = reverse.eq_inner[s];
+                let e_1 = reverse.eq_inner[s + 1];
+                let [alpha_e_0, alpha_e_1] = mul_alpha_pair(reverse.alpha, [e_0, e_1]);
+                reverse.comb[s] += alpha_e_0;
+                reverse.comb[s + 1] += alpha_e_1;
+                z_acc += e_0 + e_1;
+                s += 2;
+            }
+            if s < end {
                 let e = reverse.eq_inner[s];
                 reverse.comb[s] += reverse.alpha * e;
-                reverse.comb[Z_CONST_POS] += e;
+                z_acc += e;
             }
+            reverse.z_const_acc += z_acc;
         };
         input_emit(&mut reverse, CV_BASE, 8 * WORD_BITS);
         input_emit(&mut reverse, M_BASE, 16 * WORD_BITS);

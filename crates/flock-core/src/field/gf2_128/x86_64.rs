@@ -231,9 +231,9 @@ unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
     }
 }
 
-/// 4 independent GF(2^128) products. `x` and `y` each hold 4 contiguous
-/// `F128`; the result holds the 4 reduced products. Field-identical to
-/// applying `ghash_mul_binius` to each lane.
+/// 4 independent GF(2^128) products via Karatsuba 3-CLMUL + 2-stage reduction.
+/// `x` and `y` each hold 4 contiguous `F128`; the result holds the 4 reduced
+/// products. Field-identical to applying `ghash_mul_binius` to each lane.
 ///
 /// # Safety
 /// Caller must ensure `avx512f` + `vpclmulqdq` are available (statically
@@ -244,16 +244,16 @@ unsafe fn gf2_128_reduce_x4(mut t0: __m512i, t1: __m512i) -> __m512i {
 pub unsafe fn ghash_mul_x4(x: __m512i, y: __m512i) -> __m512i {
     // SAFETY: caller carries avx512f+vpclmulqdq.
     unsafe {
-        // Cross terms: x.hi·y.lo (imm 0x01) ^ x.lo·y.hi (imm 0x10), at x^64.
-        let t1a = _mm512_clmulepi64_epi128::<0x01>(x, y);
-        let t1b = _mm512_clmulepi64_epi128::<0x10>(x, y);
-        let mut t1 = _mm512_xor_si512(t1a, t1b);
-        // High product x.hi·y.hi (imm 0x11), folded into the cross.
-        let t2 = _mm512_clmulepi64_epi128::<0x11>(x, y);
-        t1 = gf2_128_reduce_x4(t1, t2);
-        // Low product x.lo·y.lo (imm 0x00), then fold t1 down to the result.
-        let t0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
-        gf2_128_reduce_x4(t0, t1)
+        let p0 = _mm512_clmulepi64_epi128::<0x00>(x, y);
+        let p1 = _mm512_clmulepi64_epi128::<0x11>(x, y);
+        let x_swap = _mm512_shuffle_epi32::<0x4E>(x);
+        let x_mid = _mm512_xor_si512(x, x_swap);
+        let y_swap = _mm512_shuffle_epi32::<0x4E>(y);
+        let y_mid = _mm512_xor_si512(y, y_swap);
+        let pm = _mm512_clmulepi64_epi128::<0x00>(x_mid, y_mid);
+        let mut t1 = _mm512_xor_si512(_mm512_xor_si512(pm, p0), p1);
+        t1 = gf2_128_reduce_x4(t1, p1);
+        gf2_128_reduce_x4(p0, t1)
     }
 }
 
