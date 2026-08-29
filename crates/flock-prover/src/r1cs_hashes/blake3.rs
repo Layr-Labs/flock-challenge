@@ -698,6 +698,7 @@ struct ReverseTranspose<'a> {
     ops: Vec<ReverseWordOp>,
     adjoints: Vec<[F128; WORD_BITS]>,
     comb: Vec<F128>,
+    const_acc: F128,
 }
 
 impl<'a> ReverseTranspose<'a> {
@@ -708,6 +709,7 @@ impl<'a> ReverseTranspose<'a> {
             ops: Vec::with_capacity(32 + 12 * N_G + 16),
             adjoints: Vec::with_capacity(32 + 12 * N_G + 16),
             comb: vec![F128::ZERO; K],
+            const_acc: F128::ZERO,
         }
     }
 
@@ -781,7 +783,7 @@ impl<'a> ReverseTranspose<'a> {
     fn seed_lin_row(&mut self, value: usize, bit: usize, row: usize) {
         let e = self.eq_inner[row];
         self.adjoints[value][bit] += self.alpha * e;
-        self.comb[Z_CONST_POS] += e;
+        self.const_acc += e;
     }
 
     /// Attach two independent lin-id rows while sharing their A-side scale.
@@ -799,12 +801,11 @@ impl<'a> ReverseTranspose<'a> {
         let [first_alpha_e, second_alpha_e] = mul_alpha_pair(self.alpha, [first_e, second_e]);
 
         self.adjoints[first_value][bit] += first_alpha_e;
-        self.comb[Z_CONST_POS] += first_e;
         self.adjoints[second_value][bit] += second_alpha_e;
-        self.comb[Z_CONST_POS] += second_e;
+        self.const_acc += first_e + second_e;
     }
-
     fn finish(mut self) -> Vec<F128> {
+        let mut const_acc = self.const_acc;
         for id in (0..self.ops.len()).rev() {
             // F128 is Copy, so taking this 32-lane value avoids aliasing the
             // current node while predecessor adjoints are updated.
@@ -818,7 +819,7 @@ impl<'a> ReverseTranspose<'a> {
                 ReverseWordOp::Constant(value) => {
                     for (i, weight) in q.into_iter().enumerate() {
                         if (value >> i) & 1 == 1 {
-                            self.comb[Z_CONST_POS] += weight;
+                            const_acc += weight;
                         }
                     }
                 }
@@ -845,6 +846,7 @@ impl<'a> ReverseTranspose<'a> {
                 }
             }
         }
+        self.comb[Z_CONST_POS] = const_acc;
         self.comb
     }
 }
@@ -862,12 +864,12 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
 
         // Rows whose A side is the input itself and whose B side is one.
         let e0 = eq_inner[Z_CONST_POS];
-        reverse.comb[Z_CONST_POS] += alpha * e0 + e0;
+        reverse.const_acc += alpha * e0 + e0;
         let input_emit = |reverse: &mut ReverseTranspose<'_>, base: usize, len: usize| {
             for s in base..base + len {
                 let e = reverse.eq_inner[s];
                 reverse.comb[s] += reverse.alpha * e;
-                reverse.comb[Z_CONST_POS] += e;
+                reverse.const_acc += e;
             }
         };
         input_emit(&mut reverse, CV_BASE, 8 * WORD_BITS);
@@ -4731,6 +4733,318 @@ mod tests {
         let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0);
         let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
         assert_eq!(expected, got_csc, "CSC fold mismatch");
+    }
+    #[test]
+    fn const_accumulator_multi_seed_matches_sparse_and_csc() {
+        use flock_core::lincheck::{CscCircuit, LincheckCircuit, SparseMatrixCircuit};
+
+        let (a_0, b_0) = build_matrices();
+        let sparse = SparseMatrixCircuit::new(&a_0, &b_0);
+        let csc = CscCircuit::from_matrices(&a_0, &b_0);
+        let walker = Blake3LincheckCircuit;
+        let n_cols = walker.n_cols();
+        assert_eq!(sparse.n_cols(), n_cols);
+        assert_eq!(csc.n_cols(), n_cols);
+
+        let seeds = [
+            0x1234_5678_9ABC_DEF0u64,
+            0xFEED_FACE_CAFE_BEEFu64,
+            0x9876_5432_10FE_DCBAu64,
+            0xDEAD_BEEF_00C0_FFEEu64,
+            0x4242_4242_1337_7331u64,
+            0x0123_4567_89AB_CDEFu64,
+            0xA5A5_5A5A_F0F0_0F0Fu64,
+            0xCAFE_BABE_1122_3344u64,
+        ];
+
+        for &seed in &seeds {
+            let mut rng = Rng::new(seed);
+            let alpha = F128 {
+                lo: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+                hi: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+            };
+            let eq_inner: Vec<F128> = (0..n_cols)
+                .map(|_| F128 {
+                    lo: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+                    hi: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+                })
+                .collect();
+
+            let expected_sparse = sparse.fold_alpha_batched(alpha, &eq_inner);
+            let expected_csc = csc.fold_alpha_batched(alpha, &eq_inner);
+            let got_walker = walker.fold_alpha_batched(alpha, &eq_inner);
+
+            assert_eq!(
+                expected_sparse, expected_csc,
+                "sparse vs csc mismatch at seed {seed:#x}"
+            );
+            assert_eq!(
+                expected_sparse, got_walker,
+                "walker vs oracle mismatch at seed {seed:#x}"
+            );
+            assert_eq!(
+                expected_sparse[Z_CONST_POS], got_walker[Z_CONST_POS],
+                "constant column mismatch at seed {seed:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn const_accumulator_mutation_variants_fail() {
+        use flock_core::lincheck::{LincheckCircuit, SparseMatrixCircuit};
+
+        let (a_0, b_0) = build_matrices();
+        let sparse = SparseMatrixCircuit::new(&a_0, &b_0);
+        let n_cols = sparse.n_cols();
+
+        let mut rng = Rng::new(0x7171_8282_9393_0404);
+        let alpha = F128 {
+            lo: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+            hi: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+        };
+        let eq_inner: Vec<F128> = (0..n_cols)
+            .map(|_| F128 {
+                lo: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+                hi: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+            })
+            .collect();
+
+        let oracle = sparse.fold_alpha_batched(alpha, &eq_inner);
+        let expected_const = oracle[Z_CONST_POS];
+
+        // Helper to run fold_alpha with specific mutation injection
+        #[derive(Clone, Copy, Debug)]
+        enum Mutation {
+            OmitConstantRow,
+            UndercountConstantRowAlpha,
+            OmitInputRows,
+            OmitPairedLinearRows,
+            UndercountPairedLinearRows,
+            OmitFinalizationLinearRows,
+            OmitIvConstantPropagation,
+        }
+
+        let run_mutated = |mutation: Mutation| -> F128 {
+            let mut reverse = ReverseTranspose::new(alpha, &eq_inner);
+            let e0 = eq_inner[Z_CONST_POS];
+            match mutation {
+                Mutation::OmitConstantRow => {
+                    // Omitted
+                }
+                Mutation::UndercountConstantRowAlpha => {
+                    reverse.const_acc += e0; // Omit alpha * e0
+                }
+                _ => {
+                    reverse.const_acc += alpha * e0 + e0;
+                }
+            }
+
+            let input_emit = |reverse: &mut ReverseTranspose<'_>, base: usize, len: usize| {
+                for s in base..base + len {
+                    let e = reverse.eq_inner[s];
+                    reverse.comb[s] += reverse.alpha * e;
+                    if !matches!(mutation, Mutation::OmitInputRows) {
+                        reverse.const_acc += e;
+                    }
+                }
+            };
+            input_emit(&mut reverse, CV_BASE, 8 * WORD_BITS);
+            input_emit(&mut reverse, M_BASE, 16 * WORD_BITS);
+            input_emit(&mut reverse, T_LO_BASE, WORD_BITS);
+            input_emit(&mut reverse, T_HI_BASE, WORD_BITS);
+            input_emit(&mut reverse, BLEN_BASE, WORD_BITS);
+            input_emit(&mut reverse, FLAGS_BASE, WORD_BITS);
+
+            let cv: [usize; 8] = std::array::from_fn(|w| reverse.leaf(cv_bit(w, 0)));
+            let messages: [usize; 16] = std::array::from_fn(|w| reverse.leaf(m_bit(w, 0)));
+            let mut state: [usize; 16] = [
+                cv[0],
+                cv[1],
+                cv[2],
+                cv[3],
+                cv[4],
+                cv[5],
+                cv[6],
+                cv[7],
+                reverse.constant(BLAKE3_IV[0]),
+                reverse.constant(BLAKE3_IV[1]),
+                reverse.constant(BLAKE3_IV[2]),
+                reverse.constant(BLAKE3_IV[3]),
+                reverse.leaf(T_LO_BASE),
+                reverse.leaf(T_HI_BASE),
+                reverse.leaf(BLEN_BASE),
+                reverse.leaf(FLAGS_BASE),
+            ];
+
+            for r in 0..N_ROUNDS {
+                for g_in_round in 0..N_G_PER_ROUND {
+                    let g = r * N_G_PER_ROUND + g_in_round;
+                    let [la, lb, lc, ld] = G_LANES[g_in_round];
+                    let [mx_idx, my_idx] = PER_ROUND_MSG_IDX[r][g_in_round];
+                    let [a, b, c, d] = [state[la], state[lb], state[lc], state[ld]];
+
+                    let tmp_0 = reverse.add(a, b, g_add_carry_bit(g, ADD_TMP0, 0));
+                    let a_1 = reverse.add(tmp_0, messages[mx_idx], g_add_carry_bit(g, ADD_A1, 0));
+                    let d_1 = reverse.xor_rot(d, a_1, 16);
+                    let c_1 = reverse.add(c, d_1, g_add_carry_bit(g, ADD_C1, 0));
+                    let b_1 = reverse.xor_rot(b, c_1, 12);
+                    let tmp_1 = reverse.add(a_1, b_1, g_add_carry_bit(g, ADD_TMP1, 0));
+                    let a_2 = reverse.add(tmp_1, messages[my_idx], g_add_carry_bit(g, ADD_A2, 0));
+                    let d_2 = reverse.xor_rot(d_1, a_2, 8);
+                    let c_2 = reverse.add(c_1, d_2, g_add_carry_bit(g, ADD_C2, 0));
+
+                    let b_new = reverse.xor_rot(b_1, c_2, 7);
+                    for i in 0..WORD_BITS {
+                        match mutation {
+                            Mutation::OmitPairedLinearRows => {
+                                let first_row = g_lin_bit(g, LIN_B_NEW, i);
+                                let second_row = g_lin_bit(g, LIN_D_NEW, i);
+                                let first_e = reverse.eq_inner[first_row];
+                                let second_e = reverse.eq_inner[second_row];
+                                let [first_alpha_e, second_alpha_e] =
+                                    mul_alpha_pair(reverse.alpha, [first_e, second_e]);
+                                reverse.adjoints[b_new][i] += first_alpha_e;
+                                reverse.adjoints[d_2][i] += second_alpha_e;
+                            }
+                            Mutation::UndercountPairedLinearRows => {
+                                let first_row = g_lin_bit(g, LIN_B_NEW, i);
+                                let second_row = g_lin_bit(g, LIN_D_NEW, i);
+                                let first_e = reverse.eq_inner[first_row];
+                                let second_e = reverse.eq_inner[second_row];
+                                let [first_alpha_e, second_alpha_e] =
+                                    mul_alpha_pair(reverse.alpha, [first_e, second_e]);
+                                reverse.adjoints[b_new][i] += first_alpha_e;
+                                reverse.adjoints[d_2][i] += second_alpha_e;
+                                reverse.const_acc += first_e; // undercount: miss second_e
+                            }
+                            _ => {
+                                reverse.seed_lin_rows2(
+                                    b_new,
+                                    d_2,
+                                    i,
+                                    g_lin_bit(g, LIN_B_NEW, i),
+                                    g_lin_bit(g, LIN_D_NEW, i),
+                                );
+                            }
+                        }
+                    }
+
+                    state[la] = a_2;
+                    state[lb] = reverse.leaf(g_lin_bit(g, LIN_B_NEW, 0));
+                    state[lc] = c_2;
+                    state[ld] = reverse.leaf(g_lin_bit(g, LIN_D_NEW, 0));
+                }
+            }
+
+            for w in 0..8 {
+                let lo = reverse.xor_rot(state[w], state[w + 8], 0);
+                let hi = reverse.xor_rot(state[w + 8], cv[w], 0);
+                for i in 0..WORD_BITS {
+                    match mutation {
+                        Mutation::OmitFinalizationLinearRows => {
+                            let lo_row = out_lo_bit(w, i);
+                            let hi_row = out_hi_bit(w, i);
+                            reverse.adjoints[lo][i] += reverse.alpha * reverse.eq_inner[lo_row];
+                            reverse.adjoints[hi][i] += reverse.alpha * reverse.eq_inner[hi_row];
+                        }
+                        _ => {
+                            reverse.seed_lin_row(lo, i, out_lo_bit(w, i));
+                            reverse.seed_lin_row(hi, i, out_hi_bit(w, i));
+                        }
+                    }
+                }
+            }
+
+            if matches!(mutation, Mutation::OmitIvConstantPropagation) {
+                // Finish without IV constant propagation
+                let const_acc = reverse.const_acc;
+                for id in (0..reverse.ops.len()).rev() {
+                    let q = reverse.adjoints[id];
+                    match reverse.ops[id] {
+                        ReverseWordOp::Leaf(base) => {
+                            for (i, value) in q.into_iter().enumerate() {
+                                reverse.comb[base + i] += value;
+                            }
+                        }
+                        ReverseWordOp::Constant(_value) => {
+                            // Omit const_acc += weight
+                        }
+                        ReverseWordOp::XorRot { x, y, rotation } => {
+                            for (i, weight) in q.into_iter().enumerate() {
+                                let source_bit = (i + rotation) % WORD_BITS;
+                                reverse.adjoints[x][source_bit] += weight;
+                                reverse.adjoints[y][source_bit] += weight;
+                            }
+                        }
+                        ReverseWordOp::Add { x, y, carry_base } => {
+                            let mut suffix = F128::ZERO;
+                            for i in (0..WORD_BITS).rev() {
+                                if i < CARRY_BITS_PER_ADD {
+                                    reverse.comb[carry_base + i] += suffix;
+                                }
+                                let weight = q[i];
+                                reverse.adjoints[x][i] += weight;
+                                reverse.adjoints[y][i] += weight;
+                                suffix += weight;
+                            }
+                        }
+                    }
+                }
+                reverse.comb[Z_CONST_POS] = const_acc;
+                reverse.comb[Z_CONST_POS]
+            } else {
+                let comb = reverse.finish();
+                comb[Z_CONST_POS]
+            }
+        };
+
+        let all_mutations = [
+            Mutation::OmitConstantRow,
+            Mutation::UndercountConstantRowAlpha,
+            Mutation::OmitInputRows,
+            Mutation::OmitPairedLinearRows,
+            Mutation::UndercountPairedLinearRows,
+            Mutation::OmitFinalizationLinearRows,
+            Mutation::OmitIvConstantPropagation,
+        ];
+
+        for mutation in all_mutations {
+            let mutated_const = run_mutated(mutation);
+            assert_ne!(
+                mutated_const, expected_const,
+                "Mutation {mutation:?} failed to diverge from oracle at Z_CONST_POS"
+            );
+        }
+    }
+
+    #[test]
+    fn ranked_shape_reverse_lincheck_circuit_eval() {
+        use flock_core::lincheck::{CscCircuit, LincheckCircuit, SparseMatrixCircuit};
+        let (a_0, b_0) = build_matrices();
+        let sparse = SparseMatrixCircuit::new(&a_0, &b_0);
+        let csc = CscCircuit::from_matrices(&a_0, &b_0);
+        let circuit = &RANKED_BLAKE3_LINCHECK;
+        let n_cols = circuit.n_cols();
+
+        for seed in [0x1122_3344_5566_7788u64, 0x99AA_BBCC_DDEE_FF00u64] {
+            let mut rng = Rng::new(seed);
+            let alpha = F128 {
+                lo: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+                hi: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+            };
+            let eq_inner: Vec<F128> = (0..n_cols)
+                .map(|_| F128 {
+                    lo: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+                    hi: ((rng.next_u32() as u64) << 32) | (rng.next_u32() as u64 | 1),
+                })
+                .collect();
+
+            let expected_sparse = sparse.fold_alpha_batched(alpha, &eq_inner);
+            let expected_csc = csc.fold_alpha_batched(alpha, &eq_inner);
+            let got = circuit.fold_alpha_batched(alpha, &eq_inner);
+            assert_eq!(expected_sparse, got);
+            assert_eq!(expected_csc, got);
+        }
     }
 
     /// to `pack_z_lincheck_from_packed(z)`.
