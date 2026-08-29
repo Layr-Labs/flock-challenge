@@ -792,6 +792,7 @@ impl ScratchBytes {
     /// Donate fully initialized F128 storage while preserving its allocation
     /// layout. Every F128 bit pattern is valid, so its object representation
     /// may be viewed and overwritten as bytes.
+    #[allow(dead_code)]
     pub(crate) fn from_initialized_f128(storage: Vec<F128>) -> Self {
         Self {
             backing: ScratchBytesBacking::F128(storage),
@@ -827,6 +828,7 @@ impl ScratchBytes {
     /// `release_tag` is staged only by [`Self::recycle`] and only after the
     /// full-overwrite transition, so a partial or panicking producer cannot
     /// mint a false provenance hit.
+    #[allow(dead_code)]
     pub(crate) fn from_f128_full_overwrite(storage: Vec<F128>, release_tag: u64) -> Self {
         Self {
             backing: ScratchBytesBacking::F128(storage),
@@ -873,6 +875,7 @@ impl ScratchBytes {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn is_fully_initialized(&self) -> bool {
         self.fully_initialized
     }
@@ -881,6 +884,7 @@ impl ScratchBytes {
     /// pointer so scalar code may subsequently use ordinary slices. Ranked
     /// Apple writers never call this; their kernels already accept raw,
     /// pairwise-disjoint destinations.
+    #[allow(dead_code)]
     pub(crate) fn initialize_zeroed_for_scalar_fallback(&mut self) {
         if self.fully_initialized || self.is_empty() {
             return;

@@ -378,20 +378,24 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul(
                 ab7 = veorq_u8(ab7, vld1q_u8(table.add((wa >> 56) * 16)));
             }
 
-            macro_rules! drain_lane {
-                ($offset:literal, $ab:ident) => {{
-                    let slot = bank.as_mut_ptr().add(lane + $offset) as *mut u8;
-                    vst1q_u8(slot, veorq_u8(vld1q_u8(slot), $ab));
-                }};
-            }
-            drain_lane!(0, ab0);
-            drain_lane!(1, ab1);
-            drain_lane!(2, ab2);
-            drain_lane!(3, ab3);
-            drain_lane!(4, ab4);
-            drain_lane!(5, ab5);
-            drain_lane!(6, ab6);
-            drain_lane!(7, ab7);
+            let bank_p = bank.as_mut_ptr().add(lane) as *mut u8;
+            let b0 = vld1q_u8(bank_p);
+            let b1 = vld1q_u8(bank_p.add(16));
+            let b2 = vld1q_u8(bank_p.add(32));
+            let b3 = vld1q_u8(bank_p.add(48));
+            let b4 = vld1q_u8(bank_p.add(64));
+            let b5 = vld1q_u8(bank_p.add(80));
+            let b6 = vld1q_u8(bank_p.add(96));
+            let b7 = vld1q_u8(bank_p.add(112));
+
+            vst1q_u8(bank_p, veorq_u8(b0, ab0));
+            vst1q_u8(bank_p.add(16), veorq_u8(b1, ab1));
+            vst1q_u8(bank_p.add(32), veorq_u8(b2, ab2));
+            vst1q_u8(bank_p.add(48), veorq_u8(b3, ab3));
+            vst1q_u8(bank_p.add(64), veorq_u8(b4, ab4));
+            vst1q_u8(bank_p.add(80), veorq_u8(b5, ab5));
+            vst1q_u8(bank_p.add(96), veorq_u8(b6, ab6));
+            vst1q_u8(bank_p.add(112), veorq_u8(b7, ab7));
         }
     }
 }
@@ -1768,17 +1772,32 @@ unsafe fn horner_absorb(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        for i in 0..8 {
-            let cur = acc[i];
-            let shifted = vreinterpretq_u8_u16(vshlq_n_u16::<1>(cur));
-            let msb = vreinterpretq_u8_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(cur)));
-            // shifted ^ (msb & HORNER_CARRY_X16)
-            let folded = bcax_u8(shifted, msb, carry_not);
+        let mut i = 0;
+        while i < 8 {
+            let cur0 = acc[i];
+            let cur1 = acc[i + 1];
+
+            let shifted0 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(cur0));
+            let shifted1 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(cur1));
+
+            let msb0 = vreinterpretq_u8_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(cur0)));
+            let msb1 = vreinterpretq_u8_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(cur1)));
+
+            let folded0 = bcax_u8(shifted0, msb0, carry_not);
+            let folded1 = bcax_u8(shifted1, msb1, carry_not);
+
             acc[i] = vreinterpretq_u16_u8(xor3_u8(
-                folded,
+                folded0,
                 vreinterpretq_u8_u16(lo[i]),
                 vreinterpretq_u8_u16(hi[i]),
             ));
+            acc[i + 1] = vreinterpretq_u16_u8(xor3_u8(
+                folded1,
+                vreinterpretq_u8_u16(lo[i + 1]),
+                vreinterpretq_u8_u16(hi[i + 1]),
+            ));
+
+            i += 2;
         }
     }
 }
