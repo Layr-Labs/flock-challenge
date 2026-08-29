@@ -395,7 +395,7 @@ fn witgen_hetero_main_only() -> bool {
 /// EPOOL_MIN_CHUNKS. (Measured on b844d53: single-group claims interleave 14
 /// writers' store streams and cost +2.5 ms of pure scheduling damage;
 /// 64-group slabs recover it and the E-cores convert −1.3 ms.)
-pub(crate) const WITGEN_HETERO_SLAB: usize = 64;
+pub(crate) const WITGEN_HETERO_SLAB: usize = 128;
 
 /// Oracle arm: `FLOCK_WITGEN_HETERO_SINGLE=1` drains single groups per claim
 /// (the naive `run_hetero_chunks` shape) instead of 64-group slabs.
