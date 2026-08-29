@@ -1768,17 +1768,32 @@ unsafe fn horner_absorb(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        for i in 0..8 {
-            let cur = acc[i];
-            let shifted = vreinterpretq_u8_u16(vshlq_n_u16::<1>(cur));
-            let msb = vreinterpretq_u8_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(cur)));
-            // shifted ^ (msb & HORNER_CARRY_X16)
-            let folded = bcax_u8(shifted, msb, carry_not);
+        let mut i = 0;
+        while i < 8 {
+            let cur0 = acc[i];
+            let cur1 = acc[i + 1];
+
+            let shifted0 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(cur0));
+            let shifted1 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(cur1));
+
+            let msb0 = vreinterpretq_u8_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(cur0)));
+            let msb1 = vreinterpretq_u8_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(cur1)));
+
+            let folded0 = bcax_u8(shifted0, msb0, carry_not);
+            let folded1 = bcax_u8(shifted1, msb1, carry_not);
+
             acc[i] = vreinterpretq_u16_u8(xor3_u8(
-                folded,
+                folded0,
                 vreinterpretq_u8_u16(lo[i]),
                 vreinterpretq_u8_u16(hi[i]),
             ));
+            acc[i + 1] = vreinterpretq_u16_u8(xor3_u8(
+                folded1,
+                vreinterpretq_u8_u16(lo[i + 1]),
+                vreinterpretq_u8_u16(hi[i + 1]),
+            ));
+
+            i += 2;
         }
     }
 }

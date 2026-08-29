@@ -759,6 +759,7 @@ impl AdditiveNttF128 {
         );
     }
 
+    #[allow(dead_code)]
     fn forward_transform_interleaved_from_message_fused3_with_helper(
         &self,
         msg: &[F128],
