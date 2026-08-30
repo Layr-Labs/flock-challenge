@@ -1787,6 +1787,31 @@ pub(crate) fn eval_sk_at_vks(log_n: usize) -> Vec<F128> {
     out
 }
 
+/// Memoized inverse basis evaluations `inv_sks_vks[k] = s_k(v_k).inv()`.
+pub(crate) fn eval_inv_sk_at_vks(log_n: usize) -> Vec<F128> {
+    use std::sync::{Mutex, OnceLock};
+    if !crate::micro_stack_enabled() {
+        return batch_inverse_or_zero(&eval_sk_at_vks_uncached(log_n));
+    }
+    static MEMO: OnceLock<Mutex<Vec<(usize, Vec<F128>)>>> = OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(g) = memo.lock() {
+        for (k, v) in g.iter() {
+            if *k == log_n {
+                return v.clone();
+            }
+        }
+    }
+    let sks_vks = eval_sk_at_vks(log_n);
+    let out = batch_inverse_or_zero(&sks_vks);
+    if let Ok(mut g) = memo.lock() {
+        if !g.iter().any(|(k, _)| *k == log_n) {
+            g.push((log_n, out.clone()));
+        }
+    }
+    out
+}
+
 fn eval_sk_at_vks_uncached(log_n: usize) -> Vec<F128> {
     let mut sks_vks = vec![F128::ZERO; log_n + 1];
     sks_vks[0] = F128::ONE;
@@ -2844,8 +2869,8 @@ pub(crate) fn induce_sumcheck_poly(
         table.into_iter().take(n_queries).collect()
     };
 
-    // Precompute inv_sks_vks once across all queries and threads.
-    let inv_sks_vks = batch_inverse_or_zero(sks_vks);
+    // Precompute inv_sks_vks once across all queries and threads (memoized by log_msg_cols).
+    let inv_sks_vks = eval_inv_sk_at_vks(log_msg_cols);
     let use_dense_final_direct =
         ranked_dense_final_direct_enabled(log_msg_cols, v_challenges.len(), n_queries, alpha.len());
     let use_dense_low_domain_trunc = ranked_dense_low_domain_trunc_enabled(use_dense_final_direct);

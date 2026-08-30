@@ -303,7 +303,7 @@ impl Relay {
             st.panicked = false;
             st.posted
         };
-        self.signal.notify_all();
+        self.signal.notify_one();
         seq
     }
 
@@ -351,7 +351,7 @@ impl Relay {
                 st.done += 1;
                 st.panicked = !ok;
             }
-            self.signal.notify_all();
+            self.signal.notify_one();
         }
     }
 }

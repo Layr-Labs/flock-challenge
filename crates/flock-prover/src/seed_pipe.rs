@@ -688,6 +688,7 @@ fn speculative_temporary_path(proof_path: &Path) -> PathBuf {
     temporary.into()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn publish_bytes_atomically(proof_path: &Path, bytes: &[u8]) -> io::Result<()> {
     if proof_path.as_os_str().is_empty() {
         return Err(io::Error::new(
@@ -718,11 +719,18 @@ fn publish_speculative_result(out: &ProveOut) -> io::Result<bool> {
     }
     let proof_path = ranked_proof_path()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing ranked proof path"))?;
-    // Tuple order is `(proof, commitment, claim)`. Borrowing preserves the
-    // result for wrapper adoption and consumes the current pre-encoded prefix
-    // only once, on the publication that the harness can observe first.
-    let bytes = crate::proof_io::r1cs_parts_to_bytes(&out.1, &out.0);
-    publish_bytes_atomically(&proof_path, &bytes)?;
+    let temporary = speculative_temporary_path(&proof_path);
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary)?;
+        crate::proof_io::r1cs_parts_write_into(&out.1, &out.0, &mut file)?;
+        file.flush()?;
+        drop(file);
+        std::fs::rename(&temporary, &proof_path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return result.map(|_| true);
+    }
     Ok(true)
 }
 

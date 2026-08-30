@@ -240,6 +240,35 @@ pub(crate) fn r1cs_parts_to_bytes(
     out
 }
 
+/// Stream borrowed bundle fields directly into a writer.
+///
+/// Streams the stashed pre-encoded prefix and flat `pcs_open` into `w`
+/// without allocating an intermediate ~450 kB heap Vec for the full bundle.
+pub(crate) fn r1cs_parts_write_into<W: std::io::Write>(
+    commitment: &Commitment,
+    proof: &flock_core::proof::R1csProofLigerito,
+    mut w: W,
+) -> std::io::Result<()> {
+    if let Some(prefix) = take_matching_pre_encoded_parts(commitment, proof) {
+        w.write_all(&prefix)?;
+        encode_pcs_open_into(&mut w, &proof.pcs_open);
+        return Ok(());
+    }
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    write_header(&mut header, FLAVOR_R1CS_LIGERITO);
+    w.write_all(&header)?;
+    if fast_pcs_open_encode_enabled() {
+        bincode::serialize_into(&mut w, commitment).map_err(std::io::Error::other)?;
+        bincode::serialize_into(&mut w, &proof.zerocheck).map_err(std::io::Error::other)?;
+        bincode::serialize_into(&mut w, &proof.lincheck).map_err(std::io::Error::other)?;
+        encode_pcs_open_into(&mut w, &proof.pcs_open);
+        Ok(())
+    } else {
+        bincode::serialize_into(&mut w, commitment).map_err(std::io::Error::other)?;
+        bincode::serialize_into(&mut w, proof).map_err(std::io::Error::other)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Publish-prefix pre-encode
 // ---------------------------------------------------------------------------

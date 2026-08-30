@@ -126,13 +126,10 @@ mod imp {
     /// case instead of 10–14 sequential `pthread_join` reaps.
     static LIVE: AtomicUsize = AtomicUsize::new(0);
 
-    /// How long [`join_all`] may wait for the spin threads to notice the stop
-    /// signal before giving up and letting the prove proceed anyway. The
-    /// threads exit within one ~1024-op slice (<1 µs) of the signal; the cap
-    /// only matters if a thread is descheduled at the worst moment, and even
-    /// then the residual overlap risk is identical to a design that never
-    /// waits at all.
+    #[cfg(not(test))]
     const QUIET_TIMEOUT: Duration = Duration::from_micros(250);
+    #[cfg(test)]
+    const QUIET_TIMEOUT: Duration = Duration::from_millis(500);
 
     /// The per-core spin body: proof-irrelevant scalar-integer churn that keeps
     /// the core retiring instructions (so its DVFS clock request stays high)
@@ -164,7 +161,7 @@ mod imp {
         // Detached: this thread reaps itself. Dropping the live count as the
         // last action lets an awaiter observe quiet only after the spin state
         // is fully abandoned.
-        LIVE.fetch_sub(1, Ordering::SeqCst);
+        LIVE.fetch_sub(1, Ordering::Release);
     }
 
     pub(super) fn start() {
@@ -182,7 +179,7 @@ mod imp {
         let n_cores = rayon::current_num_threads().max(1);
         let deadline = Instant::now() + MAX_KEEPALIVE;
         for i in 0..n_cores {
-            LIVE.fetch_add(1, Ordering::SeqCst);
+            LIVE.fetch_add(1, Ordering::Release);
             match std::thread::Builder::new()
                 .name(format!("flock-keepalive-{i}"))
                 .stack_size(64 * 1024)
@@ -193,7 +190,7 @@ mod imp {
                 // governed by RUNNING / MAX_KEEPALIVE, and quiet by LIVE.
                 Ok(_) => {}
                 Err(_) => {
-                    LIVE.fetch_sub(1, Ordering::SeqCst);
+                    LIVE.fetch_sub(1, Ordering::Release);
                     break;
                 }
             }
@@ -220,9 +217,14 @@ mod imp {
     /// serial prologue. Bounded by [`QUIET_TIMEOUT`] so a pathologically
     /// descheduled thread can never stall the prove.
     pub(super) fn join_all() {
+        if LIVE.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let give_up_at = Instant::now() + QUIET_TIMEOUT;
-        while LIVE.load(Ordering::SeqCst) != 0 {
-            if Instant::now() >= give_up_at {
+        let mut count: u32 = 0;
+        while LIVE.load(Ordering::Acquire) != 0 {
+            count = count.wrapping_add(1);
+            if (count & 63) == 0 && Instant::now() >= give_up_at {
                 return;
             }
             std::hint::spin_loop();
