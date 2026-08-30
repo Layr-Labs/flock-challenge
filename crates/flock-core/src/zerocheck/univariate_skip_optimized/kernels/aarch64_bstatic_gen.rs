@@ -8,6 +8,8 @@
 // the witness disagrees, so the kernel is bit-exact for any witness.
 //
 // Included by kernels/aarch64.rs via include!.
+// The complement seed and 7-vary calls below extend the generated dispatch;
+// the fixed mask table itself is unchanged.
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) static BSTATIC_MASKS: [[(u64, u64); 8]; 31] = [
@@ -368,9 +370,13 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
     if !BSTATIC_ARM_LIVE[blk] {
         return false;
     }
-    let partials = match context {
-        StaticBContext::Prepared { partials, .. } => partials,
-        StaticBContext::LegacyPerCall => bstatic_partials(inv_table),
+    let (partials, b_complement) = match context {
+        StaticBContext::Prepared {
+            partials,
+            b_complement,
+            ..
+        } => (partials, b_complement && (3..29).contains(&blk)),
+        StaticBContext::LegacyPerCall => (bstatic_partials(inv_table), false),
     };
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let table_base = inv_table.data_ptr();
@@ -432,22 +438,47 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
             }};
         }
         macro_rules! k_static {
-            ($k:literal, [$(($j0:literal, $j1:literal)),*], [$($js:literal),*]) => {{
+            ($k:literal, $pairs:tt, $singles:tt) => {
+                k_static_inner!($k, $pairs, $singles, true);
+            };
+        }
+        macro_rules! k_complement_only {
+            ($k:literal, $pairs:tt, $singles:tt) => {
+                k_static_inner!($k, $pairs, $singles, b_complement);
+            };
+        }
+        macro_rules! k_static_inner {
+            ($k:literal, [$(($j0:literal, $j1:literal)),*], [$($js:literal),*], $enabled:expr) => {{
                 let off = byte_base_b + $k * N_CHUNKS;
                 let a_row = a_packed.as_ptr().add(off);
                 let b_row = b_packed.as_ptr().add(off);
                 let (m, e) = BSTATIC_MASKS[blk][$k];
-                let b_word = u64::from_le(core::ptr::read_unaligned(b_row.cast::<u64>()));
-                if (b_word & m) == e {
-                    let pp = partials[blk * 8 + $k].as_ptr();
-                    #[allow(unused_mut)]
-                    let mut db0 = vld1q_u8(pp);
-                    #[allow(unused_mut)]
-                    let mut db1 = vld1q_u8(pp.add(16));
-                    #[allow(unused_mut)]
-                    let mut db2 = vld1q_u8(pp.add(32));
-                    #[allow(unused_mut)]
-                    let mut db3 = vld1q_u8(pp.add(48));
+                let b_word = if $enabled {
+                    u64::from_le(core::ptr::read_unaligned(b_row.cast::<u64>()))
+                } else {
+                    0
+                };
+                if $enabled && (b_word & m) == e {
+                    // Only blk 3..28 is admitted: every pinned byte there is
+                    // ff. Thus ~B is zero on the omitted positions and
+                    // T(B) = T(~B) + T(ff) = T(~B) + ONE. Keep the existing
+                    // varying-byte images and weighted-product consumer.
+                    // Unlike the old seed, the canonical seed loads no 64B
+                    // partial row. The disabled/boundary path is unchanged.
+                    #[allow(unused_mut, unused_variables)]
+                    let (b_word, mut db0, mut db1, mut db2, mut db3) = if b_complement {
+                        let one = vdupq_n_u8(F8::ONE.0);
+                        (!b_word, one, one, one, one)
+                    } else {
+                        let pp = partials[blk * 8 + $k].as_ptr();
+                        (
+                            b_word,
+                            vld1q_u8(pp),
+                            vld1q_u8(pp.add(16)),
+                            vld1q_u8(pp.add(32)),
+                            vld1q_u8(pp.add(48)),
+                        )
+                    };
                     $(
                         xor_vary_pair::<$j0, $j1>(
                             table_base,
@@ -548,7 +579,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                 k_generic!(7);
             }
             3 => {
-                k_generic!(0);
+                k_complement_only!(0, [(0, 1), (2, 3), (4, 5)], [6]);
                 k_static!(1, [(6, 7)], []);
                 k_generic!(2);
                 k_generic!(3);
@@ -583,7 +614,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                 k_generic!(2);
                 k_generic!(3);
                 k_static!(4, [(0, 1)], []);
-                k_generic!(5);
+                k_complement_only!(5, [(1, 2), (3, 4), (5, 6)], [7]);
                 k_generic!(6);
                 k_generic!(7);
             }
@@ -601,7 +632,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                 k_static!(0, [], [7]);
                 k_generic!(1);
                 k_generic!(2);
-                k_generic!(3);
+                k_complement_only!(3, [(0, 1), (2, 3), (4, 5)], [6]);
                 k_static!(4, [(6, 7)], []);
                 k_generic!(5);
                 k_generic!(6);
@@ -632,13 +663,13 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                 k_generic!(1);
                 k_generic!(2);
                 k_static!(3, [(0, 1)], []);
-                k_generic!(4);
+                k_complement_only!(4, [(1, 2), (3, 4), (5, 6)], [7]);
                 k_generic!(5);
                 k_generic!(6);
                 k_static!(7, [(0, 1)], []);
             }
             12 => {
-                k_generic!(0);
+                k_complement_only!(0, [(1, 2), (3, 4), (5, 6)], [7]);
                 k_generic!(1);
                 k_generic!(2);
                 k_static!(3, [], [0]);
@@ -650,11 +681,11 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
             13 => {
                 k_generic!(0);
                 k_generic!(1);
-                k_generic!(2);
+                k_complement_only!(2, [(0, 1), (2, 3), (4, 5)], [6]);
                 k_static!(3, [(6, 7)], []);
                 k_generic!(4);
                 k_generic!(5);
-                k_generic!(6);
+                k_complement_only!(6, [(0, 1), (2, 3), (4, 5)], [6]);
                 k_static!(7, [(6, 7)], []);
             }
             14 => {
@@ -685,7 +716,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                 k_generic!(4);
                 k_generic!(5);
                 k_static!(6, [(0, 1)], []);
-                k_generic!(7);
+                k_complement_only!(7, [(1, 2), (3, 4), (5, 6)], [7]);
             }
             17 => {
                 k_generic!(0);
@@ -703,7 +734,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                 k_static!(2, [], [7]);
                 k_generic!(3);
                 k_generic!(4);
-                k_generic!(5);
+                k_complement_only!(5, [(0, 1), (2, 3), (4, 5)], [6]);
                 k_static!(6, [(6, 7)], []);
                 k_generic!(7);
             }
@@ -740,7 +771,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
             22 => {
                 k_generic!(0);
                 k_static!(1, [(0, 1)], []);
-                k_generic!(2);
+                k_complement_only!(2, [(1, 2), (3, 4), (5, 6)], [7]);
                 k_generic!(3);
                 k_generic!(4);
                 k_static!(5, [], [0]);
@@ -758,7 +789,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                 k_generic!(7);
             }
             24 => {
-                k_generic!(0);
+                k_complement_only!(0, [(0, 1), (2, 3), (4, 5)], [6]);
                 k_static!(1, [(6, 7)], []);
                 k_generic!(2);
                 k_generic!(3);
@@ -789,11 +820,11 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
             }
             27 => {
                 k_static!(0, [(0, 1)], []);
-                k_generic!(1);
+                k_complement_only!(1, [(1, 2), (3, 4), (5, 6)], [7]);
                 k_generic!(2);
                 k_generic!(3);
                 k_static!(4, [(0, 1)], []);
-                k_generic!(5);
+                k_complement_only!(5, [(1, 2), (3, 4), (5, 6)], [7]);
                 k_generic!(6);
                 k_generic!(7);
             }
@@ -805,7 +836,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                 k_static!(4, [], [7]);
                 k_generic!(5);
                 k_generic!(6);
-                k_generic!(7);
+                k_complement_only!(7, [(0, 1), (2, 3), (4, 5)], [6]);
             }
             29 => {
                 k_static!(0, [(6, 7)], []);
