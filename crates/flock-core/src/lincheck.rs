@@ -1630,7 +1630,10 @@ fn prove_padded_inner<Ch: Challenger>(
     }
 
     // 6. Send `z_partial` (the post-sumcheck collapsed z_vec). Length 2^k_skip.
-    let z_partial = z_vec.clone();
+    //    `z_vec` is dead after this point (the fn returns `captured_z_vec`, a
+    //    separate pre-sumcheck snapshot), so move instead of clone — same bytes,
+    //    one fewer heap alloc + memcpy per lincheck prove.
+    let z_partial = z_vec;
     challenger.observe_f128_slice(&z_partial);
 
     // 7. Sample fresh z_skip AFTER observing z_partial — gives Schwartz-Zippel

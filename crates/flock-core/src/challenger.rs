@@ -546,9 +546,12 @@ impl Challenger for FsChallenger {
                             .with_max_len(1)
                             .for_each(|_| worker());
                     };
-                    // Mirror the epool engagement floor: tiny blocks drain faster
-                    // than the cross-pool kickoff amortizes.
-                    const GRIND_EPOOL_MIN_CHUNKS: usize = 16;
+                    // Mirror the epool engagement floor (`EPOOL_MIN_CHUNKS = 8`):
+                    // tiny blocks drain faster than the cross-pool kickoff amortizes,
+                    // but at/above the same 8-chunk floor the main fold drains already
+                    // engage the E-pool profitably, so the grind PoW drain should use
+                    // the identical threshold rather than a stale higher one.
+                    const GRIND_EPOOL_MIN_CHUNKS: usize = 8;
                     match crate::epool::epool()
                         .filter(|_| main_threads > 1 && n_chunks >= GRIND_EPOOL_MIN_CHUNKS)
                     {
@@ -806,7 +809,13 @@ fn cpu_blake3_pow_window_inner(
             .with_max_len(1)
             .for_each(|_| worker());
     };
-    match crate::epool::epool().filter(|_| main_threads > 1 && n_chunks >= 16) {
+    // Mirror the epool engagement floor (`EPOOL_MIN_CHUNKS = 8`): this window
+    // drains the same 960-nonce `CHUNK`s as `grind_pow`'s two-pool grind (whose
+    // `GRIND_EPOOL_MIN_CHUNKS` is 8), so engage the E-pool at the same 8-chunk
+    // floor rather than a stale higher one. Bit-identical: every chunk is always
+    // fully scanned (no early-exit bound here) and the result is the global-min
+    // matching nonce regardless of which pool drains which chunk.
+    match crate::epool::epool().filter(|_| main_threads > 1 && n_chunks >= 8) {
         Some(ep) => std::thread::scope(|scope| {
             scope.spawn(|| ep.broadcast(|_| worker()));
             drain_main();
