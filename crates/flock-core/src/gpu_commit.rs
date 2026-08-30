@@ -1607,6 +1607,11 @@ pub(crate) fn give_tree(tree: Vec<crate::merkle::Hash>) {
     imp::give_tree(tree);
 }
 
+/// Take a ranked-size tree allocation from the GPU tree pool (or allocate uninit if empty).
+pub(crate) fn take_tree(n: usize) -> Vec<crate::merkle::Hash> {
+    imp::take_tree(n)
+}
+
 /// Wall of the round-1 AB precompute arm that runs `rayon::join`ed against
 /// the commit (f64 bits; 0 = not yet measured this process). The prover
 /// stores it every prove; the hybrid-split warmup sweep reads it to size its
@@ -5650,7 +5655,7 @@ kernel void blake3_pow_scan(
     }
 
     #[allow(clippy::uninit_vec)]
-    fn take_tree(n: usize) -> Vec<Hash> {
+    pub(crate) fn take_tree(n: usize) -> Vec<Hash> {
         let mut pool = tree_pool_lock();
         for i in 0..pool.len() {
             if pool[i].capacity() >= n {
@@ -13732,6 +13737,9 @@ mod imp {
     }
 
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}
+    pub(crate) fn take_tree(n: usize) -> Vec<crate::merkle::Hash> {
+        crate::alloc_uninit_vec(n)
+    }
 
     pub(crate) fn staging_released() {}
 }
