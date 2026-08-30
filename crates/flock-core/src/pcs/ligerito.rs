@@ -17980,12 +17980,25 @@ mod tests {
             })
         };
 
+        // `induce_sumcheck_poly`'s per-worker query chunking derives its
+        // chunk size from `rayon::current_num_threads()`; on a host with
+        // `n_threads >= n_queries` (this oracle uses 20 queries per round)
+        // every chunk holds exactly one query, so the "add" (non-first-query)
+        // branch this test exists to exercise is never reached — a real
+        // host-topology dependency, not a policy bug. Pin a small dedicated
+        // pool (matching the `.num_threads(2).build()...install(..)` idiom
+        // used throughout this file's other oracles) so the chunking, and
+        // hence which branches run, is deterministic across hosts.
+        let induction_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("build two-thread induction pool");
         let (materialized, materialized_dense_hits, materialized_first_hits, materialized_add_hits) =
-            prove(false, false);
+            induction_pool.install(|| prove(false, false));
         let (dense_kill, dense_kill_hits, dense_kill_first_hits, dense_kill_add_hits) =
-            prove(true, false);
+            induction_pool.install(|| prove(true, false));
         let (candidate, candidate_dense_hits, candidate_first_hits, candidate_add_hits) =
-            prove(true, true);
+            induction_pool.install(|| prove(true, true));
         assert_eq!(materialized_dense_hits, 0);
         assert_eq!((materialized_first_hits, materialized_add_hits), (0, 0));
         assert!(dense_kill_hits > 0, "dense-final kill arm missed induction");

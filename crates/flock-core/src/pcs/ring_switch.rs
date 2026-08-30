@@ -2600,6 +2600,14 @@ pub enum RsEqInd {
         eq_lo: Vec<F128>,
         eq_hi: Vec<F128>,
         table: Vec<F128>,
+        /// Logical length of a caller-proved-dead basis whose two equality
+        /// factors were never evaluated (`FLOCK_NO_RS_ELIDE_DEAD_BASIS=1`
+        /// restores the full zeroed build, `elided_len: None`). `eq_lo` and
+        /// `eq_hi` are both empty exactly when this is `Some`; every reader
+        /// that would dereference their contents asserts this is `None`
+        /// first, since the caller has independently proven those contents
+        /// are never observed on the route this variant takes.
+        elided_len: Option<usize>,
     },
     Sparse {
         len: usize,
@@ -2621,7 +2629,12 @@ impl RsEqInd {
     pub fn len(&self) -> usize {
         match self {
             Self::Dense(v) => v.len(),
-            Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
+            Self::DeferredDense {
+                eq_lo,
+                eq_hi,
+                elided_len,
+                ..
+            } => elided_len.unwrap_or_else(|| eq_lo.len() * eq_hi.len()),
             Self::Sparse { len, .. } => *len,
         }
     }
@@ -2644,7 +2657,13 @@ impl RsEqInd {
                 eq_lo,
                 eq_hi,
                 table,
+                elided_len,
             } => {
+                assert!(
+                    elided_len.is_none(),
+                    "add_scaled_into observed a caller-proved-dead deferred basis; \
+                     the direct-fold8 routing invariant was violated"
+                );
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 for (j, o) in out.iter_mut().enumerate() {
                     *o += gamma * deferred_dense_value(eq_lo, eq_hi, table, log_b, j);
@@ -2666,7 +2685,13 @@ impl RsEqInd {
                 eq_lo,
                 eq_hi,
                 table,
+                elided_len,
             } => {
+                assert!(
+                    elided_len.is_none(),
+                    "to_dense observed a caller-proved-dead deferred basis; \
+                     the direct-fold8 routing invariant was violated"
+                );
                 let log_b = eq_lo.len().trailing_zeros() as usize;
                 let l = eq_lo.len() * eq_hi.len();
                 (0..l)
@@ -3348,22 +3373,28 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             // bit representation.
                             let suffix = dense_suffixes[d];
                             let n_lo = deferred_split_n_lo(suffix.len());
-                            let (eq_lo, eq_hi) = if elide_basis {
+                            let (eq_lo, eq_hi, elided_len) = if elide_basis {
                                 // Only the logical length is observed on the
-                                // direct-fold8 route.  Preserve it exactly
-                                // without evaluating either dead tensor
-                                // factor.
-                                (
-                                    vec![F128::ZERO; 1usize << n_lo],
-                                    vec![F128::ZERO; 1usize << (suffix.len() - n_lo)],
-                                )
+                                // direct-fold8 route: the caller has already
+                                // proven neither factor's contents are ever
+                                // read (see `prove_batched_padded_with_precomputed_elidable`'s
+                                // doc comment). Skip building and zeroing
+                                // both `2^n_lo`/`2^(suffix.len()-n_lo)`
+                                // vectors entirely; `RsEqInd::len` and every
+                                // combine-side gate that only inspects the
+                                // logical length still see the exact same
+                                // value. `FLOCK_NO_RS_ELIDE_DEAD_BASIS=1`
+                                // restores the full zeroed build below.
+                                (Vec::new(), Vec::new(), Some(1usize << suffix.len()))
                             } else {
-                                build_eq_split(suffix, n_lo)
+                                let (lo, hi) = build_eq_split(suffix, n_lo);
+                                (lo, hi, None)
                             };
                             RsEqInd::DeferredDense {
                                 eq_lo,
                                 eq_hi,
                                 table,
+                                elided_len,
                             }
                         } else {
                             RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
@@ -4580,27 +4611,40 @@ mod tests {
                 control[claim].1.rs_eq_ind.len()
             );
 
-            let (control_lo, control_hi, control_table) = match &control[claim].1.rs_eq_ind {
-                RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => (eq_lo, eq_hi, table),
-                _ => panic!("control claim must be deferred dense"),
-            };
-            let (candidate_lo, candidate_hi, candidate_table) = match &candidate[claim].1.rs_eq_ind
-            {
-                RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => (eq_lo, eq_hi, table),
-                _ => panic!("candidate claim must be deferred dense"),
-            };
-            assert_eq!(candidate_lo.len(), control_lo.len());
-            assert_eq!(candidate_hi.len(), control_hi.len());
-            assert!(candidate_lo.iter().all(|&value| value == F128::ZERO));
-            assert!(candidate_hi.iter().all(|&value| value == F128::ZERO));
+            let (control_lo, control_hi, control_table, control_elided) =
+                match &control[claim].1.rs_eq_ind {
+                    RsEqInd::DeferredDense {
+                        eq_lo,
+                        eq_hi,
+                        table,
+                        elided_len,
+                    } => (eq_lo, eq_hi, table, *elided_len),
+                    _ => panic!("control claim must be deferred dense"),
+                };
+            let (candidate_lo, candidate_hi, candidate_table, candidate_elided) =
+                match &candidate[claim].1.rs_eq_ind {
+                    RsEqInd::DeferredDense {
+                        eq_lo,
+                        eq_hi,
+                        table,
+                        elided_len,
+                    } => (eq_lo, eq_hi, table, *elided_len),
+                    _ => panic!("candidate claim must be deferred dense"),
+                };
+            assert_eq!(
+                control_elided, None,
+                "control (basis_elidable=false) must build the real basis"
+            );
+            assert_eq!(
+                candidate_elided,
+                Some(control_lo.len() * control_hi.len()),
+                "candidate (basis_elidable=true) must elide with the exact \
+                 logical length preserved"
+            );
+            assert!(
+                candidate_lo.is_empty() && candidate_hi.is_empty(),
+                "elided factors must not be allocated"
+            );
             assert_eq!(candidate_table, control_table);
 
             let control_direct = control[claim]

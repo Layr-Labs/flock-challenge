@@ -1238,6 +1238,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                     eq_lo,
                     eq_hi,
                     table,
+                    ..
                 } => Some((
                     eq_lo.as_slice(),
                     eq_hi.as_slice(),
@@ -1474,6 +1475,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                     eq_lo,
                     eq_hi,
                     table,
+                    ..
                 } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
                 _ => None,
             })
@@ -1955,6 +1957,7 @@ mod tests {
                         eq_lo: vec![F128::ONE],
                         eq_hi: vec![F128::ONE],
                         table: Vec::new(),
+                        elided_len: None,
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: Some(direct()),
@@ -1992,6 +1995,7 @@ mod tests {
                         eq_lo: vec![F128::ONE],
                         eq_hi: vec![F128::ONE],
                         table: Vec::new(),
+                        elided_len: None,
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: Some(direct()),
@@ -2007,6 +2011,7 @@ mod tests {
                         eq_lo: vec![F128::ONE],
                         eq_hi: vec![F128::ONE],
                         table: Vec::new(),
+                        elided_len: None,
                     },
                     sumcheck_claim: F128::ZERO,
                     direct_fold2: None,

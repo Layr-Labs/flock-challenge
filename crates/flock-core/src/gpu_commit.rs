@@ -14033,6 +14033,7 @@ mod tests {
     /// dedicated plan. Here we simply compare full transforms; the dedicated
     /// single-layer test below pins per-layer exactness.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_full_ntt_matches_cpu_small_shapes() {
         for (log_d, start_layer) in [(6usize, 1usize), (7, 1), (8, 2), (9, 0), (10, 1)] {
             let ntt = AdditiveNttF128::standard(log_d);
@@ -14302,6 +14303,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_single_layers_match_cpu() {
         // Exercise every fused width f=1..4 and both shallow and deep layers
         // by running [layer, log_d) on GPU vs scalar for various layers: the
@@ -14384,6 +14386,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_merkle_matches_cpu_small() {
         for log_leaves in [0usize, 1, 4, 8, 10] {
             let n_leaves = 1usize << log_leaves;
@@ -15756,6 +15759,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// option, so a scratch allocator that stopped returning page-aligned
     /// blocks would silently disable the GPU fold. Pin that here.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn ranked_lincheck_stripe_is_wrappable_without_a_copy() {
         const PAGE: usize = 16384;
         let stripe = crate::scratch::take_u8(1usize << 29);
@@ -15777,6 +15781,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// equality check must pass and publish a share without poisoning) and
     /// the timed prefix path.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_zc_r2_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
@@ -15990,6 +15995,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// table. Exercises calibration (internal equality oracle + share
     /// publication without poisoning) and the timed prefix path.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_zc_t3_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
@@ -16124,6 +16130,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// (`fold_pairs` + message) bit-for-bit. Exercises calibration and the
     /// timed prefix path on real Metal.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_zc_loop_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
