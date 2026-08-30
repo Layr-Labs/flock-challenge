@@ -732,13 +732,14 @@ pub(crate) fn cpu_transform_and_tree(
     };
     let pipelined_leaves = helper.is_some();
     let mut prehashed_tree = helper.map(|_| {
-        // Ranked: 64 MiB flat tree. Allocation is uninitialized, so only the
-        // 32 MiB leaf prefix is page-touched during the NTT; the internal half
-        // remains untouched until the normal parent-level build below. This
-        // advances allocation lifetime but does not raise the commit's final
-        // codeword+tree peak alongside the retained prover scratch pools.
+        // Ranked: 64 MiB flat tree. The tree pool already retains up to three
+        // 64 MiB trees from the warmup proves, so a fresh
+        // `alloc_uninit_vec` here would force the kernel to fault in ~4k pages
+        // and unmap the buffer at `ProverData::drop` even though the next
+        // prove wants the same bytes. Take from the pool when a warm buffer
+        // is available; fall back to a fresh uninit alloc on miss.
         let total_nodes = 2 * params.n_leaves() - 1;
-        crate::alloc_uninit_vec::<Hash>(total_nodes)
+        crate::gpu_commit::take_tree(total_nodes)
     });
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let cpu_ntt0 = timing.then(commit_cpu_ms);
