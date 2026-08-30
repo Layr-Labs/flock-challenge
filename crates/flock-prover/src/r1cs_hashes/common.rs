@@ -84,10 +84,9 @@ impl<const NW: usize> BitRecord<NW> {
 #[inline(always)]
 pub(crate) fn add_carry_parts(x: u32, y: u32) -> (u32, u32, u32, u32) {
     let sum = x.wrapping_add(y);
-    let cin = sum ^ x ^ y;
     const MASK_LO31: u32 = 0x7FFF_FFFF;
-    let left = (x ^ cin) & MASK_LO31;
-    let right = (y ^ cin) & MASK_LO31;
+    let left = (sum ^ y) & MASK_LO31;
+    let right = (sum ^ x) & MASK_LO31;
     let carry_aux = left & right;
     (sum, left, right, carry_aux)
 }
@@ -928,9 +927,8 @@ pub(crate) fn add_carry_parts_v(
     let mut carry = [0u32; BM_V];
     for j in 0..BM_V {
         let s = x[j].wrapping_add(y[j]);
-        let cin = s ^ x[j] ^ y[j];
-        let l = (x[j] ^ cin) & MASK_LO31;
-        let r = (y[j] ^ cin) & MASK_LO31;
+        let l = (s ^ y[j]) & MASK_LO31;
+        let r = (s ^ x[j]) & MASK_LO31;
         sum[j] = s;
         left[j] = l;
         right[j] = r;

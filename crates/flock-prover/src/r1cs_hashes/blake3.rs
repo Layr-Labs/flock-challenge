@@ -1883,6 +1883,20 @@ pub(crate) mod witgen_simd {
         }
     }
 
+    /// Cached 32-byte store pair via a single `stp` instruction.
+    #[inline(always)]
+    unsafe fn store_pair(x: V4, y: V4, p: *mut u32) {
+        unsafe {
+            core::arch::asm!(
+                "stp {0:q}, {1:q}, [{2}]",
+                in(vreg) x,
+                in(vreg) y,
+                in(reg) p,
+                options(nostack)
+            );
+        }
+    }
+
     /// Last useful word (bit 15408 → word 481, 17 bits used).
     const LAST_WORD: usize = (USEFUL_BITS - 1) / 32; // 481
 
@@ -2012,14 +2026,10 @@ pub(crate) mod witgen_simd {
                     store_nt_pair(x.2, y.2, p2);
                     store_nt_pair(x.3, y.3, p3);
                 } else {
-                    vst1q_u32(p0, x.0);
-                    vst1q_u32(p0.add(4), y.0);
-                    vst1q_u32(p1, x.1);
-                    vst1q_u32(p1.add(4), y.1);
-                    vst1q_u32(p2, x.2);
-                    vst1q_u32(p2.add(4), y.2);
-                    vst1q_u32(p3, x.3);
-                    vst1q_u32(p3.add(4), y.3);
+                    store_pair(x.0, y.0, p0);
+                    store_pair(x.1, y.1, p1);
+                    store_pair(x.2, y.2, p2);
+                    store_pair(x.3, y.3, p3);
                 }
             }
         }
@@ -2049,23 +2059,46 @@ pub(crate) mod witgen_simd {
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
         unsafe {
             let sum = vaddq_u32(x, y);
-            let cin = veorq_u32(veorq_u32(sum, x), y);
-            let left = veorq_u32(x, cin);
-            let right = veorq_u32(y, cin);
+            let left = veorq_u32(sum, y);
+            let right = veorq_u32(sum, x);
             let carry = vandq_u32(left, right);
             (sum, left, right, carry)
         }
     }
 
-    /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR; shr/shl/or is
-    /// exact bitwise. M = 32 − N is spelled out at the call site (stable
-    /// Rust cannot derive const arguments from const parameters).
+    /// `(x ^ y).rotate_right(16)` via NEON `vrev32q_u16` (single `rev32` instruction).
     #[inline(always)]
-    fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
-        debug_assert_eq!(N + M, 32);
+    fn xor_rotr16(x: V4, y: V4) -> V4 {
         unsafe {
             let v = veorq_u32(x, y);
-            vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+            vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(v)))
+        }
+    }
+
+    /// `(x ^ y).rotate_right(12)` via `vshl` + `vsri` (2 instructions).
+    #[inline(always)]
+    fn xor_rotr12(x: V4, y: V4) -> V4 {
+        unsafe {
+            let v = veorq_u32(x, y);
+            vsriq_n_u32::<12>(vshlq_n_u32::<20>(v), v)
+        }
+    }
+
+    /// `(x ^ y).rotate_right(8)` via `vshl` + `vsri` (2 instructions).
+    #[inline(always)]
+    fn xor_rotr8(x: V4, y: V4) -> V4 {
+        unsafe {
+            let v = veorq_u32(x, y);
+            vsriq_n_u32::<8>(vshlq_n_u32::<24>(v), v)
+        }
+    }
+
+    /// `(x ^ y).rotate_right(7)` via `vshl` + `vsri` (2 instructions).
+    #[inline(always)]
+    fn xor_rotr7(x: V4, y: V4) -> V4 {
+        unsafe {
+            let v = veorq_u32(x, y);
+            vsriq_n_u32::<7>(vshlq_n_u32::<25>(v), v)
         }
     }
 
@@ -2262,18 +2295,13 @@ pub(crate) mod witgen_simd {
                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
                 m[13], m[14], m[15], tlo, thi, blen, flags,
             ];
-            vst1q_u32(
-                zs.add(16) as *mut u32,
-                vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
-            );
+            let w0 = vorrq_u32(one, vshlq_n_u32::<1>(chain[0]));
+            vst1q_u32(zs.add(16) as *mut u32, w0);
+            vst1q_u32(ast.add(16) as *mut u32, w0);
             for k in 1..20usize {
-                let w = vorrq_u32(vshrq_n_u32::<31>(chain[k - 1]), vshlq_n_u32::<1>(chain[k]));
+                let w = vsriq_n_u32::<31>(vshlq_n_u32::<1>(chain[k]), chain[k - 1]);
                 vst1q_u32(zs.add(16 + k) as *mut u32, w);
-            }
-            // a's message region equals z's.
-            for w in 16..36usize {
-                let v = vld1q_u32(zs.add(w) as *const u32);
-                vst1q_u32(ast.add(w) as *mut u32, v);
+                vst1q_u32(ast.add(16 + k) as *mut u32, w);
             }
 
             // ---- G stream (bits 1153..15409): sequential push network ----
@@ -2295,12 +2323,12 @@ pub(crate) mod witgen_simd {
                     pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C1, 31, c1);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
-                    let d1 = xor_rotr::<16, 16>(state[$ld], a1);
+                    let d1 = xor_rotr16(state[$ld], a1);
                     let (c1s, l2, r2, c2) = add_carry_parts_v(state[$lc], d1);
                     pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C2, 31, c2);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
-                    let b1 = xor_rotr::<12, 20>(state[$lb], c1s);
+                    let b1 = xor_rotr12(state[$lb], c1s);
                     let (t1, l3, r3, c3) = add_carry_parts_v(a1, b1);
                     pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C3, 31, c3);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
@@ -2309,12 +2337,12 @@ pub(crate) mod witgen_simd {
                     pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C4, 31, c4);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
-                    let d2 = xor_rotr::<8, 24>(d1, a2);
+                    let d2 = xor_rotr8(d1, a2);
                     let (c2s, l5, r5, c5) = add_carry_parts_v(c1s, d2);
                     pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C5, 31, c5);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
-                    let bn = xor_rotr::<7, 25>(b1, c2s);
+                    let bn = xor_rotr7(b1, c2s);
                     pushf!(wz, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
