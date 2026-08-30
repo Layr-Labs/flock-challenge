@@ -241,9 +241,10 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 fn vector_resident_rows() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_NEON_ROWS").is_none())
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_NEON_ROWS").is_none());
+    *ON
 }
 
 /// Rate-1/2 first-pass row kernel: one load of the radix-8 row group from
