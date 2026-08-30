@@ -1,5 +1,8 @@
 use crate::field::{F128, F256Unreduced};
 
+mod raw_packed;
+pub(crate) use raw_packed::fold2_packed_and_round45_chunk_neon_8;
+
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 struct WideNeon {
@@ -675,7 +678,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
 /// Returns the four folded rows plus whether the b≡1 shortcut was taken.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn r2_pair_fold_and_store(
+unsafe fn r2_pair_fold_and_store<const MATERIALIZE: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -710,8 +713,10 @@ unsafe fn r2_pair_fold_and_store(
     unsafe {
         let zero = vdupq_n_u64(0);
         if padded {
-            store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            if MATERIALIZE {
+                store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            }
             return (zero, zero, zero, zero, false);
         }
 
@@ -732,18 +737,23 @@ unsafe fn r2_pair_fold_and_store(
 
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
-            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            if MATERIALIZE {
+                store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
+                let delta_pair =
+                    core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            }
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
-        store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-        let delta_pair =
-            core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        if MATERIALIZE {
+            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
+            let delta_pair =
+                core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
+            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        }
         (a0, a1, b0, b1, false)
     }
 }
@@ -788,9 +798,54 @@ unsafe fn r2_pair_fold_and_store(
 /// need all four scaled rows.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const FULL: bool,
     const ODD_ON_GPU: bool,
+>(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    periodic_padding: bool,
+    out: *mut F128,
+) {
+    unsafe {
+        fold_round2_chunk_neon_lookahead_impl_8::<FULL, ODD_ON_GPU, true>(
+            table_data,
+            a_packed,
+            b_packed,
+            anchors,
+            deltas,
+            eq_lo,
+            lo_size,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            degen,
+            periodic_padding,
+            out,
+        );
+    }
+}
+
+/// Shared arithmetic for the materializing and message-only producers.
+/// With `MATERIALIZE = false`, anchors/deltas may be null: every pointer
+/// offset and store involving them is inside the compile-time true arm.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold_round2_chunk_neon_lookahead_impl_8<
+    const FULL: bool,
+    const ODD_ON_GPU: bool,
+    const MATERIALIZE: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -841,12 +896,14 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 
         macro_rules! zero_group {
             ($u:expr) => {{
-                let x_lo0 = 2 * $u;
-                let x_lo1 = x_lo0 + 1;
-                store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
-                store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                if MATERIALIZE {
+                    let x_lo0 = 2 * $u;
+                    let x_lo1 = x_lo0 + 1;
+                    store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
+                    vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
+                    store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
+                    vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                }
             }};
         }
 
@@ -857,10 +914,10 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let pad0 = $pad0;
                 let pad1 = $pad1;
 
-                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
+                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store::<MATERIALIZE>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
                 );
-                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
+                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store::<MATERIALIZE>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
                 );
 
@@ -2775,5 +2832,27 @@ mod tests {
         assert_eq!(periodic.0, generic.0, "anchor schedule mismatch");
         assert_eq!(periodic.1, generic.1, "delta schedule mismatch");
         assert_eq!(periodic.2, generic.2, "message/lookahead mismatch");
+
+        for periodic_padding in [false, true] {
+            let mut message_only = [F128::ZERO; 8];
+            unsafe {
+                fold_round2_chunk_neon_lookahead_impl_8::<true, false, false>(
+                    table.as_ptr().cast::<u8>(),
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    eq_lo.as_ptr(),
+                    LO_SIZE,
+                    0,
+                    127,
+                    121,
+                    true,
+                    periodic_padding,
+                    message_only.as_mut_ptr(),
+                );
+            }
+            assert_eq!(message_only, periodic.2, "message-only/null-output mismatch");
+        }
     }
 }

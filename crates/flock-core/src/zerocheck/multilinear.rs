@@ -45,6 +45,8 @@ use crate::zerocheck::PaddingSpec;
 use crate::zerocheck::univariate_skip::{SplitEqGhash, build_eq, pack_bits};
 
 mod kernels;
+mod raw_packed;
+pub(crate) use raw_packed::fold2_packed_and_round45_into;
 
 /// Pure selector for the Apple/AES inverse-reuse micro-candidate. Only the
 /// literal value `"1"` disables it; every other value keeps the candidate on.
@@ -92,7 +94,7 @@ use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
     fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8, fold_compact_stream_chunk_neon,
-    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_lookahead_8,
+    fold_round2_chunk_neon_lookahead_impl_8, fold_round2_chunk_neon_unchecked_8,
     fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
     fold2_and_message_aarch64, fold2_and_message_lookahead_aarch64,
     fold2_compact_and_round4_chunk_neon_8, fold2_compact_and_round45_chunk_neon_8,
@@ -1736,6 +1738,63 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     padding: &PaddingSpec,
     deltas_backing: Option<ScratchBytes>,
 ) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
+    let (compact, m1, mi, lookahead) =
+        uni_skip_fold_and_round_pair_padded_lookahead_impl::<true>(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            table,
+            mlv_challenges,
+            padding,
+            deltas_backing,
+        );
+    (
+        compact.expect("materializing round two must return compact state"),
+        m1,
+        mi,
+        lookahead,
+    )
+}
+
+/// Round-two messages without the 1.5 GiB ranked anchor/delta surface.
+/// The next two challenges are consumed by the packed reconstruction, so
+/// the original packed A/B remain the only retained row representation.
+pub(crate) fn uni_skip_fold_and_round_pair_packed_padded_lookahead(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> (F128, F128, Round3Lookahead) {
+    let (compact, m1, mi, lookahead) =
+        uni_skip_fold_and_round_pair_padded_lookahead_impl::<false>(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            table,
+            mlv_challenges,
+            padding,
+            None,
+        );
+    debug_assert!(compact.is_none());
+    (m1, mi, lookahead)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn uni_skip_fold_and_round_pair_padded_lookahead_impl<const MATERIALIZE: bool>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    deltas_backing: Option<ScratchBytes>,
+) -> (Option<UniSkipCompactFold>, F128, F128, Round3Lookahead) {
     assert_eq!(k_skip, 6, "lookahead compact round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
     let n_chunks = table.n_chunks;
@@ -1747,16 +1806,21 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let r1 = mlv_challenges[1];
     assert_ne!(r1, F128::ZERO, "lookahead requires a non-zero r[k_skip+1]");
 
-    let deltas_len = 2 * n_pairs * n_chunks;
-    let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take_full_overwrite(deltas_len));
-    assert_eq!(
-        deltas.len(),
-        deltas_len,
-        "donated compact delta backing has the wrong byte length"
-    );
-    let mut compact = UniSkipCompactFold {
-        anchors: crate::scratch::take_f128(2 * n_pairs),
-        deltas,
+    let mut compact = if MATERIALIZE {
+        let deltas_len = 2 * n_pairs * n_chunks;
+        let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take_full_overwrite(deltas_len));
+        assert_eq!(
+            deltas.len(),
+            deltas_len,
+            "donated compact delta backing has the wrong byte length"
+        );
+        Some(UniSkipCompactFold {
+            anchors: crate::scratch::take_f128(2 * n_pairs),
+            deltas,
+        })
+    } else {
+        assert!(deltas_backing.is_none());
+        None
     };
 
     let n_vars = mlv_challenges.len() - 1;
@@ -1813,18 +1877,32 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     // [p1_odd, pinf_odd, W0, W3, W4, W5], eq_hi-weighted, one slot per chunk.
     let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
-    let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
-    let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
+    let (anchors_base, deltas_base) = if let Some(compact) = compact.as_mut() {
+        (
+            crate::epool::SyncPtr(compact.anchors.as_mut_ptr()),
+            crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr()),
+        )
+    } else {
+        (
+            crate::epool::SyncPtr(core::ptr::null_mut::<F128>()),
+            crate::epool::SyncPtr(core::ptr::null_mut::<u8>()),
+        )
+    };
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and both partial slots.
-        let (anchors, deltas) = unsafe {
-            (
-                anchors_base.ptr().add(x_hi * anchor_chunk_size),
-                deltas_base.ptr().add(x_hi * delta_chunk_size),
-            )
+        let (anchors, deltas) = if MATERIALIZE {
+            unsafe {
+                (
+                    anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                    deltas_base.ptr().add(x_hi * delta_chunk_size),
+                )
+            }
+        } else {
+            // No pointer arithmetic is permitted on the absent surfaces.
+            (core::ptr::null_mut(), core::ptr::null_mut())
         };
         let pair_idx_base = x_hi * lo_size;
         let row_base = pair_idx_base * 2;
@@ -1841,7 +1919,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
                 if full {
-                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                    fold_round2_chunk_neon_lookahead_impl_8::<true, false, MATERIALIZE>(
                         t,
                         ap,
                         bp,
@@ -1857,7 +1935,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
+                    fold_round2_chunk_neon_lookahead_impl_8::<false, true, MATERIALIZE>(
                         t,
                         ap,
                         bp,
@@ -1873,7 +1951,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         out.as_mut_ptr(),
                     );
                 } else {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
+                    fold_round2_chunk_neon_lookahead_impl_8::<false, false, MATERIALIZE>(
                         t,
                         ap,
                         bp,
@@ -1894,8 +1972,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
 
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let anchors = unsafe { std::slice::from_raw_parts_mut(anchors, anchor_chunk_size) };
-            out = round2_lookahead_chunk_scalar(
+            out = round2_lookahead_chunk_scalar::<MATERIALIZE>(
                 a_packed,
                 b_packed,
                 table,
@@ -1967,18 +2044,26 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
             }
             crate::gpu_commit::ZcR2Result::Failed => {
                 // Redo exactly the skipped prefix products — slower, still
-                // exact. Throwaway anchor/delta scratch: the real ranges were
-                // already written by the lookahead pass. The full-lookahead
-                // monomorphization is used so the odd-parity slots are
-                // recovered too when the CPU sweep skipped them.
-                let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
-                let mut scr_deltas = vec![0u8; delta_chunk_size];
+                // exact. The materializing arm uses throwaway scratch because
+                // its real ranges were already written; message-only keeps
+                // both surfaces absent. Recover the odd-parity slots too
+                // when the CPU sweep skipped them.
+                let mut scr_anchors = if MATERIALIZE {
+                    vec![F128::ZERO; anchor_chunk_size]
+                } else {
+                    Vec::new()
+                };
+                let mut scr_deltas = if MATERIALIZE {
+                    vec![0u8; delta_chunk_size]
+                } else {
+                    Vec::new()
+                };
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
                     unsafe {
-                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                        fold_round2_chunk_neon_lookahead_impl_8::<true, false, MATERIALIZE>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
@@ -2008,13 +2093,13 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         }
     }
 
-    // Both the standard and lookahead round-two producers promise identical
-    // full delta coverage. Only after the CPU/GPU writers join may the compact
-    // reconstruction expose the byte backing to its readers.
-    // SAFETY: the lookahead writer has the same complete delta-store contract
-    // as the standard writer. All hetero workers and the optional GPU-prefix
-    // fallback have joined, covering every byte including padding rows.
-    unsafe { compact.deltas.mark_fully_initialized() };
+    // Only the materializing arm can publish full delta coverage. The
+    // message-only route has neither storage nor a provenance token to mint.
+    if let Some(compact) = compact.as_mut() {
+        // SAFETY: all hetero workers and optional GPU-prefix fallback have
+        // joined, covering every byte including padding rows.
+        unsafe { compact.deltas.mark_fully_initialized() };
+    }
 
     let (sum1, sum_inf) = partials
         .iter()
@@ -2046,11 +2131,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
 /// Portable reference for one lookahead round-two chunk (non-AArch64 builds).
 #[cfg(not(target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
-fn round2_lookahead_chunk_scalar(
+fn round2_lookahead_chunk_scalar<const MATERIALIZE: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     table: &UniSkipFoldTable,
-    anchors: &mut [F128],
+    anchors: *mut F128,
     deltas: *mut u8,
     eq_lo: &[F128],
     lo_size: usize,
@@ -2066,13 +2151,17 @@ fn round2_lookahead_chunk_scalar(
     let mut pinf_odd = F256Unreduced::ZERO;
     let mut w = [F256Unreduced::ZERO; 4];
 
-    let fold_pair = |x_lo: usize, anchors: &mut [F128]| {
+    let fold_pair = |x_lo: usize| {
         if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-            anchors[2 * x_lo] = F128::ZERO;
-            anchors[2 * x_lo + 1] = F128::ZERO;
-            // SAFETY: the caller passes the unique raw destination for this
-            // x_hi chunk; this pair owns two complete n_chunks rows.
-            unsafe { core::ptr::write_bytes(deltas.add(2 * x_lo * n_chunks), 0, 2 * n_chunks) };
+            if MATERIALIZE {
+                // SAFETY: this pair exclusively owns its two anchors and
+                // two byte rows; this arm never runs for absent surfaces.
+                unsafe {
+                    anchors.add(2 * x_lo).write(F128::ZERO);
+                    anchors.add(2 * x_lo + 1).write(F128::ZERO);
+                    core::ptr::write_bytes(deltas.add(2 * x_lo * n_chunks), 0, 2 * n_chunks);
+                }
+            }
             return None;
         }
         let x0g = row_base + 2 * x_lo;
@@ -2085,26 +2174,28 @@ fn round2_lookahead_chunk_scalar(
         let a1 = table.fold_one_row(a1_bytes);
         let b0 = table.fold_one_row(b0_bytes);
         let b1 = table.fold_one_row(b1_bytes);
-        anchors[2 * x_lo] = a0;
-        anchors[2 * x_lo + 1] = b0;
-        for j in 0..n_chunks {
-            // SAFETY: each indexed byte belongs to this chunk/pair and is
-            // written exactly once before the outer join publishes it.
+        if MATERIALIZE {
+            // SAFETY: the queue grants exclusive ownership of these rows;
+            // all offsets stay inside their present, allocated surfaces.
             unsafe {
-                deltas
-                    .add(2 * x_lo * n_chunks + j)
-                    .write(a0_bytes[j] ^ a1_bytes[j]);
-                deltas
-                    .add((2 * x_lo + 1) * n_chunks + j)
-                    .write(b0_bytes[j] ^ b1_bytes[j]);
+                anchors.add(2 * x_lo).write(a0);
+                anchors.add(2 * x_lo + 1).write(b0);
+                for j in 0..n_chunks {
+                    deltas
+                        .add(2 * x_lo * n_chunks + j)
+                        .write(a0_bytes[j] ^ a1_bytes[j]);
+                    deltas
+                        .add((2 * x_lo + 1) * n_chunks + j)
+                        .write(b0_bytes[j] ^ b1_bytes[j]);
+                }
             }
         }
         Some((a0, a1, b0, b1))
     };
 
     for u in 0..lo_size / 2 {
-        let even = fold_pair(2 * u, anchors);
-        let odd = fold_pair(2 * u + 1, anchors);
+        let even = fold_pair(2 * u);
+        let odd = fold_pair(2 * u + 1);
         if even.is_none() && odd.is_none() {
             continue;
         }

@@ -29,10 +29,12 @@ pub mod univariate_skip_optimized;
 use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into,
     fold_compact_and_compute_round_pair, fold_in_place_pair, fold2_compact_and_round4_into,
-    fold2_compact_and_round45_into, fold2_plain_and_round6_into, fold2_plain_and_round67_into,
+    fold2_compact_and_round45_into, fold2_packed_and_round45_into, fold2_plain_and_round6_into,
+    fold2_plain_and_round67_into,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_lookahead,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
+    uni_skip_fold_and_round_pair_packed_padded_lookahead,
 };
 use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
@@ -76,6 +78,46 @@ fn cascade2_off() -> bool {
         return true;
     }
     std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1")
+}
+
+/// The packed R2 representation is admitted only when the first lookahead
+/// cascade will consume it. Other shapes and every fallback keep compact
+/// anchors/deltas; exactly FLOCK_NO_ZC_R2_PACKED_REPLAY=1 restores that path.
+fn packed_r2_replay_selected(
+    apple_aes: bool,
+    m: usize,
+    k_skip: usize,
+    padding: &PaddingSpec,
+    use_cascade: bool,
+    kill: Option<&std::ffi::OsStr>,
+) -> bool {
+    apple_aes
+        && m == 32
+        && k_skip == 6
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+        && use_cascade
+        && kill != Some(std::ffi::OsStr::new("1"))
+}
+
+fn ranked_packed_r2_replay_enabled(
+    m: usize,
+    k_skip: usize,
+    padding: &PaddingSpec,
+    use_cascade: bool,
+) -> bool {
+    packed_r2_replay_selected(
+        cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        )),
+        m,
+        k_skip,
+        padding,
+        use_cascade,
+        std::env::var_os("FLOCK_NO_ZC_R2_PACKED_REPLAY").as_deref(),
+    )
 }
 
 /// Test-only forced-off latch for the third-level cascade (rounds 7+8),
@@ -781,8 +823,29 @@ fn prove_packed_padded_inner<C: Challenger>(
     // in the tree as the oracle anyway.
     let use_lookahead =
         (m == 32 || cfg!(test)) && n_mlv >= 6 && r[k_skip + 1] != F128::ZERO && !lookahead_off();
+    // Decide the first cascade BEFORE choosing R2's retained representation.
+    // Without it the original compact state is required by the consumer.
+    let use_cascade = use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
+    let use_packed_replay = ranked_packed_r2_replay_enabled(m, k_skip, padding, use_cascade);
 
-    let (compact_mlv, msg_1, msg_inf, lookahead) = if use_lookahead {
+    let (compact_mlv, msg_1, msg_inf, lookahead) = if use_packed_replay {
+        // This backing contains the now-dead AB transform, not R2 deltas.
+        // Return it without minting the full-R2-overwrite provenance token:
+        // no R2 writes occurred, so a later R1 take may need its cold fill.
+        if let Some(backing) = compact_deltas {
+            backing.recycle();
+        }
+        let (m1, mi, la) = uni_skip_fold_and_round_pair_packed_padded_lookahead(
+            a_packed,
+            b_packed,
+            m,
+            k_skip,
+            &fold_table,
+            &mlv_arg,
+            padding,
+        );
+        (None, m1, mi, Some(la))
+    } else if use_lookahead {
         let (compact, m1, mi, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
             a_packed,
             b_packed,
@@ -793,7 +856,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             padding,
             compact_deltas,
         );
-        (compact, m1, mi, Some(la))
+        (Some(compact), m1, mi, Some(la))
     } else {
         let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             a_packed,
@@ -805,7 +868,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             padding,
             compact_deltas,
         );
-        (compact, m1, mi, None)
+        (Some(compact), m1, mi, None)
     };
 
     if zc_timing {
@@ -856,7 +919,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     // the incumbent route, which stays in the tree as the oracle anyway.
     // n_mlv ≥ 7 keeps every eq split at lo_size ≥ 2 and the composed input
     // ≥ 32. Kill switch: FLOCK_NO_ZC_CASCADE2=1 (exact '1').
-    let use_cascade = use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
+    // `use_cascade` was fixed before R2 so the selected representation and
+    // this consumer cannot disagree.
 
     // Cascade one level deeper still (rounds 7+8, see
     // `fold2_plain_and_round67_into`): the composed 5+6 pass materializes each
@@ -918,7 +982,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         // Rounds three and four now fold together in one pass over the compact
         // state, replacing the T3 reconstruction *and* tail iteration i = 1.
         let t_k = std::time::Instant::now();
-        let n_groups = compact_mlv.len() / 2;
+        let n_groups = 1usize << (n_mlv - 2);
         let mut r_next4 = vec![F128::ONE; n_mlv - 2];
         r_next4[1..].copy_from_slice(&r[k_skip + 3..]);
         // Unpinned: these become the loop-round arm's no-copy wrap targets
@@ -927,22 +991,40 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut a_out = crate::scratch::take_f128_unpinned(n_groups);
         let mut b_out = crate::scratch::take_f128_unpinned(n_groups);
         if use_cascade {
-            let (m4_1, m4_inf, la5) = fold2_compact_and_round45_into(
-                &compact_mlv,
-                &fold_table,
-                mlv_rhos[0],
-                mlv_rhos[1],
-                &r_next4,
-                &mut a_out,
-                &mut b_out,
-            );
+            let (m4_1, m4_inf, la5) = if use_packed_replay {
+                fold2_packed_and_round45_into(
+                    a_packed,
+                    b_packed,
+                    &fold_table,
+                    mlv_rhos[0],
+                    mlv_rhos[1],
+                    padding,
+                    &r_next4,
+                    &mut a_out,
+                    &mut b_out,
+                )
+            } else {
+                fold2_compact_and_round45_into(
+                    compact_mlv
+                        .as_ref()
+                        .expect("compact R2 state required by fallback"),
+                    &fold_table,
+                    mlv_rhos[0],
+                    mlv_rhos[1],
+                    &r_next4,
+                    &mut a_out,
+                    &mut b_out,
+                )
+            };
             if tail_round_timing {
                 eprintln!(
-                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}): {:.2} ms",
+                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, packed={use_packed_replay}): {:.2} ms",
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
             }
-            compact_mlv.recycle();
+            if let Some(compact) = compact_mlv {
+                compact.recycle();
+            }
             multilinear_msgs.push((m4_1, m4_inf));
             challenger.observe_f128(m4_1);
             challenger.observe_f128(m4_inf);
@@ -1174,6 +1256,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 (a2_out, b2_out, 4usize)
             }
         } else {
+            let compact_mlv = compact_mlv.expect("non-cascaded R2 must retain compact state");
             let (m4_1, m4_inf) = fold2_compact_and_round4_into(
                 &compact_mlv,
                 &fold_table,
@@ -1197,6 +1280,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             (a_out, b_out, 2usize)
         }
     } else {
+        let compact_mlv = compact_mlv.expect("R2 without lookahead must retain compact state");
         let t_t3 = std::time::Instant::now();
         let mut first_r_next = vec![F128::ONE; n_mlv - 1];
         first_r_next[1..].copy_from_slice(&r[k_skip + 2..]);
@@ -1522,6 +1606,49 @@ pub fn verify<C: Challenger>(
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+
+    #[test]
+    fn packed_r2_replay_gate_requires_ranked_shape_and_first_cascade() {
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        assert!(packed_r2_replay_selected(true, 32, 6, &padding, true, None));
+        assert!(!packed_r2_replay_selected(false, 32, 6, &padding, true, None));
+        assert!(!packed_r2_replay_selected(true, 31, 6, &padding, true, None));
+        assert!(!packed_r2_replay_selected(true, 32, 5, &padding, true, None));
+        assert!(!packed_r2_replay_selected(true, 32, 6, &padding, false, None));
+        for miss in [
+            PaddingSpec {
+                k_log: 13,
+                useful_bits_per_block: 15_409,
+            },
+            PaddingSpec {
+                k_log: 14,
+                useful_bits_per_block: 15_408,
+            },
+        ] {
+            assert!(!packed_r2_replay_selected(true, 32, 6, &miss, true, None));
+        }
+        assert!(!packed_r2_replay_selected(
+            true,
+            32,
+            6,
+            &padding,
+            true,
+            Some(std::ffi::OsStr::new("1")),
+        ));
+        for value in ["", "0", "true", "01"] {
+            assert!(packed_r2_replay_selected(
+                true,
+                32,
+                6,
+                &padding,
+                true,
+                Some(std::ffi::OsStr::new(value)),
+            ));
+        }
+    }
 
     /// SplitMix64 PRNG, deterministic.
     struct Rng(u64);
