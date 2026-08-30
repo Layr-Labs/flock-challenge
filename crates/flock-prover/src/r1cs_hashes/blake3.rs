@@ -631,7 +631,8 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
 }
 
 /// Build a [`BlockR1cs`] batching `2^n_blocks_log` independent BLAKE3
-/// compressions. `n_blocks_log ≥ 3` is required (lincheck needs `n_outer ≥ 8`).
+/// compressions with full materialized A_0, B_0 sparse matrices.
+/// `n_blocks_log ≥ 3` is required (lincheck needs `n_outer ≥ 8`).
 pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
     let (a_0, b_0) = build_matrices();
     super::common::build_block_r1cs_with_matrices(
@@ -645,6 +646,19 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
         // in every block. Requires padding blocks filled with valid compressions.
         Some(Z_CONST_POS),
     )
+}
+
+/// Build a [`BlockR1cs`] with explicit materialized A_0, B_0 sparse matrices.
+/// Retained as a differential oracle / fallback.
+pub fn build_block_r1cs_with_matrices(n_blocks_log: usize) -> BlockR1cs {
+    build_block_r1cs(n_blocks_log)
+}
+
+/// Build a [`BlockR1cs`] batching `2^n_blocks_log` independent BLAKE3
+/// compressions with empty matrix stubs. Gated exclusively to exact ranked
+/// row-major setup paths where [`Blake3LincheckCircuit`] replaces sparse A/B.
+pub(crate) fn build_block_r1cs_empty_stub(n_blocks_log: usize) -> BlockR1cs {
+    super::common::build_block_r1cs_empty_stub(n_blocks_log, K_LOG, K_SKIP, USEFUL_BITS)
 }
 
 // ---------------------------------------------------------------------------
@@ -3188,6 +3202,17 @@ pub struct Blake3Setup {
     pub pcs_params: PcsParams,
 }
 
+#[inline]
+fn is_empty_stub_r1cs(r1cs: &BlockR1cs) -> bool {
+    r1cs.const_pin.is_none()
+        && r1cs.a_0.num_rows == K
+        && r1cs.a_0.num_cols == K
+        && r1cs.b_0.num_rows == K
+        && r1cs.b_0.num_cols == K
+        && r1cs.a_0.rows.iter().all(|r| r.is_empty())
+        && r1cs.b_0.rows.iter().all(|r| r.is_empty())
+}
+
 static RANKED_BLAKE3_LINCHECK: Blake3LincheckCircuit = Blake3LincheckCircuit;
 
 impl Blake3Setup {
@@ -3197,12 +3222,27 @@ impl Blake3Setup {
     /// [`flock_core::r1cs::WitnessLayout`]). The generic matrix provers and
     /// chain/Merkle wrappers still require row-major.
     pub fn new_batch_major(n_blocks: usize) -> Self {
-        let mut s = Self::new(n_blocks);
-        s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
+        assert!(n_blocks >= 1, "n_blocks must be ≥ 1");
+        let n_log = min_n_blocks_log(n_blocks);
         // Batch-major is outside the recognized reverse-transpose shape.
-        // Preserve the old eager CSC construction for this explicit fallback.
-        s.r1cs.csc_lincheck_circuit();
-        s
+        // Preserve the eager CSC construction on materialized matrices for this fallback.
+        let mut r1cs = build_block_r1cs(n_log);
+        r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
+        let pcs_params = PcsParams {
+            m: r1cs.m,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+            merkle_hash: Default::default(),
+        };
+        let setup = Self {
+            n_blocks,
+            r1cs,
+            pcs_params,
+        };
+        setup.r1cs.csc_lincheck_circuit();
+        flock_core::scratch::prewarm_prover(setup.r1cs.m);
+        setup
     }
 
     /// Fast-path witness generation dispatched on the r1cs's witness layout.
@@ -3234,7 +3274,8 @@ impl Blake3Setup {
             target_os = "macos",
             target_arch = "aarch64",
             target_feature = "aes"
-        )) && self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
+        )) && self.n_blocks == 1 << 18
+            && self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
             && self.r1cs.m == self.pcs_params.m
             && self.pcs_params.m == 32
             && self.pcs_params.log_inv_rate == 1
@@ -3245,24 +3286,22 @@ impl Blake3Setup {
     }
 
     /// Select the reverse transpose only for the promoted benchmark geometry.
-    /// `FLOCK_NO_BLAKE3_REVERSE_LINCHECK=1` is the exact CSC A/B control.
+    /// Selection is immutable from the constructed representation, so
+    /// post-construction environment changes cannot route empty stubs to CSC
+    /// or materialized setups to direct.
     #[inline]
     fn use_ranked_reverse_lincheck(&self) -> bool {
-        self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
+        self.n_blocks == 1 << 18
+            && self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
             && self.r1cs.m == 32
             && self.r1cs.m == self.pcs_params.m
             && self.r1cs.k_log == K_LOG
             && self.r1cs.k_skip == K_SKIP
             && self.r1cs.useful_bits == USEFUL_BITS
-            && self.r1cs.const_pin == Some(Z_CONST_POS)
-            && self.r1cs.a_0.num_rows == K
-            && self.r1cs.a_0.num_cols == K
-            && self.r1cs.b_0.num_rows == K
-            && self.r1cs.b_0.num_cols == K
             && self.pcs_params.log_inv_rate == 1
             && self.pcs_params.log_batch_size == 6
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
-            && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
+            && is_empty_stub_r1cs(&self.r1cs)
     }
 
     #[inline]
@@ -3316,6 +3355,18 @@ impl Blake3Setup {
         Self::with_profile_and_rate(n_blocks, profile, profile.log_inv_rate())
     }
 
+    #[inline]
+    fn is_ranked_geometry(
+        n_blocks: usize,
+        profile: flock_core::pcs::ligerito::LigeritoProfile,
+        log_inv_rate: usize,
+    ) -> bool {
+        n_blocks == 1 << 18
+            && log_inv_rate == 1
+            && profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
+            && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
+    }
+
     fn with_profile_and_rate(
         n_blocks: usize,
         profile: flock_core::pcs::ligerito::LigeritoProfile,
@@ -3323,7 +3374,12 @@ impl Blake3Setup {
     ) -> Self {
         assert!(n_blocks >= 1, "n_blocks must be ≥ 1");
         let n_log = min_n_blocks_log(n_blocks);
-        let r1cs = build_block_r1cs(n_log);
+        let is_ranked = Self::is_ranked_geometry(n_blocks, profile, log_inv_rate);
+        let r1cs = if is_ranked {
+            build_block_r1cs_empty_stub(n_log)
+        } else {
+            build_block_r1cs(n_log)
+        };
         let pcs_params = PcsParams {
             m: r1cs.m,
             log_inv_rate,
@@ -3790,7 +3846,7 @@ impl Blake3Setup {
         assert_eq!(blocks.len(), self.n_blocks);
         assert_eq!(self.n_blocks, self.n_block_slots());
         let (z_packed, a_packed, b_packed, z_lincheck) = self.generate_witness_ab(blocks);
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        let lc_circuit = self.lincheck_circuit();
         super::chain_common::prove_chain_ligerito_generic(
             &self.r1cs,
             &self.pcs_params,
@@ -3816,7 +3872,7 @@ impl Blake3Setup {
         let n_log = self.n_blocks_log();
         let cv_0_phys = cv_to_phys_bits(cv_0);
         let cv_last_phys = cv_to_phys_bits(cv_last);
-        let lc_circuit = self.r1cs.csc_lincheck_circuit();
+        let lc_circuit = self.lincheck_circuit();
         super::chain_common::verify_chain_ligerito_generic(
             &self.r1cs,
             &CHAIN_LAYOUT,
@@ -4021,6 +4077,7 @@ pub fn generate_witness_batch_major(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flock_core::lincheck::LincheckCircuit;
 
     /// SplitMix64.
     struct Rng(u64);
@@ -4703,34 +4760,38 @@ mod tests {
     fn lincheck_circuit_matches_sparse() {
         use flock_core::lincheck::{LincheckCircuit, SparseMatrixCircuit};
 
-        let mut rng = Rng::new(0xB1A_E3_CCA1);
         let (a_0, b_0) = build_matrices();
-        let sparse = SparseMatrixCircuit::new(&a_0, &b_0);
+        let sparse = SparseMatrixCircuit::new(&a_0, &b_0).with_const_pin(Some(Z_CONST_POS));
         let walker = Blake3LincheckCircuit;
         assert_eq!(sparse.n_cols(), walker.n_cols());
+        assert_eq!(walker.const_pin_col(), Some(Z_CONST_POS));
+        assert_eq!(sparse.const_pin_col(), walker.const_pin_col());
 
         let n_cols = walker.n_cols();
-        let alpha = F128 {
-            lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
-            hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
-        };
-        let eq_inner: Vec<F128> = (0..n_cols)
-            .map(|_| F128 {
+        for seed in [0xB1A_E3_CCA1u64, 0x1234_5678_9ABC, 0xDEAD_BEEF_CAFE, 0xFEED_FACE_0123] {
+            let mut rng = Rng::new(seed);
+            let alpha = F128 {
                 lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
                 hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
-            })
-            .collect();
+            };
+            let eq_inner: Vec<F128> = (0..n_cols)
+                .map(|_| F128 {
+                    lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                    hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                })
+                .collect();
 
-        let expected = sparse.fold_alpha_batched(alpha, &eq_inner);
-        let got = walker.fold_alpha_batched(alpha, &eq_inner);
-        for c in 0..n_cols {
-            assert_eq!(expected[c], got[c], "comb mismatch at col {c}");
+            let expected = sparse.fold_alpha_batched(alpha, &eq_inner);
+            let got = walker.fold_alpha_batched(alpha, &eq_inner);
+            for c in 0..n_cols {
+                assert_eq!(expected[c], got[c], "comb mismatch at col {c} with seed {seed:#x}");
+            }
+
+            // CSC gather (reference differential oracle) matches too.
+            let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0);
+            let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
+            assert_eq!(expected, got_csc, "CSC fold mismatch with seed {seed:#x}");
         }
-
-        // CSC gather (what prove_fast/verify actually use) matches too.
-        let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0);
-        let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
-        assert_eq!(expected, got_csc, "CSC fold mismatch");
     }
 
     /// to `pack_z_lincheck_from_packed(z)`.
@@ -4799,7 +4860,7 @@ mod tests {
 
         let (z_fill, a_fill, b_fill, z_lincheck_fill) =
             (z.clone(), a.clone(), b.clone(), z_lincheck.clone());
-        let circuit = setup.r1cs.csc_lincheck_circuit();
+        let circuit = setup.lincheck_circuit();
 
         let mut hot_challenger = FsChallenger::new(b"flock-hot-codeword");
         let (hot_proof, hot_commitment, hot_claim) =
@@ -5046,7 +5107,7 @@ mod tests {
         ] {
             let setup = Blake3Setup::with_profile(256, profile);
             let mut ch_p = FsChallenger::new(b"flock-blake3-prof");
-            let (proof, commitment, claim_p) = setup.prove_ligerito(&blocks, &mut ch_p);
+            let (proof, commitment, claim_p) = setup.prove_fast(&blocks, &mut ch_p);
             let mut ch_v = FsChallenger::new(b"flock-blake3-prof");
             let claim_v = setup
                 .verify(&commitment, &proof, &mut ch_v)
@@ -5095,7 +5156,20 @@ mod tests {
     #[test]
     fn prove_ligerito_generic_matches_prove_fast() {
         use flock_core::challenger::FsChallenger;
-        let setup = Blake3Setup::new(256);
+        let n_log = min_n_blocks_log(256);
+        let r1cs = build_block_r1cs(n_log);
+        let pcs_params = PcsParams {
+            m: r1cs.m,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: flock_core::pcs::ligerito::LigeritoProfile::Fast,
+            merkle_hash: Default::default(),
+        };
+        let setup = Blake3Setup {
+            n_blocks: 256,
+            r1cs,
+            pcs_params,
+        };
         let mut rng = Rng::new(0xb1a_63112);
         let blocks: Vec<Compression> = (0..256)
             .map(|_| {
@@ -5179,6 +5253,376 @@ mod tests {
         );
     }
 
+    #[test]
+    fn public_build_block_r1cs_contract_and_satisfaction() {
+        for n_log in [3, 4, 8] {
+            let r1cs = build_block_r1cs(n_log);
+            assert_eq!(r1cs.k_log, K_LOG);
+            assert_eq!(r1cs.const_pin, Some(Z_CONST_POS));
+            assert!(
+                r1cs.a_0.rows.iter().any(|r| !r.is_empty()),
+                "public build_block_r1cs must materialize A_0 matrix rows"
+            );
+            assert!(
+                r1cs.b_0.rows.iter().any(|r| !r.is_empty()),
+                "public build_block_r1cs must materialize B_0 matrix rows"
+            );
+            assert_eq!(r1cs.a_0.num_rows, K);
+            assert_eq!(r1cs.a_0.num_cols, K);
+            assert_eq!(r1cs.b_0.num_rows, K);
+            assert_eq!(r1cs.b_0.num_cols, K);
+        }
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn acquire() -> Self {
+            let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            unsafe {
+                std::env::remove_var("FLOCK_NO_BLAKE3_REVERSE_LINCHECK");
+            }
+            Self { _guard: guard }
+        }
+
+        fn set_no_reverse(&self) {
+            unsafe {
+                std::env::set_var("FLOCK_NO_BLAKE3_REVERSE_LINCHECK", "1");
+            }
+        }
+
+        fn remove_no_reverse(&self) {
+            unsafe {
+                std::env::remove_var("FLOCK_NO_BLAKE3_REVERSE_LINCHECK");
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("FLOCK_NO_BLAKE3_REVERSE_LINCHECK");
+            }
+        }
+    }
+
+    #[test]
+    fn exact_ranked_setup_uses_empty_stubs_and_direct_lincheck() {
+        let _env = EnvGuard::acquire();
+        let setup = Blake3Setup::new(1 << 18);
+        assert_eq!(setup.m(), 32);
+        assert_eq!(setup.n_blocks, 1 << 18);
+        assert_eq!(setup.r1cs.layout, flock_core::r1cs::WitnessLayout::RowMajor);
+        assert!(
+            setup.r1cs.a_0.rows.iter().all(|r| r.is_empty()),
+            "ranked setup must use empty A_0 stub"
+        );
+        assert!(
+            setup.r1cs.b_0.rows.iter().all(|r| r.is_empty()),
+            "ranked setup must use empty B_0 stub"
+        );
+        assert!(
+            setup.r1cs.csc_cache.get().is_none(),
+            "ranked setup must never allocate or cache CSC circuit during setup"
+        );
+        assert!(
+            setup.use_ranked_reverse_lincheck(),
+            "ranked setup must report use_ranked_reverse_lincheck == true"
+        );
+        let lc = setup.lincheck_circuit();
+        assert_eq!(lc.n_cols(), K);
+        assert_eq!(lc.const_pin_col(), Some(Z_CONST_POS));
+    }
+
+    #[test]
+    fn block_count_boundaries_select_representation_accurately() {
+        use flock_core::pcs::ligerito::LigeritoProfile;
+        let _env = EnvGuard::acquire();
+
+        // Boundary 1: n_blocks = 131072 (1 << 17), m = 31
+        let s1 = Blake3Setup::new(131072);
+        assert!(!Blake3Setup::is_ranked_geometry(131072, LigeritoProfile::Fast, 1));
+        assert!(!s1.use_ranked_reverse_lincheck());
+        assert!(s1.r1cs.a_0.rows.iter().any(|r| !r.is_empty()));
+        assert!(s1.r1cs.csc_cache.get().is_some());
+
+        // Boundary 2: n_blocks = 131073 (min_n_blocks_log is 18, m = 32, but n_blocks != 1 << 18)
+        let s2 = Blake3Setup::new(131073);
+        assert!(!Blake3Setup::is_ranked_geometry(131073, LigeritoProfile::Fast, 1));
+        assert!(!s2.use_ranked_reverse_lincheck());
+        assert!(s2.r1cs.a_0.rows.iter().any(|r| !r.is_empty()));
+        assert!(s2.r1cs.csc_cache.get().is_some());
+
+        // Boundary 3: n_blocks = 262143 (min_n_blocks_log is 18, m = 32, but n_blocks != 1 << 18)
+        let s3 = Blake3Setup::new(262143);
+        assert!(!Blake3Setup::is_ranked_geometry(262143, LigeritoProfile::Fast, 1));
+        assert!(!s3.use_ranked_reverse_lincheck());
+        assert!(s3.r1cs.a_0.rows.iter().any(|r| !r.is_empty()));
+        assert!(s3.r1cs.csc_cache.get().is_some());
+
+        // Boundary 4: n_blocks = 262144 (1 << 18, exact ranked block count)
+        let s4 = Blake3Setup::new(262144);
+        assert!(Blake3Setup::is_ranked_geometry(262144, LigeritoProfile::Fast, 1));
+        assert!(s4.use_ranked_reverse_lincheck());
+        assert!(s4.r1cs.a_0.rows.iter().all(|r| r.is_empty()));
+        assert!(s4.r1cs.b_0.rows.iter().all(|r| r.is_empty()));
+        assert!(s4.r1cs.csc_cache.get().is_none());
+    }
+
+    #[test]
+    fn serialized_env_before_and_env_after_immutability() {
+        let env = EnvGuard::acquire();
+
+        // 1. Env-before: FLOCK_NO_BLAKE3_REVERSE_LINCHECK is set BEFORE setup creation.
+        env.set_no_reverse();
+        let setup_csc = Blake3Setup::new(1 << 18);
+        assert!(
+            setup_csc.r1cs.a_0.rows.iter().any(|r| !r.is_empty()),
+            "setup created under env override must materialize matrices"
+        );
+        assert!(
+            setup_csc.r1cs.b_0.rows.iter().any(|r| !r.is_empty()),
+            "setup created under env override must materialize matrices"
+        );
+        assert!(
+            setup_csc.r1cs.csc_cache.get().is_some(),
+            "setup created under env override must eagerly warm CSC circuit"
+        );
+        assert!(!setup_csc.use_ranked_reverse_lincheck());
+
+        // Post-construction change: unset env var.
+        // Selection must remain immutable from the constructed representation!
+        env.remove_no_reverse();
+        assert!(
+            !setup_csc.use_ranked_reverse_lincheck(),
+            "materialized setup must retain CSC selection even after env var is unset"
+        );
+
+        // 2. Env-after: setup is created with empty stubs (env var unset).
+        let setup_direct = Blake3Setup::new(1 << 18);
+        assert!(setup_direct.r1cs.a_0.rows.iter().all(|r| r.is_empty()));
+        assert!(setup_direct.r1cs.b_0.rows.iter().all(|r| r.is_empty()));
+        assert!(setup_direct.r1cs.csc_cache.get().is_none());
+        assert!(setup_direct.use_ranked_reverse_lincheck());
+
+        // Post-construction change: set env var.
+        // Empty-stub setup must NEVER route to CSC!
+        env.set_no_reverse();
+        assert!(
+            setup_direct.use_ranked_reverse_lincheck(),
+            "empty-stub setup must retain direct walker selection even if env var is set later"
+        );
+        let lc = setup_direct.lincheck_circuit();
+        assert_eq!(lc.const_pin_col(), Some(Z_CONST_POS));
+
+        // EnvGuard Drop handles cleanup
+    }
+
+    #[test]
+    fn explicit_materialized_setup_at_ranked_size_retains_csc() {
+        use flock_core::pcs::ligerito::LigeritoProfile;
+        let n_log = 18;
+        let r1cs = build_block_r1cs(n_log);
+        let pcs_params = PcsParams {
+            m: r1cs.m,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: LigeritoProfile::Fast,
+            merkle_hash: Default::default(),
+        };
+        let setup = Blake3Setup {
+            n_blocks: 1 << 18,
+            r1cs,
+            pcs_params,
+        };
+        // Explicit materialized callers must not be routed to direct walker
+        assert!(!setup.use_ranked_reverse_lincheck());
+        assert!(setup.r1cs.a_0.rows.iter().any(|r| !r.is_empty()));
+    }
+
+    #[test]
+    fn non_ranked_configurations_materialize_matrices_and_select_csc() {
+        use flock_core::pcs::ligerito::LigeritoProfile;
+        let _env = EnvGuard::acquire();
+
+        // 1. Non-ranked size (m=22)
+        let setup_small = Blake3Setup::new(256);
+        assert!(!setup_small.use_ranked_reverse_lincheck());
+        assert!(setup_small.r1cs.a_0.rows.iter().any(|r| !r.is_empty()));
+        assert!(setup_small.r1cs.b_0.rows.iter().any(|r| !r.is_empty()));
+        assert_eq!(setup_small.r1cs.const_pin, Some(Z_CONST_POS));
+        assert!(setup_small.r1cs.csc_cache.get().is_some());
+
+        // 2. Non-ranked profile (Slim at ranked size)
+        let setup_slim = Blake3Setup::with_profile(1 << 18, LigeritoProfile::Slim);
+        assert!(!setup_slim.use_ranked_reverse_lincheck());
+        assert!(setup_slim.r1cs.a_0.rows.iter().any(|r| !r.is_empty()));
+        assert!(setup_slim.r1cs.csc_cache.get().is_some());
+
+        // 3. Non-ranked profile (Secure at ranked size)
+        let setup_sec = Blake3Setup::with_profile(1 << 18, LigeritoProfile::Secure);
+        assert!(!setup_sec.use_ranked_reverse_lincheck());
+        assert!(setup_sec.r1cs.a_0.rows.iter().any(|r| !r.is_empty()));
+        assert!(setup_sec.r1cs.csc_cache.get().is_some());
+
+        // 4. Non-ranked log_inv_rate (rate-1/4 at ranked size)
+        let setup_rate2 = Blake3Setup::with_log_inv_rate(1 << 18, 2);
+        assert!(!setup_rate2.use_ranked_reverse_lincheck());
+        assert!(setup_rate2.r1cs.a_0.rows.iter().any(|r| !r.is_empty()));
+        assert!(setup_rate2.r1cs.csc_cache.get().is_some());
+
+        // Verify CSC fold parity against direct lincheck walker
+        let mut rng = Rng::new(0x5E71_C5C1);
+        let alpha = F128 {
+            lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+            hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+        };
+        let eq_inner: Vec<F128> = (0..K)
+            .map(|_| F128 {
+                lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+                hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+            })
+            .collect();
+        let csc_fold = setup_small.lincheck_circuit().fold_alpha_batched(alpha, &eq_inner);
+        let direct_fold = Blake3LincheckCircuit.fold_alpha_batched(alpha, &eq_inner);
+        assert_eq!(csc_fold, direct_fold);
+    }
+
+    #[test]
+    fn batch_major_setup_materializes_and_uses_csc_fallback() {
+        let _env = EnvGuard::acquire();
+        let setup_bm_small = Blake3Setup::new_batch_major(256);
+        assert_eq!(
+            setup_bm_small.r1cs.layout,
+            flock_core::r1cs::WitnessLayout::BatchMajor
+        );
+        assert!(!setup_bm_small.use_ranked_reverse_lincheck());
+        assert!(setup_bm_small.r1cs.a_0.rows.iter().any(|r| !r.is_empty()));
+        assert!(setup_bm_small.r1cs.csc_cache.get().is_some());
+
+        let setup_bm_ranked_size = Blake3Setup::new_batch_major(1 << 18);
+        assert_eq!(
+            setup_bm_ranked_size.r1cs.layout,
+            flock_core::r1cs::WitnessLayout::BatchMajor
+        );
+        assert!(!setup_bm_ranked_size.use_ranked_reverse_lincheck());
+        assert!(setup_bm_ranked_size.r1cs.a_0.rows.iter().any(|r| !r.is_empty()));
+        assert!(setup_bm_ranked_size.r1cs.b_0.rows.iter().any(|r| !r.is_empty()));
+        assert!(setup_bm_ranked_size.r1cs.csc_cache.get().is_some());
+    }
+
+    #[test]
+    fn env_control_and_empty_csc_mutation_differential() {
+        use flock_core::pcs::ligerito::LigeritoProfile;
+        let env = EnvGuard::acquire();
+
+        // Test geometry predicate under clean env
+        assert!(Blake3Setup::is_ranked_geometry(1 << 18, LigeritoProfile::Fast, 1));
+        assert!(!Blake3Setup::is_ranked_geometry(256, LigeritoProfile::Fast, 1));
+        assert!(!Blake3Setup::is_ranked_geometry(1 << 18, LigeritoProfile::Slim, 1));
+        assert!(!Blake3Setup::is_ranked_geometry(1 << 18, LigeritoProfile::Fast, 2));
+
+        // Test geometry predicate with env override
+        env.set_no_reverse();
+        assert!(!Blake3Setup::is_ranked_geometry(1 << 18, LigeritoProfile::Fast, 1));
+        env.remove_no_reverse();
+
+        // Mutation check: CSC on empty matrices fails to compute nonzero fold
+        let empty_r1cs = build_block_r1cs_empty_stub(3);
+        let empty_csc = empty_r1cs.csc_lincheck_circuit();
+        let alpha = F128 { lo: 0x1234, hi: 0x5678 };
+        let eq_inner = vec![F128 { lo: 0x9ABC, hi: 0xDEF0 }; K];
+        let empty_got = empty_csc.fold_alpha_batched(alpha, &eq_inner);
+        let real_got = Blake3LincheckCircuit.fold_alpha_batched(alpha, &eq_inner);
+        assert_ne!(
+            empty_got, real_got,
+            "empty matrix CSC fold must not match true lincheck fold"
+        );
+        // Empty CSC with no const_pin produces all zeros
+        assert!(empty_got.iter().all(|v| v.is_zero()));
+    }
+
+    #[test]
+    fn malformed_representation_mutation_cases() {
+        use flock_core::pcs::ligerito::LigeritoProfile;
+        let pcs_params = PcsParams {
+            m: 32,
+            log_inv_rate: 1,
+            log_batch_size: 6,
+            profile: LigeritoProfile::Fast,
+            merkle_hash: Default::default(),
+        };
+
+        // 1. Mixed A/B: A empty, B non-empty
+        let mut r1cs_b_nonempty = build_block_r1cs_empty_stub(18);
+        r1cs_b_nonempty.b_0.rows[0] = vec![0];
+        assert!(!is_empty_stub_r1cs(&r1cs_b_nonempty));
+        let setup_b_nonempty = Blake3Setup {
+            n_blocks: 1 << 18,
+            r1cs: r1cs_b_nonempty,
+            pcs_params: pcs_params.clone(),
+        };
+        assert!(!setup_b_nonempty.use_ranked_reverse_lincheck());
+
+        // 2. Mixed A/B: A non-empty, B empty
+        let mut r1cs_a_nonempty = build_block_r1cs_empty_stub(18);
+        r1cs_a_nonempty.a_0.rows[0] = vec![0];
+        assert!(!is_empty_stub_r1cs(&r1cs_a_nonempty));
+        let setup_a_nonempty = Blake3Setup {
+            n_blocks: 1 << 18,
+            r1cs: r1cs_a_nonempty,
+            pcs_params: pcs_params.clone(),
+        };
+        assert!(!setup_a_nonempty.use_ranked_reverse_lincheck());
+
+        // 3. Wrong dimension: A num_rows != K
+        let mut r1cs_bad_dim_a = build_block_r1cs_empty_stub(18);
+        r1cs_bad_dim_a.a_0.num_rows = K - 1;
+        assert!(!is_empty_stub_r1cs(&r1cs_bad_dim_a));
+        let setup_bad_dim_a = Blake3Setup {
+            n_blocks: 1 << 18,
+            r1cs: r1cs_bad_dim_a,
+            pcs_params: pcs_params.clone(),
+        };
+        assert!(!setup_bad_dim_a.use_ranked_reverse_lincheck());
+
+        // 4. Wrong dimension: B num_cols != K
+        let mut r1cs_bad_dim_b = build_block_r1cs_empty_stub(18);
+        r1cs_bad_dim_b.b_0.num_cols = K + 1;
+        assert!(!is_empty_stub_r1cs(&r1cs_bad_dim_b));
+        let setup_bad_dim_b = Blake3Setup {
+            n_blocks: 1 << 18,
+            r1cs: r1cs_bad_dim_b,
+            pcs_params: pcs_params.clone(),
+        };
+        assert!(!setup_bad_dim_b.use_ranked_reverse_lincheck());
+
+        // 5. Wrong const_pin: Some(Z_CONST_POS) on empty stub
+        let mut r1cs_with_pin = build_block_r1cs_empty_stub(18);
+        r1cs_with_pin.const_pin = Some(Z_CONST_POS);
+        assert!(!is_empty_stub_r1cs(&r1cs_with_pin));
+        let setup_with_pin = Blake3Setup {
+            n_blocks: 1 << 18,
+            r1cs: r1cs_with_pin,
+            pcs_params: pcs_params.clone(),
+        };
+        assert!(!setup_with_pin.use_ranked_reverse_lincheck());
+
+        // 6. Wrong const_pin: Some(0)
+        let mut r1cs_wrong_pin = build_block_r1cs_empty_stub(18);
+        r1cs_wrong_pin.const_pin = Some(0);
+        assert!(!is_empty_stub_r1cs(&r1cs_wrong_pin));
+        let setup_wrong_pin = Blake3Setup {
+            n_blocks: 1 << 18,
+            r1cs: r1cs_wrong_pin,
+            pcs_params,
+        };
+        assert!(!setup_wrong_pin.use_ranked_reverse_lincheck());
+    }
     #[test]
     fn setup_sizes_correctly() {
         for &(n_blocks, expected_n_log) in
