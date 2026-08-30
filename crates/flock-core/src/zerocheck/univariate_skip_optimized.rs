@@ -4860,6 +4860,26 @@ mod tests {
         }
     }
 
+    /// The `x^2` top-bits shift + LUT kernel must reproduce scalar `F8`
+    /// multiplication for every byte across all 16 SIMD lanes.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn mul_x2_topbits_matches_field() {
+        use core::arch::aarch64::*;
+        let x2 = F8(1u8 << 2);
+        for b in 0..=255u8 {
+            unsafe {
+                let input = vdupq_n_u8(b);
+                let output = kernels::aarch64::gf8_mul_x2_vec16(input);
+                let mut buf = [0u8; 16];
+                vst1q_u8(buf.as_mut_ptr(), output);
+                for lane in 0..16 {
+                    assert_eq!(F8(buf[lane]), F8(b) * x2, "x^2 top-bits wrong for {b:#04x} lane {lane}");
+                }
+            }
+        }
+    }
+
     /// Byte-exact oracle for the low-instruction static-B kernel. Covers every
     /// live `(window, b_med)` arm, and for each of them: raw random B (guards
     /// broken, every row takes the generic path), fully-satisfied guards

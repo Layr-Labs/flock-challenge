@@ -246,23 +246,69 @@ pub(crate) unsafe fn accumulate_convert_ab(
                 ab7 = veorq_u8(ab7, vld1q_u8(table.add((wa >> 56) * 16)));
             }
 
-            macro_rules! drain_lane {
-                ($offset:literal, $ab:ident) => {{
-                    let ab = vreinterpretq_u64_u8($ab);
-                    partial_ab[lane + $offset] += F128 {
-                        lo: vgetq_lane_u64::<0>(ab),
-                        hi: vgetq_lane_u64::<1>(ab),
-                    } * eq_lo_val;
-                }};
-            }
-            drain_lane!(0, ab0);
-            drain_lane!(1, ab1);
-            drain_lane!(2, ab2);
-            drain_lane!(3, ab3);
-            drain_lane!(4, ab4);
-            drain_lane!(5, ab5);
-            drain_lane!(6, ab6);
-            drain_lane!(7, ab7);
+            use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+            let eq_vec = [eq_lo_val, eq_lo_val];
+            let p01 = ghash_mul_vec2_neon(
+                [
+                    F128 {
+                        lo: vgetq_lane_u64::<0>(vreinterpretq_u64_u8(ab0)),
+                        hi: vgetq_lane_u64::<1>(vreinterpretq_u64_u8(ab0)),
+                    },
+                    F128 {
+                        lo: vgetq_lane_u64::<0>(vreinterpretq_u64_u8(ab1)),
+                        hi: vgetq_lane_u64::<1>(vreinterpretq_u64_u8(ab1)),
+                    },
+                ],
+                eq_vec,
+            );
+            let p23 = ghash_mul_vec2_neon(
+                [
+                    F128 {
+                        lo: vgetq_lane_u64::<0>(vreinterpretq_u64_u8(ab2)),
+                        hi: vgetq_lane_u64::<1>(vreinterpretq_u64_u8(ab2)),
+                    },
+                    F128 {
+                        lo: vgetq_lane_u64::<0>(vreinterpretq_u64_u8(ab3)),
+                        hi: vgetq_lane_u64::<1>(vreinterpretq_u64_u8(ab3)),
+                    },
+                ],
+                eq_vec,
+            );
+            let p45 = ghash_mul_vec2_neon(
+                [
+                    F128 {
+                        lo: vgetq_lane_u64::<0>(vreinterpretq_u64_u8(ab4)),
+                        hi: vgetq_lane_u64::<1>(vreinterpretq_u64_u8(ab4)),
+                    },
+                    F128 {
+                        lo: vgetq_lane_u64::<0>(vreinterpretq_u64_u8(ab5)),
+                        hi: vgetq_lane_u64::<1>(vreinterpretq_u64_u8(ab5)),
+                    },
+                ],
+                eq_vec,
+            );
+            let p67 = ghash_mul_vec2_neon(
+                [
+                    F128 {
+                        lo: vgetq_lane_u64::<0>(vreinterpretq_u64_u8(ab6)),
+                        hi: vgetq_lane_u64::<1>(vreinterpretq_u64_u8(ab6)),
+                    },
+                    F128 {
+                        lo: vgetq_lane_u64::<0>(vreinterpretq_u64_u8(ab7)),
+                        hi: vgetq_lane_u64::<1>(vreinterpretq_u64_u8(ab7)),
+                    },
+                ],
+                eq_vec,
+            );
+
+            partial_ab[lane] += p01[0];
+            partial_ab[lane + 1] += p01[1];
+            partial_ab[lane + 2] += p23[0];
+            partial_ab[lane + 3] += p23[1];
+            partial_ab[lane + 4] += p45[0];
+            partial_ab[lane + 5] += p45[1];
+            partial_ab[lane + 6] += p67[0];
+            partial_ab[lane + 7] += p67[1];
         }
     }
 }
@@ -378,20 +424,24 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul(
                 ab7 = veorq_u8(ab7, vld1q_u8(table.add((wa >> 56) * 16)));
             }
 
-            macro_rules! drain_lane {
-                ($offset:literal, $ab:ident) => {{
-                    let slot = bank.as_mut_ptr().add(lane + $offset) as *mut u8;
-                    vst1q_u8(slot, veorq_u8(vld1q_u8(slot), $ab));
-                }};
-            }
-            drain_lane!(0, ab0);
-            drain_lane!(1, ab1);
-            drain_lane!(2, ab2);
-            drain_lane!(3, ab3);
-            drain_lane!(4, ab4);
-            drain_lane!(5, ab5);
-            drain_lane!(6, ab6);
-            drain_lane!(7, ab7);
+            let bank_p = bank.as_mut_ptr().add(lane) as *mut u8;
+            let b0 = vld1q_u8(bank_p);
+            let b1 = vld1q_u8(bank_p.add(16));
+            let b2 = vld1q_u8(bank_p.add(32));
+            let b3 = vld1q_u8(bank_p.add(48));
+            let b4 = vld1q_u8(bank_p.add(64));
+            let b5 = vld1q_u8(bank_p.add(80));
+            let b6 = vld1q_u8(bank_p.add(96));
+            let b7 = vld1q_u8(bank_p.add(112));
+
+            vst1q_u8(bank_p, veorq_u8(b0, ab0));
+            vst1q_u8(bank_p.add(16), veorq_u8(b1, ab1));
+            vst1q_u8(bank_p.add(32), veorq_u8(b2, ab2));
+            vst1q_u8(bank_p.add(48), veorq_u8(b3, ab3));
+            vst1q_u8(bank_p.add(64), veorq_u8(b4, ab4));
+            vst1q_u8(bank_p.add(80), veorq_u8(b5, ab5));
+            vst1q_u8(bank_p.add(96), veorq_u8(b6, ab6));
+            vst1q_u8(bank_p.add(112), veorq_u8(b7, ab7));
         }
     }
 }
@@ -542,10 +592,15 @@ pub(crate) unsafe fn accumulate_c_banks(
                             m55
                         );
                         let g = interleave8!(t);
-                        let out = dst as *mut u8;
-                        for (i, value) in g.into_iter().enumerate() {
-                            vst1q_u8(out.add(chunk * 128 + i * 16), value);
-                        }
+                        let out = (dst as *mut u8).add(chunk * 128);
+                        vst1q_u8(out, g[0]);
+                        vst1q_u8(out.add(16), g[1]);
+                        vst1q_u8(out.add(32), g[2]);
+                        vst1q_u8(out.add(48), g[3]);
+                        vst1q_u8(out.add(64), g[4]);
+                        vst1q_u8(out.add(80), g[5]);
+                        vst1q_u8(out.add(96), g[6]);
+                        vst1q_u8(out.add(112), g[7]);
                     }
                 }
             };
@@ -563,34 +618,47 @@ pub(crate) unsafe fn accumulate_c_banks(
         let t_lo = mask_tables.as_ptr() as *const u8;
         let t_hi = t_lo.add(256 * 16);
         if drain4 {
-            // Four independent lanes expose eight random table loads at once,
-            // matching the latency-hiding shape of the AB convert kernel.
-            // The old scalar drain kept only the low/high pair for one lane in
-            // flight, leaving the dependent L1 gather latency on the critical
-            // chain even though the register file has ample headroom.
             for s in 0..8 {
                 let bank = partial_c[s].as_mut_ptr() as *mut u8;
-                for lane in (0..64).step_by(4) {
-                    let lo = (m_lo[s].as_ptr().add(lane) as *const u32).read_unaligned();
-                    let hi = (m_hi[s].as_ptr().add(lane) as *const u32).read_unaligned();
+                for lane in (0..64).step_by(8) {
+                    let lo = (m_lo[s].as_ptr().add(lane) as *const u64).read_unaligned() as usize;
+                    let hi = (m_hi[s].as_ptr().add(lane) as *const u64).read_unaligned() as usize;
 
-                    let l0 = vld1q_u8(t_lo.add(usize::from((lo & 0xff) as u8) * 16));
-                    let l1 = vld1q_u8(t_lo.add(usize::from(((lo >> 8) & 0xff) as u8) * 16));
-                    let l2 = vld1q_u8(t_lo.add(usize::from(((lo >> 16) & 0xff) as u8) * 16));
-                    let l3 = vld1q_u8(t_lo.add(usize::from((lo >> 24) as u8) * 16));
-                    let h0 = vld1q_u8(t_hi.add(usize::from((hi & 0xff) as u8) * 16));
-                    let h1 = vld1q_u8(t_hi.add(usize::from(((hi >> 8) & 0xff) as u8) * 16));
-                    let h2 = vld1q_u8(t_hi.add(usize::from(((hi >> 16) & 0xff) as u8) * 16));
-                    let h3 = vld1q_u8(t_hi.add(usize::from((hi >> 24) as u8) * 16));
+                    let l0 = vld1q_u8(t_lo.add((lo & 0xff) * 16));
+                    let l1 = vld1q_u8(t_lo.add(((lo >> 8) & 0xff) * 16));
+                    let l2 = vld1q_u8(t_lo.add(((lo >> 16) & 0xff) * 16));
+                    let l3 = vld1q_u8(t_lo.add(((lo >> 24) & 0xff) * 16));
+                    let l4 = vld1q_u8(t_lo.add(((lo >> 32) & 0xff) * 16));
+                    let l5 = vld1q_u8(t_lo.add(((lo >> 40) & 0xff) * 16));
+                    let l6 = vld1q_u8(t_lo.add(((lo >> 48) & 0xff) * 16));
+                    let l7 = vld1q_u8(t_lo.add((lo >> 56) * 16));
+
+                    let h0 = vld1q_u8(t_hi.add((hi & 0xff) * 16));
+                    let h1 = vld1q_u8(t_hi.add(((hi >> 8) & 0xff) * 16));
+                    let h2 = vld1q_u8(t_hi.add(((hi >> 16) & 0xff) * 16));
+                    let h3 = vld1q_u8(t_hi.add(((hi >> 24) & 0xff) * 16));
+                    let h4 = vld1q_u8(t_hi.add(((hi >> 32) & 0xff) * 16));
+                    let h5 = vld1q_u8(t_hi.add(((hi >> 40) & 0xff) * 16));
+                    let h6 = vld1q_u8(t_hi.add(((hi >> 48) & 0xff) * 16));
+                    let h7 = vld1q_u8(t_hi.add((hi >> 56) * 16));
 
                     let p0 = bank.add(lane * 16);
                     let p1 = p0.add(16);
                     let p2 = p1.add(16);
                     let p3 = p2.add(16);
+                    let p4 = p3.add(16);
+                    let p5 = p4.add(16);
+                    let p6 = p5.add(16);
+                    let p7 = p6.add(16);
+
                     vst1q_u8(p0, xor3_u8(vld1q_u8(p0), l0, h0));
                     vst1q_u8(p1, xor3_u8(vld1q_u8(p1), l1, h1));
                     vst1q_u8(p2, xor3_u8(vld1q_u8(p2), l2, h2));
                     vst1q_u8(p3, xor3_u8(vld1q_u8(p3), l3, h3));
+                    vst1q_u8(p4, xor3_u8(vld1q_u8(p4), l4, h4));
+                    vst1q_u8(p5, xor3_u8(vld1q_u8(p5), l5, h5));
+                    vst1q_u8(p6, xor3_u8(vld1q_u8(p6), l6, h6));
+                    vst1q_u8(p7, xor3_u8(vld1q_u8(p7), l7, h7));
                 }
             }
         } else {
@@ -877,10 +945,15 @@ pub(crate) unsafe fn accumulate_c_fold4_q_pair_banks(
                     m55
                 );
                 let interleaved = interleave8!(t);
-                let dst = masks[side].as_mut_ptr() as *mut u8;
-                for (i, value) in interleaved.into_iter().enumerate() {
-                    vst1q_u8(dst.add(chunk * 128 + i * 16), value);
-                }
+                let out = (masks[side].as_mut_ptr() as *mut u8).add(chunk * 128);
+                vst1q_u8(out, interleaved[0]);
+                vst1q_u8(out.add(16), interleaved[1]);
+                vst1q_u8(out.add(32), interleaved[2]);
+                vst1q_u8(out.add(48), interleaved[3]);
+                vst1q_u8(out.add(64), interleaved[4]);
+                vst1q_u8(out.add(80), interleaved[5]);
+                vst1q_u8(out.add(96), interleaved[6]);
+                vst1q_u8(out.add(112), interleaved[7]);
             }
         }
 
@@ -1042,10 +1115,15 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
                         m55
                     );
                     let interleaved = interleave8!(t);
-                    let dst = masks[side].as_mut_ptr() as *mut u8;
-                    for (i, value) in interleaved.into_iter().enumerate() {
-                        vst1q_u8(dst.add(chunk * 128 + i * 16), value);
-                    }
+                    let out = (masks[side].as_mut_ptr() as *mut u8).add(chunk * 128);
+                    vst1q_u8(out, interleaved[0]);
+                    vst1q_u8(out.add(16), interleaved[1]);
+                    vst1q_u8(out.add(32), interleaved[2]);
+                    vst1q_u8(out.add(48), interleaved[3]);
+                    vst1q_u8(out.add(64), interleaved[4]);
+                    vst1q_u8(out.add(80), interleaved[5]);
+                    vst1q_u8(out.add(96), interleaved[6]);
+                    vst1q_u8(out.add(112), interleaved[7]);
                 }
             }
 
@@ -1768,18 +1846,36 @@ unsafe fn horner_absorb(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        for i in 0..8 {
-            let cur = acc[i];
-            let shifted = vreinterpretq_u8_u16(vshlq_n_u16::<1>(cur));
-            let msb = vreinterpretq_u8_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(cur)));
-            // shifted ^ (msb & HORNER_CARRY_X16)
-            let folded = bcax_u8(shifted, msb, carry_not);
-            acc[i] = vreinterpretq_u16_u8(xor3_u8(
-                folded,
-                vreinterpretq_u8_u16(lo[i]),
-                vreinterpretq_u8_u16(hi[i]),
-            ));
+        macro_rules! step2 {
+            ($idx0:literal, $idx1:literal) => {
+                let cur0 = acc[$idx0];
+                let cur1 = acc[$idx1];
+
+                let shifted0 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(cur0));
+                let shifted1 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(cur1));
+
+                let msb0 = vreinterpretq_u8_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(cur0)));
+                let msb1 = vreinterpretq_u8_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(cur1)));
+
+                let folded0 = bcax_u8(shifted0, msb0, carry_not);
+                let folded1 = bcax_u8(shifted1, msb1, carry_not);
+
+                acc[$idx0] = vreinterpretq_u16_u8(xor3_u8(
+                    folded0,
+                    vreinterpretq_u8_u16(lo[$idx0]),
+                    vreinterpretq_u8_u16(hi[$idx0]),
+                ));
+                acc[$idx1] = vreinterpretq_u16_u8(xor3_u8(
+                    folded1,
+                    vreinterpretq_u8_u16(lo[$idx1]),
+                    vreinterpretq_u8_u16(hi[$idx1]),
+                ));
+            };
         }
+        step2!(0, 1);
+        step2!(2, 3);
+        step2!(4, 5);
+        step2!(6, 7);
     }
 }
 
@@ -2755,28 +2851,34 @@ unsafe fn fused_apply_one_k_with_b<const K: i32>(
 // ops per group over the eight rows, 160 per 64-byte output block.
 // ---------------------------------------------------------------------------
 
-/// Multiply 16 GF(2^8) values by the constant `x^2` via nibble tables.
-/// `LO[v] = v·x^2` and `HI[v] = (v<<4)·x^2`; verified against `F8` scalar
-/// arithmetic in `mul_x2_nibble_tables_match_field`.
+/// Multiply 16 GF(2^8) values by the constant `x^2` via top-bits shift + LUT.
+/// For AES polynomial basis (x^8 + x^4 + x^3 + x + 1):
+/// `a · x^2 = ((a << 2) & 0xff) ^ R[a >> 6]` where `R = [0x00, 0x1b, 0x36, 0x2d]`.
+/// Replaces 2-nibble table lookups with 1 shift + 1 tiny LUT + 1 XOR.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn gf8_mul_x2_vec16(a: core::arch::aarch64::uint8x16_t) -> core::arch::aarch64::uint8x16_t {
+pub(crate) unsafe fn gf8_mul_x2_vec16(a: core::arch::aarch64::uint8x16_t) -> core::arch::aarch64::uint8x16_t {
     use core::arch::aarch64::*;
     unsafe {
-        let lo = vld1q_u8(MUL_X2_LO.as_ptr());
-        let hi = vld1q_u8(MUL_X2_HI.as_ptr());
-        veorq_u8(
-            vqtbl1q_u8(lo, vandq_u8(a, vdupq_n_u8(0x0f))),
-            vqtbl1q_u8(hi, vshrq_n_u8::<4>(a)),
-        )
+        let shifted = vshlq_n_u8::<2>(a);
+        let top2 = vshrq_n_u8::<6>(a);
+        let red_table = vld1q_u8(MUL_X2_RED4.as_ptr());
+        let red = vqtbl1q_u8(red_table, top2);
+        veorq_u8(shifted, red)
     }
 }
 
 #[cfg(target_arch = "aarch64")]
+pub(crate) const MUL_X2_RED4: [u8; 16] = [
+    0x00, 0x1b, 0x36, 0x2d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 pub(crate) const MUL_X2_LO: [u8; 16] = [
     0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c,
 ];
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 pub(crate) const MUL_X2_HI: [u8; 16] = [
     0x00, 0x40, 0x80, 0xc0, 0x1b, 0x5b, 0x9b, 0xdb, 0x36, 0x76, 0xb6, 0xf6, 0x2d, 0x6d, 0xad, 0xed,
 ];

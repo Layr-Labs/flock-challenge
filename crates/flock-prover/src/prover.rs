@@ -1106,8 +1106,13 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 if !stripe_job.is_finished() {
                     let spin_deadline =
                         std::time::Instant::now() + std::time::Duration::from_millis(2);
-                    while !stripe_job.is_finished() && std::time::Instant::now() < spin_deadline {
+                    let mut iter = 0u32;
+                    while !stripe_job.is_finished() {
                         std::thread::yield_now();
+                        iter += 1;
+                        if iter & 31 == 0 && std::time::Instant::now() >= spin_deadline {
+                            break;
+                        }
                     }
                 }
                 stripe_job
