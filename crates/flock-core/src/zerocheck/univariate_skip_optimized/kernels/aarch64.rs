@@ -2747,39 +2747,98 @@ unsafe fn fused_apply_one_k_with_b<const K: i32>(
 //     x^K = x^(4·(K>>2)) · x^(2·((K>>1)&1)) · x^(K&1)
 //
 // with the `x^4` from the pre-scaled inverse-NTT table image (free — the
-// byte-collapse transform is GF(2)-linear), the `x^2` from a two-lookup
+// byte-collapse transform is GF(2)-linear), the `x^2` from a one-lookup
 // constant multiply on the four `a`-side registers, and only `x^(K&1)` left
 // as an in-lane shift. Per 16-lane group per K the cost becomes
-// `2 PMULL + 2 EOR` (+2 shifts for odd K, +5 for the `x^2` multiply), i.e.
-// 4/6/9/11 ops for K ≡ 0/1/2/3 (mod 4) against a flat 13 — 40 fewer vector
-// ops per group over the eight rows, 160 per 64-byte output block.
+// `2 PMULL + 2 EOR` (+2 shifts for odd K, +4 for the `x^2` multiply), i.e.
+// 4/6/8/10 ops for K ≡ 0/1/2/3 (mod 4), before the common final reduction.
+// The `x^2` helper removes one vector operation per group compared with the
+// former five-operation nibble split: 16 operations per 64-byte block.
 // ---------------------------------------------------------------------------
 
-/// Multiply 16 GF(2^8) values by the constant `x^2` via nibble tables.
-/// `LO[v] = v·x^2` and `HI[v] = (v<<4)·x^2`; verified against `F8` scalar
-/// arithmetic in `mul_x2_nibble_tables_match_field`.
+/// Multiply 16 GF(2^8) values by `x^2` with one top-bit reduction lookup.
+/// For each byte, `(a << 2) mod 256` retains the low six coefficients;
+/// the two overflow coefficients contribute `0x1b` and `0x36`, since
+/// `x^8 = 0x1b` and `x^9 = 0x36` modulo the AES polynomial. Logical byte
+/// shifts keep every table index in 0..=3 and never mix adjacent lanes.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn gf8_mul_x2_vec16(a: core::arch::aarch64::uint8x16_t) -> core::arch::aarch64::uint8x16_t {
     use core::arch::aarch64::*;
+    const REDUCTION: [u8; 16] = [
+        0x00, 0x1b, 0x36, 0x2d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ];
     unsafe {
-        let lo = vld1q_u8(MUL_X2_LO.as_ptr());
-        let hi = vld1q_u8(MUL_X2_HI.as_ptr());
+        let reduction = vld1q_u8(REDUCTION.as_ptr());
         veorq_u8(
-            vqtbl1q_u8(lo, vandq_u8(a, vdupq_n_u8(0x0f))),
-            vqtbl1q_u8(hi, vshrq_n_u8::<4>(a)),
+            vshlq_n_u8::<2>(a),
+            vqtbl1q_u8(reduction, vshrq_n_u8::<6>(a)),
         )
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+// Preserve the old nibble split only as an independent test oracle.
+#[cfg(all(test, target_arch = "aarch64"))]
 pub(crate) const MUL_X2_LO: [u8; 16] = [
     0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c,
 ];
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(test, target_arch = "aarch64"))]
 pub(crate) const MUL_X2_HI: [u8; 16] = [
     0x00, 0x40, 0x80, 0xc0, 0x1b, 0x5b, 0x9b, 0xdb, 0x36, 0x76, 0xb6, 0xf6, 0x2d, 0x6d, 0xad, 0xed,
 ];
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod mul_x2_tests {
+    use super::{gf8_mul_x2_vec16, F8, MUL_X2_HI, MUL_X2_LO};
+    use core::arch::aarch64::*;
+
+    unsafe fn mul_x2_nibble_oracle(a: uint8x16_t) -> uint8x16_t {
+        unsafe {
+            let lo = vld1q_u8(MUL_X2_LO.as_ptr());
+            let hi = vld1q_u8(MUL_X2_HI.as_ptr());
+            veorq_u8(
+                vqtbl1q_u8(lo, vandq_u8(a, vdupq_n_u8(0x0f))),
+                vqtbl1q_u8(hi, vshrq_n_u8::<4>(a)),
+            )
+        }
+    }
+
+    fn check(input: [u8; 16]) {
+        let mut actual = [0u8; 16];
+        let mut old = [0u8; 16];
+        // All vectors are backed by initialized 16-byte arrays. The test is
+        // aarch64-only, so these baseline NEON intrinsics are available.
+        unsafe {
+            let a = vld1q_u8(input.as_ptr());
+            vst1q_u8(actual.as_mut_ptr(), gf8_mul_x2_vec16(a));
+            vst1q_u8(old.as_mut_ptr(), mul_x2_nibble_oracle(a));
+        }
+        let scalar = input.map(|byte| (F8(byte) * F8(4)).0);
+        assert_eq!(actual, scalar, "scalar x^2 mismatch for {input:?}");
+        assert_eq!(actual, old, "nibble x^2 mismatch for {input:?}");
+    }
+
+    #[test]
+    fn all_bytes_match_field_and_nibble_oracle() {
+        for byte in 0u8..=u8::MAX {
+            check([byte; 16]);
+        }
+    }
+
+    #[test]
+    fn mixed_lanes_match_field_and_nibble_oracle() {
+        for start in 0u8..=u8::MAX {
+            check(core::array::from_fn(|lane| {
+                start.wrapping_add((lane as u8).wrapping_mul(17))
+            }));
+        }
+        check([
+            0x00, 0x3f, 0x40, 0x7f, 0x80, 0xbf, 0xc0, 0xff, 0xff, 0xc0, 0xbf, 0x80, 0x7f, 0x40,
+            0x3f, 0x00,
+        ]);
+    }
+}
 
 /// XOR the raw carry-less products `da × db` into the 16-bit accumulators,
 /// weighted by `x^R` with `R ∈ {0, 1}`. When `MUL_X2` the `a` side is first
