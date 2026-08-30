@@ -4420,6 +4420,166 @@ fn transpose_forward_ntt_final_3layer_low_eighth_xor(data: &[F128]) -> Vec<F128>
     retained
 }
 
+const ENV_NO_LIG_L1_QUARTER_INDUCE: &str = "FLOCK_NO_LIG_L1_QUARTER_INDUCE";
+
+/// Strict child of the exact ranked L2 lazy-OOD selector: that parent pins
+/// the platform, full M32 Fast configuration, and recursive index zero.
+/// Recheck the actual L1 opening inputs; only literal `1` rolls this back.
+#[allow(clippy::too_many_arguments)]
+fn ranked_l1_quarter_induce_selected(
+    ranked_l2_ood: bool,
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    lane_vars: usize,
+    queries: &[usize],
+    alpha_len: usize,
+    f_len: usize,
+    disabled: Option<&std::ffi::OsStr>,
+) -> bool {
+    ranked_l2_ood
+        && log_msg_cols == 16
+        && log_inv_rate == 2
+        && lane_vars == 3
+        && queries.len() == 106
+        && alpha_len == 7
+        && f_len == (1usize << 16)
+        && positions_are_sorted(queries)
+        && queries.iter().all(|&q| q < (1usize << 18))
+        && disabled != Some(std::ffi::OsStr::new("1"))
+}
+
+/// Finish reverse layers 3,2,1,0, retaining only the low quarter.
+/// Layers 3 and 2 transform four segments within each quarter. The retained
+/// branches of layers 1 and 0 are both `top=a+b`, so their four quarter
+/// results are XORed without forming any discarded bottom branch. This
+/// deletes N field products and emits N/4 fields into exact-size storage.
+/// Paired residual rows also supply the optional introduction message.
+fn transpose_forward_ntt_final_4layer_low_quarter(
+    ntt: &AdditiveNttF128,
+    data: &[F128],
+    round_f: Option<&[F128]>,
+) -> (Vec<F128>, Option<SumcheckMessage>) {
+    use rayon::prelude::*;
+    assert!(data.len().is_power_of_two() && data.len() >= 32);
+    let quarter = data.len() >> 2;
+    let rows = quarter >> 2;
+    if let Some(f) = round_f {
+        assert_eq!(f.len(), quarter);
+    }
+    let tw3: [F128; 8] = core::array::from_fn(|block| ntt.twiddle(3, block));
+    let tw2: [F128; 4] = core::array::from_fn(|block| ntt.twiddle(2, block));
+    let mut retained = Vec::<F128>::with_capacity(quarter);
+    let out_ptr = retained.as_mut_ptr() as usize;
+    const TILE_PAIRS: usize = 16;
+    let tile_pairs = (rows / 2).min(TILE_PAIRS);
+    let (u_0, u_2) = (0..rows / (2 * tile_pairs))
+        .into_par_iter()
+        .map(|tile| {
+            let first_row = tile * 2 * tile_pairs;
+            // Coset-major tiling streams four inputs at a time. Sixteen
+            // power-of-two-strided streams would contend for the same L1 sets.
+            let mut sums = [[[F128::ZERO; 4]; 2]; TILE_PAIRS];
+            for coset in 0..4 {
+                for pair in 0..tile_pairs {
+                    for parity in 0..2 {
+                        let base = coset * quarter + first_row + 2 * pair + parity;
+                        let x0 = data[base];
+                        let x1 = data[base + rows];
+                        let x2 = data[base + 2 * rows];
+                        let x3 = data[base + 3 * rows];
+                        let a = x0 + x1;
+                        let b = tw3[2 * coset] * a + x1;
+                        let c = x2 + x3;
+                        let d = tw3[2 * coset + 1] * c + x3;
+                        let top0 = a + c;
+                        let top1 = b + d;
+                        let values = [
+                            top0, top1,
+                            tw2[coset] * top0 + c,
+                            tw2[coset] * top1 + d,
+                        ];
+                        for segment in 0..4 {
+                            sums[pair][parity][segment] += values[segment];
+                        }
+                    }
+                }
+            }
+            let mut msg = (F128::ZERO, F128::ZERO);
+            for pair in 0..tile_pairs {
+                for segment in 0..4 {
+                    let index = segment * rows + first_row + 2 * pair;
+                    let even = sums[pair][0][segment];
+                    let odd = sums[pair][1][segment];
+                    // SAFETY: each tile owns disjoint adjacent row pairs in
+                    // all four segments; together tiles cover the allocation.
+                    // Input data remains immutable and never aliases output.
+                    unsafe {
+                        (out_ptr as *mut F128).add(index).write(even);
+                        (out_ptr as *mut F128).add(index + 1).write(odd);
+                    }
+                    if let Some(f) = round_f {
+                        msg.0 += f[index] * even;
+                        msg.1 += (f[index] + f[index + 1]) * (even + odd);
+                    }
+                }
+            }
+            msg
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
+    // SAFETY: the joined iterator initialized every output slot once.
+    unsafe { retained.set_len(quarter) };
+    (retained, round_f.map(|_| SumcheckMessage { u_0, u_2 }))
+}
+
+/// Rate-four induction with the incumbent sparse prefix/dense transforms
+/// through layer 4, followed by the low-quarter tail above. No transcript
+/// operation moves: only the basis production and its later read are fused.
+fn induce_sumcheck_poly_via_l1_quarter(
+    log_msg_cols: usize,
+    opened_rows: &[Vec<F128>],
+    v_challenges: &[F128],
+    queries: &[usize],
+    alpha: &[F128],
+    f: &[F128],
+) -> (Vec<F128>, F128, SumcheckMessage) {
+    assert!(log_msg_cols >= 3);
+    assert_eq!(f.len(), 1usize << log_msg_cols);
+    assert!(positions_are_sorted(queries));
+    let log_d = log_msg_cols + 2;
+    assert!(queries.iter().all(|&q| q < (1usize << log_d)));
+    let enforced_sum = induce_sumcheck_enforced_sum(opened_rows, v_challenges, queries, alpha);
+    let mut weights = build_eq_table(alpha);
+    assert!(weights.len() >= queries.len());
+    weights.truncate(queries.len());
+    let ntt = AdditiveNttF128::standard(log_d);
+    let prefix_k = 8usize.min(log_d - 4);
+    let groups = group_sorted_positions(queries, prefix_k);
+    let mut arena = scatter_active_windows(&groups, queries, &weights, prefix_k);
+    transform_active_windows(&ntt, &mut arena, &groups, prefix_k, log_d);
+    let mut remaining = log_d - prefix_k;
+    let fuse_densify = remaining >= 7
+        && use_ranked_fused_densify_first(log_d, prefix_k, queries.len());
+    let mut data = if fuse_densify {
+        remaining -= 3;
+        densify_active_windows_fused_first_3layer(&ntt, &arena, &groups, log_d, prefix_k)
+    } else {
+        densify_active_windows(&arena, &groups, log_d, prefix_k)
+    };
+    while remaining >= 7 {
+        remaining -= 3;
+        transpose_forward_ntt_fused_3layer(&ntt, &mut data, log_d, remaining);
+    }
+    for layer in (4..remaining).rev() {
+        transpose_forward_ntt_single_layer_flat(&ntt, &mut data, log_d, layer);
+    }
+    let (basis, msg) = transpose_forward_ntt_final_4layer_low_quarter(&ntt, &data, Some(f));
+    (
+        basis,
+        enforced_sum,
+        msg.expect("L1 quarter induction supplied its witness"),
+    )
+}
+
 /// Ranked L2 tail after the fused-densify parent has already executed reverse
 /// layers 7, 6, and 5.
 ///
@@ -9151,8 +9311,32 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             direct_fold8_mode,
         );
         let _t = std::time::Instant::now();
+        let mut induced_intro_msg_i = None;
         let (basis_i_induced, enforced_sum_i) =
-            if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
+            if ranked_l1_quarter_induce_selected(
+                // The new producer uses the linear sparse-window arena;
+                // an explicit request for the old hashmap keeps its path.
+                use_lazy_l2_ood
+                    && std::env::var_os("FLOCK_NO_INDUCE_LINEAR_WINDOWS").is_none(),
+                n_next,
+                config.log_inv_rates[i + 1],
+                level_rs.len(),
+                &queries_i,
+                alpha_i.len(),
+                sc_prover.f().len(),
+                std::env::var_os(ENV_NO_LIG_L1_QUARTER_INDUCE).as_deref(),
+            ) {
+                let (basis, sum, msg) = induce_sumcheck_poly_via_l1_quarter(
+                    n_next,
+                    &opened_rows_i,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                    sc_prover.f(),
+                );
+                induced_intro_msg_i = Some(msg);
+                (basis, sum)
+            } else if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
                 induce_sumcheck_poly_via_ntt(
                     n_next,
                     config.log_inv_rates[i + 1],
@@ -9215,7 +9399,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         });
 
         let _t = std::time::Instant::now();
-        let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
+        let intro_msg_i = if let Some(msg) = induced_intro_msg_i {
+            sc_prover.introduce_new_with_precomputed_msg(basis_i_induced, enforced_sum_i, msg)
+        } else {
+            sc_prover.introduce_new(basis_i_induced, enforced_sum_i)
+        };
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
@@ -14541,6 +14729,159 @@ mod tests {
         });
         TEST_L2_FACTORED_FINAL5_HITS.with(|hits| assert_eq!(hits.get(), 1));
         TEST_L2_FACTORED_FINAL5_OVERRIDE.with(|slot| assert_eq!(slot.get(), None));
+    }
+
+    #[test]
+    fn l1_quarter_tail_and_message_match_full_transpose() {
+        use crate::challenger::Challenger;
+        let mut rng = crate::challenger::RandomChallenger::new(0x1144_2026);
+        for log_d in [5usize, 8, 12] {
+            let n = 1usize << log_d;
+            let ntt = AdditiveNttF128::standard(log_d);
+            let f = rng.sample_f128_vec(n / 4);
+            let mut input = rng.sample_f128_vec(n);
+            let mut expected = input.clone();
+            transpose_forward_ntt(&ntt, &mut expected, log_d);
+            for layer in (4..log_d).rev() {
+                transpose_forward_ntt_single_layer_flat(&ntt, &mut input, log_d, layer);
+            }
+            let (basis, msg) =
+                transpose_forward_ntt_final_4layer_low_quarter(&ntt, &input, Some(&f));
+            assert_eq!(basis.as_slice(), &expected[..n / 4], "log_d={log_d}");
+            assert_eq!(msg, Some(round_msg_lsb(&f, &expected[..n / 4])));
+            let without_msg = transpose_forward_ntt_final_4layer_low_quarter(&ntt, &input, None);
+            assert_eq!(without_msg, (basis, None));
+        }
+    }
+
+    #[test]
+    fn l1_quarter_sparse_induction_matches_incumbent() {
+        use crate::challenger::Challenger;
+        let mut rng = crate::challenger::RandomChallenger::new(0x1144_1DCE);
+        // Includes empty/duplicate queries, coset boundaries, sparse-window
+        // boundaries, and residual suffix lengths four, five, and seven.
+        for log_msg in [3usize, 8, 11, 13] {
+            let n = 1usize << log_msg;
+            let f = rng.sample_f128_vec(n);
+            let lane_point = rng.sample_f128_vec(3);
+            for count in [0usize, 1, 19] {
+                let mut queries: Vec<usize> = (0..count)
+                    .map(|j| [0, 1, 255, 256, n - 1, n, 2 * n - 1, 4 * n - 1][j % 8] % (4 * n))
+                    .collect();
+                queries.sort_unstable();
+                let rows: Vec<Vec<F128>> = queries.iter()
+                    .map(|_| rng.sample_f128_vec(8))
+                    .collect();
+                let mut alpha = rng.sample_f128_vec(ceil_log2(count));
+                if alpha.len() >= 2 {
+                    alpha[0] = F128::ZERO;
+                    alpha[1] = F128::ONE;
+                }
+                let expected = induce_sumcheck_poly_via_ntt(
+                    log_msg, 2, &rows, &lane_point, &queries, &alpha,
+                );
+                let (basis, sum, msg) = induce_sumcheck_poly_via_l1_quarter(
+                    log_msg, &rows, &lane_point, &queries, &alpha, &f,
+                );
+                assert_eq!(basis, expected.0, "log_msg={log_msg}, count={count}");
+                assert_eq!(sum, expected.1);
+                assert_eq!(msg, round_msg_lsb(&f, &expected.0));
+            }
+        }
+    }
+
+    #[test]
+    fn l1_quarter_ranked_fused_densify_matches_full_induction() {
+        use crate::challenger::Challenger;
+        const LOG_MSG: usize = 16;
+        const LOG_D: usize = 18;
+        let n = 1usize << LOG_MSG;
+        let block_len = 1usize << LOG_D;
+        let mut rng = crate::challenger::RandomChallenger::new(0x1144_F053_D318);
+        let mut queries = vec![0, 255, 256, n - 1, n, 2 * n, 3 * n, block_len - 1];
+        while queries.len() < 106 {
+            let q = (rng.sample_f128().lo as usize) & (block_len - 1);
+            if let Err(index) = queries.binary_search(&q) {
+                queries.insert(index, q);
+            }
+        }
+        let rows: Vec<Vec<F128>> = queries.iter().map(|_| rng.sample_f128_vec(8)).collect();
+        let lane_point = rng.sample_f128_vec(3);
+        let alpha = rng.sample_f128_vec(7);
+        let f = rng.sample_f128_vec(n);
+        let mut config = prover_config_for(25, 6, LigeritoProfile::Fast).unwrap();
+        config.merkle_hash = HashKind::Blake3;
+        let ranked_parent = ranked_l2_lazy_ood_eq_selected(
+            &config, 25, 0, LOG_MSG, 1, n, queries.len(), 2, true, true, false,
+        );
+        assert!(ranked_l1_quarter_induce_selected(
+            ranked_parent, LOG_MSG, 2, lane_point.len(), &queries,
+            alpha.len(), f.len(), None,
+        ));
+        assert!(is_ranked_fused_densify_first_shape(LOG_D, 8, queries.len()));
+
+        let expected = induce_sumcheck_poly_via_ntt(
+            LOG_MSG, 2, &rows, &lane_point, &queries, &alpha,
+        );
+        let expected_msg = round_msg_lsb(&f, &expected.0);
+        let (basis, sum, msg) = induce_sumcheck_poly_via_l1_quarter(
+            LOG_MSG, &rows, &lane_point, &queries, &alpha, &f,
+        );
+        assert_eq!(basis, expected.0);
+        assert_eq!(sum, expected.1);
+        assert_eq!(msg, expected_msg);
+
+        // Exercise the fused production schedule even on non-Apple targets
+        // or with the dispatch rollback set: prefix 17..10, densify 9..7,
+        // fused group 6..4, then the retained quarter of layers 3..0.
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let mut weights = build_eq_table(&alpha);
+        weights.truncate(queries.len());
+        let groups = group_sorted_positions(&queries, 8);
+        let mut arena = scatter_active_windows(&groups, &queries, &weights, 8);
+        transform_active_windows(&ntt, &mut arena, &groups, 8, LOG_D);
+        let mut data = densify_active_windows_fused_first_3layer(
+            &ntt, &arena, &groups, LOG_D, 8,
+        );
+        transpose_forward_ntt_fused_3layer(&ntt, &mut data, LOG_D, 4);
+        let (fused_basis, fused_msg) =
+            transpose_forward_ntt_final_4layer_low_quarter(&ntt, &data, Some(&f));
+        assert_eq!(fused_basis, expected.0);
+        assert_eq!(fused_msg, Some(expected_msg));
+    }
+
+    #[test]
+    fn l1_quarter_selector_requires_exact_parent_shape_and_literal_kill() {
+        use std::ffi::OsStr;
+        let queries: Vec<usize> = (0..106).collect();
+        let selected = |parent, shape: (usize, usize, usize, usize, usize), qs: &[usize], kill| {
+            ranked_l1_quarter_induce_selected(
+                parent, shape.0, shape.1, shape.2, qs, shape.3, shape.4, kill,
+            )
+        };
+        let exact = (16, 2, 3, 7, 1usize << 16);
+        assert!(selected(true, exact, &queries, None));
+        assert!(!selected(false, exact, &queries, None));
+        for shape in [
+            (15, 2, 3, 7, 1 << 16), (16, 3, 3, 7, 1 << 16),
+            (16, 2, 2, 7, 1 << 16), (16, 2, 3, 6, 1 << 16),
+            (16, 2, 3, 7, 1 << 15),
+        ] {
+            assert!(!selected(true, shape, &queries, None));
+        }
+        assert!(!selected(true, exact, &queries[..105], None));
+        let mut bad = queries.clone();
+        bad.swap(0, 1);
+        assert!(!selected(true, exact, &bad, None));
+        bad = queries;
+        bad[105] = 1 << 18;
+        assert!(!selected(true, exact, &bad, None));
+        let queries: Vec<usize> = (0..106).collect();
+        for value in ["", "0", "01", "true", "1"] {
+            assert_eq!(
+                selected(true, exact, &queries, Some(OsStr::new(value))), value != "1",
+            );
+        }
     }
 
     /// `induce_sumcheck_poly_via_ntt` must be byte-identical to dense across
