@@ -393,6 +393,158 @@ unsafe fn fold_two_row_codes_q(
     }
 }
 
+/// Seven-bank ranked fold table. The first bank consumes ten low bits and the
+/// remaining banks consume nine bits each, covering the same 64 basis weights
+/// as the eight byte banks with one fewer lookup per row.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_four_row_codes_grouped_q(
+    table_data: *const u8,
+    row0: u64,
+    row1: u64,
+    row2: u64,
+    row3: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        macro_rules! load {
+            ($row:expr, $shift:expr, $mask:expr, $offset:expr) => {{
+                let index = (($row >> $shift) & $mask) as usize;
+                vld1q_u64(table_data.add($offset + index * 16).cast::<u64>())
+            }};
+        }
+
+        let mut acc0 = load!(row0, 0, 0x3ff, 0x0000);
+        let mut acc1 = load!(row1, 0, 0x3ff, 0x0000);
+        let mut acc2 = load!(row2, 0, 0x3ff, 0x0000);
+        let mut acc3 = load!(row3, 0, 0x3ff, 0x0000);
+
+        acc0 = xor3_u64(
+            acc0,
+            load!(row0, 10, 0x1ff, 0x4000),
+            load!(row0, 19, 0x1ff, 0x6000),
+        );
+        acc1 = xor3_u64(
+            acc1,
+            load!(row1, 10, 0x1ff, 0x4000),
+            load!(row1, 19, 0x1ff, 0x6000),
+        );
+        acc2 = xor3_u64(
+            acc2,
+            load!(row2, 10, 0x1ff, 0x4000),
+            load!(row2, 19, 0x1ff, 0x6000),
+        );
+        acc3 = xor3_u64(
+            acc3,
+            load!(row3, 10, 0x1ff, 0x4000),
+            load!(row3, 19, 0x1ff, 0x6000),
+        );
+
+        acc0 = xor3_u64(
+            acc0,
+            load!(row0, 28, 0x1ff, 0x8000),
+            load!(row0, 37, 0x1ff, 0xa000),
+        );
+        acc1 = xor3_u64(
+            acc1,
+            load!(row1, 28, 0x1ff, 0x8000),
+            load!(row1, 37, 0x1ff, 0xa000),
+        );
+        acc2 = xor3_u64(
+            acc2,
+            load!(row2, 28, 0x1ff, 0x8000),
+            load!(row2, 37, 0x1ff, 0xa000),
+        );
+        acc3 = xor3_u64(
+            acc3,
+            load!(row3, 28, 0x1ff, 0x8000),
+            load!(row3, 37, 0x1ff, 0xa000),
+        );
+
+        acc0 = xor3_u64(
+            acc0,
+            load!(row0, 46, 0x1ff, 0xc000),
+            load!(row0, 55, 0x1ff, 0xe000),
+        );
+        acc1 = xor3_u64(
+            acc1,
+            load!(row1, 46, 0x1ff, 0xc000),
+            load!(row1, 55, 0x1ff, 0xe000),
+        );
+        acc2 = xor3_u64(
+            acc2,
+            load!(row2, 46, 0x1ff, 0xc000),
+            load!(row2, 55, 0x1ff, 0xe000),
+        );
+        acc3 = xor3_u64(
+            acc3,
+            load!(row3, 46, 0x1ff, 0xc000),
+            load!(row3, 55, 0x1ff, 0xe000),
+        );
+        (acc0, acc1, acc2, acc3)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_two_row_codes_grouped_q(
+    table_data: *const u8,
+    row0: u64,
+    row1: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        macro_rules! load {
+            ($row:expr, $shift:expr, $mask:expr, $offset:expr) => {{
+                let index = (($row >> $shift) & $mask) as usize;
+                vld1q_u64(table_data.add($offset + index * 16).cast::<u64>())
+            }};
+        }
+
+        let mut acc0 = load!(row0, 0, 0x3ff, 0x0000);
+        let mut acc1 = load!(row1, 0, 0x3ff, 0x0000);
+        acc0 = xor3_u64(
+            acc0,
+            load!(row0, 10, 0x1ff, 0x4000),
+            load!(row0, 19, 0x1ff, 0x6000),
+        );
+        acc1 = xor3_u64(
+            acc1,
+            load!(row1, 10, 0x1ff, 0x4000),
+            load!(row1, 19, 0x1ff, 0x6000),
+        );
+        acc0 = xor3_u64(
+            acc0,
+            load!(row0, 28, 0x1ff, 0x8000),
+            load!(row0, 37, 0x1ff, 0xa000),
+        );
+        acc1 = xor3_u64(
+            acc1,
+            load!(row1, 28, 0x1ff, 0x8000),
+            load!(row1, 37, 0x1ff, 0xa000),
+        );
+        acc0 = xor3_u64(
+            acc0,
+            load!(row0, 46, 0x1ff, 0xc000),
+            load!(row0, 55, 0x1ff, 0xe000),
+        );
+        acc1 = xor3_u64(
+            acc1,
+            load!(row1, 46, 0x1ff, 0xc000),
+            load!(row1, 55, 0x1ff, 0xe000),
+        );
+        (acc0, acc1)
+    }
+}
+
 /// Returns `true` iff a 128-bit vector is all-zero.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -676,7 +828,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn r2_pair_fold_and_store(
-    table_data: *const u8,
+    grouped_table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
     anchors: *mut F128,
@@ -731,15 +883,21 @@ unsafe fn r2_pair_fold_and_store(
         ));
 
         if degen && (b0_code & b1_code) == u64::MAX {
-            let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+            let (a0, a1) =
+                fold_two_row_codes_grouped_q(grouped_table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
             let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
             vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
             return (a0, a1, b_ones, b_ones, true);
         }
 
-        let (a0, a1, b0, b1) =
-            fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+        let (a0, a1, b0, b1) = fold_four_row_codes_grouped_q(
+            grouped_table_data,
+            a0_code,
+            a1_code,
+            b0_code,
+            b1_code,
+        );
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
         let delta_pair =
             core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
@@ -792,7 +950,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const FULL: bool,
     const ODD_ON_GPU: bool,
 >(
-    table_data: *const u8,
+    grouped_table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
     anchors: *mut F128,
@@ -832,8 +990,8 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
         let mut w4 = WideNeon { lo: zero, hi: zero };
         let mut w5 = WideNeon { lo: zero, hi: zero };
 
-        let ones_bytes = [0xFFu8; 8];
-        let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
+        let (b_ones, _) =
+            fold_two_row_codes_grouped_q(grouped_table_data, u64::MAX, u64::MAX);
         let ones_is_one = is_zero_q(veorq_u64(
             b_ones,
             core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
@@ -858,10 +1016,10 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let pad1 = $pad1;
 
                 let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
+                    grouped_table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
                 );
                 let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
+                    grouped_table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
                 );
 
                 // The odd lane's weight drives the whole group; see the doc above.

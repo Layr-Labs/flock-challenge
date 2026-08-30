@@ -745,20 +745,21 @@ pub fn uni_skip_fold_and_round_pair_naive(
 
 /// Precomputed fold table for the univariate-skip fold at a fixed `z`.
 ///
-/// Storage: `n_chunks × 256` F128 entries (32 KB at `k_skip=6`). For each
-/// byte-chunk `j ∈ 0..n_chunks` and byte value `v ∈ 0..256`:
+/// The portable byte table stores `n_chunks × 256` F128 entries (32 KiB at
+/// `k_skip=6`). For each byte chunk `j` and byte value `v`:
 ///
 ///   `data[j * 256 + v] = Σ_{b : bit b of v set} weights[8j + b]`
 ///
-/// where `weights = lagrange_weights_naive(k_skip, z)`. Built incrementally by
-/// XOR-composition over the set bits of `v` (one XOR per non-power-of-2 entry).
-///
-/// Per-row fold then becomes one table lookup + XOR per byte (n_chunks lookups
-/// total instead of `ell` Lagrange multiplications).
+/// The ranked AArch64 round-two producer also receives a 64 KiB seven-bank
+/// table that partitions the same 64 basis bits as `10,9,9,9,9,9,9`. Both
+/// layouts are built by XOR-composition over set bits. A portable row fold uses
+/// one byte-table lookup and XOR per chunk instead of `ell` multiplications.
 #[derive(Clone, Debug)]
 pub struct UniSkipFoldTable {
     pub n_chunks: usize,
     pub data: Vec<F128>,
+    #[cfg(target_arch = "aarch64")]
+    pub grouped_r2_data: Vec<F128>,
 }
 
 impl UniSkipFoldTable {
@@ -785,7 +786,41 @@ impl UniSkipFoldTable {
                 data[j * 256 + v] = data[j * 256 + parent] + data[j * 256 + lo_bit];
             }
         }
-        Self { n_chunks, data }
+
+        #[cfg(target_arch = "aarch64")]
+        let grouped_r2_data = if ell == 64 {
+            const WIDTHS: [usize; 7] = [10, 9, 9, 9, 9, 9, 9];
+            let mut grouped = Vec::with_capacity(4096);
+            let mut basis_offset = 0;
+            for width in WIDTHS {
+                let entries = 1usize << width;
+                let base = grouped.len();
+                grouped.resize(base + entries, F128::ZERO);
+                for bit in 0..width {
+                    grouped[base + (1 << bit)] = weights[basis_offset + bit];
+                }
+                for value in 3..entries {
+                    if value.is_power_of_two() {
+                        continue;
+                    }
+                    let low_bit = value & value.wrapping_neg();
+                    grouped[base + value] =
+                        grouped[base + (value ^ low_bit)] + grouped[base + low_bit];
+                }
+                basis_offset += width;
+            }
+            debug_assert_eq!(basis_offset, 64);
+            debug_assert_eq!(grouped.len(), 4096);
+            grouped
+        } else {
+            Vec::new()
+        };
+        Self {
+            n_chunks,
+            data,
+            #[cfg(target_arch = "aarch64")]
+            grouped_r2_data,
+        }
     }
 
     /// Scalar one-row fold: `Σ_j table[j][bytes[j]]`. Ports the NEON
@@ -1837,7 +1872,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let full = true;
             unsafe {
-                let t = table.data.as_ptr().cast::<u8>();
+                debug_assert_eq!(table.grouped_r2_data.len(), 4096);
+                let t = table.grouped_r2_data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
                 if full {
@@ -3941,6 +3977,42 @@ mod tests {
             assert_eq!(candidate_inv, r.inv());
             assert_eq!(candidate_kappa, control_kappa);
             assert_eq!(candidate_kappa * r, F128::ONE + r);
+        }
+    }
+
+    /// The ranked seven-bank table must preserve the byte-table fold across
+    /// every group boundary; this does not exercise the NEON load schedule.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn grouped_r2_table_matches_byte_table() {
+        const WIDTHS: [usize; 7] = [10, 9, 9, 9, 9, 9, 9];
+        let mut rng = Rng::new(0x725f_6772_6f75_7065);
+        for _ in 0..4 {
+            let table = UniSkipFoldTable::new(6, rng.f128());
+            assert_eq!(table.grouped_r2_data.len(), 4096);
+            let mut rows = vec![
+                0,
+                u64::MAX,
+                0x0000_0000_0000_03ff,
+                0xffff_ffff_ffff_fc00,
+                0x0123_4567_89ab_cdef,
+            ];
+            rows.extend((0..64).map(|_| rng.next_u64()));
+
+            for row in rows {
+                let mut grouped = F128::ZERO;
+                let mut shift = 0;
+                let mut base = 0;
+                for width in WIDTHS {
+                    let index = ((row >> shift) & ((1u64 << width) - 1)) as usize;
+                    grouped += table.grouped_r2_data[base + index];
+                    shift += width;
+                    base += 1usize << width;
+                }
+                assert_eq!(shift, 64);
+                assert_eq!(base, 4096);
+                assert_eq!(grouped, table.fold_one_row(&row.to_le_bytes()));
+            }
         }
     }
 
