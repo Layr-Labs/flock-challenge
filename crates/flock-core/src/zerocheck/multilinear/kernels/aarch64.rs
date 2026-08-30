@@ -680,7 +680,6 @@ unsafe fn r2_pair_fold_and_store(
     a_packed: *const u8,
     b_packed: *const u8,
     anchors: *mut F128,
-    deltas: *mut u8,
     x_lo: usize,
     padded: bool,
     degen: bool,
@@ -691,6 +690,7 @@ unsafe fn r2_pair_fold_and_store(
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
     bool,
+    core::arch::aarch64::uint64x2_t,
 ) {
     use core::arch::aarch64::*;
 
@@ -711,8 +711,7 @@ unsafe fn r2_pair_fold_and_store(
         let zero = vdupq_n_u64(0);
         if padded {
             store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
-            return (zero, zero, zero, zero, false);
+            return (zero, zero, zero, zero, false, zero);
         }
 
         let row0 = 2 * x_lo;
@@ -734,8 +733,7 @@ unsafe fn r2_pair_fold_and_store(
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
             let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-            return (a0, a1, b_ones, b_ones, true);
+            return (a0, a1, b_ones, b_ones, true, delta_pair);
         }
 
         let (a0, a1, b0, b1) =
@@ -743,8 +741,7 @@ unsafe fn r2_pair_fold_and_store(
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
         let delta_pair =
             core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-        (a0, a1, b0, b1, false)
+        (a0, a1, b0, b1, false, delta_pair)
     }
 }
 
@@ -821,6 +818,19 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
         }
     }
 
+    #[inline(always)]
+    unsafe fn store_delta_pair_nt(dst: *mut u8, d0: uint64x2_t, d1: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) d0,
+                b = in(vreg) d1,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
     unsafe {
         let zero = vdupq_n_u64(0);
         let mut p1_even = WideNeon { lo: zero, hi: zero };
@@ -844,9 +854,8 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let x_lo0 = 2 * $u;
                 let x_lo1 = x_lo0 + 1;
                 store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
                 store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                store_delta_pair_nt(deltas.add(x_lo0 * 16), zero, zero);
             }};
         }
 
@@ -857,12 +866,13 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let pad0 = $pad0;
                 let pad1 = $pad1;
 
-                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
+                let (a0, a1, b0, b1, deg0, delta0) = r2_pair_fold_and_store(
+                    table_data, a_packed, b_packed, anchors, x_lo0, pad0, degen, b_ones,
                 );
-                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
+                let (a2, a3, b2, b3, deg1, delta1) = r2_pair_fold_and_store(
+                    table_data, a_packed, b_packed, anchors, x_lo1, pad1, degen, b_ones,
                 );
+                store_delta_pair_nt(deltas.add(x_lo0 * 16), delta0, delta1);
 
                 // The odd lane's weight drives the whole group; see the doc above.
                 let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
