@@ -2899,6 +2899,12 @@ unsafe fn fused_apply_one_k_with_b_fast<const R: i32, const MUL_X2: bool>(
 /// `(window, b_med)` call, including the ranked static-A arm.
 #[derive(Clone, Copy)]
 pub(crate) enum StaticBContext {
+    /// Also certifies T([0xff; 8]) == [F8::ONE; 64] for the exact table used
+    /// by this AB precompute. Construct only through the preparation helpers,
+    /// and keep the context paired with that same immutable table. The two
+    /// references and the enum's payload are unchanged from the incumbent.
+    /// This certificate does not broaden the process-wide partial caches'
+    /// existing single-table contract.
     Prepared {
         partials: &'static [[u8; 64]; 248],
         static_a_k1: &'static [u8; 64],
@@ -2909,6 +2915,25 @@ pub(crate) enum StaticBContext {
 }
 
 include!("aarch64_bstatic_gen.rs");
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[path = "aarch64_bcomplement_slim_tests.rs"]
+mod bcomplement_slim_tests;
+
+fn b_complement_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("FLOCK_NO_R1_B_COMPLEMENT").is_none())
+}
+
+fn b_complement_table_is_one(inv_table: &InvNttTableByteSingleGf8) -> bool {
+    if inv_table.k != 6 || inv_table.ell != 64 || inv_table.n_chunks != 8 {
+        return false;
+    }
+    let mut folded = [F8::ZERO; 64];
+    inv_table.apply_scalar(&[0xff; 8], &mut folded);
+    folded.iter().all(|value| *value == F8::ONE)
+}
 
 fn bstatic_legacy_enabled() -> bool {
     use std::sync::OnceLock;
@@ -2941,11 +2966,35 @@ pub(crate) fn prepare_static_b_context_with_policy(
     legacy_enabled: bool,
     context_legacy: bool,
 ) -> Option<StaticBContext> {
+    prepare_static_b_context_with_complement_policy(
+        inv_table,
+        blake3_static_layout,
+        legacy_enabled,
+        context_legacy,
+        b_complement_enabled(),
+    )
+}
+
+/// Resolve the complement certificate once per precompute, not per K row.
+/// Disabling it selects the old LegacyPerCall semantics, including the old
+/// cache lookups and lack of Prepared-only outer policy specialization. It
+/// is therefore a correctness rollback, not an exact e0 performance control.
+fn prepare_static_b_context_with_complement_policy(
+    inv_table: &InvNttTableByteSingleGf8,
+    blake3_static_layout: bool,
+    legacy_enabled: bool,
+    context_legacy: bool,
+    complement_requested: bool,
+) -> Option<StaticBContext> {
     if !blake3_static_layout {
         None
     } else if context_legacy {
         Some(StaticBContext::LegacyPerCall)
     } else if legacy_enabled {
+        None
+    } else if !complement_requested {
+        Some(StaticBContext::LegacyPerCall)
+    } else if !b_complement_table_is_one(inv_table) {
         None
     } else {
         Some(StaticBContext::Prepared {
