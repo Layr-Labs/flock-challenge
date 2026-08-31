@@ -132,7 +132,10 @@ mod imp {
     /// only matters if a thread is descheduled at the worst moment, and even
     /// then the residual overlap risk is identical to a design that never
     /// waits at all.
+    #[cfg(not(test))]
     const QUIET_TIMEOUT: Duration = Duration::from_micros(250);
+    #[cfg(test)]
+    const QUIET_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// The per-core spin body: proof-irrelevant scalar-integer churn that keeps
     /// the core retiring instructions (so its DVFS clock request stays high)

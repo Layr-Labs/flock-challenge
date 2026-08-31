@@ -680,7 +680,6 @@ unsafe fn r2_pair_fold_and_store(
     a_packed: *const u8,
     b_packed: *const u8,
     anchors: *mut F128,
-    deltas: *mut u8,
     x_lo: usize,
     padded: bool,
     degen: bool,
@@ -691,6 +690,7 @@ unsafe fn r2_pair_fold_and_store(
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
     bool,
+    core::arch::aarch64::uint64x2_t,
 ) {
     use core::arch::aarch64::*;
 
@@ -711,8 +711,7 @@ unsafe fn r2_pair_fold_and_store(
         let zero = vdupq_n_u64(0);
         if padded {
             store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
-            return (zero, zero, zero, zero, false);
+            return (zero, zero, zero, zero, false, zero);
         }
 
         let row0 = 2 * x_lo;
@@ -734,8 +733,7 @@ unsafe fn r2_pair_fold_and_store(
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
             let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-            return (a0, a1, b_ones, b_ones, true);
+            return (a0, a1, b_ones, b_ones, true, delta_pair);
         }
 
         let (a0, a1, b0, b1) =
@@ -743,8 +741,62 @@ unsafe fn r2_pair_fold_and_store(
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
         let delta_pair =
             core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-        (a0, a1, b0, b1, false)
+        (a0, a1, b0, b1, false, delta_pair)
+    }
+}
+
+#[inline(always)]
+unsafe fn r2_pair_fold_and_store_unpadded(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    x_lo: usize,
+    degen: bool,
+    b_ones: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    bool,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let row0 = 2 * x_lo;
+        let [a0_code, a1_code] =
+            core::ptr::read_unaligned(a_packed.add(row0 * 8).cast::<[u64; 2]>());
+        let [b0_code, b1_code] =
+            core::ptr::read_unaligned(b_packed.add(row0 * 8).cast::<[u64; 2]>());
+
+        if degen && (b0_code & b1_code) == u64::MAX {
+            let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
+            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
+            return (a0, a1, b_ones, b_ones, true, delta_pair);
+        }
+
+        let (a0, a1, b0, b1) =
+            fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+        store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
+        let delta_pair =
+            core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
+        (a0, a1, b0, b1, false, delta_pair)
     }
 }
 
@@ -821,6 +873,19 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
         }
     }
 
+    #[inline(always)]
+    unsafe fn store_delta_pair_nt(dst: *mut u8, d0: uint64x2_t, d1: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) d0,
+                b = in(vreg) d1,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
     unsafe {
         let zero = vdupq_n_u64(0);
         let mut p1_even = WideNeon { lo: zero, hi: zero };
@@ -844,9 +909,8 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let x_lo0 = 2 * $u;
                 let x_lo1 = x_lo0 + 1;
                 store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
                 store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                store_delta_pair_nt(deltas.add(x_lo0 * 16), zero, zero);
             }};
         }
 
@@ -857,12 +921,13 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let pad0 = $pad0;
                 let pad1 = $pad1;
 
-                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
+                let (a0, a1, b0, b1, deg0, delta0) = r2_pair_fold_and_store(
+                    table_data, a_packed, b_packed, anchors, x_lo0, pad0, degen, b_ones,
                 );
-                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
+                let (a2, a3, b2, b3, deg1, delta1) = r2_pair_fold_and_store(
+                    table_data, a_packed, b_packed, anchors, x_lo1, pad1, degen, b_ones,
                 );
+                store_delta_pair_nt(deltas.add(x_lo0 * 16), delta0, delta1);
 
                 // The odd lane's weight drives the whole group; see the doc above.
                 let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
@@ -924,6 +989,69 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             }};
         }
 
+        macro_rules! process_group_unpadded {
+            ($u:expr) => {{
+                let x_lo0 = 2 * $u;
+                let x_lo1 = x_lo0 + 1;
+
+                let (a0, a1, b0, b1, deg0, delta0) = r2_pair_fold_and_store_unpadded(
+                    table_data, a_packed, b_packed, anchors, x_lo0, degen, b_ones,
+                );
+                let (a2, a3, b2, b3, deg1, delta1) = r2_pair_fold_and_store_unpadded(
+                    table_data, a_packed, b_packed, anchors, x_lo1, degen, b_ones,
+                );
+                store_delta_pair_nt(deltas.add(x_lo0 * 16), delta0, delta1);
+
+                let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
+
+                if deg0 & deg1 & ones_is_one {
+                    if FULL {
+                        wide_xor(&mut p1_even, mul_unreduced_q(w, a1));
+                    }
+                    if !ODD_ON_GPU {
+                        wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
+                    }
+                    wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                } else {
+                    let a0w = mul_q(w, a0);
+                    let a1w = mul_q(w, a1);
+                    let a2w = mul_q(w, a2);
+                    let a3w = mul_q(w, a3);
+
+                    if FULL {
+                        wide_xor(&mut p1_even, mul_unreduced_q(a1w, b1));
+                        if !deg0 {
+                            wide_xor(
+                                &mut pinf_even,
+                                mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)),
+                            );
+                        }
+                    }
+                    if !ODD_ON_GPU {
+                        wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
+                        if !deg1 {
+                            wide_xor(
+                                &mut pinf_odd,
+                                mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
+                            );
+                        }
+                    }
+                    wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+
+                    let e_aw = veorq_u64(a0w, a2w);
+                    let o_aw = veorq_u64(a1w, a3w);
+                    let e_b = veorq_u64(b0, b2);
+                    let o_b = veorq_u64(b1, b3);
+                    wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+                    wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+                    wide_xor(
+                        &mut w5,
+                        mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                    );
+                }
+            }};
+        }
+
         let n_groups = lo_size / 2;
         let ranked_periodic = periodic_padding
             && pair_in_block_mask == 127
@@ -934,7 +1062,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             for block in 0..n_groups / 64 {
                 let first = block * 64;
                 for u in first..first + 60 {
-                    process_group!(u, false, false);
+                    process_group_unpadded!(u);
                 }
                 process_group!(first + 60, false, true);
                 for u in first + 61..first + 64 {
@@ -1018,16 +1146,16 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
             for lane in 0..2usize {
                 let g = 2 * u + lane;
                 let ap = anchors.add(4 * g).cast::<u64>();
-                let anc_a0 = vld1q_u64(ap);
-                let anc_b0 = vld1q_u64(ap.add(2));
-                let anc_a1 = vld1q_u64(ap.add(4));
-                let anc_b1 = vld1q_u64(ap.add(6));
+                let anc01 = vld1q_u64_x2(ap);
+                let anc23 = vld1q_u64_x2(ap.add(4));
+                let anc_a0 = anc01.0;
+                let anc_b0 = anc01.1;
+                let anc_a1 = anc23.0;
+                let anc_b1 = anc23.1;
 
                 let dp = deltas.add(32 * g);
-                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
-                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
-                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
+                let [da0, db0, da1, db1] =
+                    core::ptr::read_unaligned(dp.cast::<[u64; 4]>());
 
                 let a_delta = veorq_u64(
                     lookup_lanes_q::<8>(table_l1, da0, 0),
@@ -1175,16 +1303,16 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
             for lane in 0..4usize {
                 let g = 4 * t + lane;
                 let ap = anchors.add(4 * g).cast::<u64>();
-                let anc_a0 = vld1q_u64(ap);
-                let anc_b0 = vld1q_u64(ap.add(2));
-                let anc_a1 = vld1q_u64(ap.add(4));
-                let anc_b1 = vld1q_u64(ap.add(6));
+                let anc01 = vld1q_u64_x2(ap);
+                let anc23 = vld1q_u64_x2(ap.add(4));
+                let anc_a0 = anc01.0;
+                let anc_b0 = anc01.1;
+                let anc_a1 = anc23.0;
+                let anc_b1 = anc23.1;
 
                 let dp = deltas.add(32 * g);
-                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
-                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
-                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
+                let [da0, db0, da1, db1] =
+                    core::ptr::read_unaligned(dp.cast::<[u64; 4]>());
 
                 let a_delta = veorq_u64(
                     lookup_lanes_q::<8>(table_l1, da0, 0),
