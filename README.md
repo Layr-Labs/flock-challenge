@@ -1,13 +1,15 @@
 # Flock BLAKE3 benchmark
 
 This benchmark measures how quickly Flock can produce a valid proof for a
-fixed batch of independent BLAKE3 compression operations on Apple Silicon.
+fixed batch of independent BLAKE3 compression operations on x86_64 Linux.
 Submissions may optimize almost all prover implementation code. A prebuilt,
 checksum-pinned verifier controls the private inputs, timing, correctness
 decision, and score.
 
 For a visual version of this document, open
-[`docs/blake3-benchmark-flow.html`](docs/blake3-benchmark-flow.html).
+[`docs/blake3-benchmark-flow.html`](docs/blake3-benchmark-flow.html). A
+condensed text version is
+[`docs/BLAKE3_X86_BENCHMARK.md`](docs/BLAKE3_X86_BENCHMARK.md).
 
 ## Ranked contract
 
@@ -22,7 +24,7 @@ For a visual version of this document, open
 | Direction | higher is better |
 | Correctness | every timed proof must pass the prebuilt verifier |
 | Proof file limit | 500,000 bytes, enforced by the prebuilt verifier |
-| Official runner | Apple M3 Max, 36 GB unified memory, 10 performance cores |
+| Official runner | Dedicated c7i.4xlarge (Intel Sapphire Rapids), 16 vCPU / 32 GB, Ubuntu 24.04 LTS x86_64 (label `x86-16c-32gb`) |
 
 The benchmark counts **BLAKE3 compression functions**, not complete
 whole-message BLAKE3 hashes. The distinction matters when presenting the
@@ -80,8 +82,8 @@ work.
 
 ## Establish a local baseline first
 
-Before changing the prover, run the complete benchmark on your own Apple
-Silicon Mac and record its score:
+Before changing the prover, run the complete benchmark on your own x86_64
+Linux machine and record its score:
 
 ```sh
 ./setup.sh
@@ -90,34 +92,38 @@ Silicon Mac and record its score:
 
 Use that result as your local baseline, then compare every optimization against
 it on the same quiet machine. The official ranked benchmark runs on a dedicated
-Apple M3 Max with 36 GB of unified memory, so its absolute score will differ
-from results on other Macs. Local before-and-after measurements are still the
-fastest way to determine whether a change is directionally useful before
-submitting it for official scoring.
+c7i.4xlarge (16 vCPU / 32 GB) x86_64 Linux instance, so its absolute score will
+differ from results on other machines: the unmodified prover measures a mean of
+approximately **381,080 verified BLAKE3 compressions per second** there. Local
+before-and-after measurements remain the fastest way to determine whether a
+change is directionally useful before submitting it for official scoring.
 
 ## Official hardware and directional local results
 
-Official scores run in GitHub Actions on a dedicated self-hosted Mac with:
+Official scores run in GitHub Actions on a dedicated self-hosted x86_64 Linux
+instance with:
 
-- Apple M3 Max with 14 CPU cores;
-- 36 GB unified memory;
-- 10 performance cores used by the default thread selection;
-- arm64 macOS;
-- runner label `m3-max-36gb`;
+- instance family c7i.4xlarge — Intel Sapphire Rapids (Xeon Platinum 8488C);
+- 16 vCPUs;
+- 32 GB memory;
+- Ubuntu 24.04 LTS x86_64;
+- all CPUs reported by `nproc` used by the default thread selection;
+- runner label `x86-16c-32gb`;
 - Rust 1.97.0;
 - candidate builds using `-C target-cpu=native`.
 
-The previous M4 Pro runner's validated stability experiment used macOS 26.4
-build 25E246. Across five independent sessions, the unmodified candidate
-averaged approximately 483,866 verified compressions/s with 0.539% run-to-run
-CV. This is a historical reference observation and is not comparable to scores
-from the M3 Max runner. Establish a fresh baseline after the hardware migration;
-system version, thermals, background load, and compiler output can move
-absolute throughput.
+The official baseline for the unmodified prover on this runner is a mean of
+**381,080 verified BLAKE3 compressions per second**, with a run-to-run
+coefficient of variation of approximately **0.6%** measured across 5 full
+ranked sessions. Expect repeat measurements of an unchanged tree to move by
+roughly that much; treat differences smaller than about 1% as noise rather than
+signal. AVX-512 availability is instance-dependent and is not part of the
+benchmark contract.
 
-Local runs on another Apple Silicon Mac are useful for correctness and
+Local runs on another x86_64 Linux machine are useful for correctness and
 directional optimization feedback. Compare performance changes on the same
-quiet machine. Only the official M3 Max runner determines the ranked score.
+quiet machine. Only the official `x86-16c-32gb` runner determines the ranked
+score.
 
 ## Editable surface
 
@@ -137,7 +143,7 @@ outside it and cannot be supplied by a solver:
 - `benchmark-tools/trusted/**`;
 - Cargo manifests and `Cargo.lock`;
 - `setup.sh` and `benchmark.sh`;
-- `.github/workflows/benchmark-blake3-mac.yml`;
+- `.github/workflows/benchmark-blake3-x86.yml`;
 - `benchmark.json` and the score path.
 
 The worker wrapper is protected, but it links the editable Flock source into
@@ -155,18 +161,19 @@ does the following before release:
    worktree.
 2. Refuses a dirty or unexpected checkout.
 3. Builds `flock_benchmark_harness` from inside that worktree with the pinned
-   Rust toolchain and conservative `target-cpu=apple-m1` target.
-4. Copies the arm64 Mach-O to `benchmark-tools/trusted/`.
+   Rust toolchain and conservative `target-cpu=x86-64-v3` target.
+4. Copies the x86_64 ELF binary to `benchmark-tools/trusted/`.
 5. Writes its SHA-256 to
    [`benchmark-tools/trusted/SHA256SUMS`](benchmark-tools/trusted/SHA256SUMS).
 
 Ranked setup never runs this author tool. `setup.sh` verifies the committed
-binary's SHA-256 and code signature before building the candidate.
+binary's SHA-256 before building the candidate.
 `benchmark.sh` checks SHA-256 again immediately before invoking it.
 
 The committed verifier was built from reviewed benchmark commit
-`6b033a9c45eb2256b9322b218e87855b5f041a3f`. Its underlying re-signed Flock
-tree matches upstream Flock commit
+`7b3c050dcc07ab9945899947b4c3fcf974fd21b8`, pinned as `REVIEWED_COMMIT` in
+[`benchmark-tools/build-trusted-verifier.sh`](benchmark-tools/build-trusted-verifier.sh).
+Its underlying re-signed Flock tree matches upstream Flock commit
 `85fc0e7cc002e7ca4dffdff805ba89976e9a5293`.
 
 ## Harness and worker interaction
@@ -174,7 +181,7 @@ tree matches upstream Flock commit
 The trusted harness repeats the following sequence 120 times:
 
 1. It creates private scratch paths and starts a fresh candidate worker under
-   a macOS Seatbelt profile.
+   a Linux bubblewrap sandbox.
 2. The worker creates `Blake3Setup`, computes one fixed-seed warm-up proof, and
    writes a ready file.
 3. Only after readiness, the harness reads 8 bytes from `/dev/urandom`.
@@ -237,13 +244,16 @@ execution, so a failed run cannot upload an earlier result as a new score.
 
 ## Worker sandbox
 
-On ranked macOS runs, `benchmark.sh` requires `sandbox-exec` and launches only
-the candidate worker under a generated Seatbelt profile. The worker:
+On ranked Linux runs, `benchmark.sh` requires bubblewrap (`bwrap`) and launches
+only the candidate worker inside its sandbox. Bubblewrap replaces the previous
+macOS Seatbelt profile. The worker:
 
 - receives a cleared environment containing only `RAYON_NUM_THREADS` and
   `TMPDIR`;
 - cannot use the network;
-- cannot create child processes;
+- runs in a separate PID namespace created with `--unshare-pid`, and
+  `--die-with-parent` tears down the sandbox with its parent; unlike Seatbelt's
+  fork denial, child processes are contained rather than forbidden outright;
 - cannot write outside its private scratch directory.
 
 The trusted harness wipes scratch between workers. Candidate code therefore
@@ -295,7 +305,7 @@ submission commit it dispatched.
 
 ## Running locally
 
-On an Apple Silicon Mac:
+On an x86_64 Linux machine:
 
 ```bash
 # First run only:
@@ -305,9 +315,10 @@ On an Apple Silicon Mac:
 ./benchmark.sh
 ```
 
-`setup.sh` checks macOS/arm64 prerequisites, installs or selects the pinned
-Rust toolchain, verifies the trusted binary, fetches locked dependencies with
-retries, and builds the candidate offline. On every invocation,
+`setup.sh` checks Linux/x86_64 prerequisites, including `sha256sum` and
+bubblewrap, installs or selects the pinned Rust toolchain, verifies the trusted
+binary, fetches locked dependencies with retries, and builds the candidate
+offline. On every invocation,
 `benchmark.sh` performs the same locked, offline candidate build before it
 starts the trusted harness. Cargo reuses unchanged artifacts, while edits under
 the solver surface are guaranteed to reach the executed worker. Compilation is
@@ -333,7 +344,7 @@ FLOCK_REQUIRE_SANDBOX=1
 ## GitHub Actions and Hilbert
 
 The production workflow is
-`.github/workflows/benchmark-blake3-mac.yml` and is dispatch-only. It:
+`.github/workflows/benchmark-blake3-x86.yml` and is dispatch-only. It:
 
 1. checks out the exact dispatched SHA with credentials disabled;
 2. records runner hardware and software information;
@@ -342,7 +353,7 @@ The production workflow is
 5. publishes the Markdown summary;
 6. uploads root `score.json` and a separate diagnostics artifact.
 
-The workflow runs on `[self-hosted, m3-max-36gb]`. Hilbert owns submission archive
-validation, editable-path enforcement, candidate commit construction, workflow
-dispatch, score comparison, and promotion. The GitHub pull request remains the
-durable record of the candidate diff, workflow run, and result.
+The workflow runs on `[self-hosted, x86-16c-32gb]`. Hilbert owns submission
+archive validation, editable-path enforcement, candidate commit construction,
+workflow dispatch, score comparison, and promotion. The GitHub pull request
+remains the durable record of the candidate diff, workflow run, and result.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install/check the Apple Silicon build prerequisites, populate Cargo's cache,
+# Install/check the Linux x86_64 build prerequisites, populate Cargo's cache,
 # verify the committed verifier, and build the candidate. Safe to rerun.
 set -euo pipefail
 
@@ -32,33 +32,27 @@ toolchain_is_installed() {
   return 1
 }
 
-# The committed verifier is an arm64 Mach-O and the ranked sandbox is macOS
-# Seatbelt, so unsupported hosts should fail before downloading anything.
-[[ "$(uname -s)" == Darwin ]] || die "macOS is required"
-[[ "$(uname -m)" == arm64 ]] || die "Apple Silicon (arm64) is required"
+# The committed verifier is an x86_64 ELF and the ranked sandbox is
+# bubblewrap, so unsupported hosts should fail before downloading anything.
+[[ "$(uname -s)" == Linux ]] || die "Linux is required"
+[[ "$(uname -m)" == x86_64 ]] || die "x86_64 is required"
 
-for dependency in git shasum codesign curl; do
+for dependency in git sha256sum curl; do
   command -v "${dependency}" >/dev/null 2>&1 || die "${dependency} is required"
 done
-if ! command -v sandbox-exec >/dev/null 2>&1; then
-  [[ "${FLOCK_REQUIRE_SANDBOX:-0}" == 1 ]] && die "sandbox-exec is required"
-  echo "setup.sh: warning: sandbox-exec is missing; ranked runs will fail" >&2
+if ! command -v bwrap >/dev/null 2>&1; then
+  [[ "${FLOCK_REQUIRE_SANDBOX:-0}" == 1 ]] && die "bubblewrap (bwrap) is required"
+  echo "setup.sh: warning: bwrap is missing; ranked runs will fail" >&2
 fi
 
-# Cargo and the cc crate need the macOS SDK plus a working Clang linker.
+# Cargo and the cc crate need a working C compiler.
 compiler=""
-if [[ -n "${CC:-}" ]] && command -v "${CC}" >/dev/null 2>&1; then
-  compiler="$(command -v "${CC}")"
-elif command -v xcrun >/dev/null 2>&1; then
-  compiler="$(xcrun --find clang 2>/dev/null || true)"
-fi
-if [[ -z "${compiler}" || ! -x "${compiler}" ]] || ! "${compiler}" --version >/dev/null 2>&1; then
-  if [[ -t 0 ]] && command -v xcode-select >/dev/null 2>&1; then
-    echo "setup.sh: requesting the Xcode Command Line Tools installer" >&2
-    xcode-select --install 2>/dev/null || true
-  fi
-  die "install Xcode Command Line Tools, wait for completion, then rerun ./setup.sh"
-fi
+for candidate in "${CC:-}" cc gcc clang; do
+  # shellcheck disable=SC2015
+  [[ -n "${candidate}" ]] && command -v "${candidate}" >/dev/null 2>&1 || continue
+  compiler="$(command -v "${candidate}")" && break
+done
+[[ -n "${compiler}" ]] || die "install gcc or clang, then rerun ./setup.sh"
 export CC="${compiler}"
 
 # Install Rustup when the host has no managed Rust installation. This mirrors
@@ -84,13 +78,12 @@ fi
 export RUSTUP_TOOLCHAIN="${toolchain}"
 command -v cargo >/dev/null 2>&1 || die "cargo is unavailable for Rust ${toolchain}"
 
-# Fail before compilation if the protected verifier bytes or signature differ.
+# Fail before compilation if the protected verifier bytes differ.
 (
   cd "${root}/benchmark-tools/trusted"
-  shasum -a 256 -c SHA256SUMS
+  sha256sum -c SHA256SUMS
 )
 [[ -x "${trusted}" ]] || die "trusted verifier is not executable"
-codesign --verify --strict "${trusted}" || die "trusted verifier signature is invalid"
 
 export CARGO_INCREMENTAL=0
 export CARGO_NET_RETRY="${CARGO_NET_RETRY:-10}"

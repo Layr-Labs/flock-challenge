@@ -1,4 +1,4 @@
-name: BLAKE3 Mac Benchmark
+name: BLAKE3 x86 Benchmark
 
 on:
   workflow_dispatch:
@@ -8,13 +8,13 @@ permissions:
   actions: read
 
 concurrency:
-  group: flock-blake3-mac-${{ github.ref }}
+  group: flock-blake3-x86-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   benchmark:
-    runs-on: [self-hosted, m3-max-36gb]
-    timeout-minutes: 8
+    runs-on: [self-hosted, x86-16c-32gb]
+    timeout-minutes: 25
     env:
       BLAKE3_LOG2: "18"
       BLAKE3_THREADS: auto
@@ -36,19 +36,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$(uname -s)" == Darwin ]]
-          [[ "$(uname -m)" == arm64 ]]
+          [[ "$(uname -s)" == Linux ]]
+          [[ "$(uname -m)" == x86_64 ]]
           command -v git
-          command -v shasum
-          command -v codesign
-          command -v sandbox-exec
+          command -v sha256sum
+          command -v bwrap
           mkdir -p benchmark-results
           {
-            sw_vers
+            cat /etc/os-release
             uname -a
-            sysctl -n machdep.cpu.brand_string
-            sysctl -n hw.memsize
-            sysctl -n hw.perflevel0.physicalcpu
+            lscpu
+            grep MemTotal /proc/meminfo
+            nproc
             git rev-parse HEAD
           } | tee benchmark-results/runner.txt
 

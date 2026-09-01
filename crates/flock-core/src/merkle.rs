@@ -99,14 +99,6 @@ mod sha256x4;
 #[path = "merkle/x86_64.rs"]
 mod sha256x4;
 
-/// Apple AArch64 BLAKE3 kernels specialized for the ranked Merkle geometry.
-/// The 1 KiB leaf path interleaves two four-lane states round-by-round, while
-/// parent nodes use three four-lane states. Every other target retains the
-/// upstream `blake3::platform::hash_many` path.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-#[path = "merkle/blake3_neon_apple.rs"]
-mod blake3_neon_apple;
-
 /// Global Merkle hash call/compression counters, enabled with
 /// `--features hash-count` (e.g. by `benches/verifier_hash_count.rs`).
 /// Relaxed atomics — exact totals, no ordering guarantees across threads.
@@ -288,10 +280,18 @@ const BLAKE3_IV: [u32; 8] = [
 const BLAKE3_CHUNK_START: u8 = 1;
 const BLAKE3_CHUNK_END: u8 = 2;
 const BLAKE3_PARENT: u8 = 4;
-const BLAKE3_ROOT: u8 = 8;
 
-/// Cached SIMD platform. `Platform::detect()` is cheap but not free, and the
-/// tree build reaches the batched path once per [`BLAKE3_BATCH`] nodes.
+/// The official x86 runner is compiled for Sapphire Rapids, so make the
+/// already-required AVX-512 platform a compile-time constant there. Besides
+/// skipping detection, this lets each const-generic `hash_many` call erase the
+/// portable/SSE/AVX2 match arms. Other targets retain dynamic detection.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn blake3_platform() -> blake3::platform::Platform {
+    blake3::platform::Platform::AVX512
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
 fn blake3_platform() -> blake3::platform::Platform {
     use std::sync::OnceLock;
     static PLATFORM: OnceLock<blake3::platform::Platform> = OnceLock::new();
@@ -300,13 +300,14 @@ fn blake3_platform() -> blake3::platform::Platform {
 
 /// Inputs handed to `hash_many` per call.
 ///
-/// Sized to the widest `simd_degree` that exists — 4 under NEON, 8 under AVX2,
-/// 16 under AVX-512 — so the batch fills the machine's vector rather than
-/// leaving lanes idle. This is portability insurance, not a local win: swept
-/// over 4/8/16/64/256 on an M4 Max (NEON, degree 4) the spread was ~1-5%, i.e.
-/// inside run-to-run noise, with 16 marginally best. It should matter on an
-/// AVX-512 host, where a 4-input call can only ever fill a quarter of the
-/// vector; that has not been measured here.
+/// AVX-512's FFI processes sixteen messages per inner SIMD iteration, but one
+/// entry can loop over several such groups. Four groups amortize the FFI and
+/// state-setup prologue while keeping the pointer array to 512 bytes. Retain
+/// the established 16-input policy on non-x86 targets, where an M4 sweep found
+/// it marginally best and the SIMD width is only four.
+#[cfg(target_arch = "x86_64")]
+const BLAKE3_BATCH: usize = 64;
+#[cfg(not(target_arch = "x86_64"))]
 const BLAKE3_BATCH: usize = 16;
 
 /// Drive `hash_many` over `data`, a run of `out.len()` contiguous `N`-byte
@@ -365,21 +366,6 @@ fn blake3_hash_many<const N: usize>(
 /// `16 << log_batch_size` bytes. Returns `false` for any other size, leaving
 /// the caller to hash leaves one at a time.
 fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> bool {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    if leaf_size == 1024 {
-        let done = blake3_neon_apple::hash_complete_groups(data, out);
-        if done < out.len() {
-            blake3_hash_many::<1024>(
-                &data[done * 1024..],
-                &mut out[done..],
-                0,
-                BLAKE3_CHUNK_START,
-                BLAKE3_CHUNK_END,
-            );
-        }
-        return true;
-    }
-
     macro_rules! dispatch {
         ($($n:literal),+ $(,)?) => {
             match leaf_size {
@@ -401,7 +387,7 @@ fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> b
 /// exactly the sizes that function dispatches on — `blake3_batch_dispatch_agrees`
 /// holds the two together.
 #[inline]
-fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
+pub(crate) fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
     matches!(leaf_size, 64 | 128 | 256 | 512 | 1024)
 }
 
@@ -409,45 +395,7 @@ fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
 /// (left ‖ right) child pairs. Equivalent to [`blake3_parent_cv`] per node.
 #[inline]
 fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        let done = blake3_neon_apple::hash_complete_parent_groups(data, out);
-        if done < out.len() {
-            blake3_hash_many::<64>(&data[done * 64..], &mut out[done..], BLAKE3_PARENT, 0, 0);
-        }
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     blake3_hash_many::<64>(data, out, BLAKE3_PARENT, 0, 0);
-}
-
-/// Batched BLAKE3 PoW grind blocks: `data` is `out.len()` contiguous
-/// 64-byte single-chunk pre-images, hashed with `CHUNK_START | CHUNK_END |
-/// ROOT` — byte-identical to `blake3::hash` on each block. Uses the
-/// twelve-way kernel on Apple AArch64, upstream `hash_many` elsewhere and
-/// for the tail.
-#[inline]
-pub(crate) fn blake3_hash_many_pow(data: &[u8], out: &mut [Hash]) {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        let done = blake3_neon_apple::hash_complete_pow_groups(data, out);
-        if done < out.len() {
-            blake3_hash_many::<64>(
-                &data[done * 64..],
-                &mut out[done..],
-                0,
-                BLAKE3_CHUNK_START,
-                BLAKE3_CHUNK_END | BLAKE3_ROOT,
-            );
-        }
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-    blake3_hash_many::<64>(
-        data,
-        out,
-        0,
-        BLAKE3_CHUNK_START,
-        BLAKE3_CHUNK_END | BLAKE3_ROOT,
-    );
 }
 
 /// Hash a run of `out.len()` equal-size leaves from `data` under `kind`.
@@ -456,7 +404,7 @@ pub(crate) fn blake3_hash_many_pow(data: &[u8], out: &mut [Hash]) {
 /// SHA-256's kernel is inherently four-wide, while BLAKE3 wants the widest
 /// batch the machine offers. Both are rayon-parallel and both are
 /// byte-identical to calling [`hash_leaf`] on each leaf.
-fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) {
+pub(crate) fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     {
         use std::sync::atomic::Ordering::Relaxed;
@@ -468,25 +416,11 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
     }
     match kind {
         HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
-            // Chunk-queue dispatch instead of a static rayon split so the
-            // efficiency-core helper pool (when present) can drain leaves
-            // alongside the main pool — see `epool`. Chunk `i` writes only
-            // `out[i*C..(i+1)*C]`, so output is byte-identical to the static
-            // split regardless of which pool claims which chunk.
-            let n = out.len();
-            let out_base = crate::epool::SyncPtr(out.as_mut_ptr());
-            crate::epool::run_hetero_chunks(n.div_ceil(BLAKE3_LEAF_QUEUE_CHUNK), |i| {
-                let start = i * BLAKE3_LEAF_QUEUE_CHUNK;
-                let end = (start + BLAKE3_LEAF_QUEUE_CHUNK).min(n);
-                // SAFETY: `Hash` is `[u8; 32]` (Copy, no padding); the queue
-                // hands out each `i` exactly once and the `[start, end)`
-                // ranges are pairwise disjoint and in-bounds (`end <= n`),
-                // so each closure holds the only `&mut` into its range.
-                let outs = unsafe {
-                    core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
-                };
-                blake3_hash_many_leaves(&data[start * leaf_size..end * leaf_size], leaf_size, outs);
-            });
+            out.par_chunks_mut(BLAKE3_GROUP)
+                .zip(data.par_chunks(BLAKE3_GROUP * leaf_size))
+                .for_each(|(outs, leaves)| {
+                    blake3_hash_many_leaves(leaves, leaf_size, outs);
+                });
         }
         HashKind::Blake3 => out
             .par_iter_mut()
@@ -516,47 +450,81 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
     }
 }
 
-/// Hash one already-partitioned run of ranked 1 KiB BLAKE3 leaves without
-/// starting another Rayon/E-core scheduling region.
+/// Serial twin of [`hash_leaves`]. Same CVs; no rayon dispatch.
 ///
-/// The ranked NTT-to-Merkle pipeline calls this from jobs that are themselves
-/// distributed across the P-core pool or handed to the existing E-core helper
-/// pool. Keeping this helper scheduling-free avoids a nested barrier per 1 MiB
-/// finalized NTT subtree while preserving the exact twelve-way leaf kernel and
-/// hash-count semantics used by [`hash_leaves`].
-pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
-    const LEAF_SIZE: usize = 1024;
-    assert_eq!(data.len(), out.len() * LEAF_SIZE);
+/// Used when a worker already owns a retired leaf-index range (Merkle
+/// rewrite 1): nested `par_chunks` inside the NTT deep pass would oversub.
+pub(crate) fn hash_leaves_serial(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     {
         use std::sync::atomic::Ordering::Relaxed;
         hash_count::LEAF_CALLS.fetch_add(out.len() as u64, Relaxed);
         hash_count::LEAF_COMPRESSIONS.fetch_add(
-            out.len() as u64 * hash_count::blocks(HashKind::Blake3, LEAF_SIZE),
+            out.len() as u64 * hash_count::blocks(kind, leaf_size),
             Relaxed,
         );
     }
-    let batched = blake3_hash_many_leaves(data, LEAF_SIZE, out);
-    assert!(batched, "ranked 1 KiB leaves must use the batched kernel");
+    match kind {
+        HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
+            for (outs, leaves) in out
+                .chunks_mut(BLAKE3_GROUP)
+                .zip(data.chunks(BLAKE3_GROUP * leaf_size))
+            {
+                blake3_hash_many_leaves(leaves, leaf_size, outs);
+            }
+        }
+        HashKind::Blake3 => {
+            for (o, leaf) in out.iter_mut().zip(data.chunks(leaf_size)) {
+                *o = blake3_leaf_cv(leaf);
+            }
+        }
+        HashKind::Sha256 => {
+            for (outs, leaves) in out.chunks_mut(4).zip(data.chunks(4 * leaf_size)) {
+                if outs.len() == 4 {
+                    sha256_hash4(
+                        [
+                            &leaves[..leaf_size],
+                            &leaves[leaf_size..2 * leaf_size],
+                            &leaves[2 * leaf_size..3 * leaf_size],
+                            &leaves[3 * leaf_size..],
+                        ],
+                        outs,
+                    );
+                } else {
+                    for (out, leaf) in outs.iter_mut().zip(leaves.chunks(leaf_size)) {
+                        *out = Sha256::digest(leaf).into();
+                    }
+                }
+            }
+        }
+    }
 }
 
-/// Leaves per queue chunk in the batched BLAKE3 leaf path (see `epool`).
-/// A multiple of 12 so every full chunk runs entirely through the twelve-way
-/// kernel with no per-chunk tail; small enough (240 KiB of input at the
-/// ranked 1 KiB leaves) that the worst-case tail wait — the last chunk
-/// claimed by an efficiency core — is a fraction of a millisecond, while an
-/// atomic claim per 240 leaves stays far below dispatch noise.
-const BLAKE3_LEAF_QUEUE_CHUNK: usize = 240;
+/// Nodes per rayon task in the batched BLAKE3 paths: enough to amortize task
+/// dispatch over many `hash_many` calls, small enough to stay cache-resident.
+const BLAKE3_GROUP: usize = 1024;
 
-/// Parents per queue chunk in the batched BLAKE3 parent path (see `epool`).
-/// Must be a multiple of 12 so every full group runs entirely through the
-/// twelve-way parent kernel (`hash_complete_parent_groups`) with no 4-wide
-/// tail. The previous static-rayon group size of 1024 = 12·85 + 4 dropped a
-/// 4-node remainder onto the slower path in *every* task; 1020 = 12·85
-/// eliminates that remainder. A full chunk is 1020 nodes × 64 B of children
-/// ≈ 64 KiB of input — one atomic claim amortises cleanly and an E-core tail
-/// is still sub-millisecond.
-const BLAKE3_PARENT_QUEUE_CHUNK: usize = 1020;
+/// Serial twin of [`hash_pairs_level`]: same CVs, no rayon dispatch. Used
+/// by the commit path to fold a deep-pass sub-group's own Merkle subtree while
+/// its leaves are still cache-hot, from inside the NTT rayon job (where a
+/// nested `par_chunks_mut` would oversubscribe the pool).
+pub(crate) fn hash_pairs_level_serial(read: &[Hash], write: &mut [Hash], kind: HashKind) {
+    #[cfg(feature = "hash-count")]
+    hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    debug_assert_eq!(read.len(), 2 * write.len());
+    // SAFETY: `Hash` is `[u8; 32]`, so a slice of `n` hashes is exactly `32n`
+    // initialized bytes with no padding.
+    let read_bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
+    match kind {
+        HashKind::Blake3 => blake3_hash_many_parents(read_bytes, write),
+        HashKind::Sha256 => {
+            for (o, children) in write.iter_mut().zip(read_bytes.chunks(64)) {
+                *o = Sha256::digest(children).into();
+            }
+        }
+    }
+}
 
 /// Hash one internal level: `write[i] = hash_pair(read[2i], read[2i+1])`.
 ///
@@ -564,9 +532,8 @@ const BLAKE3_PARENT_QUEUE_CHUNK: usize = 1020;
 /// read them zero-copy. Small upper levels can't fill the cores, so a rayon
 /// dispatch per level costs more than the hashing itself (~3× at the top of a
 /// 2^18 tree); those are hashed serially — still SIMD-batched — and only the
-/// wide lower levels fan out through the same efficiency-core-aware chunk
-/// queue the leaf path uses.
-fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
+/// wide lower levels fan out.
+pub(crate) fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: `Hash` is `[u8; 32]`, so a slice of `n` hashes is exactly `32n`
@@ -581,34 +548,10 @@ fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
             if serial {
                 blake3_hash_many_parents(read_bytes, write);
             } else {
-                // Chunk-queue dispatch so the efficiency-core helper pool can
-                // drain parent nodes alongside the main pool — same contract
-                // as the leaf path. Chunk `i` writes only
-                // `write[i*C..(i+1)*C]`, so output is byte-identical to a
-                // static rayon split regardless of claim order.
-                let n = write.len();
-                let out_base = crate::epool::SyncPtr(write.as_mut_ptr());
-                let read_base = read_bytes.as_ptr() as usize;
-                crate::epool::run_hetero_chunks(n.div_ceil(BLAKE3_PARENT_QUEUE_CHUNK), |i| {
-                    let start = i * BLAKE3_PARENT_QUEUE_CHUNK;
-                    let end = (start + BLAKE3_PARENT_QUEUE_CHUNK).min(n);
-                    // SAFETY: `Hash` is `[u8; 32]` (Copy, no padding); the
-                    // queue hands out each `i` exactly once and the
-                    // `[start, end)` ranges are pairwise disjoint and
-                    // in-bounds, so each closure holds the only `&mut` into
-                    // its output range. The read side is immutable for the
-                    // whole level.
-                    let outs = unsafe {
-                        core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
-                    };
-                    let children = unsafe {
-                        core::slice::from_raw_parts(
-                            (read_base as *const u8).add(start * 64),
-                            (end - start) * 64,
-                        )
-                    };
-                    blake3_hash_many_parents(children, outs);
-                });
+                write
+                    .par_chunks_mut(BLAKE3_GROUP)
+                    .zip(read_bytes.par_chunks(BLAKE3_GROUP * 64))
+                    .for_each(|(outs, children)| blake3_hash_many_parents(children, outs));
             }
         }
         HashKind::Sha256 => {
@@ -671,31 +614,36 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
         "data length must be a multiple of num_leaves"
     );
 
-    let leaf_size = data.len() / num_leaves;
     let total_nodes = 2 * num_leaves - 1;
     // Uninit alloc — every node is written exactly once before being read:
     // leaves at step 1, then each internal level reads the level below (which
-    // was just written) and writes itself.
+    // was just written) and writes itself. Production ligero_commit takes
+    // from TREE_POOL instead and calls [`fill_merkle_tree`] so the 16 MiB
+    // L1 tree is not mmap'd on the timed path.
     let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
+    fill_merkle_tree(&mut tree, data, num_leaves, kind);
+    tree
+}
+
+/// Write the flat `2n-1` tree into `tree`. Same leaves-then-parents sequence
+/// as [`merkle_tree`]; every node is written before it is read.
+pub(crate) fn fill_merkle_tree(tree: &mut [Hash], data: &[u8], num_leaves: usize, kind: HashKind) {
+    assert!(
+        num_leaves.is_power_of_two() && num_leaves > 0,
+        "num_leaves must be power of 2"
+    );
+    assert_eq!(
+        data.len() % num_leaves,
+        0,
+        "data length must be a multiple of num_leaves"
+    );
+    assert_eq!(tree.len(), 2 * num_leaves - 1);
+    let leaf_size = data.len() / num_leaves;
 
     // 1. Leaves — fully parallel, SIMD-batched across leaves where possible.
     hash_leaves(data, leaf_size, &mut tree[..num_leaves], kind);
 
-    merkle_tree_from_prehashed_leaves(tree, num_leaves, kind)
-}
-
-/// Complete a flat tree whose first `num_leaves` slots already contain leaf
-/// hashes. The vector must have the normal `2*num_leaves-1` allocation; every
-/// remaining slot is written level-by-level before it is read.
-pub(crate) fn merkle_tree_from_prehashed_leaves(
-    mut tree: Vec<Hash>,
-    num_leaves: usize,
-    kind: HashKind,
-) -> Vec<Hash> {
-    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
-    assert_eq!(tree.len(), 2 * num_leaves - 1);
-
-    // Internal levels — parallel within a level, sequential across levels.
+    // 2. Internal levels — parallel within a level, sequential across levels.
     let mut read_start = 0usize;
     let mut read_len = num_leaves;
     while read_len > 1 {
@@ -710,8 +658,116 @@ pub(crate) fn merkle_tree_from_prehashed_leaves(
         read_start += read_len;
         read_len = next_len;
     }
+}
 
-    tree
+/// Incremental builder for the same `2n−1` flat tree as [`merkle_tree`].
+///
+/// Leaf-index ranges must be absorbed in order and must extend a contiguous
+/// prefix. Do not absorb a range whose last NTT write has not retired.
+/// Parents fold as soon as both children exist, and only on a contiguous
+/// pair-prefix of an already-written child level. Root stays at `tree[2n−2]`.
+#[allow(dead_code)] // Streaming oracle retained for rollback and equivalence tests.
+pub(crate) struct StreamMerkle {
+    tree: Vec<Hash>,
+    n_leaves: usize,
+    leaf_size: usize,
+    kind: HashKind,
+    /// `level_done[0]` = contiguous hashed leaf prefix.
+    /// `level_done[k]` = contiguous written prefix at the level with
+    /// `n_leaves >> k` nodes (1 at the root).
+    level_done: Vec<usize>,
+}
+
+#[allow(dead_code)] // Streaming oracle retained for rollback and equivalence tests.
+impl StreamMerkle {
+    pub(crate) fn new(n_leaves: usize, leaf_size: usize, kind: HashKind) -> Self {
+        assert!(
+            n_leaves.is_power_of_two() && n_leaves > 0,
+            "num_leaves must be power of 2"
+        );
+        let levels = n_leaves.trailing_zeros() as usize + 1;
+        Self {
+            tree: crate::alloc_uninit_vec(2 * n_leaves - 1),
+            n_leaves,
+            leaf_size,
+            kind,
+            level_done: vec![0; levels],
+        }
+    }
+
+    /// Hash leaves `[lo, hi)` from `data` (exactly `(hi-lo)*leaf_size` bytes)
+    /// and fold every parent whose both children now exist.
+    pub(crate) fn absorb_leaf_range(&mut self, data: &[u8], lo: usize, hi: usize) {
+        assert!(hi > lo && hi <= self.n_leaves);
+        assert_eq!(
+            lo, self.level_done[0],
+            "leaf ranges must extend the hashed prefix (got {lo}, prefix {})",
+            self.level_done[0]
+        );
+        assert_eq!(data.len(), (hi - lo) * self.leaf_size);
+        hash_leaves(data, self.leaf_size, &mut self.tree[lo..hi], self.kind);
+        self.level_done[0] = hi;
+        self.fold_ready_parents();
+    }
+
+    fn fold_ready_parents(&mut self) {
+        let mut s = self.n_leaves;
+        let mut level = 0usize;
+        while s > 1 {
+            let child_done = self.level_done[level];
+            let parent_ready = child_done / 2;
+            let already = self.level_done[level + 1];
+            if parent_ready > already {
+                let child_start = 2 * self.n_leaves - 2 * s;
+                let (read, rest) = self.tree[child_start..].split_at_mut(s);
+                let write = &mut rest[..s / 2];
+                hash_pairs_level(
+                    &read[2 * already..2 * parent_ready],
+                    &mut write[already..parent_ready],
+                    self.kind,
+                );
+                self.level_done[level + 1] = parent_ready;
+            }
+            s >>= 1;
+            level += 1;
+        }
+    }
+
+    pub(crate) fn into_tree(self) -> Vec<Hash> {
+        assert_eq!(
+            self.level_done[0], self.n_leaves,
+            "not every leaf was absorbed"
+        );
+        debug_assert_eq!(*self.level_done.last().unwrap(), 1);
+        self.tree
+    }
+}
+
+/// Same tree as [`merkle_tree`], built by streaming `ranges` in leaf-index
+/// order and folding parents as soon as both children exist.
+#[allow(dead_code)] // Streaming oracle retained for rollback and equivalence tests.
+pub(crate) fn merkle_tree_streaming(
+    data: &[u8],
+    num_leaves: usize,
+    kind: HashKind,
+    ranges: impl IntoIterator<Item = core::ops::Range<usize>>,
+) -> Vec<Hash> {
+    assert!(
+        num_leaves.is_power_of_two() && num_leaves > 0,
+        "num_leaves must be power of 2"
+    );
+    assert_eq!(
+        data.len() % num_leaves,
+        0,
+        "data length must be a multiple of num_leaves"
+    );
+    let leaf_size = data.len() / num_leaves;
+    let mut builder = StreamMerkle::new(num_leaves, leaf_size, kind);
+    for r in ranges {
+        let bytes = &data[r.start * leaf_size..r.end * leaf_size];
+        builder.absorb_leaf_range(bytes, r.start, r.end);
+    }
+    builder.into_tree()
 }
 
 /// Sequential (single-threaded) version of [`merkle_tree`]. Used for
@@ -859,6 +915,49 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     proof
 }
 
+/// Flat-tree indices of the sibling hashes [`merkle_multi_proof`] emits, in
+/// the exact emission order. Pure index arithmetic — no tree reads — so the
+/// prover can walk the paths first and gather the (DRAM-cold, random-access)
+/// sibling hashes in one order-preserving parallel pass:
+/// `indices.map(|i| tree[i])` reproduces `merkle_multi_proof` byte-for-byte.
+pub fn merkle_multi_proof_sibling_indices(num_leaves: usize, positions: &[usize]) -> Vec<usize> {
+    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
+
+    if positions.is_empty() || num_leaves == 1 {
+        return Vec::new();
+    }
+
+    let mut active: Vec<usize> = positions.to_vec();
+    active.sort_unstable();
+    active.dedup();
+    debug_assert!(active.iter().all(|&p| p < num_leaves));
+
+    let mut indices = Vec::new();
+    let mut level_start = 0usize;
+    let mut level_len = num_leaves;
+
+    while level_len > 1 {
+        let mut next = Vec::with_capacity(active.len());
+        let mut i = 0;
+        while i < active.len() {
+            let p = active[i];
+            let sib_active = i + 1 < active.len() && active[i + 1] == (p ^ 1);
+            if sib_active {
+                i += 2;
+            } else {
+                indices.push(level_start + (p ^ 1));
+                i += 1;
+            }
+            next.push(p >> 1);
+        }
+        active = next;
+        level_start += level_len;
+        level_len >>= 1;
+    }
+
+    indices
+}
+
 /// Verify a Merkle multi-proof produced by [`merkle_multi_proof`].
 ///
 /// `sorted_unique_positions` and `leaf_hashes` must be aligned and sorted:
@@ -942,6 +1041,119 @@ pub fn verify_merkle_multi_proof(
 
 #[cfg(test)]
 mod tests {
+    /// Diagnostics: time small BLAKE3 trees (the Ligerito recursive-commit
+    /// shapes) in isolation. `cargo test -p flock-core --release small_tree_timing_probe -- --ignored --nocapture`.
+    /// Diagnostics: the Ligerito recursive-commit encode shapes (num_ntts=8,
+    /// rate 1/4) plain vs `on_range_done` (no-op) vs fused serial leaf hashing.
+    #[test]
+    #[ignore]
+    fn recursive_encode_timing_probe() {
+        use super::*;
+        use crate::field::F128;
+        use crate::ntt::AdditiveNttF128;
+        for (log_d, log_inv_rate) in [(18usize, 2usize), (16, 2), (14, 2), (12, 2), (10, 2)] {
+            let num_ntts = 8usize;
+            let ntt = AdditiveNttF128::standard(log_d);
+            let msg: Vec<F128> = (0..((1usize << (log_d - log_inv_rate)) * num_ntts))
+                .map(|i| F128::new(i as u64 * 0x9E37_79B9_7F4A_7C15, i as u64 ^ 0xABCD))
+                .collect();
+            let mut cw = vec![F128::ZERO; (1usize << log_d) * num_ntts];
+            let n_leaves = 1usize << log_d;
+            let leaf = num_ntts * 16;
+            let mut tree = vec![Hash::default(); 2 * n_leaves - 1];
+            ntt.rs_encode_interleaved(&msg, &mut cw, num_ntts);
+            let reps = 10;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                ntt.rs_encode_interleaved(&msg, &mut cw, num_ntts);
+            }
+            let plain = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                fill_merkle_tree(
+                    &mut tree,
+                    unsafe { core::slice::from_raw_parts(cw.as_ptr() as *const u8, cw.len() * 16) },
+                    n_leaves,
+                    HashKind::Blake3,
+                );
+            }
+            let merkle = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let ranges = std::sync::atomic::AtomicUsize::new(0);
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                ranges.store(0, std::sync::atomic::Ordering::Relaxed);
+                ntt.rs_encode_interleaved_on_range_done(&msg, &mut cw, num_ntts, &|_r, _d| {
+                    ranges.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+            let hooked = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let n_ranges = ranges.load(std::sync::atomic::Ordering::Relaxed);
+            let tree_addr = tree.as_mut_ptr() as usize;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                ntt.rs_encode_interleaved_on_range_done(&msg, &mut cw, num_ntts, &|r, d| {
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(d.as_ptr() as *const u8, d.len() * 16)
+                    };
+                    let out = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            (tree_addr as *mut Hash).add(r.start),
+                            r.len(),
+                        )
+                    };
+                    hash_leaves_serial(bytes, leaf, out, HashKind::Blake3);
+                });
+                crate::pcs::commit::build_upper_levels(
+                    &mut tree,
+                    n_leaves,
+                    n_leaves,
+                    HashKind::Blake3,
+                );
+            }
+            let fused = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            eprintln!(
+                "[enc-probe] log_d={log_d} n={num_ntts} rate=1/{}: encode {plain:.3} ms | +fill_merkle {merkle:.3} ms | encode+hook(noop) {hooked:.3} ms ({n_ranges} ranges) | fused encode+serial-leaves+upper {fused:.3} ms",
+                1 << log_inv_rate
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn small_tree_timing_probe() {
+        use super::*;
+        for log_leaves in [10usize, 12, 14, 16, 18] {
+            let n = 1usize << log_leaves;
+            let leaf = 128usize;
+            let data: Vec<u8> = (0..n * leaf)
+                .map(|i| (i as u32).wrapping_mul(2654435761) as u8)
+                .collect();
+            let mut tree = vec![Hash::default(); 2 * n - 1];
+            // warm
+            fill_merkle_tree(&mut tree, &data, n, HashKind::Blake3);
+            let reps = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                fill_merkle_tree(&mut tree, &data, n, HashKind::Blake3);
+            }
+            let full = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                hash_leaves(&data, leaf, &mut tree[..n], HashKind::Blake3);
+            }
+            let leaves = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                hash_leaves_serial(&data, leaf, &mut tree[..n], HashKind::Blake3);
+            }
+            let leaves_serial = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            eprintln!(
+                "[tree-probe] 2^{log_leaves} leaves x128B: fill_merkle_tree {full:.3} ms | hash_leaves(par) {leaves:.3} ms | hash_leaves_serial {leaves_serial:.3} ms | threads {}",
+                rayon::current_num_threads()
+            );
+        }
+    }
+
     use super::*;
 
     /// Every structural test runs against both hashes: the tree, path and
@@ -1033,28 +1245,20 @@ mod tests {
     /// rather than silently changing every commitment we produce.
     #[test]
     fn blake3_batched_matches_scalar_spec() {
-        // Counts straddle both the Apple twelve-way kernel width and the
-        // upstream 16-input call width. Width and tail bugs show up here.
-        let counts = [
-            1usize, 4, 5, 11, 12, 13, 15, 16, 17, 23, 24, 25, 47, 48, 49, 63, 64, 65, 127, 128,
-            129, 200,
-        ];
+        // Node counts chosen around `BLAKE3_BATCH` (64): a single node, a
+        // partial batch, exactly one batch, one past it, and several batches
+        // with a partial tail. A width bug in the batch loop shows up here.
+        let counts = [1usize, 5, 63, 64, 65, 200];
 
         // Parents.
         for n in counts {
-            for seed in [0, 1, 0xA11C_E5EE_D15C, u64::MAX] {
-                let children = random_data(n, 64, seed);
-                let mut batched = vec![[0u8; 32]; n];
-                blake3_hash_many_parents(&children, &mut batched);
-                for i in 0..n {
-                    let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
-                    let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
-                    assert_eq!(
-                        batched[i],
-                        blake3_parent_cv(l, r),
-                        "parent {i} of {n}, seed {seed:#x}"
-                    );
-                }
+            let children: Vec<u8> = (0..=255u8).cycle().take(n * 64).collect();
+            let mut batched = vec![[0u8; 32]; n];
+            blake3_hash_many_parents(&children, &mut batched);
+            for i in 0..n {
+                let l: &Hash = children[i * 64..i * 64 + 32].try_into().unwrap();
+                let r: &Hash = children[i * 64 + 32..i * 64 + 64].try_into().unwrap();
+                assert_eq!(batched[i], blake3_parent_cv(l, r), "parent {i} of {n}");
             }
         }
 
@@ -1138,6 +1342,109 @@ mod tests {
         }
     }
 
+    /// Merkle rewrite 1 oracle: streaming layers into the same `2n−1` tree
+    /// is node-for-node identical to the one-shot [`merkle_tree`] build.
+    /// Reduced geometries, including the ranked 1024 B leaf.
+    #[allow(clippy::single_range_in_vec_init)] // One case intentionally models one full range.
+    #[test]
+    fn streaming_tree_matches_merkle_tree_node_for_node() {
+        let cases: &[(usize, usize, &[core::ops::Range<usize>])] = &[
+            (16, 64, &[0..16]),
+            (16, 64, &[0..4, 4..8, 8..12, 12..16]),
+            (16, 64, &[0..1, 1..3, 3..8, 8..16]),
+            (256, 64, &[0..32, 32..64, 64..128, 128..192, 192..256]),
+            (
+                256,
+                1024,
+                &[
+                    0..32,
+                    32..64,
+                    64..96,
+                    96..128,
+                    128..160,
+                    160..192,
+                    192..224,
+                    224..256,
+                ],
+            ),
+            (
+                1024,
+                1024,
+                &[
+                    0..128,
+                    128..256,
+                    256..384,
+                    384..512,
+                    512..640,
+                    640..768,
+                    768..896,
+                    896..1024,
+                ],
+            ),
+        ];
+        for &(n_leaves, leaf_size, ranges) in cases {
+            let data = random_data(
+                n_leaves,
+                leaf_size,
+                0x51EA_u64.wrapping_mul(n_leaves as u64),
+            );
+            for kind in KINDS {
+                let oneshot = merkle_tree(&data, n_leaves, kind);
+                let streamed = merkle_tree_streaming(&data, n_leaves, kind, ranges.iter().cloned());
+                assert_eq!(
+                    streamed.len(),
+                    2 * n_leaves - 1,
+                    "{kind} n={n_leaves} leaf={leaf_size}: length"
+                );
+                assert_eq!(
+                    streamed, oneshot,
+                    "{kind} n={n_leaves} leaf={leaf_size}: node-for-node vs merkle_tree"
+                );
+                assert_eq!(
+                    streamed[2 * n_leaves - 2],
+                    *oneshot.last().unwrap(),
+                    "{kind} n={n_leaves}: root at 2n-2"
+                );
+            }
+        }
+    }
+
+    /// L1 recycle oracle: `take_tree` + [`fill_merkle_tree`] must be
+    /// node-for-node identical to a fresh [`merkle_tree`] at the ranked L1
+    /// leaf count (`2^18`). Uses a 32 B leaf so the test stays small while
+    /// still parking a floor-clearing `2^19-1`-node buffer.
+    #[test]
+    fn pooled_l1_tree_matches_merkle_tree_node_for_node() {
+        let n_leaves = 1 << 18;
+        let leaf_size = 32;
+        let data = random_data(n_leaves, leaf_size, 0x0001_1870);
+        for kind in KINDS {
+            let oracle = merkle_tree(&data, n_leaves, kind);
+            let mut pooled = crate::pcs::commit::take_tree(2 * n_leaves - 1);
+            assert_eq!(pooled.len(), 2 * n_leaves - 1, "{kind}: take_tree length");
+            fill_merkle_tree(&mut pooled, &data, n_leaves, kind);
+            assert_eq!(
+                pooled, oracle,
+                "{kind}: pooled L1 tree != merkle_tree() node-for-node"
+            );
+            crate::pcs::commit::give_tree(pooled);
+        }
+    }
+
+    #[test]
+    fn hash_leaves_serial_matches_hash_leaves() {
+        for &(n, leaf_size) in &[(1usize, 64), (7, 64), (16, 1024), (1024, 64)] {
+            let data = random_data(n, leaf_size, 0x51);
+            for kind in KINDS {
+                let mut par = vec![[0u8; 32]; n];
+                let mut ser = vec![[0u8; 32]; n];
+                hash_leaves(&data, leaf_size, &mut par, kind);
+                hash_leaves_serial(&data, leaf_size, &mut ser, kind);
+                assert_eq!(par, ser, "{kind} n={n} leaf={leaf_size}");
+            }
+        }
+    }
+
     /// Leaf sizes chosen to hit every SHA-256 tail shape in the 4-way
     /// interleaved path: rem = 0 (block-aligned), rem < 56 (one tail block),
     /// and rem ≥ 56 (two tail blocks). Also a non-multiple-of-4 leaf count
@@ -1164,31 +1471,6 @@ mod tests {
                 let seq = merkle_tree_sequential(&data, n_leaves, kind);
                 assert_eq!(par, seq, "{kind} n_leaves={n_leaves} leaf_size={leaf_size}");
             }
-        }
-    }
-
-    #[test]
-    fn blake3_ranked_shape_tree_and_proofs_match_scalar() {
-        let n_leaves = 4096;
-        let leaf_size = 1024;
-        let data = random_data(n_leaves, leaf_size, 0xB3A3_0012_5EED);
-        let parallel = merkle_tree(&data, n_leaves, HashKind::Blake3);
-        let scalar = merkle_tree_sequential(&data, n_leaves, HashKind::Blake3);
-        assert_eq!(parallel, scalar);
-        assert_eq!(parallel.last(), scalar.last());
-        for index in [
-            0,
-            1,
-            n_leaves / 2 - 1,
-            n_leaves / 2,
-            n_leaves - 2,
-            n_leaves - 1,
-        ] {
-            assert_eq!(
-                merkle_proof(&parallel, n_leaves, index),
-                merkle_proof(&scalar, n_leaves, index),
-                "proof at leaf {index}"
-            );
         }
     }
 
@@ -1326,73 +1608,6 @@ mod tests {
             *b = ((z >> 33) & 0xff) as u8;
         }
         data
-    }
-
-    /// The hetero chunk-queue leaf dispatch, driven with a forced helper
-    /// pool through the exact production closure shape, is byte-identical to
-    /// the main-pool-only path (which `blake3_batched_matches_scalar_spec`
-    /// ties to the scalar specification). Covers chunk-boundary counts and
-    /// jobs on both sides of the helper-engagement threshold.
-    #[test]
-    fn blake3_leaf_queue_with_helper_matches_plain() {
-        let helper = rayon::ThreadPoolBuilder::new()
-            .num_threads(3)
-            .build()
-            .unwrap();
-        for (n, leaf_size) in [
-            (1usize, 1024usize),
-            (239, 1024),
-            (240, 64),
-            (241, 512),
-            (4096, 1024),
-            (5000, 128),
-        ] {
-            let data = random_data(n, leaf_size, 0xE0C0_4E57);
-            let mut expect = vec![[0u8; 32]; n];
-            hash_leaves(&data, leaf_size, &mut expect, HashKind::Blake3);
-
-            let mut got = vec![[0u8; 32]; n];
-            let out_base = crate::epool::SyncPtr(got.as_mut_ptr());
-            let data_ref = data.as_slice();
-            crate::epool::run_chunks_with_helper(
-                n.div_ceil(BLAKE3_LEAF_QUEUE_CHUNK),
-                &|i| {
-                    let start = i * BLAKE3_LEAF_QUEUE_CHUNK;
-                    let end = (start + BLAKE3_LEAF_QUEUE_CHUNK).min(n);
-                    // SAFETY: same contract as the production call site —
-                    // disjoint in-bounds ranges, each chunk claimed once.
-                    let outs = unsafe {
-                        core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
-                    };
-                    blake3_hash_many_leaves(
-                        &data_ref[start * leaf_size..end * leaf_size],
-                        leaf_size,
-                        outs,
-                    );
-                },
-                Some(&helper),
-            );
-            assert_eq!(expect, got, "n={n} leaf_size={leaf_size}");
-        }
-    }
-
-    #[test]
-    fn ranked_leaf_chunks_then_parents_match_regular_tree() {
-        const N_LEAVES: usize = 256;
-        const LEAF_SIZE: usize = 1024;
-        const CHUNK_LEAVES: usize = 64;
-
-        let data = random_data(N_LEAVES, LEAF_SIZE, 0xCA5E_10CA_1B1A_0E03);
-        let expect = merkle_tree(&data, N_LEAVES, HashKind::Blake3);
-        let mut got: Vec<Hash> = crate::alloc_uninit_vec(2 * N_LEAVES - 1);
-        for (input, output) in data
-            .chunks(CHUNK_LEAVES * LEAF_SIZE)
-            .zip(got[..N_LEAVES].chunks_mut(CHUNK_LEAVES))
-        {
-            hash_ranked_blake3_leaf_chunk(input, output);
-        }
-        let got = merkle_tree_from_prehashed_leaves(got, N_LEAVES, HashKind::Blake3);
-        assert_eq!(got, expect);
     }
 
     #[test]

@@ -87,6 +87,25 @@ impl AddAssign for F128 {
     }
 }
 
+/// `a * b` for a multiplier already known to satisfy `b.hi == 0`.
+///
+/// Field-identical to `a * b`; on x86 it takes a 2-CLMUL path instead of the
+/// general 5-CLMUL one. Other targets fall back to the ordinary product, so
+/// callers may use it unconditionally once the precondition holds.
+#[inline]
+pub fn mul_low_rhs(a: F128, b: F128) -> F128 {
+    debug_assert_eq!(b.hi, 0, "mul_low_rhs requires a zero high limb");
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    {
+        // SAFETY: pclmulqdq is enabled at compile time; b.hi is zero.
+        unsafe { x86_64::ghash_mul_low_rhs(a, b.lo) }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "pclmulqdq")))]
+    {
+        a * b
+    }
+}
+
 impl Mul for F128 {
     type Output = Self;
     #[inline]
@@ -99,10 +118,10 @@ impl Mul for F128 {
         #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
         {
             // SAFETY: pclmulqdq target feature is enabled at compile time.
-            // On Zen4, karatsuba+barrett is ~17% faster in throughput (the
-            // dominant mode for the bulk parallel F128 work) than binius, which
-            // only wins the latency microbench. (M-series picked binius.)
-            unsafe { x86_64::ghash_mul_karatsuba_barrett(self, rhs) }
+            // A/B probe 2: karatsuba (3 CLMUL + shift-only ghash_reduce) vs
+            // binius (6 CLMUL). Lowest CLMUL count; shift-reduce latency is
+            // hidden in throughput-bound NTT/fold muls. Field-identical.
+            unsafe { x86_64::ghash_mul_karatsuba_vec(self, rhs) }
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_feature = "aes"),
@@ -459,22 +478,6 @@ mod tests {
             assert_eq!(sw, ka);
             assert_eq!(sw, kb);
             assert_eq!(sw, bi);
-        }
-    }
-
-    /// The shared-constant vec2 Karatsuba must agree, lane for lane, with
-    /// the scalar field product.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn const_vec2_karatsuba_matches_scalar() {
-        let mut rng = Rng::new(9);
-        for _ in 0..128 {
-            let c = rng.next_f128();
-            let b0 = rng.next_f128();
-            let b1 = rng.next_f128();
-            let prod = unsafe { aarch64::ghash_mul_const_vec2_neon(c, [b0, b1]) };
-            assert_eq!(prod[0], software::ghash_mul(c, b0));
-            assert_eq!(prod[1], software::ghash_mul(c, b1));
         }
     }
 

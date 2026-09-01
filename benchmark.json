@@ -1,19 +1,25 @@
 {
-  "schemaVersion": 1,
-  "name": "flock-challenge",
-  "description": "Optimize Flock's Rust prover sources for maximum BLAKE3 compression-proof throughput.",
-  "category": "rust",
-  "direction": "+",
-  "editablePaths": [
-    "crates/flock-core/src",
-    "crates/flock-prover/src"
-  ],
-  "setupCommand": ["bash", "-lc", "./setup.sh"],
-  "benchmarkCommand": ["bash", "-lc", "./benchmark.sh"],
-  "scorePath": "score.json",
-  "maxSubmissionBytes": 8388608,
-  "runner": {
-    "provider": "github-actions",
-    "workflow": "benchmark-blake3-mac.yml"
-  }
+  "schemaVersion": 2,
+  "name": "flock-challenge-multi",
+  "tracks": [
+    {
+      "name": "x86",
+      "description": "Optimize Flock's Rust prover sources for maximum BLAKE3 compression-proof throughput on x86_64 CPUs.",
+      "category": "rust",
+      "direction": "+",
+      "editablePaths": [
+        "crates/flock-core/src",
+        "crates/flock-prover/src"
+      ],
+      "setupCommand": ["bash", "-lc", "./setup.sh"],
+      "benchmarkCommand": ["bash", "-lc", "./benchmark.sh"],
+      "scorePath": "score.json",
+      "minScoreImprovementBips": 100,
+      "maxSubmissionBytes": 8388608,
+      "runner": {
+        "provider": "github-actions",
+        "workflow": "benchmark-blake3-x86.yml"
+      }
+    }
+  ]
 }

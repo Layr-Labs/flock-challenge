@@ -17,11 +17,8 @@ warmup_runs="${BLAKE3_WARMUP_RUNS:-20}"
 runs="${BLAKE3_RUNS:-100}"
 output_dir="${BENCHMARK_OUTPUT_DIR:-benchmark-results}"
 
-# Prefer Apple performance cores. This configures the normal Rayon pool; it is
-# not a hard CPU quota on solver-modified code.
 if [[ "${threads}" == auto ]]; then
-  threads="$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || true)"
-  [[ -n "${threads}" ]] || threads="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+  threads="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
 fi
 
 # The verifier is the committed, solver-protected binary. Verify its exact
@@ -34,7 +31,7 @@ verifier="${root}/benchmark-tools/trusted/flock_benchmark_verifier"
 }
 (
   cd "${root}/benchmark-tools/trusted"
-  shasum -a 256 -c SHA256SUMS
+  sha256sum -c SHA256SUMS
 )
 
 # Rebuild the candidate from the current solver-editable source before every
@@ -62,35 +59,20 @@ RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}" \
   exit 1
 }
 
-# Canonicalize the output path before embedding it in the Seatbelt profile.
 # Remove stale scores first so a failed run can never upload an earlier result.
 mkdir -p "${output_dir}/scratch"
 output_dir="$(cd "${output_dir}" && pwd -P)"
 scratch="${output_dir}/scratch"
 rm -f score.json "${output_dir}/score.json" "${output_dir}/summary.md"
 
-sandbox_profile=""
-cleanup() { [[ -z "${sandbox_profile}" ]] || rm -f "${sandbox_profile}"; }
-trap cleanup EXIT
-
-# Only the candidate worker enters this profile. It may read the system, but it
-# cannot use the network, create descendants, or write outside private scratch.
-if [[ "$(uname -s)" == Darwin ]] && command -v sandbox-exec >/dev/null; then
-  [[ "${scratch}" != *'"'* && "${scratch}" != *$'\n'* ]] || {
-    echo "scratch path cannot contain quotes or newlines" >&2
-    exit 1
-  }
-  sandbox_profile="$(mktemp -t flock-benchmark.XXXXXX.sb)"
-  printf '%s\n' \
-    '(version 1)' \
-    '(allow default)' \
-    '(deny network*)' \
-    '(deny process-fork)' \
-    '(deny file-write*)' \
-    "(allow file-write* (subpath \"${scratch}\"))" \
-    > "${sandbox_profile}"
+# Only the candidate worker enters the sandbox. It may read the system, but it
+# cannot use the network or write outside private scratch (see worker_command
+# in benchmark-tools/harness/src/main.rs for the bwrap policy).
+sandbox_scratch=""
+if [[ "$(uname -s)" == Linux ]] && command -v bwrap >/dev/null; then
+  sandbox_scratch="${scratch}"
 elif [[ "${FLOCK_REQUIRE_SANDBOX:-0}" == 1 ]]; then
-  echo "sandbox-exec is required for the ranked benchmark" >&2
+  echo "bubblewrap (bwrap) is required for the ranked benchmark" >&2
   exit 1
 else
   echo "WARNING: worker is not sandboxed (local development only)" >&2
@@ -100,7 +82,7 @@ fi
 # and score writing. It launches one fresh sandboxed worker per trial.
 args=("${worker}" "${scratch}" "${root}/score.json" "${output_dir}/summary.md"
   "${log2_size}" "${threads}" "${warmup_runs}" "${runs}")
-[[ -z "${sandbox_profile}" ]] || args+=("${sandbox_profile}")
+[[ -z "${sandbox_scratch}" ]] || args+=("${sandbox_scratch}")
 "${verifier}" "${args[@]}"
 
 # Reaching here means every timed proof passed pristine verification.

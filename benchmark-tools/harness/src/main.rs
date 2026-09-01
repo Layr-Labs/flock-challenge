@@ -3,6 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -36,7 +37,7 @@ struct Config {
     threads: usize,
     warmup_runs: usize,
     runs: usize,
-    sandbox_profile: Option<PathBuf>,
+    sandbox_scratch: Option<PathBuf>,
 }
 
 struct Trial {
@@ -212,9 +213,30 @@ fn reset_scratch(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn worker_command(config: &Config, ready: &Path, proof: &Path) -> Command {
-    let mut command = if let Some(profile) = &config.sandbox_profile {
-        let mut sandbox = Command::new("/usr/bin/sandbox-exec");
-        sandbox.arg("-f").arg(profile).arg(&config.worker);
+    let mut command = if let Some(scratch) = &config.sandbox_scratch {
+        // Same policy intent as the previous Seatbelt profile: the candidate
+        // worker may read the system but cannot use the network or write
+        // outside its private scratch directory.
+        let mut sandbox = Command::new("/usr/bin/bwrap");
+        sandbox
+            .arg("--ro-bind")
+            .arg("/")
+            .arg("/")
+            .arg("--dev")
+            .arg("/dev")
+            .arg("--proc")
+            .arg("/proc")
+            .arg("--bind")
+            .arg(scratch)
+            .arg(scratch)
+            .arg("--unshare-net")
+            .arg("--unshare-pid")
+            .arg("--die-with-parent")
+            .arg(&config.worker);
+        // Do not use bwrap's --new-session: its inner setsid detaches the PID-
+        // namespace init and worker from the process group that stop() kills.
+        // The outer setsid below retains the TIOCSTI mitigation without
+        // separating sandbox descendants from the teardown group.
         sandbox
     } else {
         Command::new(&config.worker)
@@ -223,6 +245,17 @@ fn worker_command(config: &Config, ready: &Path, proof: &Path) -> Command {
         .arg(config.log2_size.to_string())
         .arg(ready)
         .arg(proof);
+    // Every worker, including bwrap and all of its descendants, starts in a
+    // dedicated session/process group so timeout and post-proof teardown kill
+    // the complete sandbox rather than only its top-level process.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     command
 }
 
@@ -306,6 +339,14 @@ fn capture_proof_if_ready(path: &Path) -> Result<Option<Vec<u8>>, Box<dyn std::e
 }
 
 fn stop(child: &mut Child) {
+    if let Ok(pgid) = i32::try_from(child.id()) {
+        // worker_command makes the child's PID its process-group ID.
+        // Negative kill targets every process in that group.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    // Retain a direct-kill fallback if process-group setup unexpectedly failed.
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -446,11 +487,11 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     let threads: usize = args.next().ok_or("missing THREADS")?.parse()?;
     let warmup_runs: usize = args.next().ok_or("missing WARMUP_RUNS")?.parse()?;
     let runs: usize = args.next().ok_or("missing RUNS")?.parse()?;
-    let sandbox_profile = args.next().map(PathBuf::from);
+    let sandbox_scratch = args.next().map(PathBuf::from);
     if args.next().is_some() || !(8..=20).contains(&log2_size) || threads == 0 || runs == 0 {
         return Err(concat!(
             "usage: flock_benchmark_harness WORKER SCRATCH SCORE SUMMARY ",
-            "LOG2 THREADS WARMUP_RUNS RUNS [SANDBOX_PROFILE]"
+            "LOG2 THREADS WARMUP_RUNS RUNS [SANDBOX_SCRATCH]"
         )
         .into());
     }
@@ -463,13 +504,14 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
         threads,
         warmup_runs,
         runs,
-        sandbox_profile,
+        sandbox_scratch,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -527,6 +569,76 @@ mod tests {
         assert!(percentile_seconds(&[], 0.10).is_err());
         assert!(percentile_seconds(&trials(&[0.0]), 0.10).is_err());
         assert!(percentile_seconds(&trials(&[f64::NAN]), 0.10).is_err());
+    }
+
+    #[test]
+    fn worker_command_wraps_with_bubblewrap_when_sandboxed() {
+        let config = super::Config {
+            worker: PathBuf::from("/opt/worker"),
+            scratch: PathBuf::from("/tmp/scratch"),
+            score: PathBuf::from("/tmp/score.json"),
+            summary: PathBuf::from("/tmp/summary.md"),
+            log2_size: 8,
+            threads: 1,
+            warmup_runs: 1,
+            runs: 1,
+            sandbox_scratch: Some(PathBuf::from("/tmp/scratch")),
+        };
+        let command = super::worker_command(&config, Path::new("/r"), Path::new("/p"));
+        assert_eq!(command.get_program(), "/usr/bin/bwrap");
+        let args: Vec<_> = command.get_args().map(|a| a.to_os_string()).collect();
+        assert!(args.iter().any(|a| a == "--unshare-net"));
+        assert!(args.iter().any(|a| a == "--unshare-pid"));
+        assert!(args.iter().any(|a| a == "--die-with-parent"));
+        assert!(!args.iter().any(|a| a == "--new-session"));
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == "/tmp/scratch")
+        );
+        assert_eq!(args.last().unwrap(), "/p");
+    }
+
+    #[test]
+    fn worker_command_runs_bare_without_sandbox() {
+        let config = super::Config {
+            worker: PathBuf::from("/opt/worker"),
+            scratch: PathBuf::from("/tmp/scratch"),
+            score: PathBuf::from("/tmp/score.json"),
+            summary: PathBuf::from("/tmp/summary.md"),
+            log2_size: 8,
+            threads: 1,
+            warmup_runs: 1,
+            runs: 1,
+            sandbox_scratch: None,
+        };
+        let command = super::worker_command(&config, Path::new("/r"), Path::new("/p"));
+        assert_eq!(command.get_program(), "/opt/worker");
+    }
+
+    #[test]
+    fn worker_starts_in_own_process_group() {
+        let temp = TempDir::new();
+        let worker = temp.join("worker");
+        std::fs::write(&worker, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = super::Config {
+            worker,
+            scratch: temp.join("scratch"),
+            score: temp.join("score.json"),
+            summary: temp.join("summary.md"),
+            log2_size: 8,
+            threads: 1,
+            warmup_runs: 1,
+            runs: 1,
+            sandbox_scratch: None,
+        };
+        let mut command = super::worker_command(&config, Path::new("/r"), Path::new("/p"));
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = command.spawn().unwrap();
+
+        let child_pid = i32::try_from(child.id()).unwrap();
+        assert_eq!(unsafe { libc::getpgid(child_pid) }, child_pid);
+        stop(&mut child);
     }
 
     #[test]

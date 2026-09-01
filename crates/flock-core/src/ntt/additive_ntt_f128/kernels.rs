@@ -2,9 +2,29 @@
 //!
 //! Transform scheduling and cache-blocking policy stay in the parent module;
 //! this module owns the architecture-specific operations on blocks of data.
+//!
+//! ## Dead end: q-form (shared-twiddle Karatsuba + Barrett) butterfly leaves
+//!
+//! A full rewrite of `butterfly_row_pair` / `butterfly_fused_2layer` (and the
+//! seed row-group kernels) in the promoted zerocheck/open q-form — hoisted
+//! `lo/hi/lo⊕hi` twiddle broadcasts, 6 Karatsuba PMULL per lane pair, EOR3
+//! cross terms, per-lane Barrett `hi·0x87` reduction, `ldp/stp q` I/O, zero
+//! GPR round-trips — was measured **18-23% SLOWER** than these portable
+//! per-lane loops (ST and 10T, m=25 and m=29 shapes, `ntt_butterfly_probe`
+//! paired A/B; e2e `[commit-timing] ntt` 57 → 68 ms). Reason: under
+//! `-C target-cpu=native` LLVM already compiles the portable lane loop
+//! (binius mul) to all-NEON with EOR3 — ~15 NEON-pipe ops + 2 transfer-unit
+//! `fmov` per butterfly, i.e. already AT the 4-pipe issue floor (~3.9
+//! cyc/butterfly measured). Karatsuba+Barrett needs the same 6 PMULL per mul
+//! as binius (3+3 vs 4+2), and the SoA zip/ext glue ADDS ~1.5 NEON-pipe
+//! ops/lane. The wave-4 q-form wins came from replacing GPR-mixed leaves and
+//! ~26-op vectorised shift reductions; neither disease exists here. Do not
+//! re-attempt without first cutting PMULL count below 6/mul or NEON glue
+//! below the current form.
 
 use crate::field::F128;
 
+#[allow(dead_code)] // Portable fallbacks remain available for rollback builds.
 mod portable;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -20,15 +40,25 @@ mod x86_64;
 #[inline]
 pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
     debug_assert_eq!(top.len(), bot.len());
+    // A twiddle whose high limb is zero kills both limb products that involve
+    // it, and the reduction step that folds them. Dispatch once per row pair,
+    // outside the lane loop; `low_twiddle_disabled()` restores the general
+    // kernel for a same-binary A/B.
+    let low = twiddle.hi == 0 && !low_twiddle_disabled();
 
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    // SAFETY: the cfg gate guarantees the required target features.
+    // SAFETY: the cfg gate guarantees the required target features, and `low`
+    // is exactly the zero-high-limb precondition.
     unsafe {
-        x86_64::butterfly_row_pair(top, bot, twiddle);
+        if low {
+            x86_64::butterfly_row_pair_gen::<true>(top, bot, twiddle);
+        } else {
+            x86_64::butterfly_row_pair_gen::<false>(top, bot, twiddle);
+        }
     }
 
     #[cfg(not(all(
@@ -36,7 +66,19 @@ pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F1
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     )))]
-    portable::butterfly_row_pair(top, bot, twiddle);
+    if low {
+        portable::butterfly_row_pair_gen::<true>(top, bot, twiddle);
+    } else {
+        portable::butterfly_row_pair_gen::<false>(top, bot, twiddle);
+    }
+}
+
+/// `FLOCK_NO_LOW_TWIDDLE=1` restores the general field-multiply kernel in the
+/// same binary, so a candidate/control pair differs only in this dispatch.
+#[inline]
+fn low_twiddle_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_LOW_TWIDDLE").is_some())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -54,22 +96,33 @@ pub(super) fn butterfly_fused_2layer(
     debug_assert_eq!(a.len(), c.len());
     debug_assert_eq!(a.len(), d.len());
 
+    // The two layers carry independent twiddles, so specialize them
+    // independently: the pair is dispatched once here, never per lane.
+    let off = low_twiddle_disabled();
+    let outer_low = t_outer.hi == 0 && !off;
+    let inner_low = t_inner_a.hi == 0 && t_inner_b.hi == 0 && !off;
+
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
-    // SAFETY: the cfg gate guarantees the required target features.
+    // SAFETY: the cfg gate guarantees the required target features, and the
+    // flags above are exactly the zero-high-limb preconditions.
     unsafe {
-        x86_64::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: the cfg gate supplies `aes`; slice lengths are asserted above.
-    unsafe {
-        if vector_resident_rows() {
-            aarch64::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
-            return;
+        match (outer_low, inner_low) {
+            (false, false) => x86_64::butterfly_fused_2layer_gen::<false, false>(
+                a, b, c, d, t_outer, t_inner_a, t_inner_b,
+            ),
+            (false, true) => x86_64::butterfly_fused_2layer_gen::<false, true>(
+                a, b, c, d, t_outer, t_inner_a, t_inner_b,
+            ),
+            (true, false) => x86_64::butterfly_fused_2layer_gen::<true, false>(
+                a, b, c, d, t_outer, t_inner_a, t_inner_b,
+            ),
+            (true, true) => x86_64::butterfly_fused_2layer_gen::<true, true>(
+                a, b, c, d, t_outer, t_inner_a, t_inner_b,
+            ),
         }
     }
 
@@ -78,36 +131,518 @@ pub(super) fn butterfly_fused_2layer(
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     )))]
-    portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+    match (outer_low, inner_low) {
+        (false, false) => portable::butterfly_fused_2layer_gen::<false, false>(
+            a, b, c, d, t_outer, t_inner_a, t_inner_b,
+        ),
+        (false, true) => portable::butterfly_fused_2layer_gen::<false, true>(
+            a, b, c, d, t_outer, t_inner_a, t_inner_b,
+        ),
+        (true, false) => portable::butterfly_fused_2layer_gen::<true, false>(
+            a, b, c, d, t_outer, t_inner_a, t_inner_b,
+        ),
+        (true, true) => portable::butterfly_fused_2layer_gen::<true, true>(
+            a, b, c, d, t_outer, t_inner_a, t_inner_b,
+        ),
+    }
 }
 
-/// AArch64 specialization for a fused pair whose three twiddles all have a
-/// zero high limb. Other targets retain the ordinary field-multiply kernel.
+/// Final fused-two-layer butterfly whose four rows are published directly to
+/// four non-temporal codeword destinations instead of written back to scratch.
+///
+/// This is deliberately x86 AVX-512-only: the caller retains the incumbent
+/// in-place butterfly plus scatter on every other target and geometry.
+///
+/// # Safety
+///
+/// `src` must expose four readable 64-element rows at `src + i * src_step`.
+/// `dst_a` through `dst_d` must each expose 64 writable, 16-byte-aligned
+/// elements, be mutually disjoint, and not overlap `src`. `lanes` must be 60
+/// or 64. When `ALIGNED_ZMM`, every destination must be 64-byte aligned; the
+/// fallback only requires 16-byte alignment. The cfg gate guarantees the
+/// required target features.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
 #[allow(clippy::too_many_arguments)]
 #[inline]
-pub(super) fn butterfly_fused_2layer_low_twiddles(
-    a: &mut [F128],
-    b: &mut [F128],
-    c: &mut [F128],
-    d: &mut [F128],
+pub(super) unsafe fn butterfly_fused_2layer_publish_nt<const ALIGNED_ZMM: bool>(
+    src: *const F128,
+    src_step: usize,
+    dst_a: *mut F128,
+    dst_b: *mut F128,
+    dst_c: *mut F128,
+    dst_d: *mut F128,
+    lanes: usize,
     t_outer: F128,
     t_inner_a: F128,
     t_inner_b: F128,
 ) {
-    debug_assert_eq!(t_outer.hi, 0);
-    debug_assert_eq!(t_inner_a.hi, 0);
-    debug_assert_eq!(t_inner_b.hi, 0);
+    debug_assert!(lanes == 60 || lanes == 64);
+    debug_assert_eq!(dst_a as usize % 16, 0);
+    debug_assert_eq!(dst_b as usize % 16, 0);
+    debug_assert_eq!(dst_c as usize % 16, 0);
+    debug_assert_eq!(dst_d as usize % 16, 0);
+    debug_assert!(!ALIGNED_ZMM || dst_a as usize % 64 == 0);
+    debug_assert!(!ALIGNED_ZMM || dst_b as usize % 64 == 0);
+    debug_assert!(!ALIGNED_ZMM || dst_c as usize % 64 == 0);
+    debug_assert!(!ALIGNED_ZMM || dst_d as usize % 64 == 0);
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: the cfg gate guarantees PMULL through the aes feature.
+    // Match `butterfly_fused_2layer` exactly: both low-twiddle decisions are
+    // made once outside the lane loop, and the x86 leaf makes the same
+    // process-cached mul-diet choice.
+    let off = low_twiddle_disabled();
+    let outer_low = t_outer.hi == 0 && !off;
+    let inner_low = t_inner_a.hi == 0 && t_inner_b.hi == 0 && !off;
+
+    // SAFETY: forwarded caller contract; the flags are exactly the
+    // zero-high-limb preconditions of the selected specializations.
     unsafe {
-        aarch64::butterfly_fused_2layer_low_twiddles(
-            a, b, c, d, t_outer, t_inner_a, t_inner_b,
+        match (outer_low, inner_low) {
+            (false, false) => {
+                x86_64::butterfly_fused_2layer_publish_nt_gen::<false, false, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (false, true) => {
+                x86_64::butterfly_fused_2layer_publish_nt_gen::<false, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (true, false) => {
+                x86_64::butterfly_fused_2layer_publish_nt_gen::<true, false, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+            (true, true) => {
+                x86_64::butterfly_fused_2layer_publish_nt_gen::<true, true, ALIGNED_ZMM>(
+                    src, src_step, dst_a, dst_b, dst_c, dst_d, lanes, t_outer, t_inner_a, t_inner_b,
+                )
+            }
+        }
+    }
+}
+
+/// Process one fused-two-layer row group from a separate source buffer.
+///
+/// # Safety
+/// The caller must ensure the four selected source rows are valid, the four
+/// selected destination rows are valid, and concurrent calls write disjoint
+/// destination row groups. Source and destination must not overlap.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 3],
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from(src, dst, quarter, num_ntts, r, twiddles);
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_2layer_row_from(src, dst, quarter, num_ntts, r, twiddles);
+    }
+}
+
+/// NT-publish twin of [`butterfly_fused_2layer_row_from`]: XMM `MOVNTDQ`
+/// dest stores. x86 AVX-512 only; dest 16-byte aligned, `num_ntts` a
+/// multiple of 4.
+///
+/// # Safety
+/// Same as [`butterfly_fused_2layer_row_from`], plus the NT constraints.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_nt(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
+    num_ntts: usize,
+    r: usize,
+    twiddles: &[F128; 3],
+) {
+    // SAFETY: forwarded; identical src/dst geometry.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_geo_nt(
+            src, quarter, r, dst, quarter, r, num_ntts, twiddles,
+        );
+    }
+}
+
+/// [`butterfly_fused_2layer_row_from`] with independent source/destination
+/// row geometry (source rows `i·src_quarter + src_r`, destination rows
+/// `i·dst_quarter + dst_r`).
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from`].
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    twiddles: &[F128; 3],
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            twiddles,
         );
     }
 
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-    portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_2layer_row_from_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            twiddles,
+        );
+    }
+}
+
+/// [`butterfly_fused_2layer_row_from_sparse`] with independent
+/// source/destination row geometry.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from`].
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            right_twiddle,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_2layer_row_from_sparse_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            right_twiddle,
+        )
+    }
+}
+
+/// [`butterfly_fused_2layer_row_from_sparse_geo`] that also asks for one line
+/// of each of the four rows starting at `pf_src` on every lane step. Portable
+/// builds ignore the hints.
+///
+/// # Safety
+/// Same contract as [`butterfly_fused_2layer_row_from_sparse_geo`]; the four
+/// rows `pf_src + i * src_quarter * num_ntts` must also lie inside the source
+/// buffer.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_geo_pf(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst: *mut F128,
+    dst_quarter: usize,
+    dst_r: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    pf_src: *const F128,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_geo_pf(
+            src,
+            src_quarter,
+            src_r,
+            dst,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            right_twiddle,
+            pf_src,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        let _ = pf_src;
+        portable::butterfly_fused_2layer_row_from_sparse_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst,
+            dst_quarter,
+            dst_r,
+            num_ntts,
+            right_twiddle,
+        )
+    }
+}
+
+/// One four-row message load, both seed staging groups. x86 AVX-512 holds the
+/// four ZMMs; other builds run the two-call form (same bytes, two gathers).
+///
+/// # Safety
+/// Union of the sparse-geo and dense-geo contracts on the shared source and
+/// the two destinations. Destinations must not alias.
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+#[allow(dead_code)] // Retained fused-kernel rollback/oracle entry point.
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_dense_geo(
+    src: *const F128,
+    src_quarter: usize,
+    src_r: usize,
+    dst_sparse: *mut F128,
+    dst_dense: *mut F128,
+    dst_quarter: usize,
+    num_ntts: usize,
+    right_twiddle: F128,
+    dense_tw: &[F128; 3],
+    pf_src: *const F128,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_dense_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst_sparse,
+            dst_dense,
+            dst_quarter,
+            num_ntts,
+            right_twiddle,
+            dense_tw,
+            pf_src,
+        );
+        return;
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    unsafe {
+        let _ = pf_src;
+        portable::butterfly_fused_2layer_row_from_sparse_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst_sparse,
+            dst_quarter,
+            0,
+            num_ntts,
+            right_twiddle,
+        );
+        portable::butterfly_fused_2layer_row_from_geo(
+            src,
+            src_quarter,
+            src_r,
+            dst_dense,
+            dst_quarter,
+            0,
+            num_ntts,
+            dense_tw,
+        );
+    }
+}
+
+/// Process the sparse-twiddle first output block of the rate-1/2 layer-2 seed.
+///
+/// Its layer-1 and left layer-2 twiddles are zero; `right_twiddle` is the only
+/// non-zero tree value.
+///
+/// # Safety
+/// Same source/destination validity, non-aliasing, and disjoint-write contract
+/// as [`butterfly_fused_2layer_row_from`].
+#[cfg(any(
+    all(target_arch = "aarch64", target_feature = "aes"),
+    all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
+    num_ntts: usize,
+    r: usize,
+    right_twiddle: F128,
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: cfg gate guarantees the required target features.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse(
+            src,
+            dst,
+            quarter,
+            num_ntts,
+            r,
+            right_twiddle,
+        );
+    }
+
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        portable::butterfly_fused_2layer_row_from_sparse(
+            src,
+            dst,
+            quarter,
+            num_ntts,
+            r,
+            right_twiddle,
+        );
+    }
+}
+
+/// NT-publish twin of [`butterfly_fused_2layer_row_from_sparse`].
+///
+/// # Safety
+/// Same as [`butterfly_fused_2layer_row_from_nt`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "vpclmulqdq"
+))]
+#[inline]
+pub(super) unsafe fn butterfly_fused_2layer_row_from_sparse_nt(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
+    num_ntts: usize,
+    r: usize,
+    right_twiddle: F128,
+) {
+    // SAFETY: forwarded; identical src/dst geometry.
+    unsafe {
+        x86_64::butterfly_fused_2layer_row_from_sparse_geo_nt(
+            src,
+            quarter,
+            r,
+            dst,
+            quarter,
+            r,
+            num_ntts,
+            right_twiddle,
+        );
+    }
 }
 
 /// Process one fused-four-layer row group across every interleaved NTT lane.
@@ -120,18 +655,41 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     ptr: *mut F128,
     sixteenth: usize,
     num_ntts: usize,
+    lanes: usize,
     r: usize,
     twiddles: &[F128; 15],
 ) {
+    debug_assert!(lanes <= num_ntts);
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
         target_feature = "vpclmulqdq"
     ))]
     // SAFETY: target features are guaranteed by cfg; the caller owns the row
-    // geometry and disjointness contract.
+    // geometry and disjointness contract. The shaped arms only fire when the
+    // constants equal the runtime shape, so they are value-identical.
     unsafe {
-        x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, r, twiddles);
+        if super::ntt_shaped_enabled() && num_ntts == 64 {
+            match sixteenth {
+                128 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, 0>(
+                        ptr, lanes, r, twiddles, 0,
+                    );
+                }
+                8 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, 0>(
+                        ptr, lanes, r, twiddles, 0,
+                    );
+                }
+                1 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<1, 64, 0>(
+                        ptr, lanes, r, twiddles, 0,
+                    );
+                }
+                _ => {}
+            }
+        }
+        x86_64::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
     }
 
     #[cfg(not(all(
@@ -141,77 +699,111 @@ pub(super) unsafe fn butterfly_fused_4layer_row(
     )))]
     // SAFETY: forwarded caller contract.
     unsafe {
-        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, r, twiddles);
+        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
     }
 }
 
-/// Process one fused-three-layer row group across every interleaved NTT lane.
+/// [`butterfly_fused_4layer_row`] with one line hint per row of row group
+/// `pf_r` issued at every lane step. `H` selects the hint level (1 = L1,
+/// 2 = L2). Portable builds ignore the hint.
 ///
 /// # Safety
-/// The caller must ensure the 8 row slices selected by `r` are valid and
-/// disjoint from any row group being processed concurrently.
+/// Same contract as [`butterfly_fused_4layer_row`]; row group `pf_r` must
+/// also lie inside the block.
 #[inline]
-pub(super) unsafe fn butterfly_fused_3layer_row(
+pub(super) unsafe fn butterfly_fused_4layer_row_pf<const H: u8>(
     ptr: *mut F128,
-    eighth: usize,
+    sixteenth: usize,
     num_ntts: usize,
+    lanes: usize,
     r: usize,
-    twiddles: &[F128; 7],
+    twiddles: &[F128; 15],
+    pf_r: usize,
 ) {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    debug_assert!(lanes <= num_ntts);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: target features are guaranteed by cfg; the caller owns the row
+    // geometry and disjointness contract. The shaped arms only fire when the
+    // constants equal the runtime shape, so they are value-identical.
     unsafe {
-        if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
-            return;
+        if super::ntt_shaped_enabled() && num_ntts == 64 {
+            match sixteenth {
+                128 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<128, 64, H>(
+                        ptr, lanes, r, twiddles, pf_r,
+                    );
+                }
+                8 => {
+                    return x86_64::butterfly_fused_4layer_row_shaped::<8, 64, H>(
+                        ptr, lanes, r, twiddles, pf_r,
+                    );
+                }
+                _ => {}
+            }
         }
+        x86_64::butterfly_fused_4layer_row_pf::<H>(
+            ptr, sixteenth, num_ntts, lanes, r, twiddles, pf_r,
+        );
     }
 
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
     // SAFETY: forwarded caller contract.
     unsafe {
-        portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, r, twiddles);
+        let _ = pf_r;
+        portable::butterfly_fused_4layer_row(ptr, sixteenth, num_ntts, lanes, r, twiddles);
     }
 }
 
-/// Whether the AArch64 vector-resident radix-8 row kernels are used.
+/// Process one fused-three-layer group of eight consecutive rows.
 ///
-/// `FLOCK_NO_NTT_NEON_ROWS=1` restores the portable `F128`-typed chain in the
-/// same binary, so a candidate/control pair differs only in this dispatch —
-/// not in compilation or source revision. Read once per process; the ranked
-/// harness sets its environment before the worker starts.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline]
-fn vector_resident_rows() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_NEON_ROWS").is_none())
-}
-
-/// Root-block specialization of [`butterfly_fused_3layer_row`].
+/// Rows `0..8` start at `ptr + i · num_ntts`. Lanes `0..dense_lanes` get the
+/// full three-layer network; on lanes `dense_lanes..num_ntts` the group's odd
+/// rows are known to be zero and the reduced network runs instead.
 ///
 /// # Safety
-/// In addition to the ordinary row-geometry contract, the caller must ensure
-/// that twiddles 0, 1, and 3 are zero.
+/// The caller must ensure the eight rows are valid and disjoint from any row
+/// group being processed concurrently, that `dense_lanes <= num_ntts`, and
+/// that rows 1, 3, 5 and 7 hold zero on lanes `dense_lanes..num_ntts`.
 #[inline]
-pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
+pub(super) unsafe fn butterfly_fused_3layer_rows(
     ptr: *mut F128,
-    eighth: usize,
     num_ntts: usize,
-    r: usize,
+    dense_lanes: usize,
     twiddles: &[F128; 7],
 ) {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    debug_assert!(dense_lanes <= num_ntts);
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    ))]
+    // SAFETY: target features are guaranteed by cfg; the caller owns the row
+    // geometry, disjointness and zero-tail contract. The shaped arm only
+    // fires when the constant equals the runtime shape (value-identical).
     unsafe {
-        if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles);
+        if super::ntt_shaped_enabled() && num_ntts == 64 {
+            x86_64::butterfly_fused_3layer_rows_shaped::<64>(ptr, dense_lanes, twiddles);
             return;
         }
+        x86_64::butterfly_fused_3layer_rows(ptr, num_ntts, dense_lanes, twiddles);
     }
 
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
+    )))]
     // SAFETY: forwarded caller contract.
     unsafe {
-        portable::butterfly_fused_3layer_zero_root_row(ptr, eighth, num_ntts, r, twiddles);
+        portable::butterfly_fused_3layer_rows(ptr, num_ntts, dense_lanes, twiddles);
     }
 }
 
@@ -241,169 +833,204 @@ pub(super) unsafe fn butterfly_neon_block_pair_chunk(chunk: &mut [F128], t_a: F1
     unsafe { aarch64::butterfly_block_pair(chunk, t_a, t_b) }
 }
 
-#[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
-mod aarch64_row_tests {
+/// Largest interleaved-lane count [`seed_fused_2layer_row_group_nt`] accepts.
+/// Bounds the stack staging block at 8 rows × 64 lanes × 16 B = 8 KiB.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+pub(super) const SEED_NT_MAX_NTTS: usize = 64;
+
+/// Process one rate-1/2 seed row group (both codeword halves) through an
+/// 8-row stack staging block, publishing each output row with q-form `stnp`
+/// non-temporal pairs. Byte-identical to calling
+/// [`butterfly_fused_2layer_row_from_sparse`] then
+/// [`butterfly_fused_2layer_row_from`] on the two halves.
+///
+/// # Safety
+/// Same source/destination validity, non-aliasing, and disjoint-write
+/// contract as the unstaged pair; additionally `num_ntts` must be a multiple
+/// of 8 and at most [`SEED_NT_MAX_NTTS`], and both codeword halves must start
+/// 128-byte aligned.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) unsafe fn seed_fused_2layer_row_group_nt(
+    src: *const F128,
+    dst: *mut F128,
+    quarter: usize,
+    num_ntts: usize,
+    half_len: usize,
+    r: usize,
+    right_twiddle: F128,
+    twiddles: &[F128; 3],
+) {
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        aarch64::seed_fused_2layer_row_group_nt(
+            src,
+            dst,
+            quarter,
+            num_ntts,
+            half_len,
+            r,
+            right_twiddle,
+            twiddles,
+        )
+    }
+}
+
+#[cfg(test)]
+mod low_twiddle_tests {
     use super::*;
+    use crate::field::F128;
 
-    fn splitmix(state: &mut u64) -> u64 {
-        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn rand_f128(state: &mut u64) -> F128 {
-        F128 {
-            lo: splitmix(state),
-            hi: splitmix(state),
+    fn rng(seed: u64) -> impl FnMut() -> F128 {
+        let mut st = seed | 1;
+        move || {
+            let mut n = || {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                st
+            };
+            F128 { lo: n(), hi: n() }
         }
     }
 
-    /// Build a random row-group buffer plus twiddles for one geometry.
-    fn fixture(
-        state: &mut u64,
-        eighth: usize,
-        num_ntts: usize,
-        zero_root: bool,
-    ) -> (Vec<F128>, [F128; 7]) {
-        let buf: Vec<F128> = (0..8 * eighth * num_ntts)
-            .map(|_| rand_f128(state))
-            .collect();
-        let mut tw: [F128; 7] = core::array::from_fn(|_| rand_f128(state));
-        if zero_root {
-            tw[0] = F128::ZERO;
-            tw[1] = F128::ZERO;
-            tw[3] = F128::ZERO;
-        }
-        (buf, tw)
-    }
-
-    /// The vector-resident radix-8 row kernel must be **bit-identical** to the
-    /// portable `F128`-typed chain across the row geometries the ranked
-    /// transform uses (`num_ntts = 64` is the ranked interleaving). Both run
-    /// on identical random input; every word of all eight row streams is
-    /// compared.
+    /// The scalar low-multiplier path must equal the general product for
+    /// every multiplier with a zero high limb, including zero and one.
     #[test]
-    fn neon_fused_3layer_row_matches_portable() {
-        let mut state = 0x4E54_5F52_4F57_5300;
-        for &(eighth, num_ntts) in &[(1usize, 1usize), (1, 64), (2, 64), (4, 16), (3, 5)] {
-            for r in 0..eighth.min(2) {
-                let (base, tw) = fixture(&mut state, eighth, num_ntts, false);
-
-                let mut want = base.clone();
-                // SAFETY: buffer is 8 * eighth * num_ntts long and r < eighth.
-                unsafe {
-                    portable::butterfly_fused_3layer_row(
-                        want.as_mut_ptr(),
-                        eighth,
-                        num_ntts,
-                        r,
-                        &tw,
-                    );
-                }
-
-                let mut got = base.clone();
-                // SAFETY: same geometry; this module carries `aes` via cfg.
-                unsafe {
-                    aarch64::butterfly_fused_3layer_row(
-                        got.as_mut_ptr(),
-                        eighth,
-                        num_ntts,
-                        r,
-                        &tw,
-                    );
-                }
-
-                assert_eq!(
-                    got, want,
-                    "fused3 row mismatch at eighth={eighth} num_ntts={num_ntts} r={r}"
-                );
+    fn mul_low_rhs_matches_general() {
+        let mut next = rng(0xA11CE_5EED);
+        for _ in 0..4096 {
+            let a = next();
+            let b = F128 {
+                lo: next().lo,
+                hi: 0,
+            };
+            assert_eq!(
+                crate::field::gf2_128::mul_low_rhs(a, b),
+                a * b,
+                "a={a:?} b={b:?}"
+            );
+        }
+        for a in [F128::ZERO, F128::ONE, next()] {
+            for b in [
+                F128::ZERO,
+                F128::ONE,
+                F128 {
+                    lo: u64::MAX,
+                    hi: 0,
+                },
+            ] {
+                assert_eq!(crate::field::gf2_128::mul_low_rhs(a, b), a * b);
             }
         }
     }
 
-    /// Same equivalence for the zero-root spine specialization, including its
-    /// claim that row stream zero is left untouched.
+    /// The specialized row-pair kernel must be bit-identical to the general
+    /// one on any low twiddle, through whichever backend this host dispatches.
     #[test]
-    fn neon_fused_3layer_zero_root_row_matches_portable() {
-        let mut state = 0x5A45_524F_524F_4F54;
-        for &(eighth, num_ntts) in &[(1usize, 1usize), (1, 64), (2, 64), (4, 16), (3, 5)] {
-            for r in 0..eighth.min(2) {
-                let (base, tw) = fixture(&mut state, eighth, num_ntts, true);
+    fn row_pair_low_matches_general() {
+        let mut next = rng(0xB0B_5EED);
+        for len in [1usize, 3, 4, 7, 8, 64] {
+            let twiddle = F128 {
+                lo: next().lo,
+                hi: 0,
+            };
+            let top: Vec<F128> = (0..len).map(|_| next()).collect();
+            let bot: Vec<F128> = (0..len).map(|_| next()).collect();
 
-                let mut want = base.clone();
-                // SAFETY: geometry as above; twiddles 0/1/3 are zero.
-                unsafe {
-                    portable::butterfly_fused_3layer_zero_root_row(
-                        want.as_mut_ptr(),
-                        eighth,
-                        num_ntts,
-                        r,
-                        &tw,
-                    );
-                }
+            let (mut t1, mut b1) = (top.clone(), bot.clone());
+            let (mut t2, mut b2) = (top.clone(), bot.clone());
 
-                let mut got = base.clone();
-                // SAFETY: geometry as above; twiddles 0/1/3 are zero.
-                unsafe {
-                    aarch64::butterfly_fused_3layer_zero_root_row(
-                        got.as_mut_ptr(),
-                        eighth,
-                        num_ntts,
-                        r,
-                        &tw,
-                    );
-                }
-
-                assert_eq!(
-                    got, want,
-                    "zero-root row mismatch at eighth={eighth} num_ntts={num_ntts} r={r}"
-                );
-
-                // Row stream zero must be unchanged by either implementation.
-                for lane in 0..num_ntts {
-                    let idx = r * num_ntts + lane;
-                    assert_eq!(got[idx], base[idx], "row 0 was written");
-                }
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            ))]
+            // SAFETY: cfg supplies the features; the twiddle's high limb is 0.
+            unsafe {
+                x86_64::butterfly_row_pair_gen::<true>(&mut t1, &mut b1, twiddle);
+                x86_64::butterfly_row_pair_gen::<false>(&mut t2, &mut b2, twiddle);
             }
+            #[cfg(not(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "vpclmulqdq"
+            )))]
+            {
+                portable::butterfly_row_pair_gen::<true>(&mut t1, &mut b1, twiddle);
+                portable::butterfly_row_pair_gen::<false>(&mut t2, &mut b2, twiddle);
+            }
+            assert_eq!(t1, t2, "len={len}");
+            assert_eq!(b1, b2, "len={len}");
         }
     }
 
-    /// The vector-resident deep fused-pair kernel must be **bit-identical**
-    /// to the portable `F128`-typed chain across the row widths the ranked
-    /// deep transform uses (`num_ntts = 64` rows) plus narrow/odd widths.
+    /// Same for the fused pair, across all four low/general monomorphizations.
     #[test]
-    fn neon_fused_2layer_matches_portable() {
-        let mut state = 0x4645_5350_4149_5232;
-        for &width in &[1usize, 2, 5, 16, 64, 96] {
-            for _ in 0..4 {
-                let mut mk = |n: usize| -> Vec<F128> {
-                    (0..n).map(|_| rand_f128(&mut state)).collect()
-                };
-                let (a0, b0, c0, d0) = (mk(width), mk(width), mk(width), mk(width));
-                let t_outer = rand_f128(&mut state);
-                let t_inner_a = rand_f128(&mut state);
-                let t_inner_b = rand_f128(&mut state);
+    fn fused_2layer_low_matches_general() {
+        let mut next = rng(0xC0FFEE_5EED);
+        for len in [1usize, 4, 5, 64] {
+            let t_outer = F128 {
+                lo: next().lo,
+                hi: 0,
+            };
+            let t_a = F128 {
+                lo: next().lo,
+                hi: 0,
+            };
+            let t_b = F128 {
+                lo: next().lo,
+                hi: 0,
+            };
+            let rows: Vec<Vec<F128>> = (0..4).map(|_| (0..len).map(|_| next()).collect()).collect();
 
-                let (mut wa, mut wb, mut wc, mut wd) =
-                    (a0.clone(), b0.clone(), c0.clone(), d0.clone());
-                portable::butterfly_fused_2layer(
-                    &mut wa, &mut wb, &mut wc, &mut wd, t_outer, t_inner_a, t_inner_b,
-                );
-
-                let (mut ga, mut gb, mut gc, mut gd) = (a0, b0, c0, d0);
-                // SAFETY: this module carries `aes` via cfg; equal lengths.
-                unsafe {
-                    aarch64::butterfly_fused_2layer(
-                        &mut ga, &mut gb, &mut gc, &mut gd, t_outer, t_inner_a, t_inner_b,
-                    );
+            let run = |outer_low: bool, inner_low: bool| -> Vec<Vec<F128>> {
+                let mut r: Vec<Vec<F128>> = rows.clone();
+                let (a, rest) = r.split_at_mut(1);
+                let (b, rest) = rest.split_at_mut(1);
+                let (c, d) = rest.split_at_mut(1);
+                let (a, b, c, d) = (&mut a[0], &mut b[0], &mut c[0], &mut d[0]);
+                macro_rules! call {
+                    ($o:expr, $i:expr) => {{
+                        #[cfg(all(
+                            target_arch = "x86_64",
+                            target_feature = "avx512f",
+                            target_feature = "vpclmulqdq"
+                        ))]
+                        // SAFETY: cfg supplies features; both twiddle sets
+                        // have zero high limbs.
+                        unsafe {
+                            x86_64::butterfly_fused_2layer_gen::<$o, $i>(
+                                a, b, c, d, t_outer, t_a, t_b,
+                            )
+                        }
+                        #[cfg(not(all(
+                            target_arch = "x86_64",
+                            target_feature = "avx512f",
+                            target_feature = "vpclmulqdq"
+                        )))]
+                        portable::butterfly_fused_2layer_gen::<$o, $i>(
+                            a, b, c, d, t_outer, t_a, t_b,
+                        )
+                    }};
                 }
+                match (outer_low, inner_low) {
+                    (false, false) => call!(false, false),
+                    (false, true) => call!(false, true),
+                    (true, false) => call!(true, false),
+                    (true, true) => call!(true, true),
+                }
+                r
+            };
 
-                assert_eq!(ga, wa, "row a mismatch at width={width}");
-                assert_eq!(gb, wb, "row b mismatch at width={width}");
-                assert_eq!(gc, wc, "row c mismatch at width={width}");
-                assert_eq!(gd, wd, "row d mismatch at width={width}");
+            let reference = run(false, false);
+            for (o, i) in [(false, true), (true, false), (true, true)] {
+                assert_eq!(
+                    run(o, i),
+                    reference,
+                    "len={len} outer_low={o} inner_low={i}"
+                );
             }
         }
     }

@@ -56,10 +56,18 @@ impl InvNttTableByteSingleGf8 {
         // straddles two cache lines.
         const TABLE_ALIGNMENT: usize = 64;
         let table_len = 256 * ell;
-        // Odd byte positions need each vector's two 8-byte halves exchanged.
-        // Keep that permutation as a second AArch64 image so the URM leaf can
-        // load it directly instead of executing an EXT for every vector.
-        let table_images = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
+        // The fused URM leaves want odd byte positions with the two 8-byte
+        // halves of each 16-byte chunk exchanged (the σ₈ permutation
+        // `i ↦ i ^ 8`). Keep that permutation as a second image so the hot
+        // paths can load it directly: the AArch64 leaf saves one EXT per
+        // vector, and the x86 AVX-512 apply folds its entire first butterfly
+        // level into the loads (10 port-5 shuffles → 3 per apply). Other
+        // architectures keep the original footprint.
+        let table_images = if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+            2
+        } else {
+            1
+        };
         let mut data = vec![F8::ZERO; table_images * table_len + TABLE_ALIGNMENT - 1];
         let data_offset = (TABLE_ALIGNMENT - (data.as_ptr() as usize & (TABLE_ALIGNMENT - 1)))
             & (TABLE_ALIGNMENT - 1);
@@ -98,7 +106,7 @@ impl InvNttTableByteSingleGf8 {
             }
         }
 
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             let swapped_start = data_offset + table_len;
             let (original_storage, swapped_storage) = data.split_at_mut(swapped_start);
@@ -129,13 +137,24 @@ impl InvNttTableByteSingleGf8 {
         unsafe { self.data.as_ptr().add(self.data_offset) as *const u8 }
     }
 
-    /// AArch64-only table image with each 16-byte chunk half-swapped.
-    #[cfg(target_arch = "aarch64")]
+    /// Raw pointer to the σ₈ image in which every 16-byte chunk has its two
+    /// 8-byte halves exchanged (built on aarch64 and x86_64).
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[inline]
     pub fn half_swapped_data_ptr(&self) -> *const u8 {
         debug_assert!(self.ell >= 16);
-        // SAFETY: construction appends one complete logical table image.
+        debug_assert!(self.has_second_image());
+        // SAFETY: construction appends one complete logical table immediately
+        // after the original image in the same allocation.
         unsafe { self.data.as_ptr().add(self.data_offset + 256 * self.ell) as *const u8 }
+    }
+
+    /// True when the allocation carries the σ₈ second image (tables built by
+    /// [`Self::new`] on aarch64/x86_64; tables deserialized or built by other
+    /// constructors may not).
+    #[inline]
+    pub(crate) fn has_second_image(&self) -> bool {
+        self.data.len() >= self.data_offset + 2 * 256 * self.ell
     }
 
     #[inline]
@@ -245,7 +264,6 @@ impl InvNttTableByteSingleGf8 {
         }
     }
 
-    /// x86_64 variant of `apply` — operates in 16-byte chunks. Direct port of
     /// [`apply_neon_unchecked`]: SSE2 `_mm_loadu_si128` / `_mm_xor_si128` /
     /// `_mm_storeu_si128`, with the odd-`b` 8-byte half-swap (`vextq_u8::<8>`)
     /// realized as `_mm_shuffle_epi32::<0x4E>` (swap the two 64-bit halves).
@@ -370,9 +388,183 @@ impl InvNttTableByteSingleGf8 {
         }
     }
 
+    /// Two-image AVX-512 apply: same value as
+    /// [`Self::apply_x86_avx512_register_unchecked`] with the first butterfly
+    /// level folded into the loads. The apply is
+    /// `out = ⊕_b σ_{8b}(T[byte_b])` where `σ_s(v)[i] = v[i ^ s]` is a
+    /// coordinate permutation, hence F₂-linear and composing as
+    /// `σ_s ∘ σ_t = σ_{s^t}`. Loading odd-b rows from the σ₈ image gives
+    /// `U_c = T[byte_{2c}] ⊕ σ₈(T[byte_{2c+1}])`, and
+    /// `out = (U₀ ⊕ σ₃₂(U₂)) ⊕ σ₁₆(U₁ ⊕ σ₃₂(U₃))` — three 128-bit-lane
+    /// shuffles instead of the incumbent's ten (σ₁₆ = lane `c^1` = imm 0xB1,
+    /// σ₃₂ = lane `c^2` = imm 0x4E; `σ₄₈ = σ₁₆∘σ₃₂` rides the shared σ₁₆).
+    /// Port-5-only uop stream per apply: 3 shuffles vs 10; loads and XORs
+    /// unchanged (8 and 7).
+    ///
+    /// # Safety
+    /// As for [`Self::apply_x86_avx512_register_unchecked`], plus
+    /// `self.has_second_image()`.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    #[allow(dead_code)] // Retained two-image rollback/oracle entry point.
+    pub(crate) unsafe fn apply_x86_avx512_register_2img_unchecked(
+        &self,
+        bytes: *const u8,
+    ) -> core::arch::x86_64::__m512i {
+        use core::arch::x86_64::*;
+        debug_assert_eq!(self.ell, 64);
+        debug_assert_eq!(self.n_chunks, 8);
+        debug_assert!(self.has_second_image());
+        let base = self.data_ptr();
+        let base8 = self.half_swapped_data_ptr();
+        // SAFETY: eight readable input bytes per the contract; both images
+        // hold 256 rows of 64 readable bytes.
+        unsafe {
+            let row = |img: *const u8, b: usize| {
+                _mm512_loadu_si512(img.add(*bytes.add(b) as usize * 64) as *const __m512i)
+            };
+            let u0 = _mm512_xor_si512(row(base, 0), row(base8, 1));
+            let u1 = _mm512_xor_si512(row(base, 2), row(base8, 3));
+            let u2 = _mm512_xor_si512(row(base, 4), row(base8, 5));
+            let u3 = _mm512_xor_si512(row(base, 6), row(base8, 7));
+            let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
+            let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+            _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+        }
+    }
+
+    /// Pre-scaled-offset twin of
+    /// [`Self::apply_x86_avx512_register_2img_unchecked`]. Identical value and
+    /// identical table addresses; the only difference is that the eight row
+    /// offsets arrive already multiplied by `ell = 64` in a `u16` array, so
+    /// each row address is one `movzwl` instead of `movzbl` + `shl $6`.
+    ///
+    /// That shift is the kernel's single largest port-0/port-6 consumer
+    /// occupied in the fused AB kernel.
+    ///
+    /// # Safety
+    /// As for [`Self::apply_x86_avx512_register_2img_unchecked`], with `off`
+    /// pointing to eight readable `u16`s each equal to `input_byte * 64`.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    #[allow(dead_code)] // Retained two-image rollback/oracle entry point.
+    pub(crate) unsafe fn apply_x86_avx512_register_2img_off_unchecked(
+        &self,
+        off: *const u16,
+    ) -> core::arch::x86_64::__m512i {
+        use core::arch::x86_64::*;
+        debug_assert_eq!(self.ell, 64);
+        debug_assert_eq!(self.n_chunks, 8);
+        debug_assert!(self.has_second_image());
+        let base = self.data_ptr();
+        let base8 = self.half_swapped_data_ptr();
+        // SAFETY: eight readable pre-scaled offsets per the contract; each is
+        // `byte * 64` with `byte <= 255`, so it lands inside a 256-row image
+        // of 64 readable bytes per row.
+        unsafe {
+            let row = |img: *const u8, b: usize| {
+                _mm512_loadu_si512(img.add(*off.add(b) as usize) as *const __m512i)
+            };
+            let u0 = _mm512_xor_si512(row(base, 0), row(base8, 1));
+            let u1 = _mm512_xor_si512(row(base, 2), row(base8, 3));
+            let u2 = _mm512_xor_si512(row(base, 4), row(base8, 5));
+            let u3 = _mm512_xor_si512(row(base, 6), row(base8, 7));
+            let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
+            let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+            _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+        }
+    }
+
+    /// The base and σ₈ image pointers together. A caller that runs many
+    /// applies against the same table resolves this once instead of
+    /// re-deriving both pointers from `self` for every apply.
+    ///
+    /// # Safety
+    /// As for [`Self::half_swapped_data_ptr`]: the σ₈ image must be present.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[inline]
+    pub fn image_ptrs(&self) -> (*const u8, *const u8) {
+        (self.data_ptr(), self.half_swapped_data_ptr())
+    }
+
+    /// Wide-read twin of
+    /// [`Self::apply_x86_avx512_register_2img_off_unchecked`]. Identical value
+    /// and identical table addresses; the eight pre-scaled `u16` offsets are
+    /// fetched as two 64-bit reads and split with shifts instead of eight
+    /// separate 16-bit reads.
+    ///
+    /// # Safety
+    /// As for [`Self::apply_x86_avx512_register_2img_off_unchecked`].
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    #[allow(dead_code)] // Retained two-image rollback/oracle entry point.
+    pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_unchecked(
+        &self,
+        off: *const u16,
+    ) -> core::arch::x86_64::__m512i {
+        debug_assert_eq!(self.ell, 64);
+        debug_assert_eq!(self.n_chunks, 8);
+        debug_assert!(self.has_second_image());
+        let (base, base8) = self.image_ptrs();
+        // SAFETY: forwarded from this function's contract.
+        unsafe { apply_x86_avx512_register_2img_offw_at(base, base8, off) }
+    }
+}
+
+/// [`InvNttTableByteSingleGf8::apply_x86_avx512_register_2img_offw_unchecked`]
+/// against table images the caller already resolved. Identical value and
+/// identical table addresses.
+///
+/// # Safety
+/// As for that method, with `base`/`base8` the table's base and σ₈ image.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+#[allow(dead_code)] // Retained two-image rollback/oracle entry point.
+pub(crate) unsafe fn apply_x86_avx512_register_2img_offw_at(
+    base: *const u8,
+    base8: *const u8,
+    off: *const u16,
+) -> core::arch::x86_64::__m512i {
+    use core::arch::x86_64::*;
+    // SAFETY: eight readable pre-scaled offsets per the contract, i.e. two
+    // readable 64-bit words. Each extracted field is one of those offsets,
+    // `byte * 64` with `byte <= 255`, so it lands inside a 256-row image of
+    // 64 readable bytes per row.
+    {
+        unsafe {
+            let w0 = (off as *const u64).read_unaligned();
+            let w1 = (off.add(4) as *const u64).read_unaligned();
+            let row = |img: *const u8, o: usize| _mm512_loadu_si512(img.add(o) as *const __m512i);
+            let u0 = _mm512_xor_si512(
+                row(base, w0 as u16 as usize),
+                row(base8, (w0 >> 16) as u16 as usize),
+            );
+            let u1 = _mm512_xor_si512(
+                row(base, (w0 >> 32) as u16 as usize),
+                row(base8, (w0 >> 48) as usize),
+            );
+            let u2 = _mm512_xor_si512(
+                row(base, w1 as u16 as usize),
+                row(base8, (w1 >> 16) as u16 as usize),
+            );
+            let u3 = _mm512_xor_si512(
+                row(base, (w1 >> 32) as u16 as usize),
+                row(base8, (w1 >> 48) as usize),
+            );
+            let even = _mm512_xor_si512(u0, _mm512_shuffle_i64x2::<0x4E>(u2, u2));
+            let odd = _mm512_xor_si512(u1, _mm512_shuffle_i64x2::<0x4E>(u3, u3));
+            _mm512_xor_si512(even, _mm512_shuffle_i64x2::<0xB1>(odd, odd))
+        }
+    }
+}
+
+impl InvNttTableByteSingleGf8 {
     /// Apply M to three byte-packed rows (a, b, c) — matches the C++ hot-path
     /// signature. Identical math to three `apply` calls; kept separate so the
-    /// future NEON port can batch loads across the three rows.
     pub fn apply_triple(
         &self,
         a_bytes: &[u8],
@@ -441,14 +633,21 @@ mod tests {
             let ntt_s = AdditiveNttGf8::new(k, F8::ZERO);
             let ntt_l = AdditiveNttGf8::new(k, F8(1u8 << k));
             let table = InvNttTableByteSingleGf8::new(&ntt_s, &ntt_l);
+            assert_eq!(table.half_swapped_data_ptr() as usize % 64, 0, "k={k}");
+
             let len = 256 * table.ell;
-            // SAFETY: both pointers expose complete images owned by `table`.
+            // SAFETY: both pointers expose complete `len`-byte images owned
+            // by `table` for the duration of this test.
             let original = unsafe { core::slice::from_raw_parts(table.data_ptr(), len) };
             let swapped =
                 unsafe { core::slice::from_raw_parts(table.half_swapped_data_ptr(), len) };
-            for (source, target) in original.chunks_exact(16).zip(swapped.chunks_exact(16)) {
-                assert_eq!(&target[..8], &source[8..]);
-                assert_eq!(&target[8..], &source[..8]);
+            for (chunk_index, (source, target)) in original
+                .chunks_exact(16)
+                .zip(swapped.chunks_exact(16))
+                .enumerate()
+            {
+                assert_eq!(&target[..8], &source[8..], "k={k}, chunk={chunk_index}");
+                assert_eq!(&target[8..], &source[..8], "k={k}, chunk={chunk_index}");
             }
         }
     }
@@ -577,6 +776,54 @@ mod tests {
                         "scalar/avx512 apply disagree at k={k}, bytes={:02x?}",
                         bytes
                     );
+                    // Two-image register form: same value, first butterfly
+                    // level folded into the σ₈-image loads.
+                    assert!(table.has_second_image());
+                    // SAFETY: avx512f; ell == 64; second image just asserted.
+                    let reg =
+                        unsafe { table.apply_x86_avx512_register_2img_unchecked(bytes.as_ptr()) };
+                    let mut out_2img = [0u8; 64];
+                    // SAFETY: 64-byte destination for one ZMM store.
+                    unsafe {
+                        core::arch::x86_64::_mm512_storeu_si512(
+                            out_2img.as_mut_ptr() as *mut core::arch::x86_64::__m512i,
+                            reg,
+                        )
+                    };
+                    let out_2img: Vec<F8> = out_2img.iter().map(|&b| F8(b)).collect();
+                    assert_eq!(
+                        out_scalar, out_2img,
+                        "scalar/avx512-2img apply disagree at k={k}, bytes={:02x?}",
+                        bytes
+                    );
+                    // Pre-scaled-offset forms: same value from `byte * 64`
+                    // offsets, read either eight-wide or two-wide.
+                    let off: Vec<u16> = bytes.iter().map(|&b| b as u16 * 64).collect();
+                    for wide in [false, true] {
+                        // SAFETY: avx512f; ell == 64; second image present;
+                        // eight pre-scaled offsets in `off`.
+                        let reg = unsafe {
+                            if wide {
+                                table.apply_x86_avx512_register_2img_offw_unchecked(off.as_ptr())
+                            } else {
+                                table.apply_x86_avx512_register_2img_off_unchecked(off.as_ptr())
+                            }
+                        };
+                        let mut got = [0u8; 64];
+                        // SAFETY: 64-byte destination for one ZMM store.
+                        unsafe {
+                            core::arch::x86_64::_mm512_storeu_si512(
+                                got.as_mut_ptr() as *mut core::arch::x86_64::__m512i,
+                                reg,
+                            )
+                        };
+                        let got: Vec<F8> = got.iter().map(|&b| F8(b)).collect();
+                        assert_eq!(
+                            out_scalar, got,
+                            "scalar/avx512-off(wide={wide}) apply disagree at k={k}, bytes={:02x?}",
+                            bytes
+                        );
+                    }
                 }
             }
         }

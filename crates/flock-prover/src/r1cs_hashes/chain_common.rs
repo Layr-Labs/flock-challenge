@@ -317,7 +317,7 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
         ..
     } = core;
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.s_hat_v_c.as_slice());
     let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         &prover_data,

@@ -121,7 +121,9 @@ use crate::field::F128;
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
+use std::thread::JoinHandle;
 
 mod kernels;
 
@@ -248,50 +250,40 @@ impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
 #[derive(Clone)]
 pub struct CscCircuit {
     n_cols: usize,
+    /// Row-index bound: every entry of `a_rows` / `b_rows` is `< n_rows`
+    /// (guaranteed by [`csc_from_rows`]). Justifies the unchecked
+    /// `eq_inner[r]` gather in [`LincheckCircuit::fold_alpha_batched`].
+    n_rows: usize,
     a_col_ptr: Vec<u32>,
-    a_rows: CscRowIndices,
+    a_rows: Vec<u32>,
     b_col_ptr: Vec<u32>,
-    b_rows: CscRowIndices,
+    b_rows: Vec<u32>,
+    /// Narrow (`u16`) copies of `a_rows`/`b_rows`, used when every row index
+    /// fits in 16 bits (`n_rows <= 65536`). The gather in
+    /// [`LincheckCircuit::fold_alpha_batched`] streams the whole index array
+    /// once per proof — at the BLAKE3 shape that is ~84 MB of `u32` against a
+    /// 256 KiB `eq_inner` that stays in L2, so the pass is bound by the index
+    /// stream, and halving it halves the DRAM traffic. When these are
+    /// populated `a_rows`/`b_rows` are emptied (never both representations).
+    a_rows16: Vec<u16>,
+    b_rows16: Vec<u16>,
+    /// True iff `a_rows16`/`b_rows16` hold the row indices.
+    narrow: bool,
     /// Constant-wire pin column (see [`LincheckCircuit::const_pin_col`]).
     const_pin: Option<usize>,
 }
 
-#[derive(Clone)]
-enum CscRowIndices {
-    U16(Vec<u16>),
-    U32(Vec<u32>),
-}
-
-impl CscRowIndices {
-    fn len(&self) -> usize {
-        match self {
-            Self::U16(rows) => rows.len(),
-            Self::U32(rows) => rows.len(),
-        }
-    }
-
-    #[inline(always)]
-    fn fold_range(&self, start: usize, end: usize, eq_inner: &[F128]) -> F128 {
-        let mut sum = F128::ZERO;
-        match self {
-            Self::U16(rows) => {
-                for &row in &rows[start..end] {
-                    sum += eq_inner[row as usize];
-                }
-            }
-            Self::U32(rows) => {
-                for &row in &rows[start..end] {
-                    sum += eq_inner[row as usize];
-                }
-            }
-        }
-        sum
-    }
+/// `FLOCK_NO_LC_CSC_U16=1` restores the 32-bit CSC row-index arrays in
+/// [`CscCircuit`] (exact A/B control: same sums, twice the index bytes).
+fn csc_u16_rows_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_CSC_U16").is_none());
+    *ON
 }
 
 /// Flatten one sparse matrix into CSC arrays: rows with a 1 in column `c` are
 /// `rows_flat[col_ptr[c] as usize .. col_ptr[c+1] as usize]`.
-fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, CscRowIndices) {
+fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     assert!(m.num_rows <= u32::MAX as usize);
     assert!(m.num_cols <= u32::MAX as usize);
     let mut col_ptr = vec![0u32; m.num_cols + 1];
@@ -304,54 +296,73 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, CscRowIndices) {
         col_ptr[c + 1] += col_ptr[c];
     }
     let mut next = col_ptr.clone();
-    let nnz = *col_ptr.last().unwrap() as usize;
-    let compact =
-        m.num_rows <= (u16::MAX as usize + 1) && std::env::var_os("FLOCK_CSC_U32").is_none();
-    let rows_flat = if compact {
-        let mut rows_flat = vec![0u16; nnz];
-        for (r, row) in m.rows.iter().enumerate() {
-            for &c in row {
-                rows_flat[next[c] as usize] = r as u16;
-                next[c] += 1;
-            }
+    let mut rows_flat = vec![0u32; *col_ptr.last().unwrap() as usize];
+    for (r, row) in m.rows.iter().enumerate() {
+        for &c in row {
+            rows_flat[next[c] as usize] = r as u32;
+            next[c] += 1;
         }
-        CscRowIndices::U16(rows_flat)
-    } else {
-        let mut rows_flat = vec![0u32; nnz];
-        for (r, row) in m.rows.iter().enumerate() {
-            for &c in row {
-                rows_flat[next[c] as usize] = r as u32;
-                next[c] += 1;
-            }
-        }
-        CscRowIndices::U32(rows_flat)
-    };
+    }
     (col_ptr, rows_flat)
 }
 
 // Compact Debug — the row arrays run to millions of entries.
 impl std::fmt::Debug for CscCircuit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (nnz_a, nnz_b) = if self.narrow {
+            (self.a_rows16.len(), self.b_rows16.len())
+        } else {
+            (self.a_rows.len(), self.b_rows.len())
+        };
         f.debug_struct("CscCircuit")
             .field("n_cols", &self.n_cols)
-            .field("nnz_a", &self.a_rows.len())
-            .field("nnz_b", &self.b_rows.len())
+            .field("nnz_a", &nnz_a)
+            .field("nnz_b", &nnz_b)
             .finish()
     }
 }
 
 impl CscCircuit {
     pub fn from_matrices(a_0: &SparseBinaryMatrix, b_0: &SparseBinaryMatrix) -> Self {
+        Self::from_matrices_narrow(a_0, b_0, csc_u16_rows_enabled())
+    }
+
+    /// [`Self::from_matrices`] with the u16 row-index narrowing forced on or
+    /// off — the A/B oracle hook for tests (production goes through the
+    /// `FLOCK_NO_LC_CSC_U16` switch).
+    #[doc(hidden)]
+    pub fn from_matrices_narrow(
+        a_0: &SparseBinaryMatrix,
+        b_0: &SparseBinaryMatrix,
+        want_narrow: bool,
+    ) -> Self {
         assert_eq!(a_0.num_rows, b_0.num_rows);
         assert_eq!(a_0.num_cols, b_0.num_cols);
-        let (a_col_ptr, a_rows) = csc_from_rows(a_0);
-        let (b_col_ptr, b_rows) = csc_from_rows(b_0);
+        let (a_col_ptr, mut a_rows) = csc_from_rows(a_0);
+        let (b_col_ptr, mut b_rows) = csc_from_rows(b_0);
+        // Narrow the row indices to u16 when the base matrix has at most
+        // 2^16 rows (the BLAKE3/SHA-2 shapes have 2^14). Same values, half
+        // the bytes streamed by `fold_alpha_batched`.
+        let narrow = a_0.num_rows <= (1usize << 16) && want_narrow;
+        let (a_rows16, b_rows16) = if narrow {
+            let a16: Vec<u16> = a_rows.iter().map(|&r| r as u16).collect();
+            let b16: Vec<u16> = b_rows.iter().map(|&r| r as u16).collect();
+            a_rows = Vec::new();
+            b_rows = Vec::new();
+            (a16, b16)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Self {
             n_cols: a_0.num_cols,
+            n_rows: a_0.num_rows,
             a_col_ptr,
             a_rows,
             b_col_ptr,
             b_rows,
+            a_rows16,
+            b_rows16,
+            narrow,
             const_pin: None,
         }
     }
@@ -360,6 +371,22 @@ impl CscCircuit {
     pub fn with_const_pin(mut self, const_pin: Option<usize>) -> Self {
         self.const_pin = const_pin;
         self
+    }
+
+    /// Evaluate `one_col` for every column — sequential below the rayon
+    /// threshold, one `par_iter_mut` dispatch above it. Shared by the u16 and
+    /// u32 gather bodies so both keep exactly the same dispatch structure.
+    #[inline]
+    fn map_cols(&self, one_col: impl Fn(usize) -> F128 + Sync + Send) -> Vec<F128> {
+        use rayon::prelude::*;
+        if self.n_cols < SUMCHECK_PAR_THRESHOLD {
+            return (0..self.n_cols).map(one_col).collect();
+        }
+        let mut out = vec![F128::ZERO; self.n_cols];
+        out.par_iter_mut()
+            .enumerate()
+            .for_each(|(c, slot)| *slot = one_col(c));
+        out
     }
 }
 
@@ -371,29 +398,43 @@ impl LincheckCircuit for CscCircuit {
         self.const_pin
     }
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
-        use rayon::prelude::*;
         assert_eq!(eq_inner.len(), self.n_cols);
-        let one_col = |c: usize| {
-            let sa = self.a_rows.fold_range(
-                self.a_col_ptr[c] as usize,
-                self.a_col_ptr[c + 1] as usize,
-                eq_inner,
-            );
-            let sb = self.b_rows.fold_range(
-                self.b_col_ptr[c] as usize,
-                self.b_col_ptr[c + 1] as usize,
-                eq_inner,
-            );
-            alpha * sa + sb
-        };
-        if self.n_cols < SUMCHECK_PAR_THRESHOLD {
-            return (0..self.n_cols).map(one_col).collect();
+        // Row indices are `< n_rows` by construction ([`csc_from_rows`]);
+        // checking here (once) instead of per nonzero drops the two-branch
+        // bounds check from the ~7-instruction gather loop body.
+        assert!(self.n_rows <= eq_inner.len());
+        if self.narrow {
+            // u16 index stream: identical row order, identical XOR order,
+            // half the bytes read per nonzero.
+            return self.map_cols(|c| {
+                let mut sa = F128::ZERO;
+                for &r in &self.a_rows16[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize]
+                {
+                    // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
+                    sa += *unsafe { eq_inner.get_unchecked(r as usize) };
+                }
+                let mut sb = F128::ZERO;
+                for &r in &self.b_rows16[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize]
+                {
+                    // SAFETY: as above.
+                    sb += *unsafe { eq_inner.get_unchecked(r as usize) };
+                }
+                alpha * sa + sb
+            });
         }
-        let mut out = vec![F128::ZERO; self.n_cols];
-        out.par_iter_mut()
-            .enumerate()
-            .for_each(|(c, slot)| *slot = one_col(c));
-        out
+        self.map_cols(|c| {
+            let mut sa = F128::ZERO;
+            for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
+                // SAFETY: r < n_rows ≤ eq_inner.len(), asserted above.
+                sa += *unsafe { eq_inner.get_unchecked(r as usize) };
+            }
+            let mut sb = F128::ZERO;
+            for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
+                // SAFETY: as above.
+                sb += *unsafe { eq_inner.get_unchecked(r as usize) };
+            }
+            alpha * sa + sb
+        })
     }
 }
 
@@ -498,38 +539,22 @@ pub enum VerifyError {
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
     let d = point.len();
-    // Every slot is written by the level that first exposes it before it can
-    // be read at a later level.
-    let mut out = crate::alloc_uninit_f128_vec(1usize << d);
-    out[0] = F128::ONE;
-    const PAR_THRESHOLD: usize = 1 << 12;
+    let mut out: Vec<F128> = Vec::with_capacity(1usize << d);
+    out.push(F128::ONE);
     for j in 0..d {
         let r_j = point[j];
         let len = 1usize << j;
-        let (lo, rest) = out.split_at_mut(len);
-        let hi = &mut rest[..len];
-        // For each existing entry i ∈ [0, len), produce two children:
-        //   hi[i] = v * r_j              ← new bit_j = 1
-        //   lo[i] = v * (1 + r_j)
-        //         = v + hi[i]             ← new bit_j = 0
-        // The distributive identity saves one field multiplication per pair.
-        let build_pair = |lo_i: &mut F128, hi_i: &mut F128| {
-            let v = *lo_i;
-            let vr = v * r_j;
-            *hi_i = vr;
-            *lo_i = v + vr;
-        };
-        if len < PAR_THRESHOLD {
-            lo.iter_mut()
-                .zip(hi.iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
-        } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
+        out.resize(2 * len, F128::ZERO);
+        // Char-2: v*(1+r) = v + v*r. One GHASH plus an XOR per old entry.
+        //   out[i]       = v + v*r_j      ← new bit_j = 0
+        //   out[i + len] = v * r_j        ← new bit_j = 1
+        // Forward iteration is safe: the [i] and [i+len] slots are disjoint.
+        for i in 0..len {
+            let v = out[i];
+            let hi = v * r_j;
+            out[i + len] = hi;
+            out[i] = v + hi;
         }
     }
     out
@@ -722,16 +747,1474 @@ pub fn partial_fold_packed_z_fast_padded(
         )
 }
 
+/// Outer stripes processed together by the direct block-major fold. Eight
+/// stripes cover 64 consecutive outer blocks: their 32 KiB of sum tables fit
+/// in L1, while one 128-entry output row-group stays hot across all 8 tables.
+const DIRECT_FOLD_TILE_STRIPES: usize = 8;
+
+/// Ranked BLAKE3 has `m=32`, `k_log=14`, hence 18 outer variables. Splitting
+/// those variables 9+9 replaces the 4 MiB full equality tensor with two 8 KiB
+/// factors. Reconstructing each of the 2^18 weights once in the fold plus the
+/// two factor builds saves exactly 260,098 F128 multiplications versus the
+/// full doubling construction.
+const BLOCK_MAJOR_FACTORED_EQ_N_LOG: usize = 18;
+const BLOCK_MAJOR_FACTORED_EQ_LO_LOG: usize = 9;
+
+/// Transpose one F128 row-group from 8 consecutive outer blocks into the byte
+/// shape consumed by a lincheck sum table. Output byte `b` has bit `r` equal
+/// to bit `b` of `lanes[r]`.
+#[inline(always)]
+fn transpose_8_f128s_to_128_bytes(lanes: &[F128; 8], out: &mut [u8]) {
+    debug_assert_eq!(out.len(), 128);
+    let lo: [u64; 8] = std::array::from_fn(|r| lanes[r].lo);
+    let hi: [u64; 8] = std::array::from_fn(|r| lanes[r].hi);
+    let (out_lo, out_hi) = out.split_at_mut(64);
+    crate::bits::transpose_8_u64s_to_64_bytes(&lo, out_lo);
+    crate::bits::transpose_8_u64s_to_64_bytes(&hi, out_hi);
+}
+
+/// Byte selectors for the ranked gather/transpose `VPERMT2B` fusion.
+///
+/// A 512-bit `VPERMT2B` uses index bits 0..=5 for the byte offset and bit 6
+/// to choose its second 64-byte table; bit 7 is ignored. Rows 0..4 live in
+/// the first input ZMM and rows 4..8 in the second, with each F128 row laid
+/// out as eight low-limb bytes followed by eight high-limb bytes. The prior
+/// failed candidate used `128 + offset` for rows 4..8, which leaves bit 6
+/// clear and therefore selects the first table again. `64 + offset` is the
+/// required second-table encoding.
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )
+))]
+const fn gather_transpose_vpermt2b_indices(high: bool) -> [u8; 64] {
+    let mut indices = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        // The following GFNI affine transpose reads matrix byte `7 - row`,
+        // so feed the rows in reverse order to cancel that reversal.
+        let row = 7 - i % 8;
+        let byte_in_limb = i / 8;
+        let limb_offset = if high { 8 } else { 0 };
+        indices[i] = if row < 4 {
+            (16 * row + limb_offset + byte_in_limb) as u8
+        } else {
+            (64 + 16 * (row - 4) + limb_offset + byte_in_limb) as u8
+        };
+        i += 1;
+    }
+    indices
+}
+
+/// Direct partial fold from the canonical block-major F128 witness packing.
+/// This avoids materializing the equally-sized byte-stripe copy used by
+/// [`partial_fold_packed_z_fast`].
+///
+/// Each outer block contains `chunks_per_block = k / 128` F128 values, so
+/// `z_packed[i_outer * chunks_per_block + q]` holds inner columns
+/// `128*q..128*q+128`. For each group of 8 outer blocks, the corresponding 8
+/// F128 values are transposed into 128 bytes; byte `b` then indexes the same
+/// 256-entry sum table as the stripe fold.
+pub fn partial_fold_packed_z_block_major(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    partial_fold_packed_z_block_major_padded(z_packed, m, k_log, 1usize << k_log, eq_outer)
+}
+
+/// Padding-aware variant of [`partial_fold_packed_z_block_major`]. Inner
+/// columns `[useful_bits, k)` remain zero and are not read from the witness.
+pub fn partial_fold_packed_z_block_major_padded(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    assert!(m >= k_log);
+    let n_outer = 1usize << (m - k_log);
+    assert_eq!(eq_outer.len(), n_outer);
+    partial_fold_packed_z_block_major_padded_with_tables(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        |outer_base| std::array::from_fn(|r| eq_outer[outer_base + r]),
+        None,
+    )
+}
+
+/// Block-major partial fold with an exactly factorized outer equality tensor.
+///
+/// `eq_outer[i] = eq_lo[i & (B - 1)] * eq_hi[i >> log2(B)]`, where
+/// `B = eq_lo.len()`. The complete tensor is never materialized: each outer
+/// weight is reconstructed exactly once while building its 8-bit sum table.
+/// This preserves the existing witness sweep and private-accumulator schedule.
+fn partial_fold_packed_z_block_major_factorized_padded(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+) -> Vec<F128> {
+    partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        eq_lo,
+        eq_hi,
+        None,
+    )
+}
+
+/// Factorized block-major fold with an optional immediate bind of the top
+/// remaining inner coordinate. The GFNI arm fuses that bind into its existing
+/// cross-worker plane reduce; other targets bind the completed vector.
+fn partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    top_bind: Option<F128>,
+) -> Vec<F128> {
+    assert!(m >= k_log);
+    assert!(eq_lo.len().is_power_of_two());
+    assert!(eq_hi.len().is_power_of_two());
+    let n_outer = 1usize << (m - k_log);
+    assert_eq!(eq_lo.len() * eq_hi.len(), n_outer);
+    let log_b = eq_lo.len().trailing_zeros() as usize;
+    let lo_mask = eq_lo.len() - 1;
+
+    partial_fold_packed_z_block_major_padded_with_tables(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        |outer_base| {
+            std::array::from_fn(|r| {
+                let outer = outer_base + r;
+                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+            })
+        },
+        top_bind,
+    )
+}
+
+/// Today's one-shot block-major fold at `x_outer`. Same dispatch as
+/// [`prove_padded_inner`]: factorized eq when `n_log == 18`, else a
+/// materialized outer table. Used by the last-ρ kick and the sequential
+/// fallback so both produce the same `ẑ`, and by zerocheck's identity-C
+/// round-one fold (see `univariate_skip_optimized::identity_c_inner_fold`).
+pub(crate) fn fold_block_major_one_shot(
+    z: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    x_outer: &[F128],
+) -> Vec<F128> {
+    let n_log = m - k_log;
+    debug_assert_eq!(x_outer.len(), n_log);
+    if n_log == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
+        let (outer_lo, outer_hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+        let eq_lo = build_eq_table(outer_lo);
+        let eq_hi = build_eq_table(outer_hi);
+        partial_fold_packed_z_block_major_factorized_padded(
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq_lo,
+            &eq_hi,
+        )
+    } else {
+        let eq_x_outer = build_eq_table(x_outer);
+        partial_fold_packed_z_block_major_padded(z, m, k_log, useful_bits, &eq_x_outer)
+    }
+}
+
+/// One-shot block-major outer fold followed immediately by binding the top
+/// remaining inner coordinate. On the ranked GFNI path the bind is fused into
+/// the worker-plane reduce, so the full inner vector is never materialized.
+pub(crate) fn fold_block_major_one_shot_bind_top(
+    z: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    x_outer: &[F128],
+    r_top: F128,
+) -> Vec<F128> {
+    let n_log = m - k_log;
+    debug_assert_eq!(x_outer.len(), n_log);
+    if n_log == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
+        let (outer_lo, outer_hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+        let eq_lo = build_eq_table(outer_lo);
+        let eq_hi = build_eq_table(outer_hi);
+        partial_fold_packed_z_block_major_factorized_padded_with_top_bind(
+            z,
+            m,
+            k_log,
+            useful_bits,
+            &eq_lo,
+            &eq_hi,
+            Some(r_top),
+        )
+    } else {
+        let eq_x_outer = build_eq_table(x_outer);
+        partial_fold_packed_z_block_major_padded_with_tables(
+            z,
+            m,
+            k_log,
+            useful_bits,
+            |outer_base| std::array::from_fn(|lane| eq_x_outer[outer_base + lane]),
+            Some(r_top),
+        )
+    }
+}
+
+/// Ranked identity-C fold plus the contribution of complete K-rows whose B
+/// multilinear extension is one.
+pub(crate) fn fold_block_major_one_shot_bind_top_ranked_one_rows(
+    z: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    x_outer: &[F128],
+    r_top: F128,
+) -> (Vec<F128>, Vec<F128>) {
+    assert_eq!(m, 32);
+    assert_eq!(k_log, 14);
+    assert_eq!(useful_bits, 15409);
+    assert_eq!(x_outer.len(), BLOCK_MAJOR_FACTORED_EQ_N_LOG);
+    let (outer_lo, outer_hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+    let eq_lo = build_eq_table(outer_lo);
+    let eq_hi = build_eq_table(outer_hi);
+    let log_b = eq_lo.len().trailing_zeros() as usize;
+    let lo_mask = eq_lo.len() - 1;
+    let (full, one) = partial_fold_packed_z_block_major_padded_with_tables_result(
+        z,
+        m,
+        k_log,
+        useful_bits,
+        |outer_base| {
+            std::array::from_fn(|lane| {
+                let outer = outer_base + lane;
+                eq_lo[outer & lo_mask] * eq_hi[outer >> log_b]
+            })
+        },
+        Some(r_top),
+        true,
+    );
+    (full, one.expect("ranked one-row fold requested"))
+}
+
+/// `FLOCK_NO_LC_NIBBLE_FOLD=1` disables the AVX-512 nibble-table accumulate
+/// of the block-major sweep (exact A/B control: the scalar 256-entry
+/// byte-table loop runs instead). Resolved once per process.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+fn lincheck_nibble_fold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_NIBBLE_FOLD").is_none());
+    *ON
+}
+
+/// Test-only latch forcing the block-major GFNI arm OFF (it ships on), so
+/// both arms can be compared in one process (the env switches resolve once).
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+pub(crate) static BM_GFNI_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `FLOCK_NO_LC_BM_GFNI=1` restores the nibble-table accumulate in the
+/// block-major sweep (exact same-binary A/B). Distinct from
+/// `FLOCK_NO_LC_GFNI`, which guards only the byte-stripe dispatcher — the
+/// block-major path never reaches it. Resolved once per process.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn block_major_gfni_enabled() -> bool {
+    #[cfg(test)]
+    if BM_GFNI_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_BM_GFNI").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_GATHER_TR=1` restores the scalar stripe gather + staging
+/// transpose in the GFNI block-major arm (exact same-binary A/B).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+/// `FLOCK_NO_LC_GATHER4=1` restores single-column gather+transpose visits in
+/// the block-major GFNI fold (exact A/B control; the fused single-column arm
+/// then serves every chunk). Resolved once per process.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_gather4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER4").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order: join the
+/// kicked z-fold before `fold_alpha_batched` instead of after (exact
+/// same-binary A/B; the overlap changes scheduling only).
+fn lc_alpha_overlap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ALPHA_OVERLAP").is_none());
+    *ON
+}
+
+/// Chunks of look-ahead for the grouped block-major gather prefetch. One
+/// grouped visit consumes four F128 chunks = one 64-byte line per row, so
+/// `4` is the next visit's line on the SAME eight rows.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+const LC_ZFOLD_PF_CHUNKS: usize = 4;
+
+/// `FLOCK_NO_LC_ZFOLD_PF=1` restores the incumbent one-stripe-ahead prefetch
+/// in the grouped block-major gather (exact same-binary A/B).
+///
+/// The incumbent asks for the next stripe's eight rows at the column the loop
+/// is on now. This arm asks instead for the lines the SAME eight rows will
+/// need on a later grouped visit. Same eight prefetch instructions per stripe,
+/// different address: no work is added, and prefetches have no architectural
+/// effect, so the folded values are bit-identical either way.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_zfold_pf_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ZFOLD_PF").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_ZFOLD_PF_NEAR=1` restores the incumbent two-visit look-ahead
+/// in the grouped gather prefetch above (exact same-binary A/B). Same eight
+/// prefetch instructions per stripe, one line further out; a prefetch has no
+/// architectural effect, so the folded values are identical either way.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_zfold_pf_near_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ZFOLD_PF_NEAR").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_ZFOLD_PF_SPREAD=1` restores the incumbent delivery of the
+/// grouped gather prefetch: every stripe's hint block issued inside the
+/// gather loop, next to that stripe's own strided reads. The default arm
+/// issues the same hints for the same lines from the fold loop that follows,
+/// two stripes' worth per fold call. Exact same-binary A/B: a prefetch has
+/// no architectural effect, so the folded values are identical either way.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+fn lc_zfold_pf_spread_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_ZFOLD_PF_SPREAD").is_none());
+    *ON
+}
+
+/// Block-major row stride, in `F128`, at the ranked shape: `k = 2^14`, so
+/// `chunks_per_block = k / 128 = 128`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+const LC_RANKED_CHUNKS_PER_BLOCK: usize = 128;
+
+/// Sixteen T0 hints on the consecutive block-major rows `base .. base + 16`
+/// (row stride `chunks_per_block` F128). The `ranked` arm exists only so the
+/// stride is an immediate: identical addresses, identical order.
+///
+/// The sweep's row stride is `chunks_per_block = k / 128`, a value the
+/// compiler only sees at run time, so each of the sixteen hints a spread
+/// block issues rebuilds its own address with `lea` + `imul` + `shl`. At the
+/// ranked shape that value is the constant 128 and the sixteen rows are
+/// consecutive: handing the constant to the addressing collapses the whole
+/// block to one base register plus fifteen `disp32`. Same sixteen lines, same
+/// order, same look-ahead — a prefetch has no architectural effect and none
+/// of the folded values are touched, so `ẑ` is bit-identical either way.
+///
+/// # Safety
+/// `base .. base + 15 * chunks_per_block` must lie inside the witness
+/// allocation. A prefetch never dereferences, but the pointer arithmetic
+/// itself must stay in bounds.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512vbmi"))]
+#[inline(always)]
+unsafe fn lc_prefetch_rows16(base: *const F128, chunks_per_block: usize, ranked: bool) {
+    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+    // SAFETY: bounds per the contract.
+    unsafe {
+        if ranked {
+            for i in 0..16 {
+                _mm_prefetch(
+                    base.add(i * LC_RANKED_CHUNKS_PER_BLOCK).cast::<i8>(),
+                    _MM_HINT_T0,
+                );
+            }
+        } else {
+            let mut p = base;
+            for _ in 0..16 {
+                _mm_prefetch(p.cast::<i8>(), _MM_HINT_T0);
+                p = p.add(chunks_per_block);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // Retained same-binary rollback selector.
+fn lc_gather_tr_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_GATHER_TR").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LINCHECK_GT_FUSE=1` restores the two-instruction
+/// gather/transpose composition (`VPERMT2Q` lo/hi split plus `VPERMB` byte
+/// transpose). The default uses one `VPERMT2B` per limb with the static
+/// selectors from [`gather_transpose_vpermt2b_indices`].
+#[cfg(any(
+    test,
+    all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    )
+))]
+fn lincheck_gt_fuse_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+fn lincheck_gt_fuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !lincheck_gt_fuse_disabled_value(std::env::var_os("FLOCK_NO_LINCHECK_GT_FUSE").as_deref())
+    });
+    *ON
+}
+
+/// `FLOCK_NO_LC_DYNAMIC_TILES=1` restores the fixed contiguous tile range
+/// per worker in the block-major sweep (exact A/B control).
+fn dynamic_tiles_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_DYNAMIC_TILES").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_REDUCE_SINGLE_PASS=1` restores the per-worker sequence of
+/// rayon reductions of the block-major partials (exact A/B control).
+fn reduce_single_pass_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_REDUCE_SINGLE_PASS").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_LC_FOLD_UNTIMED=1` restores the *unconditional* per-tile /
+/// per-chunk `Instant::now()` probes inside the block-major sweep (the
+/// incumbent behaviour, and the way to get the tables / transpose+read /
+/// accumulate split back under `LINCHECK_TRACE`). Left on (default), the
+/// probes are skipped entirely: at the ranked shape the incumbent takes
+/// 4 clock reads per (tile, 128-column chunk) — 256 tiles × 121 chunks ×
+/// 4 ≈ 124 K `clock_gettime` calls per worker — in the middle of the
+/// witness sweep. Pure instrumentation: the folded values are identical
+/// either way.
+fn fold_untimed_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_FOLD_UNTIMED").is_none());
+    *ON
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+fn gather_transpose_tile_scalar(
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    stripe_base: usize,
+    q: usize,
+    transposed: &mut [u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128],
+) {
+    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+        let outer_base = 8 * (stripe_base + t);
+        let lanes: [F128; 8] =
+            std::array::from_fn(|r| z_packed[(outer_base + r) * chunks_per_block + q]);
+        transpose_8_f128s_to_128_bytes(&lanes, &mut transposed[t * 128..(t + 1) * 128]);
+    }
+}
+
+/// Gather and transpose one eight-stripe, four-column batch. `FUSE` makes
+/// the VPERMT2B/incumbent choice compile-time inside the small leaf while the
+/// caller keeps the runtime kill switch outside this eight-iteration loop.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn gather_transpose_group4_x86<const FUSE: bool>(
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    stripe_base: usize,
+    q: usize,
+    full_chunks: usize,
+    pf_far: bool,
+    pf_spread: bool,
+    pf_chunks: usize,
+    transposed: &mut [u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128],
+) {
+    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+        let outer_base = 8 * (stripe_base + t);
+        if pf_far && !pf_spread {
+            // These eight rows, pf_chunks chunks on: the lines this stripe
+            // demand-loads on a later grouped visit. Bounds keep every hint
+            // within a chunk the sweep will actually demand.
+            let qn = q + pf_chunks;
+            if qn <= full_chunks && qn < chunks_per_block {
+                unsafe {
+                    for r in 0..8 {
+                        core::arch::x86_64::_mm_prefetch(
+                            z_packed
+                                .as_ptr()
+                                .add((outer_base + r) * chunks_per_block + qn)
+                                .cast::<i8>(),
+                            core::arch::x86_64::_MM_HINT_T0,
+                        );
+                    }
+                }
+            }
+        } else if pf_far {
+        } else if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+            let next_base = 8 * (stripe_base + t + 1);
+            // One line per row covers all four columns.
+            unsafe {
+                for r in 0..8 {
+                    core::arch::x86_64::_mm_prefetch(
+                        z_packed
+                            .as_ptr()
+                            .add((next_base + r) * chunks_per_block + q)
+                            .cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
+        }
+        // SAFETY: rows (outer_base + r) * chunks_per_block + q + c for
+        // r in 0..8, c in 0..4 are the four full chunks selected by the
+        // caller; every column slab is 1024 writable bytes.
+        unsafe {
+            kernels::gather_transpose_stripe4_x86::<FUSE>(
+                z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                chunks_per_block,
+                transposed.as_mut_ptr().add(t * 128),
+                1024,
+            );
+        }
+    }
+}
+
+/// Single-column counterpart of [`gather_transpose_group4_x86`].
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512vbmi",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+fn gather_transpose_tile_x86<const FUSE: bool>(
+    z_packed: &[F128],
+    chunks_per_block: usize,
+    stripe_base: usize,
+    q: usize,
+    transposed: &mut [u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128],
+) {
+    for t in 0..DIRECT_FOLD_TILE_STRIPES {
+        let outer_base = 8 * (stripe_base + t);
+        // Row-strided F128 loads defeat sequential hardware prefetch. Pull
+        // the next stripe into L1, without crossing a dynamically scheduled
+        // tile boundary.
+        if t + 1 < DIRECT_FOLD_TILE_STRIPES {
+            let next_base = 8 * (stripe_base + t + 1);
+            unsafe {
+                for r in 0..8 {
+                    core::arch::x86_64::_mm_prefetch(
+                        z_packed
+                            .as_ptr()
+                            .add((next_base + r) * chunks_per_block + q)
+                            .cast::<i8>(),
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
+        }
+        // SAFETY: the caller's q is a live chunk, all eight row-strided
+        // F128 values are in bounds, and the destination stripe is 128 B.
+        unsafe {
+            kernels::gather_transpose_stripe_x86::<FUSE>(
+                z_packed.as_ptr().add(outer_base * chunks_per_block + q),
+                chunks_per_block,
+                transposed.as_mut_ptr().add(t * 128),
+            );
+        }
+    }
+}
+
+/// GFNI plane-major arm of the block-major sweep: per (tile, 128-column
+/// chunk) the eight gathered+transposed stripe rows drain through
+/// [`kernels::gfni_fold_tile`] into per-worker byte-plane accumulators
+/// (16 planes x 64 columns per 64-column block); one transpose back to F128
+/// happens inside the cross-worker reduce. Bit-identical to the
+/// scalar/nibble arms: F128 addition IS bitwise XOR, so plane-domain
+/// accumulation commutes with the transpose, and the whole-block writes
+/// past `useful_bits` land on index bytes that are ZERO in memory (r1cs
+/// zero padding) through a linear map with no constant — contributing
+/// nothing, exactly like the masked stores they replace.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+fn transpose_8x8_bytes(mut rows: [u64; 8]) -> [u64; 8] {
+    const M1: u64 = 0x00FF_00FF_00FF_00FF;
+    for i in (0..8).step_by(2) {
+        let t = ((rows[i] >> 8) ^ rows[i + 1]) & M1;
+        rows[i + 1] ^= t;
+        rows[i] ^= t << 8;
+    }
+
+    const M2: u64 = 0x0000_FFFF_0000_FFFF;
+    for i in [0, 1, 4, 5] {
+        let t = ((rows[i] >> 16) ^ rows[i + 2]) & M2;
+        rows[i + 2] ^= t;
+        rows[i] ^= t << 16;
+    }
+
+    const M4: u64 = 0x0000_0000_FFFF_FFFF;
+    for i in 0..4 {
+        let t = ((rows[i] >> 32) ^ rows[i + 4]) & M4;
+        rows[i + 4] ^= t;
+        rows[i] ^= t << 32;
+    }
+    rows
+}
+
+/// Reduce one 64-column GFNI plane block across workers and transpose it
+/// back to the canonical F128 column layout.
+///
+/// # Safety
+/// For every entry in `active_workers`, all 1024 bytes of plane block `blk`
+/// must have been initialized, and every worker index/block range must lie in
+/// `planes`. The producer join must happen-before this call.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[inline(always)]
+unsafe fn reduce_worker_plane_block(
+    planes: &[core::mem::MaybeUninit<u8>],
+    worker_stride: usize,
+    active_workers: &[usize],
+    blk: usize,
+    out: &mut [F128],
+) {
+    debug_assert_eq!(out.len(), 64);
+    let Some((&first_worker, rest_workers)) = active_workers.split_first() else {
+        out.fill(F128::ZERO);
+        return;
+    };
+    let base = blk * 1024;
+    let mut acc = [0u8; 1024];
+    let first = first_worker * worker_stride + base;
+    let first_block = &planes[first..first + 1024];
+    // SAFETY: callers reduce only `blk < live_blocks`, and `first_worker` is
+    // active. Its first claimed tile called `gfni_fold_tile(seed_zero=true)`,
+    // which stores all 16 x 64 bytes of every live block. The Rayon producer
+    // join completed before reduction starts, so this exact block is fully
+    // initialized and may now be viewed as bytes.
+    let first_block = unsafe {
+        core::slice::from_raw_parts(first_block.as_ptr().cast::<u8>(), first_block.len())
+    };
+    acc.copy_from_slice(first_block);
+    for &w in rest_workers {
+        let src = &planes[w * worker_stride + base..w * worker_stride + base + 1024];
+        // SAFETY: the same active-worker/live-block proof as `first_block`.
+        let src = unsafe { core::slice::from_raw_parts(src.as_ptr().cast::<u8>(), src.len()) };
+        // SAFETY: both slices are 1024 bytes (16 x 64); XOR is bitwise so
+        // VPXORD equals the scalar `*a ^= *b` loop byte-for-byte.
+        unsafe {
+            kernels::xor_bytes_avx512(acc.as_mut_ptr(), src.as_ptr(), 1024);
+        }
+    }
+    // The plane rows are contiguous, while the old per-column loop made 16
+    // strided byte loads for every F128. Transpose eight 8-byte groups with
+    // GPR delta-swaps so every load is a contiguous u64.
+    for group in 0..8 {
+        let mut lo_rows = [0u64; 8];
+        let mut hi_rows = [0u64; 8];
+        for byte in 0..8 {
+            let lo = byte * 64 + group * 8;
+            let hi = (byte + 8) * 64 + group * 8;
+            lo_rows[byte] = u64::from_le_bytes(acc[lo..lo + 8].try_into().unwrap());
+            hi_rows[byte] = u64::from_le_bytes(acc[hi..hi + 8].try_into().unwrap());
+        }
+        let lo_cols = transpose_8x8_bytes(lo_rows);
+        let hi_cols = transpose_8x8_bytes(hi_rows);
+        for col in 0..8 {
+            out[group * 8 + col] = F128 {
+                lo: lo_cols[col],
+                hi: hi_cols[col],
+            };
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+#[allow(clippy::too_many_arguments)]
+fn fold_block_major_gfni(
+    z_packed: &[F128],
+    k: usize,
+    chunks_per_block: usize,
+    useful_bits: usize,
+    useful_chunks: usize,
+    n_workers: usize,
+    tiles_per_worker: usize,
+    n_tiles: usize,
+    dynamic: bool,
+    eq8_at: &(impl Fn(usize) -> [F128; 8] + Sync),
+    top_bind: Option<F128>,
+    ranked_one_rows: bool,
+) -> (Vec<F128>, Option<Vec<F128>>) {
+    use rayon::prelude::*;
+    const TILE_GRAB: usize = 4;
+    let next_tile = std::sync::atomic::AtomicUsize::new(0);
+    // Same total footprint as the F128 partials (k*16 bytes per worker). The
+    // first claimed tile seeds every live plane block from register zero, so
+    // eager zeroing is dead work. Dynamic claiming can leave a Rayon chunk
+    // with no tile, however; `active` keeps those stale chunks out of reduce.
+    // MaybeUninit keeps the whole Rayon slice valid while only active/live
+    // subranges are initialized; it is never reinterpreted wholesale as u8.
+    let mut planes = crate::alloc_uninit_vec::<core::mem::MaybeUninit<u8>>(n_workers * k * 16);
+    let mut active = vec![0u8; n_workers];
+    planes
+        .par_chunks_mut(k * 16)
+        .zip(active.par_iter_mut())
+        .enumerate()
+        .for_each(|(worker, (wplanes, worker_active))| {
+            let tile_lo = worker * tiles_per_worker;
+            let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
+            let (mut claim_lo, mut claim_hi) = if dynamic {
+                (0usize, 0usize)
+            } else {
+                (tile_lo, tile_hi)
+            };
+            let mut mats = [0u64; 128];
+            debug_assert_eq!(DIRECT_FOLD_TILE_STRIPES * 16, mats.len());
+            // Four column-slabs of 8×128 bytes: the grouped gather writes
+            // column c at slab c; the single-column arms use slab 0 only.
+            let mut transposed = [0u8; 4 * DIRECT_FOLD_TILE_STRIPES * 128];
+            // First tile this worker writes into an uninitialized plane
+            // buffer: seed the GFNI acc from a register zero idiom. Later
+            // tiles load only blocks that this first tile initialized.
+            let mut first_tile = true;
+            // Fused register gather+transpose (no staging arrays); the
+            // scalar path stays as the kill-switch arm.
+            #[cfg(target_feature = "avx512vbmi")]
+            let gather_tr_fused = lc_gather_tr_enabled();
+            // Resolve the corrected VPERMT2B-vs-incumbent gate once per
+            // worker. The hot q loops branch once per eight-stripe batch;
+            // their const-generic leaf has no per-gather gate branch.
+            #[cfg(target_feature = "avx512vbmi")]
+            let gather_tr_vpermt2b = lincheck_gt_fuse_enabled();
+            // Grouped-gather prefetch distance, resolved once per worker
+            // (never inside the tile / chunk / stripe loops).
+            #[cfg(target_feature = "avx512vbmi")]
+            let pf_far = lc_zfold_pf_enabled();
+            #[cfg(target_feature = "avx512vbmi")]
+            let pf_chunks = if lc_zfold_pf_near_enabled() {
+                LC_ZFOLD_PF_CHUNKS
+            } else {
+                2 * LC_ZFOLD_PF_CHUNKS
+            };
+            #[cfg(target_feature = "avx512vbmi")]
+            let pf_spread = lc_zfold_pf_spread_enabled();
+            // Ranked-stride addressing, resolved once per worker (never
+            // inside the tile / chunk / stripe loops).
+            #[cfg(target_feature = "avx512vbmi")]
+            let cpb_ranked = chunks_per_block == LC_RANKED_CHUNKS_PER_BLOCK;
+            loop {
+                let tile = if claim_lo < claim_hi {
+                    claim_lo += 1;
+                    claim_lo - 1
+                } else if dynamic {
+                    let lo = next_tile.fetch_add(TILE_GRAB, std::sync::atomic::Ordering::Relaxed);
+                    if lo >= n_tiles {
+                        break;
+                    }
+                    claim_lo = lo + 1;
+                    claim_hi = (lo + TILE_GRAB).min(n_tiles);
+                    lo
+                } else {
+                    break;
+                };
+                let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
+                for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                    let eq8 = eq8_at(8 * (stripe_base + t));
+                    kernels::fold_mats_from_basis(&eq8, &mut mats[t * 16..(t + 1) * 16]);
+                }
+                let mut q = 0usize;
+                // Grouped arm: four full 128-bit chunks per gather visit.
+                // The row stride is 2048 bytes, so a tile's 64 live rows
+                // land in two L1 sets; one wide load per row per FOUR
+                // columns quarters the residency each row line needs there.
+                // Full chunks only (chunk_bits == 128 ⇔ q < useful_bits/128);
+                // the ragged final chunk takes the single-column arm below.
+                #[cfg(target_feature = "avx512vbmi")]
+                if gather_tr_fused && lc_gather4_enabled() {
+                    let full_chunks = useful_bits / 128;
+                    while q + 4 <= full_chunks {
+                        if gather_tr_vpermt2b {
+                            gather_transpose_group4_x86::<true>(
+                                z_packed,
+                                chunks_per_block,
+                                stripe_base,
+                                q,
+                                full_chunks,
+                                pf_far,
+                                pf_spread,
+                                pf_chunks,
+                                &mut transposed,
+                            );
+                        } else {
+                            gather_transpose_group4_x86::<false>(
+                                z_packed,
+                                chunks_per_block,
+                                stripe_base,
+                                q,
+                                full_chunks,
+                                pf_far,
+                                pf_spread,
+                                pf_chunks,
+                                &mut transposed,
+                            );
+                        }
+                        for c in 0..4 {
+                            // Spread delivery: the same eight-hints-per-stripe
+                            // block, issued from the fold that follows the
+                            // gather instead of from the gather itself, two
+                            // stripes at a time. Same lines, same look-ahead.
+                            if pf_far && pf_spread {
+                                let qn = q + pf_chunks;
+                                if qn <= full_chunks && qn < chunks_per_block {
+                                    // Stripes 2c and 2c+1 are the SIXTEEN
+                                    // consecutive rows 8*stripe_base + 16c ..
+                                    // + 16, so one base pointer and a fixed
+                                    // row stride reach every hint the two
+                                    // eight-row blocks used to address one at
+                                    // a time. Same sixteen lines, same order.
+                                    // SAFETY: those rows are inside this
+                                    // tile's 64 and `qn < chunks_per_block`
+                                    // keeps the column inside the block, so
+                                    // every address the helper forms is in
+                                    // bounds; a prefetch never dereferences.
+                                    unsafe {
+                                        lc_prefetch_rows16(
+                                            z_packed.as_ptr().add(
+                                                (8 * stripe_base + 16 * c) * chunks_per_block + qn,
+                                            ),
+                                            chunks_per_block,
+                                            cpb_ranked,
+                                        );
+                                    }
+                                }
+                            }
+                            // SAFETY: as for the single-column call below;
+                            // every grouped chunk is full (2 blocks of 64).
+                            unsafe {
+                                kernels::gfni_fold_tile(
+                                    transposed.as_ptr().add(c * 1024),
+                                    128,
+                                    2,
+                                    &mats,
+                                    wplanes.as_mut_ptr().cast::<u8>().add(2 * (q + c) * 1024),
+                                    first_tile,
+                                );
+                            }
+                        }
+                        q += 4;
+                    }
+                }
+                while q < useful_chunks {
+                    let inner_base = q * 128;
+                    let chunk_bits = (useful_bits - inner_base).min(128);
+                    #[cfg(target_feature = "avx512vbmi")]
+                    if gather_tr_fused {
+                        if gather_tr_vpermt2b {
+                            gather_transpose_tile_x86::<true>(
+                                z_packed,
+                                chunks_per_block,
+                                stripe_base,
+                                q,
+                                &mut transposed,
+                            );
+                        } else {
+                            gather_transpose_tile_x86::<false>(
+                                z_packed,
+                                chunks_per_block,
+                                stripe_base,
+                                q,
+                                &mut transposed,
+                            );
+                        }
+                    } else {
+                        gather_transpose_tile_scalar(
+                            z_packed,
+                            chunks_per_block,
+                            stripe_base,
+                            q,
+                            &mut transposed,
+                        );
+                    }
+                    #[cfg(not(target_feature = "avx512vbmi"))]
+                    gather_transpose_tile_scalar(
+                        z_packed,
+                        chunks_per_block,
+                        stripe_base,
+                        q,
+                        &mut transposed,
+                    );
+                    // SAFETY: `transposed` holds 8 stripes x 128 bytes at
+                    // stride 128 (max read 7*128 + 2*64 = 1024 = its size);
+                    // the worker planes cover (2q + chunk blocks) * 1024
+                    // bytes for every q < useful_chunks <= k/128. first_tile
+                    // is true iff this worker has not yet stored into wplanes.
+                    unsafe {
+                        kernels::gfni_fold_tile(
+                            transposed.as_ptr(),
+                            128,
+                            chunk_bits.div_ceil(64),
+                            &mats,
+                            wplanes.as_mut_ptr().cast::<u8>().add(2 * q * 1024),
+                            first_tile,
+                        );
+                    }
+                    q += 1;
+                }
+                first_tile = false;
+            }
+            // This byte is exclusively owned by the zipped Rayon chunk. A
+            // true `first_tile` means dynamic claiming assigned it no work,
+            // so none of its uninitialized plane bytes may enter reduction.
+            *worker_active = u8::from(!first_tile);
+        });
+
+    // Cross-worker reduce + transpose-back in ONE parallel pass over
+    // 64-column blocks (a standalone transpose would be a full-buffer
+    // read+write pass — the class this arm deletes). When the caller will
+    // immediately bind the top coordinate, pair each low/high plane block
+    // here and write only the already-bound low half. This preserves the
+    // incumbent reduction and transpose leaves while avoiding a length-k
+    // intermediate allocation plus its complete readback.
+    let worker_stride = k * 16;
+    // Iteration over the marker vector preserves the incumbent ascending
+    // worker reduction order while deleting inactive zero contributions.
+    let active_workers: Vec<usize> = active
+        .into_iter()
+        .enumerate()
+        .filter_map(|(worker, active)| (active != 0).then_some(worker))
+        .collect();
+    let live_blocks = useful_bits.div_ceil(64);
+    let out_len = if top_bind.is_some() { k / 2 } else { k };
+    // Keep output initialized as F128 throughout. The much larger plane
+    // buffer carries the dead zero-fill; avoiding this comparatively small
+    // clear would require a separate MaybeUninit ownership conversion.
+    let mut out = vec![F128::ZERO; out_len];
+    let mut one = ranked_one_rows.then(|| vec![F128::ZERO; out_len]);
+    debug_assert!(!ranked_one_rows || (k == 1 << 14 && top_bind.is_some()));
+    let reduce_block = |blk: usize, o: &mut [F128], one_o: Option<&mut [F128]>| {
+        if blk < live_blocks {
+            // SAFETY: `active_workers` contains exactly producer chunks that
+            // claimed a tile. Their first tile used `seed_zero=true` and
+            // stored every byte of each `blk < live_blocks`; the producer
+            // parallel iterator joined before this reduction starts.
+            unsafe {
+                reduce_worker_plane_block(&planes, worker_stride, &active_workers, blk, o);
+            }
+        } else {
+            // Padding has no backing worker-plane writes in the uninitialized
+            // allocation, but its canonical folded value is algebraic zero.
+            o.fill(F128::ZERO);
+        }
+        if let Some(r) = top_bind {
+            let mut hi = [F128::ZERO; 64];
+            let hi_blk = blk + k / 128;
+            if hi_blk < live_blocks {
+                // SAFETY: identical to the low-block call above; `hi_blk` is
+                // explicitly constrained to the fully stored live range.
+                unsafe {
+                    reduce_worker_plane_block(
+                        &planes,
+                        worker_stride,
+                        &active_workers,
+                        hi_blk,
+                        &mut hi,
+                    );
+                }
+            }
+            if let Some(one_o) = one_o {
+                if blk < 18 {
+                    let scale = F128::ONE + r;
+                    for (dst, src) in one_o.iter_mut().zip(o.iter()) {
+                        *dst = scale * *src;
+                    }
+                } else if (108..112).contains(&blk) {
+                    for (dst, src) in one_o.iter_mut().zip(hi.iter()) {
+                        *dst = r * *src;
+                    }
+                } else {
+                    one_o.fill(F128::ZERO);
+                }
+            }
+            crate::field::f128_slice::bind_split_half(o, &hi, r);
+        }
+    };
+    if let Some(one) = one.as_mut() {
+        out.par_chunks_mut(64)
+            .zip(one.par_chunks_mut(64))
+            .enumerate()
+            .for_each(|(blk, (o, one_o))| reduce_block(blk, o, Some(one_o)));
+    } else {
+        out.par_chunks_mut(64)
+            .enumerate()
+            .for_each(|(blk, o)| reduce_block(blk, o, None));
+    }
+    (out, one)
+}
+
+/// Shared block-major witness sweep. `eq8_at(outer_base)` returns the eight
+/// outer weights for the stripe beginning at `outer_base`; the sweep builds
+/// whichever subset tables its accumulate kernel needs from them (the
+/// 256-entry byte table for the scalar loop, or the AVX-512 kernel's two
+/// 16-entry nibble tables — both are exact splits of the same subset sums).
+fn partial_fold_packed_z_block_major_padded_with_tables(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
+    top_bind: Option<F128>,
+) -> Vec<F128> {
+    partial_fold_packed_z_block_major_padded_with_tables_result(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        eq8_at,
+        top_bind,
+        false,
+    )
+    .0
+}
+
+fn partial_fold_packed_z_block_major_padded_with_tables_result(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq8_at: impl Fn(usize) -> [F128; 8] + Sync,
+    top_bind: Option<F128>,
+    ranked_one_rows: bool,
+) -> (Vec<F128>, Option<Vec<F128>>) {
+    use rayon::prelude::*;
+
+    assert!(m >= k_log);
+    assert!(k_log >= 7, "block-major F128 fold requires k >= 128");
+    let n_log = m - k_log;
+    let k = 1usize << k_log;
+    let n_outer = 1usize << n_log;
+    let chunks_per_block = k / 128;
+    assert_eq!(z_packed.len(), n_outer * chunks_per_block);
+    assert!(n_log >= 3, "need n_outer >= 8 for byte groups");
+    assert!(useful_bits <= k);
+
+    let n_stripes = n_outer / 8;
+    let n_tiles = n_stripes.div_ceil(DIRECT_FOLD_TILE_STRIPES);
+    let p = rayon::current_num_threads().max(1);
+    let tiles_per_worker = n_tiles.div_ceil(p);
+    let n_workers = n_tiles.div_ceil(tiles_per_worker);
+    let useful_chunks = useful_bits.div_ceil(128);
+    // Dynamic tile claiming: workers grab `TILE_GRAB` tiles at a time from a
+    // shared counter instead of a fixed contiguous range, so a worker whose
+    // thread was descheduled (or shares a core) does not gate the join.
+    // Every tile is still swept exactly once by exactly one worker; the
+    // per-column XOR association changes but the sum does not.
+    const TILE_GRAB: usize = 4;
+    let next_tile = std::sync::atomic::AtomicUsize::new(0);
+    let dynamic = dynamic_tiles_enabled();
+    // Per-tile/per-chunk probe clocks: only with LINCHECK_TRACE (or the
+    // kill switch, which restores the always-on probes). Resolved once here
+    // so the worker loop reads a register, not the environment.
+    let trace_fold = std::env::var_os("LINCHECK_TRACE").is_some();
+    // NB: the split probes follow the kill switch alone, NOT `LINCHECK_TRACE`,
+    // so `LINCHECK_TRACE=1` measures the production sweep. Set
+    // `FLOCK_NO_LC_FOLD_UNTIMED=1` together with the trace to get the
+    // tables / transpose+read / accumulate split back (it costs ~1 ms/worker).
+    let timing = !fold_untimed_enabled();
+
+    // GFNI plane-major arm: exact-tile shapes only (no ragged last tile),
+    // 64-column blocks available. Everything else falls through to the
+    // incumbent nibble/scalar sweep unchanged.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    if block_major_gfni_enabled() && n_stripes % DIRECT_FOLD_TILE_STRIPES == 0 && k_log >= 6 {
+        let _ = (trace_fold, timing);
+        return fold_block_major_gfni(
+            z_packed,
+            k,
+            chunks_per_block,
+            useful_bits,
+            useful_chunks,
+            n_workers,
+            tiles_per_worker,
+            n_tiles,
+            dynamic,
+            &eq8_at,
+            top_bind,
+            ranked_one_rows,
+        );
+    }
+
+    // Outer-tile partitioning reads every useful z chunk exactly once and
+    // builds every sum table once. Each worker owns a private length-k partial;
+    // the final XOR reduction is small relative to the witness pass.
+    let probe_t0 = std::time::Instant::now();
+    let mut partials = vec![F128::ZERO; n_workers * k];
+    let probe_t1 = std::time::Instant::now();
+    partials
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(worker, partial)| {
+            let wt0 = std::time::Instant::now();
+            let mut t_tables = std::time::Duration::ZERO;
+            let mut t_tr = std::time::Duration::ZERO;
+            let mut t_acc = std::time::Duration::ZERO;
+            let tile_lo = worker * tiles_per_worker;
+            let tile_hi = ((worker + 1) * tiles_per_worker).min(n_tiles);
+            // Static range (kill switch) or dynamic claims from the counter.
+            let mut claim_lo = tile_lo;
+            let mut claim_hi = tile_hi;
+            if dynamic {
+                claim_lo = 0;
+                claim_hi = 0;
+            }
+            let mut tables = vec![F128::ZERO; DIRECT_FOLD_TILE_STRIPES * 256];
+            let mut transposed = [0u8; DIRECT_FOLD_TILE_STRIPES * 128];
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw"
+            ))]
+            let mut nib_tables = [[0u64; 64]; DIRECT_FOLD_TILE_STRIPES];
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "avx512bw"
+            ))]
+            let nibble_ok = lincheck_nibble_fold_enabled();
+
+            loop {
+                let tile = if claim_lo < claim_hi {
+                    claim_lo += 1;
+                    claim_lo - 1
+                } else if dynamic {
+                    let lo = next_tile.fetch_add(TILE_GRAB, std::sync::atomic::Ordering::Relaxed);
+                    if lo >= n_tiles {
+                        break;
+                    }
+                    claim_lo = lo + 1;
+                    claim_hi = (lo + TILE_GRAB).min(n_tiles);
+                    lo
+                } else {
+                    break;
+                };
+                let stripe_base = tile * DIRECT_FOLD_TILE_STRIPES;
+                let tile_stripes = (n_stripes - stripe_base).min(DIRECT_FOLD_TILE_STRIPES);
+                // Full tiles on AVX-512 take the nibble-table kernel and never
+                // build the 256-entry tables; every other tile builds them for
+                // the scalar loop.
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512bw"
+                ))]
+                let use_nibble = nibble_ok && tile_stripes == DIRECT_FOLD_TILE_STRIPES;
+                #[cfg(not(all(
+                    target_arch = "x86_64",
+                    target_feature = "avx512f",
+                    target_feature = "avx512bw"
+                )))]
+                let use_nibble = false;
+                let tt0 = if timing {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                for t in 0..tile_stripes {
+                    let outer_base = 8 * (stripe_base + t);
+                    let eq8 = eq8_at(outer_base);
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512bw"
+                    ))]
+                    if use_nibble {
+                        kernels::build_nibble_tables(&eq8, &mut nib_tables[t]);
+                        continue;
+                    }
+                    build_sum_table(&eq8, &mut tables[t * 256..(t + 1) * 256]);
+                }
+
+                if let Some(tt0) = tt0 {
+                    t_tables += tt0.elapsed();
+                }
+                // Keep one 128-column (2 KiB) output group hot while applying
+                // all tables in this outer tile.
+                for q in 0..useful_chunks {
+                    let inner_base = q * 128;
+                    let chunk_bits = (useful_bits - inner_base).min(128);
+                    let tq0 = if timing {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    // Full tiles take the all-NEON gather + bit-transpose
+                    // kernel (q-loads, uzp lo/hi split, tbl + vector-resident
+                    // swap rounds, no bounds checks) — byte-identical output
+                    // to the scalar-formed gather below, which remains as the
+                    // partial-tile fallback and `FLOCK_NO_LINCHECK_QFORM`
+                    // kill-switch path.
+                    #[cfg(target_arch = "aarch64")]
+                    let transposed_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES
+                        && kernels::lincheck_qform_enabled()
+                    {
+                        // SAFETY: lane (t, r) is read at index
+                        // `(8·(stripe_base + t) + r) · chunks_per_block + q`
+                        // — exactly the indices the scalar path reads; the
+                        // full-tile guard plus `q < useful_chunks ≤
+                        // chunks_per_block` keep all 64 in bounds. The output
+                        // is the whole 8×128 `transposed` buffer.
+                        unsafe {
+                            kernels::gather_transpose_tile_neon(
+                                z_packed
+                                    .as_ptr()
+                                    .add(8 * stripe_base * chunks_per_block + q),
+                                chunks_per_block,
+                                transposed.as_mut_ptr(),
+                            );
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let transposed_done = false;
+                    if !transposed_done {
+                        for t in 0..tile_stripes {
+                            let outer_base = 8 * (stripe_base + t);
+                            let lanes: [F128; 8] = std::array::from_fn(|r| {
+                                z_packed[(outer_base + r) * chunks_per_block + q]
+                            });
+                            transpose_8_f128s_to_128_bytes(
+                                &lanes,
+                                &mut transposed[t * 128..(t + 1) * 128],
+                            );
+                        }
+                    }
+                    if let Some(tq0) = tq0 {
+                        t_tr += tq0.elapsed();
+                    }
+                    let ta0 = if timing {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
+                    let group = &mut partial[inner_base..inner_base + chunk_bits];
+                    // Full tiles take the two-stream NEON wavefront leaf
+                    // (paired 8-column blocks, 16 register accumulators —
+                    // bit-identical XOR order, ~2× the independent lookup
+                    // chains in flight). Partial last tiles and the
+                    // `chunk_bits % 8` remainder use the scalar chain below.
+                    #[cfg(target_arch = "aarch64")]
+                    let b_done = if tile_stripes == DIRECT_FOLD_TILE_STRIPES {
+                        kernels::fold_block_major_chunk_neon_x2(
+                            &transposed,
+                            &tables,
+                            group,
+                            chunk_bits,
+                        )
+                    } else {
+                        0
+                    };
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        target_feature = "avx512f",
+                        target_feature = "avx512bw"
+                    ))]
+                    let b_done = if use_nibble {
+                        // SAFETY: cfg guarantees AVX-512F/BW; `transposed`
+                        // has 8×128 bytes, `nib_tables` 8 stripes, `group`
+                        // exactly `chunk_bits` F128.
+                        unsafe {
+                            kernels::fold_block_major_chunk_x86_avx512(
+                                &transposed,
+                                &nib_tables,
+                                group,
+                                chunk_bits,
+                            );
+                        }
+                        chunk_bits
+                    } else {
+                        0
+                    };
+                    #[cfg(not(any(
+                        target_arch = "aarch64",
+                        all(
+                            target_arch = "x86_64",
+                            target_feature = "avx512f",
+                            target_feature = "avx512bw"
+                        )
+                    )))]
+                    let b_done = 0;
+                    let _ = use_nibble;
+                    for b in b_done..chunk_bits {
+                        let mut acc = group[b];
+                        for t in 0..tile_stripes {
+                            let byte = transposed[t * 128 + b] as usize;
+                            acc += tables[t * 256 + byte];
+                        }
+                        group[b] = acc;
+                    }
+                    if let Some(ta0) = ta0 {
+                        t_acc += ta0.elapsed();
+                    }
+                }
+            }
+            if trace_fold {
+                eprintln!(
+                    "[lc] fold worker {worker}: total {:.2} ms tables {:.2} transpose+read {:.2} acc {:.2}",
+                    wt0.elapsed().as_secs_f64() * 1e3,
+                    t_tables.as_secs_f64() * 1e3,
+                    t_tr.as_secs_f64() * 1e3,
+                    t_acc.as_secs_f64() * 1e3
+                );
+            }
+        });
+    let probe_t2 = std::time::Instant::now();
+
+    // Reduce the per-worker partials in ONE parallel pass over column ranges
+    // (each task XORs every worker's slice of its range), instead of one
+    // rayon dispatch per worker over the whole length-k vector: on a 16-way
+    // pool the latter is fifteen back-to-back fork/joins over 16 K tiny
+    // items and measured ~30 ms at the ranked shape — more than the sweep
+    // itself. Same XORs, same association order per column (worker 0 first,
+    // then 1..n_workers), so the result is bit-identical.
+    let mut out = vec![F128::ZERO; k];
+    if reduce_single_pass_enabled() {
+        let cols_per_task = k.div_ceil(4 * p).max(64);
+        out.par_chunks_mut(cols_per_task)
+            .enumerate()
+            .for_each(|(ti, o)| {
+                let base = ti * cols_per_task;
+                let len = o.len();
+                o.copy_from_slice(&partials[base..base + len]);
+                for w in 1..n_workers {
+                    let src = &partials[w * k + base..w * k + base + len];
+                    for (a, b) in o.iter_mut().zip(src) {
+                        *a += *b;
+                    }
+                }
+            });
+    } else {
+        let (first, rest) = partials.split_at(k);
+        out.copy_from_slice(first);
+        for partial in rest.chunks(k) {
+            out.par_iter_mut()
+                .zip(partial.par_iter())
+                .for_each(|(o, p)| *o += *p);
+        }
+    }
+    if std::env::var_os("LINCHECK_TRACE").is_some() {
+        eprintln!(
+            "[lc] fold alloc {:.2} ms par {:.2} ms reduce {:.2} ms",
+            (probe_t1 - probe_t0).as_secs_f64() * 1e3,
+            (probe_t2 - probe_t1).as_secs_f64() * 1e3,
+            probe_t2.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let one = if ranked_one_rows {
+        let r = top_bind.expect("ranked one-row contribution needs top bind");
+        assert_eq!(k, 1 << 14);
+        let half = k / 2;
+        let mut one = vec![F128::ZERO; half];
+        let scale_lo = F128::ONE + r;
+        for i in 0..1152 {
+            one[i] = scale_lo * out[i];
+        }
+        for i in 15104..15360 {
+            one[i - half] = r * out[i];
+        }
+        Some(one)
+    } else {
+        None
+    };
+    if let Some(r) = top_bind {
+        let half = out.len() / 2;
+        let (lo, hi) = out.split_at_mut(half);
+        crate::field::f128_slice::bind_split_half(lo, hi, r);
+        out.truncate(half);
+    }
+    (out, one)
+}
+
 /// Stripes swept per accumulator touch in the NEON tiled partial fold.
 /// Larger ⇒ the length-`k` accumulator is re-streamed fewer times
 /// (`n_stripes / NEON_TILE_T`), but the per-tile sum tables grow
 /// `NEON_TILE_T × 4 KB` and must stay L1-resident.
-///
-/// **Single source of truth.** The dispatch gate ([`n_log_ok_for_tile`]) and
-/// the kernels' actual tiling factor MUST agree — the kernels take `TILE_T`
-/// as a const generic and the public entry points instantiate them with this
-/// constant, so the pairing is correct by construction.
-pub(crate) const NEON_TILE_T: usize = 8;
+const NEON_TILE_T: usize = 8;
 
 /// Dispatch helper: pick the fastest single-matrix partial fold available
 /// for the given (m, k_log). Threads `useful_bits` through so the kernel
@@ -770,6 +2253,18 @@ fn partial_fold_packed_z_best(
         }
         #[cfg(all(not(target_arch = "aarch64"), target_arch = "x86_64"))]
         {
+            // GFNI plane fold (`FLOCK_NO_LC_GFNI=1` restores the table-gather
+            // tile kernel; output is bit-identical either way).
+            #[cfg(all(target_feature = "avx512f", target_feature = "gfni"))]
+            if k_log >= 6 && lincheck_gfni_enabled() {
+                return kernels::partial_fold_packed_z_x86_gfni_padded(
+                    z_packed,
+                    m,
+                    k_log,
+                    useful_bits,
+                    eq_outer,
+                );
+            }
             partial_fold_packed_z_x86_tiled_padded(z_packed, m, k_log, useful_bits, eq_outer)
         }
         #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
@@ -779,6 +2274,20 @@ fn partial_fold_packed_z_best(
     } else {
         partial_fold_packed_z_fast_padded(z_packed, m, k_log, useful_bits, eq_outer)
     }
+}
+
+/// GFNI stripe-fold kill switch: exactly `FLOCK_NO_LC_GFNI=1` restores the
+/// table-gather tile kernel as a same-binary control.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "gfni"
+))]
+fn lincheck_gfni_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_LC_GFNI").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 /// Outer-dimension threshold (`n_log = m − k_log`) at/above which the
@@ -1036,23 +2545,75 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
     debug_assert_eq!(z.len(), c.len());
     let (clo, chi) = c.split_at(half);
     let (zlo, zhi) = z.split_at(half);
-    if half < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
-        for i in 0..half {
-            e1 += chi[i] * zhi[i];
-            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+    if !sumcheck_x4_enabled() {
+        if half < SUMCHECK_PAR_THRESHOLD {
+            let mut e1 = F128::ZERO;
+            let mut einf = F128::ZERO;
+            for i in 0..half {
+                e1 += chi[i] * zhi[i];
+                einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+            }
+            return (e1, einf);
         }
-        return (e1, einf);
+        return (0..half)
+            .into_par_iter()
+            .map(|i| {
+                let e1_i = chi[i] * zhi[i];
+                let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+                (e1_i, einf_i)
+            })
+            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
     }
-    (0..half)
-        .into_par_iter()
-        .map(|i| {
-            let e1_i = chi[i] * zhi[i];
-            let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
-            (e1_i, einf_i)
+    if half < SUMCHECK_PAR_THRESHOLD {
+        return crate::field::f128_slice::msg_split_half(chi, clo, zhi, zlo, half);
+    }
+    // Chunked: the per-chunk sums are XORed, and XOR is associative and
+    // commutative, so any chunking yields the same field element.
+    let chunk = sumcheck_chunk(half);
+    chi.par_chunks(chunk)
+        .zip(clo.par_chunks(chunk))
+        .zip(zhi.par_chunks(chunk))
+        .zip(zlo.par_chunks(chunk))
+        .map(|(((chi_c, clo_c), zhi_c), zlo_c)| {
+            crate::field::f128_slice::msg_split_half(chi_c, clo_c, zhi_c, zlo_c, chi_c.len())
         })
         .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+}
+
+/// Ranked default routes the lincheck product-sumcheck rounds through the
+/// four-lane split-half leaves in `field::f128_slice`, with chunk-granular
+/// rayon instead of one item per element. `FLOCK_NO_LC_SUMCHECK_X4=1` restores
+/// the per-element scalar rounds. Read once per process; default ON.
+fn sumcheck_x4_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_SUMCHECK_X4").is_none());
+    *ON
+}
+
+/// Ranked default gates the FUSED bind+eval pass's parallelism on `half =
+/// len/2` — the same granularity the standalone bind and eval passes use —
+/// instead of `half2 = len/4`. The incumbent `half2` comparison sent the
+/// fused rounds serial at twice the table size the unfused passes would
+/// have, despite the fused pass doing strictly more work per index: at the
+/// ranked lincheck shape (2^14 tables) rounds 1..6 of the product-sumcheck
+/// ran on one core. Width cannot change wire bytes: bound values are pure
+/// per-slot functions and the message terms are XOR sums, so chunked and
+/// serial evaluation give the same field elements (pinned by
+/// `split_half_chunking_is_exact` and
+/// `fused_bind_eval_threshold_arms_agree`).
+/// `FLOCK_NO_LC_SUMCHECK_PAR_FIX=1` restores the incumbent `half2`
+/// comparison for exact same-binary A/B. Read once per process; default ON.
+fn sumcheck_par_fix_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LC_SUMCHECK_PAR_FIX").is_none());
+    *ON
+}
+
+/// Rayon chunk width for one sumcheck round over `n` slots: enough chunks to
+/// fill the pool, never finer than a whole cache line of `F128`.
+fn sumcheck_chunk(n: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    n.div_ceil(threads).max(4)
 }
 
 /// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
@@ -1060,17 +2621,33 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
 fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     use rayon::prelude::*;
     let half = v.len() / 2;
-    if half < SUMCHECK_PAR_THRESHOLD {
-        for i in 0..half {
-            v[i] = v[i] + r * (v[i + half] + v[i]);
+    if !sumcheck_x4_enabled() {
+        if half < SUMCHECK_PAR_THRESHOLD {
+            for i in 0..half {
+                v[i] = v[i] + r * (v[i + half] + v[i]);
+            }
+        } else {
+            let (lo, hi) = v.split_at_mut(half);
+            let hi = &hi[..half];
+            lo.par_iter_mut()
+                .zip(hi.par_iter())
+                .for_each(|(lo_i, &hi_i)| {
+                    *lo_i = *lo_i + r * (hi_i + *lo_i);
+                });
         }
+        v.truncate(half);
+        return;
+    }
+    let (lo, hi) = v.split_at_mut(half);
+    let hi = &hi[..half];
+    if half < SUMCHECK_PAR_THRESHOLD {
+        crate::field::f128_slice::bind_split_half(lo, hi, r);
     } else {
-        let (lo, hi) = v.split_at_mut(half);
-        let hi = &hi[..half];
-        lo.par_iter_mut()
-            .zip(hi.par_iter())
-            .for_each(|(lo_i, &hi_i)| {
-                *lo_i = *lo_i + r * (hi_i + *lo_i);
+        let chunk = sumcheck_chunk(half);
+        lo.par_chunks_mut(chunk)
+            .zip(hi.par_chunks(chunk))
+            .for_each(|(lo_c, hi_c)| {
+                crate::field::f128_slice::bind_split_half(lo_c, hi_c, r);
             });
     }
     v.truncate(half);
@@ -1112,6 +2689,15 @@ fn sumcheck_bind_both_and_eval_next(
     let half = len / 2;
     let half2 = half / 2;
     debug_assert!(half2 >= 1, "fused step needs a well-defined next round");
+    // Parallelism granularity: `half` matches the standalone bind/eval passes
+    // this fusion replaced; the incumbent compared `half2` (see
+    // [`sumcheck_par_fix_enabled`]). Same field elements either way — the
+    // choice only picks serial vs chunked execution.
+    let par_gate = if sumcheck_par_fix_enabled() {
+        half
+    } else {
+        half2
+    };
 
     // q0,q1 = low half (written); q2,q3 = high half (read-only).
     let (c_lo, c_hi) = comb.split_at_mut(half);
@@ -1121,7 +2707,32 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq0, zq1) = z_lo.split_at_mut(half2);
     let (zq2, zq3) = z_hi.split_at(half2);
 
-    let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
+    let (e1, einf) = if sumcheck_x4_enabled() {
+        if par_gate < SUMCHECK_PAR_THRESHOLD {
+            crate::field::f128_slice::bind_both_and_msg_split(
+                cq0, cq1, cq2, cq3, zq0, zq1, zq2, zq3, r, half2,
+            )
+        } else {
+            // Chunked: bound values depend only on their own slot, and the
+            // message terms are XOR-summed, so any chunking is exact.
+            let chunk = sumcheck_chunk(half2);
+            cq0.par_chunks_mut(chunk)
+                .zip(cq1.par_chunks_mut(chunk))
+                .zip(cq2.par_chunks(chunk))
+                .zip(cq3.par_chunks(chunk))
+                .zip(zq0.par_chunks_mut(chunk))
+                .zip(zq1.par_chunks_mut(chunk))
+                .zip(zq2.par_chunks(chunk))
+                .zip(zq3.par_chunks(chunk))
+                .map(|(((((((c0, c1), c2), c3), z0), z1), z2), z3)| {
+                    let n = c0.len();
+                    crate::field::f128_slice::bind_both_and_msg_split(
+                        c0, c1, c2, c3, z0, z1, z2, z3, r, n,
+                    )
+                })
+                .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+        }
+    } else if par_gate < SUMCHECK_PAR_THRESHOLD {
         let mut e1 = F128::ZERO;
         let mut einf = F128::ZERO;
         for i in 0..half2 {
@@ -1168,6 +2779,167 @@ fn sumcheck_bind_both_and_eval_next(
 // ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
+
+enum PackedZ<'a> {
+    LincheckStripe(&'a [u8]),
+    BlockMajor(&'a [F128]),
+}
+
+// ---------------------------------------------------------------------------
+// Last-ρ leftover z-fold (wait-not-join)
+// ---------------------------------------------------------------------------
+//
+// Ranked BlockMajor path: start today's one-shot `ẑ(·, x_outer)` at the last
+// zerocheck ML ρ (`x_outer = mlv[inner_rest_len..]` is complete there). The
+// fold runs on a dedicated OS thread so it can own the full global rayon
+// pool while main finishes serial FS (final bind, observe â/b̂, lincheck
+// label, sample α, build eq_inner).
+//
+// When lincheck needs the pool for `fold_alpha_batched`, WAIT the handle
+// first, then run CSC at full width. Do not `rayon::join` / `rayon::scope`
+// the leftover fold with fold_alpha (that split is HOLD and can lose).
+// Residual join stays unimplemented. Incremental 18-pass packed fold stays
+// unimplemented. Compute only — no observe/sample in the kick.
+//
+// Kick after zc returns is a no-op (final bind already done; the prepare
+// slot is consumed or never armed). Kick with a short `mlv` (rounds 2–27)
+// is a no-op: `x_outer` is incomplete. Do not reuse URM `r` as `x_outer`.
+// `z` is read-only (`C` aliases it).
+
+struct LastRhoPrepared {
+    z_ptr: *const F128,
+    z_len: usize,
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    inner_rest_len: usize,
+}
+
+// SAFETY: the pointer is only read, and only while the registering thread
+// keeps `z` alive and unmutated (see [`LastRhoZFoldGuard`]).
+unsafe impl Send for LastRhoPrepared {}
+
+enum LastRhoSlot {
+    Empty,
+    Prepared(LastRhoPrepared),
+    Running(JoinHandle<Vec<F128>>),
+}
+
+thread_local! {
+    static LAST_RHO: RefCell<LastRhoSlot> = const { RefCell::new(LastRhoSlot::Empty) };
+}
+
+/// Keeps packed `z` alive until a kicked leftover fold is waited. Drop
+/// joins any in-flight handle so the raw pointer cannot dangle.
+pub struct LastRhoZFoldGuard;
+
+impl Drop for LastRhoZFoldGuard {
+    fn drop(&mut self) {
+        let _ = wait_last_rho_z_fold();
+    }
+}
+
+/// Register packed `z` for a last-ρ leftover fold. Call from the ranked
+/// BlockMajor prover **before** zerocheck. `z` must stay live and unmutated
+/// until [`wait_last_rho_z_fold`] (or drop of the returned guard).
+///
+/// `inner_rest_len = k_log − k_skip` so the kick can slice
+/// `x_outer = mlv[inner_rest_len..]` without using URM `r`.
+pub fn prepare_last_rho_z_fold(
+    z: &[F128],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    inner_rest_len: usize,
+) -> LastRhoZFoldGuard {
+    // A previous prepare on this thread that was never waited would leave a
+    // live handle holding a pointer into a now-dead buffer. Join it first.
+    let _ = wait_last_rho_z_fold();
+    LAST_RHO.with(|slot| {
+        *slot.borrow_mut() = LastRhoSlot::Prepared(LastRhoPrepared {
+            z_ptr: z.as_ptr(),
+            z_len: z.len(),
+            m,
+            k_log,
+            useful_bits,
+            inner_rest_len,
+        });
+    });
+    LastRhoZFoldGuard
+}
+
+/// Start today's one-shot z-fold. Compute only — no observe/sample.
+///
+/// No-op unless this thread prepared a BlockMajor fold **and** `mlv` is
+/// complete (`len == inner_rest_len + n_log`). A short `mlv` means the
+/// caller is still in zerocheck rounds 2–27 (`x_outer` incomplete) — that
+/// kick is REJECT, so we refuse to start. A second kick, or a kick after
+/// wait / after zc with no prepare, is a no-op.
+pub fn kick_last_rho_z_fold(mlv: &[F128]) {
+    let prepared = LAST_RHO.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match std::mem::replace(&mut *slot, LastRhoSlot::Empty) {
+            LastRhoSlot::Prepared(p) if mlv.len() == p.inner_rest_len + (p.m - p.k_log) => Some(p),
+            LastRhoSlot::Prepared(p) => {
+                *slot = LastRhoSlot::Prepared(p);
+                None
+            }
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    });
+    let Some(p) = prepared else {
+        return;
+    };
+    let x_outer = mlv[p.inner_rest_len..].to_vec();
+    // Carry the address as usize so the spawn closure is Send without
+    // relying on `*const F128: Send`.
+    let z_addr = p.z_ptr as usize;
+    let z_len = p.z_len;
+    let m = p.m;
+    let k_log = p.k_log;
+    let useful_bits = p.useful_bits;
+    let handle = std::thread::Builder::new()
+        .name("flock-last-rho-z-fold".into())
+        .spawn(move || {
+            // SAFETY: [`prepare_last_rho_z_fold`] contract — `z` is live,
+            // unmutated, and not aliased for writes (`C` aliases `z` but
+            // the leftover fold starts after the last ρ, when C is no
+            // longer written).
+            let z = unsafe { std::slice::from_raw_parts(z_addr as *const F128, z_len) };
+            let trace = std::env::var_os("LINCHECK_TRACE").is_some();
+            let t0 = std::time::Instant::now();
+            let out = fold_block_major_one_shot(z, m, k_log, useful_bits, &x_outer);
+            if trace {
+                eprintln!(
+                    "[lc] {:<26} {:>7.2} ms",
+                    "kicked z-fold (thread)",
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            out
+        })
+        .expect("spawn last-ρ z-fold");
+    LAST_RHO.with(|slot| {
+        *slot.borrow_mut() = LastRhoSlot::Running(handle);
+    });
+}
+
+/// Join a kicked leftover fold. Call **after** serial FS and **before**
+/// `fold_alpha_batched` so CSC keeps the full pool. Returns `Some(ẑ)` if
+/// a kick was running; `None` if nothing was kicked (caller runs today's
+/// sequential one-shot).
+pub fn wait_last_rho_z_fold() -> Option<Vec<F128>> {
+    let handle = LAST_RHO.with(|slot| {
+        match std::mem::replace(&mut *slot.borrow_mut(), LastRhoSlot::Empty) {
+            LastRhoSlot::Running(h) => Some(h),
+            LastRhoSlot::Prepared(_) | LastRhoSlot::Empty => None,
+        }
+    });
+    handle.map(|h| h.join().expect("last-ρ z-fold thread"))
+}
 
 /// Prove the lincheck statement for the block-diagonal R1CS instance
 /// `A = I_{2^n_log} ⊗ a_0`, `B = I ⊗ b_0`, `C = I ⊗ c_0`.
@@ -1216,18 +2988,103 @@ pub fn prove_padded<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
-    let (proof, claim, _) = prove_padded_inner(
-        z_packed,
+    let (proof, claim, _, _) = prove_padded_inner(
+        PackedZ::LincheckStripe(z_packed),
         m,
         k_log,
         k_skip,
         useful_bits,
         circuit,
         x_ab,
-        false,
+        ZCaptureMode::None,
         challenger,
     );
     (proof, claim)
+}
+
+/// Which form of lincheck's z table the caller wants back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ZCaptureMode {
+    /// Return nothing.
+    None,
+    /// Return the pre-sumcheck table.
+    PreSumcheck,
+    /// Return the table after the first top bind. At the ranked shape this is
+    /// already the Fold8 statistic consumed by the PCS opening.
+    RankedFold8Tail,
+}
+
+/// Capture lincheck's z table in the requested form, reporting the form that
+/// the shape actually allowed.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_mode<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZCaptureMode,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>, ZCaptureMode) {
+    assert!(
+        capture != ZCaptureMode::None,
+        "capture mode must not be None"
+    );
+    let (proof, claim, captured, actual) = prove_padded_inner(
+        PackedZ::LincheckStripe(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("a capture mode must produce z_vec"),
+        actual,
+    )
+}
+
+/// Block-major counterpart of [`prove_padded_capture_z_vec_mode`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_block_major_mode<Ch: Challenger>(
+    z_packed: &[F128],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZCaptureMode,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>, ZCaptureMode) {
+    assert!(
+        capture != ZCaptureMode::None,
+        "capture mode must not be None"
+    );
+    let (proof, claim, captured, actual) = prove_padded_inner(
+        PackedZ::BlockMajor(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("a capture mode must produce z_vec"),
+        actual,
+    )
 }
 
 /// Variant of [`prove_padded`] that also returns the **pre-sumcheck** z_vec
@@ -1249,36 +3106,65 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_padded_inner(
-        z_packed,
+    let (proof, claim, captured, _actual) = prove_padded_inner(
+        PackedZ::LincheckStripe(z_packed),
         m,
         k_log,
         k_skip,
         useful_bits,
         circuit,
         x_ab,
-        true,
+        ZCaptureMode::PreSumcheck,
         challenger,
     );
-    (
-        proof,
-        claim,
-        captured.expect("capture=true must produce z_vec"),
-    )
+    (proof, claim, captured.expect("capture must produce z_vec"))
 }
 
+/// Direct block-major counterpart of [`prove_padded_capture_z_vec`]. The
+/// canonical F128-packed witness is folded after `x_ab.x_outer` is known, so
+/// callers do not need to allocate or populate a lincheck byte stripe.
 #[allow(clippy::too_many_arguments)]
-fn prove_padded_inner<Ch: Challenger>(
-    z_packed: &[u8],
+pub fn prove_padded_capture_z_vec_block_major<Ch: Challenger>(
+    z_packed: &[F128],
     m: usize,
     k_log: usize,
     k_skip: usize,
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
     challenger: &mut Ch,
-) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured, _actual) = prove_padded_inner(
+        PackedZ::BlockMajor(z_packed),
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        ZCaptureMode::PreSumcheck,
+        challenger,
+    );
+    (proof, claim, captured.expect("capture must produce z_vec"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_padded_inner<Ch: Challenger>(
+    z_packed: PackedZ<'_>,
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZCaptureMode,
+    challenger: &mut Ch,
+) -> (
+    LincheckProof,
+    LincheckClaim,
+    Option<Vec<F128>>,
+    ZCaptureMode,
+) {
     let k = 1usize << k_log;
     let n_log = m - k_log;
     assert!(m >= k_log);
@@ -1313,6 +3199,34 @@ fn prove_padded_inner<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
+    // Overlap-not-park: the kicked z-fold is a pure DRAM stream running on
+    // its own OS thread against the global pool, while `fold_alpha_batched`
+    // is a load-latency-bound sparse gather into an L2-resident eq table —
+    // complementary profiles that want each other's stall slots. Run the
+    // gather NOW and join the fold only where its output is first consumed
+    // (the z_vec match below). fold_alpha never touches z, and α/β keep
+    // their transcript positions, so the proof bytes are identical. This is
+    // NOT the rayon::join-with-CSC pattern the earlier HOLD comment warns
+    // about (that pulled this thread into the fold and split the pool); the
+    // caller merely queues a second pool-wide job instead of parking.
+    // `FLOCK_NO_LC_ALPHA_OVERLAP=1` restores the park-first order.
+    let overlap = lc_alpha_overlap_enabled();
+    let mut kicked_z_vec = None;
+    if !overlap {
+        let t_wait = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        kicked_z_vec = wait_last_rho_z_fold();
+        if let Some(t) = t_wait {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "wait kicked z-fold",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
     let t = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -1326,6 +3240,21 @@ fn prove_padded_inner<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
+    if overlap {
+        let t_wait = if trace {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        kicked_z_vec = wait_last_rho_z_fold();
+        if let Some(t) = t_wait {
+            eprintln!(
+                "[lc] {:<26} {:>7.2} ms",
+                "wait kicked z-fold (overlapped)",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
 
     // 2b. Constant-wire pin. Fold β·eq(j*, ·) into the comb so the same sumcheck
     //     also proves z_vec[j*] = 1 (the all-ones constant column). Since j* is a
@@ -1338,13 +3267,30 @@ fn prove_padded_inner<Ch: Challenger>(
     }
 
     // 3. Partial fold of z at the shared outer half (length-k F128 vector).
+    //    A last-ρ kick already produced the same one-shot ẑ; reuse it.
     let t = if trace {
         Some(std::time::Instant::now())
     } else {
         None
     };
-    let eq_x_outer = build_eq_table(&x_ab.x_outer);
-    let mut z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
+    let mut z_vec = match (kicked_z_vec, z_packed) {
+        (Some(z), PackedZ::BlockMajor(_)) => z,
+        (kicked, z_packed) => {
+            debug_assert!(
+                kicked.is_none(),
+                "last-ρ kick is BlockMajor-only; stripe path must not be prepared"
+            );
+            match z_packed {
+                PackedZ::LincheckStripe(z) => {
+                    let eq_x_outer = build_eq_table(&x_ab.x_outer);
+                    partial_fold_packed_z_best(z, m, k_log, useful_bits, &eq_x_outer)
+                }
+                PackedZ::BlockMajor(z) => {
+                    fold_block_major_one_shot(z, m, k_log, useful_bits, &x_ab.x_outer)
+                }
+            }
+        }
+    };
     if let Some(t) = t {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -1352,13 +3298,22 @@ fn prove_padded_inner<Ch: Challenger>(
             t.elapsed().as_secs_f64() * 1e3
         );
     }
-    // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
-    //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
-    //     clone when explicitly requested.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
-        Some(z_vec.clone())
+    // At the ranked shape, the first lincheck bind and the downstream Fold8
+    // map use the same halves and challenge. Capture that output directly.
+    let fold8_ready = capture == ZCaptureMode::RankedFold8Tail
+        && inner_rest_len == 8
+        && z_vec.len() == (1usize << crate::pcs::LOG_PACKING) << 7;
+    let actual_capture = if fold8_ready {
+        ZCaptureMode::RankedFold8Tail
+    } else if capture == ZCaptureMode::None {
+        ZCaptureMode::None
     } else {
+        ZCaptureMode::PreSumcheck
+    };
+    let mut captured_z_vec = if capture == ZCaptureMode::None || fold8_ready {
         None
+    } else {
+        Some(z_vec.clone())
     };
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
@@ -1393,6 +3348,10 @@ fn prove_padded_inner<Ch: Challenger>(
                 // Final round: just fold; z_vec collapses to z_partial.
                 sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
+            }
+            if fold8_ready && t == 0 {
+                debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
+                captured_z_vec = Some(z_vec.clone());
             }
         }
     }
@@ -1432,7 +3391,7 @@ fn prove_padded_inner<Ch: Challenger>(
         r_inner_rest,
         w,
     };
-    (proof, claim, captured_z_vec)
+    (proof, claim, captured_z_vec, actual_capture)
 }
 
 /// Verify a lincheck proof. Walks the challenger in lockstep with `prove`,
@@ -1616,6 +3575,71 @@ mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
 
+    /// On the ranked eight-round shape, the first top bind is precisely the
+    /// incumbent Fold8 intake's only non-retained-coordinate fold. This is
+    /// the equivalence that makes `RankedFold8Tail` safe to hand directly to
+    /// the PCS opening.
+    #[test]
+    fn ranked_fold8_first_bind_matches_incumbent_intake() {
+        let mut rng = Rng::new(0xF018_C4A7_0BE5); // deterministic, nonzero seed
+        let n_packed = 1usize << crate::pcs::LOG_PACKING;
+        let mut z_vec: Vec<F128> = (0..128 * n_packed).map(|_| rng.f128()).collect();
+        let pre_sumcheck = z_vec.clone();
+        let top = rng.f128();
+        let mut inner_rest_tail = rng.f128_vec(7);
+        inner_rest_tail[6] = top;
+
+        let incumbent =
+            crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&pre_sumcheck, &inner_rest_tail);
+        sumcheck_bind_top_in_place_par(&mut z_vec, top);
+
+        assert_eq!(z_vec.len(), 64 * n_packed);
+        assert_eq!(
+            z_vec, incumbent,
+            "first top bind must be the exact ranked Fold8 intake"
+        );
+    }
+
+    /// The fused bind+eval must equal the unfused bind-bind-eval sequence —
+    /// bound tables AND next message — at sizes on BOTH sides of the parallel
+    /// threshold, including `len = 2^13` (serial under the incumbent `half2`
+    /// comparison, parallel under the `half` fix) and `2^14` (parallel under
+    /// both). Negative control: one corrupted table slot must change the
+    /// message.
+    #[test]
+    fn fused_bind_eval_threshold_arms_agree() {
+        let mut rng = Rng::new(0xF05E_D9A7);
+        for &len in &[1usize << 12, 1 << 13, 1 << 14] {
+            let comb: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
+            let z: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
+            let r = rng.f128();
+
+            // Oracle: standalone binds, then the standalone eval.
+            let mut want_comb = comb.clone();
+            let mut want_z = z.clone();
+            sumcheck_bind_top_in_place_par(&mut want_comb, r);
+            sumcheck_bind_top_in_place_par(&mut want_z, r);
+            let want_msg = sumcheck_round_eval_par(&want_comb, &want_z);
+
+            let mut got_comb = comb.clone();
+            let mut got_z = z.clone();
+            let got_msg = sumcheck_bind_both_and_eval_next(&mut got_comb, &mut got_z, r);
+            assert_eq!(got_msg, want_msg, "fused message len={len}");
+            assert_eq!(got_comb, want_comb, "fused comb table len={len}");
+            assert_eq!(got_z, want_z, "fused z table len={len}");
+
+            // Negative control: one corrupted slot must not still match.
+            let mut bad_comb = comb.clone();
+            bad_comb[len / 3] += F128::ONE;
+            let mut bad_z = z.clone();
+            let bad_msg = sumcheck_bind_both_and_eval_next(&mut bad_comb, &mut bad_z, r);
+            assert_ne!(
+                bad_msg, want_msg,
+                "corrupted table went undetected len={len}"
+            );
+        }
+    }
+
     /// SplitMix64 PRNG, deterministic.
     struct Rng(u64);
     impl Rng {
@@ -1769,6 +3793,30 @@ mod tests {
 
     // ---- Unit tests for the kernels ----
 
+    /// The u16-narrowed CSC row indices produce exactly the same
+    /// `fold_alpha_batched` output as the u32 arrays (oracle A/B for
+    /// `FLOCK_NO_LC_CSC_U16`), for both the sequential and the rayon branch.
+    #[test]
+    fn csc_u16_rows_match_u32_rows() {
+        for &(k, nnz) in &[(64usize, 500usize), (1 << 12, 40_000), (1 << 13, 90_000)] {
+            let mut rng = Rng::new(0xC5C1_6000 ^ k as u64);
+            let a = random_sparse_matrix(k, nnz, &mut rng);
+            let b = random_sparse_matrix(k, nnz, &mut rng);
+            let wide = CscCircuit::from_matrices_narrow(&a, &b, false);
+            let narrow = CscCircuit::from_matrices_narrow(&a, &b, true);
+            assert!(!wide.narrow);
+            assert!(narrow.narrow);
+            let alpha = rng.f128();
+            let eq: Vec<F128> = (0..k).map(|_| rng.f128()).collect();
+            let want = wide.fold_alpha_batched(alpha, &eq);
+            let got = narrow.fold_alpha_batched(alpha, &eq);
+            assert_eq!(want, got, "k={k}");
+            // …and both agree with the row-scatter reference.
+            let reference = sparse_row_fold_alpha_batched(alpha, &a, &b, &eq);
+            assert_eq!(want, reference, "k={k} reference");
+        }
+    }
+
     /// `build_eq_table` produces eq(point, i) for all boolean i.
     #[test]
     fn eq_table_matches_direct_formula() {
@@ -1861,6 +3909,538 @@ mod tests {
         }
     }
 
+    /// The direct block-major F128 fold is exactly the existing stripe fold,
+    /// including padded, non-128-aligned useful regions and partial outer
+    /// tiles.
+    /// The AVX-512 nibble-table accumulate must reproduce the scalar
+    /// 256-entry byte-table loop bit-for-bit for every column count
+    /// 1..=128 (exercises the masked tail store) on random weights, random
+    /// index bytes and a random pre-filled `partial`.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    #[test]
+    fn block_major_nibble_kernel_matches_scalar_tables() {
+        let mut rng = Rng::new(0x51B_B1E5);
+        for chunk_bits in (1..=128).chain([8, 16, 120, 121, 127, 128]) {
+            let eq8s: Vec<[F128; 8]> = (0..DIRECT_FOLD_TILE_STRIPES)
+                .map(|_| std::array::from_fn(|_| rng.f128()))
+                .collect();
+            let mut tables = vec![F128::ZERO; DIRECT_FOLD_TILE_STRIPES * 256];
+            let mut nib = [[0u64; 64]; DIRECT_FOLD_TILE_STRIPES];
+            for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                build_sum_table(&eq8s[t], &mut tables[t * 256..(t + 1) * 256]);
+                kernels::build_nibble_tables(&eq8s[t], &mut nib[t]);
+            }
+            let transposed: Vec<u8> = (0..DIRECT_FOLD_TILE_STRIPES * 128)
+                .map(|_| (rng.f128().lo & 0xFF) as u8)
+                .collect();
+            let base: Vec<F128> = (0..chunk_bits).map(|_| rng.f128()).collect();
+            // scalar reference
+            let mut want = base.clone();
+            for b in 0..chunk_bits {
+                let mut acc = want[b];
+                for t in 0..DIRECT_FOLD_TILE_STRIPES {
+                    acc += tables[t * 256 + transposed[t * 128 + b] as usize];
+                }
+                want[b] = acc;
+            }
+            // kernel, with a poison guard word past the end
+            let mut got = base.clone();
+            got.push(F128 {
+                lo: 0xDEAD_BEEF,
+                hi: 0xFEED_FACE,
+            });
+            unsafe {
+                kernels::fold_block_major_chunk_x86_avx512(
+                    &transposed,
+                    &nib,
+                    &mut got[..chunk_bits],
+                    chunk_bits,
+                );
+            }
+            assert_eq!(
+                got.pop(),
+                Some(F128 {
+                    lo: 0xDEAD_BEEF,
+                    hi: 0xFEED_FACE
+                })
+            );
+            assert_eq!(got, want, "chunk_bits={chunk_bits}");
+        }
+    }
+
+    #[test]
+    fn partial_fold_block_major_matches_stripe() {
+        let cases: &[(usize, usize, usize)] = &[
+            (10, 7, 1 << 7),
+            (13, 8, 233),
+            (16, 10, 997),
+            (16, 8, 241),
+            (18, 12, 3_801),
+            // The ranked k_log and useful_bits at a small n_log: 121 full
+            // 128-column chunks plus the 49-bit tail block, exact tiles.
+            (20, 14, 15_409),
+        ];
+        for &(m, k_log, useful_bits) in cases {
+            let mut rng = Rng::new(0xD1EC_7F01 + (m * 31 + k_log) as u64);
+            let k = 1usize << k_log;
+            let n_outer = 1usize << (m - k_log);
+            let mut z = rng.bits(1usize << m);
+            for outer in 0..n_outer {
+                z[outer * k + useful_bits..(outer + 1) * k].fill(false);
+            }
+
+            let z_block_major: Vec<F128> = z
+                .chunks_exact(128)
+                .map(|bits| {
+                    let mut packed = F128::ZERO;
+                    for (b, &set) in bits.iter().enumerate() {
+                        if set {
+                            if b < 64 {
+                                packed.lo |= 1u64 << b;
+                            } else {
+                                packed.hi |= 1u64 << (b - 64);
+                            }
+                        }
+                    }
+                    packed
+                })
+                .collect();
+            let z_stripe = pack_z_lincheck(&z, m, k_log);
+            let eq_outer = build_eq_table(&rng.f128_vec(m - k_log));
+
+            let want = partial_fold_packed_z_best(&z_stripe, m, k_log, useful_bits, &eq_outer);
+            let got = partial_fold_packed_z_block_major_padded(
+                &z_block_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq_outer,
+            );
+            assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
+
+            // Same call with the GFNI plane arm forced off: the nibble/scalar
+            // sweep must produce the identical vector (arm-vs-arm identity in
+            // one process; the env switches resolve once so a latch is the
+            // only way to cover both).
+            #[cfg(all(
+                target_arch = "x86_64",
+                target_feature = "avx512f",
+                target_feature = "gfni"
+            ))]
+            {
+                BM_GFNI_FORCED_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+                let got_off = partial_fold_packed_z_block_major_padded(
+                    &z_block_major,
+                    m,
+                    k_log,
+                    useful_bits,
+                    &eq_outer,
+                );
+                BM_GFNI_FORCED_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(
+                    want, got_off,
+                    "forced-off arm m={m} k_log={k_log} useful={useful_bits}"
+                );
+            }
+        }
+    }
+
+    /// Scalar oracle for the exact `VPERMT2B` selector semantics used by the
+    /// fused gather/transpose. This test runs without AVX-512: it independently
+    /// models bits 0..=5 as the byte offset, bit 6 as the table selector, and
+    /// bit 7 as ignored. It covers both limbs, random tables, selector
+    /// boundaries, poisoned source tables, and four independent columns with
+    /// poisoned output-stride gaps.
+    #[test]
+    fn gather_transpose_vpermt2b_selector_oracle() {
+        fn permute2(a: &[u8; 64], indices: &[u8; 64], b: &[u8; 64]) -> [u8; 64] {
+            std::array::from_fn(|i| {
+                let index = indices[i];
+                let table = if index & 0x40 == 0 { a } else { b };
+                table[(index & 0x3f) as usize]
+            })
+        }
+
+        fn direct(a: &[u8; 64], b: &[u8; 64], high: bool) -> [u8; 64] {
+            std::array::from_fn(|i| {
+                let row = 7 - i % 8;
+                let offset = 16 * (row % 4) + usize::from(high) * 8 + i / 8;
+                if row < 4 { a[offset] } else { b[offset] }
+            })
+        }
+
+        let lo = gather_transpose_vpermt2b_indices(false);
+        let hi = gather_transpose_vpermt2b_indices(true);
+        assert_eq!(lo[3], 64, "first byte selected from the second table");
+        assert_eq!(hi[56], 127, "largest legal 512-bit VPERMT2B index");
+        for (high, indices) in [(false, &lo), (true, &hi)] {
+            assert!(indices.iter().all(|&index| index & 0x80 == 0));
+            assert_eq!(
+                indices.iter().filter(|&&index| index & 0x40 != 0).count(),
+                32
+            );
+            for (i, &index) in indices.iter().enumerate() {
+                let row = 7 - i % 8;
+                let want_table = if row < 4 { 0 } else { 0x40 };
+                let want_offset = 16 * (row % 4) + usize::from(high) * 8 + i / 8;
+                assert_eq!(index & 0x40, want_table, "half={high} i={i} row={row}");
+                assert_eq!(
+                    index & 0x3f,
+                    want_offset as u8,
+                    "half={high} i={i} row={row}"
+                );
+            }
+        }
+
+        // Source poison catches the exact #1445 failure: 128+offset leaves
+        // selector bit 6 clear and incorrectly reads `a` for rows 4..8.
+        let a_poison = [0xA5; 64];
+        let b_poison = [0x5A; 64];
+        for (high, indices) in [(false, &lo), (true, &hi)] {
+            let want = direct(&a_poison, &b_poison, high);
+            assert_eq!(permute2(&a_poison, indices, &b_poison), want);
+            let mut broken = *indices;
+            for (i, index) in broken.iter_mut().enumerate() {
+                if 7 - i % 8 >= 4 {
+                    *index += 64; // the rejected candidate's 128+offset form
+                }
+            }
+            assert_ne!(permute2(&a_poison, &broken, &b_poison), want);
+        }
+
+        let mut rng = Rng::new(0x5650_4552_4D54_3242);
+        for _ in 0..64 {
+            let a: [u8; 64] = std::array::from_fn(|_| rng.next_u64() as u8);
+            let b: [u8; 64] = std::array::from_fn(|_| rng.next_u64() as u8);
+            assert_eq!(permute2(&a, &lo, &b), direct(&a, &b, false));
+            assert_eq!(permute2(&a, &hi, &b), direct(&a, &b, true));
+        }
+
+        // Four-column form: the SIMD tr4 network produces four independent
+        // (z0,z1) table pairs consumed by the same selectors. Model all four
+        // and prove that each 128-byte result stays inside its output slab.
+        const OUT_STRIDE: usize = 160;
+        const POISON: u8 = 0xD3;
+        let a4: [[u8; 64]; 4] =
+            std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64() as u8));
+        let b4: [[u8; 64]; 4] =
+            std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u64() as u8));
+        let mut got = [POISON; 4 * OUT_STRIDE];
+        let mut want = [POISON; 4 * OUT_STRIDE];
+        for column in 0..4 {
+            let base = column * OUT_STRIDE;
+            got[base..base + 64].copy_from_slice(&permute2(&a4[column], &lo, &b4[column]));
+            got[base + 64..base + 128].copy_from_slice(&permute2(&a4[column], &hi, &b4[column]));
+            want[base..base + 64].copy_from_slice(&direct(&a4[column], &b4[column], false));
+            want[base + 64..base + 128].copy_from_slice(&direct(&a4[column], &b4[column], true));
+        }
+        assert_eq!(got, want);
+        for column in 0..4 {
+            let gap = &got[column * OUT_STRIDE + 128..(column + 1) * OUT_STRIDE];
+            assert!(gap.iter().all(|&byte| byte == POISON));
+        }
+    }
+
+    #[test]
+    fn lincheck_gt_fuse_kill_switch_parser() {
+        use std::ffi::OsStr;
+
+        assert!(lincheck_gt_fuse_disabled_value(Some(OsStr::new("1"))));
+        for value in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("0")),
+            Some(OsStr::new("01")),
+            Some(OsStr::new("true")),
+        ] {
+            assert!(!lincheck_gt_fuse_disabled_value(value));
+        }
+    }
+
+    /// The fused register gather+transpose must equal the scalar
+    /// gather + `transpose_8_f128s_to_128_bytes` byte-for-byte, at several
+    /// strides.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512vbmi",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn gather_transpose_stripe_matches_scalar() {
+        let mut rng = Rng::new(0x6A77_37B1);
+        for stride in [1usize, 2, 17, 128] {
+            let z: Vec<F128> = (0..8 * stride).map(|_| rng.f128()).collect();
+            let mut want = [0u8; 128];
+            let lanes: [F128; 8] = std::array::from_fn(|r| z[r * stride]);
+            transpose_8_f128s_to_128_bytes(&lanes, &mut want);
+            for fuse in [false, true] {
+                let mut got = [0xA5u8; 128];
+                // SAFETY: 8 lanes at the given stride are in bounds; out is 128 B.
+                unsafe {
+                    if fuse {
+                        kernels::gather_transpose_stripe_x86::<true>(
+                            z.as_ptr(),
+                            stride,
+                            got.as_mut_ptr(),
+                        );
+                    } else {
+                        kernels::gather_transpose_stripe_x86::<false>(
+                            z.as_ptr(),
+                            stride,
+                            got.as_mut_ptr(),
+                        );
+                    }
+                }
+                assert_eq!(want, got, "stride {stride} fuse={fuse}");
+            }
+        }
+        // Four-column twin: each arm must equal four independent scalar
+        // transposes at q..q+4, with every output-stride gap untouched.
+        for stride in [4usize, 17, 128] {
+            let z: Vec<F128> = (0..8 * stride + 4).map(|_| rng.f128()).collect();
+            for q in [0usize, stride.saturating_sub(4).min(3)] {
+                let mut want = [0u8; 4 * 1024];
+                for c in 0..4 {
+                    let lanes: [F128; 8] = std::array::from_fn(|r| z[r * stride + q + c]);
+                    transpose_8_f128s_to_128_bytes(&lanes, &mut want[c * 1024..c * 1024 + 128]);
+                }
+                for fuse in [false, true] {
+                    let mut got = [0x5Au8; 4 * 1024];
+                    // SAFETY: rows r*stride + q + c are in bounds; each
+                    // output-stride slab covers 128 writable bytes.
+                    unsafe {
+                        if fuse {
+                            kernels::gather_transpose_stripe4_x86::<true>(
+                                z.as_ptr().add(q),
+                                stride,
+                                got.as_mut_ptr(),
+                                1024,
+                            );
+                        } else {
+                            kernels::gather_transpose_stripe4_x86::<false>(
+                                z.as_ptr().add(q),
+                                stride,
+                                got.as_mut_ptr(),
+                                1024,
+                            );
+                        }
+                    }
+                    for c in 0..4 {
+                        assert_eq!(
+                            want[c * 1024..c * 1024 + 128],
+                            got[c * 1024..c * 1024 + 128],
+                            "stride {stride} q {q} col {c} fuse={fuse}"
+                        );
+                        assert!(
+                            got[c * 1024 + 128..(c + 1) * 1024]
+                                .iter()
+                                .all(|&byte| byte == 0x5A)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The GFNI matrix builder must agree with `build_sum_table` on every
+    /// byte value: affine-applying the sixteen per-stripe matrices to `v`
+    /// equals `table[v]` — isolating the `8·(7−i)` byte order and the
+    /// `bit j ↔ basis j` mapping from any layout question.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn fold_mats_from_basis_matches_sum_table() {
+        let mut rng = Rng::new(0xFA57_3AB1);
+        for _ in 0..8 {
+            let eq8: [F128; 8] = std::array::from_fn(|_| rng.f128());
+            let mut mats = [0u64; 16];
+            kernels::fold_mats_from_basis(&eq8, &mut mats);
+            let mut table = vec![F128::ZERO; 256];
+            build_sum_table(&eq8, &mut table);
+            for v in 0..256usize {
+                let mut lo = 0u64;
+                let mut hi = 0u64;
+                for (byte_k, &m) in mats.iter().enumerate() {
+                    let mut out_byte = 0u8;
+                    for i in 0..8 {
+                        let row = ((m >> (8 * (7 - i))) & 0xff) as u8;
+                        let parity = ((row & v as u8).count_ones() & 1) as u8;
+                        out_byte |= parity << i;
+                    }
+                    if byte_k < 8 {
+                        lo |= (out_byte as u64) << (8 * byte_k);
+                    } else {
+                        hi |= (out_byte as u64) << (8 * (byte_k - 8));
+                    }
+                }
+                assert_eq!(
+                    F128 { lo, hi },
+                    table[v],
+                    "affine(mats, {v}) must equal table[{v}]"
+                );
+            }
+        }
+    }
+
+    /// Factoring the outer equality tensor preserves both its LSB-first
+    /// indexing and the padding-aware block-major fold. The final case uses
+    /// the ranked BLAKE3 outer geometry (18 variables split 9+9) without
+    /// allocating its full 512 MiB witness.
+    #[test]
+    fn partial_fold_block_major_factorized_matches_materialized() {
+        let cases: &[(usize, usize, usize, usize)] = &[
+            // m, k_log, useful_bits, low-factor variables
+            (10, 7, 1, 1),
+            (13, 7, 127, 2),
+            (16, 8, 233, 4),
+            (18, 10, 997, 4),
+            (25, 7, 121, 9),
+        ];
+
+        for &(m, k_log, useful_bits, lo_log) in cases {
+            let mut rng =
+                Rng::new(0xFAC7_0E00 + (m * 31 + k_log * 7 + useful_bits + lo_log) as u64);
+            let n_log = m - k_log;
+            let n_outer = 1usize << n_log;
+            let chunks_per_block = (1usize << k_log) / 128;
+            let z_block_major = rng.f128_vec(n_outer * chunks_per_block);
+            let point = rng.f128_vec(n_log);
+
+            let eq_outer = build_eq_table(&point);
+            let (point_lo, point_hi) = point.split_at(lo_log);
+            let eq_lo = build_eq_table(point_lo);
+            let eq_hi = build_eq_table(point_hi);
+            let lo_mask = eq_lo.len() - 1;
+
+            // Direct tensor oracle: catches a swapped factor order even if a
+            // sparse random witness happens not to observe a particular row.
+            for (outer, &dense) in eq_outer.iter().enumerate() {
+                assert_eq!(
+                    dense,
+                    eq_lo[outer & lo_mask] * eq_hi[outer >> lo_log],
+                    "factor mismatch at m={m}, outer={outer}",
+                );
+            }
+
+            let want = partial_fold_packed_z_block_major_padded(
+                &z_block_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq_outer,
+            );
+            let got = partial_fold_packed_z_block_major_factorized_padded(
+                &z_block_major,
+                m,
+                k_log,
+                useful_bits,
+                &eq_lo,
+                &eq_hi,
+            );
+            assert_eq!(
+                want, got,
+                "m={m} k_log={k_log} useful={useful_bits} lo_log={lo_log}",
+            );
+        }
+    }
+
+    /// Last-ρ kick then wait produces the same packed fold as today's
+    /// sequential one-shot (no Fiat–Shamir). Covers the materialized eq
+    /// path and the ranked `n_log=18` factorized path without a LOG2=18 prove.
+    #[test]
+    fn last_rho_kick_then_wait_matches_oneshot_fold() {
+        let cases: &[(usize, usize, usize)] = &[
+            (16, 8, 241),
+            (18, 10, 997),
+            (25, 7, 121), // n_log=18 factorized dispatch
+        ];
+        for &(m, k_log, useful_bits) in cases {
+            let mut rng = Rng::new(0x1A57_0D00 + (m * 31 + k_log * 7 + useful_bits) as u64);
+            let n_log = m - k_log;
+            let n_outer = 1usize << n_log;
+            let chunks_per_block = (1usize << k_log) / 128;
+            let z_block_major = rng.f128_vec(n_outer * chunks_per_block);
+            let z_before = z_block_major.clone();
+            let inner_rest_len = k_log - 6; // ranked k_skip
+            let x_inner_rest = rng.f128_vec(inner_rest_len);
+            let x_outer = rng.f128_vec(n_log);
+            let mut mlv = x_inner_rest;
+            mlv.extend_from_slice(&x_outer);
+
+            let want = if n_log == BLOCK_MAJOR_FACTORED_EQ_N_LOG {
+                let (outer_lo, outer_hi) = x_outer.split_at(BLOCK_MAJOR_FACTORED_EQ_LO_LOG);
+                partial_fold_packed_z_block_major_factorized_padded(
+                    &z_block_major,
+                    m,
+                    k_log,
+                    useful_bits,
+                    &build_eq_table(outer_lo),
+                    &build_eq_table(outer_hi),
+                )
+            } else {
+                partial_fold_packed_z_block_major_padded(
+                    &z_block_major,
+                    m,
+                    k_log,
+                    useful_bits,
+                    &build_eq_table(&x_outer),
+                )
+            };
+
+            let _guard =
+                prepare_last_rho_z_fold(&z_block_major, m, k_log, useful_bits, inner_rest_len);
+            kick_last_rho_z_fold(&mlv);
+            let got = wait_last_rho_z_fold().expect("kick at complete mlv must run");
+            assert_eq!(
+                want, got,
+                "m={m} k_log={k_log} useful={useful_bits} last-ρ ≠ one-shot"
+            );
+            assert_eq!(
+                z_block_major, z_before,
+                "m={m} last-ρ kick must not mutate z"
+            );
+            // Kick after the fold has been waited (stand-in for "after zc
+            // returns") is a no-op.
+            kick_last_rho_z_fold(&mlv);
+            assert!(
+                wait_last_rho_z_fold().is_none(),
+                "kick after wait must be a no-op"
+            );
+        }
+    }
+
+    /// Kicking with a short `mlv` (zerocheck rounds 2–27, `x_outer`
+    /// incomplete) must not start a fold. Sequential one-shot after zc
+    /// remains the path.
+    #[test]
+    fn last_rho_kick_incomplete_mlv_is_noop() {
+        let (m, k_log, useful_bits) = (16usize, 8usize, 241usize);
+        let mut rng = Rng::new(0xBAD2_2700);
+        let n_log = m - k_log;
+        let n_outer = 1usize << n_log;
+        let chunks_per_block = (1usize << k_log) / 128;
+        let z_block_major = rng.f128_vec(n_outer * chunks_per_block);
+        let z_before = z_block_major.clone();
+        let inner_rest_len = k_log - 6;
+        let short_mlv = rng.f128_vec(inner_rest_len + n_log - 1);
+
+        let _guard = prepare_last_rho_z_fold(&z_block_major, m, k_log, useful_bits, inner_rest_len);
+        kick_last_rho_z_fold(&short_mlv);
+        assert!(
+            wait_last_rho_z_fold().is_none(),
+            "incomplete mlv must not start the leftover fold"
+        );
+        assert_eq!(z_block_major, z_before, "no-op kick must not mutate z");
+    }
+
     #[test]
     fn partial_fold_dispatch_handles_small_k() {
         let (m, k_log) = (8usize, 2usize);
@@ -1937,6 +4517,48 @@ mod tests {
             let got =
                 partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
             assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
+        }
+    }
+
+    /// The GFNI plane fold must match the tiled gather kernel byte-for-byte,
+    /// including a non-64-aligned `useful_bits` boundary over honest zero
+    /// padding (the ranked BLAKE3 shape).
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "gfni"
+    ))]
+    #[test]
+    fn partial_fold_x86_gfni_matches_tiled() {
+        for &(m, k_log, useful_bits) in &[
+            (16usize, 8usize, 256usize),
+            (18, 10, 1000),
+            (20, 14, 15_409),
+        ] {
+            if !n_log_ok_for_tile(m, k_log, 8) {
+                continue;
+            }
+            let mut rng = Rng::new(9200 + m as u64);
+            let block_size = 1usize << k_log;
+            let mut z = rng.bits(1 << m);
+            for blk in 0..(1usize << (m - k_log)) {
+                for j in useful_bits..block_size {
+                    z[blk * block_size + j] = false;
+                }
+            }
+            let z_packed = pack_z_lincheck(&z, m, k_log);
+            let p = rng.f128_vec(m - k_log);
+            let eq = build_eq_table(&p);
+            let tiled =
+                partial_fold_packed_z_x86_tiled_padded(&z_packed, m, k_log, useful_bits, &eq);
+            let gfni = kernels::partial_fold_packed_z_x86_gfni_padded(
+                &z_packed,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+            );
+            assert_eq!(tiled, gfni, "at m={m}, k_log={k_log}, useful={useful_bits}");
         }
     }
 

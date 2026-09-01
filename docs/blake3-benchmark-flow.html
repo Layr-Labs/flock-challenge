@@ -360,7 +360,7 @@
             <div class="lane-body">
               <div class="lane-node"><h3>Protected process contract</h3><p>Creates setup, runs the fixed warm-up, reads one seed, invokes <code>prove_fast</code>, then writes and renames one temporary proof.</p></div>
               <div class="lane-node"><h3>Editable proving implementation</h3><p>The current submission's <code>flock-core/src</code> and <code>flock-prover/src</code> are linked here.</p></div>
-              <div class="lane-node"><h3>Seatbelt confinement</h3><p>No network, no child process, and no writes outside private scratch. The verifier wipes scratch between workers, preventing warm-up precomputation from persisting.</p></div>
+              <div class="lane-node"><h3>Bubblewrap confinement</h3><p>No network, no writes outside private scratch, and every descendant contained in the worker's own PID namespace. The verifier wipes scratch between workers, preventing warm-up precomputation from persisting.</p></div>
             </div>
           </div>
           <div class="wire">
@@ -382,15 +382,15 @@
       <section id="prebuild">
         <div class="section-label">Trusted verifier provenance</div>
         <h2>The judge is built before submissions exist.</h2>
-        <p class="lede">Ranked setup never compiles verifier source. The repository carries an arm64 verifier built from one reviewed source commit and protects it with a committed digest.</p>
+        <p class="lede">Ranked setup never compiles verifier source. The repository carries an x86_64 verifier built from one reviewed source commit and protects it with a committed digest.</p>
         <div class="build-flow">
-          <article class="build-step"><b>01 / REVIEWED COMMIT</b><h3>Freeze the source tree</h3><p>Benchmark commit <code>6b033a9…f041a3</code> contains the harness atop the re-signed tree matching upstream Flock <code>85fc0e7…5293</code>.</p></article>
-          <article class="build-step"><b>02 / DETACHED WORKTREE</b><h3>Build exactly that commit</h3><p>The author-only script refuses a dirty checkout and uses Rust 1.97.0 with <code>target-cpu=apple-m1</code>.</p></article>
-          <article class="build-step"><b>03 / COMMITTED ARTIFACT</b><h3>Publish one Mach-O</h3><p>The binary contains the generator, timer, decoder, pristine Flock verifier and imports, commitment check, and score writer.</p></article>
-          <article class="build-step"><b>04 / RANKED EXECUTION</b><h3>Verify bytes twice</h3><p><code>setup.sh</code> checks SHA-256 and signing; <code>benchmark.sh</code> checks SHA-256 again immediately before use.</p></article>
+          <article class="build-step"><b>01 / REVIEWED COMMIT</b><h3>Freeze the source tree</h3><p>Benchmark commit <code>7b3c050…fd21b8</code> contains the harness atop the re-signed tree matching upstream Flock <code>85fc0e7…5293</code>.</p></article>
+          <article class="build-step"><b>02 / DETACHED WORKTREE</b><h3>Build exactly that commit</h3><p>The author-only script refuses a dirty checkout and uses Rust 1.97.0 with <code>target-cpu=x86-64-v3</code> plus <code>+pclmulqdq,+aes</code>.</p></article>
+          <article class="build-step"><b>03 / COMMITTED ARTIFACT</b><h3>Publish one ELF</h3><p>The binary contains the generator, timer, decoder, pristine Flock verifier and imports, commitment check, and score writer.</p></article>
+          <article class="build-step"><b>04 / RANKED EXECUTION</b><h3>Verify bytes twice</h3><p><code>setup.sh</code> checks SHA-256; <code>benchmark.sh</code> checks SHA-256 again immediately before use.</p></article>
         </div>
-        <p class="hash">Committed verifier SHA-256: 210f268a50c8d9c0779b0df76e742117494f62e2672be6aacda738729cf87d5e</p>
-        <p class="strong-note"><strong>Published provenance:</strong> the committed verifier is built from reviewed commit <code>6b033a9c45eb2256b9322b218e87855b5f041a3f</code>. Ranked setup verifies its committed SHA-256 and macOS code signature before use.</p>
+        <p class="hash">Committed verifier SHA-256: 5ad0acfa59a6f3415061b0536d401075b7e7c71da5ec1e5d3d8784bd81d68798</p>
+        <p class="strong-note"><strong>Published provenance:</strong> the committed verifier is built from reviewed commit <code>7b3c050dcc07ab9945899947b4c3fcf974fd21b8</code>. Ranked setup verifies its committed SHA-256 before use; on Linux the digest is the only authenticity control.</p>
       </section>
 
       <section id="surface">
@@ -495,7 +495,7 @@
             <div class="metric"><code>score</code><p>The only ranked value: verified BLAKE3 compressions per second. Higher is better.</p></div>
             <div class="metric"><code>warmup_trial_seconds</code><p>Twenty verified machine warm-ups, visible but excluded from ranking.</p></div>
             <div class="metric"><code>trial_seconds</code><p>All 100 verified durations used to compute the median.</p></div>
-            <div class="metric"><code>batch_size · threads</code><p>Fixed work count and the selected Apple performance-core pool size.</p></div>
+            <div class="metric"><code>batch_size · threads</code><p>Fixed work count and the Rayon pool size, which defaults to every vCPU <code>nproc</code> reports.</p></div>
             <div class="metric"><code>proof_bytes</code><p>Largest accepted serialized proof in the run. Visible, but not ranked.</p></div>
             <div class="metric"><code>verified</code><p>Always true when the score exists. Any failure exits nonzero and produces no replacement score.</p></div>
             <div class="metric"><code>diagnostics</code><p>P10 latency, aggregate throughput, and p90/p10 dispersion show the distribution around the ranked median.</p></div>
@@ -506,24 +506,24 @@
       <section id="hardware">
         <div class="section-label">Hardware and operational security</div>
         <h2>Official throughput belongs to one runner class.</h2>
-        <p class="lede">Local Apple Silicon runs are useful for correctness and directional feedback. Absolute ranking comes from the dedicated M3 Max because chip configuration, compiler output, thermals, and background load affect throughput.</p>
+        <p class="lede">Local x86_64 Linux runs are useful for correctness and directional feedback. Absolute ranking comes from the dedicated c7i.4xlarge because instance family, compiler output, and background load affect throughput.</p>
         <div class="split">
           <article class="panel">
             <div class="panel-head"><h3>Official GitHub runner</h3><span>authoritative</span></div>
-            <div class="panel-body"><ul><li>14-core Apple M3 Max, 36 GB unified memory</li><li>10 performance cores selected by default</li><li>arm64 macOS</li><li>Rust 1.97.0; candidate <code>target-cpu=native</code></li><li>Self-hosted label <code>m3-max-36gb</code>; one benchmark at a time</li></ul></div>
+            <div class="panel-body"><ul><li>c7i.4xlarge — Intel Sapphire Rapids, 16 vCPU, 32 GB memory</li><li>Every vCPU <code>nproc</code> reports is used by default</li><li>Ubuntu 24.04 LTS x86_64</li><li>Rust 1.97.0; candidate <code>target-cpu=native</code></li><li>Self-hosted label <code>x86-16c-32gb</code>; one benchmark at a time</li><li>Unmodified-prover baseline: 381,080 verified compressions/s, 0.600% CV over 5 sessions</li></ul></div>
           </article>
           <article class="panel">
-            <div class="panel-head"><h3>Local Apple Silicon</h3><span>directional</span></div>
-            <div class="panel-body"><ul><li><code>./setup.sh</code> checks arm64 macOS, Xcode Clang, Rust, checksum, and signing</li><li><code>./benchmark.sh</code> rebuilds the current candidate offline, then uses local performance cores</li><li>Compilation finishes before the trusted harness starts any timer</li><li>Compare changes only on the same quiet machine; the official M3 Max result remains authoritative</li></ul></div>
+            <div class="panel-head"><h3>Local x86_64 Linux</h3><span>directional</span></div>
+            <div class="panel-body"><ul><li><code>./setup.sh</code> checks Linux on x86_64, a C compiler, bubblewrap, Rust, and the verifier checksum</li><li><code>./benchmark.sh</code> rebuilds the current candidate offline, then uses the local vCPU count</li><li>Compilation finishes before the trusted harness starts any timer</li><li>Compare changes only on the same quiet machine; the official c7i.4xlarge result remains authoritative</li></ul></div>
           </article>
         </div>
         <div class="failure-grid" style="margin-top:22px">
-          <article class="failure-card"><b>FAKE TIME OR SCORE</b><p>Worker output is ignored, the external verifier owns <code>Instant</code>, and Seatbelt prevents writes to root <code>score.json</code>.</p></article>
+          <article class="failure-card"><b>FAKE TIME OR SCORE</b><p>Worker output is ignored, the external verifier owns <code>Instant</code>, and the sandbox prevents writes to root <code>score.json</code>.</p></article>
           <article class="failure-card"><b>CHEAPER STATEMENT</b><p>Trusted input and witness reconstruction makes a different seed, input, root, or PCS profile fail before protocol acceptance.</p></article>
-          <article class="failure-card"><b>BACKGROUND WRITER</b><p>Seatbelt denies child processes. Once proof bytes are captured, the harness stops time and kills/reaps the worker before verification.</p></article>
+          <article class="failure-card"><b>BACKGROUND WRITER</b><p>Descendants stay inside the worker's PID namespace and its process group. Once proof bytes are captured, the harness stops time and kills the whole group before verification.</p></article>
           <article class="failure-card"><b>STALE RESULT</b><p><code>benchmark.sh</code> removes previous scores before execution. A failed run has no valid new score artifact.</p></article>
           <article class="failure-card"><b>VERIFIER REPLACEMENT</b><p>The checksum-pinned binary contains its own verifier imports and never loads candidate crate code.</p></article>
-          <article class="failure-card"><b>HOST BOUNDARY</b><p>Seatbelt constrains the measured worker, not an entire VM. The dedicated runner must contain no unrelated secrets or workloads.</p></article>
+          <article class="failure-card"><b>HOST BOUNDARY</b><p>Bubblewrap constrains the measured worker, not an entire VM. The dedicated runner must contain no unrelated secrets or workloads.</p></article>
         </div>
       </section>
 
@@ -540,13 +540,13 @@
           <li><a href="../benchmark-tools/build-trusted-verifier.sh">build-trusted-verifier.sh</a><span>Pinned author-only build and artifact publication.</span></li>
           <li><a href="../benchmark-tools/trusted/SHA256SUMS">trusted/SHA256SUMS</a><span>Exact committed verifier digest.</span></li>
           <li><a href="../setup.sh">setup.sh</a><span>Machine checks, dependencies, verifier integrity, and offline candidate build.</span></li>
-          <li><a href="../benchmark.sh">benchmark.sh</a><span>Core selection, stale-score removal, Seatbelt profile, and verifier invocation.</span></li>
-          <li><a href="../.github/workflows/benchmark-blake3-mac.yml">GitHub workflow</a><span>Exact-SHA checkout, M3 Max routing, ranked values, and score artifact.</span></li>
+          <li><a href="../benchmark.sh">benchmark.sh</a><span>Thread selection, stale-score removal, sandbox gating, and verifier invocation.</span></li>
+          <li><a href="../.github/workflows/benchmark-blake3-x86.yml">GitHub workflow</a><span>Exact-SHA checkout, <code>x86-16c-32gb</code> routing, ranked values, and score artifact.</span></li>
         </ol>
       </section>
     </main>
 
-    <footer>2^18 BLAKE3 compressions per proof · 20 verified warm-ups · median of 100 verified trials · prebuilt arm64 verifier · self-hosted Apple M3 Max</footer>
+    <footer>2^18 BLAKE3 compressions per proof · 20 verified warm-ups · median of 100 verified trials · prebuilt x86_64 verifier · self-hosted c7i.4xlarge</footer>
   </div>
 </body>
 </html>

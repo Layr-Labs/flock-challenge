@@ -83,7 +83,7 @@ pub trait Challenger: Send {
     /// Default implementation accepts unconditionally (no-op). Real
     /// implementations must check the PoW; an honest verifier rejects the
     /// proof if this returns `false`.
-    fn verify_pow(&mut self, _nonce: u64, _bits: u32) -> bool {
+    fn verify_pow(&mut self, _pow_counter: u64, _bits: u32) -> bool {
         true
     }
 }
@@ -392,16 +392,12 @@ impl Challenger for FsChallenger {
         // globally smallest satisfying nonce, so the result is identical to the
         // sequential search (deterministic proofs) regardless of this choice.
         const PARALLEL_GRIND_MIN_HASHES: u64 = 1 << 13;
-        // Nonces per rayon task in the parallel search. Large enough to amortize
-        // task dispatch and to let the BLAKE3 batch run many `hash_many` calls
-        // per task, small enough to keep cancellation granular once an earlier
-        // task has found a match. 960 = 20 full 48-nonce batches, so a chunk
-        // has no ragged tail batch on the twelve-way kernel; the block math
-        // below uses `div_ceil`/saturating adds and requires no power of two.
-        // Chunk partition does not affect the emitted nonce: chunks are
-        // scanned/`find_first`ed in ascending order and each returns its
-        // smallest match, so the result stays the globally smallest.
-        const GRIND_CHUNK: u64 = 960;
+        // Nonces per rayon task in the parallel search. Large enough to
+        // amortize task dispatch (a 1024-nonce chunk is ~12 µs under the
+        // aarch64 NEON kernel, ~86 Mh/s/core — and a whole multiple of its
+        // 16-lane batch), small enough to keep cancellation granular once an
+        // earlier task has found a match.
+        const GRIND_CHUNK: u64 = 1 << 10;
         let nonce = if bits == 0 {
             0
         } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
@@ -416,97 +412,38 @@ impl Challenger for FsChallenger {
                 start = start.saturating_add(GRIND_CHUNK);
             }
         } else {
-            // Two-pool block-parallel search. Blocks are scanned in order;
-            // within a block, the main Rayon workers AND the efficiency-core
-            // helper pool (when present) claim ascending chunks from one
-            // shared atomic counter — the same heterogeneous shape as
-            // `epool::run_hetero_chunks`, but with an early-exit bound so
-            // workers stop claiming chunks that can no longer contain the
-            // smallest match. The grind is pure batched BLAKE3 compute with
-            // no per-chunk tables or bandwidth pressure, i.e. the friendliest
-            // work in the prover for efficiency cores, and every ≥2^13-hash
-            // grind sits on the opening's critical path while the helper pool
-            // is otherwise parked.
-            //
-            // Determinism: the emitted nonce is re-derived after the join as
-            // the match in the lowest-indexed chunk that has one. The counter
-            // hands out indices in ascending order, a worker never abandons a
-            // chunk it has claimed, and a chunk below the final bound with a
-            // match would have lowered the bound below itself — contradiction.
-            // So every chunk below the winning one was fully scanned with no
-            // match, and the result is exactly the globally smallest nonce,
-            // byte-identical to the sequential search.
-            //
+            // Block-parallel search. Blocks are scanned in order and each task
+            // returns the smallest match within its chunk, so the result is
+            // deterministic (the globally smallest satisfying nonce).
             // Block ≈ 2× the expected attempts: large enough that the match
             // usually falls inside one block (so all threads do useful
             // pre-match work), small enough to avoid the 4× over-scan the old
             // `+2` block caused (which left ~¾ of threads doing cancelled work).
             use rayon::prelude::*;
-            use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-            const PENDING: u64 = u64::MAX;
-            const NO_MATCH: u64 = u64::MAX - 1;
             let block: u64 = 1 << (bits.min(24) + 1);
-            let n_chunks = usize::try_from(block.div_ceil(GRIND_CHUNK)).expect("chunk count");
+            let n_chunks = block.div_ceil(GRIND_CHUNK);
             let mut start: u64 = 0;
-            'blocks: loop {
-                let results: Vec<AtomicU64> =
-                    (0..n_chunks).map(|_| AtomicU64::new(PENDING)).collect();
-                let next = AtomicUsize::new(0);
-                // Lowest chunk index known to hold a match. Chunks at or past
-                // it cannot supply the answer; Relaxed is enough because the
-                // bound only prunes work — correctness comes from `results`
-                // plus the joins below.
-                let bound = AtomicUsize::new(n_chunks);
-                let worker = || {
-                    loop {
-                        let c = next.fetch_add(1, Ordering::Relaxed);
-                        if c >= n_chunks || c >= bound.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        match pow_scan(
+            loop {
+                // `find_first` takes the earliest *chunk* that yields a match
+                // and cancels the rest; within a chunk `pow_scan` returns the
+                // smallest nonce. A later chunk cannot hold a smaller nonce, so
+                // this is exactly the globally smallest — identical to the
+                // sequential search, which is what keeps proofs deterministic.
+                let found = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|c| {
+                        pow_scan(
                             &state_digest,
-                            start.saturating_add(c as u64 * GRIND_CHUNK),
+                            start.saturating_add(c * GRIND_CHUNK),
                             GRIND_CHUNK,
                             bits,
                             kind,
-                        ) {
-                            Some(n) => {
-                                results[c].store(n, Ordering::Release);
-                                bound.fetch_min(c, Ordering::Relaxed);
-                            }
-                            None => results[c].store(NO_MATCH, Ordering::Release),
-                        }
-                    }
-                };
-                let main_threads = rayon::current_num_threads();
-                let drain_main = || {
-                    (0..main_threads)
-                        .into_par_iter()
-                        .with_max_len(1)
-                        .for_each(|_| worker());
-                };
-                // Mirror the epool engagement floor: tiny blocks drain faster
-                // than the cross-pool kickoff amortizes.
-                const GRIND_EPOOL_MIN_CHUNKS: usize = 16;
-                match crate::epool::epool()
-                    .filter(|_| main_threads > 1 && n_chunks >= GRIND_EPOOL_MIN_CHUNKS)
-                {
-                    Some(ep) => std::thread::scope(|s| {
-                        // The scoped thread parks in `broadcast` while the
-                        // E-workers drain; the scope join bounds the tail wait
-                        // at one chunk on one efficiency core.
-                        s.spawn(|| ep.broadcast(|_| worker()));
-                        drain_main();
-                    }),
-                    None => drain_main(),
-                }
-                // Both pools joined (Release stores in `results` are
-                // synchronized by the joins). Take the lowest-chunk match.
-                for r in &results {
-                    match r.load(Ordering::Acquire) {
-                        PENDING | NO_MATCH => continue,
-                        n => break 'blocks n,
-                    }
+                        )
+                    })
+                    .find_first(|r| r.is_some())
+                    .flatten();
+                if let Some(n) = found {
+                    break n;
                 }
                 start = start.saturating_add(block);
             }
@@ -517,7 +454,7 @@ impl Challenger for FsChallenger {
         nonce
     }
 
-    fn verify_pow(&mut self, nonce: u64, bits: u32) -> bool {
+    fn verify_pow(&mut self, pow_counter: u64, bits: u32) -> bool {
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
         let ok = if bits == 0 {
@@ -529,14 +466,14 @@ impl Challenger for FsChallenger {
             // already carries the full security target, and the FS soundness
             // accounting assumes free re-grinding regardless — it just keeps
             // proofs canonical / non-malleable at zero-bit grinding sites.
-            nonce == 0
+            pow_counter == 0
         } else {
-            pow_has_leading_zero_bits(&state_digest, nonce, bits, kind)
+            pow_has_leading_zero_bits(&state_digest, pow_counter, bits, kind)
         };
         // Absorb regardless of `ok` so the transcript stays byte-identical to
         // the prover's (an honest prover always reaches this with the same
         // nonce); a failed check rejects the proof at the call site anyway.
-        self.observe_bytes(&nonce.to_le_bytes());
+        self.observe_bytes(&pow_counter.to_le_bytes());
         ok
     }
 }
@@ -564,10 +501,10 @@ impl Challenger for FsChallenger {
 /// BLAKE3's PoW pre-image: `state_digest ‖ nonce_le ‖ zero padding`, one whole
 /// 64-byte block. `blake3::hash` of this is what the PoW is defined against.
 #[inline]
-fn blake3_pow_preimage(state_digest: &[u8; 32], nonce: u64) -> [u8; 64] {
+fn blake3_pow_preimage(state_digest: &[u8; 32], pow_counter: u64) -> [u8; 64] {
     let mut pre = [0u8; 64];
     pre[..32].copy_from_slice(state_digest);
-    pre[32..40].copy_from_slice(&nonce.to_le_bytes());
+    pre[32..40].copy_from_slice(&pow_counter.to_le_bytes());
     pre
 }
 
@@ -597,7 +534,7 @@ fn has_leading_zero_bits(h: &[u8], bits: u32) -> bool {
 #[inline]
 fn pow_has_leading_zero_bits(
     state_digest: &[u8; 32],
-    nonce: u64,
+    pow_counter: u64,
     bits: u32,
     kind: HashKind,
 ) -> bool {
@@ -607,42 +544,82 @@ fn pow_has_leading_zero_bits(
         HashKind::Sha256 => {
             let mut pre = [0u8; 40];
             pre[..32].copy_from_slice(state_digest);
-            pre[32..].copy_from_slice(&nonce.to_le_bytes());
+            pre[32..].copy_from_slice(&pow_counter.to_le_bytes());
             let h: [u8; 32] = Sha256::digest(pre).into();
             has_leading_zero_bits(&h, bits)
         }
         HashKind::Blake3 => {
-            let h = blake3::hash(&blake3_pow_preimage(state_digest, nonce));
+            let h = blake3::hash(&blake3_pow_preimage(state_digest, pow_counter));
             has_leading_zero_bits(h.as_bytes(), bits)
         }
     }
 }
 
-/// Nonces hashed per `hash_many` call in the BLAKE3 grind.
-///
-/// Must clear the widest `simd_degree` (16, under AVX-512) so the batch fills
-/// the machine's vector. 48 = 4·12 = 3·16 is the smallest batch that is a
-/// multiple of BOTH the Apple AArch64 twelve-way kernel's group size and the
-/// AVX-512 simd_degree: at 32, every batch on the ranked path split into 24
-/// hashes through the twelve-way kernel plus 8 through the ~2.1×-slower
-/// upstream 4-lane tail (25% of all grind hashes on the slow path, a ~1.28×
-/// effective penalty measured by `grind_speed_probe`); at 48 every full batch
-/// runs entirely twelve-way. Buffers grow to 3 KiB of pre-images + 1.5 KiB
-/// of digests — still stack-resident. (The earlier 1/4/8/16/32/64 sweep on an
-/// M4 Max used a criterion harness whose noise floor exceeded the tail
-/// penalty; the kernel-level probe resolves it.)
-const BLAKE3_POW_BATCH: usize = 48;
-
 /// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
 /// leading zeros, or `None`.
 ///
-/// Batches the independent nonce hashes through the twelve-way kernel on
-/// Apple AArch64 (upstream `hash_many` tail and fallback) via
-/// [`crate::merkle::blake3_hash_many_pow`]. A 64-byte pre-image is a
-/// whole-block single chunk hashed with `CHUNK_START | CHUNK_END | ROOT` —
-/// so this agrees with `blake3::hash` on every nonce, which
-/// `blake3_batched_pow_matches_scalar` asserts.
+/// Dispatch: on aarch64 a 16-lane NEON kernel specialized to the fixed PoW
+/// message shape ([`blake3_pow_neon`]) covers every real grind — profiles top
+/// out at 21 grinding bits, and the kernel handles `1..=32`. The generic
+/// `hash_many` batch loop ([`blake3_pow_scan_many`]) remains as the portable
+/// fallback, the `bits = 0` / `bits > 32` path, and the
+/// `FLOCK_NO_GRIND_OPT=1` kill-switch target (local diagnostics / one-process
+/// A-B; the ranked worker's cleared environment never sets it). Both paths
+/// agree with `blake3::hash` on every nonce, so the smallest satisfying nonce
+/// — and therefore the proof bytes — are identical either way.
 fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        static OPT: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GRIND_OPT").is_none());
+        if (1..=32).contains(&bits) && *OPT {
+            return blake3_pow_neon::scan(state_digest, start, len, bits);
+        }
+    }
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    {
+        static OPT: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GRIND_OPT").is_none());
+        if (1..=32).contains(&bits) && *OPT {
+            return blake3_pow_avx512::scan(state_digest, start, len, bits);
+        }
+    }
+    blake3_pow_scan_many(state_digest, start, len, bits)
+}
+
+/// Nonces hashed per `hash_many` call in the BLAKE3 grind.
+///
+/// Must clear the widest `simd_degree` (16, under AVX-512) so the batch fills
+/// the machine's vector; 32 leaves headroom and keeps the buffers (2 KiB of
+/// pre-images + 1 KiB of digests) stack-resident. Swept 1/4/8/16/32/64 on an
+/// M4 Max: 1 is ~2.2× slower at 17 bits, everything from 4 up is within noise
+/// of each other.
+const BLAKE3_POW_BATCH: usize = 32;
+
+/// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
+/// leading zeros, or `None` — generic `hash_many` batch loop.
+///
+/// Batches the independent nonce hashes through the crate's SIMD compression.
+/// A 64-byte pre-image is a whole-block single chunk, which `hash_many`
+/// reproduces byte-for-byte given `CHUNK_START` / `CHUNK_END | ROOT` — so this
+/// agrees with `blake3::hash` on every nonce, which
+/// `blake3_batched_pow_matches_scalar` asserts.
+fn blake3_pow_scan_many(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
+    use blake3::platform::Platform;
+    // BLAKE3 constants, fixed by the spec.
+    const IV: [u32; 8] = [
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+        0x5BE0CD19,
+    ];
+    const CHUNK_START: u8 = 1;
+    const CHUNK_END: u8 = 2;
+    const ROOT: u8 = 8;
+
+    let plat = Platform::detect();
     // The 32-byte state prefix is constant across the whole scan; only the
     // 8 nonce bytes change per lane.
     let mut pre = [[0u8; 64]; BLAKE3_POW_BATCH];
@@ -660,17 +637,17 @@ fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> 
         }
         #[cfg(feature = "hash-count")]
         fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-        // Twelve-way kernel on Apple AArch64 (upstream `hash_many` tail and
-        // fallback), byte-identical to `blake3::hash` per pre-image.
-        // SAFETY: `pre` is `[[u8; 64]; BLAKE3_POW_BATCH]` and `out` is
-        // `[u8; 32 * BLAKE3_POW_BATCH]`, so the first `n` elements of each
-        // form contiguous 64-byte / 32-byte runs.
-        unsafe {
-            crate::merkle::blake3_hash_many_pow(
-                core::slice::from_raw_parts(pre.as_ptr() as *const u8, n * 64),
-                core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut [u8; 32], n),
-            );
-        }
+        let inputs: [&[u8; 64]; BLAKE3_POW_BATCH] = std::array::from_fn(|i| &pre[i]);
+        plat.hash_many(
+            &inputs[..n],
+            &IV,
+            0,
+            blake3::IncrementCounter::No,
+            0,
+            CHUNK_START,
+            CHUNK_END | ROOT,
+            &mut out[..n * 32],
+        );
         for i in 0..n {
             if has_leading_zero_bits(&out[i * 32..(i + 1) * 32], bits) {
                 return Some(base + i as u64);
@@ -679,6 +656,717 @@ fn blake3_pow_scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> 
         base += n as u64;
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// blake3_pow_avx512 — 32-lane (2 × 16-wide) AVX-512 kernel for the BLAKE3
+// PoW grind: the x86 twin of `blake3_pow_neon` below (same structure, same
+// determinism contract — read that module's header for the why).
+//
+// What AVX-512 changes versus the NEON port: every lane rotation is a single
+// `vprord` (`_mm512_ror_epi32`), the accept test is one `vpshufb` byte
+// reverse plus one `vpcmpud` into a 16-bit mask, and a 16-wide state already
+// exposes 4 × 16 independent G lanes per half-round, so two interleaved
+// groups (32 nonces per iteration, dividing `GRIND_CHUNK` exactly) are enough
+// to keep the two 512-bit ALU ports busy without spilling the 2 × 16 + 16
+// live ZMM registers.
+//
+// Like the NEON kernel it computes only digest word 0 (`v0 ^ v8`), which is
+// all the `bits ≤ 32` predicate reads, and hoists the nonce-independent
+// round-0 prefix (column step + three diagonals) out of the scan loop.
+// `blake3_avx512_pow_scan_matches_scalar` pins it lane-by-lane to
+// `blake3::hash` and to the `hash_many` path.
+// ---------------------------------------------------------------------------
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw"
+))]
+mod blake3_pow_avx512 {
+    use core::arch::x86_64::*;
+
+    /// BLAKE3 IV, fixed by the spec.
+    const IV: [u32; 8] = [
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+        0x5BE0CD19,
+    ];
+    /// `CHUNK_START | CHUNK_END | ROOT`: a whole-block single-chunk root
+    /// message, exactly what `blake3::hash` computes for 64 bytes.
+    const FLAGS: u32 = 1 | 2 | 8;
+    /// Per-round message-word schedule, fixed by the spec.
+    const MSG_SCHEDULE: [[usize; 16]; 7] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+        [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+        [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+        [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+        [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+        [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+    ];
+
+    type V = __m512i;
+
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn add(a: V, b: V) -> V {
+        _mm512_add_epi32(a, b)
+    }
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn xor(a: V, b: V) -> V {
+        _mm512_xor_si512(a, b)
+    }
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn ror<const N: i32>(x: V) -> V {
+        _mm512_ror_epi32::<N>(x)
+    }
+
+    /// The 16 message words of one 16-lane group: words 0..8 are the state
+    /// digest (identical across lanes), words 8..10 the per-lane nonce
+    /// halves, words 10..16 the zero tail padding.
+    #[derive(Clone, Copy)]
+    struct Msg {
+        dig: [V; 8],
+        n_lo: V,
+        n_hi: V,
+        zero: V,
+    }
+
+    impl Msg {
+        /// Message word `j`; every call site passes a `MSG_SCHEDULE` entry,
+        /// which constant-folds after inlining.
+        #[inline(always)]
+        fn w(&self, j: usize) -> V {
+            match j {
+                0..=7 => self.dig[j],
+                8 => self.n_lo,
+                9 => self.n_hi,
+                _ => self.zero,
+            }
+        }
+    }
+
+    /// The BLAKE3 quarter-round on one 16-wide state.
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn, clippy::too_many_arguments)]
+    unsafe fn g(v: &mut [V; 16], a: usize, b: usize, c: usize, d: usize, mx: V, my: V) {
+        v[a] = add(add(v[a], v[b]), mx);
+        v[d] = ror::<16>(xor(v[d], v[a]));
+        v[c] = add(v[c], v[d]);
+        v[b] = ror::<12>(xor(v[b], v[c]));
+        v[a] = add(add(v[a], v[b]), my);
+        v[d] = ror::<8>(xor(v[d], v[a]));
+        v[c] = add(v[c], v[d]);
+        v[b] = ror::<7>(xor(v[b], v[c]));
+    }
+
+    /// `g` without the final `b`-word update (final-round G's whose `b`
+    /// output feeds nothing).
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn, clippy::too_many_arguments)]
+    unsafe fn g_no_b(v: &mut [V; 16], a: usize, b: usize, c: usize, d: usize, mx: V, my: V) {
+        v[a] = add(add(v[a], v[b]), mx);
+        v[d] = ror::<16>(xor(v[d], v[a]));
+        v[c] = add(v[c], v[d]);
+        let b1 = ror::<12>(xor(v[b], v[c]));
+        v[a] = add(add(v[a], b1), my);
+        v[d] = ror::<8>(xor(v[d], v[a]));
+        v[c] = add(v[c], v[d]);
+    }
+
+    /// `g` truncated to the second `a`-word update (the final-round diagonal
+    /// whose only live output is `v0`).
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn, clippy::too_many_arguments)]
+    unsafe fn g_a_only(v: &mut [V; 16], a: usize, b: usize, c: usize, d: usize, mx: V, my: V) {
+        v[a] = add(add(v[a], v[b]), mx);
+        let d1 = ror::<16>(xor(v[d], v[a]));
+        let c1 = add(v[c], d1);
+        let b1 = ror::<12>(xor(v[b], c1));
+        v[a] = add(add(v[a], b1), my);
+    }
+
+    /// Independent 16-wide states interleaved per compression call.
+    const GROUPS: usize = 2;
+    /// Nonce lanes per scan iteration.
+    const LANES: usize = 16 * GROUPS;
+
+    /// One BLAKE3 round on `GROUPS` independent 16-wide states.
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn round_n(vs: &mut [[V; 16]; GROUPS], ms: &[Msg; GROUPS], s: &[usize; 16]) {
+        for k in 0..GROUPS {
+            g(&mut vs[k], 0, 4, 8, 12, ms[k].w(s[0]), ms[k].w(s[1]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 1, 5, 9, 13, ms[k].w(s[2]), ms[k].w(s[3]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 2, 6, 10, 14, ms[k].w(s[4]), ms[k].w(s[5]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 3, 7, 11, 15, ms[k].w(s[6]), ms[k].w(s[7]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 0, 5, 10, 15, ms[k].w(s[8]), ms[k].w(s[9]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 1, 6, 11, 12, ms[k].w(s[10]), ms[k].w(s[11]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 2, 7, 8, 13, ms[k].w(s[12]), ms[k].w(s[13]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 3, 4, 9, 14, ms[k].w(s[14]), ms[k].w(s[15]));
+        }
+    }
+
+    /// Final round (schedule row 6) pruned to what reaches `v0 ^ v8` — the
+    /// same dead-G analysis as the NEON kernel.
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn round_final_n(vs: &mut [[V; 16]; GROUPS], ms: &[Msg; GROUPS]) {
+        let s = &MSG_SCHEDULE[6];
+        for k in 0..GROUPS {
+            g_no_b(&mut vs[k], 0, 4, 8, 12, ms[k].w(s[0]), ms[k].w(s[1]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 1, 5, 9, 13, ms[k].w(s[2]), ms[k].w(s[3]));
+        }
+        for k in 0..GROUPS {
+            g_no_b(&mut vs[k], 2, 6, 10, 14, ms[k].w(s[4]), ms[k].w(s[5]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 3, 7, 11, 15, ms[k].w(s[6]), ms[k].w(s[7]));
+        }
+        for k in 0..GROUPS {
+            g_a_only(&mut vs[k], 0, 5, 10, 15, ms[k].w(s[8]), ms[k].w(s[9]));
+        }
+        for k in 0..GROUPS {
+            g_no_b(&mut vs[k], 2, 7, 8, 13, ms[k].w(s[12]), ms[k].w(s[13]));
+        }
+    }
+
+    /// Round-0 constant prefix (column step + the three nonce-free
+    /// diagonals), computed once per scan.
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn round0_prefix(dig: &[V; 8], zero: V) -> [V; 16] {
+        let mut v: [V; 16] = [
+            _mm512_set1_epi32(IV[0] as i32),
+            _mm512_set1_epi32(IV[1] as i32),
+            _mm512_set1_epi32(IV[2] as i32),
+            _mm512_set1_epi32(IV[3] as i32),
+            _mm512_set1_epi32(IV[4] as i32),
+            _mm512_set1_epi32(IV[5] as i32),
+            _mm512_set1_epi32(IV[6] as i32),
+            _mm512_set1_epi32(IV[7] as i32),
+            _mm512_set1_epi32(IV[0] as i32),
+            _mm512_set1_epi32(IV[1] as i32),
+            _mm512_set1_epi32(IV[2] as i32),
+            _mm512_set1_epi32(IV[3] as i32),
+            zero,
+            zero,
+            _mm512_set1_epi32(64),
+            _mm512_set1_epi32(FLAGS as i32),
+        ];
+        g(&mut v, 0, 4, 8, 12, dig[0], dig[1]);
+        g(&mut v, 1, 5, 9, 13, dig[2], dig[3]);
+        g(&mut v, 2, 6, 10, 14, dig[4], dig[5]);
+        g(&mut v, 3, 7, 11, 15, dig[6], dig[7]);
+        g(&mut v, 1, 6, 11, 12, zero, zero);
+        g(&mut v, 2, 7, 8, 13, zero, zero);
+        g(&mut v, 3, 4, 9, 14, zero, zero);
+        v
+    }
+
+    /// Compress all groups from the round-0 prefix; digest word 0 per lane.
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn compress_word0(prefix: &[V; 16], ms: &[Msg; GROUPS]) -> [V; GROUPS] {
+        let mut vs = [*prefix; GROUPS];
+        for k in 0..GROUPS {
+            g(&mut vs[k], 0, 5, 10, 15, ms[k].n_lo, ms[k].n_hi);
+        }
+        round_n(&mut vs, ms, &MSG_SCHEDULE[1]);
+        round_n(&mut vs, ms, &MSG_SCHEDULE[2]);
+        round_n(&mut vs, ms, &MSG_SCHEDULE[3]);
+        round_n(&mut vs, ms, &MSG_SCHEDULE[4]);
+        round_n(&mut vs, ms, &MSG_SCHEDULE[5]);
+        round_final_n(&mut vs, ms);
+        std::array::from_fn(|k| xor(vs[k][0], vs[k][8]))
+    }
+
+    /// Smallest nonce in `start .. start + len` (saturating) whose BLAKE3
+    /// PoW digest has at least `bits` leading zero bits. Requires
+    /// `1 ≤ bits ≤ 32`.
+    pub(super) fn scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
+        debug_assert!((1..=32).contains(&bits));
+        // SAFETY: the enclosing cfg gates this module on compile-time
+        // AVX-512F + BW, so every intrinsic below is available.
+        unsafe { scan_impl(state_digest, start, len, bits) }
+    }
+
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn scan_impl(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
+        let zero = _mm512_setzero_si512();
+        let mut dig = [zero; 8];
+        for (i, d) in dig.iter_mut().enumerate() {
+            *d = _mm512_set1_epi32(u32::from_le_bytes(
+                state_digest[4 * i..4 * i + 4].try_into().unwrap(),
+            ) as i32);
+        }
+        // Leading zero bits of the digest byte stream = integer leading
+        // zeros of the byte-reversed word 0: pass iff `bswap32(w0) < 2^(32-bits)`.
+        let thresh = _mm512_set1_epi32(
+            (if bits == 32 {
+                1u32
+            } else {
+                1u32 << (32 - bits)
+            }) as i32,
+        );
+        // Per-dword byte reverse for `vpshufb` (same pattern in every 128-bit lane).
+        let bswap = _mm512_set4_epi32(0x0C0D_0E0F, 0x0809_0A0B, 0x0405_0607, 0x0001_0203);
+        let prefix = round0_prefix(&dig, zero);
+        // Lane offsets 0..16 for the nonce-low word; the high word carries.
+        let lane_idx: [u32; 16] = std::array::from_fn(|i| i as u32);
+        let lane_idx_v = _mm512_loadu_si512(lane_idx.as_ptr().cast());
+
+        let end = start.saturating_add(len);
+        let mut base = start;
+        while base < end {
+            let n = (end - base).min(LANES as u64) as u32;
+            // Lane nonces `base + 16k + i`: low word = (base_lo + 16k) + i
+            // with the carry folded into the high word per lane (a ragged
+            // tail hashes all lanes and masks the extras off).
+            let ms: [Msg; GROUPS] = std::array::from_fn(|k| {
+                let gb = base.wrapping_add((16 * k) as u64);
+                let lo_base = _mm512_set1_epi32(gb as u32 as i32);
+                let lo = _mm512_add_epi32(lo_base, lane_idx_v);
+                // carry iff the 32-bit add wrapped: lo < lo_base (unsigned)
+                let carry: __mmask16 = _mm512_cmplt_epu32_mask(lo, lo_base);
+                let hi_base = _mm512_set1_epi32((gb >> 32) as u32 as i32);
+                let hi = _mm512_mask_add_epi32(hi_base, carry, hi_base, _mm512_set1_epi32(1));
+                Msg {
+                    dig,
+                    n_lo: lo,
+                    n_hi: hi,
+                    zero,
+                }
+            });
+            #[cfg(feature = "hash-count")]
+            super::fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            let h0 = compress_word0(&prefix, &ms);
+            let mut mask: u32 = 0;
+            for (k, &h) in h0.iter().enumerate() {
+                let rev = _mm512_shuffle_epi8(h, bswap);
+                let m: __mmask16 = _mm512_cmplt_epu32_mask(rev, thresh);
+                mask |= (m as u32) << (16 * k);
+            }
+            if n < 32 {
+                mask &= (1u32 << n) - 1;
+            }
+            if mask != 0 {
+                return Some(base + u64::from(mask.trailing_zeros()));
+            }
+            base += u64::from(n);
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// blake3_pow_neon — 16-lane (4 × 4-wide) NEON kernel for the BLAKE3 PoW grind.
+//
+// Why not `hash_many`? Three structural costs it cannot shed for this message
+// shape, together measured ~3× off the compression roofline:
+//
+//   * Transposition + setup: `hash4_neon` loads and transposes 16 message
+//     words × 4 lanes per call — but 56 of the 64 pre-image bytes are
+//     *constant* across the whole grind (32-byte state digest + 24 zero
+//     bytes), and the 8 nonce bytes are pre-known as `base + lane`.
+//     Broadcasting the constants once per scan deletes the entire
+//     load/transpose stage, the per-batch pre-image patching, and the
+//     pointer-array setup.
+//   * Latency: a single 4-wide compression exposes only 4 independent G
+//     chains per half-round, so Apple's 4 NEON pipes sit roughly half idle
+//     waiting on the ~14-op dependency chain inside each G. Interleaving
+//     `GROUPS` independent 4-wide states (16 lanes per compression at the
+//     swept optimum) multiplies the live chains and fills the pipes.
+//   * Output: the PoW predicate at `bits ≤ 32` reads only digest word 0, so
+//     the kernel computes one output XOR per group instead of eight, and the
+//     byte-wise digest scan becomes two vector compares per 8 nonces.
+//
+// Determinism: the kernel computes bit-identical digest words to
+// `blake3::hash` (asserted lane-by-lane by
+// `blake3_neon_pow_scan_matches_scalar`), scans ascending, and reports the
+// lowest passing lane — the same smallest satisfying nonce as the scalar
+// spec and the `hash_many` path.
+// ---------------------------------------------------------------------------
+#[cfg(target_arch = "aarch64")]
+mod blake3_pow_neon {
+    use core::arch::aarch64::*;
+
+    /// BLAKE3 IV, fixed by the spec.
+    const IV: [u32; 8] = [
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
+        0x5BE0CD19,
+    ];
+    /// `CHUNK_START | CHUNK_END | ROOT` — a whole-block single-chunk root
+    /// message, exactly what `blake3::hash` computes for 64 bytes.
+    const FLAGS: u32 = 1 | 2 | 8;
+    /// Per-round message-word schedule, fixed by the spec.
+    const MSG_SCHEDULE: [[usize; 16]; 7] = [
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8],
+        [3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1],
+        [10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6],
+        [12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4],
+        [9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7],
+        [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
+    ];
+
+    /// Rotate each 32-bit lane right by 16: a `rev32.16` byte swap.
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn ror16(x: uint32x4_t) -> uint32x4_t {
+        vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(x)))
+    }
+
+    /// Rotate each 32-bit lane right by 12: `shl` + `sri`.
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn ror12(x: uint32x4_t) -> uint32x4_t {
+        vsriq_n_u32(vshlq_n_u32(x, 20), x, 12)
+    }
+
+    /// Rotate each 32-bit lane right by 8: a single `tbl` byte shuffle (the
+    /// constant index vector is materialized once and hoisted).
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn ror8(x: uint32x4_t) -> uint32x4_t {
+        const IDX: [u8; 16] = [1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12];
+        let idx = vld1q_u8(IDX.as_ptr());
+        vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(x), idx))
+    }
+
+    /// Rotate each 32-bit lane right by 7: `shl` + `sri`.
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn ror7(x: uint32x4_t) -> uint32x4_t {
+        vsriq_n_u32(vshlq_n_u32(x, 25), x, 7)
+    }
+
+    /// The 16 message words of one 4-lane group in broadcast/lane-vector
+    /// form: words 0..8 are the state digest (identical across lanes), words
+    /// 8..10 the per-lane nonce halves, words 10..16 the zero tail padding.
+    #[derive(Clone, Copy)]
+    struct Msg {
+        dig: [uint32x4_t; 8],
+        n_lo: uint32x4_t,
+        n_hi: uint32x4_t,
+        zero: uint32x4_t,
+    }
+
+    impl Msg {
+        /// Message word `j`. Every call site passes a `MSG_SCHEDULE` entry,
+        /// which constant-folds after inlining — no branch survives.
+        #[inline(always)]
+        fn w(&self, j: usize) -> uint32x4_t {
+            match j {
+                0..=7 => self.dig[j],
+                8 => self.n_lo,
+                9 => self.n_hi,
+                _ => self.zero,
+            }
+        }
+    }
+
+    /// The BLAKE3 quarter-round on one 4-wide state.
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn g(
+        v: &mut [uint32x4_t; 16],
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        mx: uint32x4_t,
+        my: uint32x4_t,
+    ) {
+        v[a] = vaddq_u32(vaddq_u32(v[a], v[b]), mx);
+        v[d] = ror16(veorq_u32(v[d], v[a]));
+        v[c] = vaddq_u32(v[c], v[d]);
+        v[b] = ror12(veorq_u32(v[b], v[c]));
+        v[a] = vaddq_u32(vaddq_u32(v[a], v[b]), my);
+        v[d] = ror8(veorq_u32(v[d], v[a]));
+        v[c] = vaddq_u32(v[c], v[d]);
+        v[b] = ror7(veorq_u32(v[b], v[c]));
+    }
+
+    /// `g` without the final `b`-word update, for final-round G's whose `b`
+    /// output feeds nothing (`b1` is still needed mid-chain for `a`).
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn g_no_b(
+        v: &mut [uint32x4_t; 16],
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        mx: uint32x4_t,
+        my: uint32x4_t,
+    ) {
+        v[a] = vaddq_u32(vaddq_u32(v[a], v[b]), mx);
+        v[d] = ror16(veorq_u32(v[d], v[a]));
+        v[c] = vaddq_u32(v[c], v[d]);
+        let b1 = ror12(veorq_u32(v[b], v[c]));
+        v[a] = vaddq_u32(vaddq_u32(v[a], b1), my);
+        v[d] = ror8(veorq_u32(v[d], v[a]));
+        v[c] = vaddq_u32(v[c], v[d]);
+    }
+
+    /// `g` truncated to just the second `a`-word update, for the one
+    /// final-round diagonal whose only live output is `v0`.
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn g_a_only(
+        v: &mut [uint32x4_t; 16],
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        mx: uint32x4_t,
+        my: uint32x4_t,
+    ) {
+        v[a] = vaddq_u32(vaddq_u32(v[a], v[b]), mx);
+        let d1 = ror16(veorq_u32(v[d], v[a]));
+        let c1 = vaddq_u32(v[c], d1);
+        let b1 = ror12(veorq_u32(v[b], c1));
+        v[a] = vaddq_u32(vaddq_u32(v[a], b1), my);
+    }
+
+    /// Independent 4-wide states interleaved per compression call (the scan
+    /// hashes `4 * GROUPS` nonces per iteration). One 4-wide state exposes
+    /// only 4 independent G chains per half-round — not enough to hide the
+    /// ~2-2.5-cycle effective latency of the add/eor/sri/tbl chain on 4 NEON
+    /// pipes. Swept on an M4 Max (paired vs `hash_many`, 1 core): 2 → 1.75×,
+    /// 3 → 1.81×, 4 → 1.89×, 6 → 1.94×, 8 → 1.93×. 4 is the pick: 16 lanes
+    /// divide `GRIND_CHUNK` exactly (a 24-lane batch masks off 8 dead lanes
+    /// every 1024-nonce chunk, refunding 6's edge), and past 4 the register
+    /// file is so oversubscribed that gains drown in spill traffic.
+    const GROUPS: usize = 4;
+    /// Nonce lanes per scan iteration.
+    const LANES: usize = 4 * GROUPS;
+
+    /// One BLAKE3 round on `GROUPS` independent 4-wide states. Same-position
+    /// G's of all groups are issued adjacently so the independent dependency
+    /// chains sit together in the instruction window (the OoO core spreads
+    /// them across the 4 NEON pipes).
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn round_n(vs: &mut [[uint32x4_t; 16]; GROUPS], ms: &[Msg; GROUPS], s: &[usize; 16]) {
+        // Column step.
+        for k in 0..GROUPS {
+            g(&mut vs[k], 0, 4, 8, 12, ms[k].w(s[0]), ms[k].w(s[1]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 1, 5, 9, 13, ms[k].w(s[2]), ms[k].w(s[3]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 2, 6, 10, 14, ms[k].w(s[4]), ms[k].w(s[5]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 3, 7, 11, 15, ms[k].w(s[6]), ms[k].w(s[7]));
+        }
+        // Diagonal step.
+        for k in 0..GROUPS {
+            g(&mut vs[k], 0, 5, 10, 15, ms[k].w(s[8]), ms[k].w(s[9]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 1, 6, 11, 12, ms[k].w(s[10]), ms[k].w(s[11]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 2, 7, 8, 13, ms[k].w(s[12]), ms[k].w(s[13]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 3, 4, 9, 14, ms[k].w(s[14]), ms[k].w(s[15]));
+        }
+    }
+
+    /// Final round (schedule row 6), pruned to what reaches the output word
+    /// `v0 ^ v8`: the diagonals writing `v1/v6/v11/v12` and `v3/v4/v9/v14`
+    /// are dead, `G(0,5,10,15)` only needs its `a` output (`v0`), and
+    /// `G(2,7,8,13)` everything but `b` (`v8` is its `c`). Of the column
+    /// G's, col0/col2 feed the live diagonals through `a`/`c` only (their
+    /// `b`/`d` outputs go to the dead diagonals), while col1/col3 must stay
+    /// whole for `v5/v13` and `v7/v15`. Saves ~37% of the round.
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn round_final_n(vs: &mut [[uint32x4_t; 16]; GROUPS], ms: &[Msg; GROUPS]) {
+        let s = &MSG_SCHEDULE[6];
+        // Column step.
+        for k in 0..GROUPS {
+            g_no_b(&mut vs[k], 0, 4, 8, 12, ms[k].w(s[0]), ms[k].w(s[1]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 1, 5, 9, 13, ms[k].w(s[2]), ms[k].w(s[3]));
+        }
+        for k in 0..GROUPS {
+            g_no_b(&mut vs[k], 2, 6, 10, 14, ms[k].w(s[4]), ms[k].w(s[5]));
+        }
+        for k in 0..GROUPS {
+            g(&mut vs[k], 3, 7, 11, 15, ms[k].w(s[6]), ms[k].w(s[7]));
+        }
+        // Diagonal step — only the two output-reaching G's survive.
+        for k in 0..GROUPS {
+            g_a_only(&mut vs[k], 0, 5, 10, 15, ms[k].w(s[8]), ms[k].w(s[9]));
+        }
+        for k in 0..GROUPS {
+            g_no_b(&mut vs[k], 2, 7, 8, 13, ms[k].w(s[12]), ms[k].w(s[13]));
+        }
+    }
+
+    /// Round-0 constant prefix, computed once per scan. Under the identity
+    /// schedule the whole column step reads only the constant digest words
+    /// `m0..m8`, and three of the four diagonal G's read only the zero words
+    /// `m10..m16` — all independent of the nonce (the initial state is the
+    /// spec constant: CV = IV, counter = 0, block length 64, root flags).
+    /// Per iteration only the remaining diagonal `G(0,5,10,15)` — messages
+    /// `m8`/`m9`, the nonce halves — runs, cutting round 0 from 8 G's to 1.
+    /// Its word set is disjoint from the three precomputed diagonals, so the
+    /// split is exact.
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn round0_prefix(dig: &[uint32x4_t; 8], zero: uint32x4_t) -> [uint32x4_t; 16] {
+        let mut v: [uint32x4_t; 16] = [
+            vdupq_n_u32(IV[0]),
+            vdupq_n_u32(IV[1]),
+            vdupq_n_u32(IV[2]),
+            vdupq_n_u32(IV[3]),
+            vdupq_n_u32(IV[4]),
+            vdupq_n_u32(IV[5]),
+            vdupq_n_u32(IV[6]),
+            vdupq_n_u32(IV[7]),
+            vdupq_n_u32(IV[0]),
+            vdupq_n_u32(IV[1]),
+            vdupq_n_u32(IV[2]),
+            vdupq_n_u32(IV[3]),
+            vdupq_n_u32(0),
+            vdupq_n_u32(0),
+            vdupq_n_u32(64),
+            vdupq_n_u32(FLAGS),
+        ];
+        // Column step (schedule row 0 is the identity: m0..m8).
+        g(&mut v, 0, 4, 8, 12, dig[0], dig[1]);
+        g(&mut v, 1, 5, 9, 13, dig[2], dig[3]);
+        g(&mut v, 2, 6, 10, 14, dig[4], dig[5]);
+        g(&mut v, 3, 7, 11, 15, dig[6], dig[7]);
+        // Nonce-free diagonals (m10..m16 are the zero tail padding).
+        g(&mut v, 1, 6, 11, 12, zero, zero);
+        g(&mut v, 2, 7, 8, 13, zero, zero);
+        g(&mut v, 3, 4, 9, 14, zero, zero);
+        v
+    }
+
+    /// Compress all `GROUPS` 4-lane groups from the round-0 prefix and
+    /// return digest word 0 per lane (`v0 ^ v8`; full digest word `i` would
+    /// be `v[i] ^ v[i+8]`, but the `bits ≤ 32` PoW predicate reads only
+    /// word 0).
+    #[inline(always)]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn compress_word0(
+        prefix: &[uint32x4_t; 16],
+        ms: &[Msg; GROUPS],
+    ) -> [uint32x4_t; GROUPS] {
+        let mut vs = [*prefix; GROUPS];
+        // Rest of round 0: the nonce-carrying diagonal.
+        for k in 0..GROUPS {
+            g(&mut vs[k], 0, 5, 10, 15, ms[k].n_lo, ms[k].n_hi);
+        }
+        round_n(&mut vs, ms, &MSG_SCHEDULE[1]);
+        round_n(&mut vs, ms, &MSG_SCHEDULE[2]);
+        round_n(&mut vs, ms, &MSG_SCHEDULE[3]);
+        round_n(&mut vs, ms, &MSG_SCHEDULE[4]);
+        round_n(&mut vs, ms, &MSG_SCHEDULE[5]);
+        round_final_n(&mut vs, ms);
+        std::array::from_fn(|k| veorq_u32(vs[k][0], vs[k][8]))
+    }
+
+    /// Smallest nonce in `start .. start + len` (saturating) whose BLAKE3
+    /// PoW digest has at least `bits` leading zero bits. Requires
+    /// `1 ≤ bits ≤ 32` — the predicate then depends only on digest word 0.
+    pub(super) fn scan(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
+        debug_assert!((1..=32).contains(&bits));
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { scan_impl(state_digest, start, len, bits) }
+    }
+
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn scan_impl(state_digest: &[u8; 32], start: u64, len: u64, bits: u32) -> Option<u64> {
+        let mut dig = [vdupq_n_u32(0); 8];
+        for (i, d) in dig.iter_mut().enumerate() {
+            *d = vdupq_n_u32(u32::from_le_bytes(
+                state_digest[4 * i..4 * i + 4].try_into().unwrap(),
+            ));
+        }
+        let zero = vdupq_n_u32(0);
+        // Leading zero bits of the digest byte stream = integer leading
+        // zeros of byte-reversed word 0, so the pass test is
+        // `bswap32(w0) < 2^(32 - bits)`.
+        let thresh = vdupq_n_u32(if bits == 32 { 1 } else { 1u32 << (32 - bits) });
+        let lane_bits = vld1q_u32([1u32, 2, 4, 8].as_ptr());
+        // Nonce-independent round-0 prefix, hoisted out of the scan loop.
+        let prefix = round0_prefix(&dig, zero);
+
+        let end = start.saturating_add(len);
+        let mut base = start;
+        while base < end {
+            let n = (end - base).min(LANES as u64) as u32;
+            // Lane nonces `base + i`, split into 32-bit message words. A
+            // ragged tail hashes all `LANES` lanes anyway and masks the
+            // extras off — cheaper than a second code path (wrapping only
+            // matters at the 2^64 boundary, where the masked lanes are never
+            // inspected).
+            let mut lo = [0u32; LANES];
+            let mut hi = [0u32; LANES];
+            for i in 0..LANES {
+                let x = base.wrapping_add(i as u64);
+                lo[i] = x as u32;
+                hi[i] = (x >> 32) as u32;
+            }
+            #[cfg(feature = "hash-count")]
+            super::fs_count::POW_SHA256.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            let ms: [Msg; GROUPS] = std::array::from_fn(|k| Msg {
+                dig,
+                n_lo: vld1q_u32(lo.as_ptr().add(4 * k)),
+                n_hi: vld1q_u32(hi.as_ptr().add(4 * k)),
+                zero,
+            });
+            let h0 = compress_word0(&prefix, &ms);
+            let cmp: [uint32x4_t; GROUPS] = std::array::from_fn(|k| {
+                vcltq_u32(
+                    vreinterpretq_u32_u8(vrev32q_u8(vreinterpretq_u8_u32(h0[k]))),
+                    thresh,
+                )
+            });
+            let mut any = cmp[0];
+            for &c in &cmp[1..] {
+                any = vorrq_u32(any, c);
+            }
+            if vmaxvq_u32(any) != 0 {
+                let mut mask = 0u32;
+                for (k, &c) in cmp.iter().enumerate() {
+                    mask |= vaddvq_u32(vandq_u32(c, lane_bits)) << (4 * k);
+                }
+                mask &= (1u32 << n) - 1;
+                if mask != 0 {
+                    return Some(base + u64::from(mask.trailing_zeros()));
+                }
+            }
+            base += u64::from(n);
+        }
+        None
+    }
 }
 
 /// Smallest nonce in `start .. start + len` satisfying the PoW, or `None`.
@@ -707,33 +1395,6 @@ mod tests {
     /// the tagging, absorption order and duplex structure are shared, and
     /// only the primitive differs.
     const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
-
-    /// The two-pool early-exit grind must emit exactly the smallest
-    /// satisfying nonce — proof bytes depend on it. The oracle is the
-    /// library's own `pow_scan` over ascending blocks, which is the
-    /// sequential search's definition of "globally smallest". bits = 14
-    /// crosses both the parallel threshold (2^13 expected hashes) and, on
-    /// hosts with a helper pool, the grind's epool engagement floor, so this
-    /// exercises the heterogeneous claim/bound/re-derive path end to end.
-    #[test]
-    fn grind_two_pool_matches_sequential_scan_smallest() {
-        for kind in KINDS {
-            let mut ch = FsChallenger::with_hash(b"grind-2pool-test", kind);
-            ch.observe_label(b"flock-grind-2pool");
-            ch.observe_bytes(b"determinism probe");
-            let digest = ch.state_digest();
-            let bits = 14;
-            let nonce = ch.grind_pow(bits);
-            let mut block_start = 0u64;
-            let expect = loop {
-                if let Some(n) = pow_scan(&digest, block_start, 4096, bits, kind) {
-                    break n;
-                }
-                block_start += 4096;
-            };
-            assert_eq!(nonce, expect, "kind={kind:?}");
-        }
-    }
 
     /// Prover-side PoW grinding produces a nonce that the verifier-side
     /// `verify_pow` accepts at the same transcript position. State binding
@@ -912,64 +1573,245 @@ mod tests {
         }
     }
 
-    /// Timing probe (not a correctness gate): upstream 4-lane `hash_many`
-    /// vs the twelve-way PoW path on 2^20 grind hashes. Run with
-    /// `cargo test -p flock-core --lib -- --ignored --nocapture grind_speed`.
+    /// The 16-lane NEON kernel must agree with the scalar spec
+    /// (`blake3::hash` of the 64-byte pre-image) and with the `hash_many`
+    /// path on every nonce, across ragged widths, lane-boundary starts, the
+    /// `2^32` nonce-word carry, and the full `1..=32` bits range the kernel
+    /// accepts. This is the determinism oracle for the fast grind path.
+    #[cfg(target_arch = "aarch64")]
     #[test]
-    #[ignore]
-    fn grind_speed_probe() {
-        let n = 1usize << 20;
-        let digest = [0xABu8; 32];
-        let mut pre = vec![0u8; n * 64];
-        for i in 0..n {
-            pre[i * 64..i * 64 + 32].copy_from_slice(&digest);
-            pre[i * 64 + 32..i * 64 + 40].copy_from_slice(&(i as u64).to_le_bytes());
+    fn blake3_neon_pow_scan_matches_scalar() {
+        // Several digests so the constant-broadcast path sees varied words
+        // (including all-zero, which zeroes 8 of the 10 live message words).
+        let digests: [[u8; 32]; 3] = [
+            [0x5Au8; 32],
+            [0u8; 32],
+            std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11)),
+        ];
+        // Starts straddle lane
+        // alignment and the 2^32 boundary where the nonce-hi word kicks in.
+        // Widths straddle the 16-lane batch (15/16/17), a two-batch span
+        // (31/32/33), and longer ragged shapes.
+        let lens = [1u64, 3, 7, 8, 9, 15, 16, 17, 24, 25, 31, 32, 33, 100];
+        let starts = [0u64, 5, 8, (1u64 << 32) - 4, u64::from(u32::MAX), 1 << 40];
+        for state in &digests {
+            for &len in &lens {
+                for &start in &starts {
+                    for bits in [1u32, 6, 8, 13, 32] {
+                        let want = (start..start + len)
+                            .find(|&n| pow_has_leading_zero_bits(state, n, bits, HashKind::Blake3));
+                        assert_eq!(
+                            blake3_pow_neon::scan(state, start, len, bits),
+                            want,
+                            "neon vs scalar: start={start} len={len} bits={bits}"
+                        );
+                        assert_eq!(
+                            blake3_pow_scan_many(state, start, len, bits),
+                            want,
+                            "hash_many vs scalar: start={start} len={len} bits={bits}"
+                        );
+                    }
+                }
+            }
         }
-        let mut out = vec![[0u8; 32]; n];
+        // Lane-exact digest-word check: the kernel's word-0 predicate at
+        // bits = 32 must single out exactly the nonces whose full digest
+        // starts with 4 zero bytes — i.e. the kernel's compression output
+        // word 0 is bit-identical to `blake3::hash`. Verified implicitly
+        // above; here pin one known hash directly through a 1-lane scan.
+        let state = digests[2];
+        for nonce in [0u64, 1, 255, 1 << 33] {
+            let h = blake3::hash(&blake3_pow_preimage(&state, nonce));
+            // Recover the number of leading zero bits the digest actually
+            // has (capped at 32) and check the kernel's accept/reject edge.
+            let w0 = u32::from_le_bytes(h.as_bytes()[..4].try_into().unwrap()).swap_bytes();
+            let lz = w0.leading_zeros().min(32);
+            if lz >= 1 {
+                assert_eq!(blake3_pow_neon::scan(&state, nonce, 1, lz), Some(nonce));
+            }
+            if lz < 32 {
+                assert_eq!(blake3_pow_neon::scan(&state, nonce, 1, lz + 1), None);
+            }
+        }
+    }
 
-        let t = std::time::Instant::now();
-        {
-            use blake3::platform::Platform;
-            const IV: [u32; 8] = [
-                0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB,
-                0x5BE0CD19,
-            ];
-            let plat = Platform::detect();
-            let mut out_bytes = vec![0u8; n * 32];
-            for chunk in 0..n / 16 {
-                let base = chunk * 16;
-                let inputs: [&[u8; 64]; 16] = std::array::from_fn(|i| {
-                    pre[(base + i) * 64..(base + i + 1) * 64]
-                        .try_into()
-                        .unwrap()
-                });
-                plat.hash_many(
-                    &inputs,
-                    &IV,
-                    0,
-                    blake3::IncrementCounter::No,
-                    0,
-                    1,
-                    2 | 8,
-                    &mut out_bytes[base * 32..(base + 16) * 32],
+    /// The 32-lane AVX-512 kernel must agree with the scalar spec
+    /// (`blake3::hash` of the 64-byte pre-image) and with the `hash_many`
+    /// path on every nonce: ragged widths, lane-boundary starts, the 2^32
+    /// nonce-word carry (including a carry INSIDE a 16-lane group), and the
+    /// full `1..=32` bits range. Determinism oracle for the x86 grind path.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    #[test]
+    fn blake3_avx512_pow_scan_matches_scalar() {
+        let digests: [[u8; 32]; 3] = [
+            [0x5Au8; 32],
+            [0u8; 32],
+            std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11)),
+        ];
+        let lens = [1u64, 3, 7, 8, 9, 15, 16, 17, 24, 25, 31, 32, 33, 100];
+        let starts = [
+            0u64,
+            5,
+            8,
+            (1u64 << 32) - 4,
+            (1u64 << 32) - 20,
+            u64::from(u32::MAX),
+            1 << 40,
+        ];
+        for state in &digests {
+            for &len in &lens {
+                for &start in &starts {
+                    for bits in [1u32, 6, 8, 13, 32] {
+                        let want = (start..start + len)
+                            .find(|&n| pow_has_leading_zero_bits(state, n, bits, HashKind::Blake3));
+                        assert_eq!(
+                            blake3_pow_avx512::scan(state, start, len, bits),
+                            want,
+                            "avx512 vs scalar: start={start} len={len} bits={bits}"
+                        );
+                        assert_eq!(
+                            blake3_pow_scan_many(state, start, len, bits),
+                            want,
+                            "hash_many vs scalar: start={start} len={len} bits={bits}"
+                        );
+                    }
+                }
+            }
+        }
+        let state = digests[2];
+        for nonce in [0u64, 1, 255, 1 << 33] {
+            let h = blake3::hash(&blake3_pow_preimage(&state, nonce));
+            let w0 = u32::from_le_bytes(h.as_bytes()[..4].try_into().unwrap()).swap_bytes();
+            let lz = w0.leading_zeros().min(32);
+            if lz >= 1 {
+                assert_eq!(blake3_pow_avx512::scan(&state, nonce, 1, lz), Some(nonce));
+            }
+            if lz < 32 {
+                assert_eq!(blake3_pow_avx512::scan(&state, nonce, 1, lz + 1), None);
+            }
+        }
+        // Every lane position must be reachable as the FIRST match: plant a
+        // threshold that only a specific nonce meets inside a 32-lane batch.
+        for state in &digests {
+            let base = 1u64 << 20;
+            for off in 0..32u64 {
+                let nonce = base + off;
+                let h = blake3::hash(&blake3_pow_preimage(state, nonce));
+                let w0 = u32::from_le_bytes(h.as_bytes()[..4].try_into().unwrap()).swap_bytes();
+                let lz = w0.leading_zeros().min(32);
+                if lz == 0 {
+                    continue;
+                }
+                let want = (base..base + 32)
+                    .find(|&n| pow_has_leading_zero_bits(state, n, lz, HashKind::Blake3));
+                assert_eq!(
+                    blake3_pow_avx512::scan(state, base, 32, lz),
+                    want,
+                    "off={off} lz={lz}"
                 );
             }
-            out.copy_from_slice(unsafe {
-                core::slice::from_raw_parts(out_bytes.as_ptr() as *const [u8; 32], n)
-            });
         }
-        let old_ms = t.elapsed().as_secs_f64() * 1e3;
+    }
 
-        let mut out2 = vec![[0u8; 32]; n];
-        let t = std::time::Instant::now();
-        crate::merkle::blake3_hash_many_pow(&pre, &mut out2);
-        let new_ms = t.elapsed().as_secs_f64() * 1e3;
-
-        assert_eq!(out, out2, "outputs differ");
-        eprintln!(
-            "{n} hashes: old (4-lane hash_many) {old_ms:.2} ms, new (12-way) {new_ms:.2} ms, speedup {:.2}x",
-            old_ms / new_ms
+    /// Paired micro-bench of the AVX-512 grind kernel vs the `hash_many`
+    /// batch loop (1 core, no-match scan). Ignored by default.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw"
+    ))]
+    #[test]
+    #[ignore]
+    fn grind_throughput_bench_avx512() {
+        let state = [0x37u8; 32];
+        let len: u64 = 1 << 21;
+        let mut k_best = f64::MAX;
+        let mut many_best = f64::MAX;
+        for rep in 0..6 {
+            let t = std::time::Instant::now();
+            let r = blake3_pow_avx512::scan(&state, rep * len, len, 32);
+            let dt = t.elapsed().as_secs_f64();
+            assert_eq!(r, None);
+            k_best = k_best.min(dt);
+            let t = std::time::Instant::now();
+            let r = blake3_pow_scan_many(&state, rep * len, len, 32);
+            let dt = t.elapsed().as_secs_f64();
+            assert_eq!(r, None);
+            many_best = many_best.min(dt);
+        }
+        let mh = |dt: f64| (len as f64 / dt) / 1e6;
+        println!(
+            "scan throughput (1 core): avx512 {:.1} Mh/s | hash_many {:.1} Mh/s | ratio {:.2}x",
+            mh(k_best),
+            mh(many_best),
+            many_best / k_best
         );
+        // Whole-grind wall clock at the ranked L0 profile (19 bits) through
+        // the parallel `grind_pow`, both kernels.
+        for bits in [19u32, 16, 14] {
+            let mut ch = FsChallenger::with_hash(b"grind-bench", HashKind::Blake3);
+            ch.observe_bytes(b"root");
+            let t = std::time::Instant::now();
+            let n = ch.grind_pow(bits);
+            println!(
+                "grind_pow({bits}) = {n} in {:.2} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+
+    /// Paired micro-bench of the two BLAKE3 grind scans (NEON kernel vs
+    /// `hash_many` batch loop), plus wall-clock `grind_pow` at the profile
+    /// bit range. Ignored by default; run with
+    /// `cargo test --release -p flock-core --lib -- --ignored --nocapture grind_throughput`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn grind_throughput_bench() {
+        let state = [0x37u8; 32];
+        // No-match scan (bits = 32 ⇒ hit probability ~2^-32 per nonce): pure
+        // throughput, no early exit. Interleave the two paths A/B/A/B to
+        // cancel thermal drift.
+        let len: u64 = 1 << 21;
+        let mut neon_best = f64::MAX;
+        let mut many_best = f64::MAX;
+        for rep in 0..6 {
+            let t = std::time::Instant::now();
+            let r = blake3_pow_neon::scan(&state, rep * len, len, 32);
+            let dt = t.elapsed().as_secs_f64();
+            assert_eq!(r, None);
+            neon_best = neon_best.min(dt);
+            let t = std::time::Instant::now();
+            let r = blake3_pow_scan_many(&state, rep * len, len, 32);
+            let dt = t.elapsed().as_secs_f64();
+            assert_eq!(r, None);
+            many_best = many_best.min(dt);
+        }
+        let mh = |dt: f64| (len as f64 / dt) / 1e6;
+        println!(
+            "scan throughput (1 core): neon {:.1} Mh/s | hash_many {:.1} Mh/s | ratio {:.2}x",
+            mh(neon_best),
+            mh(many_best),
+            many_best / neon_best
+        );
+        // Grind-level wall clock at the profile bit range (parallel rayon
+        // path; nonce position varies per bits, so report implied Mh/s too).
+        for bits in 14..=19u32 {
+            let mut ch = FsChallenger::with_hash(b"grind-bench", HashKind::Blake3);
+            ch.observe_bytes(b"bench-root");
+            let t = std::time::Instant::now();
+            let nonce = ch.grind_pow(bits);
+            let dt = t.elapsed().as_secs_f64();
+            println!(
+                "grind_pow bits={bits}: {:.3} ms (nonce={nonce}, ~{:.1} Mh/s aggregate)",
+                dt * 1e3,
+                (nonce + 1) as f64 / dt / 1e6
+            );
+        }
     }
 
     /// The grind must return the globally smallest satisfying nonce, on both

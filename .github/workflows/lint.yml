@@ -1,9 +1,16 @@
-# Formatting + Clippy gate. Runner scheme follows succinctlabs/sp1
-# (.github/workflows/pr.yml `lint` job): runs-on self-hosted runners.
+# Formatting, Clippy and repository static checks for solver pull requests.
 #
-# Both architecture legs matter: arm64 type-checks the NEON kernels, while the
-# x86_64 leg enables a representative AVX-512 target so those kernels cannot
-# accumulate target-specific lint or type-checking failures.
+# Everything here runs on GitHub-hosted runners. None of these checks need
+# benchmark hardware, and the dedicated x86-16c-32gb runner has to stay free
+# for ranked jobs.
+#
+# RUSTFLAGS pin the same portability floor the committed trusted verifier is
+# built with (see benchmark-tools/build-trusted-verifier.sh): AVX2 via
+# x86-64-v3, plus the carry-less-multiply extensions that x86-64-v3 does not
+# imply. It is a fixed target rather than the harness's `-C target-cpu=native`
+# because a hosted runner's CPU model varies between runs, and a lint gate that
+# type-checks a different set of `cfg(target_feature)` kernels from one run to
+# the next is not a gate.
 
 name: Lint
 
@@ -13,75 +20,66 @@ on:
   pull_request:
   merge_group:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
 jobs:
-  lint:
-    name: Formatting & Clippy (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: 16cpu-linux-arm64
-            rustflags: -C target-cpu=native
-          - arch: x86_64-avx512
-            runner: 16cpu-linux-x64
-            rustflags: -C target-cpu=znver4
-    runs-on:
-      [
-        runs-on,
-        "runner=${{ matrix.runner }}",
-        spot=false,
-        "run-id=${{ github.run_id }}",
-      ]
+  rust:
+    name: Formatting & Clippy (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-      RUSTFLAGS: ${{ matrix.rustflags }}
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+aes"
+      RUSTUP_TOOLCHAIN: "1.97.0"
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v6
-
-      - name: Get stable toolchain date (cache key)
-        id: rust-version
-        shell: bash
-        run: |
-          # Cache key tracks the stable release so a new Rust version
-          # invalidates the cached toolchain instead of updating in place
-          # (same scheme as sp1's setup action).
-          STABLE_DATE=$(curl -sS https://static.rust-lang.org/dist/channel-rust-stable-date.txt)
-          echo "date=$STABLE_DATE" >> $GITHUB_OUTPUT
-
-      - name: rust-cache
-        # actions/cache@v4.2.3 (pinned by sha, matching sp1)
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            ~/.rustup/
-            target/
-          key: flock-lint-${{ runner.arch }}-${{ runner.os }}-${{ steps.rust-version.outputs.date }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            flock-lint-${{ runner.arch }}-${{ runner.os }}-${{ steps.rust-version.outputs.date }}-
+          persist-credentials: false
 
-      - name: Install Rust (stable + rustfmt + clippy)
-        shell: bash
+      - name: Install Rust
         run: |
-          if ! command -v rustup &> /dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-            export PATH="$HOME/.cargo/bin:$PATH"
-          fi
-          rustup toolchain install stable --component rustfmt --component clippy
-          rustup default stable
-          rustc --version && cargo fmt --version && cargo clippy --version
+          rustup toolchain install "${RUSTUP_TOOLCHAIN}" --profile minimal \
+            --component rustfmt --component clippy
+          rustc --version
+          cargo fmt --version
+          cargo clippy --version
 
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
         run: cargo clippy --release --workspace --all-targets -- -D warnings
+
+  repo:
+    name: Shell & JSON
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate files
+        run: |
+          shopt -s nullglob
+          scripts=(
+            setup.sh
+            benchmark.sh
+            benchmark-tools/build-trusted-verifier.sh
+            scripts/profile-aggregate.sh
+            .github/scripts/*.sh
+          )
+          bash -n "${scripts[@]}"
+          jq empty benchmark.json

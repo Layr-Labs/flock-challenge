@@ -1,18 +1,5 @@
 use super::super::{F8, F128, InvNttTableByteSingleGf8, N_CHUNKS};
 
-/// Four-lane convert-table fold.
-///
-/// Mirrors [`accumulate_convert_with_s_hat_v`]: four lanes are processed
-/// together so eight independent gather/XOR chains (4 lanes × 2 banks) are in
-/// flight, versus the single chain the previous one-lane-at-a-time loop
-/// exposed. Each convert-table gather is an L1-resident dependent load whose
-/// latency the one-chain form could not hide; the profiled gather and ALU arms
-/// overlap only ~59%, so the win is overlap, not fewer operations.
-///
-/// Bit-exactness: each lane keeps its own accumulator and still XORs exactly
-/// the same table rows in the same `b_med` order, then is scaled by the same
-/// `eq_lo_val` and added into the same `partial_*` slot. Only the interleaving
-/// between independent lanes changes, so every accumulator is bit-identical.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert(
@@ -29,135 +16,35 @@ pub(crate) unsafe fn accumulate_convert(
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        for lane in (0..64).step_by(4) {
-            // 8 live accumulator q-registers (4 lanes × 2 banks) leave ample
-            // headroom in the 32-register file for the gathers in flight and
-            // their address temporaries, so nothing spills.
-            let mut ab0 = vdupq_n_u8(0);
-            let mut ab1 = vdupq_n_u8(0);
-            let mut ab2 = vdupq_n_u8(0);
-            let mut ab3 = vdupq_n_u8(0);
-            let mut c0 = vdupq_n_u8(0);
-            let mut c1 = vdupq_n_u8(0);
-            let mut c2 = vdupq_n_u8(0);
-            let mut c3 = vdupq_n_u8(0);
-            for pair in 0..n_b_med / 2 {
-                let b0 = 2 * pair;
-                let b1 = b0 + 1;
-                let table0 = convert_ptr.add(b0 * 256 * 16);
-                let table1 = convert_ptr.add(b1 * 256 * 16);
-                let ab_word0 =
-                    (chunk_ab_bytes[b0].as_ptr().add(lane) as *const u32).read_unaligned() as usize;
-                let ab_word1 =
-                    (chunk_ab_bytes[b1].as_ptr().add(lane) as *const u32).read_unaligned() as usize;
-                let c_word0 =
-                    (chunk_c_bytes[b0].as_ptr().add(lane) as *const u32).read_unaligned() as usize;
-                let c_word1 =
-                    (chunk_c_bytes[b1].as_ptr().add(lane) as *const u32).read_unaligned() as usize;
-                ab0 = xor3_u8(
-                    ab0,
-                    vld1q_u8(table0.add((ab_word0 & 0xff) * 16)),
-                    vld1q_u8(table1.add((ab_word1 & 0xff) * 16)),
+        for lane in 0..64 {
+            let mut converted_ab = vdupq_n_u8(0);
+            let mut converted_c = vdupq_n_u8(0);
+            for b_med in 0..n_b_med {
+                let ab = chunk_ab_bytes[b_med][lane] as usize;
+                let c = chunk_c_bytes[b_med][lane] as usize;
+                converted_ab = veorq_u8(
+                    converted_ab,
+                    vld1q_u8(convert_ptr.add((b_med * 256 + ab) * 16)),
                 );
-                ab1 = xor3_u8(
-                    ab1,
-                    vld1q_u8(table0.add(((ab_word0 >> 8) & 0xff) * 16)),
-                    vld1q_u8(table1.add(((ab_word1 >> 8) & 0xff) * 16)),
-                );
-                ab2 = xor3_u8(
-                    ab2,
-                    vld1q_u8(table0.add(((ab_word0 >> 16) & 0xff) * 16)),
-                    vld1q_u8(table1.add(((ab_word1 >> 16) & 0xff) * 16)),
-                );
-                ab3 = xor3_u8(
-                    ab3,
-                    vld1q_u8(table0.add((ab_word0 >> 24) * 16)),
-                    vld1q_u8(table1.add((ab_word1 >> 24) * 16)),
-                );
-                c0 = xor3_u8(
-                    c0,
-                    vld1q_u8(table0.add((c_word0 & 0xff) * 16)),
-                    vld1q_u8(table1.add((c_word1 & 0xff) * 16)),
-                );
-                c1 = xor3_u8(
-                    c1,
-                    vld1q_u8(table0.add(((c_word0 >> 8) & 0xff) * 16)),
-                    vld1q_u8(table1.add(((c_word1 >> 8) & 0xff) * 16)),
-                );
-                c2 = xor3_u8(
-                    c2,
-                    vld1q_u8(table0.add(((c_word0 >> 16) & 0xff) * 16)),
-                    vld1q_u8(table1.add(((c_word1 >> 16) & 0xff) * 16)),
-                );
-                c3 = xor3_u8(
-                    c3,
-                    vld1q_u8(table0.add((c_word0 >> 24) * 16)),
-                    vld1q_u8(table1.add((c_word1 >> 24) * 16)),
+                converted_c = veorq_u8(
+                    converted_c,
+                    vld1q_u8(convert_ptr.add((b_med * 256 + c) * 16)),
                 );
             }
-            if n_b_med & 1 == 1 {
-                let b_med = n_b_med - 1;
-                let table = convert_ptr.add(b_med * 256 * 16);
-                let ab_word = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
-                let c_word = (chunk_c_bytes[b_med].as_ptr().add(lane) as *const u32)
-                    .read_unaligned() as usize;
-                ab0 = veorq_u8(ab0, vld1q_u8(table.add((ab_word & 0xff) * 16)));
-                ab1 = veorq_u8(ab1, vld1q_u8(table.add(((ab_word >> 8) & 0xff) * 16)));
-                ab2 = veorq_u8(ab2, vld1q_u8(table.add(((ab_word >> 16) & 0xff) * 16)));
-                ab3 = veorq_u8(ab3, vld1q_u8(table.add((ab_word >> 24) * 16)));
-                c0 = veorq_u8(c0, vld1q_u8(table.add((c_word & 0xff) * 16)));
-                c1 = veorq_u8(c1, vld1q_u8(table.add(((c_word >> 8) & 0xff) * 16)));
-                c2 = veorq_u8(c2, vld1q_u8(table.add(((c_word >> 16) & 0xff) * 16)));
-                c3 = veorq_u8(c3, vld1q_u8(table.add((c_word >> 24) * 16)));
-            }
-
-            macro_rules! drain_lane {
-                ($offset:literal, $ab:ident, $c:ident) => {{
-                    let ab = vreinterpretq_u64_u8($ab);
-                    let c = vreinterpretq_u64_u8($c);
-                    partial_ab[lane + $offset] += F128 {
-                        lo: vgetq_lane_u64::<0>(ab),
-                        hi: vgetq_lane_u64::<1>(ab),
-                    } * eq_lo_val;
-                    partial_c[lane + $offset] += F128 {
-                        lo: vgetq_lane_u64::<0>(c),
-                        hi: vgetq_lane_u64::<1>(c),
-                    } * eq_lo_val;
-                }};
-            }
-            drain_lane!(0, ab0, c0);
-            drain_lane!(1, ab1, c1);
-            drain_lane!(2, ab2, c2);
-            drain_lane!(3, ab3, c3);
+            let ab = vreinterpretq_u64_u8(converted_ab);
+            let c = vreinterpretq_u64_u8(converted_c);
+            partial_ab[lane] += F128 {
+                lo: vgetq_lane_u64::<0>(ab),
+                hi: vgetq_lane_u64::<1>(ab),
+            } * eq_lo_val;
+            partial_c[lane] += F128 {
+                lo: vgetq_lane_u64::<0>(c),
+                hi: vgetq_lane_u64::<1>(c),
+            } * eq_lo_val;
         }
     }
 }
 
-/// Two-bank convert fold, with the C-side gathers halved by `b_med` pairing.
-///
-/// The two C banks select `c & 0x55` and `c & 0xaa`, so each index carries only
-/// 4 live bits while spending a full 256-row lookup — the C side runs at half
-/// its addressing capacity, while the AB side consumes all 8 bits and is
-/// incompressible. Pairing two adjacent `b_med` into one lookup per bank
-/// therefore removes 4 of the 12 gathers per `b_med` per 4-lane group (the C
-/// side goes 8 → 4) at the cost of a few non-dependent integer ops per index.
-///
-/// `m0` / `m1` are [`super::super::paired_c_tables`], laid out `p * 256 + i`.
-/// For pair `p` covering `b_med = 2p, 2p+1`, with
-/// `i0 = (c_2p & 0x55) | ((c_2p1 << 1) & 0xaa)`:
-/// ```text
-/// m0[p][i0] == T_2p[c_2p & 0x55] ^ T_2p1[c_2p1 & 0x55]
-/// ```
-/// which is exactly the two bank-0 terms the unpaired loop XORs across those
-/// `b_med`, and symmetrically for bank 1. The banks never mix, so
-/// `partial_c_0` and `partial_c_1` stay separate. This is an identity, not an
-/// approximation: it follows from `convert` being F2-linear in its index bits
-/// (verified exhaustively by `convert_table_index_linear`), so the result is
-/// bit-identical to the unpaired fold.
-///
-/// An odd trailing `b_med` (only reachable on the padded boundary window) falls
-/// back to the unpaired path.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
@@ -165,8 +52,6 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
     chunk_c_bytes: &[[u8; 64]; 16],
     n_b_med: usize,
     convert: &[F128],
-    m0: &[F128],
-    m1: &[F128],
     eq_lo_val: F128,
     partial_ab: &mut [F128; 64],
     partial_c_0: &mut [F128; 64],
@@ -174,23 +59,14 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
 ) {
     use core::arch::aarch64::*;
 
-    debug_assert!(n_b_med <= 16);
-    debug_assert_eq!(convert.len(), 16 * 256);
-    debug_assert_eq!(m0.len(), 8 * 256);
-    debug_assert_eq!(m1.len(), 8 * 256);
-
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
-    // Every table offset below is a `u8` index scaled by the 16-byte row size,
-    // bounded by the debug-asserted table lengths: `b_med < 16` selects one of
-    // 16 convert blocks, and `p < 8` one of 8 paired blocks.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        let m0_ptr = m0.as_ptr() as *const u8;
-        let m1_ptr = m1.as_ptr() as *const u8;
-        let n_pairs = n_b_med / 2;
         for lane in (0..64).step_by(4) {
-            // 12 live accumulator q-registers (4 lanes × 3 banks); the paired
-            // loop adds only address temporaries, so nothing spills.
+            // Four independent lanes form one lookup wavefront. Keeping the
+            // twelve XOR accumulators live together exposes table-load MLP;
+            // the historical lane-at-a-time order had only three independent
+            // chains before draining into the field multiplier.
             let mut ab0 = vdupq_n_u8(0);
             let mut ab1 = vdupq_n_u8(0);
             let mut ab2 = vdupq_n_u8(0);
@@ -203,150 +79,29 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
             let mut c11 = vdupq_n_u8(0);
             let mut c12 = vdupq_n_u8(0);
             let mut c13 = vdupq_n_u8(0);
-
-            macro_rules! gather_pair {
-                ($p:expr) => {{
-                    let p = $p;
-                    let (b_even, b_odd) = (2 * p, 2 * p + 1);
-                    let t_even = convert_ptr.add(b_even * 256 * 16);
-                    let t_odd = convert_ptr.add(b_odd * 256 * 16);
-                    let q0 = m0_ptr.add(p * 256 * 16);
-                    let q1 = m1_ptr.add(p * 256 * 16);
-
-                    // One u32 load per (side, b_med) covers the 4 adjacent
-                    // lanes; each extracted byte addresses the same table row
-                    // as the original byte-load form.
-                    let we = (chunk_ab_bytes[b_even].as_ptr().add(lane) as *const u32)
-                        .read_unaligned() as usize;
-                    let wo = (chunk_ab_bytes[b_odd].as_ptr().add(lane) as *const u32)
-                        .read_unaligned() as usize;
-                    let e0 = we & 0xff;
-                    let e1 = (we >> 8) & 0xff;
-                    let e2 = (we >> 16) & 0xff;
-                    let e3 = we >> 24;
-                    let o0 = wo & 0xff;
-                    let o1 = (wo >> 8) & 0xff;
-                    let o2 = (wo >> 16) & 0xff;
-                    let o3 = wo >> 24;
-                    ab0 = xor3_u8(
-                        ab0,
-                        vld1q_u8(t_even.add(e0 * 16)),
-                        vld1q_u8(t_odd.add(o0 * 16)),
-                    );
-                    ab1 = xor3_u8(
-                        ab1,
-                        vld1q_u8(t_even.add(e1 * 16)),
-                        vld1q_u8(t_odd.add(o1 * 16)),
-                    );
-                    ab2 = xor3_u8(
-                        ab2,
-                        vld1q_u8(t_even.add(e2 * 16)),
-                        vld1q_u8(t_odd.add(o2 * 16)),
-                    );
-                    ab3 = xor3_u8(
-                        ab3,
-                        vld1q_u8(t_even.add(e3 * 16)),
-                        vld1q_u8(t_odd.add(o3 * 16)),
-                    );
-
-                    // The pairing masks distribute over the word; one
-                    // mask/shift sequence builds all 4 lanes' j and k.
-                    let ce = (chunk_c_bytes[b_even].as_ptr().add(lane) as *const u32)
-                        .read_unaligned() as usize;
-                    let co = (chunk_c_bytes[b_odd].as_ptr().add(lane) as *const u32)
-                        .read_unaligned() as usize;
-                    let jw = (ce & 0x5555_5555) | ((co << 1) & 0xaaaa_aaaa);
-                    let kw = (ce & 0xaaaa_aaaa) | ((co >> 1) & 0x5555_5555);
-                    (q0, q1, jw, kw)
-                }};
-            }
-
-            // Two adjacent paired-C rows feed one EOR3 per bank/lane. The AB
-            // side already folds each pair's even/odd rows in one EOR3.
-            let mut p = 0;
-            while p + 1 < n_pairs {
-                let (q00, q10, jw0, kw0) = gather_pair!(p);
-                let (q01, q11, jw1, kw1) = gather_pair!(p + 1);
-                c00 = xor3_u8(
-                    c00,
-                    vld1q_u8(q00.add((jw0 & 0xff) * 16)),
-                    vld1q_u8(q01.add((jw1 & 0xff) * 16)),
-                );
-                c01 = xor3_u8(
-                    c01,
-                    vld1q_u8(q00.add(((jw0 >> 8) & 0xff) * 16)),
-                    vld1q_u8(q01.add(((jw1 >> 8) & 0xff) * 16)),
-                );
-                c02 = xor3_u8(
-                    c02,
-                    vld1q_u8(q00.add(((jw0 >> 16) & 0xff) * 16)),
-                    vld1q_u8(q01.add(((jw1 >> 16) & 0xff) * 16)),
-                );
-                c03 = xor3_u8(
-                    c03,
-                    vld1q_u8(q00.add((jw0 >> 24) * 16)),
-                    vld1q_u8(q01.add((jw1 >> 24) * 16)),
-                );
-                c10 = xor3_u8(
-                    c10,
-                    vld1q_u8(q10.add((kw0 & 0xff) * 16)),
-                    vld1q_u8(q11.add((kw1 & 0xff) * 16)),
-                );
-                c11 = xor3_u8(
-                    c11,
-                    vld1q_u8(q10.add(((kw0 >> 8) & 0xff) * 16)),
-                    vld1q_u8(q11.add(((kw1 >> 8) & 0xff) * 16)),
-                );
-                c12 = xor3_u8(
-                    c12,
-                    vld1q_u8(q10.add(((kw0 >> 16) & 0xff) * 16)),
-                    vld1q_u8(q11.add(((kw1 >> 16) & 0xff) * 16)),
-                );
-                c13 = xor3_u8(
-                    c13,
-                    vld1q_u8(q10.add((kw0 >> 24) * 16)),
-                    vld1q_u8(q11.add((kw1 >> 24) * 16)),
-                );
-                p += 2;
-            }
-            if p < n_pairs {
-                let (q0, q1, jw, kw) = gather_pair!(p);
-                c00 = veorq_u8(c00, vld1q_u8(q0.add((jw & 0xff) * 16)));
-                c01 = veorq_u8(c01, vld1q_u8(q0.add(((jw >> 8) & 0xff) * 16)));
-                c02 = veorq_u8(c02, vld1q_u8(q0.add(((jw >> 16) & 0xff) * 16)));
-                c03 = veorq_u8(c03, vld1q_u8(q0.add((jw >> 24) * 16)));
-                c10 = veorq_u8(c10, vld1q_u8(q1.add((kw & 0xff) * 16)));
-                c11 = veorq_u8(c11, vld1q_u8(q1.add(((kw >> 8) & 0xff) * 16)));
-                c12 = veorq_u8(c12, vld1q_u8(q1.add(((kw >> 16) & 0xff) * 16)));
-                c13 = veorq_u8(c13, vld1q_u8(q1.add((kw >> 24) * 16)));
-            }
-
-            // Odd trailing b_med: unpaired fallback.
-            if n_b_med & 1 == 1 {
-                let b_med = n_b_med - 1;
+            for b_med in 0..n_b_med {
                 let table = convert_ptr.add(b_med * 256 * 16);
-                let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
-                    as usize;
-                let wc = (chunk_c_bytes[b_med].as_ptr().add(lane) as *const u32).read_unaligned()
-                    as usize;
-                let a0 = wa & 0xff;
-                let a1 = (wa >> 8) & 0xff;
-                let a2 = (wa >> 16) & 0xff;
-                let a3 = wa >> 24;
-                let j = wc & 0x5555_5555;
-                let k = wc & 0xaaaa_aaaa;
+                let a0 = chunk_ab_bytes[b_med][lane] as usize;
+                let a1 = chunk_ab_bytes[b_med][lane + 1] as usize;
+                let a2 = chunk_ab_bytes[b_med][lane + 2] as usize;
+                let a3 = chunk_ab_bytes[b_med][lane + 3] as usize;
+                let c0 = chunk_c_bytes[b_med][lane] as usize;
+                let c1 = chunk_c_bytes[b_med][lane + 1] as usize;
+                let c2 = chunk_c_bytes[b_med][lane + 2] as usize;
+                let c3 = chunk_c_bytes[b_med][lane + 3] as usize;
+
                 ab0 = veorq_u8(ab0, vld1q_u8(table.add(a0 * 16)));
                 ab1 = veorq_u8(ab1, vld1q_u8(table.add(a1 * 16)));
                 ab2 = veorq_u8(ab2, vld1q_u8(table.add(a2 * 16)));
                 ab3 = veorq_u8(ab3, vld1q_u8(table.add(a3 * 16)));
-                c00 = veorq_u8(c00, vld1q_u8(table.add((j & 0xff) * 16)));
-                c01 = veorq_u8(c01, vld1q_u8(table.add(((j >> 8) & 0xff) * 16)));
-                c02 = veorq_u8(c02, vld1q_u8(table.add(((j >> 16) & 0xff) * 16)));
-                c03 = veorq_u8(c03, vld1q_u8(table.add((j >> 24) * 16)));
-                c10 = veorq_u8(c10, vld1q_u8(table.add((k & 0xff) * 16)));
-                c11 = veorq_u8(c11, vld1q_u8(table.add(((k >> 8) & 0xff) * 16)));
-                c12 = veorq_u8(c12, vld1q_u8(table.add(((k >> 16) & 0xff) * 16)));
-                c13 = veorq_u8(c13, vld1q_u8(table.add((k >> 24) * 16)));
+                c00 = veorq_u8(c00, vld1q_u8(table.add((c0 & 0x55) * 16)));
+                c01 = veorq_u8(c01, vld1q_u8(table.add((c1 & 0x55) * 16)));
+                c02 = veorq_u8(c02, vld1q_u8(table.add((c2 & 0x55) * 16)));
+                c03 = veorq_u8(c03, vld1q_u8(table.add((c3 & 0x55) * 16)));
+                c10 = veorq_u8(c10, vld1q_u8(table.add((c0 & 0xaa) * 16)));
+                c11 = veorq_u8(c11, vld1q_u8(table.add((c1 & 0xaa) * 16)));
+                c12 = veorq_u8(c12, vld1q_u8(table.add((c2 & 0xaa) * 16)));
+                c13 = veorq_u8(c13, vld1q_u8(table.add((c3 & 0xaa) * 16)));
             }
 
             macro_rules! drain_lane {
@@ -374,50 +129,6 @@ pub(crate) unsafe fn accumulate_convert_with_s_hat_v(
             drain_lane!(3, ab3, c03, c13);
         }
     }
-}
-
-// The SHA3 extension includes EOR3; retain the two-EOR form for generic
-// AArch64 builds that do not enable it.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-unsafe fn xor3_u64(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-    c: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    unsafe { core::arch::aarch64::veor3q_u64(a, b, c) }
-}
-
-#[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn xor3_u64(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-    c: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    unsafe { core::arch::aarch64::veorq_u64(a, core::arch::aarch64::veorq_u64(b, c)) }
-}
-
-// The SHA3 extension includes EOR3; retain the two-EOR form for generic
-// AArch64 builds that do not enable it.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-unsafe fn xor3_u8(
-    a: core::arch::aarch64::uint8x16_t,
-    b: core::arch::aarch64::uint8x16_t,
-    c: core::arch::aarch64::uint8x16_t,
-) -> core::arch::aarch64::uint8x16_t {
-    unsafe { core::arch::aarch64::veor3q_u8(a, b, c) }
-}
-
-#[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn xor3_u8(
-    a: core::arch::aarch64::uint8x16_t,
-    b: core::arch::aarch64::uint8x16_t,
-    c: core::arch::aarch64::uint8x16_t,
-) -> core::arch::aarch64::uint8x16_t {
-    unsafe { core::arch::aarch64::veorq_u8(a, core::arch::aarch64::veorq_u8(b, c)) }
 }
 
 /// NEON 64-byte bit-transpose. Two-stage:
@@ -459,30 +170,30 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [
         let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<7>(y1)), mask1);
         let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<7>(y2)), mask1);
         let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<7>(y3)), mask1);
-        y0 = xor3_u64(y0, t0, vshlq_n_u64::<7>(t0));
-        y1 = xor3_u64(y1, t1, vshlq_n_u64::<7>(t1));
-        y2 = xor3_u64(y2, t2, vshlq_n_u64::<7>(t2));
-        y3 = xor3_u64(y3, t3, vshlq_n_u64::<7>(t3));
+        y0 = veorq_u64(y0, veorq_u64(t0, vshlq_n_u64::<7>(t0)));
+        y1 = veorq_u64(y1, veorq_u64(t1, vshlq_n_u64::<7>(t1)));
+        y2 = veorq_u64(y2, veorq_u64(t2, vshlq_n_u64::<7>(t2)));
+        y3 = veorq_u64(y3, veorq_u64(t3, vshlq_n_u64::<7>(t3)));
 
         // Round 2: distance 14.
         let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<14>(y0)), mask2);
         let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<14>(y1)), mask2);
         let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<14>(y2)), mask2);
         let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<14>(y3)), mask2);
-        y0 = xor3_u64(y0, t0, vshlq_n_u64::<14>(t0));
-        y1 = xor3_u64(y1, t1, vshlq_n_u64::<14>(t1));
-        y2 = xor3_u64(y2, t2, vshlq_n_u64::<14>(t2));
-        y3 = xor3_u64(y3, t3, vshlq_n_u64::<14>(t3));
+        y0 = veorq_u64(y0, veorq_u64(t0, vshlq_n_u64::<14>(t0)));
+        y1 = veorq_u64(y1, veorq_u64(t1, vshlq_n_u64::<14>(t1)));
+        y2 = veorq_u64(y2, veorq_u64(t2, vshlq_n_u64::<14>(t2)));
+        y3 = veorq_u64(y3, veorq_u64(t3, vshlq_n_u64::<14>(t3)));
 
         // Round 3: distance 28.
         let t0 = vandq_u64(veorq_u64(y0, vshrq_n_u64::<28>(y0)), mask3);
         let t1 = vandq_u64(veorq_u64(y1, vshrq_n_u64::<28>(y1)), mask3);
         let t2 = vandq_u64(veorq_u64(y2, vshrq_n_u64::<28>(y2)), mask3);
         let t3 = vandq_u64(veorq_u64(y3, vshrq_n_u64::<28>(y3)), mask3);
-        y0 = xor3_u64(y0, t0, vshlq_n_u64::<28>(t0));
-        y1 = xor3_u64(y1, t1, vshlq_n_u64::<28>(t1));
-        y2 = xor3_u64(y2, t2, vshlq_n_u64::<28>(t2));
-        y3 = xor3_u64(y3, t3, vshlq_n_u64::<28>(t3));
+        y0 = veorq_u64(y0, veorq_u64(t0, vshlq_n_u64::<28>(t0)));
+        y1 = veorq_u64(y1, veorq_u64(t1, vshlq_n_u64::<28>(t1)));
+        y2 = veorq_u64(y2, veorq_u64(t2, vshlq_n_u64::<28>(t2)));
+        y3 = veorq_u64(y3, veorq_u64(t3, vshlq_n_u64::<28>(t3)));
 
         let out_ptr = output.as_mut_ptr();
         vst1q_u8(out_ptr, vreinterpretq_u8_u64(y0));
@@ -590,18 +301,11 @@ pub(crate) fn shift_reduce_inner_ab_neon(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn byte_from_word<const BYTE: u32>(word: u64) -> usize {
-    debug_assert!(BYTE < 8);
-    ((word >> (BYTE * 8)) & 0xff) as usize
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
 unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
     table_base: *const u8,
     half_swapped_table_base: *const u8,
-    a_byte: usize,
-    b_byte: usize,
+    a_byte: u8,
+    b_byte: u8,
     da0: &mut core::arch::aarch64::uint8x16_t,
     da1: &mut core::arch::aarch64::uint8x16_t,
     da2: &mut core::arch::aarch64::uint8x16_t,
@@ -618,8 +322,8 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
         } else {
             table_base
         };
-        let ra = selected_table.add(a_byte * 64);
-        let rb = selected_table.add(b_byte * 64);
+        let ra = selected_table.add(a_byte as usize * 64);
+        let rb = selected_table.add(b_byte as usize * 64);
         let va0 = vld1q_u8(ra.add((0 ^ BH) * 16));
         let va1 = vld1q_u8(ra.add((1 ^ BH) * 16));
         let va2 = vld1q_u8(ra.add((2 ^ BH) * 16));
@@ -636,88 +340,6 @@ unsafe fn xor_apply_byte_into_8_regs<const BH: usize, const ODD: bool>(
         *db1 = veorq_u8(*db1, vb1);
         *db2 = veorq_u8(*db2, vb2);
         *db3 = veorq_u8(*db3, vb3);
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn xor_apply_byte_pair_into_8_regs<
-    const BH0: usize,
-    const ODD0: bool,
-    const BH1: usize,
-    const ODD1: bool,
->(
-    table_base: *const u8,
-    half_swapped_table_base: *const u8,
-    a_byte0: usize,
-    b_byte0: usize,
-    a_byte1: usize,
-    b_byte1: usize,
-    da0: &mut core::arch::aarch64::uint8x16_t,
-    da1: &mut core::arch::aarch64::uint8x16_t,
-    da2: &mut core::arch::aarch64::uint8x16_t,
-    da3: &mut core::arch::aarch64::uint8x16_t,
-    db0: &mut core::arch::aarch64::uint8x16_t,
-    db1: &mut core::arch::aarch64::uint8x16_t,
-    db2: &mut core::arch::aarch64::uint8x16_t,
-    db3: &mut core::arch::aarch64::uint8x16_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let table0 = if ODD0 {
-            half_swapped_table_base
-        } else {
-            table_base
-        };
-        let table1 = if ODD1 {
-            half_swapped_table_base
-        } else {
-            table_base
-        };
-        let ra0 = table0.add(a_byte0 * 64);
-        let rb0 = table0.add(b_byte0 * 64);
-        let ra1 = table1.add(a_byte1 * 64);
-        let rb1 = table1.add(b_byte1 * 64);
-        *da0 = xor3_u8(
-            *da0,
-            vld1q_u8(ra0.add((0 ^ BH0) * 16)),
-            vld1q_u8(ra1.add((0 ^ BH1) * 16)),
-        );
-        *da1 = xor3_u8(
-            *da1,
-            vld1q_u8(ra0.add((1 ^ BH0) * 16)),
-            vld1q_u8(ra1.add((1 ^ BH1) * 16)),
-        );
-        *da2 = xor3_u8(
-            *da2,
-            vld1q_u8(ra0.add((2 ^ BH0) * 16)),
-            vld1q_u8(ra1.add((2 ^ BH1) * 16)),
-        );
-        *da3 = xor3_u8(
-            *da3,
-            vld1q_u8(ra0.add((3 ^ BH0) * 16)),
-            vld1q_u8(ra1.add((3 ^ BH1) * 16)),
-        );
-        *db0 = xor3_u8(
-            *db0,
-            vld1q_u8(rb0.add((0 ^ BH0) * 16)),
-            vld1q_u8(rb1.add((0 ^ BH1) * 16)),
-        );
-        *db1 = xor3_u8(
-            *db1,
-            vld1q_u8(rb0.add((1 ^ BH0) * 16)),
-            vld1q_u8(rb1.add((1 ^ BH1) * 16)),
-        );
-        *db2 = xor3_u8(
-            *db2,
-            vld1q_u8(rb0.add((2 ^ BH0) * 16)),
-            vld1q_u8(rb1.add((2 ^ BH1) * 16)),
-        );
-        *db3 = xor3_u8(
-            *db3,
-            vld1q_u8(rb0.add((3 ^ BH0) * 16)),
-            vld1q_u8(rb1.add((3 ^ BH1) * 16)),
-        );
     }
 }
 
@@ -742,12 +364,9 @@ unsafe fn fused_apply_one_k<const K: i32>(
     use crate::field::gf2_8::neon::gf8_mul_vec16;
     use core::arch::aarch64::*;
     unsafe {
-        let a_word = u64::from_le(core::ptr::read_unaligned(a_row.cast::<u64>()));
-        let b_word = u64::from_le(core::ptr::read_unaligned(b_row.cast::<u64>()));
-
         // b = 0: identity permutation — plain load of the 4 chunks.
-        let ra0 = table_base.add(byte_from_word::<0>(a_word) * 64);
-        let rb0 = table_base.add(byte_from_word::<0>(b_word) * 64);
+        let ra0 = table_base.add(*a_row as usize * 64);
+        let rb0 = table_base.add(*b_row as usize * 64);
         let mut da0 = vld1q_u8(ra0);
         let mut da1 = vld1q_u8(ra0.add(16));
         let mut da2 = vld1q_u8(ra0.add(32));
@@ -757,14 +376,12 @@ unsafe fn fused_apply_one_k<const K: i32>(
         let mut db2 = vld1q_u8(rb0.add(32));
         let mut db3 = vld1q_u8(rb0.add(48));
 
-        // b = 1..6: consume two table rows per EOR3, permuted per (BH, ODD).
-        xor_apply_byte_pair_into_8_regs::<0, true, 1, false>(
+        // b = 1..7: XOR with table row[bytes[b]], permuted per (BH, ODD).
+        xor_apply_byte_into_8_regs::<0, true>(
             table_base,
             half_swapped_table_base,
-            byte_from_word::<1>(a_word),
-            byte_from_word::<1>(b_word),
-            byte_from_word::<2>(a_word),
-            byte_from_word::<2>(b_word),
+            *a_row.add(1),
+            *b_row.add(1),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -774,13 +391,11 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_pair_into_8_regs::<1, true, 2, false>(
+        xor_apply_byte_into_8_regs::<1, false>(
             table_base,
             half_swapped_table_base,
-            byte_from_word::<3>(a_word),
-            byte_from_word::<3>(b_word),
-            byte_from_word::<4>(a_word),
-            byte_from_word::<4>(b_word),
+            *a_row.add(2),
+            *b_row.add(2),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -790,13 +405,11 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db2,
             &mut db3,
         );
-        xor_apply_byte_pair_into_8_regs::<2, true, 3, false>(
+        xor_apply_byte_into_8_regs::<1, true>(
             table_base,
             half_swapped_table_base,
-            byte_from_word::<5>(a_word),
-            byte_from_word::<5>(b_word),
-            byte_from_word::<6>(a_word),
-            byte_from_word::<6>(b_word),
+            *a_row.add(3),
+            *b_row.add(3),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -806,12 +419,53 @@ unsafe fn fused_apply_one_k<const K: i32>(
             &mut db2,
             &mut db3,
         );
-        // b = 7: one trailing row.
+        xor_apply_byte_into_8_regs::<2, false>(
+            table_base,
+            half_swapped_table_base,
+            *a_row.add(4),
+            *b_row.add(4),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+            &mut db0,
+            &mut db1,
+            &mut db2,
+            &mut db3,
+        );
+        xor_apply_byte_into_8_regs::<2, true>(
+            table_base,
+            half_swapped_table_base,
+            *a_row.add(5),
+            *b_row.add(5),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+            &mut db0,
+            &mut db1,
+            &mut db2,
+            &mut db3,
+        );
+        xor_apply_byte_into_8_regs::<3, false>(
+            table_base,
+            half_swapped_table_base,
+            *a_row.add(6),
+            *b_row.add(6),
+            &mut da0,
+            &mut da1,
+            &mut da2,
+            &mut da3,
+            &mut db0,
+            &mut db1,
+            &mut db2,
+            &mut db3,
+        );
         xor_apply_byte_into_8_regs::<3, true>(
             table_base,
             half_swapped_table_base,
-            byte_from_word::<7>(a_word),
-            byte_from_word::<7>(b_word),
+            *a_row.add(7),
+            *b_row.add(7),
             &mut da0,
             &mut da1,
             &mut da2,
@@ -908,5 +562,217 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon(
         vst1q_u8(p.add(16), r1);
         vst1q_u8(p.add(32), r2);
         vst1q_u8(p.add(48), r3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Two-window software wavefront: process b_med windows `w` and `w + 1` in a
+// single call with two fully independent register sets, interleaved per
+// K-row (w0-K, w1-K, w0-K+1, w1-K+1, ...).
+//
+// Rationale: one window's K-row is a bundle of 8 serial depth-7 XOR chains
+// (da0..3 / db0..3), each link gated on a 16-byte table load — the stall
+// source on M4 P-cores. Alternating K-rows from two independent windows
+// keeps ~2x the independent work inside the scheduler window so the second
+// window's table loads issue under the first window's XOR-tree tail.
+//
+// Register budget: the 16 u16x8 accumulators (two full sets) stay live for
+// the whole body, but only ONE window's 8 da/db lookup registers are live at
+// any point (they die at that window's gf8_mul), so peak pressure is
+// 16 + 8 + short-lived load/mul temps ≤ ~28 of 32 q-registers — no spills.
+// Interleaving finer than K-row granularity would need both windows' da/db
+// sets live at once (16 + 16 = 32 + temps → guaranteed spills), and a
+// 4-window variant blows the budget the same way; both rejected by design.
+//
+// Values are bit-identical to two `shift_reduce_inner_ab_fused_neon` calls:
+// the two windows share no state, and each window performs the exact same
+// loads, XORs, muls, and shift-XOR accumulation as the single-window path.
+// ---------------------------------------------------------------------------
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn shift_reduce_inner_ab_fused_neon_x2(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    out0: &mut [u8; 64],
+    out1: &mut [u8; 64],
+) {
+    use crate::field::gf2_8::neon::gf8_reduce_vec16;
+    use core::arch::aarch64::*;
+
+    let byte_base_b0 = chunk_byte_base + b_med * N_CHUNKS * 8;
+    let byte_base_b1 = chunk_byte_base + (b_med + 1) * N_CHUNKS * 8;
+    let table_base = inv_table.data_ptr();
+    let half_swapped_table_base = inv_table.half_swapped_data_ptr();
+
+    unsafe {
+        // Window 0 accumulators.
+        let mut w0_acc0_lo = vdupq_n_u16(0);
+        let mut w0_acc0_hi = vdupq_n_u16(0);
+        let mut w0_acc1_lo = vdupq_n_u16(0);
+        let mut w0_acc1_hi = vdupq_n_u16(0);
+        let mut w0_acc2_lo = vdupq_n_u16(0);
+        let mut w0_acc2_hi = vdupq_n_u16(0);
+        let mut w0_acc3_lo = vdupq_n_u16(0);
+        let mut w0_acc3_hi = vdupq_n_u16(0);
+        // Window 1 accumulators.
+        let mut w1_acc0_lo = vdupq_n_u16(0);
+        let mut w1_acc0_hi = vdupq_n_u16(0);
+        let mut w1_acc1_lo = vdupq_n_u16(0);
+        let mut w1_acc1_hi = vdupq_n_u16(0);
+        let mut w1_acc2_lo = vdupq_n_u16(0);
+        let mut w1_acc2_hi = vdupq_n_u16(0);
+        let mut w1_acc3_lo = vdupq_n_u16(0);
+        let mut w1_acc3_hi = vdupq_n_u16(0);
+
+        // Per K: window 0's K-row then window 1's K-row — two independent
+        // instruction streams back to back for the runtime OoO engine to
+        // overlap. `pin_accs` is a compile-time-only fence (empty asm, zero
+        // instructions emitted) that (a) clobbers memory, so no table load
+        // may be hoisted or sunk across a segment boundary, and (b) takes
+        // the segment's 8 accumulators as `inout(vreg)` operands, so the
+        // whole segment — loads, XOR tree, gf8 mul, widen-shift-XOR — must
+        // be fully scheduled inside its boundaries. Without it LLVM merges
+        // all 16 lookup streams into one region (16 accs + 16 da/db sets
+        // live at once) and spills the entire kernel state to the stack.
+        // Register pressure per segment stays at 16 accs + 8 lookup regs +
+        // mul temps/constants ≤ ~30 of 32 q-registers.
+        #[inline(always)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn pin_accs(
+            a0: &mut core::arch::aarch64::uint16x8_t,
+            a1: &mut core::arch::aarch64::uint16x8_t,
+            a2: &mut core::arch::aarch64::uint16x8_t,
+            a3: &mut core::arch::aarch64::uint16x8_t,
+            a4: &mut core::arch::aarch64::uint16x8_t,
+            a5: &mut core::arch::aarch64::uint16x8_t,
+            a6: &mut core::arch::aarch64::uint16x8_t,
+            a7: &mut core::arch::aarch64::uint16x8_t,
+        ) {
+            unsafe {
+                core::arch::asm!(
+                    "/* pin {0:v} {1:v} {2:v} {3:v} {4:v} {5:v} {6:v} {7:v} */",
+                    inout(vreg) * a0,
+                    inout(vreg) * a1,
+                    inout(vreg) * a2,
+                    inout(vreg) * a3,
+                    inout(vreg) * a4,
+                    inout(vreg) * a5,
+                    inout(vreg) * a6,
+                    inout(vreg) * a7,
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
+
+        macro_rules! do_k_x2 {
+            ($k:literal) => {{
+                let off0 = byte_base_b0 + $k * N_CHUNKS;
+                fused_apply_one_k::<$k>(
+                    table_base,
+                    half_swapped_table_base,
+                    a_packed.as_ptr().add(off0),
+                    b_packed.as_ptr().add(off0),
+                    &mut w0_acc0_lo,
+                    &mut w0_acc0_hi,
+                    &mut w0_acc1_lo,
+                    &mut w0_acc1_hi,
+                    &mut w0_acc2_lo,
+                    &mut w0_acc2_hi,
+                    &mut w0_acc3_lo,
+                    &mut w0_acc3_hi,
+                );
+                pin_accs(
+                    &mut w0_acc0_lo,
+                    &mut w0_acc0_hi,
+                    &mut w0_acc1_lo,
+                    &mut w0_acc1_hi,
+                    &mut w0_acc2_lo,
+                    &mut w0_acc2_hi,
+                    &mut w0_acc3_lo,
+                    &mut w0_acc3_hi,
+                );
+                let off1 = byte_base_b1 + $k * N_CHUNKS;
+                fused_apply_one_k::<$k>(
+                    table_base,
+                    half_swapped_table_base,
+                    a_packed.as_ptr().add(off1),
+                    b_packed.as_ptr().add(off1),
+                    &mut w1_acc0_lo,
+                    &mut w1_acc0_hi,
+                    &mut w1_acc1_lo,
+                    &mut w1_acc1_hi,
+                    &mut w1_acc2_lo,
+                    &mut w1_acc2_hi,
+                    &mut w1_acc3_lo,
+                    &mut w1_acc3_hi,
+                );
+                pin_accs(
+                    &mut w1_acc0_lo,
+                    &mut w1_acc0_hi,
+                    &mut w1_acc1_lo,
+                    &mut w1_acc1_hi,
+                    &mut w1_acc2_lo,
+                    &mut w1_acc2_hi,
+                    &mut w1_acc3_lo,
+                    &mut w1_acc3_hi,
+                );
+            }};
+        }
+        do_k_x2!(0);
+        do_k_x2!(1);
+        do_k_x2!(2);
+        do_k_x2!(3);
+        do_k_x2!(4);
+        do_k_x2!(5);
+        do_k_x2!(6);
+        do_k_x2!(7);
+
+        // Reduce 16-bit accs → 16-byte F_8 results (4 × 16 lanes per window).
+        let r0 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w0_acc0_lo),
+            vreinterpretq_u8_u16(w0_acc0_hi),
+        );
+        let r1 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w0_acc1_lo),
+            vreinterpretq_u8_u16(w0_acc1_hi),
+        );
+        let r2 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w0_acc2_lo),
+            vreinterpretq_u8_u16(w0_acc2_hi),
+        );
+        let r3 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w0_acc3_lo),
+            vreinterpretq_u8_u16(w0_acc3_hi),
+        );
+        let s0 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w1_acc0_lo),
+            vreinterpretq_u8_u16(w1_acc0_hi),
+        );
+        let s1 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w1_acc1_lo),
+            vreinterpretq_u8_u16(w1_acc1_hi),
+        );
+        let s2 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w1_acc2_lo),
+            vreinterpretq_u8_u16(w1_acc2_hi),
+        );
+        let s3 = gf8_reduce_vec16(
+            vreinterpretq_u8_u16(w1_acc3_lo),
+            vreinterpretq_u8_u16(w1_acc3_hi),
+        );
+
+        let p0 = out0.as_mut_ptr();
+        vst1q_u8(p0, r0);
+        vst1q_u8(p0.add(16), r1);
+        vst1q_u8(p0.add(32), r2);
+        vst1q_u8(p0.add(48), r3);
+        let p1 = out1.as_mut_ptr();
+        vst1q_u8(p1, s0);
+        vst1q_u8(p1.add(16), s1);
+        vst1q_u8(p1.add(32), s2);
+        vst1q_u8(p1.add(48), s3);
     }
 }
