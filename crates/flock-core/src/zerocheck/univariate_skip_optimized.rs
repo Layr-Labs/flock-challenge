@@ -1968,6 +1968,15 @@ pub const ENV_ZC_AB_EQ_FOLD_S: &str = "FLOCK_ZC_AB_EQ_FOLD_S";
 /// unchanged.
 pub const ENV_NO_ZC_AB_BANK_DEFERRED: &str = "FLOCK_NO_ZC_AB_BANK_DEFERRED";
 
+/// Same-binary rollback for the quad-lane fold kernel: only literal
+/// `FLOCK_NO_ZC_AB_QUAD=1` restores the paired-lane kernel. Output is
+/// bit-identical either way; the selector exists for differential probing.
+pub const ENV_NO_ZC_AB_QUAD: &str = "FLOCK_NO_ZC_AB_QUAD";
+
+fn zc_ab_quad_enabled() -> bool {
+    std::env::var_os(ENV_NO_ZC_AB_QUAD).as_deref() != Some(std::ffi::OsStr::new("1"))
+}
+
 /// `x_lo` bits kept in the pre-scaled table index; the rest select the bank.
 const AB_EQ_FOLD_TABLE_BITS: usize = 5;
 
@@ -2164,7 +2173,11 @@ fn finish_ab_eq_fold_banks(
         let weights: &[F128; 128] = eq_bot
             .try_into()
             .expect("ranked deferred fold has exactly 128 weights");
-        crate::field::f128_slice::fold_bank_major_128x64_rows2(weights, banks, partial_ab);
+        if zc_ab_quad_enabled() {
+            crate::field::f128_slice::fold_bank_major_128x64_rows4(weights, banks, partial_ab);
+        } else {
+            crate::field::f128_slice::fold_bank_major_128x64_rows2(weights, banks, partial_ab);
+        }
     } else {
         partial_ab.fill(F128::ZERO);
         for (bank, eq_bot_val) in banks.chunks_exact(ELL).zip(eq_bot) {
