@@ -562,6 +562,79 @@ pub(super) unsafe fn fold_bank_major_128x64_rows2(
     }
 }
 
+/// Quad-lane variant of [`fold_bank_major_128x64_rows2`]: four adjacent lanes
+/// share each of the 128 weight loads. Same math per lane (identical output),
+/// half the weight-load traffic and a quarter of the row-pointer advances.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `input` must contain exactly
+/// 128 consecutive rows of 64 [`F128`] values.
+#[inline(never)]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_bank_major_128x64_rows4(
+    // Quad-lane fold: four input rows share each weight load, halving the
+    // weight-load traffic of the paired-lane rows2 kernel. Selected at
+    // runtime unless FLOCK_NO_ZC_AB_QUAD=1 (bit-exact, see the rows4-vs-
+    // rows2 oracle test). r856: draw marker, no code change.
+    weight: &[F128; 128],
+    input: &[F128],
+    output: &mut [F128; 64],
+) {
+    unsafe {
+        debug_assert_eq!(input.len(), 128 * 64);
+        let zero = vdupq_n_u64(0);
+        let wp = weight.as_ptr();
+        let xp = input.as_ptr();
+        let out = output.as_mut_ptr();
+
+        let mut lane = 0usize;
+        while lane < 64 {
+            let mut acc0 = KaratsubaNeon {
+                ll: zero,
+                hh: zero,
+                mm: zero,
+            };
+            let mut acc1 = KaratsubaNeon {
+                ll: zero,
+                hh: zero,
+                mm: zero,
+            };
+            let mut acc2 = KaratsubaNeon {
+                ll: zero,
+                hh: zero,
+                mm: zero,
+            };
+            let mut acc3 = KaratsubaNeon {
+                ll: zero,
+                hh: zero,
+                mm: zero,
+            };
+
+            let mut bank = 0usize;
+            let mut row = xp.add(lane);
+            while bank < 128 {
+                let wk = vld1q_u64(wp.add(bank).cast::<u64>());
+                let x0 = vld1q_u64(row.cast::<u64>());
+                let x1 = vld1q_u64(row.add(1).cast::<u64>());
+                let x2 = vld1q_u64(row.add(2).cast::<u64>());
+                let x3 = vld1q_u64(row.add(3).cast::<u64>());
+                xor_karatsuba_const_pair(&mut acc0, &mut acc1, x0, x1, wk);
+                xor_karatsuba_const_pair(&mut acc2, &mut acc3, x2, x3, wk);
+                bank += 1;
+                row = row.add(64);
+            }
+
+            let reduced01 = reduce_wide_pair(karatsuba_to_wide(acc0), karatsuba_to_wide(acc1));
+            let reduced23 = reduce_wide_pair(karatsuba_to_wide(acc2), karatsuba_to_wide(acc3));
+            vst1q_u64(out.add(lane).cast::<u64>(), reduced01[0]);
+            vst1q_u64(out.add(lane + 1).cast::<u64>(), reduced01[1]);
+            vst1q_u64(out.add(lane + 2).cast::<u64>(), reduced23[0]);
+            vst1q_u64(out.add(lane + 3).cast::<u64>(), reduced23[1]);
+            lane += 4;
+        }
+    }
+}
+
 /// Deferred-reduction round-zero message `(u_0, u_2)` over paired slots.
 ///
 /// Bitwise-identical to the scalar pair loop: both accumulate

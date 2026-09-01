@@ -186,6 +186,39 @@ pub(crate) fn fold_bank_major_128x64_rows2(
     }
 }
 
+/// Quad-lane counterpart of [`fold_bank_major_128x64_rows2`]: identical
+/// arithmetic, four lanes per shared weight load. Draw r857.
+#[inline]
+pub(crate) fn fold_bank_major_128x64_rows4(
+    weight: &[F128; 128],
+    input: &[F128],
+    output: &mut [F128; 64],
+) {
+    assert_eq!(
+        input.len(),
+        128 * 64,
+        "ranked AB bank fold requires exactly 128 banks by 64 lanes"
+    );
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies PMULL through `aes`; the exact input and
+    // output shapes are established by the types and assertion above.
+    unsafe {
+        aarch64::fold_bank_major_128x64_rows4(weight, input, output)
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        for lane in 0..64 {
+            let mut value = F128::ZERO;
+            for bank in 0..128 {
+                value += weight[bank] * input[bank * 64 + lane];
+            }
+            output[lane] = value;
+        }
+    }
+}
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where
@@ -1133,6 +1166,72 @@ mod tests {
             let random_x: Vec<F128> = (0..128 * 64).map(|_| F128::new(next(), next())).collect();
             check(&format!("random-{trial}"), &random_w, &random_x);
         }
+    }
+
+    /// Quad-lane fold: same fully-reduced oracle, plus byte-equality with the
+    /// paired-lane kernel on the same inputs, plus a print-only relative
+    /// throughput probe (no assertion — CI noise would be flaky).
+    #[test]
+    fn bank_major_128x64_rows4_matches_oracle_and_rows2() {
+        fn oracle(weight: &[F128; 128], input: &[F128]) -> [F128; 64] {
+            assert_eq!(input.len(), 128 * 64);
+            std::array::from_fn(|lane| {
+                let mut value = F128::ZERO;
+                for bank in 0..128 {
+                    value += weight[bank] * input[bank * 64 + lane];
+                }
+                value
+            })
+        }
+
+        let mut state = 0xa409_3822_299f_31d0_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for trial in 0..4 {
+            let random_w: [F128; 128] = std::array::from_fn(|_| F128::new(next(), next()));
+            let random_x: Vec<F128> = (0..128 * 64).map(|_| F128::new(next(), next())).collect();
+            let expected = oracle(&random_w, &random_x);
+            let mut actual = [F128::ZERO; 64];
+            fold_bank_major_128x64_rows4(&random_w, &random_x, &mut actual);
+            assert_eq!(actual, expected, "rows4 vs oracle, trial={trial}");
+            let mut via_rows2 = [F128::ZERO; 64];
+            fold_bank_major_128x64_rows2(&random_w, &random_x, &mut via_rows2);
+            assert_eq!(actual, via_rows2, "rows4 vs rows2, trial={trial}");
+        }
+
+        // Print-only throughput probe over 512 repeats of a fixed draw.
+        let random_w: [F128; 128] = std::array::from_fn(|_| F128::new(next(), next()));
+        let random_x: Vec<F128> = (0..128 * 64).map(|_| F128::new(next(), next())).collect();
+        let mut sink = [F128::ZERO; 64];
+        let iters = 512u32;
+        let t2 = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(fold_bank_major_128x64_rows2(
+                std::hint::black_box(&random_w),
+                std::hint::black_box(&random_x),
+                std::hint::black_box(&mut sink),
+            ));
+        }
+        let rows2_ns = t2.elapsed().as_nanos() as f64 / iters as f64;
+        let t4 = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(fold_bank_major_128x64_rows4(
+                std::hint::black_box(&random_w),
+                std::hint::black_box(&random_x),
+                std::hint::black_box(&mut sink),
+            ));
+        }
+        let rows4_ns = t4.elapsed().as_nanos() as f64 / iters as f64;
+        eprintln!(
+            "fold128x64 probe: rows2 {:.0} ns/fold, rows4 {:.0} ns/fold, ratio rows4/rows2 = {:.3}",
+            rows2_ns,
+            rows4_ns,
+            rows4_ns / rows2_ns
+        );
     }
 
     /// Oracle for the deferred-reduction round-zero kernel that replaces the
