@@ -50,11 +50,20 @@ unsafe fn karatsuba_products_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let p0 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
-        let p2 = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
+        let p0 = core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
+            vgetq_lane_u64::<0>(a),
+            vgetq_lane_u64::<0>(b),
+        ));
+        let p2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(a),
+            vreinterpretq_p64_u64(b),
+        ));
         let a_sum = veorq_u64(a, vextq_u64::<1>(a, a));
         let b_sum = veorq_u64(b, vextq_u64::<1>(b, b));
-        let pm = pmull_lane(vgetq_lane_u64::<0>(a_sum), vgetq_lane_u64::<0>(b_sum));
+        let pm = core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
+            vgetq_lane_u64::<0>(a_sum),
+            vgetq_lane_u64::<0>(b_sum),
+        ));
         let cross = xor3_u64(pm, p0, p2);
         (p0, cross, p2)
     }
@@ -680,7 +689,6 @@ unsafe fn r2_pair_fold_and_store(
     a_packed: *const u8,
     b_packed: *const u8,
     anchors: *mut F128,
-    deltas: *mut u8,
     x_lo: usize,
     padded: bool,
     degen: bool,
@@ -691,6 +699,7 @@ unsafe fn r2_pair_fold_and_store(
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
     bool,
+    core::arch::aarch64::uint64x2_t,
 ) {
     use core::arch::aarch64::*;
 
@@ -711,8 +720,7 @@ unsafe fn r2_pair_fold_and_store(
         let zero = vdupq_n_u64(0);
         if padded {
             store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
-            return (zero, zero, zero, zero, false);
+            return (zero, zero, zero, zero, false, zero);
         }
 
         let row0 = 2 * x_lo;
@@ -734,8 +742,7 @@ unsafe fn r2_pair_fold_and_store(
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
             let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-            return (a0, a1, b_ones, b_ones, true);
+            return (a0, a1, b_ones, b_ones, true, delta_pair);
         }
 
         let (a0, a1, b0, b1) =
@@ -743,8 +750,92 @@ unsafe fn r2_pair_fold_and_store(
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
         let delta_pair =
             core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-        (a0, a1, b0, b1, false)
+        (a0, a1, b0, b1, false, delta_pair)
+    }
+}
+
+#[inline(always)]
+unsafe fn r2_group_fold_and_store_unpadded(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    u: usize,
+    degen: bool,
+    b_ones: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    bool,
+    bool,
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn store_delta_pair_nt(dst: *mut u8, d0: uint64x2_t, d1: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) d0,
+                b = in(vreg) d1,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    unsafe {
+        let [a0_code, a1_code, a2_code, a3_code] =
+            core::ptr::read_unaligned(a_packed.add(32 * u).cast::<[u64; 4]>());
+        let [b0_code, b1_code, b2_code, b3_code] =
+            core::ptr::read_unaligned(b_packed.add(32 * u).cast::<[u64; 4]>());
+
+        let deg0 = degen && (b0_code & b1_code) == u64::MAX;
+        let deg1 = degen && (b2_code & b3_code) == u64::MAX;
+
+        let (a0, a1, b0, b1, d0) = if deg0 {
+            let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+            store_anchor_pair_nt(anchors.add(4 * u), a0, b_ones);
+            (a0, a1, b_ones, b_ones, core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]))
+        } else {
+            let (a0, a1, b0, b1) = fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+            store_anchor_pair_nt(anchors.add(4 * u), a0, b0);
+            (a0, a1, b0, b1, core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]))
+        };
+
+        let (a2, a3, b2, b3, d1) = if deg1 {
+            let (a2, a3) = fold_two_row_codes_q(table_data, a2_code, a3_code);
+            store_anchor_pair_nt(anchors.add(4 * u + 2), a2, b_ones);
+            (a2, a3, b_ones, b_ones, core::mem::transmute::<[u64; 2], uint64x2_t>([a2_code ^ a3_code, 0]))
+        } else {
+            let (a2, a3, b2, b3) = fold_four_row_codes_q(table_data, a2_code, a3_code, b2_code, b3_code);
+            store_anchor_pair_nt(anchors.add(4 * u + 2), a2, b2);
+            (a2, a3, b2, b3, core::mem::transmute::<[u64; 2], uint64x2_t>([a2_code ^ a3_code, b2_code ^ b3_code]))
+        };
+
+        store_delta_pair_nt(deltas.add(32 * u), d0, d1);
+
+        (a0, a1, b0, b1, a2, a3, b2, b3, deg0, deg1)
     }
 }
 
@@ -821,6 +912,19 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
         }
     }
 
+    #[inline(always)]
+    unsafe fn store_delta_pair_nt(dst: *mut u8, d0: uint64x2_t, d1: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) d0,
+                b = in(vreg) d1,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
     unsafe {
         let zero = vdupq_n_u64(0);
         let mut p1_even = WideNeon { lo: zero, hi: zero };
@@ -844,9 +948,8 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let x_lo0 = 2 * $u;
                 let x_lo1 = x_lo0 + 1;
                 store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
                 store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                store_delta_pair_nt(deltas.add(x_lo0 * 16), zero, zero);
             }};
         }
 
@@ -857,12 +960,13 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let pad0 = $pad0;
                 let pad1 = $pad1;
 
-                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
+                let (a0, a1, b0, b1, deg0, delta0) = r2_pair_fold_and_store(
+                    table_data, a_packed, b_packed, anchors, x_lo0, pad0, degen, b_ones,
                 );
-                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
+                let (a2, a3, b2, b3, deg1, delta1) = r2_pair_fold_and_store(
+                    table_data, a_packed, b_packed, anchors, x_lo1, pad1, degen, b_ones,
                 );
+                store_delta_pair_nt(deltas.add(x_lo0 * 16), delta0, delta1);
 
                 // The odd lane's weight drives the whole group; see the doc above.
                 let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
@@ -924,6 +1028,64 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             }};
         }
 
+        macro_rules! process_group_unpadded {
+            ($u:expr) => {{
+                let (a0, a1, b0, b1, a2, a3, b2, b3, deg0, deg1) =
+                    r2_group_fold_and_store_unpadded(
+                        table_data, a_packed, b_packed, anchors, deltas, $u, degen, b_ones,
+                    );
+
+                let x_lo1 = 2 * $u + 1;
+                let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
+
+                if deg0 & deg1 & ones_is_one {
+                    if FULL {
+                        wide_xor(&mut p1_even, mul_unreduced_q(w, a1));
+                    }
+                    if !ODD_ON_GPU {
+                        wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
+                    }
+                    wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                } else {
+                    let a0w = mul_q(w, a0);
+                    let a1w = mul_q(w, a1);
+                    let a2w = mul_q(w, a2);
+                    let a3w = mul_q(w, a3);
+
+                    if FULL {
+                        wide_xor(&mut p1_even, mul_unreduced_q(a1w, b1));
+                        if !deg0 {
+                            wide_xor(
+                                &mut pinf_even,
+                                mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)),
+                            );
+                        }
+                    }
+                    if !ODD_ON_GPU {
+                        wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
+                        if !deg1 {
+                            wide_xor(
+                                &mut pinf_odd,
+                                mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
+                            );
+                        }
+                    }
+                    wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+
+                    let e_aw = veorq_u64(a0w, a2w);
+                    let o_aw = veorq_u64(a1w, a3w);
+                    let e_b = veorq_u64(b0, b2);
+                    let o_b = veorq_u64(b1, b3);
+                    wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+                    wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+                    wide_xor(
+                        &mut w5,
+                        mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                    );
+                }
+            }};
+        }
+
         let n_groups = lo_size / 2;
         let ranked_periodic = periodic_padding
             && pair_in_block_mask == 127
@@ -934,7 +1096,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             for block in 0..n_groups / 64 {
                 let first = block * 64;
                 for u in first..first + 60 {
-                    process_group!(u, false, false);
+                    process_group_unpadded!(u);
                 }
                 process_group!(first + 60, false, true);
                 for u in first + 61..first + 64 {
