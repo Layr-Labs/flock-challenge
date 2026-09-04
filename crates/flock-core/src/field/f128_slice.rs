@@ -72,6 +72,18 @@ pub(crate) fn round0_factorized_eq(f: &[F128], eq_tail: &[F128]) -> (F128, F128)
     portable::round0_factorized_eq(f, eq_tail)
 }
 
+#[cfg(test)]
+fn round0_factorized_eq_baseline(f: &[F128], eq_tail: &[F128]) -> (F128, F128) {
+    assert_eq!(f.len(), 2 * eq_tail.len());
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: feature guard supplies PMULL and slice shape was checked.
+        unsafe { aarch64::round0_factorized_eq_baseline(f, eq_tail) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    { portable::round0_factorized_eq(f, eq_tail) }
+}
+
 /// Expand one level of an equality table from its populated low half into an
 /// equally sized high half. Both architecture paths implement, exactly,
 /// `hi[i] = lo_old[i] * r` and `lo[i] = lo_old[i] + hi[i]`.
@@ -587,6 +599,55 @@ mod tests {
             let expected = portable::round0_factorized_eq(&f, &eq_tail);
             let actual = round0_factorized_eq(&f, &eq_tail);
             assert_eq!(actual, expected, "tail_len={tail_len}");
+            assert_eq!(round0_factorized_eq_baseline(&f, &eq_tail), expected);
+        }
+    }
+
+    /// Fixed local arithmetic assay against the submitted incumbent.
+    #[test]
+    #[ignore = "manual paired factorized equality timing"]
+    fn factorized_eq_eor3_arithmetic_timing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut state = 0x319d_a760_825b_c4efu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let eq: Vec<F128> = (0..2048).map(|_| F128::new(next(), next())).collect();
+        let input: Vec<F128> = (0..4096 * 64).map(|_| F128::new(next(), next())).collect();
+        for f in input.chunks_exact(4096) {
+            assert_eq!(round0_factorized_eq_baseline(f, &eq), round0_factorized_eq(f, &eq));
+        }
+        let passes = std::env::var("FLOCK_FACTOR_EQ_PASSES")
+            .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1024);
+        assert!((1..=8192).contains(&passes));
+        let time = |candidate: bool| {
+            let start = Instant::now();
+            for _ in 0..passes {
+                for f in input.chunks_exact(4096) {
+                    let result = if candidate {
+                        round0_factorized_eq(black_box(f), black_box(&eq))
+                    } else {
+                        round0_factorized_eq_baseline(black_box(f), black_box(&eq))
+                    };
+                    black_box(result);
+                }
+            }
+            start.elapsed().as_secs_f64()
+        };
+        black_box(time(false));
+        black_box(time(true));
+        for trial in 0..8 {
+            let (baseline, candidate) = if trial % 2 == 0 {
+                (time(false), time(true))
+            } else {
+                let c = time(true);
+                (time(false), c)
+            };
+            println!("arithmetic_trial={trial} baseline_seconds={baseline:.9} candidate_seconds={candidate:.9} candidate_over_baseline={:.6}", candidate / baseline);
         }
     }
 

@@ -670,6 +670,65 @@ pub(super) unsafe fn round0_factorized_eq(f: &[F128], eq_tail: &[F128]) -> (F128
             let w_0 = vld1q_u64(wp.add(j).cast::<u64>());
             let w_1 = vld1q_u64(wp.add(j + 1).cast::<u64>());
 
+            // Fuse the accumulator and two consecutive product components.
+            // xor3_u64 keeps the existing SHA3 feature guard and fallback.
+            let empty = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+            let (mut a0, mut b0, mut a1, mut b1) = (empty, empty, empty, empty);
+            xor_karatsuba_const_pair(&mut a0, &mut b0, f_00, f_01, w_0);
+            xor_karatsuba_const_pair(&mut a1, &mut b1, f_10, f_11, w_1);
+            a.ll = xor3_u64(a.ll, a0.ll, a1.ll);
+            a.hh = xor3_u64(a.hh, a0.hh, a1.hh);
+            a.mm = xor3_u64(a.mm, a0.mm, a1.mm);
+            odd.ll = xor3_u64(odd.ll, b0.ll, b1.ll);
+            odd.hh = xor3_u64(odd.hh, b0.hh, b1.hh);
+            odd.mm = xor3_u64(odd.mm, b0.mm, b1.mm);
+            j += 2;
+        }
+        if j < eq_tail.len() {
+            let f_0 = vld1q_u64(fp.add(2 * j).cast::<u64>());
+            let f_1 = vld1q_u64(fp.add(2 * j + 1).cast::<u64>());
+            let w = vld1q_u64(wp.add(j).cast::<u64>());
+            xor_karatsuba_const_pair(&mut a, &mut odd, f_0, f_1, w);
+        }
+
+        let a_reduced = reduce_wide(karatsuba_to_wide(a));
+        let odd_reduced = reduce_wide(karatsuba_to_wide(odd));
+        let s_reduced = veorq_u64(a_reduced, odd_reduced);
+        (transmute(a_reduced), transmute(s_reduced))
+    }
+}
+
+// Literal submitted-incumbent control for local arithmetic diagnostics.
+#[cfg(test)]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn round0_factorized_eq_baseline(f: &[F128], eq_tail: &[F128]) -> (F128, F128) {
+    unsafe {
+        debug_assert_eq!(f.len(), 2 * eq_tail.len());
+
+        let zero = vdupq_n_u64(0);
+        let mut a = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut odd = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+
+        let fp = f.as_ptr();
+        let wp = eq_tail.as_ptr();
+        let main = eq_tail.len() & !1;
+        let mut j = 0usize;
+        while j < main {
+            let f_00 = vld1q_u64(fp.add(2 * j).cast::<u64>());
+            let f_01 = vld1q_u64(fp.add(2 * j + 1).cast::<u64>());
+            let f_10 = vld1q_u64(fp.add(2 * j + 2).cast::<u64>());
+            let f_11 = vld1q_u64(fp.add(2 * j + 3).cast::<u64>());
+            let w_0 = vld1q_u64(wp.add(j).cast::<u64>());
+            let w_1 = vld1q_u64(wp.add(j + 1).cast::<u64>());
+
             xor_karatsuba_const_pair(&mut a, &mut odd, f_00, f_01, w_0);
             xor_karatsuba_const_pair(&mut a, &mut odd, f_10, f_11, w_1);
             j += 2;
