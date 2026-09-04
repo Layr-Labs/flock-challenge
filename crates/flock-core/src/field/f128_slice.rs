@@ -149,6 +149,19 @@ pub(crate) fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+#[cfg(test)]
+#[inline]
+fn fold_banked_slots2_baseline<const BANKS: usize>(weight: &[F128; BANKS], input: &[F128]) -> [F128; 2] {
+    assert!(input.len() >= 2 * BANKS);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the feature gate supplies PMULL; both complete slots exist.
+        unsafe { aarch64::fold_banked_slots2_baseline(weight, input) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    { fold_banked_slots2(weight, input) }
+}
+
 /// Fold the ranked zerocheck AB bank matrix, laid out bank-major, into its
 /// 64 lane sums. Two adjacent lanes share each of the 128 weight loads, and
 /// each lane's complete product sum is reduced only once.
@@ -1043,6 +1056,91 @@ mod tests {
                 ],
                 "pair banks=6 trial={trial}"
             );
+        }
+    }
+
+    #[test]
+    fn paired_fold_eor3_matches_scalar_and_original() {
+        fn check<const B: usize>() {
+            let mut state = 0x12f8_66da_c831_097bu64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for trial in 0..32 {
+                let weights: [F128; B] = std::array::from_fn(|_| F128::new(next(), next()));
+                let input: Vec<F128> = (0..2 * B).map(|_| match trial {
+                    0 => F128::ZERO,
+                    1 => F128::ONE,
+                    2 => F128::new(u64::MAX, u64::MAX),
+                    _ => F128::new(next(), next()),
+                }).collect();
+                let expected: [F128; 2] = std::array::from_fn(|slot| {
+                    (0..B).fold(F128::ZERO, |sum, bank| sum + weights[bank] * input[slot * B + bank])
+                });
+                assert_eq!(fold_banked_slots2(&weights, &input), expected, "banks={B} trial={trial}");
+                assert_eq!(fold_banked_slots2_baseline(&weights, &input), expected);
+            }
+        }
+        check::<0>();
+        check::<1>();
+        check::<2>();
+        check::<3>();
+        check::<6>();
+        check::<16>();
+        check::<64>();
+    }
+
+    /// Explicit local arithmetic diagnostic, never a leaderboard score.
+    #[test]
+    #[ignore = "manual paired arithmetic timing"]
+    fn pair_fold_eor3_arithmetic_timing() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut state = 0x93af_648b_127d_eca1u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let weight: [F128; 64] = std::array::from_fn(|_| F128::new(next(), next()));
+        let input: Vec<F128> = (0..256 * 1024).map(|_| F128::new(next(), next())).collect();
+        for values in input.chunks_exact(128) {
+            assert_eq!(fold_banked_slots2_baseline(&weight, values), fold_banked_slots2(&weight, values));
+        }
+        let passes = std::env::var("FLOCK_ARITHMETIC_PASSES")
+            .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1024);
+        assert!((1..=8192).contains(&passes));
+        let time = |candidate: bool| {
+            let start = Instant::now();
+            for _ in 0..passes {
+                for values in input.chunks_exact(256) {
+                    let values = black_box(values);
+                    let (a, b) = if candidate {
+                        (fold_banked_slots2(black_box(&weight), values),
+                         fold_banked_slots2(black_box(&weight), &values[128..]))
+                    } else {
+                        (fold_banked_slots2_baseline(black_box(&weight), values),
+                         fold_banked_slots2_baseline(black_box(&weight), &values[128..]))
+                    };
+                    black_box([a[0], a[1], b[0], b[1]]);
+                }
+            }
+            start.elapsed().as_secs_f64()
+        };
+        black_box(time(false));
+        black_box(time(true));
+        for trial in 0..8 {
+            let (baseline, candidate) = if trial % 2 == 0 {
+                (time(false), time(true))
+            } else {
+                let c = time(true);
+                (time(false), c)
+            };
+            println!("arithmetic_trial={trial} baseline_seconds={baseline:.9} candidate_seconds={candidate:.9} candidate_over_baseline={:.6}", candidate / baseline);
         }
     }
 
