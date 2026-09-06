@@ -256,3 +256,10 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // dispersion-resample marker r265-sample-265-20260818-20260818-2309
 
 // dispersion-resample marker r266-sample-266-20260818-20260818-2319
+// darthweenies-resample marker r3-1-1788689782
+// darthweenies-resample marker r4-2-1788690390
+// darthweenies-resample marker r5-3-1788691000
+// darthweenies-resample marker r6-4-1788691609
+// darthweenies-resample marker r7-5-1788692220
+// darthweenies-resample marker r8-6-1788692830
+// darthweenies-resample marker r9-7-1788693439
