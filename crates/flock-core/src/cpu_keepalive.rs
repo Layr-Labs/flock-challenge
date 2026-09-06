@@ -163,8 +163,10 @@ mod imp {
         std::hint::black_box(x);
         // Detached: this thread reaps itself. Dropping the live count as the
         // last action lets an awaiter observe quiet only after the spin state
-        // is fully abandoned.
-        LIVE.fetch_sub(1, Ordering::SeqCst);
+        // is fully abandoned. AcqRel is sufficient: the protocol is a single
+        // flag plus a single counter with no multi-location total-order
+        // requirement, so the SeqCst fence is pure overhead on the timed path.
+        LIVE.fetch_sub(1, Ordering::AcqRel);
     }
 
     pub(super) fn start() {
@@ -172,7 +174,9 @@ mod imp {
             return;
         }
         // Claim the run: if it was already true, another start is live.
-        if RUNNING.swap(true, Ordering::SeqCst) {
+        // AcqRel: pairs with the Release signal / Acquire quiet-check; no
+        // SeqCst total order is needed for a single run flag.
+        if RUNNING.swap(true, Ordering::AcqRel) {
             return;
         }
         // Size to the existing performance-core pool. The global Rayon pool the
@@ -182,7 +186,7 @@ mod imp {
         let n_cores = rayon::current_num_threads().max(1);
         let deadline = Instant::now() + MAX_KEEPALIVE;
         for i in 0..n_cores {
-            LIVE.fetch_add(1, Ordering::SeqCst);
+            LIVE.fetch_add(1, Ordering::AcqRel);
             match std::thread::Builder::new()
                 .name(format!("flock-keepalive-{i}"))
                 .stack_size(64 * 1024)
@@ -193,7 +197,7 @@ mod imp {
                 // governed by RUNNING / MAX_KEEPALIVE, and quiet by LIVE.
                 Ok(_) => {}
                 Err(_) => {
-                    LIVE.fetch_sub(1, Ordering::SeqCst);
+                    LIVE.fetch_sub(1, Ordering::AcqRel);
                     break;
                 }
             }
@@ -207,9 +211,11 @@ mod imp {
     }
 
     /// Clear the run flag without waiting. Threads notice within one spin
-    /// slice and exit on their own.
+    /// slice and exit on their own. Release-paired with the spin threads'
+    /// Relaxed poll and the Acquire quiet-check; called at the very front of
+    /// the timed window, so the lighter fence is the whole win.
     pub(super) fn signal() {
-        RUNNING.swap(false, Ordering::SeqCst);
+        RUNNING.swap(false, Ordering::AcqRel);
     }
 
     /// Wait until every spin thread has finished. All spin threads are
@@ -221,7 +227,10 @@ mod imp {
     /// descheduled thread can never stall the prove.
     pub(super) fn join_all() {
         let give_up_at = Instant::now() + QUIET_TIMEOUT;
-        while LIVE.load(Ordering::SeqCst) != 0 {
+        // Acquire pairs with the threads' Release decrement: observing zero
+        // synchronizes with every thread's final action. Common case is a
+        // single load-and-return (threads exited during seed forward).
+        while LIVE.load(Ordering::Acquire) != 0 {
             if Instant::now() >= give_up_at {
                 return;
             }
