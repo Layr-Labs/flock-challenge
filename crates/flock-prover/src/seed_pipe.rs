@@ -645,18 +645,28 @@ impl Drop for SeedForwardFallback<'_> {
 
 /// True only for the protected ranked worker: `flock-benchmark-worker LOG2
 /// READY PROOF`. Keeps every test, bench and example on the ordinary path.
+///
+/// Process args are fixed for the lifetime of the process, so the result is
+/// cached in a `OnceLock`: the ranked worker calls this 5+ times per timed
+/// trial (speculative-publish gate, proof-path gate, warmup-gen check,
+/// seed-pipe gate, proof-io gate) and each uncached call pays an `args_os`
+/// scan + path alloc inside the harness-measured seed→proof window. Caching
+/// is proof-irrelevant (pure argv selector, no witness/commitment state).
 pub(crate) fn is_ranked_worker() -> bool {
-    let mut args = std::env::args_os();
-    let Some(exe) = args.next() else {
-        return false;
-    };
-    if args.count() != 3 {
-        return false;
-    }
-    std::path::Path::new(&exe)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let mut args = std::env::args_os();
+        let Some(exe) = args.next() else {
+            return false;
+        };
+        if args.len() != 3 {
+            return false;
+        }
+        std::path::Path::new(&exe)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
+    })
 }
 
 /// Pure selector for the literal-value kill test. Values such as `0`,
