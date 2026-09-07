@@ -646,17 +646,20 @@ impl Drop for SeedForwardFallback<'_> {
 /// True only for the protected ranked worker: `flock-benchmark-worker LOG2
 /// READY PROOF`. Keeps every test, bench and example on the ordinary path.
 pub(crate) fn is_ranked_worker() -> bool {
-    let mut args = std::env::args_os();
-    let Some(exe) = args.next() else {
-        return false;
-    };
-    if args.count() != 3 {
-        return false;
-    }
-    std::path::Path::new(&exe)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let mut args = std::env::args_os();
+        let Some(exe) = args.next() else {
+            return false;
+        };
+        if args.len() != 3 {
+            return false;
+        }
+        std::path::Path::new(&exe)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
+    })
 }
 
 /// Pure selector for the literal-value kill test. Values such as `0`,
@@ -673,11 +676,16 @@ fn speculative_publish_enabled() -> bool {
 }
 
 fn ranked_proof_path() -> Option<PathBuf> {
-    if !is_ranked_worker() {
-        return None;
-    }
-    let path = PathBuf::from(std::env::args_os().nth(3)?);
-    (!path.as_os_str().is_empty()).then_some(path)
+    static CACHED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            if !is_ranked_worker() {
+                return None;
+            }
+            let path = PathBuf::from(std::env::args_os().nth(3)?);
+            (!path.as_os_str().is_empty()).then_some(path)
+        })
+        .clone()
 }
 
 /// Sibling temporary name: distinct from the wrapper's `{proof}.tmp`, and on
