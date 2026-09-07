@@ -738,7 +738,7 @@ pub(crate) fn cpu_transform_and_tree(
         // advances allocation lifetime but does not raise the commit's final
         // codeword+tree peak alongside the retained prover scratch pools.
         let total_nodes = 2 * params.n_leaves() - 1;
-        crate::alloc_uninit_vec::<Hash>(total_nodes)
+        crate::gpu_commit::take_tree(total_nodes)
     });
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let cpu_ntt0 = timing.then(commit_cpu_ms);
