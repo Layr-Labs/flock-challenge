@@ -164,7 +164,7 @@ mod imp {
         // Detached: this thread reaps itself. Dropping the live count as the
         // last action lets an awaiter observe quiet only after the spin state
         // is fully abandoned.
-        LIVE.fetch_sub(1, Ordering::SeqCst);
+        LIVE.fetch_sub(1, Ordering::Release);
     }
 
     pub(super) fn start() {
@@ -209,7 +209,7 @@ mod imp {
     /// Clear the run flag without waiting. Threads notice within one spin
     /// slice and exit on their own.
     pub(super) fn signal() {
-        RUNNING.swap(false, Ordering::SeqCst);
+        RUNNING.swap(false, Ordering::Release);
     }
 
     /// Wait until every spin thread has finished. All spin threads are
@@ -221,7 +221,7 @@ mod imp {
     /// descheduled thread can never stall the prove.
     pub(super) fn join_all() {
         let give_up_at = Instant::now() + QUIET_TIMEOUT;
-        while LIVE.load(Ordering::SeqCst) != 0 {
+        while LIVE.load(Ordering::Acquire) != 0 {
             if Instant::now() >= give_up_at {
                 return;
             }
