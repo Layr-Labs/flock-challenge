@@ -6894,7 +6894,7 @@ fn materialize_direct_fold8(
     // disjoint witness stripe `[64·i·B, 64·(i+1)·B)` and returns the block's
     // round-0 partial. Which worker (or pool) runs a block cannot change a
     // single bit of it.
-    let fold8_block = |scratch: &mut Vec<F128>,
+    let fold8_block = |scratch: &mut (Vec<F128>, Vec<F128>),
                        block: usize,
                        b_out: &mut [F128],
                        f_out: &mut [F128]|
@@ -6921,55 +6921,98 @@ fn materialize_direct_fold8(
             value
         };
 
-        let (first_claim, rest_claims) = claims.split_first().unwrap();
-        let (first_table, rest_tables) = direct_tables.split_first().unwrap();
-        super::ring_switch::compose_fold_byte_table_into(
-            first_claim.eq_hi[block],
-            first_table,
-            scratch,
-        );
-        let mut slot = 0usize;
-        if pair_fold64 {
-            while slot + 1 < block_len {
-                let base = 64 * slot;
-                let folded_f = crate::field::f128_slice::fold_banked_slots2::<64>(
-                    &fold_weight,
-                    &f_in[base..base + 128],
-                );
-                f_out[slot] = folded_f[0];
-                f_out[slot + 1] = folded_f[1];
+        if claims.len() == 2 && !has_ordinary {
+            // Ranked geometry specialization: exactly 2 claims (AB and C),
+            // no ordinary basis. Precompute both composed byte tables, then
+            // evaluate both claims and write b_out in a single pass.
+            super::ring_switch::compose_fold_byte_table_into(
+                claims[0].eq_hi[block],
+                &direct_tables[0],
+                &mut scratch.0,
+            );
+            super::ring_switch::compose_fold_byte_table_into(
+                claims[1].eq_hi[block],
+                &direct_tables[1],
+                &mut scratch.1,
+            );
 
-                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                let direct1 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
-                if has_ordinary {
-                    let folded_b = crate::field::f128_slice::fold_banked_slots2::<64>(
+            let mut slot = 0usize;
+            if pair_fold64 {
+                while slot + 1 < block_len {
+                    let base = 64 * slot;
+                    let folded_f = crate::field::f128_slice::fold_banked_slots2::<64>(
                         &fold_weight,
-                        &b_in[base..base + 128],
+                        &f_in[base..base + 128],
                     );
-                    b_out[slot] = direct0 + folded_b[0];
-                    b_out[slot + 1] = direct1 + folded_b[1];
-                } else {
-                    b_out[slot] = direct0;
-                    b_out[slot + 1] = direct1;
+                    f_out[slot] = folded_f[0];
+                    f_out[slot + 1] = folded_f[1];
+
+                    let d0 = super::ring_switch::fold_one_slot(claims[0].eq_lo[slot], &scratch.0)
+                        + super::ring_switch::fold_one_slot(claims[1].eq_lo[slot], &scratch.1);
+                    let d1 = super::ring_switch::fold_one_slot(claims[0].eq_lo[slot + 1], &scratch.0)
+                        + super::ring_switch::fold_one_slot(claims[1].eq_lo[slot + 1], &scratch.1);
+                    b_out[slot] = d0;
+                    b_out[slot + 1] = d1;
+                    slot += 2;
                 }
-                slot += 2;
             }
-        }
-        while slot < block_len {
-            f_out[slot] = fold64(f_in, slot);
-            let direct = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-            b_out[slot] = if has_ordinary {
-                direct + fold64(b_in, slot)
-            } else {
-                direct
-            };
-            slot += 1;
-        }
-        for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
-            super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
-            for (slot, out) in b_out.iter_mut().enumerate() {
-                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+            while slot < block_len {
+                f_out[slot] = fold64(f_in, slot);
+                b_out[slot] = super::ring_switch::fold_one_slot(claims[0].eq_lo[slot], &scratch.0)
+                    + super::ring_switch::fold_one_slot(claims[1].eq_lo[slot], &scratch.1);
+                slot += 1;
+            }
+        } else {
+            let (first_claim, rest_claims) = claims.split_first().unwrap();
+            let (first_table, rest_tables) = direct_tables.split_first().unwrap();
+            super::ring_switch::compose_fold_byte_table_into(
+                first_claim.eq_hi[block],
+                first_table,
+                &mut scratch.0,
+            );
+            let mut slot = 0usize;
+            if pair_fold64 {
+                while slot + 1 < block_len {
+                    let base = 64 * slot;
+                    let folded_f = crate::field::f128_slice::fold_banked_slots2::<64>(
+                        &fold_weight,
+                        &f_in[base..base + 128],
+                    );
+                    f_out[slot] = folded_f[0];
+                    f_out[slot + 1] = folded_f[1];
+
+                    let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], &scratch.0);
+                    let direct1 =
+                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], &scratch.0);
+                    if has_ordinary {
+                        let folded_b = crate::field::f128_slice::fold_banked_slots2::<64>(
+                            &fold_weight,
+                            &b_in[base..base + 128],
+                        );
+                        b_out[slot] = direct0 + folded_b[0];
+                        b_out[slot + 1] = direct1 + folded_b[1];
+                    } else {
+                        b_out[slot] = direct0;
+                        b_out[slot + 1] = direct1;
+                    }
+                    slot += 2;
+                }
+            }
+            while slot < block_len {
+                f_out[slot] = fold64(f_in, slot);
+                let direct = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], &scratch.0);
+                b_out[slot] = if has_ordinary {
+                    direct + fold64(b_in, slot)
+                } else {
+                    direct
+                };
+                slot += 1;
+            }
+            for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
+                super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, &mut scratch.0);
+                for (slot, out) in b_out.iter_mut().enumerate() {
+                    *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], &scratch.0);
+                }
             }
         }
         super::round0_deferred(f_out, b_out)
@@ -6998,7 +7041,12 @@ fn materialize_direct_fold8(
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
         crate::epool::run_hetero_chunks_stateful(
             n_blocks,
-            || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+            || {
+                (
+                    vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                    vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                )
+            },
             |scratch, block| {
                 // SAFETY: the queue hands out each `block` exactly once; it
                 // owns output range `[block·B, (block+1)·B)` in both arrays
@@ -7031,7 +7079,12 @@ fn materialize_direct_fold8(
             .zip(folded_f.par_chunks_mut(block_len))
             .enumerate()
             .map_init(
-                || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                || {
+                    (
+                        vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                        vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                    )
+                },
                 |scratch, (block, (b_out, f_out))| fold8_block(scratch, block, b_out, f_out),
             )
             .reduce(
