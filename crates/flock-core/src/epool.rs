@@ -157,7 +157,11 @@ pub fn helper_pool() -> Option<&'static rayon::ThreadPool> {
 
 /// Don't engage the helper pool below this many chunks: tiny jobs (recursive
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
-const EPOOL_MIN_CHUNKS: usize = 8;
+/// Follow-up probe on promoted `3de02b2` (16 -> 8): extend E-core engagement
+/// to the 4-7-chunk drains. Scheduling only — chunk-claim order is already
+/// nondeterministic and every caller writes disjoint ranges, so output bytes
+/// cannot change. The official runner arbitrates (unresolvable locally).
+const EPOOL_MIN_CHUNKS: usize = 4;
 
 /// Process chunks `0..n_chunks` exactly once each, in parallel, drawing from
 /// a shared atomic queue drained by the main rayon pool plus (when present
