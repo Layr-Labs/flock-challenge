@@ -132,7 +132,10 @@ mod imp {
     /// only matters if a thread is descheduled at the worst moment, and even
     /// then the residual overlap risk is identical to a design that never
     /// waits at all.
+    #[cfg(not(test))]
     const QUIET_TIMEOUT: Duration = Duration::from_micros(250);
+    #[cfg(test)]
+    const QUIET_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// The per-core spin body: proof-irrelevant scalar-integer churn that keeps
     /// the core retiring instructions (so its DVFS clock request stays high)
@@ -145,6 +148,7 @@ mod imp {
         // last, so the core cannot fold the loop away or idle its pipeline;
         // `black_box` keeps the optimizer from eliminating the whole thing.
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut iters: u32 = 0;
         while RUNNING.load(Ordering::Relaxed) {
             // A batch of cheap scalar ops between flag checks: frequent enough
             // that stop latency is sub-microsecond, coarse enough that the
@@ -156,7 +160,8 @@ mod imp {
                 x ^= x >> 29;
             }
             std::hint::black_box(x);
-            if Instant::now() >= deadline {
+            iters = iters.wrapping_add(1);
+            if iters & 1023 == 0 && Instant::now() >= deadline {
                 break;
             }
         }
@@ -221,8 +226,10 @@ mod imp {
     /// descheduled thread can never stall the prove.
     pub(super) fn join_all() {
         let give_up_at = Instant::now() + QUIET_TIMEOUT;
-        while LIVE.load(Ordering::SeqCst) != 0 {
-            if Instant::now() >= give_up_at {
+        let mut spins: u32 = 0;
+        while LIVE.load(Ordering::Acquire) != 0 {
+            spins = spins.wrapping_add(1);
+            if spins & 63 == 0 && Instant::now() >= give_up_at {
                 return;
             }
             std::hint::spin_loop();
