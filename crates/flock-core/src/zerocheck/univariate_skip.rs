@@ -25,17 +25,17 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build the multilinear-eq evaluation table over `r`:
-/// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
+/// Build the multilinear-eq evaluation table over `r` scaled by `root`:
+/// `table[x] = root · ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
-pub fn build_eq(r: &[F128]) -> Vec<F128> {
+pub fn build_eq_scaled(r: &[F128], root: F128) -> Vec<F128> {
     use rayon::prelude::*;
 
     let n = r.len();
     // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
     // every slot in t[0..2^n] is written exactly once before any read.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
-    t[0] = F128::ONE;
+    t[0] = root;
     const PAR_THRESHOLD: usize = 1 << 12;
     for i in 0..n {
         let r_i = r[i];
@@ -60,6 +60,13 @@ pub fn build_eq(r: &[F128]) -> Vec<F128> {
         }
     }
     t
+}
+
+/// Build the multilinear-eq evaluation table over `r`:
+/// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
+/// where `n = r.len()`. Standard in-place power-of-two doubling.
+pub fn build_eq(r: &[F128]) -> Vec<F128> {
+    build_eq_scaled(r, F128::ONE)
 }
 
 // ---------------------------------------------------------------------------

@@ -47,7 +47,9 @@ use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
 
 use super::PaddingSpec;
-use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, pack_bits};
+use super::univariate_skip::{
+    SplitEqGhash, build_eq, build_eq_scaled, ntt_extend_f128_vec_ghash, pack_bits,
+};
 
 mod kernels;
 
@@ -144,6 +146,70 @@ fn c_s_inverse_literal_enabled() -> bool {
     false
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn d_inv_literal_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let kill = std::env::var("FLOCK_NO_ZC_D_INV_LITERAL").ok();
+        apple_inverse_literal_selected(true, kill.as_deref())
+    });
+    *ENABLED
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn d_inv_literal_enabled() -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn d_hi_inv_literal_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let kill = std::env::var("FLOCK_NO_ZC_D_HI_INV_LITERAL").ok();
+        apple_inverse_literal_selected(true, kill.as_deref())
+    });
+    *ENABLED
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn d_hi_inv_literal_enabled() -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn c_2_small_literal_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let kill = std::env::var("FLOCK_NO_ZC_C_2_SMALL_LITERAL").ok();
+        apple_inverse_literal_selected(true, kill.as_deref())
+    });
+    *ENABLED
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn c_2_small_literal_enabled() -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn alpha_inv_literal_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let kill = std::env::var("FLOCK_NO_ZC_ALPHA_INV_LITERAL").ok();
+        apple_inverse_literal_selected(true, kill.as_deref())
+    });
+    *ENABLED
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn alpha_inv_literal_enabled() -> bool {
+    false
+}
+
 const MEDIUM_CHALLENGES_GHASH_LITERAL: [F128; 4] = [
     F128 {
         lo: 0xffff_ffff_ffff_ff83,
@@ -166,6 +232,26 @@ const MEDIUM_CHALLENGES_GHASH_LITERAL: [F128; 4] = [
 const C_S_INV_GHASH_LITERAL: F128 = F128 {
     lo: 0x9904_8380_6bff_be0d,
     hi: 0x71af_641f_08db_d1a0,
+};
+
+const D_INV_GHASH_LITERAL: F128 = F128 {
+    lo: 0xadd9_add9_add9_ad8c,
+    hi: 0xadd9_add9_add9_add9,
+};
+
+const D_HI_INV_GHASH_LITERAL: F128 = F128 {
+    lo: 0x2fc1_2fc1_2fc1_2fd6,
+    hi: 0x2fc1_2fc1_2fc1_2fc1,
+};
+
+const C_2_SMALL_GHASH_LITERAL: F128 = F128 {
+    lo: 0x29c2_d5f0_e387_11f5,
+    hi: 0x7009_e616_ae59_e6a2,
+};
+
+const ALPHA_INV_GHASH_LITERAL: F128 = F128 {
+    lo: 0x65f4_d24a_569c_4b3e,
+    hi: 0xc326_348c_aa99_58aa,
 };
 
 /// The constant `C_s = φ_8(0x1C) ∈ F_{2^128}` — the relative scaling factor
@@ -242,10 +328,22 @@ fn c_s_inv_f128() -> F128 {
 /// Used in [`round1_shift_reduce_extract_c_packed_padded_with_s_hat_v`] to
 /// post-scale the raw bank values into canonical `s_hat_v_c` (which
 /// `ring_switch::fold_1b_rows` would produce against suffix `r[k_skip+1..m]`).
-pub fn c_2_small_f128() -> F128 {
+fn c_2_small_reference() -> F128 {
     let r_2 = phi8(F8(SMALL_CHAL_F8[1]));
     let r_3 = phi8(F8(SMALL_CHAL_F8[2]));
     (F128::ONE + r_2) * (F128::ONE + r_3)
+}
+
+pub fn c_2_small_f128() -> F128 {
+    if c_2_small_literal_enabled() {
+        C_2_SMALL_GHASH_LITERAL
+    } else {
+        c_2_small_reference()
+    }
+}
+
+fn alpha_inv_reference() -> F128 {
+    phi8(F8(0x02).inv())
 }
 
 /// `α⁻¹` in F_128, as a subfield-embedded F_8 element. Used to strip the
@@ -255,7 +353,11 @@ pub fn c_2_small_f128() -> F128 {
 pub fn alpha_inv_f128() -> F128 {
     // α in F_8 = byte 0x02 (the polynomial generator). Its inverse is α^254;
     // F8::inv computes it via the standard extended Euclidean / power table.
-    phi8(F8(0x02).inv())
+    if alpha_inv_literal_enabled() {
+        ALPHA_INV_GHASH_LITERAL
+    } else {
+        alpha_inv_reference()
+    }
 }
 
 /// `D = (1+γ)(1+γ^2)(1+γ^4)(1+γ^8)`; `D⁻¹` cancels the medium-eq normalization.
@@ -281,7 +383,11 @@ fn compute_d_inv() -> F128 {
 
 static D_INV_CACHE: OnceLock<F128> = OnceLock::new();
 fn d_inv() -> F128 {
-    *D_INV_CACHE.get_or_init(compute_d_inv)
+    if d_inv_literal_enabled() {
+        D_INV_GHASH_LITERAL
+    } else {
+        *D_INV_CACHE.get_or_init(compute_d_inv)
+    }
 }
 
 /// `D_hi = (1+gamma^4)(1+gamma^8)`.  Direct-fold4 retains the two low
@@ -301,7 +407,11 @@ fn compute_d_hi_inv() -> F128 {
 
 static D_HI_INV_CACHE: OnceLock<F128> = OnceLock::new();
 fn d_hi_inv() -> F128 {
-    *D_HI_INV_CACHE.get_or_init(compute_d_hi_inv)
+    if d_hi_inv_literal_enabled() {
+        D_HI_INV_GHASH_LITERAL
+    } else {
+        *D_HI_INV_CACHE.get_or_init(compute_d_hi_inv)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2071,10 +2181,7 @@ std::thread_local! {
 /// `r_lo[..s]` sub-product and the rest exactly the `r_lo[s..]` one.
 fn ab_eq_fold_factors(r_lo: &[F128], bank_bits: usize) -> (Vec<F128>, Vec<F128>) {
     let eq_bot = build_eq(&r_lo[..bank_bits]);
-    let eq_top_scaled = build_eq(&r_lo[bank_bits..])
-        .into_iter()
-        .map(|v| v * d_inv())
-        .collect();
+    let eq_top_scaled = build_eq_scaled(&r_lo[bank_bits..], d_inv());
     (eq_bot, eq_top_scaled)
 }
 
@@ -3769,6 +3876,23 @@ mod tests {
         assert_eq!(C_S_INV_GHASH_LITERAL, reference_c_s_inv);
         assert_eq!(c_s_inv_f128(), reference_c_s_inv);
         assert_eq!(C_S_INV_GHASH_LITERAL * c_s_f128(), F128::ONE);
+
+        let reference_d_inv = compute_d_inv();
+        assert_eq!(D_INV_GHASH_LITERAL, reference_d_inv);
+        assert_eq!(d_inv(), reference_d_inv);
+
+        let reference_d_hi_inv = compute_d_hi_inv();
+        assert_eq!(D_HI_INV_GHASH_LITERAL, reference_d_hi_inv);
+        assert_eq!(d_hi_inv(), reference_d_hi_inv);
+
+        let reference_c_2 = c_2_small_reference();
+        assert_eq!(C_2_SMALL_GHASH_LITERAL, reference_c_2);
+        assert_eq!(c_2_small_f128(), reference_c_2);
+
+        let reference_alpha_inv = alpha_inv_reference();
+        assert_eq!(ALPHA_INV_GHASH_LITERAL, reference_alpha_inv);
+        assert_eq!(alpha_inv_f128(), reference_alpha_inv);
+        assert_eq!(ALPHA_INV_GHASH_LITERAL * phi8(F8(0x02)), F128::ONE);
     }
 
     /// **Soundness assumption.** Zerocheck and the Ligerito PCS opening at
