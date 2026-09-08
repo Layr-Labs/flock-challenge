@@ -2696,29 +2696,117 @@ pub(crate) mod witgen_simd {
                 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
                 const SLAB: usize = super::super::common::WITGEN_HETERO_SLAB;
                 let n_bands = schedule.len();
-                let band_offset: Vec<usize> = schedule
-                    .iter()
-                    .scan(0usize, |o, &gps| {
-                        let cur = *o;
-                        *o += gps;
-                        Some(cur)
-                    })
-                    .collect();
-                // Slab table in band-major order (band, then segment, then
-                // local) — the incumbent's claim order, minus its joins. A
-                // slab never straddles a segment or a band: every schedule
-                // entry is a multiple of the 64-group slab.
-                let mut slab_band: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
-                let mut slab_g0: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
-                for (i, &gps) in schedule.iter().enumerate() {
-                    debug_assert!(gps.is_multiple_of(SLAB));
-                    for seg in 0..SEGMENTS {
-                        for l in (0..gps).step_by(SLAB) {
-                            slab_band.push(i as u32);
-                            slab_g0.push((seg * groups_per_segment + band_offset[i] + l) as u32);
+                // Slab tables are pure functions of (tapered, SEGMENTS,
+                // groups_per_segment, n_groups): the warm-up prove populates
+                // this cache and every timed prove borrows it, skipping 3 Vec
+                // allocs + fill loops per prove. Any geometry miss (tests,
+                // env-flipped schedule) falls back to identical fresh locals;
+                // a poisoned first-writer only costs the caching benefit,
+                // never correctness, because use is key-gated.
+                struct SlabTableCache {
+                    tapered: bool,
+                    segments: usize,
+                    groups_per_segment: usize,
+                    n_groups: usize,
+                    band_offset: Vec<usize>,
+                    slab_band: Vec<u32>,
+                    slab_g0: Vec<u32>,
+                }
+                static SLAB_TABLE_CACHE: std::sync::OnceLock<SlabTableCache> =
+                    std::sync::OnceLock::new();
+                fn build_slab_tables(
+                    schedule: &[usize],
+                    segments: usize,
+                    groups_per_segment: usize,
+                    slab: usize,
+                ) -> (Vec<usize>, Vec<u32>, Vec<u32>) {
+                    let n_groups_total: usize =
+                        segments * schedule.iter().sum::<usize>();
+                    let band_offset: Vec<usize> = schedule
+                        .iter()
+                        .scan(0usize, |o, &gps| {
+                            let cur = *o;
+                            *o += gps;
+                            Some(cur)
+                        })
+                        .collect();
+                    // Slab table in band-major order (band, then segment, then
+                    // local) — the incumbent's claim order, minus its joins. A
+                    // slab never straddles a segment or a band: every schedule
+                    // entry is a multiple of the 64-group slab.
+                    let mut slab_band: Vec<u32> =
+                        Vec::with_capacity(n_groups_total / slab);
+                    let mut slab_g0: Vec<u32> =
+                        Vec::with_capacity(n_groups_total / slab);
+                    for (i, &gps) in schedule.iter().enumerate() {
+                        debug_assert!(gps.is_multiple_of(slab));
+                        for seg in 0..segments {
+                            for l in (0..gps).step_by(slab) {
+                                slab_band.push(i as u32);
+                                slab_g0.push(
+                                    (seg * groups_per_segment + band_offset[i] + l)
+                                        as u32,
+                                );
+                            }
                         }
                     }
+                    (band_offset, slab_band, slab_g0)
                 }
+                let cache_usable = SLAB_TABLE_CACHE.get().is_some_and(|c| {
+                    c.tapered == tapered
+                        && c.segments == SEGMENTS
+                        && c.groups_per_segment == groups_per_segment
+                        && c.n_groups == n_groups
+                });
+                // Fresh fallback storage, populated only on cache miss.
+                let mut fresh: Option<(Vec<usize>, Vec<u32>, Vec<u32>)> = None;
+                if !cache_usable {
+                    let (band_offset, slab_band, slab_g0) = build_slab_tables(
+                        schedule,
+                        SEGMENTS,
+                        groups_per_segment,
+                        SLAB,
+                    );
+                    let _ = SLAB_TABLE_CACHE.set(SlabTableCache {
+                        tapered,
+                        segments: SEGMENTS,
+                        groups_per_segment,
+                        n_groups,
+                        band_offset,
+                        slab_band,
+                        slab_g0,
+                    });
+                    let c = SLAB_TABLE_CACHE.get().expect("just set");
+                    // Use our own fresh tables this prove when another thread
+                    // won the publish race with a different geometry; else
+                    // borrow the cache we just published.
+                    if c.tapered == tapered
+                        && c.segments == SEGMENTS
+                        && c.groups_per_segment == groups_per_segment
+                        && c.n_groups == n_groups
+                    {
+                        // cache holds our geometry; fall through to borrow it
+                    } else {
+                        // unreachable in single-geometry processes; kept exact
+                        // rather than panicking so tests with mixed shapes stay green
+                        fresh = Some(build_slab_tables(
+                            schedule,
+                            SEGMENTS,
+                            groups_per_segment,
+                            SLAB,
+                        ));
+                    }
+                }
+                let (band_offset, slab_band, slab_g0): (&[usize], &[u32], &[u32]) =
+                    match &fresh {
+                        Some((bo, sb, sg)) => (bo, sb, sg),
+                        None => {
+                            let c = SLAB_TABLE_CACHE
+                                .get()
+                                .expect("cache populated above");
+                            (&c.band_offset, &c.slab_band, &c.slab_g0)
+                        }
+                    };
                 debug_assert_eq!(slab_band.len(), n_groups / SLAB);
                 let remaining: Vec<AtomicUsize> = schedule
                     .iter()

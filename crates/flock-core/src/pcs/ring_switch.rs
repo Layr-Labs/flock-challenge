@@ -1463,8 +1463,6 @@ pub(crate) fn collapse_s_hat_v_fold4(s_hat_v_fold4: &[F128], low_point: &[F128])
 /// packed-prefix entries. Same intake layout as the fold4 statistic, one
 /// level wider; every `z_vec` element is touched exactly once.
 pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
     assert!(
         x_inner_rest_tail.len() >= 6,
         "fold8 s_hat_v requires six retained packed-index coordinates"
@@ -1482,14 +1480,17 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
     if x_inner_rest_tail.len() == 7 {
         // The scored shape has one coordinate left after retaining six. Fold
         // its two contiguous 64-bank halves with one product per output.
+        // Ranked half = 64*128 = 8192: a triple-Rayon's dispatch dwarfs ~24k
+        // field ops, so stay serial (bit-identical order, same ops).
         let r = x_inner_rest_tail[6];
         let half = 64 * n_packed;
         let (z0, z1) = z_vec.split_at(half);
         let mut out = vec![F128::ZERO; half];
-        out.par_iter_mut()
-            .zip(z0.par_iter())
-            .zip(z1.par_iter())
-            .for_each(|((out, &z0), &z1)| *out = z0 + r * (z0 + z1));
+        for i in 0..half {
+            let a = z0[i];
+            let b = z1[i];
+            out[i] = a + r * (a + b);
+        }
         return out;
     }
 
