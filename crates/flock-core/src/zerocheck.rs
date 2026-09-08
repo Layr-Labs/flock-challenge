@@ -1239,8 +1239,11 @@ fn prove_packed_padded_inner<C: Challenger>(
 
     // H2 engagement evidence: E-core chunks claimed across the loop rounds
     // (T3's hetero drain is already behind us, so the delta is loop-only).
+    // Trace-gated like the witgen driver (`common.rs`): no counter load on
+    // the timed path unless the trace env var is set.
     let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
-    let hetero_claimed_before = crate::epool::helper_chunks_claimed();
+    let hetero_claimed_before =
+        hetero_trace.then(crate::epool::helper_chunks_claimed);
     for i in loop_start..(n_mlv - 1) {
         let t_round_i = std::time::Instant::now();
         let rho_prev = mlv_rhos[i];
@@ -1288,10 +1291,10 @@ fn prove_packed_padded_inner<C: Challenger>(
         }
     }
 
-    if hetero_trace {
+    if let Some(before) = hetero_claimed_before {
         eprintln!(
             "[zc-tail] hetero loop rounds: {} chunks claimed by E-cores",
-            crate::epool::helper_chunks_claimed() - hetero_claimed_before
+            crate::epool::helper_chunks_claimed() - before
         );
     }
 
