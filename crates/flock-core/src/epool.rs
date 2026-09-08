@@ -157,7 +157,8 @@ pub fn helper_pool() -> Option<&'static rayon::ThreadPool> {
 
 /// Don't engage the helper pool below this many chunks: tiny jobs (recursive
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
-const EPOOL_MIN_CHUNKS: usize = 8;
+/// Lowered 8->4 to engage E-core helper on 4..7-chunk recursive Ligerito rounds.
+const EPOOL_MIN_CHUNKS: usize = 4;
 
 /// Process chunks `0..n_chunks` exactly once each, in parallel, drawing from
 /// a shared atomic queue drained by the main rayon pool plus (when present
