@@ -143,6 +143,23 @@ pub(crate) fn quirky_x_outer_full(point: &QuirkyPoint) -> Vec<F128> {
     v
 }
 
+/// Stack buffer for the two-claim ranked open: `m − k_skip ≤ 64` covers every
+/// shipped shape (ranked `32 − 6 = 26`); wider shapes take the generic path.
+const X_OUTER_FULL_STACK_CAP: usize = 64;
+
+/// Write `x_inner_rest ‖ x_outer` into `out`, returning the length when it
+/// fits. Element order and values are exactly `quirky_x_outer_full`'s, so
+/// PCS slices over the prefix are transcript-identical.
+fn write_quirky_x_outer_full(point: &QuirkyPoint, out: &mut [F128; X_OUTER_FULL_STACK_CAP]) -> Option<usize> {
+    let n = point.x_inner_rest.len() + point.x_outer.len();
+    if n > X_OUTER_FULL_STACK_CAP {
+        return None;
+    }
+    out[..point.x_inner_rest.len()].copy_from_slice(&point.x_inner_rest);
+    out[point.x_inner_rest.len()..n].copy_from_slice(&point.x_outer);
+    Some(n)
+}
+
 /// Batched PCS open over an arbitrary list of `ẑ`-evaluation claims. This is
 /// the generic seam: the base R1CS proof opens `[ab, c]`; relation wrappers
 /// (e.g. the hash chain) append their own claims and open `[ab, c, …]`.
@@ -164,6 +181,32 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
     lig_config: &pcs::ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> pcs::BatchOpeningProofLigerito {
+    // Ranked fast path: exactly the two base claims (`ab`, `c`) with short
+    // coordinates. Two heap `Vec`s + two slices for 52 F128s is pure dispatch
+    // overhead next to the ~19 ms open, so stage both concatenations in stack
+    // buffers and hand the PCS identical slices. Any shape miss (arity or
+    // width) falls through to the generic path unchanged.
+    if claims.len() == 2 {
+        let mut buf0 = [F128::ZERO; X_OUTER_FULL_STACK_CAP];
+        let mut buf1 = [F128::ZERO; X_OUTER_FULL_STACK_CAP];
+        if let (Some(n0), Some(n1)) = (
+            write_quirky_x_outer_full(&claims[0].point, &mut buf0),
+            write_quirky_x_outer_full(&claims[1].point, &mut buf1),
+        ) {
+            let x_refs: [&[F128]; 2] = [&buf0[..n0], &buf1[..n1]];
+            return pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+                z_packed,
+                prover_data,
+                commitment,
+                &x_refs,
+                precomputed_s_hat_v,
+                &[],
+                padding,
+                lig_config,
+                challenger,
+            );
+        }
+    }
     let x_fulls: Vec<Vec<F128>> = claims
         .iter()
         .map(|c| quirky_x_outer_full(&c.point))
@@ -566,7 +609,7 @@ enum LincheckStripeInput {
     DeferredRanked,
 }
 
-const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 64;
+const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 256;
 
 fn fill_deferred_lincheck_stripe_group(
     z_packed: &[F128],
