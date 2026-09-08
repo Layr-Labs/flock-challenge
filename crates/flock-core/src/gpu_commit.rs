@@ -1607,6 +1607,10 @@ pub(crate) fn give_tree(tree: Vec<crate::merkle::Hash>) {
     imp::give_tree(tree);
 }
 
+pub(crate) fn take_tree(n: usize) -> Vec<crate::merkle::Hash> {
+    imp::take_tree(n)
+}
+
 /// Wall of the round-1 AB precompute arm that runs `rayon::join`ed against
 /// the commit (f64 bits; 0 = not yet measured this process). The prover
 /// stores it every prove; the hybrid-split warmup sweep reads it to size its
@@ -5650,21 +5654,22 @@ kernel void blake3_pow_scan(
     }
 
     #[allow(clippy::uninit_vec)]
-    fn take_tree(n: usize) -> Vec<Hash> {
-        let mut pool = tree_pool_lock();
-        for i in 0..pool.len() {
-            if pool[i].capacity() >= n {
-                let mut v = pool.swap_remove(i);
-                drop(pool);
-                v.clear();
-                // SAFETY: capacity checked; Hash is Copy POD; caller writes
-                // every slot before reading (same contract as
-                // alloc_uninit_vec).
-                unsafe { v.set_len(n) };
-                return v;
+    pub(crate) fn take_tree(n: usize) -> Vec<Hash> {
+        if n == RANKED_TREE_NODES {
+            let mut pool = tree_pool_lock();
+            for i in 0..pool.len() {
+                if pool[i].capacity() >= n {
+                    let mut v = pool.swap_remove(i);
+                    drop(pool);
+                    v.clear();
+                    // SAFETY: capacity checked; Hash is Copy POD; caller writes
+                    // every slot before reading (same contract as
+                    // alloc_uninit_vec).
+                    unsafe { v.set_len(n) };
+                    return v;
+                }
             }
         }
-        drop(pool);
         crate::alloc_uninit_vec(n)
     }
 
@@ -13733,6 +13738,10 @@ mod imp {
 
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}
 
+    pub(crate) fn take_tree(n: usize) -> Vec<crate::merkle::Hash> {
+        crate::alloc_uninit_vec(n)
+    }
+
     pub(crate) fn staging_released() {}
 }
 
@@ -13888,7 +13897,10 @@ mod tests {
         match r {
             Ok(v) => Some(v),
             Err(e)
-                if e.contains("disabled") || e.contains("dlopen") || e.contains("returned nil") =>
+                if e.contains("disabled")
+                    || e.contains("dlopen")
+                    || e.contains("returned nil")
+                    || e.contains("unavailable") =>
             {
                 eprintln!("skipping GPU test: {e}");
                 None

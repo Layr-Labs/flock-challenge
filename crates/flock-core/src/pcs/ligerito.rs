@@ -5791,7 +5791,7 @@ fn fold_and_msg_lsb_into(
     // the outputs exactly; each chunk owns `[ci*CHUNK, (ci+1)*CHUNK)` of both
     // outputs and one partial slot. Same chunk grid as the rayon path below,
     // so bytes are identical either way.
-    if half >= 16 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
+    if half >= 8 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
         let n_chunks = half / CHUNK;
         let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
         let f_base = crate::epool::SyncPtr(nf.as_mut_ptr());
@@ -6100,7 +6100,7 @@ fn fold2_and_msgs_lsb(
     // Hetero queue over the identical chunk grid: same bases, same kernel,
     // XOR-merged partials — bytes unchanged, only chunk ownership differs.
     let acc =
-        if quarter >= 16 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
+        if quarter >= 8 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
             let n_chunks = quarter / CHUNK;
             let mut partials = vec![(F128::ZERO, F128::ZERO, [F128::ZERO; 6]); n_chunks];
             let f_base = crate::epool::SyncPtr(wf.as_mut_ptr());
@@ -6189,7 +6189,7 @@ fn fold2_and_msg_lsb(
             )
         };
         // Hetero queue over the identical chunk grid — bytes unchanged.
-        if quarter >= 16 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
+        if quarter >= 8 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
             let n_chunks = quarter / CHUNK;
             let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
             let f_base = crate::epool::SyncPtr(wf.as_mut_ptr());
