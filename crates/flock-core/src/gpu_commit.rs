@@ -1607,6 +1607,16 @@ pub(crate) fn give_tree(tree: Vec<crate::merkle::Hash>) {
     imp::give_tree(tree);
 }
 
+/// Take a ranked-size tree allocation from the GPU tree pool (fresh
+/// allocation when the pool is empty or the GPU is unavailable/off).
+/// Same overwrite-before-read contract as `alloc_uninit_vec`: the caller
+/// writes every slot before reading. Recycles the warmup-timed 64 MiB
+/// buffers the pool already retains instead of mmap-faulting fresh pages
+/// inside the scored window on the CPU commit path.
+pub(crate) fn take_tree(n: usize) -> Vec<crate::merkle::Hash> {
+    imp::take_tree(n)
+}
+
 /// Wall of the round-1 AB precompute arm that runs `rayon::join`ed against
 /// the commit (f64 bits; 0 = not yet measured this process). The prover
 /// stores it every prove; the hybrid-split warmup sweep reads it to size its
@@ -5650,21 +5660,22 @@ kernel void blake3_pow_scan(
     }
 
     #[allow(clippy::uninit_vec)]
-    fn take_tree(n: usize) -> Vec<Hash> {
-        let mut pool = tree_pool_lock();
-        for i in 0..pool.len() {
-            if pool[i].capacity() >= n {
-                let mut v = pool.swap_remove(i);
-                drop(pool);
-                v.clear();
-                // SAFETY: capacity checked; Hash is Copy POD; caller writes
-                // every slot before reading (same contract as
-                // alloc_uninit_vec).
-                unsafe { v.set_len(n) };
-                return v;
+    pub(crate) fn take_tree(n: usize) -> Vec<Hash> {
+        if n == RANKED_TREE_NODES {
+            let mut pool = tree_pool_lock();
+            for i in 0..pool.len() {
+                if pool[i].capacity() >= n {
+                    let mut v = pool.swap_remove(i);
+                    drop(pool);
+                    v.clear();
+                    // SAFETY: capacity checked; Hash is Copy POD; caller writes
+                    // every slot before reading (same contract as
+                    // alloc_uninit_vec).
+                    unsafe { v.set_len(n) };
+                    return v;
+                }
             }
         }
-        drop(pool);
         crate::alloc_uninit_vec(n)
     }
 
@@ -11499,7 +11510,12 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 15 / 16)
+        // Unclamped up to hi_size (port of pepedesigner's unpromoted 94e0f03):
+        // the 15/16 ceiling forced 128 of 2048 chunks onto the CPU-full path
+        // while the measured GPU drained the other 1920 in ~half the CPU
+        // sweep's time and then idled; the balance-point formula above is the
+        // only share bound now.
+        (g as usize).min(hi_size)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -11926,7 +11942,7 @@ kernel void zc_r2_products(
             // 1/8 probe that shipped there.
             (hi_size / 16).clamp(8, 128)
         } else {
-            tuned.min(hi_size * 15 / 16)
+            tuned.min(hi_size)
         };
         if chunks == 0 {
             return None;
@@ -13732,6 +13748,10 @@ mod imp {
     }
 
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}
+
+    pub(crate) fn take_tree(n: usize) -> Vec<crate::merkle::Hash> {
+        crate::alloc_uninit_vec(n)
+    }
 
     pub(crate) fn staging_released() {}
 }
@@ -15610,13 +15630,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[test]
     fn zc_r2_gate_share_policy() {
         use imp::zc_r2_gate_share;
-        // Balance point hi/(ratio+0.45); ranked-observed ratios land above
-        // the 15·hi/16 cap, which is the binding overshoot guard.
-        assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
-        assert_eq!(zc_r2_gate_share(0.38, 2048), 1920);
-        // The guard still binds before the GPU can straggle: at 15/16 the
-        // crossover is (1-0.45·15/16)/(15/16) ≈ 0.617, above the ranked 0.57.
-        assert!(zc_r2_gate_share(0.62, 2048) < 2048);
+        // Balance point hi/(ratio+0.45); unclamped up to hi_size.
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 2008);
+        assert_eq!(zc_r2_gate_share(0.38, 2048), 2048);
+        assert_eq!(zc_r2_gate_share(0.62, 2048), 1914);
         // Slow-but-usable GPU: the formula takes over below the cap.
         assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
         assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
