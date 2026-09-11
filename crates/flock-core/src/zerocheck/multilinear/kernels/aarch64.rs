@@ -7,6 +7,49 @@ struct WideNeon {
     hi: core::arch::aarch64::uint64x2_t,
 }
 
+/// Unreduced product sum kept as the three 128-bit partial products of
+/// [`clmul_products_q`]. Combining them into a [`WideNeon`] costs two EXT and
+/// two EOR, so an accumulator that only ever XORs products in defers that to
+/// one combine per chunk instead of one per product.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct TriNeon {
+    ll: core::arch::aarch64::uint64x2_t,
+    cross: core::arch::aarch64::uint64x2_t,
+    hh: core::arch::aarch64::uint64x2_t,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn tri_xor(
+    acc: &mut TriNeon,
+    (ll, cross, hh): (
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+    ),
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        acc.ll = veorq_u64(acc.ll, ll);
+        acc.cross = veorq_u64(acc.cross, cross);
+        acc.hh = veorq_u64(acc.hh, hh);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn reduce_tri_q(value: TriNeon) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        reduce_wide_q(WideNeon {
+            lo: veorq_u64(value.ll, vextq_u64::<1>(zero, value.cross)),
+            hi: veorq_u64(value.hh, vextq_u64::<1>(value.cross, zero)),
+        })
+    }
+}
+
 // The SHA3 extension includes EOR3; retain the two-EOR form for generic
 // AArch64 builds that do not enable it.
 #[cfg(target_feature = "sha3")]
@@ -40,7 +83,12 @@ unsafe fn pmull_lane(a: u64, b: u64) -> core::arch::aarch64::uint64x2_t {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "aes")]
-unsafe fn karatsuba_products_q(
+/// The three 128-bit partial products of `a * b`: `(lo*lo, lo*hi + hi*lo,
+/// hi*hi)`. Schoolbook, not Karatsuba: the fourth PMULL is cheaper on Apple
+/// Silicon than the two operand sums, the EXT each needs and the three-way
+/// XOR that Karatsuba spends to avoid it, and the vector pipes, not the PMULL
+/// units, are what the fused sumcheck kernels saturate.
+unsafe fn clmul_products_q(
     a: core::arch::aarch64::uint64x2_t,
     b: core::arch::aarch64::uint64x2_t,
 ) -> (
@@ -52,11 +100,10 @@ unsafe fn karatsuba_products_q(
     unsafe {
         let p0 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
         let p2 = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
-        let a_sum = veorq_u64(a, vextq_u64::<1>(a, a));
-        let b_sum = veorq_u64(b, vextq_u64::<1>(b, b));
-        let pm = pmull_lane(vgetq_lane_u64::<0>(a_sum), vgetq_lane_u64::<0>(b_sum));
-        let cross = xor3_u64(pm, p0, p2);
-        (p0, cross, p2)
+        let b_swap = vextq_u64::<1>(b, b);
+        let p01 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b_swap));
+        let p10 = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b_swap));
+        (p0, veorq_u64(p01, p10), p2)
     }
 }
 
@@ -71,7 +118,7 @@ unsafe fn mul_q(
     use core::arch::aarch64::*;
     unsafe {
         let zero = vdupq_n_u64(0);
-        let (t0, mut t1, t2) = karatsuba_products_q(a, b);
+        let (t0, mut t1, t2) = clmul_products_q(a, b);
 
         t1 = xor3_u64(
             t1,
@@ -97,7 +144,7 @@ unsafe fn mul_unreduced_q(
     use core::arch::aarch64::*;
     unsafe {
         let zero = vdupq_n_u64(0);
-        let (ll, cross, hh) = karatsuba_products_q(a, b);
+        let (ll, cross, hh) = clmul_products_q(a, b);
         WideNeon {
             lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
             hi: veorq_u64(hh, vextq_u64::<1>(cross, zero)),
@@ -191,18 +238,19 @@ unsafe fn mul_const_unreduced_pair_q(
         let zero = vdupq_n_u64(0);
         let constant_lo = vgetq_lane_u64::<0>(constant);
         let constant_hi = vgetq_lane_u64::<1>(constant);
-        let constant_mid = constant_lo ^ constant_hi;
-        let x0_mid = veorq_u64(x0, vextq_u64::<1>(x0, x0));
-        let x1_mid = veorq_u64(x1, vextq_u64::<1>(x1, x1));
 
         let ll0 = pmull_lane(vgetq_lane_u64::<0>(x0), constant_lo);
         let hh0 = pmull_lane(vgetq_lane_u64::<1>(x0), constant_hi);
-        let mm0 = pmull_lane(vgetq_lane_u64::<0>(x0_mid), constant_mid);
         let ll1 = pmull_lane(vgetq_lane_u64::<0>(x1), constant_lo);
         let hh1 = pmull_lane(vgetq_lane_u64::<1>(x1), constant_hi);
-        let mm1 = pmull_lane(vgetq_lane_u64::<0>(x1_mid), constant_mid);
-        let cross0 = xor3_u64(mm0, ll0, hh0);
-        let cross1 = xor3_u64(mm1, ll1, hh1);
+        let cross0 = veorq_u64(
+            pmull_lane(vgetq_lane_u64::<0>(x0), constant_hi),
+            pmull_lane(vgetq_lane_u64::<1>(x0), constant_lo),
+        );
+        let cross1 = veorq_u64(
+            pmull_lane(vgetq_lane_u64::<0>(x1), constant_hi),
+            pmull_lane(vgetq_lane_u64::<1>(x1), constant_lo),
+        );
 
         (
             WideNeon {
@@ -823,14 +871,19 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 
     unsafe {
         let zero = vdupq_n_u64(0);
-        let mut p1_even = WideNeon { lo: zero, hi: zero };
-        let mut pinf_even = WideNeon { lo: zero, hi: zero };
-        let mut p1_odd = WideNeon { lo: zero, hi: zero };
-        let mut pinf_odd = WideNeon { lo: zero, hi: zero };
-        let mut w0 = WideNeon { lo: zero, hi: zero };
-        let mut w3 = WideNeon { lo: zero, hi: zero };
-        let mut w4 = WideNeon { lo: zero, hi: zero };
-        let mut w5 = WideNeon { lo: zero, hi: zero };
+        let tri_zero = TriNeon {
+            ll: zero,
+            cross: zero,
+            hh: zero,
+        };
+        let mut p1_even = tri_zero;
+        let mut pinf_even = tri_zero;
+        let mut p1_odd = tri_zero;
+        let mut pinf_odd = tri_zero;
+        let mut w0 = tri_zero;
+        let mut w3 = tri_zero;
+        let mut w4 = tri_zero;
+        let mut w5 = tri_zero;
 
         let ones_bytes = [0xFFu8; 8];
         let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
@@ -871,12 +924,12 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                     // b === 1 across the group: e_b = o_b = 0 kills W3/W4/W5 and
                     // both G(inf) chains, and every surviving product is `w * a_i`.
                     if FULL {
-                        wide_xor(&mut p1_even, mul_unreduced_q(w, a1));
+                        tri_xor(&mut p1_even, clmul_products_q(w, a1));
                     }
                     if !ODD_ON_GPU {
-                        wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
+                        tri_xor(&mut p1_odd, clmul_products_q(w, a3));
                     }
-                    wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                    tri_xor(&mut w0, clmul_products_q(w, a2));
                 } else {
                     let a0w = mul_q(w, a0);
                     let a1w = mul_q(w, a1);
@@ -888,25 +941,25 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 
                     // ---- round-two products, split by the parity of x' ----
                     if FULL {
-                        wide_xor(&mut p1_even, mul_unreduced_q(a1w, b1));
+                        tri_xor(&mut p1_even, clmul_products_q(a1w, b1));
                         if !deg0 {
-                            wide_xor(
+                            tri_xor(
                                 &mut pinf_even,
-                                mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)),
+                                clmul_products_q(veorq_u64(a0w, a1w), veorq_u64(b0, b1)),
                             );
                         }
                     }
                     if !pad1 {
                         if !ODD_ON_GPU {
-                            wide_xor(&mut p1_odd, mul_unreduced_q(a3w, b3));
+                            tri_xor(&mut p1_odd, clmul_products_q(a3w, b3));
                             if !deg1 {
-                                wide_xor(
+                                tri_xor(
                                     &mut pinf_odd,
-                                    mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
+                                    clmul_products_q(veorq_u64(a2w, a3w), veorq_u64(b2, b3)),
                                 );
                             }
                         }
-                        wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                        tri_xor(&mut w0, clmul_products_q(a2w, b2));
                     }
 
                     // ---- deferred round-three aggregates (no extra lookups) ----
@@ -914,11 +967,11 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                     let o_aw = veorq_u64(a1w, a3w);
                     let e_b = veorq_u64(b0, b2);
                     let o_b = veorq_u64(b1, b3);
-                    wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
-                    wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
-                    wide_xor(
+                    tri_xor(&mut w3, clmul_products_q(e_aw, e_b));
+                    tri_xor(&mut w4, clmul_products_q(o_aw, o_b));
+                    tri_xor(
                         &mut w5,
-                        mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                        clmul_products_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
                     );
                 }
             }};
@@ -955,14 +1008,14 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
             }
         }
 
-        *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));
-        *out.add(1) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_even));
-        *out.add(2) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_odd));
-        *out.add(3) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_odd));
-        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w0));
-        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w3));
-        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w4));
-        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w5));
+        *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(p1_even));
+        *out.add(1) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(pinf_even));
+        *out.add(2) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(p1_odd));
+        *out.add(3) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(pinf_odd));
+        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(w0));
+        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(w3));
+        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(w4));
+        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(w5));
     }
 }
 
@@ -2484,7 +2537,7 @@ mod tests {
     }
 
     #[test]
-    fn karatsuba_q_products_match_scalar_field_products() {
+    fn clmul_q_products_match_scalar_field_products() {
         let mut state = 0x4b41_5241_5453_5542;
 
         unsafe {
@@ -2494,7 +2547,7 @@ mod tests {
                 let a_q = core::mem::transmute::<F128, uint64x2_t>(a);
                 let b_q = core::mem::transmute::<F128, uint64x2_t>(b);
 
-                let (p0, cross, p2) = karatsuba_products_q(a_q, b_q);
+                let (p0, cross, p2) = clmul_products_q(a_q, b_q);
                 let product = WideNeon {
                     lo: core::arch::aarch64::veorq_u64(
                         p0,
