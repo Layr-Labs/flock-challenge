@@ -5760,10 +5760,10 @@ kernel void blake3_pow_scan(
 
     /// Parent levels built by each finalized 1,024-leaf CPU-suffix chunk.
     ///
-    /// Eight levels leave four roots (128 contiguous bytes) per chunk for the
-    /// existing aligned-subtree builder. This is the same cache-local boundary
-    /// used by the full-CPU ranked NTT-to-Merkle pipeline.
-    const HYBRID_LOCAL_PARENT_LEVELS: usize = 8;
+    /// Ten levels leave one root per chunk. This is the same cache-local
+    /// boundary used by the full-CPU ranked NTT-to-Merkle pipeline.
+    const HYBRID_LOCAL_PARENT_LEVELS: usize = 10;
+
 
     /// A/B-CONTROL: set the default to `false` for an exact source-level
     /// control when the worker environment is cleared by the benchmark

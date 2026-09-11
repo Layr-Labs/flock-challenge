@@ -519,10 +519,12 @@ fn ranked_ntt_with_pipelined_leaves(
     assert_eq!(num_ntts, 64);
     let num_leaves = codeword.len() / num_ntts;
     assert_eq!(tree.len(), 2 * num_leaves - 1);
-    // Stop at four roots (128 contiguous bytes) per 1,024-leaf job. These eight
-    // local levels cover 1,020 of each subtree's 1,023 parent nodes while
-    // leaving the shared top for the level-wide builder.
-    const LOCAL_PARENT_LEVELS: usize = 8;
+    // Stop at one root per 1,024-leaf job. Ten local levels cover all 1,023
+    // parent nodes of the subtree while leaves are still cache-hot, leaving
+    // only the shared top for the level-wide builder.
+    const LOCAL_PARENT_LEVELS: usize = 10;
+
+
     let local_parent_levels = if std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_some() {
         0
     } else {
