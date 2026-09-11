@@ -1492,9 +1492,14 @@ pub fn fold_compact_and_compute_round_pair(
     // wrap budget; the loop arm adds only 0.5 GiB and ships alone to
     // bisect). The kernel, oracle test, and CPU sibling stay in-tree —
     // re-enable by restoring this launch once the budget is understood.
-    // UN-PARKED (v11): the scoreless deaths were the job-wall timeout, not
-    // this arm — the static warmup latch frees minutes of wall and both
-    // arms' once-per-process costs fit in a fraction of it.
+    // The v11 write-up ("the scoreless deaths were the job-wall timeout,
+    // not this arm") was never followed by the flip, and the const is now
+    // moot on the ranked path: the two-challenge lookahead route
+    // (`use_lookahead`, m = 32) replaces this call with
+    // `fold2_compact_and_round45_into`, so this launch is only reachable
+    // under `FLOCK_NO_ZC_LOOKAHEAD=1`. Measured there on an M2 Max with
+    // the const flipped: this round took 30.1 ms against 17.1 ms all-CPU
+    // (the GPU's 256/2048-chunk prefix straggled the join). Stays parked.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     const ZC_T3_INTEGRATION_PARKED: bool = true;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3636,6 +3641,12 @@ fn fold_and_compute_round_pair_into_with_n_hi(
         // behind compile-time consts while the shared-scratch cache fix
         // ships alone. Re-enable by flipping the const once the freed job
         // wall is confirmed on the runner.
+        // Moot on the ranked path for the same reason as the T3 arm: with
+        // the lookahead cascades the loop starts at i = 10 (half = 2^15),
+        // so `half >= 2^24` is only reachable under
+        // `FLOCK_NO_ZC_LOOKAHEAD=1`. Measured there on an M2 Max with the
+        // const flipped: 10.7 ms with the arm against 9.8 ms all-CPU.
+        // Stays parked.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         const ZC_LOOP_INTEGRATION_PARKED: bool = true;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

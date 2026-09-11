@@ -6345,7 +6345,16 @@ kernel void blake3_pow_scan(
             chosen = default_k;
         }
         if chosen == 0 && best_ms[chosen_i] > best_ms[default_i] * (1.0 - 0.04) {
-            chosen = default_k;
+            // Pure-GPU failed its 4% gate. Fall through to the next share
+            // still inside the tie band rather than all the way to the
+            // default, which need not be in the band at all and can be the
+            // slowest candidate measured. Skipping to it discards a
+            // measured near-fastest share whenever k=0 is competitive
+            // enough to win the band, which is the shape a runner with a
+            // relatively faster GPU than the tuning host produces.
+            chosen = (1..candidates.len())
+                .find(|&i| best_ms[i] <= fastest * (1.0 + tie))
+                .map_or(default_k, |i| candidates[i]);
         }
         Some(chosen)
     }
@@ -10296,6 +10305,15 @@ kernel void lc_fold_stripes_factored_b4(
             // k=0 fastest but beats the default by < 4% → default retained.
             let ms = [100.0, 130.0, 125.0, 103.0];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(5));
+        }
+
+        #[test]
+        fn rejected_pure_gpu_falls_to_the_next_in_band_share() {
+            // k=0 wins the band but fails the 4% gate, and k=2 is both in
+            // the band and the fastest measured. Deferring to the default
+            // would pick the slowest of the four.
+            let ms = [100.0, 99.0, 101.0, 102.0];
+            assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(2));
         }
 
         #[test]
