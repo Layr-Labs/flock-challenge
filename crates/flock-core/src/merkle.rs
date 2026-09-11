@@ -565,6 +565,8 @@ pub(crate) fn hash_ranked_blake3_parent_chunk(read: &[Hash], write: &mut [Hash])
     hash_pairs_level(read, write, HashKind::Blake3);
 }
 
+
+
 /// Leaves per queue chunk in the batched BLAKE3 leaf path (see `epool`).
 /// A multiple of 12 so every full chunk runs entirely through the twelve-way
 /// kernel with no per-chunk tail; small enough (240 KiB of input at the
@@ -600,6 +602,8 @@ fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
         unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
     const SERIAL_LEVEL_NODES: usize = 1024;
     let serial = write.len() <= SERIAL_LEVEL_NODES;
+
+
 
     match kind {
         HashKind::Blake3 => {
@@ -1095,12 +1099,14 @@ mod tests {
     /// rather than silently changing every commitment we produce.
     #[test]
     fn blake3_batched_matches_scalar_spec() {
-        // Counts straddle both the Apple twelve-way kernel width and the
-        // upstream 16-input call width. Width and tail bugs show up here.
+        // Counts straddle the Apple twelve-way kernel, the eight-wide
+        // remainder, and the upstream 16-input call width. Width and tail
+        // bugs show up here.
         let counts = [
-            1usize, 4, 5, 11, 12, 13, 15, 16, 17, 23, 24, 25, 47, 48, 49, 63, 64, 65, 127, 128,
-            129, 200,
+            1usize, 4, 5, 8, 11, 12, 13, 15, 16, 17, 20, 23, 24, 25, 32, 47, 48, 49, 63, 64, 65,
+            127, 128, 129, 200,
         ];
+
 
         // Parents.
         for n in counts {

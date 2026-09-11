@@ -154,8 +154,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.b_combined,
             direct,
             combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            prover_data.codeword(),
+            prover_data.merkle_tree(),
             combined.round0_prime,
             challenger,
         )
@@ -166,8 +166,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.b_combined,
             direct,
             combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            prover_data.codeword(),
+            prover_data.merkle_tree(),
             combined.round0_prime,
             combined
                 .round1_lookahead
@@ -187,8 +187,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             combined.b_combined,
             direct,
             combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            prover_data.codeword(),
+            prover_data.merkle_tree(),
             combined.round0_prime,
             combined
                 .round1_lookahead
@@ -201,8 +201,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
             packed_witness,
             combined.b_combined,
             combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
+            prover_data.codeword(),
+            prover_data.merkle_tree(),
             combined.round0_prime,
             combined.round1_lookahead,
             challenger,

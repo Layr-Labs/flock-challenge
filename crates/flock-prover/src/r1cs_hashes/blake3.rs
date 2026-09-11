@@ -4156,13 +4156,13 @@ mod tests {
             let guard = ZeroOddTailLanes::scope(num_ntts, tail);
             let (commitment, data) = flock_core::pcs::commit(z, &setup.pcs_params);
             let digest = |v: &[u8]| *::blake3::hash(v).as_bytes();
-            let cw: &[flock_core::field::F128] = &data.codeword;
+            let cw: &[flock_core::field::F128] = data.codeword();
             let out = (
                 commitment.root,
                 digest(unsafe {
                     std::slice::from_raw_parts(cw.as_ptr().cast::<u8>(), std::mem::size_of_val(cw))
                 }),
-                data.merkle_tree.len(),
+                data.merkle_tree().len(),
             );
             drop(data);
             drop(guard);
