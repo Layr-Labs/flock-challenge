@@ -14,6 +14,11 @@
 //!
 //! pepedesigner sample 64 on frontier `e0afcac` + detached-keepalive
 //! (cpu_keepalive.rs): marker comment only, semantics unchanged.
+//!
+//! Measurement draw (DJLougen, 2026-09-12): this account's retained local
+//! variant of the frontier source; this comment only distinguishes the
+//! archive from the account's earlier identical archive (`e349f9e`),
+//! which the server deduplicates. No executable effect.
 
 pub use flock_core::*;
 

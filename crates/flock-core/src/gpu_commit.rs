@@ -5242,7 +5242,7 @@ kernel void blake3_pow_scan(
         /// GPU-owned flat tree buffer (leaves + parents, 64 MiB).
         tree_buf: Id,
         /// GPU-owned codeword home (1 GiB). The commit graph writes the
-        /// transformed codeword here and `ProverData.codeword` derefs into
+        /// transformed codeword here and `ProverData::codeword()` borrows
         /// it (Metal-allocated memory measured ~30% faster for the streaming
         /// graph than no-copy-wrapped malloc pages; CPU reads of shared
         /// Metal memory during the open are ordinary cached reads).
@@ -5760,10 +5760,9 @@ kernel void blake3_pow_scan(
 
     /// Parent levels built by each finalized 1,024-leaf CPU-suffix chunk.
     ///
-    /// Eight levels leave four roots (128 contiguous bytes) per chunk for the
-    /// existing aligned-subtree builder. This is the same cache-local boundary
-    /// used by the full-CPU ranked NTT-to-Merkle pipeline.
-    const HYBRID_LOCAL_PARENT_LEVELS: usize = 8;
+    /// Ten levels leave one root per chunk. This is the same cache-local
+    /// boundary used by the full-CPU ranked NTT-to-Merkle pipeline.
+    const HYBRID_LOCAL_PARENT_LEVELS: usize = 10;
 
     /// A/B-CONTROL: set the default to `false` for an exact source-level
     /// control when the worker environment is cleared by the benchmark
@@ -6036,17 +6035,17 @@ kernel void blake3_pow_scan(
                 // The twiddle table is deterministic per log_d; built once per
                 // process (the autotune sweep prebuilds it untimed).
                 let ntt = hybrid_suffix_ntt(log_d);
-                let data: &mut [F128] = core::slice::from_raw_parts_mut(
-                    gpu.buffer_contents(staging).cast::<F128>(),
-                    n_leaves * 64,
-                );
-                let tree: &mut [Hash] = core::slice::from_raw_parts_mut(
-                    gpu.buffer_contents(tree_buf).cast::<Hash>(),
-                    2 * n_leaves - 1,
-                );
-                let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
                 let suffix_leaf_start = prefix_leaves;
                 let suffix_leaves = n_leaves - prefix_leaves;
+                let elem_origin = prefix_leaves * 64;
+                // cb2 owns the prefix until the join. Never create an exclusive
+                // reference covering that live GPU range, even if later CPU
+                // indexing would only use the suffix.
+                let data: &mut [F128] = core::slice::from_raw_parts_mut(
+                    gpu.buffer_contents(staging).cast::<F128>().add(elem_origin),
+                    suffix_leaves * 64,
+                );
+                let tree_base = crate::epool::SyncPtr(gpu.buffer_contents(tree_buf).cast::<Hash>());
                 let deep_pipeline = hybrid_cpu_suffix_deep_pipeline_enabled();
                 let local_parent_levels = if deep_pipeline {
                     hybrid_local_parent_levels()
@@ -6091,6 +6090,7 @@ kernel void blake3_pow_scan(
                         log_d,
                         16 - k_cpu16,
                         16,
+                        elem_origin,
                         finish_chunk,
                     );
                 } else {
@@ -6103,10 +6103,11 @@ kernel void blake3_pow_scan(
                         log_d,
                         16 - k_cpu16,
                         16,
+                        elem_origin,
                         crate::ntt::additive_ntt_f128::ranked_zero_odd_tail_lanes(log_d, 64),
                     );
                     let suffix_bytes: &[u8] = core::slice::from_raw_parts(
-                        data.as_ptr().cast::<u8>().add(suffix_leaf_start * 1024),
+                        data.as_ptr().cast::<u8>(),
                         suffix_leaves * 1024,
                     );
                     const LEAF_JOB: usize = 1 << 12;
@@ -10991,8 +10992,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         /// dispatch; the buffer is retained across its short-lived pool and
         /// drained in `finish` (the from-z first-pass stream idiom).
         fn submit_pending(&self, inner: &mut L1OverlapInner) {
-            if inner.pending.is_empty() || self.failed.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if inner.pending.is_empty() || self.failed.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
             // Publish every pending chunk's CPU stores to the encode below.
@@ -14076,7 +14076,7 @@ mod tests {
 
         let mut expect_first = vec![F128::ZERO; 64 << log_d];
         crate::pcs::commit::replicate_message_fill(&mut expect_first, &z);
-        ntt.forward_transform_interleaved_block_range(&mut expect_first, 64, 1, 4, 0, 2, 0);
+        ntt.forward_transform_interleaved_block_range(&mut expect_first, 64, 1, 4, 0, 2, 0, 0);
 
         let mut expect_full = vec![F128::ZERO; 64 << log_d];
         crate::pcs::commit::replicate_message_fill(&mut expect_full, &z);
@@ -15198,8 +15198,8 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
 
         // Warmup commit: dual-run, CPU-authoritative, decides the latch.
         let (c1, pd1) = crate::pcs::commit::commit(&z, &params);
-        let tree1 = pd1.merkle_tree.to_vec();
-        let codeword1 = pd1.codeword.to_vec();
+        let tree1 = pd1.merkle_tree().to_vec();
+        let codeword1 = pd1.codeword().to_vec();
         drop(pd1); // returns codeword + tree to the pools, as the prover does
 
         // Timed-style commit: latched GPU path over the pooled buffer.
@@ -15209,18 +15209,22 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         eprintln!("latched commit (replicate+gpu graph+zero-copy tree): {latched_ms:.2} ms");
 
         assert_eq!(c1.root, c2.root, "roots differ between warmup and latched");
-        assert_eq!(tree1, pd2.merkle_tree, "trees differ");
-        assert!(codeword1[..] == pd2.codeword[..], "codewords differ");
+        assert_eq!(tree1, pd2.merkle_tree(), "trees differ");
+        assert!(codeword1[..] == pd2.codeword()[..], "codewords differ");
 
         // And both must equal a pure-CPU oracle from scratch.
         let mut oracle = vec![F128::ZERO; params.codeword_len_f128()];
         crate::pcs::commit::replicate_message_fill(&mut oracle, &z);
         let oracle_tree = crate::pcs::commit::cpu_transform_and_tree(&mut oracle, &params, None);
         assert!(
-            oracle[..] == pd2.codeword[..],
+            oracle[..] == pd2.codeword()[..],
             "codeword differs from CPU oracle"
         );
-        assert_eq!(oracle_tree, pd2.merkle_tree, "tree differs from CPU oracle");
+        assert_eq!(
+            oracle_tree,
+            pd2.merkle_tree(),
+            "tree differs from CPU oracle"
+        );
     }
 
     #[test]

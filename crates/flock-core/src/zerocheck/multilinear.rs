@@ -289,7 +289,10 @@ fn zc_tail_hetero_enabled() -> bool {
 /// the hetero branch owns the same disjoint per-`x_hi` output ranges, and the
 /// message partials are XOR sums.
 #[cfg(target_arch = "aarch64")]
-const ZC_TAIL_HETERO_LOW_FLOOR: usize = 1 << 17;
+const ZC_TAIL_HETERO_LOW_FLOOR: usize = 1 << 16;
+
+
+
 
 #[cfg(target_arch = "aarch64")]
 fn zc_tail_hetero_low_floor() -> usize {
@@ -309,7 +312,13 @@ fn zc_tail_hetero_low_floor() -> usize {
 /// are already small enough that the extra claims and final partials can
 /// dominate the cache benefit.
 const LARGE_TAIL_EQ_N_HI: usize = 11;
+
+
 const LARGE_TAIL_EQ_MIN_HALF: usize = 1 << 22;
+
+
+
+
 
 /// Correctness-preserving kill switch for same-binary A/B screening.
 #[cfg(target_arch = "aarch64")]
@@ -319,6 +328,7 @@ fn zc_tail_split11_enabled() -> bool {
         LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_SPLIT11").is_none());
     *ENABLED
 }
+
 
 /// Exact same-binary rollback for the expanded fold4 pair. The control keeps
 /// the incumbent arithmetic and the same NT stores; only the fold schedule
@@ -1805,6 +1815,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     // restores the incumbent division of labour within the same binary.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_calib = gpu_job.as_ref().is_some_and(|j| j.is_calibration());
+
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let odd_on_gpu = false;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1913,20 +1926,48 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         let eq_h = eq_hi[x_hi];
         // `out[0..2]` carry the even lane on the odd lane's weight; κ restores
         // `eq₂(2y)` exactly (field arithmetic, no rounding).
-        let p1 = kappa * out[0] + out[2];
-        let pinf = kappa * out[1] + out[3];
+        // GPU Prefix overwrites partials (and la[0:1] when odd_on_gpu) for the
+        // offloaded prefix after join. Skip those stores on timed proves;
+        // calibration still needs the CPU oracle. W0/W3/W4/W5 stay CPU-only.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let skip_overwritten = x_hi < gpu_prefix && !gpu_calib;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let skip_overwritten = false;
         // SAFETY: exclusive owner of both partial slots (see above).
         unsafe {
-            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
-            *la_base.ptr().add(x_hi) = [
-                eq_h * out[2],
-                eq_h * out[3],
-                eq_h * out[4],
-                eq_h * out[5],
-                eq_h * out[6],
-                eq_h * out[7],
-            ];
+            if skip_overwritten && odd_on_gpu {
+                *la_base.ptr().add(x_hi) = [
+                    F128::ZERO,
+                    F128::ZERO,
+                    eq_h * out[4],
+                    eq_h * out[5],
+                    eq_h * out[6],
+                    eq_h * out[7],
+                ];
+            } else if skip_overwritten {
+                *la_base.ptr().add(x_hi) = [
+                    eq_h * out[2],
+                    eq_h * out[3],
+                    eq_h * out[4],
+                    eq_h * out[5],
+                    eq_h * out[6],
+                    eq_h * out[7],
+                ];
+            } else {
+                let p1 = kappa * out[0] + out[2];
+                let pinf = kappa * out[1] + out[3];
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+                *la_base.ptr().add(x_hi) = [
+                    eq_h * out[2],
+                    eq_h * out[3],
+                    eq_h * out[4],
+                    eq_h * out[5],
+                    eq_h * out[6],
+                    eq_h * out[7],
+                ];
+            }
         }
+
     });
 
     // Drain the GPU products arm. The arm returns `[p1_even, pinf_even,

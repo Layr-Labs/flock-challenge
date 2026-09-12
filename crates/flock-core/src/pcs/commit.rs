@@ -149,23 +149,40 @@ pub struct Commitment {
 /// retaining its own copy of the packed witness across commit + open. This
 /// avoids ~4 GB of duplication at large `m`, dropping peak commit memory by
 /// a factor of ~1.5 (e.g. at m=35: 13 GB → 9 GB).
+///
+/// The codeword and tree share one GPU lease. Borrowed accessors keep both
+/// views tied to this owner so neither can outlive that lease.
 pub struct ProverData {
-    pub codeword: CodewordBuf,
-    pub merkle_tree: MerkleTreeBuf,
+    codeword: CodewordBuf,
+    merkle_tree: MerkleTreeBuf,
+}
+
+impl ProverData {
+    /// Borrow the committed L0 codeword.
+    #[inline]
+    pub fn codeword(&self) -> &[F128] {
+        &self.codeword
+    }
+
+    /// Borrow the committed L0 Merkle tree.
+    #[inline]
+    pub fn merkle_tree(&self) -> &[Hash] {
+        &self.merkle_tree
+    }
 }
 
 /// Storage for the L0 codeword. Normally a pooled `Vec` (CPU commit); with
 /// the GPU commit latched on it is a view into the process-persistent Metal
 /// staging buffer instead (unified memory — CPU reads during the open are
 /// ordinary cached reads). Derefs to `[F128]` either way.
-pub enum CodewordBuf {
+pub(crate) enum CodewordBuf {
     Cpu(Vec<F128>),
     Gpu(crate::gpu_commit::GpuCodeword),
 }
 
 /// Storage for the L0 Merkle tree. Ranked GPU commitments leave the tree in
 /// their persistent host-visible Metal buffer, avoiding a 64 MiB copy-out.
-pub enum MerkleTreeBuf {
+pub(crate) enum MerkleTreeBuf {
     Cpu(Vec<Hash>),
     Gpu(crate::gpu_commit::GpuMerkleTree),
 }
@@ -177,26 +194,6 @@ impl core::ops::Deref for MerkleTreeBuf {
             MerkleTreeBuf::Cpu(v) => v,
             MerkleTreeBuf::Gpu(g) => g,
         }
-    }
-}
-
-impl core::fmt::Debug for MerkleTreeBuf {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("MerkleTreeBuf")
-            .field("len", &self.len())
-            .finish()
-    }
-}
-
-impl PartialEq<Vec<Hash>> for MerkleTreeBuf {
-    fn eq(&self, other: &Vec<Hash>) -> bool {
-        &**self == other.as_slice()
-    }
-}
-
-impl PartialEq<MerkleTreeBuf> for Vec<Hash> {
-    fn eq(&self, other: &MerkleTreeBuf) -> bool {
-        self.as_slice() == &**other
     }
 }
 
@@ -494,6 +491,8 @@ fn use_ranked_ntt_merkle_leaf_pipeline(params: &PcsParams) -> bool {
 #[derive(Clone, Copy)]
 struct RankedLeafJob {
     elem_offset: usize,
+    // Derived from the finalized callback slice, not a pre-NTT base pointer.
+    data: crate::epool::SyncPtr<F128>,
     elem_len: usize,
 }
 
@@ -519,16 +518,16 @@ fn ranked_ntt_with_pipelined_leaves(
     assert_eq!(num_ntts, 64);
     let num_leaves = codeword.len() / num_ntts;
     assert_eq!(tree.len(), 2 * num_leaves - 1);
-    // Stop at four roots (128 contiguous bytes) per 1,024-leaf job. These eight
-    // local levels cover 1,020 of each subtree's 1,023 parent nodes while
-    // leaving the shared top for the level-wide builder.
-    const LOCAL_PARENT_LEVELS: usize = 8;
+    // Stop at one root per 1,024-leaf job. Ten local levels cover all 1,023
+    // parent nodes of the subtree while leaves are still cache-hot, leaving
+    // only the shared top for the level-wide builder.
+    const LOCAL_PARENT_LEVELS: usize = 10;
+
     let local_parent_levels = if std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_some() {
         0
     } else {
         LOCAL_PARENT_LEVELS
     };
-    let codeword_base = crate::epool::SyncPtr(codeword.as_mut_ptr());
     let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
 
     let hash_job = |job: RankedLeafJob| {
@@ -545,8 +544,7 @@ fn ranked_ntt_with_pipelined_leaves(
         // pairwise disjoint and in bounds. Channel send/receive synchronizes the
         // completed NTT writes before a helper worker reads them.
         unsafe {
-            let elems =
-                core::slice::from_raw_parts(codeword_base.ptr().add(job.elem_offset), job.elem_len);
+            let elems = core::slice::from_raw_parts(job.data.ptr(), job.elem_len);
             let bytes = core::slice::from_raw_parts(
                 elems.as_ptr().cast::<u8>(),
                 core::mem::size_of_val(elems),
@@ -630,6 +628,7 @@ fn ranked_ntt_with_pipelined_leaves(
         let finish_chunk = |elem_offset, chunk: &[F128]| {
             let job = RankedLeafJob {
                 elem_offset,
+                data: crate::epool::SyncPtr(chunk.as_ptr().cast_mut()),
                 elem_len: chunk.len(),
             };
             match sender.try_send(job) {
@@ -983,10 +982,9 @@ mod tests {
 
     #[test]
     fn pipelined_ntt_leaves_match_separate_oracle() {
-        // log_d=12 is large enough to split into multiple finalized chunks on
-        // ordinary test hosts. This exercises concurrent helper receives,
-        // bounded-queue overflow to inline hashing, and the post-NTT tail
-        // drain, rather than only the scalar one-callback fallback.
+        // Four main workers produce four finalized 1,024-leaf chunks,
+        // independently of the host's default Rayon pool. The separate
+        // helper pool consumes published chunks while the NTT finishes.
         let params = PcsParams {
             m: 24,
             log_inv_rate: 1,
@@ -1021,16 +1019,22 @@ mod tests {
             .num_threads(2)
             .build()
             .unwrap();
+        let main = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
         let mut got_codeword = source;
         let mut got_tree = vec![[0u8; 32]; 2 * params.n_leaves() - 1];
-        let prehashed_parent_levels = ranked_ntt_with_pipelined_leaves(
-            &ntt,
-            &mut got_codeword,
-            &params,
-            &mut got_tree,
-            &helper,
-            None,
-        );
+        let prehashed_parent_levels = main.install(|| {
+            ranked_ntt_with_pipelined_leaves(
+                &ntt,
+                &mut got_codeword,
+                &params,
+                &mut got_tree,
+                &helper,
+                None,
+            )
+        });
         let got_tree = merkle::merkle_tree_from_prehashed_level(
             got_tree,
             params.n_leaves(),
@@ -1070,7 +1074,7 @@ mod tests {
             ntt.forward_transform_interleaved(&mut oracle, params.num_ntts());
 
             assert!(
-                pd.codeword[..] == oracle[..],
+                pd.codeword()[..] == oracle[..],
                 "codeword mismatch at m={m} r={log_inv_rate}"
             );
             let oracle_bytes: &[u8] = unsafe {
@@ -1095,9 +1099,9 @@ mod tests {
             let z_packed = super::super::pack::pack_witness(&z, m);
             let params = default_params(m);
             let (commitment, prover_data) = commit(&z_packed, &params);
-            assert_eq!(prover_data.codeword.len(), params.codeword_len_f128());
+            assert_eq!(prover_data.codeword().len(), params.codeword_len_f128());
             assert_eq!(
-                prover_data.merkle_tree.last().copied().unwrap(),
+                prover_data.merkle_tree().last().copied().unwrap(),
                 commitment.root
             );
             assert_eq!(z_packed.len(), 1 << params.log_msg_len());
@@ -1140,8 +1144,8 @@ mod tests {
         let (_, pd1) = commit(&pack(&z1), &params);
         let (_, pd2) = commit(&pack(&z2), &params);
         let (_, pd_x) = commit(&pack(&z_xor), &params);
-        for (i, (&c1, &c2)) in pd1.codeword.iter().zip(pd2.codeword.iter()).enumerate() {
-            assert_eq!(c1 + c2, pd_x.codeword[i], "linearity fails at i={i}");
+        for (i, (&c1, &c2)) in pd1.codeword().iter().zip(pd2.codeword().iter()).enumerate() {
+            assert_eq!(c1 + c2, pd_x.codeword()[i], "linearity fails at i={i}");
         }
     }
 
@@ -1153,6 +1157,6 @@ mod tests {
         let z = rng.bits(1 << m);
         let z_packed = super::super::pack::pack_witness(&z, m);
         let (_, pd) = commit(&z_packed, &params);
-        assert_eq!(pd.codeword.len(), 2 * z_packed.len());
+        assert_eq!(pd.codeword().len(), 2 * z_packed.len());
     }
 }

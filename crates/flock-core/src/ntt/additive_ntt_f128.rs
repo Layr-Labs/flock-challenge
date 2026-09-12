@@ -1057,6 +1057,13 @@ impl AdditiveNttF128 {
     /// and block numbering of the full `log_d` transform), so outputs are
     /// bit-identical to the unsplit transform on the same positions.
     ///
+    /// `data` may be a tail slice of the full transform buffer whose first
+    /// element sits at absolute offset `elem_origin` (a whole number of
+    /// layer-`start_layer` blocks) and which ends at the full-domain end, so
+    /// `elem_origin + data.len()` is the full-domain element count. Block and
+    /// twiddle indices stay absolute over the full domain; only storage
+    /// indexing is rebased onto the slice. Whole-buffer callers pass 0.
+    ///
     /// Plain per-layer fused passes (fused-3 → fused-2 → single) over the
     /// suffix slice; the suffix is a minority share sized so streaming
     /// simplicity beats cache heroics.
@@ -1068,17 +1075,31 @@ impl AdditiveNttF128 {
         stop_layer: usize,
         b_start: usize,
         b_end: usize,
+        // Absolute element offset of `data`'s first element in the full
+        // transform buffer; 0 for a whole-buffer call.
+        elem_origin: usize,
         // Trailing lanes known zero at every odd position of `data`; 0 for an
         // ordinary dense transform.
         odd_tail: usize,
     ) {
-        let log_d = log2_pow2(data.len() / num_ntts);
+        let full_elems = elem_origin
+            .checked_add(data.len())
+            .expect("elem_origin + data.len() overflows usize");
+        let log_d = log2_pow2(full_elems / num_ntts);
         debug_assert!(stop_layer <= log_d);
         let range_blocks = b_end - b_start;
         debug_assert!(range_blocks > 0 && b_end <= (1usize << start_layer));
         let top_block_positions = 1usize << (log_d - start_layer);
-        let base_pos = b_start * top_block_positions;
-
+        // Rebased once, outside the layer loop: absolute first-element offset
+        // of the range minus the slice origin. Loop-invariant across layers.
+        let top_block_elems = top_block_positions
+            .checked_mul(num_ntts)
+            .expect("top block element count overflows usize");
+        debug_assert!(elem_origin % top_block_elems == 0);
+        let range_base_elem = b_start
+            .checked_mul(top_block_elems)
+            .and_then(|range_base_abs| range_base_abs.checked_sub(elem_origin))
+            .expect("block range must lie inside the origin-rebased slice");
         let mut layer = start_layer;
         while layer < stop_layer {
             let block_size = 1usize << (log_d - layer);
@@ -1086,7 +1107,6 @@ impl AdditiveNttF128 {
             // Absolute block index of the range's first block at this layer.
             let abs_first = b_start << (layer - start_layer);
             let num_blocks = range_blocks << (layer - start_layer);
-            let range_base_elem = base_pos * num_ntts;
 
             // Never leave a lone final layer (block_size 2 ⇒ 2^19 serial
             // kernel calls): when exactly 4 layers remain, take two fused-2
@@ -1191,12 +1211,20 @@ impl AdditiveNttF128 {
         stop_layer: usize,
         b_start: usize,
         b_end: usize,
+        // Absolute element offset of `data`'s first element in the full
+        // transform buffer; 0 for a whole-buffer call.
+        elem_origin: usize,
         finish_chunk: F,
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
         const DEEP_LAYER: usize = 10;
-        let log_d = log2_pow2(data.len() / num_ntts);
+        let log_d = log2_pow2(
+            elem_origin
+                .checked_add(data.len())
+                .expect("elem_origin + data.len() overflows usize")
+                / num_ntts,
+        );
         assert_eq!(log_d, 20, "ranked hybrid suffix requires log_d=20");
         assert_eq!(num_ntts, 64, "ranked hybrid suffix requires 64 lanes");
         assert_eq!(start_layer, 4, "ranked hybrid suffix starts at layer 4");
@@ -1217,6 +1245,7 @@ impl AdditiveNttF128 {
             DEEP_LAYER,
             b_start,
             b_end,
+            elem_origin,
             odd_tail,
         );
 
@@ -1232,6 +1261,7 @@ impl AdditiveNttF128 {
             log_d,
             sub_start,
             sub_end,
+            elem_origin,
             odd_tail,
             &finish_chunk,
         );
@@ -1761,6 +1791,7 @@ impl AdditiveNttF128 {
             log_d,
             0,
             1usize << n_top,
+            0,
             odd_tail,
             finish_chunk,
         );
@@ -1777,6 +1808,9 @@ impl AdditiveNttF128 {
         log_d: usize,
         sub_start: usize,
         sub_end: usize,
+        // Absolute element offset of `data`'s first element in the full
+        // transform buffer; 0 for a whole-buffer call.
+        elem_origin: usize,
         // Trailing lanes known zero at every odd position; 0 = dense.
         zero_tail: usize,
         finish_chunk: &F,
@@ -1786,16 +1820,35 @@ impl AdditiveNttF128 {
         use rayon::prelude::*;
 
         debug_assert!(n_top <= log_d);
-        debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
+        // `data` is a tail slice ending at the full-domain end, so its
+        // checked sum with the origin is the full-domain element count.
+        let full_elems = (1usize << log_d)
+            .checked_mul(num_ntts)
+            .expect("full-domain element count overflows usize");
+        let suffix_end = elem_origin
+            .checked_add(data.len())
+            .expect("elem_origin + data.len() overflows usize");
+        debug_assert_eq!(suffix_end, full_elems);
         debug_assert!(sub_start < sub_end && sub_end <= (1usize << n_top));
         let sub_size_positions = 1usize << (log_d - n_top);
-        let sub_elems = sub_size_positions * num_ntts;
+        let sub_elems = sub_size_positions
+            .checked_mul(num_ntts)
+            .expect("sub-NTT element count overflows usize");
+        debug_assert_ne!(sub_elems, 0);
+        debug_assert!(elem_origin % sub_elems == 0);
         let low_twiddle_final_pair = use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
         debug_assert!(zero_tail < num_ntts);
 
-        let range_start = sub_start * sub_elems;
-        let range_end = sub_end * sub_elems;
-
+        // Rebased onto the slice; both checked so a mis-shaped caller panics
+        // instead of silently indexing out of bounds.
+        let range_start = sub_start
+            .checked_mul(sub_elems)
+            .and_then(|abs| abs.checked_sub(elem_origin))
+            .expect("deep range must lie inside the origin-rebased slice");
+        let range_end = sub_end
+            .checked_mul(sub_elems)
+            .and_then(|abs| abs.checked_sub(elem_origin))
+            .expect("deep range must lie inside the origin-rebased slice");
         data[range_start..range_end]
             .par_chunks_mut(sub_elems)
             .enumerate()
@@ -3148,14 +3201,8 @@ mod tests {
         assert!(l2_recursive_ntt_epool_killed_by(Some("1")));
 
         // The union gate matches each shape exactly, independent of env.
-        assert_eq!(
-            is_recursive_ntt_epool_shape(18, 8, 2),
-            enabled_here
-        );
-        assert_eq!(
-            is_recursive_ntt_epool_shape(16, 8, 3),
-            enabled_here
-        );
+        assert_eq!(is_recursive_ntt_epool_shape(18, 8, 2), enabled_here);
+        assert_eq!(is_recursive_ntt_epool_shape(16, 8, 3), enabled_here);
         assert!(!is_recursive_ntt_epool_shape(17, 8, 2));
         assert!(!is_recursive_ntt_epool_shape(16, 8, 2));
     }
@@ -3650,13 +3697,13 @@ mod block_range_equivalence {
 
         // Whole range through the block-range driver.
         let mut whole = src.clone();
-        ntt.forward_transform_interleaved_block_range(&mut whole, num_ntts, 1, log_d, 0, 2, 0);
+        ntt.forward_transform_interleaved_block_range(&mut whole, num_ntts, 1, log_d, 0, 2, 0, 0);
         assert_eq!(full, whole, "block_range over the full range diverges");
 
         // Split at layer 4: shared top layers 1..4, then independent
         // per-block completion — the hybrid-commit shape.
         let mut split = src.clone();
-        ntt.forward_transform_interleaved_block_range(&mut split, num_ntts, 1, 4, 0, 2, 0);
+        ntt.forward_transform_interleaved_block_range(&mut split, num_ntts, 1, 4, 0, 2, 0, 0);
         for b in 0..16 {
             ntt.forward_transform_interleaved_block_range(
                 &mut split,
@@ -3665,6 +3712,7 @@ mod block_range_equivalence {
                 log_d,
                 b,
                 b + 1,
+                0,
                 0,
             );
         }
@@ -3700,6 +3748,7 @@ mod block_range_equivalence {
             b_start,
             b_end,
             0,
+            0,
         );
 
         let mut cache_local = src;
@@ -3710,6 +3759,7 @@ mod block_range_equivalence {
             n_top,
             b_start,
             b_end,
+            0,
             0,
         );
         let sub_start = b_start << (n_top - start_layer);
@@ -3723,6 +3773,7 @@ mod block_range_equivalence {
             log_d,
             sub_start,
             sub_end,
+            0,
             0,
             &|elem_offset, chunk| {
                 assert_eq!(elem_offset % sub_elems, 0);
@@ -3742,6 +3793,143 @@ mod block_range_equivalence {
         assert_eq!(
             got_offsets, expected_offsets,
             "callback coverage/offsets diverge"
+        );
+    }
+
+    /// Nonzero-origin suffix differential on the production tail shape:
+    /// `data` is the tail slice `[elem_origin, full)` of the full transform
+    /// buffer. Both completion paths (ordinary block range and deep fused
+    /// pairs) must be bit-identical to the scalar-from-layer oracle computed
+    /// on the entire original input, the untouched prefix must remain at the
+    /// shared-top state, and callbacks must carry absolute offsets into the
+    /// finalized oracle slices.
+    #[test]
+    fn suffix_origin_block_and_deep_match_full_transform() {
+        let num_ntts = 4usize;
+        let log_d = 12usize;
+        let start_layer = 4usize;
+        let n_top = 8usize;
+        // One trailing lane known zero at every odd position — a valid
+        // nonzero tail for this geometry, exercised through both paths.
+        const TAIL: usize = 1;
+        // `src` is treated as the shared layer-4 state: the deterministic
+        // input has the zero-lane geometry at every odd position, exactly
+        // like the hybrid commit's codeword when the GPU finishes layers
+        // 0..4. Layer-4 blocks [b_start, b_end) are the CPU-owned suffix.
+        let (b_start, b_end) = (2usize, 1usize << start_layer);
+        let top_block_positions = 1usize << (log_d - start_layer);
+        let elem_origin = b_start * top_block_positions * num_ntts;
+        let n = (1usize << log_d) * num_ntts;
+        debug_assert!(elem_origin > 0 && elem_origin < n);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let src: Vec<F128> = (0..n)
+            .map(|i| {
+                let odd_pos = (i / num_ntts) & 1 == 1;
+                if odd_pos && i % num_ntts >= num_ntts - TAIL {
+                    F128::ZERO
+                } else {
+                    F128::new(next(), next())
+                }
+            })
+            .collect();
+
+        // Independent oracle: scalar-from-layer over the ENTIRE shared-top
+        // state. Never calls the changed range APIs.
+        let mut oracle = src.clone();
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut oracle, num_ntts, start_layer);
+
+        // Ordinary block-range completion over the exclusive suffix slice
+        // (tail ending at the full-domain end).
+        let mut data = src.clone();
+        {
+            let suffix = &mut data[elem_origin..];
+            ntt.forward_transform_interleaved_block_range(
+                suffix,
+                num_ntts,
+                start_layer,
+                log_d,
+                b_start,
+                b_end,
+                elem_origin,
+                TAIL,
+            );
+        }
+        assert_eq!(
+            &data[..elem_origin],
+            &src[..elem_origin],
+            "prefix mutated by the suffix-only block-range call"
+        );
+        assert_eq!(
+            &data[elem_origin..],
+            &oracle[elem_origin..],
+            "origin-rebased block-range completion diverges on the suffix"
+        );
+
+        // Deep completion: the hybrid split shape — block range finishes
+        // layers 4..8, then the deep fused-pairs scheduler completes
+        // layers 8..log_d with absolute callback offsets.
+        let mut deep = src.clone();
+        let sub_start = b_start << (n_top - start_layer);
+        let sub_end = b_end << (n_top - start_layer);
+        let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
+        let offsets = std::sync::Mutex::new(Vec::new());
+        {
+            let suffix = &mut deep[elem_origin..];
+            ntt.forward_transform_interleaved_block_range(
+                suffix,
+                num_ntts,
+                start_layer,
+                n_top,
+                b_start,
+                b_end,
+                elem_origin,
+                TAIL,
+            );
+            ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                suffix,
+                num_ntts,
+                n_top,
+                log_d,
+                sub_start,
+                sub_end,
+                elem_origin,
+                TAIL,
+                &|elem_offset, chunk| {
+                    assert_eq!(elem_offset % sub_elems, 0);
+                    assert!(elem_offset >= elem_origin);
+                    assert_eq!(
+                        chunk,
+                        &oracle[elem_offset..elem_offset + sub_elems],
+                        "deep callback chunk diverges at absolute offset"
+                    );
+                    offsets.lock().unwrap().push(elem_offset);
+                },
+            );
+        }
+        assert_eq!(
+            &deep[..elem_origin],
+            &src[..elem_origin],
+            "deep path mutated the shared-top prefix"
+        );
+        assert_eq!(
+            &deep[elem_origin..],
+            &oracle[elem_origin..],
+            "origin-rebased deep completion diverges on the suffix"
+        );
+        let mut got_offsets = offsets.into_inner().unwrap();
+        got_offsets.sort_unstable();
+        let expected_offsets: Vec<usize> =
+            (sub_start..sub_end).map(|sub| sub * sub_elems).collect();
+        assert_eq!(
+            got_offsets, expected_offsets,
+            "deep callback coverage/offsets diverge from absolute sub-NTT map"
         );
     }
 }
@@ -3815,6 +4003,7 @@ mod zero_lane_skip {
                 n_top,
                 0,
                 1 << start_layer,
+                0,
                 tail,
             );
             ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
@@ -3824,6 +4013,7 @@ mod zero_lane_skip {
                 log_d,
                 0,
                 1 << n_top,
+                0,
                 tail,
                 &|_, _| {},
             );

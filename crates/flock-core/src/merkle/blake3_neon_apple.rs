@@ -192,6 +192,80 @@ unsafe fn round3(
     g3!(3, 4, 9, 14, schedule[14], schedule[15]);
 }
 
+#[inline(always)]
+unsafe fn round2(
+    v0: &mut [uint32x4_t; 16],
+    v1: &mut [uint32x4_t; 16],
+    m0: &[uint32x4_t; 16],
+    m1: &[uint32x4_t; 16],
+    schedule: &[u8; 16],
+) {
+    macro_rules! g2 {
+        ($a:literal, $b:literal, $c:literal, $d:literal, $x:expr, $y:expr) => {{
+            let x = $x as usize;
+            let y = $y as usize;
+            unsafe {
+                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), *m0.get_unchecked(x));
+                v1[$a] = vaddq_u32(vaddq_u32(v1[$a], v1[$b]), *m1.get_unchecked(x));
+                v0[$d] = rotate16(veorq_u32(v0[$d], v0[$a]));
+                v1[$d] = rotate16(veorq_u32(v1[$d], v1[$a]));
+                v0[$c] = vaddq_u32(v0[$c], v0[$d]);
+                v1[$c] = vaddq_u32(v1[$c], v1[$d]);
+                v0[$b] = rotate12(veorq_u32(v0[$b], v0[$c]));
+                v1[$b] = rotate12(veorq_u32(v1[$b], v1[$c]));
+                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), *m0.get_unchecked(y));
+                v1[$a] = vaddq_u32(vaddq_u32(v1[$a], v1[$b]), *m1.get_unchecked(y));
+                v0[$d] = rotate8(veorq_u32(v0[$d], v0[$a]));
+                v1[$d] = rotate8(veorq_u32(v1[$d], v1[$a]));
+                v0[$c] = vaddq_u32(v0[$c], v0[$d]);
+                v1[$c] = vaddq_u32(v1[$c], v1[$d]);
+                v0[$b] = rotate7(veorq_u32(v0[$b], v0[$c]));
+                v1[$b] = rotate7(veorq_u32(v1[$b], v1[$c]));
+            }
+        }};
+    }
+
+    g2!(0, 4, 8, 12, schedule[0], schedule[1]);
+    g2!(1, 5, 9, 13, schedule[2], schedule[3]);
+    g2!(2, 6, 10, 14, schedule[4], schedule[5]);
+    g2!(3, 7, 11, 15, schedule[6], schedule[7]);
+    g2!(0, 5, 10, 15, schedule[8], schedule[9]);
+    g2!(1, 6, 11, 12, schedule[10], schedule[11]);
+    g2!(2, 7, 8, 13, schedule[12], schedule[13]);
+    g2!(3, 4, 9, 14, schedule[14], schedule[15]);
+}
+
+#[inline(always)]
+unsafe fn round1(v0: &mut [uint32x4_t; 16], m0: &[uint32x4_t; 16], schedule: &[u8; 16]) {
+    macro_rules! g1 {
+        ($a:literal, $b:literal, $c:literal, $d:literal, $x:expr, $y:expr) => {{
+            let x = $x as usize;
+            let y = $y as usize;
+            unsafe {
+                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), *m0.get_unchecked(x));
+                v0[$d] = rotate16(veorq_u32(v0[$d], v0[$a]));
+                v0[$c] = vaddq_u32(v0[$c], v0[$d]);
+                v0[$b] = rotate12(veorq_u32(v0[$b], v0[$c]));
+                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), *m0.get_unchecked(y));
+                v0[$d] = rotate8(veorq_u32(v0[$d], v0[$a]));
+                v0[$c] = vaddq_u32(v0[$c], v0[$d]);
+                v0[$b] = rotate7(veorq_u32(v0[$b], v0[$c]));
+            }
+        }};
+    }
+
+    g1!(0, 4, 8, 12, schedule[0], schedule[1]);
+    g1!(1, 5, 9, 13, schedule[2], schedule[3]);
+    g1!(2, 6, 10, 14, schedule[4], schedule[5]);
+    g1!(3, 7, 11, 15, schedule[6], schedule[7]);
+    g1!(0, 5, 10, 15, schedule[8], schedule[9]);
+    g1!(1, 6, 11, 12, schedule[10], schedule[11]);
+    g1!(2, 7, 8, 13, schedule[12], schedule[13]);
+    g1!(3, 4, 9, 14, schedule[14], schedule[15]);
+}
+
+
+
 /// Hash complete groups of twelve contiguous 64-byte BLAKE3 parent blocks.
 ///
 /// This intrinsic path is Apple-only through the parent module's cfg. Tails
@@ -638,15 +712,14 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
     }
 }
 
-/// Shared driver: hash complete groups of twelve contiguous 64-byte blocks
-/// with the given BLAKE3 domain `flags`. Returns the number of outputs
-/// written; the caller handles the tail through upstream `hash_many`.
+/// Shared driver: hash 12-wide groups, then an 8-wide remainder, then a
+/// 4-wide remainder. Ranked pipelined Merkle subtrees are power-of-two, so
+/// this covers every local parent level with no `hash_many` tail. Leftover
+/// 1..=3 (non-ranked partitions) still go to upstream `hash_many`.
 fn hash_complete_groups_flags(data: &[u8], out: &mut [[u8; 32]], flags: u32) -> usize {
     debug_assert_eq!(data.len(), out.len() * 64);
-    let groups = out.len() / 12;
-    if groups == 0 {
-        return 0;
-    }
+    let groups12 = out.len() / 12;
+    let mut done = groups12 * 12;
 
     unsafe {
         let zero = vdupq_n_u32(0);
@@ -678,7 +751,7 @@ fn hash_complete_groups_flags(data: &[u8], out: &mut [[u8; 32]], flags: u32) -> 
             vdupq_n_u32(64),
             vdupq_n_u32(flags),
         ];
-        for group in 0..groups {
+        for group in 0..groups12 {
             let input = data.as_ptr().add(group * 12 * 64);
             let mut m0 = [zero; 16];
             let mut m1 = [zero; 16];
@@ -699,6 +772,38 @@ fn hash_complete_groups_flags(data: &[u8], out: &mut [[u8; 32]], flags: u32) -> 
             store_cv4(&mut v1, output.add(4 * 32));
             store_cv4(&mut v2, output.add(8 * 32));
         }
+        if out.len() - done >= 8 {
+            let input = data.as_ptr().add(done * 64);
+            let mut m0 = [zero; 16];
+            let mut m1 = [zero; 16];
+            transpose_parent4(input, &mut m0);
+            transpose_parent4(input.add(4 * 64), &mut m1);
+            let mut v0 = init;
+            let mut v1 = init;
+            for schedule in &MSG_SCHEDULE {
+                round2(&mut v0, &mut v1, &m0, &m1, schedule);
+            }
+            let output = out.as_mut_ptr().cast::<u8>().add(done * 32);
+            store_cv4(&mut v0, output);
+            store_cv4(&mut v1, output.add(4 * 32));
+            done += 8;
+        }
+        if out.len() - done >= 4 {
+            let input = data.as_ptr().add(done * 64);
+            let mut m0 = [zero; 16];
+            transpose_parent4(input, &mut m0);
+            let mut v0 = init;
+            for schedule in &MSG_SCHEDULE {
+                round1(&mut v0, &m0, schedule);
+            }
+            let output = out.as_mut_ptr().cast::<u8>().add(done * 32);
+            store_cv4(&mut v0, output);
+            done += 4;
+        }
+
+
+
     }
-    groups * 12
+    done
 }
+
