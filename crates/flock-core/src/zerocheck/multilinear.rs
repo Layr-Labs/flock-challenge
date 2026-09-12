@@ -152,6 +152,31 @@ fn zc_r2_odd_offload_enabled() -> bool {
     *ON
 }
 
+/// Anchors/deltas GPU offload for the round-two arm — **opt-in, default
+/// off** (`FLOCK_ZC_R2_AD_OFFLOAD=1` arms it). When armed, the Metal
+/// products kernel additionally writes each covered chunk's compact
+/// reconstruction (anchors + deltas) in place, through zero-copy wraps of
+/// the caller's own buffers, and the CPU sweep skips those stores; the
+/// stored bytes are proven byte-identical to the NEON kernels by the
+/// extended `gpu_zc_r2_products_match_cpu_oracle` test.
+///
+/// Incomplete for production: the lookahead sweep's covered chunks still
+/// owe the deferred round-three aggregates (`W0/W3/W4/W5`), which the
+/// per-pair GPU kernel does not yet produce (they need the group-structured
+/// x_lo pairing and four more chunk reductions). Until that lands, the
+/// default-off incumbent division keeps every proof byte-identical —
+/// `lincheck_stripe_c_proof_is_byte_identical_with_gpu_prefix` pins both
+/// arms. Requires the odd-parity offload (`FLOCK_NO_ZC_R2_ODD_OFFLOAD=1`
+/// forces this off too).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zc_r2_ad_offload_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        zc_r2_odd_offload_enabled()
+            && std::env::var_os("FLOCK_ZC_R2_AD_OFFLOAD").is_some_and(|v| v == *"1")
+    });
+    *ON
+}
+
 /// ZC-window GPU idle fill (see `gpu_commit::ENV_NO_ZC_IDLE_FILL`): stage
 /// round two's GPU-arm window setup while the ZC C-fold's GPU prefix is in
 /// flight. Everything staged derives from inputs bound BEFORE the fold
@@ -953,11 +978,13 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
 
     // GPU round-two products arm (see `ENV_NO_GPU_ZC_R2`): a measured
     // prefix of the hi-chunks gets its message products computed on the
-    // otherwise-idle GPU while the CPU writes those chunks' anchors and
-    // deltas through the anchors-only sibling kernel (byte-identical
-    // stores). Partials for prefix chunks are merged after the join; the
-    // XOR reduce below is order-independent, so the output is bit-identical
-    // to the all-CPU sweep. `None` = the exact incumbent path.
+    // otherwise-idle GPU. With the anchors/deltas offload armed (default)
+    // the dispatch also writes those chunks' compact reconstruction in
+    // place, so the CPU skips them outright; otherwise the CPU writes them
+    // through the anchors-only sibling kernel (byte-identical stores).
+    // Partials for prefix chunks are merged after the join; the XOR reduce
+    // below is order-independent, so the output is bit-identical to the
+    // all-CPU sweep. `None` = the exact incumbent path.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_job = crate::gpu_commit::launch_zc_r2_products(
         a_packed,
@@ -969,9 +996,27 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        zc_r2_ad_offload_enabled(),
+        // SAFETY: same contract as the lookahead site — the launch wraps
+        // these ranges for GPU writes into exactly the chunks the sweep
+        // below skips.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                compact.anchors.as_mut_ptr().cast::<u8>(),
+                2 * n_pairs * 16,
+            )
+        },
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                compact.deltas.full_overwrite_ptr(),
+                2 * n_pairs * n_chunks,
+            )
+        },
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_wrote_ad = gpu_job.as_ref().is_some_and(|j| j.wrote_ad);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -985,6 +1030,13 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // Anchors/deltas offload: the GPU dispatch wrote this chunk's
+        // compact reconstruction and owns its products (merged after the
+        // join) — nothing for the CPU to do.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if gpu_wrote_ad && x_hi < gpu_prefix {
+            return;
+        }
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and partials[x_hi]. The
         // queue's completion join publishes the writes before the reduction
@@ -1127,21 +1179,37 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                 }
             }
             crate::gpu_commit::ZcR2Result::Failed => {
-                // Redo exactly the skipped prefix products — slower, still
-                // exact. Throwaway anchor/delta scratch: the real ranges
-                // were already written by the anchors-only pass.
+                // Redo exactly the skipped prefix chunks — slower, still
+                // exact. When the anchors/deltas offload owned them the real
+                // compact ranges were not CPU-written (a failed drain leaves
+                // them unknown), so the redo writes the REAL ranges; on the
+                // incumbent division the anchors-only pass already wrote
+                // them and the redo keeps throwaway scratch.
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
+                    // SAFETY: chunk x_hi owns its real ranges exclusively
+                    // (the sweep skipped them; the failed GPU writer is
+                    // drained/poisoned before this loop runs).
+                    let (anchor_dst, delta_dst) = unsafe {
+                        if gpu_wrote_ad {
+                            (
+                                anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                                deltas_base.ptr().add(x_hi * delta_chunk_size),
+                            )
+                        } else {
+                            (scr_anchors.as_mut_ptr(), scr_deltas.as_mut_ptr())
+                        }
+                    };
                     let (p1, pinf) = unsafe {
                         fold_round2_compact_chunk_neon_unchecked_8(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
-                            scr_anchors.as_mut_ptr(),
-                            scr_deltas.as_mut_ptr(),
+                            anchor_dst,
+                            delta_dst,
                             eq_lo.as_ptr(),
                             lo_size,
                             pair_idx_base,
@@ -1785,6 +1853,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     // the *summed* `(p1, pinf)` for its prefix. The CPU keeps producing the
     // odd-parity halves on those chunks (the GPU's sums are not parity-split),
     // which is what makes `W1`/`W2` recoverable everywhere.
+    //
+    // With the anchors/deltas offload armed (default), the dispatch writes
+    // its chunks' compact reconstruction in place through zero-copy wraps of
+    // `compact`'s own buffers, and the CPU sweep skips those chunks entirely.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_job = crate::gpu_commit::launch_zc_r2_products(
         a_packed,
@@ -1796,9 +1868,27 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        zc_r2_ad_offload_enabled(),
+        // SAFETY: the launch only wraps these ranges for GPU writes into
+        // exactly the chunk ranges the CPU sweep below skips; the drain's
+        // completion wait orders those writes before any read.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                compact.anchors.as_mut_ptr().cast::<u8>(),
+                2 * n_pairs * 16,
+            )
+        },
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                compact.deltas.full_overwrite_ptr(),
+                2 * n_pairs * n_chunks,
+            )
+        },
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_wrote_ad = gpu_job.as_ref().is_some_and(|j| j.wrote_ad);
     // The GPU arm now returns its round-two products parity-split, so on an
     // offloaded chunk the CPU can skip the odd-parity pair as well as the even
     // one instead of recomputing the odd half for `W1`/`W2`. The kill switch
@@ -1818,6 +1908,13 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // Anchors/deltas offload: the GPU dispatch wrote this chunk's compact
+        // reconstruction in place AND owns its products (parity-split merge
+        // after the join), so the CPU has nothing to do for it.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if gpu_wrote_ad && x_hi < gpu_prefix {
+            return;
+        }
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and both partial slots.
         let (anchors, deltas) = unsafe {
@@ -1966,24 +2063,40 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                 }
             }
             crate::gpu_commit::ZcR2Result::Failed => {
-                // Redo exactly the skipped prefix products — slower, still
-                // exact. Throwaway anchor/delta scratch: the real ranges were
-                // already written by the lookahead pass. The full-lookahead
-                // monomorphization is used so the odd-parity slots are
-                // recovered too when the CPU sweep skipped them.
+                // Redo exactly the skipped prefix chunks — slower, still
+                // exact. When the anchors/deltas offload owned them the real
+                // compact ranges were NOT CPU-written (and a failed Metal
+                // drain leaves them in an unknown state), so the redo runs
+                // the full-lookahead kernel into the REAL ranges, rewriting
+                // every byte. On the incumbent division the sweep's
+                // lookahead pass already wrote the real ranges, so the redo
+                // keeps its throwaway scratch and recovers only the products.
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
+                    // SAFETY: chunk x_hi owns its real ranges exclusively
+                    // (the sweep skipped them; the failed GPU writer is
+                    // drained/poisoned before this loop runs).
+                    let (anchor_dst, delta_dst) = unsafe {
+                        if gpu_wrote_ad {
+                            (
+                                anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                                deltas_base.ptr().add(x_hi * delta_chunk_size),
+                            )
+                        } else {
+                            (scr_anchors.as_mut_ptr(), scr_deltas.as_mut_ptr())
+                        }
+                    };
                     unsafe {
                         fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
-                            scr_anchors.as_mut_ptr(),
-                            scr_deltas.as_mut_ptr(),
+                            anchor_dst,
+                            delta_dst,
                             eq_lo.as_ptr(),
                             lo_size,
                             pair_idx_base,
