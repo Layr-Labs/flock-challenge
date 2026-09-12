@@ -1607,6 +1607,16 @@ pub(crate) fn give_tree(tree: Vec<crate::merkle::Hash>) {
     imp::give_tree(tree);
 }
 
+/// Take a ranked-size tree allocation from the GPU tree pool (fresh
+/// allocation when the pool is empty or the GPU is unavailable/off).
+/// Same overwrite-before-read contract as `alloc_uninit_vec`: the caller
+/// writes every slot before reading. Recycles the warmup-timed 64 MiB
+/// buffers the pool already retains instead of mmap-faulting fresh pages
+/// inside the scored window on the CPU commit path.
+pub(crate) fn take_tree(n: usize) -> Vec<crate::merkle::Hash> {
+    imp::take_tree(n)
+}
+
 /// Wall of the round-1 AB precompute arm that runs `rayon::join`ed against
 /// the commit (f64 bits; 0 = not yet measured this process). The prover
 /// stores it every prove; the hybrid-split warmup sweep reads it to size its
@@ -5650,21 +5660,22 @@ kernel void blake3_pow_scan(
     }
 
     #[allow(clippy::uninit_vec)]
-    fn take_tree(n: usize) -> Vec<Hash> {
-        let mut pool = tree_pool_lock();
-        for i in 0..pool.len() {
-            if pool[i].capacity() >= n {
-                let mut v = pool.swap_remove(i);
-                drop(pool);
-                v.clear();
-                // SAFETY: capacity checked; Hash is Copy POD; caller writes
-                // every slot before reading (same contract as
-                // alloc_uninit_vec).
-                unsafe { v.set_len(n) };
-                return v;
+    pub(crate) fn take_tree(n: usize) -> Vec<Hash> {
+        if n == RANKED_TREE_NODES {
+            let mut pool = tree_pool_lock();
+            for i in 0..pool.len() {
+                if pool[i].capacity() >= n {
+                    let mut v = pool.swap_remove(i);
+                    drop(pool);
+                    v.clear();
+                    // SAFETY: capacity checked; Hash is Copy POD; caller writes
+                    // every slot before reading (same contract as
+                    // alloc_uninit_vec).
+                    unsafe { v.set_len(n) };
+                    return v;
+                }
             }
         }
-        drop(pool);
         crate::alloc_uninit_vec(n)
     }
 
@@ -9421,6 +9432,85 @@ kernel void lc_fold_stripes_factored_b4(
         }
     }
 
+    /// Admission retry for the GPU products arms' first-prove calibration.
+    ///
+    /// The calibration prices `u_cpu` from the CPU sweep that just ran (hot:
+    /// the P-cores are spun up from the earlier phases) but prices `u_gpu`
+    /// from back-to-back replays whose count is deliberately tight (the job
+    /// wall is cap-adjacent across ~120 worker processes). When the Metal
+    /// governor's clock ramp outlasts that replay budget, the minimum wall
+    /// is a mid-ramp price, the ratio inflates past the disable threshold,
+    /// and the arm stays off for the whole process — the documented ranked
+    /// failure mode ("admission failing on a majority of ranked worker
+    /// processes while every admitted process posts record p10s").
+    ///
+    /// This runs only on that failure path — after the calibration equality
+    /// oracle has already proven the kernel exact on this machine and the
+    /// priced share still came out degenerate (0, or the hi/8 admission
+    /// floor). It re-warms the engine with unpriced back-to-back replays
+    /// (the ramp is ~10–20 ms of sustained duty; probe replays are ~10 ms
+    /// each), then re-prices from fresh replay minima and takes the gate's
+    /// answer. Everything is bounded by a wall budget so a pathological
+    /// submit cannot stall the warmup; `None` keeps the original share.
+    fn zc_admission_retry_ramp(
+        gpu: &Gpu,
+        mut submit: impl FnMut() -> Result<Id, String>,
+        probe_chunks: usize,
+        u_cpu: f64,
+        hi_size: usize,
+        gate: fn(f64, usize) -> usize,
+        tag: &str,
+        debug_on: bool,
+    ) -> Option<usize> {
+        const RAMP_REPLAYS: usize = 6;
+        const PRICED_REPLAYS: usize = 3;
+        const RETRY_BUDGET_MS: f64 = 250.0;
+        let start = std::time::Instant::now();
+        let over_budget =
+            || start.elapsed().as_secs_f64() * 1e3 > RETRY_BUDGET_MS;
+        for _ in 0..RAMP_REPLAYS {
+            let cb = submit().ok()?;
+            // SAFETY: the caller's submit hands out command buffers owned by
+            // this thread; wait then release, discarding the wall entirely.
+            let _ = unsafe { gpu.wait_cb(cb) };
+            unsafe { gpu.release(cb) };
+            if over_budget() {
+                return None;
+            }
+        }
+        let mut w_min = f64::MAX;
+        let mut priced = 0usize;
+        for _ in 0..PRICED_REPLAYS {
+            let cb = submit().ok()?;
+            let w = if unsafe { gpu.wait_cb(cb) }.is_ok() {
+                unsafe { zc_fold_gpu_wall_ms(gpu, cb) }
+            } else {
+                0.0
+            };
+            unsafe { gpu.release(cb) };
+            if w <= 0.0 {
+                break;
+            }
+            w_min = w_min.min(w);
+            priced += 1;
+            if over_budget() {
+                break;
+            }
+        }
+        if priced == 0 || w_min == f64::MAX || !(u_cpu > 0.0) || probe_chunks == 0 {
+            return None;
+        }
+        let ratio = (w_min / probe_chunks as f64) / u_cpu;
+        let share = gate(ratio, hi_size);
+        if debug_on {
+            eprintln!(
+                "[{tag}] admission retry after degenerate share: \
+                 repriced ratio={ratio:.3} -> share {share}/{hi_size}"
+            );
+        }
+        Some(share)
+    }
+
     /// Tuned GPU claim share (sentinel `usize::MAX` = not yet tuned).
     static ZC_FOLD_TUNED_CLAIMS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(usize::MAX);
@@ -11499,7 +11589,12 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 15 / 16)
+        // Unclamped up to hi_size (port of pepedesigner's unpromoted 94e0f03):
+        // the 15/16 ceiling forced 128 of 2048 chunks onto the CPU-full path
+        // while the measured GPU drained the other 1920 in ~half the CPU
+        // sweep's time and then idled; the balance-point formula above is the
+        // only share bound now.
+        (g as usize).min(hi_size)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -11926,7 +12021,7 @@ kernel void zc_r2_products(
             // 1/8 probe that shipped there.
             (hi_size / 16).clamp(8, 128)
         } else {
-            tuned.min(hi_size * 15 / 16)
+            tuned.min(hi_size)
         };
         if chunks == 0 {
             return None;
@@ -12172,7 +12267,7 @@ kernel void zc_r2_products(
                 f64::INFINITY
             };
             let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
-            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+            let mut share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
                 let g = zc_r2_gate_share(ratio, hi_size);
@@ -12188,6 +12283,42 @@ kernel void zc_r2_products(
             } else {
                 0
             };
+            // Admission retry: the equality oracle above already proved this
+            // kernel exact on this machine, so a degenerate share (off or the
+            // hi/8 floor) points at a mid-ramp GPU price rather than a bad
+            // kernel — re-warm and re-price once. Only on the un-forced path
+            // (a forced ratio is a deliberate experiment, not a measurement).
+            if share <= hi_size / 8 && zc_r2_forced_ratio().is_none() {
+                if let Some(state_retry) = zc_r2_state().and_then(|m| m.lock().ok()) {
+                    if let (Some(&(_, _, a_buf)), Some(&(_, _, b_buf))) =
+                        (state_retry.wraps.first(), state_retry.wraps.get(1))
+                    {
+                        if let Some(repriced) = zc_admission_retry_ramp(
+                            gpu,
+                            || {
+                                zc_r2_submit(
+                                    gpu,
+                                    &state_retry,
+                                    a_buf,
+                                    b_buf,
+                                    job.chunks,
+                                    job.lo_size,
+                                    job.mask,
+                                    job.useful,
+                                )
+                            },
+                            job.chunks,
+                            u_cpu,
+                            hi_size,
+                            zc_r2_gate_share,
+                            "zc-r2",
+                            super::gpu_zc_r2_debug(),
+                        ) {
+                            share = repriced;
+                        }
+                    }
+                }
+            }
             ZC_R2_TUNED.store(share, Ordering::Relaxed);
             ZcR2Result::Calibrated
         }
@@ -12443,7 +12574,11 @@ kernel void zc_t3_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_T3_ALPHA))).round();
-        (g as usize).min(hi_size * 7 / 8)
+        // Unclamped up to hi_size, extending the r2-unclamp lesson (pepedesigner
+        // 94e0f03): the measured-ratio balance formula is the share authority;
+        // a fixed 7/8 ceiling strands the last eighth on the slower CPU-full
+        // path whenever the GPU measures multiple× faster.
+        (g as usize).min(hi_size)
     }
 
     fn zc_t3_init(gpu: &'static Gpu) -> Result<ZcT3, String> {
@@ -12668,7 +12803,8 @@ kernel void zc_t3_products(
             // halved. 64 chunks still price the kernel stably.
             (hi_size / 32).clamp(8, 64)
         } else {
-            tuned.min(hi_size * 7 / 8)
+            // Unclamped launch arm, matching the t3 gate above.
+            tuned.min(hi_size)
         };
         if chunks == 0 {
             return None;
@@ -12861,7 +12997,7 @@ kernel void zc_t3_products(
                 f64::INFINITY
             };
             let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
-            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+            let mut share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_t3_forced_ratio().unwrap_or(measured);
                 let g = zc_t3_gate_share(ratio, hi_size);
@@ -12877,6 +13013,30 @@ kernel void zc_t3_products(
             } else {
                 0
             };
+            // Admission retry, same as zc-r2: the equality oracle above proved
+            // the kernel exact here, so a degenerate share points at a
+            // mid-ramp GPU price — re-warm and re-price once, unforced only.
+            if share <= hi_size / 8 && zc_t3_forced_ratio().is_none() {
+                if let Some(state_retry) = zc_t3_state().and_then(|m| m.lock().ok()) {
+                    if let (Some(&(_, _, anchors_buf)), Some(&(_, _, deltas_buf))) =
+                        (state_retry.wraps.first(), state_retry.wraps.get(1))
+                    {
+                        let lo_size = state_retry.eq_lo_cap / 16;
+                        if let Some(repriced) = zc_admission_retry_ramp(
+                            gpu,
+                            || zc_t3_submit(gpu, &state_retry, anchors_buf, deltas_buf, job.chunks, lo_size),
+                            job.chunks,
+                            u_cpu,
+                            hi_size,
+                            zc_t3_gate_share,
+                            "zc-t3",
+                            super::gpu_zc_t3_debug(),
+                        ) {
+                            share = repriced;
+                        }
+                    }
+                }
+            }
             ZC_T3_TUNED.store(share, Ordering::Relaxed);
             ZcT3Result::Calibrated
         }
@@ -13126,7 +13286,9 @@ kernel void zc_loop_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_LOOP_ALPHA))).round();
-        (g as usize).min(hi_size * 7 / 8)
+        // Unclamped up to hi_size, same as the t3/r2 gates: the measured
+        // balance formula decides; the fixed ceiling only strands work.
+        (g as usize).min(hi_size)
     }
 
     fn zc_loop_init(gpu: &'static Gpu) -> Result<ZcLoop, String> {
@@ -13349,7 +13511,8 @@ kernel void zc_loop_products(
             // halved. 64 chunks still price the kernel stably.
             (hi_size / 32).clamp(8, 64)
         } else {
-            tuned.min(hi_size * 7 / 8)
+            // Unclamped launch arm, matching the loop gate above.
+            tuned.min(hi_size)
         };
         if chunks == 0 {
             return None;
@@ -13548,7 +13711,7 @@ kernel void zc_loop_products(
                 f64::INFINITY
             };
             let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
-            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+            let mut share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_loop_forced_ratio().unwrap_or(measured);
                 let g = zc_loop_gate_share(ratio, hi_size);
@@ -13564,6 +13727,29 @@ kernel void zc_loop_products(
             } else {
                 0
             };
+            // Admission retry, same as zc-r2/zc-t3: equality-oracle-passed
+            // kernel + degenerate share = suspect the cold-GPU price, not
+            // the engine. Re-warm, re-price once, unforced only.
+            if share <= hi_size / 8 && zc_loop_forced_ratio().is_none() {
+                if let Some(state_retry) = zc_loop_state().and_then(|m| m.lock().ok()) {
+                    if let (Some(&(_, _, a_buf)), Some(&(_, _, b_buf))) =
+                        (state_retry.wraps.first(), state_retry.wraps.get(1))
+                    {
+                        if let Some(repriced) = zc_admission_retry_ramp(
+                            gpu,
+                            || zc_loop_submit(gpu, &state_retry, a_buf, b_buf, job.chunks, job.lo_size),
+                            job.chunks,
+                            u_cpu,
+                            hi_size,
+                            zc_loop_gate_share,
+                            "zc-loop",
+                            super::gpu_zc_loop_debug(),
+                        ) {
+                            share = repriced;
+                        }
+                    }
+                }
+            }
             ZC_LOOP_TUNED.store(share, Ordering::Relaxed);
             ZcLoopResult::Calibrated
         }
@@ -13732,6 +13918,10 @@ mod imp {
     }
 
     pub(crate) fn give_tree(_tree: Vec<crate::merkle::Hash>) {}
+
+    pub(crate) fn take_tree(n: usize) -> Vec<crate::merkle::Hash> {
+        crate::alloc_uninit_vec(n)
+    }
 
     pub(crate) fn staging_released() {}
 }
@@ -15610,13 +15800,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[test]
     fn zc_r2_gate_share_policy() {
         use imp::zc_r2_gate_share;
-        // Balance point hi/(ratio+0.45); ranked-observed ratios land above
-        // the 15·hi/16 cap, which is the binding overshoot guard.
-        assert_eq!(zc_r2_gate_share(0.57, 2048), 1920);
-        assert_eq!(zc_r2_gate_share(0.38, 2048), 1920);
-        // The guard still binds before the GPU can straggle: at 15/16 the
-        // crossover is (1-0.45·15/16)/(15/16) ≈ 0.617, above the ranked 0.57.
-        assert!(zc_r2_gate_share(0.62, 2048) < 2048);
+        // Balance point hi/(ratio+0.45); unclamped up to hi_size.
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 2008);
+        assert_eq!(zc_r2_gate_share(0.38, 2048), 2048);
+        assert_eq!(zc_r2_gate_share(0.62, 2048), 1914);
         // Slow-but-usable GPU: the formula takes over below the cap.
         assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
         assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
@@ -15629,6 +15816,35 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
         assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
         assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_t3_gate_share_policy() {
+        use imp::zc_t3_gate_share;
+        // Balance point hi/(ratio+0.35); unclamped up to hi_size (same
+        // extension of the measured-formula authority as the r2 gate).
+        assert_eq!(zc_t3_gate_share(0.57, 2048), 2048); // 2048/0.92 = 2226
+        assert_eq!(zc_t3_gate_share(1.0, 2048), 1517); // 2048/1.35
+        assert_eq!(zc_t3_gate_share(2.0, 2048), 871); // 2048/2.35
+        // Admission floor for ratios in (2, 8), and the hard disable.
+        assert_eq!(zc_t3_gate_share(2.01, 2048), 256);
+        assert_eq!(zc_t3_gate_share(8.0, 2048), 0);
+        assert_eq!(zc_t3_gate_share(f64::NAN, 2048), 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_loop_gate_share_policy() {
+        use imp::zc_loop_gate_share;
+        // Balance point hi/(ratio+0.5); unclamped up to hi_size.
+        assert_eq!(zc_loop_gate_share(0.4, 2048), 2048); // 2048/0.9 = 2276
+        assert_eq!(zc_loop_gate_share(1.0, 2048), 1365); // 2048/1.5
+        assert_eq!(zc_loop_gate_share(2.0, 2048), 819); // 2048/2.5
+        // Admission floor for ratios in (2, 8), and the hard disable.
+        assert_eq!(zc_loop_gate_share(2.01, 2048), 256);
+        assert_eq!(zc_loop_gate_share(8.0, 2048), 0);
+        assert_eq!(zc_loop_gate_share(f64::NAN, 2048), 0);
     }
 
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
