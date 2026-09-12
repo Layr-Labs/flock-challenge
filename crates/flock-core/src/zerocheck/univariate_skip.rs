@@ -29,13 +29,25 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
+    build_eq_scaled(r, F128::ONE)
+}
+
+/// [`build_eq`] with the whole table pre-scaled by `root`:
+/// `table[x] = root · ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))`.
+///
+/// By linearity over the base ring the scale factors commute with the
+/// inductive doubling, so seeding the tree root with `root` instead of one
+/// produces the scaled table in a single pass — no intermediate buffer, no
+/// second traversal (port of pepedesigner's unpromoted `755c0d7` fusion;
+/// `build_eq` is the `root = 1` special case and stays bit-identical).
+pub fn build_eq_scaled(r: &[F128], root: F128) -> Vec<F128> {
     use rayon::prelude::*;
 
     let n = r.len();
     // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
     // every slot in t[0..2^n] is written exactly once before any read.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
-    t[0] = F128::ONE;
+    t[0] = root;
     const PAR_THRESHOLD: usize = 1 << 12;
     for i in 0..n {
         let r_i = r[i];
