@@ -92,6 +92,19 @@ pub struct BlockR1cs {
     pub csc_cache: std::sync::OnceLock<crate::lincheck::CscCircuit>,
 }
 
+/// Statement receipt proving that C is identity and the first 1,024 B rows
+/// select this R1CS's pinned constant-one coordinate.
+///
+/// The fields are private so code outside this module can obtain the
+/// receipt only through [`BlockR1cs::round1_pinned_one_prefix_statement`],
+/// which inspects the public matrices. This receipt says nothing about A's
+/// evaluated values. A producer must separately guarantee that its actual
+/// packed prefix has `A = C = Z` before identity-prefix omission is valid.
+#[derive(Clone, Copy, Debug)]
+pub struct Round1PinnedOnePrefixStatement {
+    _private: (),
+}
+
 // Manual Clone — std::sync::OnceLock doesn't derive Clone, and a fresh cache
 // after cloning is the right behavior (recomputes lazily on first use).
 impl Clone for BlockR1cs {
@@ -148,6 +161,41 @@ impl BlockR1cs {
         // may be stale. A global insertion here could otherwise contaminate a
         // different `BlockR1cs` carrying the original statement.
         c0_is_identity_scan(self.k(), &self.c_0)
+    }
+
+    /// Inspect the statement properties needed by the ranked BLAKE3
+    /// round-one identity-prefix omission.
+    ///
+    /// This checks matrix contents, rather than recognizing a shape: C must
+    /// be the full identity, B's first 1,024 rows must each select the R1CS's
+    /// pinned constant-one coordinate, and both A/B matrices must have the
+    /// advertised square block geometry. The lincheck constant-wire constraint
+    /// makes that selected B value one in every block. This does not establish
+    /// that A's evaluated prefix equals C; the packed-value producer must
+    /// provide that separate invariant.
+    pub fn round1_pinned_one_prefix_statement(&self) -> Option<Round1PinnedOnePrefixStatement> {
+        const PREFIX_BITS: usize = 1_024;
+        let k = self.k();
+        let const_pin = self.const_pin.filter(|pin| *pin < k)?;
+        if k < PREFIX_BITS
+            || self.a_0.num_rows != k
+            || self.a_0.num_cols != k
+            || self.a_0.rows.len() != k
+            || self.b_0.num_rows != k
+            || self.b_0.num_cols != k
+            || self.b_0.rows.len() != k
+            || self.c_0.rows.len() != k
+            || !c0_is_identity_scan(k, &self.c_0)
+        {
+            return None;
+        }
+        let prefix_matches = (0..PREFIX_BITS).all(|i| {
+            self.b_0
+                .rows
+                .get(i)
+                .is_some_and(|row| row.as_slice() == [const_pin])
+        });
+        prefix_matches.then_some(Round1PinnedOnePrefixStatement { _private: () })
     }
 
     /// Default `LincheckCircuit` wrapping this R1CS's sparse matrices.

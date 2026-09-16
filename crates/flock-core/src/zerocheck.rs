@@ -598,8 +598,9 @@ fn prove_packed_padded_inner<C: Challenger>(
             }
             let cpu_c = crate::pcs::commit::commit_cpu_ms();
             let t_c = std::time::Instant::now();
-            if crate::pcs::ranked_direct_fold8_enabled() {
-                let (c, s_hat_v_c, quad, fold8) =
+            let recover_identity_prefix = ab_inner.identity_prefix_was_omitted();
+            let (c, capture, recovered_ab) = if crate::pcs::ranked_direct_fold8_enabled() {
+                let (c, s_hat_v_c, quad, fold8, recovered_ab) =
                     crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
                         c_lincheck,
                         m,
@@ -609,6 +610,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         &r,
                         inv_table,
                         c_prelude,
+                        recover_identity_prefix,
                     );
                 if zc_timing {
                     eprintln!(
@@ -618,7 +620,6 @@ fn prove_packed_padded_inner<C: Challenger>(
                     );
                 }
                 (
-                    ab,
                     c,
                     Some(CapturedSHatVC {
                         s_hat_v_c,
@@ -626,9 +627,10 @@ fn prove_packed_padded_inner<C: Challenger>(
                         fold4: None,
                         fold8: Some(fold8),
                     }),
+                    recovered_ab,
                 )
             } else {
-                let (c, s_hat_v_c, quad, fold4) =
+                let (c, s_hat_v_c, quad, fold4, recovered_ab) =
                     crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
                         c_lincheck,
                         m,
@@ -638,6 +640,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                         &r,
                         inv_table,
                         c_prelude,
+                        recover_identity_prefix,
                     );
                 if zc_timing {
                     eprintln!(
@@ -647,7 +650,6 @@ fn prove_packed_padded_inner<C: Challenger>(
                     );
                 }
                 (
-                    ab,
                     c,
                     Some(CapturedSHatVC {
                         s_hat_v_c,
@@ -655,8 +657,16 @@ fn prove_packed_padded_inner<C: Challenger>(
                         fold4: Some(fold4),
                         fold8: None,
                     }),
+                    recovered_ab,
                 )
+            };
+            let mut ab = ab;
+            if let Some(recovered) = recovered_ab {
+                for (dst, value) in ab.iter_mut().zip(recovered) {
+                    *dst += value;
+                }
             }
+            (ab, c, capture)
         } else if m == 32 && crate::pcs::ranked_direct_fold4_enabled() {
             let (ab, c, s_hat_v_c, quad, fold4) =
                 crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
@@ -1633,7 +1643,7 @@ mod tests {
         let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
 
         let old_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-            &a_p, &b_p, M, K_SKIP, inv_table, &padding,
+            &a_p, &b_p, M, K_SKIP, inv_table, &padding, None,
         );
         let mut old_ch = FsChallenger::new(b"flock-c-stripe-proof-v0");
         let (old_proof, old_claim, old_capture) = prove_packed_padded_inner(
@@ -1657,7 +1667,7 @@ mod tests {
             .collect();
         let c_lincheck = crate::lincheck::pack_z_lincheck_from_packed(&c_words, M, K_LOG);
         let new_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-            &a_p, &b_p, M, K_SKIP, inv_table, &padding,
+            &a_p, &b_p, M, K_SKIP, inv_table, &padding, None,
         );
         let mut new_ch = FsChallenger::new(b"flock-c-stripe-proof-v0");
         let (new_proof, new_claim, new_capture) = prove_packed_padded_inner(
@@ -1728,7 +1738,7 @@ mod tests {
             let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
 
             let old_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-                &a_p, &b_p, M, K_SKIP, inv_table, &padding,
+                &a_p, &b_p, M, K_SKIP, inv_table, &padding, None,
             );
             let mut old_ch = FsChallenger::new(b"flock-c-stripe-gpu-v0");
             let (old_proof, old_claim, old_capture) = prove_packed_padded_inner(
@@ -1752,7 +1762,7 @@ mod tests {
                 .collect();
             let c_lincheck = crate::lincheck::pack_z_lincheck_from_packed(&c_words, M, K_LOG);
             let new_ab = univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
-                &a_p, &b_p, M, K_SKIP, inv_table, &padding,
+                &a_p, &b_p, M, K_SKIP, inv_table, &padding, None,
             );
             let submits_before = crate::gpu_commit::zerocheck_gpu_submits();
             let mut new_ch = FsChallenger::new(b"flock-c-stripe-gpu-v0");
