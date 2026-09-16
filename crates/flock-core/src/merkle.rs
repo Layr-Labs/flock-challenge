@@ -894,7 +894,7 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     let mut level_len = num_leaves;
 
     while level_len > 1 {
-        let mut next = Vec::with_capacity(active.len());
+        let mut written = 0;
         let mut i = 0;
         while i < active.len() {
             let p = active[i];
@@ -908,12 +908,16 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
                 proof.push(tree[level_start + (p ^ 1)]);
                 i += 1;
             }
-            next.push(p >> 1);
+            // Each parent consumes at least one child. The write index is
+            // therefore strictly behind the next unread child, so one buffer
+            // can hold both the current frontier and its compacted parents.
+            active[written] = p >> 1;
+            written += 1;
         }
-        // `next` is sorted-unique by construction: the input was sorted-unique;
+        // The compacted prefix is sorted-unique: the input was sorted-unique;
         // consecutive sibling pairs (handled above) collapse to one; otherwise
         // p >> 1 preserves strict ordering.
-        active = next;
+        active.truncate(written);
         level_start += level_len;
         level_len >>= 1;
     }
