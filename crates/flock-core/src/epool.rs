@@ -1,3 +1,4 @@
+// ZARAR-REDRAW-20260928-145254-D324: independent official re-measurement marker.
 //! Efficiency-core helper pool: barrier-free extra throughput for the
 //! prover's embarrassingly parallel phases.
 //!
@@ -157,7 +158,7 @@ pub fn helper_pool() -> Option<&'static rayon::ThreadPool> {
 
 /// Don't engage the helper pool below this many chunks: tiny jobs (recursive
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
-const EPOOL_MIN_CHUNKS: usize = 8;
+const EPOOL_MIN_CHUNKS: usize = 8usize;
 
 /// Process chunks `0..n_chunks` exactly once each, in parallel, drawing from
 /// a shared atomic queue drained by the main rayon pool plus (when present
