@@ -36,9 +36,7 @@ static inline uint32x4_t rot12(uint32x4_t x) {
 }
 
 static inline uint32x4_t rot8(uint32x4_t x) {
-  return vreinterpretq_u32_u8(__builtin_shufflevector(
-      vreinterpretq_u8_u32(x), vreinterpretq_u8_u32(x),
-      1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12));
+  return vsriq_n_u32(vshlq_n_u32(x, 24), x, 8);
 }
 
 static inline uint32x4_t rot7(uint32x4_t x) {

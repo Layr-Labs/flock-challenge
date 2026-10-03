@@ -54,6 +54,18 @@ pub trait Challenger: Send {
         // default no-op — RandomChallenger inherits this.
     }
 
+    /// Absorb one already-derived BLAKE3 chunk-root (32 bytes). Default
+    /// implementation is a no-op (RandomChallenger inherits this) — real
+    /// implementations observe the bytes; for [`crate::challenger::FsChallenger`]
+    /// it is bit-exact to [`Self::observe_bytes`] on a 32-byte slice, so the
+    /// transcript stays stable whether the chunk-root is absorbed by the
+    /// parent-fan-in driver or by a generic byte observation. Provided as a
+    /// typed seam so callers that already have a `[u8; 32]` chunk-root in
+    /// hand can hand it to the transcript without re-deriving the CV.
+    fn observe_chunk_root(&mut self, _root: &[u8; 32]) {
+        // default no-op
+    }
+
     /// Produce one F128 challenge.
     fn sample_f128(&mut self) -> F128;
 
@@ -391,6 +403,19 @@ impl Challenger for FsChallenger {
         self.absorb(&[OP_BYTES]);
         self.absorb(&(bytes.len() as u64).to_le_bytes());
         self.absorb(bytes);
+    }
+
+    /// Absorb one already-derived BLAKE3 chunk-root (32 bytes) into the
+    /// transcript. Semantically identical to [`Self::observe_bytes`]
+    /// (`length-prefixed raw byte absorption`, OP_BYTES), so the transcript
+    /// bytes — and therefore every challenge bound to them — are bit-exact
+    /// whether the caller hands in a 32-byte root directly or wraps it in a
+    /// slice. Provided as a typed seam so the Merkle parent-fan-in driver
+    /// can hand a pre-derived `[u8; 32]` chunk-root to the transcript
+    /// without re-encoding it into a slice and without each call site
+    /// re-deriving the CV by re-hashing the chunk.
+    fn observe_chunk_root(&mut self, root: &[u8; 32]) {
+        self.observe_bytes(root);
     }
 
     fn sample_f128(&mut self) -> F128 {

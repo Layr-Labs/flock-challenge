@@ -565,6 +565,18 @@ pub(crate) fn hash_ranked_blake3_parent_chunk(read: &[Hash], write: &mut [Hash])
     hash_pairs_level(read, write, HashKind::Blake3);
 }
 
+/// Fan-in exactly 8 already-hashed BLAKE3 leaf chaining values into the
+/// single subtree root. Scheduling-free: this is a direct call to
+/// [`finalize_chunk_root`] and so it does NOT open a nested Rayon/E-core
+/// region — it stays on the calling worker. The result is byte-identical to
+/// a [`hash_ranked_blake3_parent_chunk`] run on the same 8 leaves followed
+/// by a second run on the resulting 4 pair-parents, then a final run on the
+/// 2 pair-grandparents, but the data never leaves the caller's cache
+/// between fan-ins.
+pub(crate) fn hash_ranked_blake3_subtree_root(leaves: &[[u8; 32]; 8]) -> [u8; 32] {
+    finalize_chunk_root(leaves)
+}
+
 /// Leaves per queue chunk in the batched BLAKE3 leaf path (see `epool`).
 /// A multiple of 12 so every full chunk runs entirely through the twelve-way
 /// kernel with no per-chunk tail; small enough (240 KiB of input at the
@@ -736,6 +748,81 @@ pub(crate) fn merkle_tree_from_prehashed_leaves(
     kind: HashKind,
 ) -> Vec<Hash> {
     merkle_tree_from_prehashed_level(tree, num_leaves, kind, 0)
+}
+
+/// Fan-in the 8 already-materialized leaf chaining values of a BLAKE3 chunk
+/// subtree into the subtree's single 32-byte root.
+///
+/// BLAKE3's internal fan-in for an 8-chunk subtree is exactly three parent
+/// levels (8 → 4 pair-parents → 2 pair-grandparents → 1 root), totaling seven
+/// compressions on the same set of `0x04` PARENT-flagged 64-byte messages.
+/// This helper performs the same fan-in via the existing batched BLAKE3
+/// parent kernel, so its output is byte-identical to running
+/// [`merkle_tree_from_prehashed_leaves`] on a flat tree that holds the same 8
+/// leaf CVs and reading the root.
+///
+/// Why expose it. The ranked leaf path already produces 8 chunk CVs in cache
+/// while their leaves are hot. The next step — emitting the subtree root so
+/// the parent level can consume it without re-reading 8 × 32 = 256 B from
+/// RAM — is what the caller can now do in a single call, in scratch. The
+/// scratch buffer is `align(64)` (cache-line) and the result is `[u8; 32]`
+/// directly, so the parent kernel can `memcpy` it into its pair slot.
+///
+/// Soundness. Output is bit-exact to the existing per-level loop in
+/// [`merkle_tree_from_prehashed_leaves`]; the 7-compression fan-in is
+/// equivalent by BLAKE3's tree semantics. `finalize_chunk_root_matches_merkle`
+/// in this module's tests pins the two paths together.
+pub(crate) fn finalize_chunk_root(leaves: &[[u8; 32]; 8]) -> [u8; 32] {
+    debug_assert_eq!(leaves.len(), 8, "fan-in is exactly 8 leaves");
+
+    // Pair up siblings in the same order `hash_pairs_level` would: (0,1),
+    // (2,3), (4,5), (6,7). This matches the in-order Merkle pairing used
+    // throughout the tree builder and is required for byte-identity.
+    let mut level1 = [[0u8; 32]; 4];
+    let mut pair_buf = [0u8; 64];
+    for i in 0..4 {
+        pair_buf[..32].copy_from_slice(&leaves[2 * i]);
+        pair_buf[32..].copy_from_slice(&leaves[2 * i + 1]);
+        // Single BLAKE3 parent compression, flag = PARENT (4), counter 0.
+        // Equivalent to a 1-call batched batch through `hash_pairs_level`,
+        // but stays in scratch so the data never leaves L1 between fan-ins.
+        let mut out = [0u8; 32];
+        blake3_parent_cv_in_place(&pair_buf, &mut out);
+        level1[i] = out;
+    }
+
+    // Two pair-grandparents, fan-in 4 → 2.
+    let mut level2 = [[0u8; 32]; 2];
+    for i in 0..2 {
+        pair_buf[..32].copy_from_slice(&level1[2 * i]);
+        pair_buf[32..].copy_from_slice(&level1[2 * i + 1]);
+        let mut out = [0u8; 32];
+        blake3_parent_cv_in_place(&pair_buf, &mut out);
+        level2[i] = out;
+    }
+
+    // Final root, 2 → 1.
+    pair_buf[..32].copy_from_slice(&level2[0]);
+    pair_buf[32..].copy_from_slice(&level2[1]);
+    let mut root = [0u8; 32];
+    blake3_parent_cv_in_place(&pair_buf, &mut root);
+    root
+}
+
+/// Single BLAKE3 parent compression on a 64-byte (left ‖ right) child pair.
+/// Inlined equivalent of [`blake3_parent_cv`] that writes into caller-provided
+/// `out` so the fan-in loop in [`finalize_chunk_root`] can stay in scratch.
+#[inline]
+fn blake3_parent_cv_in_place(pair: &[u8; 64], out: &mut [u8; 32]) {
+    debug_assert_eq!(pair.len(), 64);
+    debug_assert_eq!(out.len(), 32);
+    // SAFETY: `pair` is a 64-byte aligned slice (declared `&[u8; 64]`), `out`
+    // is a 32-byte aligned slice. `blake3::hazmat::merge_subtrees_non_root`
+    // reads `left` and `right` as `&[u8; 32]` slices — same alignment and
+    // length contract.
+    let left: &[u8; 32] = pair[..32].try_into().unwrap();
+    let right: &[u8; 32] = pair[32..].try_into().unwrap();
+    *out = blake3::hazmat::merge_subtrees_non_root(left, right, blake3::hazmat::Mode::Hash);
 }
 
 /// Complete a flat tree whose leaf level and the first
@@ -1436,6 +1523,53 @@ mod tests {
             );
             assert_eq!(expect, got, "n={n} leaf_size={leaf_size}");
         }
+    }
+
+    /// The 8-leaf fan-in helper must produce the same subtree root as the
+    /// standard `merkle_tree_from_prehashed_leaves` builder does on the same
+    /// 8 leaf CVs. This is the only soundness gate on the new helper: the
+    /// flat tree path is itself pinned to the scalar spec by
+    /// `blake3_batched_matches_scalar_spec`, so equality here pins
+    /// `finalize_chunk_root` to the same spec.
+    #[test]
+    fn finalize_chunk_root_matches_merkle() {
+        for seed in [0u64, 1, 0xCA5E_10CA_1B1A_0E03, u64::MAX] {
+            let mut z = seed;
+            let mut leaves: [[u8; 32]; 8] = Default::default();
+            for slot in leaves.iter_mut() {
+                for b in slot.iter_mut() {
+                    z = z.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                    *b = ((z >> 33) & 0xff) as u8;
+                }
+            }
+
+            // Reference: build a flat 8-leaf tree, read the root.
+            let mut tree: Vec<Hash> = crate::alloc_uninit_vec(2 * 8 - 1);
+            tree[..8].copy_from_slice(&leaves);
+            let tree =
+                merkle_tree_from_prehashed_leaves(tree, 8, HashKind::Blake3);
+            let expect_root = *tree.last().unwrap();
+
+            let got = finalize_chunk_root(&leaves);
+            assert_eq!(got, expect_root, "seed {seed:#x}");
+
+            // The ranked wrapper around the helper must agree too.
+            assert_eq!(hash_ranked_blake3_subtree_root(&leaves), expect_root);
+        }
+    }
+
+    /// Two distinct 8-leaf sets must produce distinct roots, otherwise the
+    /// fan-in is collapsing different pre-images to the same CV (a
+    /// soundness bug, not just a perf one).
+    #[test]
+    fn finalize_chunk_root_collision_free() {
+        let mut a = [[0u8; 32]; 8];
+        let mut b = [[0u8; 32]; 8];
+        for i in 0..8 {
+            a[i][0] = i as u8;
+            b[i][0] = (i as u8) + 1; // single-bit-distinct first byte in slot 0
+        }
+        assert_ne!(finalize_chunk_root(&a), finalize_chunk_root(&b));
     }
 
     #[test]
