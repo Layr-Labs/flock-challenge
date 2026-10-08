@@ -164,7 +164,7 @@ mod imp {
         // Detached: this thread reaps itself. Dropping the live count as the
         // last action lets an awaiter observe quiet only after the spin state
         // is fully abandoned.
-        LIVE.fetch_sub(1, Ordering::SeqCst);
+        LIVE.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub(super) fn start() {
@@ -172,7 +172,7 @@ mod imp {
             return;
         }
         // Claim the run: if it was already true, another start is live.
-        if RUNNING.swap(true, Ordering::SeqCst) {
+        if RUNNING.swap(true, Ordering::Relaxed) {
             return;
         }
         // Size to the existing performance-core pool. The global Rayon pool the
@@ -182,7 +182,7 @@ mod imp {
         let n_cores = rayon::current_num_threads().max(1);
         let deadline = Instant::now() + MAX_KEEPALIVE;
         for i in 0..n_cores {
-            LIVE.fetch_add(1, Ordering::SeqCst);
+            LIVE.fetch_add(1, Ordering::Relaxed);
             match std::thread::Builder::new()
                 .name(format!("flock-keepalive-{i}"))
                 .stack_size(64 * 1024)
@@ -193,7 +193,7 @@ mod imp {
                 // governed by RUNNING / MAX_KEEPALIVE, and quiet by LIVE.
                 Ok(_) => {}
                 Err(_) => {
-                    LIVE.fetch_sub(1, Ordering::SeqCst);
+                    LIVE.fetch_sub(1, Ordering::Relaxed);
                     break;
                 }
             }
@@ -209,7 +209,7 @@ mod imp {
     /// Clear the run flag without waiting. Threads notice within one spin
     /// slice and exit on their own.
     pub(super) fn signal() {
-        RUNNING.swap(false, Ordering::SeqCst);
+        RUNNING.store(false, Ordering::Relaxed);
     }
 
     /// Wait until every spin thread has finished. All spin threads are
@@ -221,7 +221,7 @@ mod imp {
     /// descheduled thread can never stall the prove.
     pub(super) fn join_all() {
         let give_up_at = Instant::now() + QUIET_TIMEOUT;
-        while LIVE.load(Ordering::SeqCst) != 0 {
+        while LIVE.load(Ordering::Relaxed) != 0 {
             if Instant::now() >= give_up_at {
                 return;
             }
