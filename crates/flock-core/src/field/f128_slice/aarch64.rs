@@ -183,6 +183,27 @@ unsafe fn mul_unreduced(a: uint64x2_t, b: uint64x2_t) -> WideNeon {
     }
 }
 
+/// Accumulate a variable-by-variable product in raw Karatsuba components.
+/// Cross-term reconstruction is linear over XOR, so the message scan can
+/// reconstruct once per chunk instead of once per product.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn xor_karatsuba_product(acc: &mut KaratsubaNeon, a: uint64x2_t, b: uint64x2_t) {
+    unsafe {
+        let ll = pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+        let hh = transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(a),
+            vreinterpretq_p64_u64(b),
+        ));
+        let a_mid = veorq_u64(a, vextq_u64::<1>(a, a));
+        let b_mid = veorq_u64(b, vextq_u64::<1>(b, b));
+        let mm = pmull(vgetq_lane_u64::<0>(a_mid), vgetq_lane_u64::<0>(b_mid));
+        acc.ll = veorq_u64(acc.ll, ll);
+        acc.hh = veorq_u64(acc.hh, hh);
+        acc.mm = veorq_u64(acc.mm, mm);
+    }
+}
+
 /// XOR two products by a shared multiplier into raw Karatsuba-component
 /// accumulators. Delaying cross-term reconstruction until after the scan
 /// removes the per-product `cross` and word-shuffle work from the hot loop.
@@ -505,60 +526,6 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
         ]
-    }
-}
-
-/// Fixed 128-bank by 64-lane bank-major fold for the ranked zerocheck AB
-/// completion. Adjacent lanes share a weight load; six raw Karatsuba
-/// components stay live across the complete bank scan, followed by one
-/// paired reduction and two write-only output stores.
-///
-/// # Safety
-/// Requires the `aes` target feature (PMULL). `input` must contain exactly
-/// 128 consecutive rows of 64 [`F128`] values.
-#[inline(never)]
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn fold_bank_major_128x64_rows2(
-    weight: &[F128; 128],
-    input: &[F128],
-    output: &mut [F128; 64],
-) {
-    unsafe {
-        debug_assert_eq!(input.len(), 128 * 64);
-        let zero = vdupq_n_u64(0);
-        let wp = weight.as_ptr();
-        let xp = input.as_ptr();
-        let out = output.as_mut_ptr();
-
-        let mut lane = 0usize;
-        while lane < 64 {
-            let mut first = KaratsubaNeon {
-                ll: zero,
-                hh: zero,
-                mm: zero,
-            };
-            let mut second = KaratsubaNeon {
-                ll: zero,
-                hh: zero,
-                mm: zero,
-            };
-
-            let mut bank = 0usize;
-            let mut row = xp.add(lane);
-            while bank < 128 {
-                let wk = vld1q_u64(wp.add(bank).cast::<u64>());
-                let first_x = vld1q_u64(row.cast::<u64>());
-                let second_x = vld1q_u64(row.add(1).cast::<u64>());
-                xor_karatsuba_const_pair(&mut first, &mut second, first_x, second_x, wk);
-                bank += 1;
-                row = row.add(64);
-            }
-
-            let reduced = reduce_wide_pair(karatsuba_to_wide(first), karatsuba_to_wide(second));
-            vst1q_u64(out.add(lane).cast::<u64>(), reduced[0]);
-            vst1q_u64(out.add(lane + 1).cast::<u64>(), reduced[1]);
-            lane += 2;
-        }
     }
 }
 
@@ -1058,27 +1025,34 @@ pub(super) unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_adden
             t += 2;
         }
 
-        // The ranked caller supplies one `eq_lo`-sized output pair: 2,048
-        // entries per chunk at L1/L2 and 1,024 at L3. Scan the just-written
-        // 64 KiB or 32 KiB working set while it is cache-hot, keeping the four
-        // wide message accumulators out of the substantially higher-pressure
-        // corrected-fold loop above.
+        // The ranked caller supplies one 2,048-output pair of 32 KiB chunks.
+        // Scan their just-written 64 KiB working set while it is cache-hot,
+        // keeping the message accumulators out of the substantially
+        // higher-pressure corrected-fold loop above.
         let zero = vdupq_n_u64(0);
-        let mut u0 = WideNeon { lo: zero, hi: zero };
-        let mut u2 = WideNeon { lo: zero, hi: zero };
+        let mut u0 = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut u2 = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
         let mut t = 0usize;
         while t < nf.len() {
             let f0 = vld1q_u64(nf.as_ptr().add(t).cast::<u64>());
             let f1 = vld1q_u64(nf.as_ptr().add(t + 1).cast::<u64>());
             let b0 = vld1q_u64(nb.as_ptr().add(t).cast::<u64>());
             let b1 = vld1q_u64(nb.as_ptr().add(t + 1).cast::<u64>());
-            xor_wide(&mut u0, mul_unreduced(f0, b0));
-            xor_wide(&mut u2, mul_unreduced(veorq_u64(f0, f1), veorq_u64(b0, b1)));
+            xor_karatsuba_product(&mut u0, f0, b0);
+            xor_karatsuba_product(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
         (
-            transmute::<uint64x2_t, F128>(reduce_wide(u0)),
-            transmute::<uint64x2_t, F128>(reduce_wide(u2)),
+            transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(u0))),
+            transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(u2))),
         )
     }
 }

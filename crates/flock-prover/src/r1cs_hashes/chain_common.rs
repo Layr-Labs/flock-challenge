@@ -169,14 +169,23 @@ pub fn fold_in_out(
         acc
     };
 
-    let in_vals: Vec<F128> = (0..n_inst)
-        .into_par_iter()
-        .map(|i| fold_one(i, in_pos_base))
-        .collect();
-    let out_vals: Vec<F128> = (0..n_inst)
-        .into_par_iter()
-        .map(|i| fold_one(i, out_pos_base))
-        .collect();
+    // Both regions read the same immutable witness and equality table, so
+    // overlap their independent instance folds instead of completing two
+    // full Rayon traversals serially.
+    let (in_vals, out_vals) = rayon::join(
+        || {
+            (0..n_inst)
+                .into_par_iter()
+                .map(|i| fold_one(i, in_pos_base))
+                .collect()
+        },
+        || {
+            (0..n_inst)
+                .into_par_iter()
+                .map(|i| fold_one(i, out_pos_base))
+                .collect()
+        },
+    );
 
     (in_vals, out_vals)
 }
@@ -302,8 +311,10 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     let chain_claim = assemble_chain_claim(layout, r1cs.layout, &fold, &claims);
 
     let padding = r1cs.padding_spec();
-    let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
-    let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
+    let (ab_x_outer, c_x_outer) = rayon::join(
+        || crate::prover::quirky_x_outer_full(&core.ab.point),
+        || crate::prover::quirky_x_outer_full(&core.c.point),
+    );
     // Destructure core to move z_packed by value into the open (saves a 128 MB
     // clone at m=30 BLAKE3).
     let crate::prover::ProveCore {

@@ -103,10 +103,12 @@ pub(crate) fn add_carry_parts(x: u32, y: u32) -> (u32, u32, u32, u32) {
 /// K × K sparse matrix with no nonzero entries. Used as an `a_0`/`b_0` stub
 /// when the constraint definition lives in a `LincheckCircuit` walker.
 pub(crate) fn empty_matrix(k: usize) -> SparseBinaryMatrix {
+    let mut rows = Vec::with_capacity(k);
+    rows.resize_with(k, Vec::new);
     SparseBinaryMatrix {
         num_rows: k,
         num_cols: k,
-        rows: vec![Vec::new(); k],
+        rows,
     }
 }
 
@@ -766,21 +768,23 @@ mod streamed_first_pass_tests {
 /// Sort `v` and remove pairs of duplicates (GF(2) cancellation). Keeps R1CS
 /// rows in canonical (sorted, square-free) form.
 pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
-    v.sort();
-    let mut out = Vec::with_capacity(v.len());
-    let mut i = 0;
-    while i < v.len() {
-        let val = v[i];
+    v.sort_unstable();
+    let mut read = 0;
+    let mut write = 0;
+    while read < v.len() {
+        let val = v[read];
         let mut count = 0;
-        while i < v.len() && v[i] == val {
+        while read < v.len() && v[read] == val {
             count += 1;
-            i += 1;
+            read += 1;
         }
         if count % 2 == 1 {
-            out.push(val);
+            v[write] = val;
+            write += 1;
         }
     }
-    out
+    v.truncate(write);
+    v
 }
 
 // ---------------------------------------------------------------------------

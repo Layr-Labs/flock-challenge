@@ -245,8 +245,8 @@ fn generate_f_and_claim(
     use rayon::prelude::*;
     let len = 1usize << params.m;
     let area = params.area() as usize;
-    let eq_row = build_eq_table(z_row);
-    let eq_col = build_eq_table(z_col);
+    // The row and column equality tables are independent and can be built in parallel.
+    let (eq_row, eq_col) = rayon::join(|| build_eq_table(z_row), || build_eq_table(z_col));
     let prefix = &params.col_prefix_sums;
     let mut b = crate::alloc_uninit_f128_vec(len);
 
@@ -725,7 +725,7 @@ mod tests {
         // --- Phase 1: B-vector + claim generation, serial vs parallel-fused. ---
         let mut t_gen_ser = std::time::Duration::MAX;
         let mut t_gen_par = std::time::Duration::MAX;
-        let (mut b, mut v) = (Vec::new(), F128::ZERO);
+        let (mut b, mut v) = (Vec::with_capacity(self.params.m + 1), F128::ZERO);
         for _ in 0..REPS {
             // Serial reference: column-major build + separate v reduction.
             let t0 = Instant::now();

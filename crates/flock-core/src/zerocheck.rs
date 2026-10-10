@@ -538,7 +538,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
-    let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_ref() {
+    let (mut round1_ab, mut round1_c, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_ref() {
         assert!(
             capture_s_hat_v_c,
             "precomputed AB path currently requires s_hat_v capture"
@@ -734,8 +734,10 @@ fn prove_packed_padded_inner<C: Challenger>(
     let compact_deltas =
         precomputed_ab.map(univariate_skip_optimized::Round1AbInner::into_scratch_bytes);
     let c_s = c_s_f128();
-    let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
-    let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
+    // The raw round-one vectors are dead after restoring the C_s factor, so
+    // scale them in place rather than allocating and filling two replacements.
+    round1_ab.iter_mut().for_each(|x| *x = c_s * *x);
+    round1_c.iter_mut().for_each(|x| *x = c_s * *x);
     if zc_timing {
         eprintln!(
             "[zc-timing] round1 URM: {:.2} ms cpu={:.1}",
@@ -766,8 +768,12 @@ fn prove_packed_padded_inner<C: Challenger>(
     let cpu_r2 = crate::pcs::commit::commit_cpu_ms();
     let t_round2 = std::time::Instant::now();
     let fold_table = UniSkipFoldTable::new(k_skip, z);
-    let mut mlv_arg = vec![F128::ONE; n_mlv];
-    mlv_arg[1..].copy_from_slice(&r[k_skip + 1..]);
+    // Copy the challenge suffix once, then replace its convention-only first
+    // entry. Initializing the whole vector to ONE before overwriting all but
+    // that entry adds a redundant full write across this timed hot path.
+    let mut mlv_arg = Vec::with_capacity(r.len() - k_skip);
+    mlv_arg.push(F128::ONE);
+    mlv_arg.extend_from_slice(&r[k_skip + 1..]);
 
     // Two-challenge symbolic lookahead (variant K): round three's message is a
     // quadratic in ρ₁, so its six coefficients ride along inside round two's
@@ -1333,7 +1339,9 @@ fn prove_packed_padded_inner<C: Challenger>(
         );
     }
 
-    let r_rest: Vec<F128> = r[k_skip..].to_vec();
+    // Reuse the challenge allocation for the surviving tail instead of
+    // allocating and copying it into a second Vec.
+    r.drain(..k_skip);
 
     let proof = ZerocheckProof {
         round1_ab,
@@ -1346,7 +1354,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let claim = ZerocheckClaim {
         z,
         mlv_challenges: mlv_rhos,
-        r_rest,
+        r_rest: r,
         a_eval: final_a_eval,
         b_eval: final_b_eval,
         c_eval: final_c_eval,

@@ -105,69 +105,6 @@ pub const SMALL_CHAL_F8: [u8; 3] = [0xF7, 0x53, 0xB5];
 /// `C_s` as an F_8 value. Verified empirically by the C++ project.
 pub const C_S_F8: u8 = 0x1C;
 
-/// Pure selector shared by the two Apple/AES fixed-inverse micro-candidates.
-/// Only a literal `"1"` disables the selected arm.
-#[inline(always)]
-fn apple_inverse_literal_selected(platform_supported: bool, kill: Option<&str>) -> bool {
-    platform_supported && kill != Some("1")
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
-#[inline]
-fn medium_challenge_literals_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let kill = std::env::var("FLOCK_NO_ZC_MEDIUM_CONST_LITERALS").ok();
-        apple_inverse_literal_selected(true, kill.as_deref())
-    });
-    *ENABLED
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
-#[inline(always)]
-fn medium_challenge_literals_enabled() -> bool {
-    false
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
-#[inline]
-fn c_s_inverse_literal_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let kill = std::env::var("FLOCK_NO_ZC_C_S_INV_LITERAL").ok();
-        apple_inverse_literal_selected(true, kill.as_deref())
-    });
-    *ENABLED
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
-#[inline(always)]
-fn c_s_inverse_literal_enabled() -> bool {
-    false
-}
-
-const MEDIUM_CHALLENGES_GHASH_LITERAL: [F128; 4] = [
-    F128 {
-        lo: 0xffff_ffff_ffff_ff83,
-        hi: 0xffff_ffff_ffff_ffff,
-    },
-    F128 {
-        lo: 0x5555_5555_5555_557f,
-        hi: 0x5555_5555_5555_5555,
-    },
-    F128 {
-        lo: 0xeeee_eeee_eeee_ee9a,
-        hi: 0xeeee_eeee_eeee_eeee,
-    },
-    F128 {
-        lo: 0xd3d3_d3d3_d3d3_d3b9,
-        hi: 0xd3d3_d3d3_d3d3_d3d3,
-    },
-];
-
-const C_S_INV_GHASH_LITERAL: F128 = F128 {
-    lo: 0x9904_8380_6bff_be0d,
-    hi: 0x71af_641f_08db_d1a0,
-};
-
 /// The constant `C_s = φ_8(0x1C) ∈ F_{2^128}` — the relative scaling factor
 /// between this optimized output and the naive output.
 pub fn c_s_f128() -> F128 {
@@ -188,7 +125,7 @@ pub fn small_challenges_ghash() -> [F128; 3] {
 /// The four F_128 medium challenges `β_i = γ^{2^{i-1}} / (1 + γ^{2^{i-1}})`.
 /// Caller must place these at `r[k_skip+3..k_skip+7]` for the naive
 /// cross-check.
-fn medium_challenges_ghash_reference() -> [F128; 4] {
+pub fn medium_challenges_ghash() -> [F128; 4] {
     let g1 = F128 {
         lo: 1u64 << 1,
         hi: 0,
@@ -211,23 +148,6 @@ fn medium_challenges_ghash_reference() -> [F128; 4] {
         g4 * (F128::ONE + g4).inv(),
         g8 * (F128::ONE + g8).inv(),
     ]
-}
-
-pub fn medium_challenges_ghash() -> [F128; 4] {
-    if medium_challenge_literals_enabled() {
-        MEDIUM_CHALLENGES_GHASH_LITERAL
-    } else {
-        medium_challenges_ghash_reference()
-    }
-}
-
-#[inline]
-fn c_s_inv_f128() -> F128 {
-    if c_s_inverse_literal_enabled() {
-        C_S_INV_GHASH_LITERAL
-    } else {
-        c_s_f128().inv()
-    }
 }
 
 /// `C_2 = (1+r_2)(1+r_3)` where `r_2 = φ_8(0x53)` (= `α^2/(1+α^2)`),
@@ -641,23 +561,6 @@ pub fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
     kernels::bit_transpose_64bytes(input, output);
 }
 
-/// Provenance class for the large compact-AB backing after round two has
-/// overwritten every byte and its final reader immediately recycles it. The
-/// tag vouches only for full object initialization, never for byte values.
-const AB_COMPACT_R2_FULL_INIT_TAG: u64 = 0xA8F1_2002_0000_0001;
-static AB_COMPACT_BACKING_TOKEN_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static AB_COMPACT_BACKING_TOKEN_MISSES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Monotonic receipt for same-process warmup→timed provenance reuse.
-pub fn ab_compact_backing_token_counts() -> (usize, usize) {
-    (
-        AB_COMPACT_BACKING_TOKEN_HITS.load(std::sync::atomic::Ordering::Relaxed),
-        AB_COMPACT_BACKING_TOKEN_MISSES.load(std::sync::atomic::Ordering::Relaxed),
-    )
-}
-
 /// Challenge-independent AB half of the optimized round-1 kernel.
 ///
 /// The storage has exactly the same byte length and block layout as either
@@ -688,15 +591,7 @@ impl Round1AbInner {
     /// Donate the now-dead transform to a byte-oriented scratch consumer
     /// without changing the allocation's element type or deallocation layout.
     pub(crate) fn into_scratch_bytes(mut self) -> crate::scratch::ScratchBytes {
-        // Round1's backing is fully initialized: a cold provenance miss was
-        // raw-zeroed before any slice existed, while a hit names this exact
-        // allocation after a prior full R2 overwrite. R2 may read slices on
-        // portable targets, but cannot mint the next token until its complete
-        // overwrite has joined and called `mark_fully_initialized`.
-        crate::scratch::ScratchBytes::from_initialized_f128_for_full_overwrite(
-            core::mem::take(&mut self.storage),
-            AB_COMPACT_R2_FULL_INIT_TAG,
-        )
+        crate::scratch::ScratchBytes::from_initialized_f128(core::mem::take(&mut self.storage))
     }
 }
 
@@ -802,30 +697,6 @@ pub fn precompute_round1_ab_inner_packed_padded(
     )
 }
 
-/// Full-write scratch arm for the untimed exact-contention replay. It never
-/// consumes or advances compact-backing provenance, so the production arm is
-/// the sole owner of the warmup→timed token lifecycle.
-pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    inv_table: &InvNttTableByteSingleGf8,
-    padding: &PaddingSpec,
-) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_body(
-        a_packed,
-        b_packed,
-        m,
-        k_skip,
-        inv_table,
-        padding,
-        ab_pre_nt_enabled(),
-        false,
-        false,
-    )
-}
-
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
 /// choices, tests compare arms byte-for-byte in one process. `nt` selects the
 /// non-temporal drain vs the incumbent cached store; `compact` selects the
@@ -839,23 +710,6 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     padding: &PaddingSpec,
     nt: bool,
     compact: bool,
-) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_body(
-        a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn precompute_round1_ab_inner_packed_padded_body(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    inv_table: &InvNttTableByteSingleGf8,
-    padding: &PaddingSpec,
-    nt: bool,
-    compact: bool,
-    use_provenance: bool,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -882,33 +736,17 @@ fn precompute_round1_ab_inner_packed_padded_body(
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
-    // Compact stores leave dead tail rows unwritten, yet the completion path
-    // forms ordinary block references spanning those rows. Admit sparse
-    // writes only on an exact allocation returned from a prior full R2
-    // overwrite. A cold miss still has scratch's uninitialized contract, so
-    // raw-zero the complete allocation before constructing any reference and
-    // force the historical full-store arm for that warmup/fail-safe proof.
-    let storage_len = total_bytes / core::mem::size_of::<F128>();
-    let (mut storage, token_hit) = if use_provenance {
-        crate::scratch::take_f128_with_token(storage_len, AB_COMPACT_R2_FULL_INIT_TAG)
-    } else {
-        (crate::scratch::take_f128(storage_len), false)
-    };
-    if use_provenance && token_hit {
-        AB_COMPACT_BACKING_TOKEN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else if use_provenance {
-        AB_COMPACT_BACKING_TOKEN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    if !token_hit {
-        // SAFETY: `storage` is exclusively owned and exposes exactly
-        // `total_bytes`; zero is a valid object representation for F128.
-        unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
-    }
-    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
-        let (hits, misses) = ab_compact_backing_token_counts();
-        eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
-    }
-    let compact = compact && token_hit;
+    // Reuse an A-sized resident F128 allocation from the prover scratch pool.
+    // Treating it as bytes is valid under the read contract every consumer
+    // honors: each LIVE byte — rows `[0, n_b_med)` of every `x_outer` chunk —
+    // is written below before it is read. With the QS3 compacted store the
+    // dead tail rows `[n_b_med, 16)` are left recycled/uninitialized; this is
+    // sound because NO consumer ever reads them (all bound their per-`b_med`
+    // reads by the same `n_b_med`, derived from the same `padding`), and round
+    // two rewrites the whole donated buffer before use. The kill switch
+    // `FLOCK_NO_AB_COMPACT_STORE=1` restores the historical invariant "every
+    // byte written below (explicit zero fills for the skipped-b_med holes)".
+    let mut storage = crate::scratch::take_f128(total_bytes / core::mem::size_of::<F128>());
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
 
@@ -1962,12 +1800,6 @@ pub const ENV_NO_ZC_AB_EQ_FOLD: &str = "FLOCK_NO_ZC_AB_EQ_FOLD";
 /// accepting a typo would make component profiles incomparable.
 pub const ENV_ZC_AB_EQ_FOLD_S: &str = "FLOCK_ZC_AB_EQ_FOLD_S";
 
-/// Exact same-binary rollback for the ranked bank-major deferred reduction:
-/// only literal `FLOCK_NO_ZC_AB_BANK_DEFERRED=1` restores the scalar bank by
-/// lane collapse. The surrounding tensor fold and final `eq_hi` multiply are
-/// unchanged.
-pub const ENV_NO_ZC_AB_BANK_DEFERRED: &str = "FLOCK_NO_ZC_AB_BANK_DEFERRED";
-
 /// `x_lo` bits kept in the pre-scaled table index; the rest select the bank.
 const AB_EQ_FOLD_TABLE_BITS: usize = 5;
 
@@ -2011,47 +1843,6 @@ fn ab_eq_fold_from_env() -> AbEqFold {
                 .expect("FLOCK_ZC_AB_EQ_FOLD_S must be an integer in 0..=16")
         }))
     })
-}
-
-fn zc_ab_bank_deferred_enabled() -> bool {
-    zc_ab_bank_deferred_enabled_from_value(std::env::var_os(ENV_NO_ZC_AB_BANK_DEFERRED).as_deref())
-}
-
-fn zc_ab_bank_deferred_enabled_from_value(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("1"))
-}
-
-/// Restrict the fixed architecture kernel to the one geometry it was built
-/// for. Shape and provisioning are explicit inputs so selector tests can
-/// reject each near miss without mutating process-global state.
-#[allow(clippy::too_many_arguments)]
-fn ranked_ab_bank_deferred_shape(
-    m: usize,
-    k_skip: usize,
-    n_hi: usize,
-    n_lo: usize,
-    bank_bits: usize,
-    bank_len: usize,
-    k_log: usize,
-    useful_bits_per_block: usize,
-    main_threads: usize,
-    enabled: bool,
-) -> bool {
-    cfg!(all(
-        target_os = "macos",
-        target_arch = "aarch64",
-        target_feature = "aes"
-    )) && enabled
-        && m == 32
-        && k_skip == K_SKIP
-        && n_hi == 7
-        && n_lo == 12
-        && bank_bits == 7
-        && bank_len == 128 * ELL
-        && ELL == 64
-        && k_log == 14
-        && useful_bits_per_block == 15_409
-        && main_threads == 10
 }
 
 std::thread_local! {
@@ -2115,7 +1906,6 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     eq_hi_val: F128,
     tables: &[F128],
     bank_bits: usize,
-    bank_deferred: bool,
     banks: &mut [F128],
     partial_ab: &mut [F128; ELL],
 ) {
@@ -2146,31 +1936,10 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
         );
     }
 
-    finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks, bank_deferred, partial_ab);
-}
-
-/// Collapse the bank-major tensor-fold scratch and apply the unchanged high
-/// equality factor. Kept as one helper so tests can force both same-shape
-/// implementations without satisfying or bypassing the production selector.
-fn finish_ab_eq_fold_banks(
-    eq_bot: &[F128],
-    eq_hi_val: F128,
-    banks: &[F128],
-    bank_deferred: bool,
-    partial_ab: &mut [F128; ELL],
-) {
-    debug_assert_eq!(banks.len(), eq_bot.len() * ELL);
-    if bank_deferred {
-        let weights: &[F128; 128] = eq_bot
-            .try_into()
-            .expect("ranked deferred fold has exactly 128 weights");
-        crate::field::f128_slice::fold_bank_major_128x64_rows2(weights, banks, partial_ab);
-    } else {
-        partial_ab.fill(F128::ZERO);
-        for (bank, eq_bot_val) in banks.chunks_exact(ELL).zip(eq_bot) {
-            for (out, value) in partial_ab.iter_mut().zip(bank) {
-                *out += *eq_bot_val * *value;
-            }
+    partial_ab.fill(F128::ZERO);
+    for (bank, eq_bot_val) in banks.chunks_exact(ELL).zip(eq_bot) {
+        for (out, value) in partial_ab.iter_mut().zip(bank) {
+            *out += *eq_bot_val * *value;
         }
     }
     for value in partial_ab {
@@ -2254,18 +2023,6 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
             let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
             let tables = build_ab_eq_fold_tables(&eq_top_scaled, convert);
             let bank_len = eq_bot.len() * ELL;
-            let bank_deferred = ranked_ab_bank_deferred_shape(
-                m,
-                k_skip,
-                eq.n_hi,
-                eq.n_lo,
-                bank_bits,
-                bank_len,
-                padding.k_log,
-                padding.useful_bits_per_block,
-                rayon::current_num_threads(),
-                zc_ab_bank_deferred_enabled(),
-            );
             crate::epool::run_hetero_chunks(hi_size, |x_hi| {
                 let mut partial = [F128::ZERO; ELL];
                 AB_EQ_FOLD_BANKS.with(|cell| {
@@ -2285,7 +2042,6 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                         eq.hi[x_hi],
                         &tables,
                         bank_bits,
-                        bank_deferred,
                         &mut banks,
                         &mut partial,
                     );
@@ -2574,7 +2330,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     // it before placing the message on the transcript.
     let prefix = r[k_skip];
     let mut res_c_s = [F128::ZERO; ELL];
-    let c_s_inv = c_s_inv_f128();
+    let c_s_inv = c_s_f128().inv();
     for lane in 0..ELL {
         let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
         res_c_s[lane] = c_s_inv * naive;
@@ -2634,7 +2390,7 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     // it before placing the message on the transcript.
     let prefix = r[k_skip];
     let mut res_c_s = [F128::ZERO; ELL];
-    let c_s_inv = c_s_inv_f128();
+    let c_s_inv = c_s_f128().inv();
     for lane in 0..ELL {
         let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
         res_c_s[lane] = c_s_inv * naive;
@@ -3737,40 +3493,6 @@ mod tests {
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
 
-    #[test]
-    fn apple_fixed_inverse_selectors_are_literal_and_fail_closed() {
-        assert!(apple_inverse_literal_selected(true, None));
-        assert!(apple_inverse_literal_selected(true, Some("0")));
-        assert!(apple_inverse_literal_selected(true, Some("true")));
-        assert!(!apple_inverse_literal_selected(true, Some("1")));
-        assert!(!apple_inverse_literal_selected(false, None));
-        assert!(!apple_inverse_literal_selected(false, Some("0")));
-    }
-
-    #[test]
-    fn apple_fixed_inverse_literals_match_runtime_field_oracles() {
-        let reference_medium = medium_challenges_ghash_reference();
-        assert_eq!(MEDIUM_CHALLENGES_GHASH_LITERAL, reference_medium);
-        assert_eq!(medium_challenges_ghash(), reference_medium);
-
-        for (i, (&beta, shift)) in reference_medium.iter().zip([1u32, 2, 4, 8]).enumerate() {
-            let gamma_power = F128 {
-                lo: 1u64 << shift,
-                hi: 0,
-            };
-            assert_eq!(
-                beta * (F128::ONE + gamma_power),
-                gamma_power,
-                "medium literal {i} must equal gamma^2^i/(1+gamma^2^i)"
-            );
-        }
-
-        let reference_c_s_inv = c_s_f128().inv();
-        assert_eq!(C_S_INV_GHASH_LITERAL, reference_c_s_inv);
-        assert_eq!(c_s_inv_f128(), reference_c_s_inv);
-        assert_eq!(C_S_INV_GHASH_LITERAL * c_s_f128(), F128::ONE);
-    }
-
     /// **Soundness assumption.** Zerocheck and the Ligerito PCS opening at
     /// L0 both depend on the seven "friendly" constants — three small
     /// (`φ_8(SMALL_CHAL_F8[k])`, k ∈ 0..3) and four medium
@@ -4523,6 +4245,69 @@ mod tests {
             unsafe { bit_transpose_64bytes_neon(&input, &mut out_neon) };
             assert_eq!(out_scalar, out_neon, "bit_transpose disagreement");
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_bit_transpose_matches_scalar() {
+        use kernels::x86_64::bit_transpose_64bytes_avx2;
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return; // not on an AVX2 CPU; nothing to compare
+        }
+        let mut rng = Rng::new(0x4B17_BB17);
+        for _ in 0..10_000 {
+            let mut input = [0u8; 64];
+            for byte in input.iter_mut() {
+                *byte = (rng.next_u64() & 0xff) as u8;
+            }
+            let mut out_scalar = [0u8; 64];
+            let mut out_avx2 = [0u8; 64];
+            bit_transpose_64bytes_scalar(&input, &mut out_scalar);
+            // SAFETY: guarded by the avx2 feature check above.
+            unsafe { bit_transpose_64bytes_avx2(&input, &mut out_avx2) };
+            assert_eq!(
+                out_scalar, out_avx2,
+                "avx2 bit_transpose disagreement (round-trips through the dispatch too)"
+            );
+            // Also exercise the wired dispatch path itself.
+            let mut out_dispatch = [0u8; 64];
+            bit_transpose_64bytes(&input, &mut out_dispatch);
+            assert_eq!(out_scalar, out_dispatch, "dispatch disagreement");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_bit_transpose_bench() {
+        use kernels::x86_64::bit_transpose_64bytes_avx2;
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut rng = Rng::new(0xBEEF_CAFE);
+        let mut blocks = [[0u8; 64]; 1024];
+        for block in blocks.iter_mut() {
+            for byte in block.iter_mut() {
+                *byte = (rng.next_u64() & 0xff) as u8;
+            }
+        }
+        let n = 8_000_000usize;
+        let mut out = [0u8; 64];
+        let t0 = std::time::Instant::now();
+        for i in 0..n {
+            bit_transpose_64bytes_scalar(&blocks[i & 1023], &mut out);
+        }
+        let t_scalar = t0.elapsed().as_nanos() as f64 / n as f64;
+        let t1 = std::time::Instant::now();
+        for i in 0..n {
+            // SAFETY: guarded by the avx2 feature check above.
+            unsafe { bit_transpose_64bytes_avx2(&blocks[i & 1023], &mut out) };
+        }
+        let t_avx2 = t1.elapsed().as_nanos() as f64 / n as f64;
+        std::hint::black_box(&out);
+        println!(
+            "bit_transpose: scalar {t_scalar:.2} ns/call, avx2 {t_avx2:.2} ns/call, speedup {:.1}x",
+            t_scalar / t_avx2
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -5450,185 +5235,6 @@ mod tests {
                     "eq_lo tensor factorization at x={x}, s={bank_bits}"
                 );
             }
-        }
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn ranked_ab_bank_deferred_selector_is_exact() {
-        let selected =
-            |m, k_skip, n_hi, n_lo, bank_bits, bank_len, k_log, useful, threads, enabled| {
-                ranked_ab_bank_deferred_shape(
-                    m, k_skip, n_hi, n_lo, bank_bits, bank_len, k_log, useful, threads, enabled,
-                )
-            };
-        let ranked = (32, K_SKIP, 7, 12, 7, 128 * ELL, 14, 15_409, 10, true);
-        assert!(selected(
-            ranked.0, ranked.1, ranked.2, ranked.3, ranked.4, ranked.5, ranked.6, ranked.7,
-            ranked.8, ranked.9,
-        ));
-
-        assert!(!selected(
-            31,
-            K_SKIP,
-            7,
-            12,
-            7,
-            128 * ELL,
-            14,
-            15_409,
-            10,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP + 1,
-            7,
-            12,
-            7,
-            128 * ELL,
-            14,
-            15_409,
-            10,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            6,
-            12,
-            7,
-            128 * ELL,
-            14,
-            15_409,
-            10,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            7,
-            11,
-            7,
-            128 * ELL,
-            14,
-            15_409,
-            10,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            7,
-            12,
-            6,
-            128 * ELL,
-            14,
-            15_409,
-            10,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            7,
-            12,
-            7,
-            64 * ELL,
-            14,
-            15_409,
-            10,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            7,
-            12,
-            7,
-            128 * ELL,
-            13,
-            15_409,
-            10,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            7,
-            12,
-            7,
-            128 * ELL,
-            14,
-            15_408,
-            10,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            7,
-            12,
-            7,
-            128 * ELL,
-            14,
-            15_409,
-            9,
-            true
-        ));
-        assert!(!selected(
-            32,
-            K_SKIP,
-            7,
-            12,
-            7,
-            128 * ELL,
-            14,
-            15_409,
-            10,
-            false
-        ));
-    }
-
-    #[test]
-    fn ab_bank_deferred_kill_is_literal_one_only() {
-        use std::ffi::OsStr;
-
-        for enabled in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("01"),
-            Some("true"),
-            Some(" 1"),
-        ] {
-            assert!(
-                zc_ab_bank_deferred_enabled_from_value(enabled.map(OsStr::new)),
-                "value {enabled:?} must keep the candidate enabled"
-            );
-        }
-        assert!(!zc_ab_bank_deferred_enabled_from_value(Some(OsStr::new(
-            "1"
-        ))));
-    }
-
-    /// Force both production collapse arms at the candidate's exact 128x64
-    /// geometry. This zerocheck-layer differential also covers the final
-    /// `eq_hi` multiplication that intentionally remains outside the field
-    /// kernel.
-    #[test]
-    fn ab_bank_deferred_finish_matches_scalar_collapse() {
-        let mut rng = Rng::new(0xABBA_1280_0064);
-        for trial in 0..16 {
-            let eq_bot = rng.f128_vec(128);
-            let banks = rng.f128_vec(128 * ELL);
-            let eq_hi = if trial == 0 { F128::ZERO } else { rng.f128() };
-            let sentinel = F128::new(0xdead_beef_dead_beef, 0xfeed_face_feed_face);
-            let mut scalar = [sentinel; ELL];
-            let mut deferred = [sentinel; ELL];
-            finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, false, &mut scalar);
-            finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, true, &mut deferred);
-            assert_eq!(deferred, scalar, "trial={trial}");
         }
     }
 
