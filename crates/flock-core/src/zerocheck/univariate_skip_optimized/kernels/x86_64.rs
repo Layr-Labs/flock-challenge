@@ -236,3 +236,307 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_avx512(
         }
     }
 }
+
+/// AVX2 64-byte bit-transpose — the missing x86 mid-tier kernel.
+///
+/// The AVX-512 (VBMI) kernel and the scalar fallback are the only x86 paths;
+/// an AVX2-only CPU (no AVX-512) therefore runs the 512-branchy-op scalar
+/// kernel on every 64-byte C-block of round 1. This kernel replicates the
+/// same two-stage algorithm with AVX2 primitives:
+///
+/// 1. Stage 1 is the `IDX` byte-gather (the 8×8 byte transpose) done as two
+///    dword permutes (`_mm256_permutevar8x32_epi32`, lanes duplicated so one
+///    in-lane table serves both destination lanes) + per-lane byte shuffles
+///    + per-lane blends, OR-combined across the lo/hi 32-byte contributions.
+/// 2. Stage 2 is the identical three masked bit-swap rounds (distances
+///    7/14/28) as the AVX-512 kernel, applied per 64-bit lane on each
+///    256-bit half.
+///
+/// Output is byte-identical to [`super::super::kernels::portable::bit_transpose_64bytes_scalar`]
+/// (oracle test `avx2_bit_transpose_matches_scalar`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn bit_transpose_64bytes_avx2(input: &[u8; 64], output: &mut [u8; 64]) {
+    use core::arch::x86_64::*;
+
+    // Byte-shuffle tables (16 entries, applied to each 128-bit lane; 0x80
+    // zeroes the byte). After the dword permute, each lane holds the four
+    // gathered dwords; `A`/`C` pick byte offsets {0,1}/{2,3} of those dwords
+    // into the low half of the destination lane, `B`/`D` the same offsets
+    // into the high half (the lo/hi 32-byte source contributions).
+    #[rustfmt::skip]
+    const TA: [i8; 32] = [
+        0, 4, 8, 12, -128, -128, -128, -128, 1, 5, 9, 13, -128, -128, -128, -128,
+        0, 4, 8, 12, -128, -128, -128, -128, 1, 5, 9, 13, -128, -128, -128, -128,
+    ];
+    #[rustfmt::skip]
+    const TC: [i8; 32] = [
+        2, 6, 10, 14, -128, -128, -128, -128, 3, 7, 11, 15, -128, -128, -128, -128,
+        2, 6, 10, 14, -128, -128, -128, -128, 3, 7, 11, 15, -128, -128, -128, -128,
+    ];
+    #[rustfmt::skip]
+    const TB: [i8; 32] = [
+        -128, -128, -128, -128, 0, 4, 8, 12, -128, -128, -128, -128, 1, 5, 9, 13,
+        -128, -128, -128, -128, 0, 4, 8, 12, -128, -128, -128, -128, 1, 5, 9, 13,
+    ];
+    #[rustfmt::skip]
+    const TD: [i8; 32] = [
+        -128, -128, -128, -128, 2, 6, 10, 14, -128, -128, -128, -128, 3, 7, 11, 15,
+        -128, -128, -128, -128, 2, 6, 10, 14, -128, -128, -128, -128, 3, 7, 11, 15,
+    ];
+
+    unsafe {
+        let lo = _mm256_loadu_si256(input.as_ptr() as *const __m256i);
+        let hi = _mm256_loadu_si256(input.as_ptr().add(32) as *const __m256i);
+
+        // Stage 1: 8×8 byte transpose (the IDX gather). Dest lanes 0,1 read
+        // source dwords {0,2,4,6} (+{8,10,12,14} from hi); dest lanes 2,3
+        // read {1,3,5,7} (+{9,11,13,15}). Duplicating the permute index per
+        // lane lets one in-lane shuffle table serve both destination lanes.
+        let perm_a = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+        let perm_b = _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7);
+        let pa_lo = _mm256_permutevar8x32_epi32(lo, perm_a);
+        let pa_hi = _mm256_permutevar8x32_epi32(hi, perm_a);
+        let pb_lo = _mm256_permutevar8x32_epi32(lo, perm_b);
+        let pb_hi = _mm256_permutevar8x32_epi32(hi, perm_b);
+
+        let ta = _mm256_loadu_si256(TA.as_ptr() as *const __m256i);
+        let tb = _mm256_loadu_si256(TB.as_ptr() as *const __m256i);
+        let tc = _mm256_loadu_si256(TC.as_ptr() as *const __m256i);
+        let td = _mm256_loadu_si256(TD.as_ptr() as *const __m256i);
+        // lane0 → A/B pattern, lane1 → C/D pattern.
+        let mask0 = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            -1, -1, -1, -1, -1, -1,
+        );
+
+        let lo_part = _mm256_blendv_epi8(
+            _mm256_shuffle_epi8(pa_lo, ta),
+            _mm256_shuffle_epi8(pa_lo, tc),
+            mask0,
+        );
+        let hi_part = _mm256_blendv_epi8(
+            _mm256_shuffle_epi8(pa_hi, tb),
+            _mm256_shuffle_epi8(pa_hi, td),
+            mask0,
+        );
+        let mut y0 = _mm256_or_si256(lo_part, hi_part); // dest lanes 0,1
+
+        let lo_part = _mm256_blendv_epi8(
+            _mm256_shuffle_epi8(pb_lo, ta),
+            _mm256_shuffle_epi8(pb_lo, tc),
+            mask0,
+        );
+        let hi_part = _mm256_blendv_epi8(
+            _mm256_shuffle_epi8(pb_hi, tb),
+            _mm256_shuffle_epi8(pb_hi, td),
+            mask0,
+        );
+        let mut y1 = _mm256_or_si256(lo_part, hi_part); // dest lanes 2,3
+
+        // Stage 2: three masked bit-swap rounds on 64-bit lanes (identical to
+        // the AVX-512 kernel, applied to each 256-bit half).
+        let mask1 = _mm256_set1_epi64x(0x00AA00AA00AA00AAu64 as i64);
+        let mask2 = _mm256_set1_epi64x(0x0000CCCC0000CCCCu64 as i64);
+        let mask3 = _mm256_set1_epi64x(0x00000000F0F0F0F0u64 as i64);
+
+        let t = _mm256_and_si256(_mm256_xor_si256(y0, _mm256_srli_epi64::<7>(y0)), mask1);
+        y0 = _mm256_xor_si256(y0, _mm256_xor_si256(t, _mm256_slli_epi64::<7>(t)));
+        let t = _mm256_and_si256(_mm256_xor_si256(y0, _mm256_srli_epi64::<14>(y0)), mask2);
+        y0 = _mm256_xor_si256(y0, _mm256_xor_si256(t, _mm256_slli_epi64::<14>(t)));
+        let t = _mm256_and_si256(_mm256_xor_si256(y0, _mm256_srli_epi64::<28>(y0)), mask3);
+        y0 = _mm256_xor_si256(y0, _mm256_xor_si256(t, _mm256_slli_epi64::<28>(t)));
+
+        let t = _mm256_and_si256(_mm256_xor_si256(y1, _mm256_srli_epi64::<7>(y1)), mask1);
+        y1 = _mm256_xor_si256(y1, _mm256_xor_si256(t, _mm256_slli_epi64::<7>(t)));
+        let t = _mm256_and_si256(_mm256_xor_si256(y1, _mm256_srli_epi64::<14>(y1)), mask2);
+        y1 = _mm256_xor_si256(y1, _mm256_xor_si256(t, _mm256_slli_epi64::<14>(t)));
+        let t = _mm256_and_si256(_mm256_xor_si256(y1, _mm256_srli_epi64::<28>(y1)), mask3);
+        y1 = _mm256_xor_si256(y1, _mm256_xor_si256(t, _mm256_slli_epi64::<28>(t)));
+
+        _mm256_storeu_si256(output.as_mut_ptr() as *mut __m256i, y0);
+        _mm256_storeu_si256(output.as_mut_ptr().add(32) as *mut __m256i, y1);
+    }
+}
+
+/// x86 SSE2 acceleration of the paired Fold4 C drain
+/// (`accumulate_c_fold4_q_pair_banks` scalar fallback).
+///
+/// The scalar fallback bit-transposes each live c row separately (phase 1),
+/// then re-extracts bit `k` of every transposed row per (lane, bank) in the
+/// drain — ~24 scalar ops per (lane, bank). This kernel keeps phase 1 exactly
+/// (the `bit_transpose_64bytes` arch dispatch, which is the AVX2 kernel on
+/// modern x86) and replaces the per-lane scalar extraction with a 16-lane
+/// vectorized nibble assembly: for each bank `k`, the four transposed rows
+/// are loaded as 128-bit vectors, bit `k` of every byte is isolated with a
+/// masked 16-bit shift, shifted into the `h` nibble position and OR-accumulated
+/// into `masks[side][k][lane]`. The drain (64-bit mask loads, `even | odd << 4`
+/// index assembly, 16-byte pair-table gathers) is unchanged. SSE2 is a
+/// baseline x86_64 feature, so the 128-bit ops need no runtime gate. Output
+/// is byte-identical to `accumulate_c_fold4_q_pair_banks_scalar` (differential
+/// oracle in the bt_cdrain standalone bench).
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn accumulate_c_fold4_q_pair_banks_x86(
+    c_block_even: &[u8; 16 * 64],
+    n_b_med_even: usize,
+    c_block_odd: &[u8; 16 * 64],
+    n_b_med_odd: usize,
+    q: usize,
+    pair_mask_table: &[super::super::F128; 256],
+    partial_c: &mut [[super::super::F128; 64]; 8],
+) {
+    use core::arch::x86_64::*;
+
+    debug_assert!(n_b_med_even <= 16);
+    debug_assert!(n_b_med_odd <= 16);
+    debug_assert!(q < 4);
+    debug_assert_eq!(pair_mask_table.len(), 256);
+
+    // SAFETY: every live row is bounds-checked against its block's independent
+    // padding count; rows at or beyond `n_b_med` read as zero through the
+    // zero-initialized `transposed`/`masks` buffers. Each mask byte is a
+    // four-bit h-nibble, so the concatenated pair is a valid u8 table index.
+    unsafe {
+        // Phase 1: per-row 64-byte bit-transposes through the arch dispatch
+        // (AVX2 on this class of CPU) — byte-identical to the scalar fallback.
+        let mut transposed = [[[0u8; 64]; 4]; 2];
+        for (side, (c_block, n_b_med)) in [(c_block_even, n_b_med_even), (c_block_odd, n_b_med_odd)]
+            .into_iter()
+            .enumerate()
+        {
+            for (h, row_out) in transposed[side].iter_mut().enumerate() {
+                let b_med = q + 4 * h;
+                if b_med < n_b_med {
+                    let row: &[u8; 64] = c_block[b_med * 64..(b_med + 1) * 64]
+                        .try_into()
+                        .expect("64 c-bytes per medium position");
+                    super::super::bit_transpose_64bytes(row, row_out);
+                }
+            }
+        }
+
+        // Phase 2: vectorized nibble assembly. `masks[side][k][lane]` = the
+        // h-mask for bank k at lane, built 16 lanes at a time. The per-byte
+        // `(v >> k) & 1` uses a masked 16-bit shift: `_mm_srli_epi16` carries
+        // byte j+1's low bits into byte j's high bits, but the `& 0x0101`
+        // keeps only bit 0, which the carry can never reach. The `<< h`
+        // carries bit 0 into the next byte's bit 0, masked by `0xFF << h`.
+        let mut masks = [[[0u8; 64]; 8]; 2];
+        let one = _mm_set1_epi16(0x0101);
+        for side in 0..2 {
+            for chunk in 0..4 {
+                let col = chunk * 16;
+                let rows = [
+                    _mm_loadu_si128(transposed[side][0].as_ptr().add(col) as *const __m128i),
+                    _mm_loadu_si128(transposed[side][1].as_ptr().add(col) as *const __m128i),
+                    _mm_loadu_si128(transposed[side][2].as_ptr().add(col) as *const __m128i),
+                    _mm_loadu_si128(transposed[side][3].as_ptr().add(col) as *const __m128i),
+                ];
+                for k in 0..8 {
+                    let mut nib = _mm_setzero_si128();
+                    for h in 0..4 {
+                        let bit = match k {
+                            0 => _mm_and_si128(rows[h], one),
+                            1 => _mm_and_si128(_mm_srli_epi16::<1>(rows[h]), one),
+                            2 => _mm_and_si128(_mm_srli_epi16::<2>(rows[h]), one),
+                            3 => _mm_and_si128(_mm_srli_epi16::<3>(rows[h]), one),
+                            4 => _mm_and_si128(_mm_srli_epi16::<4>(rows[h]), one),
+                            5 => _mm_and_si128(_mm_srli_epi16::<5>(rows[h]), one),
+                            6 => _mm_and_si128(_mm_srli_epi16::<6>(rows[h]), one),
+                            _ => _mm_and_si128(_mm_srli_epi16::<7>(rows[h]), one),
+                        };
+                        let shifted = match h {
+                            0 => bit,
+                            1 => _mm_and_si128(
+                                _mm_slli_epi16::<1>(bit),
+                                _mm_set1_epi16(0xFEFEu16 as i16),
+                            ),
+                            2 => _mm_and_si128(
+                                _mm_slli_epi16::<2>(bit),
+                                _mm_set1_epi16(0xFCFCu16 as i16),
+                            ),
+                            _ => _mm_and_si128(
+                                _mm_slli_epi16::<3>(bit),
+                                _mm_set1_epi16(0xF8F8u16 as i16),
+                            ),
+                        };
+                        nib = _mm_or_si128(nib, shifted);
+                    }
+                    _mm_storeu_si128(masks[side][k].as_mut_ptr().add(col) as *mut __m128i, nib);
+                }
+            }
+        }
+
+        // Phase 3: drain — identical to the scalar semantics: 64-bit mask
+        // loads, per-byte index assembly (`even | odd << 4` cannot carry
+        // across bytes because both operands hold only low nibbles), then
+        // 16-byte pair-table gathers XORed into the eight bank accumulators.
+        let table = pair_mask_table.as_ptr() as *const u8;
+        for k in 0..8 {
+            let bank = partial_c[k].as_mut_ptr() as *mut u8;
+            for lane in (0..64).step_by(8) {
+                let even = (masks[0][k].as_ptr().add(lane) as *const u64).read_unaligned();
+                let odd = (masks[1][k].as_ptr().add(lane) as *const u64).read_unaligned();
+                let indices = even | (odd << 4);
+                let i0 = usize::from((indices & 0xff) as u8);
+                let i1 = usize::from(((indices >> 8) & 0xff) as u8);
+                let i2 = usize::from(((indices >> 16) & 0xff) as u8);
+                let i3 = usize::from(((indices >> 24) & 0xff) as u8);
+                let i4 = usize::from(((indices >> 32) & 0xff) as u8);
+                let i5 = usize::from(((indices >> 40) & 0xff) as u8);
+                let i6 = usize::from(((indices >> 48) & 0xff) as u8);
+                let i7 = usize::from((indices >> 56) as u8);
+
+                let t0 = _mm_loadu_si128(table.add(i0 * 16) as *const __m128i);
+                let t1 = _mm_loadu_si128(table.add(i1 * 16) as *const __m128i);
+                let t2 = _mm_loadu_si128(table.add(i2 * 16) as *const __m128i);
+                let t3 = _mm_loadu_si128(table.add(i3 * 16) as *const __m128i);
+                let t4 = _mm_loadu_si128(table.add(i4 * 16) as *const __m128i);
+                let t5 = _mm_loadu_si128(table.add(i5 * 16) as *const __m128i);
+                let t6 = _mm_loadu_si128(table.add(i6 * 16) as *const __m128i);
+                let t7 = _mm_loadu_si128(table.add(i7 * 16) as *const __m128i);
+
+                let p0 = bank.add(lane * 16);
+                let p1 = p0.add(16);
+                let p2 = p1.add(16);
+                let p3 = p2.add(16);
+                let p4 = p3.add(16);
+                let p5 = p4.add(16);
+                let p6 = p5.add(16);
+                let p7 = p6.add(16);
+                _mm_storeu_si128(
+                    p0 as *mut __m128i,
+                    _mm_xor_si128(_mm_loadu_si128(p0 as *const __m128i), t0),
+                );
+                _mm_storeu_si128(
+                    p1 as *mut __m128i,
+                    _mm_xor_si128(_mm_loadu_si128(p1 as *const __m128i), t1),
+                );
+                _mm_storeu_si128(
+                    p2 as *mut __m128i,
+                    _mm_xor_si128(_mm_loadu_si128(p2 as *const __m128i), t2),
+                );
+                _mm_storeu_si128(
+                    p3 as *mut __m128i,
+                    _mm_xor_si128(_mm_loadu_si128(p3 as *const __m128i), t3),
+                );
+                _mm_storeu_si128(
+                    p4 as *mut __m128i,
+                    _mm_xor_si128(_mm_loadu_si128(p4 as *const __m128i), t4),
+                );
+                _mm_storeu_si128(
+                    p5 as *mut __m128i,
+                    _mm_xor_si128(_mm_loadu_si128(p5 as *const __m128i), t5),
+                );
+                _mm_storeu_si128(
+                    p6 as *mut __m128i,
+                    _mm_xor_si128(_mm_loadu_si128(p6 as *const __m128i), t6),
+                );
+                _mm_storeu_si128(
+                    p7 as *mut __m128i,
+                    _mm_xor_si128(_mm_loadu_si128(p7 as *const __m128i), t7),
+                );
+            }
+        }
+    }
+}

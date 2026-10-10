@@ -30,11 +30,11 @@
 //! warm-up (before the worker publishes its ready file, so entirely outside
 //! every measured interval) [`arm`] splices a pipe onto descriptor 0 and keeps
 //! the original on a private descriptor. A dedicated thread blocks on the real
-//! stdin; when the seed line arrives it regenerates the inputs in parallel and
-//! starts the real proof. On the ranked publication path it holds the exact
-//! seed bytes until that proof has been atomically published, then forwards
-//! them so the wrapper can finish its normal generation and adopt the result.
-//! `FLOCK_NO_SPEC_PUBLISH=1` restores the incumbent forward-first ordering.
+//! stdin; when the seed line arrives it
+//!
+//! 1. **forwards the identical bytes** to the worker, which is blocked in
+//!    `read_line` and resumes exactly as it would have, then
+//! 2. regenerates the inputs in parallel and starts the real proof.
 //!
 //! The worker still runs its own serial expansion — we cannot and do not skip
 //! it — but it now runs on one core *concurrently* with a proof that is
@@ -75,9 +75,8 @@
 //!
 //! - Arms only in the ranked worker (argv shape) and only once.
 //! - `FLOCK_NO_SEED_PIPE=1` disables it — the exact A/B control.
-//! - A scope guard forwards the exact seed line and marks the pipe dead on any
-//!   unwind; parse, path, serialization, write, and rename failures likewise
-//!   forward before falling back to the wrapper's ordinary publication path.
+//! - The seed line is forwarded before anything fallible runs, so the worker
+//!   can never be left blocked on stdin by a failure on our side.
 //! - The speculative body runs under `catch_unwind`; any failure marks the
 //!   pipe dead and `prove_fast` falls back to the ordinary path.
 //! - Adoption requires a full byte-equality check of the worker's blocks
@@ -85,9 +84,6 @@
 //!   only thing standing between a bug here and an invalid proof) discards the
 //!   speculative result and re-proves normally.
 
-use std::ffi::OsStr;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -587,58 +583,6 @@ fn write_all_fd(fd: i32, mut buf: &[u8]) -> bool {
     true
 }
 
-/// Keeps the wrapper live across every deferred-forward exit, including an
-/// unexpected unwind outside the prover's explicit `catch_unwind`. Until
-/// `complete`, dropping this guard forwards any still-pending seed and marks
-/// speculative state dead so [`try_adopt`] falls back instead of waiting.
-struct SeedForwardFallback<'a> {
-    writer: i32,
-    bytes: &'a [u8],
-    pending: bool,
-    completed: bool,
-}
-
-impl<'a> SeedForwardFallback<'a> {
-    fn new(writer: i32, bytes: &'a [u8]) -> Self {
-        Self {
-            writer,
-            bytes,
-            pending: true,
-            completed: false,
-        }
-    }
-
-    fn forward(&mut self) -> bool {
-        if !self.pending {
-            return true;
-        }
-        self.pending = false;
-        if write_all_fd(self.writer, self.bytes) {
-            true
-        } else {
-            // SAFETY: the forwarding descriptor is owned by this thread and
-            // a failed write makes it unusable. Closing it gives the wrapper
-            // EOF instead of leaving it blocked on a partial line.
-            unsafe { close(self.writer) };
-            false
-        }
-    }
-
-    fn complete(&mut self) {
-        self.completed = true;
-    }
-}
-
-impl Drop for SeedForwardFallback<'_> {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        let _ = self.forward();
-        mark_dead();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Arming
 // ---------------------------------------------------------------------------
@@ -657,86 +601,6 @@ pub(crate) fn is_ranked_worker() -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
-}
-
-/// Pure selector for the literal-value kill test. Values such as `0`,
-/// `true`, or an empty string deliberately keep direct publication enabled.
-fn speculative_publish_enabled_for(ranked: bool, kill: Option<&OsStr>) -> bool {
-    ranked && kill != Some(OsStr::new("1"))
-}
-
-fn speculative_publish_enabled() -> bool {
-    speculative_publish_enabled_for(
-        is_ranked_worker(),
-        std::env::var_os("FLOCK_NO_SPEC_PUBLISH").as_deref(),
-    )
-}
-
-fn ranked_proof_path() -> Option<PathBuf> {
-    if !is_ranked_worker() {
-        return None;
-    }
-    let path = PathBuf::from(std::env::args_os().nth(3)?);
-    (!path.as_os_str().is_empty()).then_some(path)
-}
-
-/// Sibling temporary name: distinct from the wrapper's `{proof}.tmp`, and on
-/// the same filesystem as the destination so the final rename is atomic.
-fn speculative_temporary_path(proof_path: &Path) -> PathBuf {
-    let mut temporary = proof_path.as_os_str().to_os_string();
-    temporary.push(".spec.tmp");
-    temporary.into()
-}
-
-fn publish_bytes_atomically(proof_path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if proof_path.as_os_str().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "empty proof path",
-        ));
-    }
-    let temporary = speculative_temporary_path(proof_path);
-    let result = (|| {
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(bytes)?;
-        file.flush()?;
-        // The handle must be closed before visibility changes. The harness
-        // opens the final path only after rename and therefore observes either
-        // no file or the complete byte string, never a partial write.
-        drop(file);
-        std::fs::rename(&temporary, proof_path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn publish_speculative_result(out: &ProveOut) -> io::Result<bool> {
-    if !speculative_publish_enabled() {
-        return Ok(false);
-    }
-    let proof_path = ranked_proof_path()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing ranked proof path"))?;
-    // Tuple order is `(proof, commitment, claim)`. Borrowing preserves the
-    // result for wrapper adoption and consumes the current pre-encoded prefix
-    // only once, on the publication that the harness can observe first.
-    let bytes = crate::proof_io::r1cs_parts_to_bytes(&out.1, &out.0);
-    publish_bytes_atomically(&proof_path, &bytes)?;
-    Ok(true)
-}
-
-/// Serialization can panic (the flat encoder uses invariant `expect`s), while
-/// path/file operations return errors. Both are a normal `false` here: the
-/// caller must forward the seed and let the wrapper publish the same result.
-fn catch_speculative_publish<F>(publish: F) -> bool
-where
-    F: FnOnce() -> io::Result<bool>,
-{
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(publish))
-        .ok()
-        .and_then(|result| result.ok())
-        .unwrap_or(false)
 }
 
 /// Establish generator agreement during the untimed warm-up.
@@ -875,7 +739,7 @@ fn speculative_main(
 
     // The seed's first byte has arrived: this thread is about to forward it and
     // start the speculative prove. Signal the CPU keep-alive down immediately —
-    // the spin threads notice within one ~64-op slice and exit on their own —
+    // the spin threads notice within one ~1024-op slice and exit on their own —
     // but defer their 10–14 sequential joins until after the seed forward, so
     // that pure serial join time is off the timed window's first microseconds.
     // `FLOCK_NO_KEEPALIVE_DEFER=1` (exact '1') restores signal+join up front.
@@ -887,46 +751,44 @@ fn speculative_main(
         flock_core::cpu_keepalive::keepalive_stop();
     }
 
-    let Some(bytes) = line.as_deref() else {
-        // EOF or error: closing the write end turns the worker's read into a
-        // clean EOF instead of an indefinite block.
-        // SAFETY: closing a descriptor this thread owns.
-        unsafe { close(writer) };
-        mark_dead();
-        return;
-    };
-    let mut seed_forward = SeedForwardFallback::new(writer, bytes);
-
-    // Resolve the exact kill before parsing or doing any speculative work.
-    // Its off arm preserves the incumbent signal → forward → join → parse
-    // ordering byte-for-byte; no publication helper is even entered.
-    let defer_forward = speculative_publish_enabled();
-    if !defer_forward && !seed_forward.forward() {
-        return;
+    // Forward first and unconditionally. Everything after this point can fail
+    // without ever leaving the worker blocked on stdin.
+    match &line {
+        Some(bytes) => {
+            if !write_all_fd(writer, bytes) {
+                // SAFETY: closing descriptors this thread owns.
+                unsafe { close(writer) };
+                mark_dead();
+                return;
+            }
+        }
+        None => {
+            // EOF or error: closing the write end turns the worker's read into
+            // a clean EOF instead of an indefinite block.
+            // SAFETY: closing a descriptor this thread owns.
+            unsafe { close(writer) };
+            mark_dead();
+            return;
+        }
     }
-    if !defer_forward && defer_join {
+
+    // Seed forwarded: drain the keep-alive joins now. The spin threads were
+    // signalled before the forward and have already exited by this point, so
+    // the joins are reaping, not waiting.
+    if defer_join {
         flock_core::cpu_keepalive::keepalive_join();
     }
 
-    let parsed = std::str::from_utf8(bytes)
-        .ok()
+    let parsed = line
+        .as_deref()
+        .and_then(|b| std::str::from_utf8(b).ok())
         .and_then(|s| s.trim().parse::<u64>().ok());
     let Some(seed) = parsed else {
-        if defer_forward {
-            let _ = seed_forward.forward();
-        }
         mark_dead();
-        seed_forward.complete();
         return;
     };
 
     let seed_at = std::time::Instant::now();
-    // On the direct-publication arm, parse and timestamp first, then reap the
-    // already-signalled keep-alive threads. This is the remote candidate's
-    // measured ordering; the literal kill branch above remains incumbent.
-    if defer_forward && defer_join {
-        flock_core::cpu_keepalive::keepalive_join();
-    }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut buf = std::mem::take(&mut scratch);
         let n_total = 1usize << log2_size;
@@ -972,38 +834,11 @@ fn speculative_main(
 
     match outcome {
         Ok(out) => {
-            if defer_forward {
-                // Success makes the final file visible before the wrapper is
-                // released. Error or panic is fail-closed: `out` is still made
-                // adoptable below and the wrapper can publish it through its
-                // incumbent `{proof}.tmp` path.
-                let _ = catch_speculative_publish(|| publish_speculative_result(&out));
-            }
-            {
-                // Publish the result to the adoption state before releasing
-                // stdin. Happens-before proof: this scope unlocks `state`
-                // before the following seed `write`; the wrapper's seed read
-                // completes before it can enter `try_adopt`, whose lock of
-                // the same mutex observes `result`. Thus no scheduler gap can
-                // leave it waiting for this producer after its serial input
-                // expansion. This is the evidenced a78 ordering on both the
-                // direct-success and publication-fallback arms.
-                let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
-                state.result = Some(out);
-                shared().signal.notify_all();
-            }
-            if defer_forward && !seed_forward.forward() {
-                return;
-            }
-            seed_forward.complete();
+            let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
+            state.result = Some(out);
+            shared().signal.notify_all();
         }
-        Err(_) => {
-            if defer_forward {
-                let _ = seed_forward.forward();
-            }
-            mark_dead();
-            seed_forward.complete();
-        }
+        Err(_) => mark_dead(),
     }
 }
 
@@ -1108,17 +943,6 @@ mod tests {
     use super::*;
 
     static SPEC_IDENTITY_TEST_LOCK: Mutex<()> = Mutex::new(());
-    static PUBLICATION_TEST_ID: AtomicUsize = AtomicUsize::new(0);
-
-    fn publication_test_dir(label: &str) -> PathBuf {
-        let id = PUBLICATION_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "flock-seed-pipe-{label}-{}-{id}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&path).expect("create publication test directory");
-        path
-    }
 
     struct SpecIdentityReset;
 
@@ -1351,72 +1175,5 @@ mod tests {
         // `try_adopt` must be inert rather than blocking.
         assert!(!is_ranked_worker());
         assert!(try_adopt(&[]).is_none());
-    }
-
-    #[test]
-    fn speculative_publish_kill_is_literal_one() {
-        assert!(!speculative_publish_enabled_for(false, None));
-        assert!(speculative_publish_enabled_for(true, None));
-        assert!(!speculative_publish_enabled_for(
-            true,
-            Some(OsStr::new("1"))
-        ));
-        for value in ["", "0", "01", "true", " 1", "1 "] {
-            assert!(
-                speculative_publish_enabled_for(true, Some(OsStr::new(value))),
-                "unexpected kill for {value:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn speculative_publish_catches_every_failure_mode() {
-        assert!(catch_speculative_publish(|| Ok(true)));
-        assert!(!catch_speculative_publish(|| Ok(false)));
-        assert!(!catch_speculative_publish(|| Err(io::Error::other("io"))));
-        assert!(!catch_speculative_publish(|| -> io::Result<bool> {
-            panic!("serialization invariant")
-        }));
-    }
-
-    #[test]
-    fn speculative_atomic_publish_never_exposes_partial_bytes() {
-        let dir = publication_test_dir("atomic");
-        let proof_path = dir.join("proof.bin");
-        let expected: Vec<u8> = (0..(1 << 20)).map(|i| (i * 131 + 17) as u8).collect();
-        let reader_path = proof_path.clone();
-        let reader = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                match std::fs::read(&reader_path) {
-                    Ok(bytes) => return bytes,
-                    Err(error)
-                        if error.kind() == io::ErrorKind::NotFound
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        std::thread::yield_now();
-                    }
-                    Err(error) => panic!("atomic publication reader failed: {error}"),
-                }
-            }
-        });
-
-        publish_bytes_atomically(&proof_path, &expected).expect("atomic publication");
-        assert_eq!(reader.join().expect("reader thread"), expected);
-        assert!(!speculative_temporary_path(&proof_path).exists());
-        std::fs::remove_dir_all(&dir).expect("remove publication test directory");
-    }
-
-    #[test]
-    fn speculative_atomic_publish_cleans_up_after_rename_failure() {
-        let dir = publication_test_dir("failure");
-        let proof_path = dir.join("proof.bin");
-        // Renaming a regular temp file over a directory is guaranteed to fail;
-        // this exercises the same cleanup/fallback arm as a bad harness path.
-        std::fs::create_dir(&proof_path).expect("create conflicting destination");
-        assert!(publish_bytes_atomically(&proof_path, b"complete proof").is_err());
-        assert!(!speculative_temporary_path(&proof_path).exists());
-        assert!(proof_path.is_dir());
-        std::fs::remove_dir_all(&dir).expect("remove publication test directory");
     }
 }

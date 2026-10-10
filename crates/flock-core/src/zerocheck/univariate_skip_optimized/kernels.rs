@@ -4,6 +4,8 @@ mod portable;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 pub(super) use portable::bit_transpose_64bytes_scalar;
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(super) use portable::bit_transpose_64bytes_scalar;
 #[cfg(all(
     test,
     any(
@@ -94,6 +96,16 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
         x86_64::bit_transpose_64bytes_avx512(input, output);
     }
 
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: runtime `avx2` detection gates the call; the kernel carries its
+    // own `#[target_feature(enable = "avx2")]` attribute.
+    unsafe {
+        if avx2_bit_transpose_enabled() {
+            x86_64::bit_transpose_64bytes_avx2(input, output);
+            return;
+        }
+    }
+
     #[cfg(not(any(
         target_arch = "aarch64",
         all(
@@ -104,6 +116,19 @@ pub(super) fn bit_transpose_64bytes(input: &[u8; 64], output: &mut [u8; 64]) {
         )
     )))]
     portable::bit_transpose_64bytes_scalar(input, output);
+}
+
+/// Runtime gate for the AVX2 bit-transpose. The AVX-512 kernel is gated at
+/// compile time, so on an AVX2-only x86 CPU the dispatch otherwise falls all
+/// the way to the 512-branchy-op scalar kernel. `FLOCK_NO_AVX2_BITTRANSPOSE=1`
+/// forces the scalar path for A/B measurement.
+#[cfg(target_arch = "x86_64")]
+fn avx2_bit_transpose_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::env::var("FLOCK_NO_AVX2_BITTRANSPOSE").map_or(true, |v| v != "1")
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -398,7 +423,8 @@ pub(super) fn accumulate_c_fold4_four_banks(
         let q_banks: &mut [[super::F128; 64]; 8] = (&mut partial_c[q * 8..(q + 1) * 8])
             .try_into()
             .expect("eight Fold4 banks per retained q group");
-        super::accumulate_c_fold4_q_pair_banks_scalar(
+        // Route through the arch dispatch so x86 also gets the SIMD drain.
+        accumulate_c_fold4_q_pair_banks(
             c_blocks[0],
             n_b_med[0],
             c_blocks[1],
@@ -407,7 +433,7 @@ pub(super) fn accumulate_c_fold4_four_banks(
             pair_mask_tables[0],
             q_banks,
         );
-        super::accumulate_c_fold4_q_pair_banks_scalar(
+        accumulate_c_fold4_q_pair_banks(
             c_blocks[2],
             n_b_med[2],
             c_blocks[3],
@@ -455,6 +481,24 @@ pub(super) fn accumulate_c_fold4_q_pair_banks(
         );
     }
 
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is a baseline x86_64 feature; the fixed arrays cover every
+    // selected row, and the two four-bit masks form a bounded eight-bit index.
+    unsafe {
+        if x86_c_drain_enabled() {
+            x86_64::accumulate_c_fold4_q_pair_banks_x86(
+                c_block_even,
+                n_b_med_even,
+                c_block_odd,
+                n_b_med_odd,
+                q,
+                pair_mask_table,
+                partial_c,
+            );
+            return;
+        }
+    }
+
     #[cfg(not(target_arch = "aarch64"))]
     super::accumulate_c_fold4_q_pair_banks_scalar(
         c_block_even,
@@ -465,6 +509,15 @@ pub(super) fn accumulate_c_fold4_q_pair_banks(
         pair_mask_table,
         partial_c,
     );
+}
+
+/// Runtime gate for the x86 SSE2 Fold4 C-drain kernel.
+/// `FLOCK_NO_X86_CDRAIN=1` restores the scalar drain for A/B measurement;
+/// the 128-bit ops are baseline SSE2, so no feature detection is needed.
+#[cfg(target_arch = "x86_64")]
+fn x86_c_drain_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("FLOCK_NO_X86_CDRAIN").map_or(true, |v| v != "1"))
 }
 
 /// AB-only half of [`accumulate_convert_with_s_hat_v`].  Keeping this as a

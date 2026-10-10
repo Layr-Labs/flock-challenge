@@ -543,10 +543,10 @@ fn direct_fold4_message_coefficients(h: &[F128; 256], round: usize) -> (Vec<F128
         }
     }
 
-    let (u0, u2) = endpoints.split_at_mut(grid_len);
-    tensor_quadratic_coefficients(u0, round);
-    tensor_quadratic_coefficients(u2, round);
-    (u0.to_vec(), u2.to_vec())
+    let mut u2 = endpoints.split_off(grid_len);
+    tensor_quadratic_coefficients(&mut endpoints, round);
+    tensor_quadratic_coefficients(&mut u2, round);
+    (endpoints, u2)
 }
 
 /// Derive the first four transcript messages from sixteen-bank direct
@@ -640,10 +640,10 @@ fn direct_fold8_message_coefficients(h: &[F128; 4096], round: usize) -> (Vec<F12
         }
     }
 
-    let (u0, u2) = endpoints.split_at_mut(grid_len);
-    tensor_quadratic_coefficients(u0, round);
-    tensor_quadratic_coefficients(u2, round);
-    (u0.to_vec(), u2.to_vec())
+    let mut u2 = endpoints.split_off(grid_len);
+    tensor_quadratic_coefficients(&mut endpoints, round);
+    tensor_quadratic_coefficients(&mut u2, round);
+    (endpoints, u2)
 }
 
 /// Derive the first six transcript messages from sixty-four-bank direct
@@ -1045,29 +1045,16 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
 
     // 1. Ring-switching for all x_outers.
     let t = std::time::Instant::now();
-    // Consumer-side capability for eliding ring-switch basis factors.  This
-    // is the `direct_common` predicate below, restricted to the ranked Apple
-    // lane and evaluated before ring_switch builds any suffix factors.  The
-    // producer still proves the other half of the contract itself: every
-    // claim must actually yield a direct-fold8 bundle and no ordinary fold may
-    // need the factors.  On any miss it builds the ordinary factors unchanged.
-    let basis_elidable = cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && enable_fold2
-        && n_rs == 2
-        && n_pd == 0
-        && packed_witness.len() == (1usize << 25)
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
     let (mut rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
     ) = if n_rs > 0 {
-        ring_switch::prove_batched_padded_with_precomputed_elidable(
+        ring_switch::prove_batched_padded_with_precomputed(
             packed_witness,
             x_outers,
             precomputed_s_hat_v,
             padding,
             challenger,
-            basis_elidable,
         )
     } else {
         (Vec::new(), Vec::new())
@@ -1478,7 +1465,8 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                 _ => None,
             })
             .collect();
-        let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
+        let mut rs_dense_all: Vec<&[F128]> = Vec::with_capacity(n_rs);
+        rs_dense_all.extend_from_slice(&rs_baked);
         rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
         let prime = b_combined
             .par_chunks_mut(2)
