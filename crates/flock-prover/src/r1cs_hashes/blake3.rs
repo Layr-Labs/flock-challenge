@@ -2262,18 +2262,16 @@ pub(crate) mod witgen_simd {
                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
                 m[13], m[14], m[15], tlo, thi, blen, flags,
             ];
-            vst1q_u32(
-                zs.add(16) as *mut u32,
-                vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
-            );
+            // z and a share the message prefix. Publish the computed value
+            // to both stages while it is live, rather than reloading z's
+            // twenty vectors solely to copy them to a.
+            let first = vorrq_u32(one, vshlq_n_u32::<1>(chain[0]));
+            vst1q_u32(zs.add(16) as *mut u32, first);
+            vst1q_u32(ast.add(16) as *mut u32, first);
             for k in 1..20usize {
                 let w = vorrq_u32(vshrq_n_u32::<31>(chain[k - 1]), vshlq_n_u32::<1>(chain[k]));
                 vst1q_u32(zs.add(16 + k) as *mut u32, w);
-            }
-            // a's message region equals z's.
-            for w in 16..36usize {
-                let v = vld1q_u32(zs.add(w) as *const u32);
-                vst1q_u32(ast.add(w) as *mut u32, v);
+                vst1q_u32(ast.add(16 + k) as *mut u32, w);
             }
 
             // ---- G stream (bits 1153..15409): sequential push network ----

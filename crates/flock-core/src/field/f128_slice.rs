@@ -1163,3 +1163,30 @@ mod tests {
         }
     }
 }
+
+#[inline]
+pub(crate) fn fold_bank_major_64_scaled(
+    weight: &[F128],
+    input: &[F128],
+    scale: F128,
+    output: &mut [F128; 64],
+) {
+    assert_eq!(input.len(), weight.len().checked_mul(64).expect("bank size overflow"));
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg supplies PMULL, and the check establishes all reads.
+    unsafe {
+        aarch64::fold_bank_major_64_scaled(weight, input, scale, output);
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        output.fill(F128::ZERO);
+        for (row, w) in input.chunks_exact(64).zip(weight) {
+            for (out, x) in output.iter_mut().zip(row) {
+                *out += *w * *x;
+            }
+        }
+        for out in output {
+            *out *= scale;
+        }
+    }
+}

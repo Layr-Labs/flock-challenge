@@ -2160,6 +2160,20 @@ fn finish_ab_eq_fold_banks(
     partial_ab: &mut [F128; ELL],
 ) {
     debug_assert_eq!(banks.len(), eq_bot.len() * ELL);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        static USE_BANK4: OnceLock<bool> = OnceLock::new();
+        let use_bank4 = *USE_BANK4.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_ZC_AB_BANK4").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+        });
+        if bank_deferred && use_bank4 {
+            crate::field::f128_slice::fold_bank_major_64_scaled(
+                eq_bot, banks, eq_hi_val, partial_ab,
+            );
+            return;
+        }
+    }
     if bank_deferred {
         let weights: &[F128; 128] = eq_bot
             .try_into()

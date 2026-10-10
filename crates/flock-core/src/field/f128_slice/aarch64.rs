@@ -1058,27 +1058,34 @@ pub(super) unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_adden
             t += 2;
         }
 
-        // The ranked caller supplies one `eq_lo`-sized output pair: 2,048
-        // entries per chunk at L1/L2 and 1,024 at L3. Scan the just-written
-        // 64 KiB or 32 KiB working set while it is cache-hot, keeping the four
-        // wide message accumulators out of the substantially higher-pressure
-        // corrected-fold loop above.
+        // The ranked caller supplies one 2,048-output pair of 32 KiB chunks.
+        // Scan their just-written 64 KiB working set while it is cache-hot,
+        // keeping the message accumulators out of the substantially
+        // higher-pressure corrected-fold loop above.
         let zero = vdupq_n_u64(0);
-        let mut u0 = WideNeon { lo: zero, hi: zero };
-        let mut u2 = WideNeon { lo: zero, hi: zero };
+        let mut u0 = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut u2 = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
         let mut t = 0usize;
         while t < nf.len() {
             let f0 = vld1q_u64(nf.as_ptr().add(t).cast::<u64>());
             let f1 = vld1q_u64(nf.as_ptr().add(t + 1).cast::<u64>());
             let b0 = vld1q_u64(nb.as_ptr().add(t).cast::<u64>());
             let b1 = vld1q_u64(nb.as_ptr().add(t + 1).cast::<u64>());
-            xor_wide(&mut u0, mul_unreduced(f0, b0));
-            xor_wide(&mut u2, mul_unreduced(veorq_u64(f0, f1), veorq_u64(b0, b1)));
+            xor_karatsuba_product(&mut u0, f0, b0);
+            xor_karatsuba_product(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
         (
-            transmute::<uint64x2_t, F128>(reduce_wide(u0)),
-            transmute::<uint64x2_t, F128>(reduce_wide(u2)),
+            transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(u0))),
+            transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(u2))),
         )
     }
 }
@@ -1428,6 +1435,66 @@ mod tests {
                     "lane=1 case={case}"
                 );
             }
+        }
+    }
+}
+
+
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn xor_karatsuba_product(acc: &mut KaratsubaNeon, a: uint64x2_t, b: uint64x2_t) {
+    unsafe {
+        let ll = pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+        let hh = transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(a),
+            vreinterpretq_p64_u64(b),
+        ));
+        let a_mid = veorq_u64(a, vextq_u64::<1>(a, a));
+        let b_mid = veorq_u64(b, vextq_u64::<1>(b, b));
+        let mm = pmull(vgetq_lane_u64::<0>(a_mid), vgetq_lane_u64::<0>(b_mid));
+        acc.ll = veorq_u64(acc.ll, ll);
+        acc.hh = veorq_u64(acc.hh, hh);
+        acc.mm = veorq_u64(acc.mm, mm);
+    }
+}
+
+
+#[inline(never)]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_bank_major_64_scaled(
+    weight: &[F128],
+    input: &[F128],
+    scale: F128,
+    output: &mut [F128; 64],
+) {
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let empty = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let scale_v = transmute::<F128, uint64x2_t>(scale);
+        for lane in (0..64).step_by(4) {
+            let mut a = empty;
+            let mut b = empty;
+            let mut c = empty;
+            let mut d = empty;
+            for bank in 0..weight.len() {
+                let w = vld1q_u64(weight.as_ptr().add(bank).cast::<u64>());
+                let row = input.as_ptr().add(bank * 64 + lane).cast::<u64>();
+                let x0 = vld1q_u64(row);
+                let x1 = vld1q_u64(row.add(2));
+                let x2 = vld1q_u64(row.add(4));
+                let x3 = vld1q_u64(row.add(6));
+                xor_karatsuba_const_pair(&mut a, &mut b, x0, x1, w);
+                xor_karatsuba_const_pair(&mut c, &mut d, x2, x3, w);
+            }
+            let ab = reduce_wide_pair(karatsuba_to_wide(a), karatsuba_to_wide(b));
+            let cd = reduce_wide_pair(karatsuba_to_wide(c), karatsuba_to_wide(d));
+            let ab = mul_const_vec2(scale_v, ab[0], ab[1]);
+            let cd = mul_const_vec2(scale_v, cd[0], cd[1]);
+            let out = output.as_mut_ptr().add(lane).cast::<u64>();
+            vst1q_u64(out, ab[0]);
+            vst1q_u64(out.add(2), ab[1]);
+            vst1q_u64(out.add(4), cd[0]);
+            vst1q_u64(out.add(6), cd[1]);
         }
     }
 }
