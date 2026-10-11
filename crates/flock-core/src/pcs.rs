@@ -969,8 +969,8 @@ fn direct_fold8_all_claim_mix_supported(
         [(_, ab), (_, c)]
             if ab.direct_fold8.is_some()
                 && c.direct_fold8.is_some()
-                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
-                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. } | ring_switch::RsEqInd::ElidedDense { .. })
+                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. } | ring_switch::RsEqInd::ElidedDense { .. })
     )
 }
 
@@ -1120,6 +1120,11 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let use_direct_fold8 = direct_common
         && ranked_direct_fold8_enabled()
         && direct_fold8_all_claim_mix_supported(&rs_results);
+    assert!(
+        use_direct_fold8 || rs_results.iter().all(|(_, output)|
+            !matches!(output.rs_eq_ind, ring_switch::RsEqInd::ElidedDense { .. })),
+        "elided ring-switch basis requires the complete direct-fold8 consumer"
+    );
     let use_direct_fold4 = !use_direct_fold8
         && direct_common
         && ranked_direct_fold4_enabled()
