@@ -28,6 +28,20 @@ unsafe fn lane1(v: __m128i) -> u64 {
     _mm_extract_epi64::<1>(v) as u64
 }
 
+/// Square with two independent CLMULs and shift/XOR reduction.
+///
+/// # Safety
+/// Requires `pclmulqdq` and `sse4.1`.
+#[inline]
+#[target_feature(enable = "pclmulqdq,sse4.1")]
+pub unsafe fn ghash_square(a: F128) -> F128 {
+    unsafe {
+        let lo = pmull(a.lo, a.lo);
+        let hi = pmull(a.hi, a.hi);
+        ghash_reduce(lane0(lo), lane1(lo), lane0(hi), lane1(hi))
+    }
+}
+
 /// Schoolbook 4 CLMUL — fully independent products, then scalar reduction.
 ///
 /// # Safety

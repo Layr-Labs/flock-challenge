@@ -54,17 +54,53 @@ impl F128 {
         ghash_mul_unreduced(self, rhs)
     }
 
-    /// Multiplicative inverse via Fermat: x^{2^128 − 2}.
-    /// Used in one-time setup (Lagrange weight computation), not in hot paths.
-    pub fn inv(self) -> Self {
-        // x^{2^128 - 2} = ∏_{i=1..127} x^{2^i}
-        let mut r = Self::ONE;
-        let mut cur = self * self; // x^2
-        for _ in 1..128 {
-            r *= cur;
-            cur = cur * cur;
+    /// Square in characteristic two: the two cross-products cancel.
+    /// Hardware paths need only two carry-less products, followed by reduction.
+    #[inline]
+    pub fn square(self) -> Self {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        {
+            // SAFETY: aes is enabled statically.
+            unsafe { aarch64::ghash_square(self) }
         }
-        r
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        {
+            // SAFETY: same statically enabled features as the Mul path.
+            unsafe { x86_64::ghash_square(self) }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_feature = "aes"),
+            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        )))]
+        {
+            self * self
+        }
+    }
+
+    /// Multiplicative inverse via a fixed Itoh–Tsujii addition chain.
+    /// For t_n = x^(2^n - 1), t_(a+b) = t_a^(2^b) * t_b.
+    /// The chain uses 127 squarings and 10 general multiplications, rather
+    /// than the Fermat product's 128 squarings and 127 multiplications.
+    /// As before, zero maps to zero. Work is independent of the input.
+    pub fn inv(self) -> Self {
+        #[inline]
+        fn square_n(mut x: F128, n: usize) -> F128 {
+            for _ in 0..n {
+                x = x.square();
+            }
+            x
+        }
+        let t2 = square_n(self, 1) * self;
+        let t3 = square_n(t2, 1) * self;
+        let t6 = square_n(t3, 3) * t3;
+        let t7 = square_n(t6, 1) * self;
+        let t14 = square_n(t7, 7) * t7;
+        let t28 = square_n(t14, 14) * t14;
+        let t56 = square_n(t28, 28) * t28;
+        let t63 = square_n(t56, 7) * t7;
+        let t126 = square_n(t63, 63) * t63;
+        let t127 = square_n(t126, 1) * self;
+        square_n(t127, 1)
     }
 }
 

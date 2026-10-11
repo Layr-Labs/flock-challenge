@@ -30,6 +30,23 @@ unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
     unsafe { transmute::<u128, uint64x2_t>(prod) }
 }
 
+/// Square with two independent PMULLs and shift/XOR reduction.
+///
+/// # Safety
+/// Requires the `aes` target feature.
+#[inline]
+#[target_feature(enable = "aes")]
+pub unsafe fn ghash_square(a: F128) -> F128 {
+    unsafe {
+        let lo = pmull(a.lo, a.lo);
+        let hi = pmull(a.hi, a.hi);
+        ghash_reduce(
+            vgetq_lane_u64::<0>(lo), vgetq_lane_u64::<1>(lo),
+            vgetq_lane_u64::<0>(hi), vgetq_lane_u64::<1>(hi),
+        )
+    }
+}
+
 /// Schoolbook 4 PMULL — fully independent products, then scalar reduction.
 ///
 /// # Safety
