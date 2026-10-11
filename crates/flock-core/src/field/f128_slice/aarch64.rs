@@ -183,6 +183,24 @@ unsafe fn mul_unreduced(a: uint64x2_t, b: uint64x2_t) -> WideNeon {
     }
 }
 
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn xor_karatsuba_product(acc: &mut KaratsubaNeon, a: uint64x2_t, b: uint64x2_t) {
+    unsafe {
+        let ll = pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+        let hh = transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(a),
+            vreinterpretq_p64_u64(b),
+        ));
+        let a_mid = veorq_u64(a, vextq_u64::<1>(a, a));
+        let b_mid = veorq_u64(b, vextq_u64::<1>(b, b));
+        let mm = pmull(vgetq_lane_u64::<0>(a_mid), vgetq_lane_u64::<0>(b_mid));
+        acc.ll = veorq_u64(acc.ll, ll);
+        acc.hh = veorq_u64(acc.hh, hh);
+        acc.mm = veorq_u64(acc.mm, mm);
+    }
+}
+
 /// XOR two products by a shared multiplier into raw Karatsuba-component
 /// accumulators. Delaying cross-term reconstruction until after the scan
 /// removes the per-product `cross` and word-shuffle work from the hot loop.
@@ -335,12 +353,12 @@ pub(super) unsafe fn round0_and_round1_lookahead(
         let zero = vdupq_n_u64(0);
         let mut a_c0 = WideNeon { lo: zero, hi: zero };
         let mut a_c1_endpoint = WideNeon { lo: zero, hi: zero };
-        let mut a_c2 = WideNeon { lo: zero, hi: zero };
+        let mut a_c2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut a_u0_second = WideNeon { lo: zero, hi: zero };
         let mut a_u2_second = WideNeon { lo: zero, hi: zero };
         let mut a_c3 = WideNeon { lo: zero, hi: zero };
         let mut a_c4_endpoint = WideNeon { lo: zero, hi: zero };
-        let mut a_c5 = WideNeon { lo: zero, hi: zero };
+        let mut a_c5 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
 
         let mut i = 0usize;
         while i < witness.len() {
@@ -359,7 +377,7 @@ pub(super) unsafe fn round0_and_round1_lookahead(
             let sb1 = veorq_u64(b2, b3);
             xor_wide(&mut a_c0, mul_unreduced(a0, b0));
             xor_wide(&mut a_c1_endpoint, mul_unreduced(a1, b1));
-            xor_wide(&mut a_c2, mul_unreduced(sa0, sb0));
+            xor_karatsuba_product(&mut a_c2, sa0, sb0);
             xor_wide(&mut a_u0_second, mul_unreduced(a2, b2));
             xor_wide(&mut a_u2_second, mul_unreduced(sa1, sb1));
 
@@ -371,19 +389,20 @@ pub(super) unsafe fn round0_and_round1_lookahead(
             let sum_b = veorq_u64(even_b, odd_b);
             xor_wide(&mut a_c3, mul_unreduced(even_a, even_b));
             xor_wide(&mut a_c4_endpoint, mul_unreduced(odd_a, odd_b));
-            xor_wide(&mut a_c5, mul_unreduced(sum_a, sum_b));
+            xor_karatsuba_product(&mut a_c5, sum_a, sum_b);
             i += 4;
         }
 
-        let red = |value: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(value));
-        let c0 = red(a_c0);
+        let red_wide = |value: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(value));
+        let red = |value: KaratsubaNeon| transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(value)));
+        let c0 = red_wide(a_c0);
         let c2 = red(a_c2);
-        let c3 = red(a_c3);
+        let c3 = red_wide(a_c3);
         let c5 = red(a_c5);
-        let c1 = red(a_c1_endpoint) + c0 + c2;
-        let c4 = red(a_c4_endpoint) + c3 + c5;
-        let u0 = c0 + red(a_u0_second);
-        let u2 = c2 + red(a_u2_second);
+        let c1 = red_wide(a_c1_endpoint) + c0 + c2;
+        let c4 = red_wide(a_c4_endpoint) + c3 + c5;
+        let u0 = c0 + red_wide(a_u0_second);
+        let u2 = c2 + red_wide(a_u2_second);
         ((u0, u2), [c0, c1, c2, c3, c4, c5])
     }
 }
