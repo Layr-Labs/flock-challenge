@@ -88,7 +88,6 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     // an unspecified-QoS thread is freely E-cluster-eligible, which can park
     // that serial work on efficiency cores while the P-cluster's DVFS domain
     // still participates in the QoS decision. Pin the caller first so the
-    // whole prover process is USER_INITIATED before any timed trial starts.
     set_prover_thread_qos();
     match rayon::ThreadPoolBuilder::new()
         .num_threads(n)
@@ -142,17 +141,16 @@ fn set_shadow_thread_qos() {
 #[cfg(not(target_os = "macos"))]
 fn set_shadow_thread_qos() {}
 
-/// Mark Rayon prover workers as latency-sensitive on macOS. A bare Rayon pool
 /// inherits default QoS, which lets sustained jobs drift onto efficiency cores
 /// even when the pool was deliberately sized to the performance-core count.
+///
 #[cfg(target_os = "macos")]
 fn set_prover_thread_qos() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
-    // QOS_CLASS_USER_INITIATED: explicit user work that should finish promptly.
     unsafe {
-        let _ = pthread_set_qos_class_self_np(0x19, 0);
+        let _ = pthread_set_qos_class_self_np(0x21, 0);
     }
 }
 

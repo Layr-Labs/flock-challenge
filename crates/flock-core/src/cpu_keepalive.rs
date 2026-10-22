@@ -18,7 +18,6 @@
 //!
 //! From the tail of the warm-up ([`keepalive_start`]) until the seed's first
 //! byte is read ([`keepalive_stop`]), spawn one light spin thread per
-//! performance core, each tagged `QOS_CLASS_USER_INITIATED` (via
 //! [`crate::set_calling_thread_prover_qos`]) so the scheduler keeps it on a
 //! P-core rather than an efficiency core. Each thread retires a tight loop of
 //! **scalar integer** arithmetic on a private register — no SIMD, no CLMUL, no
