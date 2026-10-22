@@ -969,8 +969,8 @@ fn direct_fold8_all_claim_mix_supported(
         [(_, ab), (_, c)]
             if ab.direct_fold8.is_some()
                 && c.direct_fold8.is_some()
-                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
-                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. } | ring_switch::RsEqInd::DirectFold8Only { .. })
+                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. } | ring_switch::RsEqInd::DirectFold8Only { .. })
     )
 }
 
@@ -1120,6 +1120,16 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     let use_direct_fold8 = direct_common
         && ranked_direct_fold8_enabled()
         && direct_fold8_all_claim_mix_supported(&rs_results);
+    assert!(
+        use_direct_fold8
+            || rs_results.iter().all(|(_, output)| {
+                !matches!(
+                    output.rs_eq_ind,
+                    ring_switch::RsEqInd::DirectFold8Only { .. }
+                )
+            }),
+        "direct-fold8-only basis requires the direct-fold8 consumer",
+    );
     let use_direct_fold4 = !use_direct_fold8
         && direct_common
         && ranked_direct_fold4_enabled()
@@ -1933,6 +1943,51 @@ mod tests {
             });
 
         assert_eq!(message_from_direct_factors_fold8(&factors), expected);
+    }
+
+    #[test]
+    fn direct_fold8_marker_gate_requires_both_live_bundles() {
+        let claim = || {
+            (
+                RingSwitchProof {
+                    s_hat_v: Vec::new(),
+                },
+                ring_switch::RingSwitchBatchOutput {
+                    rs_eq_ind: ring_switch::RsEqInd::DirectFold8Only { len: 64 },
+                    sumcheck_claim: F128::ZERO,
+                    direct_fold2: None,
+                    direct_fold4: None,
+                    direct_fold8: Some(ring_switch::DirectFold8Factors {
+                        eq_lo: vec![F128::ONE],
+                        eq_hi: vec![F128::ONE],
+                        a_state: vec![F128::ZERO; 64 * (1 << LOG_PACKING)],
+                        w_state: vec![F128::ZERO; 64 * (1 << LOG_PACKING)],
+                        round0: (F128::ZERO, F128::ZERO),
+                    }),
+                    deferred_c_fold2: None,
+                },
+            )
+        };
+        let mut claims = vec![claim(), claim()];
+        assert!(direct_fold8_all_claim_mix_supported(&claims));
+        assert!(!direct_all_claim_mix_supported(&claims));
+        assert!(!direct_fold4_all_claim_mix_supported(&claims));
+        assert!(!direct_ab_claim_mix_supported(&claims));
+        assert!(!direct_fold8_all_claim_mix_supported(&claims[..1]));
+        let live = claims[1].1.direct_fold8.take();
+        assert!(!direct_fold8_all_claim_mix_supported(&claims));
+        claims[1].1.direct_fold8 = live;
+        claims[1].1.rs_eq_ind = ring_switch::RsEqInd::Sparse {
+            len: 64,
+            entries: Vec::new(),
+        };
+        assert!(!direct_fold8_all_claim_mix_supported(&claims));
+        claims[1].1.rs_eq_ind = ring_switch::RsEqInd::DeferredDense {
+            eq_lo: vec![F128::ONE; 64],
+            eq_hi: vec![F128::ONE],
+            table: Vec::new(),
+        };
+        assert!(direct_fold8_all_claim_mix_supported(&claims));
     }
 
     #[test]

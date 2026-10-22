@@ -2590,6 +2590,11 @@ pub struct RingSwitchBatchOutput {
 #[derive(Clone, Debug)]
 pub enum RsEqInd {
     Dense(Vec<F128>),
+    /// Length-only basis for a caller-proved direct-fold8 consumer. The live
+    /// values are held in DirectFold8Factors; ordinary basis access is invalid.
+    DirectFold8Only {
+        len: usize,
+    },
     /// Deferred dense: the `γ_k·B_k` buffer is **not** materialized. Instead the
     /// fold ingredients (`build_eq_split` factors + the γ-baked byte table) are
     /// carried so pcs's combine can fold each slot on the fly and accumulate it
@@ -2622,7 +2627,7 @@ impl RsEqInd {
         match self {
             Self::Dense(v) => v.len(),
             Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
-            Self::Sparse { len, .. } => *len,
+            Self::Sparse { len, .. } | Self::DirectFold8Only { len } => *len,
         }
     }
 
@@ -2635,6 +2640,9 @@ impl RsEqInd {
     pub fn add_scaled_into(&self, gamma: F128, out: &mut [F128]) {
         debug_assert_eq!(out.len(), self.len());
         match self {
+            Self::DirectFold8Only { .. } => {
+                panic!("direct-fold8-only basis cannot be materialized")
+            }
             Self::Dense(v) => {
                 for (o, &x) in out.iter_mut().zip(v.iter()) {
                     *o += gamma * x;
@@ -2661,6 +2669,9 @@ impl RsEqInd {
     /// Materialize the dense view. O(L) regardless of variant; use sparingly.
     pub fn to_dense(&self) -> Vec<F128> {
         match self {
+            Self::DirectFold8Only { .. } => {
+                panic!("direct-fold8-only basis cannot be materialized")
+            }
             Self::Dense(v) => v.clone(),
             Self::DeferredDense {
                 eq_lo,
@@ -2687,6 +2698,9 @@ impl RsEqInd {
     /// already `Dense` (no copy).
     pub fn into_dense(self) -> Vec<F128> {
         match self {
+            Self::DirectFold8Only { .. } => {
+                panic!("direct-fold8-only basis cannot be materialized")
+            }
             Self::Dense(v) => v,
             Self::DeferredDense { .. } => self.to_dense(),
             Self::Sparse { len, entries } => {
@@ -2860,10 +2874,10 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
 /// its own inputs before eliding any work.  Every miss retains the ordinary
 /// factor construction.
 ///
-/// When the contract holds, length-correct zero factors replace the unused
-/// `build_eq_split` outputs.  `RsEqInd::len()` therefore remains unchanged;
-/// the direct-fold8 consumer filters every claim before any factor value can
-/// be observed.  `FLOCK_NO_RS_ELIDE_DEAD_BASIS=1` restores the full build.
+/// When the contract holds, a length-only marker replaces the unused basis.
+/// `RsEqInd::len()` remains unchanged; the direct-fold8 consumer filters every
+/// claim before any factor value can be observed. Ordinary value access fails
+/// immediately.  `FLOCK_NO_RS_ELIDE_DEAD_BASIS=1` restores the full build.
 pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     packed_witness: &[F128],
     x_outers: &[&[F128]],
@@ -3347,23 +3361,18 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             // `build_eq_split`), and field elements have a unique
                             // bit representation.
                             let suffix = dense_suffixes[d];
-                            let n_lo = deferred_split_n_lo(suffix.len());
-                            let (eq_lo, eq_hi) = if elide_basis {
-                                // Only the logical length is observed on the
-                                // direct-fold8 route.  Preserve it exactly
-                                // without evaluating either dead tensor
-                                // factor.
-                                (
-                                    vec![F128::ZERO; 1usize << n_lo],
-                                    vec![F128::ZERO; 1usize << (suffix.len() - n_lo)],
-                                )
+                            if elide_basis {
+                                // The consumer needs only length. Retain the live
+                                // direct-fold8 factors, not unused zero buffers.
+                                RsEqInd::DirectFold8Only { len: l }
                             } else {
-                                build_eq_split(suffix, n_lo)
-                            };
-                            RsEqInd::DeferredDense {
-                                eq_lo,
-                                eq_hi,
-                                table,
+                                let n_lo = deferred_split_n_lo(suffix.len());
+                                let (eq_lo, eq_hi) = build_eq_split(suffix, n_lo);
+                                RsEqInd::DeferredDense {
+                                    eq_lo,
+                                    eq_hi,
+                                    table,
+                                }
                             }
                         } else {
                             RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
@@ -4503,6 +4512,26 @@ mod tests {
     /// maps, and direct-fold8 factor states must remain bit-identical, while
     /// the replacement retains the exact logical basis length.
     #[test]
+    fn direct_fold8_only_basis_rejects_ordinary_consumers() {
+        for len in [0, 1, 64, 1usize << 25] {
+            let basis = RsEqInd::DirectFold8Only { len };
+            assert_eq!(basis.len(), len);
+            assert_eq!(basis.is_empty(), len == 0);
+            assert!(std::panic::catch_unwind(|| basis.to_dense()).is_err());
+            assert!(std::panic::catch_unwind(|| basis.clone().into_dense()).is_err());
+        }
+        let basis = RsEqInd::DirectFold8Only { len: 1 };
+        let mut out = [F128::ONE];
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                basis.add_scaled_into(F128::ONE, &mut out);
+            }))
+            .is_err()
+        );
+        assert_eq!(out, [F128::ONE]);
+    }
+
+    #[test]
     fn fold8_dead_basis_elision_preserves_live_output_and_length() {
         use crate::challenger::FsChallenger;
 
@@ -4580,28 +4609,20 @@ mod tests {
                 control[claim].1.rs_eq_ind.len()
             );
 
-            let (control_lo, control_hi, control_table) = match &control[claim].1.rs_eq_ind {
-                RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => (eq_lo, eq_hi, table),
-                _ => panic!("control claim must be deferred dense"),
-            };
-            let (candidate_lo, candidate_hi, candidate_table) = match &candidate[claim].1.rs_eq_ind
-            {
-                RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => (eq_lo, eq_hi, table),
-                _ => panic!("candidate claim must be deferred dense"),
-            };
-            assert_eq!(candidate_lo.len(), control_lo.len());
-            assert_eq!(candidate_hi.len(), control_hi.len());
-            assert!(candidate_lo.iter().all(|&value| value == F128::ZERO));
-            assert!(candidate_hi.iter().all(|&value| value == F128::ZERO));
-            assert_eq!(candidate_table, control_table);
+            assert!(matches!(
+                control[claim].1.rs_eq_ind,
+                RsEqInd::DeferredDense { .. }
+            ));
+            if crate::pcs::ranked_direct_fold8_enabled() && rs_elide_dead_basis_enabled() {
+                assert!(
+                    matches!(candidate[claim].1.rs_eq_ind, RsEqInd::DirectFold8Only { len } if len == packed.len())
+                );
+            } else {
+                assert_eq!(
+                    candidate[claim].1.rs_eq_ind.to_dense(),
+                    control[claim].1.rs_eq_ind.to_dense()
+                );
+            }
 
             let control_direct = control[claim]
                 .1
