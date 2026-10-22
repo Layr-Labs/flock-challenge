@@ -1739,7 +1739,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod leaf_kernel_bench {
     // Diagnostics-only microbench: single-thread ns/compression of the
     // 8-wide NEON leaf kernel on L2-resident data. Run with:

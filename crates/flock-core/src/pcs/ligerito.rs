@@ -3801,7 +3801,8 @@ fn induce_sumcheck_poly_via_pruned_rate8_ntt(
     use_l2_fused_densify: bool,
     use_l2_fused_final5: bool,
     use_l2_factored_final5: bool,
-) -> (Vec<F128>, F128) {
+    f: Option<&[F128]>,
+) -> (Vec<F128>, F128, Option<SumcheckMessage>) {
     assert_eq!(
         log_inv_rate, 3,
         "low-eighth transposed NTT requires rate eight"
@@ -3846,7 +3847,7 @@ fn induce_sumcheck_poly_via_pruned_rate8_ntt(
     };
 
     let ntt = AdditiveNttF128::standard(log_block);
-    let coeffs = transpose_forward_ntt_sparse_rate8_low_eighth(
+    let (coeffs, intro_msg) = transpose_forward_ntt_sparse_rate8_low_eighth(
         &ntt,
         queries,
         &alpha_pows,
@@ -3854,9 +3855,10 @@ fn induce_sumcheck_poly_via_pruned_rate8_ntt(
         use_l2_fused_densify,
         use_l2_fused_final5,
         use_l2_factored_final5,
+        f,
     );
     debug_assert_eq!(coeffs.len(), n);
-    (coeffs, enforced_sum)
+    (coeffs, enforced_sum, intro_msg)
 }
 
 /// Cost-based dispatch between the dense [`induce_sumcheck_poly`] and the
@@ -4167,7 +4169,8 @@ fn densify_active_windows_fused_first_3layer(
     // Keep the vector length at zero until every Rayon job has initialized its
     // disjoint block. This avoids ever constructing a safe reference to an
     // uninitialized `F128`; a panic before `set_len` merely drops capacity.
-    let mut data = Vec::<F128>::with_capacity(n);
+    let mut data: Vec<F128> = crate::scratch::take_f128(n);
+    unsafe { data.set_len(0) };
     let data_ptr = data.as_mut_ptr() as usize;
     (0..num_blocks).into_par_iter().for_each(|block| {
         let arena_indices: [usize; 8] = core::array::from_fn(|i| window_to_arena[8 * block + i]);
@@ -4763,6 +4766,455 @@ fn transpose_forward_ntt_final_5layer_low_eighth_factored(
     retained
 }
 
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn transpose_forward_ntt_final_5layer_factored_tile_with_round_msg(
+    data_ptr: usize,
+    retained_ptr: usize,
+    f: &[F128],
+    row_start: usize,
+    eighth: usize,
+    quarter: usize,
+    constants: &L2FactoredFinal5Constants,
+) -> (F128, F128) {
+    let mut staged = [[[core::mem::MaybeUninit::<F128>::uninit();
+        L2_FACTORED_FINAL5_CHANNELS];
+        L2_FACTORED_FINAL5_ROW_TILE];
+        L2_FACTORED_FINAL5_COSETS];
+
+    for coset in 0..L2_FACTORED_FINAL5_COSETS {
+        for local_row in 0..L2_FACTORED_FINAL5_ROW_TILE {
+            let row = row_start + local_row;
+            let base = coset * eighth + row;
+            // SAFETY: `coset < 8`, `row < quarter`, and the four quarter
+            // offsets cover one disjoint in-bounds layer-3 block row.
+            let (x0, x1, x2, x3) = unsafe {
+                let ptr = data_ptr as *const F128;
+                (
+                    *ptr.add(base),
+                    *ptr.add(base + quarter),
+                    *ptr.add(base + 2 * quarter),
+                    *ptr.add(base + 3 * quarter),
+                )
+            };
+            let p0 = x0 + x1;
+            let p1 = x2 + x3;
+            staged[coset][local_row][0].write(p0 + p1);
+            staged[coset][local_row][1].write(p1);
+            staged[coset][local_row][2].write(x1 + x3);
+            staged[coset][local_row][3].write(x3);
+        }
+    }
+
+    let mut row_values = [[F128::ZERO; 4]; L2_FACTORED_FINAL5_ROW_TILE];
+    for (local_row, out_row) in row_values.iter_mut().enumerate() {
+        let load_channel = |channel: usize| {
+            core::array::from_fn(|coset| {
+                // SAFETY: the complete coset-major gather above initialized
+                // every channel/coset/row slot before this loop begins.
+                unsafe { *staged[coset][local_row][channel].assume_init_ref() }
+            })
+        };
+        let (p, p_i, p_ij) = l2_factored_second_moments(load_channel(0));
+        let (r, r_i) = l2_factored_first_moments(load_channel(1));
+        let (d, d_i) = l2_factored_first_moments(load_channel(2));
+        let b1 = l2_factored_sum8(load_channel(3));
+
+        let delta_r = constants.delta * r;
+
+        let ap = constants.a[0] * p_i[0]
+            + constants.a[1] * p_i[1]
+            + constants.a[2] * p_i[2];
+        let bp = constants.b[0] * p_i[0]
+            + constants.b[1] * p_i[1]
+            + constants.b[2] * p_i[2];
+        let gp = constants.g[0] * p_i[0]
+            + constants.g[1] * p_i[1]
+            + constants.g[2] * p_i[2];
+        let er = constants.e[0] * r_i[0]
+            + constants.e[1] * r_i[1]
+            + constants.e[2] * r_i[2];
+        let bd = constants.b[0] * d_i[0]
+            + constants.b[1] * d_i[1]
+            + constants.b[2] * d_i[2];
+        let hp = constants.h[0] * p_ij[0]
+            + constants.h[1] * p_ij[1]
+            + constants.h[2] * p_ij[2];
+
+        *out_row = [
+            p,
+            d + delta_r + ap,
+            r + bp,
+            b1 + delta_r + gp + er + bd + hp,
+        ];
+    }
+
+    let mut local_u_0 = F128::ZERO;
+    let mut local_u_2 = F128::ZERO;
+    for pair in 0..(L2_FACTORED_FINAL5_ROW_TILE / 2) {
+        let even_local = 2 * pair;
+        let odd_local = even_local + 1;
+        let even_row = row_start + even_local;
+        let even = row_values[even_local];
+        let odd = row_values[odd_local];
+        // SAFETY: the caller assigns one disjoint 8-row tile. Each tile
+        // writes those rows exactly once in all four retained quarters.
+        unsafe {
+            let ptr = retained_ptr as *mut F128;
+            for output in 0..4 {
+                let even_index = output * quarter + even_row;
+                ptr.add(even_index).write(even[output]);
+                ptr.add(even_index + 1).write(odd[output]);
+                let f_0 = f[even_index];
+                let f_1 = f[even_index + 1];
+                local_u_0 += f_0 * even[output];
+                local_u_2 += (f_0 + f_1) * (even[output] + odd[output]);
+            }
+        }
+    }
+    (local_u_0, local_u_2)
+}
+
+#[inline(never)]
+fn transpose_forward_ntt_final_5layer_low_eighth_factored_with_round_msg(
+    ntt: &AdditiveNttF128,
+    data: &[F128],
+    log_d: usize,
+    f: &[F128],
+) -> (Vec<F128>, SumcheckMessage) {
+    use rayon::prelude::*;
+
+    assert_eq!(log_d, 16, "ranked L2 factored tail requires log_d=16");
+    assert_eq!(data.len(), 1usize << log_d);
+    let eighth = data.len() >> 3;
+    let quarter = eighth >> 2;
+    assert_eq!(f.len(), eighth);
+    assert_eq!(quarter, 2048);
+    assert!(quarter.is_multiple_of(L2_FACTORED_FINAL5_ROW_TILE));
+
+    let constants = l2_factored_final5_constants(ntt);
+    let data_ptr = data.as_ptr() as usize;
+    let mut retained: Vec<F128> = crate::scratch::take_f128(eighth);
+    unsafe { retained.set_len(0) };
+    let retained_ptr = retained.as_mut_ptr() as usize;
+
+    let (u_0, u_2) = (0..quarter / L2_FACTORED_FINAL5_ROW_TILE)
+        .into_par_iter()
+        .map(|tile| {
+            transpose_forward_ntt_final_5layer_factored_tile_with_round_msg(
+                data_ptr,
+                retained_ptr,
+                f,
+                tile * L2_FACTORED_FINAL5_ROW_TILE,
+                eighth,
+                quarter,
+                &constants,
+            )
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(a_0, a_2), (b_0, b_2)| (a_0 + b_0, a_2 + b_2),
+        );
+
+    // SAFETY: 256 disjoint leaf tiles initialize every retained output slot,
+    // and the Rayon join completes before the initialized length is published.
+    unsafe { retained.set_len(eighth) };
+    (retained, SumcheckMessage { u_0, u_2 })
+}
+
+#[derive(Clone, Copy)]
+struct L1FactoredFinal4Constants {
+    delta: F128,
+    a: [F128; 2],
+    b: [F128; 2],
+    g: [F128; 2],
+    e: [F128; 2],
+    h01: F128,
+}
+
+#[inline]
+fn l1_factored_final4_constants(ntt: &AdditiveNttF128) -> L1FactoredFinal4Constants {
+    let delta = ntt.twiddle(3, 1);
+    let a = [ntt.twiddle(3, 2), ntt.twiddle(3, 4)];
+    let b = [ntt.twiddle(2, 1), ntt.twiddle(2, 2)];
+    let g = [b[0] * a[0], b[1] * a[1]];
+    let e = [b[0] * delta + a[0], b[1] * delta + a[1]];
+    let h01 = (b[0] + b[1]) * (a[0] + a[1]) + g[0] + g[1];
+    L1FactoredFinal4Constants {
+        delta,
+        a,
+        b,
+        g,
+        e,
+        h01,
+    }
+}
+
+#[inline(always)]
+fn l1_factored_first_moments(values: [F128; 4]) -> (F128, [F128; 2]) {
+    let s01 = values[0] + values[1];
+    let s23 = values[2] + values[3];
+    let total = s01 + s23;
+    let bit0 = values[1] + values[3];
+    (total, [bit0, s23])
+}
+
+#[inline(always)]
+fn l1_factored_second_moments(values: [F128; 4]) -> (F128, [F128; 2], F128) {
+    let s01 = values[0] + values[1];
+    let s23 = values[2] + values[3];
+    let total = s01 + s23;
+    let bit0 = values[1] + values[3];
+    (total, [bit0, s23], values[3])
+}
+
+#[inline(always)]
+fn l1_factored_sum4(values: [F128; 4]) -> F128 {
+    (values[0] + values[1]) + (values[2] + values[3])
+}
+
+const L1_FACTORED_FINAL4_COSETS: usize = 4;
+const L1_FACTORED_FINAL4_CHANNELS: usize = 4;
+const L1_FACTORED_FINAL4_ROW_TILE: usize = 8;
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn transpose_forward_ntt_final_4layer_factored_tile_with_round_msg(
+    data_ptr: usize,
+    retained_ptr: usize,
+    f: &[F128],
+    row_start: usize,
+    quarter: usize,
+    sixteenth: usize,
+    constants: &L1FactoredFinal4Constants,
+) -> (F128, F128) {
+    let mut staged = [[[core::mem::MaybeUninit::<F128>::uninit();
+        L1_FACTORED_FINAL4_CHANNELS];
+        L1_FACTORED_FINAL4_ROW_TILE];
+        L1_FACTORED_FINAL4_COSETS];
+
+    for coset in 0..L1_FACTORED_FINAL4_COSETS {
+        for local_row in 0..L1_FACTORED_FINAL4_ROW_TILE {
+            let row = row_start + local_row;
+            let base = coset * quarter + row;
+            // SAFETY: `coset < 4`, `row < sixteenth`, and the four sixteenth
+            // offsets cover one disjoint in-bounds layer-2 block row.
+            let (x0, x1, x2, x3) = unsafe {
+                let ptr = data_ptr as *const F128;
+                (
+                    *ptr.add(base),
+                    *ptr.add(base + sixteenth),
+                    *ptr.add(base + 2 * sixteenth),
+                    *ptr.add(base + 3 * sixteenth),
+                )
+            };
+            let p0 = x0 + x1;
+            let p1 = x2 + x3;
+            staged[coset][local_row][0].write(p0 + p1);
+            staged[coset][local_row][1].write(p1);
+            staged[coset][local_row][2].write(x1 + x3);
+            staged[coset][local_row][3].write(x3);
+        }
+    }
+
+    let mut row_values = [[F128::ZERO; 4]; L1_FACTORED_FINAL4_ROW_TILE];
+    for (local_row, out_row) in row_values.iter_mut().enumerate() {
+        let load_channel = |channel: usize| {
+            core::array::from_fn(|coset| {
+                // SAFETY: the complete coset-major gather above initialized
+                // every channel/coset/row slot before this loop begins.
+                unsafe { *staged[coset][local_row][channel].assume_init_ref() }
+            })
+        };
+        let (p, p_i, p01) = l1_factored_second_moments(load_channel(0));
+        let (r, r_i) = l1_factored_first_moments(load_channel(1));
+        let (d, d_i) = l1_factored_first_moments(load_channel(2));
+        let b1 = l1_factored_sum4(load_channel(3));
+
+        let delta_r = constants.delta * r;
+        let ap = constants.a[0] * p_i[0] + constants.a[1] * p_i[1];
+        let bp = constants.b[0] * p_i[0] + constants.b[1] * p_i[1];
+        let gp = constants.g[0] * p_i[0] + constants.g[1] * p_i[1];
+        let er = constants.e[0] * r_i[0] + constants.e[1] * r_i[1];
+        let bd = constants.b[0] * d_i[0] + constants.b[1] * d_i[1];
+        let hp = constants.h01 * p01;
+
+        *out_row = [
+            p,
+            d + delta_r + ap,
+            r + bp,
+            b1 + delta_r + gp + er + bd + hp,
+        ];
+    }
+
+    let mut local_u_0 = F128::ZERO;
+    let mut local_u_2 = F128::ZERO;
+    for pair in 0..(L1_FACTORED_FINAL4_ROW_TILE / 2) {
+        let even_local = 2 * pair;
+        let odd_local = even_local + 1;
+        let even_row = row_start + even_local;
+        let even = row_values[even_local];
+        let odd = row_values[odd_local];
+        // SAFETY: each tile owns a disjoint 8-row range in all four output
+        // sixteenths.
+        unsafe {
+            let ptr = retained_ptr as *mut F128;
+            for output in 0..4 {
+                let even_index = output * sixteenth + even_row;
+                ptr.add(even_index).write(even[output]);
+                ptr.add(even_index + 1).write(odd[output]);
+                let f_0 = f[even_index];
+                let f_1 = f[even_index + 1];
+                local_u_0 += f_0 * even[output];
+                local_u_2 += (f_0 + f_1) * (even[output] + odd[output]);
+            }
+        }
+    }
+    (local_u_0, local_u_2)
+}
+
+#[inline(never)]
+fn transpose_forward_ntt_final_4layer_low_quarter_factored_with_round_msg(
+    ntt: &AdditiveNttF128,
+    data: &[F128],
+    log_d: usize,
+    f: &[F128],
+) -> (Vec<F128>, SumcheckMessage) {
+    use rayon::prelude::*;
+
+    assert_eq!(log_d, 18, "ranked L1 factored tail requires log_d=18");
+    assert_eq!(data.len(), 1usize << log_d);
+    let quarter = data.len() >> 2;
+    let sixteenth = quarter >> 2;
+    assert_eq!(f.len(), quarter);
+    assert_eq!(sixteenth, 16384);
+    assert!(sixteenth.is_multiple_of(L1_FACTORED_FINAL4_ROW_TILE));
+
+    let constants = l1_factored_final4_constants(ntt);
+    let data_ptr = data.as_ptr() as usize;
+    let mut retained: Vec<F128> = crate::scratch::take_f128(quarter);
+    unsafe { retained.set_len(0) };
+    let retained_ptr = retained.as_mut_ptr() as usize;
+
+    let (u_0, u_2) = (0..sixteenth / L1_FACTORED_FINAL4_ROW_TILE)
+        .into_par_iter()
+        .map(|tile| {
+            transpose_forward_ntt_final_4layer_factored_tile_with_round_msg(
+                data_ptr,
+                retained_ptr,
+                f,
+                tile * L1_FACTORED_FINAL4_ROW_TILE,
+                quarter,
+                sixteenth,
+                &constants,
+            )
+        })
+        .reduce(
+            || (F128::ZERO, F128::ZERO),
+            |(a_0, a_2), (b_0, b_2)| (a_0 + b_0, a_2 + b_2),
+        );
+
+    // SAFETY: 2048 disjoint leaf tiles initialize every retained output slot,
+    // and the Rayon join completes before the initialized length is published.
+    unsafe { retained.set_len(quarter) };
+    (retained, SumcheckMessage { u_0, u_2 })
+}
+
+fn transpose_forward_ntt_sparse_rate4_low_quarter_with_round_msg(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    f: &[F128],
+) -> (Vec<F128>, SumcheckMessage) {
+    assert_eq!(positions.len(), values.len());
+    assert_eq!(log_d, 18, "ranked L1 rate-four prune requires log_d=18");
+    assert!(positions_are_sorted(positions));
+    let n = 1usize << log_d;
+    assert!(positions.iter().all(|&position| position < n));
+
+    let prefix_k = 8usize;
+    let groups = group_sorted_positions(positions, prefix_k);
+    let mut arena = scatter_active_windows(&groups, positions, values, prefix_k);
+    transform_active_windows(ntt, &mut arena, &groups, prefix_k, log_d);
+
+    let mut data = densify_active_windows_fused_first_3layer(ntt, &arena, &groups, log_d, prefix_k);
+    let remaining = log_d - prefix_k - 3;
+    assert_eq!(remaining, 7, "ranked L1 fused densify must leave layers 6..0");
+
+    transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, 4);
+    let out = transpose_forward_ntt_final_4layer_low_quarter_factored_with_round_msg(
+        ntt, &data, log_d, f,
+    );
+    crate::scratch::give_f128(data);
+    out
+}
+
+fn induce_sumcheck_poly_via_pruned_rate4_ntt_with_round_msg(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    opened_rows: &[Vec<F128>],
+    v_challenges: &[F128],
+    queries: &[usize],
+    alpha: &[F128],
+    f: &[F128],
+) -> (Vec<F128>, F128, SumcheckMessage) {
+    assert_eq!(
+        log_inv_rate, 2,
+        "low-quarter transposed NTT requires rate four"
+    );
+    let n = 1usize << log_msg_cols;
+    let log_block = log_msg_cols + log_inv_rate;
+    let n_queries = queries.len();
+    assert_eq!(opened_rows.len(), n_queries);
+    assert_eq!(f.len(), n);
+    assert!(
+        positions_are_sorted(queries),
+        "ranked sparse induction requires sorted queries"
+    );
+
+    let eq = build_eq_table(v_challenges);
+    let alpha_pows: Vec<F128> = if n_queries == 0 {
+        Vec::new()
+    } else {
+        let table = build_eq_table(alpha);
+        debug_assert!(table.len() >= n_queries);
+        table.into_iter().take(n_queries).collect()
+    };
+
+    const PAR_QUERY_THRESHOLD: usize = 32;
+    let query_term = |i: usize| -> F128 {
+        let dot: F128 = opened_rows[i]
+            .iter()
+            .zip(eq.iter())
+            .map(|(&r, &e)| r * e)
+            .fold(F128::ZERO, |a, v| a + v);
+        dot * alpha_pows[i]
+    };
+    let enforced_sum = if n_queries >= PAR_QUERY_THRESHOLD {
+        use rayon::prelude::*;
+        (0..n_queries)
+            .into_par_iter()
+            .map(query_term)
+            .reduce(|| F128::ZERO, |a, b| a + b)
+    } else {
+        (0..n_queries)
+            .map(query_term)
+            .fold(F128::ZERO, |a, b| a + b)
+    };
+
+    let ntt = AdditiveNttF128::standard(log_block);
+    let (coeffs, intro_msg) = transpose_forward_ntt_sparse_rate4_low_quarter_with_round_msg(
+        &ntt,
+        queries,
+        &alpha_pows,
+        log_block,
+        f,
+    );
+    debug_assert_eq!(coeffs.len(), n);
+    (coeffs, enforced_sum, intro_msg)
+}
+
 /// Sparse-prefix transposed NTT with an exact rate-eight output prune. The
 /// sparse prefix consumes the highest reverse layers inside active windows,
 /// ordinary/fused dense work stops after layer 3, and the final three top-only
@@ -4775,7 +5227,8 @@ fn transpose_forward_ntt_sparse_rate8_low_eighth(
     use_l2_fused_densify: bool,
     use_l2_fused_final5: bool,
     use_l2_factored_final5: bool,
-) -> Vec<F128> {
+    f: Option<&[F128]>,
+) -> (Vec<F128>, Option<SumcheckMessage>) {
     assert_eq!(positions.len(), values.len());
     assert!(log_d >= 3, "rate-eight prune needs at least three layers");
     assert!(positions_are_sorted(positions));
@@ -4813,7 +5266,19 @@ fn transpose_forward_ntt_sparse_rate8_low_eighth(
             "ranked L2 factored tail requires direct-final-five parent"
         );
         assert_eq!(remaining, 5, "ranked L2 factored tail requires layers 4..0");
-        return transpose_forward_ntt_final_5layer_low_eighth_factored(ntt, &data, log_d);
+        let out = if let Some(f_slice) = f {
+            let (retained, msg) = transpose_forward_ntt_final_5layer_low_eighth_factored_with_round_msg(
+                ntt, &data, log_d, f_slice,
+            );
+            (retained, Some(msg))
+        } else {
+            (
+                transpose_forward_ntt_final_5layer_low_eighth_factored(ntt, &data, log_d),
+                None,
+            )
+        };
+        crate::scratch::give_f128(data);
+        return out;
     }
 
     if use_l2_fused_final5 {
@@ -4822,7 +5287,9 @@ fn transpose_forward_ntt_sparse_rate8_low_eighth(
             "ranked L2 direct tail requires fused-densify parent"
         );
         assert_eq!(remaining, 5, "ranked L2 direct tail requires layers 4..0");
-        return transpose_forward_ntt_final_5layer_low_eighth_direct(ntt, &data, log_d);
+        let retained = transpose_forward_ntt_final_5layer_low_eighth_direct(ntt, &data, log_d);
+        crate::scratch::give_f128(data);
+        return (retained, None);
     }
 
     // The still-live reverse layers are `(remaining-1)..=3`. Reuse the
@@ -4837,7 +5304,9 @@ fn transpose_forward_ntt_sparse_rate8_low_eighth(
         transpose_forward_ntt_single_layer_flat(ntt, &mut data, log_d, layer);
     }
 
-    transpose_forward_ntt_final_3layer_low_eighth_xor(&data)
+    let retained = transpose_forward_ntt_final_3layer_low_eighth_xor(&data);
+    crate::scratch::give_f128(data);
+    (retained, None)
 }
 
 #[cfg(test)]
@@ -7679,20 +8148,26 @@ impl SumcheckProver {
                     beta,
                 }),
                 deferred_basis,
-            ) => fold_and_msg_lsb_into_with_lazy_ood_eq(
-                &self.f,
-                &self.combined_basis,
-                deferred_basis
-                    .as_ref()
-                    .map(|(basis, alpha)| (basis.as_slice(), *alpha)),
-                r,
-                &eq_lo,
-                &eq_hi,
-                beta,
-                z_0,
-                &mut self.spare_f,
-                &mut self.spare_b,
-            ),
+            ) => {
+                let m = fold_and_msg_lsb_into_with_lazy_ood_eq(
+                    &self.f,
+                    &self.combined_basis,
+                    deferred_basis
+                        .as_ref()
+                        .map(|(basis, alpha)| (basis.as_slice(), *alpha)),
+                    r,
+                    &eq_lo,
+                    &eq_hi,
+                    beta,
+                    z_0,
+                    &mut self.spare_f,
+                    &mut self.spare_b,
+                );
+                if let Some((basis, _)) = deferred_basis {
+                    crate::scratch::give_f128(basis);
+                }
+                m
+            }
             (Some(PendingOodEq::Introduced { .. }), _) => {
                 panic!("fold before lazy OOD glue")
             }
@@ -7944,6 +8419,7 @@ impl SumcheckProver {
                 .with_min_len(PAR_THRESHOLD / 4)
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
+        crate::scratch::give_f128(b_new);
         self.t_r += alpha * h_new;
     }
 
@@ -9151,16 +9627,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             direct_fold8_mode,
         );
         let _t = std::time::Instant::now();
-        let (basis_i_induced, enforced_sum_i) =
+        let (basis_i_induced, enforced_sum_i, induced_intro_msg_i) =
             if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
-                induce_sumcheck_poly_via_ntt(
+                let (coeffs, sum, msg) = induce_sumcheck_poly_via_pruned_rate4_ntt_with_round_msg(
                     n_next,
                     config.log_inv_rates[i + 1],
                     &opened_rows_i,
                     &level_rs,
                     &queries_i,
                     &alpha_i,
-                )
+                    sc_prover.f(),
+                );
+                (coeffs, sum, Some(msg))
             } else if use_l2_pruned_sparse_ntt {
                 let log_d = n_next + config.log_inv_rates[i + 1];
                 let prefix_k = 8usize.min(log_d - 3);
@@ -9182,7 +9660,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     prefix_k,
                     queries_i.len(),
                 );
-                induce_sumcheck_poly_via_pruned_rate8_ntt(
+                let (coeffs, sum, msg) = induce_sumcheck_poly_via_pruned_rate8_ntt(
                     n_next,
                     config.log_inv_rates[i + 1],
                     &opened_rows_i,
@@ -9192,16 +9670,19 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     use_l2_fused_densify,
                     use_l2_fused_final5,
                     use_l2_factored_final5,
-                )
+                    Some(sc_prover.f()),
+                );
+                (coeffs, sum, msg)
             } else {
-                induce_sumcheck_poly(
+                let (coeffs, sum) = induce_sumcheck_poly(
                     n_next,
                     &sks_vks_i,
                     &opened_rows_i,
                     &level_rs,
                     &queries_i,
                     &alpha_i,
-                )
+                );
+                (coeffs, sum, None)
             };
         if trace {
             t_induce += _t.elapsed();
@@ -9215,7 +9696,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         });
 
         let _t = std::time::Instant::now();
-        let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
+        let intro_msg_i = if let Some(msg) = induced_intro_msg_i {
+            sc_prover.introduce_new_with_precomputed_msg(basis_i_induced, enforced_sum_i, msg)
+        } else {
+            sc_prover.introduce_new(basis_i_induced, enforced_sum_i)
+        };
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
@@ -14630,6 +15115,7 @@ mod tests {
         alpha[1] = F128::ONE;
         let sks_vks = eval_sk_at_vks(LOG_MSG);
 
+        let f: Vec<F128> = (0..n).map(|_| rng.sample_f128()).collect();
         let dense = induce_sumcheck_poly(
             LOG_MSG,
             &sks_vks,
@@ -14648,6 +15134,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
         let candidate = induce_sumcheck_poly_via_pruned_rate8_ntt(
             LOG_MSG,
@@ -14659,6 +15146,7 @@ mod tests {
             true,
             false,
             false,
+            None,
         );
         let final5_candidate = induce_sumcheck_poly_via_pruned_rate8_ntt(
             LOG_MSG,
@@ -14670,6 +15158,7 @@ mod tests {
             true,
             true,
             false,
+            None,
         );
         let factored_candidate = induce_sumcheck_poly_via_pruned_rate8_ntt(
             LOG_MSG,
@@ -14681,6 +15170,7 @@ mod tests {
             true,
             true,
             true,
+            Some(&f),
         );
         assert_eq!(control.1, dense.1, "control enforced sum changed");
         assert_eq!(control.0, dense.0, "control L2 basis bytes changed");
@@ -14701,6 +15191,11 @@ mod tests {
         assert_eq!(
             factored_candidate.0, final5_candidate.0,
             "factored-tail L2 basis bytes changed"
+        );
+        assert_eq!(
+            factored_candidate.2,
+            Some(round_msg_lsb(&f, &dense.0)),
+            "factored-tail L2 fused round_msg_lsb changed"
         );
     }
 
@@ -19356,6 +19851,62 @@ mod tests {
             HashKind::Sha256,
         );
         assert_eq!(w.root(), w2.root());
+    }
+
+    #[test]
+    fn l1_pruned_rate4_ntt_with_round_msg_matches_dense_baseline() {
+        use crate::challenger::Challenger;
+        let log_msg_cols = 16;
+        let log_inv_rate = 2;
+        let log_d = log_msg_cols + log_inv_rate;
+        let n_queries = 106;
+        let mut rng = crate::challenger::RandomChallenger::new(0x11_4FA4_1816_0106);
+
+        let mut queries: Vec<usize> = (0..n_queries)
+            .map(|i| (i * 2473 + 19) & ((1 << log_d) - 1))
+            .collect();
+        queries.sort_unstable();
+        queries.dedup();
+        let mut step = 0usize;
+        while queries.len() < n_queries {
+            step += 1;
+            let candidate = (step * 7919 + 3) & ((1 << log_d) - 1);
+            if let Err(pos) = queries.binary_search(&candidate) {
+                queries.insert(pos, candidate);
+            }
+        }
+
+        let opened_rows: Vec<Vec<F128>> = (0..n_queries)
+            .map(|_| (0..8).map(|_| rng.sample_f128()).collect())
+            .collect();
+        let v_challenges: Vec<F128> = (0..3).map(|_| rng.sample_f128()).collect();
+        let alpha: Vec<F128> = (0..7).map(|_| rng.sample_f128()).collect();
+        let f: Vec<F128> = (0..(1 << log_msg_cols)).map(|_| rng.sample_f128()).collect();
+
+        let (base_coeffs, base_sum) = induce_sumcheck_poly_via_ntt(
+            log_msg_cols,
+            log_inv_rate,
+            &opened_rows,
+            &v_challenges,
+            &queries,
+            &alpha,
+        );
+        let base_msg = round_msg_lsb(&f, &base_coeffs);
+
+        let (cand_coeffs, cand_sum, cand_msg) =
+            induce_sumcheck_poly_via_pruned_rate4_ntt_with_round_msg(
+                log_msg_cols,
+                log_inv_rate,
+                &opened_rows,
+                &v_challenges,
+                &queries,
+                &alpha,
+                &f,
+            );
+
+        assert_eq!(cand_sum, base_sum);
+        assert_eq!(cand_msg, base_msg);
+        assert_eq!(cand_coeffs, base_coeffs);
     }
 }
 // Redraw marker 4 (drift probe): zero-diff; prior draws 1,205,646 / 1,205,107 / 1,206,245.

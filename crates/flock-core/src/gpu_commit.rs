@@ -15777,6 +15777,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// equality check must pass and publish a share without poisoning) and
     /// the timed prefix path.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_zc_r2_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
@@ -15990,6 +15991,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// table. Exercises calibration (internal equality oracle + share
     /// publication without poisoning) and the timed prefix path.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_zc_t3_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
@@ -16124,6 +16126,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// (`fold_pairs` + message) bit-for-bit. Exercises calibration and the
     /// timed prefix path on real Metal.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_zc_loop_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {

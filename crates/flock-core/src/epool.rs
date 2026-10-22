@@ -20,7 +20,9 @@
 //!   atomic chunk queue drained by both pools. The ranked NTT-to-Merkle path
 //!   instead streams finalized cache chunks through its own bounded queue so
 //!   leaf hashing can overlap the transform. In both shapes an E-core owns at
-//!   most one tail chunk when the main pool finishes.
+//!   most one tail chunk when the main pool finishes, and
+//!   [`helper_claim_limit`] keeps that chunk away from the end of the queue so
+//!   the drain does not finish on the slower core.
 //!
 //! Output is byte-identical by construction: chunk `i` covers a fixed range
 //! and is processed by the same function regardless of which pool claims it.
@@ -158,6 +160,71 @@ pub fn helper_pool() -> Option<&'static rayon::ThreadPool> {
 /// Don't engage the helper pool below this many chunks: tiny jobs (recursive
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
 const EPOOL_MIN_CHUNKS: usize = 8;
+
+/// Chunks at the tail of a drain's queue that only the main pool may claim.
+///
+/// The queue is greedy and unbounded on both sides, so an efficiency core can
+/// claim one of the very last chunks; the drain then ends on that core. That is
+/// the "at most one tail chunk" this module's header accepts, and it is not
+/// free: an E-core runs these kernels appreciably slower than a P-core, so the
+/// whole drain waits out the difference. Declining a late helper claim hands
+/// that chunk to a performance core and lets the E-core stop instead of
+/// extending the critical path.
+///
+/// The bound is the standard stopping rule for greedy heterogeneous list
+/// scheduling: a slow worker should not start another unit once the fast
+/// workers can finish everything that remains before it would. Keeping one
+/// chunk per main thread in reserve means the main pool still has a full round
+/// of work in hand when a helper takes its last chunk.
+///
+/// Clamped to half the queue so small drains keep the helper engaged: four
+/// E-cores never need more than half of any queue against ten P-cores, and the
+/// clamp is what stops the `EPOOL_MIN_CHUNKS`-sized drains — deliberately
+/// enabled by the 16 -> 8 tuning — from losing the helper altogether.
+fn helper_claim_limit(n_chunks: usize, main_threads: usize) -> usize {
+    if !tail_reserve_enabled() {
+        return n_chunks;
+    }
+    n_chunks - main_threads.min(n_chunks / 2)
+}
+
+/// Whether engaged drains reserve the queue's tail for the main pool. Kill
+/// switch: `FLOCK_NO_EPOOL_TAIL_RESERVE=1` (exactly `"1"`) restores the
+/// unbounded helper claim. Read once per process.
+pub(crate) fn tail_reserve_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !tail_reserve_killed_by(std::env::var("FLOCK_NO_EPOOL_TAIL_RESERVE").ok().as_deref())
+    })
+}
+
+/// Kill rule for [`tail_reserve_enabled`]: the value must be exactly `"1"`,
+/// the same rule as [`relay_killed_by`], so a stray export can never silently
+/// change the ranked shape.
+fn tail_reserve_killed_by(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Claim the next chunk index below `limit`, or `None` once the queue has
+/// reached it.
+///
+/// Unlike the main pool's plain `fetch_add`, a bounded claim must never
+/// consume an index it will not run, so it re-checks the bound and commits
+/// with a compare-exchange. The retry cost falls only on the helper pool,
+/// where one chunk's work dwarfs a CAS.
+#[inline]
+fn claim_below(next: &AtomicUsize, limit: usize) -> Option<usize> {
+    let mut cur = next.load(Ordering::Relaxed);
+    loop {
+        if cur >= limit {
+            return None;
+        }
+        match next.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(cur),
+            Err(observed) => cur = observed,
+        }
+    }
+}
 
 /// Process chunks `0..n_chunks` exactly once each, in parallel, drawing from
 /// a shared atomic queue drained by the main rayon pool plus (when present
@@ -452,7 +519,8 @@ pub(crate) fn drain_hetero<B>(
     // Per-drain relay — kill switch, no relay thread, or the relay is already
     // carrying a concurrent drain. The scoped thread parks inside `broadcast`
     // while the E-workers drain; it costs no main-pool worker, and the scope
-    // join bounds the tail wait at one chunk on one efficiency core.
+    // join bounds the tail wait at one chunk on one efficiency core — a chunk
+    // the claim limit keeps out of the queue's tail.
     std::thread::scope(|s| {
         s.spawn(|| broadcast());
         (0..main_threads)
@@ -594,13 +662,10 @@ fn run_chunks_with_helper_relay<F>(
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => {
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
+            let limit = helper_claim_limit(n_chunks, main_threads);
             let broadcast = || {
                 ep.broadcast(|_| {
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= n_chunks {
-                            break;
-                        }
+                    while let Some(i) = claim_below(&next, limit) {
                         EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
                         f(i);
                     }
@@ -669,14 +734,11 @@ fn run_chunks_with_helper_stateful_relay<S, I, F>(
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => {
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
+            let limit = helper_claim_limit(n_chunks, main_threads);
             let broadcast = || {
                 ep.broadcast(|_| {
                     let mut state = init();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= n_chunks {
-                            break;
-                        }
+                    while let Some(i) = claim_below(&next, limit) {
                         EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
                         f(&mut state, i);
                     }
@@ -782,6 +844,83 @@ mod tests {
     #[test]
     fn zero_chunks_is_noop() {
         run_chunks_with_helper(0, &|_| panic!("must not run"), None);
+    }
+
+    /// The reserved tail is one chunk per main thread, clamped to half the
+    /// queue so the smallest engaged drains keep the helper.
+    #[test]
+    fn helper_claim_limit_reserves_one_round_clamped_to_half() {
+        // Large queue: a flat reserve of `main_threads`, i.e. a tail fix only.
+        assert_eq!(helper_claim_limit(1024, 10), 1014);
+        assert_eq!(helper_claim_limit(100, 10), 90);
+        // The clamp binds once `main_threads > n_chunks / 2`.
+        assert_eq!(helper_claim_limit(20, 10), 10);
+        assert_eq!(helper_claim_limit(EPOOL_MIN_CHUNKS, 10), 4);
+        // The helper always keeps a share of the smallest engaged drain.
+        assert!(helper_claim_limit(EPOOL_MIN_CHUNKS, 64) > 0);
+        // A single-worker main pool reserves one chunk at most.
+        assert_eq!(helper_claim_limit(8, 1), 7);
+    }
+
+    /// A bounded claim hands out every index below the limit exactly once and
+    /// never consumes one at or above it.
+    #[test]
+    fn claim_below_is_exclusive_and_respects_the_limit() {
+        let n = 500;
+        let limit = 300;
+        let next = AtomicUsize::new(0);
+        let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .broadcast(|_| {
+                while let Some(i) = claim_below(&next, limit) {
+                    counts[i].fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        for (i, c) in counts.iter().enumerate() {
+            let got = c.load(Ordering::Relaxed);
+            assert_eq!(got, usize::from(i < limit), "index {i} ran {got} times");
+        }
+        // The counter stops at the limit, so the main pool's plain `fetch_add`
+        // still finds every reserved index unclaimed.
+        assert_eq!(next.load(Ordering::Relaxed), limit);
+    }
+
+    /// With the tail reserved, both pools together still run every chunk
+    /// exactly once — the main pool's unbounded claim covers the reserve.
+    #[test]
+    fn reserved_tail_still_runs_every_chunk_exactly_once() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for n in [EPOOL_MIN_CHUNKS, 9, 17, 64, 1000] {
+            let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+            run_chunks_with_helper(
+                n,
+                &|i| {
+                    counts[i].fetch_add(1, Ordering::Relaxed);
+                },
+                Some(&helper),
+            );
+            assert!(
+                counts.iter().all(|c| c.load(Ordering::Relaxed) == 1),
+                "n = {n}"
+            );
+        }
+    }
+
+    /// Only an exact `"1"` disables the reservation, so a stray export cannot
+    /// silently change the ranked shape.
+    #[test]
+    fn tail_reserve_kill_rule_needs_exactly_one() {
+        assert!(tail_reserve_killed_by(Some("1")));
+        assert!(!tail_reserve_killed_by(Some("0")));
+        assert!(!tail_reserve_killed_by(Some("true")));
+        assert!(!tail_reserve_killed_by(Some("")));
+        assert!(!tail_reserve_killed_by(None));
     }
 
     /// The helper-only drain never recruits the caller/main pool and still
