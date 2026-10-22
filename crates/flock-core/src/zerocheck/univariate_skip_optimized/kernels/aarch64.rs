@@ -1076,41 +1076,6 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
                     let i236 = usize::from(((indices23 >> 48) & 0xff) as u8);
                     let i237 = usize::from((indices23 >> 56) as u8);
 
-                    // Combine the two independent pair-table loads first, so
-                    // only eight values remain live across accumulator loads.
-                    let t0 = veorq_u8(
-                        vld1q_u8(table01.add(i010 * 16)),
-                        vld1q_u8(table23.add(i230 * 16)),
-                    );
-                    let t1 = veorq_u8(
-                        vld1q_u8(table01.add(i011 * 16)),
-                        vld1q_u8(table23.add(i231 * 16)),
-                    );
-                    let t2 = veorq_u8(
-                        vld1q_u8(table01.add(i012 * 16)),
-                        vld1q_u8(table23.add(i232 * 16)),
-                    );
-                    let t3 = veorq_u8(
-                        vld1q_u8(table01.add(i013 * 16)),
-                        vld1q_u8(table23.add(i233 * 16)),
-                    );
-                    let t4 = veorq_u8(
-                        vld1q_u8(table01.add(i014 * 16)),
-                        vld1q_u8(table23.add(i234 * 16)),
-                    );
-                    let t5 = veorq_u8(
-                        vld1q_u8(table01.add(i015 * 16)),
-                        vld1q_u8(table23.add(i235 * 16)),
-                    );
-                    let t6 = veorq_u8(
-                        vld1q_u8(table01.add(i016 * 16)),
-                        vld1q_u8(table23.add(i236 * 16)),
-                    );
-                    let t7 = veorq_u8(
-                        vld1q_u8(table01.add(i017 * 16)),
-                        vld1q_u8(table23.add(i237 * 16)),
-                    );
-
                     let p0 = bank.add(lane * 16);
                     let p1 = p0.add(16);
                     let p2 = p1.add(16);
@@ -1119,14 +1084,70 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
                     let p5 = p4.add(16);
                     let p6 = p5.add(16);
                     let p7 = p6.add(16);
-                    vst1q_u8(p0, veorq_u8(vld1q_u8(p0), t0));
-                    vst1q_u8(p1, veorq_u8(vld1q_u8(p1), t1));
-                    vst1q_u8(p2, veorq_u8(vld1q_u8(p2), t2));
-                    vst1q_u8(p3, veorq_u8(vld1q_u8(p3), t3));
-                    vst1q_u8(p4, veorq_u8(vld1q_u8(p4), t4));
-                    vst1q_u8(p5, veorq_u8(vld1q_u8(p5), t5));
-                    vst1q_u8(p6, veorq_u8(vld1q_u8(p6), t6));
-                    vst1q_u8(p7, veorq_u8(vld1q_u8(p7), t7));
+                    vst1q_u8(
+                        p0,
+                        xor3_u8(
+                            vld1q_u8(p0),
+                            vld1q_u8(table01.add(i010 * 16)),
+                            vld1q_u8(table23.add(i230 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p1,
+                        xor3_u8(
+                            vld1q_u8(p1),
+                            vld1q_u8(table01.add(i011 * 16)),
+                            vld1q_u8(table23.add(i231 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p2,
+                        xor3_u8(
+                            vld1q_u8(p2),
+                            vld1q_u8(table01.add(i012 * 16)),
+                            vld1q_u8(table23.add(i232 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p3,
+                        xor3_u8(
+                            vld1q_u8(p3),
+                            vld1q_u8(table01.add(i013 * 16)),
+                            vld1q_u8(table23.add(i233 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p4,
+                        xor3_u8(
+                            vld1q_u8(p4),
+                            vld1q_u8(table01.add(i014 * 16)),
+                            vld1q_u8(table23.add(i234 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p5,
+                        xor3_u8(
+                            vld1q_u8(p5),
+                            vld1q_u8(table01.add(i015 * 16)),
+                            vld1q_u8(table23.add(i235 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p6,
+                        xor3_u8(
+                            vld1q_u8(p6),
+                            vld1q_u8(table01.add(i016 * 16)),
+                            vld1q_u8(table23.add(i236 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p7,
+                        xor3_u8(
+                            vld1q_u8(p7),
+                            vld1q_u8(table01.add(i017 * 16)),
+                            vld1q_u8(table23.add(i237 * 16)),
+                        ),
+                    );
                 }
             }
         }
