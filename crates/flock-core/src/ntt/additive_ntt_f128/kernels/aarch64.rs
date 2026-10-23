@@ -39,13 +39,6 @@ unsafe fn pmull_ll(
     }
 }
 
-/// `pmull` of a lane against the fixed reduction constant `0x87`.
-#[inline(always)]
-unsafe fn pmull_87(x: u64) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe { core::mem::transmute::<u128, uint64x2_t>(vmull_p64(x, 0x87)) }
-}
-
 #[cfg(target_feature = "sha3")]
 #[inline(always)]
 unsafe fn xor3(
@@ -69,12 +62,6 @@ unsafe fn xor3(
 
 /// GHASH multiply with both operands and the result held in q registers.
 ///
-/// Same algorithm as [`crate::field::gf2_128::aarch64::ghash_mul_binius`] —
-/// four schoolbook PMULLs and the two-stage recursive reduction — but it
-/// neither accepts nor returns an `F128`, so no lane ever moves to a
-/// general-purpose register on the way in or out. `vmull_high_p64` reads the
-/// high lanes in place, so the operand extraction the scalar form needs
-/// disappears too.
 #[inline(always)]
 unsafe fn mul_q(
     a: core::arch::aarch64::uint64x2_t,
@@ -83,35 +70,43 @@ unsafe fn mul_q(
     use core::arch::aarch64::*;
     unsafe {
         let zero = vdupq_n_u64(0);
-
-        let t0 = pmull_ll(a, b);
-        let t1a = core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
-            vgetq_lane_u64::<0>(a),
-            vgetq_lane_u64::<1>(b),
-        ));
-        let t1b = core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
-            vgetq_lane_u64::<1>(a),
-            vgetq_lane_u64::<0>(b),
-        ));
-        let t2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+        let a_sum = veorq_u64(a, vextq_u64::<1>(a, a));
+        let b_sum = veorq_u64(b, vextq_u64::<1>(b, b));
+        let ll = pmull_ll(a, b);
+        let hh = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
             vreinterpretq_p64_u64(a),
             vreinterpretq_p64_u64(b),
         ));
-        let t1_cross = veorq_u64(t1a, t1b);
+        let mm = pmull_ll(a_sum, b_sum);
+        let cross = xor3(mm, ll, hh);
+        let lo = veorq_u64(ll, vextq_u64::<1>(zero, cross));
+        let hi = veorq_u64(hh, vextq_u64::<1>(cross, zero));
 
-        // t1 += x^64 · t2 (mod p): {0, t2.lo} places t2.lo into t1.hi.
-        let t1 = xor3(
-            t1_cross,
-            vextq_u64::<1>(zero, t2),
-            pmull_87(vgetq_lane_u64::<1>(t2)),
+        let shift1 = veorq_u64(
+            vshlq_n_u64::<1>(hi),
+            vextq_u64::<1>(zero, vshrq_n_u64::<63>(hi)),
         );
-
-        // t0 += x^64 · t1 (mod p).
-        xor3(
-            t0,
-            vextq_u64::<1>(zero, t1),
-            pmull_87(vgetq_lane_u64::<1>(t1)),
-        )
+        let shift2 = veorq_u64(
+            vshlq_n_u64::<2>(hi),
+            vextq_u64::<1>(zero, vshrq_n_u64::<62>(hi)),
+        );
+        let shift7 = veorq_u64(
+            vshlq_n_u64::<7>(hi),
+            vextq_u64::<1>(zero, vshrq_n_u64::<57>(hi)),
+        );
+        let folded = xor3(hi, shift1, veorq_u64(shift2, shift7));
+        let high_word = vextq_u64::<1>(hi, zero);
+        let overflow = xor3(
+            vshrq_n_u64::<63>(high_word),
+            vshrq_n_u64::<62>(high_word),
+            vshrq_n_u64::<57>(high_word),
+        );
+        let correction = xor3(
+            overflow,
+            vshlq_n_u64::<1>(overflow),
+            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
+        );
+        xor3(lo, folded, correction)
     }
 }
 
