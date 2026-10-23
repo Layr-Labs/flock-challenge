@@ -125,3 +125,26 @@ unsafe impl GlobalAlloc for RecycleAlloc {
         unsafe { System.dealloc(ptr, layout) }
     }
 }
+
+/// Wire every block parked on the recycling freelists (see
+/// [`flock_core::scratch::wire_parked_buffers`] for why). Returns the number
+/// of bytes wired. Holds each class lock while walking its list, so no block
+/// can be popped mid-walk.
+pub fn wire_freelists() -> usize {
+    let mut wired = 0;
+    for class in &CLASSES {
+        let size = class.size.load(Acquire);
+        if size == 0 {
+            continue;
+        }
+        let head = class.head.lock().unwrap();
+        let mut node = *head;
+        while node != 0 {
+            if flock_core::scratch::wire_range(node as *const u8, size) {
+                wired += size;
+            }
+            node = unsafe { *(node as *const usize) };
+        }
+    }
+    wired
+}

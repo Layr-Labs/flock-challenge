@@ -3459,6 +3459,20 @@ impl Blake3Setup {
                     blocks,
                 );
             }
+            // Keep the recycled working set resident for the timed prove;
+            // see `flock_core::scratch::wire_parked_buffers`.
+            if std::env::var_os("FLOCK_NO_WIRE_PARKED").is_none() {
+                let t_wire = std::time::Instant::now();
+                let wired = flock_core::scratch::wire_parked_buffers()
+                    + crate::recycle_alloc::wire_freelists();
+                if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+                    eprintln!(
+                        "[phase-timing] warm-up wire parked: {:.1} MiB in {:.2} ms",
+                        wired as f64 / (1u64 << 20) as f64,
+                        t_wire.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+            }
             // Last thing the untimed warm-up does: hand stdin to the seed-pipe
             // thread. The worker publishes its ready file immediately after we
             // return and only then touches `io::stdin()`, so the splice lands
