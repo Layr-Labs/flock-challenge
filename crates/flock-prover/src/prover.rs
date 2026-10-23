@@ -364,6 +364,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
+    ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -374,7 +375,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
         b_packed_f128,
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
-        CommitCodeword::StreamedFirstPass(codeword, stream),
+        CommitCodeword::StreamedFirstPass(codeword, stream, ab_inner),
         challenger,
     )
 }
@@ -396,6 +397,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
+    ab_inner: Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -406,7 +408,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
         b_packed_f128,
         LincheckStripeInput::DeferredRanked,
         lincheck_circuit,
-        CommitCodeword::StreamedFirstPass(codeword, stream),
+        CommitCodeword::StreamedFirstPass(codeword, stream, ab_inner),
         challenger,
     )
 }
@@ -555,7 +557,11 @@ enum CommitCodeword {
     Allocate,
     NeedsReplication(Vec<F128>),
     Preinitialized(Vec<F128>),
-    StreamedFirstPass(Vec<F128>, flock_core::gpu_commit::FromZFirstPassStream),
+    StreamedFirstPass(
+        Vec<F128>,
+        flock_core::gpu_commit::FromZFirstPassStream,
+        Option<zerocheck::univariate_skip_optimized::Round1AbInner>,
+    ),
 }
 
 /// Lincheck stripe ownership at the commit boundary. `DeferredRanked` is
@@ -842,29 +848,45 @@ fn commit_with_round1_ab_precompute(
         ),
     );
 
-    let result = rayon::join(
-        || {
-            let pre = match commit_codeword {
-                CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
-                CommitCodeword::NeedsReplication(buf) => {
-                    pcs::commit_into(z_packed, pcs_params, buf)
-                }
-                CommitCodeword::Preinitialized(buf) => {
-                    pcs::commit_preinitialized(z_packed, buf, pcs_params)
-                }
-                CommitCodeword::StreamedFirstPass(buf, stream) => {
-                    pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
-                }
-            };
-            // Graph complete, root final — the AB arm is (typically) still
-            // running. Fire the tail-fill hook here so its staged GPU work
-            // executes in the arm-tail idle.
-            if let Some(hook) = tail_fill {
-                hook(&pre.0);
+    // A streamed witness can supply the complete transform. Keep its input
+    // buffers for round two, but do not read them again in a second AB drain.
+    let (commit_codeword, supplied_ab) = match commit_codeword {
+        CommitCodeword::StreamedFirstPass(buf, stream, ab_inner) => (
+            CommitCodeword::StreamedFirstPass(buf, stream, None),
+            ab_inner,
+        ),
+        other => (other, None),
+    };
+    let commit = || {
+        let pre = match commit_codeword {
+            CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
+            CommitCodeword::NeedsReplication(buf) => pcs::commit_into(z_packed, pcs_params, buf),
+            CommitCodeword::Preinitialized(buf) => {
+                pcs::commit_preinitialized(z_packed, buf, pcs_params)
             }
-            pre
-        },
-        || {
+            CommitCodeword::StreamedFirstPass(buf, stream, _) => {
+                pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
+            }
+        };
+        // Graph complete, root final — the AB arm is (typically) still
+        // running. Fire the tail-fill hook here so its staged GPU work
+        // executes in the arm-tail idle.
+        if let Some(hook) = tail_fill {
+            hook(&pre.0);
+        }
+        pre
+    };
+    let result = match supplied_ab {
+        Some(ab_inner) => {
+            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+                eprintln!(
+                    "[phase-timing] AB supplied by witness: {} bytes; later drain skipped",
+                    ab_inner.len_bytes()
+                );
+            }
+            (commit(), ab_inner)
+        }
+        None => rayon::join(commit, || {
             let t = std::time::Instant::now();
             let r = precompute_ab();
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -876,8 +898,8 @@ fn commit_with_round1_ab_precompute(
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
             r
-        },
-    );
+        }),
+    };
 
     if run_ranked_exact_tune {
         flock_core::gpu_commit::retune_ranked_hybrid_with_exact_contention(

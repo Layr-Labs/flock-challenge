@@ -1594,8 +1594,8 @@ fn build_block_witness_ab_stream_into(
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod witgen_simd {
     use super::{
-        BLAKE3_IV, Compression, G_STRIDE, GS_BASE, K, N_G, OUT_HI_BASE, REC_C0, REC_C1, REC_C2,
-        REC_C3, REC_C4, REC_C5, REC_LIN0, REC_LIN1, USEFUL_BITS,
+        BLAKE3_IV, Compression, G_STRIDE, GS_BASE, K, K_LOG, N_G, OUT_HI_BASE, REC_C0, REC_C1,
+        REC_C2, REC_C3, REC_C4, REC_C5, REC_LIN0, REC_LIN1, USEFUL_BITS,
     };
     use core::arch::aarch64::*;
     use flock_core::bits::transpose_8_u64s_to_64_bytes;
@@ -2408,11 +2408,26 @@ pub(crate) mod witgen_simd {
         }
     }
 
-    /// SIMD counterpart of `drive_witness_packed_and_lincheck_impl`
-    /// (PER_BLOCK_FULLY_WRITES, no rate-2 codeword): same scratch pools, same
-    /// process_group shape, same optional Metal band streaming, same stripe
-    /// pass; the per-block builder runs as two NEON quads per group and the
-    /// a/b/stripe stores are non-temporal (§14; z stays plain, §16).
+    #[cfg(test)]
+    static LAST_STREAMED_AB_GROUPS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(test)]
+    pub(crate) fn last_streamed_ab_groups() -> usize {
+        LAST_STREAMED_AB_GROUPS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(super) fn select_streamed_ab(
+        n_blocks_log: usize,
+        deferred_stream: bool,
+        disabled: bool,
+    ) -> bool {
+        n_blocks_log == 18 && deferred_stream && !disabled
+    }
+
+    /// SIMD witness driver with the existing group and Metal band layout.
+    /// The streamed AB experiment consumes cached A/B before its job returns;
+    /// the control keeps the existing non-temporal A/B stores and later drain.
     #[allow(clippy::type_complexity)]
     fn generate_impl(
         blocks: &[Compression],
@@ -2425,6 +2440,7 @@ pub(crate) mod witgen_simd {
         Vec<F128>,
         Option<Vec<u8>>,
         Option<flock_core::gpu_commit::FromZFirstPassStream>,
+        Option<flock_core::zerocheck::univariate_skip_optimized::Round1AbInner>,
     ) {
         let n_total = 1usize << n_blocks_log;
         let n_blocks = blocks.len();
@@ -2501,6 +2517,22 @@ pub(crate) mod witgen_simd {
         // lease was actually acquired. A warmup/failure/non-ranked miss keeps
         // the ordinary stripe so no fallback can observe an absent buffer.
         let defer_ranked_stripe = defer_ranked_stripe && stream.is_some();
+        // Same-binary control for the producer-local experiment. The live
+        // stream and deferred-stripe gates already enforce ranked PCS geometry.
+        let streamed_ab = select_streamed_ab(
+            n_blocks_log,
+            defer_ranked_stripe,
+            std::env::var_os("FLOCK_NO_STREAMED_AB").is_some(),
+        )
+        .then(|| {
+            flock_core::zerocheck::univariate_skip_optimized::StreamedRound1AbInner::new(
+                K_LOG + n_blocks_log,
+                &flock_core::zerocheck::PaddingSpec {
+                    k_log: K_LOG,
+                    useful_bits_per_block: USEFUL_BITS,
+                },
+            )
+        });
         let mut z_lincheck =
             (!defer_ranked_stripe).then(|| flock_core::scratch::take_u8((n_total / 8) * K));
 
@@ -2522,6 +2554,9 @@ pub(crate) mod witgen_simd {
             .as_mut()
             .map(|stripe| WritePtr(stripe.as_mut_ptr()));
         let nt = nt_enabled();
+        // The transform consumes each completed group immediately. Cached A/B
+        // stores keep those reads local; the retained bytes still feed R2.
+        let ab_nt = nt && streamed_ab.is_none();
         // The ordinary path rereads z immediately to emit the lincheck
         // stripe, so its cached stores remain intentional. With an acquired
         // Metal stream and deferred stripe, z's next consumer is the GPU;
@@ -2565,7 +2600,7 @@ pub(crate) mod witgen_simd {
                                 a_grp[base..].as_mut_ptr() as *mut u32,
                                 b_grp[base..].as_mut_ptr() as *mut u32,
                                 z_nt,
-                                nt,
+                                ab_nt,
                                 elide,
                             );
                         }
@@ -2606,10 +2641,16 @@ pub(crate) mod witgen_simd {
                         a_grp[base..].as_mut_ptr() as *mut u32,
                         b_grp[base..].as_mut_ptr() as *mut u32,
                         z_nt,
-                        nt,
+                        ab_nt,
                         elide,
                     );
                 }
+            }
+            if let Some(ab) = &streamed_ab {
+                // SAFETY: process_group runs exactly once per disjoint group.
+                // Both quads are complete, and the producer joins all jobs
+                // before exposing the result to the prover.
+                unsafe { ab.write_group(g, a_grp, b_grp) };
             }
             if let Some(stripe_base) = stripe_base {
                 // Bit-transpose 8 z chunks into the lincheck stripe
@@ -2883,7 +2924,22 @@ pub(crate) mod witgen_simd {
             );
         }
 
-        (z, a, b, z_lincheck, stream)
+        #[cfg(test)]
+        LAST_STREAMED_AB_GROUPS.store(
+            if streamed_ab.is_some() { n_groups } else { 0 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if streamed_ab.is_some() && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            eprintln!("[streamed-ab] producer groups={n_groups}; A/B cached; later drain removed");
+        }
+        (
+            z,
+            a,
+            b,
+            z_lincheck,
+            stream,
+            streamed_ab.map(|ab| ab.finish()),
+        )
     }
 
     /// Non-streamed entry (matches `drive_witness_packed_and_lincheck_full_write`).
@@ -2891,7 +2947,8 @@ pub(crate) mod witgen_simd {
         blocks: &[Compression],
         n_blocks_log: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        let (z, a, b, stripe, stream) = generate_impl(blocks, n_blocks_log, None, false);
+        let (z, a, b, stripe, stream, ab) = generate_impl(blocks, n_blocks_log, None, false);
+        debug_assert!(ab.is_none());
         debug_assert!(stream.is_none());
         (
             z,
@@ -2914,6 +2971,7 @@ pub(crate) mod witgen_simd {
         Vec<F128>,
         Option<Vec<u8>>,
         Option<flock_core::gpu_commit::FromZFirstPassStream>,
+        Option<flock_core::zerocheck::univariate_skip_optimized::Round1AbInner>,
     ) {
         generate_impl(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe)
     }
@@ -3136,6 +3194,7 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
     Vec<F128>,
     Option<Vec<u8>>,
     Option<flock_core::gpu_commit::FromZFirstPassStream>,
+    Option<flock_core::zerocheck::univariate_skip_optimized::Round1AbInner>,
 ) {
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
     let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
@@ -3172,7 +3231,7 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
             pcs_params,
             per_block,
         );
-    (z, a, b, Some(stripe), stream)
+    (z, a, b, Some(stripe), stream, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -3538,12 +3597,18 @@ impl Blake3Setup {
                 };
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
-                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck, gpu_first_pass) =
-                    generate_witness_with_ab_packed_and_lincheck_streamed(
-                        blocks,
-                        self.n_blocks_log(),
-                        &self.pcs_params,
-                    );
+                let (
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    gpu_first_pass,
+                    ab_inner,
+                ) = generate_witness_with_ab_packed_and_lincheck_streamed(
+                    blocks,
+                    self.n_blocks_log(),
+                    &self.pcs_params,
+                );
                 if phase_timing {
                     let wall = t_wit.elapsed().as_secs_f64() * 1e3;
                     let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
@@ -3569,6 +3634,7 @@ impl Blake3Setup {
                                 lc_circuit,
                                 codeword,
                                 stream,
+                                ab_inner,
                                 challenger,
                             )
                         }
@@ -3581,6 +3647,7 @@ impl Blake3Setup {
                             lc_circuit,
                             codeword,
                             stream,
+                            ab_inner,
                             challenger,
                         ),
                     };
@@ -4197,6 +4264,15 @@ mod tests {
         assert!(!should_request_ranked_exact_tune(1, true));
         assert!(!should_request_ranked_exact_tune(2, true));
         assert!(!should_request_ranked_exact_tune(0, false));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn streamed_ab_requires_ranked_deferred_stream() {
+        assert!(witgen_simd::select_streamed_ab(18, true, false));
+        assert!(!witgen_simd::select_streamed_ab(17, true, false));
+        assert!(!witgen_simd::select_streamed_ab(18, false, false));
+        assert!(!witgen_simd::select_streamed_ab(18, true, true));
     }
 
     #[test]
@@ -4972,8 +5048,20 @@ mod tests {
         // elision path was actually exercised (bit0 z, bit1 a, bit2 b).
         #[cfg(target_arch = "aarch64")]
         let first_hits = witgen_simd::last_elide_hits();
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(witgen_simd::last_streamed_ab_groups(), 0);
         let mut prover2 = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
         let (proof2, commitment2, claim2) = setup.prove_fast(&blocks, &mut prover2);
+        #[cfg(target_arch = "aarch64")]
+        {
+            let groups = witgen_simd::last_streamed_ab_groups();
+            eprintln!("[streamed-ab-canary] groups={groups}");
+            if std::env::var_os("FLOCK_NO_STREAMED_AB").is_none() {
+                assert_eq!(groups, RANKED_N_BLOCKS / 8, "producer-local AB must engage");
+            } else {
+                assert_eq!(groups, 0, "control must use the later AB drain");
+            }
+        }
         let proof2_bytes = crate::proof_io::R1csProofBundleLigerito {
             commitment: commitment2.clone(),
             proof: proof2.clone(),

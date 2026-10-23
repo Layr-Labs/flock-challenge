@@ -706,6 +706,136 @@ impl Drop for Round1AbInner {
     }
 }
 
+/// Producer-local AB transform. Each witness job supplies only its completed
+/// eight-block group; no slice covers input that another job is still writing.
+pub struct StreamedRound1AbInner {
+    inner: Round1AbInner,
+    out: crate::epool::SyncPtr<u8>,
+    inv_table: &'static InvNttTableByteSingleGf8,
+    b_med_counts: Vec<u8>,
+    static_b_context: Option<kernels::StaticBContext>,
+    nt: bool,
+    compact: bool,
+    fast_policy: bool,
+    #[cfg(test)]
+    fast_chunks: std::sync::atomic::AtomicUsize,
+}
+
+impl StreamedRound1AbInner {
+    const GROUP_BYTES: usize = 8 * (1 << 14) / 8;
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    const CHUNKS_PER_GROUP: usize = Self::GROUP_BYTES / Self::OUTER_BYTES;
+
+    /// The caller selects the exact ranked streamed path. Smaller congruent
+    /// allocations are accepted here so tests can compare every output byte.
+    pub fn new(m: usize, padding: &PaddingSpec) -> Self {
+        assert!(m >= 17);
+        assert_eq!(padding.k_log, 14);
+        assert_eq!(padding.useful_bits_per_block, 15_409);
+        let total_bytes = (1usize << m) / 8;
+        let (mut storage, token_hit) = take_ab_inner_storage(total_bytes, true);
+        let out = crate::epool::SyncPtr(storage.as_mut_ptr().cast::<u8>());
+        let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+        assert_eq!(within_outer_mask, 1);
+        let static_b_context = kernels::prepare_static_b_context(inv_table, true);
+        let fast_policy = ranked_ab_pre_fast_policy_hoist_shape(
+            m,
+            K_SKIP,
+            total_bytes / Self::OUTER_BYTES,
+            padding.k_log,
+            padding.useful_bits_per_block,
+            rayon::current_num_threads(),
+            crate::epool::helper_pool().map_or(0, rayon::ThreadPool::current_num_threads),
+            kernels::static_b_context_is_prepared(static_b_context),
+            zc_ab_pre_fast_policy_hoist_enabled(),
+        ) && kernels::fast_shift_reduce_enabled();
+        Self {
+            inner: Round1AbInner { storage },
+            out,
+            inv_table,
+            b_med_counts,
+            static_b_context,
+            nt: ab_pre_nt_enabled(),
+            compact: ab_compact_store_enabled() && token_hit,
+            fast_policy,
+            #[cfg(test)]
+            fast_chunks: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// # Safety
+    /// Each group must be written exactly once, and all calls must finish
+    /// before `finish`. The caller must own both completed input ranges.
+    pub unsafe fn write_group(&self, group: usize, a: &[F128], b: &[F128]) {
+        assert_eq!(core::mem::size_of_val(a), Self::GROUP_BYTES);
+        assert_eq!(a.len(), b.len());
+        let base = group * Self::GROUP_BYTES;
+        assert!(base + Self::GROUP_BYTES <= self.inner.len_bytes());
+        let cast = |v: &[F128]| unsafe {
+            core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v))
+        };
+        let (a, b) = (cast(a), cast(b));
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
+        let first_outer = group * Self::CHUNKS_PER_GROUP;
+        let run = |fast_policy: bool, direct: bool, a_col: &mut _, b_col: &mut _| {
+            for local in 0..Self::CHUNKS_PER_GROUP {
+                // SAFETY: the witness job owns this whole output group.
+                let out = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        self.out.ptr().add(base + local * Self::OUTER_BYTES),
+                        Self::OUTER_BYTES,
+                    )
+                };
+                macro_rules! chunk {
+                    ($policy:expr, $direct:expr) => {
+                        precompute_ab_one_chunk::<$policy, $direct>(
+                            a,
+                            b,
+                            self.inv_table,
+                            1,
+                            &self.b_med_counts,
+                            true,
+                            self.static_b_context,
+                            self.nt,
+                            self.compact,
+                            first_outer + local,
+                            first_outer,
+                            out,
+                            a_col,
+                            b_col,
+                        )
+                    };
+                }
+                if fast_policy && direct {
+                    chunk!({ kernels::AB_FAST_POLICY_FORCE_FAST }, true);
+                    #[cfg(test)]
+                    self.fast_chunks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else if fast_policy {
+                    chunk!({ kernels::AB_FAST_POLICY_FORCE_FAST }, false);
+                    #[cfg(test)]
+                    self.fast_chunks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    chunk!({ kernels::AB_FAST_POLICY_PROCESS }, false);
+                }
+            }
+        };
+        run(
+            self.fast_policy,
+            self.nt && ab_pre_nt_direct_enabled(),
+            &mut a_col,
+            &mut b_col,
+        );
+    }
+
+    pub fn finish(self) -> Round1AbInner {
+        self.inner
+    }
+}
+
 /// Kill switch for the non-temporal store flavor of the deferred AB
 /// precompute output: `FLOCK_NO_ZC_AB_PRE_NT=1` restores the incumbent plain
 /// cached stores as a same-binary control. Store flavor only — the bytes
@@ -845,6 +975,36 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     )
 }
 
+fn take_ab_inner_storage(total_bytes: usize, use_provenance: bool) -> (Vec<F128>, bool) {
+    // Compact stores leave dead tail rows unwritten, yet the completion path
+    // forms ordinary block references spanning those rows. Admit sparse
+    // writes only on an exact allocation returned from a prior full R2
+    // overwrite. A cold miss still has scratch's uninitialized contract, so
+    // raw-zero the complete allocation before constructing any reference and
+    // force the historical full-store arm for that warmup/fail-safe proof.
+    let storage_len = total_bytes / core::mem::size_of::<F128>();
+    let (mut storage, token_hit) = if use_provenance {
+        crate::scratch::take_f128_with_token(storage_len, AB_COMPACT_R2_FULL_INIT_TAG)
+    } else {
+        (crate::scratch::take_f128(storage_len), false)
+    };
+    if use_provenance && token_hit {
+        AB_COMPACT_BACKING_TOKEN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else if use_provenance {
+        AB_COMPACT_BACKING_TOKEN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if !token_hit {
+        // SAFETY: `storage` is exclusively owned and exposes exactly
+        // `total_bytes`; zero is a valid object representation for F128.
+        unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
+    }
+    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+        let (hits, misses) = ab_compact_backing_token_counts();
+        eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
+    }
+    (storage, token_hit)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn precompute_round1_ab_inner_packed_padded_body(
     a_packed: &[u8],
@@ -882,32 +1042,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     debug_assert_eq!(OUTER_BYTES, (1 << N_INNER) * N_CHUNKS);
 
-    // Compact stores leave dead tail rows unwritten, yet the completion path
-    // forms ordinary block references spanning those rows. Admit sparse
-    // writes only on an exact allocation returned from a prior full R2
-    // overwrite. A cold miss still has scratch's uninitialized contract, so
-    // raw-zero the complete allocation before constructing any reference and
-    // force the historical full-store arm for that warmup/fail-safe proof.
-    let storage_len = total_bytes / core::mem::size_of::<F128>();
-    let (mut storage, token_hit) = if use_provenance {
-        crate::scratch::take_f128_with_token(storage_len, AB_COMPACT_R2_FULL_INIT_TAG)
-    } else {
-        (crate::scratch::take_f128(storage_len), false)
-    };
-    if use_provenance && token_hit {
-        AB_COMPACT_BACKING_TOKEN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else if use_provenance {
-        AB_COMPACT_BACKING_TOKEN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    if !token_hit {
-        // SAFETY: `storage` is exclusively owned and exposes exactly
-        // `total_bytes`; zero is a valid object representation for F128.
-        unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
-    }
-    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
-        let (hits, misses) = ab_compact_backing_token_counts();
-        eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
-    }
+    let (mut storage, token_hit) = take_ab_inner_storage(total_bytes, use_provenance);
     let compact = compact && token_hit;
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
@@ -1011,6 +1146,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     nt,
                     compact,
                     x_outer,
+                    0,
                     out_outer,
                     a_col,
                     b_col,
@@ -1144,6 +1280,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     nt,
                     compact,
                     x_outer,
+                    0,
                     out_outer,
                     a_col,
                     b_col,
@@ -1169,6 +1306,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     nt: bool,
     compact: bool,
     x_outer: usize,
+    input_outer_base: usize,
     out_outer: &mut [u8],
     a_col: &mut [F8; ELL],
     b_col: &mut [F8; ELL],
@@ -1176,7 +1314,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     let within_hash_outer = x_outer & within_outer_mask;
     let n_b_med = b_med_counts[within_hash_outer] as usize;
-    let chunk_byte_base = x_outer * OUTER_BYTES;
+    let chunk_byte_base = (x_outer - input_outer_base) * OUTER_BYTES;
 
     // NT arm: the kernel drains each 64-byte block to the big buffer with
     // `stnp` (write-once lines, consumer runs after the commit root). By
@@ -3738,6 +3876,85 @@ mod tests {
     use crate::zerocheck::univariate_skip::round1_naive;
 
     #[test]
+    fn streamed_ab_groups_match_full_transform_and_keep_inputs() {
+        use rayon::prelude::*;
+
+        const M: usize = 19;
+        const GROUP_FIELDS: usize = StreamedRound1AbInner::GROUP_BYTES / 16;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let mut rng = Rng::new(0x57EA_AB01);
+        let a = rng.f128_vec(1 << (M - 7));
+        let b = rng.f128_vec(a.len());
+        let (before_a, before_b) = (a.clone(), b.clone());
+        let cast = |v: &[F128]| unsafe {
+            core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), core::mem::size_of_val(v))
+        };
+        let expected = precompute_round1_ab_inner_packed_padded_with_flavor(
+            cast(&a),
+            cast(&b),
+            M,
+            K_SKIP,
+            InvNttTableByteSingleGf8::cached_standard_k6(),
+            &padding,
+            false,
+            false,
+        );
+        for fast_policy in [false, true] {
+            for nt in [false, true] {
+                for compact in [false, true] {
+                    let mut producer = StreamedRound1AbInner::new(M, &padding);
+                    // Model a fully initialized recycled backing with observable
+                    // dead rows. The ranked canary checks the real token handoff.
+                    producer.inner.storage.fill(F128::new(u64::MAX, u64::MAX));
+                    producer.out =
+                        crate::epool::SyncPtr(producer.inner.storage.as_mut_ptr().cast::<u8>());
+                    producer.fast_policy = fast_policy;
+                    producer.nt = nt;
+                    producer.compact = compact;
+                    let n_groups = a.len() / GROUP_FIELDS;
+                    (0..n_groups).into_par_iter().for_each(|job| {
+                        let group = n_groups - 1 - job;
+                        let range = group * GROUP_FIELDS..(group + 1) * GROUP_FIELDS;
+                        // SAFETY: each group has one caller and disjoint output.
+                        unsafe { producer.write_group(group, &a[range.clone()], &b[range]) };
+                    });
+                    let fast_chunks = producer
+                        .fast_chunks
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    assert_eq!(
+                        fast_chunks,
+                        if fast_policy {
+                            n_groups * StreamedRound1AbInner::CHUNKS_PER_GROUP
+                        } else {
+                            0
+                        }
+                    );
+                    eprintln!(
+                        "[streamed-ab-oracle] fast_policy={fast_policy} nt={nt} compact={compact} fast_chunks={fast_chunks}"
+                    );
+                    let actual = producer.finish();
+                    for chunk in 0..actual.len_bytes() / 1024 {
+                        let live = if chunk & 1 == 0 { 1024 } else { 15 * 64 };
+                        let base = chunk * 1024;
+                        assert_eq!(
+                            &actual.as_bytes()[base..base + live],
+                            &expected.as_bytes()[base..base + live],
+                            "group-local transform differs at chunk {chunk}, nt={nt}, compact={compact}"
+                        );
+                        let dead = &actual.as_bytes()[base + live..base + 1024];
+                        assert!(dead.iter().all(|&v| v == if compact { 255 } else { 0 }));
+                    }
+                }
+            }
+        }
+        assert_eq!(a, before_a);
+        assert_eq!(b, before_b);
+    }
+
+    #[test]
     fn apple_fixed_inverse_selectors_are_literal_and_fail_closed() {
         assert!(apple_inverse_literal_selected(true, None));
         assert!(apple_inverse_literal_selected(true, Some("0")));
@@ -4014,6 +4231,7 @@ mod tests {
             false,
             false,
             0,
+            0,
             &mut cached,
             &mut cached_a_col,
             &mut cached_b_col,
@@ -4032,6 +4250,7 @@ mod tests {
             None,
             true,
             false,
+            0,
             0,
             &mut direct,
             &mut direct_a_col,
