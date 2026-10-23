@@ -3459,6 +3459,17 @@ impl Blake3Setup {
                     blocks,
                 );
             }
+            // Leave the timed prove enough parked mid-size blocks; see
+            // `recycle_alloc::top_up_freelists`.
+            if std::env::var_os("FLOCK_NO_FREELIST_TOP_UP").is_none() {
+                let parked = crate::recycle_alloc::top_up_freelists(256 << 20);
+                if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+                    eprintln!(
+                        "[phase-timing] warm-up freelist top-up: {:.1} MiB",
+                        parked as f64 / (1u64 << 20) as f64
+                    );
+                }
+            }
             // Last thing the untimed warm-up does: hand stdin to the seed-pipe
             // thread. The worker publishes its ready file immediately after we
             // return and only then touches `io::stdin()`, so the splice lands
