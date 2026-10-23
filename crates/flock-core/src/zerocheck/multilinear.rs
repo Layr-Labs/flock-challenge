@@ -488,7 +488,8 @@ fn lagrange_weights_fast(
     den_inv: &[F128],
 ) -> Vec<F128> {
     let ell = 1usize << k_skip;
-    let mut weights = vec![F128::ZERO; ell];
+    // The prefix pass writes every slot before the suffix pass reads it.
+    let mut weights = crate::alloc_uninit_f128_vec(ell);
     let mut prefix = F128::ONE;
     for i in 0..ell {
         weights[i] = prefix;
