@@ -31,10 +31,34 @@ unsafe fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
 
 #[inline]
 #[target_feature(enable = "aes")]
-unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
-    // SAFETY: the caller provides the `aes` target feature; both types are
-    // 128-bit bit containers with compatible alignment.
-    unsafe { transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
+unsafe fn pmull_lo(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    unsafe {
+        let d: uint64x2_t;
+        core::arch::asm!(
+            "pmull {d}.1q, {a}.1d, {b}.1d",
+            d = out(vreg) d,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack),
+        );
+        d
+    }
+}
+
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn pmull_hi(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    unsafe {
+        let d: uint64x2_t;
+        core::arch::asm!(
+            "pmull2 {d}.1q, {a}.2d, {b}.2d",
+            d = out(vreg) d,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack),
+        );
+        d
+    }
 }
 
 /// Multiply two independent values by the same constant and reduce them in
@@ -44,18 +68,16 @@ unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
 #[target_feature(enable = "aes")]
 unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint64x2_t; 2] {
     unsafe {
-        let r_lo = vgetq_lane_u64::<0>(r);
-        let r_hi = vgetq_lane_u64::<1>(r);
         let r_mid = veorq_u64(r, vextq_u64::<1>(r, r));
         let x0_mid = veorq_u64(x0, vextq_u64::<1>(x0, x0));
         let x1_mid = veorq_u64(x1, vextq_u64::<1>(x1, x1));
 
-        let p0_ll = pmull(vgetq_lane_u64::<0>(x0), r_lo);
-        let p0_hh = pmull(vgetq_lane_u64::<1>(x0), r_hi);
-        let p0_mm = pmull(vgetq_lane_u64::<0>(x0_mid), vgetq_lane_u64::<0>(r_mid));
-        let p1_ll = pmull(vgetq_lane_u64::<0>(x1), r_lo);
-        let p1_hh = pmull(vgetq_lane_u64::<1>(x1), r_hi);
-        let p1_mm = pmull(vgetq_lane_u64::<0>(x1_mid), vgetq_lane_u64::<0>(r_mid));
+        let p0_ll = pmull_lo(x0, r);
+        let p0_hh = pmull_hi(x0, r);
+        let p0_mm = pmull_lo(x0_mid, r_mid);
+        let p1_ll = pmull_lo(x1, r);
+        let p1_hh = pmull_hi(x1, r);
+        let p1_mm = pmull_lo(x1_mid, r_mid);
         let c0 = xor3_u64(p0_mm, p0_ll, p0_hh);
         let c1 = xor3_u64(p1_mm, p1_ll, p1_hh);
 
@@ -109,28 +131,18 @@ unsafe fn mul_two_const_sum_vec2(
     y1: uint64x2_t,
 ) -> [uint64x2_t; 2] {
     unsafe {
-        let c_lo = vgetq_lane_u64::<0>(c);
-        let c_hi = vgetq_lane_u64::<1>(c);
-        let c_mid = c_lo ^ c_hi;
-        let d_lo = vgetq_lane_u64::<0>(d);
-        let d_hi = vgetq_lane_u64::<1>(d);
-        let d_mid = d_lo ^ d_hi;
-
-        let x0_lo = vgetq_lane_u64::<0>(x0);
-        let x0_hi = vgetq_lane_u64::<1>(x0);
-        let y0_lo = vgetq_lane_u64::<0>(y0);
-        let y0_hi = vgetq_lane_u64::<1>(y0);
-        let p0_ll = veorq_u64(pmull(x0_lo, c_lo), pmull(y0_lo, d_lo));
-        let p0_hh = veorq_u64(pmull(x0_hi, c_hi), pmull(y0_hi, d_hi));
-        let p0_mm = veorq_u64(pmull(x0_lo ^ x0_hi, c_mid), pmull(y0_lo ^ y0_hi, d_mid));
-
-        let x1_lo = vgetq_lane_u64::<0>(x1);
-        let x1_hi = vgetq_lane_u64::<1>(x1);
-        let y1_lo = vgetq_lane_u64::<0>(y1);
-        let y1_hi = vgetq_lane_u64::<1>(y1);
-        let p1_ll = veorq_u64(pmull(x1_lo, c_lo), pmull(y1_lo, d_lo));
-        let p1_hh = veorq_u64(pmull(x1_hi, c_hi), pmull(y1_hi, d_hi));
-        let p1_mm = veorq_u64(pmull(x1_lo ^ x1_hi, c_mid), pmull(y1_lo ^ y1_hi, d_mid));
+        let c_mid = veorq_u64(c, vextq_u64::<1>(c, c));
+        let d_mid = veorq_u64(d, vextq_u64::<1>(d, d));
+        let x0_mid = veorq_u64(x0, vextq_u64::<1>(x0, x0));
+        let y0_mid = veorq_u64(y0, vextq_u64::<1>(y0, y0));
+        let x1_mid = veorq_u64(x1, vextq_u64::<1>(x1, x1));
+        let y1_mid = veorq_u64(y1, vextq_u64::<1>(y1, y1));
+        let p0_ll = veorq_u64(pmull_lo(x0, c), pmull_lo(y0, d));
+        let p0_hh = veorq_u64(pmull_hi(x0, c), pmull_hi(y0, d));
+        let p0_mm = veorq_u64(pmull_lo(x0_mid, c_mid), pmull_lo(y0_mid, d_mid));
+        let p1_ll = veorq_u64(pmull_lo(x1, c), pmull_lo(y1, d));
+        let p1_hh = veorq_u64(pmull_hi(x1, c), pmull_hi(y1, d));
+        let p1_mm = veorq_u64(pmull_lo(x1_mid, c_mid), pmull_lo(y1_mid, d_mid));
 
         let cross0 = xor3_u64(p0_mm, p0_ll, p0_hh);
         let cross1 = xor3_u64(p1_mm, p1_ll, p1_hh);
@@ -169,11 +181,11 @@ unsafe fn mul_two_const_sum_vec2(
 #[target_feature(enable = "aes")]
 unsafe fn mul_unreduced(a: uint64x2_t, b: uint64x2_t) -> WideNeon {
     unsafe {
-        let ll = pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
-        let hh = pmull(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
+        let ll = pmull_lo(a, b);
+        let hh = pmull_hi(a, b);
         let a_mid = veorq_u64(a, vextq_u64::<1>(a, a));
         let b_mid = veorq_u64(b, vextq_u64::<1>(b, b));
-        let middle = pmull(vgetq_lane_u64::<0>(a_mid), vgetq_lane_u64::<0>(b_mid));
+        let middle = pmull_lo(a_mid, b_mid);
         let cross = xor3_u64(middle, ll, hh);
         let zero = vdupq_n_u64(0);
         WideNeon {
@@ -199,23 +211,14 @@ unsafe fn xor_karatsuba_const_pair(
         let weight_mid = veorq_u64(weight, vextq_u64::<1>(weight, weight));
         let even_mid = veorq_u64(even, vextq_u64::<1>(even, even));
         let odd_mid = veorq_u64(odd, vextq_u64::<1>(odd, odd));
-        let weight_p = vreinterpretq_p64_u64(weight);
 
         // Keep all six independent PMULLs visible before consuming results.
-        let even_ll = pmull(vgetq_lane_u64::<0>(even), vgetq_lane_u64::<0>(weight));
-        let odd_ll = pmull(vgetq_lane_u64::<0>(odd), vgetq_lane_u64::<0>(weight));
-        let even_hh =
-            transmute::<u128, uint64x2_t>(vmull_high_p64(vreinterpretq_p64_u64(even), weight_p));
-        let odd_hh =
-            transmute::<u128, uint64x2_t>(vmull_high_p64(vreinterpretq_p64_u64(odd), weight_p));
-        let even_mm = pmull(
-            vgetq_lane_u64::<0>(even_mid),
-            vgetq_lane_u64::<0>(weight_mid),
-        );
-        let odd_mm = pmull(
-            vgetq_lane_u64::<0>(odd_mid),
-            vgetq_lane_u64::<0>(weight_mid),
-        );
+        let even_ll = pmull_lo(even, weight);
+        let odd_ll = pmull_lo(odd, weight);
+        let even_hh = pmull_hi(even, weight);
+        let odd_hh = pmull_hi(odd, weight);
+        let even_mm = pmull_lo(even_mid, weight_mid);
+        let odd_mm = pmull_lo(odd_mid, weight_mid);
 
         even_acc.ll = veorq_u64(even_acc.ll, even_ll);
         even_acc.hh = veorq_u64(even_acc.hh, even_hh);
