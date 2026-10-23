@@ -1093,36 +1093,31 @@ impl AdditiveNttF128 {
             // passes instead of fused-3 + single.
             if layer + 2 < stop_layer && stop_layer - layer != 4 && block_size >= 8 {
                 let eighth = block_size >> 3;
-                for local in 0..num_blocks {
-                    let abs = abs_first + local;
-                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-                    tw[0] = self.twiddle(layer, abs);
-                    for s in 0..2 {
-                        tw[1 + s] = self.twiddle(layer + 1, 2 * abs + s);
-                    }
-                    for s in 0..4 {
-                        tw[3 + s] = self.twiddle(layer + 2, 4 * abs + s);
-                    }
-                    let start = local * block_elems;
-                    let slice =
-                        &mut data[range_base_elem + start..range_base_elem + start + block_elems];
-                    // `eighth` even ⇒ every row group stays inside one
-                    // position parity, so the static zero tail survives.
-                    let tail = if eighth.is_multiple_of(2) {
-                        odd_tail
-                    } else {
-                        0
-                    };
-                    if tw[0] == F128::ZERO && tw[1] == F128::ZERO && tw[3] == F128::ZERO {
-                        butterfly_interleaved_fused_3layer_par_rows::<true>(
-                            slice, &tw, eighth, num_ntts, tail,
-                        );
-                    } else {
-                        butterfly_interleaved_fused_3layer_par_rows::<false>(
-                            slice, &tw, eighth, num_ntts, tail,
-                        );
-                    }
-                }
+                let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+                    .map(|local| {
+                        let abs = abs_first + local;
+                        let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                        tw[0] = self.twiddle(layer, abs);
+                        for s in 0..2 {
+                            tw[1 + s] = self.twiddle(layer + 1, 2 * abs + s);
+                        }
+                        for s in 0..4 {
+                            tw[3 + s] = self.twiddle(layer + 2, 4 * abs + s);
+                        }
+                        tw
+                    })
+                    .collect();
+                // `eighth` even ⇒ every row group stays inside one position
+                // parity, so the static zero tail survives.
+                let tail = if eighth.is_multiple_of(2) {
+                    odd_tail
+                } else {
+                    0
+                };
+                let range = &mut data[range_base_elem..range_base_elem + num_blocks * block_elems];
+                butterfly_interleaved_fused_3layer_range_par_rows(
+                    range, &twiddles, eighth, num_ntts, tail,
+                );
                 layer += 3;
             } else if layer + 1 < stop_layer && block_size >= 4 {
                 let quarter = block_size >> 2;
@@ -2437,6 +2432,72 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
                 }
             };
         });
+    }
+}
+
+/// Block-range sibling of [`butterfly_interleaved_fused_3layer_par_rows`]:
+/// every `(block, row group)` of the range runs in one indexed Rayon region
+/// instead of one blocking region per block. The ranked hybrid suffix covers
+/// 5 layer-4 blocks then 40 layer-7 blocks, which per-block regions turned
+/// into 45 sequential fork/join barriers. Per-block zero-root selection and
+/// the odd-position zero-lane skip match the per-block driver exactly.
+fn butterfly_interleaved_fused_3layer_range_par_rows(
+    data: &mut [F128],
+    twiddles: &[[F128; 7]],
+    eighth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_JOB_THRESHOLD: usize = 256;
+
+    let num_blocks = twiddles.len();
+    let block_elems = 8 * eighth * num_ntts;
+    debug_assert_eq!(data.len(), num_blocks * block_elems);
+    debug_assert!(odd_tail == 0 || eighth.is_multiple_of(2));
+    let zero_root: Vec<bool> = twiddles
+        .iter()
+        .map(|t| t[0] == F128::ZERO && t[1] == F128::ZERO && t[3] == F128::ZERO)
+        .collect();
+    let base = data.as_mut_ptr() as usize;
+    let job = |job: usize| {
+        let block = job / eighth;
+        let r = job % eighth;
+        let lanes = if r & 1 == 1 {
+            num_ntts - odd_tail
+        } else {
+            num_ntts
+        };
+        // SAFETY: each job owns the disjoint rows `{i·eighth + r}` of one
+        // block, so concurrent jobs never alias.
+        unsafe {
+            let block_base = (base as *mut F128).add(block * block_elems);
+            if zero_root[block] {
+                kernels::butterfly_fused_3layer_zero_root_row(
+                    block_base,
+                    eighth,
+                    num_ntts,
+                    lanes,
+                    r,
+                    &twiddles[block],
+                )
+            } else {
+                kernels::butterfly_fused_3layer_row(
+                    block_base,
+                    eighth,
+                    num_ntts,
+                    lanes,
+                    r,
+                    &twiddles[block],
+                )
+            }
+        }
+    };
+    let n_jobs = num_blocks * eighth;
+    if n_jobs < PARALLEL_JOB_THRESHOLD {
+        (0..n_jobs).for_each(job);
+    } else {
+        (0..n_jobs).into_par_iter().for_each(job);
     }
 }
 
