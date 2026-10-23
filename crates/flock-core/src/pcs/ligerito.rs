@@ -8468,7 +8468,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         "L0 must not take explicit OOD samples"
     );
     let mut ood_values: Vec<F128> = Vec::new();
-    let mut fold_grinding_nonces: Vec<u64> = Vec::new();
+    let mut fold_grinding_nonces: Vec<u64> =
+        Vec::with_capacity(initial_k + config.recursive_ks.iter().sum::<usize>());
     let fold_bits =
         |lvl: usize| -> u32 { config.fold_grinding_bits.get(lvl).copied().unwrap_or(0) as u32 };
     let ood_count = |lvl: usize| -> usize { config.ood_samples.get(lvl).copied().unwrap_or(0) };
