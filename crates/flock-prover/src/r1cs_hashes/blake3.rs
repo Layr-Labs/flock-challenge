@@ -864,9 +864,21 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
         let e0 = eq_inner[Z_CONST_POS];
         reverse.comb[Z_CONST_POS] += alpha * e0 + e0;
         let input_emit = |reverse: &mut ReverseTranspose<'_>, base: usize, len: usize| {
-            for s in base..base + len {
-                let e = reverse.eq_inner[s];
-                reverse.comb[s] += reverse.alpha * e;
+            let mut offset = 0;
+            while offset + 1 < len {
+                let weights = [
+                    reverse.eq_inner[base + offset],
+                    reverse.eq_inner[base + offset + 1],
+                ];
+                let scaled = mul_alpha_pair(reverse.alpha, weights);
+                reverse.comb[base + offset] += scaled[0];
+                reverse.comb[base + offset + 1] += scaled[1];
+                reverse.comb[Z_CONST_POS] += weights[0] + weights[1];
+                offset += 2;
+            }
+            if offset < len {
+                let e = reverse.eq_inner[base + offset];
+                reverse.comb[base + offset] += reverse.alpha * e;
                 reverse.comb[Z_CONST_POS] += e;
             }
         };
