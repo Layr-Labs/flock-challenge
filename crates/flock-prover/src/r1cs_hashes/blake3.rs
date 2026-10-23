@@ -2251,8 +2251,14 @@ pub(crate) mod witgen_simd {
             let maxv = vdupq_n_u32(u32::MAX);
             // b prefix words 0..36 = MAX (the out_lo slot is MAX too — the
             // scalar writes MAX over MAX, so b needs no out_lo pass).
-            for w in 0..36usize {
-                vst1q_u32(bs.add(w) as *mut u32, maxv);
+            if elide[2] {
+                for w in 32..36usize {
+                    vst1q_u32(bs.add(w) as *mut u32, maxv);
+                }
+            } else {
+                for w in 0..36usize {
+                    vst1q_u32(bs.add(w) as *mut u32, maxv);
+                }
             }
             // Message region words 16..36: word16 = 1|m0<<1, then
             // word16+k = chain[k-1]>>31 | chain[k]<<1 over
@@ -2378,11 +2384,30 @@ pub(crate) mod witgen_simd {
             const ZF: usize = USEFUL_BITS.div_ceil(32); // 482
             const {
                 assert!(U32_PER_BLOCK - ZF == 30);
+                assert!(8 * ELIDE_ZERO_CHUNK == ZF + 6);
             }
-            for w in 0..30usize {
-                vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
+            if elide[0] {
+                for w in 0..6usize {
+                    vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
+                }
+            } else {
+                for w in 0..30usize {
+                    vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
+                }
+            }
+            if elide[1] {
+                for w in 0..6usize {
+                    vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
+                }
+            } else {
+                for w in 0..30usize {
+                    vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
+                }
+            }
+            if !elide[2] {
+                for w in 0..30usize {
+                    vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
+                }
             }
 
             // ---- out_lo slot, words 8..16 (z/a only) ----
