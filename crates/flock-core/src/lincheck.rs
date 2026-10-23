@@ -1128,16 +1128,18 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
     let ell_skip = 1usize << k_skip;
     let ell_rest = 1usize << x_inner_rest.len();
     let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
-    let eq_rest = build_eq_table(x_inner_rest);
     let total = ell_skip * ell_rest;
-    let mut out = Vec::with_capacity(total);
+    let mut out = crate::alloc_uninit_f128_vec(total);
+    build_eq_table_into(x_inner_rest, &mut out[..ell_rest]);
     // Layout: index = i_skip + i_inner_rest · 2^k_skip  ⇒  i_skip is low bits.
-    for &er in &eq_rest {
-        for &ls in &lambda_skip {
-            out.push(ls * er);
+    // Expand backwards so the output rows cannot overwrite unread eq values.
+    for i_rest in (0..ell_rest).rev() {
+        let er = out[i_rest];
+        let row = &mut out[i_rest * ell_skip..(i_rest + 1) * ell_skip];
+        for (dst, &ls) in row.iter_mut().zip(&lambda_skip) {
+            *dst = ls * er;
         }
     }
-    debug_assert_eq!(out.len(), total);
     out
 }
 
