@@ -478,10 +478,20 @@ pub(crate) fn pow_scan_reg(
     debug_assert!((1..=32).contains(&bits));
     let fx = pow_fixed(state_digest);
     let mask = word0_mask(bits);
-    unsafe { pow_scan_reg_inner(&fx, start, len, mask) }
+    unsafe { pow_scan_reg_inner::<4>(&fx, start, len, mask) }
 }
 
-unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> Option<u64> {
+// Four active lanes keep the 16 state words and fixed digest in NEON
+// registers. The unused streams in the shared three-state round helpers
+// have no live outputs and are removed at compile time. Tests retain the
+// twelve-lane specialization as an exact nonce-order reference.
+unsafe fn pow_scan_reg_inner<const LANES: usize>(
+    fx: &PowFixed,
+    start: u64,
+    len: u64,
+    mask: u32,
+) -> Option<u64> {
+    debug_assert!(LANES == 4 || LANES == 12);
     unsafe {
         // Broadcast the grind-invariant state once; these stay live across
         // every attempt in the scan.
@@ -492,15 +502,15 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
 
         let end = start.saturating_add(len);
         let mut base = start;
-        while base + 12 <= end {
+        while end - base >= LANES as u64 {
             #[cfg(feature = "hash-count")]
             crate::challenger::fs_count::POW_SHA256
-                .fetch_add(12, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(LANES as u64, std::sync::atomic::Ordering::Relaxed);
             // Nonce lanes: scalar build handles the (astronomically rare)
             // 32-bit carry between lanes for free.
             let mut lo = [[0u32; 4]; 3];
             let mut hi = [[0u32; 4]; 3];
-            for i in 0..12 {
+            for i in 0..LANES {
                 let n = base + i as u64;
                 lo[i / 4][i % 4] = n as u32;
                 hi[i / 4][i % 4] = (n >> 32) as u32;
@@ -602,22 +612,29 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
             let t0 = vandq_u32(veorq_u32(v0[0], v0[8]), maskv);
             let t1 = vandq_u32(veorq_u32(v1[0], v1[8]), maskv);
             let t2 = vandq_u32(veorq_u32(v2[0], v2[8]), maskv);
-            if vminvq_u32(vminq_u32(vminq_u32(t0, t1), t2)) == 0 {
+            let min = if LANES == 4 {
+                t0
+            } else {
+                vminq_u32(vminq_u32(t0, t1), t2)
+            };
+            if vminvq_u32(min) == 0 {
                 // Rare path: recover the smallest matching lane in nonce order.
                 let mut words = [0u32; 12];
                 vst1q_u32(words[0..4].as_mut_ptr(), t0);
-                vst1q_u32(words[4..8].as_mut_ptr(), t1);
-                vst1q_u32(words[8..12].as_mut_ptr(), t2);
-                for (i, w) in words.iter().enumerate() {
+                if LANES == 12 {
+                    vst1q_u32(words[4..8].as_mut_ptr(), t1);
+                    vst1q_u32(words[8..12].as_mut_ptr(), t2);
+                }
+                for (i, w) in words[..LANES].iter().enumerate() {
                     if *w == 0 {
                         return Some(base + i as u64);
                     }
                 }
                 unreachable!("vminvq said a lane matched");
             }
-            base += 12;
+            base += LANES as u64;
         }
-        // Tail (< 12 lanes): scalar, byte-exact by construction.
+        // Tail (< LANES): scalar, byte-exact by construction.
         while base < end {
             #[cfg(feature = "hash-count")]
             crate::challenger::fs_count::POW_SHA256
@@ -701,4 +718,35 @@ fn hash_complete_groups_flags(data: &[u8], out: &mut [[u8; 32]], flags: u32) -> 
         }
     }
     groups * 12
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pow_four_lanes_match_twelve_and_scalar_at_boundaries() {
+        for digest in [[0u8; 32], [0x5A; 32], [0xFF; 32]] {
+            let fx = pow_fixed(&digest);
+            for bits in 1..=32 {
+                let mask = word0_mask(bits);
+                for start in [0, 7, u32::MAX as u64 - 2, u64::MAX - 9] {
+                    for len in [0, 1, 3, 4, 5, 7, 8, 9, 11, 12, 13, 49] {
+                        let want = (start..start.saturating_add(len)).find(|nonce| {
+                            let mut pre = [0u8; 64];
+                            pre[..32].copy_from_slice(&digest);
+                            pre[32..40].copy_from_slice(&nonce.to_le_bytes());
+                            let hash = blake3::hash(&pre);
+                            let word = u32::from_le_bytes(hash.as_bytes()[..4].try_into().unwrap());
+                            word & mask == 0
+                        });
+                        let four = unsafe { pow_scan_reg_inner::<4>(&fx, start, len, mask) };
+                        let twelve = unsafe { pow_scan_reg_inner::<12>(&fx, start, len, mask) };
+                        assert_eq!(four, want, "four: bits={bits} start={start} len={len}");
+                        assert_eq!(twelve, want, "twelve: bits={bits} start={start} len={len}");
+                    }
+                }
+            }
+        }
+    }
 }

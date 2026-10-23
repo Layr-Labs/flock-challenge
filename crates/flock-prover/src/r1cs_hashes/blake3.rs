@@ -1606,7 +1606,7 @@ pub(crate) mod witgen_simd {
 
     const U32_PER_BLOCK: usize = K / 32; // 512
     const F128_PER_BLOCK: usize = K / 128;
-    /// [`dump`] drains a block in 64 chunks of 8 u32 words (32 bytes).
+    /// Drain a block in 64 chunks of 8 u32 words (32 bytes).
     const DUMP_CHUNKS: usize = U32_PER_BLOCK / 8; // 64
 
     // -----------------------------------------------------------------------
@@ -1984,42 +1984,86 @@ pub(crate) mod witgen_simd {
         }
     }
 
-    /// Drain a 512-word block-lane stage to the four row-major block
-    /// destinations. `ld4` deinterleaves four block-lane words into
-    /// per-block 16-B runs (the register transpose the batch-major layout
-    /// dodged), so each block's 2 KiB drains as ONE long ascending burst:
-    /// stnp pairs for the §14-passing buffers (a/b), plain stores for z
-    /// (§16 in-closure stripe re-read). Drains dump-chunk range `g0..g1`
-    /// only (a dump chunk `g` covers u32 words `8g..8g+8` of every block in
-    /// the quad — 32 bytes per block; the full block is `0..DUMP_CHUNKS`).
-    /// The recycled-scratch constant-region elision narrows the range to
-    /// skip chunks whose destination bytes are token-verified to already
-    /// hold the per-block constants the builder would rewrite.
+    /// Store two deinterleaved groups in the four row-major blocks.
     #[inline(always)]
-    unsafe fn dump_range<const NT: bool>(stage: *const V4, dst: *mut u32, g0: usize, g1: usize) {
+    unsafe fn store_quad<const NT: bool>(x: uint32x4x4_t, y: uint32x4x4_t, dst: *mut u32) {
         unsafe {
-            for g in g0..g1 {
+            let p1 = dst.add(U32_PER_BLOCK);
+            let p2 = dst.add(2 * U32_PER_BLOCK);
+            let p3 = dst.add(3 * U32_PER_BLOCK);
+            if NT {
+                store_nt_pair(x.0, y.0, dst);
+                store_nt_pair(x.1, y.1, p1);
+                store_nt_pair(x.2, y.2, p2);
+                store_nt_pair(x.3, y.3, p3);
+            } else {
+                vst1q_u32(dst, x.0);
+                vst1q_u32(dst.add(4), y.0);
+                vst1q_u32(p1, x.1);
+                vst1q_u32(p1.add(4), y.1);
+                vst1q_u32(p2, x.2);
+                vst1q_u32(p2.add(4), y.2);
+                vst1q_u32(p3, x.3);
+                vst1q_u32(p3.add(4), y.3);
+            }
+        }
+    }
+
+    /// The honest C=I witness satisfies z=A&B at every row, including
+    /// inputs, linear rows and padding. Derive z while draining A/B, with no z
+    /// stage or third packing stream. Each stage is loaded only once.
+    #[inline(always)]
+    unsafe fn dump_product<const Z_NT: bool, const AB_NT: bool>(
+        ast: *const V4,
+        bs: *const V4,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        elide: [bool; 3],
+    ) {
+        let z_end = if elide[0] {
+            ELIDE_ZERO_CHUNK
+        } else {
+            DUMP_CHUNKS
+        };
+        let a_end = if elide[1] {
+            ELIDE_ZERO_CHUNK
+        } else {
+            DUMP_CHUNKS
+        };
+        let b_start = if elide[2] { ELIDE_B_PREFIX_CHUNKS } else { 0 };
+        let b_end = if elide[2] {
+            ELIDE_B_TAIL_CHUNK
+        } else {
+            DUMP_CHUNKS
+        };
+        unsafe {
+            for g in 0..z_end.max(a_end).max(b_end) {
                 let w = 8 * g;
-                let x = vld4q_u32(stage.add(w) as *const u32);
-                let y = vld4q_u32(stage.add(w + 4) as *const u32);
-                let p0 = dst.add(w);
-                let p1 = dst.add(U32_PER_BLOCK + w);
-                let p2 = dst.add(2 * U32_PER_BLOCK + w);
-                let p3 = dst.add(3 * U32_PER_BLOCK + w);
-                if NT {
-                    store_nt_pair(x.0, y.0, p0);
-                    store_nt_pair(x.1, y.1, p1);
-                    store_nt_pair(x.2, y.2, p2);
-                    store_nt_pair(x.3, y.3, p3);
-                } else {
-                    vst1q_u32(p0, x.0);
-                    vst1q_u32(p0.add(4), y.0);
-                    vst1q_u32(p1, x.1);
-                    vst1q_u32(p1.add(4), y.1);
-                    vst1q_u32(p2, x.2);
-                    vst1q_u32(p2.add(4), y.2);
-                    vst1q_u32(p3, x.3);
-                    vst1q_u32(p3.add(4), y.3);
+                let ax = vld4q_u32(ast.add(w) as *const u32);
+                let ay = vld4q_u32(ast.add(w + 4) as *const u32);
+                let bx = vld4q_u32(bs.add(w) as *const u32);
+                let by = vld4q_u32(bs.add(w + 4) as *const u32);
+                if g < z_end {
+                    let zx = uint32x4x4_t(
+                        vandq_u32(ax.0, bx.0),
+                        vandq_u32(ax.1, bx.1),
+                        vandq_u32(ax.2, bx.2),
+                        vandq_u32(ax.3, bx.3),
+                    );
+                    let zy = uint32x4x4_t(
+                        vandq_u32(ay.0, by.0),
+                        vandq_u32(ay.1, by.1),
+                        vandq_u32(ay.2, by.2),
+                        vandq_u32(ay.3, by.3),
+                    );
+                    store_quad::<Z_NT>(zx, zy, z.add(w));
+                }
+                if g < a_end {
+                    store_quad::<AB_NT>(ax, ay, a.add(w));
+                }
+                if g >= b_start && g < b_end {
+                    store_quad::<AB_NT>(bx, by, b.add(w));
                 }
             }
         }
@@ -2039,21 +2083,19 @@ pub(crate) mod witgen_simd {
         }};
     }
 
-    /// Lane-wise `add_carry_parts`: `(sum, left, right, carry_aux)`.
+    /// Lane-wise `add_carry_parts`: `(sum, left, right)`.
     /// `vaddq_u32` wraps mod 2^32 per lane — bit-identical to scalar
     /// `wrapping_add` for each independent block; carries never cross lanes.
-    /// The three row values retain their irrelevant bit 31. [`W32::push`]
+    /// Both row values retain their irrelevant bit 31. [`W32::push`]
     /// consumes only the low 31 bits and overwrites that dirty boundary bit,
     /// removing two vector masks from every one of the 336 additions.
     #[inline(always)]
-    fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
+    fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4) {
         unsafe {
             let sum = vaddq_u32(x, y);
-            let cin = veorq_u32(veorq_u32(sum, x), y);
-            let left = veorq_u32(x, cin);
-            let right = veorq_u32(y, cin);
-            let carry = vandq_u32(left, right);
-            (sum, left, right, carry)
+            let left = veorq_u32(sum, y);
+            let right = veorq_u32(sum, x);
+            (sum, left, right)
         }
     }
 
@@ -2095,27 +2137,6 @@ pub(crate) mod witgen_simd {
                 [false; 3],
             )
         }
-    }
-
-    /// [`dump`] with the constant-region skips applied: `elide_tail` drops
-    /// the zero-tail chunks, `elide_prefix` drops b's MAX-prefix chunks.
-    /// Callers may only pass `true` for destinations whose skipped bytes
-    /// are token-verified to already hold those constants.
-    #[inline(always)]
-    unsafe fn dump_elide<const NT: bool>(
-        stage: *const V4,
-        dst: *mut u32,
-        elide_tail: bool,
-        elide_prefix: bool,
-        tail_chunk: usize,
-    ) {
-        let g0 = if elide_prefix {
-            ELIDE_B_PREFIX_CHUNKS
-        } else {
-            0
-        };
-        let g1 = if elide_tail { tail_chunk } else { DUMP_CHUNKS };
-        unsafe { dump_range::<NT>(stage, dst, g0, g1) }
     }
 
     /// [`build_quad_witness_ab_stream_neon`] with per-buffer constant-region
@@ -2233,19 +2254,16 @@ pub(crate) mod witgen_simd {
             // Every element is written before it is read: prefix/out_lo own
             // words 0..35, W32 owns 36..481, and the explicit suffix owns
             // 482..511. Keep the stages uninitialized so each quad avoids
-            // three redundant 8 KiB bzero calls before those full writes.
+            // two redundant 8 KiB bzero calls before those full writes.
             let zero = vdupq_n_u32(0);
-            let mut zs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
             let mut ast = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
             let mut bs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
-            let zs = zs.as_mut_ptr().cast::<V4>();
             let ast = ast.as_mut_ptr().cast::<V4>();
             let bs = bs.as_mut_ptr().cast::<V4>();
 
             // ---- prefix (bits 0..1153), straight into the stages ----
-            // cv slot, words 0..8: z=a=cv, b=MAX.
+            // cv slot, words 0..8: a=cv, b=MAX.
             for w in 0..8usize {
-                vst1q_u32(zs.add(w) as *mut u32, cv_v[w]);
                 vst1q_u32(ast.add(w) as *mut u32, cv_v[w]);
             }
             let maxv = vdupq_n_u32(u32::MAX);
@@ -2256,69 +2274,55 @@ pub(crate) mod witgen_simd {
             }
             // Message region words 16..36: word16 = 1|m0<<1, then
             // word16+k = chain[k-1]>>31 | chain[k]<<1 over
-            // {m1..m15, t_lo, t_hi, blen, flags}. z and a share the content.
+            // {m1..m15, t_lo, t_hi, blen, flags}. B is one here.
             let one = vdupq_n_u32(1);
             let chain: [V4; 20] = [
                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
                 m[13], m[14], m[15], tlo, thi, blen, flags,
             ];
             vst1q_u32(
-                zs.add(16) as *mut u32,
+                ast.add(16) as *mut u32,
                 vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
             );
             for k in 1..20usize {
                 let w = vorrq_u32(vshrq_n_u32::<31>(chain[k - 1]), vshlq_n_u32::<1>(chain[k]));
-                vst1q_u32(zs.add(16 + k) as *mut u32, w);
-            }
-            // a's message region equals z's.
-            for w in 16..36usize {
-                let v = vld1q_u32(zs.add(w) as *const u32);
-                vst1q_u32(ast.add(w) as *mut u32, v);
+                vst1q_u32(ast.add(16 + k) as *mut u32, w);
             }
 
             // ---- G stream (bits 1153..15409): sequential push network ----
             // Writers start at u32 word 36 with one pending bit (flags>>31
-            // for z/a, 1 for b) — the scalar writer's u64-word-18 state.
+            // for a, 1 for b) — the scalar writer's u64-word-18 state.
             let pending_bit = vshrq_n_u32::<31>(flags);
-            let mut wz = W32::at(zs, pending_bit);
             let mut wa = W32::at(ast, pending_bit);
             let mut wb = W32::at(bs, one);
 
             macro_rules! g {
                 ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
                  $mx:literal, $my:literal) => {{
-                    let (t0, l0, r0, c0) = add_carry_parts_v(state[$la], state[$lb]);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C0, 31, c0);
+                    let (t0, l0, r0) = add_carry_parts_v(state[$la], state[$lb]);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C0, 31, l0);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C0, 31, r0);
-                    let (a1, l1, r1, c1) = add_carry_parts_v(t0, m[$mx]);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C1, 31, c1);
+                    let (a1, l1, r1) = add_carry_parts_v(t0, m[$mx]);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C1, 31, l1);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C1, 31, r1);
                     let d1 = xor_rotr::<16, 16>(state[$ld], a1);
-                    let (c1s, l2, r2, c2) = add_carry_parts_v(state[$lc], d1);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C2, 31, c2);
+                    let (c1s, l2, r2) = add_carry_parts_v(state[$lc], d1);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C2, 31, l2);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C2, 31, r2);
                     let b1 = xor_rotr::<12, 20>(state[$lb], c1s);
-                    let (t1, l3, r3, c3) = add_carry_parts_v(a1, b1);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C3, 31, c3);
+                    let (t1, l3, r3) = add_carry_parts_v(a1, b1);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C3, 31, l3);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C3, 31, r3);
-                    let (a2, l4, r4, c4) = add_carry_parts_v(t1, m[$my]);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C4, 31, c4);
+                    let (a2, l4, r4) = add_carry_parts_v(t1, m[$my]);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C4, 31, l4);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C4, 31, r4);
                     let d2 = xor_rotr::<8, 24>(d1, a2);
-                    let (c2s, l5, r5, c5) = add_carry_parts_v(c1s, d2);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_C5, 31, c5);
+                    let (c2s, l5, r5) = add_carry_parts_v(c1s, d2);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_C5, 31, l5);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_C5, 31, r5);
                     let bn = xor_rotr::<7, 25>(b1, c2s);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, bn);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_LIN0, 32, maxv);
-                    pushf!(wz, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
                     pushf!(wa, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, d2);
                     pushf!(wb, GS_BASE + G_STRIDE * $g + REC_LIN1, 32, maxv);
                     state[$la] = a2;
@@ -2357,7 +2361,6 @@ pub(crate) mod witgen_simd {
             macro_rules! oh {
                 ($w:literal) => {{
                     let hv = veorq_u32(state[$w + 8], cv_v[$w]);
-                    pushf!(wz, OUT_HI_BASE + 32 * $w, 32, hv);
                     pushf!(wa, OUT_HI_BASE + 32 * $w, 32, hv);
                     pushf!(wb, OUT_HI_BASE + 32 * $w, 32, maxv);
                 }};
@@ -2370,7 +2373,6 @@ pub(crate) mod witgen_simd {
             oh!(5);
             oh!(6);
             oh!(7);
-            wz.finish();
             wa.finish();
             wb.finish();
 
@@ -2380,30 +2382,22 @@ pub(crate) mod witgen_simd {
                 assert!(U32_PER_BLOCK - ZF == 30);
             }
             for w in 0..30usize {
-                vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
                 vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
                 vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
             }
 
-            // ---- out_lo slot, words 8..16 (z/a only) ----
+            // ---- out_lo slot, words 8..16 (a only; b is one) ----
             for w in 0..8usize {
                 let lo = veorq_u32(state[w], state[w + 8]);
-                vst1q_u32(zs.add(8 + w) as *mut u32, lo);
                 vst1q_u32(ast.add(8 + w) as *mut u32, lo);
             }
 
-            // ---- drain stages: per-block 2 KiB ascending bursts ----
-            if z_nt {
-                dump_elide::<true>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
-            } else {
-                dump_elide::<false>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
-            }
-            if ab_nt {
-                dump_elide::<true>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
-                dump_elide::<true>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
-            } else {
-                dump_elide::<false>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
-                dump_elide::<false>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+            // ---- fused drain: z is the row-wise A&B product ----
+            match (z_nt, ab_nt) {
+                (true, true) => dump_product::<true, true>(ast, bs, z, a, b, elide),
+                (true, false) => dump_product::<true, false>(ast, bs, z, a, b, elide),
+                (false, true) => dump_product::<false, true>(ast, bs, z, a, b, elide),
+                (false, false) => dump_product::<false, false>(ast, bs, z, a, b, elide),
             }
         }
     }
@@ -4535,8 +4529,12 @@ mod tests {
         };
         // Per-block kernel equality, all independently selectable store modes.
         for (z_nt, ab_nt) in [(false, false), (false, true), (true, false), (true, true)] {
-            for _ in 0..8 {
-                let inputs: [Compression; 4] = std::array::from_fn(|_| mk(&mut rng));
+            for case in 0..8 {
+                let inputs: [Compression; 4] = match case {
+                    0 => [([0; 8], [0; 16], 0, 0, 0); 4],
+                    1 => [([u32::MAX; 8], [u32::MAX; 16], u64::MAX, u32::MAX, u32::MAX); 4],
+                    _ => std::array::from_fn(|_| mk(&mut rng)),
+                };
                 let mut zq = [u64::MAX; 4 * WORDS];
                 let mut aq = [u64::MAX; 4 * WORDS];
                 let mut bq = [u64::MAX; 4 * WORDS];
@@ -4599,28 +4597,30 @@ mod tests {
                         }
                     }
                 };
-                let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
-                let mut ae = ze;
-                let mut be = ze;
-                seed_consts(&mut ze, false);
-                seed_consts(&mut ae, false);
-                seed_consts(&mut be, true);
-                unsafe {
-                    witgen_simd::build_quad_witness_ab_stream_neon_elide(
-                        witgen_simd::QuadInput::Blocks([
-                            &inputs[0], &inputs[1], &inputs[2], &inputs[3],
-                        ]),
-                        ze.as_mut_ptr() as *mut u32,
-                        ae.as_mut_ptr() as *mut u32,
-                        be.as_mut_ptr() as *mut u32,
-                        z_nt,
-                        ab_nt,
-                        [true; 3],
-                    );
+                for mask in 0..8 {
+                    let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
+                    let mut ae = ze;
+                    let mut be = ze;
+                    seed_consts(&mut ze, false);
+                    seed_consts(&mut ae, false);
+                    seed_consts(&mut be, true);
+                    unsafe {
+                        witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                            witgen_simd::QuadInput::Blocks([
+                                &inputs[0], &inputs[1], &inputs[2], &inputs[3],
+                            ]),
+                            ze.as_mut_ptr() as *mut u32,
+                            ae.as_mut_ptr() as *mut u32,
+                            be.as_mut_ptr() as *mut u32,
+                            z_nt,
+                            ab_nt,
+                            [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0],
+                        );
+                    }
+                    assert_eq!(ze, zq, "elided z diverged z_nt={z_nt} ab_nt={ab_nt}");
+                    assert_eq!(ae, aq, "elided a diverged z_nt={z_nt} ab_nt={ab_nt}");
+                    assert_eq!(be, bq, "elided b diverged z_nt={z_nt} ab_nt={ab_nt}");
                 }
-                assert_eq!(ze, zq, "elided z diverged z_nt={z_nt} ab_nt={ab_nt}");
-                assert_eq!(ae, aq, "elided a diverged z_nt={z_nt} ab_nt={ab_nt}");
-                assert_eq!(be, bq, "elided b diverged z_nt={z_nt} ab_nt={ab_nt}");
             }
         }
         // Driver equality incl. padding slots and the stripe.

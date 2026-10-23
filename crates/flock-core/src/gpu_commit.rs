@@ -492,6 +492,20 @@ mod eq_direct_gate_tests {
 /// target machine itself.
 pub const ENV_NO_GPU_ZC_R2: &str = "FLOCK_NO_GPU_ZC_R2";
 
+/// Exact-`1` control for the round-two GPU carry-less multiplication.
+pub const ENV_NO_GPU_ZC_R2_KARATSUBA: &str = "FLOCK_NO_GPU_ZC_R2_KARATSUBA";
+
+fn gpu_zc_r2_karatsuba_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_zc_r2_karatsuba_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_zc_r2_karatsuba_value_enabled(std::env::var_os(ENV_NO_GPU_ZC_R2_KARATSUBA).as_deref())
+    })
+}
+
 pub(crate) fn gpu_zc_r2_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_R2).is_none());
@@ -11222,7 +11236,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 using namespace metal;
 
 // 32x32 -> 64 carry-less multiply via 4-bit-spaced masked integer multiplies.
-static inline ulong clmul32(uint a, uint b) {
+static inline ulong clmul32_incumbent(uint a, uint b) {
     const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
                 M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
     ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
@@ -11234,6 +11248,35 @@ static inline ulong clmul32(uint a, uint b) {
     ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
     ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
     return r0 | r1 | r2 | r3;
+}
+
+// Each aligned plane has eight coefficients in radix 16. An ordinary
+// product's coefficient is at most eight, so carries cannot cross a radix-16
+// digit. Masking its low bits therefore gives the exact polynomial product.
+static inline ulong clmul_plane_pair(uint a0, uint a1, uint b0, uint b1) {
+    const ulong MASK = 0x1111111111111111UL;
+    ulong p0 = (ulong(a0) * ulong(b0)) & MASK;
+    ulong p2 = (ulong(a1) * ulong(b1)) & MASK;
+    ulong pm = (ulong(a0 ^ a1) * ulong(b0 ^ b1)) & MASK;
+    return p0 ^ ((pm ^ p0 ^ p2) << 1) ^ (p2 << 2);
+}
+
+// Two Karatsuba levels use nine integer products rather than sixteen.
+// The aligned inputs occupy bits 0,4,...,28; the final product ends at bit 62.
+static inline ulong clmul32(uint a, uint b) {
+#ifdef FLOCK_ZC_R2_CLMUL_INCUMBENT
+    return clmul32_incumbent(a, b);
+#else
+    const uint MASK = 0x11111111u;
+    uint a0 = a & MASK, a1 = (a >> 1) & MASK;
+    uint a2 = (a >> 2) & MASK, a3 = (a >> 3) & MASK;
+    uint b0 = b & MASK, b1 = (b >> 1) & MASK;
+    uint b2 = (b >> 2) & MASK, b3 = (b >> 3) & MASK;
+    ulong lo = clmul_plane_pair(a0, a1, b0, b1);
+    ulong hi = clmul_plane_pair(a2, a3, b2, b3);
+    ulong mid = clmul_plane_pair(a0 ^ a2, a1 ^ a3, b0 ^ b2, b1 ^ b3);
+    return lo ^ ((mid ^ lo ^ hi) << 2) ^ (hi << 4);
+#endif
 }
 
 struct U128k { ulong lo; ulong hi; };
@@ -11384,6 +11427,42 @@ kernel void zc_r2_products(
 }
 "#;
 
+    fn zc_r2_msl_source(incumbent: bool) -> std::borrow::Cow<'static, str> {
+        if incumbent {
+            std::borrow::Cow::Owned(format!(
+                "#define FLOCK_ZC_R2_CLMUL_INCUMBENT 1\n{ZC_R2_MSL_SOURCE}"
+            ))
+        } else {
+            std::borrow::Cow::Borrowed(ZC_R2_MSL_SOURCE)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_arithmetic_test_source(incumbent: bool) -> String {
+        let mut source = zc_r2_msl_source(incumbent).into_owned();
+        source.push_str(
+            r#"
+kernel void zc_r2_arithmetic_oracle(
+    device const uint4* a [[buffer(0)]],
+    device const uint4* b [[buffer(1)]],
+    device ulong* out [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    U256k p = clmul128(a[id], b[id]);
+    uint4 reduced = gf_reduce(p);
+    out[id * 7u] = clmul32(a[id].x, b[id].x);
+    out[id * 7u + 1u] = p.r0;
+    out[id * 7u + 2u] = p.r1;
+    out[id * 7u + 3u] = p.r2;
+    out[id * 7u + 4u] = p.r3;
+    out[id * 7u + 5u] = (ulong(reduced.y) << 32) | reduced.x;
+    out[id * 7u + 6u] = (ulong(reduced.w) << 32) | reduced.z;
+}
+"#,
+        );
+        source
+    }
+
     /// Process-lifetime Metal state for the round-two products arm.
     struct ZcR2 {
         pso: Id,
@@ -11506,7 +11585,8 @@ kernel void zc_r2_products(
         unsafe {
             let pool = gpu.pool_push();
             let built = (|| -> Result<Id, String> {
-                let src = gpu.api.nsstring(ZC_R2_MSL_SOURCE)?;
+                let source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled());
+                let src = gpu.api.nsstring(&source)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
                     gpu.api,
@@ -15767,6 +15847,144 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             0,
             "ranked stripe length must be a page multiple"
         );
+    }
+
+    #[test]
+    fn gpu_zc_r2_karatsuba_exact_control() {
+        use std::ffi::OsStr;
+        assert!(!gpu_zc_r2_karatsuba_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(gpu_zc_r2_karatsuba_value_enabled(value.map(OsStr::new)));
+        }
+    }
+
+    /// Exercise both compiled multipliers with basis pairs, dense carry
+    /// patterns and random full-width inputs. Check the unreduced limbs as
+    /// well as the reduced field value, so reduction cannot hide an error.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_zc_r2_karatsuba_arithmetic_matches_cpu() {
+        let gpu = imp::gpu().expect("arithmetic oracle requires real Metal");
+        let mut pairs = Vec::new();
+        let basis: Vec<F128> = (0..128)
+            .map(|bit| {
+                if bit < 64 {
+                    F128::new(1u64 << bit, 0)
+                } else {
+                    F128::new(0, 1u64 << (bit - 64))
+                }
+            })
+            .collect();
+        for &a in &basis {
+            for &b in &basis {
+                pairs.push((a, b));
+            }
+        }
+        let mut edges = vec![F128::ZERO, F128::ONE];
+        for word in [
+            u64::MAX,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x5555_5555_5555_5555,
+            0x1111_1111_1111_1111,
+            0x8888_8888_8888_8888,
+            0xFFFF_FFFF,
+            0xFFFF_FFFF_0000_0000,
+        ] {
+            edges.extend([
+                F128::new(word, 0),
+                F128::new(0, word),
+                F128::new(word, word),
+            ]);
+        }
+        for &a in &edges {
+            for &b in &edges {
+                pairs.push((a, b));
+            }
+        }
+        let mut rng = Rng::new(0xF10C_2CA7_A128_0032);
+        let random = rng.vec(8192);
+        pairs.extend(random.chunks_exact(2).map(|v| (v[0], v[1])));
+        while pairs.len() % 64 != 0 {
+            pairs.push((F128::ZERO, F128::ZERO));
+        }
+        let a: Vec<F128> = pairs.iter().map(|v| v.0).collect();
+        let b: Vec<F128> = pairs.iter().map(|v| v.1).collect();
+        let expected: Vec<u64> = pairs
+            .iter()
+            .flat_map(|&(a, b)| {
+                let mut p32 = 0u64;
+                for bit in 0..32 {
+                    if (b.lo >> bit) & 1 != 0 {
+                        p32 ^= u64::from(a.lo as u32) << bit;
+                    }
+                }
+                let p = a.mul_unreduced(b);
+                let reduced = p.reduce();
+                [p32, p.r0, p.r1, p.r2, p.r3, reduced.lo, reduced.hi]
+            })
+            .collect();
+
+        unsafe {
+            let pool = gpu.pool_push();
+            let input_bytes = core::mem::size_of_val(a.as_slice());
+            let output_bytes = core::mem::size_of_val(expected.as_slice());
+            let a_buf = gpu.new_buffer(input_bytes).unwrap();
+            let b_buf = gpu.new_buffer(input_bytes).unwrap();
+            let out_buf = gpu.new_buffer(output_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(
+                a.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(a_buf),
+                input_bytes,
+            );
+            std::ptr::copy_nonoverlapping(
+                b.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(b_buf),
+                input_bytes,
+            );
+            let mut resources = Vec::new();
+            for incumbent in [true, false] {
+                let source = imp::zc_r2_arithmetic_test_source(incumbent);
+                let pso =
+                    imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_arithmetic_oracle")
+                        .unwrap();
+                let products =
+                    imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_products").unwrap();
+                let usage = gpu.pipeline_resources(products);
+                eprintln!("[zc-r2-arithmetic] incumbent={incumbent} products-resources={usage:?}");
+                resources.push(usage);
+                std::ptr::write_bytes(gpu.buffer_contents(out_buf), 0xA5, output_bytes);
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, a_buf, 0, 0);
+                gpu.set_buffer(enc, b_buf, 0, 1);
+                gpu.set_buffer(enc, out_buf, 0, 2);
+                gpu.dispatch(enc, (pairs.len() / 64) as u64, 64);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let actual = core::slice::from_raw_parts(
+                    gpu.buffer_contents(out_buf).cast::<u64>(),
+                    expected.len(),
+                );
+                assert_eq!(actual, expected.as_slice(), "incumbent={incumbent}");
+                gpu.release(pso);
+                gpu.release(products);
+            }
+            assert_eq!(resources[0].0, resources[1].0, "shared-memory use changed");
+            assert_eq!(resources[0].1, resources[1].1, "SIMD width changed");
+            assert!(
+                resources.iter().all(|v| v.2 >= 256),
+                "production group no longer fits"
+            );
+            eprintln!(
+                "[zc-r2-arithmetic] checked {} field pairs per pipeline",
+                pairs.len()
+            );
+            gpu.release(a_buf);
+            gpu.release(b_buf);
+            gpu.release(out_buf);
+            gpu.pool_pop(pool);
+        }
     }
 
     /// Round-two products arm oracle: the GPU's per-chunk reduced partials

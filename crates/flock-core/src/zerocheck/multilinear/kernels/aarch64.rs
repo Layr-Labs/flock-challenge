@@ -783,9 +783,10 @@ unsafe fn r2_pair_fold_and_store(
 /// threadgroup reduction and hand back only the sum, which forced the CPU to
 /// recompute the odd half for the lookahead's `W1`/`W2`. Keeping that split
 /// costs the GPU nothing, and lets this kernel drop two more of its eight
-/// products: **32 PMULL per group instead of 38** on every offloaded chunk.
-/// The four `mul_q` row weightings survive because `W0`/`W3`/`W4`/`W5` still
-/// need all four scaled rows.
+/// products. The remaining four aggregates need only three independent
+/// weighted A values: `w*a2`, `w*(a0+a2)`, and `w*(a1+a3)`. Their last two
+/// values also give `w*(a0+a1+a2+a3)` by XOR. This costs **27 PMULL per group**
+/// on an offloaded chunk, instead of 32 with four separate row weightings.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
@@ -877,6 +878,21 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                         wide_xor(&mut p1_odd, mul_unreduced_q(w, a3));
                     }
                     wide_xor(&mut w0, mul_unreduced_q(w, a2));
+                } else if !FULL && ODD_ON_GPU {
+                    let a2w = if pad1 { zero } else { mul_q(w, a2) };
+                    let e_aw = mul_q(w, veorq_u64(a0, a2));
+                    let o_aw = mul_q(w, veorq_u64(a1, a3));
+                    if !pad1 {
+                        wide_xor(&mut w0, mul_unreduced_q(a2w, b2));
+                    }
+                    let e_b = veorq_u64(b0, b2);
+                    let o_b = veorq_u64(b1, b3);
+                    wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+                    wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+                    wide_xor(
+                        &mut w5,
+                        mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                    );
                 } else {
                     let a0w = mul_q(w, a0);
                     let a1w = mul_q(w, a1);
@@ -2724,6 +2740,76 @@ mod tests {
             assert_eq!(normal_a, incumbent_a, "normal A mismatch at case {case}");
             assert_eq!(normal_b, incumbent_b, "normal B mismatch at case {case}");
             assert_eq!(normal, incumbent, "normal message mismatch at case {case}");
+        }
+    }
+
+    #[test]
+    fn round2_gpu_lookahead_weighted_sums_match_full_cpu() {
+        const LO_SIZE: usize = 128;
+        let mut state = 0x5232_5745_4947_4854;
+        let table =
+            crate::zerocheck::multilinear::UniSkipFoldTable::new(6, F128::new(0x91a3, 0x782d));
+        let mut a_packed = vec![0u8; 16 * LO_SIZE];
+        let mut b_packed = vec![0u8; 16 * LO_SIZE];
+        for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
+            *byte = splitmix64(&mut state) as u8;
+        }
+        // Include complete and mixed b=1 groups, plus a group whose odd
+        // pair is padded in the ranked periodic schedule.
+        b_packed[..32].fill(0xff);
+        b_packed[32..48].fill(0xff);
+        let eq_lo: Vec<F128> = (0..LO_SIZE)
+            .map(|i| match i % 3 {
+                0 => F128::ZERO,
+                1 => F128::ONE,
+                _ => F128::new(splitmix64(&mut state), splitmix64(&mut state)),
+            })
+            .collect();
+        for (mask, useful, periodic) in [
+            (usize::MAX, usize::MAX, false),
+            (127, 121, false),
+            (127, 121, true),
+        ] {
+            for degen in [false, true] {
+                let run = |offload: bool| {
+                    let mut anchors = vec![F128::ZERO; 2 * LO_SIZE];
+                    let mut deltas = vec![0xa5u8; 16 * LO_SIZE];
+                    let mut out = [F128::ZERO; 8];
+                    macro_rules! call {
+                        ($full:literal, $odd:literal) => {
+                            unsafe {
+                                fold_round2_compact_chunk_neon_lookahead_8::<$full, $odd>(
+                                    table.data.as_ptr().cast::<u8>(),
+                                    a_packed.as_ptr(),
+                                    b_packed.as_ptr(),
+                                    anchors.as_mut_ptr(),
+                                    deltas.as_mut_ptr(),
+                                    eq_lo.as_ptr(),
+                                    LO_SIZE,
+                                    0,
+                                    mask,
+                                    useful,
+                                    degen,
+                                    periodic,
+                                    out.as_mut_ptr(),
+                                );
+                            }
+                        };
+                    }
+                    if offload {
+                        call!(false, true);
+                    } else {
+                        call!(true, false);
+                    }
+                    (anchors, deltas, out)
+                };
+                let cpu = run(false);
+                let gpu = run(true);
+                assert_eq!(gpu.0, cpu.0, "anchor mismatch");
+                assert_eq!(gpu.1, cpu.1, "delta mismatch");
+                assert_eq!(&gpu.2[..4], &[F128::ZERO; 4], "GPU owns parity products");
+                assert_eq!(&gpu.2[4..], &cpu.2[4..], "lookahead mismatch");
+            }
         }
     }
 

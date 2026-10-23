@@ -3693,6 +3693,52 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
     (basis, enforced_sum)
 }
 
+/// Exact ranked L1 geometry. The control keeps the full transpose and its
+/// separate introduction scan available in the same binary.
+fn is_ranked_l1_factored_final4_shape(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    lane_challenges: usize,
+    queries: usize,
+    alpha_len: usize,
+    f_len: usize,
+) -> bool {
+    (
+        log_msg_cols,
+        log_inv_rate,
+        lane_challenges,
+        queries,
+        alpha_len,
+        f_len,
+    ) == (16, 2, 3, 106, 7, 1usize << 16)
+}
+
+fn l1_factored_final4_disabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn ranked_l1_factored_final4_enabled(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    lane_challenges: usize,
+    queries: usize,
+    alpha_len: usize,
+    f_len: usize,
+) -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && is_ranked_l1_factored_final4_shape(
+            log_msg_cols,
+            log_inv_rate,
+            lane_challenges,
+            queries,
+            alpha_len,
+            f_len,
+        )
+        && !l1_factored_final4_disabled_value(
+            std::env::var_os("FLOCK_NO_L1_FACTORED_FINAL4").as_deref(),
+        )
+}
+
 fn induce_sumcheck_poly_via_ntt_impl(
     log_msg_cols: usize,
     log_inv_rate: usize,
@@ -3715,9 +3761,19 @@ fn induce_sumcheck_poly_via_ntt_impl(
         n_queries,
         alpha.len(),
     );
+    let use_l1_factored_final4 = round_f.is_some_and(|f| {
+        is_ranked_l1_factored_final4_shape(
+            log_msg_cols,
+            log_inv_rate,
+            v_challenges.len(),
+            n_queries,
+            alpha.len(),
+            f.len(),
+        )
+    });
     assert!(
-        round_f.is_none() || truncate_final_group,
-        "fused induction message requires the truncated final group"
+        round_f.is_none() || truncate_final_group || use_l1_factored_final4,
+        "fused induction message requires a retained-output tail"
     );
     assert!(
         !use_l0_factored_final3 || round_f.is_some(),
@@ -3764,7 +3820,16 @@ fn induce_sumcheck_poly_via_ntt_impl(
             .fold(F128::ZERO, |a, b| a + b)
     };
 
-    let (mut coeffs, intro_msg) = if log_block == 0 {
+    let (mut coeffs, intro_msg) = if use_l1_factored_final4 {
+        let ntt = AdditiveNttF128::standard(log_block);
+        let (basis, msg) = transpose_forward_ntt_sparse_rate4_low_quarter_with_msg(
+            &ntt,
+            queries,
+            &alpha_pows,
+            round_f.expect("L1 induction witness"),
+        );
+        (basis, Some(msg))
+    } else if log_block == 0 {
         assert!(round_f.is_none());
         let mut c = vec![F128::ZERO; block_len];
         for i in 0..n_queries {
@@ -4530,6 +4595,141 @@ fn transpose_forward_ntt_final_5layer_low_eighth_direct(
     // SAFETY: 32 disjoint tiles initialize all four 2,048-field quarters.
     unsafe { retained.set_len(eighth) };
     retained
+}
+
+/// Final four transpose layers when the caller retains only the low quarter.
+/// Layers 1 and 0 take only top branches, so their twiddles disappear. The
+/// remaining layer-3/layer-2 twiddles are linear in two coset bits. Expanding
+/// those bits uses 12 field products for 16 inputs, rather than 32 products
+/// for the incumbent full four-layer tail. Each row pair also emits its
+/// exact introduction message before its basis values are stored.
+fn transpose_forward_ntt_final_4layer_low_quarter_with_msg(
+    ntt: &AdditiveNttF128,
+    data: &[F128],
+    f: &[F128],
+) -> (Vec<F128>, SumcheckMessage) {
+    use rayon::prelude::*;
+
+    assert!(data.len().is_power_of_two() && data.len() >= 128);
+    assert_eq!(f.len(), data.len() >> 2);
+    let row_len = data.len() >> 4;
+    assert!(row_len.is_multiple_of(2));
+    let delta = ntt.twiddle(3, 1);
+    let a: [F128; 2] = core::array::from_fn(|i| ntt.twiddle(3, 1usize << (i + 1)));
+    let b: [F128; 2] = core::array::from_fn(|i| ntt.twiddle(2, 1usize << i));
+    let g: [F128; 2] = core::array::from_fn(|i| a[i] * b[i]);
+    let e: [F128; 2] = core::array::from_fn(|i| b[i] * delta + a[i]);
+    let h = (a[0] + a[1]) * (b[0] + b[1]) + g[0] + g[1];
+
+    let retained_row = |row: usize| -> [F128; 4] {
+        // P holds total, bit-0, bit-1 and bit-0/bit-1 moments.
+        // R and D hold total and first moments; B needs only its total.
+        let mut p = [F128::ZERO; 4];
+        let mut r = [F128::ZERO; 3];
+        let mut d = [F128::ZERO; 3];
+        let mut last = F128::ZERO;
+        for coset in 0..4 {
+            let base = 4 * coset * row_len + row;
+            let x0 = data[base];
+            let x1 = data[base + row_len];
+            let x2 = data[base + 2 * row_len];
+            let x3 = data[base + 3 * row_len];
+            let pc = x0 + x1 + x2 + x3;
+            let rc = x2 + x3;
+            let dc = x1 + x3;
+            p[0] += pc;
+            r[0] += rc;
+            d[0] += dc;
+            last += x3;
+            for bit in 0..2 {
+                if coset & (1 << bit) != 0 {
+                    p[bit + 1] += pc;
+                    r[bit + 1] += rc;
+                    d[bit + 1] += dc;
+                }
+            }
+            if coset == 3 {
+                p[3] = pc;
+            }
+        }
+        let delta_r = delta * r[0];
+        [
+            p[0],
+            d[0] + delta_r + a[0] * p[1] + a[1] * p[2],
+            r[0] + b[0] * p[1] + b[1] * p[2],
+            last + delta_r + g[0] * p[1] + g[1] * p[2]
+                + e[0] * r[1] + e[1] * r[2]
+                + b[0] * d[1] + b[1] * d[2] + h * p[3],
+        ]
+    };
+    let mut retained = Vec::<F128>::with_capacity(f.len());
+    let retained_ptr = retained.as_mut_ptr() as usize;
+    let (u_0, u_2) = (0..row_len / 2)
+        .into_par_iter()
+        .map(|row_pair| {
+            let row = 2 * row_pair;
+            let even = retained_row(row);
+            let odd = retained_row(row + 1);
+            let mut msg = (F128::ZERO, F128::ZERO);
+            for segment in 0..4 {
+                let base = segment * row_len + row;
+                let f0 = f[base];
+                let f1 = f[base + 1];
+                msg.0 += f0 * even[segment];
+                msg.1 += (f0 + f1) * (even[segment] + odd[segment]);
+                // SAFETY: each job owns two disjoint rows in all four
+                // retained segments. The join publishes every output write.
+                unsafe {
+                    let ptr = (retained_ptr as *mut F128).add(base);
+                    ptr.write(even[segment]);
+                    ptr.add(1).write(odd[segment]);
+                }
+            }
+            msg
+        })
+        .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1));
+    // SAFETY: the joined row pairs initialize every retained output element.
+    unsafe { retained.set_len(f.len()) };
+    (retained, SumcheckMessage { u_0, u_2 })
+}
+
+/// Keep the accepted sparse prefix and dense passes through layer 4, then
+/// construct only the retained L1 basis quarter and its introduction message.
+fn transpose_forward_ntt_sparse_rate4_low_quarter_with_msg(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    f: &[F128],
+) -> (Vec<F128>, SumcheckMessage) {
+    const LOG_D: usize = 18;
+    const PREFIX: usize = 8;
+    assert_eq!(positions.len(), values.len());
+    assert!(positions_are_sorted(positions));
+    assert!(positions.iter().all(|&p| p < 1usize << LOG_D));
+    assert_eq!(f.len(), 1usize << 16);
+    let groups = group_sorted_positions(positions, PREFIX);
+    let mut arena = scatter_active_windows(&groups, positions, values, PREFIX);
+    transform_active_windows(ntt, &mut arena, &groups, PREFIX, LOG_D);
+    let (mut data, mut remaining) =
+        if use_ranked_fused_densify_first(LOG_D, PREFIX, positions.len()) {
+            (
+                densify_active_windows_fused_first_3layer(ntt, &arena, &groups, LOG_D, PREFIX),
+                LOG_D - PREFIX - 3,
+            )
+        } else {
+            (
+                densify_active_windows(&arena, &groups, LOG_D, PREFIX),
+                LOG_D - PREFIX,
+            )
+        };
+    while remaining > 4 {
+        let layer = remaining - 3;
+        assert!(layer >= 4);
+        transpose_forward_ntt_fused_3layer(ntt, &mut data, LOG_D, layer);
+        remaining -= 3;
+    }
+    assert_eq!(remaining, 4);
+    transpose_forward_ntt_final_4layer_low_quarter_with_msg(ntt, &data, f)
 }
 
 #[derive(Clone, Copy)]
@@ -9151,8 +9351,29 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             direct_fold8_mode,
         );
         let _t = std::time::Instant::now();
+        let mut induced_intro_msg_i = None;
         let (basis_i_induced, enforced_sum_i) =
-            if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
+            if ranked_l1_factored_final4_enabled(
+                n_next,
+                config.log_inv_rates[i + 1],
+                level_rs.len(),
+                queries_i.len(),
+                alpha_i.len(),
+                sc_prover.f().len(),
+            ) {
+                let (basis, sum, msg) = induce_sumcheck_poly_via_ntt_impl(
+                    n_next,
+                    config.log_inv_rates[i + 1],
+                    &opened_rows_i,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                    Some(sc_prover.f()),
+                    false,
+                );
+                induced_intro_msg_i = msg;
+                (basis, sum)
+            } else if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
                 induce_sumcheck_poly_via_ntt(
                     n_next,
                     config.log_inv_rates[i + 1],
@@ -9215,7 +9436,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         });
 
         let _t = std::time::Instant::now();
-        let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
+        let intro_msg_i = if let Some(msg) = induced_intro_msg_i {
+            sc_prover.introduce_new_with_precomputed_msg(basis_i_induced, enforced_sum_i, msg)
+        } else {
+            sc_prover.introduce_new(basis_i_induced, enforced_sum_i)
+        };
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
@@ -14805,6 +15030,169 @@ mod tests {
                     .all(|(index, &value)| index == 5 || value == F128::ZERO)
             );
         }
+    }
+
+    #[test]
+    fn l1_factored_final4_shape_is_exact() {
+        assert!(!l1_factored_final4_disabled_value(None));
+        assert!(l1_factored_final4_disabled_value(Some(std::ffi::OsStr::new("1"))));
+        for value in ["", "0", "true", "01"] {
+            assert!(!l1_factored_final4_disabled_value(Some(std::ffi::OsStr::new(value))));
+        }
+        assert!(is_ranked_l1_factored_final4_shape(
+            16,
+            2,
+            3,
+            106,
+            7,
+            1 << 16
+        ));
+        for changed in 0..6 {
+            let mut shape = [16, 2, 3, 106, 7, 1 << 16];
+            shape[changed] += 1;
+            assert!(!is_ranked_l1_factored_final4_shape(
+                shape[0], shape[1], shape[2], shape[3], shape[4], shape[5],
+            ));
+        }
+    }
+
+    #[test]
+    fn l1_factored_final4_matches_full_tail_and_message() {
+        use crate::challenger::Challenger;
+
+        let mut rng = crate::challenger::RandomChallenger::new(0x1F14_5EED);
+        let check = |ntt: &AdditiveNttF128, input: Vec<F128>, f: &[F128]| {
+            let log_d = input.len().ilog2() as usize;
+            let mut expected = input.clone();
+            for layer in (0..4).rev() {
+                let block_size = 1usize << (log_d - layer);
+                for block in 0..1usize << layer {
+                    let twiddle = ntt.twiddle(layer, block);
+                    let start = block * block_size;
+                    let (top, bottom) =
+                        expected[start..start + block_size].split_at_mut(block_size / 2);
+                    for (top, bottom) in top.iter_mut().zip(bottom.iter_mut()) {
+                        let sum = *top + *bottom;
+                        *bottom += twiddle * sum;
+                        *top = sum;
+                    }
+                }
+            }
+            expected.truncate(input.len() / 4);
+            let (actual, message) =
+                transpose_forward_ntt_final_4layer_low_quarter_with_msg(ntt, &input, f);
+            assert_eq!(actual, expected);
+            assert_eq!(message, round_msg_lsb(f, &expected));
+            assert_eq!(actual.capacity(), actual.len());
+        };
+        for log_d in [7, 9, 12, 18] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            assert_eq!(ntt.twiddle(3, 0), F128::ZERO);
+            assert_eq!(ntt.twiddle(2, 0), F128::ZERO);
+            for coset in 0..4usize {
+                let a = (if coset & 1 != 0 {
+                    ntt.twiddle(3, 2)
+                } else {
+                    F128::ZERO
+                }) + (if coset & 2 != 0 {
+                    ntt.twiddle(3, 4)
+                } else {
+                    F128::ZERO
+                });
+                let b = (if coset & 1 != 0 {
+                    ntt.twiddle(2, 1)
+                } else {
+                    F128::ZERO
+                }) + (if coset & 2 != 0 {
+                    ntt.twiddle(2, 2)
+                } else {
+                    F128::ZERO
+                });
+                assert_eq!(a, ntt.twiddle(3, 2 * coset));
+                assert_eq!(a + ntt.twiddle(3, 1), ntt.twiddle(3, 2 * coset + 1));
+                assert_eq!(b, ntt.twiddle(2, coset));
+            }
+            let input = rng.sample_f128_vec(1usize << log_d);
+            let f = rng.sample_f128_vec(1usize << (log_d - 2));
+            check(&ntt, input, &f);
+        }
+        let ntt = AdditiveNttF128::standard(9);
+        let f = rng.sample_f128_vec(128);
+        for coset in 0..16 {
+            for row in [0, 31] {
+                let mut input = vec![F128::ZERO; 512];
+                input[coset * 32 + row] = F128::new(0x1F14, 0xCAFE);
+                check(&ntt, input, &f);
+            }
+        }
+        check(&ntt, vec![F128::ZERO; 512], &f);
+        check(&ntt, vec![F128::new(u64::MAX, u64::MAX); 512], &f);
+    }
+
+    #[test]
+    fn l1_factored_final4_sparse_induction_matches_incumbent() {
+        use crate::challenger::Challenger;
+
+        let mut rng = crate::challenger::RandomChallenger::new(0x1F14_A1FA);
+        let mut queries = std::collections::BTreeSet::new();
+        queries.insert(0usize);
+        queries.insert((1usize << 18) - 1);
+        while queries.len() < 106 {
+            queries.insert((rng.sample_f128().lo as usize) & ((1 << 18) - 1));
+        }
+        let queries: Vec<usize> = queries.into_iter().collect();
+        let rows: Vec<Vec<F128>> = (0..106).map(|_| rng.sample_f128_vec(8)).collect();
+        let lane_rs = rng.sample_f128_vec(3);
+        let alpha = rng.sample_f128_vec(7);
+        let f = rng.sample_f128_vec(1 << 16);
+        let (control, control_sum) =
+            induce_sumcheck_poly_via_ntt(16, 2, &rows, &lane_rs, &queries, &alpha);
+        let (candidate, candidate_sum, candidate_msg) = induce_sumcheck_poly_via_ntt_impl(
+            16,
+            2,
+            &rows,
+            &lane_rs,
+            &queries,
+            &alpha,
+            Some(&f),
+            false,
+        );
+        assert_eq!(candidate, control);
+        assert_eq!(candidate_sum, control_sum);
+        assert_eq!(candidate_msg, Some(round_msg_lsb(&f, &control)));
+
+        // The optimized introduction must leave the same deferred-glue state.
+        let existing_basis = rng.sample_f128_vec(1 << 16);
+        let (mut control_sc, _) =
+            SumcheckProver::new(f.clone(), existing_basis.clone(), F128::ZERO);
+        let (mut candidate_sc, _) = SumcheckProver::new(f, existing_basis, F128::ZERO);
+        let z = rng.sample_f128_vec(16);
+        assert_eq!(
+            control_sc.introduce_new_ood_factorized(&z),
+            candidate_sc.introduce_new_ood_factorized(&z),
+        );
+        let ood_beta = rng.sample_f128();
+        control_sc.glue_factorized_ood(ood_beta);
+        candidate_sc.glue_factorized_ood(ood_beta);
+        assert_eq!(
+            control_sc.introduce_new(control, control_sum),
+            candidate_sc.introduce_new_with_precomputed_msg(
+                candidate,
+                candidate_sum,
+                candidate_msg.unwrap(),
+            ),
+        );
+        let beta = rng.sample_f128();
+        control_sc.glue_deferred_into_lazy_ood_fold(beta);
+        candidate_sc.glue_deferred_into_lazy_ood_fold(beta);
+        for _ in 0..3 {
+            let r = rng.sample_f128();
+            assert_eq!(control_sc.fold(r), candidate_sc.fold(r));
+            assert_eq!(control_sc.f, candidate_sc.f);
+            assert_eq!(control_sc.combined_basis, candidate_sc.combined_basis);
+            assert_eq!(control_sc.t_r, candidate_sc.t_r);
+        }
+        assert_eq!(control_sc.transcript, candidate_sc.transcript);
     }
 
     #[test]

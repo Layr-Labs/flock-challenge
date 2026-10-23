@@ -1724,7 +1724,7 @@ mod tests {
     /// The register-resident grind scan must agree with the generic batched
     /// scan — same match/no-match, same (smallest) nonce — for random
     /// digests, every bits value it dispatches on, ragged range shapes, and
-    /// ranges crossing the 12-lane group and 32-bit nonce boundaries. The
+    /// ranges crossing the four-lane group and 32-bit nonce boundaries. The
     /// generic path is itself held to `blake3::hash` by
     /// `blake3_batched_pow_matches_scalar`, so equality here pins the
     /// specialized kernel to the byte-exact spec.
@@ -1737,15 +1737,23 @@ mod tests {
             for b in digest.iter_mut() {
                 *b = (splitmix64(&mut seed) & 0xFF) as u8;
             }
-            for bits in [1u32, 2, 6, 8, 13, 19, 24, 32] {
+            for bits in 1u32..=32 {
                 for (start, len) in [
-                    (0u64, 1u64),
+                    (0u64, 0u64),
+                    (0, 1),
+                    (0, 3),
+                    (0, 4),
+                    (0, 5),
+                    (0, 7),
+                    (0, 8),
+                    (0, 9),
                     (0, 11),
                     (0, 12),
                     (0, 13),
                     (7, 500),
                     (1_000_000, 960),
-                    (u32::MAX as u64 - 30, 60), // nonce-lo carry inside a group
+                    (u32::MAX as u64 - 2, 9), // nonce-lo carry inside a group
+                    (u64::MAX - 9, 20),       // saturated end and ragged tail
                 ] {
                     let want = blake3_pow_scan_generic(&digest, start, len, bits);
                     let got = crate::merkle::blake3_pow_scan_reg(&digest, start, len, bits);
