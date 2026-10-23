@@ -2501,6 +2501,9 @@ pub(crate) mod witgen_simd {
         // lease was actually acquired. A warmup/failure/non-ranked miss keeps
         // the ordinary stripe so no fallback can observe an absent buffer.
         let defer_ranked_stripe = defer_ranked_stripe && stream.is_some();
+        if defer_ranked_stripe {
+            stream.as_mut().unwrap().enable_lincheck_stripe();
+        }
         let mut z_lincheck =
             (!defer_ranked_stripe).then(|| flock_core::scratch::take_u8((n_total / 8) * K));
 
@@ -4910,6 +4913,17 @@ mod tests {
     #[test]
     #[ignore = "ranked canary constructs and verifies one full m=32 proof"]
     fn ranked_blake3_proof_canary() {
+        ranked_blake3_proof_canary_impl(false);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "three full ranked proofs with Metal stripe use assertions"]
+    fn ranked_blake3_first_pass_stripe_canary() {
+        ranked_blake3_proof_canary_impl(true);
+    }
+
+    fn ranked_blake3_proof_canary_impl(check_gpu_stripe: bool) {
         use flock_core::challenger::FsChallenger;
 
         const RANKED_N_BLOCKS: usize = 1 << 18;
@@ -4925,6 +4939,7 @@ mod tests {
             (0, 0),
             "filtered canary must start in a fresh process"
         );
+        assert_eq!(crate::prover::gpu_stripe_test_counts(), (0, 0));
 
         // Match `benches/blake3_proof.rs`'s deterministic run-0 input exactly.
         let mut rng = Rng::new(0xC0FFEE_BEEF ^ RANKED_N_BLOCKS as u64);
@@ -4958,6 +4973,7 @@ mod tests {
             .verify(&commitment, &proof, &mut verifier)
             .expect("ranked preinitialized-codeword proof must verify");
         assert_eq!(verified, claim);
+        assert_eq!(crate::prover::gpu_stripe_test_counts(), (0, 0));
         assert_eq!(
             flock_core::zerocheck::univariate_skip_optimized::ab_compact_backing_token_counts(),
             (0, 1),
@@ -5017,6 +5033,51 @@ mod tests {
                     "second ranked prove should token-hit z (pinned), a and b"
                 );
             }
+        }
+        if check_gpu_stripe {
+            let expected = usize::from(
+                std::env::var_os("FLOCK_NO_GPU_FIRST_PASS_STRIPE").as_deref()
+                    != Some(std::ffi::OsStr::new("1"))
+                    && std::env::var_os("FLOCK_NO_WITNESS_GPU_STREAM").is_none(),
+            );
+            assert_eq!(crate::prover::gpu_stripe_test_counts(), (expected, 0));
+            let mut blocks3 = blocks.clone();
+            for (cv, message, counter, _, _) in &mut blocks3 {
+                for word in cv.iter_mut().chain(message.iter_mut()) {
+                    *word = !*word;
+                }
+                *counter = counter.wrapping_add(1);
+            }
+            let mut prover3 = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+            let (proof3, commitment3, claim3) = setup.prove_fast(&blocks3, &mut prover3);
+            let proof3_bytes = crate::proof_io::R1csProofBundleLigerito {
+                commitment: commitment3.clone(),
+                proof: proof3.clone(),
+            }
+            .to_bytes();
+            assert_ne!(
+                proof3_bytes, proof_bytes,
+                "changed witness reused old proof"
+            );
+            eprintln!(
+                "[gpu-stripe-canary] changed-bundle-blake3={}",
+                blake3::hash(&proof3_bytes).to_hex()
+            );
+            let mut verifier3 = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
+            assert_eq!(
+                setup.verify(&commitment3, &proof3, &mut verifier3).unwrap(),
+                claim3
+            );
+            let counts = crate::prover::gpu_stripe_test_counts();
+            assert_eq!(counts, (2 * expected, 0));
+            assert!(
+                flock_core::pcs::ranked_gpu_commit_latched_on(),
+                "ranked canary must retain the GPU commitment latch"
+            );
+            eprintln!(
+                "[gpu-stripe-canary] completed={} cpu_refills={}",
+                counts.0, counts.1
+            );
         }
     }
 

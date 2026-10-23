@@ -1488,6 +1488,117 @@ pub struct FromZFirstPassStream {
     inner: imp::FromZFirstPassStream,
 }
 
+/// Exact-1 control for the ranked first-pass stripe experiment.
+fn gpu_first_pass_stripe_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_first_pass_stripe_enabled() -> bool {
+    gpu_first_pass_stripe_value_enabled(
+        std::env::var_os("FLOCK_NO_GPU_FIRST_PASS_STRIPE").as_deref(),
+    )
+}
+
+#[cfg(test)]
+mod first_pass_stripe_gate_tests {
+    #[test]
+    fn exact_one_disables_first_pass_stripe() {
+        use std::ffi::OsStr;
+        assert!(!super::gpu_first_pass_stripe_value_enabled(Some(
+            OsStr::new("1")
+        )));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_first_pass_stripe_value_enabled(
+                value.map(OsStr::new)
+            ));
+        }
+    }
+}
+
+/// Unique CPU owner of a stripe produced by a streamed first pass. The
+/// stream holds a second lease until its device writes have completed.
+pub struct GpuLincheckStripe {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    inner: std::sync::Arc<imp::LincheckStripeLease>,
+}
+
+impl GpuLincheckStripe {
+    /// # Safety
+    /// The caller must only load this flag. Changing it can expose bytes
+    /// before the device has finished writing them.
+    pub unsafe fn ready_flag(&self) -> &std::sync::atomic::AtomicBool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            &self.inner.ready
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            unreachable!("Metal stripe cannot exist on this target")
+        }
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.storage.ptr()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            unreachable!("Metal stripe cannot exist on this target")
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.storage.len
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            unreachable!("Metal stripe cannot exist on this target")
+        }
+    }
+
+    /// Called after commit has consumed the stream. Failed or incomplete
+    /// streams leave ready=false; all submitted writes must have drained.
+    pub fn fill_after_commit(&mut self, fill: impl FnOnce(&mut [u8])) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            use std::sync::atomic::Ordering;
+            assert!(self.inner.drained.load(Ordering::Acquire));
+            if !self.inner.ready.load(Ordering::Acquire) {
+                // Only one CPU owner can be taken from a stream. That
+                // stream has drained and cannot submit more writes.
+                let bytes =
+                    unsafe { std::slice::from_raw_parts_mut(self.inner.storage.ptr(), self.len()) };
+                fill(bytes);
+                self.inner.ready.store(true, Ordering::Release);
+            }
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = fill;
+            unreachable!("Metal stripe cannot exist on this target")
+        }
+    }
+}
+
+impl Drop for GpuLincheckStripe {
+    fn drop(&mut self) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        imp::drain_lincheck_stripe_reader(self.as_ptr() as usize, self.len());
+    }
+}
+
+impl std::ops::Deref for GpuLincheckStripe {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        assert!(unsafe { self.ready_flag() }.load(std::sync::atomic::Ordering::Acquire));
+        // The unique CPU owner retains the lease for this entire view.
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len()) }
+    }
+}
+
 /// Reserve the latched ranked GPU staging buffer before `z` is initialized.
 /// Returns `None` during warmup, on unsupported targets/shapes, or whenever
 /// the ordinary CPU/GPU fallback machinery should remain in control.
@@ -1507,6 +1618,30 @@ pub unsafe fn begin_from_z_first_pass_stream(
 }
 
 impl FromZFirstPassStream {
+    /// Enable only from the exact ranked BLAKE3 deferred-stripe selector,
+    /// before publishing any witness bands. Failure retains the CPU fill.
+    pub fn enable_lincheck_stripe(&mut self) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.enable_lincheck_stripe()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            false
+        }
+    }
+
+    pub fn take_lincheck_stripe(&mut self) -> Option<GpuLincheckStripe> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.take_lincheck_stripe()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            None
+        }
+    }
+
     /// Publish `r_start..r_start+r_count` (in position tiles). Ranges must be
     /// contiguous, ordered, and multiples of four for the tuned g4 kernel.
     #[doc(hidden)]
@@ -3489,6 +3624,161 @@ kernel void export_from_z_zero_root_tabs(
 }
 "#;
 
+    // Supplemental first-pass stripe producer. Each SIMD32 owns eight rows
+    // and four field columns; raw input feeds both outputs before mutation.
+    const FROM_Z_STRIPE_MSL_SOURCE: &str = r#"
+static inline ulong stripe_transpose8(ulong x) {
+    ulong t = (x ^ (x >> 7)) & 0x00aa00aa00aa00aaul;
+    x ^= t ^ (t << 7);
+    t = (x ^ (x >> 14)) & 0x0000cccc0000ccccul;
+    x ^= t ^ (t << 14);
+    t = (x ^ (x >> 28)) & 0x00000000f0f0f0f0ul;
+    return x ^ t ^ (t << 28);
+}
+
+static inline uint4 stripe_pack_chunks(uint4 t) {
+    ulong lo = 0ul, hi = 0ul;
+    #pragma unroll
+    for (uint row = 0u; row < 8u; row++) {
+        uint v = t[row >> 1] >> ((row & 1u) * 16u);
+        lo |= ulong(v & 255u) << (8u * row);
+        hi |= ulong((v >> 8) & 255u) << (8u * row);
+    }
+    lo = stripe_transpose8(lo);
+    hi = stripe_transpose8(hi);
+    return uint4(uint(lo), uint(lo >> 32), uint(hi), uint(hi >> 32));
+}
+
+static inline uint4 stripe_rows(uint4 raw, uint row) {
+    uint4 t = raw;
+    uint4 p4 = simd_shuffle_xor(t, 4u);
+    uint keep = (row & 1u) ? 0xffff0000u : 0x0000ffffu;
+    t = (t & keep) | ((row & 1u) ? (p4 >> 16) : (p4 << 16));
+    uint2 send = (row & 2u) ? t.xz : t.yw;
+    uint2 p2 = simd_shuffle_xor(send, 8u);
+    t = (row & 2u) ? uint4(p2.x, t.y, p2.y, t.w)
+                   : uint4(t.x, p2.x, t.z, p2.y);
+    send = (row & 4u) ? t.xy : t.zw;
+    p2 = simd_shuffle_xor(send, 16u);
+    t = (row & 4u) ? uint4(p2.x, p2.y, t.z, t.w)
+                   : uint4(t.x, t.y, p2.x, p2.y);
+    return stripe_pack_chunks(t);
+}
+
+// Direct-gather reference, used only by the real-Metal transpose oracle.
+static inline uint4 stripe_rows_reference(uint4 raw, uint row, uint column) {
+    uint4 chunks = uint4(0u);
+    #pragma unroll
+    for (uint source = 0u; source < 8u; source++) {
+        uint4 v = simd_shuffle(raw, source * 4u + column);
+        uint part = (v[row >> 1] >> ((row & 1u) * 16u)) & 0xffffu;
+        chunks[source >> 1] |= part << ((source & 1u) * 16u);
+    }
+    return stripe_pack_chunks(chunks);
+}
+
+kernel void stripe_transpose_oracle(
+    device const uint4* input [[buffer(0)]],
+    device uint4* output [[buffer(1)]],
+    device uint4* reference [[buffer(2)]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    uint row = (lid >> 2) & 7u;
+    uint column = lid & 3u;
+    uint4 raw = input[lid];
+    output[lid] = stripe_rows(raw, row);
+    reference[lid] = stripe_rows_reference(raw, row, column);
+}
+
+kernel void ntt_from_z_stripe(
+    device uint4* data [[buffer(0)]],
+    device const uint4* twiddles [[buffer(1)]],
+    constant NttParams& P [[buffer(2)]],
+    device const uint4* z [[buffer(3)]],
+    device uint4* stripe [[buffer(4)]],
+    constant uint& stripe_group_offset [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    constexpr uint NF = 16u;
+    threadgroup uint4 bases[11u * 4u];
+    threadgroup uint4 tabs[11u * 64u];
+    build_zero_root_tabs(twiddles, bases, tabs, lid);
+    const uint group = tgid >> 2;
+    const uint column_tile = tgid & 3u;
+    const uint row = (lid >> 2) & 7u;
+    const uint column = (lid & 3u) | ((lid >> 5) << 2);
+    for (uint half_column = 0u; half_column < 2u; half_column++) {
+      const uint lane = column_tile * 16u + half_column * 8u + column;
+      for (uint parity = 0u; parity < 2u; parity++) {
+        const uint r = group * 16u + row * 2u + parity;
+        uint4 elems[NF];
+        for (uint e = 0u; e < NF / 2u; e++) {
+            uint4 raw = z[(((e << P.s) + r) << 6) + lane];
+            const uint stripe_group = e * (1u << (P.s - 4u))
+                                    + stripe_group_offset + group;
+            // Indices are uint4 units: one output per 16 consecutive bits.
+            const uint out = stripe_group * 1024u
+                           + (parity * 64u + lane) * 8u + row;
+            stripe[out] = stripe_rows(raw, row);
+            elems[e] = raw;
+            elems[e + NF / 2u] = raw;
+        }
+        // Literal indices are deliberate: a dynamic register-array index in
+        // this hot network can spill the sixteen F128 values. Seven ZERO
+        // calls replace c=0 multiplication; seventeen TAB calls cover every
+        // remaining butterfly with a compile-time compact-table offset.
+        #define ZERO_BFLY(EU, EV) \
+            elems[EV] ^= elems[EU];
+        #define TAB_BFLY(EU, EV, CT) { \
+            uint4 nu = elems[EU] \
+                ^ gf_mul_tab4_zero_root(elems[EV], &tabs[(CT) * 64u]); \
+            elems[EU] = nu; \
+            elems[EV] ^= nu; \
+        }
+
+        // Layer one: raw zero selector 1; compact selector 0 -> raw 2.
+        ZERO_BFLY(0, 4)
+        ZERO_BFLY(1, 5)
+        ZERO_BFLY(2, 6)
+        ZERO_BFLY(3, 7)
+        TAB_BFLY(8, 12, 0)
+        TAB_BFLY(9, 13, 0)
+        TAB_BFLY(10, 14, 0)
+        TAB_BFLY(11, 15, 0)
+
+        // Layer two: raw zero selector 3; compact 1..3 -> raw 4..6.
+        ZERO_BFLY(0, 2)
+        ZERO_BFLY(1, 3)
+        TAB_BFLY(4, 6, 1)
+        TAB_BFLY(5, 7, 1)
+        TAB_BFLY(8, 10, 2)
+        TAB_BFLY(9, 11, 2)
+        TAB_BFLY(12, 14, 3)
+        TAB_BFLY(13, 15, 3)
+
+        // Layer three: raw zero selector 7; compact 4..10 -> raw 8..14.
+        ZERO_BFLY(0, 1)
+        TAB_BFLY(2, 3, 4)
+        TAB_BFLY(4, 5, 5)
+        TAB_BFLY(6, 7, 6)
+        TAB_BFLY(8, 9, 7)
+        TAB_BFLY(10, 11, 8)
+        TAB_BFLY(12, 13, 9)
+        TAB_BFLY(14, 15, 10)
+
+        #undef TAB_BFLY
+        #undef ZERO_BFLY
+
+
+        for (uint e = 0u; e < NF; e++) {
+            data[((r + (e << P.s)) << 6) + lane] = elems[e];
+        }
+      }
+    }
+}
+"#;
+
     // One BLAKE3 compression per nonce.  The protocol hashes the exact
     // 64-byte single-chunk message `state_digest || nonce_le || 24*0`; ROOT is
     // therefore set together with CHUNK_START/CHUNK_END.  Each dispatch owns
@@ -3713,6 +4003,9 @@ kernel void blake3_pow_scan(
         /// PSO constructs eleven compact tables per group; it never reads a
         /// prebuilt device table.
         pub(crate) pso_ntt4zg4_zero_root: Id,
+        pub(crate) pso_ntt_stripe: Id,
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub(crate) pso_stripe_oracle: Id,
         /// Real-Metal oracle exporter for the shared compact table builder.
         /// `NIL` outside `cfg(test)`.
         #[cfg_attr(not(test), allow(dead_code))]
@@ -3961,6 +4254,103 @@ kernel void blake3_pow_scan(
                     } else {
                         (NIL, NIL)
                     };
+
+                // Compile separately: any failure retains the exact old path.
+                let (pso_ntt_stripe, pso_stripe_oracle) = if cfg!(test)
+                    || super::gpu_first_pass_stripe_enabled()
+                {
+                    (|| -> Result<(Id, Id), String> {
+                        let source =
+                            format!("{FROM_Z_ZERO_ROOT_MSL_SOURCE}\n{FROM_Z_STRIPE_MSL_SOURCE}");
+                        let src = api.nsstring(&source)?;
+                        let mut err = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!("stripe shader: {}", api.error_string(err)));
+                        }
+                        let build = |name: &str| -> Result<Id, String> {
+                            let ns = api.nsstring(name)?;
+                            let f: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                                library,
+                                c"newFunctionWithName:",
+                                ns
+                            );
+                            if f.is_null() {
+                                return Err(format!("missing stripe kernel {name}"));
+                            }
+                            let mut err = NIL;
+                            let pso: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                device,
+                                c"newComputePipelineStateWithFunction:error:",
+                                f,
+                                &mut err
+                            );
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                            if pso.is_null() {
+                                return Err(api.error_string(err));
+                            }
+                            let width: u64 = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> u64,
+                                pso,
+                                c"threadExecutionWidth"
+                            );
+                            if width != 32 {
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                                return Err("stripe needs SIMD32".into());
+                            }
+                            Ok(pso)
+                        };
+                        let result = match build("ntt_from_z_stripe") {
+                            Ok(candidate) => {
+                                if cfg!(test) {
+                                    match build("stripe_transpose_oracle") {
+                                        Ok(oracle) => Ok((candidate, oracle)),
+                                        Err(e) => {
+                                            send!(
+                                                api,
+                                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                                candidate,
+                                                c"release"
+                                            );
+                                            Err(e)
+                                        }
+                                    }
+                                } else {
+                                    Ok((candidate, NIL))
+                                }
+                            }
+                            Err(e) => Err(e),
+                        };
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
+                        result
+                    })()
+                    .unwrap_or_else(|e| {
+                        if debug_enabled() {
+                            eprintln!("[gpu-stripe] disabled: {e}");
+                        }
+                        (NIL, NIL)
+                    })
+                } else {
+                    (NIL, NIL)
+                };
 
                 // Supplemental leaf+parent3 fuse. Failure → NIL → exact
                 // incumbent leaf + parent3 path. Compile only when the ranked
@@ -4244,6 +4634,8 @@ kernel void blake3_pow_scan(
                     pso_ntt4z,
                     pso_ntt4zg4,
                     pso_ntt4zg4_zero_root,
+                    pso_ntt_stripe,
+                    pso_stripe_oracle,
                     pso_export_from_z_zero_root_tabs,
                     pso_ntt4h8,
                     pso_ntt5mix,
@@ -4733,6 +5125,40 @@ kernel void blake3_pow_scan(
                     64,
                 );
             }
+        }
+    }
+
+    pub(crate) unsafe fn encode_from_z_stripe_range(
+        gpu: &Gpu,
+        enc: Id,
+        staging: Id,
+        tw_buf: Id,
+        z_buf: Id,
+        stripe_buf: Id,
+        log_d: usize,
+        r_start: usize,
+        r_count: usize,
+    ) {
+        assert!(log_d >= 8 && r_start.is_multiple_of(16) && r_count.is_multiple_of(16));
+        unsafe {
+            gpu.set_pipeline(enc, gpu.pso_ntt_stripe);
+            gpu.set_buffer(enc, staging, r_start * 1024, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            let p = NttParams {
+                log_d: log_d as u32,
+                l: 0,
+                f: 4,
+                s: (log_d - 4) as u32,
+            };
+            let bytes = core::slice::from_raw_parts(
+                (&p as *const NttParams).cast(),
+                core::mem::size_of::<NttParams>(),
+            );
+            gpu.set_bytes(enc, bytes, 2);
+            gpu.set_buffer(enc, z_buf, r_start * 1024, 3);
+            gpu.set_buffer(enc, stripe_buf, 0, 4);
+            gpu.set_bytes(enc, &(r_start as u32 / 16).to_ne_bytes(), 5);
+            gpu.dispatch(enc, (r_count / 4) as u64, 64);
         }
     }
 
@@ -5235,6 +5661,59 @@ kernel void blake3_pow_scan(
     use crate::merkle::Hash;
     use std::sync::Mutex;
 
+    pub(crate) struct LincheckStripeStorage {
+        gpu: &'static Gpu,
+        buf: Id,
+        pub(crate) len: usize,
+        busy: std::sync::atomic::AtomicBool,
+    }
+    unsafe impl Send for LincheckStripeStorage {}
+    unsafe impl Sync for LincheckStripeStorage {}
+
+    impl LincheckStripeStorage {
+        pub(crate) fn ptr(&self) -> *mut u8 {
+            unsafe { self.gpu.buffer_contents(self.buf) }
+        }
+
+        fn acquire(self: &std::sync::Arc<Self>) -> Option<std::sync::Arc<LincheckStripeLease>> {
+            use std::sync::atomic::Ordering;
+            self.busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .ok()?;
+            Some(std::sync::Arc::new(LincheckStripeLease {
+                storage: self.clone(),
+                ready: std::sync::atomic::AtomicBool::new(false),
+                drained: std::sync::atomic::AtomicBool::new(false),
+            }))
+        }
+    }
+    impl Drop for LincheckStripeStorage {
+        fn drop(&mut self) {
+            unsafe { self.gpu.release(self.buf) };
+        }
+    }
+
+    pub(crate) struct LincheckStripeLease {
+        pub(crate) storage: std::sync::Arc<LincheckStripeStorage>,
+        pub(crate) ready: std::sync::atomic::AtomicBool,
+        pub(crate) drained: std::sync::atomic::AtomicBool,
+    }
+    impl Drop for LincheckStripeLease {
+        fn drop(&mut self) {
+            // A stream always drains before releasing its last lease. The
+            // CPU owner also drains any parked C-fold reader before Drop.
+            assert!(self.drained.load(std::sync::atomic::Ordering::Acquire));
+            self.storage
+                .busy
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    // Fold state caches no-copy views. Keep this one backing allocation
+    // alive for the process, even when commitment releases its whole latch.
+    static FIRST_PASS_STRIPE_STORAGE: OnceLock<Option<std::sync::Arc<LincheckStripeStorage>>> =
+        OnceLock::new();
+
     /// Persistent Metal state owned by the latched-on path.
     struct Latched {
         /// Uploaded breadth-first twiddle table (16 MiB at the ranked shape).
@@ -5329,6 +5808,8 @@ kernel void blake3_pow_scan(
         /// order makes it start the moment the first pass completes, deleting
         /// the host wait/encode bubble; `finish` consumes (or drains) it.
         early_cb2: Option<(Id, usize)>,
+        stripe: Option<std::sync::Arc<LincheckStripeLease>>,
+        stripe_owner_taken: bool,
     }
 
     // SAFETY: all captured Metal objects are process-persistent and Metal's
@@ -5337,6 +5818,30 @@ kernel void blake3_pow_scan(
     unsafe impl Send for FromZFirstPassStream {}
 
     impl FromZFirstPassStream {
+        pub(crate) fn enable_lincheck_stripe(&mut self) -> bool {
+            if !super::gpu_first_pass_stripe_enabled()
+                || self.next_r != 0
+                || self.stripe.is_some()
+                || self.gpu.pso_ntt_stripe.is_null()
+            {
+                return false;
+            }
+            self.stripe = FIRST_PASS_STRIPE_STORAGE
+                .get()
+                .and_then(Option::as_ref)
+                .and_then(|storage| storage.acquire());
+            self.stripe.is_some()
+        }
+
+        pub(crate) fn take_lincheck_stripe(&mut self) -> Option<super::GpuLincheckStripe> {
+            if self.stripe_owner_taken {
+                return None;
+            }
+            let inner = self.stripe.as_ref()?.clone();
+            self.stripe_owner_taken = true;
+            Some(super::GpuLincheckStripe { inner })
+        }
+
         pub(crate) fn submit_ready_range(&mut self, r_start: usize, r_count: usize) {
             if self.failed.is_some() {
                 return;
@@ -5347,6 +5852,8 @@ kernel void blake3_pow_scan(
                 || r_start + r_count > total_r
                 || !r_start.is_multiple_of(4)
                 || !r_count.is_multiple_of(4)
+                || (self.stripe.is_some()
+                    && (!r_start.is_multiple_of(16) || !r_count.is_multiple_of(16)))
             {
                 self.failed = Some(format!(
                     "invalid streamed range start={r_start} count={r_count} next={} total={total_r}",
@@ -5365,16 +5872,30 @@ kernel void blake3_pow_scan(
                 let result = (|| -> Result<Id, String> {
                     let cb = self.gpu.command_buffer()?;
                     let enc = self.gpu.compute_encoder(cb)?;
-                    FromZFirstPassPlan::new(self.log_d).encode_range(
-                        self.gpu,
-                        enc,
-                        self.staging,
-                        self.tw_buf,
-                        self.z_buf,
-                        self.log_d,
-                        byte_offset,
-                        r_count,
-                    );
+                    if let Some(stripe) = &self.stripe {
+                        encode_from_z_stripe_range(
+                            self.gpu,
+                            enc,
+                            self.staging,
+                            self.tw_buf,
+                            self.z_buf,
+                            stripe.storage.buf,
+                            self.log_d,
+                            r_start,
+                            r_count,
+                        );
+                    } else {
+                        FromZFirstPassPlan::new(self.log_d).encode_range(
+                            self.gpu,
+                            enc,
+                            self.staging,
+                            self.tw_buf,
+                            self.z_buf,
+                            self.log_d,
+                            byte_offset,
+                            r_count,
+                        );
+                    }
                     self.gpu.end_encoding(enc);
                     // `commandBuffer` is autoreleased. Retain it before
                     // popping this short-lived pool because completion is
@@ -5450,6 +5971,23 @@ kernel void blake3_pow_scan(
             }
         }
 
+        pub(crate) fn finish_first_pass(&mut self) -> Result<(), String> {
+            self.wait_pending()?;
+            let total = 1usize << (self.log_d - 4);
+            if self.next_r != total {
+                return Err(format!(
+                    "streamed first pass incomplete: {} of {total} r tiles",
+                    self.next_r
+                ));
+            }
+            if let Some(stripe) = &self.stripe {
+                stripe
+                    .ready
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            Ok(())
+        }
+
         fn wait_pending(&mut self) -> Result<(), String> {
             let mut result = self.failed.take().map_or(Ok(()), Err);
             let trace = window_trace_enabled();
@@ -5504,6 +6042,11 @@ kernel void blake3_pow_scan(
                     (last_end - first_start) * 1e3,
                     self.started.elapsed().as_secs_f64() * 1e3,
                 );
+            }
+            if let Some(stripe) = &self.stripe {
+                stripe
+                    .drained
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
             result
         }
@@ -5596,7 +6139,408 @@ kernel void blake3_pow_scan(
             started: std::time::Instant::now(),
             early_k,
             early_cb2: None,
+            stripe: None,
+            stripe_owner_taken: false,
         })
+    }
+
+    #[cfg(test)]
+    mod first_pass_stripe_tests {
+        use super::*;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        fn test_gpu() -> Option<&'static Gpu> {
+            match gpu() {
+                Ok(g) => Some(g),
+                Err(e)
+                    if e.contains("disabled")
+                        || e.contains("dlopen")
+                        || e.contains("returned nil") =>
+                {
+                    eprintln!("skipping GPU test: {e}");
+                    None
+                }
+                Err(e) => panic!("GPU error: {e}"),
+            }
+        }
+
+        struct Buffers {
+            gpu: &'static Gpu,
+            ids: Vec<Id>,
+            pool: *mut c_void,
+        }
+        impl Buffers {
+            unsafe fn new(gpu: &'static Gpu) -> Self {
+                Self {
+                    gpu,
+                    ids: Vec::new(),
+                    pool: unsafe { gpu.pool_push() },
+                }
+            }
+            unsafe fn alloc(&mut self, bytes: usize) -> Id {
+                let id = unsafe { self.gpu.new_buffer(bytes).unwrap() };
+                self.ids.push(id);
+                id
+            }
+        }
+        impl Drop for Buffers {
+            fn drop(&mut self) {
+                unsafe {
+                    for &id in &self.ids {
+                        self.gpu.release(id);
+                    }
+                    self.gpu.pool_pop(self.pool);
+                }
+            }
+        }
+
+        fn storage(gpu: &'static Gpu, len: usize) -> Arc<LincheckStripeStorage> {
+            let buf = unsafe { gpu.new_buffer(len).unwrap() };
+            unsafe {
+                std::ptr::write_bytes(gpu.buffer_contents(buf), 0xa5, len);
+            }
+            Arc::new(LincheckStripeStorage {
+                gpu,
+                buf,
+                len,
+                busy: AtomicBool::new(false),
+            })
+        }
+
+        fn stream(
+            gpu: &'static Gpu,
+            z_buf: Id,
+            staging: Id,
+            tw_buf: Id,
+            log_d: usize,
+            lease: Arc<LincheckStripeLease>,
+        ) -> FromZFirstPassStream {
+            FromZFirstPassStream {
+                gpu,
+                z_buf,
+                staging,
+                tw_buf,
+                tree_buf: NIL,
+                log_d,
+                n_leaves: 1 << log_d,
+                next_r: 0,
+                pending: Vec::new(),
+                failed: None,
+                owns_lease: false,
+                started: std::time::Instant::now(),
+                early_k: 0,
+                early_cb2: None,
+                stripe: Some(lease),
+                stripe_owner_taken: false,
+            }
+        }
+
+        #[test]
+        fn gpu_first_pass_stripe_transpose_basis_matches_gather() {
+            let Some(gpu) = test_gpu() else { return };
+            assert!(
+                !gpu.pso_stripe_oracle.is_null(),
+                "stripe PSO compile failed"
+            );
+            unsafe {
+                let mut buffers = Buffers::new(gpu);
+                let input = buffers.alloc(64 * 16);
+                let output = buffers.alloc(64 * 16);
+                let reference = buffers.alloc(64 * 16);
+                // All 8 rows × 128 bits, in both SIMD groups and every column.
+                for bit in 0..128 {
+                    for row in 0..8 {
+                        std::ptr::write_bytes(gpu.buffer_contents(input), 0, 64 * 16);
+                        let words = std::slice::from_raw_parts_mut(
+                            gpu.buffer_contents(input).cast::<u32>(),
+                            256,
+                        );
+                        for simd in 0..2 {
+                            for column in 0..4 {
+                                words[(simd * 32 + row * 4 + column) * 4 + bit / 32] =
+                                    1 << (bit % 32);
+                            }
+                        }
+                        let cb = gpu.command_buffer().unwrap();
+                        let enc = gpu.compute_encoder(cb).unwrap();
+                        gpu.set_pipeline(enc, gpu.pso_stripe_oracle);
+                        gpu.set_buffer(enc, input, 0, 0);
+                        gpu.set_buffer(enc, output, 0, 1);
+                        gpu.set_buffer(enc, reference, 0, 2);
+                        gpu.dispatch(enc, 1, 64);
+                        gpu.end_encoding(enc);
+                        gpu.commit_and_wait(cb).unwrap();
+                        let got = std::slice::from_raw_parts(gpu.buffer_contents(output), 1024);
+                        let want = std::slice::from_raw_parts(gpu.buffer_contents(reference), 1024);
+                        assert_eq!(got, want, "gather mismatch row={row} bit={bit}");
+                        for lid in 0..64 {
+                            let target = (lid >> 2) & 7;
+                            for byte in 0..16 {
+                                let expected = if target * 16 + byte == bit {
+                                    1 << row
+                                } else {
+                                    0
+                                };
+                                assert_eq!(got[lid * 16 + byte], expected);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn gpu_first_pass_stripe_matches_cpu_and_preserves_lease() {
+            let Some(gpu) = test_gpu() else { return };
+            assert!(!gpu.pso_ntt_stripe.is_null(), "stripe PSO compile failed");
+            let log_d = 10;
+            let m = log_d + 12;
+            let ntt = AdditiveNttF128::standard(log_d);
+            let twiddles = super::super::flat_twiddle_table(&ntt, log_d);
+            unsafe {
+                let mut buffers = Buffers::new(gpu);
+                let z_buf = buffers.alloc(1 << (m - 3));
+                let staging = buffers.alloc(1 << (m - 2));
+                let tw_buf = buffers.alloc(core::mem::size_of_val(twiddles.as_slice()));
+                std::ptr::copy_nonoverlapping(
+                    twiddles.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(tw_buf),
+                    core::mem::size_of_val(twiddles.as_slice()),
+                );
+                let storage = storage(gpu, 1 << (m - 3));
+                for mode in 0..4 {
+                    let mut z: Vec<F128> = (0..64 << (log_d - 1))
+                        .map(|i: usize| {
+                            let x = (i as u64).wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1);
+                            F128::new(x ^ x.rotate_left(17), (!x).rotate_right(11))
+                        })
+                        .collect();
+                    if mode == 1 {
+                        for (i, v) in z.iter_mut().enumerate() {
+                            match i % 128 {
+                                120 => *v = F128::new(v.lo & ((1 << 49) - 1), 0),
+                                121..=127 => *v = F128::ZERO,
+                                _ => {}
+                            }
+                        }
+                    }
+                    let expected = crate::lincheck::pack_z_lincheck_from_packed(&z, m, 14);
+                    let mut expected_first = vec![F128::ZERO; 64 << log_d];
+                    crate::pcs::commit::replicate_message_fill(&mut expected_first, &z);
+                    ntt.forward_transform_interleaved_block_range(
+                        &mut expected_first,
+                        64,
+                        1,
+                        4,
+                        0,
+                        2,
+                        0,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        z.as_ptr().cast::<u8>(),
+                        gpu.buffer_contents(z_buf),
+                        core::mem::size_of_val(z.as_slice()),
+                    );
+                    std::ptr::write_bytes(storage.ptr(), 0xa5, storage.len);
+                    let mut stream = stream(
+                        gpu,
+                        z_buf,
+                        staging,
+                        tw_buf,
+                        log_d,
+                        storage.acquire().unwrap(),
+                    );
+                    let mut owner = stream.take_lincheck_stripe().unwrap();
+                    assert!(stream.take_lincheck_stripe().is_none());
+                    assert!(!owner.ready_flag().load(Ordering::Acquire));
+                    assert!(!owner.inner.drained.load(Ordering::Acquire));
+                    assert!(
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            std::hint::black_box(&owner[..]);
+                        }))
+                        .is_err(),
+                        "no CPU view before device completion"
+                    );
+                    stream.submit_ready_range(0, 16);
+                    if mode != 2 {
+                        stream.submit_ready_range(16, 32);
+                        stream.submit_ready_range(48, 16);
+                    }
+                    if mode >= 2 {
+                        stream.submit_ready_range(0, 16);
+                    }
+                    let result = stream.finish_first_pass();
+                    assert_eq!(result.is_ok(), mode < 2);
+                    assert_eq!(owner.ready_flag().load(Ordering::Acquire), mode < 2);
+                    assert!(owner.inner.drained.load(Ordering::Acquire));
+                    if mode == 1 {
+                        // First pass is valid. Force only the later latch
+                        // identity check to fail, through the real finish
+                        // entry. Dummy latch buffers are distinct from both
+                        // the stripe and this fixture's staging allocation.
+                        let old_busy = STAGING_IN_USE.load(Ordering::Acquire);
+                        let previous = {
+                            let mut latch = latch_lock();
+                            std::mem::replace(
+                                &mut *latch,
+                                LatchState::On(Latched {
+                                    tw_buf: gpu.new_buffer(16).unwrap(),
+                                    tree_buf: gpu.new_buffer(32).unwrap(),
+                                    staging: gpu.new_buffer(16).unwrap(),
+                                    wraps: Vec::new(),
+                                }),
+                            )
+                        };
+                        let params = crate::pcs::commit::PcsParams {
+                            m,
+                            log_inv_rate: 1,
+                            log_batch_size: 6,
+                            profile: crate::pcs::ligerito::LigeritoProfile::Fast,
+                            merkle_hash: crate::merkle::HashKind::Blake3,
+                        };
+                        let fallback = finish_from_z_first_pass_or_fallback(
+                            stream,
+                            &z,
+                            Vec::new(),
+                            &params,
+                            |cw| {
+                                cw.fill(F128::ZERO);
+                                vec![[0; 32]]
+                            },
+                        );
+                        let released = {
+                            let mut latch = latch_lock();
+                            std::mem::replace(&mut *latch, previous)
+                        };
+                        STAGING_IN_USE.store(old_busy, Ordering::Release);
+                        assert!(matches!(released, LatchState::Off));
+                        assert!(matches!(
+                            fallback.0,
+                            crate::pcs::commit::CodewordBuf::Cpu(_)
+                        ));
+                        assert!(owner.ready_flag().load(Ordering::Acquire));
+                        owner.fill_after_commit(|_| {
+                            panic!("valid stripe must survive commitment fallback")
+                        });
+                    } else {
+                        drop(stream);
+                    }
+                    // Drop must not publish a formerly failed stream.
+                    assert_eq!(owner.ready_flag().load(Ordering::Acquire), mode < 2);
+                    owner.fill_after_commit(|bytes| bytes.copy_from_slice(&expected));
+                    assert_eq!(&*owner, expected.as_slice());
+                    if mode < 2 {
+                        let got = std::slice::from_raw_parts(
+                            gpu.buffer_contents(staging).cast::<F128>(),
+                            expected_first.len(),
+                        );
+                        assert_eq!(got, expected_first.as_slice(), "first pass mode={mode}");
+                    }
+                    // The stream (and its staging lease) has gone. A live
+                    // stripe owner still prevents any new stripe producer.
+                    assert!(storage.acquire().is_none());
+                    assert_eq!(&*owner, expected.as_slice());
+                    drop(owner);
+                    let next = storage.acquire().expect("last owner releases stripe");
+                    next.drained.store(true, Ordering::Release);
+                    drop(next);
+                }
+                // No CPU stripe owner: dropping a partial stream must still
+                // drain its writer and release the independent stripe lease.
+                let mut partial = stream(
+                    gpu,
+                    z_buf,
+                    staging,
+                    tw_buf,
+                    log_d,
+                    storage.acquire().unwrap(),
+                );
+                partial.submit_ready_range(0, 16);
+                drop(partial);
+                let next = storage.acquire().unwrap();
+                next.drained.store(true, Ordering::Release);
+                drop(next);
+            }
+        }
+
+        #[test]
+        fn gpu_first_pass_stripe_owner_drains_parked_reader() {
+            let Some(gpu) = test_gpu() else { return };
+            assert!(!gpu.pso_stripe_oracle.is_null());
+            unsafe {
+                let mut buffers = Buffers::new(gpu);
+                let output = buffers.alloc(1024);
+                let reference = buffers.alloc(1024);
+                let storage = storage(gpu, 16384);
+                let lease = storage.acquire().unwrap();
+                lease.drained.store(true, Ordering::Release);
+                lease.ready.store(true, Ordering::Release);
+                let owner = super::super::GpuLincheckStripe { inner: lease };
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, gpu.pso_stripe_oracle);
+                gpu.set_buffer(enc, storage.buf, 0, 0);
+                gpu.set_buffer(enc, output, 0, 1);
+                gpu.set_buffer(enc, reference, 0, 2);
+                gpu.dispatch(enc, 1, 64);
+                gpu.end_encoding(enc);
+                let cb = gpu.retain(cb);
+                let observer = gpu.retain(cb);
+                {
+                    let mut guard = ZC_FOLD.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.is_none() {
+                        *guard = Some(zc_fold_init(gpu));
+                    }
+                    let state = guard.as_mut().unwrap().as_mut().unwrap();
+                    abandon_staged_prefix(state);
+                    gpu.commit_async(cb);
+                    // A real submitted reader, parked through the same
+                    // record that commit-tail staging uses in production.
+                    state.staged = Some(ZcFoldStaged {
+                        cb,
+                        plan: ZcFoldPlan {
+                            z_buf: storage.buf,
+                            pso_fold: gpu.pso_stripe_oracle,
+                            byte_fold: true,
+                            factored_b4: false,
+                            k: 16384,
+                            useful: 16384,
+                            stripe_hi: 1,
+                            stripes_per_chunk: 1,
+                            i_groups: 16,
+                        },
+                        k: 16384,
+                        claim_lo: 0,
+                        n_claims: 1,
+                        submitted: std::time::Instant::now(),
+                        r: Vec::new(),
+                        z_ptr: storage.ptr() as usize,
+                        z_len: storage.len,
+                        eq_len: 1,
+                        eq_owned: None,
+                    });
+                }
+                assert!(storage.acquire().is_none());
+                drop(owner);
+                let status: u64 = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    observer,
+                    c"status"
+                );
+                assert_eq!(status, 4, "reader completed before stripe reuse");
+                gpu.release(observer);
+                let guard = ZC_FOLD.lock().unwrap_or_else(|e| e.into_inner());
+                assert!(guard.as_ref().unwrap().as_ref().unwrap().staged.is_none());
+                drop(guard);
+                let next = storage.acquire().unwrap();
+                next.drained.store(true, Ordering::Release);
+                drop(next);
+            }
+        }
     }
 
     /// Pool for ranked-size tree allocations (the 64 MiB copy-out target).
@@ -7286,6 +8230,41 @@ kernel void blake3_pow_scan(
                 let z_buf = gpu.wrap_buffer(z_packed.as_ptr().cast_mut().cast::<u8>(), z_bytes)?;
                 created.push(z_buf);
 
+                // Warm the supplemental producer outside the timed proof.
+                // It fully writes its own buffer; the ordinary wiring run
+                // below restores staging before all incumbent comparisons.
+                if super::gpu_first_pass_stripe_enabled() && !gpu.pso_ntt_stripe.is_null() {
+                    FIRST_PASS_STRIPE_STORAGE.get_or_init(|| {
+                        (|| -> Result<_, String> {
+                            let buf = gpu.new_buffer(1usize << 29)?;
+                            let storage = std::sync::Arc::new(LincheckStripeStorage {
+                                gpu,
+                                buf,
+                                len: 1usize << 29,
+                                busy: std::sync::atomic::AtomicBool::new(false),
+                            });
+                            let cb = gpu.command_buffer()?;
+                            let enc = gpu.compute_encoder(cb)?;
+                            encode_from_z_stripe_range(
+                                gpu,
+                                enc,
+                                staging,
+                                tw_buf,
+                                z_buf,
+                                buf,
+                                log_d,
+                                0,
+                                1usize << (log_d - 4),
+                            );
+                            gpu.end_encoding(enc);
+                            gpu.commit_and_wait(cb)?;
+                            warm_lincheck_stripe_wrap(&storage);
+                            Ok(storage)
+                        })()
+                        .ok()
+                    });
+                }
+
                 // Untimed wiring run, then the identical timed run.
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
                 let mut gpu_tree = take_tree(total_nodes);
@@ -7775,17 +8754,7 @@ kernel void blake3_pow_scan(
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
         use std::sync::atomic::Ordering;
 
-        let total_r = 1usize << (stream.log_d - 4);
-        let first_pass = stream.wait_pending().and_then(|()| {
-            if stream.next_r == total_r {
-                Ok(())
-            } else {
-                Err(format!(
-                    "streamed first pass incomplete: {} of {total_r} r tiles",
-                    stream.next_r
-                ))
-            }
-        });
+        let first_pass = stream.finish_first_pass();
 
         let mut latch = latch_lock();
         let state_matches = matches!(
@@ -9736,6 +10705,39 @@ kernel void lc_fold_stripes_factored_b4(
         }
     }
 
+    // Retain the shared buffer itself in the existing fold cache during
+    // warmup. This avoids a timed no-copy wrap of the new stripe address.
+    fn warm_lincheck_stripe_wrap(storage: &LincheckStripeStorage) {
+        let mut guard = ZC_FOLD.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(zc_fold_init(storage.gpu));
+        }
+        if let Some(Ok(state)) = guard.as_mut() {
+            if state.z_wraps.len() == 3 {
+                let (_, _, old) = state.z_wraps.remove(0);
+                unsafe { state.gpu.release(old) };
+            }
+            state
+                .z_wraps
+                .push((storage.ptr() as usize, storage.len, unsafe {
+                    storage.gpu.retain(storage.buf)
+                }));
+        }
+    }
+
+    pub(crate) fn drain_lincheck_stripe_reader(ptr: usize, len: usize) {
+        let mut guard = ZC_FOLD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Ok(state)) = guard.as_mut() {
+            if state
+                .staged
+                .as_ref()
+                .is_some_and(|s| s.z_ptr == ptr && s.z_len == len)
+            {
+                unsafe { abandon_staged_prefix(state) };
+            }
+        }
+    }
+
     /// Direct, fixed-plan candidate/control result for the real-Metal B4
     /// oracle. This path deliberately bypasses `FoldArm::claims_for`,
     /// `ZcFoldJob::finish_xor_into`, submit counters, calibration, and every
@@ -10991,8 +11993,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         /// dispatch; the buffer is retained across its short-lived pool and
         /// drained in `finish` (the from-z first-pass stream idiom).
         fn submit_pending(&self, inner: &mut L1OverlapInner) {
-            if inner.pending.is_empty() || self.failed.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if inner.pending.is_empty() || self.failed.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
             // Publish every pending chunk's CPU stores to the encode below.

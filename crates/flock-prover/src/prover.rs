@@ -395,16 +395,20 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
     b_packed_f128: Vec<F128>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
-    stream: flock_core::gpu_commit::FromZFirstPassStream,
+    mut stream: flock_core::gpu_commit::FromZFirstPassStream,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    let stripe = stream
+        .take_lincheck_stripe()
+        .map(LincheckStripeInput::GpuPending)
+        .unwrap_or(LincheckStripeInput::DeferredRanked);
     prove_fast_ligerito_from_witness_with_commit_codeword(
         r1cs,
         pcs_params,
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        LincheckStripeInput::DeferredRanked,
+        stripe,
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
         challenger,
@@ -564,6 +568,39 @@ enum CommitCodeword {
 enum LincheckStripeInput {
     Ready(Vec<u8>),
     DeferredRanked,
+    GpuPending(flock_core::gpu_commit::GpuLincheckStripe),
+}
+
+#[cfg(test)]
+static GPU_STRIPE_TEST_COUNTS: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+
+#[cfg(test)]
+pub(crate) fn gpu_stripe_test_counts() -> (usize, usize) {
+    *GPU_STRIPE_TEST_COUNTS.lock().unwrap()
+}
+
+// Both owners provide the same canonical byte layout to existing folds.
+enum LincheckStripe {
+    Cpu(Vec<u8>),
+    Gpu(flock_core::gpu_commit::GpuLincheckStripe),
+}
+
+impl std::ops::Deref for LincheckStripe {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Cpu(bytes) => bytes,
+            Self::Gpu(bytes) => bytes,
+        }
+    }
+}
+
+impl LincheckStripe {
+    fn recycle(self) {
+        if let Self::Cpu(bytes) = self {
+            flock_core::scratch::give_u8(bytes);
+        }
+    }
 }
 
 const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 64;
@@ -1009,7 +1046,48 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 stripe.as_ptr() as usize,
                 stripe.len(),
             );
-            (run_commit(hook), stripe)
+            (run_commit(hook), LincheckStripe::Cpu(stripe))
+        }
+        LincheckStripeInput::GpuPending(mut stripe) => {
+            assert_eq!((r1cs.m, r1cs.k_log, r1cs.useful_bits), (32, 14, 15_409));
+            let hook = make_commit_tail_fill_hook(
+                &*challenger,
+                r1cs,
+                &padding,
+                // The hook only loads readiness after the device wait.
+                unsafe { stripe.ready_flag() },
+                stripe.as_ptr() as usize,
+                stripe.len(),
+            );
+            let pre = run_commit(hook);
+            #[cfg(test)]
+            if unsafe { stripe.ready_flag() }.load(std::sync::atomic::Ordering::Acquire) {
+                GPU_STRIPE_TEST_COUNTS.lock().unwrap().0 += 1;
+            }
+            // Commit consumed and drained the stream. A failed or partial
+            // first pass keeps ready=false and uses the exact CPU transpose.
+            stripe.fill_after_commit(|bytes| {
+                #[cfg(test)]
+                {
+                    GPU_STRIPE_TEST_COUNTS.lock().unwrap().1 += 1;
+                }
+                fill_deferred_lincheck_stripe(
+                    &z_packed,
+                    bytes,
+                    r1cs.m,
+                    r1cs.k_log,
+                    1usize << r1cs.k_log,
+                );
+            });
+            #[cfg(test)]
+            {
+                let expected = pack_z_lincheck_from_packed(&z_packed, r1cs.m, r1cs.k_log);
+                assert!(
+                    &*stripe == expected.as_slice(),
+                    "full GPU stripe differs from canonical packing"
+                );
+            }
+            (pre, LincheckStripe::Gpu(stripe))
         }
         LincheckStripeInput::DeferredRanked => {
             assert_eq!(r1cs.m, 32);
@@ -1121,7 +1199,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 }
                 pre
             });
-            (pre, stripe)
+            (pre, LincheckStripe::Cpu(stripe))
         }
     };
     let (commitment, prover_data, ab_inner) = pre_zerocheck;
@@ -1199,7 +1277,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // The lincheck stripe copy of z is dead from here on; return it to the
     // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
     // m = 32) so the next prove reuses its resident pages.
-    flock_core::scratch::give_u8(z_packed_lincheck);
+    z_packed_lincheck.recycle();
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
