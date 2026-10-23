@@ -1012,6 +1012,25 @@ pub const ENV_NO_NTT_PASS_TUNE: &str = "FLOCK_NO_NTT_PASS_TUNE";
 /// Exact `1` restores the untouched incumbent g4 pipeline state.
 pub const ENV_NO_GPU_FROM_Z_ZERO_ROOT: &str = "FLOCK_NO_GPU_FROM_Z_ZERO_ROOT";
 
+/// Exact-`1` rollback for sixteen-tile first-pass table reuse. Small
+/// published ranges retain the four-tile path.
+pub const ENV_NO_GPU_FROM_Z_REUSE: &str = "FLOCK_NO_GPU_FROM_Z_REUSE";
+
+fn gpu_from_z_reuse_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_from_z_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_from_z_reuse_value_enabled(std::env::var_os(ENV_NO_GPU_FROM_Z_REUSE).as_deref())
+    })
+}
+
+fn select_gpu_from_z_reuse(zero_root: bool, r_count: usize, enabled: bool) -> bool {
+    zero_root && enabled && r_count >= 4096 && r_count.is_multiple_of(16)
+}
+
 fn gpu_from_z_zero_root_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -1049,6 +1068,24 @@ fn gpu_from_z_zero_root_selected(log_d: usize) -> bool {
 #[cfg(test)]
 mod from_z_zero_root_gate_tests {
     use std::ffi::OsStr;
+
+    #[test]
+    fn reuse_exact_control_and_published_range_gate() {
+        assert!(!super::gpu_from_z_reuse_value_enabled(Some(OsStr::new(
+            "1"
+        ))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_from_z_reuse_value_enabled(value.map(OsStr::new)));
+        }
+        for r_count in [0, 4, 16, 1024, 4092, 4100] {
+            assert!(!super::select_gpu_from_z_reuse(true, r_count, true));
+        }
+        for r_count in [4096, 7168, 8192, 65536] {
+            assert!(super::select_gpu_from_z_reuse(true, r_count, true));
+            assert!(!super::select_gpu_from_z_reuse(false, r_count, true));
+            assert!(!super::select_gpu_from_z_reuse(true, r_count, false));
+        }
+    }
 
     #[test]
     fn exact_one_rollback_and_ranked_shape_only() {
@@ -3404,13 +3441,20 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
     uint lid  [[thread_index_in_threadgroup]])
 {
     constexpr uint NF = 16u;
+    #ifdef FLOCK_FROM_Z_REUSE_G16
+    constexpr uint LOG_G = 4u;
+    #else
     constexpr uint LOG_G = 2u;
+    #endif
     threadgroup uint4 bases[11u * 4u];
     threadgroup uint4 tabs[11u * 64u];
     build_zero_root_tabs(twiddles, bases, tabs, lid);
 
     const uint lane = lid & 63u;
     const uint r_base = tgid << LOG_G;
+    #ifdef FLOCK_FROM_Z_REUSE_G16
+    #pragma clang loop unroll(disable)
+    #endif
     for (uint rr = 0u; rr < (1u << LOG_G); rr++) {
         const uint r = r_base + rr;
         uint4 elems[NF];
@@ -3488,6 +3532,14 @@ kernel void export_from_z_zero_root_tabs(
     }
 }
 "#;
+
+    fn from_z_reuse_msl_source() -> String {
+        format!(
+            "#define FLOCK_FROM_Z_REUSE_G16 1\n\
+             #define ntt_fused_reg4_from_zg4_zero_root ntt_fused_reg4_from_zg16_zero_root\n\
+             {FROM_Z_ZERO_ROOT_MSL_SOURCE}"
+        )
+    }
 
     // One BLAKE3 compression per nonce.  The protocol hashes the exact
     // 64-byte single-chunk message `state_digest || nonce_le || 24*0`; ROOT is
@@ -3713,6 +3765,8 @@ kernel void blake3_pow_scan(
         /// PSO constructs eleven compact tables per group; it never reads a
         /// prebuilt device table.
         pub(crate) pso_ntt4zg4_zero_root: Id,
+        /// Same tables and one live tile, reused across sixteen r positions.
+        pub(crate) pso_ntt4zg16_zero_root: Id,
         /// Real-Metal oracle exporter for the shared compact table builder.
         /// `NIL` outside `cfg(test)`.
         #[cfg_attr(not(test), allow(dead_code))]
@@ -3961,6 +4015,73 @@ kernel void blake3_pow_scan(
                     } else {
                         (NIL, NIL)
                     };
+
+                let pso_ntt4zg16_zero_root = if cfg!(test)
+                    || (super::gpu_from_z_zero_root_selected(20)
+                        && super::gpu_from_z_reuse_enabled())
+                {
+                    (|| -> Result<Id, String> {
+                        let source = from_z_reuse_msl_source();
+                        let src = api.nsstring(&source)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "from-z reuse shader compile failed: {}",
+                                api.error_string(err)
+                            ));
+                        }
+                        let ns = api.nsstring("ntt_fused_reg4_from_zg16_zero_root")?;
+                        let f: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            library,
+                            c"newFunctionWithName:",
+                            ns
+                        );
+                        if f.is_null() {
+                            send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                library,
+                                c"release"
+                            );
+                            return Err("from-z reuse kernel not found".into());
+                        }
+                        let mut perr: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            f,
+                            &mut perr
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            library,
+                            c"release"
+                        );
+                        if pso.is_null() {
+                            Err(format!("from-z reuse pipeline: {}", api.error_string(perr)))
+                        } else {
+                            Ok(pso)
+                        }
+                    })()
+                    .unwrap_or(NIL)
+                } else {
+                    NIL
+                };
 
                 // Supplemental leaf+parent3 fuse. Failure → NIL → exact
                 // incumbent leaf + parent3 path. Compile only when the ranked
@@ -4244,6 +4365,7 @@ kernel void blake3_pow_scan(
                     pso_ntt4z,
                     pso_ntt4zg4,
                     pso_ntt4zg4_zero_root,
+                    pso_ntt4zg16_zero_root,
                     pso_export_from_z_zero_root_tabs,
                     pso_ntt4h8,
                     pso_ntt5mix,
@@ -4681,6 +4803,15 @@ kernel void blake3_pow_scan(
         zero_root: bool,
     }
 
+    #[cfg(test)]
+    static FROM_Z_REUSE_TEST_DISPATCHES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(test)]
+    pub(crate) fn from_z_reuse_test_dispatches() -> usize {
+        FROM_Z_REUSE_TEST_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     impl FromZFirstPassPlan {
         fn new(log_d: usize) -> Self {
             let grouped = super::pass_tune_enabled();
@@ -4704,7 +4835,14 @@ kernel void blake3_pow_scan(
             debug_assert!(!self.zero_root || self.grouped);
             debug_assert!(!self.grouped || r_count.is_multiple_of(4));
             unsafe {
-                let pso = if self.zero_root {
+                let reuse = super::select_gpu_from_z_reuse(
+                    self.zero_root,
+                    r_count,
+                    super::gpu_from_z_reuse_enabled(),
+                ) && !gpu.pso_ntt4zg16_zero_root.is_null();
+                let pso = if reuse {
+                    gpu.pso_ntt4zg16_zero_root
+                } else if self.zero_root {
                     debug_assert!(!gpu.pso_ntt4zg4_zero_root.is_null());
                     gpu.pso_ntt4zg4_zero_root
                 } else if self.grouped {
@@ -4729,10 +4867,50 @@ kernel void blake3_pow_scan(
                 gpu.set_buffer(enc, z_buf, byte_offset, 3);
                 gpu.dispatch(
                     enc,
-                    (r_count >> if self.grouped { 2 } else { 0 }) as u64,
+                    (r_count
+                        >> if reuse {
+                            4
+                        } else if self.grouped {
+                            2
+                        } else {
+                            0
+                        }) as u64,
                     64,
                 );
+                #[cfg(test)]
+                if reuse {
+                    FROM_Z_REUSE_TEST_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) unsafe fn encode_from_z_reuse_range_for_test(
+        gpu: &Gpu,
+        enc: Id,
+        staging: Id,
+        tw_buf: Id,
+        z_buf: Id,
+        log_d: usize,
+        r_start: usize,
+        r_count: usize,
+    ) {
+        unsafe {
+            FromZFirstPassPlan {
+                grouped: true,
+                zero_root: true,
+            }
+            .encode_range(
+                gpu,
+                enc,
+                staging,
+                tw_buf,
+                z_buf,
+                log_d,
+                r_start * 64 * core::mem::size_of::<F128>(),
+                r_count,
+            );
         }
     }
 
@@ -7059,13 +7237,16 @@ kernel void blake3_pow_scan(
     /// Cache key component tying entries to both the exact GPU source and
     /// selected from-z mode. Candidate and exact-rollback processes must not
     /// consume each other's latch or tuned split.
-    fn warmup_cache_msl_fnv_for(zero_root: bool, leaf_vec4: bool) -> u64 {
+    fn warmup_cache_msl_fnv_for(zero_root: bool, leaf_vec4: bool, from_z_reuse: bool) -> u64 {
         let mut key = fnv1a64(MSL_SOURCE);
         if zero_root {
             key ^= fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1) ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
         }
         if leaf_vec4 {
             key ^= fnv1a64(LEAF_VEC4_MSL_SOURCE).rotate_left(2) ^ 0x4C45_4146_5F56_3431; // "LEAF_V41"
+        }
+        if zero_root && from_z_reuse {
+            key ^= fnv1a64(&from_z_reuse_msl_source()).rotate_left(3) ^ 0x465A_5245_5553_3136; // "FZREUS16"
         }
         key
     }
@@ -7074,6 +7255,7 @@ kernel void blake3_pow_scan(
         warmup_cache_msl_fnv_for(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
+            super::gpu_from_z_reuse_enabled(),
         )
     }
 
@@ -7081,8 +7263,8 @@ kernel void blake3_pow_scan(
     mod zero_root_cache_key_tests {
         #[test]
         fn supplemental_source_and_mode_have_a_distinct_fingerprint() {
-            let incumbent = super::warmup_cache_msl_fnv_for(false, false);
-            let candidate = super::warmup_cache_msl_fnv_for(true, false);
+            let incumbent = super::warmup_cache_msl_fnv_for(false, false, false);
+            let candidate = super::warmup_cache_msl_fnv_for(true, false, false);
             assert_eq!(incumbent, super::fnv1a64(super::MSL_SOURCE));
             assert_ne!(candidate, incumbent);
             assert_eq!(
@@ -7093,15 +7275,35 @@ kernel void blake3_pow_scan(
             );
             // The leaf-vec4 dimension is independent and non-degenerate:
             // candidate and exact-rollback processes never share a latch.
-            let vec4 = super::warmup_cache_msl_fnv_for(false, true);
+            let vec4 = super::warmup_cache_msl_fnv_for(false, true, false);
             assert_ne!(vec4, incumbent);
-            assert_ne!(super::warmup_cache_msl_fnv_for(true, true), candidate);
+            assert_ne!(
+                super::warmup_cache_msl_fnv_for(true, true, false),
+                candidate
+            );
             assert_eq!(
                 vec4,
                 incumbent
                     ^ super::fnv1a64(super::LEAF_VEC4_MSL_SOURCE).rotate_left(2)
                     ^ 0x4C45_4146_5F56_3431
             );
+        }
+
+        #[test]
+        fn reuse_source_and_mode_have_a_distinct_fingerprint() {
+            let g4 = super::warmup_cache_msl_fnv_for(true, false, false);
+            let g16 = super::warmup_cache_msl_fnv_for(true, false, true);
+            assert_ne!(g4, g16);
+            assert_eq!(
+                super::warmup_cache_msl_fnv_for(false, false, true),
+                super::warmup_cache_msl_fnv_for(false, false, false)
+            );
+            let source = super::from_z_reuse_msl_source();
+            assert!(source.starts_with("#define FLOCK_FROM_Z_REUSE_G16 1\n"));
+            assert!(source.contains("#pragma clang loop unroll(disable)"));
+            assert_eq!(source.matches("uint4 elems[NF]").count(), 1);
+            assert_eq!(source.matches("ZERO_BFLY(").count(), 8);
+            assert_eq!(source.matches("TAB_BFLY(").count(), 18);
         }
 
         #[test]
@@ -14054,6 +14256,184 @@ mod tests {
                 "GPU NTT mismatch at log_d={log_d} start={start_layer}"
             );
         }
+    }
+
+    /// Compare the full first-pass output before and after every input changes.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn from_z_reuse_output_oracle(log_d: usize) {
+        use super::imp;
+
+        assert!(
+            gpu_from_z_reuse_enabled(),
+            "oracle requires default reuse mode"
+        );
+        let gpu = imp::gpu().expect("reuse oracle requires real Metal");
+        assert!(
+            !gpu.pso_ntt4zg16_zero_root.is_null(),
+            "reuse PSO is required"
+        );
+        let g4_resources = unsafe { gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root) };
+        let g16_resources = unsafe { gpu.pipeline_resources(gpu.pso_ntt4zg16_zero_root) };
+        assert_eq!(g16_resources.0, 11_968);
+        assert_eq!(g16_resources.0, g4_resources.0);
+        assert_eq!(g16_resources.1, g4_resources.1);
+        assert!(
+            g16_resources.2 >= g4_resources.2,
+            "pipeline thread bound fell"
+        );
+        eprintln!("[from-z-reuse] g4={g4_resources:?} g16={g16_resources:?}");
+
+        let ntt = AdditiveNttF128::standard(log_d);
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let total_r = 1usize << (log_d - 4);
+        let mut rng = Rng::new(0xF10C_0016_A11C_0004);
+        let mut z = rng.vec(64 << (log_d - 1));
+        let mut expected = vec![F128::ZERO; 64 << log_d];
+        let data_bytes = core::mem::size_of_val(expected.as_slice());
+        let z_bytes = core::mem::size_of_val(z.as_slice());
+
+        unsafe {
+            let pool = gpu.pool_push();
+            let candidate = gpu.new_buffer(data_bytes).unwrap();
+            let incumbent = gpu.new_buffer(data_bytes).unwrap();
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            let z_buf = gpu.new_buffer(z_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            std::ptr::write_bytes(gpu.buffer_contents(candidate), 0xA5, data_bytes);
+            std::ptr::write_bytes(gpu.buffer_contents(incumbent), 0x5A, data_bytes);
+
+            for changed in [false, true] {
+                if changed {
+                    for value in &mut z {
+                        let delta = rng.f128();
+                        assert_ne!(delta, F128::ZERO);
+                        *value += delta;
+                    }
+                }
+                crate::pcs::commit::replicate_message_fill(&mut expected, &z);
+                ntt.forward_transform_interleaved_block_range(&mut expected, 64, 1, 4, 0, 2, 0);
+                if changed {
+                    let old = core::slice::from_raw_parts(
+                        gpu.buffer_contents(candidate).cast::<F128>(),
+                        expected.len(),
+                    );
+                    assert!(
+                        old.iter().zip(&expected).all(|(a, b)| a != b),
+                        "every output must change to detect stale writes"
+                    );
+                }
+                std::ptr::copy_nonoverlapping(
+                    z.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(z_buf),
+                    z_bytes,
+                );
+
+                // Reuse the same allocations without clearing the old output.
+                // Every changed-input output must be written again.
+                let ranges = if !changed {
+                    vec![total_r]
+                } else if log_d == 20 {
+                    vec![8192, 8192, 8192, 8192, 8192, 8192, 8192, 7168, 1024]
+                } else {
+                    vec![1024, total_r - 2048, 1024]
+                };
+                assert_eq!(ranges.iter().sum::<usize>(), total_r);
+                let expected_reuse = ranges
+                    .iter()
+                    .filter(|&&count| select_gpu_from_z_reuse(true, count, true))
+                    .count();
+                let before = imp::from_z_reuse_test_dispatches();
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                let mut r_start = 0;
+                for count in ranges {
+                    imp::encode_from_z_reuse_range_for_test(
+                        gpu, enc, candidate, tw_buf, z_buf, log_d, r_start, count,
+                    );
+                    r_start += count;
+                }
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                assert_eq!(
+                    imp::from_z_reuse_test_dispatches() - before,
+                    expected_reuse,
+                    "production encoder did not use the reuse PSO"
+                );
+
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, gpu.pso_ntt4zg4_zero_root);
+                gpu.set_buffer(enc, incumbent, 0, 0);
+                gpu.set_buffer(enc, tw_buf, 0, 1);
+                let p = imp::NttParams {
+                    log_d: log_d as u32,
+                    l: 0,
+                    f: 4,
+                    s: (log_d - 4) as u32,
+                };
+                let p_bytes = core::slice::from_raw_parts(
+                    (&p as *const imp::NttParams).cast::<u8>(),
+                    core::mem::size_of::<imp::NttParams>(),
+                );
+                gpu.set_bytes(enc, p_bytes, 2);
+                gpu.set_buffer(enc, z_buf, 0, 3);
+                gpu.dispatch(enc, (total_r / 4) as u64, 64);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+
+                let candidate_values = core::slice::from_raw_parts(
+                    gpu.buffer_contents(candidate).cast::<F128>(),
+                    expected.len(),
+                );
+                let incumbent_values = core::slice::from_raw_parts(
+                    gpu.buffer_contents(incumbent).cast::<F128>(),
+                    expected.len(),
+                );
+                let mismatch = candidate_values
+                    .iter()
+                    .zip(&expected)
+                    .position(|(a, b)| a != b);
+                assert!(
+                    mismatch.is_none(),
+                    "reuse changed={changed} mismatch={mismatch:?}"
+                );
+                let mismatch = incumbent_values
+                    .iter()
+                    .zip(&expected)
+                    .position(|(a, b)| a != b);
+                assert!(
+                    mismatch.is_none(),
+                    "g4 changed={changed} mismatch={mismatch:?}"
+                );
+                eprintln!(
+                    "[from-z-reuse] checked {data_bytes} bytes changed={changed} reuse-dispatches={expected_reuse}"
+                );
+            }
+            gpu.release(candidate);
+            gpu.release(incumbent);
+            gpu.release(tw_buf);
+            gpu.release(z_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_from_z_reuse_full_output_and_changed_input() {
+        from_z_reuse_output_oracle(17);
+    }
+
+    #[test]
+    #[ignore = "allocates multi-GiB ranked Metal and CPU buffers"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_from_z_reuse_ranked_full_output_and_changed_input() {
+        from_z_reuse_output_oracle(20);
     }
 
     /// Compact real-Metal oracle for the direct zero-root specialization. It
