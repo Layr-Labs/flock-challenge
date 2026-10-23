@@ -157,7 +157,8 @@ pub fn helper_pool() -> Option<&'static rayon::ThreadPool> {
 
 /// Don't engage the helper pool below this many chunks: tiny jobs (recursive
 /// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
-const EPOOL_MIN_CHUNKS: usize = 8;
+///
+const EPOOL_MIN_CHUNKS: usize = 4;
 
 /// Process chunks `0..n_chunks` exactly once each, in parallel, drawing from
 /// a shared atomic queue drained by the main rayon pool plus (when present
@@ -594,8 +595,12 @@ fn run_chunks_with_helper_relay<F>(
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => {
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
+            let helper_workers = n_chunks.min(ep.current_num_threads());
             let broadcast = || {
-                ep.broadcast(|_| {
+                ep.broadcast(|context| {
+                    if context.index() >= helper_workers {
+                        return;
+                    }
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= n_chunks {
@@ -669,8 +674,12 @@ fn run_chunks_with_helper_stateful_relay<S, I, F>(
     match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => {
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
+            let helper_workers = n_chunks.min(ep.current_num_threads());
             let broadcast = || {
-                ep.broadcast(|_| {
+                ep.broadcast(|context| {
+                    if context.index() >= helper_workers {
+                        return;
+                    }
                     let mut state = init();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
