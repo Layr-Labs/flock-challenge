@@ -4155,13 +4155,26 @@ mod tests {
         let commit_with = |z: &[F128], tail: usize| {
             let guard = ZeroOddTailLanes::scope(num_ntts, tail);
             let (commitment, data) = flock_core::pcs::commit(z, &setup.pcs_params);
-            let digest = |v: &[u8]| *::blake3::hash(v).as_bytes();
-            let cw: &[flock_core::field::F128] = &data.codeword;
+            let mut hasher = ::blake3::Hasher::new();
+            if let Some(cw) = data.codeword.canonical_slice() {
+                hasher.update(unsafe {
+                    std::slice::from_raw_parts(cw.as_ptr().cast::<u8>(), std::mem::size_of_val(cw))
+                });
+            } else {
+                let rows = data.codeword.rows();
+                for q in 0..rows.len() / num_ntts {
+                    let row = rows.row(q, num_ntts);
+                    hasher.update(unsafe {
+                        std::slice::from_raw_parts(
+                            row.as_ptr().cast::<u8>(),
+                            std::mem::size_of_val(row.as_slice()),
+                        )
+                    });
+                }
+            }
             let out = (
                 commitment.root,
-                digest(unsafe {
-                    std::slice::from_raw_parts(cw.as_ptr().cast::<u8>(), std::mem::size_of_val(cw))
-                }),
+                *hasher.finalize().as_bytes(),
                 data.merkle_tree.len(),
             );
             drop(data);
