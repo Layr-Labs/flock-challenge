@@ -293,6 +293,32 @@ fn is_recursive_l2_ntt_epool_shape(log_d: usize, num_ntts: usize, start_layer: u
         && start_layer == 3
 }
 
+/// Only the two recursive tails on the current 32-claim split may use the
+/// low-twiddle final pair. Earlier layers keep their single-layer kernels.
+#[inline]
+fn is_recursive_low_twiddle_final_pair_shape(
+    log_d: usize,
+    num_ntts: usize,
+    start_layer: usize,
+    n_top: usize,
+) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && num_ntts == 8
+        && n_top == 5
+        && matches!((log_d, start_layer), (18, 5) | (16, 6))
+}
+
+#[inline]
+fn recursive_low_twiddle_final_pair_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var("FLOCK_NO_RECURSIVE_NTT_LOW_FINAL_PAIR").is_ok_and(|value| value == "1")
+    });
+    *ON
+}
+
 // r1020 resample marker: AB redraw of 4912aee after the r1019 frontier control
 // landed in-band (−0.47%); comment-only delta versus the r1018 archive.
 /// The union gate for both recursive-commit epool shapes. Keep it separate
@@ -1690,10 +1716,8 @@ impl AdditiveNttF128 {
             });
     }
 
-    /// Execute one independently-owned deep sub-transform. Both the ordinary
-    /// Rayon partitioner and the recursive-L1 P+E queue call this exact loop,
-    /// so the candidate changes ownership/scheduling but no butterfly,
-    /// twiddle, or layer order.
+    /// Execute one independently-owned deep sub-transform. The recursive
+    /// 32-claim tails fuse only their final pair when its twiddles are low.
     #[inline(always)]
     fn forward_transform_interleaved_deep_subtree(
         &self,
@@ -1704,7 +1728,18 @@ impl AdditiveNttF128 {
         log_d: usize,
         sub_idx: usize,
     ) {
-        for layer in n_top.max(start_layer)..log_d {
+        let low_final_pair =
+            is_recursive_low_twiddle_final_pair_shape(log_d, num_ntts, start_layer, n_top)
+                && recursive_low_twiddle_final_pair_enabled()
+                && self.log_domain_size() == log_d
+                // Final layers use eval rows 1 and 0. Every twiddle is an
+                // XOR of these generators; check them to retain the generic
+                // path for custom bases with nonzero high limbs.
+                && self.evals[..2]
+                    .iter()
+                    .all(|row| row[1..].iter().all(|value| value.hi == 0));
+        let single_layer_end = if low_final_pair { log_d - 2 } else { log_d };
+        for layer in n_top.max(start_layer)..single_layer_end {
             let layer_in_sub = layer - n_top;
             let num_blocks_in_sub = 1usize << layer_in_sub;
             let block_size = 1usize << (log_d - layer);
@@ -1717,6 +1752,22 @@ impl AdditiveNttF128 {
                 let block_start = block_in_sub * block_bytes;
                 let block = &mut sub_data[block_start..block_start + block_bytes];
                 butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
+            }
+        }
+        if low_final_pair {
+            let layer = log_d - 2;
+            let num_blocks_in_sub = 1usize << (layer - n_top);
+            let block_elems = 4 * num_ntts;
+            for (block_in_sub, block) in sub_data.chunks_exact_mut(block_elems).enumerate() {
+                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
+                    block,
+                    self.twiddle(layer, global_block),
+                    self.twiddle(layer + 1, 2 * global_block),
+                    self.twiddle(layer + 1, 2 * global_block + 1),
+                    1,
+                    num_ntts,
+                );
             }
         }
     }
@@ -2741,6 +2792,105 @@ mod tests {
         assert!(!use_ranked_low_twiddle_final_pair(19, 64, 10));
         assert!(!use_ranked_low_twiddle_final_pair(20, 32, 10));
         assert!(!use_ranked_low_twiddle_final_pair(20, 64, 9));
+    }
+
+    #[test]
+    fn recursive_low_twiddle_final_pair_shape_is_narrow() {
+        let enabled_here = cfg!(all(
+            target_os = "macos",
+            target_arch = "aarch64",
+            target_feature = "aes"
+        ));
+        assert_eq!(
+            is_recursive_low_twiddle_final_pair_shape(18, 8, 5, 5),
+            enabled_here
+        );
+        assert_eq!(
+            is_recursive_low_twiddle_final_pair_shape(16, 8, 6, 5),
+            enabled_here
+        );
+        for (log_d, num_ntts, start_layer, n_top) in [
+            (18, 8, 4, 5),
+            (18, 8, 6, 5),
+            (16, 8, 5, 5),
+            (16, 8, 7, 5),
+            (17, 8, 5, 5),
+            (20, 64, 1, 10),
+            (18, 16, 5, 5),
+            (18, 8, 5, 4),
+            (16, 8, 6, 4),
+            (18, 8, 5, 6),
+        ] {
+            assert!(!is_recursive_low_twiddle_final_pair_shape(
+                log_d, num_ntts, start_layer, n_top,
+            ));
+        }
+    }
+
+    #[test]
+    fn recursive_low_twiddle_final_pair_tables_are_low() {
+        for log_d in [16, 18] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            for layer in log_d - 2..log_d {
+                for block in 0..1usize << layer {
+                    assert_eq!(
+                        ntt.twiddle(layer, block).hi,
+                        0,
+                        "log_d={log_d} layer={layer} block={block}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recursive_low_twiddle_final_pair_subtrees_match_scalar() {
+        const NUM_NTTS: usize = 8;
+        const N_TOP: usize = 5;
+        let mut rng = Rng::new(0x105F_1A1F_0018_0016);
+        for (log_d, start_layer) in [(18, 5), (16, 6)] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let mut got = rand_vec(&mut rng, (1usize << log_d) * NUM_NTTS);
+            let mut want = got.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut want, NUM_NTTS, start_layer);
+            let sub_elems = (1usize << (log_d - N_TOP)) * NUM_NTTS;
+            for (sub_idx, sub_data) in got.chunks_exact_mut(sub_elems).enumerate() {
+                ntt.forward_transform_interleaved_deep_subtree(
+                    sub_data, NUM_NTTS, start_layer, N_TOP, log_d, sub_idx,
+                );
+            }
+            assert_eq!(got, want, "log_d={log_d}");
+        }
+    }
+
+    #[test]
+    fn recursive_low_twiddle_final_pair_custom_basis_keeps_fallback() {
+        const LOG_D: usize = 16;
+        const NUM_NTTS: usize = 8;
+        const N_TOP: usize = 5;
+        const START_LAYER: usize = 6;
+        let mut basis: Vec<F128> = (0..LOG_D).map(|i| F128::new(1u64 << i, 0)).collect();
+        basis[LOG_D - 1] = F128::new(0, 1);
+        let custom = AdditiveNttF128::new(&basis);
+        assert!(
+            custom.evals[..2]
+                .iter()
+                .any(|row| row[1..].iter().any(|value| value.hi != 0))
+        );
+        let mut rng = Rng::new(0xF411_BAC0_0016_0008);
+        // A transform smaller than its NTT object uses different eval rows.
+        for ntt in [custom, AdditiveNttF128::standard(LOG_D + 2)] {
+            let mut got = rand_vec(&mut rng, (1usize << LOG_D) * NUM_NTTS);
+            let mut want = got.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut want, NUM_NTTS, START_LAYER);
+            let sub_elems = (1usize << (LOG_D - N_TOP)) * NUM_NTTS;
+            for (sub_idx, sub_data) in got.chunks_exact_mut(sub_elems).enumerate() {
+                ntt.forward_transform_interleaved_deep_subtree(
+                    sub_data, NUM_NTTS, START_LAYER, N_TOP, LOG_D, sub_idx,
+                );
+            }
+            assert_eq!(got, want);
+        }
     }
 
     /// Exercise five fused deep pairs with the ranked 1024-position subtree
