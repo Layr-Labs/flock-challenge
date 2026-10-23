@@ -36,11 +36,8 @@
 //! inside the pool it is waking). That used to be a fresh `std::thread::scope`
 //! + `spawn` per engaged drain — one OS thread created and joined every time.
 //! [`Relay`] replaces it with a single persistent thread that parks between
-//! drains, so an engaged drain costs a condvar signal instead of a thread
-//! lifecycle. `FLOCK_NO_EPOOL_RELAY=1` restores the per-drain spawn; so does
-//! any drain that finds the relay already carrying a concurrent one.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 use rayon::prelude::*;
@@ -238,17 +235,9 @@ impl JobPtr {
     }
 }
 
-#[derive(Default)]
-struct RelayState {
-    /// Job posted and not yet picked up.
-    job: Option<JobPtr>,
-    /// Jobs posted so far; a job's sequence number is `posted` after its post.
-    posted: u64,
-    /// Jobs the relay thread has finished.
-    done: u64,
-    /// Whether the most recently finished job unwound.
-    panicked: bool,
-}
+const _: () = assert!(
+    std::mem::size_of::<unsafe fn(*const ())>() == std::mem::size_of::<usize>()
+);
 
 /// The process-wide broadcast relay: one persistent thread that hands the
 /// helper pool a `broadcast` on request, so an engaged drain no longer creates
@@ -256,20 +245,23 @@ struct RelayState {
 /// — so it occupies neither pool, and it is created lazily on the first
 /// engaged drain, which on the ranked worker falls inside the untimed warm-up
 /// proof. A prove that engages no drain never creates it.
+///
 struct Relay {
-    state: Mutex<RelayState>,
-    /// Signalled on post (the relay waits on it) and on completion (the
-    /// posting drain waits on it).
-    signal: Condvar,
+    job_data: AtomicPtr<()>,
+    job_call: AtomicUsize,
+    posted: AtomicU64,
+    /// Jobs the relay thread has finished.
+    done: AtomicU64,
+    panicked: AtomicBool,
+    done_mu: Mutex<()>,
+    done_cv: Condvar,
+    thread: OnceLock<std::thread::Thread>,
     /// Held for the whole of one relayed drain. A concurrent (e.g. nested)
     /// drain that cannot take it falls back to the per-drain spawn rather than
     /// queueing behind this one.
     busy: AtomicBool,
 }
 
-/// A poisoned relay mutex must degrade to "keep running", never to a panic:
-/// the relay only ever holds it across bookkeeping, so its contents stay
-/// consistent even if some other thread unwound while waiting.
 fn relay_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -277,8 +269,14 @@ fn relay_lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl Relay {
     fn new() -> Self {
         Self {
-            state: Mutex::new(RelayState::default()),
-            signal: Condvar::new(),
+            job_data: AtomicPtr::new(std::ptr::null_mut()),
+            job_call: AtomicUsize::new(0),
+            posted: AtomicU64::new(0),
+            done: AtomicU64::new(0),
+            panicked: AtomicBool::new(false),
+            done_mu: Mutex::new(()),
+            done_cv: Condvar::new(),
+            thread: OnceLock::new(),
             busy: AtomicBool::new(false),
         }
     }
@@ -296,45 +294,57 @@ impl Relay {
     /// `job` must stay valid until [`Relay::wait_done`] has returned for the
     /// sequence number this call yields.
     unsafe fn post(&self, job: JobPtr) -> u64 {
-        let seq = {
-            let mut st = relay_lock(&self.state);
-            st.job = Some(job);
-            st.posted += 1;
-            st.panicked = false;
-            st.posted
-        };
-        self.signal.notify_all();
+        self.job_data.store(job.data.cast_mut(), Ordering::Relaxed);
+        self.job_call.store(job.call as usize, Ordering::Relaxed);
+        let seq = self.posted.fetch_add(1, Ordering::Release) + 1;
+        if let Some(thread) = self.thread.get() {
+            thread.unpark();
+        }
         seq
     }
 
     /// Block until the relay thread has finished job `seq`; reports whether
     /// that job unwound.
     fn wait_done(&self, seq: u64) -> bool {
-        let mut st = relay_lock(&self.state);
-        while st.done < seq {
-            st = self
-                .signal
-                .wait(st)
+        if self.done.load(Ordering::Acquire) >= seq {
+            return self.panicked.load(Ordering::Acquire);
+        }
+        let mut guard = relay_lock(&self.done_mu);
+        while self.done.load(Ordering::Acquire) < seq {
+            guard = self
+                .done_cv
+                .wait(guard)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-        st.panicked
+        self.panicked.load(Ordering::Acquire)
+    }
+
+    ///
+    fn wait_posted(&self, seen: u64) -> u64 {
+        for _ in 0..128 {
+            let seq = self.posted.load(Ordering::Acquire);
+            if seq != seen {
+                return seq;
+            }
+            std::hint::spin_loop();
+        }
+        loop {
+            let seq = self.posted.load(Ordering::Acquire);
+            if seq != seen {
+                return seq;
+            }
+            std::thread::park();
+        }
     }
 
     /// Relay thread body: park until a job arrives, run it, report completion.
     fn run(&self) -> ! {
+        let mut seen = 0u64;
         loop {
-            let job = {
-                let mut st = relay_lock(&self.state);
-                loop {
-                    if let Some(job) = st.job.take() {
-                        break job;
-                    }
-                    st = self
-                        .signal
-                        .wait(st)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
-            };
+            let seq = self.wait_posted(seen);
+            let data = self.job_data.load(Ordering::Relaxed) as *const ();
+            let call_bits = self.job_call.load(Ordering::Relaxed);
+            let call = unsafe { std::mem::transmute::<usize, unsafe fn(*const ())>(call_bits) };
             // SAFETY: the posting drain blocks in `PostedJob::drop` until
             // `done` reaches this job's sequence, so the closure and every
             // frame it borrows are still live for the whole call. Unwinding is
@@ -343,15 +353,16 @@ impl Relay {
             // `PostedJob::drop` re-raises on the poster's own thread (the
             // per-drain scope did the same).
             let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                (job.call)(job.data);
+                call(data);
             }))
             .is_ok();
+            seen = seq;
             {
-                let mut st = relay_lock(&self.state);
-                st.done += 1;
-                st.panicked = !ok;
+                let _guard = relay_lock(&self.done_mu);
+                self.panicked.store(!ok, Ordering::Relaxed);
+                self.done.store(seq, Ordering::Release);
+                self.done_cv.notify_one();
             }
-            self.signal.notify_all();
         }
     }
 }
@@ -369,7 +380,10 @@ fn relay() -> Option<&'static Relay> {
             .name("flock-epool-relay".to_string())
             .spawn(move || relay.run())
             .ok()
-            .map(|_handle| relay)
+            .map(|handle| {
+                let _ = relay.thread.set(handle.thread().clone());
+                relay
+            })
     })
 }
 
@@ -402,8 +416,6 @@ impl Drop for PostedJob<'_> {
 /// WAKE ORDER. The relay path requests the broadcast from *inside* the
 /// main-pool `for_each` body, ahead of that worker's own drain loop, so no
 /// E-worker can be woken until a main-pool worker has already entered the
-/// drain — and the signal still has to travel through the mutex, the condvar,
-/// the relay's wake-up and rayon's broadcast injection before one runs. The
 /// per-drain-spawn arm below issues its `spawn` *before* `drain_main` is even
 /// called. The relay therefore starts the helper strictly no earlier, relative
 /// to the main drain, than the shape it replaces; it only removes the thread
