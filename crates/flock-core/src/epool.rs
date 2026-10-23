@@ -14,8 +14,9 @@
 //!
 //! - the main pool is untouched — same width, same QoS, same kernels;
 //! - a separate lazily-built pool of `hw.perflevel1.logicalcpu` threads at
-//!   `QOS_CLASS_UTILITY` (the scheduler places these on E-cores while the
-//!   higher-QoS main workers own the P-cores);
+//!   `QOS_CLASS_USER_INITIATED` at relative priority −15 (the scheduler spills
+//!   these onto the E-cores while the higher-priority main workers own the
+//!   P-cores; see [`set_helper_qos`]);
 //! - ordinary phases hand work to it through [`run_hetero_chunks`], a shared
 //!   atomic chunk queue drained by both pools. The ranked NTT-to-Merkle path
 //!   instead streams finalized cache chunks through its own bounded queue so
@@ -98,22 +99,33 @@ fn ecore_count() -> usize {
         .unwrap_or(0)
 }
 
-/// Tag the current thread `QOS_CLASS_UTILITY` (Darwin value `0x11`). Utility
-/// work is scheduled onto efficiency cores while `USER_INITIATED` (`0x19`,
-/// the main pool) threads occupy the performance cores. Best-effort: QoS is a
-/// scheduling hint and a failure must not affect correctness.
+/// Tag a helper thread `QOS_CLASS_USER_INITIATED` (`0x19`) at the lowest
+/// relative priority (−15).
+///
+/// Helpers used to run at `QOS_CLASS_UTILITY` (`0x11`), the band macOS system
+/// daemons (indexing, scanning, backup) share. Every hetero drain waits for
+/// the chunk a helper has claimed, so a helper time-sliced against such a
+/// daemon stalls the whole drain for a scheduler quantum. Official runs show
+/// exactly that signature: the first two workers of a job prove in ~146 ms,
+/// then a system-service window holds every later worker near 180–200 ms
+/// until it ends, when the same job snaps back to ~146 ms. The user-initiated
+/// band outranks those daemons; −15 keeps helpers below the main pool's
+/// workers (relative priority 0) whenever both want the same core, while the
+/// four helpers still spill onto the E-cluster beside the ten-thread main
+/// pool. Best-effort: QoS is a scheduling hint and a failure must not affect
+/// correctness.
 #[cfg(target_os = "macos")]
-fn set_utility_qos() {
+fn set_helper_qos() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
     unsafe {
-        let _ = pthread_set_qos_class_self_np(0x11, 0);
+        let _ = pthread_set_qos_class_self_np(0x19, -15);
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn set_utility_qos() {}
+fn set_helper_qos() {}
 
 fn build_epool() -> Option<rayon::ThreadPool> {
     let n = ecore_count();
@@ -123,7 +135,7 @@ fn build_epool() -> Option<rayon::ThreadPool> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(n)
         .thread_name(|i| format!("flock-ecore-{i}"))
-        .start_handler(|_| set_utility_qos())
+        .start_handler(|_| set_helper_qos())
         .build()
         .ok()
 }
@@ -148,8 +160,8 @@ pub fn helper_pool_available() -> bool {
 
 /// The efficiency-core helper pool itself, for callers that overlap a small
 /// best-effort task with main-pool work via `in_place_scope` (e.g. the
-/// prover's publish-prefix pre-encode alongside the PCS open). Tasks run at
-/// `QOS_CLASS_UTILITY` on E-cores and must not affect output bytes — the
+/// prover's publish-prefix pre-encode alongside the PCS open). Tasks run on
+/// the helper threads (see [`set_helper_qos`]) and must not affect output bytes — the
 /// caller owns a fallback for `None` (off-target hosts).
 pub fn helper_pool() -> Option<&'static rayon::ThreadPool> {
     epool()
