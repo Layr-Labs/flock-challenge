@@ -11472,10 +11472,6 @@ kernel void zc_r2_products(
     /// calibration, is the binding constraint on both hosts. Moving to
     /// `15·hi/16` takes the balanced solution's remaining reachable ground
     /// while keeping the straggle threshold (0.617) above the ranked ratio.
-    /// Deliberately *not* uncapped: at `hi` the threshold falls to
-    /// `1-0.45 = 0.55`, which is **below** the 0.57 measured on the ranked
-    /// M3 Max, so full offload would make the GPU the straggler.
-    ///
     /// Ratios in `(2, 8)`: the probe's equality oracle has already proven
     /// the kernel exact on this machine, so a slow-looking GPU gets a floor
     /// share of `hi/8` instead of 0 — the GPU only becomes the straggler at
@@ -11485,6 +11481,7 @@ kernel void zc_r2_products(
     /// processes while every admitted process posts record p10s). Ratio ≥ 8
     /// or unusable ⇒ 0 = exact incumbent.
     const ZC_R2_ALPHA: f64 = 0.55;
+    const ZC_R2_FULL_OFFLOAD_MAX_RATIO: f64 = 0.275;
     const ZC_R2_MAX_RATIO: f64 = 2.0;
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
@@ -11499,7 +11496,12 @@ kernel void zc_r2_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
-        (g as usize).min(hi_size * 15 / 16)
+        let cap = if ratio <= ZC_R2_FULL_OFFLOAD_MAX_RATIO {
+            hi_size
+        } else {
+            hi_size * 15 / 16
+        };
+        (g as usize).min(cap)
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
@@ -11926,7 +11928,7 @@ kernel void zc_r2_products(
             // 1/8 probe that shipped there.
             (hi_size / 16).clamp(8, 128)
         } else {
-            tuned.min(hi_size * 15 / 16)
+            tuned.min(hi_size)
         };
         if chunks == 0 {
             return None;
@@ -12427,8 +12429,8 @@ kernel void zc_t3_products(
     /// balanced form `(hi - (1-ALPHA) g) c_f = g u_g` ⇒
     /// `g* = hi/(ratio + 0.35)`; same 7·hi/8 overshoot cap, same hi/8
     /// admission floor for ratios in (2, 8), same ≥ 8 disable (ticket-26
-    /// clamp-audit law, instance five).
     const ZC_T3_ALPHA: f64 = 0.65;
+    const ZC_T3_FULL_OFFLOAD_MAX_RATIO: f64 = 0.325;
     const ZC_T3_MAX_RATIO: f64 = 2.0;
     const ZC_T3_FLOOR_MAX_RATIO: f64 = 8.0;
 
@@ -12443,7 +12445,12 @@ kernel void zc_t3_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_T3_ALPHA))).round();
-        (g as usize).min(hi_size * 7 / 8)
+        let cap = if ratio <= ZC_T3_FULL_OFFLOAD_MAX_RATIO {
+            hi_size
+        } else {
+            hi_size * 7 / 8
+        };
+        (g as usize).min(cap)
     }
 
     fn zc_t3_init(gpu: &'static Gpu) -> Result<ZcT3, String> {
@@ -12668,7 +12675,7 @@ kernel void zc_t3_products(
             // halved. 64 chunks still price the kernel stably.
             (hi_size / 32).clamp(8, 64)
         } else {
-            tuned.min(hi_size * 7 / 8)
+            tuned.min(hi_size)
         };
         if chunks == 0 {
             return None;
@@ -13110,8 +13117,8 @@ kernel void zc_loop_products(
     /// Fold-only CPU work is the four constant-multiplier folds of the
     /// fused chunk's eight muls per pair: ALPHA = 0.5 ⇒
     /// `g* = hi/(ratio + 0.5)`; same 7·hi/8 overshoot cap, hi/8 admission
-    /// floor for ratio ∈ (2, 8), ≥ 8 disable.
     const ZC_LOOP_ALPHA: f64 = 0.5;
+    const ZC_LOOP_FULL_OFFLOAD_MAX_RATIO: f64 = 0.25;
     const ZC_LOOP_MAX_RATIO: f64 = 2.0;
     const ZC_LOOP_FLOOR_MAX_RATIO: f64 = 8.0;
 
@@ -13126,7 +13133,12 @@ kernel void zc_loop_products(
             return 0;
         }
         let g = (hi_size as f64 / (ratio + (1.0 - ZC_LOOP_ALPHA))).round();
-        (g as usize).min(hi_size * 7 / 8)
+        let cap = if ratio <= ZC_LOOP_FULL_OFFLOAD_MAX_RATIO {
+            hi_size
+        } else {
+            hi_size * 7 / 8
+        };
+        (g as usize).min(cap)
     }
 
     fn zc_loop_init(gpu: &'static Gpu) -> Result<ZcLoop, String> {
@@ -13349,7 +13361,7 @@ kernel void zc_loop_products(
             // halved. 64 chunks still price the kernel stably.
             (hi_size / 32).clamp(8, 64)
         } else {
-            tuned.min(hi_size * 7 / 8)
+            tuned.min(hi_size)
         };
         if chunks == 0 {
             return None;
@@ -15617,6 +15629,9 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // The guard still binds before the GPU can straggle: at 15/16 the
         // crossover is (1-0.45·15/16)/(15/16) ≈ 0.617, above the ranked 0.57.
         assert!(zc_r2_gate_share(0.62, 2048) < 2048);
+        assert_eq!(zc_r2_gate_share(0.125, 2048), 2048);
+        assert_eq!(zc_r2_gate_share(0.275, 2048), 2048);
+        assert_eq!(zc_r2_gate_share(0.28, 2048), 1920);
         // Slow-but-usable GPU: the formula takes over below the cap.
         assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
         assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
