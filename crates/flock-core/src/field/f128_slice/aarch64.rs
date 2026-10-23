@@ -508,6 +508,68 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+/// Checked-padding counterpart of the 64-bank pair kernel. The caller
+/// proves second-slot banks 57..63 and the high bits of bank 56 are zero.
+/// It uses 362 PMULL rather than 384, with the same paired final reduction.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_slots2_padding_15409(
+    weight: &[F128; 64],
+    input: &[F128],
+) -> [F128; 2] {
+    unsafe {
+        debug_assert!(input.len() >= 128);
+        let zero = vdupq_n_u64(0);
+        let mut first = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut second = first;
+        let w = weight.as_ptr();
+        let x = input.as_ptr();
+        let mut bank = 0usize;
+        while bank < 56 {
+            let w0 = vld1q_u64(w.add(bank).cast::<u64>());
+            let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
+            let x00 = vld1q_u64(x.add(bank).cast::<u64>());
+            let x10 = vld1q_u64(x.add(64 + bank).cast::<u64>());
+            let x01 = vld1q_u64(x.add(bank + 1).cast::<u64>());
+            let x11 = vld1q_u64(x.add(65 + bank).cast::<u64>());
+            xor_karatsuba_const_pair(&mut first, &mut second, x00, x10, w0);
+            xor_karatsuba_const_pair(&mut first, &mut second, x01, x11, w1);
+            bank += 2;
+        }
+        for bank in 56..64 {
+            let wk = vld1q_u64(w.add(bank).cast::<u64>());
+            let first_x = vld1q_u64(x.add(bank).cast::<u64>());
+            let w_mid = veorq_u64(wk, vextq_u64::<1>(wk, wk));
+            let first_mid = veorq_u64(first_x, vextq_u64::<1>(first_x, first_x));
+            let first_ll = pmull(vgetq_lane_u64::<0>(first_x), vgetq_lane_u64::<0>(wk));
+            let first_hh = transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(first_x),
+                vreinterpretq_p64_u64(wk),
+            ));
+            let first_mm = pmull(vgetq_lane_u64::<0>(first_mid), vgetq_lane_u64::<0>(w_mid));
+            first.ll = veorq_u64(first.ll, first_ll);
+            first.hh = veorq_u64(first.hh, first_hh);
+            first.mm = veorq_u64(first.mm, first_mm);
+            if bank == 56 {
+                // The second input has no high limb. Its hh product is zero
+                // and its Karatsuba middle input equals its low limb.
+                let second_lo = (*x.add(120)).lo;
+                second.ll = veorq_u64(second.ll, pmull(second_lo, vgetq_lane_u64::<0>(wk)));
+                second.mm = veorq_u64(second.mm, pmull(second_lo, vgetq_lane_u64::<0>(w_mid)));
+            }
+        }
+        let reduced = reduce_wide_pair(karatsuba_to_wide(first), karatsuba_to_wide(second));
+        [
+            transmute::<uint64x2_t, F128>(reduced[0]),
+            transmute::<uint64x2_t, F128>(reduced[1]),
+        ]
+    }
+}
+
 /// Fixed 128-bank by 64-lane bank-major fold for the ranked zerocheck AB
 /// completion. Adjacent lanes share a weight load; six raw Karatsuba
 /// components stay live across the complete bank scan, followed by one

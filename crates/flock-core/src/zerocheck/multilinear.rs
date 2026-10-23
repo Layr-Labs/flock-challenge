@@ -92,10 +92,11 @@ use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
     fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8, fold_compact_stream_chunk_neon,
-    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_lookahead_8,
-    fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
-    fold2_and_message_aarch64, fold2_and_message_lookahead_aarch64,
-    fold2_compact_and_round4_chunk_neon_8, fold2_compact_and_round45_chunk_neon_8,
+    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_horner_8,
+    fold_round2_compact_chunk_neon_lookahead_8, fold_round2_compact_chunk_neon_unchecked_8,
+    fold_round2_compact_stream_chunk_neon, fold2_and_message_aarch64,
+    fold2_and_message_lookahead_aarch64, fold2_compact_and_round4_chunk_neon_8,
+    fold2_compact_and_round45_chunk_neon_8,
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::{
@@ -136,6 +137,20 @@ fn r2_degen_enabled() -> bool {
 #[cfg(target_arch = "aarch64")]
 fn r2_periodic_padding_enabled() -> bool {
     std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
+}
+
+#[cfg(target_arch = "aarch64")]
+fn round2_horner_table_is_linear(table: &UniSkipFoldTable) -> bool {
+    if table.n_chunks != 8 || table.data.len() != 8 * 256 {
+        return false;
+    }
+    table.data.chunks_exact(256).all(|bank| {
+        bank[0] == F128::ZERO
+            && (1usize..256).all(|value| {
+                let low_bit = value & value.wrapping_neg();
+                bank[value] == bank[value ^ low_bit] + bank[low_bit]
+            })
+    })
 }
 
 /// Kill switch for adopting the round-two GPU arm's odd-parity products as the
@@ -1779,6 +1794,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let degen = r2_degen_enabled();
     #[cfg(target_arch = "aarch64")]
     let periodic_padding = r2_periodic_padding_enabled();
+    #[cfg(target_arch = "aarch64")]
+    let horner_weights = m == 32
+        && lo_size == 1 << 14
+        && pair_in_block_mask == 127
+        && useful_pairs_inclusive == 121
+        && periodic_padding
+        && mlv_challenges[3..7]
+            == crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash();
 
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
@@ -1807,6 +1830,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let odd_on_gpu = false;
+    // Check the current table once. It stays immutably borrowed through the
+    // sweep; a later phase must check again even if it reuses the same address.
+    #[cfg(target_arch = "aarch64")]
+    let horner_linear_table = odd_on_gpu && horner_weights && round2_horner_table_is_linear(table);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -1856,6 +1883,38 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         periodic_padding,
                         out.as_mut_ptr(),
                     );
+                } else if odd_on_gpu && horner_weights {
+                    if horner_linear_table {
+                        fold_round2_compact_chunk_neon_horner_8::<true>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            out.as_mut_ptr(),
+                        );
+                    } else {
+                        fold_round2_compact_chunk_neon_horner_8::<false>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            out.as_mut_ptr(),
+                        );
+                    }
                 } else if odd_on_gpu {
                     fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
                         t,

@@ -149,6 +149,42 @@ pub(crate) fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+/// Try the exact BLAKE3-shaped pair: 64 full fields in the first slot,
+/// 56 full fields plus one 49-bit field in the second slot. Actual values,
+/// rather than geometry alone, establish the seven zero fields and width.
+/// Every call checks fresh input bytes; a mismatch retains the full fold.
+#[inline]
+pub(crate) fn try_fold_banked_slots2_padding_15409(
+    weight: &[F128; 64],
+    input: &[F128],
+) -> Option<[F128; 2]> {
+    assert!(input.len() >= 128);
+    if input[120].hi != 0
+        || input[120].lo >> 49 != 0
+        || input[121..128].iter().any(|value| !value.is_zero())
+    {
+        return None;
+    }
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg supplies PMULL and the checks above prove every
+    // omitted high bit and field is zero for this exact input pair.
+    unsafe {
+        Some(aarch64::fold_banked_slots2_padding_15409(weight, input))
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let mut first = super::F256Unreduced::ZERO;
+        let mut second = super::F256Unreduced::ZERO;
+        for bank in 0..64 {
+            first ^= weight[bank].mul_unreduced(input[bank]);
+        }
+        for bank in 0..57 {
+            second ^= weight[bank].mul_unreduced(input[64 + bank]);
+        }
+        Some([first.reduce(), second.reduce()])
+    }
+}
+
 /// Fold the ranked zerocheck AB bank matrix, laid out bank-major, into its
 /// 64 lane sums. Two adjacent lanes share each of the 128 weight loads, and
 /// each lane's complete product sum is reduced only once.
@@ -588,6 +624,78 @@ mod tests {
             let actual = round0_factorized_eq(&f, &eq_tail);
             assert_eq!(actual, expected, "tail_len={tail_len}");
         }
+    }
+
+    #[test]
+    fn fold8_padding_matches_full_for_zero_tail_and_random_weights() {
+        let mut seed = 0x5041_4444_4544_3634u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for trial in 0..32 {
+            let weights: [F128; 64] = core::array::from_fn(|_| F128::new(next(), next()));
+            let mut input: [F128; 128] = core::array::from_fn(|_| F128::new(next(), next()));
+            input[120] = F128::new(input[120].lo & ((1u64 << 49) - 1), 0);
+            input[121..128].fill(F128::ZERO);
+            if trial == 0 {
+                input.fill(F128::ZERO);
+            }
+            if trial == 1 {
+                input[120] = F128::new(1u64 << 48, 0);
+            }
+            let expected = fold_banked_slots2::<64>(&weights, &input);
+            assert_eq!(
+                try_fold_banked_slots2_padding_15409(&weights, &input),
+                Some(expected)
+            );
+            let scalar = |offset| {
+                (0..64).fold(F128::ZERO, |sum, bank| {
+                    sum + weights[bank] * input[offset + bank]
+                })
+            };
+            assert_eq!(expected, [scalar(0), scalar(64)]);
+        }
+    }
+
+    #[test]
+    fn fold8_padding_checks_nonzero_tail_and_fresh_input() {
+        let weights = core::array::from_fn(|i| F128::new(i as u64 + 1, 0x5041_44));
+        let mut input = [F128::ZERO; 128];
+        let address = input.as_ptr();
+        for index in 121..128 {
+            for value in [F128::ONE, F128::new(0, 1u64 << 63)] {
+                input[index] = value;
+                assert!(try_fold_banked_slots2_padding_15409(&weights, &input).is_none());
+                input[index] = F128::ZERO;
+                assert!(try_fold_banked_slots2_padding_15409(&weights, &input).is_some());
+            }
+        }
+        for value in [
+            F128::new(1u64 << 49, 0),
+            F128::new(1u64 << 63, 0),
+            F128::new(0, 1),
+        ] {
+            input[120] = value;
+            assert!(try_fold_banked_slots2_padding_15409(&weights, &input).is_none());
+        }
+        input[120] = F128::new((1u64 << 49) - 1, 0);
+        input[0] = F128::new(0x1234, 0x5678);
+        input[119] = F128::new(u64::MAX, u64::MAX);
+        assert_eq!(input.as_ptr(), address);
+        assert_eq!(
+            try_fold_banked_slots2_padding_15409(&weights, &input),
+            Some(fold_banked_slots2::<64>(&weights, &input)),
+        );
+        input.fill(F128::new(u64::MAX, u64::MAX));
+        assert!(try_fold_banked_slots2_padding_15409(&weights, &input).is_none());
+        input.fill(F128::ZERO);
+        assert_eq!(
+            try_fold_banked_slots2_padding_15409(&weights, &input),
+            Some([F128::ZERO; 2])
+        );
     }
 
     #[test]
