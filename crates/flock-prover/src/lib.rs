@@ -22,7 +22,7 @@ pub mod merkle_path;
 pub mod proof_io;
 pub mod prover;
 pub mod r1cs_hashes;
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(target_os = "macos")]
 pub mod recycle_alloc;
 pub mod seed_pipe;
 
