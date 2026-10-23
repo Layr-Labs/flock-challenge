@@ -69,8 +69,7 @@ unsafe fn xor3(
 
 /// GHASH multiply with both operands and the result held in q registers.
 ///
-/// Same algorithm as [`crate::field::gf2_128::aarch64::ghash_mul_binius`] —
-/// four schoolbook PMULLs and the two-stage recursive reduction — but it
+/// Three Karatsuba PMULLs and the two-stage recursive Binius reduction. It
 /// neither accepts nor returns an `F128`, so no lane ever moves to a
 /// general-purpose register on the way in or out. `vmull_high_p64` reads the
 /// high lanes in place, so the operand extraction the scalar form needs
@@ -85,19 +84,13 @@ unsafe fn mul_q(
         let zero = vdupq_n_u64(0);
 
         let t0 = pmull_ll(a, b);
-        let t1a = core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
-            vgetq_lane_u64::<0>(a),
-            vgetq_lane_u64::<1>(b),
-        ));
-        let t1b = core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
-            vgetq_lane_u64::<1>(a),
-            vgetq_lane_u64::<0>(b),
-        ));
         let t2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
             vreinterpretq_p64_u64(a),
             vreinterpretq_p64_u64(b),
         ));
-        let t1_cross = veorq_u64(t1a, t1b);
+        let a_sum = veorq_u64(a, vextq_u64::<1>(a, a));
+        let b_sum = veorq_u64(b, vextq_u64::<1>(b, b));
+        let t1_cross = xor3(pmull_ll(a_sum, b_sum), t0, t2);
 
         // t1 += x^64 · t2 (mod p): {0, t2.lo} places t2.lo into t1.hi.
         let t1 = xor3(
@@ -112,6 +105,55 @@ unsafe fn mul_q(
             vextq_u64::<1>(zero, t1),
             pmull_87(vgetq_lane_u64::<1>(t1)),
         )
+    }
+}
+
+#[cfg(test)]
+mod mul_tests {
+    use super::mul_q;
+    use crate::field::{F128, gf2_128::software};
+    use core::arch::aarch64::*;
+
+    fn check(a: F128, b: F128) {
+        // This module is compiled only with AES enabled. The independent
+        // software oracle uses bitwise polynomial multiplication.
+        let actual = unsafe {
+            let aq = vld1q_u64((&raw const a).cast::<u64>());
+            let bq = vld1q_u64((&raw const b).cast::<u64>());
+            core::mem::transmute::<uint64x2_t, F128>(mul_q(aq, bq))
+        };
+        assert_eq!(actual, software::ghash_mul(a, b), "a={a:?}, b={b:?}");
+    }
+
+    #[test]
+    fn karatsuba_binius_q_matches_software_basis_and_adversarial() {
+        // Both maps are bilinear over F2. Every basis pair therefore checks
+        // every product coefficient, including both reduction boundaries.
+        for i in 0..128 {
+            for j in 0..128 {
+                let a = 1u128 << i;
+                let b = 1u128 << j;
+                check(
+                    F128::new(a as u64, (a >> 64) as u64),
+                    F128::new(b as u64, (b >> 64) as u64),
+                );
+            }
+        }
+
+        let values = [
+            F128::ZERO,
+            F128::ONE,
+            F128::new(u64::MAX, 0),
+            F128::new(0, u64::MAX),
+            F128::new(u64::MAX, u64::MAX),
+            F128::new(0, 1 << 63),
+            F128::new(0x5555_5555_5555_5555, 0xaaaa_aaaa_aaaa_aaaa),
+        ];
+        for a in values {
+            for b in values {
+                check(a, b);
+            }
+        }
     }
 }
 
@@ -260,8 +302,8 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
 
         // Two 8 KiB staging tiles (8 rows × ≤64 lanes × 16 B): L1-resident,
         // written per lane, read back once for the sequential row bursts.
-        let mut stage0 = [F128 { lo: 0, hi: 0 }; 512];
-        let mut stage1 = [F128 { lo: 0, hi: 0 }; 512];
+        let mut stage0 = [core::mem::MaybeUninit::<F128>::uninit(); 512];
+        let mut stage1 = [core::mem::MaybeUninit::<F128>::uninit(); 512];
 
         let off = r * num_ntts;
         let step = eighth * num_ntts;
@@ -405,7 +447,7 @@ unsafe fn butterfly_fused_3layer_from_src_row_impl<const ZERO_ROOT: bool>(
         }
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        let mut stage = [F128 { lo: 0, hi: 0 }; 64];
+        let mut stage = [core::mem::MaybeUninit::<F128>::uninit(); 64];
         let off = r * num_ntts;
         let step = eighth * num_ntts;
 

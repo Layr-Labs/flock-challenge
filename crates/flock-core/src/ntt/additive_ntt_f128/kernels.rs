@@ -579,6 +579,73 @@ mod aarch64_row_tests {
         }
     }
 
+    /// The staged dual-source row must match the scalar chain for both
+    /// output blocks, including the last store pair and unused stage tail.
+    #[test]
+    fn neon_dual_from_message_rows_match_portable() {
+        let mut state = 0x4455_414C_5F53_5243;
+        let guard = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        let poison0 = F128::new(0xa5a5_a5a5_a5a5_a5a5, 0x5a5a_5a5a_5a5a_5a5a);
+        let poison1 = F128::new(0x3c3c_3c3c_3c3c_3c3c, 0xc3c3_c3c3_c3c3_c3c3);
+        for eighth in [1usize, 3] {
+            for num_ntts in [2usize, 62, 64] {
+                for zero_input in [false, true] {
+                    let (mut src, t_zero) = fixture(&mut state, eighth, num_ntts, true);
+                    let t_gen = core::array::from_fn(|_| rand_f128(&mut state));
+                    if zero_input {
+                        src.fill(F128::ZERO);
+                    }
+                    let len = src.len();
+                    src.insert(0, guard);
+                    src.push(guard);
+                    let mut got0 = vec![poison0; len + 2];
+                    let mut got1 = vec![poison1; len + 2];
+                    let mut want0 = got0.clone();
+                    let mut want1 = got1.clone();
+                    for r in 0..eighth {
+                        got0.fill(poison0);
+                        got1.fill(poison1);
+                        want0.fill(poison0);
+                        want1.fill(poison1);
+                        // SAFETY: each disjoint allocation holds the full
+                        // 8 * eighth * num_ntts geometry plus two guards.
+                        // F128 keeps the offset pointers 16-byte aligned;
+                        // r < eighth, num_ntts is even and <= 64, and the
+                        // fixture sets t_zero[0], [1], and [3] to zero.
+                        unsafe {
+                            portable::butterfly_fused_3layer_dual_from_src_row(
+                                src.as_ptr().add(1),
+                                want0.as_mut_ptr().add(1),
+                                want1.as_mut_ptr().add(1),
+                                eighth,
+                                num_ntts,
+                                r,
+                                &t_zero,
+                                &t_gen,
+                            );
+                            aarch64::butterfly_fused_3layer_dual_from_src_row(
+                                src.as_ptr().add(1),
+                                got0.as_mut_ptr().add(1),
+                                got1.as_mut_ptr().add(1),
+                                eighth,
+                                num_ntts,
+                                r,
+                                &t_zero,
+                                &t_gen,
+                            );
+                        }
+                        let case = (eighth, num_ntts, r, zero_input);
+                        assert_eq!(got0, want0, "zero-root block, case={case:?}");
+                        assert_eq!(got1, want1, "general block, case={case:?}");
+                        assert_eq!((got0[0], got0[len + 1]), (poison0, poison0));
+                        assert_eq!((got1[0], got1[len + 1]), (poison1, poison1));
+                        assert_eq!((src[0], src[len + 1]), (guard, guard));
+                    }
+                }
+            }
+        }
+    }
+
     /// The vector-resident deep fused-pair kernel must be **bit-identical**
     /// to the portable `F128`-typed chain across the row widths the ranked
     /// deep transform uses (`num_ntts = 64` rows) plus narrow/odd widths.

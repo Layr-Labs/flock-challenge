@@ -2251,8 +2251,14 @@ pub(crate) mod witgen_simd {
             let maxv = vdupq_n_u32(u32::MAX);
             // b prefix words 0..36 = MAX (the out_lo slot is MAX too — the
             // scalar writes MAX over MAX, so b needs no out_lo pass).
-            for w in 0..36usize {
-                vst1q_u32(bs.add(w) as *mut u32, maxv);
+            if elide[2] {
+                for w in 32..36usize {
+                    vst1q_u32(bs.add(w) as *mut u32, maxv);
+                }
+            } else {
+                for w in 0..36usize {
+                    vst1q_u32(bs.add(w) as *mut u32, maxv);
+                }
             }
             // Message region words 16..36: word16 = 1|m0<<1, then
             // word16+k = chain[k-1]>>31 | chain[k]<<1 over
@@ -2374,15 +2380,35 @@ pub(crate) mod witgen_simd {
             wa.finish();
             wb.finish();
 
-            // ---- zero fill, words 482..512 (finish() 241..256 semantics) ----
+            // Zero only stage words that the selected drain reads. Token-hit
+            // z/a drains end at word 488; a token-hit b drain ends at 472,
+            // before this zero suffix. Cold and independent misses retain
+            // all their zero words. No stage pointer escapes this builder.
             const ZF: usize = USEFUL_BITS.div_ceil(32); // 482
+            const ZERO_READ_END: usize = 8 * ELIDE_ZERO_CHUNK; // 488
             const {
                 assert!(U32_PER_BLOCK - ZF == 30);
+                assert!(ZF < ZERO_READ_END && ZERO_READ_END <= U32_PER_BLOCK);
+                assert!(8 * ELIDE_B_TAIL_CHUNK <= ZF);
             }
-            for w in 0..30usize {
-                vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
+            for w in ZF..ZERO_READ_END {
+                vst1q_u32(zs.add(w) as *mut u32, zero);
+                vst1q_u32(ast.add(w) as *mut u32, zero);
+            }
+            if !elide[0] {
+                for w in ZERO_READ_END..U32_PER_BLOCK {
+                    vst1q_u32(zs.add(w) as *mut u32, zero);
+                }
+            }
+            if !elide[1] {
+                for w in ZERO_READ_END..U32_PER_BLOCK {
+                    vst1q_u32(ast.add(w) as *mut u32, zero);
+                }
+            }
+            if !elide[2] {
+                for w in ZF..U32_PER_BLOCK {
+                    vst1q_u32(bs.add(w) as *mut u32, zero);
+                }
             }
 
             // ---- out_lo slot, words 8..16 (z/a only) ----
@@ -4155,13 +4181,26 @@ mod tests {
         let commit_with = |z: &[F128], tail: usize| {
             let guard = ZeroOddTailLanes::scope(num_ntts, tail);
             let (commitment, data) = flock_core::pcs::commit(z, &setup.pcs_params);
-            let digest = |v: &[u8]| *::blake3::hash(v).as_bytes();
-            let cw: &[flock_core::field::F128] = &data.codeword;
+            let mut hasher = ::blake3::Hasher::new();
+            if let Some(cw) = data.codeword.canonical_slice() {
+                hasher.update(unsafe {
+                    std::slice::from_raw_parts(cw.as_ptr().cast::<u8>(), std::mem::size_of_val(cw))
+                });
+            } else {
+                let rows = data.codeword.rows();
+                for q in 0..rows.len() / num_ntts {
+                    let row = rows.row(q, num_ntts);
+                    hasher.update(unsafe {
+                        std::slice::from_raw_parts(
+                            row.as_ptr().cast::<u8>(),
+                            std::mem::size_of_val(row.as_slice()),
+                        )
+                    });
+                }
+            }
             let out = (
                 commitment.root,
-                digest(unsafe {
-                    std::slice::from_raw_parts(cw.as_ptr().cast::<u8>(), std::mem::size_of_val(cw))
-                }),
+                *hasher.finalize().as_bytes(),
                 data.merkle_tree.len(),
             );
             drop(data);
@@ -4535,8 +4574,12 @@ mod tests {
         };
         // Per-block kernel equality, all independently selectable store modes.
         for (z_nt, ab_nt) in [(false, false), (false, true), (true, false), (true, true)] {
-            for _ in 0..8 {
-                let inputs: [Compression; 4] = std::array::from_fn(|_| mk(&mut rng));
+            for case in 0..8 {
+                let inputs: [Compression; 4] = match case {
+                    0 => [([0; 8], [0; 16], 0, 0, 0); 4],
+                    1 => [([u32::MAX; 8], [u32::MAX; 16], u64::MAX, u32::MAX, u32::MAX); 4],
+                    _ => std::array::from_fn(|_| mk(&mut rng)),
+                };
                 let mut zq = [u64::MAX; 4 * WORDS];
                 let mut aq = [u64::MAX; 4 * WORDS];
                 let mut bq = [u64::MAX; 4 * WORDS];
@@ -4599,28 +4642,46 @@ mod tests {
                         }
                     }
                 };
-                let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
-                let mut ae = ze;
-                let mut be = ze;
-                seed_consts(&mut ze, false);
-                seed_consts(&mut ae, false);
-                seed_consts(&mut be, true);
-                unsafe {
-                    witgen_simd::build_quad_witness_ab_stream_neon_elide(
-                        witgen_simd::QuadInput::Blocks([
-                            &inputs[0], &inputs[1], &inputs[2], &inputs[3],
-                        ]),
-                        ze.as_mut_ptr() as *mut u32,
-                        ae.as_mut_ptr() as *mut u32,
-                        be.as_mut_ptr() as *mut u32,
-                        z_nt,
-                        ab_nt,
-                        [true; 3],
-                    );
+                for reuse_previous in [false, true] {
+                    for mask in 0..8 {
+                        let mut ze = [0xA5A5_A5A5_A5A5_A5A5u64; 4 * WORDS];
+                        let mut ae = ze;
+                        let mut be = ze;
+                        if reuse_previous {
+                            let previous: [Compression; 4] = std::array::from_fn(|_| mk(&mut rng));
+                            unsafe {
+                                witgen_simd::build_quad_witness_ab_stream_neon(
+                                    [&previous[0], &previous[1], &previous[2], &previous[3]],
+                                    ze.as_mut_ptr() as *mut u32,
+                                    ae.as_mut_ptr() as *mut u32,
+                                    be.as_mut_ptr() as *mut u32,
+                                    z_nt,
+                                    ab_nt,
+                                );
+                            }
+                        } else {
+                            seed_consts(&mut ze, false);
+                            seed_consts(&mut ae, false);
+                            seed_consts(&mut be, true);
+                        }
+                        unsafe {
+                            witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                                witgen_simd::QuadInput::Blocks([
+                                    &inputs[0], &inputs[1], &inputs[2], &inputs[3],
+                                ]),
+                                ze.as_mut_ptr() as *mut u32,
+                                ae.as_mut_ptr() as *mut u32,
+                                be.as_mut_ptr() as *mut u32,
+                                z_nt,
+                                ab_nt,
+                                [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0],
+                            );
+                        }
+                        assert_eq!(ze, zq, "elided z diverged z_nt={z_nt} ab_nt={ab_nt}");
+                        assert_eq!(ae, aq, "elided a diverged z_nt={z_nt} ab_nt={ab_nt}");
+                        assert_eq!(be, bq, "elided b diverged z_nt={z_nt} ab_nt={ab_nt}");
+                    }
                 }
-                assert_eq!(ze, zq, "elided z diverged z_nt={z_nt} ab_nt={ab_nt}");
-                assert_eq!(ae, aq, "elided a diverged z_nt={z_nt} ab_nt={ab_nt}");
-                assert_eq!(be, bq, "elided b diverged z_nt={z_nt} ab_nt={ab_nt}");
             }
         }
         // Driver equality incl. padding slots and the stripe.

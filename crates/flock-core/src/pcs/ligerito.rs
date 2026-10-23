@@ -30,6 +30,7 @@
 //!    c. Else: commit f^{i+2}, open f^{i+1}, induce next basis, glue.
 
 // r498 archive identity: preserve optimized dispatch while awaiting validator turnover.
+use super::commit::CodewordRows;
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
@@ -6847,6 +6848,31 @@ fn materialize_direct_fold8(
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
+    let checked_padding = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && packed_witness.len() == 1usize << 25
+        && ordinary_basis.is_empty()
+        && claims.len() == 2
+        && claims
+            .first()
+            .is_some_and(|claim| claim.eq_lo.len() == 2048)
+        && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PADDING").as_deref()
+            != Some(std::ffi::OsStr::new("1"));
+    materialize_direct_fold8_impl(
+        packed_witness,
+        ordinary_basis,
+        claims,
+        challenges,
+        checked_padding,
+    )
+}
+
+fn materialize_direct_fold8_impl(
+    packed_witness: Vec<F128>,
+    ordinary_basis: Vec<F128>,
+    claims: &[super::ring_switch::DirectFold8Factors],
+    challenges: [F128; 6],
+    checked_padding: bool,
+) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
 
     assert!(!claims.is_empty());
@@ -6932,10 +6958,18 @@ fn materialize_direct_fold8(
         if pair_fold64 {
             while slot + 1 < block_len {
                 let base = 64 * slot;
-                let folded_f = crate::field::f128_slice::fold_banked_slots2::<64>(
-                    &fold_weight,
-                    &f_in[base..base + 128],
-                );
+                let input_pair = &f_in[base..base + 128];
+                let padded = if checked_padding {
+                    crate::field::f128_slice::try_fold_banked_slots2_padding_15409(
+                        &fold_weight,
+                        input_pair,
+                    )
+                } else {
+                    None
+                };
+                let folded_f = padded.unwrap_or_else(|| {
+                    crate::field::f128_slice::fold_banked_slots2::<64>(&fold_weight, input_pair)
+                });
                 f_out[slot] = folded_f[0];
                 f_out[slot + 1] = folded_f[1];
 
@@ -8182,12 +8216,12 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
 /// basis with no single `z`), runs `initial_k` real sumcheck rounds folding
 /// both `f` and `b` together with FS challenges. The folded f becomes wtns_1
 /// and the rest of the protocol proceeds identically.
-pub fn recursive_prover_with_basis<Ch: Challenger>(
+pub fn recursive_prover_with_basis<'a, Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     b_initial: Vec<F128>,
     target: F128,
-    l0_codeword: &[F128],
+    l0_codeword: impl Into<CodewordRows<'a>>,
     l0_tree: &[Hash],
     challenger: &mut Ch,
 ) -> LigeritoProof {
@@ -8196,7 +8230,7 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
         packed_witness,
         b_initial,
         target,
-        l0_codeword,
+        l0_codeword.into(),
         l0_tree,
         None,
         None,
@@ -8217,12 +8251,12 @@ pub fn recursive_prover_with_basis<Ch: Challenger>(
 /// side effect while building `b_initial` — passing them in here lets
 /// `SumcheckProver::new` skip the redundant 256 MB read pass over (f, b1).
 #[allow(clippy::too_many_arguments)]
-pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
+pub fn recursive_prover_with_basis_precomputed_round0<'a, Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     b_initial: Vec<F128>,
     target: F128,
-    l0_codeword: &[F128],
+    l0_codeword: impl Into<CodewordRows<'a>>,
     l0_tree: &[Hash],
     round0_uv: (F128, F128),
     round1_lookahead: Option<[F128; 6]>,
@@ -8233,7 +8267,7 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
         packed_witness,
         b_initial,
         target,
-        l0_codeword,
+        l0_codeword.into(),
         l0_tree,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
@@ -8254,13 +8288,13 @@ pub fn recursive_prover_with_basis_precomputed_round0<Ch: Challenger>(
 /// that stays on the incumbent materialized path (currently C); `direct`
 /// contains only the AB sufficient statistics.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
+pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<'a, Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     direct: Vec<super::ring_switch::DirectFold2Factors>,
     target: F128,
-    l0_codeword: &[F128],
+    l0_codeword: impl Into<CodewordRows<'a>>,
     l0_tree: &[Hash],
     round0_uv: (F128, F128),
     round1_lookahead: [F128; 6],
@@ -8271,7 +8305,7 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
         packed_witness,
         ordinary_basis,
         target,
-        l0_codeword,
+        l0_codeword.into(),
         l0_tree,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
@@ -8293,13 +8327,13 @@ pub(crate) fn recursive_prover_with_basis_direct_ab_fold2<Ch: Challenger>(
 /// entirely from `direct` product matrices; after four sequential FS samples
 /// the state is materialized at N/16 and rejoins the incumbent final fold2.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
+pub(crate) fn recursive_prover_with_basis_direct_fold4<'a, Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     direct: Vec<super::ring_switch::DirectFold4Factors>,
     target: F128,
-    l0_codeword: &[F128],
+    l0_codeword: impl Into<CodewordRows<'a>>,
     l0_tree: &[Hash],
     round0_uv: (F128, F128),
     round1_lookahead: [F128; 6],
@@ -8316,7 +8350,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
         packed_witness,
         ordinary_basis,
         target,
-        l0_codeword,
+        l0_codeword.into(),
         l0_tree,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
@@ -8339,13 +8373,13 @@ pub(crate) fn recursive_prover_with_basis_direct_fold4<Ch: Challenger>(
 /// resumes — the fold2 pair of the fold4 route never runs (the 2^21 and
 /// 2^20 states never exist).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
+pub(crate) fn recursive_prover_with_basis_direct_fold8<'a, Ch: Challenger>(
     config: &ProverConfig,
     packed_witness: Vec<F128>,
     ordinary_basis: Vec<F128>,
     direct: Vec<super::ring_switch::DirectFold8Factors>,
     target: F128,
-    l0_codeword: &[F128],
+    l0_codeword: impl Into<CodewordRows<'a>>,
     l0_tree: &[Hash],
     round0_uv: (F128, F128),
     challenger: &mut Ch,
@@ -8359,7 +8393,7 @@ pub(crate) fn recursive_prover_with_basis_direct_fold8<Ch: Challenger>(
         packed_witness,
         ordinary_basis,
         target,
-        l0_codeword,
+        l0_codeword.into(),
         l0_tree,
         Some(SumcheckMessage {
             u_0: round0_uv.0,
@@ -8382,7 +8416,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     packed_witness: Vec<F128>,
     b_initial: Vec<F128>,
     target: F128,
-    l0_codeword: &[F128],
+    l0_codeword: CodewordRows<'_>,
     l0_tree: &[Hash],
     first_msg: Option<SumcheckMessage>,
     round1_lookahead: Option<[F128; 6]>,
@@ -8452,10 +8486,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let initial_root: Hash = l0_tree[l0_tree.len() - 1];
     let l0_block_len = block_len_0;
     let l0_num_interleaved = num_interleaved_0;
-    let l0_row = |q: usize| -> &[F128] {
-        let start = q * l0_num_interleaved;
-        &l0_codeword[start..start + l0_num_interleaved]
-    };
     challenger.observe_bytes(&initial_root);
 
     // L0 takes no explicit OOD samples: it is bound by the opening's own
@@ -8827,7 +8857,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         use rayon::prelude::*;
         // Indexed parallel collect is order-preserving: bit-identical to
         // the serial map; each row copy is independent of the challenger.
-        queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect()
+        queries_0
+            .par_iter()
+            .map(|&q| l0_codeword.row(q, l0_num_interleaved))
+            .collect()
     };
     let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
     if trace {
@@ -14804,6 +14837,58 @@ mod tests {
                     .enumerate()
                     .all(|(index, &value)| index == 5 || value == F128::ZERO)
             );
+        }
+    }
+
+    #[test]
+    fn direct_fold8_padding_materialization_matches_full() {
+        use crate::challenger::Challenger;
+
+        let mut rng = crate::challenger::RandomChallenger::new(0x5041_4444_4544_4638);
+        for instances in [2usize, 32, 2048] {
+            let out_len = 2 * instances;
+            let block_len = out_len.min(2048);
+            let claims: Vec<super::super::ring_switch::DirectFold8Factors> = (0..2)
+                .map(|_| super::super::ring_switch::DirectFold8Factors {
+                    eq_lo: rng.sample_f128_vec(block_len),
+                    eq_hi: rng.sample_f128_vec(out_len / block_len),
+                    a_state: Vec::new(),
+                    w_state: rng.sample_f128_vec(256),
+                    round0: (F128::ZERO, F128::ZERO),
+                })
+                .collect();
+            let challenges: [F128; 6] = core::array::from_fn(|_| rng.sample_f128());
+            let mut input = rng.sample_f128_vec(128 * instances);
+            let check = |input: &[F128]| {
+                let control = materialize_direct_fold8_impl(
+                    input.to_vec(),
+                    Vec::new(),
+                    &claims,
+                    challenges,
+                    false,
+                );
+                let candidate = materialize_direct_fold8_impl(
+                    input.to_vec(),
+                    Vec::new(),
+                    &claims,
+                    challenges,
+                    true,
+                );
+                assert_eq!(candidate, control);
+            };
+            check(&input); // Fully dense data must use the exact fallback.
+            for instance in input.chunks_exact_mut(128) {
+                instance[120] = F128::new(instance[120].lo & ((1u64 << 49) - 1), 0);
+                instance[121..128].fill(F128::ZERO);
+            }
+            check(&input); // Every pair uses the shorter path on native ARM.
+            input[127] = F128::new(0, 1);
+            check(&input); // One nonzero tail must not be omitted.
+            input[127] = F128::ZERO;
+            input[120] = F128::new(1u64 << 49, 0);
+            check(&input); // A nonzero bit above the partial-word limit.
+            input.fill(F128::ZERO);
+            check(&input);
         }
     }
 
