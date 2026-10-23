@@ -156,11 +156,69 @@ pub struct ProverData {
 
 /// Storage for the L0 codeword. Normally a pooled `Vec` (CPU commit); with
 /// the GPU commit latched on it is a view into the process-persistent Metal
-/// staging buffer instead (unified memory — CPU reads during the open are
-/// ordinary cached reads). Derefs to `[F128]` either way.
+/// staging buffer instead. `rows()` restores requested canonical rows from
+/// a pending GPU stage. `canonical_slice()` exposes a slice only when the
+/// complete buffer is canonical.
 pub enum CodewordBuf {
     Cpu(Vec<F128>),
     Gpu(crate::gpu_commit::GpuCodeword),
+}
+
+/// Borrowed canonical row access without exposing pending GPU stages as a slice.
+#[derive(Clone, Copy)]
+pub enum CodewordRows<'a> {
+    Dense(&'a [F128]),
+    Gpu(&'a crate::gpu_commit::GpuCodeword),
+}
+
+impl<'a> From<&'a [F128]> for CodewordRows<'a> {
+    fn from(values: &'a [F128]) -> Self {
+        Self::Dense(values)
+    }
+}
+
+impl<'a> From<&'a Vec<F128>> for CodewordRows<'a> {
+    fn from(values: &'a Vec<F128>) -> Self {
+        Self::Dense(values)
+    }
+}
+
+impl<'a> From<&'a CodewordBuf> for CodewordRows<'a> {
+    fn from(values: &'a CodewordBuf) -> Self {
+        values.rows()
+    }
+}
+
+impl CodewordRows<'_> {
+    pub fn len(self) -> usize {
+        match self {
+            Self::Dense(v) => v.len(),
+            Self::Gpu(g) => g.len(),
+        }
+    }
+
+    pub fn row(self, index: usize, width: usize) -> Vec<F128> {
+        match self {
+            Self::Dense(values) => values[index * width..(index + 1) * width].to_vec(),
+            Self::Gpu(g) => g.row(index, width),
+        }
+    }
+}
+
+impl CodewordBuf {
+    pub fn rows(&self) -> CodewordRows<'_> {
+        match self {
+            Self::Cpu(v) => CodewordRows::Dense(v),
+            Self::Gpu(g) => CodewordRows::Gpu(g),
+        }
+    }
+
+    pub fn canonical_slice(&self) -> Option<&[F128]> {
+        match self {
+            Self::Cpu(v) => Some(v),
+            Self::Gpu(g) => g.canonical_slice(),
+        }
+    }
 }
 
 /// Storage for the L0 Merkle tree. Ranked GPU commitments leave the tree in
