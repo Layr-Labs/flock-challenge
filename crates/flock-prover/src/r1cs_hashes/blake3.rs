@@ -2045,27 +2045,24 @@ pub(crate) mod witgen_simd {
     /// The three row values retain their irrelevant bit 31. [`W32::push`]
     /// consumes only the low 31 bits and overwrites that dirty boundary bit,
     /// removing two vector masks from every one of the 336 additions.
+    ///
     #[inline(always)]
     fn add_carry_parts_v(x: V4, y: V4) -> (V4, V4, V4, V4) {
         unsafe {
             let sum = vaddq_u32(x, y);
-            let cin = veorq_u32(veorq_u32(sum, x), y);
-            let left = veorq_u32(x, cin);
-            let right = veorq_u32(y, cin);
+            let left = veorq_u32(sum, y);
+            let right = veorq_u32(sum, x);
             let carry = vandq_u32(left, right);
             (sum, left, right, carry)
         }
     }
 
-    /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR; shr/shl/or is
-    /// exact bitwise. M = 32 − N is spelled out at the call site (stable
-    /// Rust cannot derive const arguments from const parameters).
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
         unsafe {
             let v = veorq_u32(x, y);
-            vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+            vsliq_n_u32::<M>(vshrq_n_u32::<N>(v), v)
         }
     }
 
@@ -2250,9 +2247,14 @@ pub(crate) mod witgen_simd {
             }
             let maxv = vdupq_n_u32(u32::MAX);
             // b prefix words 0..36 = MAX (the out_lo slot is MAX too — the
-            // scalar writes MAX over MAX, so b needs no out_lo pass).
-            for w in 0..36usize {
-                vst1q_u32(bs.add(w) as *mut u32, maxv);
+            if elide[2] {
+                for w in (ELIDE_B_PREFIX_CHUNKS * 8)..36usize {
+                    vst1q_u32(bs.add(w) as *mut u32, maxv);
+                }
+            } else {
+                for w in 0..36usize {
+                    vst1q_u32(bs.add(w) as *mut u32, maxv);
+                }
             }
             // Message region words 16..36: word16 = 1|m0<<1, then
             // word16+k = chain[k-1]>>31 | chain[k]<<1 over
@@ -2262,18 +2264,13 @@ pub(crate) mod witgen_simd {
                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
                 m[13], m[14], m[15], tlo, thi, blen, flags,
             ];
-            vst1q_u32(
-                zs.add(16) as *mut u32,
-                vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
-            );
+            let w16 = vsliq_n_u32::<1>(one, chain[0]);
+            vst1q_u32(zs.add(16) as *mut u32, w16);
+            vst1q_u32(ast.add(16) as *mut u32, w16);
             for k in 1..20usize {
-                let w = vorrq_u32(vshrq_n_u32::<31>(chain[k - 1]), vshlq_n_u32::<1>(chain[k]));
+                let w = vsliq_n_u32::<1>(vshrq_n_u32::<31>(chain[k - 1]), chain[k]);
                 vst1q_u32(zs.add(16 + k) as *mut u32, w);
-            }
-            // a's message region equals z's.
-            for w in 16..36usize {
-                let v = vld1q_u32(zs.add(w) as *const u32);
-                vst1q_u32(ast.add(w) as *mut u32, v);
+                vst1q_u32(ast.add(16 + k) as *mut u32, w);
             }
 
             // ---- G stream (bits 1153..15409): sequential push network ----
@@ -2378,11 +2375,33 @@ pub(crate) mod witgen_simd {
             const ZF: usize = USEFUL_BITS.div_ceil(32); // 482
             const {
                 assert!(U32_PER_BLOCK - ZF == 30);
+                assert!(8 * ELIDE_ZERO_CHUNK >= ZF && 8 * ELIDE_ZERO_CHUNK < U32_PER_BLOCK);
+                assert!(8 * ELIDE_B_TAIL_CHUNK <= ZF);
             }
-            for w in 0..30usize {
-                vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
-                vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
+            const ZTAIL: usize = U32_PER_BLOCK - ZF;
+            const ZTAIL_ELIDED: usize = 8 * ELIDE_ZERO_CHUNK - ZF;
+            if elide[0] {
+                for w in 0..ZTAIL_ELIDED {
+                    vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
+                }
+            } else {
+                for w in 0..ZTAIL {
+                    vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
+                }
+            }
+            if elide[1] {
+                for w in 0..ZTAIL_ELIDED {
+                    vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
+                }
+            } else {
+                for w in 0..ZTAIL {
+                    vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
+                }
+            }
+            if !elide[2] {
+                for w in 0..ZTAIL {
+                    vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
+                }
             }
 
             // ---- out_lo slot, words 8..16 (z/a only) ----
