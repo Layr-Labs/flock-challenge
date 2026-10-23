@@ -128,7 +128,7 @@ pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
     #[cfg(target_arch = "aarch64")]
     {
         let _ = (a_col, b_col);
-        aarch64::shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<FAST_POLICY>(
+        aarch64::shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<FAST_POLICY, true>(
             a_packed,
             b_packed,
             inv_table,

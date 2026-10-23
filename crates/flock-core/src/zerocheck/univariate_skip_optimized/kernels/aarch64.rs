@@ -2978,7 +2978,10 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
     static_b_context: Option<StaticBContext>,
     nt_store: bool,
 ) {
-    shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<{ super::AB_FAST_POLICY_PROCESS }>(
+    shift_reduce_inner_ab_fused_neon_checked_with_fast_policy::<
+        { super::AB_FAST_POLICY_PROCESS },
+        false,
+    >(
         a_packed,
         b_packed,
         inv_table,
@@ -3006,7 +3009,10 @@ fn fast_shift_reduce_with_policy<const FAST_POLICY: u8>() -> bool {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FAST_POLICY: u8>(
+pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<
+    const FAST_POLICY: u8,
+    const TRUST_B: bool,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -3185,7 +3191,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         // branch inside one.
         let handled = enabled
             && if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                shift_reduce_inner_ab_bstatic::<true>(
+                shift_reduce_inner_ab_bstatic::<true, TRUST_B>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -3197,7 +3203,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     nt_store,
                 )
             } else {
-                shift_reduce_inner_ab_bstatic::<false>(
+                shift_reduce_inner_ab_bstatic::<false, TRUST_B>(
                     a_packed,
                     b_packed,
                     inv_table,

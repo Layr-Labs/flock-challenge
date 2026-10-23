@@ -4919,14 +4919,14 @@ mod tests {
                             );
                             let mut slow = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false>(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<false, false>(
                                     &a_packed, &b, &table, 0, b_med, w, context, &mut slow, false,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
                             );
                             let mut fast = [0u8; 64];
                             assert!(
-                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true>(
+                                kernels::aarch64::shift_reduce_inner_ab_bstatic::<true, false>(
                                     &a_packed, &b, &table, 0, b_med, w, context, &mut fast, true,
                                 ),
                                 "arm (w={w}, b_med={b_med}) must be live"
