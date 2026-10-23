@@ -1122,6 +1122,13 @@ mod from_z_zero_root_gate_tests {
 /// incumbent h8 kernel as a same-binary control.
 pub const ENV_NO_GPU_MIXED_FINAL: &str = "FLOCK_NO_GPU_MIXED_FINAL";
 
+/// Restore dense GPU continuation kernels when the value is exactly `1`.
+pub const ENV_NO_GPU_ZERO_TAIL: &str = "FLOCK_NO_GPU_ZERO_TAIL";
+
+fn gpu_zero_tail_enabled() -> bool {
+    std::env::var_os(ENV_NO_GPU_ZERO_TAIL).as_deref() != Some(std::ffi::OsStr::new("1"))
+}
+
 /// Exact-`1` control for keeping the warmup's ranked z allocation bound to
 /// its retained Metal no-copy view across later proves.
 pub const ENV_NO_GPU_Z_PIN: &str = "FLOCK_NO_GPU_Z_PIN";
@@ -1502,7 +1509,23 @@ pub unsafe fn begin_from_z_first_pass_stream(
     z_len: usize,
     params: &crate::pcs::commit::PcsParams,
 ) -> Option<FromZFirstPassStream> {
-    unsafe { imp::begin_from_z_first_pass_stream(z_ptr, z_len, params) }
+    unsafe { imp::begin_from_z_first_pass_stream(z_ptr, z_len, params, 0) }
+        .map(|inner| FromZFirstPassStream { inner })
+}
+
+/// Stream a witness with trailing zero lanes at every odd source position.
+///
+/// # Safety
+/// The allocation and publication rules of [`begin_from_z_first_pass_stream`]
+/// apply. The last `zero_odd_tail` lanes of each odd source position must be
+/// zero. The stream captures this count before witness publication.
+pub unsafe fn begin_from_z_first_pass_stream_with_zero_odd_tail(
+    z_ptr: *mut F128,
+    z_len: usize,
+    params: &crate::pcs::commit::PcsParams,
+    zero_odd_tail: usize,
+) -> Option<FromZFirstPassStream> {
+    unsafe { imp::begin_from_z_first_pass_stream(z_ptr, z_len, params, zero_odd_tail) }
         .map(|inner| FromZFirstPassStream { inner })
 }
 
@@ -3697,6 +3720,95 @@ kernel void blake3_pow_scan(
     // Context: device, queue, pipelines. Created once per process.
     // -----------------------------------------------------------------------
 
+    /// Use the incumbent field arithmetic and table builders verbatim. Only
+    /// the zero-lane data work changes; every thread still builds tables and
+    /// reaches every threadgroup barrier.
+    fn zero_tail_msl_source() -> String {
+        fn replace(source: &mut String, from: &str, to: &str) {
+            assert_eq!(source.matches(from).count(), 1);
+            *source = source.replacen(from, to, 1);
+        }
+        let common = MSL_SOURCE.split("kernel void ntt_fused(").next().unwrap();
+        let mut grouped = MSL_SOURCE
+            .split("// One f=4 sub-layer:")
+            .nth(1)
+            .unwrap()
+            .split("// Half-footprint variant")
+            .next()
+            .unwrap()
+            .to_owned();
+        // The first split removes a comment marker, so start at the macro.
+        grouped = grouped[grouped.find("#define NTT_G4_B16_SUBLAYER").unwrap()..].to_owned();
+        let mut final_pass = MSL_SOURCE
+            .split("// a * x^4 mod P.")
+            .nth(1)
+            .unwrap()
+            .split("// From-z first pass:")
+            .next()
+            .unwrap()
+            .to_owned();
+        for source in [&mut grouped, &mut final_pass] {
+            replace(
+                source,
+                "constant NttParams& P             [[buffer(2)]],",
+                "constant NttParams& P             [[buffer(2)]],\n                             constant uint& odd_tail [[buffer(4)]],",
+            );
+        }
+        replace(
+            &mut grouped,
+            "for (uint bb = 0; bb < BPER; bb++) {",
+            "if (active_lane) { for (uint bb = 0; bb < BPER; bb++) {",
+        );
+        replace(&mut grouped, "elems[ev] ^= nu;", "elems[ev] ^= nu; }");
+        replace(
+            &mut grouped,
+            "const uint r = r_base + rr;",
+            "const uint r = r_base + rr;\n        const bool active_lane = (r & 1u) == 0u || lane < 64u - odd_tail;",
+        );
+        replace(
+            &mut grouped,
+            "elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];",
+            "elems[e] = active_lane ? data[((pos_base + (e << P.s)) << 6) + lane] : uint4(0u);",
+        );
+        replace(
+            &mut grouped,
+            "data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];",
+            "if (active_lane) data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];",
+        );
+        replace(
+            &mut final_pass,
+            "for (uint bb = 0; bb < BPER; bb++) {",
+            "for (uint bb = 0; bb < BPER; bb++) { if (!active_lane && (bb & 1u)) continue;",
+        );
+        replace(
+            &mut final_pass,
+            "const uint lane = lid & 63u;",
+            "const uint lane = lid & 63u;\n    const bool active_lane = lane < 64u - odd_tail;",
+        );
+        replace(
+            &mut final_pass,
+            "elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];",
+            "elems[e] = (active_lane || (e & 1u) == 0u) ? data[((pos_base + (e << P.s)) << 6) + lane] : uint4(0u);",
+        );
+        replace(
+            &mut final_pass,
+            "uint c = eu >> (F - j);",
+            "if (!active_lane) {\n                if (j == 3u) { elems[ev] = elems[eu]; continue; }\n                if (eu & 1u) continue;\n            }\n            uint c = eu >> (F - j);",
+        );
+        format!("{common}\n{grouped}\n{final_pass}")
+    }
+
+    fn gpu_zero_tail_selected(gpu: &Gpu, log_d: usize, tail: usize, share_log: usize) -> bool {
+        log_d == 20
+            && (1..64).contains(&tail)
+            && share_log == 2
+            && super::gpu_zero_tail_enabled()
+            && super::pass_tune_enabled()
+            && super::gpu_mixed_final_enabled()
+            && !gpu.pso_ntt4g4_zero_tail.is_null()
+            && !gpu.pso_ntt5mix_zero_tail.is_null()
+    }
+
     pub(crate) struct Gpu {
         pub(crate) api: Api,
         pub(crate) device: Id,
@@ -3719,6 +3831,8 @@ kernel void blake3_pow_scan(
         pub(crate) pso_export_from_z_zero_root_tabs: Id,
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_ntt5mix: Id,
+        pub(crate) pso_ntt4g4_zero_tail: Id,
+        pub(crate) pso_ntt5mix_zero_tail: Id,
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
         pub(crate) pso_parent3: Id,
@@ -3891,6 +4005,76 @@ kernel void blake3_pow_scan(
                         p
                     }
                 };
+
+                let (pso_ntt4g4_zero_tail, pso_ntt5mix_zero_tail) =
+                    if cfg!(test) || super::gpu_zero_tail_enabled() {
+                        (|| -> Result<(Id, Id), String> {
+                            let src = api.nsstring(&zero_tail_msl_source())?;
+                            let mut err: Id = NIL;
+                            let library: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                                device,
+                                c"newLibraryWithSource:options:error:",
+                                src,
+                                NIL,
+                                &mut err
+                            );
+                            if library.is_null() {
+                                return Err(format!("zero-tail shader: {}", api.error_string(err)));
+                            }
+                            let build = |name: &str| -> Result<Id, String> {
+                                let ns = api.nsstring(name)?;
+                                let f: Id = send!(
+                                    api,
+                                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                                    library,
+                                    c"newFunctionWithName:",
+                                    ns
+                                );
+                                if f.is_null() {
+                                    return Err(format!("zero-tail kernel {name} missing"));
+                                }
+                                let mut err: Id = NIL;
+                                let p: Id = send!(
+                                    api,
+                                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                    device,
+                                    c"newComputePipelineStateWithFunction:error:",
+                                    f,
+                                    &mut err
+                                );
+                                send!(api, unsafe extern "C" fn(Id, Sel), f, c"release");
+                                if p.is_null() {
+                                    return Err(api.error_string(err));
+                                }
+                                Ok(p)
+                            };
+                            let first = build("ntt_fused_reg4g4");
+                            let second = if first.is_ok() {
+                                build("ntt_pass5_mixed")
+                            } else {
+                                Err("first pipeline failed".into())
+                            };
+                            send!(api, unsafe extern "C" fn(Id, Sel), library, c"release");
+                            match (first, second) {
+                                (Ok(a), Ok(b)) => Ok((a, b)),
+                                (Ok(a), Err(e)) => {
+                                    send!(api, unsafe extern "C" fn(Id, Sel), a, c"release");
+                                    Err(e)
+                                }
+                                (Err(e), _) => Err(e),
+                            }
+                        })()
+                        .unwrap_or_else(|e| {
+                            if super::gpu_zero_tail_enabled() {
+                                eprintln!("[gpu-commit] {e}; dense continuation");
+                            }
+                            (NIL, NIL)
+                        })
+                    } else {
+                        (NIL, NIL)
+                    };
 
                 // Keep the embedded incumbent metallib byte-for-byte intact.
                 // The exact rollback skips this supplemental compile and
@@ -4247,6 +4431,8 @@ kernel void blake3_pow_scan(
                     pso_export_from_z_zero_root_tabs,
                     pso_ntt4h8,
                     pso_ntt5mix,
+                    pso_ntt4g4_zero_tail,
+                    pso_ntt5mix_zero_tail,
                     pso_leaf,
                     pso_parent,
                     pso_parent3,
@@ -4799,6 +4985,17 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
+            let zero_odd_tail =
+                crate::ntt::additive_ntt_f128::ranked_zero_odd_tail_lanes(log_d, 64);
+            let zero_odd_tail = if gpu_zero_tail_selected(gpu, log_d, zero_odd_tail, share_log) {
+                zero_odd_tail as u32
+            } else {
+                0u32
+            };
+            if zero_odd_tail > 0 && debug_enabled() {
+                eprintln!("[gpu-commit] zero-tail NTT continuation: tail={zero_odd_tail}");
+            }
+            gpu.set_bytes(enc, &zero_odd_tail.to_ne_bytes(), 4);
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 // Register-resident specializations for the production pass
                 // widths; the generic staged kernel covers the rest. At
@@ -4809,13 +5006,27 @@ kernel void blake3_pow_scan(
                 // loses badly because each lane keeps 16 F128s live.
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
-                    4 if share_log > 0 && s >= share_log => {
-                        (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
-                    }
+                    4 if share_log > 0 && s >= share_log => (
+                        if zero_odd_tail == 0 {
+                            gpu.pso_ntt4g4
+                        } else {
+                            gpu.pso_ntt4g4_zero_tail
+                        },
+                        64u64,
+                        1u64 << (log_d - f - share_log),
+                    ),
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
-                        (gpu.pso_ntt5mix, 64u64, 1u64 << (log_d - f))
+                        (
+                            if zero_odd_tail == 0 {
+                                gpu.pso_ntt5mix
+                            } else {
+                                gpu.pso_ntt5mix_zero_tail
+                            },
+                            64u64,
+                            1u64 << (log_d - f),
+                        )
                     }
                     // s < 2 (the final pass): no same-B tiles exist to
                     // share, so spend the same occupancy currency the other
@@ -4857,6 +5068,7 @@ kernel void blake3_pow_scan(
         log_d: usize,
         start_layer: usize,
         prefix16: u64,
+        zero_odd_tail: usize,
     ) {
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
@@ -4866,17 +5078,40 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
+            let zero_odd_tail = if gpu_zero_tail_selected(gpu, log_d, zero_odd_tail, share_log) {
+                zero_odd_tail as u32
+            } else {
+                0u32
+            };
+            if zero_odd_tail > 0 && debug_enabled() {
+                eprintln!("[gpu-commit] zero-tail NTT continuation: tail={zero_odd_tail}");
+            }
+            gpu.set_bytes(enc, &zero_odd_tail.to_ne_bytes(), 4);
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
-                    4 if share_log > 0 && s >= share_log => {
-                        (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
-                    }
+                    4 if share_log > 0 && s >= share_log => (
+                        if zero_odd_tail == 0 {
+                            gpu.pso_ntt4g4
+                        } else {
+                            gpu.pso_ntt4g4_zero_tail
+                        },
+                        64u64,
+                        1u64 << (log_d - f - share_log),
+                    ),
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
-                        (gpu.pso_ntt5mix, 64u64, 1u64 << (log_d - f))
+                        (
+                            if zero_odd_tail == 0 {
+                                gpu.pso_ntt5mix
+                            } else {
+                                gpu.pso_ntt5mix_zero_tail
+                            },
+                            64u64,
+                            1u64 << (log_d - f),
+                        )
                     }
                     // s < 2 (the final pass): no same-B tiles exist to
                     // share, so spend the same occupancy currency the other
@@ -5316,6 +5551,7 @@ kernel void blake3_pow_scan(
         tree_buf: Id,
         log_d: usize,
         n_leaves: usize,
+        zero_odd_tail: usize,
         next_r: usize,
         pending: Vec<Id>,
         failed: Option<String>,
@@ -5419,6 +5655,7 @@ kernel void blake3_pow_scan(
                             self.log_d,
                             self.n_leaves,
                             self.early_k,
+                            self.zero_odd_tail,
                         )?;
                         // Retain across the pool: completion is consumed by
                         // `finish` (same idiom as the streamed tiles above).
@@ -5526,6 +5763,7 @@ kernel void blake3_pow_scan(
         z_ptr: *mut F128,
         z_len: usize,
         params: &crate::pcs::commit::PcsParams,
+        zero_odd_tail: usize,
     ) -> Option<FromZFirstPassStream> {
         use std::sync::atomic::Ordering;
         if !super::gpu_commit_enabled()
@@ -5589,6 +5827,7 @@ kernel void blake3_pow_scan(
             tree_buf: state.tree_buf,
             log_d: params.k_code(),
             n_leaves: params.n_leaves(),
+            zero_odd_tail: if zero_odd_tail < 64 { zero_odd_tail } else { 0 },
             next_r: 0,
             pending: Vec::with_capacity(8),
             failed: None,
@@ -5969,13 +6208,14 @@ kernel void blake3_pow_scan(
         log_d: usize,
         n_leaves: usize,
         k_cpu16: usize,
+        zero_odd_tail: usize,
     ) -> Result<Id, String> {
         debug_assert!((1..16).contains(&k_cpu16));
         unsafe {
             let prefix16 = (16 - k_cpu16) as u64;
             let cb2 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb2)?;
-            encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
+            encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16, zero_odd_tail);
             // Greedy aligned power-of-two subtree decomposition of the
             // leaf prefix.
             let sixteenth = n_leaves / 16;
@@ -6024,7 +6264,14 @@ kernel void blake3_pow_scan(
                     Some(cb2) => cb2,
                     None => {
                         let cb2 = encode_hybrid_prefix_cb2(
-                            gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
+                            gpu,
+                            staging,
+                            tw_buf,
+                            tree_buf,
+                            log_d,
+                            n_leaves,
+                            k_cpu16,
+                            crate::ntt::additive_ntt_f128::ranked_zero_odd_tail_lanes(log_d, 64),
                         )?;
                         gpu.commit_async(cb2);
                         cb2
@@ -13657,6 +13904,7 @@ mod imp {
         _z_ptr: *mut F128,
         _z_len: usize,
         _params: &crate::pcs::commit::PcsParams,
+        _zero_odd_tail: usize,
     ) -> Option<FromZFirstPassStream> {
         None
     }
@@ -14241,6 +14489,130 @@ mod tests {
         }
     }
 
+    /// Compare all ranked values, including final stores over poisoned odd
+    /// tails. The prefix case also checks that the CPU-owned suffix is intact.
+    #[test]
+    #[ignore = "ranked 1 GiB Metal continuation oracle"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_zero_tail_continuation_matches_dense() {
+        let gpu = imp::gpu().expect("Metal is required for this oracle");
+        assert!(!gpu.pso_ntt4g4_zero_tail.is_null());
+        assert!(!gpu.pso_ntt5mix_zero_tail.is_null());
+        unsafe {
+            assert_eq!(
+                gpu.pipeline_resources(gpu.pso_ntt4g4_zero_tail).0,
+                gpu.pipeline_resources(gpu.pso_ntt4g4).0
+            );
+            assert_eq!(
+                gpu.pipeline_resources(gpu.pso_ntt5mix_zero_tail).0,
+                gpu.pipeline_resources(gpu.pso_ntt5mix).0
+            );
+        }
+        const LOG_D: usize = 20;
+        const LANES: usize = 64;
+        let len = (1 << LOG_D) * LANES;
+        let bytes = len * core::mem::size_of::<F128>();
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let twiddles = flat_twiddle_table(&ntt, LOG_D);
+        unsafe {
+            let pool = gpu.pool_push();
+            let candidate = gpu.new_buffer(bytes).unwrap();
+            let dense = gpu.new_buffer(bytes).unwrap();
+            let tree_len = (2 << LOG_D) - 1;
+            let tree_bytes = tree_len * core::mem::size_of::<crate::merkle::Hash>();
+            let candidate_tree = gpu.new_buffer(tree_bytes).unwrap();
+            let dense_tree = gpu.new_buffer(tree_bytes).unwrap();
+            std::ptr::write_bytes(gpu.buffer_contents(candidate_tree), 0xA5, tree_bytes);
+            std::ptr::write_bytes(gpu.buffer_contents(dense_tree), 0x5A, tree_bytes);
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            for (case, (tail, prefix16)) in [(7usize, 16u64), (7, 11), (7, 16), (0, 16)]
+                .into_iter()
+                .enumerate()
+            {
+                let got = core::slice::from_raw_parts_mut(
+                    gpu.buffer_contents(candidate).cast::<F128>(),
+                    len,
+                );
+                let want =
+                    core::slice::from_raw_parts_mut(gpu.buffer_contents(dense).cast::<F128>(), len);
+                for i in 0..len {
+                    let value = F128::new(
+                        (i as u64).wrapping_mul(0x9e3779b97f4a7c15),
+                        (i as u64).wrapping_mul(0xd6e8feb86659fd93)
+                            ^ 0x123456789abcdef0
+                            ^ (case as u64).wrapping_mul(0xa0761d6478bd642f),
+                    );
+                    let zero = tail > 0 && ((i / LANES) & 1) != 0 && i % LANES >= LANES - tail;
+                    want[i] = if zero { F128::ZERO } else { value };
+                    // A masked input must not leak from stale staging into a
+                    // final output, including the deepest layer's odd stores.
+                    got[i] = if zero {
+                        F128::new(u64::MAX, u64::MAX)
+                    } else {
+                        value
+                    };
+                }
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                imp::encode_ntt_passes_prefix(gpu, enc, dense, tw_buf, LOG_D, 4, prefix16, 0);
+                imp::encode_ntt_passes_prefix(
+                    gpu, enc, candidate, tw_buf, LOG_D, 4, prefix16, tail,
+                );
+                if prefix16 == 16 {
+                    imp::encode_merkle(gpu, enc, candidate, candidate_tree, 1 << LOG_D);
+                    imp::encode_merkle(gpu, enc, dense, dense_tree, 1 << LOG_D);
+                }
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                if prefix16 == 16 {
+                    let got_tree = core::slice::from_raw_parts(
+                        gpu.buffer_contents(candidate_tree)
+                            .cast::<crate::merkle::Hash>(),
+                        tree_len,
+                    );
+                    let want_tree = core::slice::from_raw_parts(
+                        gpu.buffer_contents(dense_tree)
+                            .cast::<crate::merkle::Hash>(),
+                        tree_len,
+                    );
+                    for i in 0..tree_len {
+                        assert_eq!(
+                            got_tree[i], want_tree[i],
+                            "tree mismatch in case {case}, node {i}"
+                        );
+                    }
+                }
+                let end = len / 16 * prefix16 as usize;
+                for i in 0..len {
+                    if i < end {
+                        assert_eq!(got[i], want[i], "tail={tail} prefix={prefix16} index={i}");
+                    } else {
+                        let zero = ((i / LANES) & 1) != 0 && i % LANES >= LANES - tail;
+                        let expected = if zero {
+                            F128::new(u64::MAX, u64::MAX)
+                        } else {
+                            want[i]
+                        };
+                        assert_eq!(got[i], expected, "CPU suffix changed at {i}");
+                    }
+                }
+            }
+            gpu.release(candidate);
+            gpu.release(dense);
+            gpu.release(tw_buf);
+            gpu.release(candidate_tree);
+            gpu.release(dense_tree);
+            gpu.pool_pop(pool);
+        }
+    }
+
     /// The hybrid commit sends only a high-block prefix through the GPU NTT
     /// encoder. Check that the grouped four-tile kernel preserves that exact
     /// range: the selected prefix matches the complete CPU transform while
@@ -14284,7 +14656,16 @@ mod tests {
 
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
-            imp::encode_ntt_passes_prefix(gpu, enc, data_buf, tw_buf, log_d, start_layer, prefix16);
+            imp::encode_ntt_passes_prefix(
+                gpu,
+                enc,
+                data_buf,
+                tw_buf,
+                log_d,
+                start_layer,
+                prefix16,
+                0,
+            );
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb).unwrap();
 

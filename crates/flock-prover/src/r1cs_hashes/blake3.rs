@@ -2485,10 +2485,15 @@ pub(crate) mod witgen_simd {
             // stream is consumed by commit. No range is submitted until all
             // eight source segments for it have been fully initialized.
             unsafe {
-                flock_core::gpu_commit::begin_from_z_first_pass_stream(
+                flock_core::gpu_commit::begin_from_z_first_pass_stream_with_zero_odd_tail(
                     z.as_mut_ptr(),
                     z.len(),
                     params,
+                    flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+                        params.num_ntts(),
+                        K_LOG,
+                        USEFUL_BITS,
+                    ),
                 )
             }
         });
