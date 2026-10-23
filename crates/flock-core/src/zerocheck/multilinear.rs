@@ -92,10 +92,11 @@ use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
     fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8, fold_compact_stream_chunk_neon,
-    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_lookahead_8,
-    fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
-    fold2_and_message_aarch64, fold2_and_message_lookahead_aarch64,
-    fold2_compact_and_round4_chunk_neon_8, fold2_compact_and_round45_chunk_neon_8,
+    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_horner_8,
+    fold_round2_compact_chunk_neon_lookahead_8, fold_round2_compact_chunk_neon_unchecked_8,
+    fold_round2_compact_stream_chunk_neon, fold2_and_message_aarch64,
+    fold2_and_message_lookahead_aarch64, fold2_compact_and_round4_chunk_neon_8,
+    fold2_compact_and_round45_chunk_neon_8,
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::{
@@ -136,6 +137,20 @@ fn r2_degen_enabled() -> bool {
 #[cfg(target_arch = "aarch64")]
 fn r2_periodic_padding_enabled() -> bool {
     std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
+}
+
+#[cfg(target_arch = "aarch64")]
+fn round2_horner_table_is_linear(table: &UniSkipFoldTable) -> bool {
+    if table.n_chunks != 8 || table.data.len() != 8 * 256 {
+        return false;
+    }
+    table.data.chunks_exact(256).all(|bank| {
+        bank[0] == F128::ZERO
+            && (1usize..256).all(|value| {
+                let low_bit = value & value.wrapping_neg();
+                bank[value] == bank[value ^ low_bit] + bank[low_bit]
+            })
+    })
 }
 
 /// Kill switch for adopting the round-two GPU arm's odd-parity products as the
@@ -1705,6 +1720,87 @@ fn lookahead_n_hi(n_vars: usize) -> usize {
     COMPACT_RECONSTRUCTION_N_HI.min(n_vars.saturating_sub(1))
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn round2_retained_sample_selected(
+    chunks: usize,
+    hi_size: usize,
+    intended_horner: bool,
+    table: &UniSkipFoldTable,
+) -> bool {
+    chunks == 128 && hi_size == 2048 && intended_horner && round2_horner_table_is_linear(table)
+}
+
+// The completed full sweep owns these compact destinations. Each callback
+// rewrites only its disjoint prefix range; GPU replay inputs are immutable A/B.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn round2_retained_sample(
+    chunks: usize,
+    table: &UniSkipFoldTable,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    lo_size: usize,
+    anchors: crate::epool::SyncPtr<F128>,
+    deltas: crate::epool::SyncPtr<u8>,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    kappa: F128,
+    full_la: &[[F128; 6]],
+) -> Result<f64, ()> {
+    let started = std::time::Instant::now();
+    let mut partials = vec![(F128::ZERO, F128::ZERO); chunks];
+    let mut la_partials = vec![[F128::ZERO; 6]; chunks];
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(chunks, |x_hi| {
+        let pair_idx_base = x_hi * lo_size;
+        let mut out = [F128::ZERO; 8];
+        unsafe {
+            fold_round2_compact_chunk_neon_horner_8::<true>(
+                table.data.as_ptr().cast::<u8>(),
+                a_packed.as_ptr().add(pair_idx_base * 16),
+                b_packed.as_ptr().add(pair_idx_base * 16),
+                anchors.ptr().add(pair_idx_base * 2),
+                deltas.ptr().add(pair_idx_base * 16),
+                eq_lo.as_ptr(),
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                out.as_mut_ptr(),
+            );
+            let eq_h = eq_hi[x_hi];
+            *partials_base.ptr().add(x_hi) = (
+                eq_h * (kappa * out[0] + out[2]),
+                eq_h * (kappa * out[1] + out[3]),
+            );
+            *la_base.ptr().add(x_hi) = [
+                eq_h * out[2],
+                eq_h * out[3],
+                eq_h * out[4],
+                eq_h * out[5],
+                eq_h * out[6],
+                eq_h * out[7],
+            ];
+        }
+    });
+    let wall_ms = started.elapsed().as_secs_f64() * 1e3;
+    if partials.iter().all(|p| *p == (F128::ZERO, F128::ZERO))
+        && la_partials
+            .iter()
+            .zip(full_la)
+            .all(|(sample, full)| sample[2..] == full[2..])
+    {
+        Ok(wall_ms)
+    } else {
+        Err(())
+    }
+}
+
 /// Round-two compact producer **plus** the deferred round-three coefficients.
 ///
 /// The compact state, the round-two wire message and every store are
@@ -1779,6 +1875,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let degen = r2_degen_enabled();
     #[cfg(target_arch = "aarch64")]
     let periodic_padding = r2_periodic_padding_enabled();
+    #[cfg(target_arch = "aarch64")]
+    let horner_weights = m == 32
+        && lo_size == 1 << 14
+        && pair_in_block_mask == 127
+        && useful_pairs_inclusive == 121
+        && periodic_padding
+        && mlv_challenges[3..7]
+            == crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash();
 
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
@@ -1807,6 +1911,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let odd_on_gpu = false;
+    // Check the current table once. It stays immutably borrowed through the
+    // sweep; a later phase must check again even if it reuses the same address.
+    #[cfg(target_arch = "aarch64")]
+    let horner_linear_table = odd_on_gpu && horner_weights && round2_horner_table_is_linear(table);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -1856,6 +1964,38 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         periodic_padding,
                         out.as_mut_ptr(),
                     );
+                } else if odd_on_gpu && horner_weights {
+                    if horner_linear_table {
+                        fold_round2_compact_chunk_neon_horner_8::<true>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            out.as_mut_ptr(),
+                        );
+                    } else {
+                        fold_round2_compact_chunk_neon_horner_8::<false>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            out.as_mut_ptr(),
+                        );
+                    }
                 } else if odd_on_gpu {
                     fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
                         t,
@@ -1939,7 +2079,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
         let calib = job.is_calibration();
         let prefix = job.cpu_split();
-        let res = crate::gpu_commit::zc_r2_wait(
+        let res = crate::gpu_commit::zc_r2_wait_with_retained_sample(
             job,
             if calib {
                 Some(partials.as_slice())
@@ -1953,6 +2093,22 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
             },
             cpu_wall_ms,
             hi_size,
+            |chunks| {
+                // Calibration has gpu_prefix=0, so do not use odd_on_gpu.
+                // Check the intended production mode and the current table.
+                if !round2_retained_sample_selected(
+                    chunks, hi_size, horner_weights && zc_r2_odd_offload_enabled(), table,
+                ) {
+                    return None;
+                }
+                Some(unsafe {
+                    round2_retained_sample(
+                        chunks, table, a_packed, b_packed, eq_lo, eq_hi, lo_size,
+                        anchors_base, deltas_base, pair_in_block_mask,
+                        useful_pairs_inclusive, degen, kappa, &la_partials,
+                    )
+                })
+            },
         );
         match res {
             crate::gpu_commit::ZcR2Result::Calibrated => {}
@@ -3915,6 +4071,94 @@ mod tests {
         fn f128_vec(&mut self, n: usize) -> Vec<F128> {
             (0..n).map(|_| self.f128()).collect()
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn round2_retained_sample_guard_is_fresh() {
+        let mut table = UniSkipFoldTable::new(6, F128::ONE);
+        assert!(round2_retained_sample_selected(128, 2048, true, &table));
+        assert!(!round2_retained_sample_selected(127, 2048, true, &table));
+        assert!(!round2_retained_sample_selected(128, 1024, true, &table));
+        assert!(!round2_retained_sample_selected(128, 2048, false, &table));
+        let address = table.data.as_ptr();
+        table.data[3] += F128::ONE;
+        assert_eq!(address, table.data.as_ptr());
+        assert!(!round2_retained_sample_selected(128, 2048, true, &table));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn round2_retained_sample_matches_full_and_preserves_compact() {
+        use crate::zerocheck::univariate_skip::build_eq;
+        const LO: usize = 256;
+        const CHUNKS: usize = 2;
+        let mut rng = Rng::new(0x5232_5153_414d_504c);
+        let a: Vec<u8> = (0..CHUNKS * LO * 16)
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        let b: Vec<u8> = (0..CHUNKS * LO * 16)
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let mut r = rng.f128_vec(8);
+        r[2..6]
+            .copy_from_slice(&crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash());
+        let eq_lo = build_eq(&r);
+        let eq_hi = rng.f128_vec(CHUNKS);
+        let mut anchors = vec![F128::ZERO; CHUNKS * LO * 2];
+        let mut deltas = vec![0u8; CHUNKS * LO * 16];
+        let mut full_la = vec![[F128::ZERO; 6]; CHUNKS];
+        for x_hi in 0..CHUNKS {
+            let base = x_hi * LO;
+            let mut out = [F128::ZERO; 8];
+            unsafe {
+                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                    table.data.as_ptr().cast::<u8>(),
+                    a.as_ptr().add(base * 16),
+                    b.as_ptr().add(base * 16),
+                    anchors.as_mut_ptr().add(base * 2),
+                    deltas.as_mut_ptr().add(base * 16),
+                    eq_lo.as_ptr(),
+                    LO,
+                    base,
+                    127,
+                    121,
+                    false,
+                    true,
+                    out.as_mut_ptr(),
+                );
+            }
+            for lane in 0..6 {
+                full_la[x_hi][lane] = eq_hi[x_hi] * out[lane + 2];
+            }
+        }
+        let expected_anchors = anchors.clone();
+        let expected_deltas = deltas.clone();
+        let mut sample = |full_la: &[[F128; 6]]| unsafe {
+            round2_retained_sample(
+                CHUNKS,
+                &table,
+                &a,
+                &b,
+                &eq_lo,
+                &eq_hi,
+                LO,
+                crate::epool::SyncPtr(anchors.as_mut_ptr()),
+                crate::epool::SyncPtr(deltas.as_mut_ptr()),
+                127,
+                121,
+                false,
+                F128::ONE,
+                full_la,
+            )
+        };
+        let wall = sample(&full_la).expect("retained W values must match full CPU");
+        assert!(wall.is_finite() && wall > 0.0);
+        full_la[1][2] += F128::ONE;
+        assert_eq!(sample(&full_la), Err(()));
+        assert_eq!(anchors, expected_anchors);
+        assert_eq!(deltas, expected_deltas);
     }
 
     #[test]

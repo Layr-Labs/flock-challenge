@@ -492,6 +492,83 @@ mod eq_direct_gate_tests {
 /// target machine itself.
 pub const ENV_NO_GPU_ZC_R2: &str = "FLOCK_NO_GPU_ZC_R2";
 
+/// Exact-`1` control for the round-two GPU carry-less multiplication.
+pub const ENV_NO_GPU_ZC_R2_KARATSUBA: &str = "FLOCK_NO_GPU_ZC_R2_KARATSUBA";
+
+fn gpu_zc_r2_karatsuba_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_zc_r2_karatsuba_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_zc_r2_karatsuba_value_enabled(std::env::var_os(ENV_NO_GPU_ZC_R2_KARATSUBA).as_deref())
+    })
+}
+
+/// Exact-`1` control for the fixed-medium-weight round-two GPU kernel.
+pub const ENV_NO_GPU_ZC_R2_HORNER: &str = "FLOCK_NO_GPU_ZC_R2_HORNER";
+
+fn gpu_zc_r2_horner_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_zc_r2_horner_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_zc_r2_horner_value_enabled(std::env::var_os(ENV_NO_GPU_ZC_R2_HORNER).as_deref())
+    })
+}
+
+/// Exact-`1` control for the one-group round-two Horner layout.
+pub const ENV_NO_GPU_ZC_R2_ONE_GROUP: &str = "FLOCK_NO_GPU_ZC_R2_ONE_GROUP";
+
+fn gpu_zc_r2_one_group_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_zc_r2_one_group_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        gpu_zc_r2_one_group_value_enabled(std::env::var_os(ENV_NO_GPU_ZC_R2_ONE_GROUP).as_deref())
+    })
+}
+
+fn zc_r2_one_group_limits_fit(
+    shared_bytes: u64,
+    simd_width: u64,
+    max_threads: u64,
+    device_shared_bytes: u64,
+    device_thread_width: u64,
+) -> bool {
+    shared_bytes == 8192
+        && simd_width == 32
+        && max_threads >= 1024
+        && shared_bytes <= device_shared_bytes
+        && device_thread_width >= 1024
+}
+
+// The ranked R2 medium coordinates are x_lo bits 2..5 and their ratios
+// are x, x^2, x^4, x^8 in the field's polynomial basis. Check the actual
+// weights so generic callers retain the ordinary kernel.
+fn zc_r2_horner_weights(eq_lo: &[F128], lo_size: usize) -> bool {
+    if lo_size != 16_384 || eq_lo.len() != lo_size {
+        return false;
+    }
+    for window in 0..256 {
+        for class in 0..4 {
+            let mut weight = eq_lo[(window << 6) | class];
+            for medium in 1..16 {
+                weight = crate::field::mul_by_x(weight);
+                if eq_lo[(window << 6) | (medium << 2) | class] != weight {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 pub(crate) fn gpu_zc_r2_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_R2).is_none());
@@ -1531,13 +1608,90 @@ pub(crate) fn finish_from_z_first_pass_or_fallback(
     imp::finish_from_z_first_pass_or_fallback(stream.inner, z_packed, codeword, params, cpu)
 }
 
-/// A read-only view of the transformed L0 codeword living in the GPU's
-/// persistent shared staging buffer (unified memory: CPU reads during the
-/// PCS open are ordinary cached reads). Dropping it releases the staging
-/// back to the latched GPU state for the next prove.
+/// Physical state of the completed GPU staging allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuCodewordLayout {
+    Canonical,
+    S16Prefix { prefix_positions: usize },
+}
+
+impl GpuCodewordLayout {
+    fn prefix_positions(self) -> usize {
+        match self {
+            Self::Canonical => 0,
+            Self::S16Prefix { prefix_positions } => prefix_positions,
+        }
+    }
+}
+
+fn ranked_final_ntt() -> &'static AdditiveNttF128 {
+    static NTT: std::sync::OnceLock<AdditiveNttF128> = std::sync::OnceLock::new();
+    NTT.get_or_init(|| AdditiveNttF128::standard(20))
+}
+
+/// Decode one physical S16 tile in caller-owned scratch, using global
+/// twiddle blocks. Staging itself remains unchanged.
+fn decode_final_tile(tile: &mut [F128], block: usize) {
+    debug_assert_eq!(tile.len(), 16 * 64);
+    let ntt = ranked_final_ntt();
+    for j in 0..4 {
+        let half = 1usize << (3 - j);
+        for c in 0..1usize << j {
+            let tw = ntt.twiddle(16 + j, (block << j) + c);
+            for r in 0..half {
+                let base = (c * 2 * half + r) * 64;
+                for lane in 0..64 {
+                    let u = base + lane;
+                    let v = u + half * 64;
+                    let old_v = tile[v];
+                    let next = tile[u] + tw * old_v;
+                    tile[u] = next;
+                    tile[v] = next + old_v;
+                }
+            }
+        }
+    }
+}
+
+/// Restore one selected canonical row with 15 products per lane. A 16-value
+/// lane scratch avoids materializing the other fifteen output rows.
+fn replay_final_row(tile: &[F128], block: usize, row: usize, out: &mut [F128]) {
+    debug_assert_eq!(tile.len(), 16 * 64);
+    debug_assert!(row < 16);
+    debug_assert_eq!(out.len(), 64);
+    let ntt = ranked_final_ntt();
+    let tw: [F128; 4] = std::array::from_fn(|j| {
+        ntt.twiddle(16 + j, (block << j) + (row >> (4 - j)))
+            + F128::new(((row >> (3 - j)) & 1) as u64, 0)
+    });
+    for lane in 0..64 {
+        let mut values: [F128; 16] = std::array::from_fn(|r| tile[r * 64 + lane]);
+        for (j, &weight) in tw.iter().enumerate() {
+            let half = 1usize << (3 - j);
+            for r in 0..half {
+                let product = weight * values[r + half];
+                values[r] += product;
+            }
+        }
+        out[lane] = values[0];
+    }
+}
+
+struct StagingLease;
+
+impl Drop for StagingLease {
+    fn drop(&mut self) {
+        imp::staging_released();
+    }
+}
+
+/// Shared staging retained through all row queries. Its typed layout prevents
+/// a pending prefix from being exposed as canonical codeword values.
 pub struct GpuCodeword {
     ptr: *const F128,
     len: usize,
+    layout: GpuCodewordLayout,
+    _lease: StagingLease,
 }
 
 /// Read-only ranked L0 tree in the persistent shared Metal buffer.
@@ -1574,29 +1728,56 @@ unsafe impl Send for GpuCodeword {}
 unsafe impl Sync for GpuCodeword {}
 
 impl GpuCodeword {
-    /// SAFETY: `ptr` must point at `len` initialized F128s that stay valid
-    /// and un-mutated for this value's lifetime (the process-persistent
-    /// staging buffer, guarded by the in-use flag).
-    #[cfg_attr(
-        not(all(target_os = "macos", target_arch = "aarch64")),
-        allow(dead_code)
-    )]
-    pub(crate) unsafe fn new(ptr: *const F128, len: usize) -> Self {
-        Self { ptr, len }
+    /// The completed graph must have written exactly the stated physical
+    /// layout. The moved token keeps staging leased until this view drops.
+    unsafe fn with_layout(
+        ptr: *const F128,
+        len: usize,
+        layout: GpuCodewordLayout,
+        lease: StagingLease,
+    ) -> Self {
+        debug_assert!(layout.prefix_positions() <= len / 64);
+        debug_assert!(layout.prefix_positions().is_multiple_of(16));
+        if layout.prefix_positions() != 0 {
+            let _ = ranked_final_ntt();
+        }
+        Self {
+            ptr,
+            len,
+            layout,
+            _lease: lease,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn canonical_slice(&self) -> Option<&[F128]> {
+        (self.layout == GpuCodewordLayout::Canonical)
+            .then(|| unsafe { core::slice::from_raw_parts(self.ptr, self.len) })
+    }
+
+    pub(crate) fn row(&self, row: usize, width: usize) -> Vec<F128> {
+        assert_eq!(width, 64);
+        assert!(row < self.len / width);
+        if row < self.layout.prefix_positions() {
+            let block = row / 16;
+            let tile = unsafe { core::slice::from_raw_parts(self.ptr.add(block * 1024), 1024) };
+            let mut out = vec![F128::ZERO; width];
+            replay_final_row(tile, block, row % 16, &mut out);
+            out
+        } else {
+            unsafe { core::slice::from_raw_parts(self.ptr.add(row * width), width) }.to_vec()
+        }
     }
 }
 
 impl core::ops::Deref for GpuCodeword {
     type Target = [F128];
     fn deref(&self) -> &[F128] {
-        // SAFETY: contract of `new`.
-        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
-    }
-}
-
-impl Drop for GpuCodeword {
-    fn drop(&mut self) {
-        imp::staging_released();
+        self.canonical_slice()
+            .expect("pending GPU codeword requires typed row access")
     }
 }
 
@@ -1742,11 +1923,16 @@ mod ranked_exact_tune_lifecycle_tests {
 #[doc(hidden)]
 pub fn retune_ranked_hybrid_with_exact_contention(
     params: &crate::pcs::commit::PcsParams,
-    cpu_codeword: &[F128],
+    cpu_codeword: &crate::pcs::commit::CodewordBuf,
     cpu_tree: &[crate::merkle::Hash],
     replay_ab: impl Fn() + Sync,
 ) {
-    imp::retune_ranked_hybrid_with_exact_contention(params, cpu_codeword, cpu_tree, replay_ab);
+    imp::retune_ranked_hybrid_with_exact_contention(
+        params,
+        cpu_codeword.canonical_slice().unwrap_or(&[]),
+        cpu_tree,
+        replay_ab,
+    );
 }
 
 #[cfg_attr(
@@ -1846,6 +2032,23 @@ pub(crate) fn select_gpu_mixed_final(
 #[inline]
 fn gpu_mixed_final_selected(log_d: usize, l: usize, f: usize) -> bool {
     select_gpu_mixed_final(log_d, l, f, true, gpu_mixed_final_enabled())
+}
+
+/// Exact rollback for the final NTT-to-leaf handoff.
+pub const ENV_NO_GPU_FINAL_LEAF4: &str = "FLOCK_NO_GPU_FINAL_LEAF4";
+
+/// Exact rollback to the fused kernel's canonical codeword stores.
+pub const ENV_NO_GPU_LAZY_FINAL: &str = "FLOCK_NO_GPU_LAZY_FINAL";
+
+fn gpu_lazy_final_enabled() -> bool {
+    std::env::var_os(ENV_NO_GPU_LAZY_FINAL).as_deref() != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_final_leaf4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_GPU_FINAL_LEAF4).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2992,6 +3195,162 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
 }
 
 "#;
+
+    /// Four lanes hold one BLAKE3 state column each. The final NTT tables
+    /// and its output tile share one 16 KiB allocation. All 64 threads hash
+    /// 16 leaves, then emit three ordinary parent levels from that tile.
+    /// The complete codeword is still stored for later openings.
+    const FINAL_LEAF4_MSL_SOURCE: &str = r#"
+static inline void final_b3_quad(threadgroup const uint* block,
+                                 uint q, uint sl, uint word_xor, uint flags,
+                                 thread uint& cv0, thread uint& cv1) {
+    uint a = cv0, b = cv1, c = B3_IV[q];
+    uint d = q == 2u ? 64u : (q == 3u ? flags : 0u);
+    const uint base = sl & ~3u;
+    // One read per message word. Four registers retain the complete block
+    // across this quad; each round uses the same four-register layout.
+    uint m0 = block[(2u * q) ^ word_xor];
+    uint m1 = block[(2u * q + 1u) ^ word_xor];
+    uint m2 = block[(8u + 2u * q) ^ word_xor];
+    uint m3 = block[(9u + 2u * q) ^ word_xor];
+    const bool q0 = q == 0u, q1 = q == 1u, q2 = q == 2u;
+    const uint shift = 2u * q;
+    const uint laneA = base | ((0xC9u >> shift) & 3u);
+    const uint laneB = base | ((0x87u >> shift) & 3u);
+    const uint laneC = base | ((0xB4u >> shift) & 3u);
+    const uint laneD = base | ((0x39u >> shift) & 3u);
+    for (uint r = 0u; r < 7u; r++) {
+        #define FINAL_G(X,Y) \
+            a += b + (X); d = rotate(d ^ a, 16u); \
+            c += d;       b = rotate(b ^ c, 20u); \
+            a += b + (Y); d = rotate(d ^ a, 24u); \
+            c += d;       b = rotate(b ^ c, 25u);
+        FINAL_G(m0, m1);
+        b = simd_shuffle(b, base | ((q + 1u) & 3u));
+        c = simd_shuffle(c, base | ((q + 2u) & 3u));
+        d = simd_shuffle(d, base | ((q + 3u) & 3u));
+        FINAL_G(m2, m3);
+        b = simd_shuffle(b, base | ((q + 3u) & 3u));
+        c = simd_shuffle(c, base | ((q + 2u) & 3u));
+        d = simd_shuffle(d, base | ((q + 1u) & 3u));
+        #undef FINAL_G
+        if (r < 6u) {
+            // The 16-word BLAKE3 permutation is four lane matchings.
+            // Seven source selects and two output selects surround four
+            // shuffles; no message array or shared-memory reread is needed.
+            uint A = select(select(m3, m2, q2), m0, q1);
+            uint B = select(select(m0, m3, q2), m2, q1);
+            uint C = select(m1, m0, q2);
+            uint D = select(select(m2, m1, q2), m3, q1);
+            A = simd_shuffle(A, laneA);
+            B = simd_shuffle(B, laneB);
+            C = simd_shuffle(C, laneC);
+            D = simd_shuffle(D, laneD);
+            m0 = select(C, A, q0);
+            m1 = B;
+            m2 = select(A, C, q0);
+            m3 = D;
+        }
+    }
+    cv0 = a ^ c;
+    cv1 = b ^ d;
+}
+
+static inline void final_leaf4_emit(threadgroup uint4* tile,
+                                    device uint* tree,
+                                    uint pos_base, uint log_d,
+                                    uint lid, uint sl) {
+    threadgroup uint* words = (threadgroup uint*)tile;
+    const uint q = lid & 3u, leaf = lid >> 2;
+    uint cv0 = B3_IV[q], cv1 = B3_IV[4u + q];
+    for (uint block = 0u; block < 16u; block++) {
+        const uint flags = (block == 0u ? B3_CHUNK_START : 0u)
+                         | (block == 15u ? B3_CHUNK_END : 0u);
+        // The row's uint4 lanes were XOR-swizzled by leaf&7. Undo its
+        // block bit in the pointer and its two word-index bits in the load.
+        final_b3_quad(words + leaf * 256u + ((block * 16u) ^ ((leaf & 4u) << 2)),
+                      q, sl, (leaf & 3u) << 2, flags, cv0, cv1);
+    }
+    const uint id = pos_base + leaf;
+    tree[id * 8u + q] = cv0;
+    tree[id * 8u + 4u + q] = cv1;
+    // Every leaf must finish reading the tile before any CV overwrites it.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    words[leaf * 8u + q] = cv0;
+    words[leaf * 8u + 4u + q] = cv1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint n = 1u << log_d;
+    for (uint level = 1u; level <= 3u; level++) {
+        const bool active = lid < (64u >> level);
+        if (active) {
+            cv0 = B3_IV[q];
+            cv1 = B3_IV[4u + q];
+            final_b3_quad(words + leaf * 16u, q, sl, 0u, B3_PARENT, cv0, cv1);
+        }
+        // In-place local reduction: reads finish before the next level writes.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            const uint level_start = 2u * n - (n >> (level - 1u));
+            const uint parent = (pos_base >> level) + leaf;
+            tree[(level_start + parent) * 8u + q] = cv0;
+            tree[(level_start + parent) * 8u + 4u + q] = cv1;
+            words[leaf * 8u + q] = cv0;
+            words[leaf * 8u + 4u + q] = cv1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+"#;
+
+    /// Keep the embedded library unchanged. Reuse the exact mixed NTT body
+    /// in a supplemental kernel; only scratch lifetime and its final stores
+    /// differ. The source checks below guard this local source contract.
+    pub(crate) fn final_leaf4_source() -> String {
+        let (_, tail) = MSL_SOURCE
+            .split_once("kernel void ntt_pass5_mixed(")
+            .expect("mixed final kernel exists");
+        let (body, _) = tail
+            .split_once("// ===========================================================================\n// From-z first pass:")
+            .expect("mixed final kernel terminator exists");
+        let old_scratch = "    threadgroup uint4 bases[3u * 4u];\n    threadgroup uint4 tab1[64u];   // build intermediate for the live twiddle\n    threadgroup uint4 tabB[512u];  // the live twiddle's two byte tables\n    threadgroup uint  nibA[4u * NNIB_A];\n    threadgroup uint  nibB[8u * NNIB_B];";
+        let new_scratch = "    threadgroup uint4 final_scratch[1024u];\n    threadgroup uint4* bases = final_scratch;\n    threadgroup uint4* tab1 = final_scratch + 12u;\n    threadgroup uint4* tabB = final_scratch + 76u;\n    threadgroup uint* nibA = (threadgroup uint*)(final_scratch + 588u);\n    threadgroup uint* nibB = nibA + 40u;";
+        let old_store = "    for (uint e = 0; e < NF; e++) {\n        data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];\n    }\n}";
+        let new_store = "    threadgroup_barrier(mem_flags::mem_threadgroup);\n    for (uint e = 0; e < NF; e++) {\n        if (write_codeword != 0u) data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];\n        final_scratch[(e << 6) + (lane ^ (e & 7u))] = elems[e];\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n    final_leaf4_emit(final_scratch, tree, pos_base, P.log_d, lid, sl);\n}";
+        assert!(body.contains(old_scratch) && body.contains(old_store));
+        let body = body
+            .replacen(old_scratch, new_scratch, 1)
+            .replacen(old_store, new_store, 1)
+            .replacen(
+                "constant NttParams& P             [[buffer(2)]],",
+                "constant NttParams& P             [[buffer(2)]],\n                            device uint* tree                 [[buffer(3)]],\n                            constant uint& write_codeword     [[buffer(4)]],",
+                1,
+            )
+            .replacen(
+                "uint lid  [[thread_index_in_threadgroup]])",
+                "uint sl   [[thread_index_in_simdgroup]],\n                            uint lid  [[thread_index_in_threadgroup]])",
+                1,
+            );
+        format!("{MSL_SOURCE}\n{FINAL_LEAF4_MSL_SOURCE}\nkernel void ntt_pass5_leaf4({body}")
+    }
+
+    fn final_leaf4_pso(gpu: &Gpu) -> Id {
+        static PSO: OnceLock<Result<usize, String>> = OnceLock::new();
+        if !super::gpu_final_leaf4_enabled() {
+            return NIL;
+        }
+        match PSO.get_or_init(|| unsafe {
+            compile_supplemental_pipeline(gpu, &final_leaf4_source(), "ntt_pass5_leaf4")
+                .map(|p| p as usize)
+        }) {
+            Ok(p) => *p as Id,
+            Err(e) => {
+                if debug_enabled() {
+                    eprintln!("[gpu-final-leaf4] unavailable ({e})");
+                }
+                NIL
+            }
+        }
+    }
 
     /// Supplemental leaf+parent3 fuse (kept out of the embedded metallib so a
     /// missing kernel cannot force a full main-library rebuild). Compiled at
@@ -4455,7 +4814,6 @@ kernel void blake3_pow_scan(
             }
         }
 
-        #[cfg(test)]
         pub(crate) unsafe fn pipeline_resources(&self, pso: Id) -> (u64, u64, u64) {
             unsafe {
                 let static_tg: u64 = send!(
@@ -4859,6 +5217,30 @@ kernel void blake3_pow_scan(
         prefix16: u64,
     ) {
         unsafe {
+            encode_ntt_passes_prefix_impl(
+                gpu,
+                enc,
+                data_buf,
+                tw_buf,
+                log_d,
+                start_layer,
+                prefix16,
+                false,
+            )
+        }
+    }
+
+    unsafe fn encode_ntt_passes_prefix_impl(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        log_d: usize,
+        start_layer: usize,
+        prefix16: u64,
+        skip_final: bool,
+    ) {
+        unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
             let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
@@ -4868,6 +5250,9 @@ kernel void blake3_pow_scan(
             };
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
+                if skip_final && l + f == log_d {
+                    continue;
+                }
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
                     4 if share_log > 0 && s >= share_log => {
@@ -4902,6 +5287,105 @@ kernel void blake3_pow_scan(
                 debug_assert_eq!(groups % 16, 0);
                 gpu.dispatch(enc, groups / 16 * prefix16, tpg);
             }
+        }
+    }
+
+    /// Complete the GPU prefix and produce flat-tree levels 0..3 directly
+    /// from the final NTT tile. `None` selects the canonical fallback graph.
+    unsafe fn encode_ntt_final_leaf4(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        prefix16: u64,
+    ) -> Option<GpuCodewordLayout> {
+        if !(1..=16).contains(&prefix16)
+            || log_d != 20
+            || !super::pass_tune_enabled()
+            || !super::gpu_mixed_final_selected(log_d, log_d - 4, 4)
+        {
+            return None;
+        }
+        let pso = final_leaf4_pso(gpu);
+        if pso.is_null() {
+            return None;
+        }
+        let retain_prefinal = super::gpu_lazy_final_enabled();
+        unsafe {
+            encode_ntt_passes_prefix_impl(gpu, enc, data_buf, tw_buf, log_d, 4, prefix16, true);
+            encode_final_leaf4_pass_impl(
+                gpu,
+                enc,
+                data_buf,
+                tw_buf,
+                tree_buf,
+                log_d,
+                prefix16,
+                pso,
+                retain_prefinal,
+            );
+        }
+        Some(if retain_prefinal {
+            GpuCodewordLayout::S16Prefix {
+                prefix_positions: (1usize << log_d) / 16 * prefix16 as usize,
+            }
+        } else {
+            GpuCodewordLayout::Canonical
+        })
+    }
+
+    /// Tests use this same pass with smaller standard-basis NTTs.
+    #[cfg(test)]
+    pub(crate) unsafe fn encode_final_leaf4_pass(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        prefix16: u64,
+        pso: Id,
+    ) {
+        unsafe {
+            encode_final_leaf4_pass_impl(
+                gpu, enc, data_buf, tw_buf, tree_buf, log_d, prefix16, pso, false,
+            )
+        }
+    }
+
+    /// Tests use this same pass with smaller standard-basis NTTs.
+    unsafe fn encode_final_leaf4_pass_impl(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        prefix16: u64,
+        pso: Id,
+        retain_prefinal: bool,
+    ) {
+        debug_assert!(log_d >= 8 && (1..=16).contains(&prefix16));
+        unsafe {
+            gpu.set_pipeline(enc, pso);
+            gpu.set_buffer(enc, data_buf, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            let p = NttParams {
+                log_d: log_d as u32,
+                l: (log_d - 4) as u32,
+                f: 4,
+                s: 0,
+            };
+            let bytes = core::slice::from_raw_parts(
+                (&p as *const NttParams).cast::<u8>(),
+                core::mem::size_of::<NttParams>(),
+            );
+            gpu.set_bytes(enc, bytes, 2);
+            gpu.set_buffer(enc, tree_buf, 0, 3);
+            gpu.set_bytes(enc, &u32::from(!retain_prefinal).to_ne_bytes(), 4);
+            gpu.dispatch(enc, (1u64 << (log_d - 8)) * prefix16, 64);
         }
     }
 
@@ -4941,8 +5425,35 @@ kernel void blake3_pow_scan(
         subtree_leaves: usize,
         parent3: bool,
     ) {
+        unsafe {
+            encode_merkle_subtree_from_level(
+                gpu,
+                enc,
+                codeword_buf,
+                tree_buf,
+                n_leaves_total,
+                leaf_start,
+                subtree_leaves,
+                parent3,
+                0,
+            )
+        }
+    }
+
+    pub(crate) unsafe fn encode_merkle_subtree_from_level(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        leaf_start: usize,
+        subtree_leaves: usize,
+        parent3: bool,
+        prehashed_levels: usize,
+    ) {
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
+        debug_assert!(subtree_leaves >= 1usize << prehashed_levels);
         unsafe {
             // Vectorized-kernel swap: identical dispatch geometry and output
             // bytes; NIL (kill switch / compile failure) keeps the incumbent.
@@ -4962,6 +5473,12 @@ kernel void blake3_pow_scan(
             let mut level_len = n_leaves_total;
             let mut local_start = leaf_start;
             let mut local_len = subtree_leaves;
+            for _ in 0..prehashed_levels {
+                level_start += level_len;
+                level_len /= 2;
+                local_start /= 2;
+                local_len /= 2;
+            }
 
             // Fused leaf + first parent3 ladder: one dispatch writes leaves and
             // three parent levels from the codeword without rereading leaves.
@@ -4970,7 +5487,7 @@ kernel void blake3_pow_scan(
                 && super::select_gpu_leaf_parent3(!gpu.pso_leaf_parent3.is_null())
                 && local_len >= 256
                 && local_len.is_multiple_of(256);
-            if leaf_parent3 {
+            if prehashed_levels == 0 && leaf_parent3 {
                 let level1_start = level_start + level_len;
                 let level1_len = level_len / 2;
                 let local1_start = local_start / 2;
@@ -4992,7 +5509,7 @@ kernel void blake3_pow_scan(
                 level_len = level3_len;
                 local_start = local3_start;
                 local_len = local3_len;
-            } else {
+            } else if prehashed_levels == 0 {
                 gpu.set_pipeline(enc, pso_leaf);
                 gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
                 gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
@@ -5308,6 +5825,20 @@ kernel void blake3_pow_scan(
         }
     }
 
+    struct EarlyPrefix {
+        gpu: &'static Gpu,
+        cb: Id,
+        k: usize,
+        layout: GpuCodewordLayout,
+    }
+
+    impl Drop for EarlyPrefix {
+        fn drop(&mut self) {
+            let _ = unsafe { self.gpu.wait_cb(self.cb) };
+            unsafe { self.gpu.release(self.cb) };
+        }
+    }
+
     pub(crate) struct FromZFirstPassStream {
         gpu: &'static Gpu,
         z_buf: Id,
@@ -5319,7 +5850,7 @@ kernel void blake3_pow_scan(
         next_r: usize,
         pending: Vec<Id>,
         failed: Option<String>,
-        owns_lease: bool,
+        lease: Option<StagingLease>,
         started: std::time::Instant,
         /// Hybrid CPU share captured at stream creation; 0 disables the
         /// early-prefix commit (kill switch, non-hybrid split, or pure-GPU).
@@ -5328,7 +5859,7 @@ kernel void blake3_pow_scan(
         /// final streamed tile, with the split it was encoded for. Queue
         /// order makes it start the moment the first pass completes, deleting
         /// the host wait/encode bubble; `finish` consumes (or drains) it.
-        early_cb2: Option<(Id, usize)>,
+        early_cb2: Option<EarlyPrefix>,
     }
 
     // SAFETY: all captured Metal objects are process-persistent and Metal's
@@ -5410,8 +5941,8 @@ kernel void blake3_pow_scan(
             {
                 let result = unsafe {
                     let pool = self.gpu.pool_push();
-                    let result = (|| -> Result<Id, String> {
-                        let cb2 = encode_hybrid_prefix_cb2(
+                    let result = (|| -> Result<(Id, GpuCodewordLayout), String> {
+                        let (cb2, layout) = encode_hybrid_prefix_cb2(
                             self.gpu,
                             self.staging,
                             self.tw_buf,
@@ -5424,14 +5955,19 @@ kernel void blake3_pow_scan(
                         // `finish` (same idiom as the streamed tiles above).
                         let cb2 = self.gpu.retain(cb2);
                         self.gpu.commit_async(cb2);
-                        Ok(cb2)
+                        Ok((cb2, layout))
                     })();
                     self.gpu.pool_pop(pool);
                     result
                 };
                 match result {
-                    Ok(cb2) => {
-                        self.early_cb2 = Some((cb2, self.early_k));
+                    Ok((cb2, layout)) => {
+                        self.early_cb2 = Some(EarlyPrefix {
+                            gpu: self.gpu,
+                            cb: cb2,
+                            k: self.early_k,
+                            layout,
+                        });
                         if debug_enabled() {
                             eprintln!(
                                 "[gpu-commit] early hybrid prefix committed behind final tile (k={})",
@@ -5512,13 +6048,7 @@ kernel void blake3_pow_scan(
     impl Drop for FromZFirstPassStream {
         fn drop(&mut self) {
             let _ = self.wait_pending();
-            if let Some((cb2, _)) = self.early_cb2.take() {
-                let _ = unsafe { self.gpu.wait_cb(cb2) };
-                unsafe { self.gpu.release(cb2) };
-            }
-            if self.owns_lease {
-                STAGING_IN_USE.store(false, std::sync::atomic::Ordering::Release);
-            }
+            drop(self.early_cb2.take());
         }
     }
 
@@ -5546,6 +6076,7 @@ kernel void blake3_pow_scan(
             return None;
         }
 
+        let lease = StagingLease;
         let z_bytes = z_len * core::mem::size_of::<F128>();
         let z_addr = z_ptr as usize;
         let cached = state
@@ -5564,7 +6095,6 @@ kernel void blake3_pow_scan(
                     if debug_enabled() {
                         eprintln!("[gpu-commit] streamed z wrap failed ({e})");
                     }
-                    STAGING_IN_USE.store(false, Ordering::Release);
                     return None;
                 }
             },
@@ -5592,7 +6122,7 @@ kernel void blake3_pow_scan(
             next_r: 0,
             pending: Vec::with_capacity(8),
             failed: None,
-            owns_lease: true,
+            lease: Some(lease),
             started: std::time::Instant::now(),
             early_k,
             early_cb2: None,
@@ -5758,6 +6288,603 @@ kernel void blake3_pow_scan(
             });
     }
 
+    /// Decode only in the existing CPU destination; physical staging keeps
+    /// the same layout for later validation and queries.
+    fn copy_canonical_codeword(src: *const u8, layout: GpuCodewordLayout, dst: &mut [F128]) {
+        use rayon::prelude::*;
+        if layout == GpuCodewordLayout::Canonical {
+            unsafe {
+                copy_bytes_parallel(
+                    src,
+                    core::slice::from_raw_parts_mut(
+                        dst.as_mut_ptr().cast::<u8>(),
+                        core::mem::size_of_val(dst),
+                    ),
+                );
+            }
+            return;
+        }
+        let physical = unsafe { core::slice::from_raw_parts(src.cast::<F128>(), dst.len()) };
+        let prefix = layout.prefix_positions();
+        dst.par_chunks_mut(1024)
+            .enumerate()
+            .for_each(|(block, tile)| {
+                tile.copy_from_slice(&physical[block * 1024..block * 1024 + tile.len()]);
+                if block * 16 < prefix {
+                    super::decode_final_tile(tile, block);
+                }
+            });
+    }
+
+    fn canonical_codeword_matches(
+        src: *const u8,
+        layout: GpuCodewordLayout,
+        want: &[F128],
+    ) -> bool {
+        use rayon::prelude::*;
+        if layout == GpuCodewordLayout::Canonical {
+            return unsafe {
+                bytes_equal_parallel(
+                    src,
+                    core::slice::from_raw_parts(
+                        want.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(want),
+                    ),
+                )
+            };
+        }
+        let physical = unsafe { core::slice::from_raw_parts(src.cast::<F128>(), want.len()) };
+        let prefix = layout.prefix_positions();
+        want.par_chunks(1024).enumerate().all(|(block, expected)| {
+            let tile = &physical[block * 1024..block * 1024 + expected.len()];
+            if block * 16 < prefix {
+                let mut decoded = [F128::ZERO; 1024];
+                decoded.copy_from_slice(tile);
+                super::decode_final_tile(&mut decoded, block);
+                decoded.as_slice() == expected
+            } else {
+                tile == expected
+            }
+        })
+    }
+
+    #[cfg(test)]
+    mod lazy_final_tests {
+        use super::*;
+
+        struct PanicGate {
+            gpu: &'static Gpu,
+            event: usize,
+            cb: std::sync::atomic::AtomicUsize,
+            entered: std::sync::mpsc::Sender<()>,
+            drained: std::sync::atomic::AtomicBool,
+        }
+
+        impl Drop for PanicGate {
+            fn drop(&mut self) {
+                let cb = self.cb.load(std::sync::atomic::Ordering::Acquire) as Id;
+                if !cb.is_null() {
+                    unsafe { self.gpu.release(cb) };
+                }
+            }
+        }
+
+        std::thread_local! {
+            static PANIC_GATE: std::cell::RefCell<Option<std::sync::Arc<PanicGate>>> = const { std::cell::RefCell::new(None) };
+        }
+
+        pub(super) unsafe fn hold_cb2(gpu: &Gpu, cb: Id) {
+            PANIC_GATE.with(|slot| {
+                if let Some(gate) = slot.borrow().as_ref() {
+                    unsafe {
+                        send!(
+                            gpu.api,
+                            unsafe extern "C" fn(Id, Sel, Id, u64),
+                            cb,
+                            c"encodeWaitForEvent:value:",
+                            gate.event as Id,
+                            1
+                        );
+                    }
+                    // The observer owns its first CB even if encoding fails
+                    // before production installs the early-prefix owner.
+                    let retained = unsafe { gpu.retain(cb) };
+                    if gate
+                        .cb
+                        .compare_exchange(
+                            0,
+                            retained as usize,
+                            std::sync::atomic::Ordering::Release,
+                            std::sync::atomic::Ordering::Relaxed,
+                        )
+                        .is_err()
+                    {
+                        unsafe { gpu.release(retained) };
+                    }
+                }
+            });
+        }
+
+        pub(super) fn panic_in_suffix() {
+            if PANIC_GATE.with(|slot| slot.borrow().is_some()) {
+                panic!("test CPU suffix panic with a submitted GPU prefix");
+            }
+        }
+
+        pub(super) fn drain_started() {
+            PANIC_GATE.with(|slot| {
+                if let Some(gate) = slot.borrow().as_ref() {
+                    let _ = gate.entered.send(());
+                }
+            });
+        }
+
+        pub(super) fn drain_finished() {
+            PANIC_GATE.with(|slot| {
+                if let Some(gate) = slot.borrow().as_ref() {
+                    gate.drained
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+            });
+        }
+
+        fn sample(seed: u64) -> F128 {
+            let mut x = seed.wrapping_add(0x9E3779B97F4A7C15);
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            let lo = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+            F128::new(lo ^ (lo >> 31), x.rotate_left(29) ^ seed)
+        }
+
+        #[test]
+        fn lazy_final_validation_preserves_physical_staging() {
+            let mut physical = vec![F128::ZERO; 4096];
+            for generation in 0..2u64 {
+                for (i, value) in physical.iter_mut().enumerate() {
+                    *value = F128::new((i as u64).wrapping_mul(0x9E37) + generation, i as u64);
+                }
+                let layout = GpuCodewordLayout::S16Prefix {
+                    prefix_positions: 32,
+                };
+                let mut expected = physical.clone();
+                for (block, tile) in expected.chunks_mut(1024).take(2).enumerate() {
+                    super::super::decode_final_tile(tile, block);
+                }
+                let before = physical.clone();
+                let mut copied = vec![F128::ZERO; physical.len()];
+                copy_canonical_codeword(physical.as_ptr().cast(), layout, &mut copied);
+                assert_eq!(copied, expected);
+                assert!(canonical_codeword_matches(
+                    physical.as_ptr().cast(),
+                    layout,
+                    &expected
+                ));
+                expected[0] += F128::ONE;
+                assert!(!canonical_codeword_matches(
+                    physical.as_ptr().cast(),
+                    layout,
+                    &expected
+                ));
+                assert_eq!(physical, before);
+            }
+        }
+
+        /// Hold a real early-prefix command behind a shared event, then
+        /// panic in the CPU suffix. The observer releases the GPU only after
+        /// it sees the drain and the live lease. The next production stream
+        /// must reuse the same witness address and return correct rows.
+        #[test]
+        #[ignore = "ranked shared buffers and process latch; requires an exclusive Metal slot"]
+        fn gpu_lazy_final_stream_panic_drains_before_lease_release() {
+            use std::sync::atomic::Ordering;
+            let gpu = gpu().expect("real Metal device is required");
+            assert!(gpu_lazy_final_enabled());
+            assert!(!final_leaf4_pso(gpu).is_null());
+            let params = crate::pcs::commit::PcsParams {
+                m: 32,
+                log_inv_rate: 1,
+                log_batch_size: 6,
+                profile: crate::pcs::ligerito::LigeritoProfile::Fast,
+                merkle_hash: crate::merkle::HashKind::Blake3,
+            };
+            let n = params.n_leaves();
+            let k = hybrid_cpu_sixteenths();
+            assert!((1..16).contains(&k));
+            let tw = flat_twiddle_table(super::super::ranked_final_ntt(), 20);
+            struct RestoreLatch {
+                gpu: &'static Gpu,
+                previous: Option<LatchState>,
+            }
+            impl Drop for RestoreLatch {
+                fn drop(&mut self) {
+                    let current =
+                        std::mem::replace(&mut *latch_lock(), self.previous.take().unwrap());
+                    if let LatchState::On(state) = current {
+                        release_latched(self.gpu, state);
+                    }
+                }
+            }
+            let stream_commit = |z: &[F128]| {
+                let mut stream = unsafe {
+                    begin_from_z_first_pass_stream(z.as_ptr().cast_mut(), z.len(), &params)
+                }
+                .expect("production stream must acquire staging");
+                assert!(STAGING_IN_USE.load(Ordering::Acquire));
+                assert!(
+                    unsafe {
+                        begin_from_z_first_pass_stream(z.as_ptr().cast_mut(), z.len(), &params)
+                    }
+                    .is_none()
+                );
+                assert!(STAGING_IN_USE.load(Ordering::Acquire));
+                stream.submit_ready_range(0, 1 << 16);
+                assert!(
+                    stream.early_cb2.is_some(),
+                    "must exercise the retained early prefix"
+                );
+                let (codeword, merkle_tree) =
+                    finish_from_z_first_pass_or_fallback(stream, z, Vec::new(), &params, |_| {
+                        panic!("unexpected CPU fallback")
+                    });
+                assert!(STAGING_IN_USE.load(Ordering::Acquire));
+                crate::pcs::commit::ProverData {
+                    codeword,
+                    merkle_tree,
+                }
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                let z_buf = gpu.new_buffer(n * 512).unwrap();
+                let staging = gpu.new_buffer(n * 1024).unwrap();
+                let tree_buf = gpu.new_buffer((2 * n - 1) * 32).unwrap();
+                let tw_buf = gpu
+                    .new_buffer(core::mem::size_of_val(tw.as_slice()))
+                    .unwrap();
+                std::ptr::copy_nonoverlapping(
+                    tw.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(tw_buf),
+                    core::mem::size_of_val(tw.as_slice()),
+                );
+                let z = core::slice::from_raw_parts_mut(
+                    gpu.buffer_contents(z_buf).cast::<F128>(),
+                    n * 32,
+                );
+                let z_address = z.as_ptr() as usize;
+                let previous = std::mem::replace(
+                    &mut *latch_lock(),
+                    LatchState::On(Latched {
+                        tw_buf,
+                        tree_buf,
+                        staging,
+                        wraps: vec![(z_address, n * 512, gpu.retain(z_buf))],
+                    }),
+                );
+                assert!(
+                    !matches!(previous, LatchState::On(_)),
+                    "test requires an unused latch"
+                );
+                let restore = RestoreLatch {
+                    gpu,
+                    previous: Some(previous),
+                };
+                let fill = |z: &mut [F128], generation: u64| {
+                    use rayon::prelude::*;
+                    z.par_iter_mut()
+                        .enumerate()
+                        .for_each(|(i, value)| *value = sample(i as u64 ^ (generation << 48)));
+                };
+                // Save a canonical control for the later fresh reuse, without
+                // retaining another full-sized codeword allocation.
+                fill(z, 2);
+                std::env::set_var(ENV_NO_GPU_LAZY_FINAL, "1");
+                let control = stream_commit(z);
+                assert!(control.codeword.canonical_slice().is_some());
+                let prefix = n / 16 * (16 - k);
+                let mut queries =
+                    std::collections::BTreeSet::from([0, 15, 16, prefix - 1, prefix, n - 1]);
+                let mut i = 0;
+                while queries.len() < 218 {
+                    queries.insert((i * 4099 + 23) % n);
+                    i += 1;
+                }
+                let expected_rows: Vec<_> = queries
+                    .iter()
+                    .map(|&q| control.codeword.rows().row(q, 64))
+                    .collect();
+                let expected_tree = control.merkle_tree.to_vec();
+                drop(control);
+                assert!(!STAGING_IN_USE.load(Ordering::Acquire));
+                std::env::remove_var(ENV_NO_GPU_LAZY_FINAL);
+
+                fill(z, 1);
+                let event: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    gpu.device,
+                    c"newSharedEvent"
+                );
+                assert!(!event.is_null());
+                let (entered, observed) = std::sync::mpsc::channel();
+                let gate = std::sync::Arc::new(PanicGate {
+                    gpu,
+                    event: event as usize,
+                    cb: std::sync::atomic::AtomicUsize::new(0),
+                    entered,
+                    drained: std::sync::atomic::AtomicBool::new(false),
+                });
+                PANIC_GATE.with(|slot| *slot.borrow_mut() = Some(gate.clone()));
+                let observer_gate = gate.clone();
+                let observer = std::thread::spawn(move || {
+                    let entered = observed
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .is_ok();
+                    let leased = STAGING_IN_USE.load(Ordering::Acquire);
+                    let cb = observer_gate.cb.load(Ordering::Acquire) as Id;
+                    let status: u64 = if !entered || cb.is_null() {
+                        0
+                    } else {
+                        send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> u64, cb, c"status")
+                    };
+                    // Signal even on a failed observation so the unwind can
+                    // drain and the test reports failure without a deadlock.
+                    send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, u64),
+                        observer_gate.event as Id,
+                        c"setSignaledValue:",
+                        1
+                    );
+                    (entered, leased, status)
+                });
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stream_commit(z)));
+                PANIC_GATE.with(|slot| *slot.borrow_mut() = None);
+                let (entered, leased, status) = observer.join().unwrap();
+                gpu.release(event);
+                assert!(result.is_err(), "CPU suffix panic must be injected");
+                assert!(
+                    entered && leased,
+                    "lease must remain held when drain begins"
+                );
+                assert!(
+                    (2..4).contains(&status),
+                    "real command must still be committed or scheduled"
+                );
+                assert!(gate.drained.load(Ordering::Acquire));
+                assert!(!STAGING_IN_USE.load(Ordering::Acquire));
+                assert_ne!(
+                    core::slice::from_raw_parts(gpu.buffer_contents(tree_buf).cast::<Hash>(), 1)[0],
+                    expected_tree[0]
+                );
+
+                // This is the first graph after the failed call. It must
+                // restore every first-pass value from a fresh witness.
+                fill(z, 2);
+                assert_eq!(z.as_ptr() as usize, z_address);
+                let data = stream_commit(z);
+                let crate::pcs::commit::CodewordBuf::Gpu(view) = &data.codeword else {
+                    panic!("expected GPU handoff")
+                };
+                assert_eq!(
+                    view.layout,
+                    GpuCodewordLayout::S16Prefix {
+                        prefix_positions: prefix
+                    }
+                );
+                assert!(data.codeword.canonical_slice().is_none());
+                assert!(begin_from_z_first_pass_stream(z.as_mut_ptr(), z.len(), &params).is_none());
+                assert!(STAGING_IN_USE.load(Ordering::Acquire));
+                for (&q, want) in queries.iter().zip(&expected_rows) {
+                    assert_eq!(&data.codeword.rows().row(q, 64), want, "fresh row {q}");
+                }
+                for (i, (got, want)) in data.merkle_tree.iter().zip(&expected_tree).enumerate() {
+                    assert_eq!(got, want, "fresh tree node {i}");
+                }
+                drop(data);
+                assert!(!STAGING_IN_USE.load(Ordering::Acquire));
+                drop(restore);
+                gpu.release(z_buf);
+                gpu.pool_pop(pool);
+            }
+        }
+
+        /// Compare all tree nodes and exactly 218 selected canonical rows.
+        /// Reuse the same Metal allocations after changing the witness.
+        #[test]
+        #[ignore = "ranked shared buffers; requires an exclusive Metal slot"]
+        fn gpu_lazy_final_tree_rows_prefix_reuse_and_fallback() {
+            use rayon::prelude::*;
+            struct Restore(Option<std::ffi::OsString>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    unsafe {
+                        match self.0.take() {
+                            Some(value) => std::env::set_var(ENV_NO_GPU_LAZY_FINAL, value),
+                            None => std::env::remove_var(ENV_NO_GPU_LAZY_FINAL),
+                        }
+                    }
+                }
+            }
+            let _restore = Restore(std::env::var_os(ENV_NO_GPU_LAZY_FINAL));
+            let gpu = gpu().expect("real Metal device is required");
+            assert!(
+                !final_leaf4_pso(gpu).is_null(),
+                "fused final PSO is required"
+            );
+            let log_d = 20;
+            let n = 1usize << log_d;
+            let tw = flat_twiddle_table(super::super::ranked_final_ntt(), log_d);
+            unsafe {
+                let pool = gpu.pool_push();
+                let z_buf = gpu.new_buffer(n * 512).unwrap();
+                let data_buf = gpu.new_buffer(n * 1024).unwrap();
+                let tree_buf = gpu.new_buffer((2 * n - 1) * 32).unwrap();
+                let tw_buf = gpu
+                    .new_buffer(core::mem::size_of_val(tw.as_slice()))
+                    .unwrap();
+                std::ptr::copy_nonoverlapping(
+                    tw.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(tw_buf),
+                    core::mem::size_of_val(tw.as_slice()),
+                );
+                let run = |k| {
+                    if k == 0 {
+                        run_commit_graph_from_z(gpu, z_buf, data_buf, tw_buf, tree_buf, log_d, n)
+                    } else {
+                        run_commit_graph_from_z_hybrid(
+                            gpu, z_buf, data_buf, tw_buf, tree_buf, log_d, n, k,
+                        )
+                    }
+                    .expect("complete graph")
+                };
+                for (generation, k) in [(0u64, 0usize), (0, 5), (1, 3)] {
+                    let z = core::slice::from_raw_parts_mut(
+                        gpu.buffer_contents(z_buf).cast::<F128>(),
+                        n * 32,
+                    );
+                    z.par_chunks_mut(4096).enumerate().for_each(|(chunk, dst)| {
+                        for (i, value) in dst.iter_mut().enumerate() {
+                            *value = sample((chunk * 4096 + i) as u64 ^ (generation << 48));
+                        }
+                    });
+                    if generation == 1 {
+                        for row in (1..n / 2).step_by(2) {
+                            z[row * 64 + 57..(row + 1) * 64].fill(F128::ZERO);
+                        }
+                    }
+                    let prefix = n / 16 * (16 - k);
+                    let mut queries =
+                        std::collections::BTreeSet::from([0, 15, 16, n - 1, prefix - 1]);
+                    if prefix < n {
+                        queries.insert(prefix);
+                    }
+                    let mut i = 0usize;
+                    while queries.len() < 218 {
+                        queries.insert((i * 4099 + 23) % n);
+                        i += 1;
+                    }
+                    std::env::set_var(ENV_NO_GPU_LAZY_FINAL, "1");
+                    assert_eq!(run(k), GpuCodewordLayout::Canonical);
+                    let dense = core::slice::from_raw_parts(
+                        gpu.buffer_contents(data_buf).cast::<F128>(),
+                        n * 64,
+                    );
+                    let expected_rows: Vec<_> = queries
+                        .iter()
+                        .map(|&q| dense[q * 64..(q + 1) * 64].to_vec())
+                        .collect();
+                    let expected_tree = core::slice::from_raw_parts(
+                        gpu.buffer_contents(tree_buf).cast::<Hash>(),
+                        2 * n - 1,
+                    )
+                    .to_vec();
+                    std::env::remove_var(ENV_NO_GPU_LAZY_FINAL);
+                    let layout = run(k);
+                    assert_eq!(
+                        layout,
+                        GpuCodewordLayout::S16Prefix {
+                            prefix_positions: prefix
+                        }
+                    );
+                    let got_tree = core::slice::from_raw_parts(
+                        gpu.buffer_contents(tree_buf).cast::<Hash>(),
+                        2 * n - 1,
+                    );
+                    for (i, (got, want)) in got_tree.iter().zip(&expected_tree).enumerate() {
+                        assert_eq!(got, want, "tree node {i}, generation {generation}, k {k}");
+                    }
+                    assert!(!STAGING_IN_USE.swap(true, std::sync::atomic::Ordering::AcqRel));
+                    let view = GpuCodeword::with_layout(
+                        gpu.buffer_contents(data_buf).cast(),
+                        n * 64,
+                        layout,
+                        StagingLease,
+                    );
+                    assert!(view.canonical_slice().is_none());
+                    assert!(STAGING_IN_USE.swap(true, std::sync::atomic::Ordering::Acquire));
+                    assert!(STAGING_IN_USE.load(std::sync::atomic::Ordering::Acquire));
+                    for (&q, want) in queries.iter().zip(&expected_rows) {
+                        assert_eq!(
+                            &view.row(q, 64),
+                            want,
+                            "row {q}, generation {generation}, k {k}"
+                        );
+                    }
+                    drop(view);
+                    assert!(!STAGING_IN_USE.load(std::sync::atomic::Ordering::Acquire));
+                    eprintln!(
+                        "[lazy-final-oracle] generation={generation} k={k} prefix={prefix}: {} tree nodes, {} canonical rows",
+                        2 * n - 1,
+                        queries.len()
+                    );
+                }
+                gpu.release(z_buf);
+                gpu.release(data_buf);
+                gpu.release(tree_buf);
+                gpu.release(tw_buf);
+                // A non-ranked graph cannot retain S16. It must return and
+                // store the complete canonical transform and tree.
+                let log_d = 10;
+                let n = 1usize << log_d;
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tw = flat_twiddle_table(&ntt, log_d);
+                let z: Vec<_> = (0..n * 32)
+                    .map(|i| sample(i as u64 ^ 0xFA11_BACC))
+                    .collect();
+                let mut expected = vec![F128::ZERO; n * 64];
+                crate::pcs::commit::replicate_message_fill(&mut expected, &z);
+                // Replication already applies layer0 to the zero-padded message.
+                ntt.forward_transform_interleaved_scalar_from_layer(&mut expected, 64, 1);
+                let bytes = core::slice::from_raw_parts(expected.as_ptr().cast::<u8>(), n * 1024);
+                let expected_tree =
+                    crate::merkle::merkle_tree(bytes, n, crate::merkle::HashKind::Blake3);
+                let z_buf = gpu.new_buffer(n * 512).unwrap();
+                let data_buf = gpu.new_buffer(n * 1024).unwrap();
+                let tree_buf = gpu.new_buffer((2 * n - 1) * 32).unwrap();
+                let tw_buf = gpu
+                    .new_buffer(core::mem::size_of_val(tw.as_slice()))
+                    .unwrap();
+                std::ptr::copy_nonoverlapping(
+                    z.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(z_buf),
+                    n * 512,
+                );
+                std::ptr::copy_nonoverlapping(
+                    tw.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(tw_buf),
+                    core::mem::size_of_val(tw.as_slice()),
+                );
+                assert_eq!(
+                    run_commit_graph_from_z(gpu, z_buf, data_buf, tw_buf, tree_buf, log_d, n)
+                        .unwrap(),
+                    GpuCodewordLayout::Canonical
+                );
+                let got = core::slice::from_raw_parts(
+                    gpu.buffer_contents(data_buf).cast::<F128>(),
+                    n * 64,
+                );
+                for (i, (got, want)) in got.iter().zip(&expected).enumerate() {
+                    assert_eq!(got, want, "fallback element {i}");
+                }
+                let got_tree = core::slice::from_raw_parts(
+                    gpu.buffer_contents(tree_buf).cast::<Hash>(),
+                    2 * n - 1,
+                );
+                for (i, (got, want)) in got_tree.iter().zip(&expected_tree).enumerate() {
+                    assert_eq!(got, want, "fallback tree node {i}");
+                }
+                eprintln!(
+                    "[lazy-final-oracle] canonical fallback: {} values, {} tree nodes",
+                    n * 64,
+                    2 * n - 1
+                );
+                for buffer in [z_buf, data_buf, tree_buf, tw_buf] {
+                    gpu.release(buffer);
+                }
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
     /// Parent levels built by each finalized 1,024-leaf CPU-suffix chunk.
     ///
     /// Eight levels leave four roots (128 contiguous bytes) per chunk for the
@@ -5843,7 +6970,7 @@ kernel void blake3_pow_scan(
         tree_buf: Id,
         log_d: usize,
         n_leaves: usize,
-    ) -> Result<(), String> {
+    ) -> Result<GpuCodewordLayout, String> {
         unsafe {
             let pool = gpu.pool_push();
             let r = (|| {
@@ -5864,10 +6991,26 @@ kernel void blake3_pow_scan(
                     1usize << (log_d - 4),
                 );
                 // Passes 2..: layers 4..log_d in place over staging.
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
-                encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                let layout = encode_ntt_final_leaf4(gpu, enc, staging, tw_buf, tree_buf, log_d, 16);
+                if layout.is_some() {
+                    encode_merkle_subtree_from_level(
+                        gpu,
+                        enc,
+                        staging,
+                        tree_buf,
+                        n_leaves,
+                        0,
+                        n_leaves,
+                        super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled()),
+                        3,
+                    );
+                } else {
+                    encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
+                    encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                }
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                gpu.commit_and_wait(cb)?;
+                Ok(layout.unwrap_or(GpuCodewordLayout::Canonical))
             })();
             gpu.pool_pop(pool);
             r
@@ -5883,16 +7026,32 @@ kernel void blake3_pow_scan(
         tree_buf: Id,
         log_d: usize,
         n_leaves: usize,
-    ) -> Result<(), String> {
+    ) -> Result<GpuCodewordLayout, String> {
         unsafe {
             let pool = gpu.pool_push();
             let r = (|| {
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
-                encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                let layout = encode_ntt_final_leaf4(gpu, enc, staging, tw_buf, tree_buf, log_d, 16);
+                if layout.is_some() {
+                    encode_merkle_subtree_from_level(
+                        gpu,
+                        enc,
+                        staging,
+                        tree_buf,
+                        n_leaves,
+                        0,
+                        n_leaves,
+                        super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled()),
+                        3,
+                    );
+                } else {
+                    encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
+                    encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                }
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                gpu.commit_and_wait(cb)?;
+                Ok(layout.unwrap_or(GpuCodewordLayout::Canonical))
             })();
             gpu.pool_pop(pool);
             r
@@ -5969,13 +7128,19 @@ kernel void blake3_pow_scan(
         log_d: usize,
         n_leaves: usize,
         k_cpu16: usize,
-    ) -> Result<Id, String> {
+    ) -> Result<(Id, GpuCodewordLayout), String> {
         debug_assert!((1..16).contains(&k_cpu16));
         unsafe {
             let prefix16 = (16 - k_cpu16) as u64;
             let cb2 = gpu.command_buffer()?;
+            #[cfg(test)]
+            lazy_final_tests::hold_cb2(gpu, cb2);
             let enc = gpu.compute_encoder(cb2)?;
-            encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
+            let fused =
+                encode_ntt_final_leaf4(gpu, enc, staging, tw_buf, tree_buf, log_d, prefix16);
+            if fused.is_none() {
+                encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
+            }
             // Greedy aligned power-of-two subtree decomposition of the
             // leaf prefix.
             let sixteenth = n_leaves / 16;
@@ -5986,11 +7151,25 @@ kernel void blake3_pow_scan(
                 while start % size != 0 {
                     size >>= 1;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                if fused.is_some() {
+                    encode_merkle_subtree_from_level(
+                        gpu,
+                        enc,
+                        staging,
+                        tree_buf,
+                        n_leaves,
+                        start,
+                        size,
+                        super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled()),
+                        3,
+                    );
+                } else {
+                    encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                }
                 start += size;
             }
             gpu.end_encoding(enc);
-            Ok(cb2)
+            Ok((cb2, fused.unwrap_or(GpuCodewordLayout::Canonical)))
         }
     }
 
@@ -6004,8 +7183,8 @@ kernel void blake3_pow_scan(
         n_leaves: usize,
         k_cpu16: usize,
         first_pass_done: bool,
-        pre_cb2: Option<Id>,
-    ) -> Result<(), String> {
+        pre_cb2: Option<(Id, GpuCodewordLayout)>,
+    ) -> Result<GpuCodewordLayout, String> {
         use rayon::prelude::*;
         debug_assert!((1..16).contains(&k_cpu16));
         unsafe {
@@ -6020,16 +7199,35 @@ kernel void blake3_pow_scan(
                 // cb2: GPU prefix — remaining passes + aligned subtrees.
                 // A pre-committed cb2 (streamed early-prefix path) was
                 // already queued directly behind the final first-pass tile.
-                let cb2 = match pre_cb2 {
+                let (cb2, layout) = match pre_cb2 {
                     Some(cb2) => cb2,
                     None => {
-                        let cb2 = encode_hybrid_prefix_cb2(
+                        let (cb2, layout) = encode_hybrid_prefix_cb2(
                             gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
                         )?;
                         gpu.commit_async(cb2);
-                        cb2
+                        (cb2, layout)
                     }
                 };
+                struct Drain<'a> {
+                    gpu: &'a Gpu,
+                    cb: Id,
+                }
+                impl Drop for Drain<'_> {
+                    fn drop(&mut self) {
+                        if !self.cb.is_null() {
+                            #[cfg(test)]
+                            lazy_final_tests::drain_started();
+                            let _ = unsafe { self.gpu.wait_cb(self.cb) };
+                            #[cfg(test)]
+                            lazy_final_tests::drain_finished();
+                        }
+                    }
+                }
+                // This drops before any outer staging lease on CPU unwind.
+                let mut drain = Drain { gpu, cb: cb2 };
+                #[cfg(test)]
+                lazy_final_tests::panic_in_suffix();
                 let prefix_leaves = (16 - k_cpu16) * (n_leaves / 16);
 
                 // CPU: suffix NTT completion + leaves + subtree parents.
@@ -6198,6 +7396,7 @@ kernel void blake3_pow_scan(
                 } else {
                     gpu.wait_cb(cb2)?;
                 }
+                drain.cb = NIL;
                 if let Some(t) = t_wait_cb2 {
                     let (s, e) = cb_gpu_interval(gpu, cb2);
                     eprintln!(
@@ -6225,7 +7424,7 @@ kernel void blake3_pow_scan(
                     level_start = write_start;
                     level_len /= 2;
                 }
-                Ok(())
+                Ok(layout)
             })();
             gpu.pool_pop(pool);
             r
@@ -6241,7 +7440,7 @@ kernel void blake3_pow_scan(
         log_d: usize,
         n_leaves: usize,
         k_cpu16: usize,
-    ) -> Result<(), String> {
+    ) -> Result<GpuCodewordLayout, String> {
         unsafe {
             run_commit_graph_from_z_hybrid_impl(
                 gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16, false, None,
@@ -6455,7 +7654,7 @@ kernel void blake3_pow_scan(
             tw_buf,
             tree_buf,
         };
-        let run_graph = |k: usize| -> Result<(), String> {
+        let run_graph = |k: usize| -> Result<GpuCodewordLayout, String> {
             let c = &ctx;
             unsafe {
                 if k == 0 {
@@ -6481,7 +7680,7 @@ kernel void blake3_pow_scan(
         // dispatch the timed prove runs. `FLOCK_NO_HYBRID_TUNE_STREAMED=1`
         // restores the full-graph probe.
         let streamed_probe = std::env::var_os("FLOCK_NO_HYBRID_TUNE_STREAMED").is_none();
-        let timed_graph = |k: usize| -> Result<(), String> {
+        let timed_graph = |k: usize| -> Result<GpuCodewordLayout, String> {
             if !streamed_probe {
                 return run_graph(k);
             }
@@ -6676,17 +7875,11 @@ kernel void blake3_pow_scan(
         if chosen != 0 {
             // Trust-but-verify the winner on this host: one more run, full
             // staging + tree byte compare against the CPU reference commit.
-            if run_graph(chosen).is_err() {
+            let Ok(layout) = run_graph(chosen) else {
                 return;
-            }
+            };
             let staging_ok = unsafe {
-                bytes_equal_parallel(
-                    gpu.buffer_contents(staging),
-                    core::slice::from_raw_parts(
-                        codeword.as_ptr().cast::<u8>(),
-                        core::mem::size_of_val(codeword),
-                    ),
-                )
+                canonical_codeword_matches(gpu.buffer_contents(staging), layout, codeword)
             };
             let tree_ok = unsafe {
                 bytes_equal_parallel(
@@ -6767,7 +7960,7 @@ kernel void blake3_pow_scan(
             tw_buf: latched.tw_buf,
             tree_buf: latched.tree_buf,
         };
-        let timed_graph = |k: usize| -> Result<(), String> {
+        let timed_graph = |k: usize| -> Result<GpuCodewordLayout, String> {
             let c = &ctx;
             unsafe {
                 if k == 0 {
@@ -6846,7 +8039,7 @@ kernel void blake3_pow_scan(
             return;
         };
 
-        let verified = unsafe {
+        let verified_run = unsafe {
             if chosen == 0 {
                 run_commit_graph_from_z(
                     gpu,
@@ -6869,17 +8062,17 @@ kernel void blake3_pow_scan(
                     chosen,
                 )
             }
-        }
-        .is_ok()
+        };
+        let verified = verified_run.is_ok()
             && cpu_codeword.len() == params.codeword_len_f128()
             && cpu_tree.len() == 2 * params.n_leaves() - 1
             && unsafe {
-                bytes_equal_parallel(
+                canonical_codeword_matches(
                     gpu.buffer_contents(ctx.staging),
-                    core::slice::from_raw_parts(
-                        cpu_codeword.as_ptr().cast::<u8>(),
-                        core::mem::size_of_val(cpu_codeword),
-                    ),
+                    *verified_run
+                        .as_ref()
+                        .expect("successful graph checked above"),
+                    cpu_codeword,
                 )
             }
             && unsafe {
@@ -7013,6 +8206,7 @@ kernel void blake3_pow_scan(
         latched: Latched,
         gpu_tree: Vec<Hash>,
         gpu_wall_ms: f64,
+        layout: GpuCodewordLayout,
         /// Root of the untimed wiring run's tree (see the static warmup
         /// latch): equality with `gpu_tree.last()` after the timed replay
         /// is a whole-graph determinism check.
@@ -7071,10 +8265,18 @@ kernel void blake3_pow_scan(
     }
 
     fn warmup_cache_msl_fnv() -> u64 {
-        warmup_cache_msl_fnv_for(
+        let mut key = warmup_cache_msl_fnv_for(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
-        )
+        );
+        if super::gpu_final_leaf4_enabled() {
+            key ^= fnv1a64(&final_leaf4_source()).rotate_left(3);
+        }
+        if super::gpu_lazy_final_enabled() {
+            key ^= 0x5331_365F_5052_4631;
+        } // S16_PRF1
+
+        key
     }
 
     #[cfg(test)]
@@ -7304,7 +8506,9 @@ kernel void blake3_pow_scan(
                     None => return Err("warmup tree empty".into()),
                 };
                 let t0 = std::time::Instant::now();
-                run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)?;
+                let layout = run_commit_graph_from_z(
+                    gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves,
+                )?;
                 let graph_ms = t0.elapsed().as_secs_f64() * 1e3;
                 copy_bytes_parallel(gpu.buffer_contents(tree_buf), {
                     core::slice::from_raw_parts_mut(
@@ -7327,6 +8531,7 @@ kernel void blake3_pow_scan(
                     },
                     gpu_tree,
                     gpu_wall_ms,
+                    layout,
                     wiring_root,
                 })
             })(&mut created);
@@ -7423,12 +8628,10 @@ kernel void blake3_pow_scan(
                         codeword = ensure_cpu_codeword(codeword, len);
                         let gpu = gpu().expect("gpu() succeeded during warmup_gpu_run");
                         unsafe {
-                            copy_bytes_parallel(
+                            copy_canonical_codeword(
                                 gpu.buffer_contents(run.latched.staging),
-                                core::slice::from_raw_parts_mut(
-                                    codeword.as_mut_ptr().cast::<u8>(),
-                                    core::mem::size_of_val(codeword.as_slice()),
-                                ),
+                                run.layout,
+                                &mut codeword,
                             );
                         }
                         let tree = run.gpu_tree;
@@ -7489,12 +8692,10 @@ kernel void blake3_pow_scan(
                     codeword = ensure_cpu_codeword(codeword, len);
                     let gpu = gpu().expect("gpu() succeeded during warmup_gpu_run");
                     unsafe {
-                        copy_bytes_parallel(
+                        copy_canonical_codeword(
                             gpu.buffer_contents(run.latched.staging),
-                            core::slice::from_raw_parts_mut(
-                                codeword.as_mut_ptr().cast::<u8>(),
-                                core::mem::size_of_val(codeword.as_slice()),
-                            ),
+                            run.layout,
+                            &mut codeword,
                         );
                     }
                     let tree = run.gpu_tree;
@@ -7553,12 +8754,10 @@ kernel void blake3_pow_scan(
 
         // Bit-exactness: full codeword and full tree.
         let codeword_ok = unsafe {
-            bytes_equal_parallel(
+            canonical_codeword_matches(
                 gpu.buffer_contents(run.latched.staging),
-                core::slice::from_raw_parts(
-                    codeword.as_ptr().cast::<u8>(),
-                    core::mem::size_of_val(codeword.as_slice()),
-                ),
+                run.layout,
+                &codeword,
             )
         };
         let tree_ok = run.gpu_tree == cpu_tree;
@@ -7682,6 +8881,8 @@ kernel void blake3_pow_scan(
             return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
         }
 
+        let lease = StagingLease;
+
         // Resolve the read-only z wrap (normally cached from the warmup).
         let z_ptr = z_packed.as_ptr() as usize;
         let z_bytes = core::mem::size_of_val(z_packed);
@@ -7708,7 +8909,6 @@ kernel void blake3_pow_scan(
                         if debug_enabled() {
                             eprintln!("[gpu-commit] z wrap failed at prove time ({e})");
                         }
-                        STAGING_IN_USE.store(false, Ordering::Release);
                         codeword = ensure_cpu_codeword(codeword, codeword_len);
                         let tree = cpu(&mut codeword);
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
@@ -7729,18 +8929,20 @@ kernel void blake3_pow_scan(
                 run_commit_graph_from_z(gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves)
             }
         };
-        if let Err(e) = run {
-            // Neither z nor the replicated codeword was written by the GPU,
-            // so the plain CPU path is a bit-identical fallback.
-            eprintln!("[gpu-commit] GPU failed mid-prove ({e}); falling back to CPU");
-            STAGING_IN_USE.store(false, Ordering::Release);
-            if let LatchState::On(state) = std::mem::replace(latch, LatchState::Off) {
-                release_latched(gpu, state);
+        let layout = match run {
+            Ok(layout) => layout,
+            Err(e) => {
+                // Neither z nor the replicated codeword was written by the GPU,
+                // so the plain CPU path is a bit-identical fallback.
+                eprintln!("[gpu-commit] GPU failed mid-prove ({e}); falling back to CPU");
+                if let LatchState::On(state) = std::mem::replace(latch, LatchState::Off) {
+                    release_latched(gpu, state);
+                }
+                codeword = ensure_cpu_codeword(codeword, codeword_len);
+                let tree = cpu(&mut codeword);
+                return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
             }
-            codeword = ensure_cpu_codeword(codeword, codeword_len);
-            let tree = cpu(&mut codeword);
-            return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
-        }
+        };
         let graph_ms = t0.elapsed().as_secs_f64() * 1e3;
         // Zero-copy: opening only needs a query-dependent subset of the 64 MiB
         // tree; keep it in the persistent shared Metal buffer.
@@ -7757,7 +8959,12 @@ kernel void blake3_pow_scan(
             crate::scratch::give_f128(codeword);
         }
         let gpu_codeword = unsafe {
-            super::GpuCodeword::new(gpu.buffer_contents(staging).cast::<F128>(), codeword_len)
+            super::GpuCodeword::with_layout(
+                gpu.buffer_contents(staging).cast::<F128>(),
+                codeword_len,
+                layout,
+                lease,
+            )
         };
         (CodewordBuf::Gpu(gpu_codeword), MerkleTreeBuf::Gpu(tree))
     }
@@ -7773,7 +8980,6 @@ kernel void blake3_pow_scan(
         crate::pcs::commit::MerkleTreeBuf,
     ) {
         use crate::pcs::commit::{CodewordBuf, MerkleTreeBuf};
-        use std::sync::atomic::Ordering;
 
         let total_r = 1usize << (stream.log_d - 4);
         let first_pass = stream.wait_pending().and_then(|()| {
@@ -7801,27 +9007,21 @@ kernel void blake3_pow_scan(
         // function must have waited on it (or handed it to the graph, which
         // waits internally).
         let early = stream.early_cb2.take();
-        let drain_early = |early: Option<(Id, usize)>| {
-            if let Some((cb2, _)) = early {
-                let _ = unsafe { stream.gpu.wait_cb(cb2) };
-                unsafe { stream.gpu.release(cb2) };
-            }
-        };
         let run = if let Err(e) = first_pass {
-            drain_early(early);
+            drop(early);
             Err(e)
         } else if !state_matches
             || z_packed.as_ptr() as usize
                 != unsafe { stream.gpu.buffer_contents(stream.z_buf) } as usize
             || z_packed.len() != 1usize << params.log_msg_len()
         {
-            drain_early(early);
+            drop(early);
             Err("streamed GPU latch or z allocation changed before finish".into())
         } else {
             let k_cpu16 = hybrid_cpu_sixteenths();
             unsafe {
                 match early {
-                    Some((cb2, k_early)) if k_early == k_cpu16 => {
+                    Some(early) if early.k == k_cpu16 => {
                         let r = run_commit_graph_from_z_hybrid_impl(
                             stream.gpu,
                             stream.z_buf,
@@ -7832,19 +9032,19 @@ kernel void blake3_pow_scan(
                             stream.n_leaves,
                             k_cpu16,
                             true,
-                            Some(cb2),
+                            Some((early.cb, early.layout)),
                         );
-                        stream.gpu.release(cb2);
+                        drop(early);
                         r
                     }
-                    Some(early_stale @ (_, _)) => {
+                    Some(early_stale) => {
                         // The published split changed between the final tile
                         // and finish (possible only around warmup): the early
                         // prefix advanced the wrong block range past layer 4.
                         // Drain it, restore the whole layer-4 staging state
                         // with a fresh full-range first pass, then run the
                         // graph for the current split.
-                        drain_early(Some(early_stale));
+                        drop(early_stale);
                         run_from_z_first_pass(
                             stream.gpu,
                             stream.z_buf,
@@ -7907,18 +9107,20 @@ kernel void blake3_pow_scan(
             }
         };
 
-        if let Err(e) = run {
-            eprintln!("[gpu-commit] streamed GPU failed ({e}); falling back to CPU");
-            stream.owns_lease = false;
-            STAGING_IN_USE.store(false, Ordering::Release);
-            if let LatchState::On(state) = std::mem::replace(&mut *latch, LatchState::Off) {
-                release_latched(stream.gpu, state);
+        let layout = match run {
+            Ok(layout) => layout,
+            Err(e) => {
+                eprintln!("[gpu-commit] streamed GPU failed ({e}); falling back to CPU");
+                drop(stream.lease.take());
+                if let LatchState::On(state) = std::mem::replace(&mut *latch, LatchState::Off) {
+                    release_latched(stream.gpu, state);
+                }
+                drop(latch);
+                codeword = ensure_cpu_codeword(codeword, params.codeword_len_f128());
+                let tree = cpu(&mut codeword);
+                return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
             }
-            drop(latch);
-            codeword = ensure_cpu_codeword(codeword, params.codeword_len_f128());
-            let tree = cpu(&mut codeword);
-            return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
-        }
+        };
 
         let total_nodes = 2 * stream.n_leaves - 1;
         let codeword_len = params.codeword_len_f128();
@@ -7939,13 +9141,14 @@ kernel void blake3_pow_scan(
             crate::scratch::give_f128(codeword);
         }
         let gpu_codeword = unsafe {
-            super::GpuCodeword::new(
+            super::GpuCodeword::with_layout(
                 stream.gpu.buffer_contents(stream.staging).cast::<F128>(),
                 codeword_len,
+                layout,
+                stream.lease.take().expect("stream owns staging lease"),
             )
         };
-        // Transfer the staging lease to `GpuCodeword`; its Drop releases it.
-        stream.owns_lease = false;
+        // The single staging token moved from the stream into GpuCodeword.
         drop(latch);
         (CodewordBuf::Gpu(gpu_codeword), MerkleTreeBuf::Gpu(tree))
     }
@@ -11222,7 +12425,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 using namespace metal;
 
 // 32x32 -> 64 carry-less multiply via 4-bit-spaced masked integer multiplies.
-static inline ulong clmul32(uint a, uint b) {
+static inline ulong clmul32_incumbent(uint a, uint b) {
     const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
                 M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
     ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
@@ -11234,6 +12437,35 @@ static inline ulong clmul32(uint a, uint b) {
     ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
     ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
     return r0 | r1 | r2 | r3;
+}
+
+// Each aligned plane has eight coefficients in radix 16. An ordinary
+// product's coefficient is at most eight, so carries cannot cross a radix-16
+// digit. Masking its low bits therefore gives the exact polynomial product.
+static inline ulong clmul_plane_pair(uint a0, uint a1, uint b0, uint b1) {
+    const ulong MASK = 0x1111111111111111UL;
+    ulong p0 = (ulong(a0) * ulong(b0)) & MASK;
+    ulong p2 = (ulong(a1) * ulong(b1)) & MASK;
+    ulong pm = (ulong(a0 ^ a1) * ulong(b0 ^ b1)) & MASK;
+    return p0 ^ ((pm ^ p0 ^ p2) << 1) ^ (p2 << 2);
+}
+
+// Two Karatsuba levels use nine integer products rather than sixteen.
+// The aligned inputs occupy bits 0,4,...,28; the final product ends at bit 62.
+static inline ulong clmul32(uint a, uint b) {
+#ifdef FLOCK_ZC_R2_CLMUL_INCUMBENT
+    return clmul32_incumbent(a, b);
+#else
+    const uint MASK = 0x11111111u;
+    uint a0 = a & MASK, a1 = (a >> 1) & MASK;
+    uint a2 = (a >> 2) & MASK, a3 = (a >> 3) & MASK;
+    uint b0 = b & MASK, b1 = (b >> 1) & MASK;
+    uint b2 = (b >> 2) & MASK, b3 = (b >> 3) & MASK;
+    ulong lo = clmul_plane_pair(a0, a1, b0, b1);
+    ulong hi = clmul_plane_pair(a2, a3, b2, b3);
+    ulong mid = clmul_plane_pair(a0 ^ a2, a1 ^ a3, b0 ^ b2, b1 ^ b3);
+    return lo ^ ((mid ^ lo ^ hi) << 2) ^ (hi << 4);
+#endif
 }
 
 struct U128k { ulong lo; ulong hi; };
@@ -11279,6 +12511,31 @@ static inline uint4 gf_reduce(U256k p) {
     return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
 }
 
+// A raw field product has degree at most 254. Fifteen Horner shifts
+// need five limbs and give degree at most 269.
+struct U320k { ulong r0; ulong r1; ulong r2; ulong r3; ulong r4; };
+
+static inline void zc_r2_horner_shift(thread U320k& h) {
+    h.r4 = (h.r4 << 1) | (h.r3 >> 63);
+    h.r3 = (h.r3 << 1) | (h.r2 >> 63);
+    h.r2 = (h.r2 << 1) | (h.r1 >> 63);
+    h.r1 = (h.r1 << 1) | (h.r0 >> 63);
+    h.r0 <<= 1;
+}
+
+static inline void zc_r2_horner_add(thread U320k& h, U256k p) {
+    h.r0 ^= p.r0; h.r1 ^= p.r1; h.r2 ^= p.r2; h.r3 ^= p.r3;
+}
+
+static inline uint4 zc_r2_horner_reduce(U320k h) {
+    // x^256 == (x^7 + x^2 + x + 1)^2 == 0x4015 mod P.
+    // h.r4 has at most 14 bits, so this fold fits in the low limb.
+    U256k p;
+    p.r0 = h.r0 ^ h.r4 ^ (h.r4 << 2) ^ (h.r4 << 4) ^ (h.r4 << 14);
+    p.r1 = h.r1; p.r2 = h.r2; p.r3 = h.r3;
+    return gf_reduce(p);
+}
+
 // Univariate-skip fold of one packed 8-byte row via per-bank nibble tables
 // (bank j, entries: [j*32 + n] = T_j[n], [j*32 + 16 + n] = T_j[n << 4];
 // T_j[v] = T_j[v & 15] ^ T_j[v & 0xF0] by F2-linearity of the byte banks).
@@ -11293,6 +12550,43 @@ static inline uint4 zc_r2_fold8(uint lo, uint hi, threadgroup const uint4* nib) 
         acc ^= nib[(j + 4u) * 32u + (b & 15u)] ^ nib[(j + 4u) * 32u + 16u + (b >> 4u)];
     }
     return acc;
+}
+
+static inline void zc_r2_write_partials(
+    ulong4 acc1, ulong4 acci, threadgroup ulong4* red,
+    device const uint4* eq_hi, device uint4* partials,
+    uint hi_chunk, uint output_group, uint lid)
+{
+    // Both mappings keep x_lo parity equal to lid parity. Stop before
+    // s == 1 so even and odd partials remain separate.
+    red[lid] = acc1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 1u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    ulong4 chunk1e = red[0];
+    ulong4 chunk1o = red[1];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[lid] = acci;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 1u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) {
+        ulong4 chunkie = red[0];
+        ulong4 chunkio = red[1];
+        U256k u1e; u1e.r0 = chunk1e.x; u1e.r1 = chunk1e.y; u1e.r2 = chunk1e.z; u1e.r3 = chunk1e.w;
+        U256k u1o; u1o.r0 = chunk1o.x; u1o.r1 = chunk1o.y; u1o.r2 = chunk1o.z; u1o.r3 = chunk1o.w;
+        U256k uie; uie.r0 = chunkie.x; uie.r1 = chunkie.y; uie.r2 = chunkie.z; uie.r3 = chunkie.w;
+        U256k uio; uio.r0 = chunkio.x; uio.r1 = chunkio.y; uio.r2 = chunkio.z; uio.r3 = chunkio.w;
+        uint4 e = eq_hi[hi_chunk];
+        partials[output_group * 4u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
+        partials[output_group * 4u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
+        partials[output_group * 4u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
+        partials[output_group * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+    }
 }
 
 struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; };
@@ -11345,48 +12639,277 @@ kernel void zc_r2_products(
         acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
     }
 
-    // Parity-split reduce. `x_lo = k*256 + lid` and 256 is even, so a thread
-    // only ever visits x_lo of a single parity. Every halving step from 128
-    // down to 2 pairs indices of equal parity; only the discarded `s == 1`
-    // step would mix them. Stopping one step early therefore leaves `red[0]`
-    // holding the even-x_lo sum and `red[1]` the odd one, and their XOR is
-    // bit-identical to the single sum this kernel used to emit. The odd half
-    // is exactly the round-three lookahead's `W1`/`W2` state, which the CPU
-    // otherwise recomputes on every offloaded chunk.
-    red[lid] = acc1;
+    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, tgid, tgid, lid);
+}
+
+// Four physical groups per logical hi chunk. Each thread owns one
+// (sampled window, small-bit class) and all sixteen medium weights.
+// eq_lo contains lambda[window * 4 + class], verified on the host.
+kernel void zc_r2_products_horner(
+    device const uint4* a_in  [[buffer(0)]],
+    device const uint4* b_in  [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       partials    [[buffer(5)]],
+    constant ZcR2Params& p          [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 nib[256];
+    threadgroup ulong4 red[256];
+    nib[lid] = nib_tab_dev[lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = 128u; s > 1u; s >>= 1u) {
-        if (lid < s) { red[lid] ^= red[lid + s]; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint hi_chunk = tgid >> 2;
+    uint window = ((tgid & 3u) << 6) | (lid >> 2);
+    uint small_class = lid & 3u;
+    U320k h1 = {0ul, 0ul, 0ul, 0ul, 0ul};
+    U320k hi = {0ul, 0ul, 0ul, 0ul, 0ul};
+    for (uint step = 0u; step < p.xpt; step++) {
+        if (step != 0u) {
+            zc_r2_horner_shift(h1);
+            zc_r2_horner_shift(hi);
+        }
+        uint medium = 15u - step;
+        uint x_lo = (window << 6) | (medium << 2) | small_class;
+        uint pair_idx = hi_chunk * p.lo_size + x_lo;
+        // A padded term is zero, but the Horner shifts must still occur.
+        if ((pair_idx & p.mask) >= p.useful) { continue; }
+        uint4 ar = a_in[pair_idx];
+        uint4 br = b_in[pair_idx];
+        uint4 a0 = zc_r2_fold8(ar.x, ar.y, nib);
+        uint4 a1 = zc_r2_fold8(ar.z, ar.w, nib);
+        uint4 b0 = zc_r2_fold8(br.x, br.y, nib);
+        uint4 b1 = zc_r2_fold8(br.z, br.w, nib);
+        zc_r2_horner_add(h1, clmul128(a1, b1));
+        zc_r2_horner_add(hi, clmul128(a0 ^ a1, b0 ^ b1));
     }
-    ulong4 chunk1e = red[0];
-    ulong4 chunk1o = red[1];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    red[lid] = acci;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = 128u; s > 1u; s >>= 1u) {
-        if (lid < s) { red[lid] ^= red[lid + s]; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint4 e = eq_lo[window * 4u + small_class];
+    U256k m1 = clmul128(e, zc_r2_horner_reduce(h1));
+    U256k mi = clmul128(e, zc_r2_horner_reduce(hi));
+    ulong4 acc1 = ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
+    ulong4 acci = ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid);
+}
+
+"#;
+
+    // Byte-identical source from the isolated compile-only probe. The new
+    // production route below is enabled only after its own PSO limit checks.
+    const ZC_R2_ONE_GROUP_MSL_SOURCE: &str = r#"// Compile-only research kernel. No production caller selects this function.
+struct ProbeWords { uint4 lo; uint4 hi; };
+
+static inline ProbeWords probe_words(U256k p) {
+    ProbeWords v;
+    v.lo = uint4(uint(p.r0), uint(p.r0 >> 32), uint(p.r1), uint(p.r1 >> 32));
+    v.hi = uint4(uint(p.r2), uint(p.r2 >> 32), uint(p.r3), uint(p.r3 >> 32));
+    return v;
+}
+
+static inline U256k probe_product(ProbeWords v) {
+    U256k p;
+    p.r0 = ulong(v.lo.x) | (ulong(v.lo.y) << 32);
+    p.r1 = ulong(v.lo.z) | (ulong(v.lo.w) << 32);
+    p.r2 = ulong(v.hi.x) | (ulong(v.hi.y) << 32);
+    p.r3 = ulong(v.hi.z) | (ulong(v.hi.w) << 32);
+    return p;
+}
+
+static inline ProbeWords probe_simd_reduce(ProbeWords v, uint lane, ushort stop) {
+    for (ushort mask = 16; mask >= stop; mask >>= 1) {
+        uint4 peer = simd_shuffle_xor(v.lo, mask);
+        if (lane < mask) { v.lo ^= peer; }
+        peer = simd_shuffle_xor(v.hi, mask);
+        if (lane < mask) { v.hi ^= peer; }
     }
-    if (lid == 0u) {
-        ulong4 chunkie = red[0];
-        ulong4 chunkio = red[1];
-        U256k u1e; u1e.r0 = chunk1e.x; u1e.r1 = chunk1e.y; u1e.r2 = chunk1e.z; u1e.r3 = chunk1e.w;
-        U256k u1o; u1o.r0 = chunk1o.x; u1o.r1 = chunk1o.y; u1o.r2 = chunk1o.z; u1o.r3 = chunk1o.w;
-        U256k uie; uie.r0 = chunkie.x; uie.r1 = chunkie.y; uie.r2 = chunkie.z; uie.r3 = chunkie.w;
-        U256k uio; uio.r0 = chunkio.x; uio.r1 = chunkio.y; uio.r2 = chunkio.z; uio.r3 = chunkio.w;
-        uint4 e = eq_hi[tgid];
-        partials[tgid * 4u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
-        partials[tgid * 4u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
-        partials[tgid * 4u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
-        partials[tgid * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+    return v;
+}
+
+static inline void probe_store(threadgroup uint* scratch, uint slot, uint simd, ProbeWords v) {
+    scratch[(slot * 8u + 0u) * 32u + simd] = v.lo.x;
+    scratch[(slot * 8u + 1u) * 32u + simd] = v.lo.y;
+    scratch[(slot * 8u + 2u) * 32u + simd] = v.lo.z;
+    scratch[(slot * 8u + 3u) * 32u + simd] = v.lo.w;
+    scratch[(slot * 8u + 4u) * 32u + simd] = v.hi.x;
+    scratch[(slot * 8u + 5u) * 32u + simd] = v.hi.y;
+    scratch[(slot * 8u + 6u) * 32u + simd] = v.hi.z;
+    scratch[(slot * 8u + 7u) * 32u + simd] = v.hi.w;
+}
+
+static inline ProbeWords probe_load(threadgroup const uint* scratch, uint slot, uint lane) {
+    ProbeWords v;
+    v.lo = uint4(scratch[(slot * 8u + 0u) * 32u + lane],
+                 scratch[(slot * 8u + 1u) * 32u + lane],
+                 scratch[(slot * 8u + 2u) * 32u + lane],
+                 scratch[(slot * 8u + 3u) * 32u + lane]);
+    v.hi = uint4(scratch[(slot * 8u + 4u) * 32u + lane],
+                 scratch[(slot * 8u + 5u) * 32u + lane],
+                 scratch[(slot * 8u + 6u) * 32u + lane],
+                 scratch[(slot * 8u + 7u) * 32u + lane]);
+    return v;
+}
+
+kernel void zc_r2_products_horner_1024_probe(
+    device const uint4* a_in [[buffer(0)]],
+    device const uint4* b_in [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4* partials [[buffer(5)]],
+    constant ZcR2Params& p [[buffer(6)]],
+    uint hi_chunk [[threadgroup_position_in_grid]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup uint4 nib[256];
+    threadgroup uint scratch[1024];
+    uint owner = simd * 32u + lane;
+    if (owner < 256u) { nib[owner] = nib_tab_dev[owner]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint window = owner >> 2;
+    uint small_class = owner & 3u;
+    U320k h1 = {0ul, 0ul, 0ul, 0ul, 0ul};
+    U320k hi = {0ul, 0ul, 0ul, 0ul, 0ul};
+    for (uint step = 0u; step < p.xpt; step++) {
+        if (step != 0u) {
+            zc_r2_horner_shift(h1);
+            zc_r2_horner_shift(hi);
+        }
+        uint medium = 15u - step;
+        uint x_lo = (window << 6) | (medium << 2) | small_class;
+        uint pair_idx = hi_chunk * p.lo_size + x_lo;
+        if ((pair_idx & p.mask) >= p.useful) { continue; }
+        uint4 ar = a_in[pair_idx];
+        uint4 br = b_in[pair_idx];
+        uint4 a0 = zc_r2_fold8(ar.x, ar.y, nib);
+        uint4 a1 = zc_r2_fold8(ar.z, ar.w, nib);
+        uint4 b0 = zc_r2_fold8(br.x, br.y, nib);
+        uint4 b1 = zc_r2_fold8(br.z, br.w, nib);
+        zc_r2_horner_add(h1, clmul128(a1, b1));
+        zc_r2_horner_add(hi, clmul128(a0 ^ a1, b0 ^ b1));
+    }
+    uint4 e = eq_lo[window * 4u + small_class];
+    U256k m1 = clmul128(e, zc_r2_horner_reduce(h1));
+    U256k mi = clmul128(e, zc_r2_horner_reduce(hi));
+    ProbeWords w1 = probe_simd_reduce(probe_words(m1), lane, 2);
+    ProbeWords wi = probe_simd_reduce(probe_words(mi), lane, 2);
+    if (lane < 2u) {
+        probe_store(scratch, lane * 2u, simd, w1);
+        probe_store(scratch, lane * 2u + 1u, simd, wi);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd == 0u) {
+        uint4 eq = uint4(0u);
+        if (lane == 0u) { eq = eq_hi[hi_chunk]; }
+        for (uint slot = 0u; slot < 4u; slot++) {
+            ProbeWords v = probe_simd_reduce(probe_load(scratch, slot, lane), lane, 1);
+            if (lane == 0u) {
+                partials[hi_chunk * 4u + slot] = gf_reduce(clmul128(eq, gf_reduce(probe_product(v))));
+            }
+        }
     }
 }
 "#;
 
+    fn zc_r2_one_group_msl_source(incumbent: bool) -> String {
+        format!("{}\n{ZC_R2_ONE_GROUP_MSL_SOURCE}", zc_r2_msl_source(incumbent))
+    }
+
+    fn zc_r2_msl_source(incumbent: bool) -> std::borrow::Cow<'static, str> {
+        if incumbent {
+            std::borrow::Cow::Owned(format!(
+                "#define FLOCK_ZC_R2_CLMUL_INCUMBENT 1\n{ZC_R2_MSL_SOURCE}"
+            ))
+        } else {
+            std::borrow::Cow::Borrowed(ZC_R2_MSL_SOURCE)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_arithmetic_test_source(incumbent: bool) -> String {
+        let mut source = zc_r2_one_group_msl_source(incumbent);
+        source.push_str(
+            r#"
+kernel void zc_r2_arithmetic_oracle(
+    device const uint4* a [[buffer(0)]],
+    device const uint4* b [[buffer(1)]],
+    device ulong* out [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    U256k p = clmul128(a[id], b[id]);
+    uint4 reduced = gf_reduce(p);
+    out[id * 7u] = clmul32(a[id].x, b[id].x);
+    out[id * 7u + 1u] = p.r0;
+    out[id * 7u + 2u] = p.r1;
+    out[id * 7u + 3u] = p.r2;
+    out[id * 7u + 4u] = p.r3;
+    out[id * 7u + 5u] = (ulong(reduced.y) << 32) | reduced.x;
+    out[id * 7u + 6u] = (ulong(reduced.w) << 32) | reduced.z;
+}
+
+kernel void zc_r2_horner_oracle(
+    device const uint4* a [[buffer(0)]],
+    device const uint4* b [[buffer(1)]],
+    device const uint4* weights [[buffer(2)]],
+    device ulong* out [[buffer(3)]],
+    uint id [[thread_position_in_grid]])
+{
+    U320k h = {0ul, 0ul, 0ul, 0ul, 0ul};
+    for (uint step = 0u; step < 16u; step++) {
+        if (step != 0u) { zc_r2_horner_shift(h); }
+        uint pos = id * 16u + 15u - step;
+        zc_r2_horner_add(h, clmul128(a[pos], b[pos]));
+    }
+    uint4 reduced = zc_r2_horner_reduce(h);
+    uint4 weighted = gf_reduce(clmul128(weights[id], reduced));
+    out[id * 9u] = h.r0;
+    out[id * 9u + 1u] = h.r1;
+    out[id * 9u + 2u] = h.r2;
+    out[id * 9u + 3u] = h.r3;
+    out[id * 9u + 4u] = h.r4;
+    out[id * 9u + 5u] = (ulong(reduced.y) << 32) | reduced.x;
+    out[id * 9u + 6u] = (ulong(reduced.w) << 32) | reduced.z;
+    out[id * 9u + 7u] = (ulong(weighted.y) << 32) | weighted.x;
+    out[id * 9u + 8u] = (ulong(weighted.w) << 32) | weighted.z;
+}
+"#,
+        );
+        source
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ZcR2Mode {
+        Ordinary,
+        HornerFourGroups,
+        HornerOneGroup,
+    }
+
+    impl ZcR2Mode {
+        fn uses_horner(self) -> bool {
+            self != Self::Ordinary
+        }
+
+        fn groups_per_chunk(self) -> usize {
+            if self == Self::HornerFourGroups { 4 } else { 1 }
+        }
+
+        fn threads_per_group(self) -> u64 {
+            if self == Self::HornerOneGroup {
+                1024
+            } else {
+                256
+            }
+        }
+    }
+
     /// Process-lifetime Metal state for the round-two products arm.
     struct ZcR2 {
         pso: Id,
+        horner_pso: Id,
+        one_group_pso: Id,
         /// Persistent small buffers: nibble table (4 KiB), eq_lo, eq_hi,
         /// reduced partials. Sized on first use for the ranked shape.
         nib_buf: Id,
@@ -11403,6 +12926,18 @@ kernel void zc_r2_products(
         /// release) before anything rewrites the buffers it binds — the next
         /// round-two launch or the next prove's staging, whichever first.
         prefetch_cb: Id,
+    }
+
+    impl ZcR2 {
+        fn mode(&self, horner: bool) -> ZcR2Mode {
+            if !horner {
+                ZcR2Mode::Ordinary
+            } else if self.one_group_pso.is_null() {
+                ZcR2Mode::HornerFourGroups
+            } else {
+                ZcR2Mode::HornerOneGroup
+            }
+        }
     }
 
     // SAFETY: the Metal pipeline and buffer handles are only touched under
@@ -11437,6 +12972,11 @@ kernel void zc_r2_products(
     #[cfg(test)]
     pub(crate) fn zc_r2_test_set_share(share: usize) {
         ZC_R2_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_one_group_available() -> bool {
+        zc_r2_state().is_some_and(|state| !state.lock().unwrap().one_group_pso.is_null())
     }
 
     /// Ratio-gate override (`FLOCK_ZC_R2_GPU_FORCE_RATIO=<f64>`).
@@ -11489,6 +13029,33 @@ kernel void zc_r2_products(
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
     pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
+        zc_r2_gate_share_with_alpha(ratio, hi_size, None)
+    }
+
+    pub(crate) fn zc_r2_sample_alpha(
+        full_ms: f64,
+        retained_ms: f64,
+        hi_size: usize,
+        chunks: usize,
+        gpu_ms: f64,
+    ) -> Option<f64> {
+        if !full_ms.is_finite()
+            || full_ms <= 0.0
+            || !retained_ms.is_finite()
+            || retained_ms <= 0.0
+            || !gpu_ms.is_finite()
+            || gpu_ms <= 0.0
+            || hi_size == 0
+            || chunks == 0
+            || chunks > hi_size
+        {
+            return None;
+        }
+        let alpha = (retained_ms / full_ms) * (hi_size as f64 / chunks as f64);
+        (alpha.is_finite() && alpha > 0.0 && alpha < 1.0).then_some(alpha)
+    }
+
+    pub(crate) fn zc_r2_gate_share_with_alpha(ratio: f64, hi_size: usize, alpha: Option<f64>) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
         }
@@ -11498,15 +13065,71 @@ kernel void zc_r2_products(
             }
             return 0;
         }
-        let g = (hi_size as f64 / (ratio + (1.0 - ZC_R2_ALPHA))).round();
+        let alpha = alpha
+            .filter(|a| a.is_finite() && *a > 0.0 && *a < 1.0)
+            .unwrap_or(ZC_R2_ALPHA);
+        let g = (hi_size as f64 / (ratio + (1.0 - alpha))).round();
         (g as usize).min(hi_size * 15 / 16)
+    }
+
+    unsafe fn zc_r2_one_group_pipeline(gpu: &Gpu) -> Id {
+        if !super::gpu_zc_r2_horner_enabled() || !super::gpu_zc_r2_one_group_enabled() {
+            return NIL;
+        }
+        unsafe {
+            let source = zc_r2_one_group_msl_source(!super::gpu_zc_r2_karatsuba_enabled());
+            let pso =
+                match compile_supplemental_pipeline(gpu, &source, "zc_r2_products_horner_1024_probe") {
+                    Ok(pso) => pso,
+                    Err(e) => {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!("[zc-r2] one-group compile declined: {e}; four-group fallback");
+                        }
+                        return NIL;
+                    }
+                };
+            let (shared, width, threads) = gpu.pipeline_resources(pso);
+            let device_shared: u64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> u64,
+                gpu.device,
+                c"maxThreadgroupMemoryLength"
+            );
+            let device_threads: MtlSize = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> MtlSize,
+                gpu.device,
+                c"maxThreadsPerThreadgroup"
+            );
+            let accepted = super::zc_r2_one_group_limits_fit(
+                shared,
+                width,
+                threads,
+                device_shared,
+                device_threads.width,
+            );
+            if super::gpu_zc_r2_debug() {
+                eprintln!(
+                    "[zc-r2] one-group PSO shared={shared} SIMD={width} max-threads={threads} \
+                     device-shared={device_shared} device-width={} accepted={accepted}",
+                    device_threads.width,
+                );
+            }
+            if accepted {
+                pso
+            } else {
+                gpu.release(pso);
+                NIL
+            }
+        }
     }
 
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
         unsafe {
             let pool = gpu.pool_push();
-            let built = (|| -> Result<Id, String> {
-                let src = gpu.api.nsstring(ZC_R2_MSL_SOURCE)?;
+            let built = (|| -> Result<(Id, Id), String> {
+                let source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled());
+                let src = gpu.api.nsstring(&source)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
                     gpu.api,
@@ -11523,52 +13146,59 @@ kernel void zc_r2_products(
                         gpu.api.error_string(err)
                     ));
                 }
-                let ns = gpu.api.nsstring("zc_r2_products")?;
-                let f: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                    library,
-                    c"newFunctionWithName:",
-                    ns
-                );
-                if f.is_null() {
-                    send!(
+                let make_pipeline = |name: &str| -> Result<Id, String> {
+                    let ns = gpu.api.nsstring(name)?;
+                    let f: Id = send!(
                         gpu.api,
-                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
                         library,
-                        c"release"
+                        c"newFunctionWithName:",
+                        ns
                     );
-                    return Err("zc_r2_products kernel not found".into());
-                }
-                let mut perr: Id = NIL;
-                let pso: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                    gpu.device,
-                    c"newComputePipelineStateWithFunction:error:",
-                    f,
-                    &mut perr
-                );
-                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-                send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel) -> Id,
-                    library,
-                    c"release"
-                );
-                if pso.is_null() {
-                    return Err(format!(
-                        "zc_r2_products pipeline: {}",
-                        gpu.api.error_string(perr)
-                    ));
-                }
-                Ok(pso)
+                    if f.is_null() {
+                        return Err(format!("{name} kernel not found"));
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    gpu.release(f);
+                    if pso.is_null() {
+                        return Err(format!("{name} pipeline: {}", gpu.api.error_string(perr)));
+                    }
+                    Ok(pso)
+                };
+                let ordinary = make_pipeline("zc_r2_products");
+                let built = match ordinary {
+                    Ok(pso) => match make_pipeline("zc_r2_products_horner") {
+                        Ok(horner_pso) => Ok((pso, horner_pso)),
+                        Err(e) => {
+                            gpu.release(pso);
+                            Err(e)
+                        }
+                    },
+                    Err(e) => Err(e),
+                };
+                gpu.release(library);
+                built
             })();
+            let one_group_pso = if built.is_ok() {
+                zc_r2_one_group_pipeline(gpu)
+            } else {
+                NIL
+            };
             gpu.pool_pop(pool);
-            let pso = built?;
+            let (pso, horner_pso) = built?;
             let nib_buf = gpu.new_buffer(256 * 16)?;
             Ok(ZcR2 {
                 pso,
+                horner_pso,
+                one_group_pso,
                 nib_buf,
                 eq_lo_buf: NIL,
                 eq_lo_cap: 0,
@@ -11601,8 +13231,12 @@ kernel void zc_r2_products(
 
     pub(crate) struct ZcR2Job {
         cb: Id,
+        a_buf: Id,
+        b_buf: Id,
+        part_buf: Id,
         pub chunks: usize,
         calibration: bool,
+        mode: ZcR2Mode,
         lo_size: usize,
         mask: u32,
         useful: u32,
@@ -11624,6 +13258,11 @@ kernel void zc_r2_products(
         pub(crate) fn is_calibration(&self) -> bool {
             self.calibration
         }
+
+        #[cfg(test)]
+        pub(crate) fn mode(&self) -> ZcR2Mode {
+            self.mode
+        }
     }
 
     /// Result of draining the round-two products arm.
@@ -11644,10 +13283,12 @@ kernel void zc_r2_products(
         state: &ZcR2,
         a_buf: Id,
         b_buf: Id,
+        part_buf: Id,
         chunks: usize,
         lo_size: usize,
         mask: u32,
         useful: u32,
+        mode: ZcR2Mode,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -11659,25 +13300,36 @@ kernel void zc_r2_products(
             }
             let params = P {
                 lo_size: lo_size as u32,
-                xpt: (lo_size / 256) as u32,
+                xpt: if mode.uses_horner() {
+                    16
+                } else {
+                    (lo_size / 256) as u32
+                },
                 mask,
                 useful,
             };
-            let pb = std::slice::from_raw_parts(
-                (&raw const params).cast::<u8>(),
-                core::mem::size_of::<P>(),
-            );
+            let pb =
+                std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let cb = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb)?;
-            gpu.set_pipeline(enc, state.pso);
+            let pso = match mode {
+                ZcR2Mode::Ordinary => state.pso,
+                ZcR2Mode::HornerFourGroups => state.horner_pso,
+                ZcR2Mode::HornerOneGroup => state.one_group_pso,
+            };
+            gpu.set_pipeline(enc, pso);
             gpu.set_buffer(enc, a_buf, 0, 0);
             gpu.set_buffer(enc, b_buf, 0, 1);
             gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
             gpu.set_buffer(enc, state.eq_hi_buf, 0, 3);
             gpu.set_buffer(enc, state.nib_buf, 0, 4);
-            gpu.set_buffer(enc, state.part_buf, 0, 5);
+            gpu.set_buffer(enc, part_buf, 0, 5);
             gpu.set_bytes(enc, pb, 6);
-            gpu.dispatch(enc, chunks as u64, 256);
+            gpu.dispatch(
+                enc,
+                (chunks * mode.groups_per_chunk()) as u64,
+                mode.threads_per_group(),
+            );
             gpu.end_encoding(enc);
             let cb = gpu.retain(cb);
             gpu.commit_async(cb);
@@ -11694,6 +13346,36 @@ kernel void zc_r2_products(
         let buf = unsafe { gpu.wrap_buffer(data.as_ptr().cast_mut(), len)? };
         state.wraps.push((ptr, len, buf));
         Ok(buf)
+    }
+
+    unsafe fn zc_r2_upload_eq_lo(
+        gpu: &Gpu,
+        state: &mut ZcR2,
+        eq_lo: &[F128],
+        horner: bool,
+    ) -> Result<(), String> {
+        unsafe {
+            let lanes = if horner { 1024 } else { eq_lo.len() };
+            let need = lanes * 16;
+            if state.eq_lo_cap < need {
+                if state.eq_lo_cap > 0 {
+                    gpu.release(state.eq_lo_buf);
+                }
+                state.eq_lo_buf = gpu.new_buffer(need)?;
+                state.eq_lo_cap = need;
+            }
+            let dst = gpu.buffer_contents(state.eq_lo_buf).cast::<F128>();
+            if horner {
+                for window in 0..256 {
+                    for class in 0..4 {
+                        *dst.add(window * 4 + class) = eq_lo[(window << 6) | class];
+                    }
+                }
+            } else {
+                std::ptr::copy_nonoverlapping(eq_lo.as_ptr(), dst, lanes);
+            }
+            Ok(())
+        }
     }
 
     // -------------------------------------------------------------------
@@ -11797,6 +13479,7 @@ kernel void zc_r2_products(
         {
             return;
         }
+        let horner = super::gpu_zc_r2_horner_enabled() && super::zc_r2_horner_weights(eq_lo, lo_size);
         let Ok(gpu) = gpu() else { return };
         let Some(state_mutex) = zc_r2_state() else {
             return;
@@ -11812,20 +13495,9 @@ kernel void zc_r2_products(
             // gated off mid-process) must complete before its buffers are
             // rewritten below.
             zc_r2_drain_prefetch(gpu, &mut state);
+            let mode = state.mode(horner);
             let ok = (|| -> Result<(), String> {
-                let need_lo = lo_size * 16;
-                if state.eq_lo_cap < need_lo {
-                    if state.eq_lo_cap > 0 {
-                        gpu.release(state.eq_lo_buf);
-                    }
-                    state.eq_lo_buf = gpu.new_buffer(need_lo)?;
-                    state.eq_lo_cap = need_lo;
-                }
-                std::ptr::copy_nonoverlapping(
-                    eq_lo.as_ptr().cast::<u8>(),
-                    gpu.buffer_contents(state.eq_lo_buf),
-                    need_lo,
-                );
+                zc_r2_upload_eq_lo(gpu, &mut state, eq_lo, horner)?;
                 let need_hi = hi_size * 16;
                 if state.eq_hi_cap < need_hi {
                     if state.eq_hi_cap > 0 {
@@ -11839,7 +13511,7 @@ kernel void zc_r2_products(
                     gpu.buffer_contents(state.eq_hi_buf),
                     need_hi,
                 );
-                let need_part = hi_size * 64;
+                let need_part = hi_size * 64 * mode.groups_per_chunk();
                 if state.part_cap < need_part {
                     if state.part_cap > 0 {
                         gpu.release(state.part_buf);
@@ -11854,10 +13526,12 @@ kernel void zc_r2_products(
                     &state,
                     a_buf,
                     b_buf,
+                    state.part_buf,
                     ZC_IDLE_FILL_PRIMER_CHUNKS.min(hi_size),
                     lo_size,
                     pair_in_block_mask as u32,
                     useful_pairs_inclusive as u32,
+                    mode,
                 )?;
                 state.prefetch_cb = cb;
                 Ok(())
@@ -11866,7 +13540,7 @@ kernel void zc_r2_products(
                 Ok(()) => {
                     if super::gpu_zc_r2_debug() {
                         eprintln!(
-                            "[zc-idle-fill] staged: primer {} chunks, eq {}+{} lanes, a/b wraps warm",
+                            "[zc-idle-fill] staged: primer {} chunks, eq {}+{} lanes, a/b wraps warm mode={mode:?}",
                             ZC_IDLE_FILL_PRIMER_CHUNKS.min(hi_size),
                             lo_size,
                             hi_size,
@@ -11931,6 +13605,7 @@ kernel void zc_r2_products(
         if chunks == 0 {
             return None;
         }
+        let horner = super::gpu_zc_r2_horner_enabled() && super::zc_r2_horner_weights(eq_lo, lo_size);
         let gpu = gpu().ok()?;
         let state_mutex = zc_r2_state()?;
         // Deliberately NOT poison-tolerant: the grow sequences below
@@ -11951,6 +13626,7 @@ kernel void zc_r2_products(
             // window's measured idle — this wait finds it done). Also emits
             // the `[zc-idle-fill]` timing line.
             zc_r2_drain_prefetch(gpu, &mut state);
+            let mode = state.mode(horner);
             // Nibble decomposition of the 32 KiB byte table (per prove; the
             // table depends on the round challenge z).
             let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
@@ -11961,19 +13637,7 @@ kernel void zc_r2_products(
                 }
             }
             // eq_lo / eq_hi / partials buffers (grown once, reused).
-            let need_lo = lo_size * 16;
-            if state.eq_lo_cap < need_lo {
-                if state.eq_lo_cap > 0 {
-                    gpu.release(state.eq_lo_buf);
-                }
-                state.eq_lo_buf = gpu.new_buffer(need_lo).ok()?;
-                state.eq_lo_cap = need_lo;
-            }
-            std::ptr::copy_nonoverlapping(
-                eq_lo.as_ptr().cast::<u8>(),
-                gpu.buffer_contents(state.eq_lo_buf),
-                need_lo,
-            );
+            zc_r2_upload_eq_lo(gpu, &mut state, eq_lo, horner).ok()?;
             let need_hi = hi_size * 16;
             if state.eq_hi_cap < need_hi {
                 if state.eq_hi_cap > 0 {
@@ -11987,9 +13651,9 @@ kernel void zc_r2_products(
                 gpu.buffer_contents(state.eq_hi_buf),
                 need_hi,
             );
-            // Four F128 per chunk: the parity-split
-            // `[p1_even, pinf_even, p1_odd, pinf_odd]`.
-            let need_part = hi_size * 64;
+            // Four F128 per physical group, merged per logical hi chunk
+            // after completion: [p1_even, pinf_even, p1_odd, pinf_odd].
+            let need_part = hi_size * 64 * mode.groups_per_chunk();
             if state.part_cap < need_part {
                 if state.part_cap > 0 {
                     gpu.release(state.part_buf);
@@ -11999,21 +13663,35 @@ kernel void zc_r2_products(
             }
             let a_buf = zc_r2_wrap(&mut state, gpu, a_packed).ok()?;
             let b_buf = zc_r2_wrap(&mut state, gpu, b_packed).ok()?;
+            let part_buf = state.part_buf;
             let cb = zc_r2_submit(
                 gpu,
                 &state,
                 a_buf,
                 b_buf,
+                part_buf,
                 chunks,
                 lo_size,
                 pair_in_block_mask as u32,
                 useful_pairs_inclusive as u32,
+                mode,
             )
             .ok()?;
+            if super::gpu_zc_r2_debug() {
+                eprintln!(
+                    "[zc-r2] submit mode={mode:?} chunks={chunks} groups-per-chunk={} threads={}",
+                    mode.groups_per_chunk(),
+                    mode.threads_per_group()
+                );
+            }
             Some(ZcR2Job {
                 cb,
+                a_buf,
+                b_buf,
+                part_buf,
                 chunks,
                 calibration,
+                mode,
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
@@ -12034,6 +13712,81 @@ kernel void zc_r2_products(
         cpu_la: Option<&[[F128; 6]]>,
         cpu_wall_ms: f64,
         hi_size: usize,
+    ) -> ZcR2Result {
+        zc_r2_wait_with_retained_sample(job, cpu_partials, cpu_la, cpu_wall_ms, hi_size, |_| None)
+    }
+
+    // The state mutex stays held during the callback. This owner must drain
+    // without acquiring it, including when a CPU sample unwinds.
+    struct ZcR2ReplayDrain<'a> {
+        gpu: &'a Gpu,
+        cb: Id,
+    }
+
+    impl ZcR2ReplayDrain<'_> {
+        unsafe fn finish(mut self) -> f64 {
+            unsafe {
+                let wall = if self.gpu.wait_cb(self.cb).is_ok() {
+                    zc_fold_gpu_wall_ms(self.gpu, self.cb)
+                } else {
+                    0.0
+                };
+                self.gpu.release(self.cb);
+                self.cb = NIL;
+                wall
+            }
+        }
+    }
+
+    impl Drop for ZcR2ReplayDrain<'_> {
+        fn drop(&mut self) {
+            if !self.cb.is_null() {
+                unsafe {
+                    let _ = self.gpu.wait_cb(self.cb);
+                    self.gpu.release(self.cb);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_replay_drain_unwind_oracle() -> Option<()> {
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_r2_state()?;
+        let _state = state_mutex.lock().ok()?;
+        unsafe {
+            let cb = gpu.retain(gpu.command_buffer().ok()?);
+            gpu.commit_async(cb);
+            let observer = gpu.retain(cb);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _replay = ZcR2ReplayDrain { gpu, cb };
+                panic!("retained callback unwind");
+            }));
+            let status: u64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> u64,
+                observer,
+                c"status"
+            );
+            gpu.release(observer);
+            assert!(panic.is_err());
+            assert_eq!(
+                status, 4,
+                "replay must complete before unwinding past its owner"
+            );
+        }
+        Some(())
+    }
+
+    /// `None` keeps the old estimate; `Err` rejects a retained-value mismatch.
+    /// The callback runs once, on the first successfully submitted replay.
+    pub(crate) fn zc_r2_wait_with_retained_sample(
+        job: ZcR2Job,
+        cpu_partials: Option<&[(F128, F128)]>,
+        cpu_la: Option<&[[F128; 6]]>,
+        cpu_wall_ms: f64,
+        hi_size: usize,
+        retained_sample: impl FnOnce(usize) -> Option<Result<f64, ()>>,
     ) -> ZcR2Result {
         use std::sync::atomic::Ordering;
         let gpu = match gpu() {
@@ -12070,25 +13823,34 @@ kernel void zc_r2_products(
                     return poison(job.cb);
                 }
             };
-            let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
+            let parts = gpu.buffer_contents(job.part_buf).cast::<F128>();
             let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
+            let groups = job.mode.groups_per_chunk();
             for c in 0..job.chunks {
-                out.push([
-                    *parts.add(c * 4),
-                    *parts.add(c * 4 + 1),
-                    *parts.add(c * 4 + 2),
-                    *parts.add(c * 4 + 3),
-                ]);
+                let base = c * groups * 4;
+                let mut merged = [
+                    *parts.add(base),
+                    *parts.add(base + 1),
+                    *parts.add(base + 2),
+                    *parts.add(base + 3),
+                ];
+                for group in 1..groups {
+                    for lane in 0..4 {
+                        merged[lane] += *parts.add((c * groups + group) * 4 + lane);
+                    }
+                }
+                out.push(merged);
             }
             if !job.calibration {
                 gpu.release(job.cb);
                 if super::gpu_zc_r2_debug() {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
-                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms",
+                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms mode={:?}",
                         job.chunks,
                         hi_size,
                         job.submitted.elapsed().as_secs_f64() * 1e3,
+                        job.mode,
                     );
                 }
                 return ZcR2Result::Prefix(out);
@@ -12131,38 +13893,55 @@ kernel void zc_r2_products(
             let mut n_walls = usize::from(walls[0] > 0.0);
             let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
             gpu.release(job.cb);
-            if let (Some(&(_, _, a_buf)), Some(&(_, _, b_buf))) =
-                (state.wraps.first(), state.wraps.get(1))
-            {
-                while n_walls < walls.len() {
-                    let Ok(cb2) = zc_r2_submit(
-                        gpu,
-                        &state,
-                        a_buf,
-                        b_buf,
-                        job.chunks,
-                        job.lo_size,
-                        job.mask,
-                        job.useful,
-                    ) else {
-                        break;
-                    };
-                    let w = if gpu.wait_cb(cb2).is_ok() {
-                        zc_fold_gpu_wall_ms(gpu, cb2)
-                    } else {
-                        0.0
-                    };
-                    gpu.release(cb2);
-                    if w <= 0.0 {
-                        break;
+            let mut retained_sample = Some(retained_sample);
+            let mut sampled_alpha = None;
+            while n_walls < walls.len() {
+                let Ok(cb2) = zc_r2_submit(
+                    gpu,
+                    &state,
+                    job.a_buf,
+                    job.b_buf,
+                    job.part_buf,
+                    job.chunks,
+                    job.lo_size,
+                    job.mask,
+                    job.useful,
+                    job.mode,
+                ) else {
+                    break;
+                };
+                let replay = ZcR2ReplayDrain { gpu, cb: cb2 };
+                let sample = retained_sample.take().and_then(|sample| sample(job.chunks));
+                // Pricing stays GPU execution time, never CPU callback/wait wall.
+                let w = replay.finish();
+                if let Some(Err(())) = sample {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!("[zc-r2] retained sample mismatch: arm disabled");
                     }
-                    walls[n_walls] = w;
-                    n_walls += 1;
-                    let prev_min = w_min;
-                    w_min = w_min.min(w);
-                    if n_walls >= 3 && w > 0.95 * prev_min {
-                        break;
+                    ZC_R2_POISONED.store(true, Ordering::Relaxed);
+                    ZC_R2_TUNED.store(0, Ordering::Relaxed);
+                    return ZcR2Result::Failed;
+                }
+                if let Some(Ok(retained_ms)) = sample {
+                    sampled_alpha = zc_r2_sample_alpha(
+                        cpu_wall_ms, retained_ms, hi_size, job.chunks, w,
+                    );
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[zc-r2] retained sample {}/{} chunks: alpha={sampled_alpha:?}",
+                            job.chunks, hi_size,
+                        );
                     }
+                }
+                if w <= 0.0 {
+                    break;
+                }
+                walls[n_walls] = w;
+                n_walls += 1;
+                let prev_min = w_min;
+                w_min = w_min.min(w);
+                if n_walls >= 3 && w > 0.95 * prev_min {
+                    break;
                 }
             }
             drop(state);
@@ -12175,7 +13954,10 @@ kernel void zc_r2_products(
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
-                let g = zc_r2_gate_share(ratio, hi_size);
+                let g = match sampled_alpha {
+                    Some(alpha) => zc_r2_gate_share_with_alpha(ratio, hi_size, Some(alpha)),
+                    None => zc_r2_gate_share(ratio, hi_size),
+                };
                 if super::gpu_zc_r2_debug() {
                     eprintln!("[zc-r2] gate replay walls: {:?}", &walls[..n_walls]);
                     eprintln!(
@@ -13600,7 +15382,9 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 /// Zerocheck round-two products GPU arm (see `ENV_NO_GPU_ZC_R2`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+pub(crate) use imp::{
+    ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait, zc_r2_wait_with_retained_sample,
+};
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -13744,6 +15528,148 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 mod tests {
     use super::*;
     use crate::field::F128;
+
+    /// Force the production fused pass at small shapes. The same allocations
+    /// receive two different inputs; prefix subtrees include nonzero starts.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_final_leaf4_codeword_tree_prefix_and_reuse_match_cpu() {
+        const SENTINEL: crate::merkle::Hash = [0xA5; 32];
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        unsafe {
+            let pool = gpu.pool_push();
+            let pso = imp::compile_supplemental_pipeline(
+                gpu,
+                &imp::final_leaf4_source(),
+                "ntt_pass5_leaf4",
+            )
+            .expect("fused final NTT/leaf shader must compile");
+            for log_d in [8usize, 10] {
+                let n = 1usize << log_d;
+                let ntt = AdditiveNttF128::standard(log_d);
+                let twiddles = flat_twiddle_table(&ntt, log_d);
+                let tw_bytes = core::mem::size_of_val(twiddles.as_slice());
+                let tw_buf = gpu.new_buffer(tw_bytes).unwrap();
+                let data_buf = gpu.new_buffer(n * 1024).unwrap();
+                let tree_buf = gpu.new_buffer((2 * n - 1) * 32).unwrap();
+                std::ptr::copy_nonoverlapping(
+                    twiddles.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(tw_buf),
+                    tw_bytes,
+                );
+                let mut rng = Rng::new(0xF14A_1EA4 + log_d as u64);
+                for generation in 0..2 {
+                    let input = rng.vec(n * 64);
+                    let mut expected = input.clone();
+                    ntt.forward_transform_interleaved_scalar_from_layer(
+                        &mut expected,
+                        64,
+                        log_d - 4,
+                    );
+                    let bytes =
+                        core::slice::from_raw_parts(expected.as_ptr().cast::<u8>(), n * 1024);
+                    let expected_tree =
+                        crate::merkle::merkle_tree(bytes, n, crate::merkle::HashKind::Blake3);
+                    for prefix16 in [16u64, 11] {
+                        let prefix = n / 16 * prefix16 as usize;
+                        std::ptr::copy_nonoverlapping(
+                            input.as_ptr().cast::<u8>(),
+                            gpu.buffer_contents(data_buf),
+                            n * 1024,
+                        );
+                        std::ptr::write_bytes(
+                            gpu.buffer_contents(tree_buf),
+                            0xA5,
+                            (2 * n - 1) * 32,
+                        );
+                        let cb = gpu.command_buffer().unwrap();
+                        let enc = gpu.compute_encoder(cb).unwrap();
+                        imp::encode_final_leaf4_pass(
+                            gpu, enc, data_buf, tw_buf, tree_buf, log_d, prefix16, pso,
+                        );
+                        let mut written = vec![false; 2 * n - 1];
+                        let mut start = 0usize;
+                        while start < prefix {
+                            let mut size = 1usize << (prefix - start).ilog2();
+                            while start % size != 0 {
+                                size >>= 1;
+                            }
+                            imp::encode_merkle_subtree_from_level(
+                                gpu, enc, data_buf, tree_buf, n, start, size, true, 3,
+                            );
+                            let mut level_start = 0;
+                            let mut level_len = n;
+                            let mut local_start = start;
+                            let mut local_len = size;
+                            while local_len != 0 {
+                                written[level_start + local_start
+                                    ..level_start + local_start + local_len]
+                                    .fill(true);
+                                level_start += level_len;
+                                level_len /= 2;
+                                local_start /= 2;
+                                local_len /= 2;
+                            }
+                            start += size;
+                        }
+                        gpu.end_encoding(enc);
+                        gpu.commit_and_wait(cb).unwrap();
+                        let got = core::slice::from_raw_parts(
+                            gpu.buffer_contents(data_buf).cast::<F128>(),
+                            n * 64,
+                        );
+                        assert_eq!(&got[..prefix * 64], &expected[..prefix * 64]);
+                        assert_eq!(&got[prefix * 64..], &input[prefix * 64..]);
+                        let got_tree = core::slice::from_raw_parts(
+                            gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                            2 * n - 1,
+                        );
+                        for i in 0..got_tree.len() {
+                            assert_eq!(
+                                got_tree[i],
+                                if written[i] {
+                                    expected_tree[i]
+                                } else {
+                                    SENTINEL
+                                },
+                                "tree index {i}, log_d={log_d}, prefix16={prefix16}, generation={generation}",
+                            );
+                        }
+                    }
+                }
+                gpu.release(data_buf);
+                gpu.release(tree_buf);
+                gpu.release(tw_buf);
+            }
+            gpu.release(pso);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    #[test]
+    fn lazy_final_row_replay_matches_full_tile() {
+        let mut rng = Rng::new(0x5160_1A20);
+        for block in [0, 1, 4095, 32767, 65535] {
+            for zero_tail in [false, true] {
+                let mut input = rng.vec(1024);
+                if zero_tail {
+                    for row in (1..16).step_by(2) {
+                        input[row * 64 + 57..(row + 1) * 64].fill(F128::ZERO);
+                    }
+                }
+                let mut expected = input.clone();
+                decode_final_tile(&mut expected, block);
+                for row in 0..16 {
+                    let mut got = [F128::ZERO; 64];
+                    replay_final_row(&input, block, row, &mut got);
+                    assert_eq!(got.as_slice(), &expected[row * 64..(row + 1) * 64]);
+                }
+            }
+        }
+    }
 
     /// GPU idle-decay probe at ranked size: full commit graph wall
     /// back-to-back vs after idle gaps. Ignored; run with --ignored --nocapture.
@@ -15210,16 +17136,25 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
 
         assert_eq!(c1.root, c2.root, "roots differ between warmup and latched");
         assert_eq!(tree1, pd2.merkle_tree, "trees differ");
-        assert!(codeword1[..] == pd2.codeword[..], "codewords differ");
+        for row in 0..params.n_leaves() {
+            assert_eq!(
+                &codeword1[row * 64..(row + 1) * 64],
+                pd2.codeword.rows().row(row, 64),
+                "codeword row {row} differs"
+            );
+        }
 
         // And both must equal a pure-CPU oracle from scratch.
         let mut oracle = vec![F128::ZERO; params.codeword_len_f128()];
         crate::pcs::commit::replicate_message_fill(&mut oracle, &z);
         let oracle_tree = crate::pcs::commit::cpu_transform_and_tree(&mut oracle, &params, None);
-        assert!(
-            oracle[..] == pd2.codeword[..],
-            "codeword differs from CPU oracle"
-        );
+        for row in 0..params.n_leaves() {
+            assert_eq!(
+                &oracle[row * 64..(row + 1) * 64],
+                pd2.codeword.rows().row(row, 64),
+                "codeword row {row} differs from CPU oracle"
+            );
+        }
         assert_eq!(oracle_tree, pd2.merkle_tree, "tree differs from CPU oracle");
     }
 
@@ -15631,6 +17566,82 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_r2_retained_alpha_and_gate_fallback() {
+        use imp::{zc_r2_gate_share, zc_r2_gate_share_with_alpha, zc_r2_sample_alpha};
+        let alpha = zc_r2_sample_alpha(160.0, 4.0, 2048, 128, 1.0);
+        assert_eq!(alpha, Some(0.4));
+        assert_eq!(zc_r2_gate_share_with_alpha(1.0, 2048, alpha), 1280);
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(zc_r2_sample_alpha(value, 4.0, 2048, 128, 1.0), None);
+            assert_eq!(zc_r2_sample_alpha(160.0, value, 2048, 128, 1.0), None);
+            assert_eq!(zc_r2_sample_alpha(160.0, 4.0, 2048, 128, value), None);
+        }
+        assert_eq!(zc_r2_sample_alpha(160.0, 10.0, 2048, 128, 1.0), None);
+        assert_eq!(zc_r2_sample_alpha(160.0, 11.0, 2048, 128, 1.0), None);
+        assert_eq!(zc_r2_sample_alpha(160.0, 4.0, 2048, 0, 1.0), None);
+        for ratio in [0.38, 1.0, 2.0, 2.01, 7.9, 8.0, f64::NAN] {
+            assert_eq!(
+                zc_r2_gate_share_with_alpha(ratio, 2048, None),
+                zc_r2_gate_share(ratio, 2048),
+            );
+            for invalid in [0.0, 1.0, -1.0, f64::NAN, f64::INFINITY] {
+                assert_eq!(
+                    zc_r2_gate_share_with_alpha(ratio, 2048, Some(invalid)),
+                    zc_r2_gate_share(ratio, 2048),
+                );
+            }
+        }
+        assert_eq!(zc_r2_gate_share_with_alpha(0.38, 2048, alpha), 1920);
+        assert_eq!(zc_r2_gate_share_with_alpha(2.01, 2048, alpha), 256);
+        assert_eq!(zc_r2_gate_share_with_alpha(7.9, 2048, alpha), 256);
+        assert_eq!(zc_r2_gate_share_with_alpha(8.0, 2048, alpha), 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_r2_retained_replay_drains_on_unwind() {
+        if imp::zc_r2_replay_drain_unwind_oracle().is_none() {
+            eprintln!("SKIP: Metal R2 replay state unavailable");
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_r2_retained_mismatch_disables_arm() {
+        if gpu_or_skip(imp::gpu()).is_none() {
+            return;
+        }
+        let (lo, hi) = (256, 8);
+        let a = leak_page_aligned(lo * hi * 16);
+        let b = leak_page_aligned(lo * hi * 16);
+        a.fill(0);
+        b.fill(0);
+        let table = vec![F128::ZERO; 2048];
+        let eq_lo = vec![F128::ZERO; lo];
+        let eq_hi = vec![F128::ZERO; hi];
+        let full = vec![(F128::ZERO, F128::ZERO); hi];
+        let la = vec![[F128::ZERO; 6]; hi];
+        imp::zc_r2_test_reset();
+        let job = imp::launch_zc_r2_products(a, b, &table, &eq_lo, &eq_hi, lo, hi, 127, 121)
+            .expect("real calibration probe must submit");
+        let mut samples = 0;
+        let result =
+            imp::zc_r2_wait_with_retained_sample(job, Some(&full), Some(&la), 50.0, hi, |chunks| {
+                samples += 1;
+                assert_eq!(chunks, hi);
+                Some(Err(()))
+            });
+        assert!(matches!(result, imp::ZcR2Result::Failed));
+        assert_eq!(samples, 1);
+        assert_eq!(imp::zc_r2_test_state(), (0, true));
+        assert!(imp::launch_zc_r2_products(a, b, &table, &eq_lo, &eq_hi, lo, hi, 127, 121).is_none());
+        assert!(full.iter().all(|p| *p == (F128::ZERO, F128::ZERO)));
+        assert!(la.iter().all(|p| *p == [F128::ZERO; 6]));
+        imp::zc_r2_test_reset();
+    }
+
     /// The lincheck arm's GPU prefix equals the CPU fold over exactly the
     /// claims it owns, and prefix ⊕ CPU-suffix equals the whole-range
     /// production fold — the same discipline the zerocheck arm is held to.
@@ -15769,6 +17780,359 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         );
     }
 
+    #[test]
+    fn gpu_zc_r2_karatsuba_exact_control() {
+        use std::ffi::OsStr;
+        assert!(!gpu_zc_r2_karatsuba_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(gpu_zc_r2_karatsuba_value_enabled(value.map(OsStr::new)));
+        }
+    }
+
+    /// Exercise both compiled multipliers with basis pairs, dense carry
+    /// patterns and random full-width inputs. Check the unreduced limbs as
+    /// well as the reduced field value, so reduction cannot hide an error.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_zc_r2_karatsuba_arithmetic_matches_cpu() {
+        let gpu = imp::gpu().expect("arithmetic oracle requires real Metal");
+        let mut pairs = Vec::new();
+        let basis: Vec<F128> = (0..128)
+            .map(|bit| {
+                if bit < 64 {
+                    F128::new(1u64 << bit, 0)
+                } else {
+                    F128::new(0, 1u64 << (bit - 64))
+                }
+            })
+            .collect();
+        for &a in &basis {
+            for &b in &basis {
+                pairs.push((a, b));
+            }
+        }
+        let mut edges = vec![F128::ZERO, F128::ONE];
+        for word in [
+            u64::MAX,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x5555_5555_5555_5555,
+            0x1111_1111_1111_1111,
+            0x8888_8888_8888_8888,
+            0xFFFF_FFFF,
+            0xFFFF_FFFF_0000_0000,
+        ] {
+            edges.extend([
+                F128::new(word, 0),
+                F128::new(0, word),
+                F128::new(word, word),
+            ]);
+        }
+        for &a in &edges {
+            for &b in &edges {
+                pairs.push((a, b));
+            }
+        }
+        let mut rng = Rng::new(0xF10C_2CA7_A128_0032);
+        let random = rng.vec(8192);
+        pairs.extend(random.chunks_exact(2).map(|v| (v[0], v[1])));
+        while pairs.len() % 64 != 0 {
+            pairs.push((F128::ZERO, F128::ZERO));
+        }
+        let a: Vec<F128> = pairs.iter().map(|v| v.0).collect();
+        let b: Vec<F128> = pairs.iter().map(|v| v.1).collect();
+        let expected: Vec<u64> = pairs
+            .iter()
+            .flat_map(|&(a, b)| {
+                let mut p32 = 0u64;
+                for bit in 0..32 {
+                    if (b.lo >> bit) & 1 != 0 {
+                        p32 ^= u64::from(a.lo as u32) << bit;
+                    }
+                }
+                let p = a.mul_unreduced(b);
+                let reduced = p.reduce();
+                [p32, p.r0, p.r1, p.r2, p.r3, reduced.lo, reduced.hi]
+            })
+            .collect();
+
+        unsafe {
+            let pool = gpu.pool_push();
+            let input_bytes = core::mem::size_of_val(a.as_slice());
+            let output_bytes = core::mem::size_of_val(expected.as_slice());
+            let a_buf = gpu.new_buffer(input_bytes).unwrap();
+            let b_buf = gpu.new_buffer(input_bytes).unwrap();
+            let out_buf = gpu.new_buffer(output_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(
+                a.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(a_buf),
+                input_bytes,
+            );
+            std::ptr::copy_nonoverlapping(
+                b.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(b_buf),
+                input_bytes,
+            );
+            let mut resources = Vec::new();
+            for incumbent in [true, false] {
+                let source = imp::zc_r2_arithmetic_test_source(incumbent);
+                let pso =
+                    imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_arithmetic_oracle")
+                        .unwrap();
+                let products =
+                    imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_products").unwrap();
+                let usage = gpu.pipeline_resources(products);
+                eprintln!("[zc-r2-arithmetic] incumbent={incumbent} products-resources={usage:?}");
+                resources.push(usage);
+                std::ptr::write_bytes(gpu.buffer_contents(out_buf), 0xA5, output_bytes);
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, a_buf, 0, 0);
+                gpu.set_buffer(enc, b_buf, 0, 1);
+                gpu.set_buffer(enc, out_buf, 0, 2);
+                gpu.dispatch(enc, (pairs.len() / 64) as u64, 64);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let actual = core::slice::from_raw_parts(
+                    gpu.buffer_contents(out_buf).cast::<u64>(),
+                    expected.len(),
+                );
+                assert_eq!(actual, expected.as_slice(), "incumbent={incumbent}");
+                gpu.release(pso);
+                gpu.release(products);
+            }
+            assert_eq!(resources[0].0, resources[1].0, "shared-memory use changed");
+            assert_eq!(resources[0].1, resources[1].1, "SIMD width changed");
+            assert!(
+                resources.iter().all(|v| v.2 >= 256),
+                "production group no longer fits"
+            );
+            eprintln!(
+                "[zc-r2-arithmetic] checked {} field pairs per pipeline",
+                pairs.len()
+            );
+            gpu.release(a_buf);
+            gpu.release(b_buf);
+            gpu.release(out_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    #[test]
+    fn gpu_zc_r2_one_group_control_and_resource_gate() {
+        use std::ffi::OsStr;
+        assert!(!gpu_zc_r2_one_group_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(gpu_zc_r2_one_group_value_enabled(value.map(OsStr::new)));
+        }
+        assert!(zc_r2_one_group_limits_fit(8192, 32, 1024, 32768, 1024));
+        for limits in [
+            (8191, 32, 1024, 32768, 1024),
+            (12288, 32, 1024, 32768, 1024),
+            (8192, 16, 1024, 32768, 1024),
+            (8192, 64, 1024, 32768, 1024),
+            (8192, 32, 1023, 32768, 1024),
+            (8192, 32, 1024, 8191, 1024),
+            (8192, 32, 1024, 32768, 1023),
+        ] {
+            assert!(!zc_r2_one_group_limits_fit(
+                limits.0, limits.1, limits.2, limits.3, limits.4
+            ));
+        }
+    }
+
+    #[test]
+    fn gpu_zc_r2_horner_control_and_weight_guard() {
+        use std::ffi::OsStr;
+        assert!(!gpu_zc_r2_horner_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(gpu_zc_r2_horner_value_enabled(value.map(OsStr::new)));
+        }
+        assert!(!zc_r2_horner_weights(&[], 16_384));
+        assert!(!zc_r2_horner_weights(&vec![F128::ZERO; 512], 512));
+        let mut weights = vec![F128::ZERO; 16_384];
+        for window in 0..256 {
+            for class in 0..4 {
+                let mut value = match class {
+                    0 => F128::ZERO,
+                    1 => F128::ONE,
+                    2 => F128::new(u64::MAX, u64::MAX),
+                    _ => F128::new(window as u64, 1 << 63),
+                };
+                for medium in 0..16 {
+                    weights[(window << 6) | (medium << 2) | class] = value;
+                    value = crate::field::mul_by_x(value);
+                }
+            }
+        }
+        assert!(zc_r2_horner_weights(&weights, 16_384));
+        weights[16_383] += F128::ONE;
+        assert!(!zc_r2_horner_weights(&weights, 16_384));
+
+        let mut seen = vec![false; 16_384];
+        for group in 0..4 {
+            for lid in 0..256 {
+                let window = (group << 6) | (lid >> 2);
+                for medium in 0..16 {
+                    let x_lo = (window << 6) | (medium << 2) | (lid & 3);
+                    assert_eq!(x_lo & 1, lid & 1);
+                    assert!(!seen[x_lo]);
+                    seen[x_lo] = true;
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|v| v));
+    }
+
+    /// Check every possible degree of a 270-bit Horner sum, dense inputs,
+    /// random inputs, the raw limbs, polynomial reduction and final weight.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_zc_r2_horner_arithmetic_matches_cpu() {
+        let gpu = imp::gpu().expect("Horner oracle requires real Metal");
+        let basis = |bit: usize| {
+            if bit < 64 {
+                F128::new(1 << bit, 0)
+            } else {
+                F128::new(0, 1 << (bit - 64))
+            }
+        };
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        for degree in 0usize..270 {
+            let shift = degree.saturating_sub(254);
+            let product_degree = degree - shift;
+            let a_bit = product_degree.min(127);
+            let mut av = [F128::ZERO; 16];
+            let mut bv = [F128::ZERO; 16];
+            av[shift] = basis(a_bit);
+            bv[shift] = basis(product_degree - a_bit);
+            a.extend(av);
+            b.extend(bv);
+        }
+        for value in [
+            F128::ZERO,
+            F128::ONE,
+            F128::new(u64::MAX, u64::MAX),
+            basis(127),
+        ] {
+            a.extend([value; 16]);
+            b.extend([value; 16]);
+        }
+        let mut rng = Rng::new(0xF10C_0320_0016_0009);
+        a.extend(rng.vec(128 * 16));
+        b.extend(rng.vec(128 * 16));
+        while a.len() / 16 % 64 != 0 {
+            a.extend([F128::ZERO; 16]);
+            b.extend([F128::ZERO; 16]);
+        }
+        let count = a.len() / 16;
+        let mut weights = rng.vec(count);
+        for (case, weight) in weights.iter_mut().enumerate() {
+            *weight = match case % 8 {
+                0 => F128::ZERO,
+                1 => F128::ONE,
+                2 => F128::new(u64::MAX, u64::MAX),
+                3 => basis(127),
+                _ => *weight,
+            };
+        }
+        let mut expected = Vec::with_capacity(count * 9);
+        for case in 0..count {
+            let mut raw = [0u64; 5];
+            for medium in 0..16 {
+                let p = a[case * 16 + medium].mul_unreduced(b[case * 16 + medium]);
+                for (word, limb) in [p.r0, p.r1, p.r2, p.r3].into_iter().enumerate() {
+                    raw[word] ^= limb << medium;
+                    if medium != 0 {
+                        raw[word + 1] ^= limb >> (64 - medium);
+                    }
+                }
+            }
+            let mut reduced = raw;
+            // Independent long division, without the shader's 0x4015 fold.
+            for degree in (128..270).rev() {
+                if reduced[degree / 64] >> (degree % 64) & 1 != 0 {
+                    for delta in [0, 1, 2, 7, 128] {
+                        let bit = degree - 128 + delta;
+                        reduced[bit / 64] ^= 1u64 << (bit % 64);
+                    }
+                }
+            }
+            let value = F128::new(reduced[0], reduced[1]);
+            let weighted = weights[case] * value;
+            expected.extend(raw);
+            expected.extend([value.lo, value.hi, weighted.lo, weighted.hi]);
+        }
+        unsafe {
+            let pool = gpu.pool_push();
+            let input_bytes = core::mem::size_of_val(a.as_slice());
+            let output_bytes = core::mem::size_of_val(expected.as_slice());
+            let a_buf = gpu.new_buffer(input_bytes).unwrap();
+            let b_buf = gpu.new_buffer(input_bytes).unwrap();
+            let w_buf = gpu.new_buffer(count * 16).unwrap();
+            let out_buf = gpu.new_buffer(output_bytes).unwrap();
+            for (data, buffer) in [
+                (a.as_slice(), a_buf),
+                (b.as_slice(), b_buf),
+                (weights.as_slice(), w_buf),
+            ] {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(buffer),
+                    core::mem::size_of_val(data),
+                );
+            }
+            let source = imp::zc_r2_arithmetic_test_source(false);
+            let pso = imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_horner_oracle").unwrap();
+            let ordinary = imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_products").unwrap();
+            let horner =
+                imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_products_horner").unwrap();
+            let one_group =
+                imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_products_horner_1024_probe")
+                    .unwrap();
+            let one_usage = gpu.pipeline_resources(one_group);
+            assert_eq!(one_usage.0, 8192, "one-group shared allocation changed");
+            assert_eq!(one_usage.1, 32, "one-group oracle needs SIMD width 32");
+            assert!(
+                one_usage.2 >= 1024,
+                "one-group oracle needs 1024-thread capacity"
+            );
+            let old_usage = gpu.pipeline_resources(ordinary);
+            let usage = gpu.pipeline_resources(horner);
+            assert_eq!(old_usage.0, usage.0, "shared-memory use changed");
+            assert_eq!(old_usage.1, usage.1, "SIMD width changed");
+            assert!(usage.2 >= 256, "Horner production group no longer fits");
+            for repeat in 0..2 {
+                std::ptr::write_bytes(gpu.buffer_contents(out_buf), 0xA5, output_bytes);
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, a_buf, 0, 0);
+                gpu.set_buffer(enc, b_buf, 0, 1);
+                gpu.set_buffer(enc, w_buf, 0, 2);
+                gpu.set_buffer(enc, out_buf, 0, 3);
+                gpu.dispatch(enc, (count / 64) as u64, 64);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let actual = core::slice::from_raw_parts(
+                    gpu.buffer_contents(out_buf).cast::<u64>(),
+                    expected.len(),
+                );
+                assert_eq!(actual, expected.as_slice(), "repeat={repeat}");
+            }
+            eprintln!(
+                "[zc-r2-horner] checked {count} sums twice; ordinary={old_usage:?} horner={usage:?} one-group={one_usage:?}"
+            );
+            for buffer in [
+                a_buf, b_buf, w_buf, out_buf, pso, ordinary, horner, one_group,
+            ] {
+                gpu.release(buffer);
+            }
+            gpu.pool_pop(pool);
+        }
+    }
+
     /// Round-two products arm oracle: the GPU's per-chunk reduced partials
     /// must equal the CPU's `(eq_hi · p1, eq_hi · pinf)` bit-for-bit, on a
     /// linear byte table (the real `UniSkipFoldTable` is F2-linear by
@@ -15778,6 +18142,14 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// the timed prefix path.
     #[test]
     fn gpu_zc_r2_products_match_cpu_oracle() {
+        for (lo_size, hi_size, fixed_weights) in
+            [(512, 64, false), (16_384, 8, true), (16_384, 8, false)]
+        {
+            zc_r2_products_case(lo_size, hi_size, fixed_weights);
+        }
+    }
+
+    fn zc_r2_products_case(lo_size: usize, hi_size: usize, fixed_weights: bool) {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
             *rng ^= *rng << 13;
@@ -15807,7 +18179,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 table_data[j * 256 + v] = acc;
             }
         }
-        let fold_row = |code: u64| -> F128 {
+        let fold_row = |table_data: &[F128], code: u64| -> F128 {
             let mut acc = F128::ZERO;
             for j in 0..8 {
                 acc += table_data[j * 256 + ((code >> (8 * j)) & 0xff) as usize];
@@ -15815,13 +18187,11 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             acc
         };
 
-        let lo_size = 512usize;
-        let hi_size = 64usize;
         let n_pairs = lo_size * hi_size;
-        // Pad the tail of every 4096-pair block: exercises the skip
-        // predicate on both engines.
-        let mask = 4095usize;
-        let useful = 3900usize;
+        // Test the ranked seven-pair tail and a generic padded block.
+        // The padded inputs contain random data, which must be ignored.
+        let mask = if fixed_weights { 127usize } else { 4095usize };
+        let useful = if fixed_weights { 121usize } else { 3900usize };
 
         let mut a_packed = vec![0u8; n_pairs * 16];
         let mut b_packed = vec![0u8; n_pairs * 16];
@@ -15831,35 +18201,52 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         for byte in b_packed.iter_mut() {
             *byte = (xs(&mut rng) & 0xff) as u8;
         }
-        let eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
-        let eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
+        let mut eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
+        if fixed_weights {
+            for window in 0..256 {
+                for class in 0..4 {
+                    let mut value = eq_lo[(window << 6) | class];
+                    for medium in 0..16 {
+                        eq_lo[(window << 6) | (medium << 2) | class] = value;
+                        value = crate::field::mul_by_x(value);
+                    }
+                }
+            }
+        }
+        assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
+        let mut eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
 
         // CPU reference partials, exactly the driver's non-aarch64 shape, kept
         // split by x_lo parity so the arm's parity contract is checked and not
         // just the sum a wrong split could still reproduce.
-        let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
-        for x_hi in 0..hi_size {
-            // [p1_even, pinf_even, p1_odd, pinf_odd]
-            let mut acc = [F256Unreduced::ZERO; 4];
-            for x_lo in 0..lo_size {
-                let pair_idx = x_hi * lo_size + x_lo;
-                if (pair_idx & mask) >= useful {
-                    continue;
+        let reference =
+            |a_packed: &[u8], b_packed: &[u8], table_data: &[F128], eq_lo: &[F128], eq_hi: &[F128]| {
+                let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
+                for x_hi in 0..hi_size {
+                    // [p1_even, pinf_even, p1_odd, pinf_odd]
+                    let mut acc = [F256Unreduced::ZERO; 4];
+                    for x_lo in 0..lo_size {
+                        let pair_idx = x_hi * lo_size + x_lo;
+                        if (pair_idx & mask) >= useful {
+                            continue;
+                        }
+                        let read = |packed: &[u8], row: usize| -> u64 {
+                            u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
+                        };
+                        let a0 = fold_row(table_data, read(&a_packed, 2 * pair_idx));
+                        let a1 = fold_row(table_data, read(&a_packed, 2 * pair_idx + 1));
+                        let b0 = fold_row(table_data, read(&b_packed, 2 * pair_idx));
+                        let b1 = fold_row(table_data, read(&b_packed, 2 * pair_idx + 1));
+                        let base = 2 * (x_lo & 1);
+                        acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
+                        acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+                    }
+                    let eq_h = eq_hi[x_hi];
+                    cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
                 }
-                let read = |packed: &[u8], row: usize| -> u64 {
-                    u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
-                };
-                let a0 = fold_row(read(&a_packed, 2 * pair_idx));
-                let a1 = fold_row(read(&a_packed, 2 * pair_idx + 1));
-                let b0 = fold_row(read(&b_packed, 2 * pair_idx));
-                let b1 = fold_row(read(&b_packed, 2 * pair_idx + 1));
-                let base = 2 * (x_lo & 1);
-                acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
-            }
-            let eq_h = eq_hi[x_hi];
-            cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
-        }
+                cpu_split
+            };
+        let cpu_split = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
         let cpu_partials: Vec<(F128, F128)> = cpu_split
             .iter()
             .map(|v| (v[0] + v[2], v[1] + v[3]))
@@ -15869,6 +18256,15 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             .iter()
             .map(|v| [v[2], v[3], F128::ZERO, F128::ZERO, F128::ZERO, F128::ZERO])
             .collect();
+
+        let expected_mode = if !fixed_weights || !gpu_zc_r2_horner_enabled() {
+            imp::ZcR2Mode::Ordinary
+        } else if imp::zc_r2_test_one_group_available() {
+            imp::ZcR2Mode::HornerOneGroup
+        } else {
+            imp::ZcR2Mode::HornerFourGroups
+        };
+        eprintln!("[zc-r2-mode-oracle] lo={lo_size} fixed={fixed_weights} expected={expected_mode:?}");
 
         // Calibration probe: internal equality oracle + share publication.
         imp::zc_r2_test_reset();
@@ -15884,6 +18280,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             useful,
         )
         .expect("calibration launch must succeed on real Metal");
+        assert_eq!(job.mode(), expected_mode);
         assert!(job.is_calibration());
         assert_eq!(job.cpu_split(), 0);
         let res = imp::zc_r2_wait(job, Some(&cpu_partials), Some(&cpu_la), 50.0, hi_size);
@@ -15909,6 +18306,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             useful,
         )
         .expect("timed launch must succeed");
+        assert_eq!(job2.mode(), expected_mode);
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
@@ -15926,6 +18324,67 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 }
             }
             _ => panic!("timed drain must return prefix partials"),
+        }
+        // Change every bound input in place after a completed prefix. The next
+        // job must read new bytes through the same cached buffers and addresses.
+        let addresses = (
+            a_packed.as_ptr(),
+            b_packed.as_ptr(),
+            table_data.as_ptr(),
+            eq_lo.as_ptr(),
+            eq_hi.as_ptr(),
+        );
+        for byte in &mut a_packed {
+            *byte ^= 0x5b;
+        }
+        for byte in &mut b_packed {
+            *byte ^= 0xa7;
+        }
+        for value in table_data
+            .iter_mut()
+            .chain(eq_lo.iter_mut())
+            .chain(eq_hi.iter_mut())
+        {
+            *value = crate::field::mul_by_x(*value);
+        }
+        assert_eq!(
+            addresses,
+            (
+                a_packed.as_ptr(),
+                b_packed.as_ptr(),
+                table_data.as_ptr(),
+                eq_lo.as_ptr(),
+                eq_hi.as_ptr(),
+            )
+        );
+        assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
+        let changed = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        assert_ne!(
+            &changed[..prefix],
+            &cpu_split[..prefix],
+            "changed prefix must change the oracle"
+        );
+        let job3 = imp::launch_zc_r2_products(
+            &a_packed,
+            &b_packed,
+            &table_data,
+            &eq_lo,
+            &eq_hi,
+            lo_size,
+            hi_size,
+            mask,
+            useful,
+        )
+        .expect("changed-input launch must succeed");
+        assert_eq!(job3.mode(), expected_mode);
+        assert!(!job3.is_calibration());
+        assert_eq!(job3.cpu_split(), prefix);
+        match imp::zc_r2_wait(job3, None, None, 0.0, hi_size) {
+            imp::ZcR2Result::Prefix(vals) => {
+                assert_eq!(vals.len(), prefix);
+                assert_eq!(&vals[..], &changed[..prefix], "same-address changed input");
+            }
+            _ => panic!("changed-input drain must return prefix partials"),
         }
         imp::zc_r2_test_reset();
     }

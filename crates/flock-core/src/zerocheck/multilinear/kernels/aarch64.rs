@@ -966,6 +966,244 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     }
 }
 
+/// GPU-covered round-two lookahead with the four fixed medium weights
+/// deferred until after a 16-position polynomial Horner sum.
+///
+/// The caller checks that the medium coordinates are the protocol constants.
+/// For a 32-group-aligned `first`, `u = first + 2*b + t` has weight
+/// `eq_lo[2*u+1] = eq_lo[2*(first+t)+1] * x^b`. Each raw product has degree
+/// at most 254, so all 16 positions fit in 270 bits. The four fifth limbs
+/// share two q registers; anchors and deltas retain their canonical form.
+/// `LINEAR` requires a fresh complete byte-bank linearity check by the caller.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const LINEAR: bool>(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    out: *mut F128,
+) {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn fold_even_and_store(
+        table_data: *const u8,
+        a_packed: *const u8,
+        b_packed: *const u8,
+        anchors: *mut F128,
+        deltas: *mut u8,
+        x_lo: usize,
+        padded: bool,
+        degen: bool,
+        b_ones: uint64x2_t,
+    ) -> (uint64x2_t, uint64x2_t, u64, u64, bool) {
+        unsafe {
+            let zero = vdupq_n_u64(0);
+            if padded {
+                let dst = anchors.add(2 * x_lo);
+                core::arch::asm!(
+                    "stnp {a:q}, {b:q}, [{dst}]",
+                    dst = in(reg) dst,
+                    a = in(vreg) zero,
+                    b = in(vreg) zero,
+                    options(nostack, preserves_flags),
+                );
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                return (zero, zero, 0, 0, false);
+            }
+            let row0 = 2 * x_lo;
+            let a0_code = u64::from_le(core::ptr::read_unaligned(
+                a_packed.add(row0 * 8).cast::<u64>(),
+            ));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(
+                a_packed.add((row0 + 1) * 8).cast::<u64>(),
+            ));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(
+                b_packed.add(row0 * 8).cast::<u64>(),
+            ));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(
+                b_packed.add((row0 + 1) * 8).cast::<u64>(),
+            ));
+            let deg = degen && (b0_code & b1_code) == u64::MAX;
+            let (a0, b0) = if deg {
+                let (a0, _) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+                (a0, b_ones)
+            } else {
+                fold_two_row_codes_q(table_data, a0_code, b0_code)
+            };
+            let dst = anchors.add(2 * x_lo);
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) a0,
+                b = in(vreg) b0,
+                options(nostack, preserves_flags),
+            );
+            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
+                a0_code ^ a1_code,
+                if deg { 0 } else { b0_code ^ b1_code },
+            ]);
+            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            (a0, b0, a1_code, b1_code, deg)
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn shift_pair(a: &mut WideNeon, b: &mut WideNeon, top: &mut uint64x2_t) {
+        unsafe {
+            let zero = vdupq_n_u64(0);
+            *top = vsriq_n_u64::<63>(vshlq_n_u64::<1>(*top), vzip2q_u64(a.hi, b.hi));
+            a.hi = vsriq_n_u64::<63>(vshlq_n_u64::<1>(a.hi), vextq_u64::<1>(a.lo, a.hi));
+            b.hi = vsriq_n_u64::<63>(vshlq_n_u64::<1>(b.hi), vextq_u64::<1>(b.lo, b.hi));
+            a.lo = vsriq_n_u64::<63>(vshlq_n_u64::<1>(a.lo), vextq_u64::<1>(zero, a.lo));
+            b.lo = vsriq_n_u64::<63>(vshlq_n_u64::<1>(b.lo), vextq_u64::<1>(zero, b.lo));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn reduce_pair(
+        mut a: WideNeon,
+        mut b: WideNeon,
+        top: uint64x2_t,
+    ) -> (uint64x2_t, uint64x2_t) {
+        unsafe {
+            let zero = vdupq_n_u64(0);
+            // x^256 = 1 + x^2 + x^4 + x^14 modulo x^128+x^7+x^2+x+1.
+            // Each top limb has at most 14 bits, so this cannot overflow.
+            let folded = veorq_u64(
+                xor3_u64(top, vshlq_n_u64::<2>(top), vshlq_n_u64::<4>(top)),
+                vshlq_n_u64::<14>(top),
+            );
+            a.lo = veorq_u64(a.lo, vzip1q_u64(folded, zero));
+            b.lo = veorq_u64(b.lo, vzip2q_u64(folded, zero));
+            (reduce_wide_q(a), reduce_wide_q(b))
+        }
+    }
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut sum0 = zero;
+        let mut sum3 = zero;
+        let mut sum4 = zero;
+        let mut sum5 = zero;
+        let b_ones = fold_row_q(table_data, [0xffu8; 8].as_ptr());
+        let ones_is_one = is_zero_q(veorq_u64(
+            b_ones,
+            core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
+        ));
+
+        for first in (0..lo_size / 2).step_by(32) {
+            for t in 0..2 {
+                let mut w0 = WideNeon { lo: zero, hi: zero };
+                let mut w3 = WideNeon { lo: zero, hi: zero };
+                let mut w4 = WideNeon { lo: zero, hi: zero };
+                let mut w5 = WideNeon { lo: zero, hi: zero };
+                let mut top03 = zero;
+                let mut top45 = zero;
+                for b in (0..16).rev() {
+                    shift_pair(&mut w0, &mut w3, &mut top03);
+                    shift_pair(&mut w4, &mut w5, &mut top45);
+                    let u = first + 2 * b + t;
+                    let x_lo0 = 2 * u;
+                    let x_lo1 = x_lo0 + 1;
+                    let pad0 =
+                        ((pair_idx_base + x_lo0) & pair_in_block_mask) >= useful_pairs_inclusive;
+                    let pad1 =
+                        ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
+                    if LINEAR {
+                        let (a0, b0, a1_code, b1_code, deg0) = fold_even_and_store(
+                            table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen,
+                            b_ones,
+                        );
+                        let (a2, b2, a3_code, b3_code, deg1) = fold_even_and_store(
+                            table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen,
+                            b_ones,
+                        );
+                        if pad0 & pad1 {
+                            continue;
+                        }
+                        if deg0 & deg1 & ones_is_one {
+                            w0.lo = veorq_u64(w0.lo, a2);
+                        } else {
+                            // Fold merge from d6376af4: the checked table is
+                            // F2-linear, so odd rows need only their code XOR.
+                            let (o_a, o_b) = fold_two_row_codes_q(
+                                table_data,
+                                a1_code ^ a3_code,
+                                b1_code ^ b3_code,
+                            );
+                            let e_a = veorq_u64(a0, a2);
+                            let e_b = veorq_u64(b0, b2);
+                            if !pad1 {
+                                wide_xor(&mut w0, mul_unreduced_q(a2, b2));
+                            }
+                            wide_xor(&mut w3, mul_unreduced_q(e_a, e_b));
+                            wide_xor(&mut w4, mul_unreduced_q(o_a, o_b));
+                            wide_xor(
+                                &mut w5,
+                                mul_unreduced_q(veorq_u64(e_a, o_a), veorq_u64(e_b, o_b)),
+                            );
+                        }
+                        continue;
+                    }
+                    let (a0, a1, a2, a3, b0, b1, b2, b3, deg0, deg1) = {
+                        let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
+                            table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen,
+                            b_ones,
+                        );
+                        let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
+                            table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen,
+                            b_ones,
+                        );
+                        (a0, a1, a2, a3, b0, b1, b2, b3, deg0, deg1)
+                    };
+                    if pad0 & pad1 {
+                        continue;
+                    }
+                    if deg0 & deg1 & ones_is_one {
+                        w0.lo = veorq_u64(w0.lo, a2);
+                    } else {
+                        let e_a = veorq_u64(a0, a2);
+                        let o_a = veorq_u64(a1, a3);
+                        let e_b = veorq_u64(b0, b2);
+                        let o_b = veorq_u64(b1, b3);
+                        if !pad1 {
+                            wide_xor(&mut w0, mul_unreduced_q(a2, b2));
+                        }
+                        let all_a = veorq_u64(e_a, o_a);
+                        let all_b = veorq_u64(e_b, o_b);
+                        wide_xor(&mut w3, mul_unreduced_q(e_a, e_b));
+                        wide_xor(&mut w4, mul_unreduced_q(o_a, o_b));
+                        wide_xor(&mut w5, mul_unreduced_q(all_a, all_b));
+                    }
+                }
+                let lambda = vld1q_u64(eq_lo.add(2 * (first + t) + 1).cast::<u64>());
+                let (w0, w3) = reduce_pair(w0, w3, top03);
+                let (w4, w5) = reduce_pair(w4, w5, top45);
+                sum0 = veorq_u64(sum0, mul_q(lambda, w0));
+                sum3 = veorq_u64(sum3, mul_q(lambda, w3));
+                sum4 = veorq_u64(sum4, mul_q(lambda, w4));
+                sum5 = veorq_u64(sum5, mul_q(lambda, w5));
+            }
+        }
+        for i in 0..4 {
+            *out.add(i) = F128::ZERO;
+        }
+        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(sum0);
+        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(sum3);
+        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(sum4);
+        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(sum5);
+    }
+}
+
 /// Bind **both** ρ₁ and ρ₂ straight out of the compact round-two state and
 /// emit the round-four message in the same pass (variant K).
 ///
@@ -2469,12 +2707,242 @@ mod tests {
     use super::*;
     use core::arch::aarch64::uint64x2_t;
 
+    type Round2HornerFn = unsafe fn(
+        *const u8,
+        *const u8,
+        *const u8,
+        *mut F128,
+        *mut u8,
+        *const F128,
+        usize,
+        usize,
+        usize,
+        usize,
+        bool,
+        *mut F128,
+    );
+
     fn splitmix64(state: &mut u64) -> u64 {
         *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = *state;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
+    }
+
+    #[test]
+    fn round2_horner_weighted_sums_match_full_cpu() {
+        use crate::field::PHI_8_TABLE;
+        use crate::zerocheck::multilinear::UniSkipFoldTable;
+        use crate::zerocheck::univariate_skip::build_eq;
+        use crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash;
+
+        const LO_SIZE: usize = 256;
+        let mut state = 0x5232_484f_524e_4552;
+        let mut a_packed = vec![0u8; 16 * LO_SIZE];
+        let mut b_packed = vec![0u8; 16 * LO_SIZE];
+        for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
+            *byte = splitmix64(&mut state) as u8;
+        }
+        for instance in 0..2 {
+            let base = instance * 2048;
+            for group in [0, 1, 2, 3, 59] {
+                b_packed[base + group * 32..base + (group + 1) * 32].fill(0xff);
+            }
+            // Also test a mixed group, and the 49 useful bits in row 240.
+            b_packed[base + 4 * 32..base + 4 * 32 + 16].fill(0xff);
+            for packed in [&mut a_packed, &mut b_packed] {
+                packed[base + 1926] &= 1;
+                packed[base + 1927..base + 1936].fill(0);
+            }
+        }
+        let random_z = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+        for (z_case, z) in [F128::ZERO, F128::ONE, PHI_8_TABLE[64], random_z]
+            .into_iter()
+            .enumerate()
+        {
+            let mut table = UniSkipFoldTable::new(6, z);
+            // An arbitrary table exercises the guard when fold(all-ones) != 1.
+            if z_case == 3 {
+                for value in &mut table.data {
+                    *value = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                }
+            }
+            for challenge_case in 0..6 {
+                let mut r: Vec<F128> = (0..8)
+                    .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+                    .collect();
+                r[2..6].copy_from_slice(&medium_challenges_ghash());
+                match challenge_case {
+                    0 => r[0] = F128::ZERO,
+                    1 => r[0] = F128::ONE,
+                    2 => r[1] = F128::ZERO,
+                    3 => r[1] = F128::ONE,
+                    4 => r[6..8].copy_from_slice(&[F128::ZERO, F128::ONE]),
+                    _ => {}
+                }
+                let eq_lo = build_eq(&r);
+                for (mask, useful) in [(usize::MAX, usize::MAX), (127, 121)] {
+                    for degen in [false, true] {
+                        let run = |horner: bool, linear: bool| {
+                            let poison = F128::new(u64::MAX, u64::MAX);
+                            let mut anchors = vec![poison; 2 * LO_SIZE];
+                            let mut deltas = vec![0xa5u8; 16 * LO_SIZE];
+                            let mut out = [poison; 8];
+                            unsafe {
+                                if horner {
+                                    let kernel: Round2HornerFn = if linear {
+                                        fold_round2_compact_chunk_neon_horner_8::<true>
+                                    } else {
+                                        fold_round2_compact_chunk_neon_horner_8::<false>
+                                    };
+                                    kernel(
+                                        table.data.as_ptr().cast::<u8>(),
+                                        a_packed.as_ptr(),
+                                        b_packed.as_ptr(),
+                                        anchors.as_mut_ptr(),
+                                        deltas.as_mut_ptr(),
+                                        eq_lo.as_ptr(),
+                                        LO_SIZE,
+                                        0,
+                                        mask,
+                                        useful,
+                                        degen,
+                                        out.as_mut_ptr(),
+                                    );
+                                } else {
+                                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                                        table.data.as_ptr().cast::<u8>(),
+                                        a_packed.as_ptr(),
+                                        b_packed.as_ptr(),
+                                        anchors.as_mut_ptr(),
+                                        deltas.as_mut_ptr(),
+                                        eq_lo.as_ptr(),
+                                        LO_SIZE,
+                                        0,
+                                        mask,
+                                        useful,
+                                        degen,
+                                        true,
+                                        out.as_mut_ptr(),
+                                    );
+                                }
+                            }
+                            (anchors, deltas, out)
+                        };
+                        let cpu = run(false, false);
+                        let horner = run(true, false);
+                        let linear =
+                            crate::zerocheck::multilinear::round2_horner_table_is_linear(&table);
+                        let selected = run(true, linear);
+                        assert_eq!(selected, horner, "checked six-fold selection");
+                        assert_eq!(
+                            horner.0, cpu.0,
+                            "anchor mismatch at {z_case}/{challenge_case}"
+                        );
+                        assert_eq!(
+                            horner.1, cpu.1,
+                            "delta mismatch at {z_case}/{challenge_case}"
+                        );
+                        assert_eq!(&horner.2[..4], &[F128::ZERO; 4]);
+                        assert_eq!(
+                            &horner.2[4..],
+                            &cpu.2[4..],
+                            "sum mismatch at {z_case}/{challenge_case}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round2_six_fold_horner_checks_current_table_and_padding() {
+        use crate::zerocheck::multilinear::{UniSkipFoldTable, round2_horner_table_is_linear};
+        use crate::zerocheck::univariate_skip::build_eq;
+        use crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash;
+
+        const LO_SIZE: usize = 256;
+        let mut table = UniSkipFoldTable::new(6, F128::new(0x1234_5678_9abc_def0, 0x5a5a));
+        let original = table.data.clone();
+        let address = table.data.as_ptr();
+        let mut a = vec![0u8; 16 * LO_SIZE];
+        let mut b = vec![0u8; 16 * LO_SIZE];
+        for (row, code) in [0u64, 1, 0, 2].into_iter().enumerate() {
+            a[row * 8..(row + 1) * 8].copy_from_slice(&code.to_le_bytes());
+            b[row * 8..(row + 1) * 8].copy_from_slice(&code.to_le_bytes());
+        }
+        for group in [1usize, 2] {
+            b[group * 32..(group + 1) * 32].fill(0xff);
+            a[group * 32] = 64;
+            a[group * 32 + 16] = 128;
+        }
+        b[4 * 32..4 * 32 + 16].fill(0xff);
+        b[5 * 32 + 16..6 * 32].fill(0xff);
+        let mut r = vec![F128::new(2, 0); 8];
+        r[1] = F128::new(3, 0);
+        r[2..6].copy_from_slice(&medium_challenges_ghash());
+        let eq = build_eq(&r);
+        assert_ne!(eq[1], F128::ZERO);
+        let kernels: [Round2HornerFn; 2] = [
+            fold_round2_compact_chunk_neon_horner_8::<false>,
+            fold_round2_compact_chunk_neon_horner_8::<true>,
+        ];
+        let run =
+            |table: &UniSkipFoldTable, linear: bool, base: usize, useful: usize, degen: bool| {
+                let mut anchors = vec![F128::new(u64::MAX, u64::MAX); 2 * LO_SIZE];
+                let mut deltas = vec![0xa5u8; 16 * LO_SIZE];
+                let mut out = [F128::new(u64::MAX, u64::MAX); 8];
+                unsafe {
+                    kernels[usize::from(linear)](
+                        table.data.as_ptr().cast::<u8>(),
+                        a.as_ptr(),
+                        b.as_ptr(),
+                        anchors.as_mut_ptr(),
+                        deltas.as_mut_ptr(),
+                        eq.as_ptr(),
+                        LO_SIZE,
+                        base,
+                        127,
+                        useful,
+                        degen,
+                        out.as_mut_ptr(),
+                    );
+                }
+                (anchors, deltas, out)
+            };
+        for phase in 0..5 {
+            table.data.copy_from_slice(&original);
+            if phase == 1 {
+                // Nonlinear even though fold(all-ones) is field one.
+                table.data.fill(F128::ZERO);
+                table.data[3] = F128::ONE;
+                table.data[255] = F128::ONE;
+            } else if phase == 3 {
+                for value in &mut table.data {
+                    *value = *value * F128::new(3, 0);
+                }
+            } else if phase == 4 {
+                table.data.fill(F128::ZERO);
+            }
+            assert_eq!(table.data.as_ptr(), address);
+            let linear = round2_horner_table_is_linear(&table);
+            assert_eq!(linear, phase != 1);
+            if phase == 1 {
+                assert_eq!(table.fold_one_row(&[0xff; 8]), F128::ONE);
+            }
+            for base in [0usize, 1, 127] {
+                for useful in [0usize, 1, 2, 121, 128] {
+                    for degen in [false, true] {
+                        assert_eq!(
+                            run(&table, linear, base, useful, degen),
+                            run(&table, false, base, useful, degen),
+                            "phase={phase} base={base} useful={useful} degen={degen}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn fold4_scalar(values: &[F128], i: usize, rho_a: F128, rho_b: F128) -> F128 {
