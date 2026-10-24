@@ -160,11 +160,13 @@ unsafe fn butterfly_fused_3layer_row_with_q(
             let mut v: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
 
-            // Layer L: stride 4, shared twiddle t[0].
+            let (p0, p1) = mul_pair_q(v[4], v[5], t[0], t[0]);
+            let (p2, p3) = mul_pair_q(v[6], v[7], t[0], t[0]);
+            let p = [p0, p1, p2, p3];
             for i in 0..4 {
-                let (a, b) = butterfly_q(v[i], v[i + 4], t[0]);
+                let a = veorq_u64(v[i], p[i]);
+                v[i + 4] = veorq_u64(v[i + 4], a);
                 v[i] = a;
-                v[i + 4] = b;
             }
             // Layer L+1: stride 2, twiddles t[1], t[2] per half.
             for s in 0..2 {
@@ -175,11 +177,13 @@ unsafe fn butterfly_fused_3layer_row_with_q(
                     v[w] = b;
                 }
             }
-            // Layer L+2: stride 1, twiddles t[3..7] per quarter.
+            let (q0, q1) = mul_pair_q(v[1], v[3], t[3], t[4]);
+            let (q2, q3) = mul_pair_q(v[5], v[7], t[5], t[6]);
+            let prods = [q0, q1, q2, q3];
             for s in 0..4 {
-                let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], t[3 + s]);
+                let a = veorq_u64(v[2 * s], prods[s]);
+                v[2 * s + 1] = veorq_u64(v[2 * s + 1], a);
                 v[2 * s] = a;
-                v[2 * s + 1] = b;
             }
 
             for (i, value) in v.iter().enumerate() {
@@ -725,6 +729,74 @@ unsafe fn mul_low_pair_q(
     }
 }
 
+///
+#[inline(always)]
+unsafe fn mul_pair_q(
+    v0: core::arch::aarch64::uint64x2_t,
+    v1: core::arch::aarch64::uint64x2_t,
+    t0: core::arch::aarch64::uint64x2_t,
+    t1: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let v0_mid = veorq_u64(v0, vextq_u64::<1>(v0, v0));
+        let v1_mid = veorq_u64(v1, vextq_u64::<1>(v1, v1));
+        let t0_mid = veorq_u64(t0, vextq_u64::<1>(t0, t0));
+        let t1_mid = veorq_u64(t1, vextq_u64::<1>(t1, t1));
+
+        let ll0 = pmull_ll(v0, t0);
+        let hh0 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(v0),
+            vreinterpretq_p64_u64(t0),
+        ));
+        let mm0 = pmull_ll(v0_mid, t0_mid);
+        let ll1 = pmull_ll(v1, t1);
+        let hh1 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(v1),
+            vreinterpretq_p64_u64(t1),
+        ));
+        let mm1 = pmull_ll(v1_mid, t1_mid);
+
+        let cross0 = xor3(mm0, ll0, hh0);
+        let cross1 = xor3(mm1, ll1, hh1);
+
+        let r0 = vzip1q_u64(ll0, ll1);
+        let r1 = veorq_u64(vzip2q_u64(ll0, ll1), vzip1q_u64(cross0, cross1));
+        let r2 = veorq_u64(vzip1q_u64(hh0, hh1), vzip2q_u64(cross0, cross1));
+        let r3 = vzip2q_u64(hh0, hh1);
+
+        let s1_lo = vshlq_n_u64::<1>(r2);
+        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
+        let s2_lo = vshlq_n_u64::<2>(r2);
+        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
+        let s7_lo = vshlq_n_u64::<7>(r2);
+        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
+
+        let t_lo = xor3(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
+        let t_hi = xor3(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
+
+        let ov = xor3(
+            vshrq_n_u64::<63>(r3),
+            vshrq_n_u64::<62>(r3),
+            vshrq_n_u64::<57>(r3),
+        );
+        let corr = xor3(
+            ov,
+            vshlq_n_u64::<1>(ov),
+            veorq_u64(vshlq_n_u64::<2>(ov), vshlq_n_u64::<7>(ov)),
+        );
+
+        let out_lo = xor3(r0, t_lo, corr);
+        let out_hi = veorq_u64(r1, t_hi);
+
+        // Unzip back to per-product `{ lo, hi }` lane order.
+        (vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi))
+    }
+}
+
 /// Fused two-layer butterfly specialized for three low-limb-only twiddles.
 /// Two products are issued together at each stage, using four PMULLs instead
 /// of twelve for the pair under the generic Binius field multiplier, and —
@@ -796,7 +868,7 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
 /// Requires the `aes` target feature.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: usize) {
-    use crate::field::gf2_128::aarch64::ghash_mul_vec2_neon;
+    use crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon;
 
     debug_assert!(half >= 2);
     debug_assert_eq!(chunk.len(), 2 * half);
@@ -809,7 +881,7 @@ pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: us
         let v_b = chunk[idx1 + 1];
 
         // SAFETY: caller guarantees the aes target feature.
-        let product = unsafe { ghash_mul_vec2_neon([twiddle, twiddle], [v_a, v_b]) };
+        let product = unsafe { ghash_mul_const_vec2_neon(twiddle, [v_a, v_b]) };
         let new_u_a = F128 {
             lo: u_a.lo ^ product[0].lo,
             hi: u_a.hi ^ product[0].hi,
@@ -909,12 +981,16 @@ unsafe fn butterfly_fused_2layer_row_with_q(
             let xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
             let xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
 
-            // Layer L: (a,c) and (b,d) share t_outer.
-            let (na, nc) = butterfly_q(xa, xc, to);
-            let (nb, nd) = butterfly_q(xb, xd, to);
-            // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
-            let (fa, fb) = butterfly_q(na, nb, ta);
-            let (fc, fd) = butterfly_q(nc, nd, tb);
+            let (o0, o1) = mul_pair_q(xc, xd, to, to);
+            let na = veorq_u64(xa, o0);
+            let nc = veorq_u64(xc, na);
+            let nb = veorq_u64(xb, o1);
+            let nd = veorq_u64(xd, nb);
+            let (i0, i1) = mul_pair_q(nb, nd, ta, tb);
+            let fa = veorq_u64(na, i0);
+            let fb = veorq_u64(nb, fa);
+            let fc = veorq_u64(nc, i1);
+            let fd = veorq_u64(nd, fc);
 
             vst1q_u64((&raw mut a[lane]).cast::<u64>(), fa);
             vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb);

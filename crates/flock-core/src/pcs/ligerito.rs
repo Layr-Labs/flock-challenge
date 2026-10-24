@@ -3693,6 +3693,35 @@ pub(crate) fn induce_sumcheck_poly_via_ntt(
     (basis, enforced_sum)
 }
 
+///
+pub(crate) fn induce_sumcheck_poly_via_ntt_l2_fused_msg(
+    log_msg_cols: usize,
+    log_inv_rate: usize,
+    opened_rows: &[Vec<F128>],
+    v_challenges: &[F128],
+    queries: &[usize],
+    alpha: &[F128],
+    f: &[F128],
+) -> (Vec<F128>, F128, Option<SumcheckMessage>) {
+    let fused = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && log_msg_cols == 16
+        && log_inv_rate == 2
+        && queries.len() == 106
+        && f.len() == (1usize << log_msg_cols)
+        && std::env::var_os("FLOCK_NO_LIG_L2_FUSED_MSG").is_none();
+    let (basis, enforced_sum, intro_msg) = induce_sumcheck_poly_via_ntt_impl(
+        log_msg_cols,
+        log_inv_rate,
+        opened_rows,
+        v_challenges,
+        queries,
+        alpha,
+        if fused { Some(f) } else { None },
+        false,
+    );
+    (basis, enforced_sum, intro_msg)
+}
+
 fn induce_sumcheck_poly_via_ntt_impl(
     log_msg_cols: usize,
     log_inv_rate: usize,
@@ -3716,8 +3745,10 @@ fn induce_sumcheck_poly_via_ntt_impl(
         alpha.len(),
     );
     assert!(
-        round_f.is_none() || truncate_final_group,
-        "fused induction message requires the truncated final group"
+        round_f.is_none()
+            || truncate_final_group
+            || (log_msg_cols == 16 && log_inv_rate == 2 && n_queries == 106),
+        "fused induction message requires a fused-message-capable tail"
     );
     assert!(
         !use_l0_factored_final3 || round_f.is_some(),
@@ -4268,8 +4299,8 @@ fn transpose_forward_ntt_dense_suffix_impl(
     let mut remaining = log_d - prefix_k;
     let mut intro_msg = None;
     assert!(
-        round_f.is_none() || truncate_final_group,
-        "fused message requires truncated dense suffix"
+        round_f.is_none() || truncate_final_group || log_d == 18,
+        "fused message requires truncated dense suffix or the ranked L2 tail"
     );
     assert!(
         !use_l0_factored_final3 || (truncate_final_group && round_f.is_some()),
@@ -4306,6 +4337,36 @@ fn transpose_forward_ntt_dense_suffix_impl(
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let half = block_size >> 1;
+        if layer == 0 && !truncate_final_group {
+            if let Some(f) = round_f {
+                assert!(num_blocks == 1, "L2 fused tail needs a single block");
+                assert_eq!(f.len(), half >> 1, "L2 fused message length");
+                let quarter = half >> 1;
+                let data_ptr = data.as_mut_ptr() as usize;
+                let (u_0, u_2) = (0..quarter / 2)
+                    .into_par_iter()
+                    .map(|row_pair| {
+                        let even = 2 * row_pair;
+                        let odd = even + 1;
+                        unsafe {
+                            let ptr = data_ptr as *mut F128;
+                            let b0 = *ptr.add(even) + *ptr.add(even + half);
+                            let b1 = *ptr.add(odd) + *ptr.add(odd + half);
+                            *ptr.add(even) = b0;
+                            *ptr.add(odd) = b1;
+                            let f0 = f[even];
+                            let f1 = f[odd];
+                            (f0 * b0, (f0 + f1) * (b0 + b1))
+                        }
+                    })
+                    .reduce(
+                        || (F128::ZERO, F128::ZERO),
+                        |(a_0, a_2), (b_0, b_2)| (a_0 + b_0, a_2 + b_2),
+                    );
+                intro_msg = Some(SumcheckMessage { u_0, u_2 });
+                continue;
+            }
+        }
         if num_blocks >= n_threads {
             data.par_chunks_mut(block_size)
                 .enumerate()
@@ -9151,16 +9212,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             direct_fold8_mode,
         );
         let _t = std::time::Instant::now();
-        let (basis_i_induced, enforced_sum_i) =
+        let (basis_i_induced, enforced_sum_i, intro_msg_i) =
             if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
-                induce_sumcheck_poly_via_ntt(
+                let (basis, sum, msg) = induce_sumcheck_poly_via_ntt_l2_fused_msg(
                     n_next,
                     config.log_inv_rates[i + 1],
                     &opened_rows_i,
                     &level_rs,
                     &queries_i,
                     &alpha_i,
-                )
+                    sc_prover.f(),
+                );
+                (basis, sum, msg)
             } else if use_l2_pruned_sparse_ntt {
                 let log_d = n_next + config.log_inv_rates[i + 1];
                 let prefix_k = 8usize.min(log_d - 3);
@@ -9182,7 +9245,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     prefix_k,
                     queries_i.len(),
                 );
-                induce_sumcheck_poly_via_pruned_rate8_ntt(
+                let (basis, sum) = induce_sumcheck_poly_via_pruned_rate8_ntt(
                     n_next,
                     config.log_inv_rates[i + 1],
                     &opened_rows_i,
@@ -9192,16 +9255,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     use_l2_fused_densify,
                     use_l2_fused_final5,
                     use_l2_factored_final5,
-                )
+                );
+                (basis, sum, None)
             } else {
-                induce_sumcheck_poly(
+                let (basis, sum) = induce_sumcheck_poly(
                     n_next,
                     &sks_vks_i,
                     &opened_rows_i,
                     &level_rs,
                     &queries_i,
                     &alpha_i,
-                )
+                );
+                (basis, sum, None)
             };
         if trace {
             t_induce += _t.elapsed();
@@ -9215,7 +9280,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         });
 
         let _t = std::time::Instant::now();
-        let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
+        let intro_msg_i = match intro_msg_i {
+            Some(msg) => {
+                sc_prover.introduce_new_with_precomputed_msg(basis_i_induced, enforced_sum_i, msg)
+            }
+            None => sc_prover.introduce_new(basis_i_induced, enforced_sum_i),
+        };
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
