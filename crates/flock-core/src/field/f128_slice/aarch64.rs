@@ -508,6 +508,94 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `input` must hold at least
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_slots4<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    input: &[F128],
+) -> [F128; 4] {
+    unsafe {
+        debug_assert!(input.len() >= 4 * BANKS);
+        let zero = vdupq_n_u64(0);
+        let mut acc = [KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        }; 4];
+
+        let w = weight.as_ptr();
+        let x = input.as_ptr();
+        let mut bank = 0usize;
+        while bank < BANKS {
+            let weight_v = vld1q_u64(w.add(bank).cast::<u64>());
+            let weight_mid = veorq_u64(weight_v, vextq_u64::<1>(weight_v, weight_v));
+            let weight_lo = vgetq_lane_u64::<0>(weight_v);
+            let weight_mid_lo = vgetq_lane_u64::<0>(weight_mid);
+            let weight_p = vreinterpretq_p64_u64(weight_v);
+
+            let x0 = vld1q_u64(x.add(bank).cast::<u64>());
+            let x1 = vld1q_u64(x.add(BANKS + bank).cast::<u64>());
+            let x2 = vld1q_u64(x.add(2 * BANKS + bank).cast::<u64>());
+            let x3 = vld1q_u64(x.add(3 * BANKS + bank).cast::<u64>());
+            let m0 = veorq_u64(x0, vextq_u64::<1>(x0, x0));
+            let m1 = veorq_u64(x1, vextq_u64::<1>(x1, x1));
+            let m2 = veorq_u64(x2, vextq_u64::<1>(x2, x2));
+            let m3 = veorq_u64(x3, vextq_u64::<1>(x3, x3));
+
+            let ll0 = pmull(vgetq_lane_u64::<0>(x0), weight_lo);
+            let ll1 = pmull(vgetq_lane_u64::<0>(x1), weight_lo);
+            let ll2 = pmull(vgetq_lane_u64::<0>(x2), weight_lo);
+            let ll3 = pmull(vgetq_lane_u64::<0>(x3), weight_lo);
+            let hh0 = transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(x0),
+                weight_p,
+            ));
+            let hh1 = transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(x1),
+                weight_p,
+            ));
+            let hh2 = transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(x2),
+                weight_p,
+            ));
+            let hh3 = transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(x3),
+                weight_p,
+            ));
+            let mm0 = pmull(vgetq_lane_u64::<0>(m0), weight_mid_lo);
+            let mm1 = pmull(vgetq_lane_u64::<0>(m1), weight_mid_lo);
+            let mm2 = pmull(vgetq_lane_u64::<0>(m2), weight_mid_lo);
+            let mm3 = pmull(vgetq_lane_u64::<0>(m3), weight_mid_lo);
+
+            acc[0].ll = veorq_u64(acc[0].ll, ll0);
+            acc[0].hh = veorq_u64(acc[0].hh, hh0);
+            acc[0].mm = veorq_u64(acc[0].mm, mm0);
+            acc[1].ll = veorq_u64(acc[1].ll, ll1);
+            acc[1].hh = veorq_u64(acc[1].hh, hh1);
+            acc[1].mm = veorq_u64(acc[1].mm, mm1);
+            acc[2].ll = veorq_u64(acc[2].ll, ll2);
+            acc[2].hh = veorq_u64(acc[2].hh, hh2);
+            acc[2].mm = veorq_u64(acc[2].mm, mm2);
+            acc[3].ll = veorq_u64(acc[3].ll, ll3);
+            acc[3].hh = veorq_u64(acc[3].hh, hh3);
+            acc[3].mm = veorq_u64(acc[3].mm, mm3);
+            bank += 1;
+        }
+
+        let low = reduce_wide_pair(karatsuba_to_wide(acc[0]), karatsuba_to_wide(acc[1]));
+        let high = reduce_wide_pair(karatsuba_to_wide(acc[2]), karatsuba_to_wide(acc[3]));
+        [
+            transmute::<uint64x2_t, F128>(low[0]),
+            transmute::<uint64x2_t, F128>(low[1]),
+            transmute::<uint64x2_t, F128>(high[0]),
+            transmute::<uint64x2_t, F128>(high[1]),
+        ]
+    }
+}
+
 /// Fixed 128-bank by 64-lane bank-major fold for the ranked zerocheck AB
 /// completion. Adjacent lanes share a weight load; six raw Karatsuba
 /// components stay live across the complete bank scan, followed by one
