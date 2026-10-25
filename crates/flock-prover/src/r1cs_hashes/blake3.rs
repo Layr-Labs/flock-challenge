@@ -175,6 +175,38 @@ pub const G_MSG_IDX: [[usize; 2]; N_G_PER_ROUND] = [
 // interior padding. Everything else (const, m, counters, flags, G-blocks,
 // out_hi) packs after the two slots. The re-layout is purely a change of these
 // base offsets — all bit placement goes through the `*_bit` accessors below.
+/// Receipt for the prefix values emitted by this module's row-major BLAKE3
+/// writers: A=Z=C and B=1 in the first 1,024 bits of every block. OUT_LO is
+/// computed, not an identity A row; the writer stores its value in both A/Z.
+/// It also certifies window 30: bits 15,360..15,409 have A=Z and B=1;
+/// bits 15,409..15,872 have A=B=Z=0. Scalar output writers and the shared
+/// SIMD `oh!` publisher emit these values before joining. This is a value
+/// guarantee, independent of the separate statement mask/padding check.
+///
+/// The constructor is private and used only after witness generation joins.
+/// Addresses/lengths bind the receipt to the owned buffers moved immediately
+/// into the prover; those buffers are not mutated between minting and use.
+/// No packed-buffer scan is added to the production path.
+pub(crate) struct Blake3IdentityPrefixWitness {
+    buffers: [(usize, usize); 3],
+}
+
+impl Blake3IdentityPrefixWitness {
+    fn from_row_major_generator(z: &[F128], a: &[F128], b: &[F128]) -> Self {
+        assert_eq!(a.len(), z.len());
+        assert_eq!(b.len(), z.len());
+        Self { buffers: Self::identities(z, a, b) }
+    }
+
+    fn identities(z: &[F128], a: &[F128], b: &[F128]) -> [(usize, usize); 3] {
+        [z, a, b].map(|values| (values.as_ptr() as usize, values.len()))
+    }
+
+    pub(crate) fn matches(&self, z: &[F128], a: &[F128], b: &[F128]) -> bool {
+        self.buffers == Self::identities(z, a, b)
+    }
+}
+
 pub const SLOT_BITS: usize = 256; // 2^8, one 256-bit chaining value
 pub const CV_BASE: usize = 0; // input region, slot 0: [0, 256)
 pub const OUT_LO_BASE: usize = SLOT_BITS; // output region, slot 1: [256, 512)
@@ -3544,6 +3576,11 @@ impl Blake3Setup {
                         self.n_blocks_log(),
                         &self.pcs_params,
                     );
+                let identity_prefix_witness = Some(
+                    Blake3IdentityPrefixWitness::from_row_major_generator(
+                        &z_packed, &a_packed_f128, &b_packed_f128,
+                    ),
+                );
                 if phase_timing {
                     let wall = t_wit.elapsed().as_secs_f64() * 1e3;
                     let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
@@ -3569,6 +3606,7 @@ impl Blake3Setup {
                                 lc_circuit,
                                 codeword,
                                 stream,
+                                identity_prefix_witness,
                                 challenger,
                             )
                         }
@@ -3581,11 +3619,12 @@ impl Blake3Setup {
                             lc_circuit,
                             codeword,
                             stream,
+                            identity_prefix_witness,
                             challenger,
                         ),
                     };
                 }
-                return crate::prover::prove_fast_ligerito_from_witness(
+                return crate::prover::prove_fast_ligerito_from_witness_with_identity_prefix(
                     &self.r1cs,
                     &self.pcs_params,
                     z_packed,
@@ -3595,6 +3634,7 @@ impl Blake3Setup {
                         .expect("non-streamed witness fallback must materialize lincheck stripe"),
                     lc_circuit,
                     codeword,
+                    identity_prefix_witness,
                     challenger,
                 );
             }
@@ -3602,6 +3642,11 @@ impl Blake3Setup {
             let t_wit = std::time::Instant::now();
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);
+            let identity_prefix_witness = Some(
+                Blake3IdentityPrefixWitness::from_row_major_generator(
+                    &z_packed, &a_packed_f128, &b_packed_f128,
+                ),
+            );
             if phase_timing {
                 let wall = t_wit.elapsed().as_secs_f64() * 1e3;
                 let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
@@ -3620,6 +3665,7 @@ impl Blake3Setup {
                 z_packed_lincheck,
                 lc_circuit,
                 codeword,
+                identity_prefix_witness,
                 challenger,
             );
         }
@@ -3627,8 +3673,14 @@ impl Blake3Setup {
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                 self.generate_witness_ab(blocks)
             });
+        let identity_prefix_witness =
+            (self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor).then(|| {
+                Blake3IdentityPrefixWitness::from_row_major_generator(
+                    &z_packed, &a_packed_f128, &b_packed_f128,
+                )
+            });
         let lc_circuit = self.lincheck_circuit();
-        crate::prover::prove_fast_ligerito_from_witness(
+        crate::prover::prove_fast_ligerito_from_witness_with_identity_prefix(
             &self.r1cs,
             &self.pcs_params,
             z_packed,
@@ -3637,6 +3689,7 @@ impl Blake3Setup {
             z_packed_lincheck,
             lc_circuit,
             codeword,
+            identity_prefix_witness,
             challenger,
         )
     }
@@ -4812,6 +4865,7 @@ mod tests {
                 z_lincheck,
                 circuit,
                 hot_codeword,
+                None,
                 &mut hot_challenger,
             );
 

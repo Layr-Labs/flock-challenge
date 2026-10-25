@@ -147,6 +147,7 @@ pub(crate) unsafe fn accumulate_convert(
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab(
     chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
@@ -154,7 +155,8 @@ pub(crate) unsafe fn accumulate_convert_ab(
 ) {
     use core::arch::aarch64::*;
 
-    debug_assert!(n_b_med <= 16);
+    debug_assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    debug_assert_eq!(first_b_med & 1, 0, "paired AB drain requires an even start");
     debug_assert_eq!(convert.len(), 16 * 256);
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
@@ -163,7 +165,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
     // 16 convert blocks.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        let n_pairs = n_b_med / 2;
+        let n_pairs = (n_b_med - first_b_med) / 2;
         for lane in (0..64).step_by(8) {
             // 8 live accumulator q-registers (8 lanes × 1 bank); the removed
             // C side leaves room for the gather temporaries.
@@ -177,7 +179,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
             let mut ab7 = vdupq_n_u8(0);
 
             for p in 0..n_pairs {
-                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let (b_even, b_odd) = (first_b_med + 2 * p, first_b_med + 2 * p + 1);
                 let t_even = convert_ptr.add(b_even * 256 * 16);
                 let t_odd = convert_ptr.add(b_odd * 256 * 16);
 
@@ -231,7 +233,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
             }
 
             // Odd trailing b_med: unpaired fallback.
-            if n_b_med & 1 == 1 {
+            if (n_b_med - first_b_med) & 1 == 1 {
                 let b_med = n_b_med - 1;
                 let table = convert_ptr.add(b_med * 256 * 16);
                 let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u64).read_unaligned()
@@ -285,13 +287,15 @@ pub(crate) unsafe fn accumulate_convert_ab(
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab_nomul(
     chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
     n_b_med: usize,
     convert: &[F128],
     bank: &mut [F128; 64],
 ) {
     use core::arch::aarch64::*;
 
-    debug_assert!(n_b_med <= 16);
+    debug_assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    debug_assert_eq!(first_b_med & 1, 0, "paired AB drain requires an even start");
     debug_assert_eq!(convert.len(), 16 * 256);
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
@@ -300,7 +304,7 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul(
     // `F128` slot of the fixed-size bank.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        let n_pairs = n_b_med / 2;
+        let n_pairs = (n_b_med - first_b_med) / 2;
         for lane in (0..64).step_by(8) {
             let mut ab0 = vdupq_n_u8(0);
             let mut ab1 = vdupq_n_u8(0);
@@ -312,7 +316,7 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul(
             let mut ab7 = vdupq_n_u8(0);
 
             for p in 0..n_pairs {
-                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let (b_even, b_odd) = (first_b_med + 2 * p, first_b_med + 2 * p + 1);
                 let t_even = convert_ptr.add(b_even * 256 * 16);
                 let t_odd = convert_ptr.add(b_odd * 256 * 16);
 
@@ -363,7 +367,7 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul(
             }
 
             // Odd trailing b_med: unpaired fallback.
-            if n_b_med & 1 == 1 {
+            if (n_b_med - first_b_med) & 1 == 1 {
                 let b_med = n_b_med - 1;
                 let table = convert_ptr.add(b_med * 256 * 16);
                 let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u64).read_unaligned()
