@@ -582,7 +582,7 @@ fn ranked_ntt_with_pipelined_leaves(
 
     // Two queued subtrees per helper keep all four E-cores fed while bounding
     // not-yet-hashed input to 8 MiB on the ranked 4-E-core host.
-    let queue_capacity = (2 * helper.current_num_threads()).max(1);
+    let queue_capacity = (4 * helper.current_num_threads()).max(1);
     let (sender, receiver) = sync_channel::<RankedLeafJob>(queue_capacity);
     let receiver = Mutex::new(receiver);
 
