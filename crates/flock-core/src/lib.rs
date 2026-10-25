@@ -100,6 +100,29 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     }
 }
 
+/// Run `op` on a main-pool worker instead of the calling thread.
+///
+/// Every top-level parallel region opened from a thread that is not a pool
+/// worker (the ranked worker's seed-pipeline thread, or the process main
+/// thread) injects into the global queue, parks the caller on the region's
+/// latch, and wakes it again at the end. Wrapping a phase body in a
+/// `rayon::join` moves the body onto a worker once, so each of its many small
+/// regions becomes a nested join on that worker instead of a fresh top-level
+/// entry.
+///
+/// Schedule only: the closure runs to completion before this returns, on the
+/// same pool, with the same work and the same transcript order, so proof
+/// bytes are unchanged. `FLOCK_NO_IN_POOL=1` restores the direct call, and a
+/// caller that is already a worker of any pool takes the direct call anyway.
+pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IN_POOL").is_none());
+    if !*ON || rayon::current_thread_index().is_some() || rayon::current_num_threads() <= 1 {
+        return op();
+    }
+    rayon::join(op, || ()).0
+}
+
 /// Apply the prover's QoS class to the calling thread.
 ///
 /// Threads this crate's consumers spawn outside the Rayon pool (the ranked

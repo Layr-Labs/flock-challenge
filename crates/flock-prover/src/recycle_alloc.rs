@@ -12,7 +12,7 @@ use std::sync::atomic::{
     Ordering::{Acquire, Release},
 };
 
-const RECYCLE_MIN: usize = 32 * 1024;
+const RECYCLE_MIN: usize = 16 * 1024;
 const MAX_ALIGN: usize = 16;
 const MAX_CLASSES: usize = 512;
 
