@@ -260,8 +260,8 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
 
         // Two 8 KiB staging tiles (8 rows × ≤64 lanes × 16 B): L1-resident,
         // written per lane, read back once for the sequential row bursts.
-        let mut stage0 = [F128 { lo: 0, hi: 0 }; 512];
-        let mut stage1 = [F128 { lo: 0, hi: 0 }; 512];
+        let mut stage0 = [core::mem::MaybeUninit::<F128>::uninit(); 512];
+        let mut stage1 = [core::mem::MaybeUninit::<F128>::uninit(); 512];
 
         let off = r * num_ntts;
         let step = eighth * num_ntts;
@@ -405,7 +405,7 @@ unsafe fn butterfly_fused_3layer_from_src_row_impl<const ZERO_ROOT: bool>(
         }
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        let mut stage = [F128 { lo: 0, hi: 0 }; 64];
+        let mut stage = [core::mem::MaybeUninit::<F128>::uninit(); 64];
         let off = r * num_ntts;
         let step = eighth * num_ntts;
 
