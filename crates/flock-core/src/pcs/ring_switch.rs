@@ -1541,10 +1541,18 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
     debug_assert_eq!(low_point.len(), 6);
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = build_eq(low_point);
-    let mut out = vec![F128::ZERO; n_packed];
-    for bank in 0..64 {
-        for packed in 0..n_packed {
-            out[packed] += low_eq[bank] * s_hat_v_fold8[bank * n_packed + packed];
+    let mut out = crate::alloc_uninit_f128_vec(n_packed);
+    let w0 = low_eq[0];
+    for (dst, &src) in out.iter_mut().zip(&s_hat_v_fold8[..n_packed]) {
+        *dst = w0 * src;
+    }
+    for bank in 1..64 {
+        let w = low_eq[bank];
+        for (dst, &src) in out
+            .iter_mut()
+            .zip(&s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed])
+        {
+            *dst += w * src;
         }
     }
     out
@@ -1652,6 +1660,13 @@ pub fn inner_product(a: &[F128], b: &[F128]) -> F128 {
 /// replaces 16,384 branchy bit tests/deposits with 32 fixed 64-byte
 /// transposes while preserving the exact polynomial-basis layout.
 pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
+    let mut out = [F128::ZERO; 1 << LOG_PACKING];
+    tensor_algebra_transpose_into(s_hat_v, &mut out);
+    out.to_vec()
+}
+
+#[inline]
+fn tensor_algebra_transpose_into(s_hat_v: &[F128], out: &mut [F128; 1 << LOG_PACKING]) {
     assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
     let mut out_bytes = [[0u8; 16]; 1 << LOG_PACKING];
     for row_group in 0..16 {
@@ -1667,15 +1682,12 @@ pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
             out_bytes[64 + bit][row_group] = hi_columns[bit];
         }
     }
-    out_bytes
-        .into_iter()
-        .map(|bytes| {
-            F128::new(
-                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-            )
-        })
-        .collect()
+    for (slot, bytes) in out.iter_mut().zip(out_bytes.iter()) {
+        *slot = F128::new(
+            u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+        );
+    }
 }
 
 /// Straight-line definition retained only as the independent oracle for the
@@ -3196,7 +3208,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         work.into_par_iter()
             .zip(gammas_rs.par_iter())
             .enumerate()
-            .map(|(i, (w, &g))| {
+            .map(|(i, (mut w, &g))| {
                 let scaled_eq_r_dprime: Vec<F128> =
                     w.eq_r_dprime.iter().map(|value| g * *value).collect();
                 let table = build_fold_byte_table(&scaled_eq_r_dprime);
@@ -3207,7 +3219,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             .try_into()
                             .expect("two-coordinate eq has four entries");
                         let mut products = [F128::ZERO; 16];
-                        let mut scaled_bank = vec![F128::ZERO; n_packed];
+                        let mut scaled_bank = crate::alloc_uninit_f128_vec(n_packed);
                         for e in 0..4 {
                             let bank = &quad[e * n_packed..(e + 1) * n_packed];
                             for d_low in 0..4 {
@@ -3238,7 +3250,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             .try_into()
                             .expect("four-coordinate eq has sixteen entries");
                         let mut products = [F128::ZERO; 256];
-                        let mut scaled_bank = vec![F128::ZERO; n_packed];
+                        let mut scaled_bank = crate::alloc_uninit_f128_vec(n_packed);
                         for e in 0..16 {
                             let bank = &fold4[e * n_packed..(e + 1) * n_packed];
                             for d_low in 0..16 {
@@ -3262,7 +3274,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                     }
                     _ => None,
                 };
-                let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.as_deref()) {
+                let direct_fold8 = match (kinds[i], w.s_hat_v_fold8.take()) {
                     (Kind::Dense(d), Some(fold8)) if use_split && dense_suffixes[d].len() >= 6 => {
                         let suffix = dense_suffixes[d];
                         let low_eq: [F128; 64] = build_eq(&suffix[..6])
@@ -3275,7 +3287,18 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                         // first six PCS challenges fold their bank coordinate
                         // online. Store bit-major so adjacent banks are adjacent
                         // for the existing pair-fold kernels.
-                        let mut w_state = vec![F128::ZERO; 64 * n_packed];
+                        // Compute `a_state` into an uninitialized buffer first,
+                        // then reuse the owned `fold8` allocation for `w_state`.
+                        let mut a_state = crate::alloc_uninit_f128_vec(64 * n_packed);
+                        let mut transposed = [F128::ZERO; 1 << LOG_PACKING];
+                        for e in 0..64 {
+                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
+                            tensor_algebra_transpose_into(bank, &mut transposed);
+                            for (bit, &value) in transposed.iter().enumerate() {
+                                a_state[bit * 64 + e] = value;
+                            }
+                        }
+                        let mut w_state = fold8;
                         for d_low in 0..64 {
                             let scale = low_eq[d_low];
                             let mut basis_product = scale;
@@ -3283,14 +3306,6 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             for bit in 1..n_packed {
                                 basis_product = mul_by_x(basis_product);
                                 w_state[bit * 64 + d_low] = fold_one_slot(basis_product, &table);
-                            }
-                        }
-                        let mut a_state = vec![F128::ZERO; 64 * n_packed];
-                        for e in 0..64 {
-                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-                            let transposed = tensor_algebra_transpose(bank);
-                            for (bit, value) in transposed.into_iter().enumerate() {
-                                a_state[bit * 64 + e] = value;
                             }
                         }
                         let round0 = super::round0_deferred(&a_state, &w_state);
@@ -3351,11 +3366,11 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             let (eq_lo, eq_hi) = if elide_basis {
                                 // Only the logical length is observed on the
                                 // direct-fold8 route.  Preserve it exactly
-                                // without evaluating either dead tensor
-                                // factor.
+                                // without evaluating or zero-filling either
+                                // dead tensor factor.
                                 (
-                                    vec![F128::ZERO; 1usize << n_lo],
-                                    vec![F128::ZERO; 1usize << (suffix.len() - n_lo)],
+                                    crate::alloc_uninit_f128_vec(1usize << n_lo),
+                                    crate::alloc_uninit_f128_vec(1usize << (suffix.len() - n_lo)),
                                 )
                             } else {
                                 build_eq_split(suffix, n_lo)
