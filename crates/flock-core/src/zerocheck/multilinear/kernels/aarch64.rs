@@ -1779,6 +1779,55 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     }
 }
 
+///
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+fn fold_two_by_rho(even0: F128, odd0: F128, even1: F128, odd1: F128, rho: F128) -> (F128, F128) {
+    let products = unsafe {
+        crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(rho, [even0 + odd0, even1 + odd1])
+    };
+    (even0 + products[0], even1 + products[1])
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+#[inline(always)]
+fn fold_two_by_rho(even0: F128, odd0: F128, even1: F128, odd1: F128, rho: F128) -> (F128, F128) {
+    (
+        even0 + rho * (even0 + odd0),
+        even1 + rho * (even1 + odd1),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fold4_two(v: &[F128], i: usize, rho_a: F128, rho_b: F128, rho_ab: F128) -> (F128, F128) {
+    #[cfg(target_feature = "aes")]
+    {
+        unsafe {
+            let (x, y) = fold4_pair_expanded_binius_q(
+                v.as_ptr().add(i),
+                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(rho_a),
+                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(rho_b),
+                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(rho_ab),
+            );
+            return (
+                core::mem::transmute::<core::arch::aarch64::uint64x2_t, F128>(x),
+                core::mem::transmute::<core::arch::aarch64::uint64x2_t, F128>(y),
+            );
+        }
+    }
+    #[cfg(not(target_feature = "aes"))]
+    {
+        let _ = rho_ab;
+        let one = |j: usize| {
+            let t0 = v[j] + rho_a * (v[j] + v[j + 1]);
+            let t1 = v[j + 2] + rho_a * (v[j + 2] + v[j + 3]);
+            t0 + rho_b * (t0 + t1)
+        };
+        (one(i), one(i + 4))
+    }
+}
+
 /// Fuse one multilinear tail fold with construction of the following round's
 /// message. The previous AArch64 path first streamed all of `a_in`/`b_in` into
 /// `a_out`/`b_out`, then immediately reread both outputs in a second pass.
@@ -1854,10 +1903,8 @@ fn fold_and_message_body<const NT: bool>(
         let b_even_1 = b_in[i + 2];
         let b_odd_1 = b_in[i + 3];
 
-        let a0 = a_even_0 + r_fold * (a_even_0 + a_odd_0);
-        let a1 = a_even_1 + r_fold * (a_even_1 + a_odd_1);
-        let b0 = b_even_0 + r_fold * (b_even_0 + b_odd_0);
-        let b1 = b_even_1 + r_fold * (b_even_1 + b_odd_1);
+        let (a0, a1) = fold_two_by_rho(a_even_0, a_odd_0, a_even_1, a_odd_1, r_fold);
+        let (b0, b1) = fold_two_by_rho(b_even_0, b_odd_0, b_even_1, b_odd_1, r_fold);
 
         if NT {
             // SAFETY: `o + 1 < a_out.len()` by the len contract above; F128
@@ -1951,14 +1998,7 @@ fn fold2_and_message_body<const NT: bool>(
         }
     }
 
-    // One composed output from four consecutive inputs: two rho_a folds, one
-    // rho_b fold. Exactly the value the two sequential passes produce.
-    #[inline(always)]
-    fn fold4(v: &[F128], i: usize, rho_a: F128, rho_b: F128) -> F128 {
-        let t0 = v[i] + rho_a * (v[i] + v[i + 1]);
-        let t1 = v[i + 2] + rho_a * (v[i + 2] + v[i + 3]);
-        t0 + rho_b * (t0 + t1)
-    }
+    let rho_ab = rho_a * rho_b;
 
     let mut p1_acc = F256Unreduced::ZERO;
     let mut pinf_acc = F256Unreduced::ZERO;
@@ -1970,10 +2010,8 @@ fn fold2_and_message_body<const NT: bool>(
         let i = 8 * x_lo;
         let o = 2 * x_lo;
 
-        let a0 = fold4(a_in, i, rho_a, rho_b);
-        let a1 = fold4(a_in, i + 4, rho_a, rho_b);
-        let b0 = fold4(b_in, i, rho_a, rho_b);
-        let b1 = fold4(b_in, i + 4, rho_a, rho_b);
+        let (a0, a1) = fold4_two(a_in, i, rho_a, rho_b, rho_ab);
+        let (b0, b1) = fold4_two(b_in, i, rho_a, rho_b, rho_ab);
 
         if NT {
             // SAFETY: `o + 1 < a_out.len()` by the len contract above; F128
@@ -2133,14 +2171,7 @@ fn fold2_and_message_lookahead_body<const NT: bool>(
         }
     }
 
-    // One composed output from four consecutive inputs — identical expression
-    // to `fold2_and_message_body`, so the stored tables are value-identical.
-    #[inline(always)]
-    fn fold4(v: &[F128], i: usize, rho_a: F128, rho_b: F128) -> F128 {
-        let t0 = v[i] + rho_a * (v[i] + v[i + 1]);
-        let t1 = v[i + 2] + rho_a * (v[i + 2] + v[i + 3]);
-        t0 + rho_b * (t0 + t1)
-    }
+    let rho_ab = rho_a * rho_b;
 
     let mut acc = [F256Unreduced::ZERO; 8];
 
@@ -2151,14 +2182,10 @@ fn fold2_and_message_lookahead_body<const NT: bool>(
         let i = 16 * t;
         let o = 4 * t;
 
-        let a0 = fold4(a_in, i, rho_a, rho_b);
-        let a1 = fold4(a_in, i + 4, rho_a, rho_b);
-        let a2 = fold4(a_in, i + 8, rho_a, rho_b);
-        let a3 = fold4(a_in, i + 12, rho_a, rho_b);
-        let b0 = fold4(b_in, i, rho_a, rho_b);
-        let b1 = fold4(b_in, i + 4, rho_a, rho_b);
-        let b2 = fold4(b_in, i + 8, rho_a, rho_b);
-        let b3 = fold4(b_in, i + 12, rho_a, rho_b);
+        let (a0, a1) = fold4_two(a_in, i, rho_a, rho_b, rho_ab);
+        let (a2, a3) = fold4_two(a_in, i + 8, rho_a, rho_b, rho_ab);
+        let (b0, b1) = fold4_two(b_in, i, rho_a, rho_b, rho_ab);
+        let (b2, b3) = fold4_two(b_in, i + 8, rho_a, rho_b, rho_ab);
 
         if NT {
             // SAFETY: `o + 3 < a_out.len()` by the len contract above; F128 is
