@@ -773,26 +773,31 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
         let tile_lo = claim * TILES_PER_CLAIM;
         let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
         // SAFETY: the queue hands out each claim index exactly once; claim
-        // `c` exclusively owns `partials[c·k .. (c+1)·k]`, which it fully
-        // zero-initializes below before any read. The queue join publishes
+        // `c` exclusively owns `partials[c·k .. (c+1)·k]`, and zeroes the
+        // `[0..useful)` prefix below before any read. The queue join publishes
         // all writes before the reduction reads them.
         let partial = unsafe { std::slice::from_raw_parts_mut(partials_base.ptr().add(c * k), k) };
-        // SAFETY: F128 is Copy and all-zero bytes are valid F128::ZERO.
+        // SAFETY: F128 is Copy and all-zero bytes are valid F128::ZERO; only
+        // `[0..useful)` is ever read or written by the tile loops.
         unsafe {
-            std::ptr::write_bytes(partial.as_mut_ptr(), 0, k);
+            std::ptr::write_bytes(partial.as_mut_ptr(), 0, useful);
         }
-        // TILE_T × 256 F128 tables, L1-resident, built once per tile.
-        let mut tables = vec![F128::ZERO; TILE_T * 256];
+        // TILE_T × 256 F128 tables, L1-resident on stack, built once per tile.
+        let mut tables_uninit = core::mem::MaybeUninit::<[[F128; 256]; TILE_T]>::uninit();
+        let tables_ptr = tables_uninit.as_mut_ptr() as *const u8;
         for tile in tile_lo..tile_hi {
             let stripe_base = tile * TILE_T;
             for t in 0..TILE_T {
                 let eq_off = 8 * (stripe_base + t);
-                build_sum_table(
-                    &eq_outer[eq_off..eq_off + 8],
-                    &mut tables[t * 256..(t + 1) * 256],
-                );
+                // SAFETY: `t < TILE_T` and `build_sum_table` writes all 256 entries.
+                let table_t = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (tables_uninit.as_mut_ptr() as *mut F128).add(t * 256),
+                        256,
+                    )
+                };
+                build_sum_table(&eq_outer[eq_off..eq_off + 8], table_t);
             }
-            let tables_ptr = tables.as_ptr() as *const u8;
             let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
             let mut bs = 0usize;
             #[cfg(target_feature = "sha3")]
@@ -829,25 +834,24 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     let n_workers = n_claims;
 
     // XOR-reduce the per-worker partials in ONE parallel pass over column bands:
-    // each worker owns a band of the output and XORs it across all `n_workers`
-    // partials, so the band lands in registers/L1 once and is written once.
-    //
-    // The obvious alternative — fold one partial at a time with a parallel
-    // `zip` per partial — costs `n_workers - 1` separate parallel regions, each
-    // a full read-modify-write of the 256 KB accumulator plus a rayon barrier.
-    // That is `n_workers - 1` accumulator reads and writes (≈2.5× the traffic
-    // here) and 9 barriers instead of 1 at `n_workers = 10`; measured ≈0.7 ms
-    // of the fold at m=32, k_log=14.
-    let band = k.div_ceil(rayon::current_num_threads().max(1)).max(1024);
-    let mut out = vec![F128::ZERO; k];
-    out.par_chunks_mut(band).enumerate().for_each(|(bi, dst)| {
-        let lo = bi * band;
-        for w in 0..n_workers {
-            let src = &partials[w * k + lo..w * k + lo + dst.len()];
-            for (o, s) in dst.iter_mut().zip(src.iter()) {
-                *o += *s;
+    // each worker owns a band of the output, copies partial 0, and XORs the
+    // remaining `n_workers - 1` partials, so the band lands in registers/L1
+    // once and is written without an up-front zero-fill of `out`.
+    let band = useful.div_ceil(rayon::current_num_threads().max(1)).max(1024);
+    let mut out = crate::alloc_uninit_f128_vec(k);
+    out[useful..k].fill(F128::ZERO);
+    out[..useful]
+        .par_chunks_mut(band)
+        .enumerate()
+        .for_each(|(bi, dst)| {
+            let lo = bi * band;
+            dst.copy_from_slice(&partials[lo..lo + dst.len()]);
+            for w in 1..n_workers {
+                let src = &partials[w * k + lo..w * k + lo + dst.len()];
+                for (o, s) in dst.iter_mut().zip(src.iter()) {
+                    *o += *s;
+                }
             }
-        }
-    });
+        });
     out
 }

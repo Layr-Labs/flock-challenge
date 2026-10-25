@@ -574,6 +574,60 @@ pub fn prewarm_prover(m: usize) {
     give_u8(stripe);
 }
 
+/// Wire `len` bytes at `addr` into physical memory (`mlock`). Best-effort:
+/// returns whether the kernel accepted the request.
+pub fn wire_range(addr: *const u8, len: usize) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn mlock(addr: *const core::ffi::c_void, len: usize) -> i32;
+        }
+        len != 0 && unsafe { mlock(addr.cast(), len) } == 0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (addr, len);
+        false
+    }
+}
+
+/// Wire every parked pool buffer so the timed prove finds it resident.
+///
+/// Prewarming and recycling only guarantee that pooled pages were touched
+/// once. Under memory pressure the kernel compresses idle anonymous pages, so
+/// a buffer parked between the warm-up and the timed prove is decompressed
+/// fault by fault inside the timed window: on a pressured 24 GB host a timed
+/// prove re-faults 2–4 GiB this way and spends ~40% of its CPU time in the
+/// kernel. Wired pages are exempt from compression. Called once at the end of
+/// the untimed warm-up; returns the number of bytes wired.
+pub fn wire_parked_buffers() -> usize {
+    fn wire_bytes<T>(buf: &Vec<T>) -> usize {
+        let bytes = buf.capacity() * core::mem::size_of::<T>();
+        if wire_range(buf.as_ptr().cast(), bytes) {
+            bytes
+        } else {
+            0
+        }
+    }
+    let mut wired = 0;
+    for entry in POOL.lock().unwrap().iter() {
+        wired += wire_bytes(&entry.buf);
+    }
+    for buf in POOL_U8.lock().unwrap().iter() {
+        wired += wire_bytes(buf);
+    }
+    for buf in POOL_HASH_TREE.lock().unwrap().iter() {
+        wired += wire_bytes(buf);
+    }
+    for slot in [&PINNED_F128, &PINNED2_F128] {
+        let pinned = slot.lock().unwrap();
+        if let Some(buf) = pinned.as_ref().and_then(|p| p.buffer.as_ref()) {
+            wired += wire_bytes(buf);
+        }
+    }
+    wired
+}
+
 /// Release every ordinary pooled buffer back to the OS.
 ///
 /// A buffer registered through [`pin_f128_allocation`] is intentionally not
