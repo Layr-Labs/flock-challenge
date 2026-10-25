@@ -37,6 +37,13 @@ use crate::merkle::{self, Hash, HashKind};
 use crate::ntt::additive_ntt_f128::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
 
+#[path = "ligerito/c2.rs"]
+mod c2;
+
+#[cfg(test)]
+#[path = "ligerito/c2_tests.rs"]
+mod c2_tests;
+
 // ===================================================================
 // Config
 // ===================================================================
@@ -6887,6 +6894,8 @@ fn materialize_direct_fold8(
     let pair_fold64 = deferred_reduce
         && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
         && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none();
+    let quad_fold64 =
+        pair_fold64 && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_QUAD").is_none();
 
     // One shared per-block body for both drains below, so the scheduling
     // choice cannot drift from the value computation. For block `i` it fully
@@ -6929,6 +6938,43 @@ fn materialize_direct_fold8(
             scratch,
         );
         let mut slot = 0usize;
+        if quad_fold64 {
+            while slot + 3 < block_len {
+                let base = 64 * slot;
+                let folded_f = crate::field::f128_slice::fold_banked_slots4::<64>(
+                    &fold_weight,
+                    &f_in[base..base + 256],
+                );
+                f_out[slot] = folded_f[0];
+                f_out[slot + 1] = folded_f[1];
+                f_out[slot + 2] = folded_f[2];
+                f_out[slot + 3] = folded_f[3];
+
+                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                let direct1 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
+                let direct2 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 2], scratch);
+                let direct3 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 3], scratch);
+                if has_ordinary {
+                    let folded_b = crate::field::f128_slice::fold_banked_slots4::<64>(
+                        &fold_weight,
+                        &b_in[base..base + 256],
+                    );
+                    b_out[slot] = direct0 + folded_b[0];
+                    b_out[slot + 1] = direct1 + folded_b[1];
+                    b_out[slot + 2] = direct2 + folded_b[2];
+                    b_out[slot + 3] = direct3 + folded_b[3];
+                } else {
+                    b_out[slot] = direct0;
+                    b_out[slot + 1] = direct1;
+                    b_out[slot + 2] = direct2;
+                    b_out[slot + 3] = direct3;
+                }
+                slot += 4;
+            }
+        }
         if pair_fold64 {
             while slot + 1 < block_len {
                 let base = 64 * slot;
@@ -8838,8 +8884,26 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // levels stay dense).
     let sks_vks_n1 = eval_sk_at_vks(n1);
     let _t = std::time::Instant::now();
-    let (basis_0_induced, enforced_sum_0, induced_intro_msg_0) =
-        induce_sumcheck_poly_auto_with_ranked_msg(
+    let use_c2 = c2::enabled(
+        use_lazy_l1_ood,
+        std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
+    );
+    // Cache owned residues while the borrowed committed L0 codeword is live.
+    // Unsupported geometry takes the unchanged complete induction below.
+    let sparse_l0 = use_c2.then(|| {
+        c2::Dual::new(
+            n1 + log_inv_rate_0,
+            log_inv_rate_0,
+            &r_lane_fold,
+            &queries_0,
+            &alpha_0,
+            l0_row,
+        )
+    });
+    let full_l0 = if use_c2 {
+        None
+    } else {
+        Some(induce_sumcheck_poly_auto_with_ranked_msg(
             n1,
             log_inv_rate_0,
             &sks_vks_n1,
@@ -8848,7 +8912,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             &queries_0,
             &alpha_0,
             sc_prover.f(),
-        );
+        ))
+    };
+    if trace {
+        eprintln!("  C2 selected={use_c2}");
+    }
     if trace {
         t_induce += _t.elapsed();
     }
@@ -8863,15 +8931,24 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     // Introduce + glue basis_0.
     let _t = std::time::Instant::now();
-    let intro_msg_0 = if let Some(msg) = induced_intro_msg_0 {
-        sc_prover.introduce_new_with_precomputed_msg(basis_0_induced, enforced_sum_0, msg)
+    let (mut pending_c2, intro_msg_0) = if let Some((dual, enforced)) = sparse_l0 {
+        let (pending, msg) = c2::Pending::introduce(dual, enforced, &mut sc_prover);
+        (Some(pending), msg)
     } else {
-        sc_prover.introduce_new(basis_0_induced, enforced_sum_0)
+        let (basis, enforced, precomputed) = full_l0.expect("complete L0 induction");
+        let msg = if let Some(msg) = precomputed {
+            sc_prover.introduce_new_with_precomputed_msg(basis, enforced, msg)
+        } else {
+            sc_prover.introduce_new(basis, enforced)
+        };
+        (None, msg)
     };
     challenger.observe_f128(intro_msg_0.u_0);
     challenger.observe_f128(intro_msg_0.u_2);
     let beta_0 = challenger.sample_f128();
-    if use_lazy_l1_ood {
+    if let Some(pending) = pending_c2.as_mut() {
+        pending.glue(beta_0, &mut sc_prover);
+    } else if use_lazy_l1_ood {
         sc_prover.glue_deferred_into_lazy_ood_fold(beta_0);
     } else {
         sc_prover.glue(beta_0);
@@ -8898,11 +8975,26 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                 fold_grinding_nonces.push(challenger.grind_pow(bits));
             }
             let ri = challenger.sample_f128();
-            let msg = sc_prover.fold(ri);
+            let msg = if let Some(pending) = pending_c2.as_mut() {
+                let (msg, complete) = pending.fold(ri, &mut sc_prover);
+                if complete {
+                    pending_c2 = None;
+                    if trace {
+                        eprintln!("  C2 merged after fold 2");
+                    }
+                }
+                msg
+            } else {
+                sc_prover.fold(ri)
+            };
             challenger.observe_f128(msg.u_0);
             challenger.observe_f128(msg.u_2);
             level_rs.push(ri);
         }
+        assert!(
+            pending_c2.is_none(),
+            "C2 must merge before the next introduction"
+        );
         if trace {
             t_sumcheck_folds += _t.elapsed();
         }

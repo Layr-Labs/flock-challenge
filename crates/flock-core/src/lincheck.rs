@@ -396,7 +396,7 @@ impl LincheckCircuit for CscCircuit {
         if self.n_cols < SUMCHECK_PAR_THRESHOLD {
             return (0..self.n_cols).map(one_col).collect();
         }
-        let mut out = vec![F128::ZERO; self.n_cols];
+        let mut out = crate::alloc_uninit_f128_vec(self.n_cols);
         out.par_iter_mut()
             .enumerate()
             .for_each(|(c, slot)| *slot = one_col(c));
@@ -1130,11 +1130,11 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
     let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
     let eq_rest = build_eq_table(x_inner_rest);
     let total = ell_skip * ell_rest;
-    let mut out = Vec::with_capacity(total);
+    let mut out = crate::alloc_uninit_f128_vec(total);
     // Layout: index = i_skip + i_inner_rest · 2^k_skip  ⇒  i_skip is low bits.
-    for &er in &eq_rest {
-        for &ls in &lambda_skip {
-            out.push(ls * er);
+    for (row, &er) in out.chunks_exact_mut(ell_skip).zip(eq_rest.iter()) {
+        for (dst, &ls) in row.iter_mut().zip(lambda_skip.iter()) {
+            *dst = ls * er;
         }
     }
     debug_assert_eq!(out.len(), total);

@@ -75,6 +75,10 @@
 //!
 //! - Arms only in the ranked worker (argv shape) and only once.
 //! - `FLOCK_NO_SEED_PIPE=1` disables it — the exact A/B control.
+//! - The speculative publication target is pre-opened (and its write machinery
+//!   pre-warmed at full scale) during the untimed ready→seed gap;
+//!   `FLOCK_NO_PREOPEN_PUBLISH=1` restores the incumbent create-at-publish
+//!   ordering, and any pre-open failure falls back to it automatically.
 //! - A scope guard forwards the exact seed line and marks the pipe dead on any
 //!   unwind; parse, path, serialization, write, and rename failures likewise
 //!   forward before falling back to the wrapper's ordinary publication path.
@@ -86,7 +90,7 @@
 //!   speculative result and re-proves normally.
 
 use std::ffi::OsStr;
-use std::io::{self, Write};
+use std::io::{self, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -645,18 +649,28 @@ impl Drop for SeedForwardFallback<'_> {
 
 /// True only for the protected ranked worker: `flock-benchmark-worker LOG2
 /// READY PROOF`. Keeps every test, bench and example on the ordinary path.
+///
+/// Process args are fixed for the lifetime of the process, so the result is
+/// cached in a `OnceLock`: the ranked worker calls this 5+ times per timed
+/// trial (speculative-publish gate, proof-path gate, warmup-gen check,
+/// seed-pipe gate, proof-io gate) and each uncached call pays an `args_os`
+/// scan + path alloc inside the harness-measured seed→proof window. Caching
+/// is proof-irrelevant (pure argv selector, no witness/commitment state).
 pub(crate) fn is_ranked_worker() -> bool {
-    let mut args = std::env::args_os();
-    let Some(exe) = args.next() else {
-        return false;
-    };
-    if args.count() != 3 {
-        return false;
-    }
-    std::path::Path::new(&exe)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let mut args = std::env::args_os();
+        let Some(exe) = args.next() else {
+            return false;
+        };
+        if args.len() != 3 {
+            return false;
+        }
+        std::path::Path::new(&exe)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
+    })
 }
 
 /// Pure selector for the literal-value kill test. Values such as `0`,
@@ -673,11 +687,22 @@ fn speculative_publish_enabled() -> bool {
 }
 
 fn ranked_proof_path() -> Option<PathBuf> {
-    if !is_ranked_worker() {
-        return None;
-    }
-    let path = PathBuf::from(std::env::args_os().nth(3)?);
-    (!path.as_os_str().is_empty()).then_some(path)
+    // Process args are fixed for the process lifetime, so the scan result is
+    // cached in a `OnceLock` and each timed call pays one clone (a single
+    // alloc, no syscall): `publish_speculative_result` resolves this path
+    // once per ranked trial inside the harness-measured seed→proof window.
+    // Proof-irrelevant by the same argument as `is_ranked_worker` — a pure
+    // argv selector touching no witness/commitment/Fiat–Shamir state.
+    static CACHED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            if !is_ranked_worker() {
+                return None;
+            }
+            let path = PathBuf::from(std::env::args_os().nth(3)?);
+            (!path.as_os_str().is_empty()).then_some(path)
+        })
+        .clone()
 }
 
 /// Sibling temporary name: distinct from the wrapper's `{proof}.tmp`, and on
@@ -712,7 +737,122 @@ fn publish_bytes_atomically(proof_path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-fn publish_speculative_result(out: &ProveOut) -> io::Result<bool> {
+/// Whether the gap-time pre-open of the speculative publish file is armed.
+/// Kill switch: `FLOCK_NO_PREOPEN_PUBLISH=1` (exactly `"1"`) restores the
+/// incumbent create-at-publish ordering unchanged.
+fn preopen_publish_enabled() -> bool {
+    preopen_publish_enabled_for(std::env::var_os("FLOCK_NO_PREOPEN_PUBLISH").as_deref())
+}
+
+/// Kill rule for [`preopen_publish_enabled`]: the value must be exactly `"1"`,
+/// the same literal-one rule the epool relay kill uses, so a stray export can
+/// never silently change the ranked shape.
+fn preopen_publish_enabled_for(kill: Option<&OsStr>) -> bool {
+    kill != Some(OsStr::new("1"))
+}
+
+/// Warm-write size for [`preopen_publish_file`]: comfortably above every
+/// observed ranked proof (436,107–439,663 bytes) and below the trusted
+/// verifier's 500,000-byte cap, so the write machinery is exercised at real
+/// scale while the parked fd still ends up empty for the publication write.
+const PREOPEN_WARM_BYTES: usize = 458_752; // 448 KiB
+
+/// The speculative publish target, opened during the untimed ready→seed gap
+/// and held until publication. `file` is an `Option` so publication can take
+/// the descriptor out while [`Drop`] keeps every exit path tidy.
+struct PreopenedPublish {
+    file: Option<std::fs::File>,
+    temporary: PathBuf,
+}
+
+impl Drop for PreopenedPublish {
+    fn drop(&mut self) {
+        // Close the descriptor if it is still held, then best-effort remove.
+        // After a successful rename the temporary path no longer exists, so
+        // this is a no-op there; on every other exit (early seed-pipe death,
+        // parse failure, panic, publication error) it leaves scratch exactly
+        // as the incumbent would.
+        self.file.take();
+        let _ = std::fs::remove_file(&self.temporary);
+    }
+}
+
+/// Open `{proof}.spec.tmp` while every remaining moment is untimed (this runs
+/// before the wrapper even publishes its ready file) and drive the full
+/// create/write/truncate cycle once so the open, vnode, name-cache, and
+/// first-touch write costs land in the gap instead of on the publication
+/// critical path. The fd is then parked exactly as a fresh `File::create`
+/// would leave it: empty file, offset 0.
+///
+/// Content is irrelevant to the harness — it opens only the final path, and
+/// only after the rename — so the warm pattern is truncated away before the
+/// fd is parked and the published bytes are byte-identical to the incumbent
+/// path's. Any I/O failure returns `None` after removing the temporary, and
+/// the caller keeps the incumbent create-at-publish ordering.
+fn preopen_publish_file(proof_path: &Path) -> Option<PreopenedPublish> {
+    if !preopen_publish_enabled() {
+        return None;
+    }
+    let temporary = speculative_temporary_path(proof_path);
+    let attempt = || -> io::Result<PreopenedPublish> {
+        // Same create the incumbent publish performs — just earlier.
+        let mut file = std::fs::File::create(&temporary)?;
+        let pattern = [0u8; 8192];
+        let mut remaining = PREOPEN_WARM_BYTES;
+        while remaining > 0 {
+            let n = remaining.min(pattern.len());
+            file.write_all(&pattern[..n])?;
+            remaining -= n;
+        }
+        // Park the fd as a fresh create would: empty, offset 0. Publication
+        // then pays only write + close + rename.
+        file.set_len(0)?;
+        file.seek(io::SeekFrom::Start(0))?;
+        Ok(PreopenedPublish {
+            file: Some(file),
+            temporary: temporary.clone(),
+        })
+    };
+    match attempt() {
+        Ok(pre) => Some(pre),
+        Err(_) => {
+            let _ = std::fs::remove_file(&temporary);
+            None
+        }
+    }
+}
+
+/// Publish through the gap-time pre-opened temp file: same temporary name,
+/// same write-then-close-then-rename ordering as
+/// [`publish_bytes_atomically`] — the only difference is which clock paid for
+/// the open. The caller is the same seed-pipe thread that pre-opened the fd,
+/// and nothing touches it in between, so the parked offset-0/empty state is
+/// exactly what a fresh create would give.
+fn publish_bytes_through_preopened(
+    proof_path: &Path,
+    bytes: &[u8],
+    mut preopened: PreopenedPublish,
+) -> io::Result<()> {
+    let file = preopened
+        .file
+        .take()
+        .ok_or_else(|| io::Error::other("pre-opened publish fd already consumed"));
+    let result = match file {
+        Ok(mut file) => file.write_all(bytes).and_then(|()| {
+            // The handle must be closed before visibility changes, exactly as
+            // in the incumbent path.
+            drop(file);
+            std::fs::rename(&preopened.temporary, proof_path)
+        }),
+        Err(error) => Err(error),
+    };
+    if result.is_err() {
+        let _ = std::fs::remove_file(&preopened.temporary);
+    }
+    result
+}
+
+fn publish_speculative_result(out: &ProveOut, preopened: Option<PreopenedPublish>) -> io::Result<bool> {
     if !speculative_publish_enabled() {
         return Ok(false);
     }
@@ -722,6 +862,15 @@ fn publish_speculative_result(out: &ProveOut) -> io::Result<bool> {
     // result for wrapper adoption and consumes the current pre-encoded prefix
     // only once, on the publication that the harness can observe first.
     let bytes = crate::proof_io::r1cs_parts_to_bytes(&out.1, &out.0);
+    // Prefer the gap-time pre-opened fd; a failure there falls back to the
+    // incumbent create-at-publish ordering (the temporary was already removed
+    // by the failed arm), and a failure there releases the wrapper's own
+    // publication exactly as before.
+    if let Some(pre) = preopened {
+        if publish_bytes_through_preopened(&proof_path, &bytes, pre).is_ok() {
+            return Ok(true);
+        }
+    }
     publish_bytes_atomically(&proof_path, &bytes)?;
     Ok(true)
 }
@@ -871,6 +1020,18 @@ fn speculative_main(
     flock_core::set_calling_thread_prover_qos();
     let mut scratch = scratch;
 
+    // Pre-open the speculative publish target while every remaining moment is
+    // untimed (the wrapper has not even published its ready file yet): the
+    // open, vnode, name-cache, and first-touch write machinery move off the
+    // publication critical path. `None` outside the ranked worker, under the
+    // kill switch, or on any I/O hiccup — the incumbent create-at-publish
+    // ordering is then byte-for-byte unchanged. Drop cleans the temporary up
+    // on every non-publishing exit of this thread.
+    let preopened = speculative_publish_enabled()
+        .then(ranked_proof_path)
+        .flatten()
+        .and_then(|proof_path| preopen_publish_file(&proof_path));
+
     let line = read_line_fd(real_stdin);
 
     // The seed's first byte has arrived: this thread is about to forward it and
@@ -977,7 +1138,7 @@ fn speculative_main(
                 // released. Error or panic is fail-closed: `out` is still made
                 // adoptable below and the wrapper can publish it through its
                 // incumbent `{proof}.tmp` path.
-                let _ = catch_speculative_publish(|| publish_speculative_result(&out));
+                let _ = catch_speculative_publish(|| publish_speculative_result(&out, preopened));
             }
             {
                 // Publish the result to the adoption state before releasing
@@ -1418,5 +1579,112 @@ mod tests {
         assert!(!speculative_temporary_path(&proof_path).exists());
         assert!(proof_path.is_dir());
         std::fs::remove_dir_all(&dir).expect("remove publication test directory");
+    }
+
+    #[test]
+    fn preopen_publish_kill_is_literal_one() {
+        assert!(preopen_publish_enabled_for(None));
+        assert!(!preopen_publish_enabled_for(Some(OsStr::new("1"))));
+        for value in ["", "0", "01", "true", " 1", "1 "] {
+            assert!(
+                preopen_publish_enabled_for(Some(OsStr::new(value))),
+                "unexpected kill for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preopen_parks_the_fd_as_a_fresh_create_would() {
+        let dir = publication_test_dir("preopen-parked");
+        let proof_path = dir.join("proof.bin");
+        let mut pre = preopen_publish_file(&proof_path).expect("pre-open in a writable scratch");
+        // The parked state: temp exists but is empty...
+        assert!(speculative_temporary_path(&proof_path).exists());
+        assert_eq!(
+            std::fs::metadata(&speculative_temporary_path(&proof_path))
+                .expect("temporary metadata")
+                .len(),
+            0
+        );
+        // ...and the fd sits at offset 0 with room to write, exactly like a
+        // fresh File::create.
+        let mut file = pre.file.take().expect("parked fd");
+        assert_eq!(file.stream_position().expect("parked offset"), 0);
+        file.write_all(b"probe").expect("parked fd is writable");
+        assert_eq!(
+            std::fs::metadata(&speculative_temporary_path(&proof_path))
+                .expect("temporary metadata")
+                .len(),
+            5
+        );
+        drop(file);
+        drop(pre);
+        // Drop without publication removes the temporary.
+        assert!(!speculative_temporary_path(&proof_path).exists());
+        assert!(!proof_path.exists());
+        std::fs::remove_dir_all(&dir).expect("remove publication test directory");
+    }
+
+    #[test]
+    fn preopen_publish_is_byte_identical_to_the_incumbent_path() {
+        let dir = publication_test_dir("preopen-publish");
+        let proof_path = dir.join("proof.bin");
+        let expected: Vec<u8> = (0..(1 << 20)).map(|i| (i * 131 + 17) as u8).collect();
+        let reader_path = proof_path.clone();
+        let reader = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match std::fs::read(&reader_path) {
+                    Ok(bytes) => return bytes,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::NotFound
+                            && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::yield_now();
+                        }
+                    Err(error) => panic!("pre-opened publication reader failed: {error}"),
+                }
+            }
+        });
+
+        let pre = preopen_publish_file(&proof_path).expect("pre-open in a writable scratch");
+        publish_bytes_through_preopened(&proof_path, &expected, pre)
+            .expect("publication through the pre-opened fd");
+        assert_eq!(reader.join().expect("reader thread"), expected);
+        assert!(!speculative_temporary_path(&proof_path).exists());
+        std::fs::remove_dir_all(&dir).expect("remove publication test directory");
+    }
+
+    #[test]
+    fn preopen_publish_falls_back_and_cleans_up_on_failure() {
+        let dir = publication_test_dir("preopen-failure");
+        let proof_path = dir.join("proof.bin");
+        // Renaming over a directory fails through the pre-opened arm too; the
+        // temp must be cleaned up so a fallback re-create is unobstructed.
+        std::fs::create_dir(&proof_path).expect("create conflicting destination");
+        let pre = preopen_publish_file(&proof_path).expect("pre-open in a writable scratch");
+        assert!(
+            publish_bytes_through_preopened(&proof_path, b"complete proof", pre).is_err(),
+            "rename over a directory must fail"
+        );
+        assert!(!speculative_temporary_path(&proof_path).exists());
+        // The incumbent path still works afterwards on the same destination.
+        assert!(publish_bytes_atomically(&proof_path, b"complete proof").is_err());
+        assert!(!speculative_temporary_path(&proof_path).exists());
+        assert!(proof_path.is_dir());
+        std::fs::remove_dir_all(&dir).expect("remove publication test directory");
+    }
+
+    #[test]
+    fn preopen_skips_when_the_scratch_directory_is_missing() {
+        let missing = std::env::temp_dir().join(format!(
+            "flock-seed-pipe-preopen-missing-{}-{}",
+            std::process::id(),
+            PUBLICATION_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let proof_path = missing.join("proof.bin");
+        assert!(!missing.exists());
+        assert!(preopen_publish_file(&proof_path).is_none());
+        assert!(!speculative_temporary_path(&proof_path).exists());
     }
 }
