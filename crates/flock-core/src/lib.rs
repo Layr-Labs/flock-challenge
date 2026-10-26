@@ -88,7 +88,6 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     // an unspecified-QoS thread is freely E-cluster-eligible, which can park
     // that serial work on efficiency cores while the P-cluster's DVFS domain
     // still participates in the QoS decision. Pin the caller first so the
-    // whole prover process is USER_INITIATED before any timed trial starts.
     set_prover_thread_qos();
     match rayon::ThreadPoolBuilder::new()
         .num_threads(n)
@@ -98,6 +97,29 @@ pub fn init_perf_thread_pool() -> Option<usize> {
         Ok(()) => Some(n),
         Err(_) => None, // pool already built
     }
+}
+
+/// Run `op` on a main-pool worker instead of the calling thread.
+///
+/// Every top-level parallel region opened from a thread that is not a pool
+/// worker (the ranked worker's seed-pipeline thread, or the process main
+/// thread) injects into the global queue, parks the caller on the region's
+/// latch, and wakes it again at the end. Wrapping a phase body in a
+/// `rayon::join` moves the body onto a worker once, so each of its many small
+/// regions becomes a nested join on that worker instead of a fresh top-level
+/// entry.
+///
+/// Schedule only: the closure runs to completion before this returns, on the
+/// same pool, with the same work and the same transcript order, so proof
+/// bytes are unchanged. `FLOCK_NO_IN_POOL=1` restores the direct call, and a
+/// caller that is already a worker of any pool takes the direct call anyway.
+pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IN_POOL").is_none());
+    if !*ON || rayon::current_thread_index().is_some() || rayon::current_num_threads() <= 1 {
+        return op();
+    }
+    rayon::join(op, || ()).0
 }
 
 /// Apply the prover's QoS class to the calling thread.
@@ -142,17 +164,16 @@ fn set_shadow_thread_qos() {
 #[cfg(not(target_os = "macos"))]
 fn set_shadow_thread_qos() {}
 
-/// Mark Rayon prover workers as latency-sensitive on macOS. A bare Rayon pool
 /// inherits default QoS, which lets sustained jobs drift onto efficiency cores
 /// even when the pool was deliberately sized to the performance-core count.
+///
 #[cfg(target_os = "macos")]
 fn set_prover_thread_qos() {
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
-    // QOS_CLASS_USER_INITIATED: explicit user work that should finish promptly.
     unsafe {
-        let _ = pthread_set_qos_class_self_np(0x19, 0);
+        let _ = pthread_set_qos_class_self_np(0x21, 0);
     }
 }
 
