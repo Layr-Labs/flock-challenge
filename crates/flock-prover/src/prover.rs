@@ -521,6 +521,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    flock_core::tmark::mark("open start");
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
     // Publish-prefix pre-encode: `commitment` / `zc_proof` / `lc_proof` are
@@ -1228,6 +1229,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     };
     let (commitment, prover_data, ab_inner) = pre_zerocheck;
     bind_statement(challenger, r1cs, &commitment);
+    flock_core::tmark::mark("zc start");
     let cpu_zc0 = phase_timing.then(process_cpu_ms);
     let t_zc = std::time::Instant::now();
 
@@ -1284,6 +1286,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
+    flock_core::tmark::mark("zc end");
     let cpu_lc0 = phase_timing.then(process_cpu_ms);
     let t_lc = std::time::Instant::now();
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);

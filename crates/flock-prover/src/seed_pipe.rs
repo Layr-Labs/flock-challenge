@@ -532,6 +532,7 @@ fn shared() -> &'static Pipe {
 }
 
 fn mark_dead() {
+    flock_core::cpu_keepalive::pool_spin_release();
     let mut state = shared().state.lock().unwrap_or_else(|e| e.into_inner());
     state.dead = true;
     shared().signal.notify_all();
@@ -549,6 +550,44 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
     fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32;
+}
+
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+/// Upper bound on the hot seed wait; past it the thread parks in the
+/// ordinary blocking `read`. Matches the CPU keep-alive's own cap.
+const HOT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Spin on a zero-timeout `poll` until `fd` is readable (or reports
+/// EOF/error), for at most [`HOT_WAIT_BUDGET`]. The thread stays on-core, so
+/// the seed's arrival is seen without a kernel wake-up; the caller's
+/// subsequent `read` then returns immediately. Purely a change in how the
+/// untimed wait before the seed is spent: nothing is read here.
+fn hot_wait_readable(fd: i32) {
+    if std::env::var_os("FLOCK_NO_HOT_SEED_WAIT").is_some() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + HOT_WAIT_BUDGET;
+    let mut spins = 0u32;
+    loop {
+        let mut p = PollFd { fd, events: 0x0001, revents: 0 };
+        // SAFETY: one valid pollfd, zero timeout.
+        let rc = unsafe { poll(&mut p, 1, 0) };
+        if rc != 0 {
+            return; // readable, hung up, or error: let `read` decide
+        }
+        spins = spins.wrapping_add(1);
+        if spins % 1024 == 0 && std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::hint::spin_loop();
+    }
 }
 
 /// Blocking read of one newline-terminated line. Returns `None` on EOF or a
@@ -751,6 +790,12 @@ fn preopen_publish_enabled_for(kill: Option<&OsStr>) -> bool {
     kill != Some(OsStr::new("1"))
 }
 
+/// Whether the pre-opened publish file is parked at its warm length (blocks
+/// allocated) rather than empty. Exact-`1` kill: `FLOCK_NO_PUBLISH_OVERWRITE`.
+fn publish_overwrite_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_PUBLISH_OVERWRITE").as_deref() != Some(OsStr::new("1"))
+}
+
 /// Warm-write size for [`preopen_publish_file`]: comfortably above every
 /// observed ranked proof (436,107–439,663 bytes) and below the trusted
 /// verifier's 500,000-byte cap, so the write machinery is exercised at real
@@ -806,7 +851,13 @@ fn preopen_publish_file(proof_path: &Path) -> Option<PreopenedPublish> {
         }
         // Park the fd as a fresh create would: empty, offset 0. Publication
         // then pays only write + close + rename.
-        file.set_len(0)?;
+        // Keep the warm blocks allocated (publication overwrites them in
+        // place and then cuts the file to the exact proof length, so no block
+        // allocation lands on the critical path); rewind to offset 0.
+        // `FLOCK_NO_PUBLISH_OVERWRITE=1` restores the empty parked file.
+        if !publish_overwrite_enabled() {
+            file.set_len(0)?;
+        }
         file.seek(io::SeekFrom::Start(0))?;
         Ok(PreopenedPublish {
             file: Some(file),
@@ -839,9 +890,17 @@ fn publish_bytes_through_preopened(
         .ok_or_else(|| io::Error::other("pre-opened publish fd already consumed"));
     let result = match file {
         Ok(mut file) => file.write_all(bytes).and_then(|()| {
+            // Overwrite mode: the parked file still holds the warm pattern
+            // past `bytes.len()`; truncate it away so the published file is
+            // exactly `bytes` (a no-op when the file was parked empty).
+            if publish_overwrite_enabled() {
+                file.set_len(bytes.len() as u64)?;
+            }
+            flock_core::tmark::mark("written");
             // The handle must be closed before visibility changes, exactly as
             // in the incumbent path.
             drop(file);
+            flock_core::tmark::mark("closed");
             std::fs::rename(&preopened.temporary, proof_path)
         }),
         Err(error) => Err(error),
@@ -862,6 +921,7 @@ fn publish_speculative_result(out: &ProveOut, preopened: Option<PreopenedPublish
     // result for wrapper adoption and consumes the current pre-encoded prefix
     // only once, on the publication that the harness can observe first.
     let bytes = crate::proof_io::r1cs_parts_to_bytes(&out.1, &out.0);
+    flock_core::tmark::mark("encoded");
     // Prefer the gap-time pre-opened fd; a failure there falls back to the
     // incumbent create-at-publish ordering (the temporary was already removed
     // by the failed arm), and a failure there releases the wrapper's own
@@ -1032,7 +1092,9 @@ fn speculative_main(
         .flatten()
         .and_then(|proof_path| preopen_publish_file(&proof_path));
 
+    hot_wait_readable(real_stdin);
     let line = read_line_fd(real_stdin);
+    flock_core::tmark::mark("seed read");
 
     // The seed's first byte has arrived: this thread is about to forward it and
     // start the speculative prove. Signal the CPU keep-alive down immediately —
@@ -1128,7 +1190,9 @@ fn speculative_main(
             state.blocks = Some(Arc::clone(&blocks));
             shared().signal.notify_all();
         }
-        run(setup_addr, &blocks)
+        let out = run(setup_addr, &blocks);
+        flock_core::tmark::mark("prove done");
+        out
     }));
 
     match outcome {
@@ -1153,6 +1217,8 @@ fn speculative_main(
                 state.result = Some(out);
                 shared().signal.notify_all();
             }
+            flock_core::tmark::mark("published");
+            flock_core::tmark::dump();
             if defer_forward && !seed_forward.forward() {
                 return;
             }

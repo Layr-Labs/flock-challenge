@@ -3630,6 +3630,7 @@ impl Blake3Setup {
         // The warm publish below and the spawn-free kickoff stay: their
         // mechanisms are contention-free.
         let (proof, commitment, claim) = self.prove_fast_inner(blocks, challenger);
+        flock_core::cpu_keepalive::pool_spin_release();
         if call == 0 {
             let (proof, commitment) = warm_publish_path(proof, commitment);
             // Still untimed: prove here, against the wrapper's own warm-up
@@ -3692,7 +3693,9 @@ impl Blake3Setup {
             crate::seed_pipe::BENCH_DOMAIN,
             HashKind::Blake3,
         );
-        setup.prove_fast_inner(blocks, &mut challenger)
+        let out = setup.prove_fast_inner(blocks, &mut challenger);
+        flock_core::cpu_keepalive::pool_spin_release();
+        out
     }
 
     fn prove_fast_inner<Ch: Challenger>(
@@ -3721,12 +3724,17 @@ impl Blake3Setup {
                 };
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
+                flock_core::tmark::mark("witgen start");
                 let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck, gpu_first_pass) =
                     generate_witness_with_ab_packed_and_lincheck_streamed(
                         blocks,
                         self.n_blocks_log(),
                         &self.pcs_params,
                     );
+                flock_core::tmark::mark("witgen end");
+                // Witness work is all handed out; the hot pool spin (ready→seed
+                // gap + witness phase) ends here.
+                flock_core::cpu_keepalive::pool_spin_release();
                 let identity_prefix_witness = Some(
                     Blake3IdentityPrefixWitness::from_row_major_generator(
                         &z_packed, &a_packed_f128, &b_packed_f128,

@@ -71,7 +71,20 @@
 /// fires for tests, benches or examples.
 pub fn keepalive_start() {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    imp::start();
+    {
+        if imp::pool_spin_start() {
+            return;
+        }
+        imp::start();
+    }
+}
+
+/// Release the hot pool spin started by [`keepalive_start`] (when the pool
+/// form is engaged). Called once the witness phase has handed its work to
+/// the pool; idempotent, and a no-op when nothing is spinning.
+pub fn pool_spin_release() {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    imp::pool_spin_release();
 }
 
 /// Stop the keep-alive: signal the spin threads and join them. Idempotent and
@@ -166,6 +179,70 @@ mod imp {
         // flag plus a single counter with no multi-location total-order
         // requirement, so the SeqCst fence is pure overhead on the timed path.
         LIVE.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Hot pool spin: `true` while the main Rayon pool's own workers spin in
+    /// [`pool_spin_body`] instead of parking.
+    static POOL_SPIN: AtomicBool = AtomicBool::new(false);
+
+    /// Keep the main pool's workers on-core across the ready→seed gap and the
+    /// witness phase. Each worker (but one, left free for the seed-pipe
+    /// thread's poll) retires the same scalar churn as the detached spin
+    /// threads, so the P-cluster DVFS request stays up, and between slices
+    /// calls `rayon::yield_now`, which executes any pending pool job (local,
+    /// broadcast, stolen or injected). The first parallel regions after the
+    /// seed therefore start on workers that are already running instead of
+    /// waking parked ones one by one. Bounded by `MAX_KEEPALIVE`, released by
+    /// [`pool_spin_release`] after witness generation. Scheduling only: the
+    /// jobs are the same jobs, run by the same pool.
+    ///
+    /// `FLOCK_NO_POOL_SPIN=1` keeps the detached-thread keep-alive instead.
+    pub(super) fn pool_spin_start() -> bool {
+        if std::env::var_os("FLOCK_NO_CPU_KEEPALIVE").is_some()
+            || std::env::var_os("FLOCK_NO_POOL_SPIN").is_some()
+            || rayon::current_thread_index().is_some()
+            || rayon::current_num_threads() <= 1
+        {
+            return false;
+        }
+        if POOL_SPIN.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        let deadline = Instant::now() + MAX_KEEPALIVE;
+        rayon::spawn_broadcast(move |ctx| {
+            // Leave one core to the seed-pipe thread's hot poll.
+            if ctx.index() + 1 == ctx.num_threads() {
+                return;
+            }
+            pool_spin_body(deadline);
+        });
+        true
+    }
+
+    fn pool_spin_body(deadline: Instant) {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        while POOL_SPIN.load(Ordering::Relaxed) {
+            if let Some(rayon::Yield::Executed) = rayon::yield_now() {
+                continue;
+            }
+            for _ in 0..64 {
+                x = x
+                    .wrapping_mul(0x2545_F491_4F6C_DD1D)
+                    .wrapping_add(0x9E37_79B9_7F4A_7C15);
+                x ^= x >> 29;
+            }
+            std::hint::black_box(x);
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        std::hint::black_box(x);
+    }
+
+    pub(super) fn pool_spin_release() {
+        if POOL_SPIN.load(Ordering::Relaxed) {
+            POOL_SPIN.store(false, Ordering::Release);
+        }
     }
 
     pub(super) fn start() {
