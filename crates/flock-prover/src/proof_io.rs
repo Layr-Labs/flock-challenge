@@ -642,6 +642,227 @@ fn put_rows_bulk_vec(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Zero-copy vectored publication
+// ---------------------------------------------------------------------------
+
+/// The ranked bundle as a gather list: the stashed prefix, then every
+/// `pcs_open` section either as a slice of the proof's own buffers (row
+/// payloads, hash vectors, flat tails) or as a slice of a small arena that
+/// holds the length words. Concatenated, the slices are exactly
+/// [`r1cs_parts_to_bytes`]'s output — the same flat encoder, with each
+/// bulk `memcpy` into the output Vec replaced by a reference to its source —
+/// so a vectored `write` hands the kernel the proof bytes without first
+/// copying ~430 kB into one buffer on the publication tail.
+pub(crate) struct GatherBundle<'a> {
+    prefix: Vec<u8>,
+    arena: Vec<u8>,
+    segs: Vec<GatherSeg<'a>>,
+}
+
+enum GatherSeg<'a> {
+    Arena(usize, usize),
+    Ext(&'a [u8]),
+}
+
+impl<'a> GatherBundle<'a> {
+    fn u64(&mut self, v: u64) {
+        let start = self.arena.len();
+        self.arena.extend_from_slice(&v.to_le_bytes());
+        if let Some(GatherSeg::Arena(_, len)) = self.segs.last_mut() {
+            *len += 8;
+        } else {
+            self.segs.push(GatherSeg::Arena(start, 8));
+        }
+    }
+    fn bytes(&mut self, b: &'a [u8]) {
+        if !b.is_empty() {
+            self.segs.push(GatherSeg::Ext(b));
+        }
+    }
+    fn f128s(&mut self, v: &'a [F128]) {
+        self.u64(v.len() as u64);
+        // SAFETY: as in `put_f128_vec` — little-endian (gated by the caller),
+        // `F128` is two adjacent u64s with no padding.
+        self.bytes(unsafe {
+            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
+        });
+    }
+    fn hashes(&mut self, v: &'a [MerkleHash]) {
+        self.u64(v.len() as u64);
+        self.bytes(v.as_flattened());
+    }
+    fn rows(&mut self, rows: &'a [Vec<F128>]) {
+        self.u64(rows.len() as u64);
+        for row in rows {
+            self.f128s(row);
+        }
+    }
+    fn recursive(&mut self, rp: &'a RecursiveProof) {
+        let RecursiveProof {
+            opened_rows,
+            merkle_proof,
+        } = rp;
+        self.rows(opened_rows);
+        self.hashes(merkle_proof);
+    }
+
+    /// Total encoded length.
+    pub(crate) fn len(&self) -> usize {
+        self.prefix.len()
+            + self
+                .segs
+                .iter()
+                .map(|s| match s {
+                    GatherSeg::Arena(_, l) => *l,
+                    GatherSeg::Ext(b) => b.len(),
+                })
+                .sum::<usize>()
+    }
+
+    /// The I/O slices, in order (the arena is complete, so its address is
+    /// stable from here on).
+    pub(crate) fn io_slices(&self) -> Vec<std::io::IoSlice<'_>> {
+        let mut out = Vec::with_capacity(self.segs.len() + 1);
+        out.push(std::io::IoSlice::new(&self.prefix));
+        for s in &self.segs {
+            out.push(std::io::IoSlice::new(match s {
+                GatherSeg::Arena(start, len) => &self.arena[*start..*start + *len],
+                GatherSeg::Ext(b) => b,
+            }));
+        }
+        out
+    }
+
+    /// Write every byte to `w` with vectored writes (at most 1024 slices per
+    /// call, the Darwin `IOV_MAX`).
+    pub(crate) fn write_all_to<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        let mut slices = self.io_slices();
+        let mut rest: &mut [std::io::IoSlice<'_>] = &mut slices;
+        while !rest.is_empty() {
+            let take = rest.len().min(1024);
+            let n = w.write_vectored(&rest[..take])?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole proof",
+                ));
+            }
+            std::io::IoSlice::advance_slices(&mut rest, n);
+        }
+        Ok(())
+    }
+
+    /// Flatten (tests and diagnostics).
+    #[cfg(test)]
+    pub(crate) fn to_vec(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(self.len());
+        for s in self.io_slices() {
+            v.extend_from_slice(&s);
+        }
+        v
+    }
+}
+
+/// `FLOCK_NO_GATHER_PUBLISH=1` keeps the encode-then-write publication.
+pub(crate) fn gather_publish_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLOCK_NO_GATHER_PUBLISH").map_or(true, |v| v != "1"))
+}
+
+/// Gather form of [`r1cs_parts_to_bytes`]. `None` unless the flat encoder's
+/// bulk paths are all live and the pre-encoded prefix matches — the exact
+/// conditions under which `r1cs_parts_to_bytes` emits stash ‖ flat
+/// `pcs_open`, which this mirrors field for field. On `None` the stash is
+/// left in place for the caller's `r1cs_parts_to_bytes` fallback.
+pub(crate) fn r1cs_parts_gather<'a>(
+    commitment: &Commitment,
+    proof: &'a flock_core::proof::R1csProofLigerito,
+) -> Option<GatherBundle<'a>> {
+    if !gather_publish_enabled()
+        || !fast_pcs_open_encode_enabled()
+        || !flat_rows_bulk_enabled()
+        || !flat_tail_bulk_enabled()
+        || !crate::seed_pipe::is_ranked_worker()
+    {
+        return None;
+    }
+    let prefix = {
+        let mut slot = PRE_ENCODED.lock().ok()?;
+        if slot.as_ref()?.root != commitment.root {
+            return None;
+        }
+        slot.take()?.bytes
+    };
+    let p = &proof.pcs_open;
+    let mut g = GatherBundle {
+        prefix,
+        arena: Vec::with_capacity(64 * 1024),
+        segs: Vec::with_capacity(4096),
+    };
+    let BatchOpeningProofLigerito {
+        ring_switches,
+        ligerito,
+    } = p;
+    g.u64(ring_switches.len() as u64);
+    for rs in ring_switches {
+        let RingSwitchProof { s_hat_v } = rs;
+        g.f128s(s_hat_v);
+    }
+    let LigeritoProof {
+        initial_root,
+        initial_proof,
+        recursive_roots,
+        recursive_proofs,
+        final_proof,
+        sumcheck_transcript,
+        grinding_nonces,
+        ood_values,
+        fold_grinding_nonces,
+    } = ligerito;
+    g.bytes(&initial_root[..]);
+    g.recursive(initial_proof);
+    g.hashes(recursive_roots);
+    g.u64(recursive_proofs.len() as u64);
+    for rp in recursive_proofs {
+        g.recursive(rp);
+    }
+    let FinalProof {
+        yr,
+        opened_rows,
+        merkle_proof,
+    } = final_proof;
+    g.f128s(yr);
+    g.rows(opened_rows);
+    g.hashes(merkle_proof);
+    g.u64(sumcheck_transcript.len() as u64);
+    // SAFETY: same layout facts as `put_sumcheck_vec`'s bulk arm.
+    g.bytes(unsafe {
+        std::slice::from_raw_parts(
+            sumcheck_transcript.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(sumcheck_transcript.as_slice()),
+        )
+    });
+    g.u64(grinding_nonces.len() as u64);
+    // SAFETY: u64 slices on a little-endian target, as in `put_u64_vec`.
+    g.bytes(unsafe {
+        std::slice::from_raw_parts(
+            grinding_nonces.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(grinding_nonces.as_slice()),
+        )
+    });
+    g.f128s(ood_values);
+    g.u64(fold_grinding_nonces.len() as u64);
+    // SAFETY: as above.
+    g.bytes(unsafe {
+        std::slice::from_raw_parts(
+            fold_grinding_nonces.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(fold_grinding_nonces.as_slice()),
+        )
+    });
+    Some(g)
+}
+
 impl ChainProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + 1024);

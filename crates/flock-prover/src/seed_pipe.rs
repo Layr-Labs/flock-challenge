@@ -790,10 +790,10 @@ fn preopen_publish_enabled_for(kill: Option<&OsStr>) -> bool {
     kill != Some(OsStr::new("1"))
 }
 
-/// Whether the pre-opened publish file is parked at its warm length (blocks
-/// allocated) rather than empty. Exact-`1` kill: `FLOCK_NO_PUBLISH_OVERWRITE`.
-fn publish_overwrite_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_PUBLISH_OVERWRITE").as_deref() != Some(OsStr::new("1"))
+/// Whether the pre-opened publish descriptor is closed after the rename
+/// rather than before it. Exact-`1` kill: `FLOCK_NO_LATE_CLOSE`.
+fn late_close_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_LATE_CLOSE").as_deref() != Some(OsStr::new("1"))
 }
 
 /// Warm-write size for [`preopen_publish_file`]: comfortably above every
@@ -851,13 +851,7 @@ fn preopen_publish_file(proof_path: &Path) -> Option<PreopenedPublish> {
         }
         // Park the fd as a fresh create would: empty, offset 0. Publication
         // then pays only write + close + rename.
-        // Keep the warm blocks allocated (publication overwrites them in
-        // place and then cuts the file to the exact proof length, so no block
-        // allocation lands on the critical path); rewind to offset 0.
-        // `FLOCK_NO_PUBLISH_OVERWRITE=1` restores the empty parked file.
-        if !publish_overwrite_enabled() {
-            file.set_len(0)?;
-        }
+        file.set_len(0)?;
         file.seek(io::SeekFrom::Start(0))?;
         Ok(PreopenedPublish {
             file: Some(file),
@@ -882,26 +876,42 @@ fn preopen_publish_file(proof_path: &Path) -> Option<PreopenedPublish> {
 fn publish_bytes_through_preopened(
     proof_path: &Path,
     bytes: &[u8],
-    mut preopened: PreopenedPublish,
+    preopened: PreopenedPublish,
 ) -> io::Result<()> {
+    publish_through_preopened_with(proof_path, preopened, |file| file.write_all(bytes))
+}
+
+/// [`publish_bytes_through_preopened`] with the content written by `fill`
+/// (the plain byte slice, or the zero-copy gather list).
+fn publish_through_preopened_with<F>(
+    proof_path: &Path,
+    mut preopened: PreopenedPublish,
+    fill: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&mut std::fs::File) -> io::Result<()>,
+{
     let file = preopened
         .file
         .take()
         .ok_or_else(|| io::Error::other("pre-opened publish fd already consumed"));
     let result = match file {
-        Ok(mut file) => file.write_all(bytes).and_then(|()| {
-            // Overwrite mode: the parked file still holds the warm pattern
-            // past `bytes.len()`; truncate it away so the published file is
-            // exactly `bytes` (a no-op when the file was parked empty).
-            if publish_overwrite_enabled() {
-                file.set_len(bytes.len() as u64)?;
-            }
+        Ok(mut file) => fill(&mut file).and_then(|()| {
             flock_core::tmark::mark("written");
-            // The handle must be closed before visibility changes, exactly as
-            // in the incumbent path.
+            // Every byte is in the file (and the shared buffer cache) once
+            // `write_all` returns, at its final length, so the rename alone
+            // makes the complete proof visible. Closing the descriptor is
+            // bookkeeping that nothing reading the final path waits on: do it
+            // after the rename, off the published-proof critical path.
+            // `FLOCK_NO_LATE_CLOSE=1` restores close-then-rename.
+            if !late_close_enabled() {
+                drop(file);
+                return std::fs::rename(&preopened.temporary, proof_path);
+            }
+            let renamed = std::fs::rename(&preopened.temporary, proof_path);
+            flock_core::tmark::mark("renamed");
             drop(file);
-            flock_core::tmark::mark("closed");
-            std::fs::rename(&preopened.temporary, proof_path)
+            renamed
         }),
         Err(error) => Err(error),
     };
@@ -920,6 +930,23 @@ fn publish_speculative_result(out: &ProveOut, preopened: Option<PreopenedPublish
     // Tuple order is `(proof, commitment, claim)`. Borrowing preserves the
     // result for wrapper adoption and consumes the current pre-encoded prefix
     // only once, on the publication that the harness can observe first.
+    // Zero-copy arm: hand the kernel the proof's own buffers in one gather
+    // write instead of first copying ~430 kB into a single Vec. Same bytes
+    // in the same order (see `proof_io::GatherBundle`). Needs the pre-opened
+    // descriptor; any failure of that write leaves the stash consumed, so
+    // the fallback below re-encodes from scratch exactly as before.
+    let mut preopened = preopened;
+    if preopened.is_some() {
+        if let Some(gather) = crate::proof_io::r1cs_parts_gather(&out.1, &out.0) {
+            flock_core::tmark::mark("encoded");
+            let pre = preopened.take().expect("checked above");
+            if publish_through_preopened_with(&proof_path, pre, |file| gather.write_all_to(file))
+                .is_ok()
+            {
+                return Ok(true);
+            }
+        }
+    }
     let bytes = crate::proof_io::r1cs_parts_to_bytes(&out.1, &out.0);
     flock_core::tmark::mark("encoded");
     // Prefer the gap-time pre-opened fd; a failure there falls back to the

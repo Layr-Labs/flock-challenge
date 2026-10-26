@@ -207,7 +207,7 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
         .map(|c| quirky_x_outer_full(&c.point))
         .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    let out = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         prover_data,
         commitment,
@@ -217,7 +217,9 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
         padding,
         lig_config,
         challenger,
-    )
+    );
+    flock_core::tmark::mark("open body end");
+    out
 }
 
 /// Run the full R1CS proof on an F_{2^128}-packed witness.
@@ -549,6 +551,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             // start as nested joins (`flock_core::in_pool`); the helper scope
             // and its spawned prefix encode are unchanged.
             flock_core::in_pool(|| {
+                flock_core::tmark::mark("open body start");
                 open_claims_with_precomputed_ligerito(
                     z_packed,
                     &prover_data,
@@ -574,6 +577,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             )
         }),
     };
+    flock_core::tmark::mark("open returned");
     if phase_timing {
         let wall = t_open.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_open0.unwrap_or(0.0);
@@ -1236,6 +1240,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // Zerocheck runs on a main-pool worker so its parallel regions start as
     // nested joins (`flock_core::in_pool`). Same work, same transcript order.
     let (zc_proof, zc_claim, s_hat_v_c) = flock_core::in_pool(|| {
+        flock_core::tmark::mark("zc body start");
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
         let a_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
@@ -1294,7 +1299,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
     // Lincheck runs on a main-pool worker (`flock_core::in_pool`), as above.
+    flock_core::tmark::mark("lc call");
     let (lc_proof, lc_claim, z_vec_pre) = flock_core::in_pool(|| {
+        flock_core::tmark::mark("lc body start");
         lincheck::prove_padded_capture_z_vec(
             &z_packed_lincheck,
             r1cs.m,
@@ -1309,6 +1316,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // The lincheck stripe copy of z is dead from here on; return it to the
     // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
     // m = 32) so the next prove reuses its resident pages.
+    flock_core::tmark::mark("lc returned");
     flock_core::scratch::give_u8(z_packed_lincheck);
 
     let ab = ZClaim {
