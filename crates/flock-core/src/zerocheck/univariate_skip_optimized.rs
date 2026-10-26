@@ -45,9 +45,12 @@ use std::sync::OnceLock;
 
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
+use crate::r1cs::Round1PinnedOnePrefixStatement;
 
 use super::PaddingSpec;
-use super::univariate_skip::{SplitEqGhash, build_eq, ntt_extend_f128_vec_ghash, pack_bits};
+use super::univariate_skip::{
+    SplitEqGhash, build_eq, build_eq_scaled, ntt_extend_f128_vec_ghash, pack_bits,
+};
 
 mod kernels;
 
@@ -144,6 +147,76 @@ fn c_s_inverse_literal_enabled() -> bool {
     false
 }
 
+// Fixed-inverse literals for the remaining preprocessing constants (port of
+// pepedesigner's unpromoted `755c0d7`). Each replaces a runtime field
+// inversion (Fermat / Euclid) or per-call challenge arithmetic with its exact
+// compile-time representation; each is verified against the runtime oracle by
+// `apple_fixed_inverse_literals_match_runtime_field_oracles`, and each has an
+// exact-`"1"` kill switch restoring the incumbent computation.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn d_inv_literal_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let kill = std::env::var("FLOCK_NO_ZC_D_INV_LITERAL").ok();
+        apple_inverse_literal_selected(true, kill.as_deref())
+    });
+    *ENABLED
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn d_inv_literal_enabled() -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn d_hi_inv_literal_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let kill = std::env::var("FLOCK_NO_ZC_D_HI_INV_LITERAL").ok();
+        apple_inverse_literal_selected(true, kill.as_deref())
+    });
+    *ENABLED
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn d_hi_inv_literal_enabled() -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn c_2_small_literal_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let kill = std::env::var("FLOCK_NO_ZC_C_2_LITERAL").ok();
+        apple_inverse_literal_selected(true, kill.as_deref())
+    });
+    *ENABLED
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn c_2_small_literal_enabled() -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+fn alpha_inv_literal_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let kill = std::env::var("FLOCK_NO_ZC_ALPHA_INV_LITERAL").ok();
+        apple_inverse_literal_selected(true, kill.as_deref())
+    });
+    *ENABLED
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+#[inline(always)]
+fn alpha_inv_literal_enabled() -> bool {
+    false
+}
+
 const MEDIUM_CHALLENGES_GHASH_LITERAL: [F128; 4] = [
     F128 {
         lo: 0xffff_ffff_ffff_ff83,
@@ -166,6 +239,34 @@ const MEDIUM_CHALLENGES_GHASH_LITERAL: [F128; 4] = [
 const C_S_INV_GHASH_LITERAL: F128 = F128 {
     lo: 0x9904_8380_6bff_be0d,
     hi: 0x71af_641f_08db_d1a0,
+};
+
+/// `D⁻¹` literal for `D = (1+γ)(1+γ²)(1+γ⁴)(1+γ⁸)` (port of pepedesigner's
+/// unpromoted `755c0d7`; oracle-checked against `compute_d_inv`).
+const D_INV_GHASH_LITERAL: F128 = F128 {
+    lo: 0xadd9_add9_add9_ad8c,
+    hi: 0xadd9_add9_add9_add9,
+};
+
+/// `D_hi⁻¹` literal for `D_hi = (1+γ⁴)(1+γ⁸)` (same port; oracle-checked
+/// against `compute_d_hi_inv`).
+const D_HI_INV_GHASH_LITERAL: F128 = F128 {
+    lo: 0x2fc1_2fc1_2fc1_2fd6,
+    hi: 0x2fc1_2fc1_2fc1_2fc1,
+};
+
+/// `C_2 = (1 + φ_8(0x53)) · (1 + φ_8(0xB5))` literal (same port;
+/// oracle-checked against `c_2_small_f128`'s runtime computation).
+const C_2_SMALL_GHASH_LITERAL: F128 = F128 {
+    lo: 0x29c2_d5f0_e387_11f5,
+    hi: 0x7009_e616_ae59_e6a2,
+};
+
+/// `α⁻¹ = φ_8(0x02)⁻¹` literal (same port; oracle-checked against
+/// `alpha_inv_f128`'s runtime computation).
+const ALPHA_INV_GHASH_LITERAL: F128 = F128 {
+    lo: 0x65f4_d24a_569c_4b3e,
+    hi: 0xc326_348c_aa99_58aa,
 };
 
 /// The constant `C_s = φ_8(0x1C) ∈ F_{2^128}` — the relative scaling factor
@@ -243,6 +344,9 @@ fn c_s_inv_f128() -> F128 {
 /// post-scale the raw bank values into canonical `s_hat_v_c` (which
 /// `ring_switch::fold_1b_rows` would produce against suffix `r[k_skip+1..m]`).
 pub fn c_2_small_f128() -> F128 {
+    if c_2_small_literal_enabled() {
+        return C_2_SMALL_GHASH_LITERAL;
+    }
     let r_2 = phi8(F8(SMALL_CHAL_F8[1]));
     let r_3 = phi8(F8(SMALL_CHAL_F8[2]));
     (F128::ONE + r_2) * (F128::ONE + r_3)
@@ -253,6 +357,9 @@ pub fn c_2_small_f128() -> F128 {
 /// contribution is `α · α^{2 b_3[1] + 4 b_3[2]}`; canonical wants just
 /// `α^{2 b_3[1] + 4 b_3[2]}`).
 pub fn alpha_inv_f128() -> F128 {
+    if alpha_inv_literal_enabled() {
+        return ALPHA_INV_GHASH_LITERAL;
+    }
     // α in F_8 = byte 0x02 (the polynomial generator). Its inverse is α^254;
     // F8::inv computes it via the standard extended Euclidean / power table.
     phi8(F8(0x02).inv())
@@ -281,6 +388,9 @@ fn compute_d_inv() -> F128 {
 
 static D_INV_CACHE: OnceLock<F128> = OnceLock::new();
 fn d_inv() -> F128 {
+    if d_inv_literal_enabled() {
+        return D_INV_GHASH_LITERAL;
+    }
     *D_INV_CACHE.get_or_init(compute_d_inv)
 }
 
@@ -301,6 +411,9 @@ fn compute_d_hi_inv() -> F128 {
 
 static D_HI_INV_CACHE: OnceLock<F128> = OnceLock::new();
 fn d_hi_inv() -> F128 {
+    if d_hi_inv_literal_enabled() {
+        return D_HI_INV_GHASH_LITERAL;
+    }
     *D_HI_INV_CACHE.get_or_init(compute_d_hi_inv)
 }
 
@@ -667,6 +780,38 @@ pub fn ab_compact_backing_token_counts() -> (usize, usize) {
 /// original A and B tables after the round-1 transcript challenge is sampled.
 pub struct Round1AbInner {
     storage: Vec<F128>,
+    representation: Round1AbRepresentation,
+}
+
+/// Representation carried with the large round-one AB transform backing.
+/// An omitted buffer is a residual component and must never reach a consumer
+/// that assumes all sixteen medium rows were materialized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Round1AbRepresentation {
+    Complete,
+    Blake3IdentityPrefixOmitted { output_window: bool },
+}
+
+impl Round1AbRepresentation {
+    #[inline]
+    fn first_materialized_b_med(self, within_hash_outer: usize) -> usize {
+        match self {
+            Self::Blake3IdentityPrefixOmitted { .. } if within_hash_outer == 0 => 2,
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    fn materialized_b_med_end(self, within_hash_outer: usize, n_b_med: usize) -> usize {
+        if matches!(self, Self::Blake3IdentityPrefixOmitted { output_window: true })
+            && within_hash_outer == 1
+        {
+            debug_assert_eq!(n_b_med, 15);
+            14
+        } else {
+            n_b_med
+        }
+    }
 }
 
 impl Round1AbInner {
@@ -683,6 +828,25 @@ impl Round1AbInner {
     /// Resident scratch bytes retained until the challenge-weighted finish.
     pub fn len_bytes(&self) -> usize {
         self.storage.len() * core::mem::size_of::<F128>()
+    }
+
+    #[inline]
+    fn assert_complete(&self, consumer: &str) {
+        assert_eq!(
+            self.representation,
+            Round1AbRepresentation::Complete,
+            "{consumer} cannot consume an identity-prefix residual AB transform"
+        );
+    }
+
+    #[inline]
+    pub(crate) fn identity_prefix_was_omitted(&self) -> bool {
+        matches!(self.representation, Round1AbRepresentation::Blake3IdentityPrefixOmitted { .. })
+    }
+
+    #[inline]
+    pub(crate) fn output_window_was_omitted(&self) -> bool {
+        matches!(self.representation, Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true })
     }
 
     /// Donate the now-dead transform to a byte-oriented scratch consumer
@@ -778,10 +942,11 @@ unsafe fn store_nt_64(src: *const u8, dst: *mut u8) {
     unsafe { core::ptr::copy_nonoverlapping(src, dst, 64) };
 }
 
-/// Precompute the challenge-independent inverse-NTT/product/shift-reduce AB
-/// transform. The result can be produced before the commitment root is
-/// available and consumed later by
-/// [`round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab`].
+/// Precompute the challenge-independent AB transform. A C1 statement receipt
+/// requires the caller's separate producer guarantee: A=C=Z and B=1 in each
+/// block's first 1,024 bits. With the output extension, bits 15,360..15,409
+/// also have A=C=Z, B=1 and bits 15,409..15,872 have A=B=C=0.
+/// None retains the complete transform.
 pub fn precompute_round1_ab_inner_packed_padded(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -789,8 +954,38 @@ pub fn precompute_round1_ab_inner_packed_padded(
     k_skip: usize,
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
 ) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_with_flavor(
+    precompute_round1_ab_inner_packed_padded_with_tail(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        identity_prefix,
+        None,
+    )
+}
+
+/// [`precompute_round1_ab_inner_packed_padded`] whose hetero-queue main-pool
+/// workers each call `tail` once the precompute queue is empty, before the
+/// drain waits for its helper broadcast. `tail` never touches the precompute
+/// output, so the result is byte-identical to the plain call; the ranked
+/// prover passes the deferred lincheck stripe's help drain here. Ignored on
+/// the non-hetero path.
+#[allow(clippy::too_many_arguments)]
+pub fn precompute_round1_ab_inner_packed_padded_with_tail(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    tail: Option<&(dyn Fn() + Sync)>,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_body(
         a_packed,
         b_packed,
         m,
@@ -799,12 +994,15 @@ pub fn precompute_round1_ab_inner_packed_padded(
         padding,
         ab_pre_nt_enabled(),
         ab_compact_store_enabled(),
+        true,
+        identity_prefix,
+        tail,
     )
 }
 
 /// Full-write scratch arm for the untimed exact-contention replay. It never
-/// consumes or advances compact-backing provenance, so the production arm is
-/// the sole owner of the warmup→timed token lifecycle.
+/// consumes or advances compact-backing provenance. The optional C1 receipt
+/// has the same producer precondition as the normal precompute above.
 pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -812,6 +1010,7 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
     k_skip: usize,
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
 ) -> Round1AbInner {
     precompute_round1_ab_inner_packed_padded_body(
         a_packed,
@@ -823,6 +1022,8 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
         ab_pre_nt_enabled(),
         false,
         false,
+        identity_prefix,
+        None,
     )
 }
 
@@ -830,6 +1031,7 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
 /// choices, tests compare arms byte-for-byte in one process. `nt` selects the
 /// non-temporal drain vs the incumbent cached store; `compact` selects the
 /// QS3 tail-skip vs the incumbent zero-fill of the dead skipped-`b_med` rows.
+#[cfg(test)]
 fn precompute_round1_ab_inner_packed_padded_with_flavor(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -839,9 +1041,11 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     padding: &PaddingSpec,
     nt: bool,
     compact: bool,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
 ) -> Round1AbInner {
     precompute_round1_ab_inner_packed_padded_body(
-        a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true,
+        a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true, identity_prefix,
+        None,
     )
 }
 
@@ -856,6 +1060,8 @@ fn precompute_round1_ab_inner_packed_padded_body(
     nt: bool,
     compact: bool,
     use_provenance: bool,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    tail: Option<&(dyn Fn() + Sync)>,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -870,6 +1076,17 @@ fn precompute_round1_ab_inner_packed_padded_body(
     assert_eq!(b_packed.len(), total_bytes);
     assert_eq!(inv_table.k, k_skip);
     assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
+
+    let representation = if let Some(statement) = identity_prefix {
+        assert!(m >= padding.k_log, "C1 requires complete blocks");
+        assert_eq!(padding.k_log, 14, "C1 requires 16,384-bit blocks");
+        assert_eq!(padding.useful_bits_per_block, 15_409);
+        Round1AbRepresentation::Blake3IdentityPrefixOmitted {
+            output_window: statement.includes_output_window(),
+        }
+    } else {
+        Round1AbRepresentation::Complete
+    };
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Besides
@@ -958,8 +1175,10 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     static_b_context,
                     nt,
                     compact,
+                    representation,
                     n_chunks,
                     out_bytes,
+                    tail,
                 );
             } else {
                 precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
@@ -972,8 +1191,10 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     static_b_context,
                     nt,
                     compact,
+                    representation,
                     n_chunks,
                     out_bytes,
+                    tail,
                 );
             }
         } else {
@@ -987,11 +1208,16 @@ fn precompute_round1_ab_inner_packed_padded_body(
                 static_b_context,
                 nt,
                 compact,
+                representation,
                 n_chunks,
                 out_bytes,
+                tail,
             );
         }
-        return Round1AbInner { storage };
+        return Round1AbInner {
+            storage,
+            representation,
+        };
     }
 
     out_bytes
@@ -1010,6 +1236,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     static_b_context,
                     nt,
                     compact,
+                    representation,
                     x_outer,
                     out_outer,
                     a_col,
@@ -1018,7 +1245,10 @@ fn precompute_round1_ab_inner_packed_padded_body(
             },
         );
 
-    Round1AbInner { storage }
+    Round1AbInner {
+        storage,
+        representation,
+    }
 }
 
 /// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
@@ -1097,8 +1327,10 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     static_b_context: Option<kernels::StaticBContext>,
     nt: bool,
     compact: bool,
+    representation: Round1AbRepresentation,
     n_chunks: usize,
     out_bytes: &mut [u8],
+    tail: Option<&(dyn Fn() + Sync)>,
 ) {
     // This is a private specialization contract, but keep it checked in
     // release builds so a future caller cannot accidentally select
@@ -1117,7 +1349,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
     let n_jobs = n_chunks.div_ceil(chunks_per_job);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
-    crate::epool::run_hetero_chunks_stateful(
+    crate::epool::run_hetero_chunks_stateful_with_tail(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
@@ -1143,6 +1375,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     static_b_context,
                     nt,
                     compact,
+                    representation,
                     x_outer,
                     out_outer,
                     a_col,
@@ -1150,6 +1383,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 );
             }
         },
+        tail,
     );
 }
 
@@ -1168,6 +1402,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     static_b_context: Option<kernels::StaticBContext>,
     nt: bool,
     compact: bool,
+    representation: Round1AbRepresentation,
     x_outer: usize,
     out_outer: &mut [u8],
     a_col: &mut [F8; ELL],
@@ -1177,6 +1412,11 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     let within_hash_outer = x_outer & within_outer_mask;
     let n_b_med = b_med_counts[within_hash_outer] as usize;
     let chunk_byte_base = x_outer * OUTER_BYTES;
+    let first_b_med = representation.first_materialized_b_med(within_hash_outer);
+    // C1b changes only AB's materialized range. Keep n_b_med unchanged for
+    // static-B dispatch (especially mixed row 13), C and tail initialization.
+    let ab_end = representation.materialized_b_med_end(within_hash_outer, n_b_med);
+    debug_assert!(first_b_med <= n_b_med);
 
     // NT arm: the kernel drains each 64-byte block to the big buffer with
     // `stnp` (write-once lines, consumer runs after the commit root). By
@@ -1192,7 +1432,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         nt && ab_pre_nt_direct_enabled()
     };
     let mut tmp = [0u8; 64];
-    for b_med in 0..n_b_med {
+    for b_med in first_b_med..ab_end {
         let dst: &mut [u8; 64] = if nt && !direct {
             &mut tmp
         } else {
@@ -1770,6 +2010,7 @@ fn process_one_x_hi_with_precomputed_ab(
             };
             kernels::accumulate_convert_ab(
                 chunk_ab_bytes,
+                0,
                 n_b_med,
                 convert,
                 eq_lo_scaled[x_outer_lo],
@@ -1865,6 +2106,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
     within_outer_mask: usize,
     b_med_counts: &[u8],
     ab_inner: &[u8],
+    representation: Round1AbRepresentation,
     eq_lo_scaled: &[F128],
     eq_hi_val: F128,
     convert: &[F128],
@@ -1879,14 +2121,17 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab(
     let t_ab = timing_cpu_ns.map(|_| std::time::Instant::now());
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
-        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
         if n_b_med == 0 {
             continue;
         }
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let first_b_med = representation.first_materialized_b_med(within_hash_outer);
         kernels::accumulate_convert_ab(
             precomputed_ab_rows(ab_inner, chunk_byte_base),
-            n_b_med,
+            first_b_med,
+            representation.materialized_b_med_end(within_hash_outer, n_b_med),
             convert,
             eq_lo_scaled[x_outer_lo],
             partial_ab,
@@ -2071,10 +2316,10 @@ std::thread_local! {
 /// `r_lo[..s]` sub-product and the rest exactly the `r_lo[s..]` one.
 fn ab_eq_fold_factors(r_lo: &[F128], bank_bits: usize) -> (Vec<F128>, Vec<F128>) {
     let eq_bot = build_eq(&r_lo[..bank_bits]);
-    let eq_top_scaled = build_eq(&r_lo[bank_bits..])
-        .into_iter()
-        .map(|v| v * d_inv())
-        .collect();
+    // Fused scaling (port of pepedesigner's unpromoted `755c0d7`): seeding
+    // the doubling root with `d_inv()` produces the scaled table in one pass
+    // — no intermediate buffer, no second traversal, bit-identical output.
+    let eq_top_scaled = build_eq_scaled(&r_lo[bank_bits..], d_inv());
     (eq_bot, eq_top_scaled)
 }
 
@@ -2111,6 +2356,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     within_outer_mask: usize,
     b_med_counts: &[u8],
     ab_inner: &[u8],
+    representation: Round1AbRepresentation,
     eq_bot: &[F128],
     eq_hi_val: F128,
     tables: &[F128],
@@ -2128,11 +2374,13 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
 
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
-        let n_b_med = b_med_counts[x_outer & within_outer_mask] as usize;
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
         if n_b_med == 0 {
             continue;
         }
         let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let first_b_med = representation.first_materialized_b_med(within_hash_outer);
         let w = x_outer_lo >> bank_bits;
         let u = x_outer_lo & bank_mask;
         let bank: &mut [F128; ELL] = (&mut banks[u * ELL..(u + 1) * ELL])
@@ -2140,7 +2388,8 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
             .expect("one ELL-lane bank per low x_lo index");
         kernels::accumulate_convert_ab_nomul(
             precomputed_ab_rows(ab_inner, chunk_byte_base),
-            n_b_med,
+            first_b_med,
+            representation.materialized_b_med_end(within_hash_outer, n_b_med),
             &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE],
             bank,
         );
@@ -2213,6 +2462,10 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
     let total_bytes = (1usize << m) / 8;
     assert_eq!(ab_inner.len_bytes(), total_bytes);
     assert_eq!(r.len(), m);
+    if ab_inner.identity_prefix_was_omitted() {
+        assert_eq!(padding.k_log, 14);
+        assert_eq!(padding.useful_bits_per_block, 15_409);
+    }
 
     let fold4_n_hi = fold4_n_hi_from_env();
     let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], fold4_n_hi);
@@ -2237,6 +2490,7 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                     within_outer_mask,
                     &b_med_counts,
                     ab_inner_bytes,
+                    ab_inner.representation,
                     &eq_lo_scaled,
                     eq.hi[x_hi],
                     convert,
@@ -2281,6 +2535,7 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                         within_outer_mask,
                         &b_med_counts,
                         ab_inner_bytes,
+                        ab_inner.representation,
                         &eq_bot,
                         eq.hi[x_hi],
                         &tables,
@@ -2539,7 +2794,10 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
     prelude: Round1CPrelude,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    recover_identity_prefix: bool,
+    recover_output_window: bool,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Option<Vec<F128>>) {
+    assert!(!recover_output_window || recover_identity_prefix);
     assert_eq!(k_skip, K_SKIP);
     assert!(
         k_log >= k_skip + 5,
@@ -2549,6 +2807,16 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
+    // This runs only after the GPU result has landed or its failed prefix has
+    // been repaired on CPU. The same complete C inner fold feeds both the
+    // incumbent C/capture derivation and the omitted AB-region recovery.
+    let recovered_ab = recover_identity_prefix.then(|| {
+        let mut ab = round1_identity_prefix_ab_recovery(&c_inner, r, k_log, inv_table);
+        if recover_output_window {
+            add_round1_output_window_ab_recovery(&mut ab, &c_inner, r, inv_table);
+        }
+        ab
+    });
     let inner_tail = &r[k_skip + 1..k_log];
     let fold4 = crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&c_inner, inner_tail);
 
@@ -2580,7 +2848,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
         res_c_s[lane] = c_s_inv * naive;
     }
     let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (round1_c_opt, s_hat_v_c, quad, fold4)
+    (round1_c_opt, s_hat_v_c, quad, fold4, recovered_ab)
 }
 
 /// Fold8 sibling of [`round1_c_fold4_from_lincheck_stripe`]: same single
@@ -2599,7 +2867,10 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     r: &[F128],
     inv_table: &InvNttTableByteSingleGf8,
     prelude: Round1CPrelude,
-) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    recover_identity_prefix: bool,
+    recover_output_window: bool,
+) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Option<Vec<F128>>) {
+    assert!(!recover_output_window || recover_identity_prefix);
     assert_eq!(k_skip, K_SKIP);
     assert!(
         k_log >= k_skip + 7,
@@ -2609,6 +2880,13 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
+    let recovered_ab = recover_identity_prefix.then(|| {
+        let mut ab = round1_identity_prefix_ab_recovery(&c_inner, r, k_log, inv_table);
+        if recover_output_window {
+            add_round1_output_window_ab_recovery(&mut ab, &c_inner, r, inv_table);
+        }
+        ab
+    });
     let inner_tail = &r[k_skip + 1..k_log];
     let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
 
@@ -2640,7 +2918,64 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
         res_c_s[lane] = c_s_inv * naive;
     }
     let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
-    (round1_c_opt, s_hat_v_c, quad, fold8)
+    (round1_c_opt, s_hat_v_c, quad, fold8, recovered_ab)
+}
+
+/// Recover the optimized-convention round-one AB contribution of the first
+/// 1,024 bits in every 16,384-bit block from identity C's already-completed
+/// inner fold.
+///
+/// `t` is kept as the original eight-coordinate index: rows `0..16` have the
+/// four high coordinates equal to zero, so `eq(r[6..14], t)` is the exact
+/// medium/within-block weight. Dividing by C_s converts the C inner values to
+/// the optimized AB convention before the existing S-to-Lambda extension.
+fn round1_identity_prefix_ab_recovery(
+    c_inner: &[F128],
+    r: &[F128],
+    k_log: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
+    assert_eq!(k_log, 14, "identity-prefix recovery fixes 16,384-bit blocks");
+    assert!(c_inner.len() >= 1_024);
+    assert!(r.len() >= k_log);
+    let eq_inner = build_eq(&r[K_SKIP..k_log]);
+    let mut recovered_s = [F128::ZERO; ELL];
+    for t in 0..16 {
+        let weight = eq_inner[t];
+        for lane in 0..ELL {
+            recovered_s[lane] += weight * c_inner[ELL * t + lane];
+        }
+    }
+    let c_s_inv = c_s_inv_f128();
+    for value in &mut recovered_s {
+        *value *= c_s_inv;
+    }
+    ntt_extend_f128_vec_ghash(&recovered_s, inv_table)
+}
+
+/// Window 30 has only row 240 live, with a fixed 49-bit B mask. Fixed B
+/// makes its AB transform linear in A, so fold the compression dimension
+/// first using identity C's completed inner table, then extend just once.
+fn add_round1_output_window_ab_recovery(
+    ab: &mut [F128],
+    c_inner: &[F128],
+    r: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) {
+    const ROW: usize = 240;
+    let weight = r[K_SKIP..14].iter().enumerate().fold(c_s_inv_f128(), |w, (bit, ri)| {
+        w * if (ROW >> bit) & 1 == 1 { *ri } else { F128::ONE + *ri }
+    });
+    let mut s = [F128::ZERO; ELL];
+    for lane in 0..ELL {
+        s[lane] = weight * c_inner[ROW * ELL + lane];
+    }
+    let extended = ntt_extend_f128_vec_ghash(&s, inv_table);
+    let mut beta = [F8::ZERO; ELL];
+    inv_table.apply(&0x0001_ffff_ffff_ffffu64.to_le_bytes(), &mut beta);
+    for lane in 0..ELL {
+        ab[lane] += extended[lane] * phi8(beta[lane]);
+    }
 }
 
 /// Pair-fused C job with the original 32-bank accumulator and one job per
@@ -3265,6 +3600,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     inv_table: &InvNttTableByteSingleGf8,
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    ab_inner.assert_complete("combined round-one AB/C completion");
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -3430,6 +3766,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
     q_partition: bool,
     pair4: bool,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
+    ab_inner.assert_complete("combined round-one Fold4 AB/C completion");
     let profile =
         std::env::var_os("FLOCK_FOLD4_TIMING").as_deref() == Some(std::ffi::OsStr::new("1"));
     let t_total = std::time::Instant::now();
@@ -3508,6 +3845,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
                     within_outer_mask,
                     &b_med_counts,
                     ab_inner_bytes,
+                    ab_inner.representation,
                     &eq_lo_scaled,
                     eq_hi[x_hi],
                     convert,
@@ -3582,6 +3920,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
                 within_outer_mask,
                 &b_med_counts,
                 ab_inner_bytes,
+                ab_inner.representation,
                 &eq_lo_scaled,
                 eq_hi[x_hi],
                 convert,
@@ -3769,6 +4108,33 @@ mod tests {
         assert_eq!(C_S_INV_GHASH_LITERAL, reference_c_s_inv);
         assert_eq!(c_s_inv_f128(), reference_c_s_inv);
         assert_eq!(C_S_INV_GHASH_LITERAL * c_s_f128(), F128::ONE);
+
+        // Ported fixed-inverse literals (pepedesigner's unpromoted 755c0d7):
+        // each must equal the runtime oracle AND invert its defining element.
+        let d = (F128::ONE + F128 { lo: 1u64 << 1, hi: 0 })
+            * (F128::ONE + F128 { lo: 1u64 << 2, hi: 0 })
+            * (F128::ONE + F128 { lo: 1u64 << 4, hi: 0 })
+            * (F128::ONE + F128 { lo: 1u64 << 8, hi: 0 });
+        assert_eq!(D_INV_GHASH_LITERAL, compute_d_inv());
+        assert_eq!(d_inv(), compute_d_inv());
+        assert_eq!(D_INV_GHASH_LITERAL * d, F128::ONE);
+
+        let d_hi = (F128::ONE + F128 { lo: 1u64 << 4, hi: 0 })
+            * (F128::ONE + F128 { lo: 1u64 << 8, hi: 0 });
+        assert_eq!(D_HI_INV_GHASH_LITERAL, compute_d_hi_inv());
+        assert_eq!(d_hi_inv(), compute_d_hi_inv());
+        assert_eq!(D_HI_INV_GHASH_LITERAL * d_hi, F128::ONE);
+
+        let reference_c_2 = {
+            let r_2 = phi8(F8(SMALL_CHAL_F8[1]));
+            let r_3 = phi8(F8(SMALL_CHAL_F8[2]));
+            (F128::ONE + r_2) * (F128::ONE + r_3)
+        };
+        assert_eq!(C_2_SMALL_GHASH_LITERAL, reference_c_2);
+
+        let reference_alpha_inv = phi8(F8(0x02).inv());
+        assert_eq!(ALPHA_INV_GHASH_LITERAL, reference_alpha_inv);
+        assert_eq!(ALPHA_INV_GHASH_LITERAL * phi8(F8(0x02)), F128::ONE);
     }
 
     /// **Soundness assumption.** Zerocheck and the Ligerito PCS opening at
@@ -4013,6 +4379,7 @@ mod tests {
             None,
             false,
             false,
+            Round1AbRepresentation::Complete,
             0,
             &mut cached,
             &mut cached_a_col,
@@ -4032,6 +4399,7 @@ mod tests {
             None,
             true,
             false,
+            Round1AbRepresentation::Complete,
             0,
             &mut direct,
             &mut direct_a_col,
@@ -4323,7 +4691,7 @@ mod tests {
             // The precomputed-AB entry point (the one the ranked prove runs)
             // must agree on all four outputs.
             let precomputed =
-                precompute_round1_ab_inner_packed_padded(&a_p, &b_p, m, K_SKIP, &table, &padding);
+                precompute_round1_ab_inner_packed_padded(&a_p, &b_p, m, K_SKIP, &table, &padding, None);
             let (pre_ab, pre_c, pre_s_hat_v, pre_quad) =
                 round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
                     &precomputed,
@@ -4381,10 +4749,10 @@ mod tests {
             // both flavors with `compact = false` so the dead tail is zeroed
             // deterministically and the full-buffer comparison stays valid.
             let plain = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, false, false,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, false, false, None,
             );
             let nt = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, true, false,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, true, false, None,
             );
             assert_eq!(
                 plain.as_bytes(),
@@ -4436,10 +4804,10 @@ mod tests {
             let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
             for nt in [false, true] {
                 let filled = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, false,
+                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, false, None,
                 );
                 let compact = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
+                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true, None,
                 );
                 let filled = filled.as_bytes();
                 let compact = compact.as_bytes();
@@ -4491,14 +4859,14 @@ mod tests {
         // exercises the shipped QS3 path (dead tail rows never stored).
         for nt in [false, true] {
             let _ = precompute_round1_ab_inner_packed_padded_with_flavor(
-                &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
+                &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true, None,
             );
         }
         for rep in 0..4 {
             for nt in [rep % 2 == 1, rep % 2 == 0] {
                 let t0 = std::time::Instant::now();
                 let out = precompute_round1_ab_inner_packed_padded_with_flavor(
-                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true,
+                    &a_p, &b_p, m, K_SKIP, &table, &padding, nt, true, None,
                 );
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
                 println!("rep={rep} nt={nt}: {ms:.2} ms");
@@ -5392,7 +5760,7 @@ mod tests {
                 &a, &b, &c, m, K_SKIP, &r, &inv_table, &padding,
             );
             let precomputed =
-                precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+                precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding, None);
             assert_eq!(precomputed.len_bytes(), a.len());
             let got = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
                 &precomputed,
@@ -5713,7 +6081,7 @@ mod tests {
                 let r = build_protocol_r(m, &outer);
                 let inv_table = make_inv_table();
                 let ab_inner = precompute_round1_ab_inner_packed_padded(
-                    &a, &b, m, K_SKIP, &inv_table, &padding,
+                    &a, &b, m, K_SKIP, &inv_table, &padding, None,
                 );
                 let n_lo =
                     SplitEqGhash::with_n_hi(&r[K_SKIP + N_INNER..], fold4_n_hi_from_env()).n_lo;
@@ -5831,7 +6199,7 @@ mod tests {
             let r = build_protocol_r(m, &outer);
             let inv_table = make_inv_table();
             let precomputed =
-                precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding);
+                precompute_round1_ab_inner_packed_padded(&a, &b, m, K_SKIP, &inv_table, &padding, None);
 
             let incumbent = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
                 &precomputed,
@@ -6591,7 +6959,7 @@ mod tests {
             let r = build_protocol_r(M, &outer);
             let inv_table = make_inv_table();
             let ab_inner =
-                precompute_round1_ab_inner_packed_padded(&a, &b, M, K_SKIP, &inv_table, &padding);
+                precompute_round1_ab_inner_packed_padded(&a, &b, M, K_SKIP, &inv_table, &padding, None);
             let incumbent = round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4(
                 &ab_inner, &c, M, K_SKIP, &r, &inv_table, &padding,
             );
@@ -6622,6 +6990,8 @@ mod tests {
                 &r,
                 &inv_table,
                 round1_c_prelude(&c_lincheck, M, K_LOG, padding.useful_bits_per_block, &r),
+                false,
+                false,
             );
             assert_eq!(got_c.0, incumbent.1, "round-one C mismatch in case {case}");
             assert_eq!(got_c.1, incumbent.2, "canonical C mismatch in case {case}");
@@ -6639,6 +7009,8 @@ mod tests {
                 &r,
                 &inv_table,
                 round1_c_prelude(&c_lincheck, M, K_LOG, padding.useful_bits_per_block, &r),
+                false,
+                false,
             );
             assert_eq!(
                 got_c8.0, incumbent.1,
