@@ -6450,9 +6450,11 @@ kernel void blake3_pow_scan(
     /// ranked runner. With F2 graph-arm scoring the mid-basin point k=2 is
     /// informative again — it was invisible when join-max scoring collapsed
     /// AB-dominated samples — so it re-enters between pure-GPU and k=3.
-    /// Four candidates × 2 reverse-order samples is still well inside the
-    /// 10-minute job wall at ~120 workers.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 4] = [0, 2, 3, 5];
+    /// k=4 fills the gap between k=3 and the default: a GPU-heavy host whose
+    /// balanced split sits between the two otherwise rounds to one side.
+    /// Five candidates × 2 reverse-order samples, all in the untimed warmup,
+    /// is still well inside the 10-minute job wall at ~120 workers.
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 5] = [0, 2, 3, 4, 5];
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
@@ -10319,7 +10321,7 @@ kernel void lc_fold_stripes_factored_b4(
 
         #[test]
         fn trimmed_candidate_set_is_stable() {
-            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, C);
+            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, [0, 2, 3, 4, 5]);
         }
 
         #[test]
@@ -10336,13 +10338,14 @@ kernel void lc_fold_stripes_factored_b4(
                 },
             )
             .unwrap();
-            // Forward 0,2,3,5 then reverse 5,3,2,0 — each preceded by reprime.
+            // Forward 0,2,3,4,5 then reverse 5,4,3,2,0 — each preceded by reprime.
             assert_eq!(
                 *events.borrow(),
-                [-1, 0, -1, 2, -1, 3, -1, 5, -1, 5, -1, 3, -1, 2, -1, 0]
+                [-1, 0, -1, 2, -1, 3, -1, 4, -1, 5, -1, 5, -1, 4, -1, 3, -1, 2, -1, 0]
             );
             assert_eq!(samples[0], [0.0, 0.0]);
-            assert_eq!(samples[3], [5.0, 5.0]);
+            assert_eq!(samples[3], [4.0, 4.0]);
+            assert_eq!(samples[4], [5.0, 5.0]);
         }
 
         #[test]
@@ -10461,7 +10464,7 @@ kernel void lc_fold_stripes_factored_b4(
                 state ^= state << 17;
                 grid[(state % grid.len() as u64) as usize]
             };
-            let sets: [&[usize]; 2] = [&C, &[0, 2, 3, 4, 5, 6, 7, 8]];
+            let sets: [&[usize]; 3] = [&C, &RANKED_EXACT_TUNE_CANDIDATES, &[0, 2, 3, 4, 5, 6, 7, 8]];
             for set in sets {
                 for &tie in &[0.005, 0.015, 0.02, 0.05] {
                     for &keep in &[false, true] {
@@ -10476,7 +10479,7 @@ kernel void lc_fold_stripes_factored_b4(
                                 assert_eq!(k, DEFAULT_HYBRID_K, "{ms:?} tie={tie} keep");
                                 continue;
                             }
-                            // set[0] == 0 in both candidate sets.
+                            // set[0] == 0 in every candidate set.
                             let zero_in_band = ms[0] <= limit;
                             let zero_passes = ms[0] <= ms[d] * (1.0 - 0.04);
                             if zero_in_band && zero_passes {
