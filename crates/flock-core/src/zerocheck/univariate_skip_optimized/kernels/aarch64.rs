@@ -147,6 +147,7 @@ pub(crate) unsafe fn accumulate_convert(
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab(
     chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
@@ -154,7 +155,8 @@ pub(crate) unsafe fn accumulate_convert_ab(
 ) {
     use core::arch::aarch64::*;
 
-    debug_assert!(n_b_med <= 16);
+    debug_assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    debug_assert_eq!(first_b_med & 1, 0, "paired AB drain requires an even start");
     debug_assert_eq!(convert.len(), 16 * 256);
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
@@ -163,7 +165,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
     // 16 convert blocks.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        let n_pairs = n_b_med / 2;
+        let n_pairs = (n_b_med - first_b_med) / 2;
         for lane in (0..64).step_by(8) {
             // 8 live accumulator q-registers (8 lanes × 1 bank); the removed
             // C side leaves room for the gather temporaries.
@@ -177,7 +179,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
             let mut ab7 = vdupq_n_u8(0);
 
             for p in 0..n_pairs {
-                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let (b_even, b_odd) = (first_b_med + 2 * p, first_b_med + 2 * p + 1);
                 let t_even = convert_ptr.add(b_even * 256 * 16);
                 let t_odd = convert_ptr.add(b_odd * 256 * 16);
 
@@ -231,7 +233,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
             }
 
             // Odd trailing b_med: unpaired fallback.
-            if n_b_med & 1 == 1 {
+            if (n_b_med - first_b_med) & 1 == 1 {
                 let b_med = n_b_med - 1;
                 let table = convert_ptr.add(b_med * 256 * 16);
                 let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u64).read_unaligned()
@@ -285,13 +287,15 @@ pub(crate) unsafe fn accumulate_convert_ab(
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab_nomul(
     chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
     n_b_med: usize,
     convert: &[F128],
     bank: &mut [F128; 64],
 ) {
     use core::arch::aarch64::*;
 
-    debug_assert!(n_b_med <= 16);
+    debug_assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    debug_assert_eq!(first_b_med & 1, 0, "paired AB drain requires an even start");
     debug_assert_eq!(convert.len(), 16 * 256);
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
@@ -300,7 +304,7 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul(
     // `F128` slot of the fixed-size bank.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
-        let n_pairs = n_b_med / 2;
+        let n_pairs = (n_b_med - first_b_med) / 2;
         for lane in (0..64).step_by(8) {
             let mut ab0 = vdupq_n_u8(0);
             let mut ab1 = vdupq_n_u8(0);
@@ -312,7 +316,7 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul(
             let mut ab7 = vdupq_n_u8(0);
 
             for p in 0..n_pairs {
-                let (b_even, b_odd) = (2 * p, 2 * p + 1);
+                let (b_even, b_odd) = (first_b_med + 2 * p, first_b_med + 2 * p + 1);
                 let t_even = convert_ptr.add(b_even * 256 * 16);
                 let t_odd = convert_ptr.add(b_odd * 256 * 16);
 
@@ -363,7 +367,7 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul(
             }
 
             // Odd trailing b_med: unpaired fallback.
-            if n_b_med & 1 == 1 {
+            if (n_b_med - first_b_med) & 1 == 1 {
                 let b_med = n_b_med - 1;
                 let table = convert_ptr.add(b_med * 256 * 16);
                 let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u64).read_unaligned()
@@ -1076,41 +1080,6 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
                     let i236 = usize::from(((indices23 >> 48) & 0xff) as u8);
                     let i237 = usize::from((indices23 >> 56) as u8);
 
-                    // Combine the two independent pair-table loads first, so
-                    // only eight values remain live across accumulator loads.
-                    let t0 = veorq_u8(
-                        vld1q_u8(table01.add(i010 * 16)),
-                        vld1q_u8(table23.add(i230 * 16)),
-                    );
-                    let t1 = veorq_u8(
-                        vld1q_u8(table01.add(i011 * 16)),
-                        vld1q_u8(table23.add(i231 * 16)),
-                    );
-                    let t2 = veorq_u8(
-                        vld1q_u8(table01.add(i012 * 16)),
-                        vld1q_u8(table23.add(i232 * 16)),
-                    );
-                    let t3 = veorq_u8(
-                        vld1q_u8(table01.add(i013 * 16)),
-                        vld1q_u8(table23.add(i233 * 16)),
-                    );
-                    let t4 = veorq_u8(
-                        vld1q_u8(table01.add(i014 * 16)),
-                        vld1q_u8(table23.add(i234 * 16)),
-                    );
-                    let t5 = veorq_u8(
-                        vld1q_u8(table01.add(i015 * 16)),
-                        vld1q_u8(table23.add(i235 * 16)),
-                    );
-                    let t6 = veorq_u8(
-                        vld1q_u8(table01.add(i016 * 16)),
-                        vld1q_u8(table23.add(i236 * 16)),
-                    );
-                    let t7 = veorq_u8(
-                        vld1q_u8(table01.add(i017 * 16)),
-                        vld1q_u8(table23.add(i237 * 16)),
-                    );
-
                     let p0 = bank.add(lane * 16);
                     let p1 = p0.add(16);
                     let p2 = p1.add(16);
@@ -1119,14 +1088,70 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
                     let p5 = p4.add(16);
                     let p6 = p5.add(16);
                     let p7 = p6.add(16);
-                    vst1q_u8(p0, veorq_u8(vld1q_u8(p0), t0));
-                    vst1q_u8(p1, veorq_u8(vld1q_u8(p1), t1));
-                    vst1q_u8(p2, veorq_u8(vld1q_u8(p2), t2));
-                    vst1q_u8(p3, veorq_u8(vld1q_u8(p3), t3));
-                    vst1q_u8(p4, veorq_u8(vld1q_u8(p4), t4));
-                    vst1q_u8(p5, veorq_u8(vld1q_u8(p5), t5));
-                    vst1q_u8(p6, veorq_u8(vld1q_u8(p6), t6));
-                    vst1q_u8(p7, veorq_u8(vld1q_u8(p7), t7));
+                    vst1q_u8(
+                        p0,
+                        xor3_u8(
+                            vld1q_u8(p0),
+                            vld1q_u8(table01.add(i010 * 16)),
+                            vld1q_u8(table23.add(i230 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p1,
+                        xor3_u8(
+                            vld1q_u8(p1),
+                            vld1q_u8(table01.add(i011 * 16)),
+                            vld1q_u8(table23.add(i231 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p2,
+                        xor3_u8(
+                            vld1q_u8(p2),
+                            vld1q_u8(table01.add(i012 * 16)),
+                            vld1q_u8(table23.add(i232 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p3,
+                        xor3_u8(
+                            vld1q_u8(p3),
+                            vld1q_u8(table01.add(i013 * 16)),
+                            vld1q_u8(table23.add(i233 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p4,
+                        xor3_u8(
+                            vld1q_u8(p4),
+                            vld1q_u8(table01.add(i014 * 16)),
+                            vld1q_u8(table23.add(i234 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p5,
+                        xor3_u8(
+                            vld1q_u8(p5),
+                            vld1q_u8(table01.add(i015 * 16)),
+                            vld1q_u8(table23.add(i235 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p6,
+                        xor3_u8(
+                            vld1q_u8(p6),
+                            vld1q_u8(table01.add(i016 * 16)),
+                            vld1q_u8(table23.add(i236 * 16)),
+                        ),
+                    );
+                    vst1q_u8(
+                        p7,
+                        xor3_u8(
+                            vld1q_u8(p7),
+                            vld1q_u8(table01.add(i017 * 16)),
+                            vld1q_u8(table23.add(i237 * 16)),
+                        ),
+                    );
                 }
             }
         }
@@ -1193,6 +1218,29 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [
         let v1 = vld1q_u8(in_ptr.add(16));
         let v2 = vld1q_u8(in_ptr.add(32));
         let v3 = vld1q_u8(in_ptr.add(48));
+        let [y0, y1, y2, y3] = bit_transpose_64bytes_neon_regs(v0, v1, v2, v3);
+        let out_ptr = output.as_mut_ptr();
+        vst1q_u8(out_ptr, vreinterpretq_u8_u64(y0));
+        vst1q_u8(out_ptr.add(16), vreinterpretq_u8_u64(y1));
+        vst1q_u8(out_ptr.add(32), vreinterpretq_u8_u64(y2));
+        vst1q_u8(out_ptr.add(48), vreinterpretq_u8_u64(y3));
+    }
+}
+
+/// Register form of [`bit_transpose_64bytes_neon`]: `v0..v3` hold input bytes
+/// 0..16, 16..32, 32..48 and 48..64; the result holds output bytes in the same
+/// order. Lets a caller fill the input straight from memory lanes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn bit_transpose_64bytes_neon_regs(
+    v0: core::arch::aarch64::uint8x16_t,
+    v1: core::arch::aarch64::uint8x16_t,
+    v2: core::arch::aarch64::uint8x16_t,
+    v3: core::arch::aarch64::uint8x16_t,
+) -> [core::arch::aarch64::uint64x2_t; 4] {
+    use core::arch::aarch64::*;
+
+    unsafe {
         let table = uint8x16x4_t(v0, v1, v2, v3);
 
         // vqtbl4q indexes that bring bytes belonging to byte-chunk b ∈ 0..8
@@ -1241,11 +1289,7 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [
         y2 = xor3_u64(y2, t2, vshlq_n_u64::<28>(t2));
         y3 = xor3_u64(y3, t3, vshlq_n_u64::<28>(t3));
 
-        let out_ptr = output.as_mut_ptr();
-        vst1q_u8(out_ptr, vreinterpretq_u8_u64(y0));
-        vst1q_u8(out_ptr.add(16), vreinterpretq_u8_u64(y1));
-        vst1q_u8(out_ptr.add(32), vreinterpretq_u8_u64(y2));
-        vst1q_u8(out_ptr.add(48), vreinterpretq_u8_u64(y3));
+        [y0, y1, y2, y3]
     }
 }
 
@@ -1349,7 +1393,25 @@ pub(crate) fn shift_reduce_inner_ab_neon(
 #[inline(always)]
 fn byte_from_word<const BYTE: u32>(word: u64) -> usize {
     debug_assert!(BYTE < 8);
-    ((word >> (BYTE * 8)) & 0xff) as usize
+    if BYTE == 0 || BYTE == 7 {
+        return ((word >> (BYTE * 8)) & 0xff) as usize;
+    }
+    // Bytes 1..6 index 64-byte table rows. From the plain expression LLVM
+    // folds the `* 64` into the mask, `(word >> (8*BYTE - 6)) & 0x3fc0`,
+    // which loses the shifted-register add and costs a third integer op per
+    // lookup. An opaque `ubfx` keeps the row address at `ubfx` + `add lsl #6`.
+    let index: usize;
+    // SAFETY: register-only bit-field extract; reads and writes no memory.
+    unsafe {
+        core::arch::asm!(
+            "ubfx {index}, {word}, #{shift}, #8",
+            shift = const BYTE * 8,
+            word = in(reg) word,
+            index = lateout(reg) index,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    index
 }
 
 #[cfg(target_arch = "aarch64")]
