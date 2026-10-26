@@ -88,6 +88,7 @@ pub(super) fn accumulate_convert(
 )))]
 pub(super) fn accumulate_convert_ab(
     chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
@@ -95,7 +96,7 @@ pub(super) fn accumulate_convert_ab(
 ) {
     for lane in 0..64 {
         let mut converted_ab = F128::ZERO;
-        for b_med in 0..n_b_med {
+        for b_med in first_b_med..n_b_med {
             converted_ab += convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
         }
         partial_ab[lane] += converted_ab * eq_lo_val;
@@ -116,13 +117,14 @@ pub(super) fn accumulate_convert_ab(
 )))]
 pub(super) fn accumulate_convert_ab_nomul(
     chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
     n_b_med: usize,
     convert: &[F128],
     bank: &mut [F128; 64],
 ) {
     for lane in 0..64 {
         let mut converted_ab = F128::ZERO;
-        for b_med in 0..n_b_med {
+        for b_med in first_b_med..n_b_med {
             converted_ab += convert[b_med * 256 + chunk_ab_bytes[b_med][lane] as usize];
         }
         bank[lane] += converted_ab;
