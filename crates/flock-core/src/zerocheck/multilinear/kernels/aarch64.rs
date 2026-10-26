@@ -1661,6 +1661,20 @@ unsafe fn lookup_lanes_q<const L: usize>(
                     .cast::<u64>(),
             )
         };
+        if L == 8 && lane0 == 0 {
+            // Every full-width caller passes a literal 0, so after inlining
+            // this is the only path: the same eight loads in the same XOR
+            // tree, bytes 1..7 through the two-instruction scaled lookup.
+            macro_rules! bank {
+                ($lane:literal) => {
+                    bank_load_q::<{ 8 * $lane }>(table_data.add($lane * STRIDE), code)
+                };
+            }
+            let acc = xor3_u64(load(0), bank!(1), bank!(2));
+            let acc = xor3_u64(acc, bank!(3), bank!(4));
+            let acc = xor3_u64(acc, bank!(5), bank!(6));
+            return veorq_u64(acc, bank!(7));
+        }
         let mut acc = load(0);
         let mut j = 1;
         while j + 1 < L {
