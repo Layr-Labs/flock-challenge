@@ -1234,6 +1234,37 @@ fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
     n_chunks.div_ceil(640).max(1)
 }
 
+/// Job boundaries for the AB queue: `chunks_per_job`-sized slabs while plenty
+/// of work remains, then guided self-scheduling — each job takes
+/// `remaining / (3 · workers)` chunks (at least [`AB_PRE_MIN_JOB_CHUNKS`]) —
+/// so the queue drains in ever smaller slabs and no worker, in particular a
+/// slower efficiency core, is left holding a full-size slab after the others
+/// run dry. Boundaries depend only on `(n_chunks, chunks_per_job, workers)`;
+/// every chunk still writes only its own disjoint output, so the bytes are
+/// those of the fixed-size queue. `FLOCK_NO_AB_GUIDED=1` restores fixed slabs.
+fn ab_pre_job_bounds(n_chunks: usize, chunks_per_job: usize, workers: usize) -> Vec<usize> {
+    let guided = std::env::var_os("FLOCK_NO_AB_GUIDED").as_deref() != Some(std::ffi::OsStr::new("1"));
+    let divisor = 3 * workers.max(1);
+    let mut bounds = Vec::with_capacity(n_chunks.div_ceil(chunks_per_job) + 4 * divisor + 2);
+    let mut start = 0usize;
+    bounds.push(0);
+    while start < n_chunks {
+        let remaining = n_chunks - start;
+        let size = if guided {
+            (remaining / divisor).clamp(AB_PRE_MIN_JOB_CHUNKS, chunks_per_job)
+        } else {
+            chunks_per_job
+        };
+        start += size.min(remaining);
+        bounds.push(start);
+    }
+    bounds
+}
+
+/// Smallest guided AB slab: 32 chunks, about 0.45k output rows (~20 µs on a
+/// performance core), well above the queue's per-claim cost.
+const AB_PRE_MIN_JOB_CHUNKS: usize = 32;
+
 /// Ranked-shape selector for resolving the process-wide Horner policy once
 /// before the AB queue starts. Every other shape retains the incumbent
 /// per-row policy lookup so this codegen specialization cannot perturb
@@ -1322,14 +1353,20 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // generation and maximizes spatial locality; queue-level heterogeneity still
     // distributes independent slabs dynamically.
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
-    let n_jobs = n_chunks.div_ceil(chunks_per_job);
+    let bounds = ab_pre_job_bounds(
+        n_chunks,
+        chunks_per_job,
+        rayon::current_num_threads()
+            + crate::epool::helper_pool().map_or(0, rayon::ThreadPool::current_num_threads),
+    );
+    let n_jobs = bounds.len() - 1;
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     crate::epool::run_hetero_chunks_stateful(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
-            let chunk_start = job * chunks_per_job;
-            let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
+            let chunk_start = bounds[job];
+            let chunk_end = bounds[job + 1];
             let slab_len = chunk_end - chunk_start;
             for offset in 0..slab_len {
                 let x_outer = chunk_start + offset;

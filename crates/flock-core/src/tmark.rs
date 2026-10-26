@@ -62,3 +62,7 @@ pub fn dump() {
         eprintln!("[tmark] {} {}", NS[i].load(Ordering::Relaxed), l.get(i).copied().unwrap_or(""));
     }
 }
+
+/// Archive marker so a re-run of the same tree is not deduplicated. Unused.
+#[allow(dead_code)]
+const GAUNTLET_REDRAW_1: u32 = 1;

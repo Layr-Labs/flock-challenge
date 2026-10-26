@@ -1661,6 +1661,17 @@ unsafe fn lookup_lanes_q<const L: usize>(
                     .cast::<u64>(),
             )
         };
+        if L == 8 && lane0 == 0 {
+            // Full width: bytes 1..=7 as `ubfx` + scaled-index `ldr` (two
+            // integer-side instructions instead of `lsr` + `and #0xff0` +
+            // `ldr`). Same addresses, same XOR tree, same result.
+            let bank = |k: usize| table_data.add(k * STRIDE);
+            let mut acc = load(0);
+            acc = xor3_u64(acc, bank_load_q::<8>(bank(1), code), bank_load_q::<16>(bank(2), code));
+            acc = xor3_u64(acc, bank_load_q::<24>(bank(3), code), bank_load_q::<32>(bank(4), code));
+            acc = xor3_u64(acc, bank_load_q::<40>(bank(5), code), bank_load_q::<48>(bank(6), code));
+            return veorq_u64(acc, bank_load_q::<56>(bank(7), code));
+        }
         let mut acc = load(0);
         let mut j = 1;
         while j + 1 < L {
