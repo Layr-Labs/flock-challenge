@@ -1,10 +1,3 @@
-//! Parallel additive NTT over F_{2^128} (GHASH form).
-//!
-//! Mirrors [`super::parallel_f32`] / [`super::parallel_f64`]: position-major
-//! SoA layout, SIMD across NTT instances via [`ghash_mul_vec2_neon`], shared
-//! twiddle table for all parallel NTTs. SIMD width is 2 (one F128 pair per
-//! `ghash_mul_vec2_neon`), so `num_ntts` must be a multiple of 2.
-
 use crate::field::F128;
 
 #[inline]
@@ -50,7 +43,7 @@ pub fn compute_twiddles(k: usize, beta: F128) -> Vec<F128> {
 }
 
 #[inline]
-#[allow(dead_code)] // active in tests and non-aarch64 builds
+#[allow(dead_code)]
 fn butterfly_scalar(data: &mut [F128], lambda: F128, num_ntts: usize) {
     let rows = data.len() / num_ntts;
     let half = rows >> 1;
@@ -73,7 +66,7 @@ fn butterfly_row_pair_neon(top_row: &mut [F128], bot_row: &mut [F128], lambda: F
 
     debug_assert_eq!(top_row.len(), bot_row.len());
     let num_ntts = top_row.len();
-    // SAFETY: aes/neon are statically enabled at compile time.
+
     unsafe {
         let mut lane = 0usize;
         while lane < num_ntts {

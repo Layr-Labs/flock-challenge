@@ -1,8 +1,3 @@
-//! Top-level R1CS verifier: walks the challenger in lockstep with the
-//! prover, runs `zerocheck::verify` and `lincheck::verify`, derives the two
-//! ZClaims, and verifies the PCS openings at those points against the
-//! witness commitment.
-
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck;
@@ -19,28 +14,12 @@ pub enum VerifyError {
     PcsC(pcs::VerifyError),
 }
 
-/// Dedicated single-thread rayon pool that the verifier runs inside.
-///
-/// The verifier is intentionally single-threaded — matching the convention of
-/// comparable provers (binius64, plonky3, hashcaster all ship serial
-/// verifiers) and keeping reported verify times honest single-core numbers.
-/// The verify path shares several `par_*` helpers with the (multi-threaded)
-/// prover — e.g. `lincheck::fold_alpha_batched`, `sumcheck_bind_top_in_place_par`,
-/// and the Ligerito residual eval — so rather than fork every shared helper, the
-/// reusable verify cores (`verify_core`, `verify_claims_ligerito`)
-/// run their body via `verifier_pool().install(..)`. Any `par_iter` reached from
-/// there uses this 1-thread pool and collapses onto a single worker, without
-/// touching the prover's use of the global pool.
 fn verifier_pool() -> &'static rayon::ThreadPool {
     use std::sync::OnceLock;
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(1)
-            // The whole verify body runs on this worker — including the deep
-            // recursive Ligerito verifier — so give it an ample stack. A rayon
-            // worker otherwise defaults to ~2 MiB (vs the 8 MiB main thread),
-            // which the recursion overflows.
             .stack_size(64 * 1024 * 1024)
             .thread_name(|_| "flock-verify".to_string())
             .build()
@@ -48,8 +27,6 @@ fn verifier_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// Verify an R1CS proof: replay zerocheck + lincheck → the two base z-claims,
-/// then verify the batched Ligerito PCS opening covering both.
 pub fn verify_ligerito<Ch: Challenger>(
     r1cs: &BlockR1cs,
     commitment: &Commitment,
@@ -77,10 +54,6 @@ pub fn verify_ligerito<Ch: Challenger>(
     Ok(R1csClaim { ab, c })
 }
 
-/// Verify a batched PCS opening over an arbitrary list of `ẑ`-claims — the
-/// mirror of `flock_prover::prover::open_claims_with_precomputed_ligerito`.
-/// Relation wrappers (e.g. the hash chain) reuse this with their own appended
-/// claims. Must run at the same transcript position as the prover's open.
 pub fn verify_claims_ligerito<Ch: Challenger>(
     commitment: &Commitment,
     claims: &[ZClaim],
@@ -88,7 +61,6 @@ pub fn verify_claims_ligerito<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<(), pcs::VerifyError> {
-    // Verification is single-threaded; run the body on the dedicated 1-thread pool.
     verifier_pool().install(move || {
         verify_claims_ligerito_inner(commitment, claims, pcs_open, pcs_params, challenger)
     })
@@ -127,10 +99,6 @@ fn verify_claims_ligerito_inner<Ch: Challenger>(
     )
 }
 
-/// Replay bind → zerocheck → lincheck and reconstruct the two base z-claims
-/// (`ab`, `c`), stopping before the PCS open. Mirror of
-/// `flock_prover::prover::prove_fast_core`; relation wrappers reuse this then call
-/// [`verify_claims_ligerito`] over `[ab, c, …]`.
 pub fn verify_core<Ch: Challenger>(
     r1cs: &BlockR1cs,
     zerocheck_proof: &zerocheck::ZerocheckProof,
@@ -139,7 +107,6 @@ pub fn verify_core<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> Result<(ZClaim, ZClaim), VerifyError> {
-    // Verification is single-threaded; run the body on the dedicated 1-thread pool.
     verifier_pool().install(move || {
         verify_core_inner(
             r1cs,
@@ -170,7 +137,6 @@ fn verify_core_inner<Ch: Challenger>(
         }
     };
 
-    // ---- Bind FS transcript to the statement (mirrors prover::prove).
     let t = std::time::Instant::now();
     crate::proof::bind_statement(challenger, r1cs, commitment);
     if trace {
@@ -180,7 +146,6 @@ fn verify_core_inner<Ch: Challenger>(
         );
     }
 
-    // ---- Zerocheck.
     let t = std::time::Instant::now();
     let zc_claim =
         zerocheck::verify(r1cs.m, zerocheck_proof, challenger).map_err(VerifyError::Zerocheck)?;
@@ -191,11 +156,8 @@ fn verify_core_inner<Ch: Challenger>(
         );
     }
 
-    // ---- Build lincheck's shared quirky point from the zerocheck output
-    // (layout-aware: the mlv challenges are address-ordered).
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
-    // ---- Lincheck. v_a, v_b come from the zerocheck's final â, b̂ evals.
     let t = std::time::Instant::now();
     let lc_claim = lincheck::verify(
         r1cs.m,
@@ -216,13 +178,11 @@ fn verify_core_inner<Ch: Challenger>(
         );
     }
 
-    // ---- Build the two z-claims (must match what `prove` returned).
-    // Layout-aware: the ZClaim points are address-ordered for the PCS.
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
         value: lc_claim.w,
     };
-    // c-claim is already a z-claim since `C = I` ⇒ ĉ = ẑ.
+
     let c = ZClaim {
         point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
@@ -233,14 +193,7 @@ fn verify_core_inner<Ch: Challenger>(
 
 #[cfg(test)]
 mod tests {
-    /// The verifier is intentionally single-threaded: every `par_*` reached
-    /// from a verify core must collapse onto the one-thread `verifier_pool`.
-    /// Guard the invariant so a future `ThreadPoolBuilder` tweak can't silently
-    /// re-parallelize verification.
-    ///
-    /// (The end-to-end prove → verify roundtrip and tamper-rejection tests live
-    /// in `flock-prover`'s `tests/verifier_roundtrip.rs`, since they need the
-    /// prove path.)
+
     #[test]
     fn verifier_pool_is_single_threaded() {
         let n = super::verifier_pool().install(rayon::current_num_threads);

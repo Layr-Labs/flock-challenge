@@ -1,62 +1,10 @@
-//! **SHA-256** compression-function R1CS-over-GF(2), **I/O-aligned layout for
-//! the hash chain** (forked from [`super::sha2`]). Identical R1CS semantics;
-//! only the input chaining value `H_in` and the output chaining value `H_out`
-//! move to aligned 256-bit slots (slots 0 and 1), so the chain shift argument
-//! folds them via a single tensor opening. `H_in` and `H_out` are exactly 256
-//! bits each, so the slots have NO interior padding. `K_LOG = 15` is unchanged.
-//!
-//! ## Slot layout (single instance, chain-aligned)
-//!
-//! ```text
-//! z[0..256]         H_in        — 8 words × 32 bits  (slot 0, byte 0)
-//! z[256..512]       H_out       — 8 words × 32 bits  (slot 1, byte 32)
-//! z[512]            Z_CONST (= 1)
-//! z[513..1025]      M_in        — 16 words × 32 bits
-//! z[1025..3073]     ch_and      — 64 rounds × 32 bits (AND outputs)
-//! z[3073..5121]     maj_and     — 64 rounds × 32 bits (AND outputs)
-//! z[5121..19009]    round carry-aux — 64 rounds × 7 adds × 31 carries
-//! z[19009..20545]   W[t]        — 48 schedule final sums (sched_2)
-//! z[20545..25009]   sched carries — 48 × 3 × 31
-//! z[25009..27057]   T1[r]       — 64 round final T1 sums
-//! z[27057..29105]   E_NEW[r]    — 64 round new-e sums
-//! z[29105..31153]   A_NEW[r]    — 64 round new-a sums
-//! z[31153..31401]   output carries — 8 × 31
-//! z[31401..32768]   padding (forced to 0)
-//! ```
-//!
-//! All bit placement goes through the `*_bit` accessors below — flipping the
-//! base offsets is the only change required for the R1CS construction.
-//!
-//! ## Inlined adders
-//!
-//! Per 32-bit add, only the 31 `carry_aux` slots are allocated; the 32 sum
-//! bits are symbolic XOR expressions inlined into the next consumer's row.
-//! This keeps the witness compact (~31,401 useful rows).
-//!
-//! ## Sum slots that *are* materialized
-//!
-//! - `W[t]` for `t ∈ 16..64` — referenced once each by `T1_3`, but the
-//!   schedule chain is 3 deep and `W[t]` itself depends on prior `W`'s
-//!   (cascades for `t ≥ 32`). Slotting breaks the cascade.
-//! - `T1[r]` — referenced twice (E_NEW and A_NEW), so slotting saves
-//!   duplicate inlining.
-//! - `E_NEW[r]`, `A_NEW[r]` — feed downstream rounds (4 uses each via
-//!   register shift); without slots the state would cascade end-to-end and
-//!   each Ch / Maj AND row would blow up to thousands of terms.
-//! - `H_out[w]` — the public output of the compression.
-
 use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit};
 use flock_core::field::F128;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 
-// ───────────────────────────────────────────────────────────────────────────
-// Compile-time slot layout
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Inner-dimension log: `K = 2^15 = 32,768` rows per block.
 pub const K_LOG: usize = 15;
 pub const K: usize = 1 << K_LOG;
-/// Univariate-skip width.
+
 pub const K_SKIP: usize = 6;
 
 pub const N_ROUNDS: usize = 64;
@@ -67,13 +15,12 @@ pub const M_WORDS: usize = 16;
 pub const N_OUT_WORDS: usize = 8;
 pub const ADDS_PER_ROUND: usize = 7;
 pub const ADDS_PER_SCHED: usize = 3;
-pub const CARRIES_PER_ADD: usize = WORD_BITS - 1; // 31
+pub const CARRIES_PER_ADD: usize = WORD_BITS - 1;
 
-/// SHA-256 IV (FIPS 180-4 §5.3.3).
 pub const SHA256_IV: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
-/// SHA-256 round constants (FIPS 180-4 §4.2.2).
+
 pub const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -85,39 +32,23 @@ pub const SHA256_K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-// **I/O-aligned layout** for the hash chain (forked from `sha2`): the input
-// chaining value `H_in` lives in aligned slot 0 and the output chaining value
-// `H_out` in aligned slot 1 — each a clean 256-bit (`2^8`) window, so the
-// chain shift argument folds them via a single tensor opening. H_in/H_out are
-// *exactly* 256 bits, so the slots have NO interior padding. Everything else
-// (const, M, intermediates, output carries) packs after the two slots. The
-// re-layout is purely a change of these base offsets — all bit placement goes
-// through the `*_bit` accessors below.
-pub const SLOT_BITS: usize = 256; // 2^8, one 256-bit chaining value
-pub const H_BASE: usize = 0; // input region, slot 0: [0, 256)
-pub const H_OUT_BASE: usize = SLOT_BITS; // output region, slot 1: [256, 512)
-// Note: M (the 512-bit message block) lives at bits 512..1024 — directly
-// after H_OUT, with no Z_CONST gap in the middle. This gives a clean 4-slot
-// region of 1024 bits at the start of each block (slot 0 = H, slot 1 = H_OUT,
-// slot 2 = M_lo, slot 3 = M_hi), so the Merkle-path protocol's
-// `MerkleLayout` can address `(H_in, H_out, M_left, M_right)` by single-bit
-// slot selectors. The Z_CONST constant-1 bit moved to the end of useful_bits
-// (after the OUT_CARRY block), where it sits in a 1-bit gap that doesn't
-// disturb the slot alignment.
-pub const M_BASE: usize = 2 * SLOT_BITS; // 512
-pub const CH_AND_BASE: usize = M_BASE + M_WORDS * WORD_BITS; // 1,024
-pub const MAJ_AND_BASE: usize = CH_AND_BASE + N_ROUNDS * WORD_BITS; // 3,072
-pub const ROUND_CARRY_BASE: usize = MAJ_AND_BASE + N_ROUNDS * WORD_BITS; // 5,120
-pub const W_BASE: usize = ROUND_CARRY_BASE + N_ROUNDS * ADDS_PER_ROUND * CARRIES_PER_ADD; // 19,008
-pub const SCHED_CARRY_BASE: usize = W_BASE + N_SCHED * WORD_BITS; // 20,544
-pub const T1_BASE: usize = SCHED_CARRY_BASE + N_SCHED * ADDS_PER_SCHED * CARRIES_PER_ADD; // 25,008
-pub const E_NEW_BASE: usize = T1_BASE + N_ROUNDS * WORD_BITS; // 27,056
-pub const A_NEW_BASE: usize = E_NEW_BASE + N_ROUNDS * WORD_BITS; // 29,104
-pub const OUT_CARRY_BASE: usize = A_NEW_BASE + N_ROUNDS * WORD_BITS; // 31,152
-pub const Z_CONST_POS: usize = OUT_CARRY_BASE + N_OUT_WORDS * CARRIES_PER_ADD; // 31,400
-pub const USEFUL_BITS: usize = Z_CONST_POS + 1; // 31,401
+pub const SLOT_BITS: usize = 256;
+pub const H_BASE: usize = 0;
+pub const H_OUT_BASE: usize = SLOT_BITS;
 
-// Slot accessors.
+pub const M_BASE: usize = 2 * SLOT_BITS;
+pub const CH_AND_BASE: usize = M_BASE + M_WORDS * WORD_BITS;
+pub const MAJ_AND_BASE: usize = CH_AND_BASE + N_ROUNDS * WORD_BITS;
+pub const ROUND_CARRY_BASE: usize = MAJ_AND_BASE + N_ROUNDS * WORD_BITS;
+pub const W_BASE: usize = ROUND_CARRY_BASE + N_ROUNDS * ADDS_PER_ROUND * CARRIES_PER_ADD;
+pub const SCHED_CARRY_BASE: usize = W_BASE + N_SCHED * WORD_BITS;
+pub const T1_BASE: usize = SCHED_CARRY_BASE + N_SCHED * ADDS_PER_SCHED * CARRIES_PER_ADD;
+pub const E_NEW_BASE: usize = T1_BASE + N_ROUNDS * WORD_BITS;
+pub const A_NEW_BASE: usize = E_NEW_BASE + N_ROUNDS * WORD_BITS;
+pub const OUT_CARRY_BASE: usize = A_NEW_BASE + N_ROUNDS * WORD_BITS;
+pub const Z_CONST_POS: usize = OUT_CARRY_BASE + N_OUT_WORDS * CARRIES_PER_ADD;
+pub const USEFUL_BITS: usize = Z_CONST_POS + 1;
+
 #[inline]
 pub fn h_bit(w: usize, b: usize) -> usize {
     H_BASE + WORD_BITS * w + b
@@ -173,13 +104,8 @@ pub fn h_out_bit(w: usize, b: usize) -> usize {
     H_OUT_BASE + w * WORD_BITS + b
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Symbolic XOR-support builder
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Sorted-deduplicated XOR support — a row of `A` or `B` is one such Vec.
 type Sup = Vec<usize>;
-/// 32 per-bit supports = one 32-bit "word" in the symbolic computation.
+
 type Word = Vec<Sup>;
 
 fn zero_word() -> Word {
@@ -190,7 +116,6 @@ fn wire_word<F: Fn(usize) -> usize>(slot: F) -> Word {
     (0..WORD_BITS).map(|b| vec![slot(b)]).collect()
 }
 
-/// Symmetric difference of two sorted Vecs.
 fn xor_sup(a: &Sup, b: &Sup) -> Sup {
     let mut out = Vec::with_capacity(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
@@ -268,9 +193,6 @@ fn big_sigma_1(w: &Word) -> Word {
     rot_xor3(w, 6, 11, 25)
 }
 
-/// 32-bit modular add `x + y`. Allocates 31 carry-aux AND rows via
-/// `carry_slot(i)`; the carry chain is `cin[i+1] = cin[i] ⊕ carry_aux[i]`.
-/// Returns the symbolic 32-bit sum (per-bit XOR support).
 fn add32_inline<F: Fn(usize) -> usize>(
     x: &Word,
     y: &Word,
@@ -292,8 +214,6 @@ fn add32_inline<F: Fn(usize) -> usize>(
     sum
 }
 
-/// Materialize a symbolic word at fresh slots: emit 32 rows
-/// `(linear support) · z[Z_CONST] = z[slot]`, return a slot-word.
 fn materialize<F: Fn(usize) -> usize>(
     raw: &Word,
     slot_fn: F,
@@ -322,22 +242,13 @@ fn add32_alloc<F1: Fn(usize) -> usize, F2: Fn(usize) -> usize>(
     materialize(&raw, sum_slot, a_rows, b_rows)
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Public matrix builder
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Build `(A_0, B_0)` for one block of the hybrid SHA-256 R1CS. `C_0 = I`
-/// (circuit shape); use [`build_block_r1cs`] to wrap these into a
-/// [`BlockR1cs`].
 pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     let mut a_rows: Vec<Sup> = vec![Sup::new(); K];
     let mut b_rows: Vec<Sup> = vec![Sup::new(); K];
 
-    // Z_CONST tautology: z[0]·z[0] = z[0] (boolean-pin).
     a_rows[Z_CONST_POS] = vec![Z_CONST_POS];
     b_rows[Z_CONST_POS] = vec![Z_CONST_POS];
 
-    // H_in, M_in: free-witness rows.
     for w in 0..H_WORDS {
         for b in 0..WORD_BITS {
             let s = h_bit(w, b);
@@ -356,7 +267,6 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     let h_in: Vec<Word> = (0..H_WORDS).map(|w| wire_word(|b| h_bit(w, b))).collect();
     let mut w_arr: Vec<Word> = (0..M_WORDS).map(|i| wire_word(|b| m_bit(i, b))).collect();
 
-    // Message schedule (W[16..64]). Inline sched_0, sched_1; allocate W[t] = sched_2.
     for t in 16..(16 + N_SCHED) {
         let s1 = sigma_1(&w_arr[t - 2]);
         let s0 = sigma_0(&w_arr[t - 15]);
@@ -387,7 +297,6 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         w_arr.push(w_t);
     }
 
-    // Working state (a, b, c, d, e, f, g, h).
     let mut state: [Word; 8] = [
         h_in[0].clone(),
         h_in[1].clone(),
@@ -409,7 +318,6 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
         let g = state[6].clone();
         let h_var = state[7].clone();
 
-        // ch_and[r][bit] = e[bit] · (f[bit] ⊕ g[bit])
         let mut ch_and = zero_word();
         for bit in 0..WORD_BITS {
             let s = ch_and_bit(r, bit);
@@ -417,7 +325,7 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
             b_rows[s] = xor_sup(&f[bit], &g[bit]);
             ch_and[bit] = vec![s];
         }
-        // maj_and[r][bit] = (a[bit] ⊕ b[bit]) · (a[bit] ⊕ c[bit])
+
         let mut maj_and = zero_word();
         for bit in 0..WORD_BITS {
             let s = maj_and_bit(r, bit);
@@ -425,10 +333,9 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
             b_rows[s] = xor_sup(&a[bit], &c[bit]);
             maj_and[bit] = vec![s];
         }
-        let ch_out = xor_words(&ch_and, &g); // Ch = e·(f⊕g) ⊕ g
-        let maj_out = xor_words(&maj_and, &a); // Maj = (a⊕b)·(a⊕c) ⊕ a
+        let ch_out = xor_words(&ch_and, &g);
+        let maj_out = xor_words(&maj_and, &a);
 
-        // T1 chain: inline T1_0..T1_2, allocate T1.
         let t1_0 = add32_inline(
             &h_var,
             &big_sigma_1(&e),
@@ -467,7 +374,7 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
             &mut a_rows,
             &mut b_rows,
         );
-        // T2 inlined; E_NEW, A_NEW allocated.
+
         let t2 = add32_inline(
             &big_sigma_0(&a),
             &maj_out,
@@ -492,11 +399,9 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
             &mut b_rows,
         );
 
-        // Register shift: (a', b', c', d', e', f', g', h') = (A_NEW, a, b, c, E_NEW, e, f, g)
         state = [a_new, a, bb, c, e_new, e, f, g];
     }
 
-    // Output feed-forward: H_out[w] = state[w] + H_in[w].
     for w in 0..N_OUT_WORDS {
         let _ = add32_alloc(
             &state[w],
@@ -516,17 +421,12 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     (to_mat(a_rows), to_mat(b_rows))
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Witness generator
-// ───────────────────────────────────────────────────────────────────────────
-
 fn write_word(z: &mut [bool], base: usize, v: u32) {
     for b in 0..WORD_BITS {
         z[base + b] = (v >> b) & 1 == 1;
     }
 }
 
-/// 32-bit add with carry-aux output. `cin[i+1] = cin[i] ⊕ carry_aux[i]`.
 fn add32_w(x: u32, y: u32, carry_base: usize, z: &mut [bool]) -> u32 {
     let mut cin: bool = false;
     for i in 0..CARRIES_PER_ADD {
@@ -539,9 +439,6 @@ fn add32_w(x: u32, y: u32, carry_base: usize, z: &mut [bool]) -> u32 {
     x.wrapping_add(y)
 }
 
-/// Build the per-block boolean witness for one SHA-256 compression
-/// `f(h_in, m) → H_out`. Length = `K = 2^15`. Slot positions [USEFUL_BITS, K)
-/// are zero-padded.
 pub fn build_block_witness(h_in: &[u32; 8], m: &[u32; 16]) -> Vec<bool> {
     let mut z = vec![false; K];
     z[Z_CONST_POS] = true;
@@ -553,7 +450,6 @@ pub fn build_block_witness(h_in: &[u32; 8], m: &[u32; 16]) -> Vec<bool> {
         write_word(&mut z, m_bit(i, 0), m[i]);
     }
 
-    // Schedule W[16..64].
     let mut w_arr = [0u32; 64];
     w_arr[..16].copy_from_slice(m);
     for t in 16..64 {
@@ -568,7 +464,6 @@ pub fn build_block_witness(h_in: &[u32; 8], m: &[u32; 16]) -> Vec<bool> {
         w_arr[t] = w_t;
     }
 
-    // Rounds.
     let mut state = *h_in;
     for r in 0..N_ROUNDS {
         let (a, b, c, d, e, f, g, h_var) = (
@@ -599,7 +494,6 @@ pub fn build_block_witness(h_in: &[u32; 8], m: &[u32; 16]) -> Vec<bool> {
         state = [a_new, a, b, c, e_new, e, f, g];
     }
 
-    // Output feed-forward.
     for w in 0..N_OUT_WORDS {
         let h_out = add32_w(state[w], h_in[w], out_carry_bit(w, 0), &mut z);
         write_word(&mut z, h_out_bit(w, 0), h_out);
@@ -607,20 +501,12 @@ pub fn build_block_witness(h_in: &[u32; 8], m: &[u32; 16]) -> Vec<bool> {
     z
 }
 
-/// Read the 8-word post-compression hash out of a single block of witness.
 pub fn read_h_out(z: &[bool]) -> [u32; 8] {
     std::array::from_fn(|w| {
         (0..WORD_BITS).fold(0u32, |acc, b| acc | ((z[h_out_bit(w, b)] as u32) << b))
     })
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// BlockR1cs constructor
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Build a [`BlockR1cs`] for `2^n_blocks_log` SHA-256 compressions batched
-/// block-diagonally (one compression per block). `n_blocks_log ≥ 3` is the
-/// lincheck floor.
 pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
     let (a_0, b_0) = build_matrices();
     super::common::build_block_r1cs_with_matrices(
@@ -630,17 +516,9 @@ pub fn build_block_r1cs(n_blocks_log: usize) -> BlockR1cs {
         USEFUL_BITS,
         a_0,
         b_0,
-        // Constant-wire pin (docs/const-wire-pin.md): forces z[Z_CONST_POS] = 1
-        // in every block. Requires padding blocks filled with valid compressions.
         Some(Z_CONST_POS),
     )
 }
-
-// ───────────────────────────────────────────────────────────────────────────
-// Lincheck circuit walker — mirrors `build_matrices`. Same structure as
-// `sha2::Sha2LincheckCircuit` but uses this module's I/O-aligned slot
-// positions.
-// ───────────────────────────────────────────────────────────────────────────
 
 fn scatter_add32_inline<F: Fn(usize) -> usize>(
     x: &Word,
@@ -717,14 +595,13 @@ impl flock_core::lincheck::LincheckCircuit for Sha2LincheckCircuit {
         let mut comb = vec![F128::ZERO; K];
 
         let e0 = eq_inner[Z_CONST_POS];
-        comb[Z_CONST_POS] += alpha * e0;
-        comb[Z_CONST_POS] += e0;
+        comb[Z_CONST_POS] = alpha.fma(e0, comb[Z_CONST_POS] + e0);
 
         for w in 0..H_WORDS {
             for b in 0..WORD_BITS {
                 let s = h_bit(w, b);
                 let e = eq_inner[s];
-                comb[s] += alpha * e;
+                comb[s] = alpha.fma(e, comb[s]);
                 comb[Z_CONST_POS] += e;
             }
         }
@@ -732,7 +609,7 @@ impl flock_core::lincheck::LincheckCircuit for Sha2LincheckCircuit {
             for b in 0..WORD_BITS {
                 let s = m_bit(i, b);
                 let e = eq_inner[s];
-                comb[s] += alpha * e;
+                comb[s] = alpha.fma(e, comb[s]);
                 comb[Z_CONST_POS] += e;
             }
         }
@@ -911,45 +788,77 @@ impl flock_core::lincheck::LincheckCircuit for Sha2LincheckCircuit {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Fast-path: fused (z, a, b, z_lincheck) packed witness builder.
-//
-// Each adder writes its carry-aux rows always; the sum row is written only
-// for *slotted* adders (W[t], T1, E_NEW, A_NEW, H_out).
-//
-// Witness-value insight: at a carry-aux slot, `a` and `b` are the *scalar
-// evaluations* of the row's linear A/B supports — `(x[i] ⊕ cin[i])` is the
-// same bit value regardless of how many slots the A-row carries.
-// ───────────────────────────────────────────────────────────────────────────
-
-// ───────────────────────────────────────────────────────────────────────────
-// SHA-256 reference helpers (used by witness gen).
-// ───────────────────────────────────────────────────────────────────────────
-
 #[inline]
 pub(crate) fn big_sigma0(x: u32) -> u32 {
-    x.rotate_right(2) ^ x.rotate_right(13) ^ x.rotate_right(22)
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        flock_core::gf2_kernels::gf2_kern_sha256_big_sigma0(x as u64) as u32
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        x.rotate_right(2) ^ x.rotate_right(13) ^ x.rotate_right(22)
+    }
 }
 #[inline]
 pub(crate) fn big_sigma1(x: u32) -> u32 {
-    x.rotate_right(6) ^ x.rotate_right(11) ^ x.rotate_right(25)
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        flock_core::gf2_kernels::gf2_kern_sha256_big_sigma1(x as u64) as u32
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        x.rotate_right(6) ^ x.rotate_right(11) ^ x.rotate_right(25)
+    }
 }
 #[inline]
 pub(crate) fn small_sigma0(x: u32) -> u32 {
-    x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3)
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        flock_core::gf2_kernels::gf2_kern_sha256_small_sigma0(x as u64) as u32
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3)
+    }
 }
 #[inline]
 pub(crate) fn small_sigma1(x: u32) -> u32 {
-    x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10)
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        flock_core::gf2_kernels::gf2_kern_sha256_small_sigma1(x as u64) as u32
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10)
+    }
+}
+#[inline(always)]
+fn sha256_ch_and_out(e: u32, f: u32, g: u32) -> (u32, u32) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        let p = flock_core::gf2_kernels::gf2_kern_sha256_ch_and_out(e as u64, f as u64, g as u64);
+        (p as u32, (p >> 32) as u32)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let ch_and = e & (f ^ g);
+        (ch_and, ch_and ^ g)
+    }
+}
+#[inline(always)]
+fn sha256_maj_and_out(a: u32, b: u32, c: u32) -> (u32, u32) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        let p = flock_core::gf2_kernels::gf2_kern_sha256_maj_and_out(a as u64, b as u64, c as u64);
+        (p as u32, (p >> 32) as u32)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let maj_and = (a ^ b) & (a ^ c);
+        (maj_and, maj_and ^ a)
+    }
 }
 
-/// 32-bit add `x + y`. Writes 31 carry-aux rows at `carry_base..+31` with
-/// `(z, a, b) = (aux, left, right)` where `aux = left & right`,
-/// `left = (x ⊕ cin) & 0x7FFFFFFF`, `right = (y ⊕ cin) & 0x7FFFFFFF`. Top
-/// carry bit is masked so the unallocated 32nd slot isn't touched.
-///
-/// **No c buffer.** C = I, so c == z byte-for-byte; callers wrap z_packed
-/// as the c-side input to zerocheck.
 #[inline(always)]
 fn add_inline_ab(
     x: u32,
@@ -959,20 +868,13 @@ fn add_inline_ab(
     b: &mut [u64],
     carry_base: usize,
 ) -> u32 {
-    let sum_word: u32 = x.wrapping_add(y);
-    let cin: u32 = sum_word ^ x ^ y;
-    const MASK_LO31: u32 = 0x7FFF_FFFF;
-    let left = (x ^ cin) & MASK_LO31;
-    let right = (y ^ cin) & MASK_LO31;
-    let carry_aux = left & right;
+    let (sum_word, left, right, carry_aux) = add_carry_parts(x, y);
     or_u32_at_bit(z, carry_base, carry_aux);
     or_u32_at_bit(a, carry_base, left);
     or_u32_at_bit(b, carry_base, right);
     sum_word
 }
 
-/// 32-bit add that ALSO materializes the sum bits at `sum_base..+32` with
-/// `(z, a, b) = (sum, sum, 1)`. c == z by aliasing.
 #[inline(always)]
 fn add_alloc_ab(
     x: u32,
@@ -990,9 +892,6 @@ fn add_alloc_ab(
     sum
 }
 
-/// Build the (z, a, b) packed buffers for ONE SHA-256 compression into the
-/// u64 views (one block worth: `K / 64` u64s each). Buffers must be zero on
-/// entry. **No c buffer** (c == z byte-for-byte since C = I).
 fn build_block_ab_packed_into(
     h_in: &[u32; 8],
     m: &[u32; 16],
@@ -1005,12 +904,10 @@ fn build_block_ab_packed_into(
     debug_assert_eq!(a.len(), U64_PER_BLOCK);
     debug_assert_eq!(b.len(), U64_PER_BLOCK);
 
-    // Z_CONST: (z, a, b) = (1, 1, 1).
     or_bit_at(z, Z_CONST_POS);
     or_bit_at(a, Z_CONST_POS);
     or_bit_at(b, Z_CONST_POS);
 
-    // H_in, M: free-witness tautologies → (z, a, b) = (v, v, 1).
     for w in 0..H_WORDS {
         let off = h_bit(w, 0);
         let v = h_in[w];
@@ -1026,10 +923,6 @@ fn build_block_ab_packed_into(
         or_u32_at_bit(b, off, 0xFFFF_FFFF);
     }
 
-    // Message schedule. sched_0, sched_1 inlined; W[t] = sched_2 allocated.
-    // The 3 × 31-bit sched carries per t are contiguous (93 bits at stride
-    // 93) — composed in a register record and flushed once per buffer (see
-    // [`BitRecord`]).
     let mut w_sched = [0u32; 64];
     w_sched[..16].copy_from_slice(m);
     const SC0: usize = 0;
@@ -1059,7 +952,6 @@ fn build_block_ab_packed_into(
         ra.flush(a, sched_base);
         rb.flush(b, sched_base);
 
-        // W[t] sum row: (z, a, b) = (w_t, w_t, 1).
         let off = w_bit(t, 0);
         or_u32_at_bit(z, off, w_t);
         or_u32_at_bit(a, off, w_t);
@@ -1068,7 +960,6 @@ fn build_block_ab_packed_into(
         w_sched[t] = w_t;
     }
 
-    // 64 rounds.
     let [
         mut aa,
         mut bb,
@@ -1080,27 +971,21 @@ fn build_block_ab_packed_into(
         mut hh,
     ] = *h_in;
     for r in 0..N_ROUNDS {
-        // ch_and AND row: (z, a, b) = (ch, e, f⊕g); c == z = ch.
         let f_xor_g = ff ^ gg;
-        let ch_and_v = ee & f_xor_g;
+        let (ch_and_v, ch_out) = sha256_ch_and_out(ee, ff, gg);
         let off = ch_and_bit(r, 0);
         or_u32_at_bit(z, off, ch_and_v);
         or_u32_at_bit(a, off, ee);
         or_u32_at_bit(b, off, f_xor_g);
-        let ch_out = ch_and_v ^ gg;
 
-        // maj_and AND row.
         let b_xor_a = bb ^ aa;
         let c_xor_a = cc ^ aa;
-        let maj_and_v = b_xor_a & c_xor_a;
+        let (maj_and_v, maj_out) = sha256_maj_and_out(aa, bb, cc);
         let off = maj_and_bit(r, 0);
         or_u32_at_bit(z, off, maj_and_v);
         or_u32_at_bit(a, off, b_xor_a);
         or_u32_at_bit(b, off, c_xor_a);
-        let maj_out = maj_and_v ^ aa;
 
-        // The 7 × 31-bit round carries are contiguous (217 bits at stride
-        // 217) — composed in a register record and flushed once per buffer.
         const RC0: usize = 0;
         const RC1: usize = CARRIES_PER_ADD;
         const RC2: usize = 2 * CARRIES_PER_ADD;
@@ -1122,7 +1007,6 @@ fn build_block_ab_packed_into(
             }};
         }
 
-        // T1 chain: T1_0..T1_2 inlined, T1 (= T1_3) allocated.
         let t1_0 = add_into!(RC0, hh, big_sigma1(ee));
         let t1_1 = add_into!(RC1, t1_0, ch_out);
         let t1_2 = add_into!(RC2, t1_1, SHA256_K[r]);
@@ -1132,9 +1016,8 @@ fn build_block_ab_packed_into(
         or_u32_at_bit(a, off, t1);
         or_u32_at_bit(b, off, 0xFFFF_FFFF);
 
-        // T2 inlined.
         let t2 = add_into!(RC4, big_sigma0(aa), maj_out);
-        // E_NEW, A_NEW allocated.
+
         let e_new = add_into!(RC5, dd, t1);
         let off = e_new_bit(r, 0);
         or_u32_at_bit(z, off, e_new);
@@ -1151,7 +1034,6 @@ fn build_block_ab_packed_into(
         ra.flush(a, round_base);
         rb.flush(b, round_base);
 
-        // Register shift.
         hh = gg;
         gg = ff;
         ff = ee;
@@ -1162,7 +1044,6 @@ fn build_block_ab_packed_into(
         aa = a_new;
     }
 
-    // Output feed-forward.
     let final_state = [aa, bb, cc, dd, ee, ff, gg, hh];
     for w in 0..N_OUT_WORDS {
         add_alloc_ab(
@@ -1177,11 +1058,6 @@ fn build_block_ab_packed_into(
     }
 }
 
-/// Like [`generate_witness`] but produces F128-packed `(z, a, b, c)` AND the
-/// lincheck byte-stripe in one fused parallel pass. Replaces
-/// `pack_witness` + `apply_{a,b,c}_packed` + `pack_z_lincheck_from_packed`.
-///
-/// 8 k-blocks per parallel task (matching the lincheck stripe granularity).
 pub fn generate_witness_with_ab_packed_and_lincheck(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
@@ -1191,10 +1067,6 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     Vec<flock_core::field::F128>,
     Vec<u8>,
 ) {
-    // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
-    // valid compression (of the all-zero input) so the constant cell is 1 in
-    // every block. (The chain forbids padding, so this only affects the
-    // standalone batch setup.)
     let padding: ([u32; 8], [u32; 16]) = ([0u32; 8], [0u32; 16]);
     super::common::drive_witness_packed_and_lincheck(
         compressions,
@@ -1208,20 +1080,12 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     )
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Multi-block witness gen + Setup
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Minimum `n_blocks_log` to fit `n_compressions` (one compression per
-/// k-block), subject to the lincheck floor of `n_blocks_log ≥ 3`.
 pub fn min_n_blocks_log(n_compressions: usize) -> usize {
     assert!(n_compressions >= 1);
     let n = n_compressions.max(8);
     n.next_power_of_two().trailing_zeros() as usize
 }
 
-/// Build the boolean witness across `2^n_blocks_log` blocks, one compression
-/// per block. Parallelized via rayon.
 pub fn generate_witness(compressions: &[([u32; 8], [u32; 16])], n_blocks_log: usize) -> Vec<bool> {
     use rayon::prelude::*;
     let n_total_blocks = 1usize << n_blocks_log;
@@ -1232,7 +1096,7 @@ pub fn generate_witness(compressions: &[([u32; 8], [u32; 16])], n_blocks_log: us
         .enumerate()
         .for_each(|(block_idx, chunk)| {
             if block_idx >= compressions.len() {
-                return; // padding k-block (all zeros)
+                return;
             }
             let (h_in, m) = &compressions[block_idx];
             let block_witness = build_block_witness(h_in, m);
@@ -1253,16 +1117,12 @@ impl Sha256HybridSetup {
         Self::with_log_inv_rate(n_compressions, 1)
     }
 
-    /// [`Self::new`] with the **batch-major** witness layout (see
-    /// [`flock_core::r1cs::WitnessLayout`]). The generic matrix provers and
-    /// chain/Merkle wrappers still require row-major.
     pub fn new_batch_major(n_compressions: usize) -> Self {
         let mut s = Self::new(n_compressions);
         s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
         s
     }
 
-    /// Fast-path witness generation dispatched on the r1cs's witness layout.
     fn generate_witness_ab(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
@@ -1283,17 +1143,14 @@ impl Sha256HybridSetup {
     }
 
     pub fn with_log_inv_rate(n_compressions: usize, log_inv_rate: usize) -> Self {
-        // Rate keys the legacy profiles: 1 -> Fast, 2 -> Slim.
         let profile = match log_inv_rate {
             1 => flock_core::pcs::ligerito::LigeritoProfile::Fast,
             2 => flock_core::pcs::ligerito::LigeritoProfile::Slim,
-            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // other rates default to Fast
+            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast,
         };
         Self::with_profile_and_rate(n_compressions, profile, log_inv_rate)
     }
 
-    /// Build a setup for a named Ligerito profile (fast/slim/secure);
-    /// the PCS rate follows the profile.
     pub fn with_profile(
         n_compressions: usize,
         profile: flock_core::pcs::ligerito::LigeritoProfile,
@@ -1309,9 +1166,7 @@ impl Sha256HybridSetup {
         assert!(n_compressions >= 1, "n_compressions must be ≥ 1");
         let n_log = min_n_blocks_log(n_compressions);
         let r1cs = build_block_r1cs(n_log);
-        // Warm the CSC fold circuit so its one-time build stays out of the
-        // first prove/verify, and pre-fault the prove-cycle scratch buffers
-        // so even the first prove performs no page faults.
+
         r1cs.csc_lincheck_circuit();
         flock_core::scratch::prewarm_prover(r1cs.m);
         let pcs_params = flock_core::pcs::PcsParams {
@@ -1343,10 +1198,6 @@ impl Sha256HybridSetup {
         generate_witness(compressions, self.n_blocks_log())
     }
 
-    /// Packed witness trace for the generic (matrix-driven) provers — the
-    /// per-circuit code they need. Implemented by reusing the fused builder
-    /// (its a/b outputs are discarded): no separate packed-trace writer to
-    /// maintain, and ~5× cheaper than the bool trace → `pack_witness` path.
     pub fn generate_witness_packed(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
@@ -1355,9 +1206,6 @@ impl Sha256HybridSetup {
         z_packed
     }
 
-    /// Generic (matrix-driven) prover. Same witness path (bool trace →
-    /// pack) as the fused [`Self::prove_fast`]; produces a byte-identical
-    /// proof, verifiable with [`Self::verify`].
     pub fn prove_ligerito<Ch: flock_core::challenger::Challenger>(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
@@ -1371,9 +1219,6 @@ impl Sha256HybridSetup {
         crate::prover::prove_ligerito(&self.r1cs, z_packed, &self.pcs_params, challenger)
     }
 
-    /// Fast prover: skips `pack_witness`, `apply_{a,b,c}_packed`, and
-    /// `pack_z_lincheck_from_packed` by emitting `(z, a, b, c, z_lincheck)`
-    /// directly via the fused witness builder. Requires m ≥ ~21 (Ligerito).
     pub fn prove_fast<Ch: flock_core::challenger::Challenger>(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
@@ -1384,9 +1229,7 @@ impl Sha256HybridSetup {
         flock_core::proof::R1csClaim,
     ) {
         assert_eq!(compressions.len(), self.n_compressions);
-        // Pre-fault the commit codeword buffer on a background (E-core) thread
-        // while witness generation runs on the perf cores; gated so
-        // RAYON_NUM_THREADS=1 stays truly serial (no extra thread).
+
         let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                 self.generate_witness_ab(compressions)
@@ -1404,9 +1247,6 @@ impl Sha256HybridSetup {
         )
     }
 
-    /// [`Self::prove_fast`] with a per-phase timing breakdown of the real
-    /// Ligerito prover (witness gen + commit + zerocheck + lincheck + recursive
-    /// open). Benchmark-only.
     pub fn prove_fast_timed<Ch: flock_core::challenger::Challenger>(
         &self,
         compressions: &[([u32; 8], [u32; 16])],
@@ -1455,36 +1295,19 @@ impl Sha256HybridSetup {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Hash chain: SHA-256 geometry + thin wrappers over the generic chain core.
-// ───────────────────────────────────────────────────────────────────────────
-
 pub use super::chain_common::{ChainFold, ChainVerifyError};
 
-/// One SHA-256 compression input: `(H_in, M)` — the 8-word input chaining
-/// value plus the 16-word message block. Mirrors the [`Sha256HybridSetup`]
-/// witness-gen tuple type.
 pub type Compression = ([u32; 8], [u32; 16]);
 
-/// SHA-256's I/O-region geometry for the generic chain core. The input
-/// chaining value `H_in` sits in aligned slot 0 (byte 0), the output chaining
-/// value `H_out` in slot 1 (byte 32); each region is exactly 256 bits in a
-/// 256-bit (`region_log = 8`) slot — no interior padding. Within a slot the
-/// layout is word-contiguous (8 × 32-bit words), and since the low
-/// `K_SKIP = 6` physical bits are the φ8 z-skip block, the fold weight matches
-/// the generic `phys_weights[p] = λ[p & 63]·eq(r_rest, p >> 6)`.
 pub const CHAIN_LAYOUT: super::chain_common::ChainLayout = super::chain_common::ChainLayout {
     k_log: K_LOG,
     k_skip: K_SKIP,
-    region_log: 8,                   // SLOT_BITS = 2^8 = 256
-    region_bits: 256,                // 8 words × 32 bits, fills the slot exactly
-    input_byte_off: H_BASE / 8,      // 0
-    output_byte_off: H_OUT_BASE / 8, // 32
+    region_log: 8,
+    region_bits: 256,
+    input_byte_off: H_BASE / 8,
+    output_byte_off: H_OUT_BASE / 8,
 };
 
-/// Convert a public 256-bit chaining value (8 × u32 words, LE bit order within
-/// each word) to the region's **physical** within-slot bool layout. The region
-/// is word-contiguous: physical bit `32·w + b` holds bit `b` of word `w`.
 pub fn cv_to_phys_bits(cv: &[u32; 8]) -> Vec<bool> {
     let mut phys = vec![false; 256];
     for w in 0..8 {
@@ -1495,10 +1318,6 @@ pub fn cv_to_phys_bits(cv: &[u32; 8]) -> Vec<bool> {
     phys
 }
 
-/// Reference SHA-256 compression. Returns the 8-word output chaining value
-/// `H_out = H_in + state` where `state = compress256(M)` is the post-rounds
-/// register state. Public so the chain caller can build honest chains via
-/// `blocks[i+1].0 = sha256_compress(blocks[i])`.
 pub fn sha256_compress(h_in: &[u32; 8], m: &[u32; 16]) -> [u32; 8] {
     let mut w = [0u32; 64];
     w[..16].copy_from_slice(m);
@@ -1546,14 +1365,6 @@ pub fn sha256_compress(h_in: &[u32; 8], m: &[u32; 16]) -> [u32; 8] {
 }
 
 impl Sha256HybridSetup {
-    /// Prove that the committed compressions form a sequential chaining-value
-    /// chain: for each instance `i`, the output CV (`H_out`) equals the input
-    /// CV (`H_in`) of instance `i+1`, with public endpoints `cv_0` (first
-    /// input) and `cv_last` (last output).
-    ///
-    /// The prover is **given the full sequence** of `Compression`s (one per
-    /// instance) so trace-gen is parallel; for an honest chain the caller sets
-    /// `blocks[i+1].0 = sha256_compress(&blocks[i].0, &blocks[i].1)`.
     pub fn prove_chain<Ch: flock_core::challenger::Challenger>(
         &self,
         compressions: &[Compression],
@@ -1563,8 +1374,7 @@ impl Sha256HybridSetup {
         flock_core::pcs::Commitment,
     ) {
         assert_eq!(compressions.len(), self.n_compressions);
-        // The chain shift sumcheck enforces the relation across ALL witness
-        // slots, including padding — require an exact fit.
+
         assert_eq!(
             self.n_compressions,
             self.n_block_slots(),
@@ -1615,50 +1425,25 @@ impl Sha256HybridSetup {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Merkle path: SHA-256 geometry + thin wrappers over the generic Merkle core.
-// ───────────────────────────────────────────────────────────────────────────
-
 pub use super::merkle_path_common::{MerklePathProofLigerito, MerklePathVerifyError};
 
-/// SHA-256's 4-slot geometry for the Merkle-path protocol. The block starts
-/// with four 256-bit slots in order:
-/// - slot 0 (bytes 0..32)    = `H` (the IV — committed but unconstrained by
-///                              the Merkle protocol)
-/// - slot 1 (bytes 32..64)   = `H_out` (= z_i, the per-hash output) → `Z`
-/// - slot 2 (bytes 64..96)   = `M[0..8]` (left 8 words of the message) → `X_L`
-/// - slot 3 (bytes 96..128)  = `M[8..16]` (right 8 words of the message) → `X_R`
-///
-/// The slot offsets are byte-aligned (32 byte each) and contiguous because of
-/// the layout adjustment that moved `Z_CONST_POS` to the end of the witness.
 pub const MERKLE_LAYOUT: super::merkle_path_common::MerkleLayout =
     super::merkle_path_common::MerkleLayout {
         k_log: K_LOG,
         k_skip: K_SKIP,
-        region_log: 8,         // 2^8 = 256-bit slots
-        region_bits: 256,      // each slot fully used (no padding within slot)
-        slot_base_byte_off: 0, // 4-slot region starts at byte 0
+        region_log: 8,
+        region_bits: 256,
+        slot_base_byte_off: 0,
         z_slot: 1,
         x_l_slot: 2,
         x_r_slot: 3,
-        // other_slot = 0 (the IV / H_in)
     };
 
-/// Convert a public 256-bit hash value (8 × u32 words, LE bit order within
-/// each word) to physical within-slot bool order. Same shape as
-/// `cv_to_phys_bits`; reused for the Merkle-path leaf and root.
 pub fn hash_to_phys_bits(h: &[u32; 8]) -> Vec<bool> {
     cv_to_phys_bits(h)
 }
 
 impl Sha256HybridSetup {
-    /// Prove a Merkle path of length `K = 2^n_log` SHA-256 hashes. The prover
-    /// is given the full per-hash `Compression` sequence (each hash's
-    /// `(H_in, M)`) so trace-gen is parallel. Honest data must satisfy: for
-    /// each `i = 1..K-1`, the `b[i]`-selected half of `M[i]` equals
-    /// `compressions[i-1].1[H_out]` (i.e. the previous compression's digest,
-    /// byte-equivalent). Requires a registered Ligerito security config for
-    /// this `m` (m ≥ 22).
     pub fn prove_merkle_path_ligerito<Ch: flock_core::challenger::Challenger>(
         &self,
         compressions: &[Compression],
@@ -1685,7 +1470,7 @@ impl Sha256HybridSetup {
             &self.r1cs,
             &self.pcs_params,
             &MERKLE_LAYOUT,
-            0, // path_log: single-path
+            0,
             z_packed,
             a_packed,
             b_packed,
@@ -1696,7 +1481,6 @@ impl Sha256HybridSetup {
         )
     }
 
-    /// Ligerito-backend mirror of [`Self::verify_merkle_path`].
     pub fn verify_merkle_path_ligerito<Ch: flock_core::challenger::Challenger>(
         &self,
         commitment: &flock_core::pcs::Commitment,
@@ -1723,7 +1507,7 @@ impl Sha256HybridSetup {
         super::merkle_path_common::verify_merkle_paths_ligerito_generic(
             &self.r1cs,
             &MERKLE_LAYOUT,
-            0, // path_log: single-path
+            0,
             commitment,
             proof,
             n_log,
@@ -1736,7 +1520,6 @@ impl Sha256HybridSetup {
         )
     }
 
-    /// Ligerito-backend mirror of [`Self::prove_merkle_paths`].
     pub fn prove_merkle_paths_ligerito<Ch: flock_core::challenger::Challenger>(
         &self,
         path_log: usize,
@@ -1781,7 +1564,6 @@ impl Sha256HybridSetup {
         )
     }
 
-    /// Ligerito-backend mirror of [`Self::verify_merkle_paths`].
     pub fn verify_merkle_paths_ligerito<Ch: flock_core::challenger::Challenger>(
         &self,
         path_log: usize,
@@ -1826,20 +1608,6 @@ impl Sha256HybridSetup {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Tests
-// ───────────────────────────────────────────────────────────────────────────
-
-// ---------------------------------------------------------------------------
-// Batch-major witness producer (WitnessLayout::BatchMajor).
-//
-// V = 8 compressions in lockstep ([u32; 8] lanes — the adds/sigmas
-// auto-vectorize); witness fields are OR'd V-wide into an L1-resident
-// interleaved row buffer (already batch-major order) and NT-flushed per
-// useful 128-bit chunk by the shared driver. See
-// `common::drive_witness_batch_major`.
-// ---------------------------------------------------------------------------
-
 use super::common::{BM_V, BmRow, add_carry_parts_v, or_bit_row, or_u32_row};
 
 #[inline(always)]
@@ -1861,7 +1629,6 @@ struct BmRows<'a> {
     b: &'a mut [BmRow],
 }
 
-/// z = a = v, b = all-ones (free-witness tautology rows).
 #[inline(always)]
 fn bm_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
     or_u32_row(rows.z, bit, vals);
@@ -1869,7 +1636,6 @@ fn bm_write_lin(rows: &mut BmRows<'_>, bit: usize, vals: &[u32; BM_V]) {
     or_u32_row(rows.b, bit, &[0xFFFF_FFFF; BM_V]);
 }
 
-/// Inline add: carry rows only.
 #[inline(always)]
 fn bm_add_inline(
     rows: &mut BmRows<'_>,
@@ -1884,9 +1650,6 @@ fn bm_add_inline(
     sum
 }
 
-/// Build one V = 8 group of compressions into interleaved rows. Mirrors
-/// [`build_block_ab_packed_into`] field-for-field (the lockstep test below
-/// pins byte-equality against the row-major driver).
 fn build_group_batch_major(
     inputs: [&([u32; 8], [u32; 16]); BM_V],
     rz: &mut [BmRow],
@@ -1912,7 +1675,6 @@ fn build_group_batch_major(
         bm_write_lin(&mut rows, m_bit(i, 0), &m[i]);
     }
 
-    // Message schedule.
     let mut w_sched: Vec<[u32; BM_V]> = Vec::with_capacity(64);
     w_sched.extend_from_slice(&m);
     for t in 16..64 {
@@ -1933,7 +1695,6 @@ fn build_group_batch_major(
         w_sched.push(w_t);
     }
 
-    // 64 rounds.
     let mut aa = h_in[0];
     let mut bb = h_in[1];
     let mut cc = h_in[2];
@@ -1991,7 +1752,6 @@ fn build_group_batch_major(
         aa = a_new;
     }
 
-    // Output feed-forward.
     let final_state = [aa, bb, cc, dd, ee, ff, gg, hh];
     for w in 0..N_OUT_WORDS {
         let sum = bm_add_inline(&mut rows, &final_state[w], &h_in[w], out_carry_bit(w, 0));
@@ -1999,9 +1759,6 @@ fn build_group_batch_major(
     }
 }
 
-/// Batch-major counterpart of [`generate_witness_with_ab_packed_and_lincheck`]
-/// — `(z, a, b, z_lincheck)` with z/a/b in the batch-major layout. Padding
-/// slots run a compression of the all-zero input (constant wire = 1).
 pub fn generate_witness_batch_major(
     compressions: &[([u32; 8], [u32; 16])],
     n_blocks_log: usize,
@@ -2026,7 +1783,6 @@ pub fn generate_witness_batch_major(
 mod tests {
     use super::*;
 
-    /// SplitMix64 PRNG, deterministic.
     struct Rng(u64);
     impl Rng {
         fn new(seed: u64) -> Self {
@@ -2044,8 +1800,6 @@ mod tests {
         }
     }
 
-    /// Batch-major witness equality vs the row-major driver (word-transpose
-    /// + identical stripe), incl. padding slots via a non-power-of-two count.
     #[test]
     fn batch_major_witness_matches_row_major_transposed() {
         for (n_inputs, n_log) in [(8usize, 3usize), (11, 4)] {
@@ -2076,7 +1830,6 @@ mod tests {
         }
     }
 
-    /// Batch-major end-to-end Ligerito roundtrip + tamper rejection.
     #[test]
     #[ignore]
     fn batch_major_prove_fast_roundtrip() {
@@ -2105,7 +1858,6 @@ mod tests {
         );
     }
 
-    /// Row-by-row R1CS check `(A·z) ⊙ (B·z) = (C·z) = z`.
     fn satisfies_singleblock(
         a: &SparseBinaryMatrix,
         b: &SparseBinaryMatrix,
@@ -2123,10 +1875,6 @@ mod tests {
 
     #[test]
     fn useful_bits_matches_constants() {
-        // Merkle-aligned: H, H_out, M_lo, M_hi occupy the first four 256-bit
-        // slots (= one 4-slot region of 1024 bits) for clean Merkle-path
-        // protocol addressing. Z_CONST_POS moved to bit 31,400 so it doesn't
-        // interrupt the slot alignment.
         assert_eq!(H_BASE, 0);
         assert_eq!(H_OUT_BASE, 256);
         assert_eq!(M_BASE, 512);
@@ -2192,7 +1940,6 @@ mod tests {
         }
     }
 
-    /// `Sha2LincheckCircuit` walker matches sparse fold byte-for-byte.
     #[test]
     fn lincheck_circuit_matches_sparse() {
         use flock_core::lincheck::{LincheckCircuit, SparseMatrixCircuit};
@@ -2221,13 +1968,11 @@ mod tests {
             assert_eq!(expected[c], got[c], "comb mismatch at col {c}");
         }
 
-        // CSC gather (what prove_fast/verify actually use) matches too.
         let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0);
         let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
         assert_eq!(expected, got_csc, "CSC fold mismatch");
     }
 
-    /// Ligerito-backend prove_fast roundtrip. Needs ≥ 128 compressions (m=22).
     #[test]
     #[ignore]
     fn prove_fast_ligerito_roundtrip() {
@@ -2246,10 +1991,6 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
-    /// Generic (matrix-driven) Ligerito prove produces a byte-identical
-    /// proof to the specialized `prove_fast` — pins that the generic path
-    /// (bool trace → pack → apply → prove) and the fused path agree.
-    /// 128 compressions = m = 22, the smallest default-Ligerito-legal size.
     #[test]
     fn prove_ligerito_generic_matches_prove_fast() {
         use flock_core::challenger::FsChallenger;
@@ -2275,7 +2016,7 @@ mod tests {
             bincode::serialize(&proof_g).unwrap(),
             "generic and fused Ligerito proofs must be byte-identical"
         );
-        // And it verifies through the standard (Ligerito) verifier.
+
         let mut ch_v = FsChallenger::new(b"flock-sha2-gvf");
         let claim_v = setup
             .verify(&commit_g, &proof_g, &mut ch_v)
@@ -2283,19 +2024,13 @@ mod tests {
         assert_eq!(claim_v, claim_g);
     }
 
-    /// Constant-wire pin (docs/const-wire-pin.md). `new(120)` has padding
-    /// blocks (filled with a valid all-zero-input compression, constant = 1)
-    /// so the honest proof verifies; the all-zero witness must be rejected by
-    /// the pin. (For SHA-2 the pin lives on the R1CS-built CSC circuit, not
-    /// the walker.)
     #[test]
     fn const_pin_all_zero_rejected() {
         use flock_core::challenger::FsChallenger;
 
-        let n = 120; // 8 padding blocks at n_block_slots = 128 (m = 22)
+        let n = 120;
         let setup = Sha256HybridSetup::new(n);
 
-        // (1) Honest proof with filled padding verifies.
         let mut rng = Rng::new(0x5EED_50A2);
         let compressions: Vec<([u32; 8], [u32; 16])> =
             (0..n).map(|_| (SHA256_IV, rng.next_block())).collect();
@@ -2307,7 +2042,6 @@ mod tests {
             .unwrap_or_else(|e| panic!("honest padded proof rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
 
-        // (2) All-zero witness must be rejected by the pin.
         let zeros: Vec<([u32; 8], [u32; 16])> = vec![([0u32; 8], [0u32; 16]); n];
         let (mut z, mut a, mut b, mut zlc) =
             generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_blocks_log());
@@ -2341,33 +2075,16 @@ mod tests {
 
     #[test]
     fn block_r1cs_satisfies_for_one_block() {
-        // Smallest valid: n_blocks_log = 3 → 8 outer blocks, 7 of which are empty padding.
         let r1cs = build_block_r1cs(3);
         let n_blocks = 1 << 3;
         let z_block = build_block_witness(&SHA256_IV, &[0u32; 16]);
-        // Tile: real block in slot 0, zeros elsewhere.
+
         let mut z = vec![false; n_blocks * K];
         z[..K].copy_from_slice(&z_block);
-        // The remaining (n_blocks - 1) blocks are all-zero, which trivially
-        // satisfies the R1CS — all AND rows become 0·0 = 0, all "free witness"
-        // tautologies hold for 0, padding rows are 0.
-        // BUT z[0] = 1 only in block 0; in other blocks z[0]=0, which breaks
-        // the K-row's z[0]·z[0] = z[0] when z[0]=0 trivially (0·0=0 ✓).
-        // The H/M free-witness rows are fine at 0 as well.
-        // The carry rows are 0·0 = 0 ✓.
-        // Sum rows constrain z[slot] = XOR of zeros = 0 ✓.
+
         assert!(r1cs.satisfies(&z));
     }
 
-    // -----------------------------------------------------------------------
-    // Hash-chain end-to-end tests: honest chain, prove → verify roundtrip,
-    // and verifier mutation rejection. Mirrors the blake3_chain / keccak_chain
-    // suite.
-    // -----------------------------------------------------------------------
-
-    /// Build an honest SHA-256 chain of `n` compressions: each block's H_in
-    /// equals the previous block's H_out (= `sha256_compress` of the previous).
-    /// Returns `(blocks, cv_0, cv_last)`.
     fn honest_chain(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32; 8]) {
         let mut rng = Rng::new(seed);
         let mut cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
@@ -2381,12 +2098,11 @@ mod tests {
         (blocks, cv0, cv)
     }
 
-    /// Ligerito-backend chain roundtrip.
     #[test]
     #[ignore]
     fn prove_chain_ligerito_roundtrip() {
         use flock_core::challenger::FsChallenger;
-        // n=128 → m=22 with K_LOG=15.
+
         let setup = Sha256HybridSetup::new(128);
         let (blocks, cv_0, cv_last) = honest_chain(setup.n_compressions, 0x511_3E_C0DE);
         let mut ch = FsChallenger::new(b"sha2-chain-lig");
@@ -2396,7 +2112,6 @@ mod tests {
             .verify_chain(&commitment, &proof, &cv_0, &cv_last, &mut chv)
             .expect("ligerito chain must verify");
 
-        // Wrong public endpoints must be rejected.
         let mut mutated_last = cv_last;
         mutated_last[0] ^= 1;
         let mut chv = FsChallenger::new(b"sha2-chain-lig");
@@ -2410,7 +2125,6 @@ mod tests {
         assert!(res.is_err(), "verifier must reject wrong cv_0");
     }
 
-    /// `prove_chain` must require `n_compressions == n_block_slots`.
     #[test]
     #[should_panic(expected = "prove_chain requires n_compressions to exactly fill n_block_slots")]
     fn prove_chain_panics_on_padding() {
@@ -2423,16 +2137,6 @@ mod tests {
         let _ = setup.prove_chain(&blocks, &mut ch);
     }
 
-    // -----------------------------------------------------------------------
-    // Merkle-path end-to-end tests.
-    // -----------------------------------------------------------------------
-
-    /// Build an honest Merkle path of `n` SHA-256 compressions:
-    /// - block 0: M = (leaf, sibling_0). z_0 = sha256_compress(IV, M).
-    /// - block i ≥ 1: depending on `b_bits[i]`, M = (z_{i-1}, sibling_i) when
-    ///   `b=0`, or (sibling_i, z_{i-1}) when `b=1`. z_i = sha256_compress(IV, M).
-    /// All blocks use the public SHA-256 IV as `H_in`.
-    /// Returns `(blocks, leaf, root, b_bits)`.
     fn honest_merkle_path(
         n: usize,
         seed: u64,
@@ -2448,13 +2152,11 @@ mod tests {
         for i in 0..n {
             let sibling: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
             let m: [u32; 16] = if !b_bits[i] {
-                // selected = left half of M = current; unselected = sibling
                 let mut m = [0u32; 16];
                 m[..8].copy_from_slice(&current);
                 m[8..].copy_from_slice(&sibling);
                 m
             } else {
-                // selected = right half of M = current
                 let mut m = [0u32; 16];
                 m[..8].copy_from_slice(&sibling);
                 m[8..].copy_from_slice(&current);
@@ -2467,16 +2169,6 @@ mod tests {
         (blocks, leaf, root, b_bits)
     }
 
-    // -----------------------------------------------------------------------
-    // Multi-path Merkle tests.
-    // -----------------------------------------------------------------------
-
-    /// Build `n_paths = 2^path_log` Merkle paths into a single shared root by
-    /// replicating the same honest path `n_paths` times. Per-path length
-    /// `L = total_compressions / n_paths`. Returns `(compressions, leaves,
-    /// root, b_bits)` where `compressions` is path-id-major concatenation,
-    /// `leaves` has length `P`, and `b_bits` is the concatenated bit vector
-    /// of length `total_compressions`.
     fn honest_merkle_paths_identical(
         total: usize,
         path_log: usize,
@@ -2500,16 +2192,14 @@ mod tests {
     #[test]
     fn multi_path_log0_matches_single_path() {
         use flock_core::challenger::FsChallenger;
-        // path_log = 0 should be byte-identical to single-path. n=128 → m=22.
+
         let setup = Sha256HybridSetup::new(128);
         let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0xC0FFEE);
 
-        // Single-path proof.
         let mut ch_single = FsChallenger::new(b"sha2-merkle-equiv");
         let (proof_single, commit_single) =
             setup.prove_merkle_path_ligerito(&blocks, &b, &mut ch_single);
 
-        // Multi-path with path_log=0.
         let mut ch_multi = FsChallenger::new(b"sha2-merkle-equiv");
         let (proof_multi, commit_multi) =
             setup.prove_merkle_paths_ligerito(0, &blocks, &b, &mut ch_multi);
@@ -2524,7 +2214,6 @@ mod tests {
             "path_log=0 must serialize identically to single-path"
         );
 
-        // Both verify against the leaves array of length 1.
         let mut chv = FsChallenger::new(b"sha2-merkle-equiv");
         setup
             .verify_merkle_paths_ligerito(
@@ -2542,7 +2231,7 @@ mod tests {
     #[test]
     fn prove_merkle_paths_ligerito_roundtrip_p4() {
         use flock_core::challenger::FsChallenger;
-        // path_log = 2 → P = 4 paths of length 32 each = 128 total → m=22.
+
         let setup = Sha256HybridSetup::new(128);
         let (blocks, leaves, root, b) =
             honest_merkle_paths_identical(setup.n_compressions, 2, 0xF00D);
@@ -2557,7 +2246,7 @@ mod tests {
     #[test]
     fn prove_merkle_path_ligerito_roundtrip() {
         use flock_core::challenger::FsChallenger;
-        // n=128 → m=22 with K_LOG=15 (smallest m with a Ligerito config).
+
         let setup = Sha256HybridSetup::new(128);
         let (blocks, leaf, root, b) = honest_merkle_path(setup.n_compressions, 0x5EED_F00D);
         let mut ch = FsChallenger::new(b"sha2-merkle-lig");
@@ -2567,7 +2256,6 @@ mod tests {
             .verify_merkle_path_ligerito(&commitment, &proof, &leaf, &root, &b, &mut chv)
             .expect("ligerito merkle path must verify");
 
-        // Wrong public leaf must be rejected.
         let mut bad_leaf = leaf;
         bad_leaf[0] ^= 1;
         let mut chv = FsChallenger::new(b"sha2-merkle-lig");
@@ -2575,7 +2263,6 @@ mod tests {
             setup.verify_merkle_path_ligerito(&commitment, &proof, &bad_leaf, &root, &b, &mut chv);
         assert!(res.is_err(), "verifier must reject wrong leaf");
 
-        // Wrong public root must be rejected.
         let mut bad_root = root;
         bad_root[7] ^= 1 << 31;
         let mut chv = FsChallenger::new(b"sha2-merkle-lig");
@@ -2583,9 +2270,6 @@ mod tests {
             setup.verify_merkle_path_ligerito(&commitment, &proof, &leaf, &bad_root, &b, &mut chv);
         assert!(res.is_err(), "verifier must reject wrong root");
 
-        // Flip one non-leading bit (B(0) := 0 by convention regardless of
-        // b[0], so flipping b[0] wouldn't actually change the protocol value;
-        // flip b[1] instead, which is a real chain constraint).
         let mut bad_b = b.clone();
         bad_b[1] = !bad_b[1];
         let mut chv = FsChallenger::new(b"sha2-merkle-lig");
@@ -2594,7 +2278,6 @@ mod tests {
         assert!(res.is_err(), "verifier must reject wrong bit vector");
     }
 
-    /// Batch-major Merkle-path roundtrip and wrong-leaf rejection on Ligerito.
     #[test]
     #[ignore]
     fn batch_major_prove_merkle_path_ligerito_roundtrip() {
@@ -2623,7 +2306,7 @@ mod tests {
     #[test]
     fn prove_merkle_paths_ligerito_roundtrip_p2() {
         use flock_core::challenger::FsChallenger;
-        // path_log=1 → P=2 paths of length 64 = 128 total → m=22.
+
         let setup = Sha256HybridSetup::new(128);
         let (blocks, leaves, root, b) =
             honest_merkle_paths_identical(setup.n_compressions, 1, 0xC0DE_BABE);
@@ -2634,7 +2317,6 @@ mod tests {
             .verify_merkle_paths_ligerito(1, &commitment, &proof, &leaves, &root, &b, &mut chv)
             .expect("ligerito 2-path proof must verify");
 
-        // Wrong leaf in path 0 must be rejected.
         let mut bad_leaves = leaves.clone();
         bad_leaves[0][0] ^= 1;
         let mut chv = FsChallenger::new(b"sha2-merkle-paths-lig");
@@ -2649,7 +2331,6 @@ mod tests {
         );
         assert!(res.is_err(), "verifier must reject wrong leaf in path 0");
 
-        // Wrong shared root must be rejected.
         let mut bad_root = root;
         bad_root[7] ^= 1 << 31;
         let mut chv = FsChallenger::new(b"sha2-merkle-paths-lig");
@@ -2667,8 +2348,6 @@ mod tests {
 
     #[test]
     fn cv_to_phys_bits_roundtrips() {
-        // Round-trip a fixed CV through bool-pack and assert the per-word bits
-        // are recovered (sanity check on the within-slot layout convention).
         let cv: [u32; 8] = [
             0x01234567, 0x89ABCDEF, 0xDEADBEEF, 0xFEEDC0DE, 0xCAFEBABE, 0x12345678, 0x9ABCDEF0,
             0x0F1E2D3C,

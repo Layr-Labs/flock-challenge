@@ -1,86 +1,84 @@
-//! Round-1 prover message (univariate skip).
-//!
-//! The round-1 message is `(P^{AB}, P^C)`, each a length-`2^k_skip` vector
-//! of F128 values. They are evaluations on the NTT domain `Λ` of the
-//! polynomial (over λ) defined by
-//!
-//!   P^{AB}(λ) = Σ_{x ∈ {0,1}^{m-k_skip}} eq(r_rest, x) · φ₈(â(λ, x) · b̂(λ, x))
-//!   P^C(λ)   = Σ_{x ∈ {0,1}^{m-k_skip}} eq(r_rest, x) · φ₈(ĉ(λ, x))
-//!
-//! where â(λ, x), b̂(λ, x), ĉ(λ, x) ∈ F₂⁸ are the values at λ of the
-//! univariate polynomial whose evaluations on `S = {0,…,2^k_skip − 1}` are
-//! the boolean witness values `a(s, x), b(s, x), c(s, x)`. The polynomial is
-//! recovered via `inv_NTT_S`; we then evaluate on `Λ = {2^k_skip, …}` via
-//! `fwd_NTT_Λ`.
-//!
-//! Unoptimized reference: returns the AB and C polynomials separately (the
-//! extract_c variant). The optimized variant in
-//! [`super::univariate_skip_optimized`] drops a constant F₈ factor
-//! `C_s = φ₈(0x1C)` from the eq-on-S weights; this one keeps it.
-
 use crate::field::{F8, F128, mul_by_x, phi8};
 use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Build the multilinear-eq evaluation table over `r`:
-/// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
-/// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
-    use rayon::prelude::*;
-
     let n = r.len();
-    // Uninit alloc — same invariant as `build_eq_parallel` in ring_switch:
-    // every slot in t[0..2^n] is written exactly once before any read.
+
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
     t[0] = F128::ONE;
-    const PAR_THRESHOLD: usize = 1 << 12;
-    for i in 0..n {
-        let r_i = r[i];
-        let half = 1usize << i;
-        let (lo, rest) = t.split_at_mut(half);
-        let hi = &mut rest[..half];
-        let build_pair = |lo_x: &mut F128, hi_x: &mut F128| {
-            let v = *lo_x;
-            let vr = v * r_i;
-            *hi_x = vr;
-            // v * (1 + r_i) = v + v * r_i in characteristic two.
-            *lo_x = v + vr;
-        };
-        if half < PAR_THRESHOLD {
-            lo.iter_mut()
-                .zip(hi.iter_mut())
-                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
-        } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
-        }
+    if n == 0 {
+        return t;
     }
-    t
+    let r0 = r[0];
+    t[1] = r0;
+    t[0] = F128::ONE + r0;
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    unsafe {
+        use core::arch::x86_64::*;
+        let ptr = t.as_mut_ptr() as *mut __m128i;
+        for (i, &r_i) in r.iter().enumerate().skip(1) {
+            let half = 1usize << i;
+            let vr = _mm_set_epi64x(r_i.hi as i64, r_i.lo as i64);
+            let (rr0, rr1) = crate::gf2_kernels::k0_f128_pre_reduce_const_m128i(vr);
+            let mut x = half;
+            while x >= 2 {
+                x -= 2;
+                let old0 = _mm_loadu_si128(ptr.add(x));
+                let old1 = _mm_loadu_si128(ptr.add(x + 1));
+                let (hi0, hi1) = crate::gf2_kernels::k0_f128_mul_const_vec2_m128i(
+                    old0, old1, rr0, rr1, rr0, rr1,
+                );
+                _mm_storeu_si128(ptr.add(x + half), hi0);
+                _mm_storeu_si128(ptr.add(x + 1 + half), hi1);
+                _mm_storeu_si128(ptr.add(x), _mm_xor_si128(old0, hi0));
+                _mm_storeu_si128(ptr.add(x + 1), _mm_xor_si128(old1, hi1));
+            }
+        }
+        t
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    unsafe {
+        use core::arch::aarch64::*;
+        let ptr = t.as_mut_ptr() as *mut u64;
+        for (i, &r_i) in r.iter().enumerate().skip(1) {
+            let half = 1usize << i;
+            let vr = vcombine_u64(vcreate_u64(r_i.lo), vcreate_u64(r_i.hi));
+            let (rr0, rr1) = crate::gf2_kernels::k0_f128_pre_reduce_const_neon(vr);
+            let mut x = half;
+            while x >= 2 {
+                x -= 2;
+                let old0 = vld1q_u64(ptr.add(2 * x));
+                let old1 = vld1q_u64(ptr.add(2 * (x + 1)));
+                let (hi0, hi1) =
+                    crate::gf2_kernels::k0_f128_mul_const_vec2_neon(old0, old1, rr0, rr1, rr0, rr1);
+                vst1q_u64(ptr.add(2 * (x + half)), hi0);
+                vst1q_u64(ptr.add(2 * (x + 1 + half)), hi1);
+                vst1q_u64(ptr.add(2 * x), veorq_u64(old0, hi0));
+                vst1q_u64(ptr.add(2 * (x + 1)), veorq_u64(old1, hi1));
+            }
+        }
+        return t;
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+        all(target_arch = "aarch64", target_feature = "aes")
+    )))]
+    {
+        for (i, &r_i) in r.iter().enumerate().skip(1) {
+            for x in (0..(1usize << i)).rev() {
+                let old = t[x];
+                let hi_val = old * r_i;
+                t[x | (1 << i)] = hi_val;
+                t[x] = old + hi_val;
+            }
+        }
+        t
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Naive round-1 prover message (extract_c form)
-// ---------------------------------------------------------------------------
-
-/// Compute the round-1 prover message naively (no shift-reduce, no fused
-/// inner, no deferred reduction — direct algorithmic translation of the
-/// protocol formula).
-///
-/// Returns `(p_ab, p_c)`, each a length-`2^k_skip` F128 vector of evaluations
-/// on Λ.
-///
-/// Preconditions:
-/// - `a.len() == b.len() == c.len() == 2^m`
-/// - `r.len() == m`
-/// - `k_skip <= m`
-///
-/// Index convention: for index `i ∈ 0..2^m`, the low `k_skip` bits address
-/// the *skip* variables (`y_skip ∈ S`), the high `m - k_skip` bits address
-/// the *rest* variables (`y_rest`).
 pub fn round1_naive(
     a: &[bool],
     b: &[bool],
@@ -98,12 +96,9 @@ pub fn round1_naive(
     let ell = 1usize << k_skip;
     let n_chunks_x = 1usize << (m - k_skip);
 
-    // NTT for evaluating-on-Λ via inv-on-S then fwd-on-Λ.
     let ntt_s = AdditiveNttGf8::new(k_skip, F8::ZERO);
     let ntt_l = AdditiveNttGf8::new(k_skip, F8(ell as u8));
 
-    // eq table over the rest-of-r challenges; only r[k_skip..] is used here
-    // (the skip portion r[0..k_skip] is consumed by the verifier later).
     let eq_full = build_eq(&r[k_skip..]);
 
     let mut p_ab = vec![F128::ZERO; ell];
@@ -120,7 +115,7 @@ pub fn round1_naive(
             b_col[s] = F8(b[base + s] as u8);
             c_col[s] = F8(c[base + s] as u8);
         }
-        // Extend the row polynomial from S to Λ.
+
         ntt_s.inverse(&mut a_col);
         ntt_l.forward(&mut a_col);
         ntt_s.inverse(&mut b_col);
@@ -139,46 +134,36 @@ pub fn round1_naive(
     (p_ab, p_c)
 }
 
-// ---------------------------------------------------------------------------
-// Algorithmically-structured optimized round-1 (extract_c form, scalar)
-// ---------------------------------------------------------------------------
-//
-// Same output as `round1_naive`, but:
-//   * uses `InvNttTableByteSingleGf8::apply` (one L1 lookup pass) instead of
-//     two F8 NTT calls per row;
-//   * splits the eq table into lo/hi halves (cache-friendly outer/inner);
-//   * processes C in extract_c form — accumulates on S, NTT-extends to Λ once
-//     at the end, instead of NTT-extending per row.
-//
-// The geometric-eq shift_reduce + convert-table tricks (which give the C++ its
-// final ~5× win) are a follow-up; they change the output by the C_s factor,
-// so doing them on a separately-validated scaffold is cleaner.
-
-/// Pack a bit vector LSB-first into bytes.
 pub fn pack_bits(bits: &[bool]) -> Vec<u8> {
-    use rayon::prelude::*;
     let n_bytes = bits.len().div_ceil(8);
     let mut out = vec![0u8; n_bytes];
-    // Each output byte depends on 8 contiguous input bits — disjoint, so
-    // process bytes in parallel.
-    out.par_chunks_mut(1)
-        .enumerate()
-        .for_each(|(byte_idx, slot)| {
-            let mut byte = 0u8;
-            let base = byte_idx * 8;
-            for j in 0..8 {
-                let bit_idx = base + j;
-                if bit_idx < bits.len() && bits[bit_idx] {
-                    byte |= 1u8 << j;
-                }
+
+    let bytes: &[u8] =
+        unsafe { core::slice::from_raw_parts(bits.as_ptr() as *const u8, bits.len()) };
+    let full_bytes = bytes.len() / 8;
+    for byte_idx in 0..full_bytes {
+        let base = byte_idx * 8;
+        let x = u64::from_le_bytes(bytes[base..base + 8].try_into().unwrap());
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let packed = unsafe { crate::gf2_kernels::gf2_kern_pack8_bool_bytes(x) as u8 };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let packed = (x.wrapping_mul(0x0102_0408_1020_4080) >> 56) as u8;
+        out[byte_idx] = packed;
+    }
+    for byte_idx in full_bytes..n_bytes {
+        let mut byte = 0u8;
+        let base = byte_idx * 8;
+        for j in 0..8 {
+            let bit_idx = base + j;
+            if bit_idx < bits.len() && bits[bit_idx] {
+                byte |= 1u8 << j;
             }
-            slot[0] = byte;
-        });
+        }
+        out[byte_idx] = byte;
+    }
     out
 }
 
-/// Eq table split into a lo half (large, L2-resident) and a hi half (small,
-/// kept in registers across the inner loop).
 #[derive(Clone, Debug)]
 pub struct SplitEqGhash {
     pub n_lo: usize,
@@ -188,20 +173,13 @@ pub struct SplitEqGhash {
 }
 
 impl SplitEqGhash {
-    /// Cap on the hi half size. The original C++ default was 7 (128 chunks),
-    /// which with a 10-thread ranked pool yields a 2-wave rayon schedule
-    /// (128 → 16 jobs of 8 after four binary splits). Raising to 9 gives
-    /// 512 chunks / ~51 per thread and is bit-identical: the lo/hi split is
-    /// an exact tensor factorisation, XOR is associative, and deferred
-    /// reduction is F2-linear so regrouping across different chunk boundaries
-    /// is exact. The hi table grows from 2 KB to 8 KB (still register-friendly
-    /// as an outer product over 512 F128s); the lo table shrinks 4× and stays
-    /// more L2-resident across the ~120 ms of zerocheck that use this split.
-    pub const MAX_N_HI: usize = 9;
+    pub const MAX_N_HI: usize = 7;
+
+    pub const MAX_N_LO: usize = 12;
 
     pub fn new(r: &[F128]) -> Self {
         let n = r.len();
-        let n_hi = n.min(Self::MAX_N_HI);
+        let n_hi = n.min(Self::MAX_N_HI).max(n.saturating_sub(Self::MAX_N_LO));
         Self::with_n_hi(r, n_hi)
     }
 
@@ -218,14 +196,6 @@ impl SplitEqGhash {
     }
 }
 
-/// Extend a length-`ell` F128 vector from the input domain S to the extension
-/// domain Λ using bit-plane decomposition: for each of the 128 bit positions
-/// of F128, run the bit-input NTT (`inv_NTT_S` then `fwd_NTT_Λ` via the
-/// precomputed table) on that bit-plane, scale by γ^b, and accumulate.
-///
-/// Ports `ntt_extend_f128_vec_ghash` (scalar form). The NTT is F_2-linear and
-/// φ_8 commutes with that linearity, which is what makes the bit-by-bit
-/// decomposition equal to the direct F_8-valued NTT extension.
 pub fn ntt_extend_f128_vec_ghash(in_s: &[F128], inv_table: &InvNttTableByteSingleGf8) -> Vec<F128> {
     let ell = inv_table.ell;
     assert_eq!(in_s.len(), ell);
@@ -234,7 +204,6 @@ pub fn ntt_extend_f128_vec_ghash(in_s: &[F128], inv_table: &InvNttTableByteSingl
     let mut out = vec![F128::ZERO; ell];
     let n_chunks = inv_table.n_chunks;
 
-    // γ^b for b ∈ [0, 128).
     let mut gamma_pow = [F128::ZERO; 128];
     gamma_pow[0] = F128::ONE;
     for b in 1..128 {
@@ -244,21 +213,28 @@ pub fn ntt_extend_f128_vec_ghash(in_s: &[F128], inv_table: &InvNttTableByteSingl
     let mut input_bits = vec![0u8; n_chunks];
     let mut out_bytes = vec![F8::ZERO; ell];
 
+    let mut transposed_lo = vec![[0u8; 64]; n_chunks];
+    let mut transposed_hi = vec![[0u8; 64]; n_chunks];
+    for c in 0..n_chunks {
+        let base = c * 8;
+        let lo_lanes: [u64; 8] = core::array::from_fn(|j| in_s[base + j].lo);
+        let hi_lanes: [u64; 8] = core::array::from_fn(|j| in_s[base + j].hi);
+        crate::bits::transpose_8_u64s_to_64_bytes(&lo_lanes, &mut transposed_lo[c]);
+        crate::bits::transpose_8_u64s_to_64_bytes(&hi_lanes, &mut transposed_hi[c]);
+    }
+
     for b in 0..128 {
-        // Pack bit b of each in_s[z] into z-indexed LSB-first byte form.
-        input_bits.iter_mut().for_each(|x| *x = 0);
-        for z in 0..ell {
-            let bit = if b < 64 {
-                (in_s[z].lo >> b) & 1
-            } else {
-                (in_s[z].hi >> (b - 64)) & 1
-            };
-            if bit != 0 {
-                input_bits[z / 8] |= 1u8 << (z % 8);
+        if b < 64 {
+            for c in 0..n_chunks {
+                input_bits[c] = transposed_lo[c][b];
+            }
+        } else {
+            let b_hi = b - 64;
+            for c in 0..n_chunks {
+                input_bits[c] = transposed_hi[c][b_hi];
             }
         }
 
-        // Bit-input NTT.
         inv_table.apply(&input_bits, &mut out_bytes);
 
         let g_b = gamma_pow[b];
@@ -270,12 +246,6 @@ pub fn ntt_extend_f128_vec_ghash(in_s: &[F128], inv_table: &InvNttTableByteSingl
     out
 }
 
-/// Round-1 prover message (extract_c form, scalar, algorithmically optimized
-/// but without the geometric-eq shift_reduce trick).
-///
-/// Output: `(res_AB, res_C_lifted)`, each length `2^k_skip` F128 vector.
-/// Both are evaluations on Λ. Output equals `round1_naive(..)` byte-for-byte
-/// (no C_s factor — see module-level comment).
 pub fn round1_extract_c(
     a: &[bool],
     b: &[bool],
@@ -294,10 +264,6 @@ pub fn round1_extract_c(
     round1_extract_c_packed(&a_packed, &b_packed, &c_packed, m, k_skip, r, inv_table)
 }
 
-/// Packed-input variant of [`round1_extract_c`]. Skips the bool→byte packing —
-/// caller passes pre-packed bytes (LSB-first within each byte, as produced
-/// by [`pack_bits`]). Use this when the caller already has packed witnesses
-/// or wants to factor packing out of timed work.
 pub fn round1_extract_c_packed(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -323,7 +289,7 @@ pub fn round1_extract_c_packed(
     let hi_size = 1usize << eq.n_hi;
 
     let mut res_ab = vec![F128::ZERO; ell];
-    // C accumulator stays in S-domain; we NTT-extend once at the end.
+
     let mut res_c_s = vec![F128::ZERO; ell];
 
     let mut partial_ab = vec![F128::ZERO; ell];
@@ -340,19 +306,16 @@ pub fn round1_extract_c_packed(
             let x_rest = (x_hi << eq.n_lo) | x_lo;
             let chunk_offset = x_rest * n_chunks;
 
-            // A, B → Λ-domain via table lookup.
             inv_table.apply(&a_packed[chunk_offset..chunk_offset + n_chunks], &mut a_col);
             inv_table.apply(&b_packed[chunk_offset..chunk_offset + n_chunks], &mut b_col);
 
             let eq_lo = eq.lo[x_lo];
 
-            // AB on Λ.
             for lambda in 0..ell {
                 let ab = a_col[lambda] * b_col[lambda];
                 partial_ab[lambda] += eq_lo * phi8(ab);
             }
 
-            // C on S — read original bits, no NTT yet.
             for s in 0..ell {
                 let c_bit = (c_packed[chunk_offset + s / 8] >> (s % 8)) & 1;
                 if c_bit != 0 {
@@ -362,49 +325,15 @@ pub fn round1_extract_c_packed(
         }
 
         let eq_hi = eq.hi[x_hi];
-        for lambda in 0..ell {
-            res_ab[lambda] += eq_hi * partial_ab[lambda];
-            res_c_s[lambda] += eq_hi * partial_c[lambda];
-        }
+        crate::field::f128_slice::scalar_mul_add_assign(&mut res_ab, &partial_ab, eq_hi);
+        crate::field::f128_slice::scalar_mul_add_assign(&mut res_c_s, &partial_c, eq_hi);
     }
 
-    // Lift C from S to Λ via bit-plane NTT extension.
     let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
 
     (res_ab, res_c_lifted)
 }
 
-/// Same as [`round1_extract_c_packed`] but **also returns `s_hat_v_c`** — the
-/// 128-entry vector ring-switch would otherwise produce via `fold_1b_rows` for
-/// the c-claim's PCS opening at point `r[k_skip..]`.
-///
-/// # Trick
-///
-/// Round 1's c-side already does the witness scan needed for `s_hat_v_c`; it
-/// just collapses one too many dims. The first friendly constant `r[k_skip]`
-/// (= φ_8(α)) applies to bit `i_inner[k_skip]` of the witness, which is also
-/// bit 0 of `x_rest` in this function's loop nest. So splitting the `partial_c`
-/// accumulator into **two banks**, one per value of that bit, gives us the
-/// per-`b_7`-slice partial folds that `s_hat_v_c` indexes by.
-///
-/// Specifically, for `b_7 ∈ {0, 1}`:
-/// ```text
-/// res_c_s_{b_7}[lane] = Σ_{x_rest with bit-0 = b_7}
-///                        eq(r[k_skip..m], x_rest) · c_bit(lane, x_rest)
-/// ```
-/// The wire output `res_c_s` is recovered by `res_c_s_0 + res_c_s_1` (the eq
-/// factor for `r[k_skip]` is already absorbed in each bank), then NTT-extended
-/// as before to produce `res_c_lifted`.
-///
-/// To get the canonical `s_hat_v_c` (eq weight WITHOUT the `r[k_skip]` factor),
-/// divide bank 0 by `1 + r[k_skip]` (= `eq(r[k_skip], 0)`) and bank 1 by
-/// `r[k_skip]` (= `eq(r[k_skip], 1)`):
-/// ```text
-/// s_hat_v_c[(lane, b_7)] = res_c_s_{b_7}[lane] / eq(r[k_skip], b_7)
-/// ```
-/// Output layout (matches `fold_1b_rows`): `s_hat_v_c[lane | (b_7 << k_skip)]`
-/// for `lane ∈ [0, 2^k_skip)`, `b_7 ∈ {0, 1}`. Length = `2 · 2^k_skip` =
-/// `2^LOG_PACKING = 128` when `k_skip = 6`.
 pub fn round1_extract_c_packed_with_s_hat_v(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -430,8 +359,7 @@ pub fn round1_extract_c_packed_with_s_hat_v(
     let hi_size = 1usize << eq.n_hi;
 
     let mut res_ab = vec![F128::ZERO; ell];
-    // Two C banks, one per value of bit 0 of `x_rest` = bit `k_skip` of the
-    // flat witness index (= `b_7` in ring-switch's parlance).
+
     let mut res_c_s_0 = vec![F128::ZERO; ell];
     let mut res_c_s_1 = vec![F128::ZERO; ell];
 
@@ -452,22 +380,16 @@ pub fn round1_extract_c_packed_with_s_hat_v(
             let chunk_offset = x_rest * n_chunks;
             let b_7 = x_rest & 1;
 
-            // A, B → Λ-domain via table lookup.
             inv_table.apply(&a_packed[chunk_offset..chunk_offset + n_chunks], &mut a_col);
             inv_table.apply(&b_packed[chunk_offset..chunk_offset + n_chunks], &mut b_col);
 
             let eq_lo = eq.lo[x_lo];
 
-            // AB on Λ — unchanged.
             for lambda in 0..ell {
                 let ab = a_col[lambda] * b_col[lambda];
                 partial_ab[lambda] += eq_lo * phi8(ab);
             }
 
-            // C on S — route into bank 0 or bank 1 based on b_7. The eq
-            // factor `eq(r[k_skip], b_7)` is implicit in eq_lo because the
-            // SplitEqGhash builds the tensor for r[k_skip..]; we strip that
-            // factor out at the end via division.
             let target = if b_7 == 0 {
                 &mut partial_c_0
             } else {
@@ -482,140 +404,24 @@ pub fn round1_extract_c_packed_with_s_hat_v(
         }
 
         let eq_hi = eq.hi[x_hi];
-        for lambda in 0..ell {
-            res_ab[lambda] += eq_hi * partial_ab[lambda];
-            res_c_s_0[lambda] += eq_hi * partial_c_0[lambda];
-            res_c_s_1[lambda] += eq_hi * partial_c_1[lambda];
-        }
+        crate::field::f128_slice::scalar_mul_add_assign(&mut res_ab, &partial_ab, eq_hi);
+        crate::field::f128_slice::scalar_mul_add_assign(&mut res_c_s_0, &partial_c_0, eq_hi);
+        crate::field::f128_slice::scalar_mul_add_assign(&mut res_c_s_1, &partial_c_1, eq_hi);
     }
 
-    // Wire output: combined bank sum = original res_c_s. (The eq(r[k_skip], 0)
-    // factor (= 1 + r[k_skip]) is baked into bank 0, eq(r[k_skip], 1) (= r[k_skip])
-    // into bank 1. Summing reconstitutes the eq(r[k_skip..m], x_rest) sum.)
-    let mut res_c_s = vec![F128::ZERO; ell];
-    for s in 0..ell {
-        res_c_s[s] = res_c_s_0[s] + res_c_s_1[s];
-    }
+    let mut res_c_s = res_c_s_0.clone();
+    crate::field::f128_slice::xor_assign(&mut res_c_s, &res_c_s_1);
     let res_c_lifted = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
 
-    // s_hat_v_c: strip the eq(r[k_skip], ·) factor from each bank by dividing
-    // by 1 + r[k_skip] (bank 0) and r[k_skip] (bank 1). No NTT extension —
-    // lanes are already boolean indices, which is what ring-switch consumes.
     let inv_zero = (F128::ONE + r[k_skip]).inv();
     let inv_one = r[k_skip].inv();
     let mut s_hat_v_c = vec![F128::ZERO; 2 * ell];
-    for lane in 0..ell {
-        s_hat_v_c[lane] = res_c_s_0[lane] * inv_zero;
-        s_hat_v_c[ell + lane] = res_c_s_1[lane] * inv_one;
-    }
+    crate::field::f128_slice::scalar_mul_into(&mut s_hat_v_c[..ell], &res_c_s_0, inv_zero);
+    crate::field::f128_slice::scalar_mul_into(&mut s_hat_v_c[ell..], &res_c_s_1, inv_one);
 
     (res_ab, res_c_lifted, s_hat_v_c)
 }
 
-/// **Test oracle, not part of the protocol.** Eight-bank generalization of
-/// [`round1_extract_c_packed_with_s_hat_v`], producing the C claim's four-bank
-/// (quad) sufficient statistic.
-///
-/// Where the two-bank form routes on `x_rest & 1` (= witness bit `k_skip`) and
-/// divides by `eq(r[k_skip], b_7)`, this routes on `x_rest & 7` (witness bits
-/// `k_skip..k_skip+3`) and divides bank `K = b_7 + 2 e` by the full
-/// `eq(r[k_skip], b_7) · eq(r[k_skip+1], e₀) · eq(r[k_skip+2], e₁)`. Because the
-/// division is by the literal eq weights, this oracle is **generic in `r`** —
-/// it never mentions α — so it is an independent check of the α-free convention
-/// the optimized capture's banks are defined in.
-///
-/// Output layout: `quad[e · 128 + (lane | (b_7 << k_skip))]`, length `4 · 128`.
-#[cfg(test)]
-pub(crate) fn round1_extract_c_packed_quad_oracle(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    c_packed: &[u8],
-    m: usize,
-    k_skip: usize,
-    r: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-) -> Vec<F128> {
-    let _ = (a_packed, b_packed);
-    assert!(k_skip + 3 <= m);
-    let total_bytes = (1usize << m) / 8;
-    assert_eq!(c_packed.len(), total_bytes);
-    assert_eq!(r.len(), m);
-    assert_eq!(inv_table.k, k_skip);
-
-    let ell = 1usize << k_skip;
-    let n_chunks = ell / 8;
-
-    let eq = SplitEqGhash::new(&r[k_skip..]);
-    let lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-
-    // Eight raw banks indexed by K = x_rest & 7.
-    let mut res = vec![vec![F128::ZERO; ell]; 8];
-    let mut partial = vec![vec![F128::ZERO; ell]; 8];
-
-    for x_hi in 0..hi_size {
-        partial
-            .iter_mut()
-            .for_each(|bank| bank.iter_mut().for_each(|p| *p = F128::ZERO));
-
-        for x_lo in 0..lo_size {
-            let x_rest = (x_hi << eq.n_lo) | x_lo;
-            let chunk_offset = x_rest * n_chunks;
-            let eq_lo = eq.lo[x_lo];
-            let target = &mut partial[x_rest & 7];
-            for s in 0..ell {
-                let c_bit = (c_packed[chunk_offset + s / 8] >> (s % 8)) & 1;
-                if c_bit != 0 {
-                    target[s] += eq_lo;
-                }
-            }
-        }
-
-        let eq_hi = eq.hi[x_hi];
-        for (bank, part) in res.iter_mut().zip(partial.iter()) {
-            for lane in 0..ell {
-                bank[lane] += eq_hi * part[lane];
-            }
-        }
-    }
-
-    // Strip the three small-eq factors that routed each bank.
-    let eq_small = |coord: usize, bit: usize| -> F128 {
-        if bit == 0 {
-            F128::ONE + r[coord]
-        } else {
-            r[coord]
-        }
-    };
-    let mut quad = vec![F128::ZERO; 4 * 2 * ell];
-    for e in 0..4 {
-        for b_7 in 0..2 {
-            let k = b_7 + 2 * e;
-            let weight = (eq_small(k_skip, b_7)
-                * eq_small(k_skip + 1, e & 1)
-                * eq_small(k_skip + 2, (e >> 1) & 1))
-            .inv();
-            let base = e * 2 * ell + b_7 * ell;
-            for lane in 0..ell {
-                quad[base + lane] = res[k][lane] * weight;
-            }
-        }
-    }
-    quad
-}
-
-// ---------------------------------------------------------------------------
-// Test oracle: round-1 polynomial values evaluated AT S
-// ---------------------------------------------------------------------------
-
-/// **Test oracle, not part of the protocol.**
-///
-/// Returns `(P^{AB} at S, P^C at S)` — i.e. evaluations of the same round-1
-/// polynomial on the input domain S instead of the extension domain Λ.
-/// Computed directly from the boolean witness, skipping the NTT extension.
-///
-/// For an honest prover (`a·b = c` everywhere on the hypercube),
-/// `P^{AB}(λ) + P^C(λ) = 0` for every `λ ∈ S`.
 pub fn round1_evals_on_s(
     a: &[bool],
     b: &[bool],
@@ -653,10 +459,6 @@ pub fn round1_evals_on_s(
     (p_ab, p_c)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,9 +494,8 @@ mod tests {
 
     #[test]
     fn build_eq_basic() {
-        // Empty r → table = [1].
         assert_eq!(build_eq(&[]), vec![F128::ONE]);
-        // Single r = [r0] → table = [(1+r0), r0].
+
         let r0 = F128 {
             lo: 0xCAFEBABE,
             hi: 0x12345678,
@@ -703,7 +504,7 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert_eq!(t[0], F128::ONE + r0);
         assert_eq!(t[1], r0);
-        // Sum of all eq values is 1 (a defining property of the multilinear eq).
+
         let n = 5;
         let mut rng = Rng::new(99);
         let r = rng.f128_vec(n);
@@ -755,7 +556,6 @@ mod tests {
 
     #[test]
     fn round1_p_c_is_xor_linear_in_c() {
-        // p_c(c1 XOR c2) = p_c(c1) + p_c(c2), with a, b fixed.
         let m = 6;
         let k_skip = 3;
         let mut rng = Rng::new(4);
@@ -770,10 +570,9 @@ mod tests {
         let (ab2, pc2) = round1_naive(&a, &b, &c2, m, k_skip, &r);
         let (ab_sum, pc_sum) = round1_naive(&a, &b, &c_sum, m, k_skip, &r);
 
-        // P^AB only depends on (a, b), not c: should be unchanged.
         assert_eq!(ab1, ab_sum);
         assert_eq!(ab2, ab_sum);
-        // P^C is XOR-linear in c.
+
         for i in 0..pc1.len() {
             assert_eq!(pc1[i] + pc2[i], pc_sum[i]);
         }
@@ -781,22 +580,12 @@ mod tests {
 
     #[test]
     fn round1_at_s_zero_for_honest_witness() {
-        // The strongest correctness check we can write without the optimized
-        // version: for an honest witness with a · b = c on the hypercube,
-        // the round-1 polynomial P^{AB}(λ) + P^C(λ) is zero at every λ ∈ S.
-        // (At S the extension polynomial equals the original boolean values,
-        // so P at S is just the eq-weighted sum of (a·b ⊕ c) = 0.)
-        //
-        // We use `round1_evals_on_s` as the test oracle since it computes P at S
-        // directly without the NTT. The protocol's actual round-1 message
-        // (`round1_naive`) lives at Λ; cross-checking S↔Λ via NTT
-        // interpolation is left for the optimized-vs-naive comparison.
         let m = 8;
         let k_skip = 3;
         let mut rng = Rng::new(5);
         let a = rng.bits(1 << m);
         let b = rng.bits(1 << m);
-        // Honest c: c = a AND b for every i.
+
         let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
         let r = rng.f128_vec(m);
 
@@ -812,9 +601,6 @@ mod tests {
 
     #[test]
     fn round1_at_s_nonzero_for_random_witness() {
-        // Sanity: for an arbitrary (likely-not-honest) witness, P at S is
-        // generally nonzero. This guards against round1_evals_on_s returning
-        // zero trivially.
         let m = 8;
         let k_skip = 3;
         let mut rng = Rng::new(6);
@@ -865,9 +651,6 @@ mod tests {
         assert_eq!(out1, out2);
     }
 
-    /// `round1_extract_c_packed_with_s_hat_v` produces the same `res_ab` and
-    /// `res_c_lifted` as `round1_extract_c_packed` (the wire output is
-    /// reconstructed from the two banks via summation).
     #[test]
     fn extract_c_with_s_hat_v_matches_original_wire() {
         for &(m, k_skip) in &[(4, 3), (5, 3), (6, 3), (7, 4), (8, 3), (9, 6)] {
@@ -887,17 +670,11 @@ mod tests {
         }
     }
 
-    /// The `s_hat_v_c` output is byte-identical to what ring-switch's
-    /// `fold_1b_rows` would produce on the C-witness against the canonical
-    /// suffix `r[k_skip + 1 ..]` (everything past `prefix0 = r[k_skip]`).
     #[test]
     fn extract_c_with_s_hat_v_matches_fold_1b_rows() {
         use crate::pcs::pack::pack_witness;
         use crate::pcs::ring_switch::fold_1b_rows_naive;
-        // K_SKIP = 6 is the production setup (LOG_PACKING = 7, so 2 · 2^K_SKIP
-        // = 128 matches s_hat_v's length). The kernel needs m >= K_SKIP + 1 =
-        // 7 for pack_witness, plus the SplitEqGhash's n_lo + n_hi machinery
-        // wants m - k_skip >= some floor — tested at m=8..11.
+
         const K_SKIP: usize = 6;
         for &m in &[8usize, 9, 10, 11] {
             let mut rng = Rng::new(0xC0FFEE_u64.wrapping_add(m as u64));
@@ -911,8 +688,6 @@ mod tests {
             let (_, _, s_hat_v_c) =
                 round1_extract_c_packed_with_s_hat_v(&a, &b, &c, m, K_SKIP, &r, &table);
 
-            // Reference: fold_1b_rows on the packed C-witness against the
-            // suffix tensor built from r[k_skip + 1 ..].
             let packed_c = pack_witness(&z_bits, m);
             let suffix = &r[K_SKIP + 1..];
             let suffix_tensor = build_eq(suffix);
@@ -923,9 +698,6 @@ mod tests {
         }
     }
 
-    /// The strongest correctness check: extract_c must produce **identical**
-    /// output to the naive round-1 message — same eq weights, same protocol,
-    /// just a faster algorithm.
     #[test]
     fn extract_c_matches_naive() {
         for &(m, k_skip) in &[(4, 3), (5, 3), (6, 3), (7, 4), (8, 3), (9, 6)] {
@@ -944,10 +716,6 @@ mod tests {
         }
     }
 
-    /// Honest-witness check at extract_c level: when c = a AND b, the
-    /// combined polynomial `res_AB + res_C_lifted` at every λ ∈ Λ should be
-    /// the same as the naive `p_ab + p_c` (which is also zero on S after
-    /// inverse-NTT — but at Λ it can be nonzero in general).
     #[test]
     fn extract_c_honest_witness_combined_matches_naive() {
         let m = 8;
@@ -969,8 +737,6 @@ mod tests {
 
     #[test]
     fn split_eq_basic() {
-        // Building the lo and hi tables separately should produce the same
-        // values as the full eq table when indexed appropriately.
         let mut rng = Rng::new(300);
         let n = 6;
         let r = rng.f128_vec(n);
@@ -986,24 +752,18 @@ mod tests {
 
     #[test]
     fn ntt_extend_round_trips_naive_c_path() {
-        // Sanity for the F128 NTT extension: build a length-ell F128 vector by
-        // applying the naive (eq-weighted) C accumulation at S, then
-        // NTT-extending it. Compare to running the naive C path (which does
-        // the NTT-extend per row). These must agree because both are linear.
         let m = 6;
         let k_skip = 3;
         let mut rng = Rng::new(400);
-        let a = rng.bits(1 << m); // unused for C
-        let b = rng.bits(1 << m); // unused for C
+        let a = rng.bits(1 << m);
+        let b = rng.bits(1 << m);
         let c = rng.bits(1 << m);
         let r = rng.f128_vec(m);
         let table = make_inv_table(k_skip);
-        let _ = (&a, &b); // silence unused-var lints
+        let _ = (&a, &b);
 
-        // Naive p_c: NTT-extends per row.
         let (_, naive_c) = round1_naive(&a, &b, &c, m, k_skip, &r);
 
-        // Extract_c path: accumulate on S, then NTT-extend once.
         let (_, opt_c) = round1_extract_c(&a, &b, &c, m, k_skip, &r, &table);
 
         assert_eq!(naive_c, opt_c);
@@ -1011,8 +771,6 @@ mod tests {
 
     #[test]
     fn round1_message_nonzero_for_random_witness() {
-        // Sanity: round1_naive on random inputs should give nonzero output too.
-        // (Catches accidentally zeroing the accumulators.)
         let m = 8;
         let k_skip = 3;
         let mut rng = Rng::new(7);

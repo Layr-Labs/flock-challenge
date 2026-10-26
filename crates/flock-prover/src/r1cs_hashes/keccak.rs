@@ -1,67 +1,3 @@
-//! Keccak-f[1600] permutation primitives + compact per-Keccak R1CS encoder.
-//!
-//! ## Two layers
-//!
-//! 1. **Keccak-f primitives**: reference bit-level implementation and the
-//!    fast u64-lane version following FIPS 202. Shared with the rest of the
-//!    crate (used as the oracle in tests, the witness generator's forward
-//!    simulator, and as a baseline for `keccak_native_chain`).
-//!
-//! 2. **Monolithic R1CS encoder** at **K_LOG = 16**: one R1CS instance per
-//!    full Keccak, all 24 rounds folded inline. Drops every intermediate
-//!    state slot — only `state_0` (input) and `state_24` (output) plus
-//!    `t_0..t_23` (the 24 χ AND-outputs) are materialized in the witness.
-//!    State_r for r ∈ {1..23} is *implicit* via the substitution
-//!    `state_r = φ^r·state_0 ⊕ Σ_{i<r} φ^{r-1-i}·t_i ⊕ RC_r` (with
-//!    φ = θ∘ρ∘π). The substituted A/B matrices would be ~700× denser than
-//!    a fully-materialized baseline, but we never materialize them — the
-//!    [`KeccakLincheckCircuit`] walker computes the lincheck column marginal
-//!    by a backward transpose recurrence
-//!    `K_r = φᵀ(K_{r+1}) ⊕ χ_r` density-independent in ~1M F128 ops.
-//!
-//! `state_24` is kept at an I/O-aligned slot (2048-bit window starting at
-//! bit 2048) so the generic chain shift sumcheck can compare consecutive
-//! instances' `state_24[i] == state_0[i+1]` without any layout change. It
-//! also enforces `state_24 = keccak_f(state_0)` end-to-end via a 1,600-row
-//! pin block (`L_24(state_0, t_<24)[j] = z[state_24 col j]`).
-//!
-//! ## Witness layout per block (k = 2^16 = 65,536 slots, 1024 u64 lanes)
-//!
-//! ```text
-//!   bit 0     .. 1600   state_0   (input region; aligned slot 0, pad 1600..2048 zero)
-//!   bit 2048  .. 3648   state_24  (output region; aligned slot 1, pad 3648..4096 zero)
-//!   bit 4096            constant z = 1 (bit 0 of u64[64])
-//!   bit 4160  .. 42560  t_0 .. t_23  (24 vecs, tight, 1600 stride)
-//!   bit 42560 .. K      zero tail
-//! ```
-//!
-//! Useful bits = `4160 + 24·1600 = 42,560` (padding ≈ 35%).
-//!
-//! `state_0` and `state_24` live in 2048-bit aligned slots (`region_log = 11`)
-//! so the generic chain shift sumcheck operates on them unchanged.
-//!
-//! ## What the R1CS enforces
-//!
-//! - Row 0 (const): `z[0]·z[0] = z[0]`.
-//! - state_0 input self-loops (1,600 rows): `z[row]·z[0] = z[row]`.
-//! - **state_24 pin rows (1,600 rows)**: `L_24(state_0, t_<24)[j] · z[0]
-//!   = z[z_pos_state24(j)]`, where `L_24 = φ^24·state_0 ⊕ Σ_{i<24} φ^{23-i}·t_i
-//!   ⊕ RC_24`. After substitution the A-side row has hundreds of dense taps
-//!   on (state_0 + t_<24) columns — never materialized; circuit walker handles.
-//! - 24 × 1,600 t-AND rows: `t_r[x,y,z] = (¬φ(state_r)[(x+1)%5,y,z]) ·
-//!   φ(state_r)[(x+2)%5,y,z]`, with `state_r` implicit via L_r.
-//! - Padding: empty A, B.
-//!
-//! ## Matrices
-//!
-//! [`build_block_r1cs`] returns `BlockR1cs` with **empty** `a_0`, `b_0`
-//! stubs and `c_0 = I_K`. The empty matrices are never consulted on the
-//! `prove_fast`/`verify` path — the constraint definition lives in
-//! [`KeccakLincheckCircuit`], and witness gen emits `a`, `b` values
-//! directly from the running keccak_f simulation. `r1cs.satisfies(z)` and
-//! the slow `prove` path will report "everything satisfied vacuously" for
-//! this encoding — only use `prove_fast`/`prove_chain`.
-
 use crate::r1cs_hashes::chain_common::{ChainLayout, ChainVerifyError};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
@@ -71,31 +7,20 @@ use flock_core::proof::R1csClaim;
 use flock_core::r1cs::BlockR1cs;
 use flock_core::verifier;
 
-// ===========================================================================
-// Keccak-f[1600] primitives
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Keccak-f state size in bits.
 pub const STATE_BITS: usize = 1600;
 
-/// Number of u64 lanes per Keccak state vector.
 pub const N_LANES: usize = 25;
-/// Bits per u64 lane.
+
 pub const LANE_BITS: usize = 64;
-/// Bits per state vector. Equals `STATE_BITS = N_LANES · LANE_BITS`.
+
 pub const STATE_SIZE_BITS: usize = N_LANES * LANE_BITS;
-/// Number of materialized t vectors per Keccak (t_0 … t_23).
+
 pub const N_T: usize = 24;
-/// Number of Keccak-f rounds. Matches `ROUND_CONSTANTS.len()`.
+
 pub const N_ROUNDS: usize = 24;
-/// Univariate-skip dim (must match `zerocheck::K_SKIP`).
+
 pub const K_SKIP: usize = 6;
 
-/// ρ rotation offsets `r[x][y]` (FIPS 202 Table 2).
 const RHO_OFFSETS: [[u32; 5]; 5] = [
     [0, 36, 3, 41, 18],
     [1, 44, 10, 45, 2],
@@ -104,7 +29,6 @@ const RHO_OFFSETS: [[u32; 5]; 5] = [
     [27, 20, 39, 8, 14],
 ];
 
-/// Keccak-f round constants for the ι step (24 rounds).
 pub const ROUND_CONSTANTS: [u64; 24] = [
     0x0000000000000001,
     0x0000000000008082,
@@ -132,25 +56,13 @@ pub const ROUND_CONSTANTS: [u64; 24] = [
     0x8000000080008008,
 ];
 
-/// State-bit linear index: `state_idx(x, y, z) = x + 5y + 25z`, range [0, 1600).
 #[inline]
 pub fn state_idx(x: usize, y: usize, z: usize) -> usize {
     debug_assert!(x < 5 && y < 5 && z < 64);
     x + 5 * y + 25 * z
 }
 
-// ---------------------------------------------------------------------------
-// Linear preimage: which state_in bits XOR to give B[x,y,z]?
-// ---------------------------------------------------------------------------
-
-/// Returns the state_in bit indices whose XOR equals `B[x, y, z]`, where
-/// `B = (π ∘ ρ ∘ θ)(state_in)`. There are always 11 distinct indices.
 pub fn theta_rho_pi_preimage(x: usize, y: usize, z: usize) -> [usize; 11] {
-    // π: B[x, y, z] = A_ρ[(x + 3y) mod 5, x, z]
-    // ρ: A_ρ[a, b, c] = A_θ[a, b, (c − r[a][b]) mod 64]
-    // θ: A_θ[a, b, c] = A[a, b, c]
-    //                  ⊕ ⊕_{y'} A[(a−1) mod 5, y', c]
-    //                  ⊕ ⊕_{y'} A[(a+1) mod 5, y', (c−1) mod 64]
     let a = (x + 3 * y) % 5;
     let b = x;
     let r = (RHO_OFFSETS[a][b] as usize) % 64;
@@ -170,15 +82,8 @@ pub fn theta_rho_pi_preimage(x: usize, y: usize, z: usize) -> [usize; 11] {
     bits
 }
 
-// ---------------------------------------------------------------------------
-// State types
-// ---------------------------------------------------------------------------
-
-/// Keccak-f state as 1600 GF(2) bits.
 pub type State = [bool; STATE_BITS];
 
-/// 25 u64 lanes = 1600 bits. Lane index = `x + 5y`; bit z within a lane is at
-/// u64 bit position `z`.
 pub type Lanes = [u64; 25];
 
 #[inline]
@@ -187,7 +92,6 @@ fn lane_idx(x: usize, y: usize) -> usize {
     x + 5 * y
 }
 
-/// Convert `[bool; 1600]` (state_idx layout) → `[u64; 25]` lanes.
 pub fn state_to_lanes(s: &State) -> Lanes {
     let mut lanes = [0u64; 25];
     for z in 0..64 {
@@ -202,7 +106,6 @@ pub fn state_to_lanes(s: &State) -> Lanes {
     lanes
 }
 
-/// Convert `[u64; 25]` lanes → `[bool; 1600]` (state_idx layout).
 pub fn lanes_to_state(lanes: &Lanes) -> State {
     let mut s = [false; STATE_BITS];
     for y in 0..5 {
@@ -216,11 +119,6 @@ pub fn lanes_to_state(lanes: &Lanes) -> State {
     s
 }
 
-// ---------------------------------------------------------------------------
-// Fast u64-lane Keccak — 50-100× faster than bit-by-bit reference.
-// ---------------------------------------------------------------------------
-
-/// θ on u64 lanes.
 #[inline]
 pub fn theta_lanes(s: &mut Lanes) {
     let c = [
@@ -251,11 +149,11 @@ pub fn theta_lanes(s: &mut Lanes) {
             ^ s[lane_idx(4, 4)],
     ];
     let d = [
-        c[4] ^ c[1].rotate_left(1),
-        c[0] ^ c[2].rotate_left(1),
-        c[1] ^ c[3].rotate_left(1),
-        c[2] ^ c[4].rotate_left(1),
-        c[3] ^ c[0].rotate_left(1),
+        unsafe { flock_core::gf2_kernels::gf2_kern_keccak_theta_d(c[4], c[1]) },
+        unsafe { flock_core::gf2_kernels::gf2_kern_keccak_theta_d(c[0], c[2]) },
+        unsafe { flock_core::gf2_kernels::gf2_kern_keccak_theta_d(c[1], c[3]) },
+        unsafe { flock_core::gf2_kernels::gf2_kern_keccak_theta_d(c[2], c[4]) },
+        unsafe { flock_core::gf2_kernels::gf2_kern_keccak_theta_d(c[3], c[0]) },
     ];
     for y in 0..5 {
         for x in 0..5 {
@@ -264,7 +162,6 @@ pub fn theta_lanes(s: &mut Lanes) {
     }
 }
 
-/// Combined ρ ∘ π on u64 lanes.
 #[inline]
 pub fn rho_pi_lanes(s_in: &Lanes) -> Lanes {
     let mut s_out = [0u64; 25];
@@ -272,14 +169,14 @@ pub fn rho_pi_lanes(s_in: &Lanes) -> Lanes {
         for x in 0..5 {
             let a = (x + 3 * y) % 5;
             let b = x;
-            let r = RHO_OFFSETS[a][b] % 64;
-            s_out[lane_idx(x, y)] = s_in[lane_idx(a, b)].rotate_left(r);
+            let r = (RHO_OFFSETS[a][b] % 64) as u64;
+            s_out[lane_idx(x, y)] =
+                unsafe { flock_core::gf2_kernels::gf2_kern_keccak_rol64(s_in[lane_idx(a, b)], r) };
         }
     }
     s_out
 }
 
-/// χ on u64 lanes.
 #[inline]
 pub fn chi_lanes(s_in: &Lanes) -> Lanes {
     let mut s_out = [0u64; 25];
@@ -289,22 +186,20 @@ pub fn chi_lanes(s_in: &Lanes) -> Lanes {
         let a2 = s_in[lane_idx(2, y)];
         let a3 = s_in[lane_idx(3, y)];
         let a4 = s_in[lane_idx(4, y)];
-        s_out[lane_idx(0, y)] = a0 ^ ((!a1) & a2);
-        s_out[lane_idx(1, y)] = a1 ^ ((!a2) & a3);
-        s_out[lane_idx(2, y)] = a2 ^ ((!a3) & a4);
-        s_out[lane_idx(3, y)] = a3 ^ ((!a4) & a0);
-        s_out[lane_idx(4, y)] = a4 ^ ((!a0) & a1);
+        s_out[lane_idx(0, y)] = unsafe { flock_core::gf2_kernels::gf2_kern_keccak_chi(a0, a1, a2) };
+        s_out[lane_idx(1, y)] = unsafe { flock_core::gf2_kernels::gf2_kern_keccak_chi(a1, a2, a3) };
+        s_out[lane_idx(2, y)] = unsafe { flock_core::gf2_kernels::gf2_kern_keccak_chi(a2, a3, a4) };
+        s_out[lane_idx(3, y)] = unsafe { flock_core::gf2_kernels::gf2_kern_keccak_chi(a3, a4, a0) };
+        s_out[lane_idx(4, y)] = unsafe { flock_core::gf2_kernels::gf2_kern_keccak_chi(a4, a0, a1) };
     }
     s_out
 }
 
-/// ι on u64 lanes (in-place).
 #[inline]
 pub fn iota_lanes(s: &mut Lanes, round_idx: usize) {
     s[lane_idx(0, 0)] ^= ROUND_CONSTANTS[round_idx];
 }
 
-/// One Keccak-f round on u64 lanes (in-place).
 #[inline]
 pub fn keccak_round_lanes(s: &mut Lanes, round_idx: usize) {
     theta_lanes(s);
@@ -313,9 +208,6 @@ pub fn keccak_round_lanes(s: &mut Lanes, round_idx: usize) {
     iota_lanes(s, round_idx);
 }
 
-/// Compute `t = χ((π∘ρ∘θ)(state_in))`'s "AND output" component as u64 lanes:
-/// `t_lane(x, y) = (¬B_lane(x+1, y)) ∧ B_lane(x+2, y)` where
-/// `B = (π∘ρ∘θ)(state_in)`.
 #[inline]
 pub fn compute_round_t_lanes(state_in: &Lanes) -> Lanes {
     let mut b = *state_in;
@@ -328,20 +220,15 @@ pub fn compute_round_t_lanes(state_in: &Lanes) -> Lanes {
         let b3 = b[lane_idx(3, y)];
         let b4 = b[lane_idx(4, y)];
         let b0 = b[lane_idx(0, y)];
-        t[lane_idx(0, y)] = (!b1) & b2;
-        t[lane_idx(1, y)] = (!b2) & b3;
-        t[lane_idx(2, y)] = (!b3) & b4;
-        t[lane_idx(3, y)] = (!b4) & b0;
-        t[lane_idx(4, y)] = (!b0) & b1;
+        t[lane_idx(0, y)] = unsafe { flock_core::gf2_kernels::gf2_kern_keccak_chi_and(b1, b2) };
+        t[lane_idx(1, y)] = unsafe { flock_core::gf2_kernels::gf2_kern_keccak_chi_and(b2, b3) };
+        t[lane_idx(2, y)] = unsafe { flock_core::gf2_kernels::gf2_kern_keccak_chi_and(b3, b4) };
+        t[lane_idx(3, y)] = unsafe { flock_core::gf2_kernels::gf2_kern_keccak_chi_and(b4, b0) };
+        t[lane_idx(4, y)] = unsafe { flock_core::gf2_kernels::gf2_kern_keccak_chi_and(b0, b1) };
     }
     t
 }
 
-// ---------------------------------------------------------------------------
-// Legacy bool-array Keccak primitives (kept as the test oracle / reference).
-// ---------------------------------------------------------------------------
-
-/// θ step (in-place). Linear over GF(2).
 pub fn theta(s: &mut State) {
     let mut c = [[false; 64]; 5];
     for x in 0..5 {
@@ -368,7 +255,6 @@ pub fn theta(s: &mut State) {
     }
 }
 
-/// Combined ρ ∘ π step.
 pub fn rho_pi(s_in: &State) -> State {
     let mut s_out = [false; STATE_BITS];
     for x in 0..5 {
@@ -385,7 +271,6 @@ pub fn rho_pi(s_in: &State) -> State {
     s_out
 }
 
-/// χ step. The only nonlinear step.
 pub fn chi(s_in: &State) -> State {
     let mut s_out = [false; STATE_BITS];
     for x in 0..5 {
@@ -401,7 +286,6 @@ pub fn chi(s_in: &State) -> State {
     s_out
 }
 
-/// ι step (in-place). XORs the round constant into lane (0, 0).
 pub fn iota(s: &mut State, round_idx: usize) {
     let rc = ROUND_CONSTANTS[round_idx];
     for z in 0..64 {
@@ -411,53 +295,39 @@ pub fn iota(s: &mut State, round_idx: usize) {
     }
 }
 
-/// One Keccak-f round. Fast path uses u64 lanes; bool↔lane conversions at the
-/// boundary.
 pub fn keccak_round(s: &mut State, round_idx: usize) {
     let mut lanes = state_to_lanes(s);
     keccak_round_lanes(&mut lanes, round_idx);
     *s = lanes_to_state(&lanes);
 }
 
-/// Full Keccak-f[1600] (24 rounds).
 pub fn keccak_f(s: &mut State) {
     for r in 0..24 {
         keccak_round(s, r);
     }
 }
 
-// ===========================================================================
-// Compact monolithic R1CS encoder at K_LOG = 16 (I/O-aligned)
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// Constants and layout
-// ---------------------------------------------------------------------------
-
 pub const K_LOG: usize = 16;
 pub const K: usize = 1 << K_LOG;
 
-/// 2^11 = 2048-bit aligned region for state_0 and state_24.
 pub const SLOT_BITS: usize = 2048;
 
-/// state_0 base (slot 0, bit 0).
 pub const STATE0_BIT_BASE: usize = 0;
-/// state_24 base (slot 1, bit 2048).
-pub const STATE24_BIT_BASE: usize = SLOT_BITS;
-/// Constant slot — bit 0 of u64[64].
-pub const Z_CONST: usize = 2 * SLOT_BITS; // 4096
-/// First tightly-packed t_r begins one lane past the const.
-pub const T_PACKED_BIT_BASE: usize = Z_CONST + LANE_BITS; // 4160
 
-pub const USEFUL_BITS: usize = T_PACKED_BIT_BASE + N_T * STATE_SIZE_BITS; // 42,560
+pub const STATE24_BIT_BASE: usize = SLOT_BITS;
+
+pub const Z_CONST: usize = 2 * SLOT_BITS;
+
+pub const T_PACKED_BIT_BASE: usize = Z_CONST + LANE_BITS;
+
+pub const USEFUL_BITS: usize = T_PACKED_BIT_BASE + N_T * STATE_SIZE_BITS;
 
 const _: () = {
     assert!(USEFUL_BITS <= K);
 };
 
-pub const U64_PER_BLOCK: usize = K / 64; // 1024
+pub const U64_PER_BLOCK: usize = K / 64;
 
-/// `u64`-lane index for state_r where r ∈ {0, 24}.
 #[inline]
 fn state_u64_base(r: usize) -> usize {
     match r {
@@ -467,17 +337,14 @@ fn state_u64_base(r: usize) -> usize {
     }
 }
 
-/// `u64`-lane index for t_r (r ∈ 0..N_T).
 #[inline]
 fn t_u64_base(r: usize) -> usize {
     debug_assert!(r < N_T);
     (T_PACKED_BIT_BASE / LANE_BITS) + r * N_LANES
 }
 
-/// `u64`-lane index for the constant.
-const Z_CONST_U64: usize = Z_CONST / LANE_BITS; // 64
+const Z_CONST_U64: usize = Z_CONST / LANE_BITS;
 
-/// Within-sub-vector offset for logical bit `j` (lane-contiguous).
 #[inline]
 fn within_lane_contiguous(j: usize) -> usize {
     let lane_xy = j % N_LANES;
@@ -485,7 +352,6 @@ fn within_lane_contiguous(j: usize) -> usize {
     LANE_BITS * lane_xy + z_in_lane
 }
 
-/// Position of bit `j` of state_r (r ∈ {0, 24}) in the per-block witness.
 #[inline]
 pub fn z_pos_state(r: usize, j: usize) -> usize {
     debug_assert!(j < STATE_BITS);
@@ -496,7 +362,6 @@ pub fn z_pos_state(r: usize, j: usize) -> usize {
     }
 }
 
-/// Position of bit `j` of `t_r` in the per-block witness.
 #[inline]
 pub fn z_pos_t(r: usize, j: usize) -> usize {
     debug_assert!(r < N_T);
@@ -504,12 +369,6 @@ pub fn z_pos_t(r: usize, j: usize) -> usize {
     T_PACKED_BIT_BASE + r * STATE_SIZE_BITS + within_lane_contiguous(j)
 }
 
-// ---------------------------------------------------------------------------
-// R1CS shell — uses shared helpers in `super::common`.
-// ---------------------------------------------------------------------------
-
-/// Minimum `n_keccaks_log` needed to prove `n_keccaks` Keccak permutations,
-/// subject to the lincheck floor (≥ 3).
 pub fn min_n_keccaks_log(n_keccaks: usize) -> usize {
     assert!(n_keccaks >= 1, "n_keccaks must be ≥ 1");
     let n = n_keccaks.max(8);
@@ -517,8 +376,6 @@ pub fn min_n_keccaks_log(n_keccaks: usize) -> usize {
     bits.max(3)
 }
 
-/// Apply φᵀ to a length-`STATE_BITS` F128 buffer: `out[s_in] = Σ_{s_out :
-/// s_in ∈ preim(s_out)} in[s_out]`.
 pub(crate) fn apply_phi_t(v: &[F128]) -> Vec<F128> {
     debug_assert_eq!(v.len(), STATE_BITS);
     let mut out = vec![F128::ZERO; STATE_BITS];
@@ -536,8 +393,6 @@ pub(crate) fn apply_phi_t(v: &[F128]) -> Vec<F128> {
     out
 }
 
-/// Forward-apply φ on a `bool` state — tracks the round-constant accumulator
-/// `RC_r` (an F_2 state). `out[s_out] = XOR_{s_in ∈ preim(s_out)} in[s_in]`.
 pub(crate) fn apply_phi_bool(v: &[bool; STATE_BITS]) -> [bool; STATE_BITS] {
     let mut out = [false; STATE_BITS];
     for s_out in 0..STATE_BITS {
@@ -559,10 +414,6 @@ pub fn build_block_r1cs(n_keccaks_log: usize) -> BlockR1cs {
     super::common::build_block_r1cs_empty_stub(n_keccaks_log, K_LOG, K_SKIP, USEFUL_BITS)
 }
 
-// ---------------------------------------------------------------------------
-// Witness generation
-// ---------------------------------------------------------------------------
-
 fn build_chain_witness_ab_packed_into(
     initial: &State,
     z_u64: &mut [u64],
@@ -573,12 +424,10 @@ fn build_chain_witness_ab_packed_into(
     debug_assert_eq!(a_u64.len(), U64_PER_BLOCK);
     debug_assert_eq!(b_u64.len(), U64_PER_BLOCK);
 
-    // Constant z[Z_CONST] = 1, a = b = 1.
     z_u64[Z_CONST_U64] = 1;
     a_u64[Z_CONST_U64] = 1;
     b_u64[Z_CONST_U64] = 1;
 
-    // state_0 input self-loops.
     let mut state_lanes: Lanes = state_to_lanes(initial);
     let s0_base = state_u64_base(0);
     for lane_idx in 0..N_LANES {
@@ -589,33 +438,34 @@ fn build_chain_witness_ab_packed_into(
         b_u64[pos] = u64::MAX;
     }
 
-    // 24 rounds: forward-simulate, write t_r AND-row values.
     for r in 0..N_ROUNDS {
         let mut b_state: Lanes = state_lanes;
         theta_lanes(&mut b_state);
         let b_state: Lanes = rho_pi_lanes(&b_state);
 
         let mut t_lanes: Lanes = [0u64; 25];
+        let mut next: Lanes = [0u64; 25];
         for y in 0..5 {
             let b0 = b_state[5 * y];
             let b1 = b_state[1 + 5 * y];
             let b2 = b_state[2 + 5 * y];
             let b3 = b_state[3 + 5 * y];
             let b4 = b_state[4 + 5 * y];
-            t_lanes[5 * y] = (!b1) & b2;
-            t_lanes[1 + 5 * y] = (!b2) & b3;
-            t_lanes[2 + 5 * y] = (!b3) & b4;
-            t_lanes[3 + 5 * y] = (!b4) & b0;
-            t_lanes[4 + 5 * y] = (!b0) & b1;
-        }
-
-        let mut next: Lanes = [0u64; 25];
-        for i in 0..25 {
-            next[i] = b_state[i] ^ t_lanes[i];
+            unsafe {
+                t_lanes[5 * y] = flock_core::gf2_kernels::gf2_kern_keccak_chi_and(b1, b2);
+                t_lanes[1 + 5 * y] = flock_core::gf2_kernels::gf2_kern_keccak_chi_and(b2, b3);
+                t_lanes[2 + 5 * y] = flock_core::gf2_kernels::gf2_kern_keccak_chi_and(b3, b4);
+                t_lanes[3 + 5 * y] = flock_core::gf2_kernels::gf2_kern_keccak_chi_and(b4, b0);
+                t_lanes[4 + 5 * y] = flock_core::gf2_kernels::gf2_kern_keccak_chi_and(b0, b1);
+                next[5 * y] = flock_core::gf2_kernels::gf2_kern_keccak_chi(b0, b1, b2);
+                next[1 + 5 * y] = flock_core::gf2_kernels::gf2_kern_keccak_chi(b1, b2, b3);
+                next[2 + 5 * y] = flock_core::gf2_kernels::gf2_kern_keccak_chi(b2, b3, b4);
+                next[3 + 5 * y] = flock_core::gf2_kernels::gf2_kern_keccak_chi(b3, b4, b0);
+                next[4 + 5 * y] = flock_core::gf2_kernels::gf2_kern_keccak_chi(b4, b0, b1);
+            }
         }
         iota_lanes(&mut next, r);
 
-        // t_r AND-row values.
         let t_base = t_u64_base(r);
         for y in 0..5 {
             for x in 0..5 {
@@ -630,8 +480,6 @@ fn build_chain_witness_ab_packed_into(
         state_lanes = next;
     }
 
-    // After 24 rounds state_lanes = state_24 = keccak_f(initial). Write the
-    // state_24 pin rows: z = a = state_24, b = 1 (B side is [Z_CONST]).
     let s24_base = state_u64_base(24);
     for lane_idx in 0..N_LANES {
         let pos = s24_base + lane_idx;
@@ -640,17 +488,12 @@ fn build_chain_witness_ab_packed_into(
         a_u64[pos] = v;
         b_u64[pos] = u64::MAX;
     }
-    // Trailing padding stays zero.
 }
 
 pub fn generate_witness_with_ab_packed_and_lincheck(
     initial_states: &[State],
     n_keccaks_log: usize,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-    // Constant-wire pin (docs/const-wire-pin.md): fill padding blocks with a
-    // valid keccak_f(0) computation so the constant cell is 1 in every block.
-    // (The chain forbids padding — `prove_chain` asserts no padding — so this is
-    // a no-op there and only affects the standalone batch setup.)
     let padding: State = [false; STATE_BITS];
     super::common::drive_witness_packed_and_lincheck(
         initial_states,
@@ -661,23 +504,6 @@ pub fn generate_witness_with_ab_packed_and_lincheck(
     )
 }
 
-// ---------------------------------------------------------------------------
-// Lincheck circuit walker — extends [`keccak::KeccakLincheckCircuit`] by one
-// transpose-recurrence round to absorb the state_24 pin rows.
-//
-//   K^A_24 = vec_pin (where vec_pin[j] = eq_inner[z_pos_state(24, j)])
-//   K^A_r  = φᵀ(K^A_{r+1}) ⊕ χ_{r,A}   for r ∈ 23..0
-//
-// Scattering: K^A_24 → t_23 col (pin row's t_23 coefficient = φ^0 · K^A_24);
-// K^A_r → t_{r-1} col for r ∈ {23..1}; K^A_0 → state_0 col. The state_24 col
-// itself receives no A or B contribution (pin row writes to it via C = I).
-//
-// B side: pin's B = [Z_CONST] only. K^B_24 = 0; recurrence collapses to
-// `keccak`'s B-side recurrence.
-//
-// Z_CONST: receives `α·dot(vec_pin, RC_24) + sum_eq_pin` extra (vs `keccak`).
-// ---------------------------------------------------------------------------
-
 pub struct KeccakLincheckCircuit;
 
 impl LincheckCircuit for KeccakLincheckCircuit {
@@ -685,9 +511,6 @@ impl LincheckCircuit for KeccakLincheckCircuit {
         K
     }
 
-    /// Pin the constant cell to 1 across all blocks. Requires the witness to fill
-    /// padding blocks with valid keccak computations (constant = 1) — see
-    /// [`generate_witness_with_ab_packed_and_lincheck`] and docs/const-wire-pin.md.
     fn const_pin_col(&self) -> Option<usize> {
         Some(Z_CONST)
     }
@@ -696,20 +519,16 @@ impl LincheckCircuit for KeccakLincheckCircuit {
         assert_eq!(eq_inner.len(), K, "eq_inner length must equal n_cols = K");
         let mut comb = vec![F128::ZERO; K];
 
-        // ---- Row 0 (const): A = [Z_CONST], B = [Z_CONST].
         let e0 = eq_inner[Z_CONST];
-        comb[Z_CONST] += alpha * e0;
-        comb[Z_CONST] += e0;
+        comb[Z_CONST] = alpha.fma(e0, comb[Z_CONST] + e0);
 
-        // ---- state_0 input self-loops: A = [row], B = [Z_CONST].
         for j in 0..STATE_BITS {
             let row = z_pos_state(0, j);
             let e = eq_inner[row];
-            comb[row] += alpha * e;
+            comb[row] = alpha.fma(e, comb[row]);
             comb[Z_CONST] += e;
         }
 
-        // ---- state_24 pin rows: A = L_24[j], B = [Z_CONST].
         let mut vec_pin: Vec<F128> = vec![F128::ZERO; STATE_BITS];
         let mut sum_eq_pin = F128::ZERO;
         for j in 0..STATE_BITS {
@@ -718,9 +537,8 @@ impl LincheckCircuit for KeccakLincheckCircuit {
             vec_pin[j] = e;
             sum_eq_pin += e;
         }
-        comb[Z_CONST] += sum_eq_pin; // B-side from pin's B = [Z_CONST]
+        comb[Z_CONST] += sum_eq_pin;
 
-        // ---- t-AND rows: build per-round χ marginals on state_r positions.
         let mut chi_a: Vec<Vec<F128>> = (0..N_T).map(|_| vec![F128::ZERO; STATE_BITS]).collect();
         let mut chi_b: Vec<Vec<F128>> = (0..N_T).map(|_| vec![F128::ZERO; STATE_BITS]).collect();
         let mut sum_eq_t = F128::ZERO;
@@ -744,7 +562,6 @@ impl LincheckCircuit for KeccakLincheckCircuit {
         }
         comb[Z_CONST] += alpha * sum_eq_t;
 
-        // ---- Round-constant accumulation. After loop rc = RC_24.
         let mut rc = [false; STATE_BITS];
         let mut rc_a = F128::ZERO;
         let mut rc_b = F128::ZERO;
@@ -773,40 +590,31 @@ impl LincheckCircuit for KeccakLincheckCircuit {
         comb[Z_CONST] += rc_b;
         comb[Z_CONST] += alpha * rc_pin;
 
-        // ---- Transpose recurrence, A side. Starts at K^A_24 = vec_pin.
-        // Step 1: scatter K^A_24 → t_23 col.
         let t23_base = t_u64_base(N_T - 1);
         for s in 0..STATE_BITS {
             let pos = (t23_base + s % N_LANES) * LANE_BITS + (s / N_LANES);
-            comb[pos] += alpha * vec_pin[s];
+            comb[pos] = alpha.fma(vec_pin[s], comb[pos]);
         }
-        // Step 2: K^A_23 = φᵀ(K^A_24) ⊕ χ_{23,A}.
+
         let mut k_a = apply_phi_t(&vec_pin);
-        for s in 0..STATE_BITS {
-            k_a[s] += chi_a[N_T - 1][s];
-        }
-        // Step 3: standard recurrence for r ∈ {23..1}.
+        flock_core::field::f128_slice::xor_assign(&mut k_a, &chi_a[N_T - 1]);
+
         for r in (1..N_T).rev() {
             let t_base = t_u64_base(r - 1);
             for s in 0..STATE_BITS {
                 let pos = (t_base + s % N_LANES) * LANE_BITS + (s / N_LANES);
-                comb[pos] += alpha * k_a[s];
+                comb[pos] = alpha.fma(k_a[s], comb[pos]);
             }
             let mut new_k = apply_phi_t(&k_a);
-            for s in 0..STATE_BITS {
-                new_k[s] += chi_a[r - 1][s];
-            }
+            flock_core::field::f128_slice::xor_assign(&mut new_k, &chi_a[r - 1]);
             k_a = new_k;
         }
         let s0_base = state_u64_base(0);
         for s in 0..STATE_BITS {
             let pos = (s0_base + s % N_LANES) * LANE_BITS + (s / N_LANES);
-            comb[pos] += alpha * k_a[s];
+            comb[pos] = alpha.fma(k_a[s], comb[pos]);
         }
 
-        // ---- Transpose recurrence, B side. K^B_24 = 0, so K^B_23 = χ_{23,B}
-        // — same starting point as `keccak`. Pin row doesn't contribute to
-        // t_23 col on B side.
         let mut k_b = chi_b[N_T - 1].clone();
         for r in (1..N_T).rev() {
             let t_base = t_u64_base(r - 1);
@@ -815,9 +623,7 @@ impl LincheckCircuit for KeccakLincheckCircuit {
                 comb[pos] += k_b[s];
             }
             let mut new_k = apply_phi_t(&k_b);
-            for s in 0..STATE_BITS {
-                new_k[s] += chi_b[r - 1][s];
-            }
+            flock_core::field::f128_slice::xor_assign(&mut new_k, &chi_b[r - 1]);
             k_b = new_k;
         }
         for s in 0..STATE_BITS {
@@ -829,24 +635,15 @@ impl LincheckCircuit for KeccakLincheckCircuit {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CHAIN_LAYOUT
-// ---------------------------------------------------------------------------
-
-/// I/O geometry for the generic chain core: `state_0` in aligned slot 0,
-/// `state_24` in slot 1, each in a 2048-bit (`region_log = 11`) window
-/// holding a 1600-bit Keccak state.
 pub const CHAIN_LAYOUT: ChainLayout = ChainLayout {
     k_log: K_LOG,
     k_skip: K_SKIP,
     region_log: 11,
     region_bits: STATE_BITS,
-    input_byte_off: STATE0_BIT_BASE / 8,   // 0
-    output_byte_off: STATE24_BIT_BASE / 8, // 256
+    input_byte_off: STATE0_BIT_BASE / 8,
+    output_byte_off: STATE24_BIT_BASE / 8,
 };
 
-/// Convert a public state (logical FIPS bit order) to the region's physical
-/// within-slot bit order. Used for the public-endpoint fold in verify_chain.
 pub fn state_to_phys_bits(x: &State) -> Vec<bool> {
     let mut phys = vec![false; STATE_BITS];
     for j in 0..STATE_BITS {
@@ -854,10 +651,6 @@ pub fn state_to_phys_bits(x: &State) -> Vec<bool> {
     }
     phys
 }
-
-// ---------------------------------------------------------------------------
-// Setup
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 pub struct KeccakSetup {
@@ -872,17 +665,14 @@ impl KeccakSetup {
     }
 
     pub fn with_log_inv_rate(n_keccaks: usize, log_inv_rate: usize) -> Self {
-        // Rate keys the legacy profiles: 1 -> Fast, 2 -> Slim.
         let profile = match log_inv_rate {
             1 => flock_core::pcs::ligerito::LigeritoProfile::Fast,
             2 => flock_core::pcs::ligerito::LigeritoProfile::Slim,
-            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast, // other rates default to Fast
+            _ => flock_core::pcs::ligerito::LigeritoProfile::Fast,
         };
         Self::with_profile_and_rate(n_keccaks, profile, log_inv_rate)
     }
 
-    /// Build a setup for a named Ligerito profile (fast/slim/secure);
-    /// the PCS rate follows the profile.
     pub fn with_profile(
         n_keccaks: usize,
         profile: flock_core::pcs::ligerito::LigeritoProfile,
@@ -898,7 +688,7 @@ impl KeccakSetup {
         assert!(n_keccaks >= 1);
         let n_log = min_n_keccaks_log(n_keccaks);
         let r1cs = build_block_r1cs(n_log);
-        // Pre-fault the prove-cycle scratch buffers — see scratch::prewarm_prover.
+
         flock_core::scratch::prewarm_prover(r1cs.m);
         let pcs_params = PcsParams {
             m: r1cs.m,
@@ -914,19 +704,13 @@ impl KeccakSetup {
         }
     }
 
-    /// [`Self::new`] with the **batch-major** witness layout (see
-    /// [`flock_core::r1cs::WitnessLayout`]): fold-log_n-first variable
-    /// order, contiguous padding suffix, direct-write witness producer.
-    /// Chain wrappers preserve the selected witness layout.
     pub fn new_batch_major(n_keccaks: usize) -> Self {
         let mut s = Self::new(n_keccaks);
-        // Safe to set post-construction: the digest/csc caches are lazy and
-        // untouched by `new`.
+
         s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
         s
     }
 
-    /// Witness generation dispatched on the r1cs's witness layout.
     fn generate_witness(
         &self,
         initial_states: &[State],
@@ -951,8 +735,6 @@ impl KeccakSetup {
         1usize << self.n_keccaks_log()
     }
 
-    /// Build a base R1CS proof (without the chain shift sumcheck).
-    /// Requires `m ≥ ~21` (Ligerito recursion floor).
     pub fn prove_fast<Ch: Challenger>(
         &self,
         initial_states: &[State],
@@ -976,7 +758,6 @@ impl KeccakSetup {
         )
     }
 
-    /// Verify a [`Self::prove_fast`] (Ligerito) proof.
     pub fn verify<Ch: Challenger>(
         &self,
         commitment: &Commitment,
@@ -993,10 +774,6 @@ impl KeccakSetup {
         )
     }
 
-    /// Prove that `initial_states` form a sequential chain: for the committed
-    /// witness, `state_24` of instance `i` equals `state_0` of instance `i+1`,
-    /// with public endpoints `x_0 = state_0[0]` and `x_last = state_24[N-1]`.
-    /// **Ligerito backend.** Requires m ≥ ~21.
     pub fn prove_chain<Ch: Challenger>(
         &self,
         initial_states: &[State],
@@ -1021,7 +798,6 @@ impl KeccakSetup {
         )
     }
 
-    /// Verify a [`Self::prove_chain`] (Ligerito) proof.
     pub fn verify_chain<Ch: Challenger>(
         &self,
         commitment: &Commitment,
@@ -1049,22 +825,6 @@ impl KeccakSetup {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Batch-major witness producer (WitnessLayout::BatchMajor).
-//
-// V = 8 keccak instances simulated in lockstep ([[u64; 8]; 25] lane-major
-// state — every θ/ρπ/χ/ι op is a SIMD-friendly array op) with witness words
-// written DIRECTLY at their batch-major addresses. Keccak's block layout is
-// u64-aligned, so rows go straight from simulation registers to one 128-byte
-// non-temporal chunk-row store; the lincheck stripe is transposed from the
-// same in-flight rows (V = 8 = one stripe group). No staging buffer, no
-// transpose pass; each output byte is written exactly once.
-//
-// The emission fully writes chunk-columns [0, useful_chunks) — including
-// explicit zero rows for the intra-slot gap words — so the driver only
-// zeroes the contiguous padding suffix of the recycled scratch buffers.
-// ---------------------------------------------------------------------------
-
 use super::common::{BM_V, SendPtr, nt_store_row};
 
 type VLane = [u64; BM_V];
@@ -1083,7 +843,12 @@ fn theta_v(s: &mut VLanes) {
     let mut d = [[0u64; BM_V]; 5];
     for x in 0..5 {
         for j in 0..BM_V {
-            d[x][j] = c[(x + 4) % 5][j] ^ c[(x + 1) % 5][j].rotate_left(1);
+            d[x][j] = unsafe {
+                flock_core::gf2_kernels::gf2_kern_keccak_theta_d(
+                    c[(x + 4) % 5][j],
+                    c[(x + 1) % 5][j],
+                )
+            };
         }
     }
     for i in 0..N_LANES {
@@ -1101,25 +866,22 @@ fn rho_pi_v(s_in: &VLanes) -> VLanes {
         for x in 0..5 {
             let a = (x + 3 * y) % 5;
             let b = x;
-            let r = RHO_OFFSETS[a][b] % 64;
+            let r = (RHO_OFFSETS[a][b] % 64) as u64;
             for j in 0..BM_V {
-                out[x + 5 * y][j] = s_in[a + 5 * b][j].rotate_left(r);
+                out[x + 5 * y][j] = unsafe {
+                    flock_core::gf2_kernels::gf2_kern_keccak_rol64(s_in[a + 5 * b][j], r)
+                };
             }
         }
     }
     out
 }
 
-/// Pairs even/odd u64 halves of each 128-bit chunk and emits contiguous
-/// NT-store runs at the batch-major destination. Word-rows must arrive with
-/// each odd index directly following its even partner (keccak's natural
-/// emission order guarantees this); a held even half is completed with a
-/// zero odd half at region boundaries (always genuine padding words).
 struct RowWriter {
     dest: *mut u64,
     o0_x2: usize,
     n_log: usize,
-    pending_w: usize, // block-u64 index of a held even half; usize::MAX = none
+    pending_w: usize,
     pending: VLane,
 }
 
@@ -1173,11 +935,6 @@ impl RowWriter {
     }
 }
 
-/// Build one group of V = 8 instances directly into batch-major dest buffers
-/// (+ this group's lincheck stripe).
-///
-/// SAFETY: distinct groups write disjoint instance word ranges and stripe
-/// regions; dest padding suffix is pre-zeroed by the caller.
 unsafe fn build_group_batch_major(
     states: [&State; BM_V],
     o0: usize,
@@ -1201,15 +958,13 @@ unsafe fn build_group_batch_major(
         ($w:expr, $vals:expr) => {{
             let w: usize = $w;
             let vals: &VLane = $vals;
-            // Callers expand this macro only inside the surrounding
-            // `unsafe` emission blocks.
+
             let out = std::slice::from_raw_parts_mut(stripe_base.add(w * 64), 64);
             transpose_8_u64s_to_64_bytes(vals, out);
             wz.push(w, vals);
         }};
     }
 
-    // Initial lanes, instance-minor.
     let mut lanes: VLanes = [[0u64; BM_V]; N_LANES];
     for (j, s) in states.iter().enumerate() {
         let l = state_to_lanes(s);
@@ -1221,7 +976,6 @@ unsafe fn build_group_batch_major(
     let s0_w = state_u64_base(0);
     let s24_w = state_u64_base(24);
     unsafe {
-        // state_0 self-loops: z = a = v, b = 1.
         for i in 0..N_LANES {
             push_z!(s0_w + i, &lanes[i]);
             wa.push(s0_w + i, &lanes[i]);
@@ -1231,8 +985,6 @@ unsafe fn build_group_batch_major(
         wa.flush();
         wb.flush();
 
-        // Explicit zero rows for the intra-slot gap words so the useful
-        // chunk-column prefix is FULLY written (recycled-buffer contract).
         for w in (s0_w + N_LANES + 1)..s24_w {
             push_z!(w, &zeros);
             wa.push(w, &zeros);
@@ -1242,13 +994,10 @@ unsafe fn build_group_batch_major(
         wa.flush();
         wb.flush();
 
-        // Constant word (bit 0 of word 64): z = a = b = 1. Word 64 is even;
-        // its odd partner is t_0's first row, pushed next.
         push_z!(Z_CONST_U64, &one);
         wa.push(Z_CONST_U64, &one);
         wb.push(Z_CONST_U64, &one);
 
-        // 24 rounds; t rows are word-sequential.
         for r in 0..N_ROUNDS {
             let mut b_state = lanes;
             theta_v(&mut b_state);
@@ -1262,7 +1011,10 @@ unsafe fn build_group_batch_major(
                     let i1 = (x + 1) % 5 + 5 * y;
                     let i2 = (x + 2) % 5 + 5 * y;
                     for j in 0..BM_V {
-                        t[i][j] = (!b_state[i1][j]) & b_state[i2][j];
+                        t[i][j] = flock_core::gf2_kernels::gf2_kern_keccak_chi_and(
+                            b_state[i1][j],
+                            b_state[i2][j],
+                        );
                         next[i][j] = b_state[i][j] ^ t[i][j];
                     }
                 }
@@ -1293,7 +1045,6 @@ unsafe fn build_group_batch_major(
         wa.flush();
         wb.flush();
 
-        // state_24 pin rows: z = a = state_24, b = 1.
         for i in 0..N_LANES {
             push_z!(s24_w + i, &lanes[i]);
             wa.push(s24_w + i, &lanes[i]);
@@ -1303,8 +1054,6 @@ unsafe fn build_group_batch_major(
         wa.flush();
         wb.flush();
 
-        // Zero rows for the gap words between state_24's end and the
-        // constant word.
         for w in (s24_w + N_LANES + 1)..Z_CONST_U64 {
             push_z!(w, &zeros);
             wa.push(w, &zeros);
@@ -1316,11 +1065,6 @@ unsafe fn build_group_batch_major(
     }
 }
 
-/// Batch-major counterpart of [`generate_witness_with_ab_packed_and_lincheck`]:
-/// produces `(z, a, b, z_lincheck)` with z/a/b in the **batch-major** layout
-/// (`addr = [7 in-word | n_log batch | k_log−7 chunk]`). Same padding-slot
-/// semantics (padding slots run keccak_f(0) so the constant wire is 1 in
-/// every block); the byte-stripe is identical to the row-major driver's.
 pub fn generate_witness_batch_major(
     initial_states: &[State],
     n_keccaks_log: usize,
@@ -1337,8 +1081,7 @@ pub fn generate_witness_batch_major(
     let mut a = flock_core::scratch::take_f128(total_f128);
     let mut b = flock_core::scratch::take_f128(total_f128);
     let stripe = vec![0u8; n_total * U64_PER_BLOCK * 8];
-    // Zero the padding suffix (contiguous chunk-columns >= useful_chunks);
-    // the group builder fully rewrites the useful prefix every call.
+
     let tail = useful_chunks << n_keccaks_log;
     for buf in [&mut z, &mut a, &mut b] {
         buf[tail..]
@@ -1360,7 +1103,7 @@ pub fn generate_witness_batch_major(
         let o0 = g * BM_V;
         let group: [&State; BM_V] =
             std::array::from_fn(|j| states_ref.get(o0 + j).unwrap_or(padding_ref));
-        // SAFETY: disjoint per-group ranges; suffix pre-zeroed above.
+
         unsafe {
             build_group_batch_major(
                 group,
@@ -1377,15 +1120,10 @@ pub fn generate_witness_batch_major(
     (z, a, b, stripe)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// SplitMix64 PRNG.
     struct Rng(u64);
     impl Rng {
         fn new(seed: u64) -> Self {
@@ -1414,8 +1152,6 @@ mod tests {
         }
         s
     }
-
-    // -------- Reference (u64-lane) Keccak-f, used as an independent oracle.
 
     fn keccak_f_u64(a: &mut [[u64; 5]; 5]) {
         for round in 0..24 {
@@ -1475,8 +1211,6 @@ mod tests {
         s
     }
 
-    // -------- Primitive tests.
-
     #[test]
     fn bit_keccak_f_matches_u64_lane() {
         let mut rng = Rng::new(0xC0FFEE);
@@ -1501,8 +1235,6 @@ mod tests {
         }
     }
 
-    /// XOR'ing the named state_in bits equals the actual `(π ∘ ρ ∘ θ)(state_in)`
-    /// bit at the target position.
     #[test]
     fn theta_rho_pi_preimage_matches_pipeline() {
         let mut rng = Rng::new(42);
@@ -1526,7 +1258,6 @@ mod tests {
         }
     }
 
-    /// All 11 preimage indices for any (x, y, z) are distinct.
     #[test]
     fn theta_rho_pi_preimage_has_no_duplicates() {
         for z in 0..64 {
@@ -1545,8 +1276,6 @@ mod tests {
             }
         }
     }
-
-    // -------- R1CS tests (I/O-aligned layout with state_24 pin).
 
     #[test]
     fn layout_constants_consistent() {
@@ -1603,7 +1332,6 @@ mod tests {
         }
     }
 
-    /// `comb · z = α · v_a + v_b` for random α and eq_inner.
     #[test]
     fn fold_matches_witness_consistency() {
         let mut rng = Rng::new(0xFA7E_C001_BABE);
@@ -1665,9 +1393,6 @@ mod tests {
         }
     }
 
-    /// End-to-end `prove_fast` → `verify` roundtrip (Ligerito default).
-    /// K=64 (m=22) is the smallest size for which Ligerito's default config
-    /// is feasible at log_batch_size=6.
     #[test]
     #[ignore]
     fn prove_fast_roundtrip() {
@@ -1684,8 +1409,6 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
-    /// The batch-major witness must be exactly the word-transpose of the
-    /// row-major witness, with an identical lincheck stripe.
     #[test]
     fn batch_major_witness_matches_row_major_transposed() {
         for (n_inputs, n_log) in [(8usize, 3usize), (13, 4)] {
@@ -1714,7 +1437,6 @@ mod tests {
         }
     }
 
-    /// Batch-major end-to-end Ligerito roundtrip at the smallest supported m.
     #[test]
     #[ignore]
     fn batch_major_prove_fast_roundtrip() {
@@ -1732,19 +1454,14 @@ mod tests {
         assert_eq!(claim_p, claim_v);
     }
 
-    /// Constant-wire pin (docs/const-wire-pin.md). A non-power-of-two count gives
-    /// padding blocks (filled with keccak_f(0), constant = 1) so the honest proof
-    /// still verifies; the all-zero witness — encoding the FALSE keccak_f(0) = 0 —
-    /// must be rejected by the pin.
     #[test]
-    #[ignore] // Heavier — Ligerito needs m=22; run with `cargo test const_pin_all_zero_rejected -- --ignored`
+    #[ignore]
     fn const_pin_all_zero_rejected() {
         use flock_core::challenger::FsChallenger;
 
-        let n = 60; // < 64 slots ⇒ 4 padding blocks, exercises padding fill
+        let n = 60;
         let setup = KeccakSetup::new(n);
 
-        // (1) Honest proof with filled padding verifies.
         let mut rng = Rng::new(0x5EED_C0DE);
         let inputs: Vec<State> = (0..n).map(|_| random_state(&mut rng)).collect();
         let mut ch_p = FsChallenger::new(b"honest");
@@ -1755,7 +1472,6 @@ mod tests {
             .unwrap_or_else(|e| panic!("honest padded proof rejected: {e:?}"));
         assert_eq!(claim_p, claim_v);
 
-        // (2) All-zero witness must be rejected by the pin.
         let zeros: Vec<State> = vec![[false; STATE_BITS]; n];
         let (mut z, mut a, mut b, mut zlc) =
             generate_witness_with_ab_packed_and_lincheck(&zeros, setup.n_keccaks_log());
@@ -1783,10 +1499,6 @@ mod tests {
         );
     }
 
-    /// Batch-major chain: the packed-pos fold must produce IDENTICAL In/Out
-    /// vectors from the batch-major and row-major witnesses (same semantic
-    /// content, different addressing), pinning `fold_in_out`'s batch-major
-    /// word addressing.
     #[test]
     fn batch_major_chain_fold_matches_row_major() {
         use crate::r1cs_hashes::chain_common::{ChainFold, fold_in_out};
@@ -1819,9 +1531,6 @@ mod tests {
         assert_eq!(out_b, out_r, "Out fold diverged across layouts");
     }
 
-    /// Batch-major chain roundtrip on the Ligerito backend (K=64, m=22) —
-    /// covers the mixed open (2 ring-switched + 1 packed-direct claim) with
-    /// the batch-major point ordering. Ignored like the row-major variant.
     #[test]
     #[ignore]
     fn batch_major_prove_chain_ligerito_roundtrip() {
@@ -1844,7 +1553,6 @@ mod tests {
             .expect("batch-major ligerito chain must verify");
     }
 
-    /// Chain prove → verify roundtrip (Ligerito default). K=64 → m=22.
     #[test]
     #[ignore]
     fn prove_chain_roundtrip() {

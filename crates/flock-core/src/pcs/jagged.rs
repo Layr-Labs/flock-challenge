@@ -1,69 +1,19 @@
-//! Jagged polynomial commitment — the sparse→dense reduction (standalone core).
-//!
-//! Implements the "basic jagged" reduction of Hemo–Jue–Rabinovich–Roh–Rothblum
-//! ("Jagged Polynomial Commitments", 2025/917) over `F128`. A *jagged function*
-//! `p : {0,1}^n × {0,1}^k → F` is a `2^n × 2^k` table in which column `y` is
-//! nonzero only below its height `h_y`. Its nonzero entries are flattened, in
-//! column-major order, into a single *dense* multilinear `q : {0,1}^m → F`
-//! (`2^m ≥ Σ_y h_y`). This module reduces an evaluation claim on the sparse
-//! `p̂(z_r, z_c)` to a single evaluation claim `q̂(i*) = α` on the dense `q`,
-//! which a downstream multilinear PCS would discharge.
-//!
-//! This is the **packing-agnostic kernel**: it operates on an abstract dense
-//! `F128` multilinear `q`, the cumulative column heights, and points
-//! `(z_r, z_c)`. It does *not* wire into ring-switch / ligerito / the
-//! arithmetization — that composition is deliberately deferred.
-//!
-//! ## The reduction (paper §3)
-//!
-//! With cumulative heights `t_y = h_0 + … + h_y` and the bijection
-//! `i ↦ (row_t(i), col_t(i))` between dense indices and nonzero coordinates,
-//!
-//! ```text
-//!   p̂(z_r, z_c) = Σ_{i ∈ {0,1}^m} q(i) · f̂_t(z_r, z_c, i)          (Eq. 3)
-//!   f̂_t(z_r, z_c, i) = eq(row_t(i), z_r) · eq(col_t(i), z_c)        (Eq. 4, boolean i only)
-//! ```
-//!
-//! We run a product-of-two-multilinears sumcheck on the right-hand side. The
-//! prover materializes `B[i] = eq(row_t(i), z_r)·eq(col_t(i), z_c)` over the
-//! boolean cube via two `eq`-tables. At the end the verifier needs
-//! `f̂_t(z_r, z_c, i*)` at the *field* point `i*` — where Eq. (4) no longer
-//! holds — and computes it through the branching-program evaluator below.
-//!
-//! ## Evaluating `f̂_t` at a field point (paper §3.1)
-//!
-//! By Claim 3.2.1, `f̂_t(z_r, z_c, i) = Σ_{y} eq(z_c, y) · ĝ(z_r, i, t_{y-1}, t_y)`,
-//! where `g(a,b,c,d) = [b < d ∧ b = a + c]` is computed by a width-4 read-once
-//! branching program (registers: an addition carry bit and a "less-than-so-far"
-//! bit). `ĝ` is its multilinear extension, evaluated by the Holmgren–Rothblum
-//! layer-by-layer DP over the 4 reachable states. Here `a = z_r` (row, `n`
-//! bits, zero-padded to `m`), `b = i` (dense index, `m` bits), and
-//! `c = t_{y-1}`, `d = t_y` are the (boolean, constant) cumulative heights.
-
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::lincheck::build_eq_table;
 
-/// Configuration of a jagged function: the (zero-padded to `2^k`) column
-/// heights, summarized as the cumulative-height prefix sums.
 #[derive(Clone, Debug)]
 pub struct JaggedParams {
-    /// `log2` of the height bound (number of row variables of `p̂`).
     pub n: usize,
-    /// `log2` of the number of columns (column variables of `p̂`).
+
     pub k: usize,
-    /// `log2` of the dense area: `q` has `2^m` entries, `Σ_y h_y ≤ 2^m`.
+
     pub m: usize,
-    /// Cumulative heights `[t_{-1}=0, t_0, t_1, …, t_{2^k-1}=area]`, length
-    /// `2^k + 1`. Column `c` occupies dense indices `[col_prefix_sums[c],
-    /// col_prefix_sums[c+1])`.
+
     pub col_prefix_sums: Vec<u64>,
 }
 
 impl JaggedParams {
-    /// Build params from per-column heights. `heights.len()` must be `2^k`
-    /// (zero-pad empty columns up to a power of two yourself). Requires each
-    /// height `≤ 2^n` and total area `≤ 2^m`.
     pub fn from_heights(heights: &[u64], n: usize, m: usize) -> Self {
         assert!(
             heights.len().is_power_of_two(),
@@ -87,24 +37,19 @@ impl JaggedParams {
         }
     }
 
-    /// Total number of nonzero entries `Σ_y h_y`.
     pub fn area(&self) -> u64 {
         *self.col_prefix_sums.last().unwrap()
     }
 
-    /// The bijection `i ↦ (row_t(i), col_t(i))` for a dense index `i < area`:
-    /// `col` is the column whose range contains `i`, `row = i - t_{col-1}`.
     pub fn unrank(&self, i: u64) -> (usize, usize) {
         debug_assert!(i < self.area());
-        // First prefix-sum strictly greater than `i`, minus one, is the column.
+
         let col = self.col_prefix_sums.partition_point(|&t| t <= i) - 1;
         let row = i - self.col_prefix_sums[col];
         (row as usize, col)
     }
 }
 
-/// Bit `layer` of the field "point" `z`: the coordinate `z[layer]` if present,
-/// else `ZERO` (the variable is pinned to 0 — i.e. zero-padded).
 #[inline]
 fn point_bit(z: &[F128], layer: usize) -> F128 {
     if layer < z.len() {
@@ -114,7 +59,6 @@ fn point_bit(z: &[F128], layer: usize) -> F128 {
     }
 }
 
-/// Bit `layer` of the integer `t`, as a field element.
 #[inline]
 fn int_bit(t: u64, layer: usize) -> F128 {
     if (t >> layer) & 1 == 1 {
@@ -124,40 +68,43 @@ fn int_bit(t: u64, layer: usize) -> F128 {
     }
 }
 
-/// Width-4 branching-program transition for `g(a,b,c,d) = [b<d ∧ b=a+c]`,
-/// reading one bit position (LSB→MSB). Input bits: `row=a`, `index=b`,
-/// `curr=c`, `next=d`. `state = carry + 2·comparison`. Returns the next state
-/// index, or `None` on the rejecting sink (addition inconsistency).
 #[inline]
 fn transition(row: bool, index: bool, curr: bool, next: bool, state: usize) -> Option<usize> {
-    let carry = state & 1;
-    let comparison = (state >> 1) & 1;
-    // Addition check: index bit must equal LSB of (row + carry + curr).
-    let sum = row as usize + carry + curr as usize;
-    if (index as usize) != (sum & 1) {
-        return None;
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        let out = crate::gf2_kernels::gf2_kern_jagged_transition(
+            row as u64,
+            index as u64,
+            curr as u64,
+            next as u64,
+            state as u64,
+        ) as usize;
+        if out < 4 { Some(out) } else { None }
     }
-    let new_carry = sum >> 1;
-    // i < t_{c+1}: if this bit of index and next agree, defer; else the higher
-    // bit decides (less-than iff next=1, index=0).
-    let new_comparison = if index == next {
-        comparison
-    } else {
-        next as usize
-    };
-    Some(new_carry + (new_comparison << 1))
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let carry = state & 1;
+        let comparison = (state >> 1) & 1;
+
+        let sum = row as usize + carry + curr as usize;
+        if (index as usize) != (sum & 1) {
+            return None;
+        }
+        let new_carry = sum >> 1;
+
+        let new_comparison = if index == next {
+            comparison
+        } else {
+            next as usize
+        };
+        Some(new_carry + (new_comparison << 1))
+    }
 }
 
-const STATE_INITIAL: usize = 0; // carry=0, comparison=0
-const STATE_SUCCESS: usize = 2; // carry=0, comparison=1
+const STATE_INITIAL: usize = 0;
+const STATE_SUCCESS: usize = 2;
 
-/// Multilinear extension `ĝ(z_r, z_i, t_c, t_next)` of the branching program,
-/// with the heights `t_c, t_next` as boolean constants. Holmgren–Rothblum
-/// layer-by-layer DP over the 4 reachable states; `O(m)` field ops.
 fn g_hat_eval(z_row: &[F128], z_index: &[F128], t_c: u64, t_next: u64, m: usize) -> F128 {
-    // dp[s] = weight, over already-processed (upper) layers, of reaching the
-    // accepting sink from state `s`. Seed the accepting state, peel layers from
-    // MSB down to LSB, and read off the initial state.
     let mut dp = [F128::ZERO; 4];
     dp[STATE_SUCCESS] = F128::ONE;
     for layer in (0..=m).rev() {
@@ -169,34 +116,30 @@ fn g_hat_eval(z_row: &[F128], z_index: &[F128], t_c: u64, t_next: u64, m: usize)
         ]);
         let mut new_dp = [F128::ZERO; 4];
         for (s, slot) in new_dp.iter_mut().enumerate() {
-            let mut acc = F128::ZERO;
+            let mut acc_unred = crate::field::F256Unreduced::ZERO;
             for (idx, &w) in eq16.iter().enumerate() {
-                // idx bit 0 = row, 1 = index, 2 = curr (t_c), 3 = next (t_next).
                 let row = idx & 1 != 0;
                 let index = (idx >> 1) & 1 != 0;
                 let curr = (idx >> 2) & 1 != 0;
                 let next = (idx >> 3) & 1 != 0;
                 if let Some(out) = transition(row, index, curr, next, s) {
-                    acc += w * dp[out];
+                    acc_unred ^= w.mul_unreduced(dp[out]);
                 }
             }
-            *slot = acc;
+            *slot = acc_unred.reduce();
         }
         dp = new_dp;
     }
     dp[STATE_INITIAL]
 }
 
-/// Evaluate `f̂_t(z_r, z_c, z_i)` at an arbitrary field point, via the
-/// branching-program assembly `Σ_y eq(z_c, y)·ĝ(z_r, z_i, t_{y-1}, t_y)`
-/// (paper Claim 3.2.1). Cost `O(m · 2^k)`.
 pub fn f_hat_t(params: &JaggedParams, z_row: &[F128], z_col: &[F128], z_index: &[F128]) -> F128 {
     assert_eq!(z_row.len(), params.n);
     assert_eq!(z_col.len(), params.k);
     assert_eq!(z_index.len(), params.m);
     let eq_col = build_eq_table(z_col);
     let cols = 1usize << params.k;
-    let mut acc = F128::ZERO;
+    let mut acc_unred = crate::field::F256Unreduced::ZERO;
     for c in 0..cols {
         let g = g_hat_eval(
             z_row,
@@ -205,37 +148,23 @@ pub fn f_hat_t(params: &JaggedParams, z_row: &[F128], z_col: &[F128], z_index: &
             params.col_prefix_sums[c + 1],
             params.m,
         );
-        acc += eq_col[c] * g;
+        acc_unred ^= eq_col[c].mul_unreduced(g);
     }
-    acc
+    acc_unred.reduce()
 }
 
-/// Transcript of the jagged sumcheck. Each round sends the degree-2 round
-/// polynomial as `(G(1), G(∞))`; `G(0)` is reconstructed by the verifier from
-/// the running claim. `q_eval` is the final dense claim `α = q̂(i*)`.
 #[derive(Clone, Debug)]
 pub struct JaggedSumcheckProof {
     pub rounds: Vec<(F128, F128)>,
     pub q_eval: F128,
 }
 
-/// The dense evaluation claim that the jagged reduction produces: prove
-/// `q̂(point) = alpha` with a downstream multilinear PCS.
 #[derive(Clone, Debug)]
 pub struct DenseClaim {
     pub point: Vec<F128>,
     pub alpha: F128,
 }
 
-/// Generate the second sumcheck multilinear `B[i] = eq(row_t(i), z_row) ·
-/// eq(col_t(i), z_col)` over the boolean cube (zero past `area`), together with
-/// the claim `v = Σ_i q(i)·B(i) = p̂(z_row, z_col)` — fused into one parallel
-/// pass over the `2^m` entries.
-///
-/// Each rayon chunk binary-searches its starting column once, then walks the
-/// (contiguous, jagged) columns filling `B` and accumulating its share of `v`.
-/// The column walk skips height-0 columns naturally and costs O(1) amortized per
-/// element, so there is no per-element binary search.
 fn generate_f_and_claim(
     params: &JaggedParams,
     q: &[F128],
@@ -250,7 +179,6 @@ fn generate_f_and_claim(
     let prefix = &params.col_prefix_sums;
     let mut b = crate::alloc_uninit_f128_vec(len);
 
-    // ~1 MB chunks: one binary search amortized over 64K elements.
     const CHUNK: usize = 1 << 16;
     let v = b
         .par_chunks_mut(CHUNK)
@@ -258,11 +186,11 @@ fn generate_f_and_claim(
         .map(|(ci, b_chunk)| {
             let g0 = ci * CHUNK;
             let q_chunk = &q[g0..g0 + b_chunk.len()];
-            // Column containing g0 (== num_columns sentinel once g0 ≥ area).
+
             let mut col = prefix
                 .partition_point(|&t| t <= g0 as u64)
                 .saturating_sub(1);
-            let mut acc = F128::ZERO;
+            let mut acc_unred = crate::field::F256Unreduced::ZERO;
             for (local, slot) in b_chunk.iter_mut().enumerate() {
                 let i = g0 + local;
                 if i >= area {
@@ -275,19 +203,14 @@ fn generate_f_and_claim(
                 let row = i - prefix[col] as usize;
                 let bi = eq_row[row] * eq_col[col];
                 *slot = bi;
-                acc += q_chunk[local] * bi;
+                acc_unred ^= q_chunk[local].mul_unreduced(bi);
             }
-            acc
+            acc_unred.reduce()
         })
         .reduce(|| F128::ZERO, |x, y| x + y);
     (b, v)
 }
 
-/// Prover for the jagged reduction. Given the dense multilinear `q` (length
-/// `2^m`, column-major flattening of the jagged function, zero-padded past
-/// `area`) and the sparse evaluation point `(z_row, z_col)`, runs the sumcheck
-/// and returns the proof together with the sparse claim value
-/// `v = p̂(z_row, z_col)`.
 pub fn prove<C: Challenger>(
     params: &JaggedParams,
     q: &[F128],
@@ -302,16 +225,8 @@ pub fn prove<C: Challenger>(
     assert_eq!(z_col.len(), params.k);
     challenger.observe_label(b"flock-jagged-v0");
 
-    // Second sumcheck multilinear B[i] = eq(row_t(i), z_row)·eq(col_t(i), z_col)
-    // over the boolean cube (= f̂_t(z_row, z_col, ·) on {0,1}^m), and the claim
-    // v = Σ_i q(i)·B(i) = p̂(z_row, z_col) — one fused parallel pass.
     let (b, v) = generate_f_and_claim(params, q, z_row, z_col);
 
-    // Product-of-two-multilinears sumcheck, binding the low index bit each
-    // round — parallel and fused: each fold pass also computes the next round's
-    // message, halving passes over the (bandwidth-bound) witness. We ping-pong
-    // between `a/bb` and the scratch `sa/sb`. F128 addition is XOR, so the
-    // parallel tree reduction is bit-identical to a serial fold.
     let mut a = q.to_vec();
     let mut bb = b;
     let mut sa = crate::alloc_uninit_f128_vec(len / 2);
@@ -344,10 +259,6 @@ pub fn prove<C: Challenger>(
     (proof, v)
 }
 
-/// Verifier for the jagged reduction. Replays the sumcheck against the claimed
-/// sparse value `claim_v = p̂(z_row, z_col)`, computes `f̂_t` at the final
-/// point through the branching program, and on success returns the reduced
-/// dense claim `q̂(i*) = alpha`. Returns `None` if the proof is rejected.
 pub fn verify<C: Challenger>(
     params: &JaggedParams,
     z_row: &[F128],
@@ -372,7 +283,6 @@ pub fn verify<C: Challenger>(
         point.push(r);
     }
 
-    // Final sumcheck relation: claim == q̂(i*) · f̂_t(z_row, z_col, i*).
     let beta = f_hat_t(params, z_row, z_col, &point);
     if claim == proof.q_eval * beta {
         Some(DenseClaim {
@@ -384,20 +294,13 @@ pub fn verify<C: Challenger>(
     }
 }
 
-/// Reduce the running sumcheck claim through one round. The degree-2 round
-/// polynomial `G` is given by `G(1) = g_one`, leading coeff `G(∞) = g_inf`, and
-/// `G(0) = claim + G(1)` (since `claim = G(0) + G(1)`). Returns `G(r)`.
 #[inline]
 fn fold_round_claim(claim: F128, g_one: F128, g_inf: F128, r: F128) -> F128 {
-    let g0 = claim + g_one; // char-2: G(0) = claim - G(1)
-    // G(X) = g0 + (G(1) + g0 + g_inf)·X + g_inf·X²
+    let g0 = claim + g_one;
+
     g0 + (g_one + g0 + g_inf) * r + g_inf * (r * r)
 }
 
-/// Degree-2 round message `(G(1), G(∞))` for `Σ_{x'} a(X,x')·b(X,x')`, low bit
-/// bound: `a(0,x') = a[2x']`, `a(1,x') = a[2x'+1]`. Serial reference (the
-/// production path uses [`round_msg_par`]); retained for the `runtime_m25`
-/// serial-vs-parallel benchmark.
 #[allow(dead_code)]
 #[inline]
 fn round_msg(a: &[F128], b: &[F128]) -> (F128, F128) {
@@ -413,30 +316,18 @@ fn round_msg(a: &[F128], b: &[F128]) -> (F128, F128) {
     (g_one, g_inf)
 }
 
-/// Fused round step: fold `(a, b)` at `r` (low bit) **in place** to half size
-/// and, in the same pass, compute the next round's message `(G(1), G(∞))` from
-/// the freshly folded data. Requires `a.len() >= 4`. The fold is safe in place
-/// because output index `2·xp` never exceeds the read index `4·xp` (we overwrite
-/// only the front of the buffer), so there is no per-round allocation.
-///
-/// This makes the loop `m + 1` passes instead of `2m`, but **benchmarks slower
-/// single-threaded** (~0.78×): the message muls depend on the just-computed fold
-/// muls, exposing PMULL latency that the unfused split avoids. Kept as the
-/// building block for the eventual rayon-parallel kernel, where the
-/// bandwidth saving from fewer passes should dominate. See `runtime_m25`.
 #[allow(dead_code)]
 fn fold_and_round_fused(a: &mut Vec<F128>, b: &mut Vec<F128>, r: F128) -> (F128, F128) {
     let n = a.len();
     debug_assert!(n >= 4 && n.is_power_of_two());
     debug_assert_eq!(b.len(), n);
     let half = n / 2;
-    let pairs = half / 2; // output pairs == input quads
+    let pairs = half / 2;
     let mut g_one = F128::ZERO;
     let mut g_inf = F128::ZERO;
     for xp in 0..pairs {
         let base = 4 * xp;
-        // Fold the two input pairs feeding output pair (2xp, 2xp+1). Read all
-        // four inputs into locals before writing (write idx 2xp ≤ read idx 4xp).
+
         let na0 = a[base] + r * (a[base + 1] + a[base]);
         let na1 = a[base + 2] + r * (a[base + 3] + a[base + 2]);
         let nb0 = b[base] + r * (b[base + 1] + b[base]);
@@ -445,7 +336,7 @@ fn fold_and_round_fused(a: &mut Vec<F128>, b: &mut Vec<F128>, r: F128) -> (F128,
         a[2 * xp + 1] = na1;
         b[2 * xp] = nb0;
         b[2 * xp + 1] = nb1;
-        // Next round's message contribution from this folded pair.
+
         g_one += na1 * nb1;
         g_inf += (na0 + na1) * (nb0 + nb1);
     }
@@ -454,52 +345,39 @@ fn fold_and_round_fused(a: &mut Vec<F128>, b: &mut Vec<F128>, r: F128) -> (F128,
     (g_one, g_inf)
 }
 
-/// Parallel degree-2 round message `(G(1), G(∞))`. F128 addition is XOR, so the
-/// tree reduction is bit-identical to the serial left fold.
-///
-/// Iterates contiguous slice chunks with `chunks_exact(2)` rather than indexing
-/// `a[2*x]`: eliminating the per-element bounds checks lifts the reduction from
-/// ~2.6× to ~6× parallel scaling (hits the memory-bandwidth ceiling). See
-/// `scaling_diag`.
 fn round_msg_par(a: &[F128], b: &[F128]) -> (F128, F128) {
     use rayon::prelude::*;
     const C: usize = 1 << 14;
     a.par_chunks(C)
         .zip(b.par_chunks(C))
         .map(|(ac, bc)| {
-            let mut g1 = F128::ZERO;
-            let mut gi = F128::ZERO;
+            let mut g1_unred = crate::field::F256Unreduced::ZERO;
+            let mut gi_unred = crate::field::F256Unreduced::ZERO;
             for (ap, bp) in ac
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .zip(bc.as_chunks::<2>().0.iter())
             {
-                g1 += ap[1] * bp[1];
-                gi += (ap[0] + ap[1]) * (bp[0] + bp[1]);
+                g1_unred ^= ap[1].mul_unreduced(bp[1]);
+                gi_unred ^= (ap[0] + ap[1]).mul_unreduced(bp[0] + bp[1]);
             }
-            (g1, gi)
+            (g1_unred.reduce(), gi_unred.reduce())
         })
         .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (s, t)| (p + s, q + t))
 }
 
-/// Parallel out-of-place fold (no message), `ao/bo` length `a.len()/2`. Used for
-/// the final round (size 2 → 1), where there is no successor message.
 fn fold_oop_par(a: &[F128], b: &[F128], r: F128, ao: &mut [F128], bo: &mut [F128]) {
     use rayon::prelude::*;
     ao.par_iter_mut()
         .zip(bo.par_iter_mut())
         .enumerate()
         .for_each(|(x, (oa, ob))| {
-            *oa = a[2 * x] + r * (a[2 * x + 1] + a[2 * x]);
-            *ob = b[2 * x] + r * (b[2 * x + 1] + b[2 * x]);
+            *oa = a[2 * x].mle_fold(a[2 * x + 1], r);
+            *ob = b[2 * x].mle_fold(b[2 * x + 1], r);
         });
 }
 
-/// Parallel **fused** round: out-of-place fold at `r` + the next round's message
-/// in one pass. Requires `a.len() >= 4`. This is the production kernel — in the
-/// bandwidth-bound parallel regime the halved pass count is a ~1.4× win (the
-/// serial penalty from the fold→message dependency is hidden across cores).
 fn fold_and_round_oop_par(
     a: &[F128],
     b: &[F128],
@@ -510,17 +388,15 @@ fn fold_and_round_oop_par(
     use rayon::prelude::*;
     debug_assert_eq!(a.len(), 2 * ao.len());
     debug_assert!(a.len() >= 4);
-    // Output chunk of `CO`; the aligned input chunk is `2*CO` (output is half
-    // the input). Slice/`chunks_exact` iteration — no per-element bounds checks —
-    // so the reduction scales like the fold (~6× vs ~2.6× for indexed access).
+
     const CO: usize = 1 << 13;
     ao.par_chunks_mut(CO)
         .zip(bo.par_chunks_mut(CO))
         .zip(a.par_chunks(2 * CO))
         .zip(b.par_chunks(2 * CO))
         .map(|(((oa, ob), ain), bin)| {
-            let mut g1 = F128::ZERO;
-            let mut gi = F128::ZERO;
+            let mut g1_unred = crate::field::F256Unreduced::ZERO;
+            let mut gi_unred = crate::field::F256Unreduced::ZERO;
             for (((op, opb), aq), bq) in oa
                 .as_chunks_mut::<2>()
                 .0
@@ -529,18 +405,18 @@ fn fold_and_round_oop_par(
                 .zip(ain.as_chunks::<4>().0.iter())
                 .zip(bin.as_chunks::<4>().0.iter())
             {
-                let na0 = aq[0] + r * (aq[1] + aq[0]);
-                let na1 = aq[2] + r * (aq[3] + aq[2]);
-                let nb0 = bq[0] + r * (bq[1] + bq[0]);
-                let nb1 = bq[2] + r * (bq[3] + bq[2]);
+                let na0 = aq[0].mle_fold(aq[1], r);
+                let na1 = aq[2].mle_fold(aq[3], r);
+                let nb0 = bq[0].mle_fold(bq[1], r);
+                let nb1 = bq[2].mle_fold(bq[3], r);
                 op[0] = na0;
                 op[1] = na1;
                 opb[0] = nb0;
                 opb[1] = nb1;
-                g1 += na1 * nb1;
-                gi += (na0 + na1) * (nb0 + nb1);
+                g1_unred ^= na1.mul_unreduced(nb1);
+                gi_unred ^= (na0 + na1).mul_unreduced(nb0 + nb1);
             }
-            (g1, gi)
+            (g1_unred.reduce(), gi_unred.reduce())
         })
         .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (s, t)| (p + s, q + t))
 }
@@ -555,8 +431,6 @@ mod tests {
         (0..n).map(|_| ch.sample_f128()).collect()
     }
 
-    /// Direct MLE of `f_t` in the index variable: brute-force reference for
-    /// `f̂_t` (paper Eq. 4 summed over the bijection). `O(area · (n+k+m))`.
     fn f_hat_t_bruteforce(
         params: &JaggedParams,
         z_row: &[F128],
@@ -574,7 +448,6 @@ mod tests {
         acc
     }
 
-    /// `q̂(point)` directly = ⟨q, eq(point, ·)⟩.
     fn mle_eval(q: &[F128], point: &[F128]) -> F128 {
         let eq = build_eq_table(point);
         q.iter()
@@ -583,7 +456,6 @@ mod tests {
             .fold(F128::ZERO, |s, x| s + x)
     }
 
-    /// A small random jagged config + dense data, with total area < 2^m.
     fn random_instance(
         ch: &mut RandomChallenger,
         n: usize,
@@ -593,7 +465,7 @@ mod tests {
         let cols = 1usize << k;
         let cap = 1u64 << m;
         let max_h = 1u64 << n;
-        // Pick heights with Σ ≤ 2^m. Pull pseudo-randomness from the challenger.
+
         let mut heights = vec![0u64; cols];
         let mut remaining = cap;
         for h in heights.iter_mut() {
@@ -603,7 +475,7 @@ mod tests {
             remaining -= take;
         }
         let params = JaggedParams::from_heights(&heights, n, m);
-        // Dense q: random in [0, area), zero past it.
+
         let mut q = vec![F128::ZERO; 1usize << m];
         for qi in q.iter_mut().take(params.area() as usize) {
             *qi = ch.sample_f128();
@@ -629,7 +501,6 @@ mod tests {
 
     #[test]
     fn f_hat_t_eq4_at_boolean_points() {
-        // At a boolean index i < area, f̂_t = eq(row_t(i), z_r)·eq(col_t(i), z_c).
         let mut ch = RandomChallenger::new(0xB001_2345);
         let (params, _q) = random_instance(&mut ch, 4, 3, 7);
         let z_row = sample_vec(&mut ch, 4);
@@ -661,7 +532,6 @@ mod tests {
                 let claim = verify(&params, &z_row, &z_col, v, &proof, &mut vch)
                     .expect("honest proof must verify");
 
-                // The reduced claim is consistent with the dense polynomial.
                 assert_eq!(claim.alpha, mle_eval(&q, &claim.point), "alpha ≠ q̂(i*)");
             }
         }
@@ -685,26 +555,18 @@ mod tests {
         );
     }
 
-    /// Runtime check at the realistic Option-B size: an m=32-bit trace packed
-    /// into F128 (128 bits each) is a dense `q` of `2^25` field elements, so the
-    /// jagged sumcheck runs over 25 variables. Mirrors `prove`, split into the
-    /// `f̂_t`-sequence generation and the sumcheck rounds.
-    ///
-    /// `cargo test --release -p flock-core pcs::jagged::tests::runtime_m25 -- --ignored --nocapture`
     #[test]
     #[ignore = "heavy benchmark; run explicitly with --release --ignored --nocapture"]
     fn runtime_m25() {
         use std::time::Instant;
 
-        // Match the full-prover profile (P-core pool) for an apples-to-apples ratio.
         let _ = crate::init_perf_thread_pool();
-        let (n, k, m) = (13usize, 12usize, 25usize); // 2^25 dense F128 elements
+        let (n, k, m) = (13usize, 12usize, 25usize);
         let cols = 1usize << k;
-        let height = (1u64 << m) / cols as u64; // uniform; total area = 2^m
+        let height = (1u64 << m) / cols as u64;
         let params = JaggedParams::from_heights(&vec![height; cols], n, m);
         assert_eq!(params.area(), 1u64 << m);
 
-        // Cheap deterministic dense data (field-mul cost is data-independent).
         let len = 1usize << m;
         let mut q = vec![F128::ZERO; len];
         for (i, qi) in q.iter_mut().enumerate() {
@@ -722,12 +584,10 @@ mod tests {
 
         const REPS: usize = 3;
 
-        // --- Phase 1: B-vector + claim generation, serial vs parallel-fused. ---
         let mut t_gen_ser = std::time::Duration::MAX;
         let mut t_gen_par = std::time::Duration::MAX;
         let (mut b, mut v) = (Vec::new(), F128::ZERO);
         for _ in 0..REPS {
-            // Serial reference: column-major build + separate v reduction.
             let t0 = Instant::now();
             let eq_row = build_eq_table(&z_row);
             let eq_col = build_eq_table(&z_col);
@@ -747,7 +607,6 @@ mod tests {
             t_gen_ser = t_gen_ser.min(t0.elapsed());
             std::hint::black_box(&bs);
 
-            // Parallel fused helper (the production path).
             let t1 = Instant::now();
             let (bp, vp) = generate_f_and_claim(&params, &q, &z_row, &z_col);
             t_gen_par = t_gen_par.min(t1.elapsed());
@@ -755,12 +614,8 @@ mod tests {
             b = bp;
             v = vp;
         }
-        let _ = v; // prover-side claim value; not needed past phase 1
+        let _ = v;
 
-        // --- Phase 2: 2x2 head-to-head {serial,parallel} x {unfused,fused},
-        // min over REPS to suppress thermal / allocator variance. ---
-
-        // Serial: in-place fold; unfused = msg pass + fold pass, fused = both in one.
         let run_serial = |fused: bool| -> std::time::Duration {
             let mut a = q.clone();
             let mut bb = b.clone();
@@ -792,9 +647,8 @@ mod tests {
             t.elapsed()
         };
 
-        // Parallel: rayon kernels, ping-pong between two out-of-place buffers.
         let run_par = |fused: bool| -> std::time::Duration {
-            let mut a = q.clone(); // len N
+            let mut a = q.clone();
             let mut bb = b.clone();
             let mut sa = vec![F128::ZERO; len / 2];
             let mut sb = vec![F128::ZERO; len / 2];
@@ -849,7 +703,6 @@ mod tests {
             p_fus = p_fus.min(run_par(true));
         }
 
-        // --- Verifier f̂_t eval at a random final point. ---
         let point: Vec<F128> = (0..m).map(|_| rc.sample_f128()).collect();
         let t2 = Instant::now();
         let beta = f_hat_t(&params, &z_row, &z_col, &point);
@@ -889,12 +742,6 @@ mod tests {
         );
     }
 
-    /// Diagnose the sumcheck's ~4× parallel scaling: is it the memory-bandwidth
-    /// ceiling, or fine-grained-kernel inefficiency? Compares a memcpy baseline,
-    /// fold and reduction kernels, each fine-grained (current style) vs
-    /// coarse-chunked, at 2^25 on the P-core pool.
-    ///
-    /// `cargo test --release pcs::jagged::tests::scaling_diag -- --ignored --nocapture`
     #[test]
     #[ignore = "diagnostic; run with --release --ignored --nocapture"]
     fn scaling_diag() {
@@ -916,7 +763,7 @@ mod tests {
             hi: 0x1234,
         };
         const REPS: usize = 6;
-        const CHUNK: usize = 1 << 13; // coarse: 8K outputs / task
+        const CHUNK: usize = 1 << 13;
 
         let bench = |f: &mut dyn FnMut()| {
             let mut t = Duration::MAX;
@@ -935,7 +782,6 @@ mod tests {
             rayon::current_num_threads()
         );
 
-        // --- memcpy baseline: read len, write len (the raw bandwidth ceiling) ---
         let mut dst = crate::alloc_uninit_f128_vec(len);
         let ts = bench(&mut || dst.copy_from_slice(&a));
         let tp = bench(&mut || {
@@ -943,7 +789,7 @@ mod tests {
                 .enumerate()
                 .for_each(|(ci, d)| d.copy_from_slice(&a[ci * CHUNK..ci * CHUNK + d.len()]));
         });
-        let bytes = len * 32; // read+write 16B each
+        let bytes = len * 32;
         eprintln!(
             "  memcpy        : serial {:>7.1?} ({:>4.0} GB/s)  parallel {:>7.1?} ({:>4.0} GB/s)  {:.2}x",
             ts,
@@ -953,7 +799,6 @@ mod tests {
             sp(ts, tp)
         );
 
-        // --- fold (read len, write half): fine (par_iter_mut) vs coarse ---
         let mut out = crate::alloc_uninit_f128_vec(half);
         let ts = bench(&mut || {
             for x in 0..half {
@@ -974,7 +819,7 @@ mod tests {
                 }
             });
         });
-        let bytes = half * 16 * 3; // read 2, write 1
+        let bytes = half * 16 * 3;
         eprintln!(
             "  fold   serial {:>7.1?} ({:>4.0} GB/s)  par.fine {:>7.1?} {:.2}x  par.coarse {:>7.1?} {:.2}x",
             ts,
@@ -985,14 +830,13 @@ mod tests {
             sp(ts, tp_coarse)
         );
 
-        // --- real round message (contiguous a+b read): round_msg vs round_msg_par ---
         let ts = bench(&mut || {
             std::hint::black_box(round_msg(&a, &b));
         });
         let tp_fine = bench(&mut || {
             std::hint::black_box(round_msg_par(&a, &b));
         });
-        // Coarse reduction: per-chunk local accumulator, then combine.
+
         let tp_coarse = bench(&mut || {
             let acc = (0..half)
                 .into_par_iter()
@@ -1008,7 +852,7 @@ mod tests {
                 .reduce(|| (F128::ZERO, F128::ZERO), |(p, q), (s, t)| (p + s, q + t));
             std::hint::black_box(acc);
         });
-        let rd_bytes = len * 16 * 2; // read all of a and b
+        let rd_bytes = len * 16 * 2;
         eprintln!(
             "  round_msg serial {:>7.1?} ({:>4.0} GB/s)  par.fine {:>7.1?} {:.2}x  par.coarse {:>7.1?} {:.2}x",
             ts,
@@ -1018,7 +862,7 @@ mod tests {
             tp_coarse,
             sp(ts, tp_coarse)
         );
-        // slice/chunks_exact iteration: no per-element bounds checks.
+
         let tp_slice = bench(&mut || {
             let acc = a
                 .par_chunks(2 * CHUNK)
@@ -1047,7 +891,6 @@ mod tests {
             sp(ts, tp_slice)
         );
 
-        // --- per-round breakdown of the actual parallel-fused sumcheck ---
         let mut sa = crate::alloc_uninit_f128_vec(half);
         let mut sb = crate::alloc_uninit_f128_vec(half);
         let mut round_t = vec![Duration::MAX; m + 1];
@@ -1085,7 +928,7 @@ mod tests {
             }
         }
         let total: Duration = round_t.iter().sum();
-        let tail: Duration = round_t[6..].iter().sum(); // rounds with cur ≤ 2^20
+        let tail: Duration = round_t[6..].iter().sum();
         eprintln!(
             "  sumcheck per-round: total {:.1?} | r0 {:.1?} r1 {:.1?} r2 {:.1?} | tail(r6+, cur≤2^19) {:.2?} ({:.0}%)",
             total,

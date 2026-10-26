@@ -2,17 +2,6 @@
 // Copyright 2025 Irreducible, Inc.
 // Modifications copyright 2026 Succinct Labs, Benedikt Bunz, William Wang
 // SPDX-License-Identifier: Apache-2.0 OR MIT
-//
-// The `PHI_8_TABLE` values are a verbatim copy from binius64
-// (https://github.com/binius-zk/binius64, `crates/field/src/ghash.rs`).
-
-//! φ_8: GF(2^8) → GF(2^128)-GHASH subfield embedding.
-//!
-//! `PHI_8_TABLE[v]` is the image of the F_8 element `v` (AES poly 0x11B) under
-//! the field homomorphism into F_{2^128} (GHASH poly 0x87). The table is a
-//! verbatim copy from binius64's `crates/field/src/ghash.rs`,
-//! cross-checked with binius's proptest `test_conversion_from_aes_consistency`.
-//! Verified here against the homomorphism property `phi8(a*b) = phi8(a)*phi8(b)`.
 
 use super::{F8, F128};
 
@@ -1060,8 +1049,6 @@ mod tests {
 
     #[test]
     fn homomorphism_full() {
-        // Exhaustive check: φ(a·b) = φ(a)·φ(b) and φ(a+b) = φ(a)+φ(b)
-        // for all 65536 ordered pairs in F_8.
         for a in 0u8..=255 {
             for b in 0u8..=255 {
                 let fa = F8(a);

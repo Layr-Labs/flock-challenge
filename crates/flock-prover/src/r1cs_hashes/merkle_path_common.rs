@@ -1,25 +1,3 @@
-//! Generic Merkle-path glue, analogous to [`super::chain_common`].
-//!
-//! The Merkle-path protocol (packed-pos fold → shift-with-bit-selector sumcheck
-//! → batched PCS open over `[ab, c] ring-switched + [merkle] packed-direct`)
-//! is hash-agnostic; only the *geometry* of where the left-input / right-input
-//! / output regions live in a witness block varies. This module captures that
-//! geometry in [`MerkleLayout`] and provides
-//! [`prove_merkle_paths_ligerito_generic`] /
-//! [`verify_merkle_paths_ligerito_generic`]. A per-hash
-//! module supplies its `MerkleLayout`, a `Hash → physical-bits` converter for
-//! the public leaf/root, and thin wrappers.
-//!
-//! ## Region requirements
-//!
-//! The Merkle protocol carves out a **4-slot region** at the start of each
-//! witness block: 4 consecutive aligned `2^region_log`-bit slots holding
-//! (Z, X_L, X_R, other) in some order specified by the layout. The fourth
-//! "other" slot holds whatever the per-hash R1CS uses there (e.g. SHA-2's
-//! IV) — the protocol's weight is structurally zero at that slot's boolean
-//! coords, so its contents are invisible to the sumcheck but participate in
-//! the multilinear extension over the slot-selector dimensions.
-
 use crate::merkle_path::{MerklePathShiftProof, SlotLayout};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
@@ -30,64 +8,42 @@ use flock_core::pcs::{
 use flock_core::r1cs::BlockR1cs;
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Layout
-// ---------------------------------------------------------------------------
-
-/// Geometry of one hash's 4-slot region within a witness block.
 #[derive(Clone, Copy, Debug)]
 pub struct MerkleLayout {
-    /// `log2` of the per-block witness size.
     pub k_log: usize,
-    /// Univariate-skip dimension (API parity with the zerocheck/PCS `k_skip`).
+
     pub k_skip: usize,
-    /// `log2` of each slot's aligned size.
+
     pub region_log: usize,
-    /// Real bits per slot (≤ `2^region_log`, multiple of 8).
+
     pub region_bits: usize,
-    /// Byte offset of the 4-slot region's start within a block. Slot `s` lives
-    /// at bytes `[slot_base_byte_off + s · slot_size_bytes,
-    /// slot_base_byte_off + (s+1) · slot_size_bytes)` where
-    /// `slot_size_bytes = 2^region_log / 8`.
+
     pub slot_base_byte_off: usize,
-    /// Slot index `0..4` (LSB-first: `s = sel_slot | (side << 1)`) holding Z.
+
     pub z_slot: u8,
-    /// Slot index `0..4` holding X_L.
+
     pub x_l_slot: u8,
-    /// Slot index `0..4` holding X_R.
+
     pub x_r_slot: u8,
 }
 
 impl MerkleLayout {
-    /// `τ_pos` length = `region_log − LOG_PACKING`.
     #[inline]
     pub fn tau_pos_len(&self) -> usize {
         self.region_log - LOG_PACKING
     }
 
-    /// Number of zero coords in the merkle claim's point between the side
-    /// selector and the instance index. The protocol pins the high slot-bits
-    /// of the claim point to 0 (they encode "we're inside the first 4 slots
-    /// of the block, not the rest").
-    ///
-    /// `high_zeros = k_log − region_log − 2` (the `−2` accounts for the
-    /// (sel_slot, side) bits, each handling one of the 4-slot region's
-    /// selector bits).
     #[inline]
     pub fn high_zeros(&self) -> usize {
         self.k_log - self.region_log - 2
     }
 
-    /// Slot index of the "other" slot — the one not assigned to Z, X_L, or
-    /// X_R. Its contents are committed but unconstrained by the protocol.
     pub fn other_slot(&self) -> u8 {
         (0..4)
             .find(|&s| s != self.z_slot && s != self.x_l_slot && s != self.x_r_slot)
             .expect("3 of 4 slots are assigned; the fourth always exists")
     }
 
-    /// Convert this layout's slot assignment to the bare `SlotLayout` used by
-    /// the merkle-path sumcheck driver.
     pub fn slot_layout(&self) -> SlotLayout {
         SlotLayout {
             z_slot: self.z_slot,
@@ -97,14 +53,6 @@ impl MerkleLayout {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Fold parameters
-// ---------------------------------------------------------------------------
-
-/// Packed-level fold parameters: `τ_pos` binds the packed-position dimension
-/// within each slot. The verifier samples `τ_pos`, then the prover folds each
-/// instance's 4 slots down to one `F128` apiece via
-/// `Σ_{pos} eq(τ_pos, pos) · ẑ_packed[(inst, slot, pos)]`.
 #[derive(Clone, Debug)]
 pub struct MerklePathFold {
     pub tau_pos: Vec<F128>,
@@ -120,12 +68,8 @@ impl MerklePathFold {
         Self { tau_pos }
     }
 
-    /// Fold a public k-bit endpoint (given as `region_bits` bools in physical
-    /// within-slot order) to a single F128 — the τ_pos-MLE of the endpoint
-    /// over its slot's packed positions. Mirrors what the prover computes
-    /// against the committed witness.
     pub fn fold_public_phys(&self, phys_bits: &[bool]) -> F128 {
-        let bits_per_packed = 1usize << LOG_PACKING; // 128
+        let bits_per_packed = 1usize << LOG_PACKING;
         let n_packed = 1usize << self.tau_pos.len();
         let slot_bits = n_packed * bits_per_packed;
         assert!(
@@ -154,14 +98,6 @@ impl MerklePathFold {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-slot fold from packed witness
-// ---------------------------------------------------------------------------
-
-/// For each of the 4 slot positions, compute one F128 per instance: the
-/// τ_pos-MLE of that slot's content. Output `result[s][i]` is the τ_pos-fold
-/// of slot `s` for instance `i`. Slot index uses LSB-first encoding
-/// `s = sel_slot | (side << 1)`, matching the cube convention.
 pub fn fold_all_slots(
     layout: &MerkleLayout,
     wl: flock_core::r1cs::WitnessLayout,
@@ -184,8 +120,6 @@ pub fn fold_all_slots(
 
     let eq_tau = build_eq_table(&fold.tau_pos);
 
-    // Word address of within-block word `w` of instance `i` (see
-    // `chain_common::fold_in_out`).
     let word_addr = move |i: usize, w: usize| -> usize {
         match wl {
             flock_core::r1cs::WitnessLayout::RowMajor => i * block_packed + w,
@@ -194,14 +128,25 @@ pub fn fold_all_slots(
     };
 
     let fold_one = |i: usize, base: usize| -> F128 {
-        let mut acc = F128::ZERO;
-        for pos in 0..n_packed_per_slot {
-            acc += eq_tau[pos] * packed[word_addr(i, base + pos)];
+        match wl {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                let start = i * block_packed + base;
+                flock_core::field::f128_slice::inner_product(
+                    &eq_tau,
+                    &packed[start..start + n_packed_per_slot],
+                )
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                use flock_core::field::gf2_128::F256Unreduced;
+                let mut acc = F256Unreduced::ZERO;
+                for pos in 0..n_packed_per_slot {
+                    acc ^= eq_tau[pos].mul_unreduced(packed[word_addr(i, base + pos)]);
+                }
+                acc.reduce()
+            }
         }
-        acc
     };
 
-    // Build each slot's vector in parallel.
     let mut results: [Vec<F128>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for (slot_idx, vec_out) in results.iter_mut().enumerate() {
         let slot_offset = slot_base_packed + slot_idx * n_packed_per_slot;
@@ -213,21 +158,6 @@ pub fn fold_all_slots(
     results
 }
 
-// ---------------------------------------------------------------------------
-// Packed-direct claim assembly
-// ---------------------------------------------------------------------------
-
-/// Assemble the packed-direct merkle claim from the fold and the shift
-/// sumcheck output. Claim point layout (LSB-first over `L = m − LOG_PACKING`
-/// coords):
-/// ```text
-///   [τ_pos ..., sel_slot, side, 0, 0, ..., 0, instance_point ...]
-///     ^^^^^    ^^^^^^^^^^^^^^^   ^^^^^^^^^^^^^^   ^^^^^^^^^^^^^^
-///     fold     slot selectors    high slot bits   sumcheck output
-///     coords   (sel_slot, side)  pinned to 0      instance coord
-/// ```
-/// The high-slot-bits-zero coords (`high_zeros = k_log − region_log − 2`) keep
-/// `eq_ind(point)` sparse with a `2^high_zeros ×` density reduction.
 pub fn assemble_merkle_path_claim(
     layout: &MerkleLayout,
     wl: flock_core::r1cs::WitnessLayout,
@@ -243,12 +173,6 @@ pub fn assemble_merkle_path_claim(
     }
 }
 
-/// Verifier-side helper: build the claim point identically to
-/// [`assemble_merkle_path_claim`] without constructing the sparse eq tensor.
-/// Word-index claim point ordered by the witness layout's address
-/// decomposition (see `chain_common::build_chain_claim_point`):
-/// RowMajor `[τ_pos…, sel_slot, side, 0^high, instance…]`;
-/// BatchMajor `[instance…, τ_pos…, sel_slot, side, 0^high]`.
 fn build_merkle_claim_point(
     layout: &MerkleLayout,
     wl: flock_core::r1cs::WitnessLayout,
@@ -272,13 +196,6 @@ fn build_merkle_claim_point(
     point
 }
 
-// ---------------------------------------------------------------------------
-// Proof + Error types
-// ---------------------------------------------------------------------------
-
-/// Proof that committed hash instances form Merkle path openings against a
-/// shared root. Composes the base R1CS sub-proofs, the shift-sumcheck
-/// sub-proof, and ONE batched Ligerito PCS open.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MerklePathProofLigerito {
     pub zerocheck: flock_core::zerocheck::ZerocheckProof,
@@ -289,27 +206,13 @@ pub struct MerklePathProofLigerito {
 
 #[derive(Debug)]
 pub enum MerklePathVerifyError {
-    /// Base R1CS replay failed.
     R1cs(flock_core::verifier::VerifyError),
-    /// Merkle-path shift sumcheck check failed.
+
     Shift(crate::merkle_path::MerklePathError),
-    /// The batched PCS opening failed.
+
     Pcs(flock_core::pcs::VerifyError),
 }
 
-// ---------------------------------------------------------------------------
-// Ligerito-backend prover / verifier
-// ---------------------------------------------------------------------------
-
-/// Generic multi-path Merkle prover: core → packed-pos fold → shift sumcheck
-/// → one batched Ligerito open over `[ab, c] ring-switched + [merkle]
-/// packed-direct`. Proves `P = 2^path_log` independent Merkle paths of length
-/// `L = 2^pos_log` (where `pos_log = n_log − path_log`) against one shared
-/// root, over a single PCS commitment. `b_bits` is the concatenated bit
-/// vector of length `N = PL` (per-path bit vectors stacked in path-id order;
-/// the first bit of each path is treated as 0 by convention regardless of the
-/// supplied value). `path_log = 0` recovers single-path, so this backs both
-/// single- and multi-path Merkle wrappers.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -330,7 +233,6 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
         .ligerito_prover_config()
         .expect("Ligerito config for merkle-path prove; bump m for tiny instances");
 
-    // ---- Core: commit → zerocheck → lincheck.
     let t = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -354,7 +256,6 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
         );
     }
 
-    // ---- Packed-pos fold.
     let t = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -371,7 +272,6 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
         );
     }
 
-    // ---- Merkle-path shift sumcheck.
     let t = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -400,7 +300,6 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
         );
     }
 
-    // ---- Batched open: [ab, c] ring-switched + [merkle] packed-direct, via Ligerito.
     let t = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -409,8 +308,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
-    // Destructure core to move z_packed by value into the open (saves a large
-    // clone at high m), mirroring `prove_chain_ligerito_generic`.
+
     let crate::prover::ProveCore {
         zc_proof,
         lc_proof,
@@ -422,9 +320,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
         ..
     } = core;
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    // Extra claims (chain / merkle-path I/O) put the open off the ranked
-    // two-claim shape, so C stays on the canonical 128-long statistic.
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.s_hat_v_c.as_slice());
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         &prover_data,
@@ -455,8 +351,6 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     )
 }
 
-/// Verifier for [`prove_merkle_paths_ligerito_generic`]. `path_log = 0`
-/// with a single leaf recovers the single-path verifier.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_merkle_paths_ligerito_generic<Ch: Challenger>(
     r1cs: &BlockR1cs,

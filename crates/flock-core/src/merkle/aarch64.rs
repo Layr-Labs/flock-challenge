@@ -1,8 +1,6 @@
 use super::{Hash, SHA256_IV, SHA256_K};
 use core::arch::aarch64::*;
 
-/// One interleaved compression round over 4 independent states.
-/// `blocks[i]` must be ≥ 64 bytes; only the first 64 are consumed.
 #[inline(always)]
 unsafe fn compress4(
     abcd: &mut [uint32x4_t; 4],
@@ -15,7 +13,6 @@ unsafe fn compress4(
         let mut msg2 = [vdupq_n_u32(0); 4];
         let mut msg3 = [vdupq_n_u32(0); 4];
         for i in 0..4 {
-            // SHA-256 message words are big-endian.
             msg0[i] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(blocks[i])));
             msg1[i] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(blocks[i].add(16))));
             msg2[i] = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(blocks[i].add(32))));
@@ -64,7 +61,6 @@ unsafe fn compress4(
     }
 }
 
-/// Hash 4 equal-length inputs, producing 4 standard SHA-256 digests.
 #[inline]
 pub fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
     let len = inputs[0].len();
@@ -75,7 +71,6 @@ pub fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
         let mut abcd = [vld1q_u32(SHA256_IV.as_ptr()); 4];
         let mut efgh = [vld1q_u32(SHA256_IV.as_ptr().add(4)); 4];
 
-        // Full 64-byte blocks.
         let n_full = len / 64;
         for blk in 0..n_full {
             compress4(
@@ -90,8 +85,6 @@ pub fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
             );
         }
 
-        // Tail: remaining bytes + 0x80 + zero pad + 64-bit BE bit length.
-        // One extra block when rem ≤ 55, two when 56 ≤ rem ≤ 63.
         let rem = len % 64;
         let bit_len = (len as u64) * 8;
         let n_tail = if rem < 56 { 1 } else { 2 };
@@ -114,7 +107,6 @@ pub fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
             );
         }
 
-        // Digest = big-endian a..h.
         for i in 0..4 {
             let be_lo = vrev32q_u8(vreinterpretq_u8_u32(abcd[i]));
             let be_hi = vrev32q_u8(vreinterpretq_u8_u32(efgh[i]));

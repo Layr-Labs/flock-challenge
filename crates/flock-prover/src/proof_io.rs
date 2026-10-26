@@ -1,57 +1,14 @@
-//! Serialize / deserialize proofs to bytes (and files).
-//!
-//! Two bundle types: [`R1csProofBundleLigerito`] for the base R1CS proof and
-//! [`ChainProofBundleLigerito`] for the hash-chain proof. Both pair a proof
-//! with its commitment (which the verifier needs); the chain bundle
-//! additionally carries the public endpoint bits.
-//!
-//! On-disk format:
-//! ```text
-//!   bytes 0..5    "FLOCK"                  (5-byte magic)
-//!   byte  5       VERSION                  (currently 1)
-//!   bytes 6..7    flavor: 2 = R1cs, 3 = Chain (0/1 reserved: legacy BaseFold)
-//!   bytes 7..     bincode-serialized payload
-//! ```
-//!
-//! Versioning is here to make schema changes detectable cleanly: bump
-//! `VERSION` whenever a payload field is added/removed/reordered. Forward
-//! compatibility is NOT promised — `from_bytes` of a different version is
-//! rejected (`UnsupportedVersion`).
-//!
-//! ## Round-trip example
-//! ```ignore
-//! let bundle = R1csProofBundleLigerito { commitment, proof };
-//! let bytes = bundle.to_bytes();
-//! std::fs::write("proof.bin", &bytes)?;
-//! ...
-//! let bytes = std::fs::read("proof.bin")?;
-//! let bundle = R1csProofBundleLigerito::from_bytes(&bytes)?;
-//! // Then call e.g. `setup.verify(&bundle.commitment, &bundle.proof, ...)`.
-//! ```
-
 use std::io;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
 use flock_core::pcs::Commitment;
 
-/// Magic bytes prepended to every serialized proof. Lets readers reject
-/// random binary data early.
 pub const MAGIC: [u8; 5] = *b"FLOCK";
 
-/// Format version. Bumped on incompatible serialization changes.
-/// v4 (current) adds `ood_values` + `fold_grinding_nonces` to
-/// `LigeritoProof` and `profile` to `PcsParams` (Johnson+OOD profiles).
-/// v3 restructures `BaseFoldProof`: per-query Merkle paths are replaced by
-/// shared octopus multi-proofs (one per Merkle tree). v2 added `HashKind`
-/// to [`ChainProofBundle`].
 pub const VERSION: u8 = 4;
 
-/// Which hash function a chain proof is over. Carried in
-/// [`ChainProofBundle`] so the verifier (e.g. the CLI) can pick the right
-/// `*_chain` setup without out-of-band info.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HashKind {
     Blake3,
@@ -60,8 +17,6 @@ pub enum HashKind {
 }
 
 impl HashKind {
-    /// Parse a CLI-style name; case-insensitive. Accepts `blake3`, `sha2` /
-    /// `sha256`, `keccak` / `keccak_f`.
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "blake3" => Some(Self::Blake3),
@@ -80,31 +35,23 @@ impl HashKind {
     }
 }
 
-/// Flavor discriminator (1 byte). Lets a generic reader peek what kind of
-/// bundle a file holds without parsing the payload first. Values 0/1 are
-/// reserved: they were the legacy BaseFold R1cs/Chain flavors.
 const FLAVOR_R1CS_LIGERITO: u8 = 2;
 const FLAVOR_CHAIN_LIGERITO: u8 = 3;
 
-/// Header size = 5-byte magic + 1-byte version + 1-byte flavor.
 const HEADER_LEN: usize = 7;
 
-/// Errors from `from_bytes` / `read_from_file`.
 #[derive(Debug)]
 pub enum DeserializeError {
-    /// The 5-byte magic prefix did not match `FLOCK`.
     BadMagic,
-    /// The version byte didn't match this build's `VERSION`. The number is
-    /// the version found in the file.
+
     UnsupportedVersion(u8),
-    /// The flavor byte was neither `2` (R1cs Ligerito) nor `3` (Chain Ligerito).
+
     UnknownFlavor(u8),
-    /// `from_bytes` was called with a slice shorter than `HEADER_LEN`.
+
     Truncated,
-    /// The expected flavor and the file's flavor disagree (e.g. trying to
-    /// load a `ChainProofBundle` from an R1CS bundle file).
+
     FlavorMismatch { expected: u8, found: u8 },
-    /// The bincode-deserialization step failed (corrupted payload, etc.).
+
     Bincode(bincode::Error),
 }
 
@@ -133,21 +80,12 @@ impl From<bincode::Error> for DeserializeError {
     }
 }
 
-/// Bundles a base R1CS proof with its commitment for self-contained
-/// serialization. Verification still needs the relevant [`flock_core::r1cs::BlockR1cs`]
-/// (or a `*Setup`) on the verifier side — that's a public artifact derived
-/// from the setup parameters, not part of the proof.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct R1csProofBundleLigerito {
     pub commitment: Commitment,
     pub proof: flock_core::proof::R1csProofLigerito,
 }
 
-/// Bundles a hash-chain proof with its commitment + public endpoint bits
-/// (`cv_0_phys` and `cv_last_phys` are the physical within-slot bool layouts
-/// returned by per-hash `*_to_phys_bits` helpers — `region_bits` long each)
-/// plus the [`HashKind`] discriminator so a verifier can pick the right
-/// per-hash setup from the bundle alone.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainProofBundleLigerito {
     pub hash_kind: HashKind,
@@ -159,486 +97,14 @@ pub struct ChainProofBundleLigerito {
 
 impl R1csProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
-        r1cs_parts_to_bytes(&self.commitment, &self.proof)
-    }
-    /// Single-pass publish: stream the stashed prefix (header ‖ commitment ‖
-    /// zerocheck ‖ lincheck, pre-encoded on the efficiency-core helper while
-    /// the PCS open ran) and then the flat `pcs_open` encode directly into
-    /// `w` — no ~437 kB intermediate bundle Vec and no second copy inside
-    /// `fs::write`. Output is byte-identical to [`Self::to_bytes`] (same
-    /// prefix, same flat encoder), so the trusted harness's post-timing
-    /// verification is unaffected; any divergence would fail loudly there.
-    ///
-    /// The remaining tail work is then: write prefix (~4.3 kB), write the
-    /// flat pcs_open (~433 kB) through the writer's buffer, flush, rename —
-    /// instead of encode-into-Vec + full-bundle `fs::write` copy.
-    pub fn write_into<W: std::io::Write>(&self, mut w: W) -> std::io::Result<()> {
-        if let Some(prefix) = take_matching_pre_encoded(self) {
-            w.write_all(&prefix)?;
-            encode_pcs_open_into(&mut w, &self.proof.pcs_open);
-            return Ok(());
-        }
-        // Stash miss (kill switch / staleness fingerprint): single-shot
-        // bincode, still streaming straight into the writer (header first —
-        // to_bytes' fallback writes it too).
-        let mut header = Vec::with_capacity(HEADER_LEN);
-        write_header(&mut header, FLAVOR_R1CS_LIGERITO);
-        w.write_all(&header)?;
-        bincode::serialize_into(&mut w, self).map_err(std::io::Error::other)
+        let mut out = Vec::with_capacity(HEADER_LEN + 1024);
+        write_header(&mut out, FLAVOR_R1CS_LIGERITO);
+        bincode::serialize_into(&mut out, self).expect("bincode serialize R1csProofBundleLigerito");
+        out
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DeserializeError> {
         let payload = parse_header(bytes, FLAVOR_R1CS_LIGERITO)?;
         Ok(bincode::deserialize(payload)?)
-    }
-}
-
-/// Encode borrowed bundle fields into the exact R1CS proof-file bytes.
-///
-/// The speculative seed-pipe owns its proof and commitment as separate tuple
-/// fields. Keeping this path borrowed lets it publish before handing that
-/// tuple to the wrapper, while retaining the same stashed `Vec`, ranked
-/// fingerprint shortcut, tail bulk copies, and ragged-row bulk fill used by
-/// [`R1csProofBundleLigerito::to_bytes`].
-pub(crate) fn r1cs_parts_to_bytes(
-    commitment: &Commitment,
-    proof: &flock_core::proof::R1csProofLigerito,
-) -> Vec<u8> {
-    // Fast path: the prover pre-encoded `header ‖ commitment ‖ zerocheck
-    // ‖ lincheck` concurrently with the PCS open (those sections are
-    // transcript-final before the open starts — see
-    // [`stash_pre_encoded_prefix`]); only `pcs_open` remains. bincode struct
-    // encoding is untagged field concatenation, so appending the last field
-    // reproduces the single-shot encode byte-for-byte; the fingerprint gate
-    // below guarantees the stash is for THESE fields.
-    if let Some(mut out) = take_matching_pre_encoded_parts(commitment, proof) {
-        encode_pcs_open_into_vec(&mut out, &proof.pcs_open);
-        return out;
-    }
-    // Ranked bundles serialize to ~437–440 kB; the old 1 KiB hint forced ~9
-    // doubling reallocs (~875 kB of copying) inside the timed window. 450 kB
-    // covers every observed ranked proof under the verifier's 500 kB cap
-    // while degrading gracefully (Vec growth) if exceeded.
-    let mut out = Vec::with_capacity(HEADER_LEN + 450_000);
-    write_header(&mut out, FLAVOR_R1CS_LIGERITO);
-    if fast_pcs_open_encode_enabled() {
-        // `enc(bundle) = enc(commitment) ‖ enc(zerocheck) ‖ enc(lincheck) ‖
-        // enc(pcs_open)`, so the Vec-specialized dominant section remains
-        // byte-identical to bincode and keeps the current rows/tail bulk path.
-        bincode::serialize_into(&mut out, commitment).expect("bincode serialize Commitment");
-        bincode::serialize_into(&mut out, &proof.zerocheck)
-            .expect("bincode serialize ZerocheckProof");
-        bincode::serialize_into(&mut out, &proof.lincheck)
-            .expect("bincode serialize LincheckProof");
-        encode_pcs_open_into_vec(&mut out, &proof.pcs_open);
-    } else {
-        // A bincode struct is its fields in declaration order with no struct
-        // tag. Encoding the two borrowed fields separately is therefore the
-        // exact slow-path encoding of `R1csProofBundleLigerito`.
-        bincode::serialize_into(&mut out, commitment).expect("bincode serialize Commitment");
-        bincode::serialize_into(&mut out, proof).expect("bincode serialize R1csProofLigerito");
-    }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Publish-prefix pre-encode
-// ---------------------------------------------------------------------------
-
-/// A publish prefix — `header ‖ enc(commitment) ‖ enc(zerocheck) ‖
-/// enc(lincheck)` — encoded while the PCS open runs. Those three sections are
-/// transcript-committed before the open starts and the open only produces
-/// `pcs_open`, so their serialization can leave the publish tail (which sits
-/// between `prove_fast` returning and the proof file becoming visible to the
-/// harness — all inside the scored interval). The prefix is small (~4.3 kB of
-/// a ~437 kB ranked bundle: commitment 64 B, zerocheck ~3 kB, lincheck
-/// ~1.3 kB); the tail win is that encode plus the 450 kB output allocation,
-/// which the stash performs off-tail. `pcs_open` (~99% of the bytes) exists
-/// only after the open and can never leave the tail.
-struct PreEncodedPrefix {
-    /// The commitment's Merkle root. Two distinct proves sharing a root would
-    /// be a hash collision, so a root match pins the stash to this prove.
-    root: flock_core::merkle::Hash,
-    /// bincode-fixint encoded lengths of commitment / zerocheck / lincheck,
-    /// re-derived from the candidate bundle at publish via `serialized_size`
-    /// (same default fixint config as `serialize_into`).
-    sec_lens: [u64; 3],
-    /// `HEADER_LEN + sec_lens` bytes, with capacity already covering the full
-    /// bundle so the publish-tail `pcs_open` append never reallocates.
-    bytes: Vec<u8>,
-}
-
-/// Latest stashed prefix. Process-global and single-slot: the ranked worker
-/// never overlaps proves (`seed_pipe::try_adopt` drains the speculative run
-/// before a fallback prove starts), so the slot always holds the publishing
-/// prove's prefix — warmup's stash is consumed by `warm_publish_path`'s
-/// `to_bytes` (which thereby warms this fast path too), then the timed prove
-/// (direct or speculative-adopted) stores its own. Any staleness — foreign
-/// stash, concurrent test proves — is caught by the fingerprint and falls
-/// back to the full encode.
-static PRE_ENCODED: Mutex<Option<PreEncodedPrefix>> = Mutex::new(None);
-
-/// `FLOCK_NO_PRE_ENCODE=1` (exact string, matching the tree's kill-switch
-/// convention) restores the incumbent single-shot bundle encode. The ranked
-/// harness `env_clear()`s, so pre-encode is the default.
-pub(crate) fn pre_encode_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FLOCK_NO_PRE_ENCODE").map_or(true, |v| v != "1"))
-}
-
-/// Encode and stash the publish prefix for a prove whose commitment /
-/// zerocheck / lincheck are final. Called by the prover on an efficiency-core
-/// helper concurrently with the PCS open (tens of µs of alloc + encode
-/// against a ~19 ms open). Replaces any previous stash.
-pub fn stash_pre_encoded_prefix(
-    commitment: &Commitment,
-    zerocheck: &flock_core::zerocheck::ZerocheckProof,
-    lincheck: &flock_core::lincheck::LincheckProof,
-) {
-    if !pre_encode_enabled() {
-        return;
-    }
-    // Same capacity as the incumbent `to_bytes`: the publish-tail `pcs_open`
-    // append extends this exact Vec, so it must never need to grow.
-    let mut bytes = Vec::with_capacity(HEADER_LEN + 450_000);
-    write_header(&mut bytes, FLAVOR_R1CS_LIGERITO);
-    let mut sec_lens = [0u64; 3];
-    let mut mark = bytes.len();
-    bincode::serialize_into(&mut bytes, commitment).expect("bincode serialize Commitment");
-    sec_lens[0] = (bytes.len() - mark) as u64;
-    mark = bytes.len();
-    bincode::serialize_into(&mut bytes, zerocheck).expect("bincode serialize ZerocheckProof");
-    sec_lens[1] = (bytes.len() - mark) as u64;
-    mark = bytes.len();
-    bincode::serialize_into(&mut bytes, lincheck).expect("bincode serialize LincheckProof");
-    sec_lens[2] = (bytes.len() - mark) as u64;
-    // Assignment-only critical section — nothing that can panic runs while
-    // the guard is held, so the lock cannot poison. A poisoned lock
-    // (unreachable in practice) skips the stash; publish then full-encodes.
-    if let Ok(mut slot) = PRE_ENCODED.lock() {
-        *slot = Some(PreEncodedPrefix {
-            root: commitment.root,
-            sec_lens,
-            bytes,
-        });
-    }
-}
-
-/// Take the stash iff it fingerprint-matches `bundle`: identical Merkle root
-/// AND identical bincode-fixint size for each of the three prefix sections.
-/// bincode-fixint encoding of equal values is deterministic, so a full match
-/// means the stashed bytes equal what a fresh encode of `bundle`'s prefix
-/// would produce. `None` (full-encode fallback) on any doubt — no stash,
-/// disabled switch, poisoned lock, any fingerprint miss. The stash is
-/// consumed on take; a repeat publish of the same bundle re-encodes from
-/// scratch, byte-identically.
-fn take_matching_pre_encoded(bundle: &R1csProofBundleLigerito) -> Option<Vec<u8>> {
-    take_matching_pre_encoded_parts(&bundle.commitment, &bundle.proof)
-}
-
-fn take_matching_pre_encoded_parts(
-    commitment: &Commitment,
-    proof: &flock_core::proof::R1csProofLigerito,
-) -> Option<Vec<u8>> {
-    if !pre_encode_enabled() {
-        return None;
-    }
-    let stash = PRE_ENCODED.lock().ok()?.take()?;
-    if stash.root != commitment.root {
-        return None;
-    }
-    // The ranked worker has exactly one sequential warm-up/timed prove pair.
-    // Warm-up consumes its stash before the timed prove replaces it, and
-    // seed-pipe adoption drains the speculative prove before publication.
-    // The matching commitment root therefore identifies the only live prefix;
-    // skip three `serialized_size` walks on the measured publication tail.
-    // Non-ranked callers retain the full structural fingerprint below because
-    // tests and library users may interleave proves with the same commitment.
-    if crate::seed_pipe::is_ranked_worker() {
-        return Some(stash.bytes);
-    }
-    let sec_lens = [
-        bincode::serialized_size(commitment).ok()?,
-        bincode::serialized_size(&proof.zerocheck).ok()?,
-        bincode::serialized_size(&proof.lincheck).ok()?,
-    ];
-    if sec_lens != stash.sec_lens {
-        return None;
-    }
-    let want = HEADER_LEN + sec_lens.iter().sum::<u64>() as usize;
-    (stash.bytes.len() == want).then_some(stash.bytes)
-}
-
-// ---------------------------------------------------------------------------
-// Flat bincode-compatible `pcs_open` encoder (micro-stack item 5)
-// ---------------------------------------------------------------------------
-//
-// `bincode::serialize_into` (fixint, little-endian — the bincode 1.x
-// free-function config) drives the ~433 kB `pcs_open` section through serde
-// element-at-a-time: every F128 costs two `write_u64` calls and every Merkle
-// hash 32 single-byte writes, all inside the measured publish tail. The
-// encoder below emits the *identical bytes* with bulk `extend_from_slice`
-// copies instead:
-//
-//   - struct        → field concatenation in declaration order (no framing)
-//   - Vec<T>        → u64 LE length ‖ elements
-//   - u64           → 8 LE bytes
-//   - F128 {lo,hi}  → lo LE ‖ hi LE = its in-memory bytes on a little-endian
-//                     target (`repr(C, align(16))`, two u64s, no padding) —
-//                     whole slices are memcpy'd
-//   - Hash [u8;32]  → 32 raw bytes (serde fixed arrays carry no length) —
-//                     whole slices are memcpy'd via `as_flattened`
-//
-// Every struct is destructured exhaustively (no `..`), so adding/removing/
-// reordering a field breaks compilation here instead of silently changing
-// the encoding; `flat_pcs_open_encoder_matches_bincode` byte-checks the
-// result against `bincode::serialize` on nonuniform random proofs.
-//
-// `FLOCK_NO_MICRO_STACK=1` (shared micro-stack kill switch) restores the
-// incumbent serde encode; big-endian targets always fall back.
-
-use flock_core::field::F128;
-use flock_core::merkle::Hash as MerkleHash;
-use flock_core::pcs::BatchOpeningProofLigerito;
-use flock_core::pcs::ligerito::{FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage};
-use flock_core::pcs::ring_switch::RingSwitchProof;
-
-fn fast_pcs_open_encode_enabled() -> bool {
-    cfg!(target_endian = "little") && flock_core::micro_stack_enabled()
-}
-
-/// `FLOCK_NO_FLAT_TAIL_BULK=1` restores the element-at-a-time flat encoding
-/// of sumcheck messages and nonce vectors. Other values keep the ranked
-/// publication-tail bulk copies enabled.
-fn flat_tail_bulk_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FLOCK_NO_FLAT_TAIL_BULK").map_or(true, |v| v != "1"))
-}
-
-/// `FLOCK_NO_FLAT_ROWS_BULK=1` restores the incumbent generic row encoder
-/// for `to_bytes`. All other values let its concrete `Vec<u8>` sink reserve and
-/// fill each complete ragged-row section in one pass. The generic encoder
-/// used by `write_into` is deliberately unchanged.
-fn flat_rows_bulk_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FLOCK_NO_FLAT_ROWS_BULK").map_or(true, |v| v != "1"))
-}
-
-/// Vec-specialized publication path. Unlike the generic writer path, this
-/// can hoist the capacity check and length update across an entire ragged-row
-/// section instead of extending the output once for every row prefix and
-/// payload.
-fn encode_pcs_open_into_vec(out: &mut Vec<u8>, p: &BatchOpeningProofLigerito) {
-    if !fast_pcs_open_encode_enabled() || !flat_rows_bulk_enabled() {
-        encode_pcs_open_into(out, p);
-        return;
-    }
-    encode_pcs_open_fields(out, p, put_rows_bulk_vec);
-}
-
-/// Append the bincode-fixint encoding of `p` to `out`. Byte-identical to
-/// `bincode::serialize_into(out, p)` (falls back to exactly that when the
-/// fast path is disabled).
-fn encode_pcs_open_into<W: std::io::Write>(out: &mut W, p: &BatchOpeningProofLigerito) {
-    if !fast_pcs_open_encode_enabled() {
-        bincode::serialize_into(&mut *out, p).expect("bincode serialize pcs_open");
-        return;
-    }
-    encode_pcs_open_fields(out, p, put_rows::<W>);
-}
-
-fn encode_pcs_open_fields<W, R>(out: &mut W, p: &BatchOpeningProofLigerito, put_rows_fn: R)
-where
-    W: std::io::Write,
-    R: Fn(&mut W, &[Vec<F128>]) + Copy,
-{
-    let BatchOpeningProofLigerito {
-        ring_switches,
-        ligerito,
-    } = p;
-    put_u64(out, ring_switches.len() as u64);
-    for rs in ring_switches {
-        let RingSwitchProof { s_hat_v } = rs;
-        put_f128_vec(out, s_hat_v);
-    }
-    let LigeritoProof {
-        initial_root,
-        initial_proof,
-        recursive_roots,
-        recursive_proofs,
-        final_proof,
-        sumcheck_transcript,
-        grinding_nonces,
-        ood_values,
-        fold_grinding_nonces,
-    } = ligerito;
-    out.write_all(initial_root).expect("encode write");
-    put_recursive_proof(out, initial_proof, put_rows_fn);
-    put_hash_vec(out, recursive_roots);
-    put_u64(out, recursive_proofs.len() as u64);
-    for rp in recursive_proofs {
-        put_recursive_proof(out, rp, put_rows_fn);
-    }
-    let FinalProof {
-        yr,
-        opened_rows,
-        merkle_proof,
-    } = final_proof;
-    put_f128_vec(out, yr);
-    put_rows_fn(out, opened_rows);
-    put_hash_vec(out, merkle_proof);
-    put_sumcheck_vec(out, sumcheck_transcript);
-    put_u64_vec(out, grinding_nonces);
-    put_f128_vec(out, ood_values);
-    put_u64_vec(out, fold_grinding_nonces);
-}
-
-fn put_recursive_proof<W, R>(out: &mut W, rp: &RecursiveProof, put_rows_fn: R)
-where
-    W: std::io::Write,
-    R: Fn(&mut W, &[Vec<F128>]),
-{
-    let RecursiveProof {
-        opened_rows,
-        merkle_proof,
-    } = rp;
-    put_rows_fn(out, opened_rows);
-    put_hash_vec(out, merkle_proof);
-}
-
-#[inline]
-fn put_u64<W: std::io::Write>(out: &mut W, v: u64) {
-    out.write_all(&v.to_le_bytes()).expect("encode write");
-}
-
-#[inline]
-fn put_f128<W: std::io::Write>(out: &mut W, v: F128) {
-    put_u64(out, v.lo);
-    put_u64(out, v.hi);
-}
-
-#[inline]
-fn put_f128_vec<W: std::io::Write>(out: &mut W, v: &[F128]) {
-    put_u64(out, v.len() as u64);
-    // SAFETY: `F128` is `repr(C, align(16))` with exactly two `u64` fields
-    // (size 16, no padding), so on a little-endian target the in-memory bytes
-    // of a slice are precisely the bincode-fixint encoding of its elements.
-    // The fast path is compile-time gated to little-endian above.
-    let bytes =
-        unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) };
-    out.write_all(bytes).expect("encode write");
-}
-
-#[inline]
-fn put_hash_vec<W: std::io::Write>(out: &mut W, v: &[MerkleHash]) {
-    put_u64(out, v.len() as u64);
-    out.write_all(v.as_flattened()).expect("encode write");
-}
-
-#[inline]
-fn put_sumcheck_vec<W: std::io::Write>(out: &mut W, v: &[SumcheckMessage]) {
-    put_u64(out, v.len() as u64);
-    if flat_tail_bulk_enabled() {
-        const {
-            assert!(std::mem::size_of::<SumcheckMessage>() == 2 * std::mem::size_of::<F128>());
-            assert!(std::mem::align_of::<SumcheckMessage>() == std::mem::align_of::<F128>());
-            assert!(std::mem::offset_of!(SumcheckMessage, u_0) == 0);
-            assert!(
-                std::mem::offset_of!(SumcheckMessage, u_2) == std::mem::size_of::<F128>()
-            );
-        }
-        // SAFETY: `SumcheckMessage` is `repr(C)` with two adjacent `F128`
-        // fields, and `F128` is two adjacent `u64`s. The enclosing flat
-        // encoder is admitted only on little-endian targets, so these bytes
-        // are exactly bincode's fixed-integer field-concatenation encoding.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
-        };
-        out.write_all(bytes).expect("encode write");
-    } else {
-        for m in v {
-            let SumcheckMessage { u_0, u_2 } = m;
-            put_f128(out, *u_0);
-            put_f128(out, *u_2);
-        }
-    }
-}
-
-#[inline]
-fn put_u64_vec<W: std::io::Write>(out: &mut W, v: &[u64]) {
-    put_u64(out, v.len() as u64);
-    if flat_tail_bulk_enabled() {
-        // SAFETY: a `u64` slice has no padding, and this helper is reached
-        // only from the little-endian flat encoder, so its memory bytes are
-        // exactly bincode's fixed-width little-endian element encoding.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v))
-        };
-        out.write_all(bytes).expect("encode write");
-    } else {
-        for &x in v {
-            put_u64(out, x);
-        }
-    }
-}
-
-fn put_rows<W: std::io::Write>(out: &mut W, rows: &[Vec<F128>]) {
-    put_u64(out, rows.len() as u64);
-    for row in rows {
-        put_f128_vec(out, row);
-    }
-}
-
-/// Append one bincode-fixint `Vec<Vec<F128>>` directly into a `Vec<u8>`.
-/// The wire format is unchanged:
-/// `u64(nrows) || (u64(row_len) || raw F128 bytes)*`.
-fn put_rows_bulk_vec(out: &mut Vec<u8>, rows: &[Vec<F128>]) {
-    const LEN_BYTES: usize = std::mem::size_of::<u64>();
-    let encoded_len = rows
-        .iter()
-        .try_fold(LEN_BYTES, |len, row| {
-            len.checked_add(LEN_BYTES)?
-                .checked_add(std::mem::size_of_val(row.as_slice()))
-        })
-        .expect("row encoding length overflow");
-    let old_len = out.len();
-    let new_len = old_len
-        .checked_add(encoded_len)
-        .expect("proof encoding length overflow");
-    out.reserve(encoded_len);
-
-    // SAFETY: `reserve(encoded_len)` guarantees writable allocation from
-    // `old_len..new_len`. `written` is advanced by exactly the same checked
-    // terms used to compute `encoded_len`, so every copy stays in that
-    // allocation. Safe callers cannot alias proof rows with the separately
-    // mutably borrowed output Vec. Every byte is initialized before the
-    // single `set_len`; zero-sized row payloads are skipped. The surrounding
-    // flat encoder admits this helper only on little-endian targets, where a
-    // packed F128 slice is its bincode-fixint byte representation.
-    unsafe {
-        let dst = out.as_mut_ptr().add(old_len);
-        let mut written = 0usize;
-
-        let nrows = (rows.len() as u64).to_le_bytes();
-        std::ptr::copy_nonoverlapping(nrows.as_ptr(), dst.add(written), LEN_BYTES);
-        written += LEN_BYTES;
-
-        for row in rows {
-            let row_len = (row.len() as u64).to_le_bytes();
-            std::ptr::copy_nonoverlapping(row_len.as_ptr(), dst.add(written), LEN_BYTES);
-            written += LEN_BYTES;
-
-            let row_bytes = std::mem::size_of_val(row.as_slice());
-            if row_bytes != 0 {
-                std::ptr::copy_nonoverlapping(
-                    row.as_ptr().cast::<u8>(),
-                    dst.add(written),
-                    row_bytes,
-                );
-                written += row_bytes;
-            }
-        }
-        debug_assert_eq!(written, encoded_len);
-        out.set_len(new_len);
     }
 }
 
@@ -655,10 +121,6 @@ impl ChainProofBundleLigerito {
         Ok(bincode::deserialize(payload)?)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Encoding helpers
-// ---------------------------------------------------------------------------
 
 fn write_header(out: &mut Vec<u8>, flavor: u8) {
     out.extend_from_slice(&MAGIC);
@@ -690,12 +152,6 @@ fn parse_header(bytes: &[u8], expected_flavor: u8) -> Result<&[u8], DeserializeE
     Ok(&bytes[HEADER_LEN..])
 }
 
-// ---------------------------------------------------------------------------
-// File-IO conveniences
-// ---------------------------------------------------------------------------
-
-/// Atomically write `bytes` to `path` (write-then-rename via the
-/// stdlib — best-effort; on error the rename may leave a temp file behind).
 pub fn write_bytes_to_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> io::Result<()> {
     let path = path.as_ref();
     let tmp = match path.parent() {
@@ -711,12 +167,10 @@ pub fn write_bytes_to_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> io::Result<
     std::fs::rename(&tmp, path)
 }
 
-/// Read raw bytes from a file. Thin wrapper over `std::fs::read`.
 pub fn read_bytes_from_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     std::fs::read(path)
 }
 
-/// Write a Ligerito chain bundle to `path`.
 pub fn write_chain_bundle_ligerito_to_file<P: AsRef<Path>>(
     path: P,
     bundle: &ChainProofBundleLigerito,
@@ -724,7 +178,6 @@ pub fn write_chain_bundle_ligerito_to_file<P: AsRef<Path>>(
     write_bytes_to_file(path, &bundle.to_bytes())
 }
 
-/// Read a Ligerito chain bundle from `path`.
 pub fn read_chain_bundle_ligerito_from_file<P: AsRef<Path>>(
     path: P,
 ) -> Result<ChainProofBundleLigerito, BundleReadError> {
@@ -732,8 +185,6 @@ pub fn read_chain_bundle_ligerito_from_file<P: AsRef<Path>>(
     ChainProofBundleLigerito::from_bytes(&bytes).map_err(BundleReadError::Deserialize)
 }
 
-/// Combined error returned by file-read helpers: either IO failed or the
-/// bytes weren't a valid bundle.
 #[derive(Debug)]
 pub enum BundleReadError {
     Io(io::Error),
@@ -751,17 +202,12 @@ impl std::fmt::Display for BundleReadError {
 
 impl std::error::Error for BundleReadError {}
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::r1cs_hashes::blake3::{Blake3Setup, Compression, blake3_compress, cv_to_phys_bits};
     use flock_core::challenger::FsChallenger;
 
-    /// SplitMix64.
     struct Rng(u64);
     impl Rng {
         fn new(seed: u64) -> Self {
@@ -776,7 +222,6 @@ mod tests {
         }
     }
 
-    /// Build a small honest BLAKE3 chain (n=8) for the bundle tests.
     fn honest_chain(n: usize, seed: u64) -> (Vec<Compression>, [u32; 8], [u32; 8]) {
         let mut rng = Rng::new(seed);
         let mut cv: [u32; 8] = std::array::from_fn(|_| rng.nx() as u32);
@@ -794,12 +239,9 @@ mod tests {
         (blocks, cv0, cv)
     }
 
-    /// Default Ligerito bundle roundtrip, byte-flip rejection, and file
-    /// roundtrip. Requires m ≥ 21 — use n_blocks=256 (m=22 with K_LOG=14).
     #[test]
-    #[ignore] // Heavier — run with `cargo test r1cs_bundle_roundtrip -- --ignored --nocapture`
+    #[ignore]
     fn r1cs_bundle_roundtrip() {
-        // K=256 → n_log=8 → m=22 with BLAKE3 K_LOG=14 (smallest Ligerito target).
         let setup = Blake3Setup::new(256);
         let (blocks, _, _) = honest_chain(256, 0xDEAD_5170);
         let mut ch = FsChallenger::new(b"flock-proofio-lig");
@@ -822,9 +264,6 @@ mod tests {
             .verify(&bundle2.commitment, &bundle2.proof, &mut chv)
             .expect("verify round-tripped Ligerito R1cs proof");
 
-        // Byte-flipping inside the payload should make verification reject.
-        // The flip can either fail deserialization OR succeed-then-fail-at-
-        // verify; either is acceptable evidence the proof was consumed.
         let flip_at = HEADER_LEN + (bytes.len() - HEADER_LEN) / 2;
         let mut mutated = bytes.clone();
         mutated[flip_at] ^= 0xFF;
@@ -837,7 +276,6 @@ mod tests {
             }
         }
 
-        // File roundtrip.
         let path = std::env::temp_dir().join("flock-proofio-roundtrip.bin");
         write_bytes_to_file(&path, &bytes).expect("write");
         let read_back = read_bytes_from_file(&path).expect("read");
@@ -855,50 +293,8 @@ mod tests {
         );
     }
 
-    /// Borrowed speculative publication must remain exactly the canonical
-    /// bundle encoding on both a stash miss and a matching-stash take. This
-    /// real proof covers the current ranked fingerprint structure plus the
-    /// Vec-specialized rows and tail encoders against an independent bincode
-    /// oracle.
     #[test]
-    #[ignore] // Heavier — run explicitly with the other proof I/O gates.
-    fn r1cs_parts_bytes_match_canonical_bundle_encoding() {
-        let setup = Blake3Setup::new(256);
-        let (blocks, _, _) = honest_chain(256, 0x5EED_510E);
-        let mut ch = FsChallenger::new(b"flock-proofio-parts");
-        let (proof, commitment, _claim) = setup.prove_fast(&blocks, &mut ch);
-
-        let mut canonical = Vec::with_capacity(HEADER_LEN + 450_000);
-        write_header(&mut canonical, FLAVOR_R1CS_LIGERITO);
-        bincode::serialize_into(&mut canonical, &commitment).expect("encode commitment oracle");
-        bincode::serialize_into(&mut canonical, &proof).expect("encode proof oracle");
-
-        PRE_ENCODED
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        assert_eq!(
-            r1cs_parts_to_bytes(&commitment, &proof),
-            canonical,
-            "borrowed stash-miss encoding diverged"
-        );
-
-        assert!(pre_encode_enabled(), "test requires the default stash path");
-        stash_pre_encoded_prefix(&commitment, &proof.zerocheck, &proof.lincheck);
-        assert_eq!(
-            r1cs_parts_to_bytes(&commitment, &proof),
-            canonical,
-            "borrowed matching-stash encoding diverged"
-        );
-
-        stash_pre_encoded_prefix(&commitment, &proof.zerocheck, &proof.lincheck);
-        let bundle = R1csProofBundleLigerito { commitment, proof };
-        assert_eq!(bundle.to_bytes(), canonical, "bundle delegate diverged");
-    }
-
-    /// Ligerito chain bundle roundtrip. Requires m ≥ 21 — n=256 blocks.
-    #[test]
-    #[ignore] // Heavier — run with `cargo test chain_bundle_roundtrip -- --ignored --nocapture`
+    #[ignore]
     fn chain_bundle_roundtrip_and_verify() {
         let setup = Blake3Setup::new(256);
         let (blocks, cv_0, cv_last) = honest_chain(256, 0xC0FFEE);
@@ -931,192 +327,6 @@ mod tests {
             .expect("verify round-tripped chain proof");
     }
 
-    /// The flat `pcs_open` encoder must reproduce `bincode::serialize`
-    /// byte-for-byte on nonuniform random proofs (empty vecs, ragged rows,
-    /// zero and max scalars included).
-    #[test]
-    fn flat_pcs_open_encoder_matches_bincode() {
-        use flock_core::pcs::BatchOpeningProofLigerito;
-        use flock_core::pcs::ligerito::{
-            FinalProof, LigeritoProof, RecursiveProof, SumcheckMessage,
-        };
-        use flock_core::pcs::ring_switch::RingSwitchProof;
-
-        let mut rng = Rng::new(0x515E_D0_F128);
-        let f128 = |rng: &mut Rng| F128::new(rng.nx(), rng.nx());
-        let f128_vec = |rng: &mut Rng, n: usize| -> Vec<F128> {
-            (0..n).map(|_| F128::new(rng.nx(), rng.nx())).collect()
-        };
-        let hash_vec = |rng: &mut Rng, n: usize| -> Vec<MerkleHash> {
-            (0..n)
-                .map(|_| std::array::from_fn(|_| rng.nx() as u8))
-                .collect()
-        };
-        let rows = |rng: &mut Rng, n: usize, w: usize| -> Vec<Vec<F128>> {
-            (0..n)
-                .map(|i| {
-                    (0..(w + i % 3))
-                        .map(|_| F128::new(rng.nx(), rng.nx()))
-                        .collect()
-                })
-                .collect()
-        };
-
-        for (n_rs, n_rec, n_rows, n_msgs) in [
-            (0usize, 0usize, 0usize, 0usize),
-            (1, 1, 3, 2),
-            (3, 4, 17, 55),
-        ] {
-            let recursive_proof = |rng: &mut Rng| RecursiveProof {
-                opened_rows: rows(rng, n_rows, 4),
-                merkle_proof: hash_vec(rng, n_rows * 2 + 1),
-            };
-            let proof = BatchOpeningProofLigerito {
-                ring_switches: (0..n_rs)
-                    .map(|i| RingSwitchProof {
-                        s_hat_v: f128_vec(&mut rng, i * 7),
-                    })
-                    .collect(),
-                ligerito: LigeritoProof {
-                    initial_root: std::array::from_fn(|_| rng.nx() as u8),
-                    initial_proof: recursive_proof(&mut rng),
-                    recursive_roots: hash_vec(&mut rng, n_rec),
-                    recursive_proofs: (0..n_rec).map(|_| recursive_proof(&mut rng)).collect(),
-                    final_proof: FinalProof {
-                        yr: f128_vec(&mut rng, n_msgs * 3),
-                        opened_rows: rows(&mut rng, n_rows, 2),
-                        merkle_proof: hash_vec(&mut rng, n_rows),
-                    },
-                    sumcheck_transcript: (0..n_msgs)
-                        .map(|_| SumcheckMessage {
-                            u_0: f128(&mut rng),
-                            u_2: f128(&mut rng),
-                        })
-                        .collect(),
-                    grinding_nonces: (0..n_rec).map(|_| rng.nx()).collect(),
-                    ood_values: {
-                        let mut v = f128_vec(&mut rng, n_rec);
-                        if let Some(first) = v.first_mut() {
-                            *first = F128::ZERO;
-                        }
-                        if let Some(last) = v.last_mut() {
-                            *last = F128::new(u64::MAX, u64::MAX);
-                        }
-                        v
-                    },
-                    fold_grinding_nonces: (0..n_msgs).map(|_| rng.nx()).collect(),
-                },
-            };
-            let incumbent = bincode::serialize(&proof).expect("bincode serialize");
-            let mut generic = Vec::new();
-            encode_pcs_open_into(&mut generic, &proof);
-            assert_eq!(generic, incumbent, "generic writer encoder diverged");
-            let mut flat = Vec::new();
-            encode_pcs_open_into_vec(&mut flat, &proof);
-            assert_eq!(
-                flat, incumbent,
-                "flat encoder diverged at shape (n_rs={n_rs}, n_rec={n_rec}, n_rows={n_rows}, n_msgs={n_msgs})"
-            );
-        }
-    }
-
-    /// End-to-end micro-stack byte-identity gate: the same prove published
-    /// with the micro-stack on vs `FLOCK_NO_MICRO_STACK=1` must yield an
-    /// identical commit root and identical full bundle bytes. Covers all
-    /// three shipped items (eval_sk_at_vks memo, recursion-OOD optimized eq
-    /// tables, flat pcs_open encoder) on the real prover path.
-    ///
-    /// Env-mutating — run explicitly, single-threaded:
-    /// `cargo test micro_stack_bundle_bytes_identical -- --ignored --test-threads=1`
-    #[test]
-    #[ignore] // Heavier + env-mutating; see doc comment.
-    fn micro_stack_bundle_bytes_identical() {
-        let setup = Blake3Setup::new(256);
-        let (blocks, _, _) = honest_chain(256, 0x0Ff1_CE_57AC);
-
-        let prove_bytes = || {
-            let mut ch = FsChallenger::new(b"flock-micro-stack-ab");
-            let (proof, commitment, _claim) = setup.prove_fast(&blocks, &mut ch);
-            let root = commitment.root;
-            let bundle = R1csProofBundleLigerito { commitment, proof };
-            (root, bundle.to_bytes())
-        };
-
-        let (root_on, bytes_on) = prove_bytes();
-        // SAFETY: single-threaded #[ignore]d test; no concurrent env access.
-        unsafe { std::env::set_var(flock_core::ENV_NO_MICRO_STACK, "1") };
-        let (root_off, bytes_off) = prove_bytes();
-        unsafe { std::env::remove_var(flock_core::ENV_NO_MICRO_STACK) };
-
-        assert_eq!(root_on, root_off, "commit root changed under micro-stack");
-        assert_eq!(
-            bytes_on, bytes_off,
-            "bundle bytes changed under micro-stack"
-        );
-
-        // Witgen-stack gates: each item's kill switch (and all of them at
-        // once) must leave the bundle byte-identical. The elision item is
-        // additionally exercised on its HIT path by the repeated proves
-        // here (warm scratch pool + tokens), so on/off covers both
-        // fast-path and incumbent writes. (The continuous-queue gate only
-        // changes behavior on the streamed ranked shape — the ranked
-        // canary covers that arm — but it must stay inert here too.)
-        const WITGEN_STACK_GATES: &[&str] = &[
-            "FLOCK_NO_WITGEN_CONT_QUEUE",
-            "FLOCK_NO_SCRATCH_CONST_ELIDE",
-            "FLOCK_NO_GEN_BLOCK_SIMD",
-            // ZC-window GPU idle fill (byte-inert primer + staged uploads;
-            // read uncached, so in-process toggling is honored). At this
-            // small shape the fill is structurally inert — the gate proves
-            // the toggle stays inert everywhere; the ranked canary A/B
-            // covers the engaged arm.
-            "FLOCK_NO_ZC_IDLE_FILL",
-            // Commit-tail fill (staged round-one C fold at graph
-            // completion; consumed only on exact challenge identity, so
-            // toggling it can never change bytes).
-            "FLOCK_NO_COMMIT_TAIL_FILL",
-        ];
-        for gate in WITGEN_STACK_GATES {
-            // SAFETY: single-threaded #[ignore]d test; no concurrent env
-            // access.
-            unsafe { std::env::set_var(gate, "1") };
-            let (root, bytes) = prove_bytes();
-            unsafe { std::env::remove_var(gate) };
-            assert_eq!(root, root_on, "commit root changed under {gate}=1");
-            assert_eq!(bytes, bytes_on, "bundle bytes changed under {gate}=1");
-        }
-        for gate in WITGEN_STACK_GATES {
-            // SAFETY: as above.
-            unsafe { std::env::set_var(gate, "1") };
-        }
-        let (root_all_off, bytes_all_off) = prove_bytes();
-        for gate in WITGEN_STACK_GATES {
-            // SAFETY: as above.
-            unsafe { std::env::remove_var(gate) };
-        }
-        assert_eq!(
-            root_all_off, root_on,
-            "commit root changed with the whole witgen stack off"
-        );
-        assert_eq!(
-            bytes_all_off, bytes_on,
-            "bundle bytes changed with the whole witgen stack off"
-        );
-        // And one more prove with everything back on: the scratch pool now
-        // holds tokened witness buffers from the earlier on-proves, so this
-        // is the strongest same-process elision-hit identity check at this
-        // shape.
-        let (root_on2, bytes_on2) = prove_bytes();
-        assert_eq!(
-            root_on2, root_on,
-            "commit root changed on warm token-hit prove"
-        );
-        assert_eq!(
-            bytes_on2, bytes_on,
-            "bundle bytes changed on warm token-hit prove"
-        );
-    }
-
     #[test]
     fn rejects_bad_magic() {
         let mut bytes = vec![0u8; HEADER_LEN + 10];
@@ -1139,8 +349,6 @@ mod tests {
 
     #[test]
     fn rejects_flavor_mismatch() {
-        // R1CS-flavored header — try to read as Chain. Header validation
-        // fails before any payload deserialization, so zero payload is fine.
         let mut bytes = vec![0u8; HEADER_LEN + 10];
         bytes[0..5].copy_from_slice(&MAGIC);
         bytes[5] = VERSION;
@@ -1157,7 +365,6 @@ mod tests {
 
     #[test]
     fn rejects_legacy_basefold_flavor() {
-        // Flavor bytes 0/1 were the legacy BaseFold bundles — now unknown.
         for legacy in [0u8, 1u8] {
             let mut bytes = vec![0u8; HEADER_LEN + 10];
             bytes[0..5].copy_from_slice(&MAGIC);

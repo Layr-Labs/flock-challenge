@@ -1,20 +1,3 @@
-//! `flock_chain` — CLI for proving and verifying hash-chain proofs.
-//!
-//! ```text
-//! Usage:
-//!   flock_chain prove   --hash <blake3|sha2|keccak>
-//!                       [--steps N]                     (default 8; must be a power-of-2 ≥ 8)
-//!                       [--seed HEX]                    (16 hex chars; default 0)
-//!                       [--initial-cv HEX]              (64 hex for blake3/sha2, 400 hex for keccak;
-//!                                                        default: hash's IV / all-zero state)
-//!                       --out FILE
-//!   flock_chain verify  --in FILE
-//!   flock_chain help
-//! ```
-//!
-//! Build the prover: `cargo build --release --bin flock_chain`.
-//! Run via `cargo run --release --bin flock_chain -- <subcommand> [args]`.
-
 use std::env;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -38,14 +21,6 @@ use flock_prover::r1cs_hashes::sha2::{
     sha256_compress,
 };
 
-// ---------------------------------------------------------------------------
-// Argument parsing (tiny, no clap dep)
-// ---------------------------------------------------------------------------
-
-/// Prover profile — selects the Ligerito security config. `Fast` = rate 1/2,
-/// Johnson+OOD, 100-bit (default). `Slim` = rate 1/4, Johnson+OOD + query
-/// grinding, 100-bit (smaller proof, slower prover). `Secure` = rate 1/2,
-/// unique-decoding regime, 120-bit (largest proof, most conservative).
 type Mode = flock_prover::pcs::ligerito::LigeritoProfile;
 
 #[derive(Default)]
@@ -132,10 +107,6 @@ Notes:
   --in FILE:  read proof bundle here.
 ";
 
-// ---------------------------------------------------------------------------
-// Hex helpers
-// ---------------------------------------------------------------------------
-
 fn parse_hex(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     if !s.len().is_multiple_of(2) {
@@ -174,7 +145,6 @@ fn u32_words_to_hex_be(words: &[u32; 8]) -> String {
     out
 }
 
-// SplitMix64 — deterministic message generation.
 struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {
@@ -191,10 +161,6 @@ impl Rng {
         std::array::from_fn(|_| self.nx() as u32)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Prove
-// ---------------------------------------------------------------------------
 
 fn cmd_prove(args: Args) -> Result<(), String> {
     let hash = args.hash.ok_or("prove: --hash is required")?;
@@ -321,8 +287,6 @@ fn prove_keccak(
     initial_hex: Option<&str>,
     mode: Mode,
 ) -> Result<ChainProofBundleLigerito, String> {
-    // Keccak state = 1600 bits. Default: all-zero. User may pass 400 hex chars
-    // (200 bytes), LSB-first per byte.
     let initial_state: State = if let Some(h) = initial_hex {
         let bytes = parse_hex(h)?;
         if bytes.len() != STATE_BITS / 8 {
@@ -366,10 +330,6 @@ fn prove_keccak(
     Ok(bundle)
 }
 
-// ---------------------------------------------------------------------------
-// Verify
-// ---------------------------------------------------------------------------
-
 fn cmd_verify(args: Args) -> Result<(), String> {
     let input = args.input.ok_or("verify: --in is required")?;
 
@@ -394,10 +354,7 @@ fn cmd_verify(args: Args) -> Result<(), String> {
 
     let mut ch = FsChallenger::new(b"flock_chain-cli");
     let t = Instant::now();
-    // The profile is recovered from the committed PcsParams in the proof
-    // bundle, not assumed — so `verify` works regardless of which `--mode`
-    // produced the proof. Reconstruct the setup with that profile so its
-    // r1cs/pcs_params match the prover's.
+
     let result = match hash {
         HashKind::Blake3 => {
             let setup = Blake3Setup::with_profile(steps, bundle.commitment.params.profile);
@@ -474,10 +431,6 @@ fn verify_ligerito_with_layout(
     )
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
-
 fn main() -> ExitCode {
     let mut argv: Vec<String> = env::args().skip(1).collect();
     if argv.is_empty() {
@@ -495,7 +448,6 @@ fn main() -> ExitCode {
         other => Err(format!("unknown subcommand '{other}'\n\n{USAGE}")),
     };
 
-    // Silence unused-import lint for the type-only re-export.
     let _ = F128::ZERO;
 
     match result {
