@@ -582,7 +582,7 @@ fn ranked_ntt_with_pipelined_leaves(
 
     // Two queued subtrees per helper keep all four E-cores fed while bounding
     // not-yet-hashed input to 8 MiB on the ranked 4-E-core host.
-    let queue_capacity = (2 * helper.current_num_threads()).max(1);
+    let queue_capacity = (4 * helper.current_num_threads()).max(1);
     let (sender, receiver) = sync_channel::<RankedLeafJob>(queue_capacity);
     let receiver = Mutex::new(receiver);
 
@@ -738,7 +738,7 @@ pub(crate) fn cpu_transform_and_tree(
         // advances allocation lifetime but does not raise the commit's final
         // codeword+tree peak alongside the retained prover scratch pools.
         let total_nodes = 2 * params.n_leaves() - 1;
-        crate::alloc_uninit_vec::<Hash>(total_nodes)
+        crate::gpu_commit::take_tree(total_nodes)
     });
     let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
     let cpu_ntt0 = timing.then(commit_cpu_ms);
