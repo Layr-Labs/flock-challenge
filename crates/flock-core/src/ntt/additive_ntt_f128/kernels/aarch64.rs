@@ -67,23 +67,50 @@ unsafe fn xor3(
     unsafe { veorq_u64(a, veorq_u64(b, c)) }
 }
 
-/// GHASH multiply with both operands and the result held in q registers.
+/// `x^64 · m (mod p)` added into `l`: `{0, m.lo}` places `m.lo` into the
+/// high limb and `m.hi · x^128 = m.hi · (x^7 + x^2 + x + 1)`, a product of
+/// at most 71 bits, lands in the low limbs. The map `m ↦ x^64 · m` is linear,
+/// so a sum of pending halves can be folded once.
+#[inline(always)]
+unsafe fn fold_x64_into(
+    l: core::arch::aarch64::uint64x2_t,
+    m: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        xor3(
+            l,
+            vextq_u64::<1>(vdupq_n_u64(0), m),
+            pmull_87(vgetq_lane_u64::<1>(m)),
+        )
+    }
+}
+
+/// GHASH multiply with both operands held in q registers, stopped before
+/// its last reduction fold.
 ///
 /// Same algorithm as [`crate::field::gf2_128::aarch64::ghash_mul_binius`] —
 /// four schoolbook PMULLs and the two-stage recursive reduction — but it
 /// neither accepts nor returns an `F128`, so no lane ever moves to a
-/// general-purpose register on the way in or out. `vmull_high_p64` reads the
-/// high lanes in place, so the operand extraction the scalar form needs
-/// disappears too.
+/// general-purpose register. Returns `(lo, mid)` with
+/// `a·b = lo + x^64 · (mid + acc) (mod p)` folded in as
+/// `mid' = acc + t1 + x^64·t2`: the caller adds `lo` to the row and either
+/// folds `mid'` at once ([`fold_x64_into`]) or keeps it pending in the row,
+/// to be folded together with later products. The fold is the same linear
+/// map either way, so the canonical result is bit-identical to the eager
+/// multiply. Passing a zero `acc` costs nothing: the XOR with it replaces
+/// the cross-term XOR.
 #[inline(always)]
-unsafe fn mul_q(
+unsafe fn mul_q_split(
     a: core::arch::aarch64::uint64x2_t,
     b: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
+    acc: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
     use core::arch::aarch64::*;
     unsafe {
-        let zero = vdupq_n_u64(0);
-
         let t0 = pmull_ll(a, b);
         let t1a = core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
             vgetq_lane_u64::<0>(a),
@@ -97,39 +124,146 @@ unsafe fn mul_q(
             vreinterpretq_p64_u64(a),
             vreinterpretq_p64_u64(b),
         ));
-        let t1_cross = veorq_u64(t1a, t1b);
-
-        // t1 += x^64 · t2 (mod p): {0, t2.lo} places t2.lo into t1.hi.
-        let t1 = xor3(
-            t1_cross,
-            vextq_u64::<1>(zero, t2),
-            pmull_87(vgetq_lane_u64::<1>(t2)),
-        );
-
-        // t0 += x^64 · t1 (mod p).
-        xor3(
-            t0,
-            vextq_u64::<1>(zero, t1),
-            pmull_87(vgetq_lane_u64::<1>(t1)),
-        )
+        // mid = acc + t1 + x^64 · t2 (mod p).
+        (t0, fold_x64_into(xor3(acc, t1a, t1b), t2))
     }
 }
 
-/// One forward butterfly, fully in q registers:
-/// `u' = u + v·t`, `v' = v + u'`.
+/// Eager butterfly built on the split multiply: `u' = u + v·t` with the
+/// product's x^64 half folded at once (plus any `pending` half `u` already
+/// carries), `v' = v + u'`. `v` must have no pending half.
 #[inline(always)]
-unsafe fn butterfly_q(
+unsafe fn butterfly_fold_q(
     u: core::arch::aarch64::uint64x2_t,
     v: core::arch::aarch64::uint64x2_t,
     t: core::arch::aarch64::uint64x2_t,
+    pending: core::arch::aarch64::uint64x2_t,
 ) -> (
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let new_u = veorq_u64(u, mul_q(v, t));
+        let (lo, mid) = mul_q_split(v, t, pending);
+        let new_u = fold_x64_into(veorq_u64(u, lo), mid);
         (new_u, veorq_u64(v, new_u))
+    }
+}
+
+/// Lazy butterfly: as [`butterfly_fold_q`], but the summed x^64 half is
+/// returned unfolded instead. Both outputs then carry that same pending
+/// half (`v' = v + u'`), so the caller must fold it into each before the
+/// row is a multiplicand or is stored.
+#[inline(always)]
+unsafe fn butterfly_lazy_q(
+    u: core::arch::aarch64::uint64x2_t,
+    v: core::arch::aarch64::uint64x2_t,
+    t: core::arch::aarch64::uint64x2_t,
+    pending: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let (lo, mid) = mul_q_split(v, t, pending);
+        let new_u = veorq_u64(u, lo);
+        (new_u, veorq_u64(v, new_u), mid)
+    }
+}
+
+/// General radix-8 chain (three layers, twiddles `t[0]`, `t[1..3]`,
+/// `t[3..7]`) with lazy x^64 folds: 8 folds for the 12 products instead of
+/// 12. Layer L leaves rows 0 and 1 unfolded (their halves `p0`, `p1` ride
+/// into rows 4 and 5); layer L+1 leaves rows 0 and 4 unfolded (into rows 2
+/// and 6) and folds rows 1 and 5 together with their layer-L halves;
+/// layer L+2 folds every row once. Every multiplicand (rows 4..8 at L,
+/// 2, 3, 6, 7 at L+1, odd rows at L+2) and every output is folded.
+#[inline(always)]
+unsafe fn fused3_general_q(
+    v: &mut [core::arch::aarch64::uint64x2_t; 8],
+    t: &[core::arch::aarch64::uint64x2_t; 7],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        // Layer L: stride 4, shared twiddle t[0].
+        let (a, b, p0) = butterfly_lazy_q(v[0], v[4], t[0], zero);
+        v[0] = a;
+        v[4] = b;
+        let (a, b, p1) = butterfly_lazy_q(v[1], v[5], t[0], zero);
+        v[1] = a;
+        v[5] = b;
+        for i in 2..4 {
+            let (a, b) = butterfly_fold_q(v[i], v[i + 4], t[0], zero);
+            v[i] = a;
+            v[i + 4] = b;
+        }
+        // Layer L+1: stride 2, twiddles t[1], t[2] per half. Rows 0/4 carry
+        // p0 and rows 1/5 carry p1; rows 2, 3, 6, 7 are folded.
+        let (a, b, q0) = butterfly_lazy_q(v[0], v[2], t[1], p0);
+        v[0] = a;
+        v[2] = b;
+        let (a, b) = butterfly_fold_q(v[1], v[3], t[1], p1);
+        v[1] = a;
+        v[3] = b;
+        let (a, b, q4) = butterfly_lazy_q(v[4], v[6], t[2], p0);
+        v[4] = a;
+        v[6] = b;
+        let (a, b) = butterfly_fold_q(v[5], v[7], t[2], p1);
+        v[5] = a;
+        v[7] = b;
+        // Layer L+2: stride 1, twiddles t[3..7] per quarter. Rows 0/2 carry
+        // q0 and rows 4/6 carry q4; odd rows are folded.
+        for (s, pending) in [q0, q0, q4, q4].into_iter().enumerate() {
+            let (a, b) = butterfly_fold_q(v[2 * s], v[2 * s + 1], t[3 + s], pending);
+            v[2 * s] = a;
+            v[2 * s + 1] = b;
+        }
+    }
+}
+
+/// Zero-root radix-8 chain (twiddles 0, 1 and 3 are zero) with lazy x^64
+/// folds: 4 folds for the 5 products instead of 5. Row 4's layer-L+1 half
+/// rides into row 6 and is folded with each row's layer-L+2 product.
+/// `v[0]` is unchanged.
+#[inline(always)]
+unsafe fn fused3_zero_root_q(
+    v: &mut [core::arch::aarch64::uint64x2_t; 8],
+    t2: core::arch::aarch64::uint64x2_t,
+    t4: core::arch::aarch64::uint64x2_t,
+    t5: core::arch::aarch64::uint64x2_t,
+    t6: core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        // Layer L, t[0] = 0: four XOR-only butterflies.
+        for i in 0..4 {
+            v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
+        }
+        // Layer L+1: top half t[1] = 0, bottom half t[2] general.
+        for i in 0..2 {
+            v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
+        }
+        let (a, b, p4) = butterfly_lazy_q(v[4], v[6], t2, zero);
+        v[4] = a;
+        v[6] = b;
+        let (a, b) = butterfly_fold_q(v[5], v[7], t2, zero);
+        v[5] = a;
+        v[7] = b;
+        // Layer L+2: first quarter t[3] = 0; rows 4/6 carry p4.
+        v[1] = butterfly_zero_q(v[0], v[1]);
+        let (a, b) = butterfly_fold_q(v[2], v[3], t4, zero);
+        v[2] = a;
+        v[3] = b;
+        let (a, b) = butterfly_fold_q(v[4], v[5], t5, p4);
+        v[4] = a;
+        v[5] = b;
+        let (a, b) = butterfly_fold_q(v[6], v[7], t6, p4);
+        v[6] = a;
+        v[7] = b;
     }
 }
 
@@ -160,27 +294,7 @@ unsafe fn butterfly_fused_3layer_row_with_q(
             let mut v: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
 
-            // Layer L: stride 4, shared twiddle t[0].
-            for i in 0..4 {
-                let (a, b) = butterfly_q(v[i], v[i + 4], t[0]);
-                v[i] = a;
-                v[i + 4] = b;
-            }
-            // Layer L+1: stride 2, twiddles t[1], t[2] per half.
-            for s in 0..2 {
-                for i in 0..2 {
-                    let (u, w) = (4 * s + i, 4 * s + i + 2);
-                    let (a, b) = butterfly_q(v[u], v[w], t[1 + s]);
-                    v[u] = a;
-                    v[w] = b;
-                }
-            }
-            // Layer L+2: stride 1, twiddles t[3..7] per quarter.
-            for s in 0..4 {
-                let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], t[3 + s]);
-                v[2 * s] = a;
-                v[2 * s + 1] = b;
-            }
+            fused3_general_q(&mut v, t);
 
             for (i, value) in v.iter().enumerate() {
                 vst1q_u64(base.add(i * step).cast::<u64>(), *value);
@@ -260,8 +374,8 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
 
         // Two 8 KiB staging tiles (8 rows × ≤64 lanes × 16 B): L1-resident,
         // written per lane, read back once for the sequential row bursts.
-        let mut stage0 = [F128 { lo: 0, hi: 0 }; 512];
-        let mut stage1 = [F128 { lo: 0, hi: 0 }; 512];
+        let mut stage0 = [core::mem::MaybeUninit::<F128>::uninit(); 512];
+        let mut stage1 = [core::mem::MaybeUninit::<F128>::uninit(); 512];
 
         let off = r * num_ntts;
         let step = eighth * num_ntts;
@@ -278,28 +392,7 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
             // `butterfly_fused_3layer_zero_root_row`, but keeps v[0]).
             {
                 let mut v = loaded;
-                for i in 0..4 {
-                    v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
-                }
-                for i in 0..2 {
-                    v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
-                }
-                let (a, b) = butterfly_q(v[4], v[6], z2);
-                v[4] = a;
-                v[6] = b;
-                let (a, b) = butterfly_q(v[5], v[7], z2);
-                v[5] = a;
-                v[7] = b;
-                v[1] = butterfly_zero_q(v[0], v[1]);
-                let (a, b) = butterfly_q(v[2], v[3], z4);
-                v[2] = a;
-                v[3] = b;
-                let (a, b) = butterfly_q(v[4], v[5], z5);
-                v[4] = a;
-                v[5] = b;
-                let (a, b) = butterfly_q(v[6], v[7], z6);
-                v[6] = a;
-                v[7] = b;
+                fused3_zero_root_q(&mut v, z2, z4, z5, z6);
                 for (i, value) in v.iter().enumerate() {
                     vst1q_u64(
                         stage0.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
@@ -311,24 +404,7 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
             // Block 1: general chain (mirrors `butterfly_fused_3layer_row`).
             {
                 let mut v = loaded;
-                for i in 0..4 {
-                    let (a, b) = butterfly_q(v[i], v[i + 4], g[0]);
-                    v[i] = a;
-                    v[i + 4] = b;
-                }
-                for s in 0..2 {
-                    for i in 0..2 {
-                        let (u, w) = (4 * s + i, 4 * s + i + 2);
-                        let (a, b) = butterfly_q(v[u], v[w], g[1 + s]);
-                        v[u] = a;
-                        v[w] = b;
-                    }
-                }
-                for s in 0..4 {
-                    let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], g[3 + s]);
-                    v[2 * s] = a;
-                    v[2 * s + 1] = b;
-                }
+                fused3_general_q(&mut v, &g);
                 for (i, value) in v.iter().enumerate() {
                     vst1q_u64(
                         stage1.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
@@ -405,7 +481,7 @@ unsafe fn butterfly_fused_3layer_from_src_row_impl<const ZERO_ROOT: bool>(
         }
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        let mut stage = [F128 { lo: 0, hi: 0 }; 64];
+        let mut stage = [core::mem::MaybeUninit::<F128>::uninit(); 64];
         let off = r * num_ntts;
         let step = eighth * num_ntts;
 
@@ -415,47 +491,9 @@ unsafe fn butterfly_fused_3layer_from_src_row_impl<const ZERO_ROOT: bool>(
                 core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
 
             if ZERO_ROOT {
-                for i in 0..4 {
-                    v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
-                }
-                for i in 0..2 {
-                    v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
-                }
-                let (a, b) = butterfly_q(v[4], v[6], t[2]);
-                v[4] = a;
-                v[6] = b;
-                let (a, b) = butterfly_q(v[5], v[7], t[2]);
-                v[5] = a;
-                v[7] = b;
-                v[1] = butterfly_zero_q(v[0], v[1]);
-                let (a, b) = butterfly_q(v[2], v[3], t[4]);
-                v[2] = a;
-                v[3] = b;
-                let (a, b) = butterfly_q(v[4], v[5], t[5]);
-                v[4] = a;
-                v[5] = b;
-                let (a, b) = butterfly_q(v[6], v[7], t[6]);
-                v[6] = a;
-                v[7] = b;
+                fused3_zero_root_q(&mut v, t[2], t[4], t[5], t[6]);
             } else {
-                for i in 0..4 {
-                    let (a, b) = butterfly_q(v[i], v[i + 4], t[0]);
-                    v[i] = a;
-                    v[i + 4] = b;
-                }
-                for s in 0..2 {
-                    for i in 0..2 {
-                        let (u, w) = (4 * s + i, 4 * s + i + 2);
-                        let (a, b) = butterfly_q(v[u], v[w], t[1 + s]);
-                        v[u] = a;
-                        v[w] = b;
-                    }
-                }
-                for s in 0..4 {
-                    let (a, b) = butterfly_q(v[2 * s], v[2 * s + 1], t[3 + s]);
-                    v[2 * s] = a;
-                    v[2 * s + 1] = b;
-                }
+                fused3_general_q(&mut v, &t);
             }
 
             for (i, value) in v.iter().enumerate() {
@@ -583,31 +621,7 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
             let mut v: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
 
-            // Layer L, t[0] = 0: four XOR-only butterflies.
-            for i in 0..4 {
-                v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
-            }
-            // Layer L+1: top half t[1] = 0, bottom half t[2] general.
-            for i in 0..2 {
-                v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
-            }
-            let (a, b) = butterfly_q(v[4], v[6], t2);
-            v[4] = a;
-            v[6] = b;
-            let (a, b) = butterfly_q(v[5], v[7], t2);
-            v[5] = a;
-            v[7] = b;
-            // Layer L+2: first quarter t[3] = 0.
-            v[1] = butterfly_zero_q(v[0], v[1]);
-            let (a, b) = butterfly_q(v[2], v[3], t4);
-            v[2] = a;
-            v[3] = b;
-            let (a, b) = butterfly_q(v[4], v[5], t5);
-            v[4] = a;
-            v[5] = b;
-            let (a, b) = butterfly_q(v[6], v[7], t6);
-            v[6] = a;
-            v[7] = b;
+            fused3_zero_root_q(&mut v, t2, t4, t5, t6);
 
             // v[0] is unchanged by all three layers; skip its store.
             for (i, value) in v.iter().enumerate().skip(1) {
@@ -684,6 +698,26 @@ unsafe fn mul_low_pair_q(
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
 ) {
+    unsafe {
+        let (r0, r1, r2) = mul_low_pair_words(v0, v1, ts0, ts1);
+        fold_low_pair(r0, r1, r2)
+    }
+}
+
+/// The unreduced lane-paired words of [`mul_low_pair_q`]'s two products:
+/// `r0 = ll.lo`, `r1 = ll.hi ^ hl.lo`, `r2 = hl.hi` (lane `i` = product
+/// `i`), so product `i` is `{r0[i], r1[i]} + x^128 · r2[i]`.
+#[inline(always)]
+unsafe fn mul_low_pair_words(
+    v0: core::arch::aarch64::uint64x2_t,
+    v1: core::arch::aarch64::uint64x2_t,
+    ts0: core::arch::aarch64::uint64x2_t,
+    ts1: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
     use core::arch::aarch64::*;
     unsafe {
         // With t.hi == 0 each product needs only ll = v.lo·t.lo and
@@ -699,12 +733,28 @@ unsafe fn mul_low_pair_q(
             vreinterpretq_p64_u64(ts1),
         ));
 
-        // Lane-paired unreduced words: r0 = ll.lo, r1 = ll.hi ^ hl.lo,
-        // r2 = hl.hi, r3 = 0.
         let r0 = vzip1q_u64(p0_ll, p1_ll);
         let r1 = veorq_u64(vzip2q_u64(p0_ll, p1_ll), vzip1q_u64(p0_hl, p1_hl));
         let r2 = vzip2q_u64(p0_hl, p1_hl);
+        (r0, r1, r2)
+    }
+}
 
+/// Reduce lane-paired words `{r0, r1} + x^128 · r2` (with `r2` of at most
+/// 64 bits per lane) and unzip to per-product `{ lo, hi }` order. The map
+/// `r2 ↦ x^128 · r2 (mod p)` is linear, so `r2` may be a sum of several
+/// products' high words, folded once.
+#[inline(always)]
+unsafe fn fold_low_pair(
+    r0: core::arch::aarch64::uint64x2_t,
+    r1: core::arch::aarch64::uint64x2_t,
+    r2: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
         // Fold r2·x^128 with x^128 = x^7 + x^2 + x + 1. Since r3 is zero,
         // there is no second overflow correction.
         let folded_lo = xor3(
@@ -762,7 +812,70 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
         let to = vdupq_n_u64(t_outer.lo);
         let ta = vdupq_n_u64(t_inner_a.lo);
         let tb = vdupq_n_u64(t_inner_b.lo);
-        for lane in 0..a.len() {
+        let n = a.len();
+        let mut lane = 0;
+        // Two adjacent lanes per step, each product pair taken from one row
+        // (lanes k, k+1), with a lazy x^128 fold: the layer-L products into
+        // rows a and c keep their high words `p` unreduced (rows a and c of
+        // both lanes carry the same pending `p`), and `p` is added into the
+        // layer-L+1 high words of the (a,b) and (c,d) products, which are
+        // folded once each. Rows b and d, the layer-L+1 multiplicands, are
+        // folded at layer L. Three pair folds for eight products instead of
+        // four; the fold is linear, so the result is bit-identical.
+        while lane + 2 <= n {
+            let ld = |r: &[F128]| {
+                (
+                    vld1q_u64((&raw const r[lane]).cast::<u64>()),
+                    vld1q_u64((&raw const r[lane + 1]).cast::<u64>()),
+                )
+            };
+            let (mut a0, mut a1) = ld(a);
+            let (mut b0, mut b1) = ld(b);
+            let (mut c0, mut c1) = ld(c);
+            let (mut d0, mut d1) = ld(d);
+
+            // Layer L, (b,d) under t_outer: folded now.
+            let (o0, o1) = mul_low_pair_q(d0, d1, to, to);
+            b0 = veorq_u64(b0, o0);
+            d0 = veorq_u64(d0, b0);
+            b1 = veorq_u64(b1, o1);
+            d1 = veorq_u64(d1, b1);
+
+            // Layer L, (a,c) under t_outer: high words `p` left pending.
+            let (r0, r1, p) = mul_low_pair_words(c0, c1, to, to);
+            a0 = veorq_u64(a0, vzip1q_u64(r0, r1));
+            c0 = veorq_u64(c0, a0);
+            a1 = veorq_u64(a1, vzip2q_u64(r0, r1));
+            c1 = veorq_u64(c1, a1);
+
+            // Layer L+1, (a,b) under t_inner_a: rows a carry `p`.
+            let (r0, r1, r2) = mul_low_pair_words(b0, b1, ta, ta);
+            let (y0, y1) = fold_low_pair(r0, r1, veorq_u64(r2, p));
+            a0 = veorq_u64(a0, y0);
+            b0 = veorq_u64(b0, a0);
+            a1 = veorq_u64(a1, y1);
+            b1 = veorq_u64(b1, a1);
+
+            // Layer L+1, (c,d) under t_inner_b: rows c carry `p`.
+            let (r0, r1, r2) = mul_low_pair_words(d0, d1, tb, tb);
+            let (z0, z1) = fold_low_pair(r0, r1, veorq_u64(r2, p));
+            c0 = veorq_u64(c0, z0);
+            d0 = veorq_u64(d0, c0);
+            c1 = veorq_u64(c1, z1);
+            d1 = veorq_u64(d1, c1);
+
+            vst1q_u64((&raw mut a[lane]).cast::<u64>(), a0);
+            vst1q_u64((&raw mut a[lane + 1]).cast::<u64>(), a1);
+            vst1q_u64((&raw mut b[lane]).cast::<u64>(), b0);
+            vst1q_u64((&raw mut b[lane + 1]).cast::<u64>(), b1);
+            vst1q_u64((&raw mut c[lane]).cast::<u64>(), c0);
+            vst1q_u64((&raw mut c[lane + 1]).cast::<u64>(), c1);
+            vst1q_u64((&raw mut d[lane]).cast::<u64>(), d0);
+            vst1q_u64((&raw mut d[lane + 1]).cast::<u64>(), d1);
+            lane += 2;
+        }
+        // Odd lane count: the last lane pairs (a,c) with (b,d), eagerly.
+        if lane < n {
             let mut xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
             let mut xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
             let mut xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
@@ -909,12 +1022,16 @@ unsafe fn butterfly_fused_2layer_row_with_q(
             let xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
             let xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
 
-            // Layer L: (a,c) and (b,d) share t_outer.
-            let (na, nc) = butterfly_q(xa, xc, to);
-            let (nb, nd) = butterfly_q(xb, xd, to);
-            // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
-            let (fa, fb) = butterfly_q(na, nb, ta);
-            let (fc, fd) = butterfly_q(nc, nd, tb);
+            // Layer L: (a,c) and (b,d) share t_outer. Row a keeps its
+            // x^64 half `p` pending (row c inherits it); b is folded, so
+            // 3 folds serve the 4 products.
+            let zero = vdupq_n_u64(0);
+            let (na, nc, p) = butterfly_lazy_q(xa, xc, to, zero);
+            let (nb, nd) = butterfly_fold_q(xb, xd, to, zero);
+            // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b; the
+            // multiplicands b and d are folded, a and c fold `p` here.
+            let (fa, fb) = butterfly_fold_q(na, nb, ta, p);
+            let (fc, fd) = butterfly_fold_q(nc, nd, tb, p);
 
             vst1q_u64((&raw mut a[lane]).cast::<u64>(), fa);
             vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb);
