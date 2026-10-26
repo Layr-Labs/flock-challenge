@@ -942,8 +942,10 @@ fn commit_with_round1_ab_precompute(
         ),
     );
 
+    flock_core::tmark::mark("commit join call");
     let result = rayon::join(
         || {
+            flock_core::tmark::mark("commit arm start");
             let pre = match commit_codeword {
                 CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
                 CommitCodeword::NeedsReplication(buf) => {
@@ -959,9 +961,11 @@ fn commit_with_round1_ab_precompute(
             // Graph complete, root final — the AB arm is (typically) still
             // running. Fire the tail-fill hook here so its staged GPU work
             // executes in the arm-tail idle.
+            flock_core::tmark::mark("commit arm graph");
             if let Some(hook) = tail_fill {
                 hook(&pre.0);
             }
+            flock_core::tmark::mark("commit arm done");
             pre
         },
         || {
@@ -971,6 +975,7 @@ fn commit_with_round1_ab_precompute(
             // The hybrid-commit warmup sweep sizes its contention emulation
             // from this arm's measured wall (an Instant read is free; the
             // store is one relaxed atomic per prove).
+            flock_core::tmark::mark("ab arm done");
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
             if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
@@ -979,6 +984,7 @@ fn commit_with_round1_ab_precompute(
         },
     );
 
+    flock_core::tmark::mark("commit join returned");
     if run_ranked_exact_tune {
         flock_core::gpu_commit::retune_ranked_hybrid_with_exact_contention(
             pcs_params,
@@ -1067,10 +1073,12 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
     challenger: &mut Ch,
 ) -> ProveCore {
+    flock_core::tmark::mark("core entry");
     let padding = r1cs.padding_spec();
     let identity_prefix_contract = ranked_identity_prefix_omission_contract(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
     );
+    flock_core::tmark::mark("core contract");
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>| {
         let cpu0 = phase_timing.then(process_cpu_ms);
@@ -1217,9 +1225,11 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                         std::thread::yield_now();
                     }
                 }
+                flock_core::tmark::mark("stripe wait");
                 stripe_job
                     .join()
                     .expect("deferred ranked lincheck stripe worker panicked");
+                flock_core::tmark::mark("stripe joined");
                 if phase_timing {
                     eprintln!(
                         "[phase-timing] deferred lincheck stripe join tail: {:.2} ms",

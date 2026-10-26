@@ -182,6 +182,31 @@ impl BlockR1cs {
     /// that A's evaluated prefix equals C; the packed-value producer must
     /// provide that separate invariant.
     pub fn round1_pinned_one_prefix_statement(&self) -> Option<Round1PinnedOnePrefixStatement> {
+        if let Some(cached) = self.cached_round1_statements() {
+            return cached.0;
+        }
+        self.round1_pinned_one_prefix_statement_scan()
+    }
+
+    /// Process-cache lookup for the two round-one statement receipts. Only
+    /// entries published by [`Self::statement_digest`]'s own matrix walk are
+    /// used, keyed by that digest plus the two statement fields the digest
+    /// does not absorb (`const_pin`, `useful_bits`), read at lookup time.
+    #[inline]
+    fn cached_round1_statements(&self) -> Option<Round1StatementPair> {
+        let digest = self.digest_cache.get()?;
+        if std::env::var_os("FLOCK_NO_ROUND1_STATEMENT_CACHE").is_some() {
+            return None;
+        }
+        ROUND1_STATEMENT_CACHE
+            .get()?
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(*digest, self.const_pin, self.useful_bits))
+            .copied()
+    }
+
+    fn round1_pinned_one_prefix_statement_scan(&self) -> Option<Round1PinnedOnePrefixStatement> {
         const PREFIX_BITS: usize = 1_024;
         let k = self.k();
         let const_pin = self.const_pin.filter(|pin| *pin < k)?;
@@ -210,7 +235,16 @@ impl BlockR1cs {
     /// Live A rows are computed output expressions, not identity rows; a
     /// joined BLAKE3 producer must separately certify their evaluated A=Z.
     pub fn round1_pinned_one_prefix_and_output_statement(&self) -> Option<Round1PinnedOnePrefixStatement> {
-        let mut statement = self.round1_pinned_one_prefix_statement()?;
+        if let Some(cached) = self.cached_round1_statements() {
+            return cached.1;
+        }
+        self.round1_pinned_one_prefix_and_output_statement_scan()
+    }
+
+    fn round1_pinned_one_prefix_and_output_statement_scan(
+        &self,
+    ) -> Option<Round1PinnedOnePrefixStatement> {
+        let mut statement = self.round1_pinned_one_prefix_statement_scan()?;
         if self.k_log != 14 || self.k_skip != 6 || self.useful_bits != 15_409
             || self.layout != WitnessLayout::RowMajor || self.const_pin != Some(512)
             || !(15_360..15_409).all(|i| self.b_0.rows[i].as_slice() == [512])
@@ -430,6 +464,18 @@ impl BlockR1cs {
             let c0_is_identity = absorb_c0_and_check_identity(&mut h, self.k(), &self.c_0);
             let digest = *h.finalize().as_bytes();
             cache_c0_identity(digest, c0_is_identity);
+            // The ranked prover asks for the round-one statement receipts on
+            // every prove, right after witness generation; each answer is a
+            // 16,384-row walk of C plus B/A prefix rows. They depend only on
+            // the matrices (absorbed above) and `const_pin`/`useful_bits`
+            // (part of the key), so publish them from this same walk.
+            cache_round1_statements(
+                (digest, self.const_pin, self.useful_bits),
+                (
+                    self.round1_pinned_one_prefix_statement_scan(),
+                    self.round1_pinned_one_prefix_and_output_statement_scan(),
+                ),
+            );
             digest
         })
     }
@@ -453,6 +499,24 @@ impl BlockR1cs {
 }
 
 type C0IdentityCache = HashMap<[u8; 32], bool>;
+
+type Round1StatementKey = ([u8; 32], Option<usize>, usize);
+type Round1StatementPair = (
+    Option<Round1PinnedOnePrefixStatement>,
+    Option<Round1PinnedOnePrefixStatement>,
+);
+
+static ROUND1_STATEMENT_CACHE: OnceLock<RwLock<HashMap<Round1StatementKey, Round1StatementPair>>> =
+    OnceLock::new();
+
+fn cache_round1_statements(key: Round1StatementKey, value: Round1StatementPair) {
+    ROUND1_STATEMENT_CACHE
+        .get_or_init(|| RwLock::new(HashMap::new()))
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(key)
+        .or_insert(value);
+}
 
 /// Statement digests provide a process-wide, content-addressed key for sharing
 /// this tiny derived fact across clones and equal instances. Entries are
