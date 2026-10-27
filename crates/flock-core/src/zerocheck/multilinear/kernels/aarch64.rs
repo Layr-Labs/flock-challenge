@@ -906,6 +906,7 @@ unsafe fn r2_pair_fold_and_store(
     padded: bool,
     degen: bool,
     b_ones: core::arch::aarch64::uint64x2_t,
+    skip_dead: bool,
 ) -> (
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
@@ -931,8 +932,12 @@ unsafe fn r2_pair_fold_and_store(
     unsafe {
         let zero = vdupq_n_u64(0);
         if padded {
-            store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            // `skip_dead`: the cascade K pass treats padded pairs as known
+            // zeros and never reads their slots, so the zero stores are dead.
+            if !skip_dead {
+                store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+            }
             return (zero, zero, zero, zero, false);
         }
 
@@ -1025,6 +1030,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     useful_pairs_inclusive: usize,
     degen: bool,
     periodic_padding: bool,
+    skip_dead: bool,
     out: *mut F128,
 ) {
     use core::arch::aarch64::*;
@@ -1067,12 +1073,14 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 
         macro_rules! zero_group {
             ($u:expr) => {{
-                let x_lo0 = 2 * $u;
-                let x_lo1 = x_lo0 + 1;
-                store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
-                store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                if !skip_dead {
+                    let x_lo0 = 2 * $u;
+                    let x_lo1 = x_lo0 + 1;
+                    store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
+                    vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
+                    store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
+                    vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                }
             }};
         }
 
@@ -1085,9 +1093,11 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 
                 let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
+                    skip_dead,
                 );
                 let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
+                    skip_dead,
                 );
 
                 // The odd lane's weight drives the whole group; see the doc above.
@@ -1211,6 +1221,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8(
     pair_in_block_mask: usize,
     useful_pairs_inclusive: usize,
     degen: bool,
+    skip_dead: bool,
     out: *mut F128,
 ) {
     use core::arch::aarch64::*;
@@ -1280,11 +1291,11 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8(
                     let (a0, a1, a2, a3, b0, b1, b2, b3, deg0, deg1) = {
                         let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
                             table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen,
-                            b_ones,
+                            b_ones, skip_dead,
                         );
                         let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
                             table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen,
-                            b_ones,
+                            b_ones, skip_dead,
                         );
                         (a0, a1, a2, a3, b0, b1, b2, b3, deg0, deg1)
                     };
@@ -1486,7 +1497,7 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
+pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8<const DEAD_TAIL: bool>(
     table_l1: *const u8,
     table_l3: *const u8,
     rho2: F128,
@@ -1529,103 +1540,160 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
 
         debug_assert!(out_pairs >= 2 && out_pairs.is_multiple_of(2));
         let n5 = out_pairs / 2;
-        for t in 0..n5 {
-            let mut av = [zero; 4];
-            let mut bv = [zero; 4];
-            let mut b_flat = true;
-            for lane in 0..4usize {
-                let g = 4 * t + lane;
+        // One round-five group `t` (four K outputs, eight pairs).
+        macro_rules! k_group {
+            ($t:expr) => {{
+                let t = $t;
+                let mut av = [zero; 4];
+                let mut bv = [zero; 4];
+                let mut b_flat = true;
+                for lane in 0..4usize {
+                    let g = 4 * t + lane;
+                    let ap = anchors.add(4 * g).cast::<u64>();
+                    let anc_a0 = vld1q_u64(ap);
+                    let anc_b0 = vld1q_u64(ap.add(2));
+                    let anc_a1 = vld1q_u64(ap.add(4));
+                    let anc_b1 = vld1q_u64(ap.add(6));
+
+                    let dp = deltas.add(32 * g);
+                    let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
+                    let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
+                    let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
+                    let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
+
+                    let a_delta = veorq_u64(
+                        lookup_lanes_q::<8>(table_l1, da0, 0),
+                        lookup_lanes_q::<8>(table_l3, da1, 0),
+                    );
+                    av[lane] = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
+
+                    if degen && (db0 | db1) == 0 {
+                        // b rows are constant across the group: zero deltas mean
+                        // both b halves equal their anchors.
+                        let bd = veorq_u64(anc_b0, anc_b1);
+                        bv[lane] = if is_zero_q(bd) {
+                            anc_b0
+                        } else {
+                            b_flat = false;
+                            veorq_u64(anc_b0, mul_q(rho2_q, bd))
+                        };
+                    } else {
+                        b_flat = false;
+                        let b_delta = veorq_u64(
+                            lookup_lanes_q::<8>(table_l1, db0, 0),
+                            lookup_lanes_q::<8>(table_l3, db1, 0),
+                        );
+                        bv[lane] = xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta);
+                    }
+                }
+
+                store_pair_nt(a_out.add(4 * t), av[0], av[1]);
+                store_pair_nt(a_out.add(4 * t + 2), av[2], av[3]);
+                store_pair_nt(b_out.add(4 * t), bv[0], bv[1]);
+                store_pair_nt(b_out.add(4 * t + 2), bv[2], bv[3]);
+
+                // The odd round-4 pair's weight drives the whole group; see doc.
+                let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
+
+                if b_flat {
+                    // Every b output equals its anchor; check the b≡1 mass.
+                    let ones_miss = vorrq_u64(
+                        vorrq_u64(veorq_u64(bv[0], one_q), veorq_u64(bv[1], one_q)),
+                        vorrq_u64(veorq_u64(bv[2], one_q), veorq_u64(bv[3], one_q)),
+                    );
+                    if is_zero_q(ones_miss) {
+                        wide_xor(&mut p1_even, mul_unreduced_q(w, av[1]));
+                        wide_xor(&mut p1_odd, mul_unreduced_q(w, av[3]));
+                        wide_xor(&mut w0, mul_unreduced_q(w, av[2]));
+                        continue;
+                    }
+                }
+
+                // Weight-sharing reshape: four reduced row scalings, then every
+                // product below is one unreduced multiply.
+                let a0w = mul_q(w, av[0]);
+                let a1w = mul_q(w, av[1]);
+                let a2w = mul_q(w, av[2]);
+                let a3w = mul_q(w, av[3]);
+
+                // ---- round-four products, split by round-4-pair parity ----
+                wide_xor(&mut p1_even, mul_unreduced_q(a1w, bv[1]));
+                wide_xor(
+                    &mut pinf_even,
+                    mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(bv[0], bv[1])),
+                );
+                wide_xor(&mut p1_odd, mul_unreduced_q(a3w, bv[3]));
+                wide_xor(
+                    &mut pinf_odd,
+                    mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(bv[2], bv[3])),
+                );
+
+                // ---- deferred round-five aggregates (no extra loads) ----
+                wide_xor(&mut w0, mul_unreduced_q(a2w, bv[2]));
+                let e_aw = veorq_u64(a0w, a2w);
+                let o_aw = veorq_u64(a1w, a3w);
+                let e_b = veorq_u64(bv[0], bv[2]);
+                let o_b = veorq_u64(bv[1], bv[3]);
+                wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
+                wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
+                wide_xor(
+                    &mut w5,
+                    mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
+                );
+        
+            }};
+        }
+
+        if DEAD_TAIL {
+            // Round two left the dead-pair slots unwritten: in every 128-pair
+            // block, pairs 121..128 are structural padding (the last group:
+            // lane 0's odd pair and lanes 1..3). Their dense values are known
+            // zeros (zero anchors, zero deltas, table entry 0 = 0), so the
+            // tail group is formed from lane 0's live pair alone; every
+            // product with a zero factor is dropped (XOR of zero is exact).
+            debug_assert!(n5.is_multiple_of(16));
+            for blk in 0..n5 / 16 {
+                let t0 = 16 * blk;
+                for t in t0..t0 + 15 {
+                    k_group!(t);
+                }
+                let t = t0 + 15;
+                let g = 4 * t;
                 let ap = anchors.add(4 * g).cast::<u64>();
                 let anc_a0 = vld1q_u64(ap);
                 let anc_b0 = vld1q_u64(ap.add(2));
-                let anc_a1 = vld1q_u64(ap.add(4));
-                let anc_b1 = vld1q_u64(ap.add(6));
-
                 let dp = deltas.add(32 * g);
                 let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
                 let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
-                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
-
-                let a_delta = veorq_u64(
+                // Dense lane 0 with anc1 = 0 and delta1 = 0: anc0 + rho2*anc0
+                // + T_l1(delta0) (+ T_l3(0) = 0). This one formula equals both
+                // dense b branches (degenerate and full).
+                let av0 = xor3_u64(
+                    anc_a0,
+                    mul_q(rho2_q, anc_a0),
                     lookup_lanes_q::<8>(table_l1, da0, 0),
-                    lookup_lanes_q::<8>(table_l3, da1, 0),
                 );
-                av[lane] = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
-
-                if degen && (db0 | db1) == 0 {
-                    // b rows are constant across the group: zero deltas mean
-                    // both b halves equal their anchors.
-                    let bd = veorq_u64(anc_b0, anc_b1);
-                    bv[lane] = if is_zero_q(bd) {
-                        anc_b0
-                    } else {
-                        b_flat = false;
-                        veorq_u64(anc_b0, mul_q(rho2_q, bd))
-                    };
-                } else {
-                    b_flat = false;
-                    let b_delta = veorq_u64(
-                        lookup_lanes_q::<8>(table_l1, db0, 0),
-                        lookup_lanes_q::<8>(table_l3, db1, 0),
-                    );
-                    bv[lane] = xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta);
-                }
-            }
-
-            store_pair_nt(a_out.add(4 * t), av[0], av[1]);
-            store_pair_nt(a_out.add(4 * t + 2), av[2], av[3]);
-            store_pair_nt(b_out.add(4 * t), bv[0], bv[1]);
-            store_pair_nt(b_out.add(4 * t + 2), bv[2], bv[3]);
-
-            // The odd round-4 pair's weight drives the whole group; see doc.
-            let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
-
-            if b_flat {
-                // Every b output equals its anchor; check the b≡1 mass.
-                let ones_miss = vorrq_u64(
-                    vorrq_u64(veorq_u64(bv[0], one_q), veorq_u64(bv[1], one_q)),
-                    vorrq_u64(veorq_u64(bv[2], one_q), veorq_u64(bv[3], one_q)),
+                let bv0 = xor3_u64(
+                    anc_b0,
+                    mul_q(rho2_q, anc_b0),
+                    lookup_lanes_q::<8>(table_l1, db0, 0),
                 );
-                if is_zero_q(ones_miss) {
-                    wide_xor(&mut p1_even, mul_unreduced_q(w, av[1]));
-                    wide_xor(&mut p1_odd, mul_unreduced_q(w, av[3]));
-                    wide_xor(&mut w0, mul_unreduced_q(w, av[2]));
-                    continue;
-                }
+                store_pair_nt(a_out.add(4 * t), av0, zero);
+                store_pair_nt(a_out.add(4 * t + 2), zero, zero);
+                store_pair_nt(b_out.add(4 * t), bv0, zero);
+                store_pair_nt(b_out.add(4 * t + 2), zero, zero);
+                // Lanes 1..3 are zero, so the dense group's only non-zero
+                // products are (w*a0)*b0 in pinf_even, W3' and W5'.
+                let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
+                let p = mul_unreduced_q(mul_q(w, av0), bv0);
+                wide_xor(&mut pinf_even, p);
+                wide_xor(&mut w3, p);
+                wide_xor(&mut w5, p);
             }
-
-            // Weight-sharing reshape: four reduced row scalings, then every
-            // product below is one unreduced multiply.
-            let a0w = mul_q(w, av[0]);
-            let a1w = mul_q(w, av[1]);
-            let a2w = mul_q(w, av[2]);
-            let a3w = mul_q(w, av[3]);
-
-            // ---- round-four products, split by round-4-pair parity ----
-            wide_xor(&mut p1_even, mul_unreduced_q(a1w, bv[1]));
-            wide_xor(
-                &mut pinf_even,
-                mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(bv[0], bv[1])),
-            );
-            wide_xor(&mut p1_odd, mul_unreduced_q(a3w, bv[3]));
-            wide_xor(
-                &mut pinf_odd,
-                mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(bv[2], bv[3])),
-            );
-
-            // ---- deferred round-five aggregates (no extra loads) ----
-            wide_xor(&mut w0, mul_unreduced_q(a2w, bv[2]));
-            let e_aw = veorq_u64(a0w, a2w);
-            let o_aw = veorq_u64(a1w, a3w);
-            let e_b = veorq_u64(bv[0], bv[2]);
-            let o_b = veorq_u64(bv[1], bv[3]);
-            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
-            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
-            wide_xor(
-                &mut w5,
-                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
-            );
+        } else {
+            for t in 0..n5 {
+                k_group!(t);
+            }
         }
 
         *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));
@@ -1661,6 +1729,20 @@ unsafe fn lookup_lanes_q<const L: usize>(
                     .cast::<u64>(),
             )
         };
+        if L == 8 && lane0 == 0 {
+            // Every full-width caller passes a literal 0, so after inlining
+            // this is the only path: the same eight loads in the same XOR
+            // tree, bytes 1..7 through the two-instruction scaled lookup.
+            macro_rules! bank {
+                ($lane:literal) => {
+                    bank_load_q::<{ 8 * $lane }>(table_data.add($lane * STRIDE), code)
+                };
+            }
+            let acc = xor3_u64(load(0), bank!(1), bank!(2));
+            let acc = xor3_u64(acc, bank!(3), bank!(4));
+            let acc = xor3_u64(acc, bank!(5), bank!(6));
+            return veorq_u64(acc, bank!(7));
+        }
         let mut acc = load(0);
         let mut j = 1;
         while j + 1 < L {
@@ -2918,7 +3000,9 @@ mod tests {
                 }
                 let eq_lo = build_eq(&r);
                 for (mask, useful) in [(usize::MAX, usize::MAX), (127, 121)] {
-                    for degen in [false, true] {
+                    for (degen, skip_dead) in
+                        [(false, false), (true, false), (false, true), (true, true)]
+                    {
                         let run = |horner: bool| {
                             let poison = F128::new(u64::MAX, u64::MAX);
                             let mut anchors = vec![poison; 2 * LO_SIZE];
@@ -2938,6 +3022,7 @@ mod tests {
                                         mask,
                                         useful,
                                         degen,
+                                        skip_dead,
                                         out.as_mut_ptr(),
                                     );
                                 } else {
@@ -2954,6 +3039,7 @@ mod tests {
                                         useful,
                                         degen,
                                         true,
+                                        skip_dead,
                                         out.as_mut_ptr(),
                                     );
                                 }
@@ -3250,7 +3336,7 @@ mod tests {
             .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
             .collect();
 
-        let run = |periodic_padding: bool| {
+        let run = |periodic_padding: bool, skip_dead: bool| {
             let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
             let mut anchors = vec![poison; 2 * LO_SIZE];
             let mut deltas = vec![0xa5u8; 2 * LO_SIZE * N_CHUNKS];
@@ -3269,16 +3355,38 @@ mod tests {
                     121,
                     true,
                     periodic_padding,
+                    skip_dead,
                     out.as_mut_ptr(),
                 );
             }
             (anchors, deltas, out)
         };
 
-        let periodic = run(true);
-        let generic = run(false);
+        let periodic = run(true, false);
+        let generic = run(false, false);
         assert_eq!(periodic.0, generic.0, "anchor schedule mismatch");
         assert_eq!(periodic.1, generic.1, "delta schedule mismatch");
         assert_eq!(periodic.2, generic.2, "message/lookahead mismatch");
+
+        // Dead-pair skip: both schedules leave every padded slot untouched
+        // (poison survives), write the live slots identically to the dense
+        // run, and produce the same message/lookahead sums.
+        let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
+        for periodic_padding in [true, false] {
+            let sparse = run(periodic_padding, true);
+            assert_eq!(sparse.2, periodic.2, "skip message/lookahead mismatch");
+            for x_lo in 0..LO_SIZE {
+                let dead = (x_lo & 127) >= 121;
+                let anc = &sparse.0[2 * x_lo..2 * x_lo + 2];
+                let del = &sparse.1[16 * x_lo..16 * x_lo + 16];
+                if dead {
+                    assert_eq!(anc, &[poison; 2], "dead anchor written at {x_lo}");
+                    assert!(del.iter().all(|&b| b == 0xa5), "dead delta written at {x_lo}");
+                } else {
+                    assert_eq!(anc, &periodic.0[2 * x_lo..2 * x_lo + 2], "anchor at {x_lo}");
+                    assert_eq!(del, &periodic.1[16 * x_lo..16 * x_lo + 16], "delta at {x_lo}");
+                }
+            }
+        }
     }
 }
