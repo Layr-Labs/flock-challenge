@@ -970,7 +970,36 @@ pub fn precompute_round1_ab_inner_packed_padded(
     padding: &PaddingSpec,
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
 ) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_with_flavor(
+    precompute_round1_ab_inner_packed_padded_with_tail(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        identity_prefix,
+        None,
+    )
+}
+
+/// [`precompute_round1_ab_inner_packed_padded`] whose hetero-queue main-pool
+/// workers each call `tail` once the precompute queue is empty, before the
+/// drain waits for its helper broadcast. `tail` never touches the precompute
+/// output, so the result is byte-identical to the plain call; the ranked
+/// prover passes the deferred lincheck stripe's help drain here. Ignored on
+/// the non-hetero path.
+#[allow(clippy::too_many_arguments)]
+pub fn precompute_round1_ab_inner_packed_padded_with_tail(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    tail: Option<&(dyn Fn() + Sync)>,
+) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_body(
         a_packed,
         b_packed,
         m,
@@ -979,7 +1008,9 @@ pub fn precompute_round1_ab_inner_packed_padded(
         padding,
         ab_pre_nt_enabled(),
         ab_compact_store_enabled(),
+        true,
         identity_prefix,
+        tail,
     )
 }
 
@@ -1006,6 +1037,7 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
         false,
         false,
         identity_prefix,
+        None,
     )
 }
 
@@ -1013,6 +1045,7 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
 /// choices, tests compare arms byte-for-byte in one process. `nt` selects the
 /// non-temporal drain vs the incumbent cached store; `compact` selects the
 /// QS3 tail-skip vs the incumbent zero-fill of the dead skipped-`b_med` rows.
+#[cfg(test)]
 fn precompute_round1_ab_inner_packed_padded_with_flavor(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -1026,6 +1059,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
 ) -> Round1AbInner {
     precompute_round1_ab_inner_packed_padded_body(
         a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true, identity_prefix,
+        None,
     )
 }
 
@@ -1041,6 +1075,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
     compact: bool,
     use_provenance: bool,
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    tail: Option<&(dyn Fn() + Sync)>,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -1157,6 +1192,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     representation,
                     n_chunks,
                     out_bytes,
+                    tail,
                 );
             } else {
                 precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
@@ -1172,6 +1208,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     representation,
                     n_chunks,
                     out_bytes,
+                    tail,
                 );
             }
         } else {
@@ -1188,6 +1225,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                 representation,
                 n_chunks,
                 out_bytes,
+                tail,
             );
         }
         return Round1AbInner {
@@ -1306,6 +1344,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     representation: Round1AbRepresentation,
     n_chunks: usize,
     out_bytes: &mut [u8],
+    tail: Option<&(dyn Fn() + Sync)>,
 ) {
     // This is a private specialization contract, but keep it checked in
     // release builds so a future caller cannot accidentally select
@@ -1324,7 +1363,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
     let n_jobs = n_chunks.div_ceil(chunks_per_job);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
-    crate::epool::run_hetero_chunks_stateful(
+    crate::epool::run_hetero_chunks_stateful_with_tail(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
         |(a_col, b_col), job| {
@@ -1358,6 +1397,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 );
             }
         },
+        tail,
     );
 }
 
