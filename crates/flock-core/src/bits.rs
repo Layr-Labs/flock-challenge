@@ -71,6 +71,96 @@ pub unsafe fn transpose_8_strided_u64s_to_64_bytes(base: *const u64, stride: usi
     }
 }
 
+/// [`transpose_8_strided_u64s_to_64_bytes`] with the bit transpose done in
+/// row form and the output left in four registers (output bytes 0..16, 16..32,
+/// 32..48, 48..64). Same bytes.
+///
+/// Each 64-bit half holds one source word, so byte `c` of every half is a row
+/// of 8x8 matrix `c`. The three block swaps of the transpose (row distance 4,
+/// 2, 1) pair whole halves, so they need no per-lane shift-and-mask: distance
+/// 4 is one shift-insert per output register, distance 2 a shift plus a bit
+/// select, distance 1 a half swap, a per-byte shift and a bit select. One
+/// byte table lookup per output register then puts row `t` of matrix `c` at
+/// output byte `8c + t`, the order [`transpose_8_u64s_to_64_bytes`] writes.
+///
+/// # Safety
+/// `base.add(l * stride)` must be valid for an 8-byte read for every `l < 8`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn transpose_8_strided_u64s_to_regs(
+    base: *const u64,
+    stride: usize,
+) -> [core::arch::aarch64::uint8x16_t; 4] {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn lane_pair(lo: *const u64, hi: *const u64) -> uint8x16_t {
+        // SAFETY: the caller's contract covers both 8-byte reads.
+        unsafe { vreinterpretq_u8_u64(vcombine_u64(vld1_u64(lo), vld1_u64(hi))) }
+    }
+
+    // Output byte 8c + t comes from row t (register t / 2, half t % 2), byte c.
+    const IDX0: [u8; 16] = [0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57];
+    const IDX1: [u8; 16] = [2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59];
+    const IDX2: [u8; 16] = [4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61];
+    const IDX3: [u8; 16] = [6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63];
+    // Distance 1: the low half keeps bits 0x55 and takes the high half's row
+    // shifted up one; the high half keeps 0xAA and takes the low row shifted
+    // down one (a negative per-byte shift count shifts right).
+    const KEEP1: [u8; 16] = [
+        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+        0xAA,
+    ];
+    const SHIFT1: [i8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1];
+
+    #[inline(always)]
+    unsafe fn swap1(v: uint8x16_t, keep: uint8x16_t, shift: int8x16_t) -> uint8x16_t {
+        unsafe {
+            let moved = vshlq_u8(vextq_u8::<8>(v, v), shift);
+            vbslq_u8(keep, v, moved)
+        }
+    }
+
+    // SAFETY: the caller guarantees all eight reads.
+    unsafe {
+        // Rows 0..8 = the eight source words, two per register.
+        let r01 = lane_pair(base, base.add(stride));
+        let r23 = lane_pair(base.add(2 * stride), base.add(3 * stride));
+        let r45 = lane_pair(base.add(4 * stride), base.add(5 * stride));
+        let r67 = lane_pair(base.add(6 * stride), base.add(7 * stride));
+
+        // Distance 4: row r keeps bits 0..4 and takes row r+4's bits 0..4 as
+        // its bits 4..8; row r+4 keeps bits 4..8 and takes row r's bits 4..8.
+        let a01 = vsliq_n_u8::<4>(r01, r45);
+        let a45 = vsriq_n_u8::<4>(r45, r01);
+        let a23 = vsliq_n_u8::<4>(r23, r67);
+        let a67 = vsriq_n_u8::<4>(r67, r23);
+
+        // Distance 2: rows r and r+2 sit in the same half of two registers.
+        let keep2 = vdupq_n_u8(0x33);
+        let b01 = vbslq_u8(keep2, a01, vshlq_n_u8::<2>(a23));
+        let b23 = vbslq_u8(keep2, vshrq_n_u8::<2>(a01), a23);
+        let b45 = vbslq_u8(keep2, a45, vshlq_n_u8::<2>(a67));
+        let b67 = vbslq_u8(keep2, vshrq_n_u8::<2>(a45), a67);
+
+        // Distance 1: rows r and r+1 are the two halves of one register.
+        let keep1 = vld1q_u8(KEEP1.as_ptr());
+        let shift1 = vld1q_s8(SHIFT1.as_ptr());
+        let c01 = swap1(b01, keep1, shift1);
+        let c23 = swap1(b23, keep1, shift1);
+        let c45 = swap1(b45, keep1, shift1);
+        let c67 = swap1(b67, keep1, shift1);
+
+        let rows = uint8x16x4_t(c01, c23, c45, c67);
+        [
+            vqtbl4q_u8(rows, vld1q_u8(IDX0.as_ptr())),
+            vqtbl4q_u8(rows, vld1q_u8(IDX1.as_ptr())),
+            vqtbl4q_u8(rows, vld1q_u8(IDX2.as_ptr())),
+            vqtbl4q_u8(rows, vld1q_u8(IDX3.as_ptr())),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +241,63 @@ mod tests {
                 assert_eq!(actual, expected, "stride={stride} word={word}");
             }
         }
+    }
+
+    /// The row-form register transpose matches the strided entry and the
+    /// scalar oracle bit-for-bit, on random words, single set bits and
+    /// all-zero/all-one words, at several strides.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn row_form_strided_transpose_matches_oracle() {
+        let mut state = 0x5EED_0F_B175_u64;
+        let mut next = || {
+            state = state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        };
+        let check = |words: &[u64], stride: usize, word: usize| {
+            let lanes: [u64; 8] = std::array::from_fn(|l| words[l * stride + word]);
+            let mut oracle = [0u8; 64];
+            transpose_8_u64s_to_64_bytes_scalar(&lanes, &mut oracle);
+            let mut strided = [0u8; 64];
+            let mut regs = [0u8; 64];
+            // SAFETY: the highest read is 7 * stride + word < words.len().
+            unsafe {
+                transpose_8_strided_u64s_to_64_bytes(words.as_ptr().add(word), stride, &mut strided);
+                let out = transpose_8_strided_u64s_to_regs(words.as_ptr().add(word), stride);
+                for (k, v) in out.iter().enumerate() {
+                    core::arch::aarch64::vst1q_u8(regs.as_mut_ptr().add(16 * k), *v);
+                }
+            }
+            assert_eq!(regs, oracle, "stride={stride} word={word}");
+            assert_eq!(regs, strided, "stride={stride} word={word}");
+        };
+        for stride in [1usize, 2, 3, 7, 64, 256] {
+            let words: Vec<u64> = (0..8 * stride + 5).map(|_| next()).collect();
+            for word in 0..stride.min(5) {
+                check(&words, stride, word);
+            }
+        }
+        let stride = 256;
+        for _ in 0..40 {
+            let words: Vec<u64> = (0..8 * stride).map(|_| next()).collect();
+            for word in 0..stride {
+                check(&words, stride, word);
+            }
+        }
+        // Every single set bit of the 512-bit input lands where the oracle puts it.
+        for bit in 0..512 {
+            let mut words = [0u64; 8];
+            words[bit / 64] = 1u64 << (bit % 64);
+            check(&words, 1, 0);
+            let mut inv = [u64::MAX; 8];
+            inv[bit / 64] ^= 1u64 << (bit % 64);
+            check(&inv, 1, 0);
+        }
+        check(&[0u64; 8], 1, 0);
+        check(&[u64::MAX; 8], 1, 0);
     }
 
     /// Transposing twice is the identity.
