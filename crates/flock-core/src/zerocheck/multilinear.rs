@@ -139,6 +139,15 @@ fn r2_periodic_padding_enabled() -> bool {
     std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
 }
 
+/// Kill switch for the round-two dead-pair skip: `FLOCK_NO_R2_DEADPAIR_SKIP=1`
+/// restores the zero-filled padding slots and the cascade K pass's blind
+/// read of them. Bit-identical either way: the skipped slots hold structural
+/// zeros the K pass substitutes exactly. Read once per phase call.
+#[cfg(target_arch = "aarch64")]
+fn r2_dead_pair_skip_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none_or(|v| v != *"1")
+}
+
 /// Kill switch for adopting the round-two GPU arm's odd-parity products as the
 /// round-three lookahead's `W1`/`W2`: `FLOCK_NO_ZC_R2_ODD_OFFLOAD=1` makes the
 /// CPU recompute the odd pair on offloaded chunks, which is the incumbent
@@ -146,6 +155,17 @@ fn r2_periodic_padding_enabled() -> bool {
 /// odd-parity half is the same sum the CPU would form, and the calibration
 /// oracle verifies that on the target before the arm is ever admitted.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Kill switch for the compact-writing round-two GPU arm
+/// (`FLOCK_NO_ZC_R2_COMPACT=1`): the GPU then computes products only and the
+/// CPU writes every chunk's anchors/deltas and deferred aggregates.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zc_r2_compact_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R2_COMPACT").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
 fn zc_r2_odd_offload_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_ZC_R2_ODD_OFFLOAD").is_none_or(|v| v != *"1")
@@ -856,6 +876,12 @@ pub struct UniSkipCompactFold {
     pub anchors: Vec<F128>,
     /// Interleaved `[a_delta; 8], [b_delta; 8]`, sixteen bytes per row pair.
     pub deltas: ScratchBytes,
+    /// Round two skipped the structural padding pairs (pairs 121..128 of
+    /// every 128-pair block): their anchor and delta slots hold stale bytes,
+    /// not zeros. Only the cascade K pass
+    /// ([`fold2_compact_and_round45_into`]) accepts such a state; it treats
+    /// those pairs as the known zeros the dense state stores.
+    pub dead_tail: bool,
 }
 
 impl UniSkipCompactFold {
@@ -871,7 +897,7 @@ impl UniSkipCompactFold {
 
     /// Return both large buffers to their process-wide scratch pools.
     pub fn recycle(self) {
-        let Self { anchors, deltas } = self;
+        let Self { anchors, deltas, .. } = self;
         crate::scratch::give_f128(anchors);
         deltas.recycle();
     }
@@ -938,6 +964,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     let mut compact = UniSkipCompactFold {
         anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
+        dead_tail: false,
     };
 
     let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -1127,6 +1154,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                     partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
                 }
             }
+            crate::gpu_commit::ZcR2Result::PrefixCompact(_) => {
+                unreachable!("only the lookahead sweep launches the compact arm")
+            }
             crate::gpu_commit::ZcR2Result::Failed => {
                 // Redo exactly the skipped prefix products — slower, still
                 // exact. Throwaway anchor/delta scratch: the real ranges
@@ -1219,6 +1249,7 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
         let mut compact = UniSkipCompactFold {
             anchors: crate::scratch::take_f128(2 * n_pairs),
             deltas: ScratchBytes::take_full_overwrite(2 * n_pairs * n_chunks),
+            dead_tail: false,
         };
 
         let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -1333,6 +1364,7 @@ pub fn fold_compact_and_compute_round_pair_stream(
     lanes_per_pass: usize,
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
     assert!(matches!(lanes_per_pass, 1 | 2 | 4 | 8));
+    assert!(!compact.dead_tail, "dead-pair compact state is K-pass only");
     #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = lanes_per_pass;
@@ -1445,6 +1477,7 @@ pub fn fold_compact_and_compute_round_pair(
     r_next: &[F128],
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
     let n = compact.len();
+    assert!(!compact.dead_tail, "dead-pair compact state is K-pass only");
     assert!(!compact.is_empty() && n.is_power_of_two() && n >= 4);
     assert_eq!(compact.anchors.len(), 2 * n);
     assert_eq!(compact.deltas.len(), 2 * n * table.n_chunks);
@@ -1727,6 +1760,7 @@ fn lookahead_n_hi(n_vars: usize) -> usize {
 ///
 /// Requires `r₁ = mlv_challenges[1] ≠ 0`; the caller falls back to the
 /// incumbent route otherwise.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -1736,6 +1770,47 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
     deltas_backing: Option<ScratchBytes>,
+) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
+    uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        padding,
+        deltas_backing,
+        false,
+    )
+}
+
+/// Pair count per cascade K-pass output chunk for a compact state of
+/// `n_pairs` pairs (the split [`fold2_compact_and_round45_into`] uses).
+fn cascade_k_pairs_per_chunk(n_pairs: usize) -> usize {
+    let n_groups = n_pairs / 2;
+    let n_vars = (n_groups.trailing_zeros() as usize).saturating_sub(1);
+    let n_lo = n_vars - cascade_k_pass_n_hi(n_vars);
+    4 << n_lo
+}
+
+/// [`uni_skip_fold_and_round_pair_compact_padded_lookahead`] for a caller
+/// that will hand the compact state only to the cascade K pass
+/// (`k_pass_only`). Then, on AArch64 at the ranked padding geometry, the
+/// structural padding pairs (121..128 of every 128-pair block) get no anchor
+/// or delta stores and the state is marked [`UniSkipCompactFold::dead_tail`].
+/// The round-two message and lookahead are unchanged; every live slot holds
+/// the same bytes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    deltas_backing: Option<ScratchBytes>,
+    k_pass_only: bool,
 ) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
     assert_eq!(k_skip, 6, "lookahead compact round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
@@ -1758,6 +1833,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let mut compact = UniSkipCompactFold {
         anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
+        dead_tail: false,
     };
 
     let n_vars = mlv_challenges.len() - 1;
@@ -1780,6 +1856,28 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let degen = r2_degen_enabled();
     #[cfg(target_arch = "aarch64")]
     let periodic_padding = r2_periodic_padding_enabled();
+    // Dead-pair skip. The K pass substitutes zeros for pairs 121..128 of
+    // each 128-pair block, which equals the dense state only because the
+    // fold table's index-0 entries are zero (`scaled_linear` copies them).
+    // Its block loop needs 128-pair-aligned producer and K chunks. The delta
+    // backing must already be initialized memory (the donated round-one
+    // buffer), so the skipped bytes stay valid and the completion mark below
+    // stays true; a fresh backing keeps the full overwrite.
+    #[cfg(target_arch = "aarch64")]
+    let skip_dead = k_pass_only
+        && r2_dead_pair_skip_enabled()
+        && pair_in_block_mask == 127
+        && useful_pairs_inclusive == 121
+        && lo_size.is_multiple_of(128)
+        && cascade_k_pairs_per_chunk(n_pairs).is_multiple_of(128)
+        && compact.deltas.is_fully_initialized()
+        && (0..n_chunks).all(|j| table.data[j * 256] == F128::ZERO);
+    #[cfg(not(target_arch = "aarch64"))]
+    let skip_dead = {
+        let _ = k_pass_only;
+        false
+    };
+    compact.dead_tail = skip_dead;
     #[cfg(target_arch = "aarch64")]
     let horner_weights = m == 32
         && lo_size == 1 << 14
@@ -1794,20 +1892,58 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     // the *summed* `(p1, pinf)` for its prefix. The CPU keeps producing the
     // odd-parity halves on those chunks (the GPU's sums are not parity-split),
     // which is what makes `W1`/`W2` recoverable everywhere.
+    let anchors_raw = compact.anchors.as_mut_ptr();
+    let anchors_bytes = compact.anchors.len() * core::mem::size_of::<F128>();
+    let deltas_raw = compact.deltas.full_overwrite_ptr();
+    let deltas_bytes = compact.deltas.len();
+    // On the Horner shape the GPU arm also stores its prefix chunks' anchors
+    // and deltas and returns their deferred aggregates W0/W3/W4/W5, so the
+    // CPU sweep never touches those chunks (it used to re-read and re-fold
+    // every row the GPU had already folded).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
-        a_packed,
-        b_packed,
-        &table.data,
-        eq_lo,
-        eq_hi,
-        lo_size,
-        hi_size,
-        pair_in_block_mask,
-        useful_pairs_inclusive,
-    );
+    let gpu_job = if horner_weights && zc_r2_odd_offload_enabled() && zc_r2_compact_enabled() {
+        crate::gpu_commit::launch_zc_r2_products_compact(
+            a_packed,
+            b_packed,
+            &table.data,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            crate::gpu_commit::ZcR2CompactLive {
+                anchors: anchors_raw.cast::<u8>(),
+                anchors_len: anchors_bytes,
+                deltas: deltas_raw,
+                deltas_len: deltas_bytes,
+                skip_dead,
+            },
+        )
+    } else {
+        crate::gpu_commit::launch_zc_r2_products(
+            a_packed,
+            b_packed,
+            &table.data,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+        )
+    };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_compact = gpu_job.as_ref().is_some_and(|j| j.writes_compact());
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let gpu_compact = false;
+    // Chunks below `cpu_first` belong wholly to the GPU.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cpu_first = if gpu_compact { gpu_prefix } else { 0 };
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let cpu_first = 0usize;
     // The GPU arm now returns its round-two products parity-split, so on an
     // offloaded chunk the CPU can skip the odd-parity pair as well as the even
     // one instead of recomputing the odd half for `W1`/`W2`. The kill switch
@@ -1822,11 +1958,12 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     // [p1_odd, pinf_odd, W0, W3, W4, W5], eq_hi-weighted, one slot per chunk.
     let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
-    let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
-    let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
+    let anchors_base = crate::epool::SyncPtr(anchors_raw);
+    let deltas_base = crate::epool::SyncPtr(deltas_raw);
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    crate::epool::run_hetero_chunks(hi_size - cpu_first, |i| {
+        let x_hi = cpu_first + i;
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and both partial slots.
         let (anchors, deltas) = unsafe {
@@ -1863,6 +2000,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        skip_dead,
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu && horner_weights {
@@ -1878,6 +2016,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         pair_in_block_mask,
                         useful_pairs_inclusive,
                         degen,
+                        skip_dead,
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu {
@@ -1894,6 +2033,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        skip_dead,
                         out.as_mut_ptr(),
                     );
                 } else {
@@ -1910,6 +2050,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
+                        skip_dead,
                         out.as_mut_ptr(),
                     );
                 }
@@ -1963,7 +2104,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
         let calib = job.is_calibration();
         let prefix = job.cpu_split();
-        let res = crate::gpu_commit::zc_r2_wait(
+        let res = crate::gpu_commit::zc_r2_wait_compact(
             job,
             if calib {
                 Some(partials.as_slice())
@@ -1972,6 +2113,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
             },
             if calib {
                 Some(la_partials.as_slice())
+            } else {
+                None
+            },
+            if calib {
+                Some((anchors_raw.cast_const().cast::<u8>(), deltas_raw.cast_const()))
             } else {
                 None
             },
@@ -1989,25 +2135,48 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     }
                 }
             }
+            crate::gpu_commit::ZcR2Result::PrefixCompact(vals) => {
+                // Only a compact job returns this, and it always ran with
+                // odd_on_gpu (launch gate above): every lookahead slot of a
+                // GPU chunk comes from the GPU.
+                for (x_hi, v) in vals.iter().enumerate() {
+                    partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
+                    la_partials[x_hi] = [v[2], v[3], v[4], v[5], v[6], v[7]];
+                }
+            }
             crate::gpu_commit::ZcR2Result::Failed => {
                 // Redo exactly the skipped prefix products — slower, still
-                // exact. Throwaway anchor/delta scratch: the real ranges were
-                // already written by the lookahead pass. The full-lookahead
-                // monomorphization is used so the odd-parity slots are
-                // recovered too when the CPU sweep skipped them.
+                // exact. The full-lookahead monomorphization is used so the
+                // odd-parity slots are recovered too when the CPU sweep
+                // skipped them. When the GPU owned the prefix chunks outright
+                // (compact arm), their live anchors/deltas and all six
+                // lookahead slots are rewritten as well; otherwise the real
+                // ranges were already written by the lookahead pass and the
+                // stores go to throwaway scratch.
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
+                    let (dst_anchors, dst_deltas, dst_skip) = if gpu_compact {
+                        unsafe {
+                            (
+                                anchors_raw.add(x_hi * anchor_chunk_size),
+                                deltas_raw.add(x_hi * delta_chunk_size),
+                                skip_dead,
+                            )
+                        }
+                    } else {
+                        (scr_anchors.as_mut_ptr(), scr_deltas.as_mut_ptr(), false)
+                    };
                     unsafe {
                         fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
-                            scr_anchors.as_mut_ptr(),
-                            scr_deltas.as_mut_ptr(),
+                            dst_anchors,
+                            dst_deltas,
                             eq_lo.as_ptr(),
                             lo_size,
                             pair_idx_base,
@@ -2015,6 +2184,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                             useful_pairs_inclusive,
                             degen,
                             periodic_padding,
+                            dst_skip,
                             out.as_mut_ptr(),
                         );
                     }
@@ -2026,6 +2196,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                     if odd_on_gpu {
                         la_partials[x_hi][0] = eq_h * out[2];
                         la_partials[x_hi][1] = eq_h * out[3];
+                    }
+                    if gpu_compact {
+                        for k in 2..6 {
+                            la_partials[x_hi][k] = eq_h * out[k + 2];
+                        }
                     }
                 }
             }
@@ -2184,6 +2359,7 @@ pub(crate) fn fold2_compact_and_round4_into(
 ) -> (F128, F128) {
     let n_pairs = compact.len();
     let n_groups = n_pairs / 2;
+    assert!(!compact.dead_tail, "dead-pair compact state is K-pass only");
     assert!(n_groups >= 2 && n_groups.is_power_of_two());
     assert_eq!(compact.anchors.len(), 2 * n_pairs);
     assert_eq!(compact.deltas.len(), 2 * n_pairs * table.n_chunks);
@@ -2384,6 +2560,16 @@ pub(crate) fn fold2_compact_and_round45_into(
     let eq_hi = &eq.hi;
     let eq_lo = &eq.lo;
     let out_chunk = 2 * lo_size;
+    // A dead-pair state needs every chunk to start on a 128-pair block and
+    // hold whole blocks (16 round-five groups each); the producer checked
+    // the same split through `cascade_k_pairs_per_chunk`.
+    assert!(
+        !compact.dead_tail
+            || (cfg!(target_arch = "aarch64")
+                && 2 * out_chunk == cascade_k_pairs_per_chunk(n_pairs)
+                && (2 * out_chunk).is_multiple_of(128)),
+        "dead-pair compact state needs 128-pair-aligned K chunks"
+    );
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
 
@@ -2409,19 +2595,37 @@ pub(crate) fn fold2_compact_and_round45_into(
 
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            fold2_compact_and_round45_chunk_neon_8(
-                table_l1.as_ptr().cast::<u8>(),
-                table_l3.as_ptr().cast::<u8>(),
-                rho2,
-                compact.anchors.as_ptr().add(2 * pair_base),
-                compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2),
-                a_ptr,
-                b_ptr,
-                eq_lo.as_ptr(),
-                lo_size,
-                degen,
-                outv.as_mut_ptr(),
-            );
+            let anchors = compact.anchors.as_ptr().add(2 * pair_base);
+            let deltas = compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2);
+            if compact.dead_tail {
+                fold2_compact_and_round45_chunk_neon_8::<true>(
+                    table_l1.as_ptr().cast::<u8>(),
+                    table_l3.as_ptr().cast::<u8>(),
+                    rho2,
+                    anchors,
+                    deltas,
+                    a_ptr,
+                    b_ptr,
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    degen,
+                    outv.as_mut_ptr(),
+                );
+            } else {
+                fold2_compact_and_round45_chunk_neon_8::<false>(
+                    table_l1.as_ptr().cast::<u8>(),
+                    table_l3.as_ptr().cast::<u8>(),
+                    rho2,
+                    anchors,
+                    deltas,
+                    a_ptr,
+                    b_ptr,
+                    eq_lo.as_ptr(),
+                    lo_size,
+                    degen,
+                    outv.as_mut_ptr(),
+                );
+            }
         }
 
         #[cfg(not(target_arch = "aarch64"))]
@@ -4962,6 +5166,109 @@ mod tests {
     // ----------------------------------------------------------------------
     // Cascaded lookahead (variant K, one level deeper): rounds 5+6.
     // ----------------------------------------------------------------------
+
+    /// D1 — dead-pair skip. A K-pass-only round two at the ranked padding
+    /// leaves the padding pairs' slots unwritten (poison survives on a
+    /// donated initialized backing) and the cascade K pass then reproduces
+    /// the dense state's outputs, round-four message and round-five
+    /// lookahead exactly. m = 25 is the smallest shape whose K chunks hold
+    /// whole 128-pair blocks.
+    #[test]
+    fn dead_pair_skip_matches_dense_k_pass() {
+        let f = la_fixture(25, 0xDEAD_0001, true);
+        let r_next4 = la_r_next4(&f);
+        // 16 delta bytes per pair = one F128 per pair.
+        let deltas_f128 = 1usize << (f.m - 7);
+        with_round2_settings(|| {
+            crate::scratch::clear();
+            let (dense, d1, di, dla) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                6,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+                None,
+            );
+            assert!(!dense.dead_tail);
+            let backing = ScratchBytes::from_initialized_f128(vec![LA_POISON; deltas_f128]);
+            let (sparse, s1, si, sla) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                6,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+                Some(backing),
+                true,
+            );
+            let skip_on = std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none();
+            assert_eq!(sparse.dead_tail, cfg!(target_arch = "aarch64") && skip_on);
+            assert_eq!((s1, si), (d1, di), "round-two message");
+            assert_eq!(sla.c, dla.c, "round-three lookahead");
+            let n_pairs = dense.len();
+            let poison_bytes = {
+                let v = [LA_POISON];
+                unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), 16) }.to_vec()
+            };
+            for p in 0..n_pairs {
+                let dead = (p & 127) >= 121;
+                let sd = &sparse.deltas[16 * p..16 * p + 16];
+                if dead {
+                    assert!(dense.anchors[2 * p..2 * p + 2].iter().all(|x| *x == F128::ZERO));
+                    if sparse.dead_tail {
+                        assert_eq!(sd, &poison_bytes[..], "dead delta written at pair {p}");
+                    }
+                } else {
+                    assert_eq!(&sparse.anchors[2 * p..2 * p + 2], &dense.anchors[2 * p..2 * p + 2]);
+                    assert_eq!(sd, &dense.deltas[16 * p..16 * p + 16], "delta at pair {p}");
+                }
+            }
+            let n_groups = n_pairs / 2;
+            for &(rho1, rho2) in &[
+                (f.rho_grid[3], f.rho_grid[2]),
+                (F128::ONE, f.rho_grid[3]),
+                (F128::ZERO, F128::ONE),
+            ] {
+                let mut a_d = vec![LA_POISON; n_groups];
+                let mut b_d = vec![LA_POISON; n_groups];
+                let (m1_d, mi_d, la_d) = fold2_compact_and_round45_into(
+                    &dense, &f.table, rho1, rho2, &r_next4, &mut a_d, &mut b_d,
+                );
+                let mut a_s = vec![LA_POISON; n_groups];
+                let mut b_s = vec![LA_POISON; n_groups];
+                let (m1_s, mi_s, la_s) = fold2_compact_and_round45_into(
+                    &sparse, &f.table, rho1, rho2, &r_next4, &mut a_s, &mut b_s,
+                );
+                assert_eq!((m1_s, mi_s), (m1_d, mi_d), "round-four message");
+                assert_eq!(la_s.c, la_d.c, "round-five lookahead");
+                assert!(a_s == a_d, "A'' outputs differ");
+                assert!(b_s == b_d, "B'' outputs differ");
+            }
+            dense.recycle();
+            sparse.recycle();
+            crate::scratch::clear();
+        });
+        unsafe { std::env::set_var("FLOCK_NO_R2_DEADPAIR_SKIP", "1") };
+        let backing = ScratchBytes::from_initialized_f128(vec![LA_POISON; deltas_f128]);
+        let (off, _, _, _) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+            &f.a_packed,
+            &f.b_packed,
+            f.m,
+            6,
+            &f.table,
+            &f.mlv,
+            &f.padding,
+            Some(backing),
+            true,
+        );
+        unsafe { std::env::remove_var("FLOCK_NO_R2_DEADPAIR_SKIP") };
+        assert!(!off.dead_tail, "kill switch keeps the dense state");
+        off.recycle();
+        crate::scratch::clear();
+    }
 
     /// C1 — the cascade K-pass oracle. Outputs and the round-four message
     /// must match the incumbent K pass **elementwise** (poison-filled
