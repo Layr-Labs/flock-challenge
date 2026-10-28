@@ -521,6 +521,125 @@ where
     true
 }
 
+/// A chunk queue whose owner is the efficiency-core helper pool, but which
+/// main-pool workers may help drain once their own work is done.
+///
+/// [`run_helper_only_queue`] drains it on the helper pool exactly as
+/// [`run_helper_only_chunks`] does. Any other thread may call
+/// [`HelpQueue::help`] at the same time: it claims chunks from the same atomic
+/// cursor, so every chunk index is still claimed exactly once and the output
+/// is byte-identical whichever thread ran a chunk. Because a helping thread
+/// may still be inside its last chunk when the helper broadcast returns, the
+/// owner must call [`HelpQueue::wait_done`] before publishing the output: each
+/// completed chunk bumps `done` with `Release`, and the `Acquire` load that
+/// sees `done == n_chunks` therefore happens after every chunk's writes.
+pub struct HelpQueue<'a> {
+    next: AtomicUsize,
+    done: AtomicUsize,
+    main_claims: AtomicUsize,
+    n_chunks: usize,
+    f: &'a (dyn Fn(usize) + Sync),
+}
+
+impl<'a> HelpQueue<'a> {
+    pub fn new(n_chunks: usize, f: &'a (dyn Fn(usize) + Sync)) -> Self {
+        Self {
+            next: AtomicUsize::new(0),
+            done: AtomicUsize::new(0),
+            main_claims: AtomicUsize::new(0),
+            n_chunks,
+            f,
+        }
+    }
+
+    /// Claim and run chunks until the cursor passes the end; returns how many
+    /// this call ran.
+    fn drain(&self) -> usize {
+        let mut ran = 0usize;
+        loop {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            if i >= self.n_chunks {
+                return ran;
+            }
+            (self.f)(i);
+            self.done.fetch_add(1, Ordering::Release);
+            ran += 1;
+        }
+    }
+
+    /// Help drain from a thread that has nothing else to do. Costs one relaxed
+    /// load when the queue is already exhausted.
+    pub fn help(&self) {
+        if self.next.load(Ordering::Relaxed) >= self.n_chunks {
+            return;
+        }
+        let ran = self.drain();
+        if ran > 0 {
+            self.main_claims.fetch_add(ran, Ordering::Relaxed);
+        }
+    }
+
+    /// Drain on the calling thread (the owner's fallback when no helper pool
+    /// is available). Counts as owner work, not help.
+    pub fn drain_inline(&self) {
+        self.drain();
+    }
+
+    /// Wait until every chunk has completed, on whichever thread claimed it.
+    /// The `Acquire` load pairs with each chunk's `Release` completion, so the
+    /// caller may publish the output after this returns.
+    pub fn wait_done(&self) {
+        while self.done.load(Ordering::Acquire) < self.n_chunks {
+            std::thread::yield_now();
+        }
+    }
+
+    /// Chunks run by [`HelpQueue::help`] callers (diagnostic).
+    pub fn main_claims(&self) -> usize {
+        self.main_claims.load(Ordering::Relaxed)
+    }
+
+    pub fn n_chunks(&self) -> usize {
+        self.n_chunks
+    }
+}
+
+/// [`run_helper_only_chunks`] over a [`HelpQueue`]: the helper pool drains the
+/// queue while other threads may [`HelpQueue::help`]. Returns `false` without
+/// claiming anything when the helper pool is unavailable or `max_workers` is
+/// zero. On `true` the helper broadcast has returned, so the cursor is
+/// exhausted; call [`HelpQueue::wait_done`] before reading the output.
+pub fn run_helper_only_queue(queue: &HelpQueue<'_>, max_workers: usize) -> bool {
+    run_queue_with_helper_only(queue, max_workers, epool())
+}
+
+/// [`run_helper_only_queue`] with an explicit helper pool, for tests.
+#[doc(hidden)]
+pub fn run_queue_with_helper_only(
+    queue: &HelpQueue<'_>,
+    max_workers: usize,
+    helper: Option<&rayon::ThreadPool>,
+) -> bool {
+    let Some(ep) = helper else {
+        return false;
+    };
+    let max_workers = max_workers.min(ep.current_num_threads());
+    if max_workers == 0 {
+        return false;
+    }
+    if queue.n_chunks == 0 {
+        return true;
+    }
+    ep.broadcast(|context| {
+        if context.index() >= max_workers {
+            return;
+        }
+        let ran = queue.drain();
+        EPOOL_HELPER_CHUNKS.fetch_add(ran, Ordering::Relaxed);
+    });
+    true
+}
+
 /// Stateful sibling of [`run_hetero_chunks`]. Each queue-draining worker
 /// calls `init` exactly once, then reuses that private state for every chunk
 /// it claims. This is intended for kernels with moderately large scratch
@@ -536,6 +655,31 @@ where
     F: Fn(&mut S, usize) + Sync,
 {
     run_chunks_with_helper_stateful(n_chunks, &init, &f, epool());
+}
+
+/// [`run_hetero_chunks_stateful`] whose main-pool workers each call `tail`
+/// once their claim loop finds this queue empty, before the drain waits for
+/// the helper broadcast. Helper-pool workers never call `tail`. `tail` must
+/// not affect this queue's output; the ranked caller passes
+/// [`HelpQueue::help`] for the deferred lincheck stripe, whose helper
+/// broadcast this drain's own helper broadcast is queued behind.
+pub(crate) fn run_hetero_chunks_stateful_with_tail<S, I, F>(
+    n_chunks: usize,
+    init: I,
+    f: F,
+    tail: Option<&(dyn Fn() + Sync)>,
+) where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
+    run_chunks_with_helper_stateful_relay_tail(
+        n_chunks,
+        &init,
+        &f,
+        epool(),
+        relay_enabled(),
+        tail,
+    );
 }
 
 /// [`run_hetero_chunks`] with an explicit helper pool, so tests can exercise
@@ -635,7 +779,26 @@ fn run_chunks_with_helper_stateful_relay<S, I, F>(
     I: Fn() -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
 {
+    run_chunks_with_helper_stateful_relay_tail(n_chunks, init, f, helper, use_relay, None);
+}
+
+/// The stateful drain body; `tail` (if any) runs on each main-side worker
+/// after its claim loop, see [`run_hetero_chunks_stateful_with_tail`].
+fn run_chunks_with_helper_stateful_relay_tail<S, I, F>(
+    n_chunks: usize,
+    init: &I,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+    use_relay: bool,
+    tail: Option<&(dyn Fn() + Sync)>,
+) where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
     if n_chunks == 0 {
+        if let Some(tail) = tail {
+            tail();
+        }
         return;
     }
     let main_threads = rayon::current_num_threads();
@@ -643,6 +806,9 @@ fn run_chunks_with_helper_stateful_relay<S, I, F>(
         let mut state = init();
         for i in 0..n_chunks {
             f(&mut state, i);
+        }
+        if let Some(tail) = tail {
+            tail();
         }
         return;
     }
@@ -655,6 +821,9 @@ fn run_chunks_with_helper_stateful_relay<S, I, F>(
                 break;
             }
             f(&mut state, i);
+        }
+        if let Some(tail) = tail {
+            tail();
         }
     };
     let drain_main = || {
@@ -821,6 +990,63 @@ mod tests {
             None,
         ));
         assert_eq!(untouched.load(Ordering::Relaxed), 0);
+    }
+
+    /// A helper-owned queue that the main side helps drain: every chunk runs
+    /// exactly once, `wait_done` returns only after all completions, main
+    /// claims are counted, and the tail hook of the stateful drain is what
+    /// does the helping.
+    #[test]
+    fn help_queue_runs_each_chunk_once_with_slow_helper() {
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("slow-help-queue-test-{i}"))
+            .build()
+            .unwrap();
+        let n = 64;
+        let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let helper_started = AtomicBool::new(false);
+        let job = |i: usize| {
+            if std::thread::current()
+                .name()
+                .is_some_and(|name| name.starts_with("slow-help-queue-test-"))
+            {
+                helper_started.store(true, Ordering::Release);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            counts[i].fetch_add(1, Ordering::Relaxed);
+        };
+        let queue = HelpQueue::new(n, &job);
+        let help = || queue.help();
+        std::thread::scope(|s| {
+            let owner = s.spawn(|| {
+                assert!(run_queue_with_helper_only(&queue, 2, Some(&helper)));
+                queue.wait_done();
+                assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+            });
+            while !helper_started.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            // A short unrelated stateful drain whose main-side tail helps.
+            run_chunks_with_helper_stateful_relay_tail(8, &|| (), &|_, _| {}, None, true, Some(&help));
+            owner.join().unwrap();
+        });
+        assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+        assert!(queue.main_claims() > 0);
+        assert!(queue.main_claims() < n, "slow helpers must also run chunks");
+        // Exhausted queue: help is a no-op.
+        queue.help();
+        assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+        // No helper pool: nothing is claimed and the owner drains inline.
+        let inline_counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let inline_job = |i: usize| {
+            inline_counts[i].fetch_add(1, Ordering::Relaxed);
+        };
+        let inline_queue = HelpQueue::new(n, &inline_job);
+        assert!(!run_queue_with_helper_only(&inline_queue, 2, None));
+        inline_queue.drain_inline();
+        inline_queue.wait_done();
+        assert!(inline_counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
     }
 
     /// Stateful workers initialize private scratch once and reuse it across
