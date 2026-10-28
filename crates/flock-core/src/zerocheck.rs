@@ -75,8 +75,7 @@ fn cascade2_off() -> bool {
     if ZC_CASCADE2_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1"))
+    std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1")
 }
 
 /// Test-only forced-off latch for the third-level cascade (rounds 7+8),

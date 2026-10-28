@@ -1,7 +1,4 @@
-use crate::field::F128;
-// Used by the generic-AArch64 (no SHA3) `ProdAcc` twin and cfg-gated paths.
-#[allow(unused_imports)]
-use crate::field::F256Unreduced;
+use crate::field::{F128, F256Unreduced};
 
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
@@ -65,49 +62,6 @@ unsafe fn pmull_lane(a: u64, b: u64) -> core::arch::aarch64::uint64x2_t {
     unsafe { core::mem::transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
 }
 
-/// `x.lo*y.lo ^ x.hi*y.hi` (the cross term of a schoolbook product when one
-/// operand is half-swapped) as `PMULL` + one fused `PMULL2`+`EOR` µop: two µops
-/// and three instructions instead of three µops (PMULL, PMULL2, EOR).
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline(always)]
-unsafe fn cross_sum_q(
-    x: core::arch::aarch64::uint64x2_t,
-    y: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    let out: core::arch::aarch64::uint64x2_t;
-    // SAFETY: register-only carry-less multiplies and XOR; `p` and `o` are
-    // early clobbers so neither overwrites `x` or `y` before their last read.
-    unsafe {
-        core::arch::asm!(
-            "pmull {p:v}.1q, {x:v}.1d, {y:v}.1d",
-            "pmull2 {o:v}.1q, {x:v}.2d, {y:v}.2d",
-            "eor {o:v}.16b, {o:v}.16b, {p:v}.16b",
-            x = in(vreg) x,
-            y = in(vreg) y,
-            p = out(vreg) _,
-            o = out(vreg) out,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-    out
-}
-
-#[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn cross_sum_q(
-    x: core::arch::aarch64::uint64x2_t,
-    y: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe {
-        veorq_u64(
-            pmull_lane(vgetq_lane_u64::<0>(x), vgetq_lane_u64::<0>(y)),
-            pmull_lane(vgetq_lane_u64::<1>(x), vgetq_lane_u64::<1>(y)),
-        )
-    }
-}
-
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "aes")]
@@ -129,7 +83,9 @@ unsafe fn clmul_products_q(
         let p0 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
         let p2 = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
         let b_swap = vextq_u64::<1>(b, b);
-        (p0, cross_sum_q(a, b_swap), p2)
+        let p01 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b_swap));
+        let p10 = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b_swap));
+        (p0, veorq_u64(p01, p10), p2)
     }
 }
 
@@ -222,123 +178,9 @@ unsafe fn clmul_products_sw_q(
     }
 }
 
-// ---------------------------------------------------------------------------
-// PMULL+EOR macro-fused accumulation.
-//
-// Apple P-cores issue `pmull A, B, C ; eor A, A, D` (also `pmull2`, and the
-// `eor A, D, A` operand order) in ONE SIMD issue slot when the two
-// instructions are adjacent (still two pipeline µops); `EOR3` never fuses
-// with PMULL. In the comments below, "µop" counts SIMD issue slots. Measured on an M4 P-core with a
-// cycle-calibrated microbenchmark: a fused pair issues at 4/cycle (0.25 cyc),
-// an unfused pair at 0.50 cyc, the fused pair's latency from the accumulator
-// input is 3 cycles, and vector `mov` is eliminated at rename. So an
-// accumulating product costs 1 µop when the PMULL writes a fresh register and
-// the adjacent EOR folds the old accumulator into it. The new accumulator
-// value lives in that fresh register; the old one dies, so register pressure
-// is unchanged and any loop-carried copy is a free rename.
-//
-// XOR is associative and commutative, so every accumulator holds exactly the
-// same bits as the EOR/EOR3 forms.
-// ---------------------------------------------------------------------------
-
-/// `acc ^ (a.lo * b.lo)` as one fused µop.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn fused_pmull_lo_acc(
-    acc: core::arch::aarch64::uint64x2_t,
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    let out: core::arch::aarch64::uint64x2_t;
-    // SAFETY: register-only carry-less multiply and XOR; `out` is an early
-    // clobber so the PMULL never overwrites `acc`, `a` or `b` before use.
-    unsafe {
-        core::arch::asm!(
-            "pmull {o:v}.1q, {a:v}.1d, {b:v}.1d",
-            "eor {o:v}.16b, {o:v}.16b, {c:v}.16b",
-            a = in(vreg) a,
-            b = in(vreg) b,
-            c = in(vreg) acc,
-            o = out(vreg) out,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-    out
-}
-
-/// `acc ^ (a.hi * b.hi)` as one fused µop.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn fused_pmull_hi_acc(
-    acc: core::arch::aarch64::uint64x2_t,
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    let out: core::arch::aarch64::uint64x2_t;
-    // SAFETY: as `fused_pmull_lo_acc`.
-    unsafe {
-        core::arch::asm!(
-            "pmull2 {o:v}.1q, {a:v}.2d, {b:v}.2d",
-            "eor {o:v}.16b, {o:v}.16b, {c:v}.16b",
-            a = in(vreg) a,
-            b = in(vreg) b,
-            c = in(vreg) acc,
-            o = out(vreg) out,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-    out
-}
-
-/// `acc ^ (a_sw.lo * b.lo) ^ (a_sw.hi * b.hi)` as two chained fused µops
-/// (the cross term of `a * b` when `a_sw = swap_halves_q(a)`).
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn fused_cross_acc(
-    acc: core::arch::aarch64::uint64x2_t,
-    a_sw: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    let out: core::arch::aarch64::uint64x2_t;
-    // SAFETY: register-only; `p` and `o` are early clobbers.
-    unsafe {
-        core::arch::asm!(
-            "pmull {p:v}.1q, {t:v}.1d, {b:v}.1d",
-            "eor {p:v}.16b, {p:v}.16b, {c:v}.16b",
-            "pmull2 {o:v}.1q, {t:v}.2d, {b:v}.2d",
-            "eor {o:v}.16b, {o:v}.16b, {p:v}.16b",
-            t = in(vreg) a_sw,
-            b = in(vreg) b,
-            c = in(vreg) acc,
-            p = out(vreg) _,
-            o = out(vreg) out,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-    out
-}
-
 /// `acc += a*b` in [`TriNeon`] form; the two cross products enter the cross
 /// accumulator through one `EOR3`.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn tri_acc_sw(
-    acc: &mut TriNeon,
-    a: core::arch::aarch64::uint64x2_t,
-    a_sw: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) {
-    // Fused form: four µops (four fused PMULL+EOR pairs).
-    unsafe {
-        acc.ll = fused_pmull_lo_acc(acc.ll, a, b);
-        acc.hh = fused_pmull_hi_acc(acc.hh, a, b);
-        acc.cross = fused_cross_acc(acc.cross, a_sw, b);
-    }
-}
-
-/// `acc += a*b` in [`TriNeon`] form; the two cross products enter the cross
-/// accumulator through one `EOR3`.
-#[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
+#[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn tri_acc_sw(
@@ -363,31 +205,6 @@ unsafe fn tri_acc_sw(
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[inline(always)]
 unsafe fn tri_acc_q(
-    acc: &mut TriNeon,
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) {
-    // Fused form: `ext` + four fused PMULL+EOR pairs = 5 µops per product
-    // (was 8: ext, 4 PMULL, 2 EOR, 1 EOR3 with nothing fused). Each
-    // accumulator is touched once per call, so the 3-cycle fused latency
-    // (6 on the cross chain) is far below the per-group issue time.
-    unsafe {
-        let a_sw = swap_halves_q(a);
-        acc.ll = fused_pmull_lo_acc(acc.ll, a, b);
-        acc.hh = fused_pmull_hi_acc(acc.hh, a, b);
-        acc.cross = fused_cross_acc(acc.cross, a_sw, b);
-    }
-}
-
-/// `acc += a*b` in [`TriNeon`] form as kaankolcu's single fixed sequence: one
-/// `EXT`, four `PMULL`s and three accumulating XORs (`EOR3` for the cross
-/// term) with only two scratch registers. Not fused, but its register
-/// footprint is minimal, which the cascade K pass needs: it holds eight
-/// [`TriNeon`] accumulators plus its table rows, and the fused form's fresh
-/// destinations measured 25% slower there.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn tri_acc_q_compact(
     acc: &mut TriNeon,
     a: core::arch::aarch64::uint64x2_t,
     b: core::arch::aarch64::uint64x2_t,
@@ -418,16 +235,6 @@ unsafe fn tri_acc_q_compact(
 
 #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
 #[inline(always)]
-unsafe fn tri_acc_q_compact(
-    acc: &mut TriNeon,
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) {
-    unsafe { tri_acc_sw(acc, a, swap_halves_q(a), b) }
-}
-
-#[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
-#[inline(always)]
 unsafe fn tri_acc_q(
     acc: &mut TriNeon,
     a: core::arch::aarch64::uint64x2_t,
@@ -448,10 +255,9 @@ unsafe fn mul_sw_q(
     use core::arch::aarch64::*;
     unsafe {
         let zero = vdupq_n_u64(0);
-        let t0 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
-        let t2 = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
+        let (t0, p01, p10, t2) = clmul_products_sw_q(a, a_sw, b);
         let t1 = xor3_u64(
-            cross_sum_q(a_sw, b),
+            veorq_u64(p01, p10),
             vextq_u64::<1>(zero, t2),
             pmull_lane(vgetq_lane_u64::<1>(t2), 0x87),
         );
@@ -475,9 +281,8 @@ unsafe fn mul_unreduced_sw_q(
     use core::arch::aarch64::*;
     unsafe {
         let zero = vdupq_n_u64(0);
-        let ll = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
-        let hh = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
-        let cross = cross_sum_q(a_sw, b);
+        let (ll, p01, p10, hh) = clmul_products_sw_q(a, a_sw, b);
+        let cross = veorq_u64(p01, p10);
         WideNeon {
             lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
             hi: veorq_u64(hh, vextq_u64::<1>(cross, zero)),
@@ -695,12 +500,10 @@ unsafe fn mul_sw_tri_binius_q(
 ) -> core::arch::aarch64::uint64x2_t {
     use core::arch::aarch64::*;
     unsafe {
-        let ll = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
-        let hh = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
-        let cross = cross_sum_q(a_sw, b);
+        let (ll, p01, p10, hh) = clmul_products_sw_q(a, a_sw, b);
         let t1 = xor3_u64(
             vextq_u64::<1>(ll, hh),
-            cross,
+            veorq_u64(p01, p10),
             pmull_lane(vgetq_lane_u64::<1>(hh), 0x87),
         );
         veorq_u64(
@@ -750,52 +553,7 @@ impl LookaheadTriAcc {
         b2: core::arch::aarch64::uint64x2_t,
         b3: core::arch::aarch64::uint64x2_t,
     ) {
-        unsafe { self.add_group_impl::<true>(wt, a0, a1, a2, a3, b0, b1, b2, b3) }
-    }
-
-    /// [`Self::add_group`] through [`tri_acc_q_compact`] (cascade K pass).
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn add_group_compact(
-        &mut self,
-        wt: core::arch::aarch64::uint64x2_t,
-        a0: core::arch::aarch64::uint64x2_t,
-        a1: core::arch::aarch64::uint64x2_t,
-        a2: core::arch::aarch64::uint64x2_t,
-        a3: core::arch::aarch64::uint64x2_t,
-        b0: core::arch::aarch64::uint64x2_t,
-        b1: core::arch::aarch64::uint64x2_t,
-        b2: core::arch::aarch64::uint64x2_t,
-        b3: core::arch::aarch64::uint64x2_t,
-    ) {
-        unsafe { self.add_group_impl::<false>(wt, a0, a1, a2, a3, b0, b1, b2, b3) }
-    }
-
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn add_group_impl<const FUSED: bool>(
-        &mut self,
-        wt: core::arch::aarch64::uint64x2_t,
-        a0: core::arch::aarch64::uint64x2_t,
-        a1: core::arch::aarch64::uint64x2_t,
-        a2: core::arch::aarch64::uint64x2_t,
-        a3: core::arch::aarch64::uint64x2_t,
-        b0: core::arch::aarch64::uint64x2_t,
-        b1: core::arch::aarch64::uint64x2_t,
-        b2: core::arch::aarch64::uint64x2_t,
-        b3: core::arch::aarch64::uint64x2_t,
-    ) {
         use core::arch::aarch64::*;
-        let acc_one = |t: &mut TriNeon, x: uint64x2_t, y: uint64x2_t| {
-            // SAFETY: register-only asm; the AES/SHA3 features hold for this build.
-            unsafe {
-                if FUSED {
-                    tri_acc_q(t, x, y)
-                } else {
-                    tri_acc_q_compact(t, x, y)
-                }
-            }
-        };
         unsafe {
             let wt_sw = swap_halves_q(wt);
             let a0w = mul_sw_tri_binius_q(wt, wt_sw, a0);
@@ -803,16 +561,16 @@ impl LookaheadTriAcc {
             let a2w = mul_sw_tri_binius_q(wt, wt_sw, a2);
             let a3w = mul_sw_tri_binius_q(wt, wt_sw, a3);
             let acc = &mut self.0;
-            acc_one(&mut acc[0], a1w, b1);
-            acc_one(&mut acc[1], veorq_u64(a0w, a1w), veorq_u64(b0, b1));
-            acc_one(&mut acc[2], a3w, b3);
-            acc_one(&mut acc[3], veorq_u64(a2w, a3w), veorq_u64(b2, b3));
-            acc_one(&mut acc[4], a2w, b2);
+            tri_acc_q(&mut acc[0], a1w, b1);
+            tri_acc_q(&mut acc[1], veorq_u64(a0w, a1w), veorq_u64(b0, b1));
+            tri_acc_q(&mut acc[2], a3w, b3);
+            tri_acc_q(&mut acc[3], veorq_u64(a2w, a3w), veorq_u64(b2, b3));
+            tri_acc_q(&mut acc[4], a2w, b2);
             let (e_aw, e_b) = (veorq_u64(a0w, a2w), veorq_u64(b0, b2));
             let (o_aw, o_b) = (veorq_u64(a1w, a3w), veorq_u64(b1, b3));
-            acc_one(&mut acc[5], e_aw, e_b);
-            acc_one(&mut acc[6], o_aw, o_b);
-            acc_one(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
+            tri_acc_q(&mut acc[5], e_aw, e_b);
+            tri_acc_q(&mut acc[6], o_aw, o_b);
+            tri_acc_q(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
         }
     }
 
@@ -977,6 +735,25 @@ unsafe fn fold_two_row_codes_q(
         acc0 = veorq_u64(acc0, load!(row0, 7));
         acc1 = veorq_u64(acc1, load!(row1, 7));
         (acc0, acc1)
+    }
+}
+
+/// One-row variant of [`fold_two_row_codes_q`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_row_code_q(table_data: *const u8, row: u64) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        macro_rules! load {
+            ($chunk:literal) => {
+                bank_load_q::<{ 8 * $chunk }>(table_data.add($chunk * STRIDE), row)
+            };
+        }
+        let acc = xor3_u64(load!(0), load!(1), load!(2));
+        let acc = xor3_u64(acc, load!(3), load!(4));
+        let acc = xor3_u64(acc, load!(5), load!(6));
+        veorq_u64(acc, load!(7))
     }
 }
 
@@ -1573,6 +1350,10 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 /// `eq_lo[2*u+1] = eq_lo[2*(first+t)+1] * x^b`. Each raw product has degree
 /// at most 254, so all 16 positions fit in 270 bits. The four fifth limbs
 /// share two q registers; anchors and deltas retain their canonical form.
+///
+/// `table_data` must be GF(2)-linear in each byte (`fold(x ^ y) = fold(x) +
+/// fold(y)`), as [`UniSkipFoldTable::new`] and `scaled_linear` build it: the
+/// odd rows are folded only as `a1 ^ a3` and `b1 ^ b3`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8(
@@ -1591,6 +1372,19 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8(
     out: *mut F128,
 ) {
     use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
 
     #[inline(always)]
     unsafe fn shift_pair(a: &mut WideNeon, b: &mut WideNeon, top: &mut uint64x2_t) {
@@ -1654,27 +1448,53 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8(
                         ((pair_idx_base + x_lo0) & pair_in_block_mask) >= useful_pairs_inclusive;
                     let pad1 =
                         ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
-                    let (a0, a1, a2, a3, b0, b1, b2, b3, deg0, deg1) = {
-                        let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                            table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen,
-                            b_ones, skip_dead,
-                        );
-                        let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                            table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen,
-                            b_ones, skip_dead,
-                        );
-                        (a0, a1, a2, a3, b0, b1, b2, b3, deg0, deg1)
+                    // One pair: fold and store its even rows, hand back its odd
+                    // row codes. A padded pair keeps its zero store and reads as
+                    // all-zero codes.
+                    let pair = |x_lo: usize, pad: bool| {
+                        if pad {
+                            if !skip_dead {
+                                store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
+                                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                            }
+                            return (zero, zero, 0u64, 0u64, false);
+                        }
+                        let a_row = a_packed.add(2 * x_lo * 8).cast::<u64>();
+                        let b_row = b_packed.add(2 * x_lo * 8).cast::<u64>();
+                        let a_even = u64::from_le(core::ptr::read_unaligned(a_row));
+                        let a_odd = u64::from_le(core::ptr::read_unaligned(a_row.add(1)));
+                        let b_even = u64::from_le(core::ptr::read_unaligned(b_row));
+                        let b_odd = u64::from_le(core::ptr::read_unaligned(b_row.add(1)));
+                        let deg = degen && (b_even & b_odd) == u64::MAX;
+                        let (a, b) = if deg {
+                            (fold_row_code_q(table_data, a_even), b_ones)
+                        } else {
+                            fold_two_row_codes_q(table_data, a_even, b_even)
+                        };
+                        store_anchor_pair_nt(anchors.add(2 * x_lo), a, b);
+                        let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
+                            a_even ^ a_odd,
+                            b_even ^ b_odd,
+                        ]);
+                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+                        (a, b, a_odd, b_odd, deg)
                     };
+                    let (a0, b0, a1c, b1c, deg0) = pair(x_lo0, pad0);
+                    let (a2, b2, a3c, b3c, deg1) = pair(x_lo1, pad1);
                     if pad0 & pad1 {
                         continue;
                     }
                     if deg0 & deg1 & ones_is_one {
+                        // b == 1 on all four rows: only `a2 * b2 = a2` survives.
                         w0.lo = veorq_u64(w0.lo, a2);
                     } else {
+                        // The fold is GF(2)-linear in the row code, so the odd
+                        // rows enter only through fold(a1 ^ a3) and fold(b1 ^ b3):
+                        // six row folds instead of eight. A degenerate pair's b
+                        // rows are all-ones codes, which fold to `b_ones`.
+                        let (o_a, o_b) = fold_two_row_codes_q(table_data, a1c ^ a3c, b1c ^ b3c);
                         let e_a = veorq_u64(a0, a2);
-                        let o_a = veorq_u64(a1, a3);
                         let e_b = veorq_u64(b0, b2);
-                        let o_b = veorq_u64(b1, b3);
                         if !pad1 {
                             wide_xor(&mut w0, mul_unreduced_sw_q(a2, swap_halves_q(a2), b2));
                         }
@@ -1746,8 +1566,8 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
         let zero = vdupq_n_u64(0);
         let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
         let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
-        let mut p1_acc = TriNeon { ll: zero, cross: zero, hh: zero };
-        let mut pinf_acc = TriNeon { ll: zero, cross: zero, hh: zero };
+        let mut p1_acc = WideNeon { lo: zero, hi: zero };
+        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
 
         for u in 0..out_pairs {
             let mut av = [zero; 2];
@@ -1805,23 +1625,23 @@ pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
                 } else {
                     mul_q(av[1], bv[1])
                 };
-                tri_acc_q(&mut p1_acc, eq_l, g1);
+                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
                 let b_sum = veorq_u64(bv[0], bv[1]);
                 if !is_zero_q(b_sum) {
                     let g_inf = mul_q(veorq_u64(av[0], av[1]), b_sum);
-                    tri_acc_q(&mut pinf_acc, eq_l, g_inf);
+                    wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
                 }
             } else {
                 let g1 = mul_q(av[1], bv[1]);
                 let g_inf = mul_q(veorq_u64(av[0], av[1]), veorq_u64(bv[0], bv[1]));
-                tri_acc_q(&mut p1_acc, eq_l, g1);
-                tri_acc_q(&mut pinf_acc, eq_l, g_inf);
+                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
+                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
             }
         }
 
         (
-            core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(p1_acc)),
-            core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(pinf_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
+            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
         )
     }
 }
@@ -1972,16 +1792,16 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8<const DEAD_TAIL: boo
                         vorrq_u64(veorq_u64(bv[2], one_q), veorq_u64(bv[3], one_q)),
                     );
                     if is_zero_q(ones_miss) {
-                        tri_acc_q_compact(&mut acc.0[0], w, av[1]);
-                        tri_acc_q_compact(&mut acc.0[2], w, av[3]);
-                        tri_acc_q_compact(&mut acc.0[4], w, av[2]);
+                        tri_acc_q(&mut acc.0[0], w, av[1]);
+                        tri_acc_q(&mut acc.0[2], w, av[3]);
+                        tri_acc_q(&mut acc.0[4], w, av[2]);
                         continue;
                     }
                 }
 
                 // Weight-sharing reshape: four reduced row scalings sharing
                 // one swap of w, then eight unreduced products in tri form.
-                acc.add_group_compact(w, av[0], av[1], av[2], av[3], bv[0], bv[1], bv[2], bv[3]);
+                acc.add_group(w, av[0], av[1], av[2], av[3], bv[0], bv[1], bv[2], bv[3]);
             }};
         }
 
@@ -2667,8 +2487,8 @@ fn fold_and_message_body<const NT: bool>(
         }
     }
 
-    let mut p1_acc = ProdAcc::ZERO;
-    let mut pinf_acc = ProdAcc::ZERO;
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
 
     let a_out_ptr = a_out.as_mut_ptr();
     let b_out_ptr = b_out.as_mut_ptr();
@@ -2713,8 +2533,8 @@ fn fold_and_message_body<const NT: bool>(
             b_out[o + 1] = b1;
         }
 
-        p1_acc.fma(eq_l, a1 * b1);
-        pinf_acc.fma(eq_l, (a0 + a1) * (b0 + b1));
+        p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+        pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
     }
 
     (p1_acc.reduce(), pinf_acc.reduce())
@@ -2783,8 +2603,8 @@ fn fold2_and_message_body<const NT: bool>(
 
     let rho_ab = rho_a * rho_b;
 
-    let mut p1_acc = ProdAcc::ZERO;
-    let mut pinf_acc = ProdAcc::ZERO;
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
 
     let a_out_ptr = a_out.as_mut_ptr();
     let b_out_ptr = b_out.as_mut_ptr();
@@ -2820,8 +2640,8 @@ fn fold2_and_message_body<const NT: bool>(
             b_out[o + 1] = b1;
         }
 
-        p1_acc.fma(eq_l, a1 * b1);
-        pinf_acc.fma(eq_l, (a0 + a1) * (b0 + b1));
+        p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+        pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
     }
 
     (p1_acc.reduce(), pinf_acc.reduce())
@@ -2864,8 +2684,8 @@ pub(crate) fn fold2_and_message_normal_expanded_aarch64(
             core::mem::transmute::<F128, uint64x2_t>(rho_ab),
         )
     };
-    let mut p1_acc = ProdAcc::ZERO;
-    let mut pinf_acc = ProdAcc::ZERO;
+    let mut p1_acc = F256Unreduced::ZERO;
+    let mut pinf_acc = F256Unreduced::ZERO;
 
     for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
         let i = 8 * x_lo;
@@ -2893,8 +2713,8 @@ pub(crate) fn fold2_and_message_normal_expanded_aarch64(
         b_out[o + 1] = b1;
 
         // Exactly the incumbent direct message algebra.
-        p1_acc.fma(eq_l, a1 * b1);
-        pinf_acc.fma(eq_l, (a0 + a1) * (b0 + b1));
+        p1_acc ^= eq_l.mul_unreduced(a1 * b1);
+        pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
     }
 
     (p1_acc.reduce(), pinf_acc.reduce())
@@ -2960,7 +2780,7 @@ fn fold2_and_message_lookahead_body<const NT: bool>(
 
     let rho_ab = rho_a * rho_b;
 
-    let mut acc = [ProdAcc::ZERO; 8];
+    let mut acc = [F256Unreduced::ZERO; 8];
 
     let a_out_ptr = a_out.as_mut_ptr();
     let b_out_ptr = b_out.as_mut_ptr();
@@ -3017,16 +2837,16 @@ fn fold2_and_message_lookahead_body<const NT: bool>(
         // zero-extra-multiplies parity trick as the cascade K pass.
         let wt = eq_lo[2 * t + 1];
         let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
-        acc[0].fma(a1w, b1);
-        acc[1].fma(a0w + a1w, b0 + b1);
-        acc[2].fma(a3w, b3);
-        acc[3].fma(a2w + a3w, b2 + b3);
-        acc[4].fma(a2w, b2);
+        acc[0] ^= a1w.mul_unreduced(b1);
+        acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
+        acc[2] ^= a3w.mul_unreduced(b3);
+        acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
+        acc[4] ^= a2w.mul_unreduced(b2);
         let (e_aw, e_b) = (a0w + a2w, b0 + b2);
         let (o_aw, o_b) = (a1w + a3w, b1 + b3);
-        acc[5].fma(e_aw, e_b);
-        acc[6].fma(o_aw, o_b);
-        acc[7].fma(e_aw + o_aw, e_b + o_b);
+        acc[5] ^= e_aw.mul_unreduced(e_b);
+        acc[6] ^= o_aw.mul_unreduced(o_b);
+        acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
     }
 
     [
@@ -3321,10 +3141,18 @@ mod tests {
             .enumerate()
         {
             let mut table = UniSkipFoldTable::new(6, z);
-            // An arbitrary table exercises the guard when fold(all-ones) != 1.
+            // A random linear table exercises the guard when fold(all-ones) != 1.
             if z_case == 3 {
-                for value in &mut table.data {
-                    *value = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                for bank in table.data.chunks_mut(256) {
+                    for bit in 0..8 {
+                        bank[1 << bit] = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+                    }
+                    for value in 3usize..256 {
+                        if !value.is_power_of_two() {
+                            let low = value & value.wrapping_neg();
+                            bank[value] = bank[value ^ low] + bank[low];
+                        }
+                    }
                 }
             }
             for challenge_case in 0..6 {
@@ -3730,65 +3558,5 @@ mod tests {
                 }
             }
         }
-    }
-}
-
-/// Accumulator of unreduced F128 products for the generic sumcheck kernels:
-/// `acc.fma(a, b)` is `acc ^= a.mul_unreduced(b)` and `acc.reduce()` is
-/// `F256Unreduced::reduce`. Here it keeps the three partial-product sums of
-/// [`TriNeon`] and accumulates with the fused [`tri_acc_q`] (5 µops per
-/// product). The reduced value is identical: the tri-to-wide map is linear
-/// over XOR and `reduce_wide_q` is the same GHASH reduction.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-#[derive(Clone, Copy)]
-pub(crate) struct ProdAcc(TriNeon);
-
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-impl ProdAcc {
-    // SAFETY: an all-zero bit pattern is a valid `uint64x2_t`.
-    const Z: core::arch::aarch64::uint64x2_t =
-        unsafe { core::mem::transmute::<[u64; 2], core::arch::aarch64::uint64x2_t>([0, 0]) };
-    pub(crate) const ZERO: Self = Self(TriNeon {
-        ll: Self::Z,
-        cross: Self::Z,
-        hh: Self::Z,
-    });
-
-    #[inline(always)]
-    pub(crate) fn fma(&mut self, a: F128, b: F128) {
-        // SAFETY: F128 and uint64x2_t are both 16 plain bytes; register-only asm.
-        unsafe {
-            tri_acc_q(
-                &mut self.0,
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(a),
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(b),
-            );
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn reduce(self) -> F128 {
-        // SAFETY: as above.
-        unsafe { core::mem::transmute::<core::arch::aarch64::uint64x2_t, F128>(reduce_tri_q(self.0)) }
-    }
-}
-
-/// Generic-AArch64 (no SHA3) twin: the plain `F256Unreduced` accumulator.
-#[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
-#[derive(Clone, Copy)]
-pub(crate) struct ProdAcc(F256Unreduced);
-
-#[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
-impl ProdAcc {
-    pub(crate) const ZERO: Self = Self(F256Unreduced::ZERO);
-
-    #[inline(always)]
-    pub(crate) fn fma(&mut self, a: F128, b: F128) {
-        self.0 ^= a.mul_unreduced(b);
-    }
-
-    #[inline(always)]
-    pub(crate) fn reduce(self) -> F128 {
-        self.0.reduce()
     }
 }

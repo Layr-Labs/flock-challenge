@@ -393,7 +393,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
             ($k:literal) => {{
                 let off = byte_base_b + $k * N_CHUNKS;
                 if FAST {
-                    fused_apply_one_k_fast::<0, { $k & 2 != 0 }>(
+                    fused_apply_one_k_fast::<{ $k & 1 }, { $k & 2 != 0 }>(
                         if $k & 4 != 0 { scaled_base } else { table_base },
                         if $k & 4 != 0 {
                             scaled_half_swapped_base
@@ -438,68 +438,7 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                 let b_row = b_packed.as_ptr().add(off);
                 let (m, e) = BSTATIC_MASKS[blk][$k];
                 let b_word = u64::from_le(core::ptr::read_unaligned(b_row.cast::<u64>()));
-                if FAST {
-                    // One accumulate per row: pick the b image (static
-                    // partials or the generic table lookup) first, so the
-                    // fused product block is emitted once per row.
-                    let (db0, db1, db2, db3) = if (b_word & m) == e {
-                        let pp = partials[blk * 8 + $k].as_ptr();
-                        #[allow(unused_mut)]
-                        let mut db0 = vld1q_u8(pp);
-                        #[allow(unused_mut)]
-                        let mut db1 = vld1q_u8(pp.add(16));
-                        #[allow(unused_mut)]
-                        let mut db2 = vld1q_u8(pp.add(32));
-                        #[allow(unused_mut)]
-                        let mut db3 = vld1q_u8(pp.add(48));
-                        $(
-                            xor_vary_pair::<$j0, $j1>(
-                                table_base,
-                                half_swapped_table_base,
-                                b_word,
-                                &mut db0,
-                                &mut db1,
-                                &mut db2,
-                                &mut db3,
-                            );
-                        )*
-                        $(
-                            xor_vary_single::<$js>(
-                                table_base,
-                                half_swapped_table_base,
-                                b_word,
-                                &mut db0,
-                                &mut db1,
-                                &mut db2,
-                                &mut db3,
-                            );
-                        )*
-                        (db0, db1, db2, db3)
-                    } else {
-                        apply_word_into_4_regs(table_base, half_swapped_table_base, b_word)
-                    };
-                    fused_apply_one_k_with_b_fast::<0, { $k & 2 != 0 }>(
-                        if $k & 4 != 0 { scaled_base } else { table_base },
-                        if $k & 4 != 0 {
-                            scaled_half_swapped_base
-                        } else {
-                            half_swapped_table_base
-                        },
-                        a_row,
-                        db0,
-                        db1,
-                        db2,
-                        db3,
-                        &mut acc0_lo,
-                        &mut acc0_hi,
-                        &mut acc1_lo,
-                        &mut acc1_hi,
-                        &mut acc2_lo,
-                        &mut acc2_hi,
-                        &mut acc3_lo,
-                        &mut acc3_hi,
-                    );
-                } else if (b_word & m) == e {
+                if (b_word & m) == e {
                     let pp = partials[blk * 8 + $k].as_ptr();
                     #[allow(unused_mut)]
                     let mut db0 = vld1q_u8(pp);
@@ -531,389 +470,362 @@ pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
                             &mut db3,
                         );
                     )*
-                    fused_apply_one_k_with_b::<$k>(
-                        table_base,
-                        half_swapped_table_base,
-                        a_row,
-                        db0,
-                        db1,
-                        db2,
-                        db3,
-                        &mut acc0_lo,
-                        &mut acc0_hi,
-                        &mut acc1_lo,
-                        &mut acc1_hi,
-                        &mut acc2_lo,
-                        &mut acc2_hi,
-                        &mut acc3_lo,
-                        &mut acc3_hi,
-                    );
+                    if FAST {
+                        fused_apply_one_k_with_b_fast::<{ $k & 1 }, { $k & 2 != 0 }>(
+                            if $k & 4 != 0 { scaled_base } else { table_base },
+                            if $k & 4 != 0 {
+                                scaled_half_swapped_base
+                            } else {
+                                half_swapped_table_base
+                            },
+                            a_row,
+                            db0,
+                            db1,
+                            db2,
+                            db3,
+                            &mut acc0_lo,
+                            &mut acc0_hi,
+                            &mut acc1_lo,
+                            &mut acc1_hi,
+                            &mut acc2_lo,
+                            &mut acc2_hi,
+                            &mut acc3_lo,
+                            &mut acc3_hi,
+                        );
+                    } else {
+                        fused_apply_one_k_with_b::<$k>(
+                            table_base,
+                            half_swapped_table_base,
+                            a_row,
+                            db0,
+                            db1,
+                            db2,
+                            db3,
+                            &mut acc0_lo,
+                            &mut acc0_hi,
+                            &mut acc1_lo,
+                            &mut acc1_hi,
+                            &mut acc2_lo,
+                            &mut acc2_hi,
+                            &mut acc3_lo,
+                            &mut acc3_hi,
+                        );
+                    }
                 } else {
                     k_generic!($k);
                 }
             }};
         }
-        // FAST rows accumulate raw (unshifted) products. Odd K rows run
-        // first, then every accumulator is multiplied by x once (a 1-bit
-        // lane shift; raw products are at most 15 bits, so nothing leaves
-        // the 16-bit lane), then the even K rows. Σ shl1(p_odd) ⊕ Σ p_even
-        // equals the per-product shl1 form bit for bit, and every product
-        // accumulates as one fused PMULL+EOR µop.
-        macro_rules! odd_shift {
-            () => {{
-                if FAST {
-                    acc0_lo = vshlq_n_u16::<1>(acc0_lo);
-                    acc0_hi = vshlq_n_u16::<1>(acc0_hi);
-                    acc1_lo = vshlq_n_u16::<1>(acc1_lo);
-                    acc1_hi = vshlq_n_u16::<1>(acc1_hi);
-                    acc2_lo = vshlq_n_u16::<1>(acc2_lo);
-                    acc2_hi = vshlq_n_u16::<1>(acc2_hi);
-                    acc3_lo = vshlq_n_u16::<1>(acc3_lo);
-                    acc3_hi = vshlq_n_u16::<1>(acc3_hi);
-                }
-            }};
-        }
         match blk {
             0 => {
-                k_static!(1, [], []);
-                k_static!(3, [], []);
-                k_static!(5, [], []);
-                k_static!(7, [], []);
-                odd_shift!();
                 k_static!(0, [], []);
+                k_static!(1, [], []);
                 k_static!(2, [], []);
+                k_static!(3, [], []);
                 k_static!(4, [], []);
+                k_static!(5, [], []);
                 k_static!(6, [], []);
+                k_static!(7, [], []);
             }
             1 => {
-                k_static!(1, [], []);
-                k_static!(3, [], []);
-                k_static!(5, [], []);
-                k_static!(7, [], []);
-                odd_shift!();
                 k_static!(0, [], []);
+                k_static!(1, [], []);
                 k_static!(2, [], []);
+                k_static!(3, [], []);
                 k_static!(4, [], []);
+                k_static!(5, [], []);
                 k_static!(6, [], []);
+                k_static!(7, [], []);
             }
             2 => {
-                k_static!(1, [], []);
-                k_generic!(3);
-                k_static!(5, [], [7]);
-                k_generic!(7);
-                odd_shift!();
                 k_static!(0, [], []);
+                k_static!(1, [], []);
                 k_generic!(2);
+                k_generic!(3);
                 k_generic!(4);
+                k_static!(5, [], [7]);
                 k_generic!(6);
+                k_generic!(7);
             }
             3 => {
-                k_static!(1, [(6, 7)], []);
-                k_generic!(3);
-                k_static!(5, [(5, 6)], [7]);
-                k_generic!(7);
-                odd_shift!();
                 k_generic!(0);
+                k_static!(1, [(6, 7)], []);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [(0, 1), (2, 3), (4, 5)], []);
+                k_static!(5, [(5, 6)], [7]);
                 k_generic!(6);
+                k_generic!(7);
             }
             4 => {
-                k_static!(1, [(5, 6)], [7]);
-                k_generic!(3);
-                k_static!(5, [(4, 5), (6, 7)], []);
-                k_generic!(7);
-                odd_shift!();
                 k_static!(0, [(0, 1), (2, 3), (4, 5)], []);
+                k_static!(1, [(5, 6)], [7]);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [(0, 1), (2, 3)], [4]);
+                k_static!(5, [(4, 5), (6, 7)], []);
                 k_generic!(6);
+                k_generic!(7);
             }
             5 => {
-                k_static!(1, [(3, 4), (5, 6)], [7]);
-                k_generic!(3);
-                k_static!(5, [(2, 3), (4, 5), (6, 7)], []);
-                k_generic!(7);
-                odd_shift!();
                 k_static!(0, [(0, 1), (2, 3)], []);
+                k_static!(1, [(3, 4), (5, 6)], [7]);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [(0, 1)], [2]);
+                k_static!(5, [(2, 3), (4, 5), (6, 7)], []);
                 k_generic!(6);
+                k_generic!(7);
             }
             6 => {
-                k_static!(1, [(2, 3), (4, 5), (6, 7)], []);
-                k_generic!(3);
-                k_generic!(5);
-                k_generic!(7);
-                odd_shift!();
                 k_static!(0, [(0, 1)], [2]);
+                k_static!(1, [(2, 3), (4, 5), (6, 7)], []);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [(0, 1)], []);
+                k_generic!(5);
                 k_generic!(6);
+                k_generic!(7);
             }
             7 => {
-                k_generic!(1);
-                k_generic!(3);
-                k_generic!(5);
-                k_generic!(7);
-                odd_shift!();
                 k_static!(0, [], [0]);
+                k_generic!(1);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [], [7]);
+                k_generic!(5);
                 k_generic!(6);
+                k_generic!(7);
             }
             8 => {
-                k_generic!(1);
-                k_generic!(3);
-                k_generic!(5);
-                k_static!(7, [(0, 1), (2, 3), (4, 5)], []);
-                odd_shift!();
                 k_static!(0, [], [7]);
+                k_generic!(1);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [(6, 7)], []);
+                k_generic!(5);
                 k_generic!(6);
+                k_static!(7, [(0, 1), (2, 3), (4, 5)], []);
             }
             9 => {
-                k_generic!(1);
-                k_static!(3, [(0, 1), (2, 3)], [4]);
-                k_generic!(5);
-                k_static!(7, [(0, 1), (2, 3)], [4]);
-                odd_shift!();
                 k_static!(0, [(5, 6)], [7]);
+                k_generic!(1);
                 k_generic!(2);
+                k_static!(3, [(0, 1), (2, 3)], [4]);
                 k_static!(4, [(4, 5), (6, 7)], []);
+                k_generic!(5);
                 k_generic!(6);
+                k_static!(7, [(0, 1), (2, 3)], [4]);
             }
             10 => {
-                k_generic!(1);
-                k_static!(3, [(0, 1), (2, 3)], []);
-                k_generic!(5);
-                k_static!(7, [(0, 1)], [2]);
-                odd_shift!();
                 k_static!(0, [(4, 5), (6, 7)], []);
+                k_generic!(1);
                 k_generic!(2);
+                k_static!(3, [(0, 1), (2, 3)], []);
                 k_static!(4, [(3, 4), (5, 6)], [7]);
+                k_generic!(5);
                 k_generic!(6);
+                k_static!(7, [(0, 1)], [2]);
             }
             11 => {
-                k_generic!(1);
-                k_static!(3, [(0, 1)], []);
-                k_generic!(5);
-                k_static!(7, [(0, 1)], []);
-                odd_shift!();
                 k_static!(0, [(2, 3), (4, 5), (6, 7)], []);
+                k_generic!(1);
                 k_generic!(2);
+                k_static!(3, [(0, 1)], []);
                 k_generic!(4);
+                k_generic!(5);
                 k_generic!(6);
+                k_static!(7, [(0, 1)], []);
             }
             12 => {
-                k_generic!(1);
-                k_static!(3, [], [0]);
-                k_generic!(5);
-                k_static!(7, [], [7]);
-                odd_shift!();
                 k_generic!(0);
+                k_generic!(1);
                 k_generic!(2);
+                k_static!(3, [], [0]);
                 k_generic!(4);
+                k_generic!(5);
                 k_generic!(6);
+                k_static!(7, [], [7]);
             }
             13 => {
-                k_generic!(1);
-                k_static!(3, [(6, 7)], []);
-                k_generic!(5);
-                k_static!(7, [(6, 7)], []);
-                odd_shift!();
                 k_generic!(0);
+                k_generic!(1);
                 k_generic!(2);
+                k_static!(3, [(6, 7)], []);
                 k_generic!(4);
+                k_generic!(5);
                 k_generic!(6);
+                k_static!(7, [(6, 7)], []);
             }
             14 => {
-                k_generic!(1);
-                k_static!(3, [(5, 6)], [7]);
-                k_generic!(5);
-                k_static!(7, [(4, 5), (6, 7)], []);
-                odd_shift!();
                 k_generic!(0);
+                k_generic!(1);
                 k_static!(2, [(0, 1), (2, 3), (4, 5)], []);
+                k_static!(3, [(5, 6)], [7]);
                 k_generic!(4);
+                k_generic!(5);
                 k_static!(6, [(0, 1), (2, 3)], [4]);
+                k_static!(7, [(4, 5), (6, 7)], []);
             }
             15 => {
-                k_generic!(1);
-                k_static!(3, [(3, 4), (5, 6)], [7]);
-                k_generic!(5);
-                k_static!(7, [(3, 4), (5, 6)], [7]);
-                odd_shift!();
                 k_generic!(0);
+                k_generic!(1);
                 k_static!(2, [(0, 1), (2, 3)], []);
+                k_static!(3, [(3, 4), (5, 6)], [7]);
                 k_generic!(4);
+                k_generic!(5);
                 k_static!(6, [(0, 1), (2, 3)], []);
+                k_static!(7, [(3, 4), (5, 6)], [7]);
             }
             16 => {
-                k_generic!(1);
-                k_static!(3, [(2, 3), (4, 5), (6, 7)], []);
-                k_generic!(5);
-                k_generic!(7);
-                odd_shift!();
                 k_generic!(0);
+                k_generic!(1);
                 k_static!(2, [(0, 1)], [2]);
+                k_static!(3, [(2, 3), (4, 5), (6, 7)], []);
                 k_generic!(4);
+                k_generic!(5);
                 k_static!(6, [(0, 1)], []);
+                k_generic!(7);
             }
             17 => {
-                k_generic!(1);
-                k_generic!(3);
-                k_generic!(5);
-                k_generic!(7);
-                odd_shift!();
                 k_generic!(0);
+                k_generic!(1);
                 k_static!(2, [], [0]);
+                k_generic!(3);
                 k_generic!(4);
+                k_generic!(5);
                 k_static!(6, [], [0]);
+                k_generic!(7);
             }
             18 => {
-                k_generic!(1);
-                k_generic!(3);
-                k_generic!(5);
-                k_generic!(7);
-                odd_shift!();
                 k_generic!(0);
+                k_generic!(1);
                 k_static!(2, [], [7]);
+                k_generic!(3);
                 k_generic!(4);
+                k_generic!(5);
                 k_static!(6, [(6, 7)], []);
+                k_generic!(7);
             }
             19 => {
-                k_static!(1, [(0, 1), (2, 3), (4, 5)], []);
-                k_generic!(3);
-                k_static!(5, [(0, 1), (2, 3), (4, 5)], []);
-                k_generic!(7);
-                odd_shift!();
                 k_generic!(0);
+                k_static!(1, [(0, 1), (2, 3), (4, 5)], []);
                 k_static!(2, [(5, 6)], [7]);
+                k_generic!(3);
                 k_generic!(4);
+                k_static!(5, [(0, 1), (2, 3), (4, 5)], []);
                 k_static!(6, [(5, 6)], [7]);
+                k_generic!(7);
             }
             20 => {
-                k_static!(1, [(0, 1), (2, 3)], [4]);
-                k_generic!(3);
-                k_static!(5, [(0, 1), (2, 3)], []);
-                k_generic!(7);
-                odd_shift!();
                 k_generic!(0);
+                k_static!(1, [(0, 1), (2, 3)], [4]);
                 k_static!(2, [(4, 5), (6, 7)], []);
+                k_generic!(3);
                 k_generic!(4);
+                k_static!(5, [(0, 1), (2, 3)], []);
                 k_static!(6, [(3, 4), (5, 6)], [7]);
+                k_generic!(7);
             }
             21 => {
-                k_static!(1, [(0, 1)], [2]);
-                k_generic!(3);
-                k_static!(5, [(0, 1)], [2]);
-                k_generic!(7);
-                odd_shift!();
                 k_generic!(0);
+                k_static!(1, [(0, 1)], [2]);
                 k_static!(2, [(2, 3), (4, 5), (6, 7)], []);
+                k_generic!(3);
                 k_generic!(4);
+                k_static!(5, [(0, 1)], [2]);
                 k_static!(6, [(2, 3), (4, 5), (6, 7)], []);
+                k_generic!(7);
             }
             22 => {
-                k_static!(1, [(0, 1)], []);
-                k_generic!(3);
-                k_static!(5, [], [0]);
-                k_generic!(7);
-                odd_shift!();
                 k_generic!(0);
+                k_static!(1, [(0, 1)], []);
                 k_generic!(2);
+                k_generic!(3);
                 k_generic!(4);
+                k_static!(5, [], [0]);
                 k_generic!(6);
+                k_generic!(7);
             }
             23 => {
-                k_static!(1, [], [7]);
-                k_generic!(3);
-                k_static!(5, [], [7]);
-                k_generic!(7);
-                odd_shift!();
                 k_generic!(0);
+                k_static!(1, [], [7]);
                 k_generic!(2);
+                k_generic!(3);
                 k_generic!(4);
+                k_static!(5, [], [7]);
                 k_generic!(6);
+                k_generic!(7);
             }
             24 => {
-                k_static!(1, [(6, 7)], []);
-                k_generic!(3);
-                k_static!(5, [(5, 6)], [7]);
-                k_generic!(7);
-                odd_shift!();
                 k_generic!(0);
+                k_static!(1, [(6, 7)], []);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [(0, 1), (2, 3), (4, 5)], []);
+                k_static!(5, [(5, 6)], [7]);
                 k_generic!(6);
+                k_generic!(7);
             }
             25 => {
-                k_static!(1, [(4, 5), (6, 7)], []);
-                k_generic!(3);
-                k_static!(5, [(4, 5), (6, 7)], []);
-                k_generic!(7);
-                odd_shift!();
                 k_static!(0, [(0, 1), (2, 3)], [4]);
+                k_static!(1, [(4, 5), (6, 7)], []);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [(0, 1), (2, 3)], [4]);
+                k_static!(5, [(4, 5), (6, 7)], []);
                 k_generic!(6);
+                k_generic!(7);
             }
             26 => {
-                k_static!(1, [(3, 4), (5, 6)], [7]);
-                k_generic!(3);
-                k_static!(5, [(2, 3), (4, 5), (6, 7)], []);
-                k_generic!(7);
-                odd_shift!();
                 k_static!(0, [(0, 1), (2, 3)], []);
+                k_static!(1, [(3, 4), (5, 6)], [7]);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [(0, 1)], [2]);
+                k_static!(5, [(2, 3), (4, 5), (6, 7)], []);
                 k_generic!(6);
+                k_generic!(7);
             }
             27 => {
-                k_generic!(1);
-                k_generic!(3);
-                k_generic!(5);
-                k_generic!(7);
-                odd_shift!();
                 k_static!(0, [(0, 1)], []);
+                k_generic!(1);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [(0, 1)], []);
+                k_generic!(5);
                 k_generic!(6);
+                k_generic!(7);
             }
             28 => {
-                k_generic!(1);
-                k_generic!(3);
-                k_generic!(5);
-                k_generic!(7);
-                odd_shift!();
                 k_static!(0, [], [0]);
+                k_generic!(1);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [], [7]);
+                k_generic!(5);
                 k_generic!(6);
+                k_generic!(7);
             }
             29 => {
-                k_generic!(1);
-                k_generic!(3);
-                k_static!(5, [], []);
-                k_static!(7, [], []);
-                odd_shift!();
                 k_static!(0, [(6, 7)], []);
+                k_generic!(1);
                 k_generic!(2);
+                k_generic!(3);
                 k_static!(4, [], []);
+                k_static!(5, [], []);
                 k_static!(6, [], []);
+                k_static!(7, [], []);
             }
             30 => {
-                k_static!(1, [], []);
-                k_static!(3, [], []);
-                k_static!(5, [], []);
-                k_static!(7, [], []);
-                odd_shift!();
                 k_static!(0, [], []);
+                k_static!(1, [], []);
                 k_static!(2, [], []);
+                k_static!(3, [], []);
                 k_static!(4, [], []);
+                k_static!(5, [], []);
                 k_static!(6, [], []);
+                k_static!(7, [], []);
             }
             _ => return false,
         }

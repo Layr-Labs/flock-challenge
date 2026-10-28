@@ -1130,7 +1130,7 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
     let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
     let eq_rest = build_eq_table(x_inner_rest);
     let total = ell_skip * ell_rest;
-    let mut out = crate::scratch::take_lincheck_eq(total);
+    let mut out = crate::alloc_uninit_f128_vec(total);
     // Layout: index = i_skip + i_inner_rest · 2^k_skip  ⇒  i_skip is low bits.
     for (row, &er) in out.chunks_exact_mut(ell_skip).zip(eq_rest.iter()) {
         for (dst, &ls) in row.iter_mut().zip(lambda_skip.iter()) {
@@ -1547,7 +1547,7 @@ fn prove_padded_inner<Ch: Challenger>(
         if let Some((col, beta)) = beta_pin {
             comb_vec[col] += beta;
         }
-        (comb_vec, eq_inner)
+        comb_vec
     };
     let z_branch = || {
         let t = if trace {
@@ -1572,26 +1572,18 @@ fn prove_padded_inner<Ch: Challenger>(
         }
         z_vec
     };
-    let ((mut comb_vec, eq_inner), mut z_vec) =
-        if std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some() {
-            (comb_branch(), z_branch())
-        } else {
-            rayon::join(comb_branch, z_branch)
-        };
-    // 3b. Optional capture: copy the pre-sumcheck z_vec into the dead eq_inner
-    //     allocation for downstream reuse (PCS open's AB-claim s_hat_v skipping
-    //     fold_1b_rows), avoiding a fresh 2^k_log F128 allocation.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec && eq_inner.len() == z_vec.len() {
-        let mut cap = eq_inner;
-        cap.copy_from_slice(&z_vec);
-        Some(cap)
+    let (mut comb_vec, mut z_vec) = if std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some() {
+        (comb_branch(), z_branch())
     } else {
-        crate::scratch::give_lincheck_eq(eq_inner);
-        if capture_z_vec {
-            Some(z_vec.clone())
-        } else {
-            None
-        }
+        rayon::join(comb_branch, z_branch)
+    };
+    // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
+    //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
+    //     clone when explicitly requested.
+    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
+        Some(z_vec.clone())
+    } else {
+        None
     };
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
@@ -1623,12 +1615,12 @@ fn prove_padded_inner<Ch: Challenger>(
                 e1 = ne1;
                 einf = neinf;
             } else {
-                // Final round: just fold z_vec to z_partial (comb_vec is dead).
+                // Final round: just fold; z_vec collapses to z_partial.
+                sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
         }
     }
-    crate::scratch::give_lincheck_acc(comb_vec, k);
     if let Some(t) = t_sumcheck_start {
         eprintln!(
             "[lc] {:<26} {:>7.2} ms",
@@ -1639,7 +1631,6 @@ fn prove_padded_inner<Ch: Challenger>(
 
     // 6. Send `z_partial` (the post-sumcheck collapsed z_vec). Length 2^k_skip.
     let z_partial = z_vec.clone();
-    crate::scratch::give_lincheck_z_vec(z_vec);
     challenger.observe_f128_slice(&z_partial);
 
     // 7. Sample fresh z_skip AFTER observing z_partial — gives Schwartz-Zippel
@@ -1757,7 +1748,6 @@ pub fn verify<Ch: Challenger>(
     }
     let t = std::time::Instant::now();
     let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
-    crate::scratch::give_lincheck_eq(eq_inner);
     if trace {
         eprintln!(
             "        [lcv] circuit.fold_alpha_batched: {}",
@@ -1808,7 +1798,6 @@ pub fn verify<Ch: Challenger>(
     //    must equal the running claim. Ties z_partial to the upstream v_a, v_b.
     //    Small (length 2^k_skip = 64); sequential.
     let final_sum = inner_product(&comb_vec, &proof.z_partial);
-    crate::scratch::give_lincheck_acc(comb_vec, k);
     if running != final_sum {
         return Err(VerifyError::ConsistencyFailed {
             which: "sumcheck-final",

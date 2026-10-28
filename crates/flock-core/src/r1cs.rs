@@ -182,36 +182,6 @@ impl BlockR1cs {
     /// that A's evaluated prefix equals C; the packed-value producer must
     /// provide that separate invariant.
     pub fn round1_pinned_one_prefix_statement(&self) -> Option<Round1PinnedOnePrefixStatement> {
-        if let Some(digest) = self.digest_cache.get()
-            && let Some(is_id) = cached_c0_identity(digest)
-        {
-            if !is_id {
-                return None;
-            }
-            static PRIMARY_PREFIX_STMT: OnceLock<(
-                [u8; 32],
-                Option<usize>,
-                Option<Round1PinnedOnePrefixStatement>,
-            )> = OnceLock::new();
-            let entry = PRIMARY_PREFIX_STMT.get_or_init(|| {
-                (
-                    *digest,
-                    self.const_pin,
-                    self.round1_pinned_one_prefix_statement_scan(true),
-                )
-            });
-            if entry.0 == *digest && entry.1 == self.const_pin {
-                return entry.2;
-            }
-            return self.round1_pinned_one_prefix_statement_scan(true);
-        }
-        self.round1_pinned_one_prefix_statement_scan(false)
-    }
-
-    fn round1_pinned_one_prefix_statement_scan(
-        &self,
-        c0_verified_identity: bool,
-    ) -> Option<Round1PinnedOnePrefixStatement> {
         const PREFIX_BITS: usize = 1_024;
         let k = self.k();
         let const_pin = self.const_pin.filter(|pin| *pin < k)?;
@@ -223,7 +193,7 @@ impl BlockR1cs {
             || self.b_0.num_cols != k
             || self.b_0.rows.len() != k
             || self.c_0.rows.len() != k
-            || (!c0_verified_identity && !c0_is_identity_scan(k, &self.c_0))
+            || !c0_is_identity_scan(k, &self.c_0)
         {
             return None;
         }
@@ -240,33 +210,6 @@ impl BlockR1cs {
     /// Live A rows are computed output expressions, not identity rows; a
     /// joined BLAKE3 producer must separately certify their evaluated A=Z.
     pub fn round1_pinned_one_prefix_and_output_statement(&self) -> Option<Round1PinnedOnePrefixStatement> {
-        if let Some(digest) = self.digest_cache.get()
-            && cached_c0_identity(digest).is_some()
-        {
-            static PRIMARY_OUTPUT_STMT: OnceLock<(
-                [u8; 32],
-                usize,
-                Option<usize>,
-                Option<Round1PinnedOnePrefixStatement>,
-            )> = OnceLock::new();
-            let entry = PRIMARY_OUTPUT_STMT.get_or_init(|| {
-                (
-                    *digest,
-                    self.useful_bits,
-                    self.const_pin,
-                    self.round1_pinned_one_prefix_and_output_statement_scan(),
-                )
-            });
-            if entry.0 == *digest && entry.1 == self.useful_bits && entry.2 == self.const_pin {
-                return entry.3;
-            }
-        }
-        self.round1_pinned_one_prefix_and_output_statement_scan()
-    }
-
-    fn round1_pinned_one_prefix_and_output_statement_scan(
-        &self,
-    ) -> Option<Round1PinnedOnePrefixStatement> {
         let mut statement = self.round1_pinned_one_prefix_statement()?;
         if self.k_log != 14 || self.k_skip != 6 || self.useful_bits != 15_409
             || self.layout != WitnessLayout::RowMajor || self.const_pin != Some(512)
@@ -516,15 +459,9 @@ type C0IdentityCache = HashMap<[u8; 32], bool>;
 /// published only by the digest computation that inspected the same matrix
 /// contents, never by an object address or a potentially stale key.
 static C0_IDENTITY_CACHE: OnceLock<RwLock<C0IdentityCache>> = OnceLock::new();
-static PRIMARY_C0_IDENTITY: OnceLock<([u8; 32], bool)> = OnceLock::new();
 
 #[inline]
 fn cached_c0_identity(digest: &[u8; 32]) -> Option<bool> {
-    if let Some((cached_digest, is_id)) = PRIMARY_C0_IDENTITY.get()
-        && cached_digest == digest
-    {
-        return Some(*is_id);
-    }
     C0_IDENTITY_CACHE
         .get()?
         .read()
@@ -534,7 +471,6 @@ fn cached_c0_identity(digest: &[u8; 32]) -> Option<bool> {
 }
 
 fn cache_c0_identity(digest: [u8; 32], is_identity: bool) {
-    let _ = PRIMARY_C0_IDENTITY.set((digest, is_identity));
     let mut cache = C0_IDENTITY_CACHE
         .get_or_init(|| RwLock::new(HashMap::new()))
         .write()

@@ -39,6 +39,13 @@ unsafe fn pmull_ll(
     }
 }
 
+/// `pmull` of a lane against the fixed reduction constant `0x87`.
+#[inline(always)]
+unsafe fn pmull_87(x: u64) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe { core::mem::transmute::<u128, uint64x2_t>(vmull_p64(x, 0x87)) }
+}
+
 #[cfg(target_feature = "sha3")]
 #[inline(always)]
 unsafe fn xor3(
@@ -60,72 +67,6 @@ unsafe fn xor3(
     unsafe { veorq_u64(a, veorq_u64(b, c)) }
 }
 
-/// `acc ^ (a.lo * b.lo)` as one macro-fused `pmull` + `eor` SIMD issue slot on Apple P-cores.
-#[inline(always)]
-unsafe fn fused_pmull_lo_acc(
-    acc: core::arch::aarch64::uint64x2_t,
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    let out: core::arch::aarch64::uint64x2_t;
-    unsafe {
-        core::arch::asm!(
-            "pmull {o:v}.1q, {a:v}.1d, {b:v}.1d",
-            "eor {o:v}.16b, {o:v}.16b, {c:v}.16b",
-            a = in(vreg) a,
-            b = in(vreg) b,
-            c = in(vreg) acc,
-            o = out(vreg) out,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-    out
-}
-
-/// `acc ^ (a.hi * b.hi)` as one macro-fused `pmull2` + `eor` SIMD issue slot on Apple P-cores.
-#[inline(always)]
-unsafe fn fused_pmull_hi_acc(
-    acc: core::arch::aarch64::uint64x2_t,
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    let out: core::arch::aarch64::uint64x2_t;
-    unsafe {
-        core::arch::asm!(
-            "pmull2 {o:v}.1q, {a:v}.2d, {b:v}.2d",
-            "eor {o:v}.16b, {o:v}.16b, {c:v}.16b",
-            a = in(vreg) a,
-            b = in(vreg) b,
-            c = in(vreg) acc,
-            o = out(vreg) out,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-    out
-}
-
-/// `(x.lo * y.lo) ^ (x.hi * y.hi)` as `pmull` + macro-fused `pmull2`+`eor` (two issue slots).
-#[inline(always)]
-unsafe fn cross_sum_q(
-    x: core::arch::aarch64::uint64x2_t,
-    y: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    let out: core::arch::aarch64::uint64x2_t;
-    unsafe {
-        core::arch::asm!(
-            "pmull {p:v}.1q, {x:v}.1d, {y:v}.1d",
-            "pmull2 {o:v}.1q, {x:v}.2d, {y:v}.2d",
-            "eor {o:v}.16b, {o:v}.16b, {p:v}.16b",
-            x = in(vreg) x,
-            y = in(vreg) y,
-            p = out(vreg) _,
-            o = out(vreg) out,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-    out
-}
-
 /// `x^64 · m (mod p)` added into `l`: `{0, m.lo}` places `m.lo` into the
 /// high limb and `m.hi · x^128 = m.hi · (x^7 + x^2 + x + 1)`, a product of
 /// at most 71 bits, lands in the low limbs. The map `m ↦ x^64 · m` is linear,
@@ -137,58 +78,54 @@ unsafe fn fold_x64_into(
 ) -> core::arch::aarch64::uint64x2_t {
     use core::arch::aarch64::*;
     unsafe {
-        let s = veorq_u64(l, vextq_u64::<1>(vdupq_n_u64(0), m));
-        fused_pmull_hi_acc(s, m, vdupq_n_u64(0x87))
+        xor3(
+            l,
+            vextq_u64::<1>(vdupq_n_u64(0), m),
+            pmull_87(vgetq_lane_u64::<1>(m)),
+        )
     }
 }
 
-/// Eager butterfly with zero pending half: `u' = u + v·t`, `v' = v + u'`.
+/// GHASH multiply with both operands held in q registers, stopped before
+/// its last reduction fold.
+///
+/// Same algorithm as [`crate::field::gf2_128::aarch64::ghash_mul_binius`] —
+/// four schoolbook PMULLs and the two-stage recursive reduction — but it
+/// neither accepts nor returns an `F128`, so no lane ever moves to a
+/// general-purpose register. Returns `(lo, mid)` with
+/// `a·b = lo + x^64 · (mid + acc) (mod p)` folded in as
+/// `mid' = acc + t1 + x^64·t2`: the caller adds `lo` to the row and either
+/// folds `mid'` at once ([`fold_x64_into`]) or keeps it pending in the row,
+/// to be folded together with later products. The fold is the same linear
+/// map either way, so the canonical result is bit-identical to the eager
+/// multiply. Passing a zero `acc` costs nothing: the XOR with it replaces
+/// the cross-term XOR.
 #[inline(always)]
-unsafe fn butterfly_fold_zero_q(
-    u: core::arch::aarch64::uint64x2_t,
-    v: core::arch::aarch64::uint64x2_t,
-    t: core::arch::aarch64::uint64x2_t,
+unsafe fn mul_q_split(
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+    acc: core::arch::aarch64::uint64x2_t,
 ) -> (
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let t_sw = vextq_u64::<1>(t, t);
-        let u_lo = fused_pmull_lo_acc(u, v, t);
-        let cross = cross_sum_q(v, t_sw);
-        let t2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(v),
-            vreinterpretq_p64_u64(t),
+        let t0 = pmull_ll(a, b);
+        let t1a = core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
+            vgetq_lane_u64::<0>(a),
+            vgetq_lane_u64::<1>(b),
         ));
-        let mid = fold_x64_into(cross, t2);
-        let new_u = fold_x64_into(u_lo, mid);
-        (new_u, veorq_u64(v, new_u))
-    }
-}
-
-/// Lazy butterfly with zero pending half.
-#[inline(always)]
-unsafe fn butterfly_lazy_zero_q(
-    u: core::arch::aarch64::uint64x2_t,
-    v: core::arch::aarch64::uint64x2_t,
-    t: core::arch::aarch64::uint64x2_t,
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let t_sw = vextq_u64::<1>(t, t);
-        let new_u = fused_pmull_lo_acc(u, v, t);
-        let cross = cross_sum_q(v, t_sw);
-        let t2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(v),
-            vreinterpretq_p64_u64(t),
+        let t1b = core::mem::transmute::<u128, uint64x2_t>(vmull_p64(
+            vgetq_lane_u64::<1>(a),
+            vgetq_lane_u64::<0>(b),
         ));
-        let mid = fold_x64_into(cross, t2);
-        (new_u, veorq_u64(v, new_u), mid)
+        let t2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(a),
+            vreinterpretq_p64_u64(b),
+        ));
+        // mid = acc + t1 + x^64 · t2 (mod p).
+        (t0, fold_x64_into(xor3(acc, t1a, t1b), t2))
     }
 }
 
@@ -207,15 +144,8 @@ unsafe fn butterfly_fold_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let t_sw = vextq_u64::<1>(t, t);
-        let u_lo = fused_pmull_lo_acc(u, v, t);
-        let cross = fused_pmull_hi_acc(fused_pmull_lo_acc(pending, v, t_sw), v, t_sw);
-        let t2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(v),
-            vreinterpretq_p64_u64(t),
-        ));
-        let mid = fold_x64_into(cross, t2);
-        let new_u = fold_x64_into(u_lo, mid);
+        let (lo, mid) = mul_q_split(v, t, pending);
+        let new_u = fold_x64_into(veorq_u64(u, lo), mid);
         (new_u, veorq_u64(v, new_u))
     }
 }
@@ -237,14 +167,8 @@ unsafe fn butterfly_lazy_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let t_sw = vextq_u64::<1>(t, t);
-        let new_u = fused_pmull_lo_acc(u, v, t);
-        let cross = fused_pmull_hi_acc(fused_pmull_lo_acc(pending, v, t_sw), v, t_sw);
-        let t2 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(v),
-            vreinterpretq_p64_u64(t),
-        ));
-        let mid = fold_x64_into(cross, t2);
+        let (lo, mid) = mul_q_split(v, t, pending);
+        let new_u = veorq_u64(u, lo);
         (new_u, veorq_u64(v, new_u), mid)
     }
 }
@@ -261,16 +185,18 @@ unsafe fn fused3_general_q(
     v: &mut [core::arch::aarch64::uint64x2_t; 8],
     t: &[core::arch::aarch64::uint64x2_t; 7],
 ) {
+    use core::arch::aarch64::*;
     unsafe {
+        let zero = vdupq_n_u64(0);
         // Layer L: stride 4, shared twiddle t[0].
-        let (a, b, p0) = butterfly_lazy_zero_q(v[0], v[4], t[0]);
+        let (a, b, p0) = butterfly_lazy_q(v[0], v[4], t[0], zero);
         v[0] = a;
         v[4] = b;
-        let (a, b, p1) = butterfly_lazy_zero_q(v[1], v[5], t[0]);
+        let (a, b, p1) = butterfly_lazy_q(v[1], v[5], t[0], zero);
         v[1] = a;
         v[5] = b;
         for i in 2..4 {
-            let (a, b) = butterfly_fold_zero_q(v[i], v[i + 4], t[0]);
+            let (a, b) = butterfly_fold_q(v[i], v[i + 4], t[0], zero);
             v[i] = a;
             v[i + 4] = b;
         }
@@ -310,7 +236,9 @@ unsafe fn fused3_zero_root_q(
     t5: core::arch::aarch64::uint64x2_t,
     t6: core::arch::aarch64::uint64x2_t,
 ) {
+    use core::arch::aarch64::*;
     unsafe {
+        let zero = vdupq_n_u64(0);
         // Layer L, t[0] = 0: four XOR-only butterflies.
         for i in 0..4 {
             v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
@@ -319,15 +247,15 @@ unsafe fn fused3_zero_root_q(
         for i in 0..2 {
             v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
         }
-        let (a, b, p4) = butterfly_lazy_zero_q(v[4], v[6], t2);
+        let (a, b, p4) = butterfly_lazy_q(v[4], v[6], t2, zero);
         v[4] = a;
         v[6] = b;
-        let (a, b) = butterfly_fold_zero_q(v[5], v[7], t2);
+        let (a, b) = butterfly_fold_q(v[5], v[7], t2, zero);
         v[5] = a;
         v[7] = b;
         // Layer L+2: first quarter t[3] = 0; rows 4/6 carry p4.
         v[1] = butterfly_zero_q(v[0], v[1]);
-        let (a, b) = butterfly_fold_zero_q(v[2], v[3], t4);
+        let (a, b) = butterfly_fold_q(v[2], v[3], t4, zero);
         v[2] = a;
         v[3] = b;
         let (a, b) = butterfly_fold_q(v[4], v[5], t5, p4);
@@ -998,8 +926,9 @@ unsafe fn butterfly_fused_2layer_row_with_q(
             // Layer L: (a,c) and (b,d) share t_outer. Row a keeps its
             // x^64 half `p` pending (row c inherits it); b is folded, so
             // 3 folds serve the 4 products.
-            let (na, nc, p) = butterfly_lazy_zero_q(xa, xc, to);
-            let (nb, nd) = butterfly_fold_zero_q(xb, xd, to);
+            let zero = vdupq_n_u64(0);
+            let (na, nc, p) = butterfly_lazy_q(xa, xc, to, zero);
+            let (nb, nd) = butterfly_fold_q(xb, xd, to, zero);
             // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b; the
             // multiplicands b and d are folded, a and c fold `p` here.
             let (fa, fb) = butterfly_fold_q(na, nb, ta, p);
