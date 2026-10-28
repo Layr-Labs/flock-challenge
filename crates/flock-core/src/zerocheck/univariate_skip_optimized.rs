@@ -1469,7 +1469,40 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         nt && ab_pre_nt_direct_enabled()
     };
     let mut tmp = [0u8; 64];
-    for b_med in first_b_med..ab_end {
+    // Static-B window rows (every row the dispatcher would hand to the Horner
+    // static-B kernel) run as one unrolled sequence of direct per-arm calls,
+    // skipping the per-row sniff chain and jump table. Same kernels, same
+    // bytes; any layout the run does not cover keeps the per-row loop.
+    #[cfg(target_arch = "aarch64")]
+    let static_run = if blake3_static_layout && !(nt && !direct) {
+        kernels::aarch64::bstatic_horner_window_run::<FAST_POLICY>(
+            static_b_context,
+            inv_table,
+            within_hash_outer,
+            n_b_med,
+        )
+        .filter(|&(lo, hi, _)| first_b_med <= lo && hi <= ab_end)
+    } else {
+        None
+    };
+    #[cfg(target_arch = "aarch64")]
+    let (run_lo, run_hi) = static_run.map_or((ab_end, ab_end), |(lo, hi, _)| (lo, hi));
+    #[cfg(not(target_arch = "aarch64"))]
+    let (run_lo, run_hi) = (ab_end, ab_end);
+    #[cfg(target_arch = "aarch64")]
+    if let Some((_, _, partials)) = static_run {
+        kernels::aarch64::bstatic_horner_window_rows(
+            within_hash_outer,
+            a_packed,
+            b_packed,
+            inv_table,
+            chunk_byte_base,
+            partials,
+            out_outer,
+            direct,
+        );
+    }
+    for b_med in (first_b_med..run_lo).chain(run_hi..ab_end) {
         let dst: &mut [u8; 64] = if nt && !direct {
             &mut tmp
         } else {
@@ -5344,6 +5377,26 @@ mod tests {
                                 fast, slow,
                                 "fast bstatic differs (w={w}, b_med={b_med}, variant={variant})"
                             );
+                            let kernels::aarch64::StaticBContext::Prepared { partials, .. } =
+                                context
+                            else {
+                                unreachable!("prepared static-B context");
+                            };
+                            let mut horner = [0u8; 64];
+                            let live = kernels::aarch64::shift_reduce_inner_ab_bstatic_horner(
+                                &a_packed, &b, &table, 0, b_med, w, partials, &mut horner, true,
+                            );
+                            assert_eq!(
+                                live,
+                                (3..=28).contains(&blk),
+                                "horner bstatic arm coverage (w={w}, b_med={b_med})"
+                            );
+                            if live {
+                                assert_eq!(
+                                    horner, slow,
+                                    "horner bstatic differs (w={w}, b_med={b_med}, variant={variant})"
+                                );
+                            }
                         }
                         arms += 1;
                     }
@@ -5353,6 +5406,54 @@ mod tests {
             .expect("spawn bstatic oracle")
             .join()
             .expect("bstatic oracle thread");
+    }
+
+    /// The unrolled window run of the Horner static-B kernel writes exactly the
+    /// rows the per-row entry writes, for guard-satisfying and random B.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn bstatic_horner_window_rows_match_per_row() {
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xB57A_71C0_F457_0002);
+        let context =
+            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+                .expect("enabled static-B context");
+        let kernels::aarch64::StaticBContext::Prepared { partials, .. } = context else {
+            unreachable!("prepared static-B context");
+        };
+        const N: usize = 4096;
+        for w in 0..2usize {
+            let (lo, hi) = kernels::aarch64::BSTATIC_HORNER_WINDOW_ROWS[w];
+            for satisfied in [false, true] {
+                let a_packed: Vec<u8> = (0..N).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+                let mut b: Vec<u8> = (0..N).map(|_| (rng.next_u64() >> 9 & 0xff) as u8).collect();
+                if satisfied {
+                    for b_med in lo..hi {
+                        let blk = w * (1 << N_MEDIUM) + b_med;
+                        for k in 0..N_CHUNKS {
+                            let off = b_med * N_CHUNKS * 8 + k * N_CHUNKS;
+                            let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
+                            let word = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                            b[off..off + 8]
+                                .copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                        }
+                    }
+                }
+                let mut want = vec![0u8; 16 * 64];
+                for b_med in lo..hi {
+                    let row: &mut [u8; 64] =
+                        (&mut want[b_med * 64..(b_med + 1) * 64]).try_into().unwrap();
+                    assert!(kernels::aarch64::shift_reduce_inner_ab_bstatic_horner(
+                        &a_packed, &b, &table, 0, b_med, w, partials, row, false,
+                    ));
+                }
+                let mut got = vec![0u8; 16 * 64];
+                kernels::aarch64::bstatic_horner_window_rows(
+                    w, &a_packed, &b, &table, 0, partials, &mut got, true,
+                );
+                assert_eq!(got, want, "window rows differ (w={w}, satisfied={satisfied})");
+            }
+        }
     }
 
     #[cfg(target_arch = "aarch64")]

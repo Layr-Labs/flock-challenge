@@ -2983,6 +2983,7 @@ pub(crate) enum StaticBContext {
 }
 
 include!("aarch64_bstatic_gen.rs");
+include!("aarch64_bstatic_horner_gen.rs");
 
 fn bstatic_legacy_enabled() -> bool {
     use std::sync::OnceLock;
@@ -3027,6 +3028,40 @@ pub(crate) fn prepare_static_b_context_with_policy(
             static_a_k1: static_a_k1_partial(inv_table),
         })
     }
+}
+
+/// Window `within_hash_outer`'s static-B Horner rows `[lo, hi)` and the
+/// partials to run them with, when [`bstatic_horner_window_rows`] may replace
+/// the per-row dispatch for them: the FAST policy is on, the static-B context
+/// is enabled, and the ranked BLAKE3 row counts place every sniffed row
+/// (all-ones, single-K0, const-one masks) outside `[lo, hi)`, so each row in
+/// the run would reach the same Horner body through
+/// [`shift_reduce_inner_ab_fused_neon_checked_with_fast_policy`]. The caller
+/// must also have the BLAKE3 static layout. `None` keeps the per-row loop.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn bstatic_horner_window_run<const FAST_POLICY: u8>(
+    static_b_context: Option<StaticBContext>,
+    inv_table: &InvNttTableByteSingleGf8,
+    within_hash_outer: usize,
+    n_b_med: usize,
+) -> Option<(usize, usize, &'static [[u8; 64]; 248])> {
+    let context = static_b_context?;
+    if !fast_shift_reduce_with_policy::<FAST_POLICY>()
+        || (matches!(context, StaticBContext::LegacyPerCall) && bstatic_legacy_enabled())
+    {
+        return None;
+    }
+    let (lo, hi) = match (within_hash_outer, n_b_med) {
+        (0, 16) => BSTATIC_HORNER_WINDOW_ROWS[0],
+        (1, 15) => BSTATIC_HORNER_WINDOW_ROWS[1],
+        _ => return None,
+    };
+    let partials = match context {
+        StaticBContext::Prepared { partials, .. } => partials,
+        StaticBContext::LegacyPerCall => bstatic_partials(inv_table),
+    };
+    Some((lo, hi, partials))
 }
 
 /// Checked static-structure dispatcher. Sniffs the 8 b-words (8 scalar loads
@@ -3257,16 +3292,25 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         // constant multiply and the residual shift all fold away at
         // monomorphization; the kill switch picks a whole kernel, never a
         // branch inside one.
+        // FAST rows take the Horner-layout static-B kernel: the same plans
+        // and partials as `shift_reduce_inner_ab_bstatic`, but one guard per
+        // row and a straight-line body, so the skipped table loads are
+        // actually saved (measured ~-10 P-cycles/row against the per-K
+        // guarded kernel). Arms without a plan return `false` and take h4.
         let handled = enabled
             && if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                shift_reduce_inner_ab_bstatic::<true>(
+                let partials = match context {
+                    StaticBContext::Prepared { partials, .. } => partials,
+                    StaticBContext::LegacyPerCall => bstatic_partials(inv_table),
+                };
+                shift_reduce_inner_ab_bstatic_horner(
                     a_packed,
                     b_packed,
                     inv_table,
                     chunk_byte_base,
                     b_med,
                     bstatic_w,
-                    context,
+                    partials,
                     out,
                     nt_store,
                 )
