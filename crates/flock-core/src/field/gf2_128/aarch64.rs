@@ -145,6 +145,7 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the aes target feature.
     unsafe {
         let zero = vdupq_n_u64(0);
+        let c87 = vdupq_n_u64(0x87);
 
         let t0 = pmull(a.lo, b.lo);
         let t1a = pmull(a.lo, b.hi);
@@ -153,21 +154,34 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
         let t1_cross = veorq_u64(t1a, t1b);
 
         // First reduce: t1 = t1 + x^64 · t2 (mod p).
-        // vextq_u64::<1>(zero, t2) = {0, t2.lo} — places t2.lo into t1.hi.
-        let t2_shifted = vextq_u64::<1>(zero, t2);
-        let t2_hi_s = vgetq_lane_u64::<1>(t2);
-        let t2_red = pmull(t2_hi_s, 0x87);
-        let t1 = xor3_u64(t1_cross, t2_shifted, t2_red);
+        let s2 = veorq_u64(t1_cross, vextq_u64::<1>(zero, t2));
+        let t1: uint64x2_t;
+        core::arch::asm!(
+            "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+            m = in(vreg) t2,
+            c = in(vreg) c87,
+            s = in(vreg) s2,
+            o = out(vreg) t1,
+            options(pure, nomem, nostack, preserves_flags),
+        );
 
         // Second reduce: t0 = t0 + x^64 · t1 (mod p).
-        let t1_shifted = vextq_u64::<1>(zero, t1);
-        let t1_hi_s = vgetq_lane_u64::<1>(t1);
-        let t1_red = pmull(t1_hi_s, 0x87);
-        let t0 = xor3_u64(t0, t1_shifted, t1_red);
+        let s1 = veorq_u64(t0, vextq_u64::<1>(zero, t1));
+        let out: uint64x2_t;
+        core::arch::asm!(
+            "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+            m = in(vreg) t1,
+            c = in(vreg) c87,
+            s = in(vreg) s1,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
 
         F128 {
-            lo: vgetq_lane_u64::<0>(t0),
-            hi: vgetq_lane_u64::<1>(t0),
+            lo: vgetq_lane_u64::<0>(out),
+            hi: vgetq_lane_u64::<1>(out),
         }
     }
 }
