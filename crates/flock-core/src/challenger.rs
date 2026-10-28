@@ -554,26 +554,25 @@ impl Challenger for FsChallenger {
                     {
                         Some(ep) => {
                             // Engaged grind drain: same two-pool shape as the
-                            // fold drains, so route the broadcast through the
-                            // persistent relay instead of creating and joining
-                            // one OS thread per engaged grind (7-8 of them sit
-                            // on the serial Fiat-Shamir spine per prove). The
-                            // relay posts from inside a main worker, so the
-                            // E-broadcast starts no earlier relative to the
-                            // main drain than the spawn it replaces, and a
-                            // busy or disabled relay falls back to the exact
-                            // incumbent scoped spawn. Chunk claims and the
-                            // lowest-chunk match rule are untouched, so the
-                            // nonce — and every transcript byte after it — is
-                            // identical either way.
-                            let broadcast = || {
-                                ep.broadcast(|_| worker());
-                            };
+                            // fold drains, so the helpers get the detached,
+                            // gated kickoff: the drain waits only for helpers
+                            // that may hold a chunk, never for one the
+                            // scheduler has not run yet. A helper rejected by
+                            // the gate claims nothing, so every chunk below
+                            // the final bound is still claimed (ascending
+                            // counter) by a main worker or an admitted helper
+                            // and fully scanned before the gate drains. Chunk
+                            // claims and the lowest-chunk match rule are
+                            // untouched, so the nonce — and every transcript
+                            // byte after it — is identical either way.
+                            // `FLOCK_NO_GRIND_RELAY=1` keeps the blocking
+                            // scoped broadcast.
                             crate::epool::drain_hetero(
                                 main_threads,
                                 &worker,
-                                &broadcast,
-                                grind_relay_enabled() && crate::epool::relay_enabled(),
+                                ep,
+                                &worker,
+                                grind_relay_enabled() && crate::epool::detached_enabled(),
                             );
                         }
                         None => drain_main(),
@@ -1148,12 +1147,11 @@ fn grind_latch_min_enabled() -> bool {
 }
 
 /// Route the engaged CPU-grind drain's helper broadcast through the epool's
-/// persistent relay instead of a fresh scoped thread per engaged grind.
-/// Compile-time default so the cleared ranked environment ships the decision;
-/// `FLOCK_NO_GRIND_RELAY=1` (exactly `"1"`, per the grind-reg precedent)
-/// restores the incumbent per-grind spawn as the same-binary A/B control.
-/// `FLOCK_NO_EPOOL_RELAY=1` also restores it, transitively, by disabling the
-/// relay itself.
+/// detached, gated kickoff instead of a blocking scoped broadcast per engaged
+/// grind. Compile-time default so the cleared ranked environment ships the
+/// decision; `FLOCK_NO_GRIND_RELAY=1` (exactly `"1"`, per the grind-reg
+/// precedent) restores the blocking per-grind spawn as the same-binary A/B
+/// control. `FLOCK_NO_EPOOL_RELAY=1` also restores it, transitively.
 pub const GRIND_RELAY_DEFAULT: bool = true;
 pub const ENV_NO_GRIND_RELAY: &str = "FLOCK_NO_GRIND_RELAY";
 
