@@ -4664,6 +4664,7 @@ kernel void blake3_pow_scan(
             deadline: std::time::Instant,
         ) -> Result<(), String> {
             unsafe {
+                let mut spin_count = 0u32;
                 loop {
                     let status: u64 = send!(
                         self.api,
@@ -4685,7 +4686,12 @@ kernel void blake3_pow_scan(
                     if std::time::Instant::now() >= deadline {
                         return self.wait_cb(cb);
                     }
-                    std::thread::yield_now();
+                    if spin_count < 256 {
+                        core::hint::spin_loop();
+                        spin_count += 1;
+                    } else {
+                        std::thread::yield_now();
+                    }
                 }
             }
         }

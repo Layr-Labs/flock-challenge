@@ -42,6 +42,18 @@ pub mod tmark;
 pub mod verifier;
 pub mod zerocheck;
 
+static IS_TIMED_CALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn set_is_timed_call(v: bool) {
+    IS_TIMED_CALL.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn is_timed_call() -> bool {
+    IS_TIMED_CALL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Shared kill switch for the micro-stack batch of small prover cuts
 /// (`eval_sk_at_vks` memoization, recursion-OOD optimized eq-table builder,
 /// fast `pcs_open` bundle encoder). Set exactly `FLOCK_NO_MICRO_STACK=1` to

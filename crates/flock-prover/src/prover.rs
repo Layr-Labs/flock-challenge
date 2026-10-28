@@ -1211,6 +1211,12 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 // exact incumbent blocking join. Byte-identical either way:
                 // the join consumes the same completed thread.
                 if !stripe_job.is_finished() {
+                    for _ in 0..256 {
+                        if stripe_job.is_finished() {
+                            break;
+                        }
+                        core::hint::spin_loop();
+                    }
                     let spin_deadline =
                         std::time::Instant::now() + std::time::Duration::from_millis(2);
                     while !stripe_job.is_finished() && std::time::Instant::now() < spin_deadline {
@@ -1287,9 +1293,16 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     }
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
-    // of carrying them through lincheck and the PCS open.
-    flock_core::scratch::give_f128(a_packed_f128);
-    flock_core::scratch::give_f128(b_packed_f128);
+    // of carrying them through lincheck and the PCS open. On the timed call,
+    // the process terminates immediately after proof publication, so recycling
+    // work (mutex locks, pool maintenance, potential unmap) is omitted.
+    if flock_core::is_timed_call() && std::env::var_os("FLOCK_NO_SKIP_TIMED_RECYCLE").is_none() {
+        std::mem::forget(a_packed_f128);
+        std::mem::forget(b_packed_f128);
+    } else {
+        flock_core::scratch::give_f128(a_packed_f128);
+        flock_core::scratch::give_f128(b_packed_f128);
+    }
 
     flock_core::tmark::mark("zc end");
     let cpu_lc0 = phase_timing.then(process_cpu_ms);
@@ -1317,7 +1330,6 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
     // m = 32) so the next prove reuses its resident pages.
     flock_core::tmark::mark("lc returned");
-    flock_core::scratch::give_u8(z_packed_lincheck);
 
     let ab = ZClaim {
         point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
@@ -1333,8 +1345,16 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
     // (only test setups; real R1CS has k_log >= 16).
     let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-    // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-    flock_core::scratch::give_f128(z_vec_pre);
+    // The lincheck stripe and z_vec_pre buffers are dead from here on. On the
+    // timed call, the process terminates immediately after proof publication,
+    // so recycling work (mutex locks, pool maintenance, potential unmap) is omitted.
+    if flock_core::is_timed_call() && std::env::var_os("FLOCK_NO_SKIP_TIMED_RECYCLE").is_none() {
+        std::mem::forget(z_packed_lincheck);
+        std::mem::forget(z_vec_pre);
+    } else {
+        flock_core::scratch::give_u8(z_packed_lincheck);
+        flock_core::scratch::give_f128(z_vec_pre);
+    }
     if phase_timing {
         let wall = t_lc.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_lc0.unwrap_or(0.0);

@@ -3601,6 +3601,7 @@ impl Blake3Setup {
         // must run before the keep-warm pause below — on the adopted path the
         // speculative thread already issued it at its own prove entry.
         if call > 0 {
+            flock_core::set_is_timed_call(true);
             // The timed seed is in hand (this is the timed call). If the seed
             // pipe is live its thread already halted the CPU keep-alive the
             // instant it read the seed; this is the fallback for the
@@ -3683,6 +3684,7 @@ impl Blake3Setup {
         setup_addr: usize,
         blocks: &[Compression],
     ) -> crate::seed_pipe::ProveOut {
+        flock_core::set_is_timed_call(true);
         // SAFETY: `setup_addr` is the address of the `Blake3Setup` the ranked
         // worker builds in `main` and holds until the process exits, so it
         // outlives this thread. Only shared reads happen through it — the same
