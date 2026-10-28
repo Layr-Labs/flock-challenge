@@ -4514,7 +4514,6 @@ kernel void blake3_pow_scan(
             }
         }
 
-        #[cfg(test)]
         pub(crate) unsafe fn pipeline_resources(&self, pso: Id) -> (u64, u64, u64) {
             unsafe {
                 let static_tg: u64 = send!(
@@ -11554,40 +11553,64 @@ static inline uint4 zc_r2_fold8(uint lo, uint hi, threadgroup const uint4* nib) 
     return acc;
 }
 
+// The host admits only 32-lane SIMD pipelines and full 256-thread groups.
+// Shuffle 32-bit halves so all four 64-bit limbs retain every bit.
+static inline ulong4 zc_r2_simd_shuffle_xor(ulong4 v, uint offset) {
+    uint4 lo = simd_shuffle_xor(as_type<uint4>(v.xy), offset);
+    uint4 hi = simd_shuffle_xor(as_type<uint4>(v.zw), offset);
+    return ulong4(as_type<ulong2>(lo), as_type<ulong2>(hi));
+}
+
+static inline ulong4 zc_r2_simd_shuffle(ulong4 v, uint lane) {
+    uint4 lo = simd_shuffle(as_type<uint4>(v.xy), lane);
+    uint4 hi = simd_shuffle(as_type<uint4>(v.zw), lane);
+    return ulong4(as_type<ulong2>(lo), as_type<ulong2>(hi));
+}
+
 static inline void zc_r2_write_partials(
     ulong4 acc1, ulong4 acci, threadgroup ulong4* red,
     device const uint4* eq_hi, device uint4* partials,
-    uint hi_chunk, uint output_group, uint lid)
+    uint hi_chunk, uint output_group, uint lane, uint simd_index)
 {
-    // Both mappings keep x_lo parity equal to lid parity. Stop before
-    // s == 1 so even and odd partials remain separate.
-    red[lid] = acc1;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = 128u; s > 1u; s >>= 1u) {
-        if (lid < s) { red[lid] ^= red[lid + s]; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Offsets 16,8,4,2 preserve owner parity in each full 32-lane SIMD.
+    // All lanes participate, including zero accumulators for padded rows.
+    for (uint offset = 16u; offset > 1u; offset >>= 1u) {
+        acc1 ^= zc_r2_simd_shuffle_xor(acc1, offset);
+        acci ^= zc_r2_simd_shuffle_xor(acci, offset);
     }
-    ulong4 chunk1e = red[0];
-    ulong4 chunk1o = red[1];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    red[lid] = acci;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = 128u; s > 1u; s >>= 1u) {
-        if (lid < s) { red[lid] ^= red[lid + s]; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < 2u) {
+        // Eight SIMDs write disjoint four-entry blocks, exactly red[0..32).
+        red[simd_index * 4u + lane] = acc1;
+        red[simd_index * 4u + 2u + lane] = acci;
     }
-    if (lid == 0u) {
-        ulong4 chunkie = red[0];
-        ulong4 chunkio = red[1];
-        U256k u1e; u1e.r0 = chunk1e.x; u1e.r1 = chunk1e.y; u1e.r2 = chunk1e.z; u1e.r3 = chunk1e.w;
-        U256k u1o; u1o.r0 = chunk1o.x; u1o.r1 = chunk1o.y; u1o.r2 = chunk1o.z; u1o.r3 = chunk1o.w;
-        U256k uie; uie.r0 = chunkie.x; uie.r1 = chunkie.y; uie.r2 = chunkie.z; uie.r3 = chunkie.w;
-        U256k uio; uio.r0 = chunkio.x; uio.r1 = chunkio.y; uio.r2 = chunkio.z; uio.r3 = chunkio.w;
-        uint4 e = eq_hi[hi_chunk];
-        partials[output_group * 4u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
-        partials[output_group * 4u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
-        partials[output_group * 4u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
-        partials[output_group * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_index == 0u) {
+        // Lanes [0,16) read the eight even/odd pairs. The other lanes
+        // contribute zero. This branch contains one complete SIMD.
+        ulong4 chunk1 = ulong4(0ul);
+        ulong4 chunki = ulong4(0ul);
+        if (lane < 16u) {
+            uint index = (lane >> 1u) * 4u + (lane & 1u);
+            chunk1 = red[index];
+            chunki = red[index + 2u];
+        }
+        for (uint offset = 16u; offset > 1u; offset >>= 1u) {
+            chunk1 ^= zc_r2_simd_shuffle_xor(chunk1, offset);
+            chunki ^= zc_r2_simd_shuffle_xor(chunki, offset);
+        }
+        ulong4 chunk1o = zc_r2_simd_shuffle(chunk1, 1u);
+        ulong4 chunkio = zc_r2_simd_shuffle(chunki, 1u);
+        if (lane == 0u) {
+            U256k u1e; u1e.r0 = chunk1.x; u1e.r1 = chunk1.y; u1e.r2 = chunk1.z; u1e.r3 = chunk1.w;
+            U256k u1o; u1o.r0 = chunk1o.x; u1o.r1 = chunk1o.y; u1o.r2 = chunk1o.z; u1o.r3 = chunk1o.w;
+            U256k uie; uie.r0 = chunki.x; uie.r1 = chunki.y; uie.r2 = chunki.z; uie.r3 = chunki.w;
+            U256k uio; uio.r0 = chunkio.x; uio.r1 = chunkio.y; uio.r2 = chunkio.z; uio.r3 = chunkio.w;
+            uint4 e = eq_hi[hi_chunk];
+            partials[output_group * 4u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
+            partials[output_group * 4u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
+            partials[output_group * 4u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
+            partials[output_group * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+        }
     }
 }
 
@@ -11597,8 +11620,8 @@ struct ZcR2Params { uint lo_size; uint xpt; uint mask; uint useful; };
 // per thread). Per pair: read both packed rows of a and b (one uint4 each,
 // fully coalesced), fold all four rows via the nibble tables, message
 // products via emulated clmul, eq_lo weight via a third clmul, 256-bit
-// unreduced accumulate. Threadgroup XOR-reduce, stopped one step short so the
-// even and odd x_lo halves stay apart; thread 0 reduces the four chunk
+// unreduced accumulate. Two-level SIMD XOR reduction keeps the
+// even and odd x_lo halves apart; thread 0 reduces the four chunk
 // accumulators, weights by eq_hi[chunk], and writes four REDUCED partials
 // `[p1_even, pinf_even, p1_odd, pinf_odd]`. Slot0^slot2 and slot1^slot3 are
 // exactly the CPU's per-chunk `(eq_hi * p1, eq_hi * pinf)`; slots 2 and 3 are
@@ -11612,17 +11635,21 @@ kernel void zc_r2_products(
     device uint4*       partials    [[buffer(5)]],
     constant ZcR2Params& p          [[buffer(6)]],
     uint tgid [[threadgroup_position_in_grid]],
-    uint lid  [[thread_index_in_threadgroup]])
+    uint lid  [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]])
 {
     threadgroup uint4 nib[256];
-    threadgroup ulong4 red[256];
+    threadgroup ulong4 red[32];
     nib[lid] = nib_tab_dev[lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Native IDs define a bijection onto all 256 logical owners.
+    uint owner = simd_index * 32u + lane;
     ulong4 acc1 = ulong4(0ul);
     ulong4 acci = ulong4(0ul);
     for (uint k = 0u; k < p.xpt; k++) {
-        uint x_lo = k * 256u + lid;
+        uint x_lo = k * 256u + owner;
         uint pair_idx = tgid * p.lo_size + x_lo;
         if ((pair_idx & p.mask) >= p.useful) { continue; }
         uint4 ar = a_in[pair_idx];
@@ -11641,7 +11668,7 @@ kernel void zc_r2_products(
         acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
     }
 
-    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, tgid, tgid, lid);
+    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, tgid, tgid, lane, simd_index);
 }
 
 // Four physical groups per logical hi chunk. Each thread owns one
@@ -11656,16 +11683,19 @@ kernel void zc_r2_products_horner(
     device uint4*       partials    [[buffer(5)]],
     constant ZcR2Params& p          [[buffer(6)]],
     uint tgid [[threadgroup_position_in_grid]],
-    uint lid  [[thread_index_in_threadgroup]])
+    uint lid  [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]])
 {
     threadgroup uint4 nib[256];
-    threadgroup ulong4 red[256];
+    threadgroup ulong4 red[32];
     nib[lid] = nib_tab_dev[lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    uint owner = simd_index * 32u + lane;
     uint hi_chunk = tgid >> 2;
-    uint window = ((tgid & 3u) << 6) | (lid >> 2);
-    uint small_class = lid & 3u;
+    uint window = ((tgid & 3u) << 6) | (owner >> 2);
+    uint small_class = owner & 3u;
     U320k h1 = {0ul, 0ul, 0ul, 0ul, 0ul};
     U320k hi = {0ul, 0ul, 0ul, 0ul, 0ul};
     for (uint step = 0u; step < p.xpt; step++) {
@@ -11692,12 +11722,12 @@ kernel void zc_r2_products_horner(
     U256k mi = clmul128(e, zc_r2_horner_reduce(hi));
     ulong4 acc1 = ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
     ulong4 acci = ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
-    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid);
+    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lane, simd_index);
 }
 
 "#;
 
-    fn zc_r2_msl_source(incumbent: bool) -> std::borrow::Cow<'static, str> {
+    pub(crate) fn zc_r2_msl_source(incumbent: bool) -> std::borrow::Cow<'static, str> {
         if incumbent {
             std::borrow::Cow::Owned(format!(
                 "#define FLOCK_ZC_R2_CLMUL_INCUMBENT 1\n{ZC_R2_MSL_SOURCE}"
@@ -11929,6 +11959,13 @@ kernel void zc_r2_horner_oracle(
                     gpu.release(f);
                     if pso.is_null() {
                         return Err(format!("{name} pipeline: {}", gpu.api.error_string(perr)));
+                    }
+                    let (_, width, max_threads) = gpu.pipeline_resources(pso);
+                    if width != 32 || max_threads < 256 {
+                        gpu.release(pso);
+                        return Err(format!(
+                            "{name} requires SIMD width 32 and 256 threads, got {width}/{max_threads}"
+                        ));
                     }
                     Ok(pso)
                 };
@@ -16544,15 +16581,36 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// equality check must pass and publish a share without poisoning) and
     /// the timed prefix path.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_zc_r2_products_match_cpu_oracle() {
-        for (lo_size, hi_size, fixed_weights) in
-            [(512, 64, false), (16_384, 8, true), (16_384, 8, false)]
-        {
-            zc_r2_products_case(lo_size, hi_size, fixed_weights);
+        assert!(gpu_zc_r2_enabled(), "default R2 route must be enabled");
+        assert!(
+            gpu_zc_r2_karatsuba_enabled(),
+            "default nine-multiply route must be enabled"
+        );
+        assert!(
+            gpu_zc_r2_horner_enabled(),
+            "default Horner route must be enabled"
+        );
+        for (lo_size, hi_size, fixed_weights, mask, useful) in [
+            (256, 8, false, 255, 1),
+            (512, 64, false, 4095, 3900),
+            (16_384, 8, true, 127, 121),
+            (16_384, 8, true, 16_383, 61),
+            (16_384, 8, false, 4095, 3900),
+        ] {
+            zc_r2_products_case(lo_size, hi_size, fixed_weights, mask, useful);
         }
     }
 
-    fn zc_r2_products_case(lo_size: usize, hi_size: usize, fixed_weights: bool) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn zc_r2_products_case(
+        lo_size: usize,
+        hi_size: usize,
+        fixed_weights: bool,
+        mask: usize,
+        useful: usize,
+    ) {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
             *rng ^= *rng << 13;
@@ -16591,18 +16649,29 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         };
 
         let n_pairs = lo_size * hi_size;
-        // Test the ranked seven-pair tail and a generic padded block.
-        // The padded inputs contain random data, which must be ignored.
-        let mask = if fixed_weights { 127usize } else { 4095usize };
-        let useful = if fixed_weights { 121usize } else { 3900usize };
-
-        let mut a_packed = vec![0u8; n_pairs * 16];
-        let mut b_packed = vec![0u8; n_pairs * 16];
+        // Padded inputs stay nonzero. Cases include the ranked seven-pair
+        // tail, one active owner and three wholly inactive Horner groups.
+        // The production state caches no-copy wraps for the process.
+        let a_packed = leak_page_aligned(n_pairs * 16);
+        let b_packed = leak_page_aligned(n_pairs * 16);
         for byte in a_packed.iter_mut() {
             *byte = (xs(&mut rng) & 0xff) as u8;
         }
         for byte in b_packed.iter_mut() {
             *byte = (xs(&mut rng) & 0xff) as u8;
+        }
+        // Mix structured row codes with random rows. The quadratic map
+        // makes changes in row position change several packed byte banks.
+        for (row, (a, b)) in a_packed
+            .chunks_exact_mut(8)
+            .zip(b_packed.chunks_exact_mut(8))
+            .enumerate()
+        {
+            if row % 4 == 0 {
+                let code = (row as u64).wrapping_mul(row as u64 ^ 0x9e37_79b9_7f4a_7c15);
+                a.copy_from_slice(&code.rotate_left(17).to_le_bytes());
+                b.copy_from_slice(&(!code).rotate_left(41).to_le_bytes());
+            }
         }
         let mut eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
         if fixed_weights {
@@ -16619,40 +16688,151 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
         let mut eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
 
-        // CPU reference partials, exactly the driver's non-aarch64 shape, kept
-        // split by x_lo parity so the arm's parity contract is checked and not
-        // just the sum a wrong split could still reproduce.
+        // Independent CPU field operations over each contiguous partition.
+        // Four partitions expose every physical Horner output before merging.
         let reference = |a_packed: &[u8],
                          b_packed: &[u8],
                          table_data: &[F128],
                          eq_lo: &[F128],
-                         eq_hi: &[F128]| {
-            let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
+                         eq_hi: &[F128],
+                         groups: usize| {
+            let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size * groups);
             for x_hi in 0..hi_size {
-                // [p1_even, pinf_even, p1_odd, pinf_odd]
-                let mut acc = [F256Unreduced::ZERO; 4];
-                for x_lo in 0..lo_size {
-                    let pair_idx = x_hi * lo_size + x_lo;
-                    if (pair_idx & mask) >= useful {
-                        continue;
+                for group in 0..groups {
+                    let mut acc = [F256Unreduced::ZERO; 4];
+                    for x_lo in group * lo_size / groups..(group + 1) * lo_size / groups {
+                        let pair_idx = x_hi * lo_size + x_lo;
+                        if (pair_idx & mask) >= useful {
+                            continue;
+                        }
+                        let read = |packed: &[u8], row: usize| -> u64 {
+                            u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
+                        };
+                        let a0 = fold_row(table_data, read(a_packed, 2 * pair_idx));
+                        let a1 = fold_row(table_data, read(a_packed, 2 * pair_idx + 1));
+                        let b0 = fold_row(table_data, read(b_packed, 2 * pair_idx));
+                        let b1 = fold_row(table_data, read(b_packed, 2 * pair_idx + 1));
+                        let base = 2 * (x_lo & 1);
+                        acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
+                        acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
                     }
-                    let read = |packed: &[u8], row: usize| -> u64 {
-                        u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
-                    };
-                    let a0 = fold_row(table_data, read(&a_packed, 2 * pair_idx));
-                    let a1 = fold_row(table_data, read(&a_packed, 2 * pair_idx + 1));
-                    let b0 = fold_row(table_data, read(&b_packed, 2 * pair_idx));
-                    let b1 = fold_row(table_data, read(&b_packed, 2 * pair_idx + 1));
-                    let base = 2 * (x_lo & 1);
-                    acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                    acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+                    let eq_h = eq_hi[x_hi];
+                    cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
                 }
-                let eq_h = eq_hi[x_hi];
-                cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
             }
             cpu_split
         };
-        let cpu_split = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        let cpu_split = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, 1);
+
+        // Compile and dispatch the exact production kernels in both multiply
+        // modes. Keep all Metal buffers and PSOs through the input changes.
+        let gpu = imp::gpu().expect("SIMD products oracle requires real Metal");
+        let pool = unsafe { gpu.pool_push() };
+        let max_groups = if fixed_weights { 4 } else { 1 };
+        let direct_buffers: Vec<_> = [
+            a_packed.len(),
+            b_packed.len(),
+            eq_lo.len() * 16,
+            eq_hi.len() * 16,
+            256 * 16,
+            hi_size * max_groups * 64,
+        ]
+        .into_iter()
+        .map(|bytes| unsafe { gpu.new_buffer(bytes).unwrap() })
+        .collect();
+        let mut direct_psos = Vec::new();
+        for incumbent in [true, false] {
+            for horner in [false, true] {
+                if horner && !fixed_weights {
+                    continue;
+                }
+                let source = imp::zc_r2_msl_source(incumbent);
+                let name = if horner {
+                    "zc_r2_products_horner"
+                } else {
+                    "zc_r2_products"
+                };
+                let pso = unsafe { imp::compile_supplemental_pipeline(gpu, &source, name).unwrap() };
+                let usage = unsafe { gpu.pipeline_resources(pso) };
+                assert_eq!(usage.1, 32, "SIMD admission: {name}, incumbent={incumbent}");
+                assert!(usage.2 >= 256, "full production group must fit");
+                assert!(
+                    usage.0 <= 5120,
+                    "4 KiB nibble table plus 1 KiB reduction scratch"
+                );
+                eprintln!("[zc-r2-simd] {name} incumbent={incumbent} resources={usage:?}");
+                direct_psos.push((incumbent, horner, pso));
+            }
+        }
+        let direct_check = |a: &[u8], b: &[u8], table: &[F128], lo: &[F128], hi: &[F128]| unsafe {
+            let mut nib = [F128::ZERO; 256];
+            for bank in 0..8 {
+                for value in 0..16 {
+                    nib[bank * 32 + value] = table[bank * 256 + value];
+                    nib[bank * 32 + 16 + value] = table[bank * 256 + (value << 4)];
+                }
+            }
+            for &(incumbent, horner, pso) in &direct_psos {
+                let compressed: Vec<F128> = if horner {
+                    (0..1024).map(|i| lo[(i / 4 << 6) | (i & 3)]).collect()
+                } else {
+                    lo.to_vec()
+                };
+                fn as_bytes(values: &[F128]) -> &[u8] {
+                    unsafe {
+                        core::slice::from_raw_parts(
+                            values.as_ptr().cast::<u8>(),
+                            core::mem::size_of_val(values),
+                        )
+                    }
+                }
+                for (input, &buffer) in [a, b, as_bytes(&compressed), as_bytes(hi), as_bytes(&nib)]
+                    .into_iter()
+                    .zip(&direct_buffers)
+                {
+                    std::ptr::copy_nonoverlapping(
+                        input.as_ptr(),
+                        gpu.buffer_contents(buffer),
+                        input.len(),
+                    );
+                }
+                let groups = if horner { 4 } else { 1 };
+                let expected = reference(a, b, table, lo, hi, groups);
+                let output_bytes = expected.len() * 64;
+                std::ptr::write_bytes(gpu.buffer_contents(direct_buffers[5]), 0xa5, output_bytes);
+                let params = [
+                    lo_size as u32,
+                    if horner { 16 } else { (lo_size / 256) as u32 },
+                    mask as u32,
+                    useful as u32,
+                ];
+                let params_bytes = core::slice::from_raw_parts(
+                    params.as_ptr().cast::<u8>(),
+                    core::mem::size_of_val(&params),
+                );
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                for (index, &buffer) in direct_buffers.iter().enumerate() {
+                    gpu.set_buffer(enc, buffer, 0, index);
+                }
+                gpu.set_bytes(enc, params_bytes, 6);
+                gpu.dispatch(enc, (hi_size * groups) as u64, 256);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let actual = core::slice::from_raw_parts(
+                    gpu.buffer_contents(direct_buffers[5]).cast::<[F128; 4]>(),
+                    expected.len(),
+                );
+                assert_eq!(
+                    actual,
+                    expected.as_slice(),
+                    "physical partials: incumbent={incumbent}, horner={horner}, \
+                     lo={lo_size}, mask={mask}, useful={useful}"
+                );
+            }
+        };
+        direct_check(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
         let cpu_partials: Vec<(F128, F128)> = cpu_split
             .iter()
             .map(|v| (v[0] + v[2], v[1] + v[3]))
@@ -16690,7 +16870,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             !poisoned,
             "probe partials must equal CPU partials bit-for-bit"
         );
-        assert_ne!(tuned, usize::MAX, "calibration must publish a share");
+        assert!(
+            tuned > 0 && tuned <= hi_size,
+            "default route calibration must admit a nonzero share, got {tuned}"
+        );
 
         // Timed prefix path at a forced share.
         imp::zc_r2_test_set_share(hi_size / 2);
@@ -16737,10 +16920,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             eq_lo.as_ptr(),
             eq_hi.as_ptr(),
         );
-        for byte in &mut a_packed {
+        for byte in a_packed.iter_mut() {
             *byte ^= 0x5b;
         }
-        for byte in &mut b_packed {
+        for byte in b_packed.iter_mut() {
             *byte ^= 0xa7;
         }
         for value in table_data
@@ -16761,7 +16944,8 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             )
         );
         assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
-        let changed = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        direct_check(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        let changed = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, 1);
         assert_ne!(
             &changed[..prefix],
             &cpu_split[..prefix],
@@ -16793,6 +16977,21 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             _ => panic!("changed-input drain must return prefix partials"),
         }
         imp::zc_r2_test_reset();
+        eprintln!(
+            "[zc-r2-simd] checked {} production modes twice; lo={lo_size} \
+             hi={hi_size} fixed_weights={fixed_weights} mask={mask} useful={useful} \
+             admitted_share={tuned}",
+            direct_psos.len()
+        );
+        unsafe {
+            for buffer in direct_buffers {
+                gpu.release(buffer);
+            }
+            for (_, _, pso) in direct_psos {
+                gpu.release(pso);
+            }
+            gpu.pool_pop(pool);
+        }
     }
 
     /// The L1 NTT/Merkle-leaf overlap must reproduce the incumbent commit
