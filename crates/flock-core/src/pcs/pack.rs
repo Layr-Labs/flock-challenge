@@ -81,6 +81,12 @@ pub fn pack_witness(z: &[bool], m: usize) -> Vec<F128> {
 /// witness of length `2^m`.
 ///
 /// Round-trips with [`pack_witness`] by construction.
+/// Unpacks the inverse of `pack_witness` by construction: element `i_rest`
+/// starts at bit `base = i_rest << 7`, the low word supplies bits `0..64`
+/// and the high word supplies bits `64..128`, each read LSB-first with
+/// shifts and single-bit tests, so bit `r` returns to exactly the position
+/// packing read from. The loops write disjoint `base` ranges, preserving the
+/// module's natural little-endian bit order with no cross-chunk mixing.
 pub fn unpack_witness(packed: &[F128], m: usize) -> Vec<bool> {
     let n_packed = 1usize << (m - LOG_PACKING);
     assert_eq!(

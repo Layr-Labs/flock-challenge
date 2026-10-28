@@ -733,14 +733,24 @@ struct ReverseTranspose<'a> {
     z_const_acc: F128,
 }
 
+static REVERSE_TRANSPOSE_SCRATCH: std::sync::Mutex<
+    Option<(Vec<ReverseWordOp>, Vec<[F128; WORD_BITS]>)>,
+> = std::sync::Mutex::new(None);
+
 impl<'a> ReverseTranspose<'a> {
     fn new(alpha: F128, eq_inner: &'a [F128]) -> Self {
+        let cap = 32 + 12 * N_G + 16;
+        let (ops, adjoints) = REVERSE_TRANSPOSE_SCRATCH
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+            .unwrap_or_else(|| (Vec::with_capacity(cap), vec![[F128::ZERO; WORD_BITS]; cap]));
         Self {
             alpha,
             eq_inner,
-            ops: Vec::with_capacity(32 + 12 * N_G + 16),
-            adjoints: Vec::with_capacity(32 + 12 * N_G + 16),
-            comb: vec![F128::ZERO; K],
+            ops,
+            adjoints,
+            comb: flock_core::scratch::take_lincheck_acc(K),
             z_const_acc: F128::ZERO,
         }
     }
@@ -749,7 +759,9 @@ impl<'a> ReverseTranspose<'a> {
     fn push(&mut self, op: ReverseWordOp) -> usize {
         let id = self.ops.len();
         self.ops.push(op);
-        self.adjoints.push([F128::ZERO; WORD_BITS]);
+        if id >= self.adjoints.len() {
+            self.adjoints.push([F128::ZERO; WORD_BITS]);
+        }
         id
     }
 
@@ -842,6 +854,7 @@ impl<'a> ReverseTranspose<'a> {
             // F128 is Copy, so taking this 32-lane value avoids aliasing the
             // current node while predecessor adjoints are updated.
             let q = self.adjoints[id];
+            self.adjoints[id] = [F128::ZERO; WORD_BITS];
             match self.ops[id] {
                 ReverseWordOp::Leaf(base) => {
                     for (i, value) in q.into_iter().enumerate() {
@@ -879,6 +892,10 @@ impl<'a> ReverseTranspose<'a> {
                     }
                 }
             }
+        }
+        self.ops.clear();
+        if let Ok(mut guard) = REVERSE_TRANSPOSE_SCRATCH.lock() {
+            *guard = Some((self.ops, self.adjoints));
         }
         self.comb[Z_CONST_POS] += self.z_const_acc;
         self.comb
@@ -3940,6 +3957,8 @@ fn warm_publish_path(
     if std::env::var_os("FLOCK_NO_SER_WARM").is_some() {
         return (proof, commitment);
     }
+    crate::proof_io::warm_gather_publish(&commitment, &proof);
+    crate::proof_io::stash_pre_encoded_prefix(&commitment, &proof.zerocheck, &proof.lincheck);
     let bundle = crate::proof_io::R1csProofBundleLigerito { commitment, proof };
     std::hint::black_box(bundle.to_bytes());
     let crate::proof_io::R1csProofBundleLigerito { commitment, proof } = bundle;

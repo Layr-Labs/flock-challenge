@@ -40,6 +40,121 @@ struct PoolEntry {
 
 static POOL: Mutex<Vec<PoolEntry>> = Mutex::new(Vec::new());
 
+static OBLOCK_PARTIALS_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
+static LINCHECK_ACC_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
+static LINCHECK_EQ_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
+static LINCHECK_Z_VEC_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
+
+/// Take a persistent pre-faulted buffer for `oblock_padded_tiled_impl` partials
+/// (`n_claims * k`, up to `64 * 16384 = 1,048,576` `F128`s = `16 MiB`).
+/// Avoids a 10.5–16 MiB `mmap` + 640–1024 page faults + `munmap` per prove.
+pub fn take_oblock_partials(len: usize) -> Vec<F128> {
+    if let Ok(mut guard) = OBLOCK_PARTIALS_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= len {
+                unsafe { v.set_len(len) };
+                return v;
+            }
+        }
+    }
+    let cap = len.max(64 * 16384);
+    let mut v = crate::alloc_uninit_vec(cap);
+    unsafe { v.set_len(len) };
+    v
+}
+
+/// Return the `oblock_padded_tiled_impl` partials buffer to its persistent slot.
+pub fn give_oblock_partials(mut v: Vec<F128>) {
+    if v.capacity() < 16384 {
+        return;
+    }
+    v.clear();
+    if let Ok(mut guard) = OBLOCK_PARTIALS_SCRATCH.lock() {
+        if guard.as_ref().is_none_or(|old| old.capacity() < v.capacity()) {
+            *guard = Some(v);
+        }
+    }
+}
+
+/// Take a zero-initialized accumulator vector of length `len` for Lincheck's
+/// `ReverseTranspose::comb`. When a recycled buffer is parked in
+/// `LINCHECK_ACC_SCRATCH`, its `[0..len)` prefix was already zeroed when it was
+/// returned, avoiding a per-prove heap allocation + memset.
+pub fn take_lincheck_acc(len: usize) -> Vec<F128> {
+    if let Ok(mut guard) = LINCHECK_ACC_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= len {
+                unsafe { v.set_len(len) };
+                return v;
+            }
+        }
+    }
+    vec![F128::ZERO; len]
+}
+
+/// Return the folded `comb_vec` buffer to `LINCHECK_ACC_SCRATCH`, zeroing
+/// its `[0..full_len)` prefix so the next `take_lincheck_acc(full_len)` is O(1).
+pub fn give_lincheck_acc(mut v: Vec<F128>, full_len: usize) {
+    if v.capacity() < full_len {
+        return;
+    }
+    unsafe {
+        v.set_len(full_len);
+        core::ptr::write_bytes(v.as_mut_ptr(), 0, full_len);
+    }
+    if let Ok(mut guard) = LINCHECK_ACC_SCRATCH.lock() {
+        *guard = Some(v);
+    }
+}
+
+/// Take an uninitialized `F128` vector of length `len` for `build_quirky_eq_table`.
+pub fn take_lincheck_eq(len: usize) -> Vec<F128> {
+    if let Ok(mut guard) = LINCHECK_EQ_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= len {
+                unsafe { v.set_len(len) };
+                return v;
+            }
+        }
+    }
+    crate::alloc_uninit_vec(len)
+}
+
+/// Return `eq_inner` to `LINCHECK_EQ_SCRATCH`.
+pub fn give_lincheck_eq(mut v: Vec<F128>) {
+    if v.capacity() < 16384 {
+        return;
+    }
+    v.clear();
+    if let Ok(mut guard) = LINCHECK_EQ_SCRATCH.lock() {
+        *guard = Some(v);
+    }
+}
+
+/// Take an uninitialized `F128` vector of length `len` for `z_vec` in Lincheck.
+pub fn take_lincheck_z_vec(len: usize) -> Vec<F128> {
+    if let Ok(mut guard) = LINCHECK_Z_VEC_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= len {
+                unsafe { v.set_len(len) };
+                return v;
+            }
+        }
+    }
+    crate::alloc_uninit_vec(len)
+}
+
+/// Return `z_vec` to `LINCHECK_Z_VEC_SCRATCH`.
+pub fn give_lincheck_z_vec(mut v: Vec<F128>) {
+    if v.capacity() < 16384 {
+        return;
+    }
+    v.clear();
+    if let Ok(mut guard) = LINCHECK_Z_VEC_SCRATCH.lock() {
+        *guard = Some(v);
+    }
+}
+
 /// One sampled constant-byte range a staged release token must satisfy at
 /// give time (belt-and-braces against a stale stage matching a recycled
 /// address): `len` bytes at `byte_off` must all equal `value`.
@@ -572,6 +687,21 @@ pub fn prewarm_prover(m: usize) {
         give_f128(b);
     }
     give_u8(stripe);
+    if m == 32 {
+        let mut partials = take_oblock_partials(64 * 16384);
+        partials.par_chunks_mut(1 << 16).for_each(|chunk| {
+            unsafe { std::ptr::write_bytes(chunk.as_mut_ptr(), 0u8, chunk.len()) }
+        });
+        give_oblock_partials(partials);
+        let acc = take_lincheck_acc(16384);
+        give_lincheck_acc(acc, 16384);
+        let mut eq = take_lincheck_eq(16384);
+        eq.fill(F128::ZERO);
+        give_lincheck_eq(eq);
+        let mut zv = take_lincheck_z_vec(16384);
+        zv.fill(F128::ZERO);
+        give_lincheck_z_vec(zv);
+    }
 }
 
 /// Release every ordinary pooled buffer back to the OS.

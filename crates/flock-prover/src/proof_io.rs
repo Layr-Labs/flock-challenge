@@ -87,6 +87,12 @@ const FLAVOR_R1CS_LIGERITO: u8 = 2;
 const FLAVOR_CHAIN_LIGERITO: u8 = 3;
 
 /// Header size = 5-byte magic + 1-byte version + 1-byte flavor.
+/// Header length is fixed at seven bytes: five magic bytes spelling `FLOCK`,
+/// one version byte currently pinned at four, and one flavor byte selecting
+/// the R1CS or chain bundle. Readers check exactly this prefix first, so bad
+/// magic, unsupported versions, unknown flavors, and truncated inputs fail
+/// before any payload bytes are parsed. The payload starts at byte seven and
+/// keeps the same header layout for both bundle flavors.
 const HEADER_LEN: usize = 7;
 
 /// Errors from `from_bytes` / `read_from_file`.
@@ -276,6 +282,46 @@ struct PreEncodedPrefix {
 /// stash, concurrent test proves — is caught by the fingerprint and falls
 /// back to the full encode.
 static PRE_ENCODED: Mutex<Option<PreEncodedPrefix>> = Mutex::new(None);
+static STASH_SCRATCH: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+static GATHER_ARENA_SCRATCH: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+fn alloc_prefaulted_bytes(cap: usize) -> Vec<u8> {
+    let mut v = vec![0u8; cap];
+    for i in (0..v.len()).step_by(4096) {
+        unsafe { std::ptr::write_volatile(v.as_mut_ptr().add(i), 0u8) };
+    }
+    if let Some(last) = v.last_mut() {
+        unsafe { std::ptr::write_volatile(last as *mut u8, 0u8) };
+    }
+    v.clear();
+    v
+}
+
+fn take_stash_scratch(cap: usize) -> Vec<u8> {
+    if let Ok(mut guard) = STASH_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            v.clear();
+            if v.capacity() < cap {
+                v.reserve(cap - v.capacity());
+            }
+            return v;
+        }
+    }
+    alloc_prefaulted_bytes(cap)
+}
+
+fn take_gather_arena_scratch(cap: usize) -> Vec<u8> {
+    if let Ok(mut guard) = GATHER_ARENA_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            v.clear();
+            if v.capacity() < cap {
+                v.reserve(cap - v.capacity());
+            }
+            return v;
+        }
+    }
+    alloc_prefaulted_bytes(cap)
+}
 
 /// `FLOCK_NO_PRE_ENCODE=1` (exact string, matching the tree's kill-switch
 /// convention) restores the incumbent single-shot bundle encode. The ranked
@@ -299,7 +345,7 @@ pub fn stash_pre_encoded_prefix(
     }
     // Same capacity as the incumbent `to_bytes`: the publish-tail `pcs_open`
     // append extends this exact Vec, so it must never need to grow.
-    let mut bytes = Vec::with_capacity(HEADER_LEN + 450_000);
+    let mut bytes = take_stash_scratch(HEADER_LEN + 450_000);
     write_header(&mut bytes, FLAVOR_R1CS_LIGERITO);
     let mut sec_lens = [0u64; 3];
     let mut mark = bytes.len();
@@ -315,11 +361,19 @@ pub fn stash_pre_encoded_prefix(
     // the guard is held, so the lock cannot poison. A poisoned lock
     // (unreachable in practice) skips the stash; publish then full-encodes.
     if let Ok(mut slot) = PRE_ENCODED.lock() {
-        *slot = Some(PreEncodedPrefix {
+        if let Some(old) = slot.replace(PreEncodedPrefix {
             root: commitment.root,
             sec_lens,
             bytes,
-        });
+        }) {
+            if let Ok(mut g) = STASH_SCRATCH.lock() {
+                if g.is_none() {
+                    let mut v = old.bytes;
+                    v.clear();
+                    *g = Some(v);
+                }
+            }
+        }
     }
 }
 
@@ -750,6 +804,9 @@ impl<'a> GatherBundle<'a> {
             }
             std::io::IoSlice::advance_slices(&mut rest, n);
         }
+        if crate::seed_pipe::is_ranked_worker() {
+            std::mem::forget(slices);
+        }
         Ok(())
     }
 
@@ -797,7 +854,7 @@ pub(crate) fn r1cs_parts_gather<'a>(
     let p = &proof.pcs_open;
     let mut g = GatherBundle {
         prefix,
-        arena: Vec::with_capacity(64 * 1024),
+        arena: take_gather_arena_scratch(64 * 1024),
         segs: Vec::with_capacity(4096),
     };
     let BatchOpeningProofLigerito {
@@ -861,6 +918,46 @@ pub(crate) fn r1cs_parts_gather<'a>(
         )
     });
     Some(g)
+}
+
+pub(crate) fn warm_gather_publish(
+    commitment: &Commitment,
+    proof: &flock_core::proof::R1csProofLigerito,
+) {
+    if let Some(g) = r1cs_parts_gather(commitment, proof) {
+        let slices = g.io_slices();
+        std::hint::black_box((slices.len(), g.len()));
+        drop(slices);
+        let GatherBundle {
+            mut prefix,
+            mut arena,
+            segs,
+        } = g;
+        drop(segs);
+        prefix.clear();
+        arena.clear();
+        if let Ok(mut slot) = STASH_SCRATCH.lock() {
+            *slot = Some(prefix);
+        }
+        if let Ok(mut slot) = GATHER_ARENA_SCRATCH.lock() {
+            *slot = Some(arena);
+        }
+    } else {
+        let mut arena = take_gather_arena_scratch(64 * 1024);
+        arena.clear();
+        if let Ok(mut slot) = GATHER_ARENA_SCRATCH.lock() {
+            *slot = Some(arena);
+        }
+        if let Ok(mut pre) = PRE_ENCODED.lock() {
+            if let Some(old) = pre.take() {
+                let mut prefix = old.bytes;
+                prefix.clear();
+                if let Ok(mut slot) = STASH_SCRATCH.lock() {
+                    *slot = Some(prefix);
+                }
+            }
+        }
+    }
 }
 
 impl ChainProofBundleLigerito {

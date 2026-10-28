@@ -1034,6 +1034,11 @@ pub fn gpu_keepwarm_prove_started() {
     imp::keepwarm_pause();
 }
 
+pub fn gpu_keepwarm_resume() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::keepwarm_arm();
+}
+
 /// Scan one ascending nonce block with the retained Metal PCS-grind state.
 /// Returns the smallest satisfying nonce in the block, or `None` when the
 /// block has no match.  All recurring work (output reset, command creation,
