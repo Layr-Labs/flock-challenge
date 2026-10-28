@@ -542,6 +542,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let stash_pool = (crate::proof_io::pre_encode_enabled() && rayon::current_num_threads() > 1)
         .then(flock_core::epool::helper_pool)
         .flatten();
+    let claims = [ab, c];
     let pcs_open = match stash_pool {
         Some(pool) => pool.in_place_scope(|s| {
             s.spawn(|_| {
@@ -556,7 +557,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
                     z_packed,
                     &prover_data,
                     &commitment,
-                    &[ab.clone(), c.clone()],
+                    &claims,
                     &[pre_ab, pre_c],
                     &padding,
                     &lig_config,
@@ -569,7 +570,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
                 z_packed,
                 &prover_data,
                 &commitment,
-                &[ab.clone(), c.clone()],
+                &claims,
                 &[pre_ab, pre_c],
                 &padding,
                 &lig_config,
@@ -577,6 +578,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             )
         }),
     };
+    let [ab, c] = claims;
     flock_core::tmark::mark("open returned");
     if phase_timing {
         let wall = t_open.elapsed().as_secs_f64() * 1e3;
