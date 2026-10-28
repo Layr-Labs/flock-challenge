@@ -31,7 +31,7 @@ use multilinear::{
     fold_compact_and_compute_round_pair, fold_in_place_pair, fold2_compact_and_round4_into,
     fold2_compact_and_round45_into, fold2_plain_and_round6_into, fold2_plain_and_round67_into,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
-    uni_skip_fold_and_round_pair_compact_padded_lookahead,
+    uni_skip_fold_and_round_pair_compact_padded_lookahead_for,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
 use univariate_skip_optimized::{
@@ -795,8 +795,13 @@ fn prove_packed_padded_inner<C: Challenger>(
     let use_lookahead =
         (m == 32 || cfg!(test)) && n_mlv >= 6 && r[k_skip + 1] != F128::ZERO && !lookahead_off();
 
+    // The cascade gate (see the rounds 5+6 comment below) reads only values
+    // fixed before round two, so it is decided here: a compact state that
+    // only the cascade K pass will read may skip its dead padding pairs.
+    let use_cascade = use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
+
     let (compact_mlv, msg_1, msg_inf, lookahead) = if use_lookahead {
-        let (compact, m1, mi, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+        let (compact, m1, mi, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
             a_packed,
             b_packed,
             m,
@@ -805,6 +810,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             &mlv_arg,
             padding,
             compact_deltas,
+            use_cascade,
         );
         (compact, m1, mi, Some(la))
     } else {
@@ -868,8 +874,8 @@ fn prove_packed_padded_inner<C: Challenger>(
     // for a sampled slot it is probability 2⁻¹²⁸); that case falls back to
     // the incumbent route, which stays in the tree as the oracle anyway.
     // n_mlv ≥ 7 keeps every eq split at lo_size ≥ 2 and the composed input
-    // ≥ 32. Kill switch: FLOCK_NO_ZC_CASCADE2=1 (exact '1').
-    let use_cascade = use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
+    // ≥ 32. Kill switch: FLOCK_NO_ZC_CASCADE2=1 (exact '1'). `use_cascade`
+    // itself is decided before round two (above).
 
     // Cascade one level deeper still (rounds 7+8, see
     // `fold2_plain_and_round67_into`): the composed 5+6 pass materializes each
@@ -951,7 +957,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             );
             if tail_round_timing {
                 eprintln!(
-                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}): {:.2} ms",
+                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, dead_tail={}): {:.2} ms",
+                    compact_mlv.dead_tail,
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
             }

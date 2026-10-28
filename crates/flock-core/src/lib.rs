@@ -168,6 +168,8 @@ fn set_shadow_thread_qos() {}
 /// inherits default QoS, which lets sustained jobs drift onto efficiency cores
 /// even when the pool was deliberately sized to the performance-core count.
 ///
+/// `0x21` is `QOS_CLASS_USER_INTERACTIVE`. The return code is ignored: a thread
+/// that keeps its default class still produces the same proof, possibly slower.
 #[cfg(target_os = "macos")]
 fn set_prover_thread_qos() {
     unsafe extern "C" {
