@@ -733,24 +733,14 @@ struct ReverseTranspose<'a> {
     z_const_acc: F128,
 }
 
-static REVERSE_TRANSPOSE_SCRATCH: std::sync::Mutex<
-    Option<(Vec<ReverseWordOp>, Vec<[F128; WORD_BITS]>)>,
-> = std::sync::Mutex::new(None);
-
 impl<'a> ReverseTranspose<'a> {
     fn new(alpha: F128, eq_inner: &'a [F128]) -> Self {
-        let cap = 32 + 12 * N_G + 16;
-        let (ops, adjoints) = REVERSE_TRANSPOSE_SCRATCH
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
-            .unwrap_or_else(|| (Vec::with_capacity(cap), vec![[F128::ZERO; WORD_BITS]; cap]));
         Self {
             alpha,
             eq_inner,
-            ops,
-            adjoints,
-            comb: flock_core::scratch::take_lincheck_acc(K),
+            ops: Vec::with_capacity(32 + 12 * N_G + 16),
+            adjoints: Vec::with_capacity(32 + 12 * N_G + 16),
+            comb: vec![F128::ZERO; K],
             z_const_acc: F128::ZERO,
         }
     }
@@ -759,9 +749,7 @@ impl<'a> ReverseTranspose<'a> {
     fn push(&mut self, op: ReverseWordOp) -> usize {
         let id = self.ops.len();
         self.ops.push(op);
-        if id >= self.adjoints.len() {
-            self.adjoints.push([F128::ZERO; WORD_BITS]);
-        }
+        self.adjoints.push([F128::ZERO; WORD_BITS]);
         id
     }
 
@@ -890,17 +878,6 @@ impl<'a> ReverseTranspose<'a> {
                         suffix += weight;
                     }
                 }
-            }
-        }
-        if crate::seed_pipe::is_timed_speculative_prove() {
-            std::mem::forget(self.ops);
-            std::mem::forget(self.adjoints);
-        } else {
-            let used = self.ops.len();
-            self.ops.clear();
-            self.adjoints[..used].fill([F128::ZERO; WORD_BITS]);
-            if let Ok(mut guard) = REVERSE_TRANSPOSE_SCRATCH.lock() {
-                *guard = Some((self.ops, self.adjoints));
             }
         }
         self.comb[Z_CONST_POS] += self.z_const_acc;
@@ -3966,8 +3943,6 @@ fn warm_publish_path(
     let bundle = crate::proof_io::R1csProofBundleLigerito { commitment, proof };
     std::hint::black_box(bundle.to_bytes());
     let crate::proof_io::R1csProofBundleLigerito { commitment, proof } = bundle;
-    crate::proof_io::stash_pre_encoded_prefix(&commitment, &proof.zerocheck, &proof.lincheck);
-    crate::proof_io::warm_gather_publish(&commitment, &proof);
     (proof, commitment)
 }
 
