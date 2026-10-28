@@ -4029,6 +4029,14 @@ fn scatter_active_windows(
     let window_mask = window_len - 1;
     let mut arena = vec![F128::ZERO; groups.len() * window_len];
     for (arena_index, group) in groups.iter().enumerate() {
+        if group.input_end - group.input_start == 1 {
+            // Singleton window: stays zero here; `transform_active_windows`
+            // expands its one input directly (see `expand_singleton_window`).
+            // Group mates share the window index but carry distinct positions
+            // (sorted distinct queries), so a length-1 group holds exactly one
+            // nonzero.
+            continue;
+        }
         let window = &mut arena[arena_index * window_len..(arena_index + 1) * window_len];
         for input_index in group.input_start..group.input_end {
             window[positions[input_index] & window_mask] += values[input_index];
@@ -4064,20 +4072,73 @@ fn transform_active_window(
     }
 }
 
+/// Singleton-window prefix shortcut: a window holding exactly one nonzero input
+/// at `local_pos` expands it through the `prefix_k` layers directly
+/// (`2^k - 1` products) instead of the dense `k * 2^(k-1)` butterflies of
+/// [`transform_active_window`]. Skipped all-zero pairs are exact identities
+/// (`0 + 0 = 0`, `twiddle * 0 + 0 = 0`), so the window is bit-identical to the
+/// dense transform. The window must be all zero on entry (left so by
+/// [`scatter_active_windows`]).
+fn expand_singleton_window(
+    ntt: &AdditiveNttF128,
+    window: &mut [F128],
+    window_index: usize,
+    prefix_k: usize,
+    log_d: usize,
+    local_pos: usize,
+    value: F128,
+) {
+    debug_assert!(window.iter().all(|&x| x == F128::ZERO));
+    window[local_pos] = value;
+    for s in 0..prefix_k {
+        let layer = log_d - 1 - s;
+        let half = 1usize << s;
+        let block_size = half << 1;
+        // Aligned power-of-two blocks nest, so the one block of this size
+        // holding the seed covers every nonzero the previous layer wrote.
+        let block = local_pos / block_size;
+        let twiddle = ntt.twiddle(layer, (window_index << (prefix_k - s - 1)) + block);
+        let base = block * block_size;
+        for row in 0..half {
+            let top = window[base + row];
+            let bottom = window[base + row + half];
+            let sum = top + bottom;
+            window[base + row] = sum;
+            window[base + row + half] = twiddle * sum + bottom;
+        }
+    }
+}
+
 fn transform_active_windows(
     ntt: &AdditiveNttF128,
     arena: &mut [F128],
     groups: &[ActiveWindow],
+    positions: &[usize],
+    values: &[F128],
     prefix_k: usize,
     log_d: usize,
 ) {
     use rayon::prelude::*;
     let window_len = 1usize << prefix_k;
+    let window_mask = window_len - 1;
     arena
         .par_chunks_mut(window_len)
         .zip(groups.par_iter())
         .for_each(|(window, group)| {
-            transform_active_window(ntt, window, group.window_index, prefix_k, log_d);
+            if group.input_end - group.input_start == 1 {
+                let input = group.input_start;
+                expand_singleton_window(
+                    ntt,
+                    window,
+                    group.window_index,
+                    prefix_k,
+                    log_d,
+                    positions[input] & window_mask,
+                    values[input],
+                );
+            } else {
+                transform_active_window(ntt, window, group.window_index, prefix_k, log_d);
+            }
         });
 }
 
@@ -4105,7 +4166,7 @@ fn densify_active_windows(
     let n_windows = n / window_len;
     let window_to_arena = active_window_to_arena(groups, n_windows);
 
-    let mut data: Vec<F128> = crate::alloc_uninit_vec(n);
+    let mut data: Vec<F128> = crate::scratch::take_sparse_ntt_data(n);
     data.par_chunks_mut(window_len)
         .enumerate()
         .for_each(|(window_index, destination)| {
@@ -4174,7 +4235,8 @@ fn densify_active_windows_fused_first_3layer(
     // Keep the vector length at zero until every Rayon job has initialized its
     // disjoint block. This avoids ever constructing a safe reference to an
     // uninitialized `F128`; a panic before `set_len` merely drops capacity.
-    let mut data = Vec::<F128>::with_capacity(n);
+    let mut data = crate::scratch::take_sparse_ntt_data(n);
+    unsafe { data.set_len(0); }
     let data_ptr = data.as_mut_ptr() as usize;
     (0..num_blocks).into_par_iter().for_each(|block| {
         let arena_indices: [usize; 8] = core::array::from_fn(|i| window_to_arena[8 * block + i]);
@@ -4795,7 +4857,7 @@ fn transpose_forward_ntt_sparse_rate8_low_eighth(
     let prefix_k = 8usize.min(log_d - 3);
     let groups = group_sorted_positions(positions, prefix_k);
     let mut arena = scatter_active_windows(&groups, positions, values, prefix_k);
-    transform_active_windows(ntt, &mut arena, &groups, prefix_k, log_d);
+    transform_active_windows(ntt, &mut arena, &groups, positions, values, prefix_k, log_d);
 
     let (mut data, mut remaining) = if use_l2_fused_densify {
         assert_eq!(log_d, 16, "ranked L2 fused densify requires log_d=16");
@@ -4820,7 +4882,9 @@ fn transpose_forward_ntt_sparse_rate8_low_eighth(
             "ranked L2 factored tail requires direct-final-five parent"
         );
         assert_eq!(remaining, 5, "ranked L2 factored tail requires layers 4..0");
-        return transpose_forward_ntt_final_5layer_low_eighth_factored(ntt, &data, log_d);
+        let out = transpose_forward_ntt_final_5layer_low_eighth_factored(ntt, &data, log_d);
+        crate::scratch::give_sparse_ntt_data(data);
+        return out;
     }
 
     if use_l2_fused_final5 {
@@ -4829,7 +4893,9 @@ fn transpose_forward_ntt_sparse_rate8_low_eighth(
             "ranked L2 direct tail requires fused-densify parent"
         );
         assert_eq!(remaining, 5, "ranked L2 direct tail requires layers 4..0");
-        return transpose_forward_ntt_final_5layer_low_eighth_direct(ntt, &data, log_d);
+        let out = transpose_forward_ntt_final_5layer_low_eighth_direct(ntt, &data, log_d);
+        crate::scratch::give_sparse_ntt_data(data);
+        return out;
     }
 
     // The still-live reverse layers are `(remaining-1)..=3`. Reuse the
@@ -4844,7 +4910,9 @@ fn transpose_forward_ntt_sparse_rate8_low_eighth(
         transpose_forward_ntt_single_layer_flat(ntt, &mut data, log_d, layer);
     }
 
-    transpose_forward_ntt_final_3layer_low_eighth_xor(&data)
+    let out = transpose_forward_ntt_final_3layer_low_eighth_xor(&data);
+    crate::scratch::give_sparse_ntt_data(data);
+    out
 }
 
 #[cfg(test)]
@@ -4916,7 +4984,7 @@ fn transpose_forward_ntt_sparse_impl(
 
     let mut arena = scatter_active_windows(&groups, positions, values, k);
 
-    transform_active_windows(ntt, &mut arena, &groups, k, log_d);
+    transform_active_windows(ntt, &mut arena, &groups, positions, values, k, log_d);
 
     let use_fused_densify = use_ranked_fused_densify_first(log_d, k, positions.len());
     let (mut data, dense_prefix_k) = if use_fused_densify {
@@ -7725,20 +7793,26 @@ impl SumcheckProver {
                     beta,
                 }),
                 deferred_basis,
-            ) => fold_and_msg_lsb_into_with_lazy_ood_eq(
-                &self.f,
-                &self.combined_basis,
-                deferred_basis
-                    .as_ref()
-                    .map(|(basis, alpha)| (basis.as_slice(), *alpha)),
-                r,
-                &eq_lo,
-                &eq_hi,
-                beta,
-                z_0,
-                &mut self.spare_f,
-                &mut self.spare_b,
-            ),
+            ) => {
+                let m = fold_and_msg_lsb_into_with_lazy_ood_eq(
+                    &self.f,
+                    &self.combined_basis,
+                    deferred_basis
+                        .as_ref()
+                        .map(|(basis, alpha)| (basis.as_slice(), *alpha)),
+                    r,
+                    &eq_lo,
+                    &eq_hi,
+                    beta,
+                    z_0,
+                    &mut self.spare_f,
+                    &mut self.spare_b,
+                );
+                if let Some((b_old, _)) = deferred_basis {
+                    crate::scratch::give_sparse_ntt_data(b_old);
+                }
+                m
+            }
             (Some(PendingOodEq::Introduced { .. }), _) => {
                 panic!("fold before lazy OOD glue")
             }
@@ -7990,6 +8064,7 @@ impl SumcheckProver {
                 .with_min_len(PAR_THRESHOLD / 4)
                 .for_each(|(acc, &v)| *acc += alpha * v);
         }
+        crate::scratch::give_sparse_ntt_data(b_new);
         self.t_r += alpha * h_new;
     }
 
@@ -8869,51 +8944,50 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_queries_0 = config.queries[0];
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    let _t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> = {
-        use rayon::prelude::*;
-        // Indexed parallel collect is order-preserving: bit-identical to
-        // the serial map; each row copy is independent of the challenger.
-        queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect()
-    };
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
-    if trace {
-        t_opens += _t.elapsed();
-    }
-    // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
-    // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
-    // levels stay dense).
-    let sks_vks_n1 = eval_sk_at_vks(n1);
-    let _t = std::time::Instant::now();
     let use_c2 = c2::enabled(
         use_lazy_l1_ood,
         std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
     );
-    // Cache owned residues while the borrowed committed L0 codeword is live.
-    // Unsupported geometry takes the unchanged complete induction below.
-    let sparse_l0 = use_c2.then(|| {
-        c2::Dual::new(
-            n1 + log_inv_rate_0,
-            log_inv_rate_0,
-            &r_lane_fold,
-            &queries_0,
-            &alpha_0,
-            l0_row,
+    let open_l0 = || {
+        use rayon::prelude::*;
+        rayon::join(
+            || merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0),
+            || queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect::<Vec<Vec<F128>>>(),
         )
-    });
-    let full_l0 = if use_c2 {
-        None
+    };
+    let _t = std::time::Instant::now();
+    let ((merkle_proof_0, opened_rows_0), sparse_l0, full_l0) = if use_c2 {
+        let (dual, opened) = rayon::join(
+            || {
+                c2::Dual::new(
+                    n1 + log_inv_rate_0,
+                    log_inv_rate_0,
+                    &r_lane_fold,
+                    &queries_0,
+                    &alpha_0,
+                    l0_row,
+                )
+            },
+            open_l0,
+        );
+        (opened, Some(dual), None)
     } else {
-        Some(induce_sumcheck_poly_auto_with_ranked_msg(
+        let opened = open_l0();
+        if trace {
+            t_opens += _t.elapsed();
+        }
+        let sks_vks_n1 = eval_sk_at_vks(n1);
+        let full = induce_sumcheck_poly_auto_with_ranked_msg(
             n1,
             log_inv_rate_0,
             &sks_vks_n1,
-            &opened_rows_0,
+            &opened.1,
             &r_lane_fold,
             &queries_0,
             &alpha_0,
             sc_prover.f(),
-        ))
+        );
+        (opened, None, Some(full))
     };
     if trace {
         eprintln!("  C2 selected={use_c2}");
@@ -9012,16 +9086,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            let opened_rows_last: Vec<Vec<F128>> = {
+            let (merkle_proof_last, opened_rows_last): (Vec<Hash>, Vec<Vec<F128>>) = {
                 use rayon::prelude::*;
-                // Order-preserving parallel collect — bit-identical.
-                queries_last
-                    .par_iter()
-                    .map(|&q| wtns_prev.row(q).to_vec())
-                    .collect()
+                rayon::join(
+                    || merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last),
+                    || {
+                        queries_last
+                            .par_iter()
+                            .map(|&q| wtns_prev.row(q).to_vec())
+                            .collect()
+                    },
+                )
             };
-            let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             if trace {
                 t_opens += _t.elapsed();
             }
@@ -9074,7 +9150,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     opened_rows: opened_rows_last,
                     merkle_proof: merkle_proof_last,
                 },
-                sumcheck_transcript: sc_prover.transcript().to_vec(),
+                sumcheck_transcript: std::mem::take(&mut sc_prover.transcript),
                 grinding_nonces,
                 ood_values,
                 fold_grinding_nonces,
@@ -9199,16 +9275,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let _t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> = {
+        let (merkle_proof_i, opened_rows_i): (Vec<Hash>, Vec<Vec<F128>>) = {
             use rayon::prelude::*;
-            // Order-preserving parallel collect — bit-identical.
-            queries_i
-                .par_iter()
-                .map(|&q| wtns_prev.row(q).to_vec())
-                .collect()
+            rayon::join(
+                || merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i),
+                || {
+                    queries_i
+                        .par_iter()
+                        .map(|&q| wtns_prev.row(q).to_vec())
+                        .collect()
+                },
+            )
         };
-        let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
             t_opens += _t.elapsed();
         }
@@ -9230,7 +9308,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         } else {
             wtns_prev.tree = Vec::new();
         }
-        let sks_vks_i = eval_sk_at_vks(n_next);
         let use_l2_pruned_sparse_ntt = ranked_l2_pruned_sparse_ntt_enabled(
             config,
             log_n,
@@ -9287,6 +9364,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     use_l2_factored_final5,
                 )
             } else {
+                let sks_vks_i = eval_sk_at_vks(n_next);
                 induce_sumcheck_poly(
                     n_next,
                     &sks_vks_i,
@@ -15216,7 +15294,7 @@ mod tests {
             let ntt = AdditiveNttF128::standard(log_d);
             let groups = group_sorted_positions(&positions, PREFIX_K);
             let mut arena = scatter_active_windows(&groups, &positions, &values, PREFIX_K);
-            transform_active_windows(&ntt, &mut arena, &groups, PREFIX_K, log_d);
+            transform_active_windows(&ntt, &mut arena, &groups, &positions, &values, PREFIX_K, log_d);
 
             let mut expected = densify_active_windows(&arena, &groups, log_d, PREFIX_K);
             let first_layer = log_d - PREFIX_K - 3;
@@ -15298,7 +15376,7 @@ mod tests {
         let ntt = AdditiveNttF128::standard(LOG_D);
         let groups = group_sorted_positions(&positions, PREFIX_K);
         let mut arena = scatter_active_windows(&groups, &positions, &values, PREFIX_K);
-        transform_active_windows(&ntt, &mut arena, &groups, PREFIX_K, LOG_D);
+        transform_active_windows(&ntt, &mut arena, &groups, &positions, &values, PREFIX_K, LOG_D);
 
         let mut control = densify_active_windows(&arena, &groups, LOG_D, PREFIX_K);
         let first_layer = LOG_D - PREFIX_K - 3;
@@ -15375,7 +15453,7 @@ mod tests {
             let ntt = AdditiveNttF128::standard(log_d);
             let groups = group_sorted_positions(&positions, PREFIX_K);
             let mut arena = scatter_active_windows(&groups, &positions, &values, PREFIX_K);
-            transform_active_windows(&ntt, &mut arena, &groups, PREFIX_K, log_d);
+            transform_active_windows(&ntt, &mut arena, &groups, &positions, &values, PREFIX_K, log_d);
             let first_layer = log_d - PREFIX_K - 3;
 
             let mut active_blocks = 0usize;

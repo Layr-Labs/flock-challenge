@@ -3133,44 +3133,42 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     //        already has γ_k baked in — pcs combine just adds.
     let t = std::time::Instant::now();
 
-    struct ClaimWork {
+    struct ClaimWork<'a> {
         s_hat_v: Vec<F128>,
-        s_hat_v_quad: Option<Vec<F128>>,
-        s_hat_v_fold4: Option<Vec<F128>>,
-        s_hat_v_fold8: Option<Vec<F128>>,
+        s_hat_v_quad: Option<&'a [F128]>,
+        s_hat_v_fold4: Option<&'a [F128]>,
+        s_hat_v_fold8: Option<&'a [F128]>,
         sumcheck_claim: F128,
         eq_r_dprime: Vec<F128>,
     }
-    let mut work: Vec<ClaimWork> = Vec::with_capacity(n);
+    let mut work: Vec<ClaimWork<'_>> = Vec::with_capacity(n);
     for i in 0..n {
         challenger.observe_label(b"flock-ring-switch-v0");
         let s_hat_v: Vec<F128> = match kinds[i] {
-            Kind::Dense(d) => dense_s_hat_v[d].clone(),
-            Kind::Sparse(s) => sparse_s_hat_v[s].clone(),
+            Kind::Dense(d) => std::mem::take(&mut dense_s_hat_v[d]),
+            Kind::Sparse(s) => std::mem::take(&mut sparse_s_hat_v[s]),
         };
         let s_hat_v_quad = precomputed_s_hat_v
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 4 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 4 * n_packed);
         let s_hat_v_fold4 = precomputed_s_hat_v
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 16 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 16 * n_packed);
         let s_hat_v_fold8 = precomputed_s_hat_v
             .get(i)
             .copied()
             .flatten()
-            .filter(|precomputed| precomputed.len() == 64 * n_packed)
-            .map(<[F128]>::to_vec);
+            .filter(|precomputed| precomputed.len() == 64 * n_packed);
         challenger.observe_f128_slice(&s_hat_v);
         let r_dprime = challenger.sample_f128_vec(LOG_PACKING);
         let eq_r_dprime = build_eq(&r_dprime);
 
-        let s_hat_u = tensor_algebra_transpose(&s_hat_v);
+        let mut s_hat_u = [F128::ZERO; 1usize << LOG_PACKING];
+        tensor_algebra_transpose_into(&s_hat_v, &mut s_hat_u);
         let sumcheck_claim = inner_product(&s_hat_u, &eq_r_dprime);
 
         work.push(ClaimWork {
@@ -3219,14 +3217,15 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             .try_into()
                             .expect("two-coordinate eq has four entries");
                         let mut products = [F128::ZERO; 16];
-                        let mut scaled_bank = crate::alloc_uninit_f128_vec(n_packed);
+                        let mut scaled_bank = [F128::ZERO; 1usize << LOG_PACKING];
+                        let mut transposed = [F128::ZERO; 1usize << LOG_PACKING];
                         for e in 0..4 {
                             let bank = &quad[e * n_packed..(e + 1) * n_packed];
                             for d_low in 0..4 {
                                 for p in 0..n_packed {
                                     scaled_bank[p] = low_eq[d_low] * bank[p];
                                 }
-                                let transposed = tensor_algebra_transpose(&scaled_bank);
+                                tensor_algebra_transpose_into(&scaled_bank, &mut transposed);
                                 products[e * 4 + d_low] =
                                     inner_product(&transposed, &scaled_eq_r_dprime);
                             }
@@ -3250,14 +3249,15 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                             .try_into()
                             .expect("four-coordinate eq has sixteen entries");
                         let mut products = [F128::ZERO; 256];
-                        let mut scaled_bank = crate::alloc_uninit_f128_vec(n_packed);
+                        let mut scaled_bank = [F128::ZERO; 1usize << LOG_PACKING];
+                        let mut transposed = [F128::ZERO; 1usize << LOG_PACKING];
                         for e in 0..16 {
                             let bank = &fold4[e * n_packed..(e + 1) * n_packed];
                             for d_low in 0..16 {
                                 for packed in 0..n_packed {
                                     scaled_bank[packed] = low_eq[d_low] * bank[packed];
                                 }
-                                let transposed = tensor_algebra_transpose(&scaled_bank);
+                                tensor_algebra_transpose_into(&scaled_bank, &mut transposed);
                                 products[e * 16 + d_low] =
                                     inner_product(&transposed, &scaled_eq_r_dprime);
                             }
@@ -3298,7 +3298,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                                 a_state[bit * 64 + e] = value;
                             }
                         }
-                        let mut w_state = fold8;
+                        let mut w_state = crate::alloc_uninit_f128_vec(64 * n_packed);
                         for d_low in 0..64 {
                             let scale = low_eq[d_low];
                             let mut basis_product = scale;

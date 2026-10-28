@@ -766,7 +766,7 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     if n_claims == 0 {
         return vec![F128::ZERO; k];
     }
-    let mut partials = crate::alloc_uninit_f128_vec(n_claims * k);
+    let mut partials = crate::scratch::take_f128(n_claims * k);
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     crate::epool::run_hetero_chunks(n_claims, |c| {
         let claim = c + claim_lo;
@@ -838,7 +838,7 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     // remaining `n_workers - 1` partials, so the band lands in registers/L1
     // once and is written without an up-front zero-fill of `out`.
     let band = useful.div_ceil(rayon::current_num_threads().max(1)).max(1024);
-    let mut out = crate::alloc_uninit_f128_vec(k);
+    let mut out = crate::scratch::take_lincheck_z_vec(k);
     out[useful..k].fill(F128::ZERO);
     out[..useful]
         .par_chunks_mut(band)
@@ -853,5 +853,6 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
                 }
             }
         });
+    crate::scratch::give_f128(partials);
     out
 }

@@ -18,6 +18,12 @@ fn dot(a: &[F128], b: &[F128]) -> F128 {
         .fold(F128::ZERO, |s, (&x, &y)| s + mul(x, y))
 }
 
+/// Builds the row one NTT layer at a time: `row[0]` is one, and layer `s`
+/// extends entries `0..2^s` into `2^s..2^{s+1}` by multiplying with that
+/// layer's twiddle `scale` (plus one when the query's bit `s` is set), so
+/// after `k` layers the row holds the query's exact forward-NTT weights.
+/// The `block` index folds the query's block prefix with its in-block
+/// position, keeping the whole row O(k) twiddle reads, no dense matrix.
 /// An exact row of a local forward NTT, generated without a dense matrix.
 fn local_row(ntt: &AdditiveNttF128, log_d: usize, k: usize, query: usize) -> [F128; 8] {
     let mut row = [F128::ZERO; 8];
