@@ -51,6 +51,12 @@ impl HashKind {
     }
 }
 
+/// Display prints the config-file spelling of the hash by delegating to
+/// `as_str`, so logs and serialized params always spell the same variant
+/// the same way. There is no separate display table to drift from parsing:
+/// `parse` accepts exactly these spellings plus case and dash variants, and
+/// round-trips through `to_string` in the unit tests below. An unrecognized
+/// name stays an error at parse time, never a silent default.
 impl std::fmt::Display for HashKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
