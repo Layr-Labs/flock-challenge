@@ -1,2100 +1,6 @@
-use crate::field::{F128, F256Unreduced};
+use crate::field::F128;
 
 #[cfg(target_arch = "aarch64")]
-#[derive(Clone, Copy)]
-struct WideNeon {
-    lo: core::arch::aarch64::uint64x2_t,
-    hi: core::arch::aarch64::uint64x2_t,
-}
-
-/// Unreduced product sum kept as the three 128-bit partial products of
-/// [`clmul_products_q`]. Combining them into a [`WideNeon`] costs two EXT and
-/// two EOR, so an accumulator that only ever XORs products in defers that to
-/// one combine per chunk instead of one per product.
-#[cfg(target_arch = "aarch64")]
-#[derive(Clone, Copy)]
-struct TriNeon {
-    ll: core::arch::aarch64::uint64x2_t,
-    cross: core::arch::aarch64::uint64x2_t,
-    hh: core::arch::aarch64::uint64x2_t,
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn reduce_tri_q(value: TriNeon) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        reduce_wide_q(WideNeon {
-            lo: veorq_u64(value.ll, vextq_u64::<1>(zero, value.cross)),
-            hi: veorq_u64(value.hh, vextq_u64::<1>(value.cross, zero)),
-        })
-    }
-}
-
-// The SHA3 extension includes EOR3; retain the two-EOR form for generic
-// AArch64 builds that do not enable it.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-unsafe fn xor3_u64(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-    c: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    unsafe { core::arch::aarch64::veor3q_u64(a, b, c) }
-}
-
-#[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn xor3_u64(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-    c: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    unsafe { core::arch::aarch64::veorq_u64(a, core::arch::aarch64::veorq_u64(b, c)) }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn pmull_lane(a: u64, b: u64) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe { core::mem::transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "aes")]
-/// The three 128-bit partial products of `a * b`: `(lo*lo, lo*hi + hi*lo,
-/// hi*hi)`. Schoolbook, not Karatsuba: the fourth PMULL is cheaper on Apple
-/// Silicon than the two operand sums, the EXT each needs and the three-way
-/// XOR that Karatsuba spends to avoid it, and the vector pipes, not the PMULL
-/// units, are what the fused sumcheck kernels saturate.
-unsafe fn clmul_products_q(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let p0 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
-        let p2 = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
-        let b_swap = vextq_u64::<1>(b, b);
-        let p01 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b_swap));
-        let p10 = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b_swap));
-        (p0, veorq_u64(p01, p10), p2)
-    }
-}
-
-/// GHASH multiply with both operands and the result kept in q registers.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn mul_q(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let (t0, mut t1, t2) = clmul_products_q(a, b);
-
-        t1 = xor3_u64(
-            t1,
-            vextq_u64::<1>(zero, t2),
-            pmull_lane(vgetq_lane_u64::<1>(t2), 0x87),
-        );
-
-        xor3_u64(
-            t0,
-            vextq_u64::<1>(zero, t1),
-            pmull_lane(vgetq_lane_u64::<1>(t1), 0x87),
-        )
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn mul_unreduced_q(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> WideNeon {
-    use core::arch::aarch64::*;
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let (ll, cross, hh) = clmul_products_q(a, b);
-        WideNeon {
-            lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
-            hi: veorq_u64(hh, vextq_u64::<1>(cross, zero)),
-        }
-    }
-}
-
-/// `[v.hi, v.lo]` as one `EXT`. Kept opaque so LLVM cannot fold it back into
-/// the two lane `DUP`s it otherwise emits for every product's cross term.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn swap_halves_q(v: core::arch::aarch64::uint64x2_t) -> core::arch::aarch64::uint64x2_t {
-    let out: core::arch::aarch64::uint64x2_t;
-    // SAFETY: register-only lane rotate; no memory, stack or flags.
-    unsafe {
-        core::arch::asm!(
-            "ext {out:v}.16b, {v:v}.16b, {v:v}.16b, #8",
-            v = in(vreg) v,
-            out = lateout(vreg) out,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-    out
-}
-
-/// [`clmul_products_q`] with `a_sw = swap_halves_q(a)` supplied by the caller:
-/// both cross products then read matching lanes (`PMULL`/`PMULL2` of `a_sw`
-/// and `b`), so the swap is one `EXT` that a shared operand can reuse.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn clmul_products_sw_q(
-    a: core::arch::aarch64::uint64x2_t,
-    a_sw: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let p0 = pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
-        let p2 = pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
-        let p10 = pmull_lane(vgetq_lane_u64::<0>(a_sw), vgetq_lane_u64::<0>(b));
-        let p01 = pmull_lane(vgetq_lane_u64::<1>(a_sw), vgetq_lane_u64::<1>(b));
-        (p0, p01, p10, p2)
-    }
-}
-
-/// `acc += a*b` in [`TriNeon`] form; the two cross products enter the cross
-/// accumulator through one `EOR3`.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn tri_acc_sw(
-    acc: &mut TriNeon,
-    a: core::arch::aarch64::uint64x2_t,
-    a_sw: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let (p0, p01, p10, p2) = clmul_products_sw_q(a, a_sw, b);
-        acc.ll = veorq_u64(acc.ll, p0);
-        acc.cross = xor3_u64(acc.cross, p01, p10);
-        acc.hh = veorq_u64(acc.hh, p2);
-    }
-}
-
-/// `acc += a*b` in [`TriNeon`] form as one fixed sequence: one `EXT` for the
-/// swapped operand, four `PMULL`s and three accumulating XORs with only two
-/// scratch registers, so the scheduler cannot widen the live set around the
-/// spilled accumulators.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn tri_acc_q(
-    acc: &mut TriNeon,
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) {
-    // SAFETY: register-only carry-less products and XORs (AES and SHA3 are
-    // enabled for this build); no memory, stack or flags.
-    unsafe {
-        core::arch::asm!(
-            "ext {t:v}.16b, {a:v}.16b, {a:v}.16b, #8",
-            "pmull {p:v}.1q, {a:v}.1d, {b:v}.1d",
-            "eor {ll:v}.16b, {ll:v}.16b, {p:v}.16b",
-            "pmull2 {p:v}.1q, {a:v}.2d, {b:v}.2d",
-            "eor {hh:v}.16b, {hh:v}.16b, {p:v}.16b",
-            "pmull {p:v}.1q, {t:v}.1d, {b:v}.1d",
-            "pmull2 {t:v}.1q, {t:v}.2d, {b:v}.2d",
-            "eor3 {cr:v}.16b, {cr:v}.16b, {p:v}.16b, {t:v}.16b",
-            a = in(vreg) a,
-            b = in(vreg) b,
-            t = out(vreg) _,
-            p = out(vreg) _,
-            ll = inout(vreg) acc.ll,
-            cr = inout(vreg) acc.cross,
-            hh = inout(vreg) acc.hh,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
-#[inline(always)]
-unsafe fn tri_acc_q(
-    acc: &mut TriNeon,
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) {
-    unsafe { tri_acc_sw(acc, a, swap_halves_q(a), b) }
-}
-
-/// [`mul_q`] with the caller's `a_sw = swap_halves_q(a)`.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn mul_sw_q(
-    a: core::arch::aarch64::uint64x2_t,
-    a_sw: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let (t0, p01, p10, t2) = clmul_products_sw_q(a, a_sw, b);
-        let t1 = xor3_u64(
-            veorq_u64(p01, p10),
-            vextq_u64::<1>(zero, t2),
-            pmull_lane(vgetq_lane_u64::<1>(t2), 0x87),
-        );
-        xor3_u64(
-            t0,
-            vextq_u64::<1>(zero, t1),
-            pmull_lane(vgetq_lane_u64::<1>(t1), 0x87),
-        )
-    }
-}
-
-/// [`mul_unreduced_q`] with the caller's `a_sw = swap_halves_q(a)`.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "aes")]
-unsafe fn mul_unreduced_sw_q(
-    a: core::arch::aarch64::uint64x2_t,
-    a_sw: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> WideNeon {
-    use core::arch::aarch64::*;
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let (ll, p01, p10, hh) = clmul_products_sw_q(a, a_sw, b);
-        let cross = veorq_u64(p01, p10);
-        WideNeon {
-            lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
-            hi: veorq_u64(hh, vextq_u64::<1>(cross, zero)),
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn wide_xor(acc: &mut WideNeon, value: WideNeon) {
-    use core::arch::aarch64::*;
-    unsafe {
-        acc.lo = veorq_u64(acc.lo, value.lo);
-        acc.hi = veorq_u64(acc.hi, value.hi);
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn reduce_wide_q(value: WideNeon) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let hi = value.hi;
-        let shift1 = veorq_u64(
-            vshlq_n_u64::<1>(hi),
-            vextq_u64::<1>(zero, vshrq_n_u64::<63>(hi)),
-        );
-        let shift2 = veorq_u64(
-            vshlq_n_u64::<2>(hi),
-            vextq_u64::<1>(zero, vshrq_n_u64::<62>(hi)),
-        );
-        let shift7 = veorq_u64(
-            vshlq_n_u64::<7>(hi),
-            vextq_u64::<1>(zero, vshrq_n_u64::<57>(hi)),
-        );
-        let folded = xor3_u64(hi, shift1, veorq_u64(shift2, shift7));
-
-        // Only r3 (the high lane) can overflow the 128-bit fold. Move it to
-        // the low lane so the correction lands in result coefficient 0.
-        let r3 = vextq_u64::<1>(hi, zero);
-        let ov = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
-            vshrq_n_u64::<57>(r3),
-        );
-        let corr = xor3_u64(
-            ov,
-            vshlq_n_u64::<1>(ov),
-            veorq_u64(vshlq_n_u64::<2>(ov), vshlq_n_u64::<7>(ov)),
-        );
-        xor3_u64(value.lo, folded, corr)
-    }
-}
-
-/// Reduce one arbitrary 256-bit polynomial with the same two-stage recursive
-/// Binius reduction used by the default `F128` multiplier.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline(always)]
-unsafe fn reduce_wide_binius_q(value: WideNeon) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe {
-        let zero = vdupq_n_u64(0);
-
-        // First reduce r3 into the adjacent (r1, r2) words, then reduce the
-        // resulting high word into r0. This is the arbitrary-wide form of
-        // `ghash_mul_binius`'s two recursive reduction stages.
-        let middle = vextq_u64::<1>(value.lo, value.hi);
-        let t1 = veorq_u64(middle, pmull_lane(vgetq_lane_u64::<1>(value.hi), 0x87));
-        let low_word = vsetq_lane_u64::<1>(0, value.lo);
-        xor3_u64(
-            low_word,
-            vextq_u64::<1>(zero, t1),
-            pmull_lane(vgetq_lane_u64::<1>(t1), 0x87),
-        )
-    }
-}
-
-/// Two unreduced Karatsuba products by one shared constant. Keeping both
-/// products live exposes their six independent PMULLs to the scheduler and
-/// lets the caller XOR several constant-product pairs before reducing.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline(always)]
-unsafe fn mul_const_unreduced_pair_q(
-    constant: core::arch::aarch64::uint64x2_t,
-    x0: core::arch::aarch64::uint64x2_t,
-    x1: core::arch::aarch64::uint64x2_t,
-) -> (WideNeon, WideNeon) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let constant_lo = vgetq_lane_u64::<0>(constant);
-        let constant_hi = vgetq_lane_u64::<1>(constant);
-
-        let ll0 = pmull_lane(vgetq_lane_u64::<0>(x0), constant_lo);
-        let hh0 = pmull_lane(vgetq_lane_u64::<1>(x0), constant_hi);
-        let ll1 = pmull_lane(vgetq_lane_u64::<0>(x1), constant_lo);
-        let hh1 = pmull_lane(vgetq_lane_u64::<1>(x1), constant_hi);
-        let cross0 = veorq_u64(
-            pmull_lane(vgetq_lane_u64::<0>(x0), constant_hi),
-            pmull_lane(vgetq_lane_u64::<1>(x0), constant_lo),
-        );
-        let cross1 = veorq_u64(
-            pmull_lane(vgetq_lane_u64::<0>(x1), constant_hi),
-            pmull_lane(vgetq_lane_u64::<1>(x1), constant_lo),
-        );
-
-        (
-            WideNeon {
-                lo: veorq_u64(ll0, vextq_u64::<1>(zero, cross0)),
-                hi: veorq_u64(hh0, vextq_u64::<1>(cross0, zero)),
-            },
-            WideNeon {
-                lo: veorq_u64(ll1, vextq_u64::<1>(zero, cross1)),
-                hi: veorq_u64(hh1, vextq_u64::<1>(cross1, zero)),
-            },
-        )
-    }
-}
-
-/// Compose two adjacent four-value folds with one final reduction per output.
-///
-/// For each group `(v0, v1, v2, v3)`, the sequential fold is expanded as
-///
-/// `v0 + ra*(v0+v1) + rb*(v0+v2) + (ra*rb)*(v0+v1+v2+v3)`.
-///
-/// The three products stay unreduced until their XOR sum is complete. Pairing
-/// adjacent outputs shares constant setup and interleaves the two independent
-/// recursive-Binius reductions without using the rejected shift reducer.
-///
-/// # Safety
-/// `values` must point to eight initialized, readable `F128` values. The AES
-/// target feature must be available.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline(always)]
-unsafe fn fold4_pair_expanded_binius_q(
-    values: *const F128,
-    rho_a: core::arch::aarch64::uint64x2_t,
-    rho_b: core::arch::aarch64::uint64x2_t,
-    rho_ab: core::arch::aarch64::uint64x2_t,
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let v0 = vld1q_u64(values.add(0).cast::<u64>());
-        let v1 = vld1q_u64(values.add(1).cast::<u64>());
-        let v2 = vld1q_u64(values.add(2).cast::<u64>());
-        let v3 = vld1q_u64(values.add(3).cast::<u64>());
-        let v4 = vld1q_u64(values.add(4).cast::<u64>());
-        let v5 = vld1q_u64(values.add(5).cast::<u64>());
-        let v6 = vld1q_u64(values.add(6).cast::<u64>());
-        let v7 = vld1q_u64(values.add(7).cast::<u64>());
-
-        let delta_a0 = veorq_u64(v0, v1);
-        let delta_a1 = veorq_u64(v4, v5);
-        let delta_b0 = veorq_u64(v0, v2);
-        let delta_b1 = veorq_u64(v4, v6);
-        let delta_ab0 = xor3_u64(v0, v1, veorq_u64(v2, v3));
-        let delta_ab1 = xor3_u64(v4, v5, veorq_u64(v6, v7));
-
-        let (mut acc0, mut acc1) = mul_const_unreduced_pair_q(rho_a, delta_a0, delta_a1);
-        let (product0, product1) = mul_const_unreduced_pair_q(rho_b, delta_b0, delta_b1);
-        wide_xor(&mut acc0, product0);
-        wide_xor(&mut acc1, product1);
-        let (product0, product1) = mul_const_unreduced_pair_q(rho_ab, delta_ab0, delta_ab1);
-        wide_xor(&mut acc0, product0);
-        wide_xor(&mut acc1, product1);
-        acc0.lo = veorq_u64(acc0.lo, v0);
-        acc1.lo = veorq_u64(acc1.lo, v4);
-
-        (reduce_wide_binius_q(acc0), reduce_wide_binius_q(acc1))
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fold_row_q(
-    table_data: *const u8,
-    bytes_ptr: *const u8,
-) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe {
-        const STRIDE: usize = 256 * 16;
-        let entry = |chunk: usize| {
-            table_data.add(
-                chunk * STRIDE + (*bytes_ptr.add(chunk)) as usize * core::mem::size_of::<F128>(),
-            )
-        };
-        let a = xor3_u64(
-            vreinterpretq_u64_u8(vld1q_u8(entry(0))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(1))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(2))),
-        );
-        let b = xor3_u64(
-            vreinterpretq_u64_u8(vld1q_u8(entry(3))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(4))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(5))),
-        );
-        let c = veorq_u64(
-            vreinterpretq_u64_u8(vld1q_u8(entry(6))),
-            vreinterpretq_u64_u8(vld1q_u8(entry(7))),
-        );
-        xor3_u64(a, b, c)
-    }
-}
-
-/// Entry `(row >> SHIFT) & 0xff` of the 256 x 16-byte table bank at `bank`.
-///
-/// Written as `ubfx` + scaled-index `ldr` (two instructions). From the plain
-/// expression LLVM folds the `<< 4` into the mask, `(row >> (SHIFT-4)) &
-/// 0xff0`, which loses the scaled addressing mode and costs a third integer
-/// op per lookup in the issue-bound round-two fold.
-///
-/// # Safety
-/// `bank` must point to 256 readable 16-byte entries (4 KiB).
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn bank_load_q<const SHIFT: u32>(
-    bank: *const u8,
-    row: u64,
-) -> core::arch::aarch64::uint64x2_t {
-    let out: core::arch::aarch64::uint64x2_t;
-    // SAFETY: the byte index is at most 255, so the 16-byte load stays inside
-    // the caller's 4 KiB bank; the asm only reads that memory.
-    unsafe {
-        core::arch::asm!(
-            "ubfx {idx}, {row}, #{shift}, #8",
-            "ldr {out:q}, [{bank}, {idx}, lsl #4]",
-            shift = const SHIFT,
-            row = in(reg) row,
-            bank = in(reg) bank,
-            idx = out(reg) _,
-            out = lateout(vreg) out,
-            options(pure, readonly, nostack, preserves_flags),
-        );
-    }
-    out
-}
-
-/// Fold four already-loaded packed rows together. Grouping the independent
-/// lookup chains by byte bank exposes four L1 loads at a time, and loading each
-/// row as one `u64` lets the compact round-two path reuse it for its raw delta.
-///
-/// `table_data` must point to the eight 4 KiB byte banks of a fold table.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fold_four_row_codes_q(
-    table_data: *const u8,
-    row0: u64,
-    row1: u64,
-    row2: u64,
-    row3: u64,
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        const STRIDE: usize = 256 * 16;
-        macro_rules! load {
-            ($row:expr, $chunk:literal) => {
-                bank_load_q::<{ 8 * $chunk }>(table_data.add($chunk * STRIDE), $row)
-            };
-        }
-
-        // Retain the four independent row streams while consuming two new
-        // table rows per dependent accumulator update.
-        let mut acc0 = load!(row0, 0);
-        let mut acc1 = load!(row1, 0);
-        let mut acc2 = load!(row2, 0);
-        let mut acc3 = load!(row3, 0);
-        macro_rules! step {
-            ($c0:literal, $c1:literal) => {
-                acc0 = xor3_u64(acc0, load!(row0, $c0), load!(row0, $c1));
-                acc1 = xor3_u64(acc1, load!(row1, $c0), load!(row1, $c1));
-                acc2 = xor3_u64(acc2, load!(row2, $c0), load!(row2, $c1));
-                acc3 = xor3_u64(acc3, load!(row3, $c0), load!(row3, $c1));
-            };
-        }
-        step!(1, 2);
-        step!(3, 4);
-        step!(5, 6);
-        acc0 = veorq_u64(acc0, load!(row0, 7));
-        acc1 = veorq_u64(acc1, load!(row1, 7));
-        acc2 = veorq_u64(acc2, load!(row2, 7));
-        acc3 = veorq_u64(acc3, load!(row3, 7));
-        (acc0, acc1, acc2, acc3)
-    }
-}
-
-/// Two-row variant of [`fold_four_row_codes_q`] for the degenerate-pair path
-/// (the two b rows are skipped, so only the a rows need folding).
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fold_two_row_codes_q(
-    table_data: *const u8,
-    row0: u64,
-    row1: u64,
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        const STRIDE: usize = 256 * 16;
-        macro_rules! load {
-            ($row:expr, $chunk:literal) => {
-                bank_load_q::<{ 8 * $chunk }>(table_data.add($chunk * STRIDE), $row)
-            };
-        }
-        let mut acc0 = load!(row0, 0);
-        let mut acc1 = load!(row1, 0);
-        macro_rules! step {
-            ($c0:literal, $c1:literal) => {
-                acc0 = xor3_u64(acc0, load!(row0, $c0), load!(row0, $c1));
-                acc1 = xor3_u64(acc1, load!(row1, $c0), load!(row1, $c1));
-            };
-        }
-        step!(1, 2);
-        step!(3, 4);
-        step!(5, 6);
-        acc0 = veorq_u64(acc0, load!(row0, 7));
-        acc1 = veorq_u64(acc1, load!(row1, 7));
-        (acc0, acc1)
-    }
-}
-
-/// Returns `true` iff a 128-bit vector is all-zero.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn is_zero_q(v: core::arch::aarch64::uint64x2_t) -> bool {
-    use core::arch::aarch64::*;
-    unsafe { vmaxvq_u32(vreinterpretq_u32_u64(v)) == 0 }
-}
-
-/// Complete q-register-native round-two worker chunk. Four folded rows stay in
-/// vector registers through output stores, reduced GHASH products, and the
-/// eq-weighted unreduced accumulators; only the two final chunk sums cross back
-/// to scalar `F128`. This removes the per-pair fmov/mov.d/dup round trips from
-/// the original inlined scalar-struct path.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_round2_chunk_neon_unchecked_8(
-    table_data: *const u8,
-    a_packed: *const u8,
-    b_packed: *const u8,
-    a_out: *mut F128,
-    b_out: *mut F128,
-    eq_lo: *const F128,
-    lo_size: usize,
-    pair_idx_base: usize,
-    pair_in_block_mask: usize,
-    useful_pairs_inclusive: usize,
-) -> (F128, F128) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        // Round two emits two 1 GiB F128 tables that are not consumed until
-        // the producer's Rayon barrier. They cannot remain cache-resident, so
-        // ordinary stores only add write-allocate traffic and evict the 32 KiB
-        // fold table. `stnp` is the same best-effort non-temporal pair hint
-        // used by the batch-major witness producer.
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let mut p1_acc = WideNeon { lo: zero, hi: zero };
-        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
-
-        for x_lo in 0..lo_size {
-            let out = 2 * x_lo;
-            if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                store_pair_nt(a_out.add(out), zero, zero);
-                store_pair_nt(b_out.add(out), zero, zero);
-                continue;
-            }
-
-            let row0 = 2 * x_lo;
-            let row1 = row0 + 1;
-            let a0 = fold_row_q(table_data, a_packed.add(row0 * 8));
-            let b0 = fold_row_q(table_data, b_packed.add(row0 * 8));
-            let a1 = fold_row_q(table_data, a_packed.add(row1 * 8));
-            let b1 = fold_row_q(table_data, b_packed.add(row1 * 8));
-
-            store_pair_nt(a_out.add(out), a0, a1);
-            store_pair_nt(b_out.add(out), b0, b1);
-
-            let g1 = mul_q(a1, b1);
-            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
-            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
-            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-        }
-
-        (
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
-        )
-    }
-}
-
-/// Compact round-two worker: retain only the even-row folded anchor and the
-/// packed adjacent-row delta for each pair.  The odd folded row is still kept
-/// in registers long enough to form the round message, but is not written.
-///
-/// The later challenge-specialized fold reconstructs
-/// `anchor + rho * fold(delta)` from this 24-byte-per-polynomial
-/// representation, instead of materializing both 16-byte folded rows.
-///
-/// `degen` enables the b≡1 chunk-class degeneration: when both b row codes of
-/// a pair are all-ones (statically true for the input/output/const regions of
-/// the BLAKE3 block R1CS — 11 of 121 useful pairs per block), both b folds
-/// equal `Σ_i L_i(z) = 1`, so the 16 b-table lookups are skipped, the b
-/// anchor is the precomputed all-ones fold, `G(∞)`'s `(b0 + b1)` factor
-/// vanishes (that mul chain is skipped), and — when the all-ones fold is
-/// bit-exactly `F128::ONE` (partition of unity; always in practice) —
-/// `a1 · b1` degenerates to `a1`. Value-forced, therefore bit-exact.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
-    table_data: *const u8,
-    a_packed: *const u8,
-    b_packed: *const u8,
-    anchors: *mut F128,
-    deltas: *mut u8,
-    eq_lo: *const F128,
-    lo_size: usize,
-    pair_idx_base: usize,
-    pair_in_block_mask: usize,
-    useful_pairs_inclusive: usize,
-    degen: bool,
-) -> (F128, F128) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {a:q}, {b:q}, [{dst}]",
-                dst = in(reg) dst,
-                a = in(vreg) a,
-                b = in(vreg) b,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let mut p1_acc = WideNeon { lo: zero, hi: zero };
-        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
-
-        // Fold of the all-ones row code = Σ_i L_i(z) — exactly the XOR the
-        // per-pair path would compute, so storing it as the b anchor is
-        // bit-identical. Partition of unity makes it F128::ONE; the `a1·b1 →
-        // a1` shortcut is additionally gated on that being bit-exact.
-        let ones_bytes = [0xFFu8; 8];
-        let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
-        let ones_is_one = is_zero_q(veorq_u64(
-            b_ones,
-            core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
-        ));
-
-        for x_lo in 0..lo_size {
-            if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
-                continue;
-            }
-
-            let row0 = 2 * x_lo;
-            let row1 = row0 + 1;
-            let a0_ptr = a_packed.add(row0 * 8);
-            let a1_ptr = a_packed.add(row1 * 8);
-            let b0_ptr = b_packed.add(row0 * 8);
-            let b1_ptr = b_packed.add(row1 * 8);
-            let a0_code = u64::from_le(core::ptr::read_unaligned(a0_ptr.cast::<u64>()));
-            let a1_code = u64::from_le(core::ptr::read_unaligned(a1_ptr.cast::<u64>()));
-            let b0_code = u64::from_le(core::ptr::read_unaligned(b0_ptr.cast::<u64>()));
-            let b1_code = u64::from_le(core::ptr::read_unaligned(b1_ptr.cast::<u64>()));
-
-            if degen && (b0_code & b1_code) == u64::MAX {
-                // b ≡ 1 pair: b0 = b1 = fold(all-ones) = 1. Skip the 16
-                // b-table lookups; `b0 + b1 = 0` zeroes the G(∞) term.
-                let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
-                store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-                let delta_pair =
-                    core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-
-                let g1 = if ones_is_one { a1 } else { mul_q(a1, b_ones) };
-                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                continue;
-            }
-
-            let (a0, a1, b0, b1) =
-                fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
-
-            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-            let da = a0_code ^ a1_code;
-            let db = b0_code ^ b1_code;
-            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([da, db]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-
-            let g1 = mul_q(a1, b1);
-            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
-            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
-            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-        }
-
-        (
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
-        )
-    }
-}
-
-/// Anchors-and-deltas-only sibling of
-/// [`fold_round2_compact_chunk_neon_unchecked_8`]: identical anchor stores,
-/// identical delta bytes, identical padded-pair zeroing — but no `a1`/`b1`
-/// folds and no message products. Used for the chunks whose products the
-/// round-two GPU arm computes concurrently; byte-identical output is
-/// guaranteed because every store below is the same expression the fused
-/// kernel stores (the degen branch there is a value-preserving shortcut:
-/// `fold(all-ones) == fold(b0_code)` when `b0_code` is all-ones, and its
-/// delta lanes are `[a0^a1, 0] == [a0^a1, b0^b1]`).
-#[cfg(target_arch = "aarch64")]
-pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
-    table_data: *const u8,
-    a_packed: *const u8,
-    b_packed: *const u8,
-    anchors: *mut F128,
-    deltas: *mut u8,
-    lo_size: usize,
-    pair_idx_base: usize,
-    pair_in_block_mask: usize,
-    useful_pairs_inclusive: usize,
-) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {a:q}, {b:q}, [{dst}]",
-                dst = in(reg) dst,
-                a = in(vreg) a,
-                b = in(vreg) b,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        for x_lo in 0..lo_size {
-            if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
-                continue;
-            }
-            let row0 = 2 * x_lo;
-            let row1 = row0 + 1;
-            let a0_code = u64::from_le(core::ptr::read_unaligned(
-                a_packed.add(row0 * 8).cast::<u64>(),
-            ));
-            let a1_code = u64::from_le(core::ptr::read_unaligned(
-                a_packed.add(row1 * 8).cast::<u64>(),
-            ));
-            let b0_code = u64::from_le(core::ptr::read_unaligned(
-                b_packed.add(row0 * 8).cast::<u64>(),
-            ));
-            let b1_code = u64::from_le(core::ptr::read_unaligned(
-                b_packed.add(row1 * 8).cast::<u64>(),
-            ));
-            let (a0, b0) = fold_two_row_codes_q(table_data, a0_code, b0_code);
-            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
-                a0_code ^ a1_code,
-                b0_code ^ b1_code,
-            ]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-        }
-    }
-}
-
-/// Fold one round-two pair and emit its compact anchor + delta stores.
-///
-/// Every store below is the *same expression* the incumbent
-/// [`fold_round2_compact_chunk_neon_unchecked_8`] emits for the same pair
-/// (padded pairs zeroed, degenerate pairs shortcut with the identical
-/// `[a0^a1, 0] == [a0^a1, b0^b1]` delta), so the compact state produced by
-/// the lookahead kernel is byte-identical to the incumbent's.
-///
-/// Returns the four folded rows plus whether the b≡1 shortcut was taken.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn r2_pair_fold_and_store(
-    table_data: *const u8,
-    a_packed: *const u8,
-    b_packed: *const u8,
-    anchors: *mut F128,
-    deltas: *mut u8,
-    x_lo: usize,
-    padded: bool,
-    degen: bool,
-    b_ones: core::arch::aarch64::uint64x2_t,
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    bool,
-) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {a:q}, {b:q}, [{dst}]",
-                dst = in(reg) dst,
-                a = in(vreg) a,
-                b = in(vreg) b,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        if padded {
-            store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
-            return (zero, zero, zero, zero, false);
-        }
-
-        let row0 = 2 * x_lo;
-        let row1 = row0 + 1;
-        let a0_code = u64::from_le(core::ptr::read_unaligned(
-            a_packed.add(row0 * 8).cast::<u64>(),
-        ));
-        let a1_code = u64::from_le(core::ptr::read_unaligned(
-            a_packed.add(row1 * 8).cast::<u64>(),
-        ));
-        let b0_code = u64::from_le(core::ptr::read_unaligned(
-            b_packed.add(row0 * 8).cast::<u64>(),
-        ));
-        let b1_code = u64::from_le(core::ptr::read_unaligned(
-            b_packed.add(row1 * 8).cast::<u64>(),
-        ));
-
-        if degen && (b0_code & b1_code) == u64::MAX {
-            let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
-            store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-            return (a0, a1, b_ones, b_ones, true);
-        }
-
-        let (a0, a1, b0, b1) =
-            fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
-        store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-        let delta_pair =
-            core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-        (a0, a1, b0, b1, false)
-    }
-}
-
-/// Round-two compact producer extended with the deferred round-three
-/// lookahead accumulators (variant K).
-///
-/// Anchors, deltas, padded-pair zeroing and the round-two products are the
-/// same expressions the incumbent kernel emits; the only structural change is
-/// that pairs are visited two at a time — one round-three group `y = x'/2` —
-/// so a group's four rows are live together and the six deferred round-three
-/// aggregates can be formed with **no extra table lookups**.
-///
-/// **One weight per group, one scaling per row.** The two eq2 lanes of a group
-/// and eq3 itself are constant multiples of one another —
-/// `eq2(2y) = (1+r1)*eq3(y)` and `eq2(2y+1) = r1*eq3(y)` — so the whole group is
-/// accumulated against the single weight `w = eq2_lo[2u+1]`, the four rows are
-/// pre-scaled by `w` with **four** reduced multiplies, and all eight products
-/// then cost one unreduced multiply each: 44 PMULL per group against the
-/// incumbent's 32 for half as many products. The constant rescalings
-/// (`kappa = (1+r1)/r1` on the even sums, `r1^-1` on the six deferred
-/// aggregates) are applied once by the driver, off the hot path.
-///
-/// Writes eight F128 slots to `out`, every one of them `w`-weighted:
-///
-/// | slot | value |
-/// |---|---|
-/// | 0, 1 | `sum_{x' even} w*a1*b1`, `sum_{x' even} w*(a0+a1)(b0+b1)` |
-/// | 2, 3 | the same two sums over **odd** `x'` — i.e. `r1*W1`, `r1*W2` |
-/// | 4..8 | `r1*W0`, `r1*W3`, `r1*W4`, `r1*W5` |
-///
-/// With `FULL = false` slots 0/1 stay zero: the round-two GPU arm owns this
-/// chunk's even-parity products, so the even pair's two products are skipped.
-///
-/// With `ODD_ON_GPU = true` slots 2/3 stay zero as well. The GPU arm computes
-/// both parities anyway — it used to XOR them together in the last step of its
-/// threadgroup reduction and hand back only the sum, which forced the CPU to
-/// recompute the odd half for the lookahead's `W1`/`W2`. Keeping that split
-/// costs the GPU nothing, and lets this kernel drop two more of its eight
-/// products: **32 PMULL per group instead of 38** on every offloaded chunk.
-/// The four `mul_q` row weightings survive because `W0`/`W3`/`W4`/`W5` still
-/// need all four scaled rows.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
-    const FULL: bool,
-    const ODD_ON_GPU: bool,
->(
-    table_data: *const u8,
-    a_packed: *const u8,
-    b_packed: *const u8,
-    anchors: *mut F128,
-    deltas: *mut u8,
-    eq_lo: *const F128,
-    lo_size: usize,
-    pair_idx_base: usize,
-    pair_in_block_mask: usize,
-    useful_pairs_inclusive: usize,
-    degen: bool,
-    periodic_padding: bool,
-    out: *mut F128,
-) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {a:q}, {b:q}, [{dst}]",
-                dst = in(reg) dst,
-                a = in(vreg) a,
-                b = in(vreg) b,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let tri_zero = TriNeon {
-            ll: zero,
-            cross: zero,
-            hh: zero,
-        };
-        let mut p1_even = tri_zero;
-        let mut pinf_even = tri_zero;
-        let mut p1_odd = tri_zero;
-        let mut pinf_odd = tri_zero;
-        let mut w0 = tri_zero;
-        let mut w3 = tri_zero;
-        let mut w4 = tri_zero;
-        let mut w5 = tri_zero;
-
-        let ones_bytes = [0xFFu8; 8];
-        let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
-        let ones_is_one = is_zero_q(veorq_u64(
-            b_ones,
-            core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
-        ));
-
-        macro_rules! zero_group {
-            ($u:expr) => {{
-                let x_lo0 = 2 * $u;
-                let x_lo1 = x_lo0 + 1;
-                store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
-                store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
-            }};
-        }
-
-        macro_rules! process_group {
-            ($u:expr, $pad0:expr, $pad1:expr) => {{
-                let x_lo0 = 2 * $u;
-                let x_lo1 = x_lo0 + 1;
-                let pad0 = $pad0;
-                let pad1 = $pad1;
-
-                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
-                );
-                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
-                );
-
-                // The odd lane's weight drives the whole group; see the doc above.
-                let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
-                let w_sw = swap_halves_q(w);
-
-                if deg0 & deg1 & ones_is_one {
-                    // b === 1 across the group: e_b = o_b = 0 kills W3/W4/W5 and
-                    // both G(inf) chains, and every surviving product is `w * a_i`.
-                    if FULL {
-                        tri_acc_sw(&mut p1_even, w, w_sw, a1);
-                    }
-                    if !ODD_ON_GPU {
-                        tri_acc_sw(&mut p1_odd, w, w_sw, a3);
-                    }
-                    tri_acc_sw(&mut w0, w, w_sw, a2);
-                } else {
-                    let a0w = mul_sw_q(w, w_sw, a0);
-                    let a1w = mul_sw_q(w, w_sw, a1);
-                    let (a2w, a3w) = if pad1 {
-                        (zero, zero)
-                    } else {
-                        (mul_sw_q(w, w_sw, a2), mul_sw_q(w, w_sw, a3))
-                    };
-                    macro_rules! acc {
-                        ($acc:expr, $a:expr, $b:expr) => {{
-                            tri_acc_q(&mut $acc, $a, $b);
-                        }};
-                    }
-
-                    // ---- round-two products, split by the parity of x' ----
-                    if FULL {
-                        acc!(p1_even, a1w, b1);
-                        if !deg0 {
-                            acc!(pinf_even, veorq_u64(a0w, a1w), veorq_u64(b0, b1));
-                        }
-                    }
-                    if !pad1 {
-                        if !ODD_ON_GPU {
-                            acc!(p1_odd, a3w, b3);
-                            if !deg1 {
-                                acc!(pinf_odd, veorq_u64(a2w, a3w), veorq_u64(b2, b3));
-                            }
-                        }
-                        acc!(w0, a2w, b2);
-                    }
-
-                    // ---- deferred round-three aggregates (no extra lookups) ----
-                    let e_aw = veorq_u64(a0w, a2w);
-                    let o_aw = veorq_u64(a1w, a3w);
-                    let e_b = veorq_u64(b0, b2);
-                    let o_b = veorq_u64(b1, b3);
-                    acc!(w3, e_aw, e_b);
-                    acc!(w4, o_aw, o_b);
-                    acc!(w5, veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
-                }
-            }};
-        }
-
-        let n_groups = lo_size / 2;
-        let ranked_periodic = periodic_padding
-            && pair_in_block_mask == 127
-            && useful_pairs_inclusive == 121
-            && (pair_idx_base & 127) == 0
-            && n_groups.is_multiple_of(64);
-        if ranked_periodic {
-            for block in 0..n_groups / 64 {
-                let first = block * 64;
-                for u in first..first + 60 {
-                    process_group!(u, false, false);
-                }
-                process_group!(first + 60, false, true);
-                for u in first + 61..first + 64 {
-                    zero_group!(u);
-                }
-            }
-        } else {
-            for u in 0..n_groups {
-                let x_lo0 = 2 * u;
-                let x_lo1 = x_lo0 + 1;
-                let pad0 = ((pair_idx_base + x_lo0) & pair_in_block_mask) >= useful_pairs_inclusive;
-                let pad1 = ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
-                if pad0 & pad1 {
-                    zero_group!(u);
-                    continue;
-                }
-                process_group!(u, pad0, pad1);
-            }
-        }
-
-        *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(p1_even));
-        *out.add(1) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(pinf_even));
-        *out.add(2) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(p1_odd));
-        *out.add(3) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(pinf_odd));
-        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(w0));
-        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(w3));
-        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(w4));
-        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(w5));
-    }
-}
-
-/// GPU-covered round-two lookahead with the four fixed medium weights
-/// deferred until after a 16-position polynomial Horner sum.
-///
-/// The caller checks that the medium coordinates are the protocol constants.
-/// For a 32-group-aligned `first`, `u = first + 2*b + t` has weight
-/// `eq_lo[2*u+1] = eq_lo[2*(first+t)+1] * x^b`. Each raw product has degree
-/// at most 254, so all 16 positions fit in 270 bits. The four fifth limbs
-/// share two q registers; anchors and deltas retain their canonical form.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8(
-    table_data: *const u8,
-    a_packed: *const u8,
-    b_packed: *const u8,
-    anchors: *mut F128,
-    deltas: *mut u8,
-    eq_lo: *const F128,
-    lo_size: usize,
-    pair_idx_base: usize,
-    pair_in_block_mask: usize,
-    useful_pairs_inclusive: usize,
-    degen: bool,
-    out: *mut F128,
-) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn shift_pair(a: &mut WideNeon, b: &mut WideNeon, top: &mut uint64x2_t) {
-        unsafe {
-            let zero = vdupq_n_u64(0);
-            *top = vsriq_n_u64::<63>(vshlq_n_u64::<1>(*top), vzip2q_u64(a.hi, b.hi));
-            a.hi = vsriq_n_u64::<63>(vshlq_n_u64::<1>(a.hi), vextq_u64::<1>(a.lo, a.hi));
-            b.hi = vsriq_n_u64::<63>(vshlq_n_u64::<1>(b.hi), vextq_u64::<1>(b.lo, b.hi));
-            a.lo = vsriq_n_u64::<63>(vshlq_n_u64::<1>(a.lo), vextq_u64::<1>(zero, a.lo));
-            b.lo = vsriq_n_u64::<63>(vshlq_n_u64::<1>(b.lo), vextq_u64::<1>(zero, b.lo));
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn reduce_pair(
-        mut a: WideNeon,
-        mut b: WideNeon,
-        top: uint64x2_t,
-    ) -> (uint64x2_t, uint64x2_t) {
-        unsafe {
-            let zero = vdupq_n_u64(0);
-            // x^256 = 1 + x^2 + x^4 + x^14 modulo x^128+x^7+x^2+x+1.
-            // Each top limb has at most 14 bits, so this cannot overflow.
-            let folded = veorq_u64(
-                xor3_u64(top, vshlq_n_u64::<2>(top), vshlq_n_u64::<4>(top)),
-                vshlq_n_u64::<14>(top),
-            );
-            a.lo = veorq_u64(a.lo, vzip1q_u64(folded, zero));
-            b.lo = veorq_u64(b.lo, vzip2q_u64(folded, zero));
-            (reduce_wide_q(a), reduce_wide_q(b))
-        }
-    }
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let mut sum0 = zero;
-        let mut sum3 = zero;
-        let mut sum4 = zero;
-        let mut sum5 = zero;
-        let b_ones = fold_row_q(table_data, [0xffu8; 8].as_ptr());
-        let ones_is_one = is_zero_q(veorq_u64(
-            b_ones,
-            core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
-        ));
-
-        for first in (0..lo_size / 2).step_by(32) {
-            for t in 0..2 {
-                let mut w0 = WideNeon { lo: zero, hi: zero };
-                let mut w3 = WideNeon { lo: zero, hi: zero };
-                let mut w4 = WideNeon { lo: zero, hi: zero };
-                let mut w5 = WideNeon { lo: zero, hi: zero };
-                let mut top03 = zero;
-                let mut top45 = zero;
-                for b in (0..16).rev() {
-                    shift_pair(&mut w0, &mut w3, &mut top03);
-                    shift_pair(&mut w4, &mut w5, &mut top45);
-                    let u = first + 2 * b + t;
-                    let x_lo0 = 2 * u;
-                    let x_lo1 = x_lo0 + 1;
-                    let pad0 =
-                        ((pair_idx_base + x_lo0) & pair_in_block_mask) >= useful_pairs_inclusive;
-                    let pad1 =
-                        ((pair_idx_base + x_lo1) & pair_in_block_mask) >= useful_pairs_inclusive;
-                    let (a0, a1, a2, a3, b0, b1, b2, b3, deg0, deg1) = {
-                        let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                            table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen,
-                            b_ones,
-                        );
-                        let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                            table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen,
-                            b_ones,
-                        );
-                        (a0, a1, a2, a3, b0, b1, b2, b3, deg0, deg1)
-                    };
-                    if pad0 & pad1 {
-                        continue;
-                    }
-                    if deg0 & deg1 & ones_is_one {
-                        w0.lo = veorq_u64(w0.lo, a2);
-                    } else {
-                        let e_a = veorq_u64(a0, a2);
-                        let o_a = veorq_u64(a1, a3);
-                        let e_b = veorq_u64(b0, b2);
-                        let o_b = veorq_u64(b1, b3);
-                        if !pad1 {
-                            wide_xor(&mut w0, mul_unreduced_sw_q(a2, swap_halves_q(a2), b2));
-                        }
-                        let all_a = veorq_u64(e_a, o_a);
-                        let all_b = veorq_u64(e_b, o_b);
-                        wide_xor(&mut w3, mul_unreduced_sw_q(e_a, swap_halves_q(e_a), e_b));
-                        wide_xor(&mut w4, mul_unreduced_sw_q(o_a, swap_halves_q(o_a), o_b));
-                        wide_xor(&mut w5, mul_unreduced_sw_q(all_a, swap_halves_q(all_a), all_b));
-                    }
-                }
-                let lambda = vld1q_u64(eq_lo.add(2 * (first + t) + 1).cast::<u64>());
-                let (w0, w3) = reduce_pair(w0, w3, top03);
-                let (w4, w5) = reduce_pair(w4, w5, top45);
-                sum0 = veorq_u64(sum0, mul_q(lambda, w0));
-                sum3 = veorq_u64(sum3, mul_q(lambda, w3));
-                sum4 = veorq_u64(sum4, mul_q(lambda, w4));
-                sum5 = veorq_u64(sum5, mul_q(lambda, w5));
-            }
-        }
-        for i in 0..4 {
-            *out.add(i) = F128::ZERO;
-        }
-        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(sum0);
-        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(sum3);
-        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(sum4);
-        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(sum5);
-    }
-}
-
-/// Bind **both** ρ₁ and ρ₂ straight out of the compact round-two state and
-/// emit the round-four message in the same pass (variant K).
-///
-/// `A''[y] = [anc0 + ρ₂(anc0+anc1)] + fold_{λ₁}(δ0) + fold_{λ₃}(δ1)` with
-/// `λ₁ = ρ₁(1+ρ₂)`, `λ₃ = ρ₁ρ₂` — in characteristic two `λ₀+λ₁ = 1+ρ₂` and
-/// `λ₂+λ₃ = ρ₂`, so the two anchors collapse into one ordinary ρ₂ fold and
-/// only the two deltas need λ-scaled tables. Padding needs no predicate: the
-/// compact state already carries zero anchors and zero deltas there, and a
-/// zero delta code folds to zero through the table's zero entry.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold2_compact_and_round4_chunk_neon_8(
-    table_l1: *const u8,
-    table_l3: *const u8,
-    rho2: F128,
-    anchors: *const F128,
-    deltas: *const u8,
-    a_out: *mut F128,
-    b_out: *mut F128,
-    eq_lo: *const F128,
-    out_pairs: usize,
-    degen: bool,
-) -> (F128, F128) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
-        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
-        let mut p1_acc = WideNeon { lo: zero, hi: zero };
-        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
-
-        for u in 0..out_pairs {
-            let mut av = [zero; 2];
-            let mut bv = [zero; 2];
-            let mut b_flat = true;
-            for lane in 0..2usize {
-                let g = 2 * u + lane;
-                let ap = anchors.add(4 * g).cast::<u64>();
-                let anc_a0 = vld1q_u64(ap);
-                let anc_b0 = vld1q_u64(ap.add(2));
-                let anc_a1 = vld1q_u64(ap.add(4));
-                let anc_b1 = vld1q_u64(ap.add(6));
-
-                let dp = deltas.add(32 * g);
-                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
-                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
-                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
-
-                let a_delta = veorq_u64(
-                    lookup_lanes_q::<8>(table_l1, da0, 0),
-                    lookup_lanes_q::<8>(table_l3, da1, 0),
-                );
-                av[lane] = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
-
-                if degen && (db0 | db1) == 0 {
-                    // b rows are constant across the group: zero deltas mean
-                    // both b halves equal their anchors.
-                    let bd = veorq_u64(anc_b0, anc_b1);
-                    bv[lane] = if is_zero_q(bd) {
-                        anc_b0
-                    } else {
-                        b_flat = false;
-                        veorq_u64(anc_b0, mul_q(rho2_q, bd))
-                    };
-                } else {
-                    b_flat = false;
-                    let b_delta = veorq_u64(
-                        lookup_lanes_q::<8>(table_l1, db0, 0),
-                        lookup_lanes_q::<8>(table_l3, db1, 0),
-                    );
-                    bv[lane] = xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta);
-                }
-            }
-
-            store_pair_nt(a_out.add(2 * u), av[0], av[1]);
-            store_pair_nt(b_out.add(2 * u), bv[0], bv[1]);
-
-            let eq_l = vld1q_u64(eq_lo.add(u).cast::<u64>());
-            if b_flat {
-                // Value-forced shortcuts on the static b≡1 mass, gated on the
-                // loaded values so they stay bit-exact.
-                let g1 = if is_zero_q(veorq_u64(bv[1], one_q)) {
-                    av[1]
-                } else {
-                    mul_q(av[1], bv[1])
-                };
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                let b_sum = veorq_u64(bv[0], bv[1]);
-                if !is_zero_q(b_sum) {
-                    let g_inf = mul_q(veorq_u64(av[0], av[1]), b_sum);
-                    wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-                }
-            } else {
-                let g1 = mul_q(av[1], bv[1]);
-                let g_inf = mul_q(veorq_u64(av[0], av[1]), veorq_u64(bv[0], bv[1]));
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-            }
-        }
-
-        (
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
-        )
-    }
-}
-
-/// Cascade variant of [`fold2_compact_and_round4_chunk_neon_8`]: identical
-/// per-output value computation and byte-identical stores, but K outputs are
-/// visited FOUR at a time — one round-**five** group `y' = out/4` (two
-/// adjacent round-4 pairs) — so the six deferred round-five aggregates can be
-/// formed while the group's outputs are still live in registers, exactly the
-/// position the round-2 sweep exploited for the round-3 lookahead.
-///
-/// **One weight per group, one scaling per row** (the same reshape as
-/// [`fold_round2_compact_chunk_neon_lookahead_8`]): with `r' = r_next4[1]`,
-/// `eq4(2y') = (1+r')·eq5(y')` and `eq4(2y'+1) = r'·eq5(y')`, so the whole
-/// group accumulates against the single odd-lane weight `w = eq4_lo[2t+1]`,
-/// the four A outputs are pre-scaled by `w` with four reduced multiplies, and
-/// all eight products cost one unreduced multiply each. The constant
-/// rescalings (`kappa = (1+r')/r'` on the even round-4 sums, `r'^-1` on the
-/// six deferred aggregates) are applied once by the driver, off the hot path.
-///
-/// Writes eight F128 slots to `out`, every one of them `w`-weighted:
-///
-/// | slot | value |
-/// |---|---|
-/// | 0, 1 | `sum_{u even} w·a1·b1`, `sum_{u even} w·(a0+a1)(b0+b1)` |
-/// | 2, 3 | the same two sums over **odd** round-4 pairs `u` — i.e. `r'·W1'`, `r'·W2'` |
-/// | 4..8 | `r'·W0'`, `r'·W3'`, `r'·W4'`, `r'·W5'` |
-///
-/// with `W0' = Σ eq5·a2b2`, `W3'/W4'/W5'` the even/odd K-output-parity split
-/// (`e = out[4y']+out[4y'+2]`, `o = out[4y'+1]+out[4y'+3]`), mirroring the
-/// round-3 lookahead's aggregate shape one level deeper.
-///
-/// The incumbent kernel's per-pair `b_flat` product shortcuts are replaced by
-/// a group-level `b ≡ 1` shortcut (all four `b` outputs equal ONE, value
-/// gated): every difference product vanishes (`b0+b1 = b2+b3 = e_b = o_b =
-/// 0`) and the three survivors are `w·a1`, `w·a3`, `w·a2` — three unreduced
-/// multiplies for the whole group. Mixed groups take the full path, which is
-/// value-identical (products of genuinely-zero factors XOR in as zero).
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8(
-    table_l1: *const u8,
-    table_l3: *const u8,
-    rho2: F128,
-    anchors: *const F128,
-    deltas: *const u8,
-    a_out: *mut F128,
-    b_out: *mut F128,
-    eq_lo: *const F128,
-    out_pairs: usize,
-    degen: bool,
-    out: *mut F128,
-) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
-        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
-        let mut p1_even = WideNeon { lo: zero, hi: zero };
-        let mut pinf_even = WideNeon { lo: zero, hi: zero };
-        let mut p1_odd = WideNeon { lo: zero, hi: zero };
-        let mut pinf_odd = WideNeon { lo: zero, hi: zero };
-        let mut w0 = WideNeon { lo: zero, hi: zero };
-        let mut w3 = WideNeon { lo: zero, hi: zero };
-        let mut w4 = WideNeon { lo: zero, hi: zero };
-        let mut w5 = WideNeon { lo: zero, hi: zero };
-
-        debug_assert!(out_pairs >= 2 && out_pairs.is_multiple_of(2));
-        let n5 = out_pairs / 2;
-        for t in 0..n5 {
-            let mut av = [zero; 4];
-            let mut bv = [zero; 4];
-            let mut b_flat = true;
-            for lane in 0..4usize {
-                let g = 4 * t + lane;
-                let ap = anchors.add(4 * g).cast::<u64>();
-                let anc_a0 = vld1q_u64(ap);
-                let anc_b0 = vld1q_u64(ap.add(2));
-                let anc_a1 = vld1q_u64(ap.add(4));
-                let anc_b1 = vld1q_u64(ap.add(6));
-
-                let dp = deltas.add(32 * g);
-                let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
-                let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
-                let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
-
-                let a_delta = veorq_u64(
-                    lookup_lanes_q::<8>(table_l1, da0, 0),
-                    lookup_lanes_q::<8>(table_l3, da1, 0),
-                );
-                av[lane] = xor3_u64(anc_a0, mul_q(rho2_q, veorq_u64(anc_a0, anc_a1)), a_delta);
-
-                if degen && (db0 | db1) == 0 {
-                    // b rows are constant across the group: zero deltas mean
-                    // both b halves equal their anchors.
-                    let bd = veorq_u64(anc_b0, anc_b1);
-                    bv[lane] = if is_zero_q(bd) {
-                        anc_b0
-                    } else {
-                        b_flat = false;
-                        veorq_u64(anc_b0, mul_q(rho2_q, bd))
-                    };
-                } else {
-                    b_flat = false;
-                    let b_delta = veorq_u64(
-                        lookup_lanes_q::<8>(table_l1, db0, 0),
-                        lookup_lanes_q::<8>(table_l3, db1, 0),
-                    );
-                    bv[lane] = xor3_u64(anc_b0, mul_q(rho2_q, veorq_u64(anc_b0, anc_b1)), b_delta);
-                }
-            }
-
-            store_pair_nt(a_out.add(4 * t), av[0], av[1]);
-            store_pair_nt(a_out.add(4 * t + 2), av[2], av[3]);
-            store_pair_nt(b_out.add(4 * t), bv[0], bv[1]);
-            store_pair_nt(b_out.add(4 * t + 2), bv[2], bv[3]);
-
-            // The odd round-4 pair's weight drives the whole group; see doc.
-            let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
-
-            if b_flat {
-                // Every b output equals its anchor; check the b≡1 mass.
-                let ones_miss = vorrq_u64(
-                    vorrq_u64(veorq_u64(bv[0], one_q), veorq_u64(bv[1], one_q)),
-                    vorrq_u64(veorq_u64(bv[2], one_q), veorq_u64(bv[3], one_q)),
-                );
-                if is_zero_q(ones_miss) {
-                    wide_xor(&mut p1_even, mul_unreduced_q(w, av[1]));
-                    wide_xor(&mut p1_odd, mul_unreduced_q(w, av[3]));
-                    wide_xor(&mut w0, mul_unreduced_q(w, av[2]));
-                    continue;
-                }
-            }
-
-            // Weight-sharing reshape: four reduced row scalings, then every
-            // product below is one unreduced multiply.
-            let a0w = mul_q(w, av[0]);
-            let a1w = mul_q(w, av[1]);
-            let a2w = mul_q(w, av[2]);
-            let a3w = mul_q(w, av[3]);
-
-            // ---- round-four products, split by round-4-pair parity ----
-            wide_xor(&mut p1_even, mul_unreduced_q(a1w, bv[1]));
-            wide_xor(
-                &mut pinf_even,
-                mul_unreduced_q(veorq_u64(a0w, a1w), veorq_u64(bv[0], bv[1])),
-            );
-            wide_xor(&mut p1_odd, mul_unreduced_q(a3w, bv[3]));
-            wide_xor(
-                &mut pinf_odd,
-                mul_unreduced_q(veorq_u64(a2w, a3w), veorq_u64(bv[2], bv[3])),
-            );
-
-            // ---- deferred round-five aggregates (no extra loads) ----
-            wide_xor(&mut w0, mul_unreduced_q(a2w, bv[2]));
-            let e_aw = veorq_u64(a0w, a2w);
-            let o_aw = veorq_u64(a1w, a3w);
-            let e_b = veorq_u64(bv[0], bv[2]);
-            let o_b = veorq_u64(bv[1], bv[3]);
-            wide_xor(&mut w3, mul_unreduced_q(e_aw, e_b));
-            wide_xor(&mut w4, mul_unreduced_q(o_aw, o_b));
-            wide_xor(
-                &mut w5,
-                mul_unreduced_q(veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b)),
-            );
-        }
-
-        *out.add(0) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_even));
-        *out.add(1) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_even));
-        *out.add(2) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_odd));
-        *out.add(3) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_odd));
-        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w0));
-        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w3));
-        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w4));
-        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(w5));
-    }
-}
-
-/// XOR of the `L` table entries for byte lanes `lane0..lane0 + L` of `code`.
-/// One 16-byte L1 load per lane; the tree shape matches `fold_row_q` so the
-/// full-width (`L = 8`, `lane0 = 0`) case is instruction-equivalent.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn lookup_lanes_q<const L: usize>(
-    table_data: *const u8,
-    code: u64,
-    lane0: usize,
-) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe {
-        const STRIDE: usize = 256 * 16;
-        let load = |j: usize| {
-            let lane = lane0 + j;
-            let index = ((code >> (8 * lane)) & 0xff) as usize;
-            vld1q_u64(
-                table_data
-                    .add(lane * STRIDE + index * core::mem::size_of::<F128>())
-                    .cast::<u64>(),
-            )
-        };
-        let mut acc = load(0);
-        let mut j = 1;
-        while j + 1 < L {
-            acc = xor3_u64(acc, load(j), load(j + 1));
-            j += 2;
-        }
-        if j < L {
-            acc = veorq_u64(acc, load(j));
-        }
-        acc
-    }
-}
-
-/// Pairs per tile for the byte-lane-outer streaming kernels. Accumulator
-/// footprint is `4 × 16 B × STREAM_TILE_PAIRS` (8 KiB) plus the row codes
-/// (4 KiB) — L1-resident alongside the active 4·L KiB of table rows.
-#[cfg(target_arch = "aarch64")]
-const STREAM_TILE_PAIRS: usize = 128;
-
-/// Byte-lane-outer streaming variant of
-/// [`fold_round2_compact_chunk_neon_unchecked_8`]. Identical outputs (XOR
-/// reassociation only). `L` byte lanes are consumed per pass; each tile of
-/// [`STREAM_TILE_PAIRS`] pairs keeps its four fold accumulators in an
-/// L1-resident stack array, re-reading the packed row codes once per pass.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_round2_compact_stream_chunk_neon<const L: usize>(
-    table_data: *const u8,
-    a_packed: *const u8,
-    b_packed: *const u8,
-    anchors: *mut F128,
-    deltas: *mut u8,
-    eq_lo: *const F128,
-    lo_size: usize,
-    pair_idx_base: usize,
-    pair_in_block_mask: usize,
-    useful_pairs_inclusive: usize,
-) -> (F128, F128) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {a:q}, {b:q}, [{dst}]",
-                dst = in(reg) dst,
-                a = in(vreg) a,
-                b = in(vreg) b,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    debug_assert!(L == 1 || L == 2 || L == 4 || L == 8);
-    let n_passes = 8 / L;
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let mut p1_acc = WideNeon { lo: zero, hi: zero };
-        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
-        // Per-tile fold accumulators: [a0, a1, b0, b1] per pair.
-        let mut acc = [[zero; 4]; STREAM_TILE_PAIRS];
-
-        let mut t0 = 0usize;
-        while t0 < lo_size {
-            let tlen = STREAM_TILE_PAIRS.min(lo_size - t0);
-
-            for pass in 0..n_passes {
-                let lane0 = pass * L;
-                for i in 0..tlen {
-                    let x_lo = t0 + i;
-                    if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                        if pass == 0 {
-                            store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
-                            acc[i] = [zero; 4];
-                        }
-                        continue;
-                    }
-                    let row0 = 2 * x_lo;
-                    let a0_code =
-                        u64::from_le(core::ptr::read_unaligned(a_packed.add(row0 * 8).cast()));
-                    let a1_code = u64::from_le(core::ptr::read_unaligned(
-                        a_packed.add((row0 + 1) * 8).cast(),
-                    ));
-                    let b0_code =
-                        u64::from_le(core::ptr::read_unaligned(b_packed.add(row0 * 8).cast()));
-                    let b1_code = u64::from_le(core::ptr::read_unaligned(
-                        b_packed.add((row0 + 1) * 8).cast(),
-                    ));
-
-                    let va0 = lookup_lanes_q::<L>(table_data, a0_code, lane0);
-                    let va1 = lookup_lanes_q::<L>(table_data, a1_code, lane0);
-                    let vb0 = lookup_lanes_q::<L>(table_data, b0_code, lane0);
-                    let vb1 = lookup_lanes_q::<L>(table_data, b1_code, lane0);
-
-                    if pass == 0 {
-                        acc[i] = [va0, va1, vb0, vb1];
-                        let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
-                            a0_code ^ a1_code,
-                            b0_code ^ b1_code,
-                        ]);
-                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-                    } else {
-                        acc[i][0] = veorq_u64(acc[i][0], va0);
-                        acc[i][1] = veorq_u64(acc[i][1], va1);
-                        acc[i][2] = veorq_u64(acc[i][2], vb0);
-                        acc[i][3] = veorq_u64(acc[i][3], vb1);
-                    }
-                }
-            }
-
-            // Finalize the tile: anchor stores + round message.
-            for i in 0..tlen {
-                let x_lo = t0 + i;
-                if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
-                    continue;
-                }
-                let [a0, a1, b0, b1] = acc[i];
-                store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-                let g1 = mul_q(a1, b1);
-                let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
-                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-            }
-
-            t0 += tlen;
-        }
-
-        (
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
-        )
-    }
-}
-
-/// Byte-lane-outer streaming variant of [`fold_compact_chunk_neon_unchecked_8`]
-/// (compact reconstruction). Identical outputs; same tile/pass schedule as
-/// [`fold_round2_compact_stream_chunk_neon`].
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_compact_stream_chunk_neon<const L: usize>(
-    scaled_table: *const u8,
-    anchors: *const F128,
-    deltas: *const u8,
-    a_out: *mut F128,
-    b_out: *mut F128,
-    eq_lo: *const F128,
-    lo_size: usize,
-) -> (F128, F128) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    debug_assert!(L == 1 || L == 2 || L == 4 || L == 8);
-    let n_passes = 8 / L;
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let mut p1_acc = WideNeon { lo: zero, hi: zero };
-        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
-        // Per-tile delta-fold accumulators: [a0, a1, b0, b1] per pair.
-        let mut acc = [[zero; 4]; STREAM_TILE_PAIRS];
-
-        let mut t0 = 0usize;
-        while t0 < lo_size {
-            let tlen = STREAM_TILE_PAIRS.min(lo_size - t0);
-
-            for pass in 0..n_passes {
-                let lane0 = pass * L;
-                for i in 0..tlen {
-                    let x_lo = t0 + i;
-                    let out = 2 * x_lo;
-                    let delta = deltas.add(out * 16);
-                    let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
-                    let b0_code =
-                        u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
-                    let a1_code =
-                        u64::from_le(core::ptr::read_unaligned(delta.add(16).cast::<u64>()));
-                    let b1_code =
-                        u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
-
-                    let va0 = lookup_lanes_q::<L>(scaled_table, a0_code, lane0);
-                    let va1 = lookup_lanes_q::<L>(scaled_table, a1_code, lane0);
-                    let vb0 = lookup_lanes_q::<L>(scaled_table, b0_code, lane0);
-                    let vb1 = lookup_lanes_q::<L>(scaled_table, b1_code, lane0);
-
-                    if pass == 0 {
-                        acc[i] = [va0, va1, vb0, vb1];
-                    } else {
-                        acc[i][0] = veorq_u64(acc[i][0], va0);
-                        acc[i][1] = veorq_u64(acc[i][1], va1);
-                        acc[i][2] = veorq_u64(acc[i][2], vb0);
-                        acc[i][3] = veorq_u64(acc[i][3], vb1);
-                    }
-                }
-            }
-
-            // Finalize: add anchors, store outputs, accumulate the message.
-            for i in 0..tlen {
-                let x_lo = t0 + i;
-                let out = 2 * x_lo;
-                let a0 = veorq_u64(vld1q_u64(anchors.add(2 * out).cast::<u64>()), acc[i][0]);
-                let a1 = veorq_u64(
-                    vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()),
-                    acc[i][1],
-                );
-                let b0 = veorq_u64(vld1q_u64(anchors.add(2 * out + 1).cast::<u64>()), acc[i][2]);
-                let b1 = veorq_u64(
-                    vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>()),
-                    acc[i][3],
-                );
-
-                store_pair_nt(a_out.add(out), a0, a1);
-                store_pair_nt(b_out.add(out), b0, b1);
-
-                let g1 = mul_q(a1, b1);
-                let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
-                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-            }
-
-            t0 += tlen;
-        }
-
-        (
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
-        )
-    }
-}
-
-/// Reconstruction-only sibling of [`fold_compact_chunk_neon_unchecked_8`]:
-/// writes byte-identical `a_out`/`b_out` values and skips the message
-/// products entirely. Used for the chunk prefix whose products the GPU T3
-/// arm owns — the CPU must still materialize every reconstructed value for
-/// the later tail rounds, but the two message muls and two eq-weight muls
-/// per pair move to the GPU.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_compact_chunk_neon_reconstruct_only_8(
-    scaled_table: *const u8,
-    anchors: *const F128,
-    deltas: *const u8,
-    a_out: *mut F128,
-    b_out: *mut F128,
-    lo_size: usize,
-) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        for x_lo in 0..lo_size {
-            let out = 2 * x_lo;
-            let delta = deltas.add(out * 16);
-            let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
-            let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
-            let a1_code = u64::from_le(core::ptr::read_unaligned(delta.add(16).cast::<u64>()));
-            let b1_code = u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
-
-            let a0 = veorq_u64(
-                vld1q_u64(anchors.add(2 * out).cast::<u64>()),
-                lookup_lanes_q::<8>(scaled_table, a0_code, 0),
-            );
-            let b0 = veorq_u64(
-                vld1q_u64(anchors.add(2 * out + 1).cast::<u64>()),
-                lookup_lanes_q::<8>(scaled_table, b0_code, 0),
-            );
-            let a1 = veorq_u64(
-                vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()),
-                lookup_lanes_q::<8>(scaled_table, a1_code, 0),
-            );
-            let b1 = veorq_u64(
-                vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>()),
-                lookup_lanes_q::<8>(scaled_table, b1_code, 0),
-            );
-
-            store_pair_nt(a_out.add(out), a0, a1);
-            store_pair_nt(b_out.add(out), b0, b1);
-        }
-    }
-}
-
-/// Reconstruct one compact round-two level at the sampled challenge and form
-/// the next sumcheck message. `scaled_table` is the univariate fold table with
-/// every entry multiplied by that challenge, so reconstruction needs only
-/// cache-resident table loads and XORs:
-///
-/// `folded = anchor + scaled_table_fold(packed_row0 XOR packed_row1)`.
-///
-/// `degen` enables the b≡1 chunk-class degeneration: pairs whose two b delta
-/// codes are both zero reconstruct `b = anchor` with no b-table lookups; the
-/// value-forced shortcuts (`b0 + b1 = 0` ⇒ skip the `G(∞)` mul chain,
-/// `b1 = 1` ⇒ `a1·b1 = a1`) are additionally gated on the loaded anchor
-/// values, so they are bit-exact by construction.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_compact_chunk_neon_unchecked_8(
-    scaled_table: *const u8,
-    anchors: *const F128,
-    deltas: *const u8,
-    a_out: *mut F128,
-    b_out: *mut F128,
-    eq_lo: *const F128,
-    lo_size: usize,
-    degen: bool,
-) -> (F128, F128) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    unsafe {
-        let zero = vdupq_n_u64(0);
-        let mut p1_acc = WideNeon { lo: zero, hi: zero };
-        let mut pinf_acc = WideNeon { lo: zero, hi: zero };
-
-        let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
-
-        for x_lo in 0..lo_size {
-            let out = 2 * x_lo;
-            let delta = deltas.add(out * 16);
-            let a0_code = u64::from_le(core::ptr::read_unaligned(delta.cast::<u64>()));
-            let b0_code = u64::from_le(core::ptr::read_unaligned(delta.add(8).cast::<u64>()));
-            let a1_code = u64::from_le(core::ptr::read_unaligned(delta.add(16).cast::<u64>()));
-            let b1_code = u64::from_le(core::ptr::read_unaligned(delta.add(24).cast::<u64>()));
-
-            if degen && (b0_code | b1_code) == 0 {
-                // Zero b deltas: b rows fold to zero (table entry 0 is zero),
-                // so b = anchor with no lookups. On the static b≡1 mass both
-                // anchors are 1: G(∞)'s (b0 + b1) factor vanishes and
-                // a1·b1 = a1; both shortcuts are value-gated below.
-                let (a0_delta, a1_delta) = fold_two_row_codes_q(scaled_table, a0_code, a1_code);
-                let a0 = veorq_u64(vld1q_u64(anchors.add(2 * out).cast::<u64>()), a0_delta);
-                let a1 = veorq_u64(
-                    vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()),
-                    a1_delta,
-                );
-                let b0 = vld1q_u64(anchors.add(2 * out + 1).cast::<u64>());
-                let b1 = vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>());
-
-                store_pair_nt(a_out.add(out), a0, a1);
-                store_pair_nt(b_out.add(out), b0, b1);
-
-                let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
-                let g1 = if is_zero_q(veorq_u64(b1, one_q)) {
-                    a1
-                } else {
-                    mul_q(a1, b1)
-                };
-                wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-                let b_sum = veorq_u64(b0, b1);
-                if !is_zero_q(b_sum) {
-                    let g_inf = mul_q(veorq_u64(a0, a1), b_sum);
-                    wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-                }
-                continue;
-            }
-
-            let (a0_delta, a1_delta, b0_delta, b1_delta) =
-                fold_four_row_codes_q(scaled_table, a0_code, a1_code, b0_code, b1_code);
-            let a0 = veorq_u64(vld1q_u64(anchors.add(2 * out).cast::<u64>()), a0_delta);
-            let a1 = veorq_u64(
-                vld1q_u64(anchors.add(2 * (out + 1)).cast::<u64>()),
-                a1_delta,
-            );
-            let b0 = veorq_u64(vld1q_u64(anchors.add(2 * out + 1).cast::<u64>()), b0_delta);
-            let b1 = veorq_u64(
-                vld1q_u64(anchors.add(2 * (out + 1) + 1).cast::<u64>()),
-                b1_delta,
-            );
-
-            store_pair_nt(a_out.add(out), a0, a1);
-            store_pair_nt(b_out.add(out), b0, b1);
-
-            let g1 = mul_q(a1, b1);
-            let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
-            let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
-            wide_xor(&mut p1_acc, mul_unreduced_q(eq_l, g1));
-            wide_xor(&mut pinf_acc, mul_unreduced_q(eq_l, g_inf));
-        }
-
-        (
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(p1_acc)),
-            core::mem::transmute::<uint64x2_t, F128>(reduce_wide_q(pinf_acc)),
-        )
-    }
-}
-
-/// NEON one-row fold: 8 aligned 16-byte loads + 8 XORs, hand-unrolled for
-/// `n_chunks = 8` (the k_skip=6 protocol size). Returns the folded F128.
-///
-/// The table is `Vec<F128>` with each entry 16-byte aligned (F128 is
-/// `repr(C, align(16))`), so every `vld1q_u8` lands on an aligned address.
-///
-/// # Safety
-/// Caller must guarantee `table_data` points to ≥ 8 × 256 × 16 valid bytes
-/// (an `n_chunks ≥ 8` table) and `bytes_ptr` to ≥ 8 valid bytes.
-#[cfg(all(target_arch = "aarch64", test))]
 #[inline(always)]
 pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     table_data: *const u8,
@@ -2140,1145 +46,2203 @@ pub(crate) unsafe fn fold_one_row_neon_unchecked_8(
     }
 }
 
-///
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline(always)]
-fn fold_two_by_rho(even0: F128, odd0: F128, even1: F128, odd1: F128, rho: F128) -> (F128, F128) {
-    let products = unsafe {
-        crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(rho, [even0 + odd0, even1 + odd1])
-    };
-    (even0 + products[0], even1 + products[1])
-}
-
-#[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
-#[inline(always)]
-fn fold_two_by_rho(even0: F128, odd0: F128, even1: F128, odd1: F128, rho: F128) -> (F128, F128) {
-    (
-        even0 + rho * (even0 + odd0),
-        even1 + rho * (even1 + odd1),
-    )
-}
-
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 #[inline(always)]
-fn fold4_two(v: &[F128], i: usize, rho_a: F128, rho_b: F128, rho_ab: F128) -> (F128, F128) {
-    #[cfg(target_feature = "aes")]
-    {
-        unsafe {
-            let (x, y) = fold4_pair_expanded_binius_q(
-                v.as_ptr().add(i),
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(rho_a),
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(rho_b),
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(rho_ab),
-            );
-            return (
-                core::mem::transmute::<core::arch::aarch64::uint64x2_t, F128>(x),
-                core::mem::transmute::<core::arch::aarch64::uint64x2_t, F128>(y),
-            );
-        }
-    }
-    #[cfg(not(target_feature = "aes"))]
-    {
-        let _ = rho_ab;
-        let one = |j: usize| {
-            let t0 = v[j] + rho_a * (v[j] + v[j + 1]);
-            let t1 = v[j + 2] + rho_a * (v[j + 2] + v[j + 3]);
-            t0 + rho_b * (t0 + t1)
-        };
-        (one(i), one(i + 4))
-    }
-}
-
-/// Fuse one multilinear tail fold with construction of the following round's
-/// message. The previous AArch64 path first streamed all of `a_in`/`b_in` into
-/// `a_out`/`b_out`, then immediately reread both outputs in a second pass.
-/// Keeping each four-value folded pair live until its message contribution is
-/// accumulated removes that full output readback while preserving the exact
-/// canonical output tables for the next round.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn fold_and_message_aarch64(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    r_fold: F128,
-    eq_lo: &[F128],
-    nt_stores: bool,
+pub(crate) unsafe fn fold_round3_pair_scaled_neon_unchecked_8(
+    table0_data: *const u8,
+    table1_data: *const u8,
+    a_bytes: *const u8,
+    b_bytes: *const u8,
 ) -> (F128, F128) {
-    // `nt_stores` is decided once per round by the driver (round output past
-    // LLC size ⇒ ping-pong writes not read until the next barrier ⇒ `stnp`
-    // elides the write-allocate RFO reads; small rounds keep normal stores so
-    // LLC-resident outputs stay hot). Per-chunk callers must not decide this
-    // from their sub-slice length.
-    if nt_stores {
-        fold_and_message_body::<true>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
-    } else {
-        fold_and_message_body::<false>(a_in, b_in, a_out, b_out, r_fold, eq_lo)
-    }
-}
-
-#[inline(always)]
-fn fold_and_message_body<const NT: bool>(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    r_fold: F128,
-    eq_lo: &[F128],
-) -> (F128, F128) {
-    use core::arch::aarch64::uint64x2_t;
-
-    debug_assert_eq!(a_in.len(), 2 * a_out.len());
-    debug_assert_eq!(b_in.len(), 2 * b_out.len());
-    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
+    use core::arch::aarch64::*;
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        let mut acc_a = veorq_u8(
+            vld1q_u8(table0_data.add((*a_bytes) as usize * 16)),
+            vld1q_u8(table1_data.add((*a_bytes.add(8)) as usize * 16)),
+        );
+        let mut acc_b = veorq_u8(
+            vld1q_u8(table0_data.add((*b_bytes) as usize * 16)),
+            vld1q_u8(table1_data.add((*b_bytes.add(8)) as usize * 16)),
+        );
+        macro_rules! step {
+            ($c:literal) => {{
+                let off = $c * STRIDE;
+                let a0 = vld1q_u8(table0_data.add(off + (*a_bytes.add($c)) as usize * 16));
+                let a1 = vld1q_u8(table1_data.add(off + (*a_bytes.add(8 + $c)) as usize * 16));
+                let b0 = vld1q_u8(table0_data.add(off + (*b_bytes.add($c)) as usize * 16));
+                let b1 = vld1q_u8(table1_data.add(off + (*b_bytes.add(8 + $c)) as usize * 16));
+                acc_a = veorq_u8(acc_a, veorq_u8(a0, a1));
+                acc_b = veorq_u8(acc_b, veorq_u8(b0, b1));
+            }};
         }
-    }
-
-    let mut p1_acc = F256Unreduced::ZERO;
-    let mut pinf_acc = F256Unreduced::ZERO;
-
-    let a_out_ptr = a_out.as_mut_ptr();
-    let b_out_ptr = b_out.as_mut_ptr();
-
-    for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
-        let i = 4 * x_lo;
-        let o = 2 * x_lo;
-
-        let a_even_0 = a_in[i];
-        let a_odd_0 = a_in[i + 1];
-        let a_even_1 = a_in[i + 2];
-        let a_odd_1 = a_in[i + 3];
-        let b_even_0 = b_in[i];
-        let b_odd_0 = b_in[i + 1];
-        let b_even_1 = b_in[i + 2];
-        let b_odd_1 = b_in[i + 3];
-
-        let (a0, a1) = fold_two_by_rho(a_even_0, a_odd_0, a_even_1, a_odd_1, r_fold);
-        let (b0, b1) = fold_two_by_rho(b_even_0, b_odd_0, b_even_1, b_odd_1, r_fold);
-
-        if NT {
-            // SAFETY: `o + 1 < a_out.len()` by the len contract above; F128
-            // is repr(C, align(16)) two u64s, bit-compatible with uint64x2_t;
-            // each 32-byte pair store is 16-byte aligned and lands in this
-            // iteration's disjoint output slots.
-            unsafe {
-                store_pair_nt(
-                    a_out_ptr.add(o),
-                    core::mem::transmute::<F128, uint64x2_t>(a0),
-                    core::mem::transmute::<F128, uint64x2_t>(a1),
-                );
-                store_pair_nt(
-                    b_out_ptr.add(o),
-                    core::mem::transmute::<F128, uint64x2_t>(b0),
-                    core::mem::transmute::<F128, uint64x2_t>(b1),
-                );
-            }
-        } else {
-            a_out[o] = a0;
-            a_out[o + 1] = a1;
-            b_out[o] = b0;
-            b_out[o + 1] = b1;
-        }
-
-        p1_acc ^= eq_l.mul_unreduced(a1 * b1);
-        pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
-    }
-
-    (p1_acc.reduce(), pinf_acc.reduce())
-}
-
-/// Two-challenge composed variant of [`fold_and_message_aarch64`] (cascade):
-/// binds `rho_a` then `rho_b` in ONE pass — quartering the tables instead of
-/// halving them — and emits the following round's message from the composed
-/// outputs. Replaces two sequential fused tail rounds: same fold ALU (three
-/// reduced multiplies per output vs 2+1 across the two passes), but the
-/// intermediate half-size tables are never written or re-read.
-///
-/// Value-identical to `fold(rho_a)` then `fold(rho_b)`: the composition
-/// `t0 + rho_b·(t0+t1)` over the two rho_a-folded halves IS the sequential
-/// result, term for term — no reassociation at all, just deleted traffic.
-#[cfg(target_arch = "aarch64")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fold2_and_message_aarch64(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho_a: F128,
-    rho_b: F128,
-    eq_lo: &[F128],
-    nt_stores: bool,
-) -> (F128, F128) {
-    // Same NT policy as `fold_and_message_aarch64`: decided once per round by
-    // the driver from the ROUND's output size, not per chunk.
-    if nt_stores {
-        fold2_and_message_body::<true>(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo)
-    } else {
-        fold2_and_message_body::<false>(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo)
+        step!(1);
+        step!(2);
+        step!(3);
+        step!(4);
+        step!(5);
+        step!(6);
+        step!(7);
+        let a_u64 = vreinterpretq_u64_u8(acc_a);
+        let b_u64 = vreinterpretq_u64_u8(acc_b);
+        (
+            F128 {
+                lo: vgetq_lane_u64::<0>(a_u64),
+                hi: vgetq_lane_u64::<1>(a_u64),
+            },
+            F128 {
+                lo: vgetq_lane_u64::<0>(b_u64),
+                hi: vgetq_lane_u64::<1>(b_u64),
+            },
+        )
     }
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn fold2_and_message_body<const NT: bool>(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho_a: F128,
-    rho_b: F128,
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn round2_msg_only_chunk_neon_unchecked_8(
+    table_data: *const u8,
+    a_pkt_ptr: *const u8,
+    b_pkt_ptr: *const u8,
     eq_lo: &[F128],
-) -> (F128, F128) {
-    use core::arch::aarch64::uint64x2_t;
-
-    debug_assert_eq!(a_in.len(), 4 * a_out.len());
-    debug_assert_eq!(b_in.len(), 4 * b_out.len());
-    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    let rho_ab = rho_a * rho_b;
-
-    let mut p1_acc = F256Unreduced::ZERO;
-    let mut pinf_acc = F256Unreduced::ZERO;
-
-    let a_out_ptr = a_out.as_mut_ptr();
-    let b_out_ptr = b_out.as_mut_ptr();
-
-    for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
-        let i = 8 * x_lo;
-        let o = 2 * x_lo;
-
-        let (a0, a1) = fold4_two(a_in, i, rho_a, rho_b, rho_ab);
-        let (b0, b1) = fold4_two(b_in, i, rho_a, rho_b, rho_ab);
-
-        if NT {
-            // SAFETY: `o + 1 < a_out.len()` by the len contract above; F128
-            // is repr(C, align(16)) two u64s, bit-compatible with uint64x2_t;
-            // each 32-byte pair store is 16-byte aligned and lands in this
-            // iteration's disjoint output slots.
-            unsafe {
-                store_pair_nt(
-                    a_out_ptr.add(o),
-                    core::mem::transmute::<F128, uint64x2_t>(a0),
-                    core::mem::transmute::<F128, uint64x2_t>(a1),
-                );
-                store_pair_nt(
-                    b_out_ptr.add(o),
-                    core::mem::transmute::<F128, uint64x2_t>(b0),
-                    core::mem::transmute::<F128, uint64x2_t>(b1),
-                );
-            }
-        } else {
-            a_out[o] = a0;
-            a_out[o + 1] = a1;
-            b_out[o] = b0;
-            b_out[o + 1] = b1;
-        }
-
-        p1_acc ^= eq_l.mul_unreduced(a1 * b1);
-        pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
-    }
-
-    (p1_acc.reduce(), pinf_acc.reduce())
-}
-
-/// Ordinary-store direct composed pass using the expanded fold4 pair. This is
-/// the final cascade rung (ranked rounds 11/12); the incumbent direct kernel
-/// above and both E038/E039 lookahead specializations remain separate.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fold2_and_message_normal_expanded_aarch64(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho_a: F128,
-    rho_b: F128,
-    rho_ab: F128,
-    eq_lo: &[F128],
+    base: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
 ) -> (F128, F128) {
     use core::arch::aarch64::*;
 
-    let expected_out = eq_lo
-        .len()
-        .checked_mul(2)
-        .expect("direct composed output length overflow");
-    let expected_in = expected_out
-        .checked_mul(4)
-        .expect("direct composed input length overflow");
-    assert_eq!(a_out.len(), expected_out);
-    assert_eq!(b_out.len(), expected_out);
-    assert_eq!(a_in.len(), expected_in);
-    assert_eq!(b_in.len(), expected_in);
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        let zero = vdupq_n_u64(0);
+        let mut p1_ll = zero;
+        let mut p1_mid = zero;
+        let mut p1_hh = zero;
+        let mut pinf_ll = zero;
+        let mut pinf_mid = zero;
+        let mut pinf_hh = zero;
+        let lo_size = eq_lo.len();
+        let eq_ptr = eq_lo.as_ptr() as *const u64;
 
-    let rho_a_q = unsafe { core::mem::transmute::<F128, uint64x2_t>(rho_a) };
-    let rho_b_q = unsafe { core::mem::transmute::<F128, uint64x2_t>(rho_b) };
-    let rho_ab_q = unsafe { core::mem::transmute::<F128, uint64x2_t>(rho_ab) };
-    let mut p1_acc = F256Unreduced::ZERO;
-    let mut pinf_acc = F256Unreduced::ZERO;
+        macro_rules! fold_pair {
+            ($x_lo:expr) => {{
+                let x_lo = $x_lo;
+                let x0g = base + 2 * x_lo;
+                let ap = a_pkt_ptr.add(x0g * 8);
+                let bp = b_pkt_ptr.add(x0g * 8);
+                let a0_u64 = (ap as *const u64).read_unaligned();
+                let a1_u64 = (ap.add(8) as *const u64).read_unaligned();
+                let b0_u64 = (bp as *const u64).read_unaligned();
+                let b1_u64 = (bp.add(8) as *const u64).read_unaligned();
+                let ad_u64 = a0_u64 ^ a1_u64;
+                let bd_u64 = b0_u64 ^ b1_u64;
 
-    for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
-        let i = 8 * x_lo;
-        let o = 2 * x_lo;
-        let (a0, a1, b0, b1) = unsafe {
-            // SAFETY: the release-mode geometry assertions and loop bound put
-            // both eight-value pairs wholly inside their input tables.
-            let (a0, a1) =
-                fold4_pair_expanded_binius_q(a_in.as_ptr().add(i), rho_a_q, rho_b_q, rho_ab_q);
-            let (b0, b1) =
-                fold4_pair_expanded_binius_q(b_in.as_ptr().add(i), rho_a_q, rho_b_q, rho_ab_q);
-            (
-                core::mem::transmute::<uint64x2_t, F128>(a0),
-                core::mem::transmute::<uint64x2_t, F128>(a1),
-                core::mem::transmute::<uint64x2_t, F128>(b0),
-                core::mem::transmute::<uint64x2_t, F128>(b1),
-            )
-        };
+                let mut va1 = vld1q_u8(table_data.add(((a1_u64 & 0xFF) as usize) * 16));
+                let mut vad = vld1q_u8(table_data.add(((ad_u64 & 0xFF) as usize) * 16));
+                let mut vb1 = vld1q_u8(table_data.add(((b1_u64 & 0xFF) as usize) * 16));
+                let mut vbd = vld1q_u8(table_data.add(((bd_u64 & 0xFF) as usize) * 16));
 
-        // Ordinary stores retain the 2 MiB combined output in cache for the
-        // next serial tail round.
-        a_out[o] = a0;
-        a_out[o + 1] = a1;
-        b_out[o] = b0;
-        b_out[o + 1] = b1;
+                macro_rules! fold_step {
+                    ($c:literal) => {{
+                        let off = $c * STRIDE;
+                        let sh = $c * 8;
+                        va1 = veorq_u8(
+                            va1,
+                            vld1q_u8(table_data.add(off + (((a1_u64 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        vad = veorq_u8(
+                            vad,
+                            vld1q_u8(table_data.add(off + (((ad_u64 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        vb1 = veorq_u8(
+                            vb1,
+                            vld1q_u8(table_data.add(off + (((b1_u64 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        vbd = veorq_u8(
+                            vbd,
+                            vld1q_u8(table_data.add(off + (((bd_u64 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                    }};
+                }
+                fold_step!(1);
+                fold_step!(2);
+                fold_step!(3);
+                fold_step!(4);
+                fold_step!(5);
+                fold_step!(6);
+                fold_step!(7);
 
-        // Exactly the incumbent direct message algebra.
-        p1_acc ^= eq_l.mul_unreduced(a1 * b1);
-        pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
-    }
+                let ua1 = vreinterpretq_u64_u8(va1);
+                let uad = vreinterpretq_u64_u8(vad);
+                let ub1 = vreinterpretq_u64_u8(vb1);
+                let ubd = vreinterpretq_u64_u8(vbd);
+                let (g1, ginf) = crate::gf2_kernels::k0_f128_mul_vec2_neon(ua1, uad, ub1, ubd);
 
-    (p1_acc.reduce(), pinf_acc.reduce())
-}
-
-/// [`fold2_and_message_aarch64`] **plus** the deferred round-seven aggregates
-/// (cascade level three). The composed outputs and every store are identical;
-/// the sweep consumes composed outputs four at a time (two round-6 message
-/// pairs = one round-7 group) on the shared odd-lane weight `eq_lo[2t+1]` and
-/// returns the eight per-chunk accumulators
-/// `[p1_even, pinf_even, p1_odd, pinf_odd, W0'', W3'', W4'', W5'']` — the
-/// exact slot order of `fold2_compact_and_round45_chunk_neon_8`. The driver
-/// reconstructs the round-six message via κ and rescales the six lookahead
-/// aggregates by `r''⁻¹`, mirroring the cascade K pass.
-#[inline(never)]
-pub(crate) fn fold2_and_message_lookahead_aarch64(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho_a: F128,
-    rho_b: F128,
-    eq_lo: &[F128],
-    nt_stores: bool,
-) -> [F128; 8] {
-    if nt_stores {
-        fold2_and_message_lookahead_body::<true>(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo)
-    } else {
-        fold2_and_message_lookahead_body::<false>(a_in, b_in, a_out, b_out, rho_a, rho_b, eq_lo)
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn fold2_and_message_lookahead_body<const NT: bool>(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho_a: F128,
-    rho_b: F128,
-    eq_lo: &[F128],
-) -> [F128; 8] {
-    use core::arch::aarch64::uint64x2_t;
-
-    debug_assert_eq!(a_in.len(), 4 * a_out.len());
-    debug_assert_eq!(b_in.len(), 4 * b_out.len());
-    debug_assert_eq!(a_out.len(), 2 * eq_lo.len());
-    debug_assert_eq!(eq_lo.len() % 2, 0);
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    let rho_ab = rho_a * rho_b;
-
-    let mut acc = [F256Unreduced::ZERO; 8];
-
-    let a_out_ptr = a_out.as_mut_ptr();
-    let b_out_ptr = b_out.as_mut_ptr();
-
-    for t in 0..eq_lo.len() / 2 {
-        let i = 16 * t;
-        let o = 4 * t;
-
-        let (a0, a1) = fold4_two(a_in, i, rho_a, rho_b, rho_ab);
-        let (a2, a3) = fold4_two(a_in, i + 8, rho_a, rho_b, rho_ab);
-        let (b0, b1) = fold4_two(b_in, i, rho_a, rho_b, rho_ab);
-        let (b2, b3) = fold4_two(b_in, i + 8, rho_a, rho_b, rho_ab);
-
-        if NT {
-            // SAFETY: `o + 3 < a_out.len()` by the len contract above; F128 is
-            // repr(C, align(16)) two u64s, bit-compatible with uint64x2_t;
-            // each 32-byte pair store is 16-byte aligned and lands in this
-            // iteration's disjoint output slots.
-            unsafe {
-                store_pair_nt(
-                    a_out_ptr.add(o),
-                    core::mem::transmute::<F128, uint64x2_t>(a0),
-                    core::mem::transmute::<F128, uint64x2_t>(a1),
+                let veq = vld1q_u64(eq_ptr.add(2 * x_lo));
+                crate::gf2_kernels::k0_f128_mul_acc_pair_neon(
+                    veq,
+                    g1,
+                    ginf,
+                    &mut p1_ll,
+                    &mut p1_mid,
+                    &mut p1_hh,
+                    &mut pinf_ll,
+                    &mut pinf_mid,
+                    &mut pinf_hh,
                 );
-                store_pair_nt(
-                    a_out_ptr.add(o + 2),
-                    core::mem::transmute::<F128, uint64x2_t>(a2),
-                    core::mem::transmute::<F128, uint64x2_t>(a3),
-                );
-                store_pair_nt(
-                    b_out_ptr.add(o),
-                    core::mem::transmute::<F128, uint64x2_t>(b0),
-                    core::mem::transmute::<F128, uint64x2_t>(b1),
-                );
-                store_pair_nt(
-                    b_out_ptr.add(o + 2),
-                    core::mem::transmute::<F128, uint64x2_t>(b2),
-                    core::mem::transmute::<F128, uint64x2_t>(b3),
-                );
-            }
-        } else {
-            a_out[o] = a0;
-            a_out[o + 1] = a1;
-            a_out[o + 2] = a2;
-            a_out[o + 3] = a3;
-            b_out[o] = b0;
-            b_out[o + 1] = b1;
-            b_out[o + 2] = b2;
-            b_out[o + 3] = b3;
+            }};
         }
 
-        // One weight per round-7 group: the odd lane. Weighting the a-side
-        // once makes `W1''`/`W2''` (the odd round-6 pair sums) free — the same
-        // zero-extra-multiplies parity trick as the cascade K pass.
-        let wt = eq_lo[2 * t + 1];
-        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
-        acc[0] ^= a1w.mul_unreduced(b1);
-        acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
-        acc[2] ^= a3w.mul_unreduced(b3);
-        acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
-        acc[4] ^= a2w.mul_unreduced(b2);
-        let (e_aw, e_b) = (a0w + a2w, b0 + b2);
-        let (o_aw, o_b) = (a1w + a3w, b1 + b3);
-        acc[5] ^= e_aw.mul_unreduced(e_b);
-        acc[6] ^= o_aw.mul_unreduced(o_b);
-        acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
-    }
+        macro_rules! fold_pair_unit_b {
+            ($x_lo:expr) => {{
+                let x_lo = $x_lo;
+                let x0g = base + 2 * x_lo;
+                let ap = a_pkt_ptr.add(x0g * 8);
+                let a1_u64 = (ap.add(8) as *const u64).read_unaligned();
 
-    [
-        acc[0].reduce(),
-        acc[1].reduce(),
-        acc[2].reduce(),
-        acc[3].reduce(),
-        acc[4].reduce(),
-        acc[5].reduce(),
-        acc[6].reduce(),
-        acc[7].reduce(),
-    ]
-}
+                let mut va1 = vld1q_u8(table_data.add(((a1_u64 & 0xFF) as usize) * 16));
 
-/// Ordinary-store sibling of
-/// [`fold2_and_message_lookahead_nt_expanded_aarch64`]. This intentionally has
-/// its own loop body: the screened NT kernel remains unchanged, and this rung
-/// can be inspected and rolled back without perturbing its code generation.
-/// The ranked driver selects this only for rounds 7/8 and 9/10.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fold2_and_message_lookahead_normal_expanded_aarch64(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho_a: F128,
-    rho_b: F128,
-    rho_ab: F128,
-    eq_lo: &[F128],
-) -> [F128; 8] {
-    use core::arch::aarch64::*;
+                macro_rules! fold_step_a {
+                    ($c:literal) => {{
+                        let off = $c * STRIDE;
+                        let sh = $c * 8;
+                        va1 = veorq_u8(
+                            va1,
+                            vld1q_u8(table_data.add(off + (((a1_u64 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                    }};
+                }
+                fold_step_a!(1);
+                fold_step_a!(2);
+                fold_step_a!(3);
+                fold_step_a!(4);
+                fold_step_a!(5);
+                fold_step_a!(6);
+                fold_step_a!(7);
 
-    let expected_out = eq_lo
-        .len()
-        .checked_mul(2)
-        .expect("lookahead output length overflow");
-    let expected_in = expected_out
-        .checked_mul(4)
-        .expect("lookahead input length overflow");
-    assert_eq!(eq_lo.len() % 2, 0);
-    assert_eq!(a_out.len(), expected_out);
-    assert_eq!(b_out.len(), expected_out);
-    assert_eq!(a_in.len(), expected_in);
-    assert_eq!(b_in.len(), expected_in);
-
-    let rho_a_q = unsafe { core::mem::transmute::<F128, uint64x2_t>(rho_a) };
-    let rho_b_q = unsafe { core::mem::transmute::<F128, uint64x2_t>(rho_b) };
-    let rho_ab_q = unsafe { core::mem::transmute::<F128, uint64x2_t>(rho_ab) };
-    let mut acc = [F256Unreduced::ZERO; 8];
-
-    for t in 0..eq_lo.len() / 2 {
-        let i = 16 * t;
-        let o = 4 * t;
-
-        let (a0, a1, a2, a3, b0, b1, b2, b3) = unsafe {
-            // SAFETY: the geometry assertions and loop bound place each pair
-            // wholly inside its corresponding 16-element source group.
-            let (a0, a1) =
-                fold4_pair_expanded_binius_q(a_in.as_ptr().add(i), rho_a_q, rho_b_q, rho_ab_q);
-            let (a2, a3) =
-                fold4_pair_expanded_binius_q(a_in.as_ptr().add(i + 8), rho_a_q, rho_b_q, rho_ab_q);
-            let (b0, b1) =
-                fold4_pair_expanded_binius_q(b_in.as_ptr().add(i), rho_a_q, rho_b_q, rho_ab_q);
-            let (b2, b3) =
-                fold4_pair_expanded_binius_q(b_in.as_ptr().add(i + 8), rho_a_q, rho_b_q, rho_ab_q);
-            (
-                core::mem::transmute::<uint64x2_t, F128>(a0),
-                core::mem::transmute::<uint64x2_t, F128>(a1),
-                core::mem::transmute::<uint64x2_t, F128>(a2),
-                core::mem::transmute::<uint64x2_t, F128>(a3),
-                core::mem::transmute::<uint64x2_t, F128>(b0),
-                core::mem::transmute::<uint64x2_t, F128>(b1),
-                core::mem::transmute::<uint64x2_t, F128>(b2),
-                core::mem::transmute::<uint64x2_t, F128>(b3),
-            )
-        };
-
-        // These ordinary stores intentionally mirror the incumbent false arm;
-        // the output tables remain hot for the next LLC-resident cascade pass.
-        a_out[o] = a0;
-        a_out[o + 1] = a1;
-        a_out[o + 2] = a2;
-        a_out[o + 3] = a3;
-        b_out[o] = b0;
-        b_out[o + 1] = b1;
-        b_out[o + 2] = b2;
-        b_out[o + 3] = b3;
-
-        // Byte-for-byte incumbent lookahead message algebra.
-        let wt = eq_lo[2 * t + 1];
-        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
-        acc[0] ^= a1w.mul_unreduced(b1);
-        acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
-        acc[2] ^= a3w.mul_unreduced(b3);
-        acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
-        acc[4] ^= a2w.mul_unreduced(b2);
-        let (e_aw, e_b) = (a0w + a2w, b0 + b2);
-        let (o_aw, o_b) = (a1w + a3w, b1 + b3);
-        acc[5] ^= e_aw.mul_unreduced(e_b);
-        acc[6] ^= o_aw.mul_unreduced(o_b);
-        acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
-    }
-
-    [
-        acc[0].reduce(),
-        acc[1].reduce(),
-        acc[2].reduce(),
-        acc[3].reduce(),
-        acc[4].reduce(),
-        acc[5].reduce(),
-        acc[6].reduce(),
-        acc[7].reduce(),
-    ]
-}
-
-/// NT-store specialization of the lookahead pass using the expanded,
-/// deferred-reduction fold4 pair. The ranked cascade reaches this entry only
-/// for rounds 5/6; the ordinary-store and direct composed kernels stay on the
-/// incumbent implementations above.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fold2_and_message_lookahead_nt_expanded_aarch64(
-    a_in: &[F128],
-    b_in: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rho_a: F128,
-    rho_b: F128,
-    rho_ab: F128,
-    eq_lo: &[F128],
-) -> [F128; 8] {
-    use core::arch::aarch64::*;
-
-    // The private fold helper uses unchecked input pointers and the stores
-    // below use raw output pointers. Establish their complete release-mode
-    // geometry without overflow before entering the loop.
-    let expected_out = eq_lo
-        .len()
-        .checked_mul(2)
-        .expect("lookahead output length overflow");
-    let expected_in = expected_out
-        .checked_mul(4)
-        .expect("lookahead input length overflow");
-    assert_eq!(eq_lo.len() % 2, 0);
-    assert_eq!(a_out.len(), expected_out);
-    assert_eq!(b_out.len(), expected_out);
-    assert_eq!(a_in.len(), expected_in);
-    assert_eq!(b_in.len(), expected_in);
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
-    let rho_a_q = unsafe { core::mem::transmute::<F128, uint64x2_t>(rho_a) };
-    let rho_b_q = unsafe { core::mem::transmute::<F128, uint64x2_t>(rho_b) };
-    let rho_ab_q = unsafe { core::mem::transmute::<F128, uint64x2_t>(rho_ab) };
-    let mut acc = [F256Unreduced::ZERO; 8];
-    let a_out_ptr = a_out.as_mut_ptr();
-    let b_out_ptr = b_out.as_mut_ptr();
-
-    for t in 0..eq_lo.len() / 2 {
-        let i = 16 * t;
-        let o = 4 * t;
-
-        let (a0, a1, a2, a3, b0, b1, b2, b3) = unsafe {
-            // SAFETY: the geometry assertions and loop bound place each pair
-            // wholly inside its corresponding 16-element source group.
-            let (a0, a1) =
-                fold4_pair_expanded_binius_q(a_in.as_ptr().add(i), rho_a_q, rho_b_q, rho_ab_q);
-            let (a2, a3) =
-                fold4_pair_expanded_binius_q(a_in.as_ptr().add(i + 8), rho_a_q, rho_b_q, rho_ab_q);
-            let (b0, b1) =
-                fold4_pair_expanded_binius_q(b_in.as_ptr().add(i), rho_a_q, rho_b_q, rho_ab_q);
-            let (b2, b3) =
-                fold4_pair_expanded_binius_q(b_in.as_ptr().add(i + 8), rho_a_q, rho_b_q, rho_ab_q);
-            (
-                core::mem::transmute::<uint64x2_t, F128>(a0),
-                core::mem::transmute::<uint64x2_t, F128>(a1),
-                core::mem::transmute::<uint64x2_t, F128>(a2),
-                core::mem::transmute::<uint64x2_t, F128>(a3),
-                core::mem::transmute::<uint64x2_t, F128>(b0),
-                core::mem::transmute::<uint64x2_t, F128>(b1),
-                core::mem::transmute::<uint64x2_t, F128>(b2),
-                core::mem::transmute::<uint64x2_t, F128>(b3),
-            )
-        };
-
-        // SAFETY: `o + 3 < expected_out`; every pair store is 16-byte aligned
-        // and this iteration owns four disjoint output slots per array.
-        unsafe {
-            store_pair_nt(
-                a_out_ptr.add(o),
-                core::mem::transmute::<F128, uint64x2_t>(a0),
-                core::mem::transmute::<F128, uint64x2_t>(a1),
-            );
-            store_pair_nt(
-                a_out_ptr.add(o + 2),
-                core::mem::transmute::<F128, uint64x2_t>(a2),
-                core::mem::transmute::<F128, uint64x2_t>(a3),
-            );
-            store_pair_nt(
-                b_out_ptr.add(o),
-                core::mem::transmute::<F128, uint64x2_t>(b0),
-                core::mem::transmute::<F128, uint64x2_t>(b1),
-            );
-            store_pair_nt(
-                b_out_ptr.add(o + 2),
-                core::mem::transmute::<F128, uint64x2_t>(b2),
-                core::mem::transmute::<F128, uint64x2_t>(b3),
-            );
+                let g1 = vreinterpretq_u64_u8(va1);
+                let veq = vld1q_u64(eq_ptr.add(2 * x_lo));
+                let (t_ll, t_mid, t_hh) = crate::gf2_kernels::k0_f128_mul_unreduced_neon(veq, g1);
+                p1_ll = veorq_u64(p1_ll, t_ll);
+                p1_mid = veorq_u64(p1_mid, t_mid);
+                p1_hh = veorq_u64(p1_hh, t_hh);
+            }};
         }
 
-        // This is byte-for-byte the incumbent lookahead message algebra; only
-        // construction of a0..a3/b0..b3 differs.
-        let wt = eq_lo[2 * t + 1];
-        let (a0w, a1w, a2w, a3w) = (wt * a0, wt * a1, wt * a2, wt * a3);
-        acc[0] ^= a1w.mul_unreduced(b1);
-        acc[1] ^= (a0w + a1w).mul_unreduced(b0 + b1);
-        acc[2] ^= a3w.mul_unreduced(b3);
-        acc[3] ^= (a2w + a3w).mul_unreduced(b2 + b3);
-        acc[4] ^= a2w.mul_unreduced(b2);
-        let (e_aw, e_b) = (a0w + a2w, b0 + b2);
-        let (o_aw, o_b) = (a1w + a3w, b1 + b3);
-        acc[5] ^= e_aw.mul_unreduced(e_b);
-        acc[6] ^= o_aw.mul_unreduced(o_b);
-        acc[7] ^= (e_aw + o_aw).mul_unreduced(e_b + o_b);
-    }
-
-    [
-        acc[0].reduce(),
-        acc[1].reduce(),
-        acc[2].reduce(),
-        acc[3].reduce(),
-        acc[4].reduce(),
-        acc[5].reduce(),
-        acc[6].reduce(),
-        acc[7].reduce(),
-    ]
-}
-
-#[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
-mod tests {
-    use super::*;
-    use core::arch::aarch64::uint64x2_t;
-
-    fn splitmix64(state: &mut u64) -> u64 {
-        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    #[test]
-    fn round2_horner_weighted_sums_match_full_cpu() {
-        use crate::field::PHI_8_TABLE;
-        use crate::zerocheck::multilinear::UniSkipFoldTable;
-        use crate::zerocheck::univariate_skip::build_eq;
-        use crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash;
-
-        const LO_SIZE: usize = 256;
-        let mut state = 0x5232_484f_524e_4552;
-        let mut a_packed = vec![0u8; 16 * LO_SIZE];
-        let mut b_packed = vec![0u8; 16 * LO_SIZE];
-        for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
-            *byte = splitmix64(&mut state) as u8;
-        }
-        for instance in 0..2 {
-            let base = instance * 2048;
-            for group in [0, 1, 2, 3, 59] {
-                b_packed[base + group * 32..base + (group + 1) * 32].fill(0xff);
-            }
-            // Also test a mixed group, and the 49 useful bits in row 240.
-            b_packed[base + 4 * 32..base + 4 * 32 + 16].fill(0xff);
-            for packed in [&mut a_packed, &mut b_packed] {
-                packed[base + 1926] &= 1;
-                packed[base + 1927..base + 1936].fill(0);
-            }
-        }
-        let random_z = F128::new(splitmix64(&mut state), splitmix64(&mut state));
-        for (z_case, z) in [F128::ZERO, F128::ONE, PHI_8_TABLE[64], random_z]
-            .into_iter()
-            .enumerate()
+        if pair_in_block_mask == 127
+            && useful_pairs_inclusive == 121
+            && (pair_idx_base & 127) == 0
+            && (lo_size & 127) == 0
         {
-            let mut table = UniSkipFoldTable::new(6, z);
-            // An arbitrary table exercises the guard when fold(all-ones) != 1.
-            if z_case == 3 {
-                for value in &mut table.data {
-                    *value = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+            let mut blk = 0usize;
+            while blk < lo_size {
+                let bp_blk = b_pkt_ptr.add((base + 2 * blk) * 8) as *const u64;
+                let head_ones = (bp_blk.read_unaligned()
+                    & bp_blk.add(1).read_unaligned()
+                    & bp_blk.add(2).read_unaligned()
+                    & bp_blk.add(3).read_unaligned()
+                    & bp_blk.add(4).read_unaligned()
+                    & bp_blk.add(5).read_unaligned()
+                    & bp_blk.add(6).read_unaligned()
+                    & bp_blk.add(7).read_unaligned()
+                    & bp_blk.add(8).read_unaligned()
+                    & bp_blk.add(9).read_unaligned()
+                    & bp_blk.add(10).read_unaligned()
+                    & bp_blk.add(11).read_unaligned()
+                    & bp_blk.add(12).read_unaligned()
+                    & bp_blk.add(13).read_unaligned()
+                    & bp_blk.add(14).read_unaligned()
+                    & bp_blk.add(15).read_unaligned()
+                    & bp_blk.add(16).read_unaligned()
+                    & bp_blk.add(17).read_unaligned())
+                    == !0u64;
+                let tail_ones = (bp_blk.add(236).read_unaligned()
+                    & bp_blk.add(237).read_unaligned()
+                    & bp_blk.add(238).read_unaligned()
+                    & bp_blk.add(239).read_unaligned())
+                    == !0u64;
+                if head_ones {
+                    for x_lo in blk..(blk + 9) {
+                        fold_pair_unit_b!(x_lo);
+                    }
+                } else {
+                    for x_lo in blk..(blk + 9) {
+                        fold_pair!(x_lo);
+                    }
                 }
+                for x_lo in (blk + 9)..(blk + 118) {
+                    fold_pair!(x_lo);
+                }
+                if tail_ones {
+                    for x_lo in (blk + 118)..(blk + 120) {
+                        fold_pair_unit_b!(x_lo);
+                    }
+                } else {
+                    for x_lo in (blk + 118)..(blk + 120) {
+                        fold_pair!(x_lo);
+                    }
+                }
+                {
+                    let x_lo = blk + 120;
+                    let x0g = base + 2 * x_lo;
+                    let ap = a_pkt_ptr.add(x0g * 8);
+                    let bp = b_pkt_ptr.add(x0g * 8);
+                    let a1_u64 = (ap.add(8) as *const u64).read_unaligned();
+                    let b1_u64 = (bp.add(8) as *const u64).read_unaligned();
+                    if (a1_u64 | b1_u64) == 0 {
+                        let a0_u64 = (ap as *const u64).read_unaligned();
+                        let b0_u64 = (bp as *const u64).read_unaligned();
+                        let mut va0 = vld1q_u8(table_data.add(((a0_u64 & 0xFF) as usize) * 16));
+                        let mut vb0 = vld1q_u8(table_data.add(((b0_u64 & 0xFF) as usize) * 16));
+                        macro_rules! fold_step_ab2 {
+                            ($c:literal) => {{
+                                let off = $c * STRIDE;
+                                let sh = $c * 8;
+                                va0 = veorq_u8(
+                                    va0,
+                                    vld1q_u8(
+                                        table_data
+                                            .add(off + (((a0_u64 >> sh) & 0xFF) as usize) * 16),
+                                    ),
+                                );
+                                vb0 = veorq_u8(
+                                    vb0,
+                                    vld1q_u8(
+                                        table_data
+                                            .add(off + (((b0_u64 >> sh) & 0xFF) as usize) * 16),
+                                    ),
+                                );
+                            }};
+                        }
+                        fold_step_ab2!(1);
+                        fold_step_ab2!(2);
+                        fold_step_ab2!(3);
+                        fold_step_ab2!(4);
+                        fold_step_ab2!(5);
+                        fold_step_ab2!(6);
+                        fold_step_ab2!(7);
+                        let ginf = crate::gf2_kernels::k0_f128_mul_neon(
+                            vreinterpretq_u64_u8(va0),
+                            vreinterpretq_u64_u8(vb0),
+                        );
+                        let veq = vld1q_u64(eq_ptr.add(2 * x_lo));
+                        let (t_ll, t_mid, t_hh) =
+                            crate::gf2_kernels::k0_f128_mul_unreduced_neon(veq, ginf);
+                        pinf_ll = veorq_u64(pinf_ll, t_ll);
+                        pinf_mid = veorq_u64(pinf_mid, t_mid);
+                        pinf_hh = veorq_u64(pinf_hh, t_hh);
+                    } else {
+                        fold_pair!(x_lo);
+                    }
+                }
+                blk += 128;
             }
-            for challenge_case in 0..6 {
-                let mut r: Vec<F128> = (0..8)
-                    .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
-                    .collect();
-                r[2..6].copy_from_slice(&medium_challenges_ghash());
-                match challenge_case {
-                    0 => r[0] = F128::ZERO,
-                    1 => r[0] = F128::ONE,
-                    2 => r[1] = F128::ZERO,
-                    3 => r[1] = F128::ONE,
-                    4 => r[6..8].copy_from_slice(&[F128::ZERO, F128::ONE]),
-                    _ => {}
+        } else {
+            for x_lo in 0..lo_size {
+                if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
+                    continue;
                 }
-                let eq_lo = build_eq(&r);
-                for (mask, useful) in [(usize::MAX, usize::MAX), (127, 121)] {
-                    for degen in [false, true] {
-                        let run = |horner: bool| {
-                            let poison = F128::new(u64::MAX, u64::MAX);
-                            let mut anchors = vec![poison; 2 * LO_SIZE];
-                            let mut deltas = vec![0xa5u8; 16 * LO_SIZE];
-                            let mut out = [poison; 8];
-                            unsafe {
-                                if horner {
-                                    fold_round2_compact_chunk_neon_horner_8(
-                                        table.data.as_ptr().cast::<u8>(),
-                                        a_packed.as_ptr(),
-                                        b_packed.as_ptr(),
-                                        anchors.as_mut_ptr(),
-                                        deltas.as_mut_ptr(),
-                                        eq_lo.as_ptr(),
-                                        LO_SIZE,
-                                        0,
-                                        mask,
-                                        useful,
-                                        degen,
-                                        out.as_mut_ptr(),
-                                    );
-                                } else {
-                                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                                        table.data.as_ptr().cast::<u8>(),
-                                        a_packed.as_ptr(),
-                                        b_packed.as_ptr(),
-                                        anchors.as_mut_ptr(),
-                                        deltas.as_mut_ptr(),
-                                        eq_lo.as_ptr(),
-                                        LO_SIZE,
-                                        0,
-                                        mask,
-                                        useful,
-                                        degen,
-                                        true,
-                                        out.as_mut_ptr(),
-                                    );
-                                }
-                            }
-                            (anchors, deltas, out)
-                        };
-                        let cpu = run(false);
-                        let horner = run(true);
-                        assert_eq!(
-                            horner.0, cpu.0,
-                            "anchor mismatch at {z_case}/{challenge_case}"
+                fold_pair!(x_lo);
+            }
+        }
+
+        let res1 = crate::gf2_kernels::k0_f128_reduce_3lane_neon(p1_ll, p1_mid, p1_hh);
+        let resi = crate::gf2_kernels::k0_f128_reduce_3lane_neon(pinf_ll, pinf_mid, pinf_hh);
+        (
+            F128 {
+                lo: vgetq_lane_u64::<0>(res1),
+                hi: vgetq_lane_u64::<1>(res1),
+            },
+            F128 {
+                lo: vgetq_lane_u64::<0>(resi),
+                hi: vgetq_lane_u64::<1>(resi),
+            },
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn round3_fold_in_place_chunk_neon_unchecked_8(
+    table_data: *const u8,
+    rho_0: F128,
+    a_chunk: &mut [F128],
+    b_chunk: &mut [F128],
+    eq_lo: &[F128],
+    base_j: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        let zero = vdupq_n_u64(0);
+        let mut p1_ll = zero;
+        let mut p1_mid = zero;
+        let mut p1_hh = zero;
+        let mut pinf_ll = zero;
+        let mut pinf_mid = zero;
+        let mut pinf_hh = zero;
+        let lo_size = eq_lo.len();
+        let eq_ptr = eq_lo.as_ptr() as *const u64;
+        let a_ptr = a_chunk.as_mut_ptr() as *mut u64;
+        let b_ptr = b_chunk.as_mut_ptr() as *mut u64;
+        let v_rho0 = vcombine_u64(vcreate_u64(rho_0.lo), vcreate_u64(rho_0.hi));
+        let (rho0_r0, rho0_r1) = crate::gf2_kernels::k0_f128_pre_reduce_const_neon(v_rho0);
+        let one_u64 = vcombine_u64(vcreate_u64(1), vcreate_u64(0));
+        let v_opr0 = veorq_u64(one_u64, v_rho0);
+        let (opr0_r0, opr0_r1) = crate::gf2_kernels::k0_f128_pre_reduce_const_neon(v_opr0);
+
+        macro_rules! fold_single_table4 {
+            ($tbl:expr, $a0_u64:expr, $b0_u64:expr, $a1_u64:expr, $b1_u64:expr) => {{
+                let a0w = $a0_u64;
+                let b0w = $b0_u64;
+                let a1w = $a1_u64;
+                let b1w = $b1_u64;
+                let mut acc_a0 = vld1q_u8($tbl.add(((a0w & 0xFF) as usize) * 16));
+                let mut acc_b0 = vld1q_u8($tbl.add(((b0w & 0xFF) as usize) * 16));
+                let mut acc_a1 = vld1q_u8($tbl.add(((a1w & 0xFF) as usize) * 16));
+                let mut acc_b1 = vld1q_u8($tbl.add(((b1w & 0xFF) as usize) * 16));
+                macro_rules! step4 {
+                    ($c:literal) => {{
+                        let off = $c * STRIDE;
+                        let sh = $c * 8;
+                        acc_a0 = veorq_u8(
+                            acc_a0,
+                            vld1q_u8($tbl.add(off + (((a0w >> sh) & 0xFF) as usize) * 16)),
                         );
-                        assert_eq!(
-                            horner.1, cpu.1,
-                            "delta mismatch at {z_case}/{challenge_case}"
+                        acc_b0 = veorq_u8(
+                            acc_b0,
+                            vld1q_u8($tbl.add(off + (((b0w >> sh) & 0xFF) as usize) * 16)),
                         );
-                        assert_eq!(&horner.2[..4], &[F128::ZERO; 4]);
-                        assert_eq!(
-                            &horner.2[4..],
-                            &cpu.2[4..],
-                            "sum mismatch at {z_case}/{challenge_case}"
+                        acc_a1 = veorq_u8(
+                            acc_a1,
+                            vld1q_u8($tbl.add(off + (((a1w >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        acc_b1 = veorq_u8(
+                            acc_b1,
+                            vld1q_u8($tbl.add(off + (((b1w >> sh) & 0xFF) as usize) * 16)),
+                        );
+                    }};
+                }
+                step4!(1);
+                step4!(2);
+                step4!(3);
+                step4!(4);
+                step4!(5);
+                step4!(6);
+                step4!(7);
+                (
+                    vreinterpretq_u64_u8(acc_a0),
+                    vreinterpretq_u64_u8(acc_b0),
+                    vreinterpretq_u64_u8(acc_a1),
+                    vreinterpretq_u64_u8(acc_b1),
+                )
+            }};
+        }
+
+        macro_rules! fold_single_table2 {
+            ($tbl:expr, $a0_u64:expr, $a1_u64:expr) => {{
+                let a0w = $a0_u64;
+                let a1w = $a1_u64;
+                let mut acc_a0 = vld1q_u8($tbl.add(((a0w & 0xFF) as usize) * 16));
+                let mut acc_a1 = vld1q_u8($tbl.add(((a1w & 0xFF) as usize) * 16));
+                macro_rules! step2 {
+                    ($c:literal) => {{
+                        let off = $c * STRIDE;
+                        let sh = $c * 8;
+                        acc_a0 = veorq_u8(
+                            acc_a0,
+                            vld1q_u8($tbl.add(off + (((a0w >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        acc_a1 = veorq_u8(
+                            acc_a1,
+                            vld1q_u8($tbl.add(off + (((a1w >> sh) & 0xFF) as usize) * 16)),
+                        );
+                    }};
+                }
+                step2!(1);
+                step2!(2);
+                step2!(3);
+                step2!(4);
+                step2!(5);
+                step2!(6);
+                step2!(7);
+                (vreinterpretq_u64_u8(acc_a0), vreinterpretq_u64_u8(acc_a1))
+            }};
+        }
+
+        macro_rules! round3_pair_unit_b {
+            ($x_lo:expr) => {{
+                let x_lo = $x_lo;
+                let j0l = 2 * x_lo;
+                let j1l = j0l + 1;
+                let ap0 = a_ptr.add(2 * j0l);
+                let ap1 = a_ptr.add(2 * j1l);
+                let a0_lo = ap0.read_unaligned();
+                let a0_hi = ap0.add(1).read_unaligned();
+                let a1_lo = ap1.read_unaligned();
+                let a1_hi = ap1.add(1).read_unaligned();
+                let (ua0_lo, ua0_xor, ua1_lo, ua1_xor) =
+                    fold_single_table4!(table_data, a0_lo, a0_lo ^ a0_hi, a1_lo, a1_lo ^ a1_hi);
+                let (ua0_p, ua1_p) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                    ua0_xor, ua1_xor, rho0_r0, rho0_r1, rho0_r0, rho0_r1,
+                );
+                let ua_j0 = veorq_u64(ua0_lo, ua0_p);
+                let ua_j1 = veorq_u64(ua1_lo, ua1_p);
+                vst1q_u64(a_ptr.add(2 * j0l), ua_j0);
+                vst1q_u64(a_ptr.add(2 * j1l), ua_j1);
+                vst1q_u64(b_ptr.add(2 * j0l), one_u64);
+                vst1q_u64(b_ptr.add(2 * j1l), one_u64);
+
+                let veq = vld1q_u64(eq_ptr.add(2 * x_lo));
+                let (t_ll, t_mid, t_hh) =
+                    crate::gf2_kernels::k0_f128_mul_unreduced_neon(veq, ua_j1);
+                p1_ll = veorq_u64(p1_ll, t_ll);
+                p1_mid = veorq_u64(p1_mid, t_mid);
+                p1_hh = veorq_u64(p1_hh, t_hh);
+            }};
+        }
+
+        macro_rules! round3_pair_both {
+            ($x_lo:expr) => {{
+                let x_lo = $x_lo;
+                let j0l = 2 * x_lo;
+                let j1l = j0l + 1;
+                let ap0 = a_ptr.add(2 * j0l);
+                let bp0 = b_ptr.add(2 * j0l);
+                let a0_lo = ap0.read_unaligned();
+                let a0_hi = ap0.add(1).read_unaligned();
+                let b0_lo = bp0.read_unaligned();
+                let b0_hi = bp0.add(1).read_unaligned();
+                let (ua0_lo, ub0_lo, ua0_xor, ub0_xor) =
+                    fold_single_table4!(table_data, a0_lo, b0_lo, a0_lo ^ a0_hi, b0_lo ^ b0_hi);
+                let (ua0_p, ub0_p) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                    ua0_xor, ub0_xor, rho0_r0, rho0_r1, rho0_r0, rho0_r1,
+                );
+                let ua_j0 = veorq_u64(ua0_lo, ua0_p);
+                let ub_j0 = veorq_u64(ub0_lo, ub0_p);
+
+                let ap1 = a_ptr.add(2 * j1l);
+                let bp1 = b_ptr.add(2 * j1l);
+                let a1_lo = ap1.read_unaligned();
+                let a1_hi = ap1.add(1).read_unaligned();
+                let b1_lo = bp1.read_unaligned();
+                let b1_hi = bp1.add(1).read_unaligned();
+                let (ua1_lo, ub1_lo, ua1_xor, ub1_xor) =
+                    fold_single_table4!(table_data, a1_lo, b1_lo, a1_lo ^ a1_hi, b1_lo ^ b1_hi);
+                let (ua1_p, ub1_p) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                    ua1_xor, ub1_xor, rho0_r0, rho0_r1, rho0_r0, rho0_r1,
+                );
+                let ua_j1 = veorq_u64(ua1_lo, ua1_p);
+                let ub_j1 = veorq_u64(ub1_lo, ub1_p);
+
+                vst1q_u64(a_ptr.add(2 * j0l), ua_j0);
+                vst1q_u64(a_ptr.add(2 * j1l), ua_j1);
+                vst1q_u64(b_ptr.add(2 * j0l), ub_j0);
+                vst1q_u64(b_ptr.add(2 * j1l), ub_j1);
+
+                let uad = veorq_u64(ua_j0, ua_j1);
+                let ubd = veorq_u64(ub_j0, ub_j1);
+                let (g1, ginf) = crate::gf2_kernels::k0_f128_mul_vec2_neon(ua_j1, uad, ub_j1, ubd);
+
+                let veq = vld1q_u64(eq_ptr.add(2 * x_lo));
+                crate::gf2_kernels::k0_f128_mul_acc_pair_neon(
+                    veq,
+                    g1,
+                    ginf,
+                    &mut p1_ll,
+                    &mut p1_mid,
+                    &mut p1_hh,
+                    &mut pinf_ll,
+                    &mut pinf_mid,
+                    &mut pinf_hh,
+                );
+            }};
+        }
+
+        if pair_in_block_mask == 127
+            && useful_pairs_inclusive == 121
+            && (base_j & 127) == 0
+            && (lo_size & 63) == 0
+        {
+            let mut blk = 0usize;
+            while blk < lo_size {
+                let bp_blk = b_ptr.add(4 * blk);
+                let head_ones = (bp_blk.read_unaligned()
+                    & bp_blk.add(1).read_unaligned()
+                    & bp_blk.add(2).read_unaligned()
+                    & bp_blk.add(3).read_unaligned()
+                    & bp_blk.add(4).read_unaligned()
+                    & bp_blk.add(5).read_unaligned()
+                    & bp_blk.add(6).read_unaligned()
+                    & bp_blk.add(7).read_unaligned()
+                    & bp_blk.add(8).read_unaligned()
+                    & bp_blk.add(9).read_unaligned()
+                    & bp_blk.add(10).read_unaligned()
+                    & bp_blk.add(11).read_unaligned()
+                    & bp_blk.add(12).read_unaligned()
+                    & bp_blk.add(13).read_unaligned()
+                    & bp_blk.add(14).read_unaligned()
+                    & bp_blk.add(15).read_unaligned())
+                    == !0u64;
+                let tail_ones = (bp_blk.add(236).read_unaligned()
+                    & bp_blk.add(237).read_unaligned()
+                    & bp_blk.add(238).read_unaligned()
+                    & bp_blk.add(239).read_unaligned())
+                    == !0u64;
+                if head_ones {
+                    for x_lo in blk..(blk + 4) {
+                        round3_pair_unit_b!(x_lo);
+                    }
+                } else {
+                    for x_lo in blk..(blk + 4) {
+                        round3_pair_both!(x_lo);
+                    }
+                }
+                for x_lo in (blk + 4)..(blk + 59) {
+                    round3_pair_both!(x_lo);
+                }
+                if tail_ones {
+                    round3_pair_unit_b!(blk + 59);
+                } else {
+                    round3_pair_both!(blk + 59);
+                }
+                {
+                    let x_lo = blk + 60;
+                    let j0l = 2 * x_lo;
+                    let j1l = j0l + 1;
+                    let ap0 = a_ptr.add(2 * j0l);
+                    let bp0 = b_ptr.add(2 * j0l);
+                    let a0_lo = ap0.read_unaligned();
+                    let a0_hi = ap0.add(1).read_unaligned();
+                    let b0_lo = bp0.read_unaligned();
+                    let b0_hi = bp0.add(1).read_unaligned();
+                    let (ua_j0, ub_j0) = if (a0_hi | b0_hi) == 0 {
+                        let (ua0_lo, ub0_lo) = fold_single_table2!(table_data, a0_lo, b0_lo);
+                        crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                            ua0_lo, ub0_lo, opr0_r0, opr0_r1, opr0_r0, opr0_r1,
+                        )
+                    } else {
+                        let (ua0_lo, ub0_lo, ua0_xor, ub0_xor) = fold_single_table4!(
+                            table_data,
+                            a0_lo,
+                            b0_lo,
+                            a0_lo ^ a0_hi,
+                            b0_lo ^ b0_hi
+                        );
+                        let (ua0_p, ub0_p) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                            ua0_xor, ub0_xor, rho0_r0, rho0_r1, rho0_r0, rho0_r1,
+                        );
+                        (veorq_u64(ua0_lo, ua0_p), veorq_u64(ub0_lo, ub0_p))
+                    };
+
+                    vst1q_u64(a_ptr.add(2 * j0l), ua_j0);
+                    vst1q_u64(a_ptr.add(2 * j1l), zero);
+                    vst1q_u64(b_ptr.add(2 * j0l), ub_j0);
+                    vst1q_u64(b_ptr.add(2 * j1l), zero);
+
+                    let ginf = crate::gf2_kernels::k0_f128_mul_neon(ua_j0, ub_j0);
+                    let veq = vld1q_u64(eq_ptr.add(2 * x_lo));
+                    let (t_ll, t_mid, t_hh) =
+                        crate::gf2_kernels::k0_f128_mul_unreduced_neon(veq, ginf);
+                    pinf_ll = veorq_u64(pinf_ll, t_ll);
+                    pinf_mid = veorq_u64(pinf_mid, t_mid);
+                    pinf_hh = veorq_u64(pinf_hh, t_hh);
+                }
+                for x_lo in (blk + 61)..(blk + 64) {
+                    let j0l = 2 * x_lo;
+                    let j1l = j0l + 1;
+                    vst1q_u64(a_ptr.add(2 * j0l), zero);
+                    vst1q_u64(a_ptr.add(2 * j1l), zero);
+                    vst1q_u64(b_ptr.add(2 * j0l), zero);
+                    vst1q_u64(b_ptr.add(2 * j1l), zero);
+                }
+                blk += 64;
+            }
+        } else {
+            for x_lo in 0..lo_size {
+                let j0l = 2 * x_lo;
+                let j1l = j0l + 1;
+                let j0g = base_j + j0l;
+                let j1g = j0g + 1;
+
+                if (j0g & pair_in_block_mask) >= useful_pairs_inclusive {
+                    vst1q_u64(a_ptr.add(2 * j0l), zero);
+                    vst1q_u64(a_ptr.add(2 * j1l), zero);
+                    vst1q_u64(b_ptr.add(2 * j0l), zero);
+                    vst1q_u64(b_ptr.add(2 * j1l), zero);
+                    continue;
+                }
+
+                let ap0 = a_ptr.add(2 * j0l);
+                let bp0 = b_ptr.add(2 * j0l);
+                let a0_lo = ap0.read_unaligned();
+                let a0_hi = ap0.add(1).read_unaligned();
+                let b0_lo = bp0.read_unaligned();
+                let b0_hi = bp0.add(1).read_unaligned();
+                let (ua0_lo, ub0_lo, ua0_xor, ub0_xor) =
+                    fold_single_table4!(table_data, a0_lo, b0_lo, a0_lo ^ a0_hi, b0_lo ^ b0_hi);
+                let (ua0_p, ub0_p) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                    ua0_xor, ub0_xor, rho0_r0, rho0_r1, rho0_r0, rho0_r1,
+                );
+                let ua_j0 = veorq_u64(ua0_lo, ua0_p);
+                let ub_j0 = veorq_u64(ub0_lo, ub0_p);
+
+                let (ua_j1, ub_j1) = if (j1g & pair_in_block_mask) < useful_pairs_inclusive {
+                    let ap1 = a_ptr.add(2 * j1l);
+                    let bp1 = b_ptr.add(2 * j1l);
+                    let a1_lo = ap1.read_unaligned();
+                    let a1_hi = ap1.add(1).read_unaligned();
+                    let b1_lo = bp1.read_unaligned();
+                    let b1_hi = bp1.add(1).read_unaligned();
+                    let (ua1_lo, ub1_lo, ua1_xor, ub1_xor) =
+                        fold_single_table4!(table_data, a1_lo, b1_lo, a1_lo ^ a1_hi, b1_lo ^ b1_hi);
+                    let (ua1_p, ub1_p) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                        ua1_xor, ub1_xor, rho0_r0, rho0_r1, rho0_r0, rho0_r1,
+                    );
+                    (veorq_u64(ua1_lo, ua1_p), veorq_u64(ub1_lo, ub1_p))
+                } else {
+                    (zero, zero)
+                };
+
+                vst1q_u64(a_ptr.add(2 * j0l), ua_j0);
+                vst1q_u64(a_ptr.add(2 * j1l), ua_j1);
+                vst1q_u64(b_ptr.add(2 * j0l), ub_j0);
+                vst1q_u64(b_ptr.add(2 * j1l), ub_j1);
+
+                let uad = veorq_u64(ua_j0, ua_j1);
+                let ubd = veorq_u64(ub_j0, ub_j1);
+
+                let (g1, ginf) = crate::gf2_kernels::k0_f128_mul_vec2_neon(ua_j1, uad, ub_j1, ubd);
+
+                let veq = vld1q_u64(eq_ptr.add(2 * x_lo));
+                crate::gf2_kernels::k0_f128_mul_acc_pair_neon(
+                    veq,
+                    g1,
+                    ginf,
+                    &mut p1_ll,
+                    &mut p1_mid,
+                    &mut p1_hh,
+                    &mut pinf_ll,
+                    &mut pinf_mid,
+                    &mut pinf_hh,
+                );
+            }
+        }
+
+        let res1 = crate::gf2_kernels::k0_f128_reduce_3lane_neon(p1_ll, p1_mid, p1_hh);
+        let resi = crate::gf2_kernels::k0_f128_reduce_3lane_neon(pinf_ll, pinf_mid, pinf_hh);
+        (
+            F128 {
+                lo: vgetq_lane_u64::<0>(res1),
+                hi: vgetq_lane_u64::<1>(res1),
+            },
+            F128 {
+                lo: vgetq_lane_u64::<0>(resi),
+                hi: vgetq_lane_u64::<1>(resi),
+            },
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+pub(crate) unsafe fn round23_lookahead_chunk_neon_unchecked_8(
+    table_data: *const u8,
+    a_pkt_ptr: *const u8,
+    b_pkt_ptr: *const u8,
+    eq_lo: &[F128],
+    q_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> [F128; 8] {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        let zero = vdupq_n_u64(0);
+        let mut acc = [[zero; 3]; 8];
+        let mut p240_ll = zero;
+        let mut p240_mid = zero;
+        let mut p240_hh = zero;
+        let lo_size = eq_lo.len();
+        let eq_ptr = eq_lo.as_ptr() as *const u64;
+
+        macro_rules! fold_single_table4 {
+            ($w0:expr, $w1:expr, $w2:expr, $w3:expr) => {{
+                let w0 = $w0;
+                let w1 = $w1;
+                let w2 = $w2;
+                let w3 = $w3;
+                let mut v0 = vld1q_u8(table_data.add(((w0 & 0xFF) as usize) * 16));
+                let mut v1 = vld1q_u8(table_data.add(((w1 & 0xFF) as usize) * 16));
+                let mut v2 = vld1q_u8(table_data.add(((w2 & 0xFF) as usize) * 16));
+                let mut v3 = vld1q_u8(table_data.add(((w3 & 0xFF) as usize) * 16));
+                macro_rules! step4 {
+                    ($c:literal) => {{
+                        let off = $c * STRIDE;
+                        let sh = $c * 8;
+                        v0 = veorq_u8(
+                            v0,
+                            vld1q_u8(table_data.add(off + (((w0 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        v1 = veorq_u8(
+                            v1,
+                            vld1q_u8(table_data.add(off + (((w1 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        v2 = veorq_u8(
+                            v2,
+                            vld1q_u8(table_data.add(off + (((w2 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        v3 = veorq_u8(
+                            v3,
+                            vld1q_u8(table_data.add(off + (((w3 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                    }};
+                }
+                step4!(1);
+                step4!(2);
+                step4!(3);
+                step4!(4);
+                step4!(5);
+                step4!(6);
+                step4!(7);
+                (
+                    vreinterpretq_u64_u8(v0),
+                    vreinterpretq_u64_u8(v1),
+                    vreinterpretq_u64_u8(v2),
+                    vreinterpretq_u64_u8(v3),
+                )
+            }};
+        }
+
+        macro_rules! fold_single_table3 {
+            ($w0:expr, $w1:expr, $w2:expr) => {{
+                let w0 = $w0;
+                let w1 = $w1;
+                let w2 = $w2;
+                let mut v0 = vld1q_u8(table_data.add(((w0 & 0xFF) as usize) * 16));
+                let mut v1 = vld1q_u8(table_data.add(((w1 & 0xFF) as usize) * 16));
+                let mut v2 = vld1q_u8(table_data.add(((w2 & 0xFF) as usize) * 16));
+                macro_rules! step3 {
+                    ($c:literal) => {{
+                        let off = $c * STRIDE;
+                        let sh = $c * 8;
+                        v0 = veorq_u8(
+                            v0,
+                            vld1q_u8(table_data.add(off + (((w0 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        v1 = veorq_u8(
+                            v1,
+                            vld1q_u8(table_data.add(off + (((w1 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        v2 = veorq_u8(
+                            v2,
+                            vld1q_u8(table_data.add(off + (((w2 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                    }};
+                }
+                step3!(1);
+                step3!(2);
+                step3!(3);
+                step3!(4);
+                step3!(5);
+                step3!(6);
+                step3!(7);
+                (
+                    vreinterpretq_u64_u8(v0),
+                    vreinterpretq_u64_u8(v1),
+                    vreinterpretq_u64_u8(v2),
+                )
+            }};
+        }
+
+        macro_rules! acc_unred_slot_with_sum {
+            ($idx:literal, $u:expr, $v:expr, $u_sum:expr, $v_sum:expr) => {{
+                let u = $u;
+                let v = $v;
+                let u_lo = vgetq_lane_u64::<0>(u);
+                let v_lo = vgetq_lane_u64::<0>(v);
+                let t_ll = vreinterpretq_u64_p128(vmull_p64(u_lo, v_lo));
+                let t_mid = vreinterpretq_u64_p128(vmull_p64($u_sum, $v_sum));
+                let t_hh = vreinterpretq_u64_p128(vmull_high_p64(
+                    vreinterpretq_p64_u64(u),
+                    vreinterpretq_p64_u64(v),
+                ));
+                acc[$idx][0] = veorq_u64(acc[$idx][0], t_ll);
+                acc[$idx][1] = veorq_u64(acc[$idx][1], t_mid);
+                acc[$idx][2] = veorq_u64(acc[$idx][2], t_hh);
+            }};
+        }
+
+        macro_rules! acc_unred_slot {
+            ($idx:literal, $u:expr, $v:expr) => {{
+                let (t_ll, t_mid, t_hh) = crate::gf2_kernels::k0_f128_mul_unreduced_neon($u, $v);
+                acc[$idx][0] = veorq_u64(acc[$idx][0], t_ll);
+                acc[$idx][1] = veorq_u64(acc[$idx][1], t_mid);
+                acc[$idx][2] = veorq_u64(acc[$idx][2], t_hh);
+            }};
+        }
+
+        macro_rules! round23_general_from_folded {
+            ($q_lo:expr, $va00:expr, $vb00:expr, $va10:expr, $vb10:expr, $va01:expr, $vb01:expr, $va11:expr, $vb11:expr) => {{
+                let veq = vld1q_u64(eq_ptr.add(2 * $q_lo));
+                let (eq_r0, eq_r1) = crate::gf2_kernels::k0_f128_pre_reduce_const_neon(veq);
+                let (tb00, tb10) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                    $vb00, $vb10, eq_r0, eq_r1, eq_r0, eq_r1,
+                );
+                let (tb01, tb11) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                    $vb01, $vb11, eq_r0, eq_r1, eq_r0, eq_r1,
+                );
+                let da0 = veorq_u64($va00, $va10);
+                let da1 = veorq_u64($va01, $va11);
+                let da_0 = veorq_u64($va00, $va01);
+                let da_1 = veorq_u64($va10, $va11);
+                let da_i = veorq_u64(da0, da1);
+
+                let dtb0 = veorq_u64(tb00, tb10);
+                let dtb1 = veorq_u64(tb01, tb11);
+                let dtb_0 = veorq_u64(tb00, tb01);
+                let dtb_1 = veorq_u64(tb10, tb11);
+                let dtb_i = veorq_u64(dtb0, dtb1);
+
+                let sva10 = vgetq_lane_u64::<0>($va10) ^ vgetq_lane_u64::<1>($va10);
+                let sva11 = vgetq_lane_u64::<0>($va11) ^ vgetq_lane_u64::<1>($va11);
+                let sva01 = vgetq_lane_u64::<0>($va01) ^ vgetq_lane_u64::<1>($va01);
+                let sda0 = vgetq_lane_u64::<0>(da0) ^ vgetq_lane_u64::<1>(da0);
+                let sda1 = sva01 ^ sva11;
+                let sda_1 = sva10 ^ sva11;
+                let sda_0 = sda0 ^ (sva10 ^ sva01);
+                let sda_i = sda0 ^ sda1;
+
+                let stb10 = vgetq_lane_u64::<0>(tb10) ^ vgetq_lane_u64::<1>(tb10);
+                let stb11 = vgetq_lane_u64::<0>(tb11) ^ vgetq_lane_u64::<1>(tb11);
+                let stb01 = vgetq_lane_u64::<0>(tb01) ^ vgetq_lane_u64::<1>(tb01);
+                let sdtb0 = vgetq_lane_u64::<0>(dtb0) ^ vgetq_lane_u64::<1>(dtb0);
+                let sdtb1 = stb01 ^ stb11;
+                let sdtb_1 = stb10 ^ stb11;
+                let sdtb_0 = sdtb0 ^ (stb10 ^ stb01);
+                let sdtb_i = sdtb0 ^ sdtb1;
+
+                acc_unred_slot_with_sum!(0, $va10, tb10, sva10, stb10);
+                acc_unred_slot_with_sum!(1, da0, dtb0, sda0, sdtb0);
+                acc_unred_slot_with_sum!(2, $va11, tb11, sva11, stb11);
+                acc_unred_slot_with_sum!(3, da1, dtb1, sda1, sdtb1);
+                acc_unred_slot_with_sum!(4, $va01, tb01, sva01, stb01);
+                acc_unred_slot_with_sum!(5, da_0, dtb_0, sda_0, sdtb_0);
+                acc_unred_slot_with_sum!(6, da_1, dtb_1, sda_1, sdtb_1);
+                acc_unred_slot_with_sum!(7, da_i, dtb_i, sda_i, sdtb_i);
+            }};
+        }
+
+        macro_rules! round23_general_step {
+            ($q_lo:expr) => {{
+                let ql = $q_lo;
+                let qg = q_base + ql;
+                let ap = (a_pkt_ptr as *const u64).add(4 * qg);
+                let bp = (b_pkt_ptr as *const u64).add(4 * qg);
+                let (va00, vb00, va10, vb10) = fold_single_table4!(
+                    ap.read_unaligned(),
+                    bp.read_unaligned(),
+                    ap.add(1).read_unaligned(),
+                    bp.add(1).read_unaligned()
+                );
+                let (va01, vb01, va11, vb11) = fold_single_table4!(
+                    ap.add(2).read_unaligned(),
+                    bp.add(2).read_unaligned(),
+                    ap.add(3).read_unaligned(),
+                    bp.add(3).read_unaligned()
+                );
+                round23_general_from_folded!(ql, va00, vb00, va10, vb10, va01, vb01, va11, vb11);
+            }};
+        }
+
+        macro_rules! round23_unit_b_step {
+            ($q_lo:expr) => {{
+                let ql = $q_lo;
+                let qg = q_base + ql;
+                let ap = (a_pkt_ptr as *const u64).add(4 * qg);
+                let (va10, va01, va11) = fold_single_table3!(
+                    ap.add(1).read_unaligned(),
+                    ap.add(2).read_unaligned(),
+                    ap.add(3).read_unaligned()
+                );
+                let veq = vld1q_u64(eq_ptr.add(2 * ql));
+                acc_unred_slot!(0, va10, veq);
+                acc_unred_slot!(2, va11, veq);
+                acc_unred_slot!(4, va01, veq);
+            }};
+        }
+
+        if pair_in_block_mask == 127
+            && useful_pairs_inclusive == 121
+            && (q_base & 63) == 0
+            && lo_size >= 64
+            && (lo_size & 63) == 0
+        {
+            let n_blocks = lo_size >> 6;
+            for blk in 0..n_blocks {
+                let blk_q = blk << 6;
+                let bp_blk = (b_pkt_ptr as *const u64).add(4 * (q_base + blk_q));
+                let head_ones = (bp_blk.read_unaligned()
+                    & bp_blk.add(1).read_unaligned()
+                    & bp_blk.add(2).read_unaligned()
+                    & bp_blk.add(3).read_unaligned()
+                    & bp_blk.add(4).read_unaligned()
+                    & bp_blk.add(5).read_unaligned()
+                    & bp_blk.add(6).read_unaligned()
+                    & bp_blk.add(7).read_unaligned()
+                    & bp_blk.add(8).read_unaligned()
+                    & bp_blk.add(9).read_unaligned()
+                    & bp_blk.add(10).read_unaligned()
+                    & bp_blk.add(11).read_unaligned()
+                    & bp_blk.add(12).read_unaligned()
+                    & bp_blk.add(13).read_unaligned()
+                    & bp_blk.add(14).read_unaligned()
+                    & bp_blk.add(15).read_unaligned())
+                    == !0u64;
+                let tail_ones = (bp_blk.add(236).read_unaligned()
+                    & bp_blk.add(237).read_unaligned()
+                    & bp_blk.add(238).read_unaligned()
+                    & bp_blk.add(239).read_unaligned())
+                    == !0u64;
+                if head_ones {
+                    for q_lo in blk_q..(blk_q + 4) {
+                        round23_unit_b_step!(q_lo);
+                    }
+                } else {
+                    for q_lo in blk_q..(blk_q + 4) {
+                        round23_general_step!(q_lo);
+                    }
+                }
+                for q_lo in (blk_q + 4)..(blk_q + 59) {
+                    round23_general_step!(q_lo);
+                }
+                if tail_ones {
+                    round23_unit_b_step!(blk_q + 59);
+                } else {
+                    round23_general_step!(blk_q + 59);
+                }
+                {
+                    let ql = blk_q + 60;
+                    let qg = q_base + ql;
+                    let ap = (a_pkt_ptr as *const u64).add(4 * qg);
+                    let bp = (b_pkt_ptr as *const u64).add(4 * qg);
+                    let a10 = ap.add(1).read_unaligned();
+                    let b10 = bp.add(1).read_unaligned();
+                    if (a10 | b10) == 0 {
+                        let a00 = ap.read_unaligned();
+                        let b00 = bp.read_unaligned();
+                        let mut va00 = vld1q_u8(table_data.add(((a00 & 0xFF) as usize) * 16));
+                        let mut vb00 = vld1q_u8(table_data.add(((b00 & 0xFF) as usize) * 16));
+                        macro_rules! step2 {
+                            ($c:literal) => {{
+                                let off = $c * STRIDE;
+                                let sh = $c * 8;
+                                va00 = veorq_u8(
+                                    va00,
+                                    vld1q_u8(
+                                        table_data.add(off + (((a00 >> sh) & 0xFF) as usize) * 16),
+                                    ),
+                                );
+                                vb00 = veorq_u8(
+                                    vb00,
+                                    vld1q_u8(
+                                        table_data.add(off + (((b00 >> sh) & 0xFF) as usize) * 16),
+                                    ),
+                                );
+                            }};
+                        }
+                        step2!(1);
+                        step2!(2);
+                        step2!(3);
+                        step2!(4);
+                        step2!(5);
+                        step2!(6);
+                        step2!(7);
+                        let g00 = crate::gf2_kernels::k0_f128_mul_neon(
+                            vreinterpretq_u64_u8(va00),
+                            vreinterpretq_u64_u8(vb00),
+                        );
+                        let veq = vld1q_u64(eq_ptr.add(2 * ql));
+                        let (t_ll, t_mid, t_hh) =
+                            crate::gf2_kernels::k0_f128_mul_unreduced_neon(veq, g00);
+                        p240_ll = veorq_u64(p240_ll, t_ll);
+                        p240_mid = veorq_u64(p240_mid, t_mid);
+                        p240_hh = veorq_u64(p240_hh, t_hh);
+                    } else {
+                        let (va00, vb00, va10, vb10) =
+                            fold_single_table4!(ap.read_unaligned(), bp.read_unaligned(), a10, b10);
+                        round23_general_from_folded!(
+                            ql, va00, vb00, va10, vb10, zero, zero, zero, zero
                         );
                     }
                 }
             }
-        }
-    }
-
-    fn fold4_scalar(values: &[F128], i: usize, rho_a: F128, rho_b: F128) -> F128 {
-        let t0 = values[i] + rho_a * (values[i] + values[i + 1]);
-        let t1 = values[i + 2] + rho_a * (values[i + 2] + values[i + 3]);
-        t0 + rho_b * (t0 + t1)
-    }
-
-    #[test]
-    fn clmul_q_products_match_scalar_field_products() {
-        let mut state = 0x4b41_5241_5453_5542;
-
-        unsafe {
-            for _ in 0..256 {
-                let a = F128::new(splitmix64(&mut state), splitmix64(&mut state));
-                let b = F128::new(splitmix64(&mut state), splitmix64(&mut state));
-                let a_q = core::mem::transmute::<F128, uint64x2_t>(a);
-                let b_q = core::mem::transmute::<F128, uint64x2_t>(b);
-
-                let (p0, cross, p2) = clmul_products_q(a_q, b_q);
-                let product = WideNeon {
-                    lo: core::arch::aarch64::veorq_u64(
-                        p0,
-                        core::arch::aarch64::vextq_u64::<1>(
-                            core::arch::aarch64::vdupq_n_u64(0),
-                            cross,
-                        ),
-                    ),
-                    hi: core::arch::aarch64::veorq_u64(
-                        p2,
-                        core::arch::aarch64::vextq_u64::<1>(
-                            cross,
-                            core::arch::aarch64::vdupq_n_u64(0),
-                        ),
-                    ),
+            acc[1][0] = veorq_u64(acc[1][0], p240_ll);
+            acc[1][1] = veorq_u64(acc[1][1], p240_mid);
+            acc[1][2] = veorq_u64(acc[1][2], p240_hh);
+            acc[5][0] = veorq_u64(acc[5][0], p240_ll);
+            acc[5][1] = veorq_u64(acc[5][1], p240_mid);
+            acc[5][2] = veorq_u64(acc[5][2], p240_hh);
+            acc[7][0] = veorq_u64(acc[7][0], p240_ll);
+            acc[7][1] = veorq_u64(acc[7][1], p240_mid);
+            acc[7][2] = veorq_u64(acc[7][2], p240_hh);
+        } else {
+            for q_lo in 0..lo_size {
+                let qg = q_base + q_lo;
+                let j0 = 2 * qg;
+                let j1 = j0 + 1;
+                if (j0 & pair_in_block_mask) >= useful_pairs_inclusive {
+                    continue;
+                }
+                let ap = (a_pkt_ptr as *const u64).add(4 * qg);
+                let bp = (b_pkt_ptr as *const u64).add(4 * qg);
+                let (va00, vb00, va10, vb10) = fold_single_table4!(
+                    ap.read_unaligned(),
+                    bp.read_unaligned(),
+                    ap.add(1).read_unaligned(),
+                    bp.add(1).read_unaligned()
+                );
+                let (va01, vb01, va11, vb11) = if (j1 & pair_in_block_mask) < useful_pairs_inclusive
+                {
+                    fold_single_table4!(
+                        ap.add(2).read_unaligned(),
+                        bp.add(2).read_unaligned(),
+                        ap.add(3).read_unaligned(),
+                        bp.add(3).read_unaligned()
+                    )
+                } else {
+                    (zero, zero, zero, zero)
                 };
-                let product_lo = core::mem::transmute::<uint64x2_t, [u64; 2]>(product.lo);
-                let product_hi = core::mem::transmute::<uint64x2_t, [u64; 2]>(product.hi);
-                let expected_unreduced = a.mul_unreduced(b);
-
-                assert_eq!(
-                    F256Unreduced {
-                        r0: product_lo[0],
-                        r1: product_lo[1],
-                        r2: product_hi[0],
-                        r3: product_hi[1],
-                    },
-                    expected_unreduced
-                );
-                assert_eq!(
-                    core::mem::transmute::<uint64x2_t, F128>(mul_q(a_q, b_q)),
-                    a * b
-                );
-
-                let unreduced = mul_unreduced_q(a_q, b_q);
-                let unreduced_lo = core::mem::transmute::<uint64x2_t, [u64; 2]>(unreduced.lo);
-                let unreduced_hi = core::mem::transmute::<uint64x2_t, [u64; 2]>(unreduced.hi);
-                assert_eq!(
-                    F256Unreduced {
-                        r0: unreduced_lo[0],
-                        r1: unreduced_lo[1],
-                        r2: unreduced_hi[0],
-                        r3: unreduced_hi[1],
-                    },
-                    expected_unreduced
-                );
+                round23_general_from_folded!(q_lo, va00, vb00, va10, vb10, va01, vb01, va11, vb11);
             }
         }
+
+        let mut out = [F128::ZERO; 8];
+        for k in 0..8 {
+            let r = crate::gf2_kernels::k0_f128_reduce_3lane_neon(acc[k][0], acc[k][1], acc[k][2]);
+            out[k] = F128 {
+                lo: vgetq_lane_u64::<0>(r),
+                hi: vgetq_lane_u64::<1>(r),
+            };
+        }
+        out
     }
+}
 
-    #[test]
-    fn expanded_fold4_pair_matches_nested_scalar() {
-        let mut state = 0x4558_5041_4e44_3446;
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn round4_fold_2vars_into_chunk_neon_unchecked_8(
+    table_data: *const u8,
+    rho_0: F128,
+    rho_1: F128,
+    a_pkt_ptr: *const u8,
+    b_pkt_ptr: *const u8,
+    a_out_chunk: &mut [F128],
+    b_out_chunk: &mut [F128],
+    eq_lo: &[F128],
+    q_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
 
-        for case in 0..256 {
-            let rho_a = match case {
-                0 => F128::ZERO,
-                1 => F128::ONE,
-                _ => F128::new(splitmix64(&mut state), splitmix64(&mut state)),
-            };
-            let rho_b = match case {
-                2 => F128::ZERO,
-                3 => F128::ONE,
-                _ => F128::new(splitmix64(&mut state), splitmix64(&mut state)),
-            };
-            let mut values = [F128::ZERO; 8];
-            for value in &mut values {
-                *value = F128::new(splitmix64(&mut state), splitmix64(&mut state));
-            }
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        let zero = vdupq_n_u64(0);
+        let one_u64 = vcombine_u64(vcreate_u64(1), vcreate_u64(0));
+        let mut p1_ll = zero;
+        let mut p1_mid = zero;
+        let mut p1_hh = zero;
+        let mut pinf_ll = zero;
+        let mut pinf_mid = zero;
+        let mut pinf_hh = zero;
+        let lo_size = eq_lo.len();
+        let eq_ptr = eq_lo.as_ptr() as *const u64;
+        let a_out_ptr = a_out_chunk.as_mut_ptr() as *mut u64;
+        let b_out_ptr = b_out_chunk.as_mut_ptr() as *mut u64;
 
-            let (actual0, actual1) = unsafe {
-                fold4_pair_expanded_binius_q(
-                    values.as_ptr(),
-                    core::mem::transmute::<F128, uint64x2_t>(rho_a),
-                    core::mem::transmute::<F128, uint64x2_t>(rho_b),
-                    core::mem::transmute::<F128, uint64x2_t>(rho_a * rho_b),
+        let v_rho0 = vcombine_u64(vcreate_u64(rho_0.lo), vcreate_u64(rho_0.hi));
+        let v_rho1 = vcombine_u64(vcreate_u64(rho_1.lo), vcreate_u64(rho_1.hi));
+        let rho_01 = rho_0 * rho_1;
+        let v_rho01 = vcombine_u64(vcreate_u64(rho_01.lo), vcreate_u64(rho_01.hi));
+        let opr01 = (F128::ONE + rho_0) * (F128::ONE + rho_1);
+        let v_opr01 = vcombine_u64(vcreate_u64(opr01.lo), vcreate_u64(opr01.hi));
+        let (opr01_r0, opr01_r1) = crate::gf2_kernels::k0_f128_pre_reduce_const_neon(v_opr01);
+
+        macro_rules! fold_single_table4 {
+            ($w0:expr, $w1:expr, $w2:expr, $w3:expr) => {{
+                let w0 = $w0;
+                let w1 = $w1;
+                let w2 = $w2;
+                let w3 = $w3;
+                let mut v0 = vld1q_u8(table_data.add(((w0 & 0xFF) as usize) * 16));
+                let mut v1 = vld1q_u8(table_data.add(((w1 & 0xFF) as usize) * 16));
+                let mut v2 = vld1q_u8(table_data.add(((w2 & 0xFF) as usize) * 16));
+                let mut v3 = vld1q_u8(table_data.add(((w3 & 0xFF) as usize) * 16));
+                macro_rules! step4 {
+                    ($c:literal) => {{
+                        let off = $c * STRIDE;
+                        let sh = $c * 8;
+                        v0 = veorq_u8(
+                            v0,
+                            vld1q_u8(table_data.add(off + (((w0 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        v1 = veorq_u8(
+                            v1,
+                            vld1q_u8(table_data.add(off + (((w1 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        v2 = veorq_u8(
+                            v2,
+                            vld1q_u8(table_data.add(off + (((w2 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        v3 = veorq_u8(
+                            v3,
+                            vld1q_u8(table_data.add(off + (((w3 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                    }};
+                }
+                step4!(1);
+                step4!(2);
+                step4!(3);
+                step4!(4);
+                step4!(5);
+                step4!(6);
+                step4!(7);
+                (
+                    vreinterpretq_u64_u8(v0),
+                    vreinterpretq_u64_u8(v1),
+                    vreinterpretq_u64_u8(v2),
+                    vreinterpretq_u64_u8(v3),
                 )
-            };
-            let actual = unsafe {
-                [
-                    core::mem::transmute::<uint64x2_t, F128>(actual0),
-                    core::mem::transmute::<uint64x2_t, F128>(actual1),
-                ]
-            };
-            assert_eq!(
-                actual,
-                [
-                    fold4_scalar(&values, 0, rho_a, rho_b),
-                    fold4_scalar(&values, 4, rho_a, rho_b),
-                ],
-                "expanded pair mismatch at case {case}"
-            );
+            }};
         }
-    }
 
-    #[test]
-    fn expanded_direct_normal_matches_scalar_composed_pass() {
-        const LO_SIZE: usize = 8;
-        let mut state = 0x4449_5245_4354_3446;
+        macro_rules! combine_2vars_from_folded_neon {
+            ($f00:expr, $f10:expr, $f01:expr, $f11:expr) => {{
+                let (l10, m10, h10) = crate::gf2_kernels::k0_f128_mul_unreduced_neon($f10, v_rho0);
+                let (l01, m01, h01) = crate::gf2_kernels::k0_f128_mul_unreduced_neon($f01, v_rho1);
+                let (l11, m11, h11) = crate::gf2_kernels::k0_f128_mul_unreduced_neon($f11, v_rho01);
+                let ll = veorq_u64(veorq_u64(l10, l01), l11);
+                let mid = veorq_u64(veorq_u64(m10, m01), m11);
+                let hh = veorq_u64(veorq_u64(h10, h01), h11);
+                veorq_u64(
+                    $f00,
+                    crate::gf2_kernels::k0_f128_reduce_3lane_neon(ll, mid, hh),
+                )
+            }};
+        }
 
-        for case in 0..16 {
-            let rho_a = match case {
-                0 => F128::ZERO,
-                1 => F128::ONE,
-                _ => F128::new(splitmix64(&mut state), splitmix64(&mut state)),
-            };
-            let rho_b = match case {
-                2 => F128::ZERO,
-                3 => F128::ONE,
-                _ => F128::new(splitmix64(&mut state), splitmix64(&mut state)),
-            };
-            let a_in: Vec<F128> = (0..8 * LO_SIZE)
-                .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
-                .collect();
-            let b_in: Vec<F128> = (0..8 * LO_SIZE)
-                .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
-                .collect();
-            let eq_lo: Vec<F128> = (0..LO_SIZE)
-                .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
-                .collect();
-            let mut actual_a = vec![F128::ZERO; 2 * LO_SIZE];
-            let mut actual_b = vec![F128::ZERO; 2 * LO_SIZE];
-            let actual = fold2_and_message_normal_expanded_aarch64(
-                &a_in,
-                &b_in,
-                &mut actual_a,
-                &mut actual_b,
-                rho_a,
-                rho_b,
-                rho_a * rho_b,
-                &eq_lo,
-            );
+        macro_rules! fold_2vars_one {
+            ($wp:expr) => {{
+                let wp = $wp;
+                let w00 = wp.read_unaligned();
+                let w10 = wp.add(1).read_unaligned();
+                let w01 = wp.add(2).read_unaligned();
+                let w11 = wp.add(3).read_unaligned();
+                let u10 = w00 ^ w10;
+                let u01 = w00 ^ w01;
+                let u11 = u10 ^ (w01 ^ w11);
+                let (f00, f10, f01, f11) = fold_single_table4!(w00, u10, u01, u11);
+                combine_2vars_from_folded_neon!(f00, f10, f01, f11)
+            }};
+        }
 
-            let mut expected_a = vec![F128::ZERO; 2 * LO_SIZE];
-            let mut expected_b = vec![F128::ZERO; 2 * LO_SIZE];
-            let mut p1_acc = F256Unreduced::ZERO;
-            let mut pinf_acc = F256Unreduced::ZERO;
-            for (x_lo, &eq_l) in eq_lo.iter().enumerate() {
-                let i = 8 * x_lo;
-                let o = 2 * x_lo;
-                let a0 = fold4_scalar(&a_in, i, rho_a, rho_b);
-                let a1 = fold4_scalar(&a_in, i + 4, rho_a, rho_b);
-                let b0 = fold4_scalar(&b_in, i, rho_a, rho_b);
-                let b1 = fold4_scalar(&b_in, i + 4, rho_a, rho_b);
-                expected_a[o] = a0;
-                expected_a[o + 1] = a1;
-                expected_b[o] = b0;
-                expected_b[o + 1] = b1;
-                p1_acc ^= eq_l.mul_unreduced(a1 * b1);
-                pinf_acc ^= eq_l.mul_unreduced((a0 + a1) * (b0 + b1));
+        macro_rules! fold_2vars_ab_one {
+            ($ap:expr, $bp:expr) => {{ (fold_2vars_one!($ap), fold_2vars_one!($bp)) }};
+        }
+
+        macro_rules! fold_2vars_a_pair_unit_b {
+            ($x_lo:expr) => {{
+                let xl = $x_lo;
+                let q0l = 2 * xl;
+                let q1l = q0l + 1;
+                let q0g = q_base + q0l;
+                let ap0 = (a_pkt_ptr as *const u64).add(4 * q0g);
+                let va_q0 = fold_2vars_one!(ap0);
+                let va_q1 = fold_2vars_one!(ap0.add(4));
+
+                vst1q_u64(a_out_ptr.add(2 * q0l), va_q0);
+                vst1q_u64(a_out_ptr.add(2 * q1l), va_q1);
+                vst1q_u64(b_out_ptr.add(2 * q0l), one_u64);
+                vst1q_u64(b_out_ptr.add(2 * q1l), one_u64);
+
+                let veq = vld1q_u64(eq_ptr.add(2 * xl));
+                let (t_ll, t_mid, t_hh) =
+                    crate::gf2_kernels::k0_f128_mul_unreduced_neon(veq, va_q1);
+                p1_ll = veorq_u64(p1_ll, t_ll);
+                p1_mid = veorq_u64(p1_mid, t_mid);
+                p1_hh = veorq_u64(p1_hh, t_hh);
+            }};
+        }
+
+        macro_rules! round4_general_step {
+            ($x_lo:expr) => {{
+                let xl = $x_lo;
+                let q0l = 2 * xl;
+                let q1l = q0l + 1;
+                let q0g = q_base + q0l;
+                let ap0 = (a_pkt_ptr as *const u64).add(4 * q0g);
+                let bp0 = (b_pkt_ptr as *const u64).add(4 * q0g);
+                let (va_q0, vb_q0) = fold_2vars_ab_one!(ap0, bp0);
+                let (va_q1, vb_q1) = fold_2vars_ab_one!(ap0.add(4), bp0.add(4));
+
+                vst1q_u64(a_out_ptr.add(2 * q0l), va_q0);
+                vst1q_u64(a_out_ptr.add(2 * q1l), va_q1);
+                vst1q_u64(b_out_ptr.add(2 * q0l), vb_q0);
+                vst1q_u64(b_out_ptr.add(2 * q1l), vb_q1);
+
+                let vad = veorq_u64(va_q0, va_q1);
+                let vbd = veorq_u64(vb_q0, vb_q1);
+                let (g1, ginf) = crate::gf2_kernels::k0_f128_mul_vec2_neon(va_q1, vad, vb_q1, vbd);
+                let veq = vld1q_u64(eq_ptr.add(2 * xl));
+                crate::gf2_kernels::k0_f128_mul_acc_pair_neon(
+                    veq,
+                    g1,
+                    ginf,
+                    &mut p1_ll,
+                    &mut p1_mid,
+                    &mut p1_hh,
+                    &mut pinf_ll,
+                    &mut pinf_mid,
+                    &mut pinf_hh,
+                );
+            }};
+        }
+
+        if pair_in_block_mask == 127
+            && useful_pairs_inclusive == 121
+            && (q_base & 63) == 0
+            && lo_size >= 32
+            && (lo_size & 31) == 0
+        {
+            let n_blocks = lo_size >> 5;
+            for blk in 0..n_blocks {
+                let blk_x = blk << 5;
+                let bp_blk = (b_pkt_ptr as *const u64).add(4 * (q_base + 2 * blk_x));
+                let head_ones = (bp_blk.read_unaligned()
+                    & bp_blk.add(1).read_unaligned()
+                    & bp_blk.add(2).read_unaligned()
+                    & bp_blk.add(3).read_unaligned()
+                    & bp_blk.add(4).read_unaligned()
+                    & bp_blk.add(5).read_unaligned()
+                    & bp_blk.add(6).read_unaligned()
+                    & bp_blk.add(7).read_unaligned()
+                    & bp_blk.add(8).read_unaligned()
+                    & bp_blk.add(9).read_unaligned()
+                    & bp_blk.add(10).read_unaligned()
+                    & bp_blk.add(11).read_unaligned()
+                    & bp_blk.add(12).read_unaligned()
+                    & bp_blk.add(13).read_unaligned()
+                    & bp_blk.add(14).read_unaligned()
+                    & bp_blk.add(15).read_unaligned())
+                    == !0u64;
+                let tail_ones = (bp_blk.add(236).read_unaligned()
+                    & bp_blk.add(237).read_unaligned()
+                    & bp_blk.add(238).read_unaligned()
+                    & bp_blk.add(239).read_unaligned())
+                    == !0u64;
+                if head_ones {
+                    fold_2vars_a_pair_unit_b!(blk_x);
+                    fold_2vars_a_pair_unit_b!(blk_x + 1);
+                } else {
+                    round4_general_step!(blk_x);
+                    round4_general_step!(blk_x + 1);
+                }
+                for x_lo in (blk_x + 2)..(blk_x + 29) {
+                    round4_general_step!(x_lo);
+                }
+                if tail_ones {
+                    let xl = blk_x + 29;
+                    let q0l = 2 * xl;
+                    let q1l = q0l + 1;
+                    let q0g = q_base + q0l;
+                    let ap0 = (a_pkt_ptr as *const u64).add(4 * q0g);
+                    let bp0 = (b_pkt_ptr as *const u64).add(4 * q0g);
+                    let (va_q0, vb_q0) = fold_2vars_ab_one!(ap0, bp0);
+                    let va_q1 = fold_2vars_one!(ap0.add(4));
+                    let vb_q1 = one_u64;
+
+                    vst1q_u64(a_out_ptr.add(2 * q0l), va_q0);
+                    vst1q_u64(a_out_ptr.add(2 * q1l), va_q1);
+                    vst1q_u64(b_out_ptr.add(2 * q0l), vb_q0);
+                    vst1q_u64(b_out_ptr.add(2 * q1l), vb_q1);
+
+                    let vad = veorq_u64(va_q0, va_q1);
+                    let vbd = veorq_u64(vb_q0, vb_q1);
+                    let ginf = crate::gf2_kernels::k0_f128_mul_neon(vad, vbd);
+                    let veq = vld1q_u64(eq_ptr.add(2 * xl));
+                    crate::gf2_kernels::k0_f128_mul_acc_pair_neon(
+                        veq,
+                        va_q1,
+                        ginf,
+                        &mut p1_ll,
+                        &mut p1_mid,
+                        &mut p1_hh,
+                        &mut pinf_ll,
+                        &mut pinf_mid,
+                        &mut pinf_hh,
+                    );
+                } else {
+                    round4_general_step!(blk_x + 29);
+                }
+                {
+                    let xl = blk_x + 30;
+                    let q0l = 2 * xl;
+                    let q1l = q0l + 1;
+                    let q0g = q_base + q0l;
+                    let ap0 = (a_pkt_ptr as *const u64).add(4 * q0g);
+                    let bp0 = (b_pkt_ptr as *const u64).add(4 * q0g);
+                    let a10 = ap0.add(1).read_unaligned();
+                    let b10 = bp0.add(1).read_unaligned();
+                    let (va_q0, vb_q0) = if (a10 | b10) == 0 {
+                        let a00 = ap0.read_unaligned();
+                        let b00 = bp0.read_unaligned();
+                        let mut va0 = vld1q_u8(table_data.add(((a00 & 0xFF) as usize) * 16));
+                        let mut vb0 = vld1q_u8(table_data.add(((b00 & 0xFF) as usize) * 16));
+                        macro_rules! step2 {
+                            ($c:literal) => {{
+                                let off = $c * STRIDE;
+                                let sh = $c * 8;
+                                va0 = veorq_u8(
+                                    va0,
+                                    vld1q_u8(
+                                        table_data.add(off + (((a00 >> sh) & 0xFF) as usize) * 16),
+                                    ),
+                                );
+                                vb0 = veorq_u8(
+                                    vb0,
+                                    vld1q_u8(
+                                        table_data.add(off + (((b00 >> sh) & 0xFF) as usize) * 16),
+                                    ),
+                                );
+                            }};
+                        }
+                        step2!(1);
+                        step2!(2);
+                        step2!(3);
+                        step2!(4);
+                        step2!(5);
+                        step2!(6);
+                        step2!(7);
+                        crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                            vreinterpretq_u64_u8(va0),
+                            vreinterpretq_u64_u8(vb0),
+                            opr01_r0,
+                            opr01_r1,
+                            opr01_r0,
+                            opr01_r1,
+                        )
+                    } else {
+                        fold_2vars_ab_one!(ap0, bp0)
+                    };
+                    vst1q_u64(a_out_ptr.add(2 * q0l), va_q0);
+                    vst1q_u64(a_out_ptr.add(2 * q1l), zero);
+                    vst1q_u64(b_out_ptr.add(2 * q0l), vb_q0);
+                    vst1q_u64(b_out_ptr.add(2 * q1l), zero);
+                    let ginf = crate::gf2_kernels::k0_f128_mul_neon(va_q0, vb_q0);
+                    let veq = vld1q_u64(eq_ptr.add(2 * xl));
+                    let (t_ll, t_mid, t_hh) =
+                        crate::gf2_kernels::k0_f128_mul_unreduced_neon(veq, ginf);
+                    pinf_ll = veorq_u64(pinf_ll, t_ll);
+                    pinf_mid = veorq_u64(pinf_mid, t_mid);
+                    pinf_hh = veorq_u64(pinf_hh, t_hh);
+                }
+                {
+                    let xl = blk_x + 31;
+                    let q0l = 2 * xl;
+                    let q1l = q0l + 1;
+                    vst1q_u64(a_out_ptr.add(2 * q0l), zero);
+                    vst1q_u64(a_out_ptr.add(2 * q1l), zero);
+                    vst1q_u64(b_out_ptr.add(2 * q0l), zero);
+                    vst1q_u64(b_out_ptr.add(2 * q1l), zero);
+                }
             }
-            let expected = (p1_acc.reduce(), pinf_acc.reduce());
+        } else {
+            for x_lo in 0..lo_size {
+                let q0l = 2 * x_lo;
+                let q1l = q0l + 1;
+                let q0g = q_base + q0l;
+                let q1g = q0g + 1;
 
-            assert_eq!(actual_a, expected_a, "A mismatch at case {case}");
-            assert_eq!(actual_b, expected_b, "B mismatch at case {case}");
-            assert_eq!(actual, expected, "message mismatch at case {case}");
-        }
-    }
+                let fold_one_padded = |qg: usize| -> (uint64x2_t, uint64x2_t) {
+                    let j0 = 2 * qg;
+                    let j1 = j0 + 1;
+                    if (j0 & pair_in_block_mask) >= useful_pairs_inclusive {
+                        return (zero, zero);
+                    }
+                    let ap = (a_pkt_ptr as *const u64).add(4 * qg);
+                    let bp = (b_pkt_ptr as *const u64).add(4 * qg);
+                    let a00 = ap.read_unaligned();
+                    let a10 = ap.add(1).read_unaligned();
+                    let b00 = bp.read_unaligned();
+                    let b10 = bp.add(1).read_unaligned();
+                    let (a01, a11, b01, b11) = if (j1 & pair_in_block_mask) < useful_pairs_inclusive
+                    {
+                        (
+                            ap.add(2).read_unaligned(),
+                            ap.add(3).read_unaligned(),
+                            bp.add(2).read_unaligned(),
+                            bp.add(3).read_unaligned(),
+                        )
+                    } else {
+                        (0, 0, 0, 0)
+                    };
+                    let ua10 = a00 ^ a10;
+                    let ua01 = a00 ^ a01;
+                    let ua11 = ua10 ^ (a01 ^ a11);
+                    let ub10 = b00 ^ b10;
+                    let ub01 = b00 ^ b01;
+                    let ub11 = ub10 ^ (b01 ^ b11);
+                    let (fa00, fa10, fa01, fa11) = fold_single_table4!(a00, ua10, ua01, ua11);
+                    let (fb00, fb10, fb01, fb11) = fold_single_table4!(b00, ub10, ub01, ub11);
+                    (
+                        combine_2vars_from_folded_neon!(fa00, fa10, fa01, fa11),
+                        combine_2vars_from_folded_neon!(fb00, fb10, fb01, fb11),
+                    )
+                };
 
-    #[test]
-    fn expanded_lookahead_store_variants_match_incumbent_pass() {
-        const LO_SIZE: usize = 8;
-        let mut state = 0x4e54_4c4f_4f4b_4148;
+                let (va_q0, vb_q0) = fold_one_padded(q0g);
+                let (va_q1, vb_q1) = fold_one_padded(q1g);
+                vst1q_u64(a_out_ptr.add(2 * q0l), va_q0);
+                vst1q_u64(a_out_ptr.add(2 * q1l), va_q1);
+                vst1q_u64(b_out_ptr.add(2 * q0l), vb_q0);
+                vst1q_u64(b_out_ptr.add(2 * q1l), vb_q1);
 
-        for case in 0..16 {
-            let rho_a = match case {
-                0 => F128::ZERO,
-                1 => F128::ONE,
-                _ => F128::new(splitmix64(&mut state), splitmix64(&mut state)),
-            };
-            let rho_b = match case {
-                2 => F128::ZERO,
-                3 => F128::ONE,
-                _ => F128::new(splitmix64(&mut state), splitmix64(&mut state)),
-            };
-            let a_in: Vec<F128> = (0..8 * LO_SIZE)
-                .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
-                .collect();
-            let b_in: Vec<F128> = (0..8 * LO_SIZE)
-                .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
-                .collect();
-            let eq_lo: Vec<F128> = (0..LO_SIZE)
-                .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
-                .collect();
-            let mut candidate_a = vec![F128::ZERO; 2 * LO_SIZE];
-            let mut candidate_b = vec![F128::ZERO; 2 * LO_SIZE];
-            let mut normal_a = vec![F128::ZERO; 2 * LO_SIZE];
-            let mut normal_b = vec![F128::ZERO; 2 * LO_SIZE];
-            let mut incumbent_a = vec![F128::ZERO; 2 * LO_SIZE];
-            let mut incumbent_b = vec![F128::ZERO; 2 * LO_SIZE];
-            let rho_ab = rho_a * rho_b;
-
-            let candidate = fold2_and_message_lookahead_nt_expanded_aarch64(
-                &a_in,
-                &b_in,
-                &mut candidate_a,
-                &mut candidate_b,
-                rho_a,
-                rho_b,
-                rho_ab,
-                &eq_lo,
-            );
-            let normal = fold2_and_message_lookahead_normal_expanded_aarch64(
-                &a_in,
-                &b_in,
-                &mut normal_a,
-                &mut normal_b,
-                rho_a,
-                rho_b,
-                rho_ab,
-                &eq_lo,
-            );
-            let incumbent = fold2_and_message_lookahead_aarch64(
-                &a_in,
-                &b_in,
-                &mut incumbent_a,
-                &mut incumbent_b,
-                rho_a,
-                rho_b,
-                &eq_lo,
-                false,
-            );
-
-            assert_eq!(candidate_a, incumbent_a, "A mismatch at case {case}");
-            assert_eq!(candidate_b, incumbent_b, "B mismatch at case {case}");
-            assert_eq!(candidate, incumbent, "message mismatch at case {case}");
-            assert_eq!(normal_a, incumbent_a, "normal A mismatch at case {case}");
-            assert_eq!(normal_b, incumbent_b, "normal B mismatch at case {case}");
-            assert_eq!(normal, incumbent, "normal message mismatch at case {case}");
-        }
-    }
-
-    #[test]
-    fn round2_periodic_padding_matches_generic_schedule() {
-        const LO_SIZE: usize = 128;
-        const N_CHUNKS: usize = 8;
-
-        let mut state = 0x5045_5249_4f44_4943;
-        let table: Vec<F128> = (0..N_CHUNKS * 256)
-            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
-            .collect();
-        let mut a_packed = vec![0u8; 2 * LO_SIZE * N_CHUNKS];
-        let mut b_packed = vec![0u8; 2 * LO_SIZE * N_CHUNKS];
-        for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
-            *byte = splitmix64(&mut state) as u8;
-        }
-        let eq_lo: Vec<F128> = (0..LO_SIZE)
-            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
-            .collect();
-
-        let run = |periodic_padding: bool| {
-            let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
-            let mut anchors = vec![poison; 2 * LO_SIZE];
-            let mut deltas = vec![0xa5u8; 2 * LO_SIZE * N_CHUNKS];
-            let mut out = [poison; 8];
-            unsafe {
-                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                    table.as_ptr().cast::<u8>(),
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    anchors.as_mut_ptr(),
-                    deltas.as_mut_ptr(),
-                    eq_lo.as_ptr(),
-                    LO_SIZE,
-                    0,
-                    127,
-                    121,
-                    true,
-                    periodic_padding,
-                    out.as_mut_ptr(),
+                let vad = veorq_u64(va_q0, va_q1);
+                let vbd = veorq_u64(vb_q0, vb_q1);
+                let (g1, ginf) = crate::gf2_kernels::k0_f128_mul_vec2_neon(va_q1, vad, vb_q1, vbd);
+                let veq = vld1q_u64(eq_ptr.add(2 * x_lo));
+                crate::gf2_kernels::k0_f128_mul_acc_pair_neon(
+                    veq,
+                    g1,
+                    ginf,
+                    &mut p1_ll,
+                    &mut p1_mid,
+                    &mut p1_hh,
+                    &mut pinf_ll,
+                    &mut pinf_mid,
+                    &mut pinf_hh,
                 );
             }
-            (anchors, deltas, out)
-        };
+        }
 
-        let periodic = run(true);
-        let generic = run(false);
-        assert_eq!(periodic.0, generic.0, "anchor schedule mismatch");
-        assert_eq!(periodic.1, generic.1, "delta schedule mismatch");
-        assert_eq!(periodic.2, generic.2, "message/lookahead mismatch");
+        let res1 = crate::gf2_kernels::k0_f128_reduce_3lane_neon(p1_ll, p1_mid, p1_hh);
+        let resi = crate::gf2_kernels::k0_f128_reduce_3lane_neon(pinf_ll, pinf_mid, pinf_hh);
+        (
+            F128 {
+                lo: vgetq_lane_u64::<0>(res1),
+                hi: vgetq_lane_u64::<1>(res1),
+            },
+            F128 {
+                lo: vgetq_lane_u64::<0>(resi),
+                hi: vgetq_lane_u64::<1>(resi),
+            },
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn round45_fold_2vars_into_and_lookahead_chunk_neon_unchecked_8(
+    table_data: *const u8,
+    rho_0: F128,
+    rho_1: F128,
+    a_pkt_ptr: *const u8,
+    b_pkt_ptr: *const u8,
+    a_out_chunk: &mut [F128],
+    b_out_chunk: &mut [F128],
+    eq_lo: &[F128],
+    q_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+) -> [F128; 8] {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        const STRIDE: usize = 256 * 16;
+        let zero = vdupq_n_u64(0);
+        let one_u64 = vcombine_u64(vcreate_u64(1), vcreate_u64(0));
+        let mut acc = [[zero; 3]; 8];
+        let mut p60_ll = zero;
+        let mut p60_mid = zero;
+        let mut p60_hh = zero;
+        let lo_size = eq_lo.len();
+        let eq_ptr = eq_lo.as_ptr() as *const u64;
+        let a_out_ptr = a_out_chunk.as_mut_ptr() as *mut u64;
+        let b_out_ptr = b_out_chunk.as_mut_ptr() as *mut u64;
+
+        let v_rho0 = vcombine_u64(vcreate_u64(rho_0.lo), vcreate_u64(rho_0.hi));
+        let v_rho1 = vcombine_u64(vcreate_u64(rho_1.lo), vcreate_u64(rho_1.hi));
+        let rho_01 = rho_0 * rho_1;
+        let v_rho01 = vcombine_u64(vcreate_u64(rho_01.lo), vcreate_u64(rho_01.hi));
+        let opr01 = (F128::ONE + rho_0) * (F128::ONE + rho_1);
+        let v_opr01 = vcombine_u64(vcreate_u64(opr01.lo), vcreate_u64(opr01.hi));
+        let (opr01_r0, opr01_r1) = crate::gf2_kernels::k0_f128_pre_reduce_const_neon(v_opr01);
+
+        let mut v_all_ones_u8 = vld1q_u8(table_data.add(255 * 16));
+        for c in 1..8 {
+            v_all_ones_u8 = veorq_u8(
+                v_all_ones_u8,
+                vld1q_u8(table_data.add(c * STRIDE + 255 * 16)),
+            );
+        }
+        let v_all_ones = vreinterpretq_u64_u8(v_all_ones_u8);
+        let is_unit_ones =
+            (vgetq_lane_u64::<0>(v_all_ones) == 1) && (vgetq_lane_u64::<1>(v_all_ones) == 0);
+
+        macro_rules! fold_single_table4 {
+            ($w0:expr, $w1:expr, $w2:expr, $w3:expr) => {{
+                let w0 = $w0;
+                let w1 = $w1;
+                let w2 = $w2;
+                let w3 = $w3;
+                let mut v0 = vld1q_u8(table_data.add(((w0 & 0xFF) as usize) * 16));
+                let mut v1 = vld1q_u8(table_data.add(((w1 & 0xFF) as usize) * 16));
+                let mut v2 = vld1q_u8(table_data.add(((w2 & 0xFF) as usize) * 16));
+                let mut v3 = vld1q_u8(table_data.add(((w3 & 0xFF) as usize) * 16));
+                macro_rules! step4 {
+                    ($c:literal) => {{
+                        let off = $c * STRIDE;
+                        let sh = $c * 8;
+                        v0 = veorq_u8(
+                            v0,
+                            vld1q_u8(table_data.add(off + (((w0 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        v1 = veorq_u8(
+                            v1,
+                            vld1q_u8(table_data.add(off + (((w1 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        v2 = veorq_u8(
+                            v2,
+                            vld1q_u8(table_data.add(off + (((w2 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                        v3 = veorq_u8(
+                            v3,
+                            vld1q_u8(table_data.add(off + (((w3 >> sh) & 0xFF) as usize) * 16)),
+                        );
+                    }};
+                }
+                step4!(1);
+                step4!(2);
+                step4!(3);
+                step4!(4);
+                step4!(5);
+                step4!(6);
+                step4!(7);
+                (
+                    vreinterpretq_u64_u8(v0),
+                    vreinterpretq_u64_u8(v1),
+                    vreinterpretq_u64_u8(v2),
+                    vreinterpretq_u64_u8(v3),
+                )
+            }};
+        }
+
+        macro_rules! combine_2vars_from_folded_neon {
+            ($f00:expr, $f10:expr, $f01:expr, $f11:expr) => {{
+                let (l10, m10, h10) = crate::gf2_kernels::k0_f128_mul_unreduced_neon($f10, v_rho0);
+                let (l01, m01, h01) = crate::gf2_kernels::k0_f128_mul_unreduced_neon($f01, v_rho1);
+                let (l11, m11, h11) = crate::gf2_kernels::k0_f128_mul_unreduced_neon($f11, v_rho01);
+                let ll = veorq_u64(veorq_u64(l10, l01), l11);
+                let mid = veorq_u64(veorq_u64(m10, m01), m11);
+                let hh = veorq_u64(veorq_u64(h10, h01), h11);
+                veorq_u64(
+                    $f00,
+                    crate::gf2_kernels::k0_f128_reduce_3lane_neon(ll, mid, hh),
+                )
+            }};
+        }
+
+        macro_rules! fold_2vars_one {
+            ($wp:expr) => {{
+                let wp = $wp;
+                let w00 = wp.read_unaligned();
+                let w10 = wp.add(1).read_unaligned();
+                let w01 = wp.add(2).read_unaligned();
+                let w11 = wp.add(3).read_unaligned();
+                let u10 = w00 ^ w10;
+                let u01 = w00 ^ w01;
+                let u11 = u10 ^ (w01 ^ w11);
+                let (f00, f10, f01, f11) = fold_single_table4!(w00, u10, u01, u11);
+                combine_2vars_from_folded_neon!(f00, f10, f01, f11)
+            }};
+        }
+
+        macro_rules! fold_2vars_ab_one {
+            ($ap:expr, $bp:expr) => {{ (fold_2vars_one!($ap), fold_2vars_one!($bp)) }};
+        }
+
+        macro_rules! acc_unred_slot_with_sum {
+            ($idx:literal, $u:expr, $v:expr, $u_sum:expr, $v_sum:expr) => {{
+                let u = $u;
+                let v = $v;
+                let t_ll = vreinterpretq_u64_p128(vmull_p64(
+                    vgetq_lane_u64::<0>(u),
+                    vgetq_lane_u64::<0>(v),
+                ));
+                let t_mid = vreinterpretq_u64_p128(vmull_p64($u_sum, $v_sum));
+                let t_hh = vreinterpretq_u64_p128(vmull_high_p64(
+                    vreinterpretq_p64_u64(u),
+                    vreinterpretq_p64_u64(v),
+                ));
+                acc[$idx][0] = veorq_u64(acc[$idx][0], t_ll);
+                acc[$idx][1] = veorq_u64(acc[$idx][1], t_mid);
+                acc[$idx][2] = veorq_u64(acc[$idx][2], t_hh);
+            }};
+        }
+
+        macro_rules! acc_unred_slot {
+            ($idx:literal, $u:expr, $v:expr) => {{
+                let (t_ll, t_mid, t_hh) = crate::gf2_kernels::k0_f128_mul_unreduced_neon($u, $v);
+                acc[$idx][0] = veorq_u64(acc[$idx][0], t_ll);
+                acc[$idx][1] = veorq_u64(acc[$idx][1], t_mid);
+                acc[$idx][2] = veorq_u64(acc[$idx][2], t_hh);
+            }};
+        }
+
+        macro_rules! lookahead_from_folded {
+            ($p_lo:expr, $va00:expr, $vb00:expr, $va10:expr, $vb10:expr, $va01:expr, $vb01:expr, $va11:expr, $vb11:expr) => {{
+                let veq = vld1q_u64(eq_ptr.add(2 * $p_lo));
+                let (eq_r0, eq_r1) = crate::gf2_kernels::k0_f128_pre_reduce_const_neon(veq);
+                let (tb00, tb10) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                    $vb00, $vb10, eq_r0, eq_r1, eq_r0, eq_r1,
+                );
+                let (tb01, tb11) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                    $vb01, $vb11, eq_r0, eq_r1, eq_r0, eq_r1,
+                );
+                let da0 = veorq_u64($va00, $va10);
+                let da1 = veorq_u64($va01, $va11);
+                let da_0 = veorq_u64($va00, $va01);
+                let da_1 = veorq_u64($va10, $va11);
+                let da_i = veorq_u64(da0, da1);
+
+                let dtb0 = veorq_u64(tb00, tb10);
+                let dtb1 = veorq_u64(tb01, tb11);
+                let dtb_0 = veorq_u64(tb00, tb01);
+                let dtb_1 = veorq_u64(tb10, tb11);
+                let dtb_i = veorq_u64(dtb0, dtb1);
+
+                let sva10 = vgetq_lane_u64::<0>($va10) ^ vgetq_lane_u64::<1>($va10);
+                let sva11 = vgetq_lane_u64::<0>($va11) ^ vgetq_lane_u64::<1>($va11);
+                let sva01 = vgetq_lane_u64::<0>($va01) ^ vgetq_lane_u64::<1>($va01);
+                let sda0 = vgetq_lane_u64::<0>(da0) ^ vgetq_lane_u64::<1>(da0);
+                let sda1 = sva01 ^ sva11;
+                let sda_1 = sva10 ^ sva11;
+                let sda_0 = sda0 ^ (sva10 ^ sva01);
+                let sda_i = sda0 ^ sda1;
+
+                let stb10 = vgetq_lane_u64::<0>(tb10) ^ vgetq_lane_u64::<1>(tb10);
+                let stb11 = vgetq_lane_u64::<0>(tb11) ^ vgetq_lane_u64::<1>(tb11);
+                let stb01 = vgetq_lane_u64::<0>(tb01) ^ vgetq_lane_u64::<1>(tb01);
+                let sdtb0 = vgetq_lane_u64::<0>(dtb0) ^ vgetq_lane_u64::<1>(dtb0);
+                let sdtb1 = stb01 ^ stb11;
+                let sdtb_1 = stb10 ^ stb11;
+                let sdtb_0 = sdtb0 ^ (stb10 ^ stb01);
+                let sdtb_i = sdtb0 ^ sdtb1;
+
+                acc_unred_slot_with_sum!(0, $va10, tb10, sva10, stb10);
+                acc_unred_slot_with_sum!(1, da0, dtb0, sda0, sdtb0);
+                acc_unred_slot_with_sum!(2, $va11, tb11, sva11, stb11);
+                acc_unred_slot_with_sum!(3, da1, dtb1, sda1, sdtb1);
+                acc_unred_slot_with_sum!(4, $va01, tb01, sva01, stb01);
+                acc_unred_slot_with_sum!(5, da_0, dtb_0, sda_0, sdtb_0);
+                acc_unred_slot_with_sum!(6, da_1, dtb_1, sda_1, sdtb_1);
+                acc_unred_slot_with_sum!(7, da_i, dtb_i, sda_i, sdtb_i);
+            }};
+        }
+
+        macro_rules! round45_unit_b_step {
+            ($p_lo:expr) => {{
+                let pl = $p_lo;
+                let q0l = 4 * pl;
+                let q0g = q_base + q0l;
+                let ap0 = (a_pkt_ptr as *const u64).add(4 * q0g);
+                let va00 = fold_2vars_one!(ap0);
+                let va10 = fold_2vars_one!(ap0.add(4));
+                let va01 = fold_2vars_one!(ap0.add(8));
+                let va11 = fold_2vars_one!(ap0.add(12));
+
+                vst1q_u64(a_out_ptr.add(2 * q0l), va00);
+                vst1q_u64(a_out_ptr.add(2 * (q0l + 1)), va10);
+                vst1q_u64(a_out_ptr.add(2 * (q0l + 2)), va01);
+                vst1q_u64(a_out_ptr.add(2 * (q0l + 3)), va11);
+                vst1q_u64(b_out_ptr.add(2 * q0l), one_u64);
+                vst1q_u64(b_out_ptr.add(2 * (q0l + 1)), one_u64);
+                vst1q_u64(b_out_ptr.add(2 * (q0l + 2)), one_u64);
+                vst1q_u64(b_out_ptr.add(2 * (q0l + 3)), one_u64);
+
+                let veq = vld1q_u64(eq_ptr.add(2 * pl));
+                acc_unred_slot!(0, va10, veq);
+                acc_unred_slot!(2, va11, veq);
+                acc_unred_slot!(4, va01, veq);
+            }};
+        }
+
+        macro_rules! round45_general_step {
+            ($p_lo:expr) => {{
+                let pl = $p_lo;
+                let q0l = 4 * pl;
+                let q0g = q_base + q0l;
+                let ap0 = (a_pkt_ptr as *const u64).add(4 * q0g);
+                let bp0 = (b_pkt_ptr as *const u64).add(4 * q0g);
+                let (va00, vb00) = fold_2vars_ab_one!(ap0, bp0);
+                let (va10, vb10) = fold_2vars_ab_one!(ap0.add(4), bp0.add(4));
+                let (va01, vb01) = fold_2vars_ab_one!(ap0.add(8), bp0.add(8));
+                let (va11, vb11) = fold_2vars_ab_one!(ap0.add(12), bp0.add(12));
+
+                vst1q_u64(a_out_ptr.add(2 * q0l), va00);
+                vst1q_u64(a_out_ptr.add(2 * (q0l + 1)), va10);
+                vst1q_u64(a_out_ptr.add(2 * (q0l + 2)), va01);
+                vst1q_u64(a_out_ptr.add(2 * (q0l + 3)), va11);
+                vst1q_u64(b_out_ptr.add(2 * q0l), vb00);
+                vst1q_u64(b_out_ptr.add(2 * (q0l + 1)), vb10);
+                vst1q_u64(b_out_ptr.add(2 * (q0l + 2)), vb01);
+                vst1q_u64(b_out_ptr.add(2 * (q0l + 3)), vb11);
+
+                lookahead_from_folded!(pl, va00, vb00, va10, vb10, va01, vb01, va11, vb11);
+            }};
+        }
+
+        if is_unit_ones
+            && pair_in_block_mask == 127
+            && useful_pairs_inclusive == 121
+            && (q_base & 63) == 0
+            && lo_size >= 16
+            && (lo_size & 15) == 0
+        {
+            let n_blocks = lo_size >> 4;
+            for blk in 0..n_blocks {
+                let blk_p = blk << 4;
+                let bp_blk = (b_pkt_ptr as *const u64).add(4 * (q_base + 4 * blk_p));
+                let head_ones = (bp_blk.read_unaligned()
+                    & bp_blk.add(1).read_unaligned()
+                    & bp_blk.add(2).read_unaligned()
+                    & bp_blk.add(3).read_unaligned()
+                    & bp_blk.add(4).read_unaligned()
+                    & bp_blk.add(5).read_unaligned()
+                    & bp_blk.add(6).read_unaligned()
+                    & bp_blk.add(7).read_unaligned()
+                    & bp_blk.add(8).read_unaligned()
+                    & bp_blk.add(9).read_unaligned()
+                    & bp_blk.add(10).read_unaligned()
+                    & bp_blk.add(11).read_unaligned()
+                    & bp_blk.add(12).read_unaligned()
+                    & bp_blk.add(13).read_unaligned()
+                    & bp_blk.add(14).read_unaligned()
+                    & bp_blk.add(15).read_unaligned())
+                    == !0u64;
+                if head_ones {
+                    round45_unit_b_step!(blk_p);
+                } else {
+                    round45_general_step!(blk_p);
+                }
+                for p_lo in (blk_p + 1)..(blk_p + 15) {
+                    round45_general_step!(p_lo);
+                }
+                {
+                    let pl = blk_p + 15;
+                    let q0l = 4 * pl;
+                    let q0g = q_base + q0l;
+                    let ap0 = (a_pkt_ptr as *const u64).add(4 * q0g);
+                    let bp0 = (b_pkt_ptr as *const u64).add(4 * q0g);
+                    let a10 = ap0.add(1).read_unaligned();
+                    let b10 = bp0.add(1).read_unaligned();
+                    let (va00, vb00) = if (a10 | b10) == 0 {
+                        let a00 = ap0.read_unaligned();
+                        let b00 = bp0.read_unaligned();
+                        let mut va0 = vld1q_u8(table_data.add(((a00 & 0xFF) as usize) * 16));
+                        let mut vb0 = vld1q_u8(table_data.add(((b00 & 0xFF) as usize) * 16));
+                        macro_rules! step2 {
+                            ($c:literal) => {{
+                                let off = $c * STRIDE;
+                                let sh = $c * 8;
+                                va0 = veorq_u8(
+                                    va0,
+                                    vld1q_u8(
+                                        table_data.add(off + (((a00 >> sh) & 0xFF) as usize) * 16),
+                                    ),
+                                );
+                                vb0 = veorq_u8(
+                                    vb0,
+                                    vld1q_u8(
+                                        table_data.add(off + (((b00 >> sh) & 0xFF) as usize) * 16),
+                                    ),
+                                );
+                            }};
+                        }
+                        step2!(1);
+                        step2!(2);
+                        step2!(3);
+                        step2!(4);
+                        step2!(5);
+                        step2!(6);
+                        step2!(7);
+                        crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                            vreinterpretq_u64_u8(va0),
+                            vreinterpretq_u64_u8(vb0),
+                            opr01_r0,
+                            opr01_r1,
+                            opr01_r0,
+                            opr01_r1,
+                        )
+                    } else {
+                        fold_2vars_ab_one!(ap0, bp0)
+                    };
+                    vst1q_u64(a_out_ptr.add(2 * q0l), va00);
+                    vst1q_u64(a_out_ptr.add(2 * (q0l + 1)), zero);
+                    vst1q_u64(a_out_ptr.add(2 * (q0l + 2)), zero);
+                    vst1q_u64(a_out_ptr.add(2 * (q0l + 3)), zero);
+                    vst1q_u64(b_out_ptr.add(2 * q0l), vb00);
+                    vst1q_u64(b_out_ptr.add(2 * (q0l + 1)), zero);
+                    vst1q_u64(b_out_ptr.add(2 * (q0l + 2)), zero);
+                    vst1q_u64(b_out_ptr.add(2 * (q0l + 3)), zero);
+                    let g00 = crate::gf2_kernels::k0_f128_mul_neon(va00, vb00);
+                    let veq = vld1q_u64(eq_ptr.add(2 * pl));
+                    let (t_ll, t_mid, t_hh) =
+                        crate::gf2_kernels::k0_f128_mul_unreduced_neon(veq, g00);
+                    p60_ll = veorq_u64(p60_ll, t_ll);
+                    p60_mid = veorq_u64(p60_mid, t_mid);
+                    p60_hh = veorq_u64(p60_hh, t_hh);
+                }
+            }
+            acc[1][0] = veorq_u64(acc[1][0], p60_ll);
+            acc[1][1] = veorq_u64(acc[1][1], p60_mid);
+            acc[1][2] = veorq_u64(acc[1][2], p60_hh);
+            acc[5][0] = veorq_u64(acc[5][0], p60_ll);
+            acc[5][1] = veorq_u64(acc[5][1], p60_mid);
+            acc[5][2] = veorq_u64(acc[5][2], p60_hh);
+            acc[7][0] = veorq_u64(acc[7][0], p60_ll);
+            acc[7][1] = veorq_u64(acc[7][1], p60_mid);
+            acc[7][2] = veorq_u64(acc[7][2], p60_hh);
+        } else {
+            for p_lo in 0..lo_size {
+                let q0l = 4 * p_lo;
+                let q0g = q_base + q0l;
+                let fold_one_padded = |qg: usize| -> (uint64x2_t, uint64x2_t) {
+                    let j0 = 2 * qg;
+                    let j1 = j0 + 1;
+                    if (j0 & pair_in_block_mask) >= useful_pairs_inclusive {
+                        return (zero, zero);
+                    }
+                    let ap = (a_pkt_ptr as *const u64).add(4 * qg);
+                    let bp = (b_pkt_ptr as *const u64).add(4 * qg);
+                    let a00 = ap.read_unaligned();
+                    let a10 = ap.add(1).read_unaligned();
+                    let b00 = bp.read_unaligned();
+                    let b10 = bp.add(1).read_unaligned();
+                    let (a01, a11, b01, b11) = if (j1 & pair_in_block_mask) < useful_pairs_inclusive
+                    {
+                        (
+                            ap.add(2).read_unaligned(),
+                            ap.add(3).read_unaligned(),
+                            bp.add(2).read_unaligned(),
+                            bp.add(3).read_unaligned(),
+                        )
+                    } else {
+                        (0, 0, 0, 0)
+                    };
+                    let ua10 = a00 ^ a10;
+                    let ua01 = a00 ^ a01;
+                    let ua11 = ua10 ^ (a01 ^ a11);
+                    let ub10 = b00 ^ b10;
+                    let ub01 = b00 ^ b01;
+                    let ub11 = ub10 ^ (b01 ^ b11);
+                    let (fa00, fa10, fa01, fa11) = fold_single_table4!(a00, ua10, ua01, ua11);
+                    let (fb00, fb10, fb01, fb11) = fold_single_table4!(b00, ub10, ub01, ub11);
+                    (
+                        combine_2vars_from_folded_neon!(fa00, fa10, fa01, fa11),
+                        combine_2vars_from_folded_neon!(fb00, fb10, fb01, fb11),
+                    )
+                };
+                let (va00, vb00) = fold_one_padded(q0g);
+                let (va10, vb10) = fold_one_padded(q0g + 1);
+                let (va01, vb01) = fold_one_padded(q0g + 2);
+                let (va11, vb11) = fold_one_padded(q0g + 3);
+                vst1q_u64(a_out_ptr.add(2 * q0l), va00);
+                vst1q_u64(a_out_ptr.add(2 * (q0l + 1)), va10);
+                vst1q_u64(a_out_ptr.add(2 * (q0l + 2)), va01);
+                vst1q_u64(a_out_ptr.add(2 * (q0l + 3)), va11);
+                vst1q_u64(b_out_ptr.add(2 * q0l), vb00);
+                vst1q_u64(b_out_ptr.add(2 * (q0l + 1)), vb10);
+                vst1q_u64(b_out_ptr.add(2 * (q0l + 2)), vb01);
+                vst1q_u64(b_out_ptr.add(2 * (q0l + 3)), vb11);
+                lookahead_from_folded!(p_lo, va00, vb00, va10, vb10, va01, vb01, va11, vb11);
+            }
+        }
+
+        let mut out = [F128::ZERO; 8];
+        for k in 0..8 {
+            let r = crate::gf2_kernels::k0_f128_reduce_3lane_neon(acc[k][0], acc[k][1], acc[k][2]);
+            out[k] = F128 {
+                lo: vgetq_lane_u64::<0>(r),
+                hi: vgetq_lane_u64::<1>(r),
+            };
+        }
+        out
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold_2vars_and_lookahead_chunk_neon_unchecked(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_0: F128,
+    rho_1: F128,
+    eq_lo: &[F128],
+) -> [F128; 8] {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut acc = [[zero; 3]; 8];
+        let lo_size = eq_lo.len();
+        let eq_ptr = eq_lo.as_ptr() as *const u64;
+        let a_in_ptr = a_in.as_ptr() as *const u64;
+        let b_in_ptr = b_in.as_ptr() as *const u64;
+        let a_out_ptr = a_out.as_mut_ptr() as *mut u64;
+        let b_out_ptr = b_out.as_mut_ptr() as *mut u64;
+
+        let v_rho0 = vcombine_u64(vcreate_u64(rho_0.lo), vcreate_u64(rho_0.hi));
+        let v_rho1 = vcombine_u64(vcreate_u64(rho_1.lo), vcreate_u64(rho_1.hi));
+        let rho_01 = rho_0 * rho_1;
+        let v_rho01 = vcombine_u64(vcreate_u64(rho_01.lo), vcreate_u64(rho_01.hi));
+
+        macro_rules! fold_2vars_f128 {
+            ($ptr:expr) => {{
+                let p = $ptr;
+                let w00 = vld1q_u64(p);
+                let w10 = vld1q_u64(p.add(2));
+                let w01 = vld1q_u64(p.add(4));
+                let w11 = vld1q_u64(p.add(6));
+                let f10 = veorq_u64(w00, w10);
+                let f01 = veorq_u64(w00, w01);
+                let f11 = veorq_u64(f10, veorq_u64(w01, w11));
+                let (l10, m10, h10) = crate::gf2_kernels::k0_f128_mul_unreduced_neon(f10, v_rho0);
+                let (l01, m01, h01) = crate::gf2_kernels::k0_f128_mul_unreduced_neon(f01, v_rho1);
+                let (l11, m11, h11) = crate::gf2_kernels::k0_f128_mul_unreduced_neon(f11, v_rho01);
+                let ll = veorq_u64(veorq_u64(l10, l01), l11);
+                let mid = veorq_u64(veorq_u64(m10, m01), m11);
+                let hh = veorq_u64(veorq_u64(h10, h01), h11);
+                veorq_u64(
+                    w00,
+                    crate::gf2_kernels::k0_f128_reduce_3lane_neon(ll, mid, hh),
+                )
+            }};
+        }
+
+        macro_rules! acc_unred_slot_with_sum {
+            ($idx:literal, $u:expr, $v:expr, $u_sum:expr, $v_sum:expr) => {{
+                let u = $u;
+                let v = $v;
+                let t_ll = vreinterpretq_u64_p128(vmull_p64(
+                    vgetq_lane_u64::<0>(u),
+                    vgetq_lane_u64::<0>(v),
+                ));
+                let t_mid = vreinterpretq_u64_p128(vmull_p64($u_sum, $v_sum));
+                let t_hh = vreinterpretq_u64_p128(vmull_high_p64(
+                    vreinterpretq_p64_u64(u),
+                    vreinterpretq_p64_u64(v),
+                ));
+                acc[$idx][0] = veorq_u64(acc[$idx][0], t_ll);
+                acc[$idx][1] = veorq_u64(acc[$idx][1], t_mid);
+                acc[$idx][2] = veorq_u64(acc[$idx][2], t_hh);
+            }};
+        }
+
+        for p_lo in 0..lo_size {
+            let s = 32 * p_lo;
+            let d = 8 * p_lo;
+            let ap = a_in_ptr.add(s);
+            let bp = b_in_ptr.add(s);
+            let va00 = fold_2vars_f128!(ap);
+            let vb00 = fold_2vars_f128!(bp);
+            let va10 = fold_2vars_f128!(ap.add(8));
+            let vb10 = fold_2vars_f128!(bp.add(8));
+            let va01 = fold_2vars_f128!(ap.add(16));
+            let vb01 = fold_2vars_f128!(bp.add(16));
+            let va11 = fold_2vars_f128!(ap.add(24));
+            let vb11 = fold_2vars_f128!(bp.add(24));
+
+            vst1q_u64(a_out_ptr.add(d), va00);
+            vst1q_u64(a_out_ptr.add(d + 2), va10);
+            vst1q_u64(a_out_ptr.add(d + 4), va01);
+            vst1q_u64(a_out_ptr.add(d + 6), va11);
+            vst1q_u64(b_out_ptr.add(d), vb00);
+            vst1q_u64(b_out_ptr.add(d + 2), vb10);
+            vst1q_u64(b_out_ptr.add(d + 4), vb01);
+            vst1q_u64(b_out_ptr.add(d + 6), vb11);
+
+            let veq = vld1q_u64(eq_ptr.add(2 * p_lo));
+            let (eq_r0, eq_r1) = crate::gf2_kernels::k0_f128_pre_reduce_const_neon(veq);
+            let (tb00, tb10) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                vb00, vb10, eq_r0, eq_r1, eq_r0, eq_r1,
+            );
+            let (tb01, tb11) = crate::gf2_kernels::k0_f128_mul_const_vec2_neon(
+                vb01, vb11, eq_r0, eq_r1, eq_r0, eq_r1,
+            );
+            let da0 = veorq_u64(va00, va10);
+            let da1 = veorq_u64(va01, va11);
+            let da_0 = veorq_u64(va00, va01);
+            let da_1 = veorq_u64(va10, va11);
+            let da_i = veorq_u64(da0, da1);
+
+            let dtb0 = veorq_u64(tb00, tb10);
+            let dtb1 = veorq_u64(tb01, tb11);
+            let dtb_0 = veorq_u64(tb00, tb01);
+            let dtb_1 = veorq_u64(tb10, tb11);
+            let dtb_i = veorq_u64(dtb0, dtb1);
+
+            let sva10 = vgetq_lane_u64::<0>(va10) ^ vgetq_lane_u64::<1>(va10);
+            let sva11 = vgetq_lane_u64::<0>(va11) ^ vgetq_lane_u64::<1>(va11);
+            let sva01 = vgetq_lane_u64::<0>(va01) ^ vgetq_lane_u64::<1>(va01);
+            let sda0 = vgetq_lane_u64::<0>(da0) ^ vgetq_lane_u64::<1>(da0);
+            let sda1 = sva01 ^ sva11;
+            let sda_1 = sva10 ^ sva11;
+            let sda_0 = sda0 ^ (sva10 ^ sva01);
+            let sda_i = sda0 ^ sda1;
+
+            let stb10 = vgetq_lane_u64::<0>(tb10) ^ vgetq_lane_u64::<1>(tb10);
+            let stb11 = vgetq_lane_u64::<0>(tb11) ^ vgetq_lane_u64::<1>(tb11);
+            let stb01 = vgetq_lane_u64::<0>(tb01) ^ vgetq_lane_u64::<1>(tb01);
+            let sdtb0 = vgetq_lane_u64::<0>(dtb0) ^ vgetq_lane_u64::<1>(dtb0);
+            let sdtb1 = stb01 ^ stb11;
+            let sdtb_1 = stb10 ^ stb11;
+            let sdtb_0 = sdtb0 ^ (stb10 ^ stb01);
+            let sdtb_i = sdtb0 ^ sdtb1;
+
+            acc_unred_slot_with_sum!(0, va10, tb10, sva10, stb10);
+            acc_unred_slot_with_sum!(1, da0, dtb0, sda0, sdtb0);
+            acc_unred_slot_with_sum!(2, va11, tb11, sva11, stb11);
+            acc_unred_slot_with_sum!(3, da1, dtb1, sda1, sdtb1);
+            acc_unred_slot_with_sum!(4, va01, tb01, sva01, stb01);
+            acc_unred_slot_with_sum!(5, da_0, dtb_0, sda_0, sdtb_0);
+            acc_unred_slot_with_sum!(6, da_1, dtb_1, sda_1, sdtb_1);
+            acc_unred_slot_with_sum!(7, da_i, dtb_i, sda_i, sdtb_i);
+        }
+
+        let mut out = [F128::ZERO; 8];
+        for k in 0..8 {
+            let r = crate::gf2_kernels::k0_f128_reduce_3lane_neon(acc[k][0], acc[k][1], acc[k][2]);
+            out[k] = F128 {
+                lo: vgetq_lane_u64::<0>(r),
+                hi: vgetq_lane_u64::<1>(r),
+            };
+        }
+        out
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold_2vars_and_round_pair_chunk_neon_unchecked(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_0: F128,
+    rho_1: F128,
+    eq_lo: &[F128],
+) -> (F128, F128) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut p1_ll = zero;
+        let mut p1_mid = zero;
+        let mut p1_hh = zero;
+        let mut pinf_ll = zero;
+        let mut pinf_mid = zero;
+        let mut pinf_hh = zero;
+        let lo_size = eq_lo.len();
+        let eq_ptr = eq_lo.as_ptr() as *const u64;
+        let a_in_ptr = a_in.as_ptr() as *const u64;
+        let b_in_ptr = b_in.as_ptr() as *const u64;
+        let a_out_ptr = a_out.as_mut_ptr() as *mut u64;
+        let b_out_ptr = b_out.as_mut_ptr() as *mut u64;
+
+        let v_rho0 = vcombine_u64(vcreate_u64(rho_0.lo), vcreate_u64(rho_0.hi));
+        let v_rho1 = vcombine_u64(vcreate_u64(rho_1.lo), vcreate_u64(rho_1.hi));
+        let rho_01 = rho_0 * rho_1;
+        let v_rho01 = vcombine_u64(vcreate_u64(rho_01.lo), vcreate_u64(rho_01.hi));
+
+        macro_rules! fold_2vars_f128 {
+            ($ptr:expr) => {{
+                let p = $ptr;
+                let w00 = vld1q_u64(p);
+                let w10 = vld1q_u64(p.add(2));
+                let w01 = vld1q_u64(p.add(4));
+                let w11 = vld1q_u64(p.add(6));
+                let f10 = veorq_u64(w00, w10);
+                let f01 = veorq_u64(w00, w01);
+                let f11 = veorq_u64(f10, veorq_u64(w01, w11));
+                let (l10, m10, h10) = crate::gf2_kernels::k0_f128_mul_unreduced_neon(f10, v_rho0);
+                let (l01, m01, h01) = crate::gf2_kernels::k0_f128_mul_unreduced_neon(f01, v_rho1);
+                let (l11, m11, h11) = crate::gf2_kernels::k0_f128_mul_unreduced_neon(f11, v_rho01);
+                let ll = veorq_u64(veorq_u64(l10, l01), l11);
+                let mid = veorq_u64(veorq_u64(m10, m01), m11);
+                let hh = veorq_u64(veorq_u64(h10, h01), h11);
+                veorq_u64(
+                    w00,
+                    crate::gf2_kernels::k0_f128_reduce_3lane_neon(ll, mid, hh),
+                )
+            }};
+        }
+
+        for x_lo in 0..lo_size {
+            let s = 16 * x_lo;
+            let d = 4 * x_lo;
+            let ap = a_in_ptr.add(s);
+            let bp = b_in_ptr.add(s);
+            let va0 = fold_2vars_f128!(ap);
+            let vb0 = fold_2vars_f128!(bp);
+            let va1 = fold_2vars_f128!(ap.add(8));
+            let vb1 = fold_2vars_f128!(bp.add(8));
+
+            vst1q_u64(a_out_ptr.add(d), va0);
+            vst1q_u64(a_out_ptr.add(d + 2), va1);
+            vst1q_u64(b_out_ptr.add(d), vb0);
+            vst1q_u64(b_out_ptr.add(d + 2), vb1);
+
+            let vad = veorq_u64(va0, va1);
+            let vbd = veorq_u64(vb0, vb1);
+            let (g1, ginf) = crate::gf2_kernels::k0_f128_mul_vec2_neon(va1, vad, vb1, vbd);
+            let veq = vld1q_u64(eq_ptr.add(2 * x_lo));
+            crate::gf2_kernels::k0_f128_mul_acc_pair_neon(
+                veq,
+                g1,
+                ginf,
+                &mut p1_ll,
+                &mut p1_mid,
+                &mut p1_hh,
+                &mut pinf_ll,
+                &mut pinf_mid,
+                &mut pinf_hh,
+            );
+        }
+
+        let res1 = crate::gf2_kernels::k0_f128_reduce_3lane_neon(p1_ll, p1_mid, p1_hh);
+        let resi = crate::gf2_kernels::k0_f128_reduce_3lane_neon(pinf_ll, pinf_mid, pinf_hh);
+        (
+            F128 {
+                lo: vgetq_lane_u64::<0>(res1),
+                hi: vgetq_lane_u64::<1>(res1),
+            },
+            F128 {
+                lo: vgetq_lane_u64::<0>(resi),
+                hi: vgetq_lane_u64::<1>(resi),
+            },
+        )
     }
 }

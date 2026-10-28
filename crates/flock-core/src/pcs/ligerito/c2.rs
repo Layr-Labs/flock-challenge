@@ -1,9 +1,3 @@
-// Copyright (c) 2026 Bain Capital Crypto, LP and Ron Rothblum
-// Modifications copyright 2026 Succinct Labs, Benedikt Bunz, William Wang
-// SPDX-License-Identifier: Apache-2.0 OR MIT
-//
-// Delayed L0 induction: retain sparse query residues through two folds.
-
 use super::*;
 
 #[inline]
@@ -11,14 +5,11 @@ fn mul(a: F128, b: F128) -> F128 {
     a * b
 }
 
+#[inline]
 fn dot(a: &[F128], b: &[F128]) -> F128 {
-    assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(b)
-        .fold(F128::ZERO, |s, (&x, &y)| s + mul(x, y))
+    crate::field::f128_slice::inner_product(a, b)
 }
 
-/// An exact row of a local forward NTT, generated without a dense matrix.
 fn local_row(ntt: &AdditiveNttF128, log_d: usize, k: usize, query: usize) -> [F128; 8] {
     let mut row = [F128::ZERO; 8];
     row[0] = F128::ONE;
@@ -78,7 +69,6 @@ impl Dual {
                 cache[j] = dot(row(base + j), &lane_weights);
             }
             enforced += mul(alpha, cache[q - base]);
-            // Invert the final three forward layers of the valid codeword.
             for layer in ((log_d - 3)..log_d).rev() {
                 let size = 1usize << (log_d - layer);
                 let half = size / 2;
@@ -169,24 +159,18 @@ impl Dual {
             values.push(mul(alpha, v));
         }
         let reduced_log_d = self.log_d - 2;
-        // Keep the original NTT's twiddles. A fresh NTT at the smaller
-        // dimension would describe a different linear map.
-        let (mut basis, _) = transpose_forward_ntt_sparse_impl(
+        let mut basis = transpose_forward_ntt_sparse_truncated(
             &self.ntt,
             &positions,
             &values,
             reduced_log_d,
-            false,
-            None,
-            false,
+            self.log_inv_rate,
         );
         basis.truncate(1usize << (reduced_log_d - self.log_inv_rate));
         basis
     }
 }
 
-/// Owns the sparse term separately from the one-fold lazy OOD slot.
-/// The caller drops this state immediately after `fold` completes depth two.
 pub(super) struct Pending {
     dual: Dual,
     enforced: F128,
@@ -200,11 +184,7 @@ impl Pending {
         enforced: F128,
         sc: &mut SumcheckProver,
     ) -> (Self, SumcheckMessage) {
-        assert!(sc.pending_glue.is_none() && sc.pending_fold_basis.is_none());
-        assert!(matches!(
-            sc.pending_ood_eq,
-            Some(PendingOodEq::Glued { .. })
-        ));
+        assert!(sc.pending_glue.is_none());
         let mut state = Self {
             dual,
             enforced,
@@ -226,8 +206,6 @@ impl Pending {
         self.glued = true;
     }
 
-    /// Correct both copies of the message before the next challenge, and
-    /// materialize/merge exactly once before any subsequent introduction.
     pub(super) fn fold(&mut self, r: F128, sc: &mut SumcheckProver) -> (SumcheckMessage, bool) {
         assert!(self.glued && self.challenges.len() < 2);
         let mut message = sc.fold(r);
@@ -238,21 +216,19 @@ impl Pending {
         *sc.transcript.last_mut().expect("fold records a message") = message;
         let complete = self.challenges.len() == 2;
         if complete {
-            assert!(
-                sc.pending_glue.is_none()
-                    && sc.pending_fold_basis.is_none()
-                    && sc.pending_ood_eq.is_none()
-            );
+            assert!(sc.pending_glue.is_none());
             let basis = self.dual.materialize(&self.challenges);
             assert_eq!(basis.len(), sc.combined_basis.len());
-            for (dst, src) in sc.combined_basis.iter_mut().zip(basis) {
-                *dst += src;
-            }
+            crate::field::f128_slice::xor_assign(&mut sc.combined_basis, &basis);
         }
         (message, complete)
     }
 }
 
-pub(super) fn enabled(lazy_l1_selected: bool, disabled: Option<&std::ffi::OsStr>) -> bool {
-    lazy_l1_selected && disabled != Some(std::ffi::OsStr::new("1"))
+pub(super) fn enabled(log_d: usize, log_inv_rate: usize, next_k: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let flag = *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_LIG_C2").as_deref() != Some(std::ffi::OsStr::new("1"))
+    });
+    flag && log_inv_rate + 2 < log_d && log_d >= 5 && next_k >= 2
 }

@@ -1,10 +1,3 @@
-//! Diagnostic-only cross-process timestamps (`FLOCK_TMARK=1`).
-//!
-//! Records `(label, CLOCK_UPTIME_RAW ns)` pairs into a fixed array so an
-//! external driver that stamps its own seed write on the same clock can see
-//! where the timed window goes. With the variable unset every call is one
-//! cached-bool load; nothing is recorded and nothing is printed.
-
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const SLOTS: usize = 64;
@@ -18,7 +11,6 @@ fn on() -> bool {
     *ON
 }
 
-/// Monotonic nanoseconds on the clock Python's `CLOCK_UPTIME_RAW` reads.
 pub fn now_ns() -> u64 {
     #[cfg(target_os = "macos")]
     unsafe {
@@ -33,7 +25,6 @@ pub fn now_ns() -> u64 {
     }
 }
 
-/// Record `label` now (no-op unless `FLOCK_TMARK` is set).
 #[inline]
 pub fn mark(label: &'static str) {
     if !on() {
@@ -51,7 +42,6 @@ pub fn mark(label: &'static str) {
     }
 }
 
-/// Print and clear every recorded mark to stderr.
 pub fn dump() {
     if !on() {
         return;
@@ -59,6 +49,10 @@ pub fn dump() {
     let n = NEXT.swap(0, Ordering::Relaxed).min(SLOTS);
     let l = LABELS.lock().unwrap_or_else(|e| e.into_inner());
     for i in 0..n {
-        eprintln!("[tmark] {} {}", NS[i].load(Ordering::Relaxed), l.get(i).copied().unwrap_or(""));
+        eprintln!(
+            "[tmark] {} {}",
+            NS[i].load(Ordering::Relaxed),
+            l.get(i).copied().unwrap_or("")
+        );
     }
 }

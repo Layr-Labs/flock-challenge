@@ -1,25 +1,14 @@
-#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
-use super::super::{ELL, F128, N_MEDIUM};
 #[cfg(target_feature = "gfni")]
-use super::super::{F8, InvNttTableByteSingleGf8, N_CHUNKS};
+use super::super::F8;
+#[cfg(all(target_feature = "avx512f", target_feature = "vpclmulqdq"))]
+use super::super::N_MEDIUM;
+#[cfg(target_arch = "x86_64")]
+use super::super::{ELL, F128, InvNttTableByteSingleGf8, N_CHUNKS};
 
-/// AVX-512 (VBMI) 64-byte bit-transpose — direct port of the NEON two-stage
-/// algorithm. `_mm512_permutexvar_epi8` does the byte-gather (NEON `vqtbl4q`)
-/// in one instruction; the three masked bit-swap rounds (distances 7/14/28)
-/// are identical to the NEON version, applied to all eight 64-bit lanes at once.
-///
-/// Replaces `bit_transpose_64bytes_scalar` (512 branchy bit ops/call) — which
-/// profiling showed was ~85% of round1's time on x86.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "avx512bw",
-    target_feature = "avx512vbmi"
-))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512vbmi,avx512bw,avx512f")]
 pub(crate) unsafe fn bit_transpose_64bytes_avx512(input: &[u8; 64], output: &mut [u8; 64]) {
     use core::arch::x86_64::*;
-    // Gather index = NEON IDX0 ++ IDX1 ++ IDX2 ++ IDX3 (the 8×8 byte transpose).
     #[rustfmt::skip]
     const IDX: [i8; 64] = [
         0, 8, 16, 24, 32, 40, 48, 56,  1, 9, 17, 25, 33, 41, 49, 57,
@@ -30,7 +19,7 @@ pub(crate) unsafe fn bit_transpose_64bytes_avx512(input: &[u8; 64], output: &mut
     unsafe {
         let inp = _mm512_loadu_si512(input.as_ptr() as *const __m512i);
         let idx = _mm512_loadu_si512(IDX.as_ptr() as *const __m512i);
-        let mut y = _mm512_permutexvar_epi8(idx, inp); // y[i] = input[IDX[i]]
+        let mut y = _mm512_permutexvar_epi8(idx, inp);
 
         let mask1 = _mm512_set1_epi64(0x00AA00AA00AA00AAu64 as i64);
         let mask2 = _mm512_set1_epi64(0x0000CCCC0000CCCCu64 as i64);
@@ -47,11 +36,8 @@ pub(crate) unsafe fn bit_transpose_64bytes_avx512(input: &[u8; 64], output: &mut
     }
 }
 
-/// SSE/GFNI x86 kernel. The inverse-NTT apply uses its best available x86 path,
-/// writes two 64-byte columns, and this kernel multiplies them four XMM chunks
-/// at a time. Kept as the fallback for GFNI CPUs without AVX-512.
 #[inline]
-#[allow(dead_code)] // unused in native AVX-512 builds; exercised by its oracle test
+#[allow(dead_code)]
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni"))]
 #[target_feature(enable = "gfni,sse2")]
 pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
@@ -67,24 +53,59 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
     use core::arch::x86_64::*;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
 
-    // SAFETY: function carries gfni+sse2; raw loads/stores stay within the
-    // validated `a_col`/`b_col` (len ELL) and `out` ([u8; 64]) buffers.
     unsafe {
-        // 4 byte-accumulators × 16 lanes = ELL = 64 lanes, reduced F_8 values.
         let mut acc = [_mm_setzero_si128(); 4];
         for k in 0..8usize {
             let chunk_off = byte_base_b + k * N_CHUNKS;
-            inv_table.apply(&a_packed[chunk_off..chunk_off + N_CHUNKS], a_col);
-            inv_table.apply(&b_packed[chunk_off..chunk_off + N_CHUNKS], b_col);
-            let a_ptr = a_col.as_ptr() as *const u8;
-            let b_ptr = b_col.as_ptr() as *const u8;
-            let xk = _mm_set1_epi8((1u8 << k) as i8); // x^k as an F_8 byte; k=0 ⇒ 1
-            for c in 0..4usize {
-                let av = _mm_loadu_si128(a_ptr.add(c * 16) as *const __m128i);
-                let bv = _mm_loadu_si128(b_ptr.add(c * 16) as *const __m128i);
-                // y = (a·b) · x^k in F_8. For k=0, xk=1 ⇒ second mul is identity.
-                let y = _mm_gf2p8mul_epi8(_mm_gf2p8mul_epi8(av, bv), xk);
-                acc[c] = _mm_xor_si128(acc[c], y);
+            let bw = (b_packed.as_ptr().add(chunk_off) as *const u64).read_unaligned();
+            if bw == 0 {
+                continue;
+            }
+            let aw = (a_packed.as_ptr().add(chunk_off) as *const u64).read_unaligned();
+            if aw == 0 {
+                continue;
+            }
+            let xk = _mm_set1_epi8((1u8 << k) as i8);
+            if bw == !0u64 {
+                inv_table.apply(&a_packed[chunk_off..chunk_off + N_CHUNKS], a_col);
+                let a_ptr = a_col.as_ptr() as *const u8;
+                for c in 0..4usize {
+                    let av = _mm_loadu_si128(a_ptr.add(c * 16) as *const __m128i);
+                    let y = if k == 0 {
+                        av
+                    } else {
+                        _mm_gf2p8mul_epi8(av, xk)
+                    };
+                    acc[c] = _mm_xor_si128(acc[c], y);
+                }
+            } else if aw == !0u64 {
+                inv_table.apply(&b_packed[chunk_off..chunk_off + N_CHUNKS], b_col);
+                let b_ptr = b_col.as_ptr() as *const u8;
+                for c in 0..4usize {
+                    let bv = _mm_loadu_si128(b_ptr.add(c * 16) as *const __m128i);
+                    let y = if k == 0 {
+                        bv
+                    } else {
+                        _mm_gf2p8mul_epi8(bv, xk)
+                    };
+                    acc[c] = _mm_xor_si128(acc[c], y);
+                }
+            } else {
+                inv_table.apply(&a_packed[chunk_off..chunk_off + N_CHUNKS], a_col);
+                inv_table.apply(&b_packed[chunk_off..chunk_off + N_CHUNKS], b_col);
+                let a_ptr = a_col.as_ptr() as *const u8;
+                let b_ptr = b_col.as_ptr() as *const u8;
+                for c in 0..4usize {
+                    let av = _mm_loadu_si128(a_ptr.add(c * 16) as *const __m128i);
+                    let bv = _mm_loadu_si128(b_ptr.add(c * 16) as *const __m128i);
+                    let prod = _mm_gf2p8mul_epi8(av, bv);
+                    let y = if k == 0 {
+                        prod
+                    } else {
+                        _mm_gf2p8mul_epi8(prod, xk)
+                    };
+                    acc[c] = _mm_xor_si128(acc[c], y);
+                }
             }
         }
         let out_ptr = out.as_mut_ptr();
@@ -94,16 +115,8 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_sse(
     }
 }
 
-/// Fused AVX-512/GFNI x86 kernel. Each inverse-NTT apply returns all 64 F_8
-/// evaluations in one ZMM register; the product and x^k scaling stay 64-wide
-/// and register-resident through the final XOR accumulation.
 #[inline]
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "gfni",
-    target_feature = "avx512f",
-    target_feature = "avx512bw"
-))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "gfni,avx512f,avx512bw")]
 pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     a_packed: &[u8],
@@ -113,127 +126,189 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
     b_med: usize,
     out: &mut [u8; 64],
 ) {
-    use core::arch::x86_64::*;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
 
-    // SAFETY: the caller's packed-input bounds guarantee 8 readable bytes at
-    // every K-row offset. The table has the protocol-fixed ell=64/chunks=8
-    // shape, and `out` is exactly one writable ZMM register.
     unsafe {
-        let mut acc = _mm512_setzero_si512();
-        for k in 0..8usize {
-            let off = byte_base_b + k * N_CHUNKS;
-            let av = inv_table.apply_x86_avx512_register_unchecked(a_packed.as_ptr().add(off));
-            let bv = inv_table.apply_x86_avx512_register_unchecked(b_packed.as_ptr().add(off));
-            let product = _mm512_gf2p8mul_epi8(av, bv);
-            // x^0 is the multiplicative identity, so avoid one GFNI operation
-            // for the first row.
-            let scaled = if k == 0 {
-                product
-            } else {
-                _mm512_gf2p8mul_epi8(product, _mm512_set1_epi8((1u8 << k) as i8))
-            };
-            acc = _mm512_xor_si512(acc, scaled);
-        }
-        _mm512_storeu_si512(out.as_mut_ptr() as *mut __m512i, acc);
+        crate::gf2_kernels::k0_gf8_shift_reduce_inner_ab_gfni_avx512_slice(
+            a_packed.as_ptr().add(byte_base_b),
+            b_packed.as_ptr().add(byte_base_b),
+            inv_table.data_ptr(),
+            out.as_mut_ptr(),
+        );
     }
 }
-/// x86 AVX-512 convert-table fold, AB half of the eight-bank C variant. Table
-/// lookups stay scalar because their byte-selected addresses are irregular,
-/// while four lanes of the resulting F128 accumulator are multiplied by
-/// `eq_lo_val` in one VPCLMULQDQ batch before being XORed into the worker
-/// partials. The C side is table-free (see `kernels::accumulate_c_banks`).
+
+#[inline]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+pub(crate) unsafe fn build_ab_eq_fold_mats_x86_gfni(
+    eq_lo_val: F128,
+    convert: &[F128],
+    out_mats: &mut [[u64; 16]; 16],
+) {
+    debug_assert!(convert.len() >= 16 * 256);
+    unsafe {
+        crate::gf2_kernels::k0_f128_build_ab_eq_fold_mats_gfni_slice(
+            eq_lo_val.lo,
+            eq_lo_val.hi,
+            convert.as_ptr() as *const u64,
+            out_mats.as_mut_ptr() as *mut u64,
+        );
+    }
+}
+
+#[inline]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,gfni")]
+pub(crate) unsafe fn convert_ab_gfni_nomul(
+    ab_rows: &[[u8; ELL]],
+    n_b_med: usize,
+    mats: &[[u64; 16]; 16],
+    out_banks: &mut [[u8; 64]; 16],
+) {
+    debug_assert!(n_b_med <= ab_rows.len() && n_b_med <= 16);
+    unsafe {
+        crate::gf2_kernels::k0_gf8_urm_convert_ab_nomul_gfni_slice(
+            ab_rows.as_ptr() as *const u8,
+            n_b_med,
+            mats.as_ptr() as *const u64,
+            out_banks.as_mut_ptr() as *mut u8,
+        );
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+pub(crate) unsafe fn c_plane_bank_to_f128_x86_avx512(
+    plane_bank: &[[u8; 64]; 16],
+    out: &mut [F128; ELL],
+) {
+    unsafe {
+        crate::gf2_kernels::k0_f128_plane_bank_to_f128_slice(
+            plane_bank.as_ptr() as *const u8,
+            out.as_mut_ptr() as *mut u64,
+        );
+    }
+}
+
+#[inline]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,vpclmulqdq")]
+pub(crate) unsafe fn fold_ab_plane_banks_x86_avx512(
+    plane_banks: &[[[u8; 64]; 16]],
+    weights: &[F128],
+    n_banks: usize,
+    out: &mut [F128; ELL],
+) {
+    debug_assert!(n_banks <= plane_banks.len() && n_banks <= weights.len() && n_banks <= 8);
+    unsafe {
+        crate::gf2_kernels::k0_f128_fold_ab_plane_banks_slice(
+            plane_banks.as_ptr() as *const u8,
+            weights.as_ptr() as *const u64,
+            n_banks,
+            out.as_mut_ptr() as *mut u64,
+        );
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+pub(crate) unsafe fn build_gf2_c4_fold_mats_x86_gfni(
+    table: &[F128],
+    coeffs: &[F128; 4],
+    out_bcast_mats: &mut [[u64; 8]; 64],
+) {
+    debug_assert!(table.len() >= 8 * 256);
+    unsafe {
+        crate::gf2_kernels::k0_f128_build_gf2_c4_fold_mats_gfni_slice(
+            table.as_ptr() as *const u64,
+            coeffs.as_ptr() as *const u64,
+            out_bcast_mats.as_mut_ptr() as *mut u64,
+        );
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+pub(crate) unsafe fn fold_64_gf2_rows_gfni_c4(
+    rows: &[u64; 64],
+    bcast_mats: &[[u64; 8]; 64],
+    out: &mut [F128; 16],
+    dead_lines: u8,
+) {
+    unsafe {
+        crate::gf2_kernels::k0_gf2_fold_64_rows_gfni_c4_slice(
+            rows.as_ptr() as *const u8,
+            bcast_mats.as_ptr() as *const u64,
+            out.as_mut_ptr() as *mut u64,
+            dead_lines,
+        );
+    }
+}
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
     target_feature = "vpclmulqdq"
 ))]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
-pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
+pub(crate) unsafe fn accumulate_convert_with_s_hat_v_x86_avx512(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
-    first_b_med: usize,
+    chunk_c_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
     partial_ab: &mut [F128; ELL],
+    partial_c_0: &mut [F128; ELL],
+    partial_c_1: &mut [F128; ELL],
 ) {
     use crate::field::gf2_128::x86_64::{f128x4_set, ghash_mul_x4};
     use core::arch::x86_64::*;
     debug_assert!(n_b_med <= 1 << N_MEDIUM);
     debug_assert_eq!(ELL % 4, 0);
 
-    // SAFETY: the fixed-size input/partial arrays contain every four-lane load
-    // and store below. Convert indices are `b_med * 256 + u8`, bounded by the
-    // 16*256-entry table. The cfg gate supplies both required target features.
     unsafe {
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
-            for b_med in first_b_med..n_b_med {
+            let mut cf_c_0 = [F128::ZERO; 4];
+            let mut cf_c_1 = [F128::ZERO; 4];
+            for b_med in 0..n_b_med {
                 let table_base = b_med * 256;
                 for j in 0..4 {
                     let v_ab = chunk_ab_bytes[b_med][lane + j] as usize;
+                    let v_c = chunk_c_bytes[b_med][lane + j] as usize;
                     cf_ab[j] += convert[table_base + v_ab];
+                    cf_c_0[j] += convert[table_base + (v_c & 0x55)];
+                    cf_c_1[j] += convert[table_base + (v_c & 0xAA)];
                 }
             }
 
             let scaled_ab = ghash_mul_x4(f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]), eq);
+            let scaled_c_0 =
+                ghash_mul_x4(f128x4_set(cf_c_0[0], cf_c_0[1], cf_c_0[2], cf_c_0[3]), eq);
+            let scaled_c_1 =
+                ghash_mul_x4(f128x4_set(cf_c_1[0], cf_c_1[1], cf_c_1[2], cf_c_1[3]), eq);
 
             let ab_ptr = partial_ab.as_mut_ptr().add(lane) as *mut __m512i;
+            let c0_ptr = partial_c_0.as_mut_ptr().add(lane) as *mut __m512i;
+            let c1_ptr = partial_c_1.as_mut_ptr().add(lane) as *mut __m512i;
             _mm512_storeu_si512(
                 ab_ptr,
                 _mm512_xor_si512(_mm512_loadu_si512(ab_ptr), scaled_ab),
             );
-        }
-    }
-}
-
-/// Multiply-free twin of [`accumulate_convert_ab_x86_avx512`] for the banked
-/// `eq_lo` tensor fold.
-///
-/// Same scalar table gathers; the VPCLMULQDQ batch is gone. The `eq_lo` scale
-/// now rides on the table the caller selected (`T_w[i] = convert[i] ·
-/// eq_top[w]`) and on the once-per-band `eq_bot[u]` fold of the bank, so the
-/// four-lane accumulator is XORed straight into the bank.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx512f",
-    target_feature = "vpclmulqdq"
-))]
-#[target_feature(enable = "avx512f,vpclmulqdq")]
-pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_avx512(
-    chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
-    first_b_med: usize,
-    n_b_med: usize,
-    convert: &[F128],
-    bank: &mut [F128; ELL],
-) {
-    use crate::field::gf2_128::x86_64::f128x4_set;
-    use core::arch::x86_64::*;
-    debug_assert!(n_b_med <= 1 << N_MEDIUM);
-    debug_assert_eq!(ELL % 4, 0);
-
-    // SAFETY: the fixed-size input/bank arrays contain every four-lane load and
-    // store below. Convert indices are `b_med * 256 + u8`, bounded by the
-    // 16*256-entry table. The cfg gate supplies the required target features.
-    unsafe {
-        for lane in (0..ELL).step_by(4) {
-            let mut cf_ab = [F128::ZERO; 4];
-            for b_med in first_b_med..n_b_med {
-                let table_base = b_med * 256;
-                for j in 0..4 {
-                    let v_ab = chunk_ab_bytes[b_med][lane + j] as usize;
-                    cf_ab[j] += convert[table_base + v_ab];
-                }
-            }
-
-            let ab_ptr = bank.as_mut_ptr().add(lane) as *mut __m512i;
             _mm512_storeu_si512(
-                ab_ptr,
-                _mm512_xor_si512(
-                    _mm512_loadu_si512(ab_ptr),
-                    f128x4_set(cf_ab[0], cf_ab[1], cf_ab[2], cf_ab[3]),
-                ),
+                c0_ptr,
+                _mm512_xor_si512(_mm512_loadu_si512(c0_ptr), scaled_c_0),
+            );
+            _mm512_storeu_si512(
+                c1_ptr,
+                _mm512_xor_si512(_mm512_loadu_si512(c1_ptr), scaled_c_1),
             );
         }
     }

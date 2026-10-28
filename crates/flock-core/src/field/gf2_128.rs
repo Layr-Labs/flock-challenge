@@ -1,20 +1,3 @@
-// Copyright 2025 The Binius Developers
-// Copyright 2025 Irreducible, Inc.
-// Modifications copyright 2026 Succinct Labs, Benedikt Bunz, William Wang
-// SPDX-License-Identifier: Apache-2.0 OR MIT
-//
-// The default `Mul` implementation (`ghash_mul_binius`) is a port of
-// `mul_clmul` from binius64
-// (https://github.com/binius-zk/binius64, `crates/field/src/arch/shared/ghash.rs`).
-
-//! GF(2^128) in GHASH form: irreducible polynomial x^128 + x^7 + x^2 + x + 1.
-//!
-//! Layout: `lo` holds coefficients x^0..x^63, `hi` holds x^64..x^127.
-//! Hardware: `vmull_p64` (ARM PMULL, AES extension) does a 64×64 carry-less mul
-//! in one instruction. Default `Mul` impl uses the binius64 reduction variant
-//! (4 PMULL schoolbook + 2-stage recursive reduction, 2 extra PMULL), which
-//! benchmarked as the fastest of four variants tried.
-
 use core::ops::{Add, AddAssign, BitXor, BitXorAssign, Mul, MulAssign};
 
 use serde::{Deserialize, Serialize};
@@ -35,7 +18,6 @@ impl F128 {
         Self { lo, hi }
     }
 
-    /// The generator γ (i.e. the element `x`). `mul_by_x` is a fast shift+fold.
     #[inline]
     pub const fn generator() -> Self {
         Self { lo: 2, hi: 0 }
@@ -46,20 +28,58 @@ impl F128 {
         self.lo == 0 && self.hi == 0
     }
 
-    /// 256-bit unreduced product `(self · rhs)`. Caller XORs many of these into
-    /// an `F256Unreduced` accumulator and calls `.reduce()` once at the end.
-    /// Reduction commutes with XOR, so Σ (aᵢ·bᵢ) mod p = (Σ aᵢ·bᵢ) mod p.
     #[inline]
     pub fn mul_unreduced(self, rhs: Self) -> F256Unreduced {
         ghash_mul_unreduced(self, rhs)
     }
 
-    /// Multiplicative inverse via Fermat: x^{2^128 − 2}.
-    /// Used in one-time setup (Lagrange weight computation), not in hot paths.
+    #[inline(always)]
+    pub fn mle_fold(self, v1: Self, r: Self) -> Self {
+        self + (self + v1) * r
+    }
+
+    #[inline(always)]
+    pub fn mle_fold_kernel(self, v1: Self, r: Self) -> Self {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        unsafe {
+            return Self {
+                lo: crate::gf2_kernels::gf2_kern_mle_fold_lo(
+                    self.lo, self.hi, v1.lo, v1.hi, r.lo, r.hi,
+                ),
+                hi: crate::gf2_kernels::gf2_kern_mle_fold_hi(
+                    self.lo, self.hi, v1.lo, v1.hi, r.lo, r.hi,
+                ),
+            };
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            self + (self + v1) * r
+        }
+    }
+
+    #[inline(always)]
+    pub fn fma(self, a: Self, b: Self) -> Self {
+        (self * a) + b
+    }
+
+    #[inline(always)]
+    pub fn fma_kernel(self, a: Self, b: Self) -> Self {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        unsafe {
+            return Self {
+                lo: crate::gf2_kernels::gf2_kern_f128_fma_lo(self.lo, self.hi, a.lo, a.hi, b.lo),
+                hi: crate::gf2_kernels::gf2_kern_f128_fma_hi(self.lo, self.hi, a.lo, a.hi, b.hi),
+            };
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            (self * a) + b
+        }
+    }
+
     pub fn inv(self) -> Self {
-        // x^{2^128 - 2} = ∏_{i=1..127} x^{2^i}
         let mut r = Self::ONE;
-        let mut cur = self * self; // x^2
+        let mut cur = self * self;
         for _ in 1..128 {
             r *= cur;
             cur = cur * cur;
@@ -89,25 +109,14 @@ impl AddAssign for F128 {
 
 impl Mul for F128 {
     type Output = Self;
-    #[inline]
+    #[inline(always)]
     fn mul(self, rhs: Self) -> Self {
-        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-        {
-            // SAFETY: aes target feature is enabled at compile time.
-            unsafe { aarch64::ghash_mul_binius(self, rhs) }
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        unsafe {
+            let (lo, hi) = crate::gf2_kernels::k0_f128_mul_raw(self.lo, self.hi, rhs.lo, rhs.hi);
+            return Self { lo, hi };
         }
-        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
-        {
-            // SAFETY: pclmulqdq target feature is enabled at compile time.
-            // On Zen4, karatsuba+barrett is ~17% faster in throughput (the
-            // dominant mode for the bulk parallel F128 work) than binius, which
-            // only wins the latency microbench. (M-series picked binius.)
-            unsafe { x86_64::ghash_mul_karatsuba_barrett(self, rhs) }
-        }
-        #[cfg(not(any(
-            all(target_arch = "aarch64", target_feature = "aes"),
-            all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-        )))]
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             software::ghash_mul(self, rhs)
         }
@@ -121,21 +130,25 @@ impl MulAssign for F128 {
     }
 }
 
-/// Multiply by x (the generator). One shift + conditional XOR with 0x87, no PMULL.
-/// Used by the sumcheck round when the fixed evaluation point is the generator.
 #[inline]
-pub const fn mul_by_x(z: F128) -> F128 {
-    let carry = z.hi >> 63;
-    let mask = 0u64.wrapping_sub(carry); // 0 or all-ones
-    F128 {
-        lo: (z.lo << 1) ^ (0x87 & mask),
-        hi: (z.hi << 1) | (z.lo >> 63),
+pub fn mul_by_x(z: F128) -> F128 {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        return F128 {
+            lo: crate::gf2_kernels::gf2_kern_mul_by_x_lo(z.lo, z.hi),
+            hi: crate::gf2_kernels::gf2_kern_mul_by_x_hi(z.lo, z.hi),
+        };
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let carry = z.hi >> 63;
+        let mask = 0u64.wrapping_sub(carry);
+        F128 {
+            lo: (z.lo << 1) ^ (0x87 & mask),
+            hi: (z.hi << 1) | (z.lo >> 63),
+        }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Deferred reduction: 256-bit unreduced products that can be XOR-accumulated.
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct F256Unreduced {
@@ -182,78 +195,55 @@ impl BitXorAssign for F256Unreduced {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Reduction mod p = x^128 + x^7 + x^2 + x + 1. Works on any target.
-// ---------------------------------------------------------------------------
-
-/// Fold the upper 128 bits (r2:r3) into the lower 128 bits (r0:r1) mod p.
-/// x^128 ≡ x^7 + x^2 + x + 1, so U·x^128 ≡ U ^ (U<<1) ^ (U<<2) ^ (U<<7).
 #[inline]
 pub fn ghash_reduce(r0: u64, r1: u64, r2: u64, r3: u64) -> F128 {
-    let s1_lo = r2 << 1;
-    let s1_hi = (r3 << 1) | (r2 >> 63);
-    let s2_lo = r2 << 2;
-    let s2_hi = (r3 << 2) | (r2 >> 62);
-    let s7_lo = r2 << 7;
-    let s7_hi = (r3 << 7) | (r2 >> 57);
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        return F128 {
+            lo: crate::gf2_kernels::gf2_kern_ghash_reduce_lo(r0, r2, r3),
+            hi: crate::gf2_kernels::gf2_kern_ghash_reduce_hi(r1, r2, r3),
+        };
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let s1_lo = r2 << 1;
+        let s1_hi = (r3 << 1) | (r2 >> 63);
+        let s2_lo = r2 << 2;
+        let s2_hi = (r3 << 2) | (r2 >> 62);
+        let s7_lo = r2 << 7;
+        let s7_hi = (r3 << 7) | (r2 >> 57);
 
-    let t_lo = r2 ^ s1_lo ^ s2_lo ^ s7_lo;
-    let t_hi = r3 ^ s1_hi ^ s2_hi ^ s7_hi;
+        let t_lo = r2 ^ s1_lo ^ s2_lo ^ s7_lo;
+        let t_hi = r3 ^ s1_hi ^ s2_hi ^ s7_hi;
 
-    // Bits of r3 that shifted past position 127 (top 7 bits, in 3 shifts).
-    let ov = (r3 >> 63) ^ (r3 >> 62) ^ (r3 >> 57);
-    let corr = ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+        let ov = (r3 >> 63) ^ (r3 >> 62) ^ (r3 >> 57);
+        let corr = ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
 
-    F128 {
-        lo: r0 ^ t_lo ^ corr,
-        hi: r1 ^ t_hi,
+        F128 {
+            lo: r0 ^ t_lo ^ corr,
+            hi: r1 ^ t_hi,
+        }
     }
 }
-
-// ---------------------------------------------------------------------------
-// aarch64 + AES: PMULL-based multiplication variants.
-// ---------------------------------------------------------------------------
 
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 pub mod aarch64;
 
-// ---------------------------------------------------------------------------
-// x86_64 + PCLMULQDQ: carry-less-multiply-based multiplication.
-//
-// `_mm_clmulepi64_si128(a, b, 0x00)` is the x86 analogue of ARM `vmull_p64`:
-// a 64×64 carry-less mul of the low qwords into a 128-bit `__m128i` laid out
-// as {lo = bits 0..63, hi = bits 64..127} — identical to NEON's uint64x2_t.
-// So the variants below are direct ports of the `aarch64` module; only the
-// primitive and lane-shuffle ops differ. The shared `ghash_reduce` is reused.
-// ---------------------------------------------------------------------------
-
 #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
 pub mod x86_64;
-
-// ---------------------------------------------------------------------------
-// Software fallback: bit-by-bit clmul64. Slow but portable; also the reference
-// the NEON path is checked against in tests.
-// ---------------------------------------------------------------------------
 
 #[path = "gf2_128/portable.rs"]
 pub mod software;
 
-#[inline]
+#[inline(always)]
 fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    {
-        // SAFETY: aes target feature is enabled at compile time.
-        unsafe { aarch64::ghash_mul_unreduced_neon(a, b) }
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        let (r0, r1, r2, r3) =
+            crate::gf2_kernels::k0_f128_mul_unreduced_raw(a.lo, a.hi, b.lo, b.hi);
+        return F256Unreduced { r0, r1, r2, r3 };
     }
-    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
-    {
-        // SAFETY: pclmulqdq target feature is enabled at compile time.
-        unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }
-    }
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
-    )))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         software::ghash_mul_unreduced(a, b)
     }
@@ -326,7 +316,6 @@ mod tests {
 
     #[test]
     fn deferred_xor_commutes_with_reduction() {
-        // Σ aᵢ·bᵢ in F128 must equal reduce(XOR-sum of unreduced products).
         let mut rng = Rng::new(5);
         let n = 16;
         let pairs: Vec<(F128, F128)> = (0..n).map(|_| (rng.next_f128(), rng.next_f128())).collect();
@@ -376,10 +365,6 @@ mod tests {
 
     #[test]
     fn ghash_reduction_smoking_gun() {
-        // The defining identity of the GHASH polynomial:
-        //   x · x^127 = x^128 = x^7 + x^2 + x + 1 = 0x87.
-        // If the reduction constant 0x87 is wrong (e.g. 0x86, 0x07, byte-swapped),
-        // this test fails immediately and pinpoints the bug.
         let x = F128::generator();
         let x_127 = F128 {
             lo: 0,
@@ -387,29 +372,20 @@ mod tests {
         };
         assert_eq!(x * x_127, F128 { lo: 0x87, hi: 0 }, "x · x^127");
 
-        // x · x^63 = x^64 — crosses the lo/hi word boundary with no reduction.
-        // Catches lo/hi swaps and off-by-one in the 64-bit word split.
         let x_63 = F128 {
             lo: 1u64 << 63,
             hi: 0,
         };
         assert_eq!(x * x_63, F128 { lo: 0, hi: 1 }, "x · x^63 = x^64");
 
-        // x^64 · x^64 = x^128 = 0x87 — reaches the reduction through a different
-        // multiplication path (high·high product).
         let x_64 = F128 { lo: 0, hi: 1 };
         assert_eq!(x_64 * x_64, F128 { lo: 0x87, hi: 0 }, "x^64 · x^64");
 
-        // x · x = x^2 (no reduction).
         assert_eq!(x * x, F128 { lo: 4, hi: 0 }, "x^2");
     }
 
     #[test]
     fn high_bit_inputs_reduce_correctly() {
-        // Verify mul still satisfies a^{-1} · a = 1 when both inputs have the
-        // top bit (x^127) set — exercising the most overflow-prone code path
-        // of `ghash_reduce`. The inverse test naturally lands here for random
-        // inputs only by luck; this makes it deterministic.
         let high = F128 {
             lo: 0,
             hi: 1u64 << 63,
@@ -462,22 +438,6 @@ mod tests {
         }
     }
 
-    /// The shared-constant vec2 Karatsuba must agree, lane for lane, with
-    /// the scalar field product.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    #[test]
-    fn const_vec2_karatsuba_matches_scalar() {
-        let mut rng = Rng::new(9);
-        for _ in 0..128 {
-            let c = rng.next_f128();
-            let b0 = rng.next_f128();
-            let b1 = rng.next_f128();
-            let prod = unsafe { aarch64::ghash_mul_const_vec2_neon(c, [b0, b1]) };
-            assert_eq!(prod[0], software::ghash_mul(c, b0));
-            assert_eq!(prod[1], software::ghash_mul(c, b1));
-        }
-    }
-
     #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
     #[test]
     fn all_x86_variants_agree() {
@@ -490,7 +450,6 @@ mod tests {
             let ka = unsafe { x86_64::ghash_mul_karatsuba(a, b) };
             let kb = unsafe { x86_64::ghash_mul_karatsuba_barrett(a, b) };
             let bi = unsafe { x86_64::ghash_mul_binius(a, b) };
-            // Unreduced + deferred reduce must match the direct software product.
             let un = unsafe { x86_64::ghash_mul_unreduced_x86(a, b) }.reduce();
             assert_eq!(sw, sb, "schoolbook");
             assert_eq!(sw, ka, "karatsuba");
@@ -500,9 +459,6 @@ mod tests {
         }
     }
 
-    /// The 4-lane VPCLMULQDQ multiply must agree, lane for lane, with the
-    /// canonical scalar `F128::mul` — the clmul `0x87` reduction reaches the
-    /// same field element by a different route, so verify, don't assume.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -525,7 +481,6 @@ mod tests {
                 rng.next_f128(),
                 rng.next_f128(),
             ];
-            // SAFETY: vpclmulqdq+avx512f enabled at compile time (cfg gate).
             let got: [F128; 4] = unsafe {
                 let x = _mm512_loadu_si512(xs.as_ptr() as *const __m512i);
                 let y = _mm512_loadu_si512(ys.as_ptr() as *const __m512i);
@@ -544,8 +499,6 @@ mod tests {
         }
     }
 
-    /// The 4-lane deferred-reduction accumulator must equal the scalar
-    /// XOR-of-`mul_unreduced` it replaces, both before and after `reduce()`.
     #[cfg(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -555,7 +508,6 @@ mod tests {
     fn wide_ghash_x4_matches_scalar_deferred() {
         let mut rng = Rng::new(0xDEF_E44);
         for _ in 0..128 {
-            // SAFETY: vpclmulqdq+avx512f+sse4.1 enabled at compile time.
             let mut wide = unsafe { x86_64::WideGhashX4::zero() };
             let mut scalar = F256Unreduced::ZERO;
             for _ in 0..5 {
@@ -571,7 +523,6 @@ mod tests {
                     rng.next_f128(),
                     rng.next_f128(),
                 ];
-                // xs via contiguous load, ys via scalar set — exercises both.
                 unsafe {
                     let xv = x86_64::f128x4_loadu(xs.as_ptr());
                     let yv = x86_64::f128x4_set(ys[0], ys[1], ys[2], ys[3]);
@@ -584,6 +535,193 @@ mod tests {
             let folded = unsafe { wide.fold() };
             assert_eq!(folded, scalar, "wide fold != scalar deferred accumulator");
             assert_eq!(folded.reduce(), scalar.reduce(), "reduced values differ");
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn k0_kernels_equivalence_against_frozen_reference() {
+        use crate::gf2_kernels::*;
+
+        fn ref_mul_by_x(z: F128) -> F128 {
+            let carry = z.hi >> 63;
+            let mask = 0u64.wrapping_sub(carry);
+            F128 {
+                lo: (z.lo << 1) ^ (0x87 & mask),
+                hi: (z.hi << 1) | (z.lo >> 63),
+            }
+        }
+
+        fn ref_ghash_reduce(r0: u64, r1: u64, r2: u64, r3: u64) -> F128 {
+            let s1_lo = r2 << 1;
+            let s1_hi = (r3 << 1) | (r2 >> 63);
+            let s2_lo = r2 << 2;
+            let s2_hi = (r3 << 2) | (r2 >> 62);
+            let s7_lo = r2 << 7;
+            let s7_hi = (r3 << 7) | (r2 >> 57);
+            let t_lo = r2 ^ s1_lo ^ s2_lo ^ s7_lo;
+            let t_hi = r3 ^ s1_hi ^ s2_hi ^ s7_hi;
+            let ov = (r3 >> 63) ^ (r3 >> 62) ^ (r3 >> 57);
+            let corr = ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+            F128 {
+                lo: r0 ^ t_lo ^ corr,
+                hi: r1 ^ t_hi,
+            }
+        }
+
+        fn ref_clmul64(a: u64, b: u64) -> (u64, u64) {
+            let mut lo = 0u64;
+            let mut hi = 0u64;
+            for i in 0..64 {
+                if (a >> i) & 1 != 0 {
+                    lo ^= b << i;
+                    if i != 0 {
+                        hi ^= b >> (64 - i);
+                    }
+                }
+            }
+            (lo, hi)
+        }
+
+        fn ref_ghash_mul(a: F128, b: F128) -> F128 {
+            let (ll_lo, ll_hi) = ref_clmul64(a.lo, b.lo);
+            let (lh_lo, lh_hi) = ref_clmul64(a.lo, b.hi);
+            let (hl_lo, hl_hi) = ref_clmul64(a.hi, b.lo);
+            let (hh_lo, hh_hi) = ref_clmul64(a.hi, b.hi);
+            let r0 = ll_lo;
+            let r1 = ll_hi ^ lh_lo ^ hl_lo;
+            let r2 = hh_lo ^ lh_hi ^ hl_hi;
+            let r3 = hh_hi;
+            ref_ghash_reduce(r0, r1, r2, r3)
+        }
+
+        fn ref_add_carry_parts(x: u32, y: u32) -> (u32, u32, u32, u32) {
+            let sum = x.wrapping_add(y);
+            let cin = sum ^ x ^ y;
+            const MASK_LO31: u32 = 0x7FFF_FFFF;
+            let left = (x ^ cin) & MASK_LO31;
+            let right = (y ^ cin) & MASK_LO31;
+            let carry_aux = left & right;
+            (sum, left, right, carry_aux)
+        }
+
+        unsafe {
+            assert_eq!(gf2_kern_mul_by_x_lo(1, 0), 2);
+            assert_eq!(gf2_kern_mul_by_x_hi(1, 0), 0);
+            assert_eq!(gf2_kern_mul_by_x_lo(0, 1u64 << 63), 0x87);
+            assert_eq!(gf2_kern_mul_by_x_hi(1u64 << 63, 0), 1);
+            assert_eq!(gf2_kern_ghash_reduce_lo(0, 1, 0), 0x87);
+            assert_eq!(gf2_kern_ghash_reduce_hi(0, 1, 0), 0);
+            assert_eq!(gf2_kern_clmul64_lo(3, 3), 5);
+            assert_eq!(gf2_kern_clmul64_hi(1u64 << 63, 2), 1);
+            assert_eq!(gf2_kern_ghash_mul_lo(1, 0, 1, 0), 1);
+            assert_eq!(gf2_kern_ghash_mul_hi(1, 0, 1, 0), 0);
+            assert_eq!(gf2_kern_ghash_mul_lo(0, 1u64 << 63, 2, 0), 0x87);
+            assert_eq!(gf2_kern_ghash_mul_hi(0, 1u64 << 63, 2, 0), 0);
+            assert_eq!(gf2_kern_ntt_btf_u_lo(10, 6), 12);
+            assert_eq!(gf2_kern_ntt_btf_v_lo(10, 3, 6), 15);
+            assert_eq!(gf2_kern_blake3_add_sum(1, 1), 2);
+            assert_eq!(gf2_kern_blake3_add_carry_aux(1, 1), 3);
+            assert_eq!(gf2_kern_or_u32_lo(0xdeadbeef, 8), 0xdeadbeef00);
+            assert_eq!(gf2_kern_or_u32_hi(0xdeadbeef, 48), 0xdead);
+        }
+
+        let boundaries: [u64; 12] = [
+            0,
+            1,
+            2,
+            3,
+            0x87,
+            0x7FFF_FFFF,
+            0x8000_0000,
+            0xFFFF_FFFF,
+            1u64 << 57,
+            1u64 << 62,
+            1u64 << 63,
+            u64::MAX,
+        ];
+        for &a in &boundaries {
+            for &b in &boundaries {
+                let z = F128 { lo: a, hi: b };
+                assert_eq!(mul_by_x(z), ref_mul_by_x(z));
+                assert_eq!(software::clmul64(a, b), ref_clmul64(a, b));
+                let w = F128 {
+                    lo: b.rotate_left(17),
+                    hi: a.rotate_right(29),
+                };
+                assert_eq!(z * w, ref_ghash_mul(z, w));
+                assert_eq!(
+                    ghash_reduce(a, b, a ^ b, a.wrapping_add(b)),
+                    ref_ghash_reduce(a, b, a ^ b, a.wrapping_add(b))
+                );
+                let x32 = a as u32;
+                let y32 = b as u32;
+                let (r_sum, r_left, r_right, r_aux) = ref_add_carry_parts(x32, y32);
+                unsafe {
+                    assert_eq!(
+                        gf2_kern_blake3_add_sum(x32 as u64, y32 as u64) as u32,
+                        r_sum
+                    );
+                    assert_eq!(
+                        gf2_kern_blake3_add_left(x32 as u64, y32 as u64) as u32,
+                        r_left
+                    );
+                    assert_eq!(
+                        gf2_kern_blake3_add_right(x32 as u64, y32 as u64) as u32,
+                        r_right
+                    );
+                    assert_eq!(
+                        gf2_kern_blake3_add_carry_aux(x32 as u64, y32 as u64) as u32,
+                        r_aux
+                    );
+                }
+            }
+        }
+
+        let mut rng = Rng::new(0x5A17_F128_2026_0001);
+        for _ in 0..10_000 {
+            let a = rng.next_f128();
+            let b = rng.next_f128();
+            assert_eq!(mul_by_x(a), ref_mul_by_x(a));
+            assert_eq!(a * b, ref_ghash_mul(a, b));
+            let r0 = rng.next_u64();
+            let r1 = rng.next_u64();
+            let r2 = rng.next_u64();
+            let r3 = rng.next_u64();
+            assert_eq!(
+                ghash_reduce(r0, r1, r2, r3),
+                ref_ghash_reduce(r0, r1, r2, r3)
+            );
+            let x32 = r0 as u32;
+            let y32 = r1 as u32;
+            let (r_sum, r_left, r_right, r_aux) = ref_add_carry_parts(x32, y32);
+            let shift = r2 & 63;
+            unsafe {
+                assert_eq!(
+                    gf2_kern_blake3_add_sum(x32 as u64, y32 as u64) as u32,
+                    r_sum
+                );
+                assert_eq!(
+                    gf2_kern_blake3_add_left(x32 as u64, y32 as u64) as u32,
+                    r_left
+                );
+                assert_eq!(
+                    gf2_kern_blake3_add_right(x32 as u64, y32 as u64) as u32,
+                    r_right
+                );
+                assert_eq!(
+                    gf2_kern_blake3_add_carry_aux(x32 as u64, y32 as u64) as u32,
+                    r_aux
+                );
+                let exp_lo = (x32 as u64) << shift;
+                let exp_hi = if shift > 32 {
+                    (x32 as u64) >> (64 - shift)
+                } else {
+                    0
+                };
+                assert_eq!(gf2_kern_or_u32_lo(x32 as u64, shift), exp_lo);
+                assert_eq!(gf2_kern_or_u32_hi(x32 as u64, shift), exp_hi);
+            }
         }
     }
 }

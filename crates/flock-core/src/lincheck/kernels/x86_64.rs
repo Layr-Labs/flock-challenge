@@ -1,74 +1,112 @@
 use super::super::{F128, build_sum_table};
+use std::sync::Mutex;
 
-/// x86 single-matrix inner kernel — SSE2 mirror of
-/// [`process_block_neon_single`]. Sweeps `TILE_T = 8` stripes for one
-/// `BLOCK_K = 8` block of i_inner positions, keeping all 8 F128 accumulators in
-/// xmm registers so the per-tile output is read/written once (vs once per
-/// stripe in the untiled [`partial_fold_packed_z_fast_padded`] path).
-///
-/// # Safety
-/// - `tile_bytes_ptr` must point to at least `TILE_T * k` bytes.
-/// - `tables_ptr` must point to at least `TILE_T * 256 * 16` bytes.
-/// - `out_ptr` must point to at least 8 F128 (128 bytes) of mutable storage.
+static PARTIALS_POOL: Mutex<Vec<F128>> = Mutex::new(Vec::new());
+
 #[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn process_block_x86(
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn process_block_x86_4<const INIT: bool>(
     tile_bytes_ptr: *const u8,
     k: usize,
     bs: usize,
-    tables_ptr: *const u8,
+    tables_ptr: *const F128,
     out_ptr: *mut F128,
 ) {
     use core::arch::x86_64::*;
-    const TILE_T: usize = 8;
-    // SAFETY: caller upholds the pointer/length contract documented above; SSE2
-    // is baseline on x86_64.
+    const SUB_T: usize = 4;
     unsafe {
-        let o = out_ptr as *mut u8;
-        let mut a0 = _mm_loadu_si128(o as *const __m128i);
-        let mut a1 = _mm_loadu_si128(o.add(16) as *const __m128i);
-        let mut a2 = _mm_loadu_si128(o.add(32) as *const __m128i);
-        let mut a3 = _mm_loadu_si128(o.add(48) as *const __m128i);
-        let mut a4 = _mm_loadu_si128(o.add(64) as *const __m128i);
-        let mut a5 = _mm_loadu_si128(o.add(80) as *const __m128i);
-        let mut a6 = _mm_loadu_si128(o.add(96) as *const __m128i);
-        let mut a7 = _mm_loadu_si128(o.add(112) as *const __m128i);
-        for t in 0..TILE_T {
-            let stripe_ptr = tile_bytes_ptr.add(t * k + bs);
-            let ta = tables_ptr.add(t * 256 * 16);
-            let i0 = *stripe_ptr as usize;
-            let i1 = *stripe_ptr.add(1) as usize;
-            let i2 = *stripe_ptr.add(2) as usize;
-            let i3 = *stripe_ptr.add(3) as usize;
-            let i4 = *stripe_ptr.add(4) as usize;
-            let i5 = *stripe_ptr.add(5) as usize;
-            let i6 = *stripe_ptr.add(6) as usize;
-            let i7 = *stripe_ptr.add(7) as usize;
-            a0 = _mm_xor_si128(a0, _mm_loadu_si128(ta.add(i0 * 16) as *const __m128i));
-            a1 = _mm_xor_si128(a1, _mm_loadu_si128(ta.add(i1 * 16) as *const __m128i));
-            a2 = _mm_xor_si128(a2, _mm_loadu_si128(ta.add(i2 * 16) as *const __m128i));
-            a3 = _mm_xor_si128(a3, _mm_loadu_si128(ta.add(i3 * 16) as *const __m128i));
-            a4 = _mm_xor_si128(a4, _mm_loadu_si128(ta.add(i4 * 16) as *const __m128i));
-            a5 = _mm_xor_si128(a5, _mm_loadu_si128(ta.add(i5 * 16) as *const __m128i));
-            a6 = _mm_xor_si128(a6, _mm_loadu_si128(ta.add(i6 * 16) as *const __m128i));
-            a7 = _mm_xor_si128(a7, _mm_loadu_si128(ta.add(i7 * 16) as *const __m128i));
+        let base_ptr = tile_bytes_ptr.add(bs);
+        let w0 = (base_ptr as *const u64).read_unaligned() as usize;
+        let ta0 = tables_ptr;
+        let (mut a0, mut a1, mut a2, mut a3, mut a4, mut a5, mut a6, mut a7) = if INIT {
+            (
+                _mm_load_si128(ta0.add(w0 & 0xFF) as *const __m128i),
+                _mm_load_si128(ta0.add((w0 >> 8) & 0xFF) as *const __m128i),
+                _mm_load_si128(ta0.add((w0 >> 16) & 0xFF) as *const __m128i),
+                _mm_load_si128(ta0.add((w0 >> 24) & 0xFF) as *const __m128i),
+                _mm_load_si128(ta0.add((w0 >> 32) & 0xFF) as *const __m128i),
+                _mm_load_si128(ta0.add((w0 >> 40) & 0xFF) as *const __m128i),
+                _mm_load_si128(ta0.add((w0 >> 48) & 0xFF) as *const __m128i),
+                _mm_load_si128(ta0.add(w0 >> 56) as *const __m128i),
+            )
+        } else {
+            (
+                _mm_xor_si128(
+                    _mm_load_si128(out_ptr as *const __m128i),
+                    _mm_load_si128(ta0.add(w0 & 0xFF) as *const __m128i),
+                ),
+                _mm_xor_si128(
+                    _mm_load_si128(out_ptr.add(1) as *const __m128i),
+                    _mm_load_si128(ta0.add((w0 >> 8) & 0xFF) as *const __m128i),
+                ),
+                _mm_xor_si128(
+                    _mm_load_si128(out_ptr.add(2) as *const __m128i),
+                    _mm_load_si128(ta0.add((w0 >> 16) & 0xFF) as *const __m128i),
+                ),
+                _mm_xor_si128(
+                    _mm_load_si128(out_ptr.add(3) as *const __m128i),
+                    _mm_load_si128(ta0.add((w0 >> 24) & 0xFF) as *const __m128i),
+                ),
+                _mm_xor_si128(
+                    _mm_load_si128(out_ptr.add(4) as *const __m128i),
+                    _mm_load_si128(ta0.add((w0 >> 32) & 0xFF) as *const __m128i),
+                ),
+                _mm_xor_si128(
+                    _mm_load_si128(out_ptr.add(5) as *const __m128i),
+                    _mm_load_si128(ta0.add((w0 >> 40) & 0xFF) as *const __m128i),
+                ),
+                _mm_xor_si128(
+                    _mm_load_si128(out_ptr.add(6) as *const __m128i),
+                    _mm_load_si128(ta0.add((w0 >> 48) & 0xFF) as *const __m128i),
+                ),
+                _mm_xor_si128(
+                    _mm_load_si128(out_ptr.add(7) as *const __m128i),
+                    _mm_load_si128(ta0.add(w0 >> 56) as *const __m128i),
+                ),
+            )
+        };
+        for t in 1..SUB_T {
+            let w = (base_ptr.add(t * k) as *const u64).read_unaligned() as usize;
+            let ta = tables_ptr.add(t * 256);
+            a0 = _mm_xor_si128(a0, _mm_load_si128(ta.add(w & 0xFF) as *const __m128i));
+            a1 = _mm_xor_si128(
+                a1,
+                _mm_load_si128(ta.add((w >> 8) & 0xFF) as *const __m128i),
+            );
+            a2 = _mm_xor_si128(
+                a2,
+                _mm_load_si128(ta.add((w >> 16) & 0xFF) as *const __m128i),
+            );
+            a3 = _mm_xor_si128(
+                a3,
+                _mm_load_si128(ta.add((w >> 24) & 0xFF) as *const __m128i),
+            );
+            a4 = _mm_xor_si128(
+                a4,
+                _mm_load_si128(ta.add((w >> 32) & 0xFF) as *const __m128i),
+            );
+            a5 = _mm_xor_si128(
+                a5,
+                _mm_load_si128(ta.add((w >> 40) & 0xFF) as *const __m128i),
+            );
+            a6 = _mm_xor_si128(
+                a6,
+                _mm_load_si128(ta.add((w >> 48) & 0xFF) as *const __m128i),
+            );
+            a7 = _mm_xor_si128(a7, _mm_load_si128(ta.add(w >> 56) as *const __m128i));
         }
-        _mm_storeu_si128(o as *mut __m128i, a0);
-        _mm_storeu_si128(o.add(16) as *mut __m128i, a1);
-        _mm_storeu_si128(o.add(32) as *mut __m128i, a2);
-        _mm_storeu_si128(o.add(48) as *mut __m128i, a3);
-        _mm_storeu_si128(o.add(64) as *mut __m128i, a4);
-        _mm_storeu_si128(o.add(80) as *mut __m128i, a5);
-        _mm_storeu_si128(o.add(96) as *mut __m128i, a6);
-        _mm_storeu_si128(o.add(112) as *mut __m128i, a7);
+        _mm_store_si128(out_ptr as *mut __m128i, a0);
+        _mm_store_si128(out_ptr.add(1) as *mut __m128i, a1);
+        _mm_store_si128(out_ptr.add(2) as *mut __m128i, a2);
+        _mm_store_si128(out_ptr.add(3) as *mut __m128i, a3);
+        _mm_store_si128(out_ptr.add(4) as *mut __m128i, a4);
+        _mm_store_si128(out_ptr.add(5) as *mut __m128i, a5);
+        _mm_store_si128(out_ptr.add(6) as *mut __m128i, a6);
+        _mm_store_si128(out_ptr.add(7) as *mut __m128i, a7);
     }
 }
 
-/// x86 tiled single-matrix partial fold — `TILE_T × BLOCK_K` register tile
-/// mirror of `partial_fold_packed_z_neon_single_padded`. Replaces the untiled
-/// full-k accumulator (streamed once per stripe ≈ `n_stripes × k` of acc
-/// traffic) with per-tile register accumulators, cutting acc traffic ≈ `TILE_T`×
-/// — the dominant cost of this bandwidth-bound fold on many-core hosts.
 #[cfg(target_arch = "x86_64")]
 pub fn partial_fold_packed_z_x86_tiled_padded(
     z_packed: &[u8],
@@ -80,6 +118,7 @@ pub fn partial_fold_packed_z_x86_tiled_padded(
     use rayon::prelude::*;
 
     const TILE_T: usize = 8;
+    const SUB_T: usize = 4;
     const BLOCK_K: usize = 8;
 
     let n_log = m - k_log;
@@ -93,64 +132,113 @@ pub fn partial_fold_packed_z_x86_tiled_padded(
     let n_stripes = n_outer / 8;
     assert_eq!(n_stripes % TILE_T, 0);
     assert_eq!(k % BLOCK_K, 0);
-    let n_blocks_full = k / BLOCK_K;
-    // Boundary block past useful_bits holds 0 padding → table[0] = 0 contributes
-    // nothing, so cover only blocks that touch useful bits.
-    let n_blocks = useful_bits.div_ceil(BLOCK_K).min(n_blocks_full);
+    let n_sub_tiles = n_stripes / SUB_T;
 
-    let n_tiles = n_stripes / TILE_T;
-    let tiles_per_chunk = (n_tiles / 256).max(1);
-    let bytes_per_chunk = tiles_per_chunk * TILE_T * k;
+    let useful = (useful_bits.div_ceil(BLOCK_K) * BLOCK_K).min(k);
+    if useful == 0 {
+        return vec![F128::ZERO; k];
+    }
 
-    z_packed
-        .par_chunks(bytes_per_chunk)
+    let p = rayon::current_num_threads().max(1);
+    let sub_tiles_per_worker = n_sub_tiles.div_ceil(p);
+    let n_workers = n_sub_tiles.div_ceil(sub_tiles_per_worker);
+
+    if n_workers <= 1 {
+        let mut out = vec![F128::ZERO; k];
+        let mut tables = [F128::ZERO; SUB_T * 256];
+        for sub_tile in 0..n_sub_tiles {
+            let stripe_base = sub_tile * SUB_T;
+            for t in 0..SUB_T {
+                let eq_off = 8 * (stripe_base + t);
+                build_sum_table(
+                    &eq_outer[eq_off..eq_off + 8],
+                    &mut tables[t * 256..(t + 1) * 256],
+                );
+            }
+            let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
+            unsafe {
+                crate::gf2_kernels::k0_f128_partial_fold_tile4_slice(
+                    z_base,
+                    k,
+                    0,
+                    useful,
+                    tables.as_ptr() as *const u64,
+                    out.as_mut_ptr() as *mut u64,
+                    u8::from(sub_tile == 0),
+                );
+            }
+        }
+        return out;
+    }
+
+    #[repr(C, align(64))]
+    struct AlignedTables([F128; SUB_T * 256]);
+
+    let mut out = crate::alloc_uninit_f128_vec(k);
+    out[useful..k].fill(F128::ZERO);
+
+    let rem_workers = n_workers - 1;
+    let total_len = rem_workers * k;
+    let mut partials = {
+        let mut guard = PARTIALS_POOL.lock().unwrap();
+        let mut v = std::mem::take(&mut *guard);
+        if v.capacity() < total_len {
+            v = crate::alloc_uninit_f128_vec(total_len);
+        } else {
+            unsafe { v.set_len(total_len) };
+        }
+        v
+    };
+
+    let out_base_addr = out.as_mut_ptr() as usize;
+    let partials_base_addr = partials.as_mut_ptr() as usize;
+
+    (0..n_workers).into_par_iter().for_each(|w| {
+        let sub_lo = w * sub_tiles_per_worker;
+        let sub_hi = ((w + 1) * sub_tiles_per_worker).min(n_sub_tiles);
+        let dst_ptr = unsafe {
+            if w == 0 {
+                out_base_addr as *mut u64
+            } else {
+                (partials_base_addr as *mut F128).add((w - 1) * k) as *mut u64
+            }
+        };
+        let mut tables = AlignedTables([F128::ZERO; SUB_T * 256]);
+        for sub_tile in sub_lo..sub_hi {
+            let stripe_base = sub_tile * SUB_T;
+            for t in 0..SUB_T {
+                let eq_off = 8 * (stripe_base + t);
+                build_sum_table(
+                    &eq_outer[eq_off..eq_off + 8],
+                    &mut tables.0[t * 256..(t + 1) * 256],
+                );
+            }
+            let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
+            unsafe {
+                crate::gf2_kernels::k0_f128_partial_fold_tile4_slice(
+                    z_base,
+                    k,
+                    0,
+                    useful,
+                    tables.0.as_ptr() as *const u64,
+                    dst_ptr,
+                    u8::from(sub_tile == sub_lo),
+                );
+            }
+        }
+    });
+
+    out[..useful]
+        .par_chunks_mut(256)
         .enumerate()
-        .fold(
-            || vec![F128::ZERO; k],
-            |mut out, (chunk_idx, chunk_bytes)| {
-                let tile_start = chunk_idx * tiles_per_chunk;
-                // TILE_T × 256 F128 = 32 KB tables. L1 resident.
-                let mut tables = vec![F128::ZERO; TILE_T * 256];
-                let n_tiles_in_chunk = chunk_bytes.len() / (TILE_T * k);
-                for tile_rel in 0..n_tiles_in_chunk {
-                    let tile_idx = tile_start + tile_rel;
-                    let stripe_base = tile_idx * TILE_T;
-                    // SAFETY: tile_rel < n_tiles_in_chunk so the offset stays in bounds.
-                    let tile_bytes_ptr = unsafe { chunk_bytes.as_ptr().add(tile_rel * TILE_T * k) };
-                    for t in 0..TILE_T {
-                        let byte_idx = stripe_base + t;
-                        let eq_off = 8 * byte_idx;
-                        build_sum_table(
-                            &eq_outer[eq_off..eq_off + 8],
-                            &mut tables[t * 256..(t + 1) * 256],
-                        );
-                    }
-                    let tables_ptr = tables.as_ptr() as *const u8;
-                    for block_idx in 0..n_blocks {
-                        let bs = block_idx * BLOCK_K;
-                        // SAFETY: bs + BLOCK_K ≤ k ≤ out.len(); tile_bytes_ptr
-                        // covers TILE_T*k bytes; tables_ptr covers TILE_T*256 F128.
-                        unsafe {
-                            process_block_x86(
-                                tile_bytes_ptr,
-                                k,
-                                bs,
-                                tables_ptr,
-                                out.as_mut_ptr().add(bs),
-                            );
-                        }
-                    }
-                }
-                out
-            },
-        )
-        .reduce(
-            || vec![F128::ZERO; k],
-            |mut a, b| {
-                for (x, y) in a.iter_mut().zip(b.iter()) {
-                    *x += *y;
-                }
-                a
-            },
-        )
+        .for_each(|(ci, out_chunk)| {
+            let col_off = ci * 256;
+            let chunk_len = out_chunk.len();
+            for w in 0..rem_workers {
+                let src = &partials[w * k + col_off..w * k + col_off + chunk_len];
+                crate::field::f128_slice::xor_assign(out_chunk, src);
+            }
+        });
+    *PARTIALS_POOL.lock().unwrap() = partials;
+    out
 }

@@ -33,11 +33,6 @@ unsafe fn rounds4(
     }
 }
 
-/// Compress one block for each of four independent SHA-256 states.
-///
-/// # Safety
-/// Every block pointer must expose 64 readable bytes. The module cfg
-/// guarantees SHA-NI, SSE2, SSSE3, and SSE4.1 on the compiled target.
 #[inline(always)]
 unsafe fn compress4(abef: &mut [__m128i; 4], cdgh: &mut [__m128i; 4], blocks: [*const u8; 4]) {
     unsafe {
@@ -93,15 +88,12 @@ unsafe fn compress4(abef: &mut [__m128i; 4], cdgh: &mut [__m128i; 4], blocks: [*
     }
 }
 
-/// Hash four equal-length inputs, producing standard SHA-256 digests.
 #[inline]
 pub fn hash4_equal_len(inputs: [&[u8]; 4], out: &mut [Hash]) {
     let len = inputs[0].len();
     debug_assert!(inputs.iter().all(|input| input.len() == len));
     debug_assert!(out.len() >= 4);
 
-    // SAFETY: the module is compiled only with SHA-NI enabled. Full-block
-    // pointers and fixed tail buffers satisfy compress4's 64-byte bound.
     unsafe {
         let state = SHA256_IV.as_ptr().cast::<__m128i>();
         let dcba = _mm_loadu_si128(state);

@@ -1,22 +1,3 @@
-//! Generic hash-chain glue, shared by the per-hash `*_chain` modules.
-//!
-//! The chain protocol (packed-pos fold → shift sumcheck → batched PCS open
-//! over `[ab, c] ring-switched + [chain] packed-direct`) is hash-agnostic; only
-//! the *geometry* of where the input/output regions live in a witness block
-//! varies. This module captures that geometry in [`ChainLayout`] and provides
-//! the fully generic [`prove_chain_ligerito_generic`] /
-//! [`verify_chain_ligerito_generic`]. A
-//! per-hash module supplies its `ChainLayout`, a `State → physical-bits`
-//! converter for the public endpoints, and thin wrappers.
-//!
-//! ## Region requirements
-//!
-//! Both the input and output regions must be **byte-contiguous, aligned slots**:
-//! each occupies an aligned `2^region_log`-bit window of the block, with the
-//! `region_bits` real bits (a multiple of 8) at the low end and zero padding
-//! above. The two slots must be consecutive (slot 0 = input, slot 1 = output)
-//! so the chain claim's selector is a single bit-flip in the multilinear cube.
-
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::build_eq_table;
@@ -26,46 +7,28 @@ use flock_core::pcs::{
 use flock_core::r1cs::BlockR1cs;
 use serde::{Deserialize, Serialize};
 
-/// Geometry of one hash's input/output regions within a witness block. All
-/// fields are `const`-known per hash.
 #[derive(Clone, Copy, Debug)]
 pub struct ChainLayout {
-    /// `log2` of the per-block witness size (inner variables).
     pub k_log: usize,
-    /// Univariate-skip dimension (kept for API parity with the zerocheck/PCS
-    /// `k_skip`; the packed-direct chain path does not consume it).
     pub k_skip: usize,
-    /// `log2` of the aligned slot size holding each I/O region.
     pub region_log: usize,
-    /// Real bits per region (≤ `2^region_log`, multiple of 8).
     pub region_bits: usize,
-    /// Byte offset of the input slot within a block.
     pub input_byte_off: usize,
-    /// Byte offset of the output slot within a block.
     pub output_byte_off: usize,
 }
 
 impl ChainLayout {
-    /// Length of the packed-position fold coord `τ_pos` = `region_log − LOG_PACKING`.
-    /// One `F128` per packed position within a region's 2^region_log-bit slot.
     #[inline]
     pub fn tau_pos_len(&self) -> usize {
         self.region_log - LOG_PACKING
     }
 
-    /// Number of zero coords in the chain claim's point between the selector
-    /// bit and the instance index. Drives the sparseness of `eq_ind(point)`:
-    /// each zero gives a 2× density reduction. = `k_log − region_log − 1`.
     #[inline]
     pub fn high_zeros(&self) -> usize {
         self.k_log - self.region_log - 1
     }
 }
 
-/// Packed-level fold parameters: `τ_pos` binds the packed-position dimension of
-/// each region. The verifier samples `τ_pos`, then the prover folds each
-/// instance's input/output region down to one `F128` via
-/// `Σ_{pos} eq(τ_pos, pos) · ẑ_packed[(inst, slot, pos)]`.
 #[derive(Clone, Debug)]
 pub struct ChainFold {
     pub tau_pos: Vec<F128>,
@@ -81,16 +44,8 @@ impl ChainFold {
         Self { tau_pos }
     }
 
-    /// Fold a public endpoint (given as `region_bits` bools in physical
-    /// within-slot order) to a single `F128` — the τ_pos-MLE of the endpoint
-    /// over the region's packed positions. Mirrors what the prover computes
-    /// against the committed witness.
-    ///
-    /// Algorithm: pack the bits into `2^τ_pos_len` `F128` elements (padding the
-    /// region's `region_bits..slot_bits` tail with zeros to match the witness
-    /// layout), then take the inner product with `eq(τ_pos, ·)`.
     pub fn fold_public_phys(&self, phys_bits: &[bool]) -> F128 {
-        let bits_per_packed = 1usize << LOG_PACKING; // 128
+        let bits_per_packed = 1usize << LOG_PACKING;
         let n_packed = 1usize << self.tau_pos.len();
         let slot_bits = n_packed * bits_per_packed;
         assert!(
@@ -120,14 +75,6 @@ impl ChainFold {
     }
 }
 
-/// Packed-level region fold: produces `(in_vals, out_vals)` where
-/// `in_vals[i] = Σ_pos eq(τ_pos, pos) · ẑ_packed[(i, slot=0, pos)]` (state_0
-/// of instance i, τ_pos-folded) and analogously for `out_vals`. Parallel over
-/// instances.
-///
-/// Replaces the prior bit-level byte-table fold over `region_bits` per
-/// instance; here the per-instance work is just `2^τ_pos_len` F128
-/// mul-adds (16 for keccak, 2 for blake3/sha2).
 pub fn fold_in_out(
     layout: &ChainLayout,
     wl: flock_core::r1cs::WitnessLayout,
@@ -136,7 +83,7 @@ pub fn fold_in_out(
 ) -> (Vec<F128>, Vec<F128>) {
     use rayon::prelude::*;
 
-    let bits_per_packed = 1usize << LOG_PACKING; // 128
+    let bits_per_packed = 1usize << LOG_PACKING;
     let n_packed_per_region = 1usize << fold.tau_pos.len();
     let block_packed = (1usize << layout.k_log) / bits_per_packed;
     let in_pos_base = (layout.input_byte_off * 8) / bits_per_packed;
@@ -151,9 +98,6 @@ pub fn fold_in_out(
 
     let eq_tau = build_eq_table(&fold.tau_pos);
 
-    // Word address of within-block word `w` of instance `i`: row-major puts
-    // instances contiguous (`i·block + w`); batch-major puts word-columns
-    // contiguous (`(w << n_log) + i`).
     let word_addr = move |i: usize, w: usize| -> usize {
         match wl {
             flock_core::r1cs::WitnessLayout::RowMajor => i * block_packed + w,
@@ -162,11 +106,23 @@ pub fn fold_in_out(
     };
 
     let fold_one = |i: usize, base: usize| -> F128 {
-        let mut acc = F128::ZERO;
-        for pos in 0..n_packed_per_region {
-            acc += eq_tau[pos] * packed[word_addr(i, base + pos)];
+        match wl {
+            flock_core::r1cs::WitnessLayout::RowMajor => {
+                let start = i * block_packed + base;
+                flock_core::field::f128_slice::inner_product(
+                    &eq_tau,
+                    &packed[start..start + n_packed_per_region],
+                )
+            }
+            flock_core::r1cs::WitnessLayout::BatchMajor => {
+                use flock_core::field::gf2_128::F256Unreduced;
+                let mut acc = F256Unreduced::ZERO;
+                for pos in 0..n_packed_per_region {
+                    acc ^= eq_tau[pos].mul_unreduced(packed[word_addr(i, base + pos)]);
+                }
+                acc.reduce()
+            }
         }
-        acc
     };
 
     let in_vals: Vec<F128> = (0..n_inst)
@@ -181,18 +137,6 @@ pub fn fold_in_out(
     (in_vals, out_vals)
 }
 
-/// Assemble the packed-direct chain claim from the fold and the shift
-/// sumcheck output. The point layout (LSB-first over `L = m − LOG_PACKING`
-/// coords):
-/// ```text
-///   [τ_pos ..., sel0, 0, 0, ..., 0, instance_point ...]
-///     ^^^^^   ^^^^   ^^^^^^^^^^^^   ^^^^^^^^^^^^^^
-///     fold    in/out  high slot      sumcheck output
-///     coords  selector  bits = 0     instance coord
-/// ```
-/// The high-slot-bits-zero coords (`high_zeros = k_log − region_log − 1`) make
-/// `eq_ind(point)` sparse with a 2^high_zeros × density reduction. We use
-/// `build_eq_sparse` to skip the zero-coord halvings.
 pub fn assemble_chain_claim(
     layout: &ChainLayout,
     wl: flock_core::r1cs::WitnessLayout,
@@ -208,15 +152,6 @@ pub fn assemble_chain_claim(
     }
 }
 
-/// Verifier-side helper: build the chain-claim point identically to
-/// [`assemble_chain_claim`] but without constructing the sparse eq tensor (the
-/// Word-index claim point over `L = m − LOG_PACKING` coords, ordered by the
-/// witness layout's address decomposition of a word index:
-/// - RowMajor: `word = (inst << (k_log−7)) | in_block`
-///   → `[τ_pos…, sel0, 0^high, instance…]`;
-/// - BatchMajor: `word = (in_block << n_log) | inst`
-///   → `[instance…, τ_pos…, sel0, 0^high]`.
-/// verifier evaluates `eq_eval(point, residual_challenges)` directly).
 fn build_chain_claim_point(
     layout: &ChainLayout,
     wl: flock_core::r1cs::WitnessLayout,
@@ -239,10 +174,6 @@ fn build_chain_claim_point(
     point
 }
 
-/// Proof that `2^n` committed hash instances form a sequential chain
-/// `x_{i+1} = h(x_i)` with public endpoints. Composes the base R1CS sub-proofs,
-/// the shift-sumcheck sub-proof, and ONE Ligerito PCS open over
-/// `[ab, c] (ring-switched) + [chain] (packed-direct)`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainProofLigerito {
     pub zerocheck: flock_core::zerocheck::ZerocheckProof,
@@ -251,22 +182,13 @@ pub struct ChainProofLigerito {
     pub pcs_open: flock_core::pcs::BatchOpeningProofLigerito,
 }
 
-/// Errors from chain verification.
 #[derive(Debug)]
 pub enum ChainVerifyError {
-    /// Base R1CS (zerocheck/lincheck) replay failed.
     R1cs(flock_core::verifier::VerifyError),
-    /// The shift-sumcheck (glue + endpoints) check failed.
     Shift(crate::chain::ChainError),
-    /// The batched PCS opening failed.
     Pcs(flock_core::pcs::VerifyError),
 }
 
-/// Generic chain prover. The caller supplies the hash's already-generated
-/// packed witness buffers (`z`, `a`, `b`, lincheck stripe) and the layout;
-/// this runs core → packed-pos fold → shift sumcheck → one batched Ligerito
-/// open over `[ab, c] + [chain]` where the chain claim is packed-direct. The
-/// Ligerito config is built from the PCS params.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -304,8 +226,6 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let ab_x_outer = crate::prover::quirky_x_outer_full(&core.ab.point);
     let c_x_outer = crate::prover::quirky_x_outer_full(&core.c.point);
-    // Destructure core to move z_packed by value into the open (saves a 128 MB
-    // clone at m=30 BLAKE3).
     let crate::prover::ProveCore {
         zc_proof,
         lc_proof,
@@ -317,9 +237,7 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
         ..
     } = core;
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
-    // Extra claims (chain / merkle-path I/O) put the open off the ranked
-    // two-claim shape, so C stays on the canonical 128-long statistic.
-    let pre_c: Option<&[F128]> = Some(s_hat_v_c.s_hat_v_c.as_slice());
+    let pre_c: Option<&[F128]> = Some(s_hat_v_c.as_slice());
     let pcs_open = flock_core::pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         &prover_data,
@@ -343,9 +261,6 @@ pub fn prove_chain_ligerito_generic<Ch: Challenger>(
     )
 }
 
-/// Generic chain verifier. `x0_phys` / `xlast_phys` are the public endpoints
-/// as `region_bits` bools in **physical** within-slot order; `n_log` is the
-/// instance-index arity (`m − k_log`).
 #[allow(clippy::too_many_arguments)]
 pub fn verify_chain_ligerito_generic<Ch: Challenger>(
     r1cs: &BlockR1cs,

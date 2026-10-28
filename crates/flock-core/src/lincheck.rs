@@ -1,121 +1,3 @@
-//! Lincheck PIOP for **block-diagonal** R1CS over GF(2).
-//!
-//! Reduces three MLE evaluation claims (`â(x)=v`, `b̂(x')=v'`, `ĉ(x'')=v''`)
-//! plus the linear constraints (`a = Az`, `b = Bz`, `c = Cz`) to three MLE
-//! evaluation claims on `z`, all sharing a fresh random inner coord.
-//!
-//! ## Matrix structure (the assumption we exploit)
-//!
-//! `A = I_{2^n_log} ⊗ A_0` (block-diagonal with `A_0` repeated `2^n_log`
-//! times along the diagonal). Same for B, C. Storage is `O(k²)` for the
-//! small base matrices, not `O(N²)`.
-//!
-//! With the row/col index decomposed as `(i_inner, i_outer)` with `k_log`
-//! inner bits and `n_log` outer bits (`m = k_log + n_log`), the bilinear MLE
-//! factors:
-//!
-//!   `Â(i, x)  =  Â_0(i_inner, x_inner) · eq(i_outer, x_outer)`
-//!
-//! So for the claim `v = â(x) = Σ_i z(i) · Â(i, x)` the outer summation
-//! collapses by the eq-MLE identity:
-//!
-//!   `v  =  Σ_{i_inner}  Â_0(i_inner, x_inner) · ẑ(i_inner, x_outer)`
-//!
-//! — a sum over only `2^k_log` terms, with `ẑ(·, x_outer)` being the
-//! partial fold of `z` at the outer half of the claim point.
-//!
-//! ## Protocol shape (circuit R1CS: C = I, A & B share a claim point)
-//!
-//! For R1CS coming from circuits, `C = I` (identity), so `c = Cz = z` and
-//! the zerocheck's c-claim `ĉ(point_c) = v_c` IS a direct `z`-claim
-//! `ẑ(point_c) = v_c` — handled by the PCS without going through lincheck.
-//! Likewise the zerocheck's `â` and `b̂` claims live at the **same** point
-//! `(z, ρ-values)`, so lincheck only needs to fold `z` **once** at that
-//! shared point.
-//!
-//! 1. **Prover sends** one length-`k = 2^k_log` F128 vector
-//!    `z_vec[i_inner] = ẑ(i_inner, x_ab.x_outer)`.
-//! 2. **Verifier checks** *two* consistency equations against the same
-//!    `z_vec`:
-//!    ```text
-//!    Σ_{i_inner}  Â_0_quirky(z_skip, x_inner_rest, i_inner) · z_vec[i_inner]  ==  v_a
-//!    Σ_{i_inner}  B̂_0_quirky(z_skip, x_inner_rest, i_inner) · z_vec[i_inner]  ==  v_b
-//!    ```
-//! 3. **Verifier samples** quirky `(r_inner_skip, r_inner_rest)` after
-//!    observing `z_vec`.
-//! 4. **Verifier derives** one z-claim at the shared output point:
-//!    ```text
-//!    w = ẑ((r_inner_skip, r_inner_rest), x_ab.x_outer)
-//!      = Σ_{i_inner} quirky_eq(r_inner_skip, r_inner_rest, i_inner) · z_vec[i_inner]
-//!    ```
-//!
-//! The lincheck output is one `(point, value)` z-claim; combined with the
-//! c-claim handed in directly by the caller, the PCS sees **two** z-openings.
-//!
-//! ## Soundness
-//!
-//! - The two scalar checks tie `z_vec` to `v_a` and `v_b` from the upstream
-//!   layer — without them a malicious prover could send any vector.
-//! - The post-vector random `(r_inner_skip, r_inner_rest)` plus Schwartz-Zippel
-//!   ensures that if `z_vec_claimed` differs from the true partial fold of `z`,
-//!   the derived `w` differs from the true `ẑ((r_inner_skip, r_inner_rest), x_outer)`
-//!   with probability `≈ 1 − 2⁻¹²⁸`. The PCS opening catches that downstream.
-//!
-//! ## Quirky (univariate-skip) claim points
-//!
-//! To compose with the **zerocheck's univariate skip** for the first `k_skip`
-//! variables, claim points use the [`QuirkyPoint`] representation:
-//!
-//!   `x = (z_skip ∈ F_{2^128},  x_inner_rest ∈ F_{2^128}^{k_log − k_skip},  x_outer ∈ F_{2^128}^{n_log})`
-//!
-//! - `z_skip` is the univariate-skip challenge; it represents all `k_skip`
-//!   skip variables collapsed via the polynomial extension with Lagrange
-//!   basis on `φ_8(0), …, φ_8(2^{k_skip} − 1)`.
-//! - The remaining `k_log − k_skip` inner coords plus the `n_log` outer
-//!   coords are standard multilinear.
-//!
-//! When evaluating the bilinear matrix MLE at a quirky claim point, the
-//! eq factor for the inner row index becomes the **outer product of**:
-//! `L_{i_skip}(z_skip) · eq(x_inner_rest, i_inner_rest)`, where `L_*` are
-//! Lagrange weights at `z_skip` for the `k_skip` skip dims (see
-//! [`build_quirky_eq_table`]).
-//!
-//! The prover's partial fold `ẑ(·, x_outer)` is unchanged — it only depends
-//! on `x_outer` (still pure multilinear). The verifier-side eq tables and
-//! the final-sample reduction are the only changes.
-//!
-//! ## Conventions
-//!
-//! - **Point ordering inside `QuirkyPoint`.** `x_inner_rest[0..k_log − k_skip]`
-//!   bind to inner variables `i_inner_rest[0..k_log − k_skip]`. `x_outer[0..n_log]`
-//!   to outer vars.
-//! - **Eq table layout.** `eq_table[i]` where `i = Σ b_j · 2^j` is
-//!   `Π_j eq(point[j], b_j) = Π_j (1 + point[j] + b_j)`.
-//! - **`z_packed` byte layout (specific to lincheck — enables column-scan
-//!   lookup tables without an explicit transpose).** Writing `i_outer = 8·byte_idx + r`
-//!   with `r ∈ {0,..,7}` and `byte_idx ∈ {0,..,n_outer/8 − 1}`, the bit
-//!   `z[i_inner, i_outer]` lives at:
-//!     - **byte position** `byte_idx · k + i_inner`,
-//!     - **bit-within-byte** `r`.
-//!
-//!   Equivalently: `z_packed` is organized in `n_outer/8` *stripes* of `k`
-//!   contiguous bytes each. Stripe `byte_idx` covers all `i_inner ∈ {0,..,k}`
-//!   for the same outer batch `i_outer ∈ {8·byte_idx, …, 8·byte_idx + 7}`.
-//!   Each byte holds 8 outer bits for one i_inner.
-//!
-//!   In bit-position terms, the bit-index decomposes as:
-//!   ```text
-//!   LSB:  3 bits = r           (= low 3 bits of i_outer, = bit-within-byte)
-//!         k_log bits = i_inner
-//!   MSB:  (n_log − 3) bits = byte_idx (= upper bits of i_outer)
-//!   ```
-//!
-//!   This layout makes the partial-fold column scan sequential — for each
-//!   `byte_idx`, all `k` per-i_inner bytes are at consecutive byte positions,
-//!   so we build a 256-entry sum table for the 8 outer values once per
-//!   `byte_idx` and apply it across all `i_inner` with one lookup + one XOR
-//!   per byte.
-
 use crate::challenger::Challenger;
 use crate::field::F128;
 use crate::r1cs::SparseBinaryMatrix;
@@ -128,83 +10,26 @@ mod kernels;
 #[cfg(target_arch = "x86_64")]
 pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 #[cfg(target_arch = "aarch64")]
-#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
-pub(crate) use kernels::{
-    oblock_claim_count, oblock_claim_stripe_base, partial_fold_packed_z_neon_oblock_padded_range,
-    partial_fold_packed_z_neon_oblock_padded_suffix,
-};
-#[cfg(target_arch = "aarch64")]
 pub use kernels::{
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
-    partial_fold_packed_z_neon_oblock16_padded, partial_fold_packed_z_neon_single,
-    partial_fold_packed_z_neon_single_padded,
+    partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
 };
 
-/// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
-/// `i_inner`-partitioned `partial_fold_packed_z_neon_iblock_padded` instead of the
-/// default outer(tile)-partitioned `partial_fold_packed_z_neon_oblock_padded`. The
-/// two are bit-identical (GF(2¹²⁸) add is XOR — associative + commutative), so one
-/// process can time both back-to-back and cancel thermal drift. The oblock default
-/// builds each tile's sum-tables once instead of once per worker, scaling the fold
-/// ~8.5× vs iblock's ~6.5× on 10 P-cores at m=32. See `benches/lincheck.rs` (FOLD_AB=1).
 pub static FOLD_IBLOCK: AtomicBool = AtomicBool::new(false);
 
-// ---------------------------------------------------------------------------
-// LincheckCircuit: the per-block linear structure lincheck consumes
-// ---------------------------------------------------------------------------
-//
-// Lincheck's hot path computes a single length-`k = 2^k_log` vector
-//
-//   `comb_vec[c] = α · ξ_A(c) + ξ_B(c)`
-//
-// where `ξ_M(c) = Σ_r eq_inner[r] · M[r, c]` is the eq-weighted column
-// marginal of base matrix `M ∈ {A_0, B_0}`. Today's `sparse_row_fold_alpha_batched`
-// computes it by scattering `eq_inner[r]` to every column in row r's nonzero
-// set — cost ∝ NNZ.
-//
-// For circuit-shaped R1CS (Keccak, BLAKE3, SHA-256) the same `comb_vec` can be
-// produced by walking the constraint graph in round order — same operations
-// the witness gen already does, just with eq-weights instead of bit values.
-// Per-hash impls can also avoid materializing matrices entirely (relevant for
-// encodings where intermediate state slots are dropped and substitution would
-// otherwise blow up A/B density).
-//
-// `LincheckCircuit` is the seam: `lincheck::prove`/`verify` take
-// `&dyn LincheckCircuit` instead of a pair of matrices. The default impl
-// `SparseMatrixCircuit` wraps the existing fused sparse kernel so callers
-// that haven't ported get identical behavior.
-
-/// Per-block linear structure consumed by lincheck. Implementations produce
-/// the α-batched column marginal `comb_vec[c] = α · ξ_A(c) + ξ_B(c)` either
-/// by sparse-matrix iteration (default) or by walking the circuit directly.
 pub trait LincheckCircuit: Sync {
-    /// Number of columns in the per-block matrices A_0, B_0 (= k = 2^k_log).
     fn n_cols(&self) -> usize;
 
-    /// Compute `comb_vec[c] = α · (eq^T · A_0)[c] + (eq^T · B_0)[c]` over
-    /// `c ∈ [0, n_cols())`. `eq_inner.len() == n_cols()`.
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128>;
 
-    /// Column index of a constant-one wire to pin, or `None` if the circuit has
-    /// no such wire. When `Some(col)`, lincheck folds one extra `β`-term into the
-    /// comb so the sumcheck also proves that the committed constant column is the
-    /// all-ones vector (whose MLE is the constant `1`), closing the all-zero
-    /// witness soundness gap. This REQUIRES the witness to set that wire to `1`
-    /// in *every* batched instance — padding included. See
-    /// `docs/const-wire-pin.md`. Default `None` keeps the transcript unchanged
-    /// for circuits without a constant wire.
     fn const_pin_col(&self) -> Option<usize> {
         None
     }
 }
 
-/// Default `LincheckCircuit` over a pair of sparse binary matrices. Delegates
-/// to the existing fused row-fold kernel. Callers that haven't migrated to a
-/// per-hash circuit walker use this wrapper.
 pub struct SparseMatrixCircuit<'a> {
     pub a_0: &'a SparseBinaryMatrix,
     pub b_0: &'a SparseBinaryMatrix,
-    /// Constant-wire pin column (see [`LincheckCircuit::const_pin_col`]).
     const_pin: Option<usize>,
 }
 
@@ -219,7 +44,6 @@ impl<'a> SparseMatrixCircuit<'a> {
         }
     }
 
-    /// Set the constant-wire pin column (see `docs/const-wire-pin.md`).
     pub fn with_const_pin(mut self, const_pin: Option<usize>) -> Self {
         self.const_pin = const_pin;
         self
@@ -238,67 +62,17 @@ impl<'a> LincheckCircuit for SparseMatrixCircuit<'a> {
     }
 }
 
-/// Column-major (CSC) `LincheckCircuit`: `(A_0, B_0)` transposed once into
-/// flat `col_ptr`/`row_idx` arrays. `fold_alpha_batched` becomes a gather —
-/// each column reads its own row list and sums `eq_inner[r]`, so columns are
-/// independent (parallel with no per-thread accumulator copies and no write
-/// scatter) and the α-mul amortizes to one per column:
-///
-///   `comb[c] = α · Σ_{r ∈ colA(c)} eq_inner[r] + Σ_{r ∈ colB(c)} eq_inner[r]`
-///
-/// On the SHA-256 hybrid matrices (k = 2^15, ~1.3M nonzeros) this measures
-/// ~7× faster than the row-scatter fold and ~100× faster than the symbolic
-/// per-hash walkers; on BLAKE3 (~21M nonzeros) ~1.7× faster than row-scatter.
-/// Construction costs one pass over the nonzeros (~4 ms / ~40 ms for the
-/// above) — do it once at setup, e.g. via
-/// [`crate::r1cs::BlockR1cs::csc_lincheck_circuit`].
 #[derive(Clone)]
 pub struct CscCircuit {
     n_cols: usize,
     a_col_ptr: Vec<u32>,
-    a_rows: CscRowIndices,
+    a_rows: Vec<u32>,
     b_col_ptr: Vec<u32>,
-    b_rows: CscRowIndices,
-    /// Constant-wire pin column (see [`LincheckCircuit::const_pin_col`]).
+    b_rows: Vec<u32>,
     const_pin: Option<usize>,
 }
 
-#[derive(Clone)]
-enum CscRowIndices {
-    U16(Vec<u16>),
-    U32(Vec<u32>),
-}
-
-impl CscRowIndices {
-    fn len(&self) -> usize {
-        match self {
-            Self::U16(rows) => rows.len(),
-            Self::U32(rows) => rows.len(),
-        }
-    }
-
-    #[inline(always)]
-    fn fold_range(&self, start: usize, end: usize, eq_inner: &[F128]) -> F128 {
-        let mut sum = F128::ZERO;
-        match self {
-            Self::U16(rows) => {
-                for &row in &rows[start..end] {
-                    sum += eq_inner[row as usize];
-                }
-            }
-            Self::U32(rows) => {
-                for &row in &rows[start..end] {
-                    sum += eq_inner[row as usize];
-                }
-            }
-        }
-        sum
-    }
-}
-
-/// Flatten one sparse matrix into CSC arrays: rows with a 1 in column `c` are
-/// `rows_flat[col_ptr[c] as usize .. col_ptr[c+1] as usize]`.
-fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, CscRowIndices) {
+fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, Vec<u32>) {
     assert!(m.num_rows <= u32::MAX as usize);
     assert!(m.num_cols <= u32::MAX as usize);
     let mut col_ptr = vec![0u32; m.num_cols + 1];
@@ -311,32 +85,16 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, CscRowIndices) {
         col_ptr[c + 1] += col_ptr[c];
     }
     let mut next = col_ptr.clone();
-    let nnz = *col_ptr.last().unwrap() as usize;
-    let compact =
-        m.num_rows <= (u16::MAX as usize + 1) && std::env::var_os("FLOCK_CSC_U32").is_none();
-    let rows_flat = if compact {
-        let mut rows_flat = vec![0u16; nnz];
-        for (r, row) in m.rows.iter().enumerate() {
-            for &c in row {
-                rows_flat[next[c] as usize] = r as u16;
-                next[c] += 1;
-            }
+    let mut rows_flat = vec![0u32; *col_ptr.last().unwrap() as usize];
+    for (r, row) in m.rows.iter().enumerate() {
+        for &c in row {
+            rows_flat[next[c] as usize] = r as u32;
+            next[c] += 1;
         }
-        CscRowIndices::U16(rows_flat)
-    } else {
-        let mut rows_flat = vec![0u32; nnz];
-        for (r, row) in m.rows.iter().enumerate() {
-            for &c in row {
-                rows_flat[next[c] as usize] = r as u32;
-                next[c] += 1;
-            }
-        }
-        CscRowIndices::U32(rows_flat)
-    };
+    }
     (col_ptr, rows_flat)
 }
 
-// Compact Debug — the row arrays run to millions of entries.
 impl std::fmt::Debug for CscCircuit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CscCircuit")
@@ -363,7 +121,6 @@ impl CscCircuit {
         }
     }
 
-    /// Set the constant-wire pin column (see `docs/const-wire-pin.md`).
     pub fn with_const_pin(mut self, const_pin: Option<usize>) -> Self {
         self.const_pin = const_pin;
         self
@@ -380,225 +137,261 @@ impl LincheckCircuit for CscCircuit {
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         use rayon::prelude::*;
         assert_eq!(eq_inner.len(), self.n_cols);
+        #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+        let (ar0, ar1) = unsafe {
+            use core::arch::x86_64::*;
+            let valpha = _mm_set_epi64x(alpha.hi as i64, alpha.lo as i64);
+            crate::gf2_kernels::k0_f128_pre_reduce_const_m128i(valpha)
+        };
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        let (ar0, ar1) = unsafe {
+            use core::arch::aarch64::*;
+            let valpha = vcombine_u64(vcreate_u64(alpha.lo), vcreate_u64(alpha.hi));
+            crate::gf2_kernels::k0_f128_pre_reduce_const_neon(valpha)
+        };
         let one_col = |c: usize| {
-            let sa = self.a_rows.fold_range(
-                self.a_col_ptr[c] as usize,
-                self.a_col_ptr[c + 1] as usize,
-                eq_inner,
-            );
-            let sb = self.b_rows.fold_range(
-                self.b_col_ptr[c] as usize,
-                self.b_col_ptr[c + 1] as usize,
-                eq_inner,
-            );
-            alpha * sa + sb
+            #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+            unsafe {
+                use core::arch::x86_64::*;
+                let eq_ptr = eq_inner.as_ptr() as *const __m128i;
+                let a_slice =
+                    &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize];
+                let mut sa0 = _mm_setzero_si128();
+                let mut sa1 = _mm_setzero_si128();
+                let mut sa2 = _mm_setzero_si128();
+                let mut sa3 = _mm_setzero_si128();
+                let mut ai = 0usize;
+                let alen = a_slice.len();
+                let ap = a_slice.as_ptr();
+                while ai + 4 <= alen {
+                    sa0 = _mm_xor_si128(sa0, _mm_load_si128(eq_ptr.add(*ap.add(ai) as usize)));
+                    sa1 = _mm_xor_si128(sa1, _mm_load_si128(eq_ptr.add(*ap.add(ai + 1) as usize)));
+                    sa2 = _mm_xor_si128(sa2, _mm_load_si128(eq_ptr.add(*ap.add(ai + 2) as usize)));
+                    sa3 = _mm_xor_si128(sa3, _mm_load_si128(eq_ptr.add(*ap.add(ai + 3) as usize)));
+                    ai += 4;
+                }
+                let mut sa = _mm_xor_si128(_mm_xor_si128(sa0, sa1), _mm_xor_si128(sa2, sa3));
+                while ai < alen {
+                    sa = _mm_xor_si128(sa, _mm_load_si128(eq_ptr.add(*ap.add(ai) as usize)));
+                    ai += 1;
+                }
+
+                let b_slice =
+                    &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize];
+                let mut sb0 = _mm_setzero_si128();
+                let mut sb1 = _mm_setzero_si128();
+                let mut sb2 = _mm_setzero_si128();
+                let mut sb3 = _mm_setzero_si128();
+                let mut bi = 0usize;
+                let blen = b_slice.len();
+                let bp = b_slice.as_ptr();
+                while bi + 4 <= blen {
+                    sb0 = _mm_xor_si128(sb0, _mm_load_si128(eq_ptr.add(*bp.add(bi) as usize)));
+                    sb1 = _mm_xor_si128(sb1, _mm_load_si128(eq_ptr.add(*bp.add(bi + 1) as usize)));
+                    sb2 = _mm_xor_si128(sb2, _mm_load_si128(eq_ptr.add(*bp.add(bi + 2) as usize)));
+                    sb3 = _mm_xor_si128(sb3, _mm_load_si128(eq_ptr.add(*bp.add(bi + 3) as usize)));
+                    bi += 4;
+                }
+                let mut sb = _mm_xor_si128(_mm_xor_si128(sb0, sb1), _mm_xor_si128(sb2, sb3));
+                while bi < blen {
+                    sb = _mm_xor_si128(sb, _mm_load_si128(eq_ptr.add(*bp.add(bi) as usize)));
+                    bi += 1;
+                }
+                let prod = crate::gf2_kernels::k0_f128_mul_const_m128i(sa, ar0, ar1);
+                return core::mem::transmute::<__m128i, F128>(_mm_xor_si128(prod, sb));
+            }
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+            unsafe {
+                use core::arch::aarch64::*;
+                let eq_ptr = eq_inner.as_ptr() as *const u64;
+                let a_slice =
+                    &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize];
+                let mut sa0 = vdupq_n_u64(0);
+                let mut sa1 = vdupq_n_u64(0);
+                let mut sa2 = vdupq_n_u64(0);
+                let mut sa3 = vdupq_n_u64(0);
+                let mut ai = 0usize;
+                let alen = a_slice.len();
+                let ap = a_slice.as_ptr();
+                while ai + 4 <= alen {
+                    sa0 = veorq_u64(sa0, vld1q_u64(eq_ptr.add(2 * (*ap.add(ai) as usize))));
+                    sa1 = veorq_u64(sa1, vld1q_u64(eq_ptr.add(2 * (*ap.add(ai + 1) as usize))));
+                    sa2 = veorq_u64(sa2, vld1q_u64(eq_ptr.add(2 * (*ap.add(ai + 2) as usize))));
+                    sa3 = veorq_u64(sa3, vld1q_u64(eq_ptr.add(2 * (*ap.add(ai + 3) as usize))));
+                    ai += 4;
+                }
+                let mut sa = veorq_u64(veorq_u64(sa0, sa1), veorq_u64(sa2, sa3));
+                while ai < alen {
+                    sa = veorq_u64(sa, vld1q_u64(eq_ptr.add(2 * (*ap.add(ai) as usize))));
+                    ai += 1;
+                }
+
+                let b_slice =
+                    &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize];
+                let mut sb0 = vdupq_n_u64(0);
+                let mut sb1 = vdupq_n_u64(0);
+                let mut sb2 = vdupq_n_u64(0);
+                let mut sb3 = vdupq_n_u64(0);
+                let mut bi = 0usize;
+                let blen = b_slice.len();
+                let bp = b_slice.as_ptr();
+                while bi + 4 <= blen {
+                    sb0 = veorq_u64(sb0, vld1q_u64(eq_ptr.add(2 * (*bp.add(bi) as usize))));
+                    sb1 = veorq_u64(sb1, vld1q_u64(eq_ptr.add(2 * (*bp.add(bi + 1) as usize))));
+                    sb2 = veorq_u64(sb2, vld1q_u64(eq_ptr.add(2 * (*bp.add(bi + 2) as usize))));
+                    sb3 = veorq_u64(sb3, vld1q_u64(eq_ptr.add(2 * (*bp.add(bi + 3) as usize))));
+                    bi += 4;
+                }
+                let mut sb = veorq_u64(veorq_u64(sb0, sb1), veorq_u64(sb2, sb3));
+                while bi < blen {
+                    sb = veorq_u64(sb, vld1q_u64(eq_ptr.add(2 * (*bp.add(bi) as usize))));
+                    bi += 1;
+                }
+                let prod = crate::gf2_kernels::k0_f128_mul_const_neon(sa, ar0, ar1);
+                let res = veorq_u64(prod, sb);
+                return F128 {
+                    lo: vgetq_lane_u64::<0>(res),
+                    hi: vgetq_lane_u64::<1>(res),
+                };
+            }
+            #[cfg(not(any(
+                all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+                all(target_arch = "aarch64", target_feature = "aes")
+            )))]
+            {
+                let mut sa = F128::ZERO;
+                for &r in &self.a_rows[self.a_col_ptr[c] as usize..self.a_col_ptr[c + 1] as usize] {
+                    sa += unsafe { *eq_inner.get_unchecked(r as usize) };
+                }
+                let mut sb = F128::ZERO;
+                for &r in &self.b_rows[self.b_col_ptr[c] as usize..self.b_col_ptr[c + 1] as usize] {
+                    sb += unsafe { *eq_inner.get_unchecked(r as usize) };
+                }
+                alpha * sa + sb
+            }
         };
         if self.n_cols < SUMCHECK_PAR_THRESHOLD {
             return (0..self.n_cols).map(one_col).collect();
         }
         let mut out = crate::alloc_uninit_f128_vec(self.n_cols);
-        out.par_iter_mut()
-            .enumerate()
-            .for_each(|(c, slot)| *slot = one_col(c));
+        out.par_chunks_mut(8).enumerate().for_each(|(ci, chunk)| {
+            let base = ci * 8;
+            for (i, slot) in chunk.iter_mut().enumerate() {
+                *slot = one_col(base + i);
+            }
+        });
         out
     }
 }
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
-/// A "quirky" claim point: one univariate-skip coord (`z_skip`) representing
-/// the first `k_skip` variables via the polynomial extension with the φ_8 basis,
-/// followed by multilinear coords for the rest of inner and for outer.
-///
-/// Total "elements" = `1 + (k_log − k_skip) + n_log`, which is the shape the
-/// zerocheck's extract_c output uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuirkyPoint {
-    /// Univariate-skip challenge ∈ F₁₂₈. Binds all `k_skip` skip variables.
     pub z_skip: F128,
-    /// Multilinear coords for the inner dims *after* the skip block. Length
-    /// `k_log − k_skip`.
     pub x_inner_rest: Vec<F128>,
-    /// Multilinear coords for the outer dims. Length `n_log = m − k_log`.
     pub x_outer: Vec<F128>,
 }
 
-/// Lincheck prover message: a partial product-sumcheck that proves the two
-/// scalar consistency equations against `z` partially folded at the shared
-/// outer half `x_ab.x_outer`, without sending the full length-`2^k_log`
-/// `z_vec`. Sumcheck binds the high `k_log − k_skip` multilinear inner dims;
-/// the low `k_skip` (φ8 univariate-skip) dims are handled by sending
-/// `z_partial` (the post-sumcheck length-`2^k_skip` collapsed vector) and
-/// applying a fresh-`z_skip` φ8 Lagrange combination at verify time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LincheckProof {
-    /// Per-round messages `(q(1), q(∞))` of the `k_log − k_skip`-round
-    /// product-sumcheck. `q(0)` is recovered from the running claim
-    /// (`q(0) = T_r + q(1)` in char 2). Standard multilinear binding.
     pub rounds: Vec<(F128, F128)>,
-    /// The length-`2^k_skip` collapse of the prover's `z_vec` over the
-    /// sumcheck-bound `r_rest` dims. Folded against φ8 Lagrange weights at a
-    /// fresh `z_skip` to yield the output claim's value.
     pub z_partial: Vec<F128>,
 }
 
-/// Lincheck output: one MLE evaluation claim on `z`, at the quirky inner
-/// point `(r_inner_skip, r_inner_rest)` combined with `x_ab.x_outer`
-/// (publicly known to the caller).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LincheckClaim {
-    /// Univariate-skip post-vector random sample.
     pub r_inner_skip: F128,
-    /// Multilinear post-vector random sample, length `k_log − k_skip`.
     pub r_inner_rest: Vec<F128>,
-    /// `ẑ((r_inner_skip, r_inner_rest), x_ab.x_outer)` — the single
-    /// `z`-claim derived from the A and B consistency checks.
     pub w: F128,
 }
 
-/// Reasons the verifier may reject.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
-    /// One of the proof vectors has the wrong length (expected `2^k_log`).
     BadVectorLength {
         which: &'static str,
         expected: usize,
         got: usize,
     },
-    /// One of the input quirky points has wrong `x_inner_rest` length
-    /// (expected `k_log − k_skip`).
     BadInnerRestLength {
         which: &'static str,
         expected: usize,
         got: usize,
     },
-    /// One of the input quirky points has wrong `x_outer` length
-    /// (expected `n_log = m − k_log`).
     BadOuterLength {
         which: &'static str,
         expected: usize,
         got: usize,
     },
-    /// One of the base matrices isn't `2^k_log × 2^k_log`.
     BadMatrixShape {
         which: &'static str,
         expected: usize,
         got_rows: usize,
         got_cols: usize,
     },
-    /// `k_skip` exceeds `k_log` (the matrix inner dimension).
-    KSkipExceedsKLog { k_skip: usize, k_log: usize },
-    /// The scalar consistency check failed for one of (A, B, C).
-    /// Detected: `Σ_{i_inner} M̂_0_quirky(z_skip, x_inner_rest, i_inner) · z_x_vec[i_inner] ≠ v`.
-    ConsistencyFailed { which: &'static str },
+    KSkipExceedsKLog {
+        k_skip: usize,
+        k_log: usize,
+    },
+    ConsistencyFailed {
+        which: &'static str,
+    },
 }
 
-// ---------------------------------------------------------------------------
-// Core kernels
-// ---------------------------------------------------------------------------
-
-/// Build the eq-MLE table at `point ∈ F^d`. Returns a length-`2^d` vector
-/// where `output[i] = Π_j (1 + point[j] + bit_j(i)) = Π_j eq(point[j], bit_j(i))`.
-///
-/// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
-/// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
-    // Every slot is written by the level that first exposes it before it can
-    // be read at a later level.
-    let mut out = crate::alloc_uninit_f128_vec(1usize << point.len());
-    build_eq_table_into(point, &mut out);
-    out
-}
-
-/// In-place variant of [`build_eq_table`]: the identical construction (and
-/// therefore identical bytes) into caller-provided storage. The GPU fold
-/// arms use it to host the table directly in their shared-storage upload
-/// buffer (see `gpu_commit::zc_fold_eq_table`), which deletes the launch's
-/// 4 MiB upload memcpy. `out.len()` must be exactly `1 << point.len()`.
-pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
     use rayon::prelude::*;
-
     let d = point.len();
-    assert_eq!(out.len(), 1usize << d);
-    out[0] = F128::ONE;
-    const PAR_THRESHOLD: usize = 1 << 12;
-    for j in 0..d {
-        let r_j = point[j];
-        let len = 1usize << j;
-        let (lo, rest) = out.split_at_mut(len);
-        let hi = &mut rest[..len];
-        // For each existing entry i ∈ [0, len), produce two children:
-        //   hi[i] = v * r_j              ← new bit_j = 1
-        //   lo[i] = v * (1 + r_j)
-        //         = v + hi[i]             ← new bit_j = 0
-        // The distributive identity saves one field multiplication per pair.
-        let build_pair = |lo_i: &mut F128, hi_i: &mut F128| {
-            let v = *lo_i;
-            let vr = v * r_j;
-            *hi_i = vr;
-            *lo_i = v + vr;
-        };
-        if len < PAR_THRESHOLD {
-            lo.iter_mut()
-                .zip(hi.iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
-        } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
-        }
+    if d >= 14 {
+        const D_LO: usize = 12;
+        const LO_LEN: usize = 1usize << D_LO;
+        let eq_lo = build_eq_table(&point[..D_LO]);
+        let eq_hi = build_eq_table(&point[D_LO..]);
+        let mut out = crate::scratch::take_f128(1usize << d);
+        out.par_chunks_mut(LO_LEN)
+            .zip(eq_hi.par_iter())
+            .for_each(|(chunk, &eh)| {
+                crate::field::f128_slice::scalar_mul_into(chunk, &eq_lo, eh);
+            });
+        return out;
     }
-}
-
-/// Architecture-optimized equality-table builder used by callers that opt in
-/// independently of [`build_eq_table`]. Keeping this separate leaves the
-/// generic builder available as an exact same-binary control.
-pub(crate) fn build_eq_table_optimized(point: &[F128]) -> Vec<F128> {
-    let mut out = crate::alloc_uninit_f128_vec(1usize << point.len());
-    build_eq_table_optimized_into(point, &mut out);
-    out
-}
-
-/// Caller-provided-storage variant of [`build_eq_table_optimized`].
-pub(crate) fn build_eq_table_optimized_into(point: &[F128], out: &mut [F128]) {
-    use rayon::prelude::*;
-
-    assert_eq!(out.len(), 1usize << point.len());
+    let mut out = crate::alloc_uninit_f128_vec(1usize << d);
     out[0] = F128::ONE;
-    // The two-lane PMULL kernel makes the smaller expansion levels too short
-    // to amortize a Rayon fork/join. Production-geometry crossover sweeps put
-    // the stable median minimum at 2^14 entries on ten performance cores.
-    const PAR_THRESHOLD: usize = 1 << 14;
-    const PAR_CHUNK: usize = 1 << 8;
-    for (j, &r_j) in point.iter().enumerate() {
+    if d == 0 {
+        return out;
+    }
+    let r0 = point[0];
+    out[1] = r0;
+    out[0] = F128::ONE + r0;
+    const CHUNK: usize = 4096;
+    for (j, &r_j) in point.iter().enumerate().skip(1) {
         let len = 1usize << j;
-        let (lo, rest) = out.split_at_mut(len);
-        let hi = &mut rest[..len];
-        if len < PAR_THRESHOLD {
-            crate::field::f128_slice::expand_eq_table_level(lo, hi, r_j);
+        let (lo, hi_rest) = out.split_at_mut(len);
+        let hi = &mut hi_rest[..len];
+        if len < SUMCHECK_PAR_THRESHOLD {
+            unsafe {
+                crate::gf2_kernels::k0_f128_eq_expand_slice(
+                    lo.as_mut_ptr() as *mut u64,
+                    hi.as_mut_ptr() as *mut u64,
+                    len,
+                    r_j.lo,
+                    r_j.hi,
+                );
+            }
         } else {
-            lo.par_chunks_mut(PAR_CHUNK)
-                .zip(hi.par_chunks_mut(PAR_CHUNK))
-                .for_each(|(lo_chunk, hi_chunk)| {
-                    crate::field::f128_slice::expand_eq_table_level(lo_chunk, hi_chunk, r_j);
+            lo.par_chunks_mut(CHUNK)
+                .zip(hi.par_chunks_mut(CHUNK))
+                .for_each(|(lo_c, hi_c)| unsafe {
+                    crate::gf2_kernels::k0_f128_eq_expand_slice(
+                        lo_c.as_mut_ptr() as *mut u64,
+                        hi_c.as_mut_ptr() as *mut u64,
+                        lo_c.len(),
+                        r_j.lo,
+                        r_j.hi,
+                    );
                 });
         }
     }
+    out
 }
 
-/// Fold a sparse boolean matrix's rows against an eq table at the row
-/// coords. Computes the **transposed** matrix-vector product:
-///
-///   `output[col] = Σ_{row: M[row, col] = 1} eq_table[row]`
-///
-/// This is the row-MLE `M̂_0(x_inner, ·)` evaluated at all boolean column
-/// indices — the length-`k` vector the verifier needs for the consistency
-/// check. Cost: `nnz(M)` F128 adds.
-/// Below this matrix row count, the sequential path beats rayon dispatch
-/// overhead. Tuned for `k = 2^14` (BLAKE3) — small matrices stay scalar,
-/// big ones parallelize.
 const SPARSE_ROW_FOLD_PAR_THRESHOLD: usize = 1usize << 12;
 
 pub fn sparse_row_fold(matrix: &SparseBinaryMatrix, eq_table: &[F128]) -> Vec<F128> {
@@ -618,9 +411,6 @@ pub fn sparse_row_fold(matrix: &SparseBinaryMatrix, eq_table: &[F128]) -> Vec<F1
         }
         out
     } else {
-        // Scatter-reduce: per-thread accumulator, XOR-merge at the end. Each
-        // thread allocates a length-n_cols buffer (~256 KB at k=16384) — fine
-        // vs the witness-scale buffers already in flight.
         use rayon::prelude::*;
         matrix
             .rows
@@ -648,15 +438,6 @@ pub fn sparse_row_fold(matrix: &SparseBinaryMatrix, eq_table: &[F128]) -> Vec<F1
     }
 }
 
-/// Partial fold of `z` at the outer half of a claim point — single-matrix,
-/// **scalar reference**. Uses the lincheck `z_packed` stripe layout
-/// (see module docs).
-///
-///   `output[i_inner] = Σ_{i_outer ∈ {0,1}^n_log}  z[i_inner, i_outer] · eq_outer[i_outer]`
-///
-/// Equivalently, `output[i_inner] = ẑ(i_inner_as_F128, x_outer)` for boolean
-/// `i_inner`. Used as the cross-check oracle for the production
-/// `partial_fold_packed_z_triple`.
 pub fn partial_fold_packed_z(
     z_packed: &[u8],
     m: usize,
@@ -690,23 +471,6 @@ pub fn partial_fold_packed_z(
     out
 }
 
-/// **Optimized single-matrix partial fold.** Same shape as
-/// [`partial_fold_packed_z`] but uses 256-entry **sum-table lookups** and is
-/// parallelized via rayon. The hot inner kernel does just **1 byte load +
-/// 1 table lookup + 1 XOR** per `(byte_idx, i_inner)` pair.
-///
-/// At m=29 multi-thread this is ~3× faster than the naive scalar
-/// `partial_fold_packed_z` (which we keep as the cross-check reference).
-///
-/// Iteration:
-/// 1. For each `byte_idx ∈ 0..n_outer/8`, build a 256-entry F128 table
-///    where `table[b] = Σ_{r: bit r set in b} eq_outer[8·byte_idx + r]`.
-///    Cost: 255 F128 XORs (doubling construction).
-/// 2. Sweep the `k`-byte stripe at `z_packed[byte_idx·k .. (byte_idx+1)·k]`.
-///    For each `i_inner`, do `out[i_inner] ^= table[z_byte]`.
-///
-/// Parallel: each worker owns a contiguous range of stripes and a private
-/// length-`k` accumulator; results XOR-reduced.
 pub fn partial_fold_packed_z_fast(
     z_packed: &[u8],
     m: usize,
@@ -717,10 +481,6 @@ pub fn partial_fold_packed_z_fast(
     partial_fold_packed_z_fast_padded(z_packed, m, k_log, k, eq_outer)
 }
 
-/// Padding-aware variant of [`partial_fold_packed_z_fast`]. Skips rows
-/// `i_inner ∈ [useful_bits, k)` — those rows hold zero in every block of an
-/// honestly padded witness, so the fold over the outer dim is zero. Output
-/// is byte-identical to the dense path on such witnesses.
 pub fn partial_fold_packed_z_fast_padded(
     z_packed: &[u8],
     m: usize,
@@ -728,6 +488,8 @@ pub fn partial_fold_packed_z_fast_padded(
     useful_bits: usize,
     eq_outer: &[F128],
 ) -> Vec<F128> {
+    use rayon::prelude::*;
+
     let n_log = m - k_log;
     let k = 1usize << k_log;
     let n_outer = 1usize << n_log;
@@ -738,13 +500,8 @@ pub fn partial_fold_packed_z_fast_padded(
     let n_stripes = n_outer / 8;
 
     let stripes_per_chunk = (n_stripes / 256).max(1);
-    use rayon::prelude::*;
     let bytes_per_chunk = stripes_per_chunk * k;
 
-    // fold(): one length-k accumulator per WORKER rather than per chunk —
-    // at large k the per-chunk accumulators of map().reduce() dominate MT
-    // time with allocation + tree-reduce XOR traffic (keccak3: k = 2^17
-    // means 2 MB per chunk across ~128 chunks).
     z_packed
         .par_chunks(bytes_per_chunk)
         .enumerate()
@@ -774,21 +531,8 @@ pub fn partial_fold_packed_z_fast_padded(
         )
 }
 
-/// Stripes swept per accumulator touch in the NEON tiled partial fold.
-/// Larger ⇒ the length-`k` accumulator is re-streamed fewer times
-/// (`n_stripes / NEON_TILE_T`), but the per-tile sum tables grow
-/// `NEON_TILE_T × 4 KB` and must stay L1-resident.
-///
-/// **Single source of truth.** The dispatch gate ([`n_log_ok_for_tile`]) and
-/// the kernels' actual tiling factor MUST agree — the kernels take `TILE_T`
-/// as a const generic and the public entry points instantiate them with this
-/// constant, so the pairing is correct by construction.
-pub(crate) const NEON_TILE_T: usize = 8;
+const NEON_TILE_T: usize = 8;
 
-/// Dispatch helper: pick the fastest single-matrix partial fold available
-/// for the given (m, k_log). Threads `useful_bits` through so the kernel
-/// can skip blocks past the useful region of each block (byte-identical to
-/// the dense path on honestly-padded witnesses).
 pub(crate) fn partial_fold_packed_z_best(
     z_packed: &[u8],
     m: usize,
@@ -799,14 +543,6 @@ pub(crate) fn partial_fold_packed_z_best(
     if n_log_ok_for_tile(m, k_log, NEON_TILE_T) {
         #[cfg(target_arch = "aarch64")]
         {
-            // Pick the partition that wins for this size. The outer(tile)-partitioned
-            // `oblock` builds each tile's sum-tables once instead of once per worker,
-            // so it scales the fold far better (≈8.5× vs iblock's ≈6.5× on 10 P-cores
-            // at m=32) — BUT its private-partial alloc + XOR-reduce overhead makes it
-            // up to ~1.7× SLOWER on small folds. Empirically (M4 Max, 10 P-cores) the
-            // crossover sits at n_log ≈ 15–16 across k_log ∈ {11,14}, so gate oblock at
-            // n_log ≥ 16; below that the L1-resident `iblock` wins. `FOLD_IBLOCK` forces
-            // iblock everywhere (bench A/B).
             let n_log = m - k_log;
             if n_log >= OBLOCK_MIN_N_LOG && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
             {
@@ -833,164 +569,9 @@ pub(crate) fn partial_fold_packed_z_best(
     }
 }
 
-/// Outer-dimension threshold (`n_log = m − k_log`) at/above which the
-/// outer(tile)-partitioned fold beats the i_inner-partitioned one. See
-/// [`partial_fold_packed_z_best`] for the crossover calibration.
 #[cfg(target_arch = "aarch64")]
 const OBLOCK_MIN_N_LOG: usize = 16;
 
-/// Strict rollback for the ranked lincheck outer-equality product pairing.
-/// `FLOCK_NO_LINCHECK_EQ_PAIR=1` restores the generic scalar builder.
-pub const ENV_NO_LINCHECK_EQ_PAIR: &str = "FLOCK_NO_LINCHECK_EQ_PAIR";
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn lincheck_eq_pair_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("1"))
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn ranked_lincheck_eq_pair_enabled(
-    m: usize,
-    k_log: usize,
-    k_skip: usize,
-    useful_bits: usize,
-    outer_len: usize,
-) -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        lincheck_eq_pair_value_enabled(std::env::var_os(ENV_NO_LINCHECK_EQ_PAIR).as_deref())
-    });
-    cfg!(target_feature = "aes")
-        && m == 32
-        && k_log == 14
-        && k_skip == 6
-        && useful_bits == 15_409
-        && outer_len == 18
-        && rayon::current_num_threads() == 10
-        && *ON
-}
-
-/// The one production shape the lincheck GPU fold arm is tuned and gated
-/// for (`m = 32`, `k_log = 14`). Everything else takes the exact CPU path.
-/// `n_log ≥ 6` keeps the CPU claim suffix's structural preconditions
-/// (`n_stripes % NEON_TILE_T == 0`) satisfied on every shape the GPU
-/// launcher can accept, including the small shapes tests drive.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn ranked_lincheck_fold_gpu_shape(m: usize, k_log: usize) -> bool {
-    // `cfg!(test)` widens the gate so end-to-end oracles can drive the arm
-    // at a small shape. Production is the ranked shape only.
-    (cfg!(test) || (m == 32 && k_log == 14))
-        && m >= k_log + 6
-        && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Build eq(x_outer, ·) for the witness-stripe fold. The exact ranked shape
-/// pairs shared-constant products; every other shape keeps the scalar builder.
-/// At the GPU-arm shape the table is built in place in the fold arm's persistent
-/// upload buffer so the launch skips its 4 MiB memcpy (`FLOCK_NO_EQ_DIRECT=1`
-/// restores the owned build + copy). Bytes and lane order are identical.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn build_z_fold_eq_table(
-    m: usize,
-    k_log: usize,
-    k_skip: usize,
-    useful_bits: usize,
-    x_outer: &[F128],
-) -> crate::gpu_commit::FoldEqTable {
-    let pair_products =
-        ranked_lincheck_eq_pair_enabled(m, k_log, k_skip, useful_bits, x_outer.len());
-    if ranked_lincheck_fold_gpu_shape(m, k_log) {
-        crate::gpu_commit::lincheck_fold_eq_table(x_outer, pair_products)
-    } else if pair_products {
-        crate::gpu_commit::FoldEqTable::Owned(build_eq_table_optimized(x_outer))
-    } else {
-        crate::gpu_commit::FoldEqTable::Owned(build_eq_table(x_outer))
-    }
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn build_z_fold_eq_table(
-    m: usize,
-    k_log: usize,
-    k_skip: usize,
-    useful_bits: usize,
-    x_outer: &[F128],
-) -> Vec<F128> {
-    let _ = (m, k_log, k_skip, useful_bits);
-    build_eq_table(x_outer)
-}
-
-/// Fold the witness stripe against `eq_outer`, draining the GPU prefix when
-/// one is in flight. Bit-identical to [`partial_fold_packed_z_best`] in
-/// every case: GF(2¹²⁸) add is XOR — associative and commutative — so
-/// splitting the oblock claim range between the GPU prefix and the CPU
-/// hetero-queue suffix and XORing the halves reproduces the whole-range
-/// result exactly. Any GPU-side failure makes the CPU redo exactly the
-/// skipped prefix claims (launch failure ⇒ the whole fold stays on the
-/// incumbent path) — slower, still exact.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn partial_fold_packed_z_best_gpu_split(
-    z_packed: &[u8],
-    m: usize,
-    k_log: usize,
-    useful_bits: usize,
-    eq_outer: &[F128],
-) -> Vec<F128> {
-    let gpu = ranked_lincheck_fold_gpu_shape(m, k_log)
-        .then(|| crate::gpu_commit::launch_lincheck_fold(z_packed, m, k_log, useful_bits, eq_outer))
-        .flatten();
-    if let Some(job) = gpu {
-        let claim_lo = job.claim_lo();
-        let t_suffix = std::time::Instant::now();
-        let mut out = partial_fold_packed_z_neon_oblock_padded_suffix(
-            z_packed,
-            m,
-            k_log,
-            useful_bits,
-            eq_outer,
-            claim_lo,
-        );
-        let suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
-        // No head in this window: the CPU suffix starts at submission.
-        match job.finish_xor_into(&mut out, 0.0, suffix_ms) {
-            Ok(()) => return out,
-            Err(e) => {
-                // The prefix never landed and the CPU already skipped it.
-                // Redo exactly those claims here — slower, still exact.
-                if crate::gpu_commit::gpu_lincheck_debug() {
-                    eprintln!("[gpu-lincheck] prefix failed, CPU redo: {e}");
-                }
-                let prefix = partial_fold_packed_z_neon_oblock_padded_range(
-                    z_packed,
-                    m,
-                    k_log,
-                    useful_bits,
-                    eq_outer,
-                    0,
-                    claim_lo,
-                );
-                for (a, b) in out.iter_mut().zip(prefix) {
-                    *a += b;
-                }
-                return out;
-            }
-        }
-    }
-    partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, eq_outer)
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn partial_fold_packed_z_best_gpu_split(
-    z_packed: &[u8],
-    m: usize,
-    k_log: usize,
-    useful_bits: usize,
-    eq_outer: &[F128],
-) -> Vec<F128> {
-    partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, eq_outer)
-}
-
-/// Quick test for "can we use the tiled fast path?". Tile uses `TILE_T`
-/// stripes; we need `n_stripes` divisible by TILE_T and enough outer dim.
 fn n_log_ok_for_tile(m: usize, k_log: usize, tile_t: usize) -> bool {
     if k_log < 3 {
         return false;
@@ -1003,33 +584,176 @@ fn n_log_ok_for_tile(m: usize, k_log: usize, tile_t: usize) -> bool {
     n_stripes.is_multiple_of(tile_t)
 }
 
-/// Build a 256-entry sum table over 8 F128 values:
-///   `table[b] = Σ_{r: bit r of b is set}  eq8[r]`
-///
-/// Doubling construction (255 XORs): for each new bit position `i ∈ 0..8`,
-/// extend the table by XORing `eq8[i]` into each existing entry. This
-/// avoids the naive 8·256 = 2048 operations.
 #[inline]
 fn build_sum_table(eq8: &[F128], table: &mut [F128]) {
     debug_assert_eq!(eq8.len(), 8);
     debug_assert_eq!(table.len(), 256);
-    table[0] = F128::ZERO;
-    for i in 0..8 {
-        let e = eq8[i];
-        let len = 1usize << i;
-        for j in 0..len {
-            table[len + j] = table[j] + e;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use core::arch::x86_64::*;
+        let eq_ptr = eq8.as_ptr() as *const __m128i;
+        let t_ptr = table.as_mut_ptr() as *mut __m256i;
+        let v0 = _mm_setzero_si128();
+        let e0 = _mm_loadu_si128(eq_ptr);
+        let e1 = _mm256_broadcastsi128_si256(_mm_loadu_si128(eq_ptr.add(1)));
+        let e2 = _mm256_broadcastsi128_si256(_mm_loadu_si128(eq_ptr.add(2)));
+        let e3 = _mm256_broadcastsi128_si256(_mm_loadu_si128(eq_ptr.add(3)));
+        let p0 = _mm256_set_m128i(e0, v0);
+        let p1 = _mm256_xor_si256(p0, e1);
+        let p2 = _mm256_xor_si256(p0, e2);
+        let p3 = _mm256_xor_si256(p1, e2);
+        _mm256_storeu_si256(t_ptr, p0);
+        _mm256_storeu_si256(t_ptr.add(1), p1);
+        _mm256_storeu_si256(t_ptr.add(2), p2);
+        _mm256_storeu_si256(t_ptr.add(3), p3);
+        _mm256_storeu_si256(t_ptr.add(4), _mm256_xor_si256(p0, e3));
+        _mm256_storeu_si256(t_ptr.add(5), _mm256_xor_si256(p1, e3));
+        _mm256_storeu_si256(t_ptr.add(6), _mm256_xor_si256(p2, e3));
+        _mm256_storeu_si256(t_ptr.add(7), _mm256_xor_si256(p3, e3));
+        macro_rules! expand_step_avx2 {
+            ($i:literal, $pairs:literal) => {{
+                let ei = _mm256_broadcastsi128_si256(_mm_loadu_si128(eq_ptr.add($i)));
+                let mut j = 0usize;
+                while j < $pairs {
+                    let s0 = _mm256_loadu_si256(t_ptr.add(j));
+                    let s1 = _mm256_loadu_si256(t_ptr.add(j + 1));
+                    let s2 = _mm256_loadu_si256(t_ptr.add(j + 2));
+                    let s3 = _mm256_loadu_si256(t_ptr.add(j + 3));
+                    _mm256_storeu_si256(t_ptr.add($pairs + j), _mm256_xor_si256(s0, ei));
+                    _mm256_storeu_si256(t_ptr.add($pairs + j + 1), _mm256_xor_si256(s1, ei));
+                    _mm256_storeu_si256(t_ptr.add($pairs + j + 2), _mm256_xor_si256(s2, ei));
+                    _mm256_storeu_si256(t_ptr.add($pairs + j + 3), _mm256_xor_si256(s3, ei));
+                    j += 4;
+                }
+            }};
+        }
+        expand_step_avx2!(4, 8);
+        expand_step_avx2!(5, 16);
+        expand_step_avx2!(6, 32);
+        expand_step_avx2!(7, 64);
+        return;
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    unsafe {
+        use core::arch::x86_64::*;
+        let eq_ptr = eq8.as_ptr() as *const __m128i;
+        let t_ptr = table.as_mut_ptr() as *mut __m128i;
+        let v0 = _mm_setzero_si128();
+        let e0 = _mm_loadu_si128(eq_ptr);
+        let e1 = _mm_loadu_si128(eq_ptr.add(1));
+        let e2 = _mm_loadu_si128(eq_ptr.add(2));
+        let e3 = _mm_loadu_si128(eq_ptr.add(3));
+        let t2 = _mm_xor_si128(e0, e1);
+        let t4 = e2;
+        let t5 = _mm_xor_si128(e0, e2);
+        let t6 = _mm_xor_si128(e1, e2);
+        let t7 = _mm_xor_si128(t2, e2);
+        _mm_store_si128(t_ptr, v0);
+        _mm_store_si128(t_ptr.add(1), e0);
+        _mm_store_si128(t_ptr.add(2), e1);
+        _mm_store_si128(t_ptr.add(3), t2);
+        _mm_store_si128(t_ptr.add(4), t4);
+        _mm_store_si128(t_ptr.add(5), t5);
+        _mm_store_si128(t_ptr.add(6), t6);
+        _mm_store_si128(t_ptr.add(7), t7);
+        _mm_store_si128(t_ptr.add(8), e3);
+        _mm_store_si128(t_ptr.add(9), _mm_xor_si128(e0, e3));
+        _mm_store_si128(t_ptr.add(10), _mm_xor_si128(e1, e3));
+        _mm_store_si128(t_ptr.add(11), _mm_xor_si128(t2, e3));
+        _mm_store_si128(t_ptr.add(12), _mm_xor_si128(t4, e3));
+        _mm_store_si128(t_ptr.add(13), _mm_xor_si128(t5, e3));
+        _mm_store_si128(t_ptr.add(14), _mm_xor_si128(t6, e3));
+        _mm_store_si128(t_ptr.add(15), _mm_xor_si128(t7, e3));
+        macro_rules! expand_step {
+            ($i:literal, $len:literal) => {{
+                let ei = _mm_loadu_si128(eq_ptr.add($i));
+                let mut j = 0usize;
+                while j < $len {
+                    let s0 = _mm_load_si128(t_ptr.add(j));
+                    let s1 = _mm_load_si128(t_ptr.add(j + 1));
+                    let s2 = _mm_load_si128(t_ptr.add(j + 2));
+                    let s3 = _mm_load_si128(t_ptr.add(j + 3));
+                    _mm_store_si128(t_ptr.add($len + j), _mm_xor_si128(s0, ei));
+                    _mm_store_si128(t_ptr.add($len + j + 1), _mm_xor_si128(s1, ei));
+                    _mm_store_si128(t_ptr.add($len + j + 2), _mm_xor_si128(s2, ei));
+                    _mm_store_si128(t_ptr.add($len + j + 3), _mm_xor_si128(s3, ei));
+                    j += 4;
+                }
+            }};
+        }
+        expand_step!(4, 16);
+        expand_step!(5, 32);
+        expand_step!(6, 64);
+        expand_step!(7, 128);
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let eq_ptr = eq8.as_ptr() as *const u8;
+        let t_ptr = table.as_mut_ptr() as *mut u8;
+        let v0 = vdupq_n_u8(0);
+        let e0 = vld1q_u8(eq_ptr);
+        let e1 = vld1q_u8(eq_ptr.add(16));
+        let e2 = vld1q_u8(eq_ptr.add(32));
+        let e3 = vld1q_u8(eq_ptr.add(48));
+        let t2 = veorq_u8(e0, e1);
+        let t4 = e2;
+        let t5 = veorq_u8(e0, e2);
+        let t6 = veorq_u8(e1, e2);
+        let t7 = veorq_u8(t2, e2);
+        vst1q_u8(t_ptr, v0);
+        vst1q_u8(t_ptr.add(16), e0);
+        vst1q_u8(t_ptr.add(32), e1);
+        vst1q_u8(t_ptr.add(48), t2);
+        vst1q_u8(t_ptr.add(64), t4);
+        vst1q_u8(t_ptr.add(80), t5);
+        vst1q_u8(t_ptr.add(96), t6);
+        vst1q_u8(t_ptr.add(112), t7);
+        vst1q_u8(t_ptr.add(128), e3);
+        vst1q_u8(t_ptr.add(144), veorq_u8(e0, e3));
+        vst1q_u8(t_ptr.add(160), veorq_u8(e1, e3));
+        vst1q_u8(t_ptr.add(176), veorq_u8(t2, e3));
+        vst1q_u8(t_ptr.add(192), veorq_u8(t4, e3));
+        vst1q_u8(t_ptr.add(208), veorq_u8(t5, e3));
+        vst1q_u8(t_ptr.add(224), veorq_u8(t6, e3));
+        vst1q_u8(t_ptr.add(240), veorq_u8(t7, e3));
+        macro_rules! expand_step_neon {
+            ($i:literal, $len:literal) => {{
+                let ei = vld1q_u8(eq_ptr.add($i * 16));
+                let mut j = 0usize;
+                while j < $len {
+                    let s0 = vld1q_u8(t_ptr.add(j * 16));
+                    let s1 = vld1q_u8(t_ptr.add((j + 1) * 16));
+                    let s2 = vld1q_u8(t_ptr.add((j + 2) * 16));
+                    let s3 = vld1q_u8(t_ptr.add((j + 3) * 16));
+                    vst1q_u8(t_ptr.add(($len + j) * 16), veorq_u8(s0, ei));
+                    vst1q_u8(t_ptr.add(($len + j + 1) * 16), veorq_u8(s1, ei));
+                    vst1q_u8(t_ptr.add(($len + j + 2) * 16), veorq_u8(s2, ei));
+                    vst1q_u8(t_ptr.add(($len + j + 3) * 16), veorq_u8(s3, ei));
+                    j += 4;
+                }
+            }};
+        }
+        expand_step_neon!(4, 16);
+        expand_step_neon!(5, 32);
+        expand_step_neon!(6, 64);
+        expand_step_neon!(7, 128);
+        return;
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        table[0] = F128::ZERO;
+        for i in 0..8 {
+            let e = eq8[i];
+            let len = 1usize << i;
+            for j in 0..len {
+                table[len + j] = table[j] + e;
+            }
         }
     }
 }
 
-/// Pack a logical Boolean witness vector into the lincheck `z_packed`
-/// stripe layout. The input `z_logical` is indexed linearly with
-/// `z_logical[i_inner + i_outer · k]` = z's value at `(i_inner, i_outer)`.
-/// The output `z_packed[byte_idx · k + i_inner]` holds 8 outer bits
-/// `z[i_inner, 8·byte_idx + r]` for `r ∈ 0..8`, with bit `r` within the byte.
-///
-/// See the module-level docs for the full bit-position decomposition.
 pub fn pack_z_lincheck(z_logical: &[bool], m: usize, k_log: usize) -> Vec<u8> {
     let k = 1usize << k_log;
     let n_total = 1usize << m;
@@ -1038,7 +762,6 @@ pub fn pack_z_lincheck(z_logical: &[bool], m: usize, k_log: usize) -> Vec<u8> {
     assert_eq!(n_outer % 8, 0, "need n_outer ≥ 8 for byte stripes");
     let n_stripes = n_outer / 8;
 
-    // Uninit alloc — every byte is written exactly once in the loop below.
     let mut z_packed: Vec<u8> = crate::alloc_uninit_vec(n_total / 8);
     for byte_idx in 0..n_stripes {
         for i_inner in 0..k {
@@ -1056,109 +779,70 @@ pub fn pack_z_lincheck(z_logical: &[bool], m: usize, k_log: usize) -> Vec<u8> {
     z_packed
 }
 
-/// Same output as [`pack_z_lincheck`] but reads bits from an F_{2^128}-packed
-/// witness (polynomial basis: bit `i` of logical = bit `i % 128` of
-/// `z_packed_f128[i / 128]`).
 pub fn pack_z_lincheck_from_packed(
     z_packed_f128: &[crate::field::F128],
     m: usize,
     k_log: usize,
 ) -> Vec<u8> {
+    use rayon::prelude::*;
     let k = 1usize << k_log;
     let n_total = 1usize << m;
     assert_eq!(z_packed_f128.len(), n_total / 128);
     let n_outer = n_total / k;
     assert_eq!(n_outer % 8, 0, "need n_outer ≥ 8 for byte stripes");
 
-    // Uninit alloc — the par_chunks_mut loop below writes every byte of
-    // every k-byte stripe exactly once. Saves ~10 ms of sequential
-    // zero-fill at m=29 (64 MB byte buffer) on the main thread.
     let mut z_packed: Vec<u8> = crate::alloc_uninit_vec(n_total / 8);
-    // Each stripe (byte_idx) writes a disjoint k-byte chunk — process them in
-    // parallel. Inside one stripe, k independent output bytes.
-    // Hetero-queue drain (same contract as the promoted zerocheck
-    // conversions): pure bit-extraction compute over disjoint stripes with
-    // no reduction — the ideal shape for the efficiency-core queue. Each
-    // chunk writes only its own k-byte stripe; output is bit-identical by
-    // construction.
-    let stripes = z_packed.len() / k;
-    let z_base = crate::epool::SyncPtr(z_packed.as_mut_ptr());
-    crate::epool::run_hetero_chunks(stripes, |byte_idx| {
-        // SAFETY: the queue hands out each stripe exactly once; stripe
-        // byte_idx exclusively owns z_packed[byte_idx*k..][..k]; the queue's
-        // completion join publishes the writes before the caller reads.
-        let chunk = unsafe { std::slice::from_raw_parts_mut(z_base.ptr().add(byte_idx * k), k) };
-        for i_inner in 0..k {
-            let mut byte = 0u8;
-            for r in 0..8 {
-                let i_outer = 8 * byte_idx + r;
-                let logical_idx = i_inner + i_outer * k;
-                let f128_idx = logical_idx / 128;
-                let local_bit = logical_idx % 128;
-                let bit = if local_bit < 64 {
-                    (z_packed_f128[f128_idx].lo >> local_bit) & 1 == 1
-                } else {
-                    (z_packed_f128[f128_idx].hi >> (local_bit - 64)) & 1 == 1
-                };
-                if bit {
-                    byte |= 1u8 << r;
+    z_packed
+        .par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(byte_idx, chunk)| {
+            for i_inner in 0..k {
+                let mut byte = 0u8;
+                for r in 0..8 {
+                    let i_outer = 8 * byte_idx + r;
+                    let logical_idx = i_inner + i_outer * k;
+                    let f128_idx = logical_idx / 128;
+                    let local_bit = logical_idx % 128;
+                    let bit = if local_bit < 64 {
+                        (z_packed_f128[f128_idx].lo >> local_bit) & 1 == 1
+                    } else {
+                        (z_packed_f128[f128_idx].hi >> (local_bit - 64)) & 1 == 1
+                    };
+                    if bit {
+                        byte |= 1u8 << r;
+                    }
                 }
+                chunk[i_inner] = byte;
             }
-            chunk[i_inner] = byte;
-        }
-    });
+        });
     z_packed
 }
 
-/// Build the **quirky eq table** for a claim point on the inner half:
-///
-///   `out[i_skip + i_inner_rest · 2^k_skip]
-///     = L_{i_skip}(z_skip)  ·  eq(x_inner_rest, i_inner_rest)`
-///
-/// where `L_{i_skip}` are Lagrange weights at `z_skip` for the φ_8 basis
-/// over `{0, …, 2^k_skip − 1}`. Length: `2^k_log`.
-///
-/// Encoding: the skip dim occupies the **low** `k_skip` bits of the table
-/// index (matches z_packed's stripe layout / zerocheck's LSB-first
-/// univariate-skip variable ordering). The `k_log − k_skip` multilinear
-/// inner-rest dims occupy the next bits.
-///
-/// Cost: 64 (Lagrange) + 32 (eq) + 2048 outer products ≈ tiny.
 pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize) -> Vec<F128> {
     let ell_skip = 1usize << k_skip;
     let ell_rest = 1usize << x_inner_rest.len();
     let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
     let eq_rest = build_eq_table(x_inner_rest);
     let total = ell_skip * ell_rest;
-    let mut out = crate::alloc_uninit_f128_vec(total);
-    // Layout: index = i_skip + i_inner_rest · 2^k_skip  ⇒  i_skip is low bits.
-    for (row, &er) in out.chunks_exact_mut(ell_skip).zip(eq_rest.iter()) {
-        for (dst, &ls) in row.iter_mut().zip(lambda_skip.iter()) {
-            *dst = ls * er;
-        }
+    let mut out = vec![F128::ZERO; total];
+    for (r_idx, &er) in eq_rest.iter().enumerate() {
+        let base = r_idx * ell_skip;
+        crate::field::f128_slice::scalar_mul_into(
+            &mut out[base..base + ell_skip],
+            &lambda_skip,
+            er,
+        );
     }
     debug_assert_eq!(out.len(), total);
     out
 }
 
-/// Dot product of two equal-length F128 slices.
 fn inner_product(a: &[F128], b: &[F128]) -> F128 {
-    assert_eq!(a.len(), b.len());
-    let mut acc = F128::ZERO;
-    for (x, y) in a.iter().zip(b.iter()) {
-        acc += *x * *y;
-    }
-    acc
+    crate::field::f128_slice::inner_product(a, b)
 }
 
-/// Length above which the inner product / element-wise kernels split via
-/// rayon. Below it, sequential beats dispatch overhead.
 const SUMCHECK_PAR_THRESHOLD: usize = 1usize << 12;
 
-/// Fused `sparse_row_fold(A) + α-batch + sparse_row_fold(B)`: produces the
-/// `comb_vec[c] = α · (A^T·eq)[c] + (B^T·eq)[c]` in a single pass, halving the
-/// allocations and reduction phases vs. two separate sparse_row_folds + an
-/// α-batch step. Both matrices must be `k × k` and `eq_table.len() == k`.
 fn sparse_row_fold_alpha_batched(
     alpha: F128,
     a_0: &SparseBinaryMatrix,
@@ -1173,7 +857,6 @@ fn sparse_row_fold_alpha_batched(
 
     let total_rows = a_0.num_rows + b_0.num_rows;
     if total_rows < SPARSE_ROW_FOLD_PAR_THRESHOLD {
-        // Scalar fused path.
         let mut out = vec![F128::ZERO; n_cols];
         for (r, row) in a_0.rows.iter().enumerate() {
             let e = alpha * eq_table[r];
@@ -1190,20 +873,8 @@ fn sparse_row_fold_alpha_batched(
         return out;
     }
 
-    // Parallel fused path with a BOUNDED number of accumulators. These base
-    // matrices are dense (e.g. BLAKE3: ~21M nonzeros over 16384 rows), so the
-    // fold is ~21M F128 adds. The natural `par_iter().fold()` form spawns a
-    // fresh length-`n_cols` (256 KB) accumulator per work-steal split and then
-    // tree-reduces all of them — O(n_cols × num_splits) of pure overhead that
-    // doesn't shrink with useful work, which capped scaling at ~1.5×. Here we
-    // split the *rows* into a fixed number of contiguous chunks (rows are
-    // evenly sized, so this load-balances), give each chunk one private
-    // accumulator, then reduce. Overhead is O(n_cols × num_chunks) with
-    // num_chunks ≈ 4× the thread count — negligible vs. the 21M-add body.
     let n_rows = a_0.num_rows;
     let p = rayon::current_num_threads().max(1);
-    // ~4 chunks per worker for work-stealing balance, ≥256 rows each to keep
-    // accumulator alloc/reduce overhead amortized.
     let chunk_rows = (n_rows.div_ceil(p * 4)).max(256);
     let n_chunks = n_rows.div_ceil(chunk_rows);
 
@@ -1229,49 +900,47 @@ fn sparse_row_fold_alpha_batched(
 
     let mut out = vec![F128::ZERO; n_cols];
     for acc in &partials {
-        for i in 0..n_cols {
-            out[i] += acc[i];
-        }
+        crate::field::f128_slice::xor_assign(&mut out, acc);
     }
     out
 }
 
-/// One round of product-sumcheck on `(c, z)`: compute `(q(1), q(∞))` =
-/// `(Σ c_hi·z_hi, Σ (c_hi+c_lo)·(z_hi+z_lo))` over the top-bit split. The
-/// `len()` of `c` and `z` is even; `half = len/2`.
 fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
+    use crate::field::gf2_128::F256Unreduced;
     use rayon::prelude::*;
     let half = c.len() / 2;
     debug_assert_eq!(z.len(), c.len());
     let (clo, chi) = c.split_at(half);
     let (zlo, zhi) = z.split_at(half);
     if half < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
+        let mut e1 = F256Unreduced::ZERO;
+        let mut einf = F256Unreduced::ZERO;
         for i in 0..half {
-            e1 += chi[i] * zhi[i];
-            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+            e1 ^= chi[i].mul_unreduced(zhi[i]);
+            einf ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
         }
-        return (e1, einf);
+        return (e1.reduce(), einf.reduce());
     }
-    (0..half)
+    let (e1, einf) = (0..half)
         .into_par_iter()
         .map(|i| {
-            let e1_i = chi[i] * zhi[i];
-            let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+            let e1_i = chi[i].mul_unreduced(zhi[i]);
+            let einf_i = (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
             (e1_i, einf_i)
         })
-        .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+        .reduce(
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+        );
+    (e1.reduce(), einf.reduce())
 }
 
-/// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
-/// r·(v[i+half] + v[i])` for `i ∈ [0, half)`, then truncate to `half`. In-place.
 fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     use rayon::prelude::*;
     let half = v.len() / 2;
     if half < SUMCHECK_PAR_THRESHOLD {
         for i in 0..half {
-            v[i] = v[i] + r * (v[i + half] + v[i]);
+            v[i] = v[i].mle_fold(v[i + half], r);
         }
     } else {
         let (lo, hi) = v.split_at_mut(half);
@@ -1279,37 +948,12 @@ fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
         lo.par_iter_mut()
             .zip(hi.par_iter())
             .for_each(|(lo_i, &hi_i)| {
-                *lo_i = *lo_i + r * (hi_i + *lo_i);
+                *lo_i = lo_i.mle_fold(hi_i, r);
             });
     }
     v.truncate(half);
 }
 
-/// **Fused fold + next-round evaluation.** Binds the top variable of *both*
-/// `comb` and `z` at `r` (in place, each length halves) AND returns the next
-/// product-sumcheck round's message `(q(1), q(∞))` over the just-bound tables —
-/// all in a single pass over the data.
-///
-/// Why it fuses: round `t`'s message must be sent before `r_t` is sampled, so
-/// eval(t) and bind(t) can't share a pass. But binding at `r_t` produces
-/// exactly the table eval(t+1) reads, and `r_t` is known by then. The bound
-/// values `new[i]` and `new[i+half2]` are precisely the `lo`/`hi` halves the
-/// next round's eval pairs up, so we form each product the moment both bound
-/// values exist. This replaces eval + two binds (3 passes) with 1.
-///
-/// Operates on quarters of each array (`half2 = len/4`). For `i ∈ 0..half2`:
-/// ```text
-///   lo' = q0[i] + r·(q2[i] + q0[i])   (= new[i],        next round's lo)
-///   hi' = q1[i] + r·(q3[i] + q1[i])   (= new[i+half2],  next round's hi)
-///   q0[i] ← lo';  q1[i] ← hi'
-///   e1   += hi'·zhi';   einf += (hi'+lo')·(zhi'+zlo')
-/// ```
-/// In-place is safe: each `i` reads its 4 quarter-entries before writing the 2
-/// low-half slots, and writes across distinct `i` are disjoint. Requires
-/// `comb.len() == z.len()`, a power of two ≥ 4 (so the bound length ≥ 2 has a
-/// well-defined next round — the caller guarantees this by only fusing when a
-/// later round exists). The returned message is bit-identical to
-/// `sumcheck_round_eval_par` run on the bound tables.
 fn sumcheck_bind_both_and_eval_next(
     comb: &mut Vec<F128>,
     z: &mut Vec<F128>,
@@ -1322,7 +966,6 @@ fn sumcheck_bind_both_and_eval_next(
     let half2 = half / 2;
     debug_assert!(half2 >= 1, "fused step needs a well-defined next round");
 
-    // q0,q1 = low half (written); q2,q3 = high half (read-only).
     let (c_lo, c_hi) = comb.split_at_mut(half);
     let (cq0, cq1) = c_lo.split_at_mut(half2);
     let (cq2, cq3) = c_hi.split_at(half2);
@@ -1331,42 +974,121 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq2, zq3) = z_hi.split_at(half2);
 
     let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
-        for i in 0..half2 {
-            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
-            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
-            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
-            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
-            cq0[i] = lo;
-            cq1[i] = hi;
-            zq0[i] = zlo;
-            zq1[i] = zhi;
-            e1 += hi * zhi;
-            einf += (hi + lo) * (zhi + zlo);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        unsafe {
+            let (e1_lo, e1_hi, ei_lo, ei_hi) =
+                crate::gf2_kernels::k0_f128_lincheck_bind_both_and_eval_slice(
+                    cq0.as_mut_ptr() as *mut u64,
+                    cq1.as_mut_ptr() as *mut u64,
+                    cq2.as_ptr() as *const u64,
+                    cq3.as_ptr() as *const u64,
+                    zq0.as_mut_ptr() as *mut u64,
+                    zq1.as_mut_ptr() as *mut u64,
+                    zq2.as_ptr() as *const u64,
+                    zq3.as_ptr() as *const u64,
+                    half2,
+                    r.lo,
+                    r.hi,
+                );
+            (
+                F128 {
+                    lo: e1_lo,
+                    hi: e1_hi,
+                },
+                F128 {
+                    lo: ei_lo,
+                    hi: ei_hi,
+                },
+            )
         }
-        (e1, einf)
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            use crate::field::gf2_128::F256Unreduced;
+            let mut e1 = F256Unreduced::ZERO;
+            let mut einf = F256Unreduced::ZERO;
+            for i in 0..half2 {
+                let lo = cq0[i].mle_fold(cq2[i], r);
+                let hi = cq1[i].mle_fold(cq3[i], r);
+                let zlo = zq0[i].mle_fold(zq2[i], r);
+                let zhi = zq1[i].mle_fold(zq3[i], r);
+                cq0[i] = lo;
+                cq1[i] = hi;
+                zq0[i] = zlo;
+                zq1[i] = zhi;
+                e1 ^= hi.mul_unreduced(zhi);
+                einf ^= (hi + lo).mul_unreduced(zhi + zlo);
+            }
+            (e1.reduce(), einf.reduce())
+        }
     } else {
-        cq0.par_iter_mut()
-            .zip(cq1.par_iter_mut())
-            .zip(cq2.par_iter())
-            .zip(cq3.par_iter())
-            .zip(zq0.par_iter_mut())
-            .zip(zq1.par_iter_mut())
-            .zip(zq2.par_iter())
-            .zip(zq3.par_iter())
-            .map(|(((((((c0, c1), c2), c3), z0), z1), z2), z3)| {
-                let lo = *c0 + r * (*c2 + *c0);
-                let hi = *c1 + r * (*c3 + *c1);
-                let zlo = *z0 + r * (*z2 + *z0);
-                let zhi = *z1 + r * (*z3 + *z1);
-                *c0 = lo;
-                *c1 = hi;
-                *z0 = zlo;
-                *z1 = zhi;
-                (hi * zhi, (hi + lo) * (zhi + zlo))
-            })
-            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            const CHUNK: usize = 1024;
+            cq0.par_chunks_mut(CHUNK)
+                .zip(cq1.par_chunks_mut(CHUNK))
+                .zip(cq2.par_chunks(CHUNK))
+                .zip(cq3.par_chunks(CHUNK))
+                .zip(zq0.par_chunks_mut(CHUNK))
+                .zip(zq1.par_chunks_mut(CHUNK))
+                .zip(zq2.par_chunks(CHUNK))
+                .zip(zq3.par_chunks(CHUNK))
+                .map(|(((((((c0, c1), c2), c3), z0), z1), z2), z3)| unsafe {
+                    let (e1_lo, e1_hi, ei_lo, ei_hi) =
+                        crate::gf2_kernels::k0_f128_lincheck_bind_both_and_eval_slice(
+                            c0.as_mut_ptr() as *mut u64,
+                            c1.as_mut_ptr() as *mut u64,
+                            c2.as_ptr() as *const u64,
+                            c3.as_ptr() as *const u64,
+                            z0.as_mut_ptr() as *mut u64,
+                            z1.as_mut_ptr() as *mut u64,
+                            z2.as_ptr() as *const u64,
+                            z3.as_ptr() as *const u64,
+                            c0.len(),
+                            r.lo,
+                            r.hi,
+                        );
+                    (
+                        F128 {
+                            lo: e1_lo,
+                            hi: e1_hi,
+                        },
+                        F128 {
+                            lo: ei_lo,
+                            hi: ei_hi,
+                        },
+                    )
+                })
+                .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            use crate::field::gf2_128::F256Unreduced;
+            let (e1, einf) = cq0
+                .par_iter_mut()
+                .zip(cq1.par_iter_mut())
+                .zip(cq2.par_iter())
+                .zip(cq3.par_iter())
+                .zip(zq0.par_iter_mut())
+                .zip(zq1.par_iter_mut())
+                .zip(zq2.par_iter())
+                .zip(zq3.par_iter())
+                .map(|(((((((c0, c1), c2), c3), z0), z1), z2), z3)| {
+                    let lo = (*c0).mle_fold(*c2, r);
+                    let hi = (*c1).mle_fold(*c3, r);
+                    let zlo = (*z0).mle_fold(*z2, r);
+                    let zhi = (*z1).mle_fold(*z3, r);
+                    *c0 = lo;
+                    *c1 = hi;
+                    *z0 = zlo;
+                    *z1 = zhi;
+                    (hi.mul_unreduced(zhi), (hi + lo).mul_unreduced(zhi + zlo))
+                })
+                .reduce(
+                    || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+                    |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+                );
+            (e1.reduce(), einf.reduce())
+        }
     };
 
     comb.truncate(half);
@@ -1374,21 +1096,6 @@ fn sumcheck_bind_both_and_eval_next(
     (e1, einf)
 }
 
-// ---------------------------------------------------------------------------
-// API
-// ---------------------------------------------------------------------------
-
-/// Prove the lincheck statement for the block-diagonal R1CS instance
-/// `A = I_{2^n_log} ⊗ a_0`, `B = I ⊗ b_0`, `C = I ⊗ c_0`.
-///
-/// Preconditions:
-/// - `m ≥ k_log`, `m = k_log + n_log` (caller's responsibility).
-/// - `a_0, b_0, c_0` are each `k × k` where `k = 2^k_log`.
-/// - `x.len() == x_prime.len() == x_pprime.len() == m`.
-/// - `z_packed.len() == 2^m / 8`.
-///
-/// Returns `(LincheckProof, LincheckClaim)`. The claim's `r_inner` is
-/// sampled from the challenger after the proof vectors are observed.
 pub fn prove<Ch: Challenger>(
     z_packed: &[u8],
     m: usize,
@@ -1410,11 +1117,6 @@ pub fn prove<Ch: Challenger>(
     )
 }
 
-/// Padding-aware variant of [`prove`]. `useful_bits ≤ 2^k_log` declares how
-/// many rows of each block carry real witness data; rows
-/// `[useful_bits, 2^k_log)` are honest zero padding. The partial-fold over
-/// the outer dimension skips work for those padding rows — byte-identical
-/// proof on a witness with zero-padded blocks.
 pub fn prove_padded<Ch: Challenger>(
     z_packed: &[u8],
     m: usize,
@@ -1439,15 +1141,6 @@ pub fn prove_padded<Ch: Challenger>(
     (proof, claim)
 }
 
-/// Variant of [`prove_padded`] that also returns the **pre-sumcheck** z_vec
-/// (`output[i_inner] = ẑ(i_inner, x_ab.x_outer)`, length `2^k_log`). The
-/// downstream PCS reuses this vector to compute the AB-claim's ring-switch
-/// `s_hat_v` via [`crate::pcs::ring_switch::s_hat_v_from_z_vec`], skipping a
-/// `fold_1b_rows` pass at open time.
-///
-/// Pays one extra `2^k_log` F128 clone (~2 MB at k_log=17) before the
-/// sumcheck loop; callers that don't need the reuse should keep using
-/// [`prove_padded`] to avoid that clone.
 pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     z_packed: &[u8],
     m: usize,
@@ -1501,85 +1194,55 @@ fn prove_padded_inner<Ch: Challenger>(
     challenger.observe_label(b"flock-lincheck-v0");
     let trace = std::env::var("LINCHECK_TRACE").is_ok();
 
-    // 1. Sample α (matches verifier's order). Used to batch the two scalar
-    //    consistency checks v_a, v_b into a single sumcheck.
     let alpha = challenger.sample_f128();
 
-    // 1b. Constant-wire pin challenge β. There are no transcript observes
-    // between the α and β samples, so sampling it now is byte-identical to
-    // the serial path and makes the two independent computations below safe
-    // to overlap.
-    let beta_pin: Option<(usize, F128)> = circuit
-        .const_pin_col()
-        .map(|col| (col, challenger.sample_f128()));
-
-    // Build the circuit comb and the packed-witness partial fold concurrently.
-    // The former is compute/cache-resident while the latter is bandwidth
-    // dominated. FLOCK_NO_LINCHECK_JOIN restores the exact serial scheduling
-    // for same-binary A/B measurement.
-    let comb_branch = || {
-        let t = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
-        if let Some(t) = t {
-            eprintln!(
-                "[lc] {:<26} {:>7.2} ms",
-                "build_quirky_eq",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        let t = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
-        if let Some(t) = t {
-            eprintln!(
-                "[lc] {:<26} {:>7.2} ms",
-                "fold_alpha_batched",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        if let Some((col, beta)) = beta_pin {
-            comb_vec[col] += beta;
-        }
-        comb_vec
-    };
-    let z_branch = || {
-        let t = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let eq_x_outer = build_z_fold_eq_table(m, k_log, k_skip, useful_bits, &x_ab.x_outer);
-        let z_vec = partial_fold_packed_z_best_gpu_split(
-            z_packed,
-            m,
-            k_log,
-            useful_bits,
-            eq_x_outer.as_slice(),
-        );
-        if let Some(t) = t {
-            eprintln!(
-                "[lc] {:<26} {:>7.2} ms",
-                "partial_fold_z",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        z_vec
-    };
-    let (mut comb_vec, mut z_vec) = if std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some() {
-        (comb_branch(), z_branch())
+    let t = if trace {
+        Some(std::time::Instant::now())
     } else {
-        rayon::join(comb_branch, z_branch)
+        None
     };
-    // 3b. Optional capture: clone the pre-sumcheck z_vec for downstream reuse
-    //     (PCS open's AB-claim s_hat_v skipping fold_1b_rows). Only pay the
-    //     clone when explicitly requested.
+    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+    if let Some(t) = t {
+        eprintln!(
+            "[lc] {:<26} {:>7.2} ms",
+            "build_quirky_eq",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let t = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+    if let Some(t) = t {
+        eprintln!(
+            "[lc] {:<26} {:>7.2} ms",
+            "fold_alpha_batched",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    if let Some(col) = circuit.const_pin_col() {
+        let beta = challenger.sample_f128();
+        comb_vec[col] += beta;
+    }
+
+    let t = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let eq_x_outer = build_eq_table(&x_ab.x_outer);
+    let mut z_vec = partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, &eq_x_outer);
+    crate::scratch::give_f128(eq_x_outer);
+    if let Some(t) = t {
+        eprintln!(
+            "[lc] {:<26} {:>7.2} ms",
+            "partial_fold_z",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
     let captured_z_vec: Option<Vec<F128>> = if capture_z_vec {
         Some(z_vec.clone())
     } else {
@@ -1591,17 +1254,9 @@ fn prove_padded_inner<Ch: Challenger>(
         None
     };
 
-    // 5. Standard multilinear product-sumcheck over the high `inner_rest_len`
-    //    bits of `i`. Each round binds the TOP remaining bit (mirrors
-    //    chain::prove_chain_shift). After `inner_rest_len` rounds, both
-    //    tables collapse to length `2^k_skip`. Per-round work is parallel via
-    //    rayon when the residual table is large enough.
     let mut rounds = Vec::with_capacity(inner_rest_len);
     let mut r_rounds = Vec::with_capacity(inner_rest_len);
     if inner_rest_len > 0 {
-        // Round 0's message is the only standalone evaluation pass; every later
-        // round's message falls out of binding the previous round (fold +
-        // next-eval fused into one pass — see `sumcheck_bind_both_and_eval_next`).
         let (mut e1, mut einf) = sumcheck_round_eval_par(&comb_vec, &z_vec);
         for t in 0..inner_rest_len {
             challenger.observe_f128(e1);
@@ -1610,13 +1265,10 @@ fn prove_padded_inner<Ch: Challenger>(
             rounds.push((e1, einf));
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
-                // Fused: bind both tables at r AND compute round (t+1)'s message.
                 let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
                 e1 = ne1;
                 einf = neinf;
             } else {
-                // Final round: just fold; z_vec collapses to z_partial.
-                sumcheck_bind_top_in_place_par(&mut comb_vec, r);
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
             }
         }
@@ -1629,25 +1281,14 @@ fn prove_padded_inner<Ch: Challenger>(
         );
     }
 
-    // 6. Send `z_partial` (the post-sumcheck collapsed z_vec). Length 2^k_skip.
-    let z_partial = z_vec.clone();
+    let z_partial = z_vec;
     challenger.observe_f128_slice(&z_partial);
 
-    // 7. Sample fresh z_skip AFTER observing z_partial — gives Schwartz-Zippel
-    //    soundness on the φ8 (univariate-skip) dim.
     let r_inner_skip = challenger.sample_f128();
 
-    // 8. Output claim's value: φ8 Lagrange combination of z_partial at z_skip.
-    //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest; the
-    //    PCS catches mismatches downstream.
     let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
     let w = inner_product(&lambda, &z_partial);
 
-    // 9. Convert sumcheck challenges to LSB-first `x_inner_rest` order. The
-    //    loop binds the TOP bit each round, so r_rounds[0] bound bit
-    //    (inner_rest_len − 1) of the i_rest part (= bit (k_log − 1) of i).
-    //    LSB-first: x_inner_rest[j] binds bit (k_skip + j) of i — i.e.,
-    //    r_inner_rest[j] = r_rounds[inner_rest_len − 1 − j].
     let mut r_inner_rest = r_rounds;
     r_inner_rest.reverse();
 
@@ -1660,9 +1301,6 @@ fn prove_padded_inner<Ch: Challenger>(
     (proof, claim, captured_z_vec)
 }
 
-/// Verify a lincheck proof. Walks the challenger in lockstep with `prove`,
-/// performs the three scalar consistency checks against `v, v', v''`, and
-/// derives the three output z claims.
 pub fn verify<Ch: Challenger>(
     m: usize,
     k_log: usize,
@@ -1732,12 +1370,8 @@ pub fn verify<Ch: Challenger>(
         }
     };
 
-    // 1. Sample α (matches prover's order).
     let alpha = challenger.sample_f128();
 
-    // 2. Build α-batched comb_vec via the circuit's per-block fold (same call
-    //    the prover made — sparse default delegates to the fused row-fold;
-    //    per-hash impls walk the constraint graph directly).
     let t = std::time::Instant::now();
     let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
     if trace {
@@ -1755,13 +1389,7 @@ pub fn verify<Ch: Challenger>(
         );
     }
 
-    // 3. Replay the multilinear product-sumcheck (inner_rest_len rounds),
-    //    folding comb_vec in lockstep so we end up with the "comb_partial"
-    //    vector of length 2^k_skip. Parallel fold for the early (large) rounds.
     let t = std::time::Instant::now();
-    // Constant-wire pin (mirror of prove): β sampled after α, comb gains +β at
-    // the constant column, and the initial target gains +β·1 — the honest
-    // all-ones constant column folds to 1. See docs/const-wire-pin.md.
     let mut target = alpha * v_a + v_b;
     if let Some(col) = circuit.const_pin_col() {
         let beta = challenger.sample_f128();
@@ -1774,11 +1402,9 @@ pub fn verify<Ch: Challenger>(
         challenger.observe_f128(e1);
         challenger.observe_f128(einf);
         let r = challenger.sample_f128();
-        // q(0) = claim + q(1) in char 2; q(X) = einf·X² + c1·X + e0.
         let e0 = running + e1;
         let c1 = e0 + e1 + einf;
         running = einf * r * r + c1 * r + e0;
-        // Fold comb_vec at the same r (mirrors prover's fold).
         sumcheck_bind_top_in_place_par(&mut comb_vec, r);
         r_rounds.push(r);
     }
@@ -1791,12 +1417,8 @@ pub fn verify<Ch: Challenger>(
         );
     }
 
-    // 4. Observe z_partial AFTER the sumcheck rounds (matches prover order).
     challenger.observe_f128_slice(&proof.z_partial);
 
-    // 5. Final sumcheck consistency: Σ comb_partial[i_skip] · z_partial[i_skip]
-    //    must equal the running claim. Ties z_partial to the upstream v_a, v_b.
-    //    Small (length 2^k_skip = 64); sequential.
     let final_sum = inner_product(&comb_vec, &proof.z_partial);
     if running != final_sum {
         return Err(VerifyError::ConsistencyFailed {
@@ -1804,12 +1426,8 @@ pub fn verify<Ch: Challenger>(
         });
     }
 
-    // 6. Sample fresh z_skip AFTER z_partial — gives SZ on the φ8 dim.
     let r_inner_skip = challenger.sample_f128();
 
-    // 7. Derive output claim value via φ8 Lagrange on z_partial at z_skip.
-    //    Equals ẑ_φ8(z_skip, r_rest, x_outer) when z_partial is honest;
-    //    PCS catches mismatches downstream.
     let t = std::time::Instant::now();
     let lambda = lagrange_weights_naive(k_skip, r_inner_skip);
     let w = inner_product(&lambda, &proof.z_partial);
@@ -1820,8 +1438,6 @@ pub fn verify<Ch: Challenger>(
         );
     }
 
-    // 8. Convert sumcheck challenges to LSB-first x_inner_rest order
-    //    (same convention as prover).
     let mut r_inner_rest = r_rounds;
     r_inner_rest.reverse();
 
@@ -1832,16 +1448,11 @@ pub fn verify<Ch: Challenger>(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
 
-    /// SplitMix64 PRNG, deterministic.
     struct Rng(u64);
     impl Rng {
         fn new(seed: u64) -> Self {
@@ -1868,8 +1479,6 @@ mod tests {
         }
     }
 
-    /// Naive MLE evaluation: `f̂(point) = Σ_i eq(point, i) · f[i]` where i ∈
-    /// {0,1}^d and f[i] is given as a bool slice.
     fn mle_eval_bool(f: &[bool], point: &[F128]) -> F128 {
         let d = point.len();
         assert_eq!(f.len(), 1 << d);
@@ -1883,8 +1492,6 @@ mod tests {
         acc
     }
 
-    /// Sample a random `QuirkyPoint` for testing: z_skip ∈ F₁₂₈,
-    /// x_inner_rest of length `k_log − k_skip`, x_outer of length `n_log`.
     fn random_quirky_point(m: usize, k_log: usize, k_skip: usize, rng: &mut Rng) -> QuirkyPoint {
         QuirkyPoint {
             z_skip: rng.f128(),
@@ -1893,14 +1500,6 @@ mod tests {
         }
     }
 
-    /// "Quirky MLE evaluation" of a Boolean vector `f` at a quirky point.
-    ///
-    /// `ã(z_skip, x_inner_rest, x_outer) = Σ_i  f[i] · L_{i_skip}(z_skip)
-    ///                                          · eq(x_inner_rest, i_inner_rest)
-    ///                                          · eq(x_outer, i_outer)`
-    ///
-    /// where `i = i_skip + 2^k_skip · i_inner_rest + 2^k_log · i_outer` (matches
-    /// the linear-LSB indexing of `f`).
     fn mle_eval_bool_quirky(
         f: &[bool],
         m: usize,
@@ -1935,7 +1534,6 @@ mod tests {
         acc
     }
 
-    /// Naive sparse matrix · bool-vector product: `out[i] = ⊕_{j: M[i,j]=1} z[j]`.
     fn matrix_vector_product(m: &SparseBinaryMatrix, z: &[bool]) -> Vec<bool> {
         assert_eq!(z.len(), m.num_cols);
         m.rows
@@ -1950,9 +1548,6 @@ mod tests {
             .collect()
     }
 
-    /// Build a block-diagonal full witness vector from a base matrix and the
-    /// outer dimension: full[i_inner + i_outer · k] for the i_outer-th block.
-    /// Used to construct `a = (I_{2^n_log} ⊗ A_0) · z` directly for tests.
     fn apply_block_diag(m_0: &SparseBinaryMatrix, z: &[bool], k_log: usize) -> Vec<bool> {
         let k = 1usize << k_log;
         assert_eq!(m_0.num_rows, k);
@@ -1968,8 +1563,6 @@ mod tests {
         out
     }
 
-    /// Build a sparse boolean matrix with `nnz` random nonzero entries among
-    /// `k × k` slots. Used for tests.
     fn random_sparse_matrix(k: usize, nnz: usize, rng: &mut Rng) -> SparseBinaryMatrix {
         let mut rows: Vec<Vec<usize>> = vec![Vec::new(); k];
         let mut seen = std::collections::HashSet::new();
@@ -1992,9 +1585,6 @@ mod tests {
         }
     }
 
-    // ---- Unit tests for the kernels ----
-
-    /// `build_eq_table` produces eq(point, i) for all boolean i.
     #[test]
     fn eq_table_matches_direct_formula() {
         for &d in &[1usize, 2, 3, 5, 8] {
@@ -2006,7 +1596,6 @@ mod tests {
                 let mut expected = F128::ONE;
                 for j in 0..d {
                     let bit = ((i >> j) & 1) as u64;
-                    // eq(r, bit) = (1 + r) if bit = 0 else r
                     let factor = if bit == 0 {
                         F128::ONE + point[j]
                     } else {
@@ -2019,23 +1608,6 @@ mod tests {
         }
     }
 
-    /// The opt-in vector builder is an exact replacement at every expansion
-    /// geometry, including its first parallel level (crossed at d ≥ 15; the
-    /// generic builder parallelizes from d ≥ 13). d = 16 also covers the
-    /// largest ranked recursion-OOD dim now routed through the optimized
-    /// builder (micro-stack item 3); 7/10/13 cover the deeper ranked levels.
-    #[test]
-    fn optimized_eq_table_matches_generic_bytes() {
-        for &d in &[0usize, 1, 2, 3, 5, 7, 8, 10, 12, 13, 16] {
-            let mut rng = Rng::new(0x4551_4f50 + d as u64);
-            let point = rng.f128_vec(d);
-            let generic = build_eq_table(&point);
-            let optimized = build_eq_table_optimized(&point);
-            assert_eq!(optimized, generic, "dimension={d}");
-        }
-    }
-
-    /// `sparse_row_fold` matches a brute-force dense implementation.
     #[test]
     fn sparse_row_fold_matches_dense() {
         let mut rng = Rng::new(22);
@@ -2046,7 +1618,6 @@ mod tests {
 
         let got = sparse_row_fold(&matrix, &eq_table);
 
-        // Brute force: for each col j, sum eq[i] over rows i where M[i,j] = 1.
         let mut expected = vec![F128::ZERO; k];
         for (i, row) in matrix.rows.iter().enumerate() {
             for &j in row {
@@ -2056,7 +1627,6 @@ mod tests {
         assert_eq!(got, expected);
     }
 
-    /// `partial_fold_packed_z` matches the direct sum.
     #[test]
     fn partial_fold_matches_direct() {
         for &(m, k_log) in &[(10usize, 3), (12, 4), (14, 5), (16, 8)] {
@@ -2084,8 +1654,6 @@ mod tests {
         }
     }
 
-    /// `partial_fold_packed_z_fast` (parallel lookup-table) matches the scalar
-    /// reference `partial_fold_packed_z`.
     #[test]
     fn partial_fold_fast_matches_serial() {
         for &(m, k_log) in &[(10usize, 3), (12, 4), (14, 5), (16, 8), (18, 10)] {
@@ -2115,7 +1683,6 @@ mod tests {
         assert_eq!(serial, best);
     }
 
-    /// NEON single-matrix kernel matches the scalar reference.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn partial_fold_neon_single_matches_serial() {
@@ -2139,56 +1706,15 @@ mod tests {
         }
     }
 
-    /// The fixed-register SHA3 Block16 drain is a proof-identical scheduling
-    /// change: it visits the same eight stripe tables and XORs the same entry
-    /// into each output as two adjacent incumbent Block8 calls.
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    #[test]
-    fn partial_fold_neon_block16_matches_block8() {
-        let cases = [
-            (14usize, 4usize, 13usize),
-            (20, 10, 597),
-            (22, 14, 15_409),
-            (24, 8, 253),
-        ];
-        for &(m, k_log, useful_bits) in &cases {
-            let k = 1usize << k_log;
-            let n_log = m - k_log;
-            let mut rng = Rng::new(7_160 + m as u64);
-            let mut z = rng.bits(1 << m);
-            for block in 0..(1usize << n_log) {
-                for i in useful_bits..k {
-                    z[block * k + i] = false;
-                }
-            }
-            let z_packed = pack_z_lincheck(&z, m, k_log);
-            let eq = build_eq_table(&rng.f128_vec(n_log));
-            let block8 =
-                partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
-            let block16 =
-                partial_fold_packed_z_neon_oblock16_padded(&z_packed, m, k_log, useful_bits, &eq);
-            assert_eq!(
-                block8, block16,
-                "m={m}, k_log={k_log}, useful={useful_bits}"
-            );
-        }
-    }
-
-    /// The default outer(tile)-partitioned fold is **bit-identical** to the legacy
-    /// i_inner-partitioned iblock kernel — dense (useful=k) and padded (useful<k,
-    /// including a non-byte-aligned shape) across tile-eligible sizes. GF(2¹²⁸) add
-    /// is XOR (associative + commutative), so the two partition strategies must
-    /// produce the exact same length-k vector.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn partial_fold_oblock_matches_iblock() {
-        // (m, k_log, useful_bits); mix of dense and padded, all tile-eligible.
         let cases: &[(usize, usize, usize)] = &[
-            (14, 4, 1 << 4),   // dense, small k
-            (16, 8, 1 << 8),   // dense
-            (18, 10, 1 << 10), // dense
-            (20, 10, 597),     // padded, non-byte-aligned
-            (22, 14, 15_409),  // padded, non-byte-aligned (k=16384)
+            (14, 4, 1 << 4),
+            (16, 8, 1 << 8),
+            (18, 10, 1 << 10),
+            (20, 10, 597),
+            (22, 14, 15_409),
         ];
         for &(m, k_log, useful_bits) in cases {
             assert!(
@@ -2200,7 +1726,6 @@ mod tests {
             let n_blocks = 1usize << n_log;
             let mut rng = Rng::new(7200 + (m * 31 + k_log) as u64);
             let mut z = rng.bits(1 << m);
-            // Honest padding: zero rows [useful, k) of every block.
             for blk in 0..n_blocks {
                 for j in useful_bits..k {
                     z[blk * k + j] = false;
@@ -2216,7 +1741,6 @@ mod tests {
         }
     }
 
-    /// `useful_bits = k`, several tile-eligible sizes).
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn partial_fold_x86_tiled_matches_serial() {
@@ -2237,26 +1761,10 @@ mod tests {
         }
     }
 
-    /// **Padding skip is byte-identical to the dense partial fold.** On a
-    /// witness with honest zeros at rows `[useful_bits, 2^k_log)` of every
-    /// block, the padded kernels (fast + NEON single) must produce the
-    /// exact same `z_vec` as the dense kernels — and the dense scalar
-    /// reference is the ground truth.
-    ///
-    /// Covers the three hash padding shapes plus a non-byte-aligned
-    /// `useful_bits` to exercise the NEON's boundary block (rounded up to
-    /// `BLOCK_K = 8`).
     #[test]
     fn partial_fold_padded_matches_dense() {
-        // (m, k_log, useful_bits)
-        let cases: &[(usize, usize, usize)] = &[
-            // BLAKE3 (k_log=14, useful=15409 — boundary not byte-aligned).
-            (17, 14, 15_409),
-            // SHA-2  (k_log=15, useful=31401 — boundary not byte-aligned).
-            (18, 15, 31_401),
-            // Keccak (k_log=16, useful=42560 — exact byte boundary).
-            (19, 16, 42_560),
-        ];
+        let cases: &[(usize, usize, usize)] =
+            &[(17, 14, 15_409), (18, 15, 31_401), (19, 16, 42_560)];
         for &(m, k_log, useful_bits) in cases {
             let mut rng = Rng::new(0xBADD_BEEF_u64.wrapping_add((k_log * 31 + m) as u64));
             let total_bits = 1usize << m;
@@ -2264,8 +1772,6 @@ mod tests {
             let block_size = 1usize << k_log;
             let n_blocks = 1usize << n_log;
 
-            // Random witness with bits [useful_bits, block_size) of every block
-            // zeroed — mirrors the hash-module layout.
             let mut z = rng.bits(total_bits);
             for blk in 0..n_blocks {
                 for j in useful_bits..block_size {
@@ -2298,7 +1804,6 @@ mod tests {
                     dense_neon, padded_neon,
                     "neon: m={m}, k_log={k_log}, useful={useful_bits}"
                 );
-                // i_inner-partitioned kernel: dense and padded must both match.
                 let dense_iblock = partial_fold_packed_z_neon_iblock_padded(
                     &z_packed,
                     m,
@@ -2325,8 +1830,6 @@ mod tests {
         }
     }
 
-    /// `partial_fold_packed_z(eq_outer) ↦ ẑ(·, x_outer)` matches direct MLE
-    /// evaluation of z at `(i_inner, x_outer)` for boolean i_inner.
     #[test]
     fn partial_fold_is_mle_at_outer_point() {
         let m = 14;
@@ -2340,11 +1843,7 @@ mod tests {
 
         let z_partial = partial_fold_packed_z(&z_packed, m, k_log, &eq_outer);
 
-        // For each boolean i_inner ∈ {0,1}^k_log, the partial fold should
-        // equal ẑ(i_inner, x_outer).
         for i_inner in 0..k {
-            // Construct the m-dim point: first k_log coords from i_inner (boolean lifted),
-            // then m-k_log coords from x_outer.
             let mut point = Vec::with_capacity(m);
             for j in 0..k_log {
                 point.push(if (i_inner >> j) & 1 == 1 {
@@ -2359,18 +1858,8 @@ mod tests {
         }
     }
 
-    // ---- End-to-end prove/verify roundtrip on honest data ----
-
-    /// Build a small honest instance: random sparse A_0/B_0/C_0, random z;
-    /// compute a, b, c via apply_block_diag; pick three points; compute true
-    /// MLE evals as v, v', v''. Roundtrip prove/verify, check claim matches
-    /// what the verifier would re-derive from the (now-known-honest) z.
     #[test]
     fn prove_verify_roundtrip_honest() {
-        // Exercise a range of k_skip values:
-        //   k_skip = 0 (no skip)     — reduces to multilinear lincheck
-        //   k_skip = k_log (max)     — only univariate inner
-        //   k_skip < k_log (typical) — protocol-realistic case
         for &(m, k_log, k_skip) in &[
             (10usize, 4, 0),
             (10, 4, 2),
@@ -2382,26 +1871,20 @@ mod tests {
             let k = 1usize << k_log;
             let mut rng = Rng::new(55 + (m * 100 + k_log * 10 + k_skip) as u64);
 
-            // Random sparse base matrices A_0, B_0 (no C since C = I in our use case).
             let nnz_per_mat = k * 2;
             let a_0 = random_sparse_matrix(k, nnz_per_mat, &mut rng);
             let b_0 = random_sparse_matrix(k, nnz_per_mat, &mut rng);
 
-            // Random witness z, then a = A·z, b = B·z.
             let z = rng.bits(1 << m);
             let a = apply_block_diag(&a_0, &z, k_log);
             let b = apply_block_diag(&b_0, &z, k_log);
             let z_packed = pack_z_lincheck(&z, m, k_log);
 
-            // **One shared quirky point** (since zerocheck gives a, b claims at
-            // the same point).
             let x_ab = random_quirky_point(m, k_log, k_skip, &mut rng);
 
-            // True quirky-MLE eval claims at the shared point.
             let v_a = mle_eval_bool_quirky(&a, m, k_log, k_skip, &x_ab);
             let v_b = mle_eval_bool_quirky(&b, m, k_log, k_skip, &x_ab);
 
-            // Prove and verify with matched challengers.
             let circuit = SparseMatrixCircuit::new(&a_0, &b_0);
             let mut ch_p = FsChallenger::new(b"flock-test-v0");
             let (proof, claim_p) = prove(&z_packed, m, k_log, k_skip, &circuit, &x_ab, &mut ch_p);
@@ -2419,8 +1902,6 @@ mod tests {
                 "claim mismatch at m={m}, k_log={k_log}, k_skip={k_skip}"
             );
 
-            // The single `w` value must match the true z quirky evaluation
-            // at ((r_inner_skip, r_inner_rest), x_ab.x_outer).
             let pt = QuirkyPoint {
                 z_skip: claim_v.r_inner_skip,
                 x_inner_rest: claim_v.r_inner_rest.clone(),
@@ -2434,12 +1915,6 @@ mod tests {
         }
     }
 
-    /// Verify must reject byte-mutated proofs. Mutation positions are picked
-    /// where the corresponding matrix row-vector entry is **nonzero** —
-    /// otherwise the inner-product delta vanishes and the mutation is
-    /// undetectable (a property of the random sparse matrix, not a verifier
-    /// bug). The verifier's consistency check is sound for *any* mutation in
-    /// a nonzero-weighted slot.
     #[test]
     fn verify_rejects_mutations() {
         let m = 12;
@@ -2462,8 +1937,6 @@ mod tests {
         let mut ch_p = FsChallenger::new(b"flock-test-v0");
         let (proof, _) = prove(&z_packed, m, k_log, k_skip, &circuit, &x_ab, &mut ch_p);
 
-        // Pick a mutation position where BOTH row vectors are nonzero so the
-        // mutation guarantees both checks would diverge.
         let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
         let row_a = sparse_row_fold(&a_0, &eq_inner);
         let row_b = sparse_row_fold(&b_0, &eq_inner);
@@ -2471,9 +1944,6 @@ mod tests {
             .find(|&i| row_a[i] != F128::ZERO || row_b[i] != F128::ZERO)
             .expect("no row-vector slot is nonzero in either A or B — test degenerate");
 
-        // Mutations now target `z_partial` (the post-sumcheck length-2^k_skip
-        // vector). Bit-flipping any entry must cause the sumcheck-final check
-        // to fail (running_claim ≠ Σ comb_partial · z_partial).
         let n_skip = 1usize << k_skip;
         let skip_idx = idx % n_skip;
         let mutations: Vec<(String, Box<dyn Fn(&LincheckProof) -> LincheckProof>)> = vec![
@@ -2505,7 +1975,6 @@ mod tests {
         }
     }
 
-    /// Verify must reject shape errors.
     #[test]
     fn verify_rejects_shape_errors() {
         let m = 10;
@@ -2527,7 +1996,6 @@ mod tests {
         let mut ch_p = FsChallenger::new(b"flock-test-v0");
         let (proof, _) = prove(&z_packed, m, k_log, k_skip, &circuit, &x_ab, &mut ch_p);
 
-        // Truncate z_partial.
         let mut bad = proof.clone();
         bad.z_partial.pop();
         let mut ch = FsChallenger::new(b"flock-test-v0");
@@ -2536,7 +2004,6 @@ mod tests {
             Err(VerifyError::BadVectorLength { .. })
         ));
 
-        // Wrong x_inner_rest length.
         let mut ch = FsChallenger::new(b"flock-test-v0");
         let bad_x_ab = QuirkyPoint {
             z_skip: x_ab.z_skip,
@@ -2550,7 +2017,6 @@ mod tests {
             Err(VerifyError::BadInnerRestLength { .. })
         ));
 
-        // k_skip > k_log.
         let mut ch = FsChallenger::new(b"flock-test-v0");
         assert!(matches!(
             verify(

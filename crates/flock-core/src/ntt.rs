@@ -1,13 +1,3 @@
-//! Additive NTT over GF(2^8) (Lin–Chung–Han basis).
-//!
-//! Evaluation domain `W = β + span{1, 2, …, 2^{k-1}}` (additive coset of an
-//! F_2 subspace of F_{2^8}). Maximum useful `k` is 7 (|W| = 128); going to k=8
-//! exhausts all 256 elements of F_{2^8}.
-//!
-//! Scalar/portable implementation — correctness first. NEON "triple" variants
-//! that batch a/b/c with shared twiddles can be added later if the round-1 URM
-//! hot path needs them.
-
 use crate::field::F8;
 
 pub mod additive_ntt_f128;
@@ -19,17 +9,20 @@ pub use inv_table::InvNttTableByteSingleGf8;
 pub use inv_table_deg4::InvNttTableSToV8Gf8;
 pub use parallel_f128::ParallelNttF128;
 
-/// Twiddle recurrence used to build the next subspace layer's evaluation points:
-/// `next_s(s, root) = s² + root · s = s · (s + root)`.
 #[inline]
 fn next_s(s: F8, s_at_root: F8) -> F8 {
-    s * s + s_at_root * s
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe {
+        return F8(
+            crate::gf2_kernels::gf2_kern_gf8_ntt_next_s(s.0 as u64, s_at_root.0 as u64) as u8,
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        s * (s + s_at_root)
+    }
 }
 
-/// Build the size-(2^k − 1) twiddle table for the additive NTT.
-///
-/// Layout: level-L twiddles live at offset (2^L − 1).
-/// Level 0 has 2^{k-1} twiddles, level 1 has 2^{k-2}, …, level k−1 has 1.
 pub fn compute_twiddles(k: usize, beta: F8) -> Vec<F8> {
     if k == 0 {
         return Vec::new();
@@ -37,18 +30,15 @@ pub fn compute_twiddles(k: usize, beta: F8) -> Vec<F8> {
     let n = 1usize << k;
     let mut twiddles = vec![F8::ZERO; n - 1];
 
-    // Layer 0: 2^{k-1} points beta + {0, 2, 4, ..., 2(len-1)}.
     let mut len = 1usize << (k - 1);
     let mut layer: Vec<F8> = (0..len).map(|i| beta + F8((2 * i) as u8)).collect();
     let mut s_at_root = F8::ONE;
 
-    // Write layer 0 directly (s_at_root = 1 ⇒ no scaling needed).
     let mut write_at = len;
     for i in 0..len {
         twiddles[write_at - 1 + i] = layer[i];
     }
 
-    // Subsequent layers: halve the size, advance the recurrence, scale by s⁻¹.
     for _ in 1..k {
         write_at >>= 1;
         let next_s_root = next_s(layer[1] + layer[0], s_at_root);
@@ -73,9 +63,22 @@ fn fft_butterfly(v: &mut [F8], lambda: F8) {
     let n = v.len();
     let half = n >> 1;
     for i in 0..half {
-        let w = v[half + i];
-        v[i] += lambda * w;
-        v[half + i] = w + v[i];
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        unsafe {
+            let p = crate::gf2_kernels::gf2_kern_gf8_fft_btf_pair(
+                v[i].0 as u64,
+                v[half + i].0 as u64,
+                lambda.0 as u64,
+            );
+            v[i] = F8(p as u8);
+            v[half + i] = F8((p >> 32) as u8);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let w = v[half + i];
+            v[i] += lambda * w;
+            v[half + i] = w + v[i];
+        }
     }
 }
 
@@ -96,8 +99,21 @@ fn ifft_butterfly(v: &mut [F8], lambda: F8) {
     let n = v.len();
     let half = n >> 1;
     for i in 0..half {
-        v[half + i] += v[i];
-        v[i] += lambda * v[half + i];
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        unsafe {
+            let p = crate::gf2_kernels::gf2_kern_gf8_ifft_btf_pair(
+                v[i].0 as u64,
+                v[half + i].0 as u64,
+                lambda.0 as u64,
+            );
+            v[i] = F8(p as u8);
+            v[half + i] = F8((p >> 32) as u8);
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            v[half + i] += v[i];
+            v[i] += lambda * v[half + i];
+        }
     }
 }
 
@@ -113,11 +129,6 @@ fn ifft_rec(v: &mut [F8], tw: &[F8], idx: usize) {
     ifft_butterfly(v, tw[idx - 1]);
 }
 
-/// Additive NTT over GF(2^8) with domain of size 2^k.
-///
-/// Internal LCH basis: the forward transform maps coefficients in the
-/// Lin–Chung–Han basis to evaluations at the 2^k points of the domain.
-/// `inverse` is the exact reverse.
 #[derive(Clone, Debug)]
 pub struct AdditiveNttGf8 {
     k: usize,
@@ -125,7 +136,6 @@ pub struct AdditiveNttGf8 {
 }
 
 impl AdditiveNttGf8 {
-    /// Build an NTT for a 2^k-point domain with offset β.
     pub fn new(k: usize, beta: F8) -> Self {
         Self {
             k,
