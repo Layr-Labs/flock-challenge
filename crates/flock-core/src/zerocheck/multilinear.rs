@@ -92,11 +92,10 @@ use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
     fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8, fold_compact_stream_chunk_neon,
-    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_horner_8,
-    fold_round2_compact_chunk_neon_lookahead_8, fold_round2_compact_chunk_neon_unchecked_8,
-    fold_round2_compact_stream_chunk_neon, fold2_and_message_aarch64,
-    fold2_and_message_lookahead_aarch64, fold2_compact_and_round4_chunk_neon_8,
-    fold2_compact_and_round45_chunk_neon_8,
+    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_lookahead_8,
+    fold_round2_compact_chunk_neon_unchecked_8, fold_round2_compact_stream_chunk_neon,
+    fold2_and_message_aarch64, fold2_and_message_lookahead_aarch64,
+    fold2_compact_and_round4_chunk_neon_8, fold2_compact_and_round45_chunk_neon_8,
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::{
@@ -1780,14 +1779,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     let degen = r2_degen_enabled();
     #[cfg(target_arch = "aarch64")]
     let periodic_padding = r2_periodic_padding_enabled();
-    #[cfg(target_arch = "aarch64")]
-    let horner_weights = m == 32
-        && lo_size == 1 << 14
-        && pair_in_block_mask == 127
-        && useful_pairs_inclusive == 121
-        && periodic_padding
-        && mlv_challenges[3..7]
-            == crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash();
 
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
@@ -1863,21 +1854,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
                         useful_pairs_inclusive,
                         degen,
                         periodic_padding,
-                        out.as_mut_ptr(),
-                    );
-                } else if odd_on_gpu && horner_weights {
-                    fold_round2_compact_chunk_neon_horner_8(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu {
@@ -3655,8 +3631,13 @@ fn fold_and_compute_round_pair_into_with_n_hi(
         // (12.6 → 33.7 ms) — per-size recalibration is not worth a
         // second sync for an LLC-adjacent round. `None` = the exact
         // incumbent path.
+        // PARKED alongside the T3 arm for the v10a bisect: the v9 archive
+        // carrying only this arm also died scoreless, so BOTH new arms sit
+        // behind compile-time consts while the shared-scratch cache fix
+        // ships alone. Re-enable by flipping the const once the freed job
+        // wall is confirmed on the runner.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        const ZC_LOOP_INTEGRATION_PARKED: bool = false;
+        const ZC_LOOP_INTEGRATION_PARKED: bool = true;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let gpu_job = if !ZC_LOOP_INTEGRATION_PARKED && half >= (1usize << 24) {
             crate::gpu_commit::launch_zc_loop_products(a, b, r_fold, eq_lo, eq_hi, lo_size, hi_size)

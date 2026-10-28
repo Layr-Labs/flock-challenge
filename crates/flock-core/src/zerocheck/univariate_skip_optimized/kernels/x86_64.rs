@@ -151,7 +151,6 @@ pub(crate) unsafe fn shift_reduce_inner_ab_x86_avx512(
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
-    first_b_med: usize,
     n_b_med: usize,
     convert: &[F128],
     eq_lo_val: F128,
@@ -169,7 +168,7 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
         let eq = f128x4_set(eq_lo_val, eq_lo_val, eq_lo_val, eq_lo_val);
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
-            for b_med in first_b_med..n_b_med {
+            for b_med in 0..n_b_med {
                 let table_base = b_med * 256;
                 for j in 0..4 {
                     let v_ab = chunk_ab_bytes[b_med][lane + j] as usize;
@@ -203,7 +202,6 @@ pub(crate) unsafe fn accumulate_convert_ab_x86_avx512(
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_avx512(
     chunk_ab_bytes: &[[u8; ELL]; 1 << N_MEDIUM],
-    first_b_med: usize,
     n_b_med: usize,
     convert: &[F128],
     bank: &mut [F128; ELL],
@@ -219,7 +217,7 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_x86_avx512(
     unsafe {
         for lane in (0..ELL).step_by(4) {
             let mut cf_ab = [F128::ZERO; 4];
-            for b_med in first_b_med..n_b_med {
+            for b_med in 0..n_b_med {
                 let table_base = b_med * 256;
                 for j in 0..4 {
                     let v_ab = chunk_ab_bytes[b_med][lane + j] as usize;

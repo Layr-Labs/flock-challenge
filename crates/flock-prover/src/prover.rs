@@ -30,18 +30,8 @@ use flock_core::field::F128;
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
 use flock_core::pcs::{self, Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
-use flock_core::r1cs::{BlockR1cs, Round1PinnedOnePrefixStatement};
+use flock_core::r1cs::BlockR1cs;
 use flock_core::zerocheck;
-use crate::r1cs_hashes::blake3::Blake3IdentityPrefixWitness;
-
-/// Exact rollback for C1. A cleared ranked-worker environment selects the
-/// structurally guarded omission; literal `1` retains the complete AB
-/// producer and its original completion reads.
-pub const ENV_NO_ZC_AB_IDENTITY_PREFIX_OMIT: &str = "FLOCK_NO_ZC_AB_IDENTITY_PREFIX_OMIT";
-
-/// Literal `1` retains C1 while computing window 30 normally.
-pub const ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT: &str = "FLOCK_NO_ZC_AB_OUTPUT_WINDOW_OMIT";
-
 #[inline]
 fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
@@ -92,34 +82,6 @@ fn ranked_lincheck_c_reuse_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
         && r1cs.c0_is_identity()
         && std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none()
-}
-
-/// C1 needs both statement properties and the exact row-major BLAKE3
-/// producer's value guarantee. Generic witnesses never receive the latter.
-#[inline]
-fn ranked_identity_prefix_omission_contract(
-    r1cs: &BlockR1cs,
-    witness: Option<&Blake3IdentityPrefixWitness>,
-    z: &[F128],
-    a: &[F128],
-    b: &[F128],
-) -> Option<Round1PinnedOnePrefixStatement> {
-    let witness = witness?;
-    if !ranked_lincheck_c_reuse_enabled(r1cs)
-        || std::env::var_os(ENV_NO_ZC_AB_IDENTITY_PREFIX_OMIT).as_deref()
-            == Some(std::ffi::OsStr::new("1"))
-        || !witness.matches(z, a, b)
-        || z.len() != 1usize << (r1cs.m - 7)
-    {
-        return None;
-    }
-    if std::env::var_os(ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT).as_deref()
-        != Some(std::ffi::OsStr::new("1"))
-        && let Some(statement) = r1cs.round1_pinned_one_prefix_and_output_statement()
-    {
-        return Some(statement);
-    }
-    r1cs.round1_pinned_one_prefix_statement()
 }
 
 fn precompute_ab_s_hat_v(
@@ -207,7 +169,7 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
         .map(|c| quirky_x_outer_full(&c.point))
         .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    let out = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
+    pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         prover_data,
         commitment,
@@ -217,9 +179,7 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
         padding,
         lig_config,
         challenger,
-    );
-    flock_core::tmark::mark("open body end");
-    out
+    )
 }
 
 /// Run the full R1CS proof on an F_{2^128}-packed witness.
@@ -345,27 +305,6 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
     prefaulted_codeword: Option<Vec<F128>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
-    prove_fast_ligerito_from_witness_with_identity_prefix(
-        r1cs, pcs_params, z_packed, a_packed_f128, b_packed_f128,
-        z_packed_lincheck, lincheck_circuit, prefaulted_codeword, None, challenger,
-    )
-}
-
-/// BLAKE3-only counterpart: the receipt is minted after its witness writer
-/// joins and is bound to these three allocations. No matrix-only inference.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_fast_ligerito_from_witness_with_identity_prefix<Ch: Challenger>(
-    r1cs: &BlockR1cs,
-    pcs_params: &PcsParams,
-    z_packed: Vec<F128>,
-    a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
-    z_packed_lincheck: Vec<u8>,
-    lincheck_circuit: &dyn lincheck::LincheckCircuit,
-    prefaulted_codeword: Option<Vec<F128>>,
-    identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
-    challenger: &mut Ch,
-) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let commit_codeword = match prefaulted_codeword {
         Some(codeword) => CommitCodeword::NeedsReplication(codeword),
         None => CommitCodeword::Allocate,
@@ -379,7 +318,6 @@ pub(crate) fn prove_fast_ligerito_from_witness_with_identity_prefix<Ch: Challeng
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         commit_codeword,
-        identity_prefix_witness,
         challenger,
     )
 }
@@ -397,7 +335,6 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
     z_packed_lincheck: Vec<u8>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
-    identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -409,7 +346,6 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
-        identity_prefix_witness,
         challenger,
     )
 }
@@ -428,7 +364,6 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
-    identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -440,7 +375,6 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
-        identity_prefix_witness,
         challenger,
     )
 }
@@ -462,7 +396,6 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
-    identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -474,7 +407,6 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
         LincheckStripeInput::DeferredRanked,
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
-        identity_prefix_witness,
         challenger,
     )
 }
@@ -489,7 +421,6 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     z_packed_lincheck: LincheckStripeInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
-    identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let lig_config = pcs_params
@@ -515,7 +446,6 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         z_packed_lincheck,
         lincheck_circuit,
         commit_codeword,
-        identity_prefix_witness,
         challenger,
     );
 
@@ -523,7 +453,6 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
-    flock_core::tmark::mark("open start");
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
     // Publish-prefix pre-encode: `commitment` / `zc_proof` / `lc_proof` are
@@ -547,24 +476,6 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             s.spawn(|_| {
                 crate::proof_io::stash_pre_encoded_prefix(&commitment, &zc_proof, &lc_proof)
             });
-            // The open runs on a main-pool worker so its parallel regions
-            // start as nested joins (`flock_core::in_pool`); the helper scope
-            // and its spawned prefix encode are unchanged.
-            flock_core::in_pool(|| {
-                flock_core::tmark::mark("open body start");
-                open_claims_with_precomputed_ligerito(
-                    z_packed,
-                    &prover_data,
-                    &commitment,
-                    &[ab.clone(), c.clone()],
-                    &[pre_ab, pre_c],
-                    &padding,
-                    &lig_config,
-                    challenger,
-                )
-            })
-        }),
-        None => flock_core::in_pool(|| {
             open_claims_with_precomputed_ligerito(
                 z_packed,
                 &prover_data,
@@ -576,8 +487,17 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
                 challenger,
             )
         }),
+        None => open_claims_with_precomputed_ligerito(
+            z_packed,
+            &prover_data,
+            &commitment,
+            &[ab.clone(), c.clone()],
+            &[pre_ab, pre_c],
+            &padding,
+            &lig_config,
+            challenger,
+        ),
     };
-    flock_core::tmark::mark("open returned");
     if phase_timing {
         let wall = t_open.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_open0.unwrap_or(0.0);
@@ -663,26 +583,9 @@ fn fill_deferred_lincheck_stripe_group(
     let z_u64: &[u64] =
         unsafe { std::slice::from_raw_parts(z_group.as_ptr().cast::<u64>(), z_group.len() * 2) };
     let mut transposed = [0u8; 64];
-    // Every read below is `lane * u64_per_block + word` with `lane < 8` and
-    // `word < useful_words <= u64_per_block`, inside the group's 8 blocks.
-    assert!(useful_words <= u64_per_block && z_u64.len() == 8 * u64_per_block);
     for word in 0..useful_words {
-        // aarch64: the eight lane words go from memory straight into vector
-        // lanes, not through general registers; same bytes as the array path.
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: bounded by the assert above.
-        unsafe {
-            flock_core::bits::transpose_8_strided_u64s_to_64_bytes(
-                z_u64.as_ptr().add(word),
-                u64_per_block,
-                &mut transposed,
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let lanes: [u64; 8] = std::array::from_fn(|lane| z_u64[lane * u64_per_block + word]);
-            flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
-        }
+        let lanes: [u64; 8] = std::array::from_fn(|lane| z_u64[lane * u64_per_block + word]);
+        flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
         let dst = &mut stripe[word * 64..word * 64 + 64];
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -886,7 +789,6 @@ fn commit_with_round1_ab_precompute(
     padding: &zerocheck::PaddingSpec,
     commit_codeword: CommitCodeword,
     tail_fill: Option<CommitTailFillHook<'_>>,
-    identity_prefix_contract: Option<Round1PinnedOnePrefixStatement>,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -908,7 +810,6 @@ fn commit_with_round1_ab_precompute(
             k_skip,
             inv_table,
             padding,
-            identity_prefix_contract,
         )
     };
     let precompute_ab_replay = || {
@@ -919,7 +820,6 @@ fn commit_with_round1_ab_precompute(
             k_skip,
             inv_table,
             padding,
-            identity_prefix_contract,
         )
     };
     // `Blake3Setup::prove_fast` issues this ticket before call-zero witness
@@ -1014,7 +914,6 @@ pub fn prove_fast_core<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         CommitCodeword::Allocate,
-        None,
         challenger,
     )
 }
@@ -1049,7 +948,6 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         LincheckStripeInput::Ready(z_packed_lincheck),
         lincheck_circuit,
         commit_codeword,
-        None,
         challenger,
     )
 }
@@ -1064,13 +962,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     z_packed_lincheck: LincheckStripeInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
-    identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
-    let identity_prefix_contract = ranked_identity_prefix_omission_contract(
-        r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
-    );
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>| {
         let cpu0 = phase_timing.then(process_cpu_ms);
@@ -1083,7 +977,6 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             &padding,
             commit_codeword,
             tail_fill,
-            identity_prefix_contract,
         );
         if phase_timing {
             let wall = t_commit.elapsed().as_secs_f64() * 1e3;
@@ -1233,14 +1126,10 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     };
     let (commitment, prover_data, ab_inner) = pre_zerocheck;
     bind_statement(challenger, r1cs, &commitment);
-    flock_core::tmark::mark("zc start");
     let cpu_zc0 = phase_timing.then(process_cpu_ms);
     let t_zc = std::time::Instant::now();
 
-    // Zerocheck runs on a main-pool worker so its parallel regions start as
-    // nested joins (`flock_core::in_pool`). Same work, same transcript order.
-    let (zc_proof, zc_claim, s_hat_v_c) = flock_core::in_pool(|| {
-        flock_core::tmark::mark("zc body start");
+    let (zc_proof, zc_claim, s_hat_v_c) = {
         // Zero-cost &[u8] views of the F128 buffers; c aliases z (C = I).
         let a_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
@@ -1276,7 +1165,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
             )
         }
-    });
+    };
     if phase_timing {
         let wall = t_zc.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_zc0.unwrap_or(0.0);
@@ -1291,32 +1180,25 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
-    flock_core::tmark::mark("zc end");
     let cpu_lc0 = phase_timing.then(process_cpu_ms);
     let t_lc = std::time::Instant::now();
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
     // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
-    // Lincheck runs on a main-pool worker (`flock_core::in_pool`), as above.
-    flock_core::tmark::mark("lc call");
-    let (lc_proof, lc_claim, z_vec_pre) = flock_core::in_pool(|| {
-        flock_core::tmark::mark("lc body start");
-        lincheck::prove_padded_capture_z_vec(
-            &z_packed_lincheck,
-            r1cs.m,
-            r1cs.k_log,
-            r1cs.k_skip,
-            r1cs.useful_bits,
-            lincheck_circuit,
-            &x_ab,
-            challenger,
-        )
-    });
+    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+        &z_packed_lincheck,
+        r1cs.m,
+        r1cs.k_log,
+        r1cs.k_skip,
+        r1cs.useful_bits,
+        lincheck_circuit,
+        &x_ab,
+        challenger,
+    );
     // The lincheck stripe copy of z is dead from here on; return it to the
     // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
     // m = 32) so the next prove reuses its resident pages.
-    flock_core::tmark::mark("lc returned");
     flock_core::scratch::give_u8(z_packed_lincheck);
 
     let ab = ZClaim {
@@ -1494,7 +1376,6 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
-        None,
         None,
     );
     t.commit_s = t0.elapsed().as_secs_f64();

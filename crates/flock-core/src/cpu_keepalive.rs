@@ -18,6 +18,7 @@
 //!
 //! From the tail of the warm-up ([`keepalive_start`]) until the seed's first
 //! byte is read ([`keepalive_stop`]), spawn one light spin thread per
+//! performance core, each tagged `QOS_CLASS_USER_INITIATED` (via
 //! [`crate::set_calling_thread_prover_qos`]) so the scheduler keeps it on a
 //! P-core rather than an efficiency core. Each thread retires a tight loop of
 //! **scalar integer** arithmetic on a private register — no SIMD, no CLMUL, no
@@ -71,20 +72,7 @@
 /// fires for tests, benches or examples.
 pub fn keepalive_start() {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        if imp::pool_spin_start() {
-            return;
-        }
-        imp::start();
-    }
-}
-
-/// Release the hot pool spin started by [`keepalive_start`] (when the pool
-/// form is engaged). Called once the witness phase has handed its work to
-/// the pool; idempotent, and a no-op when nothing is spinning.
-pub fn pool_spin_release() {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    imp::pool_spin_release();
+    imp::start();
 }
 
 /// Stop the keep-alive: signal the spin threads and join them. Idempotent and
@@ -175,74 +163,8 @@ mod imp {
         std::hint::black_box(x);
         // Detached: this thread reaps itself. Dropping the live count as the
         // last action lets an awaiter observe quiet only after the spin state
-        // is fully abandoned. AcqRel is sufficient: the protocol is a single
-        // flag plus a single counter with no multi-location total-order
-        // requirement, so the SeqCst fence is pure overhead on the timed path.
-        LIVE.fetch_sub(1, Ordering::AcqRel);
-    }
-
-    /// Hot pool spin: `true` while the main Rayon pool's own workers spin in
-    /// [`pool_spin_body`] instead of parking.
-    static POOL_SPIN: AtomicBool = AtomicBool::new(false);
-
-    /// Keep the main pool's workers on-core across the ready→seed gap and the
-    /// witness phase. Each worker (but one, left free for the seed-pipe
-    /// thread's poll) retires the same scalar churn as the detached spin
-    /// threads, so the P-cluster DVFS request stays up, and between slices
-    /// calls `rayon::yield_now`, which executes any pending pool job (local,
-    /// broadcast, stolen or injected). The first parallel regions after the
-    /// seed therefore start on workers that are already running instead of
-    /// waking parked ones one by one. Bounded by `MAX_KEEPALIVE`, released by
-    /// [`pool_spin_release`] after witness generation. Scheduling only: the
-    /// jobs are the same jobs, run by the same pool.
-    ///
-    /// `FLOCK_NO_POOL_SPIN=1` keeps the detached-thread keep-alive instead.
-    pub(super) fn pool_spin_start() -> bool {
-        if std::env::var_os("FLOCK_NO_CPU_KEEPALIVE").is_some()
-            || std::env::var_os("FLOCK_NO_POOL_SPIN").is_some()
-            || rayon::current_thread_index().is_some()
-            || rayon::current_num_threads() <= 1
-        {
-            return false;
-        }
-        if POOL_SPIN.swap(true, Ordering::AcqRel) {
-            return true;
-        }
-        let deadline = Instant::now() + MAX_KEEPALIVE;
-        rayon::spawn_broadcast(move |ctx| {
-            // Leave one core to the seed-pipe thread's hot poll.
-            if ctx.index() + 1 == ctx.num_threads() {
-                return;
-            }
-            pool_spin_body(deadline);
-        });
-        true
-    }
-
-    fn pool_spin_body(deadline: Instant) {
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        while POOL_SPIN.load(Ordering::Relaxed) {
-            if let Some(rayon::Yield::Executed) = rayon::yield_now() {
-                continue;
-            }
-            for _ in 0..64 {
-                x = x
-                    .wrapping_mul(0x2545_F491_4F6C_DD1D)
-                    .wrapping_add(0x9E37_79B9_7F4A_7C15);
-                x ^= x >> 29;
-            }
-            std::hint::black_box(x);
-            if Instant::now() >= deadline {
-                break;
-            }
-        }
-        std::hint::black_box(x);
-    }
-
-    pub(super) fn pool_spin_release() {
-        if POOL_SPIN.load(Ordering::Relaxed) {
-            POOL_SPIN.store(false, Ordering::Release);
-        }
+        // is fully abandoned.
+        LIVE.fetch_sub(1, Ordering::SeqCst);
     }
 
     pub(super) fn start() {
@@ -250,9 +172,7 @@ mod imp {
             return;
         }
         // Claim the run: if it was already true, another start is live.
-        // AcqRel: pairs with the Release signal / Acquire quiet-check; no
-        // SeqCst total order is needed for a single run flag.
-        if RUNNING.swap(true, Ordering::AcqRel) {
+        if RUNNING.swap(true, Ordering::SeqCst) {
             return;
         }
         // Size to the existing performance-core pool. The global Rayon pool the
@@ -262,7 +182,7 @@ mod imp {
         let n_cores = rayon::current_num_threads().max(1);
         let deadline = Instant::now() + MAX_KEEPALIVE;
         for i in 0..n_cores {
-            LIVE.fetch_add(1, Ordering::AcqRel);
+            LIVE.fetch_add(1, Ordering::SeqCst);
             match std::thread::Builder::new()
                 .name(format!("flock-keepalive-{i}"))
                 .stack_size(64 * 1024)
@@ -273,7 +193,7 @@ mod imp {
                 // governed by RUNNING / MAX_KEEPALIVE, and quiet by LIVE.
                 Ok(_) => {}
                 Err(_) => {
-                    LIVE.fetch_sub(1, Ordering::AcqRel);
+                    LIVE.fetch_sub(1, Ordering::SeqCst);
                     break;
                 }
             }
@@ -287,11 +207,9 @@ mod imp {
     }
 
     /// Clear the run flag without waiting. Threads notice within one spin
-    /// slice and exit on their own. Release-paired with the spin threads'
-    /// Relaxed poll and the Acquire quiet-check; called at the very front of
-    /// the timed window, so the lighter fence is the whole win.
+    /// slice and exit on their own.
     pub(super) fn signal() {
-        RUNNING.swap(false, Ordering::AcqRel);
+        RUNNING.swap(false, Ordering::SeqCst);
     }
 
     /// Wait until every spin thread has finished. All spin threads are
@@ -303,10 +221,7 @@ mod imp {
     /// descheduled thread can never stall the prove.
     pub(super) fn join_all() {
         let give_up_at = Instant::now() + QUIET_TIMEOUT;
-        // Acquire pairs with the threads' Release decrement: observing zero
-        // synchronizes with every thread's final action. Common case is a
-        // single load-and-return (threads exited during seed forward).
-        while LIVE.load(Ordering::Acquire) != 0 {
+        while LIVE.load(Ordering::SeqCst) != 0 {
             if Instant::now() >= give_up_at {
                 return;
             }

@@ -474,18 +474,16 @@ pub(super) fn accumulate_c_fold4_q_pair_banks(
 #[inline]
 pub(super) fn accumulate_convert_ab(
     chunk_ab_bytes: &[[u8; 64]; 16],
-    first_b_med: usize,
     n_b_med: usize,
     convert: &[super::F128],
     eq_lo_val: super::F128,
     partial_ab: &mut [super::F128; 64],
 ) {
-    assert!(first_b_med <= n_b_med && n_b_med <= 16);
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
     // every table-selected load.
     unsafe {
-        aarch64::accumulate_convert_ab(chunk_ab_bytes, first_b_med, n_b_med, convert, eq_lo_val, partial_ab);
+        aarch64::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
     }
 
     #[cfg(all(
@@ -498,7 +496,6 @@ pub(super) fn accumulate_convert_ab(
     unsafe {
         x86_64::accumulate_convert_ab_x86_avx512(
             chunk_ab_bytes,
-            first_b_med,
             n_b_med,
             convert,
             eq_lo_val,
@@ -514,7 +511,7 @@ pub(super) fn accumulate_convert_ab(
             target_feature = "vpclmulqdq"
         )
     )))]
-    portable::accumulate_convert_ab(chunk_ab_bytes, first_b_med, n_b_med, convert, eq_lo_val, partial_ab);
+    portable::accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
 }
 
 /// Multiply-free twin of [`accumulate_convert_ab`], for the banked `eq_lo`
@@ -527,17 +524,15 @@ pub(super) fn accumulate_convert_ab(
 #[inline]
 pub(super) fn accumulate_convert_ab_nomul(
     chunk_ab_bytes: &[[u8; 64]; 16],
-    first_b_med: usize,
     n_b_med: usize,
     convert: &[super::F128],
     bank: &mut [super::F128; 64],
 ) {
-    assert!(first_b_med <= n_b_med && n_b_med <= 16);
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
     // every table-selected load and every bank slot drained.
     unsafe {
-        aarch64::accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+        aarch64::accumulate_convert_ab_nomul(chunk_ab_bytes, n_b_med, convert, bank);
     }
 
     #[cfg(all(
@@ -548,7 +543,7 @@ pub(super) fn accumulate_convert_ab_nomul(
     // SAFETY: the cfg gate guarantees the SIMD features and the fixed arrays
     // cover every four-lane load/store.
     unsafe {
-        x86_64::accumulate_convert_ab_nomul_x86_avx512(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+        x86_64::accumulate_convert_ab_nomul_x86_avx512(chunk_ab_bytes, n_b_med, convert, bank);
     }
 
     #[cfg(not(any(
@@ -559,7 +554,7 @@ pub(super) fn accumulate_convert_ab_nomul(
             target_feature = "vpclmulqdq"
         )
     )))]
-    portable::accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+    portable::accumulate_convert_ab_nomul(chunk_ab_bytes, n_b_med, convert, bank);
 }
 
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
@@ -614,6 +609,6 @@ pub(super) fn accumulate_convert_with_s_hat_v(
     partial_ab: &mut [super::F128; 64],
     partial_c: &mut [[super::F128; 64]; 8],
 ) {
-    accumulate_convert_ab(chunk_ab_bytes, 0, n_b_med, convert, eq_lo_val, partial_ab);
+    accumulate_convert_ab(chunk_ab_bytes, n_b_med, convert, eq_lo_val, partial_ab);
     accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c);
 }

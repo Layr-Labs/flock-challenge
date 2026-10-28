@@ -3,6 +3,7 @@
 //!
 //! The ranked benchmark sizes the main rayon pool to the performance-core
 //! count (`RAYON_NUM_THREADS=10` on the M3 Max) and pins its workers to
+//! `QOS_CLASS_USER_INITIATED`, which keeps them off the efficiency cores.
 //! That leaves the M3 Max's 4 E-cores fully idle for the entire timed proof.
 //!
 //! Folding E-cores into the main pool is a known regression: kernels that
@@ -98,6 +99,7 @@ fn ecore_count() -> usize {
 }
 
 /// Tag the current thread `QOS_CLASS_UTILITY` (Darwin value `0x11`). Utility
+/// work is scheduled onto efficiency cores while `USER_INITIATED` (`0x19`,
 /// the main pool) threads occupy the performance cores. Best-effort: QoS is a
 /// scheduling hint and a failure must not affect correctness.
 #[cfg(target_os = "macos")]
@@ -154,7 +156,8 @@ pub fn helper_pool() -> Option<&'static rayon::ThreadPool> {
 }
 
 /// Don't engage the helper pool below this many chunks: tiny jobs (recursive
-const EPOOL_MIN_CHUNKS: usize = 4;
+/// Ligerito levels) drain faster than the cross-pool kickoff amortizes.
+const EPOOL_MIN_CHUNKS: usize = 8;
 
 /// Process chunks `0..n_chunks` exactly once each, in parallel, drawing from
 /// a shared atomic queue drained by the main rayon pool plus (when present

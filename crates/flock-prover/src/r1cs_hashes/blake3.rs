@@ -175,38 +175,6 @@ pub const G_MSG_IDX: [[usize; 2]; N_G_PER_ROUND] = [
 // interior padding. Everything else (const, m, counters, flags, G-blocks,
 // out_hi) packs after the two slots. The re-layout is purely a change of these
 // base offsets — all bit placement goes through the `*_bit` accessors below.
-/// Receipt for the prefix values emitted by this module's row-major BLAKE3
-/// writers: A=Z=C and B=1 in the first 1,024 bits of every block. OUT_LO is
-/// computed, not an identity A row; the writer stores its value in both A/Z.
-/// It also certifies window 30: bits 15,360..15,409 have A=Z and B=1;
-/// bits 15,409..15,872 have A=B=Z=0. Scalar output writers and the shared
-/// SIMD `oh!` publisher emit these values before joining. This is a value
-/// guarantee, independent of the separate statement mask/padding check.
-///
-/// The constructor is private and used only after witness generation joins.
-/// Addresses/lengths bind the receipt to the owned buffers moved immediately
-/// into the prover; those buffers are not mutated between minting and use.
-/// No packed-buffer scan is added to the production path.
-pub(crate) struct Blake3IdentityPrefixWitness {
-    buffers: [(usize, usize); 3],
-}
-
-impl Blake3IdentityPrefixWitness {
-    fn from_row_major_generator(z: &[F128], a: &[F128], b: &[F128]) -> Self {
-        assert_eq!(a.len(), z.len());
-        assert_eq!(b.len(), z.len());
-        Self { buffers: Self::identities(z, a, b) }
-    }
-
-    fn identities(z: &[F128], a: &[F128], b: &[F128]) -> [(usize, usize); 3] {
-        [z, a, b].map(|values| (values.as_ptr() as usize, values.len()))
-    }
-
-    pub(crate) fn matches(&self, z: &[F128], a: &[F128], b: &[F128]) -> bool {
-        self.buffers == Self::identities(z, a, b)
-    }
-}
-
 pub const SLOT_BITS: usize = 256; // 2^8, one 256-bit chaining value
 pub const CV_BASE: usize = 0; // input region, slot 0: [0, 256)
 pub const OUT_LO_BASE: usize = SLOT_BITS; // output region, slot 1: [256, 512)
@@ -730,7 +698,6 @@ struct ReverseTranspose<'a> {
     ops: Vec<ReverseWordOp>,
     adjoints: Vec<[F128; WORD_BITS]>,
     comb: Vec<F128>,
-    z_const_acc: F128,
 }
 
 impl<'a> ReverseTranspose<'a> {
@@ -741,7 +708,6 @@ impl<'a> ReverseTranspose<'a> {
             ops: Vec::with_capacity(32 + 12 * N_G + 16),
             adjoints: Vec::with_capacity(32 + 12 * N_G + 16),
             comb: vec![F128::ZERO; K],
-            z_const_acc: F128::ZERO,
         }
     }
 
@@ -815,7 +781,7 @@ impl<'a> ReverseTranspose<'a> {
     fn seed_lin_row(&mut self, value: usize, bit: usize, row: usize) {
         let e = self.eq_inner[row];
         self.adjoints[value][bit] += self.alpha * e;
-        self.z_const_acc += e;
+        self.comb[Z_CONST_POS] += e;
     }
 
     /// Attach two independent lin-id rows while sharing their A-side scale.
@@ -833,8 +799,9 @@ impl<'a> ReverseTranspose<'a> {
         let [first_alpha_e, second_alpha_e] = mul_alpha_pair(self.alpha, [first_e, second_e]);
 
         self.adjoints[first_value][bit] += first_alpha_e;
+        self.comb[Z_CONST_POS] += first_e;
         self.adjoints[second_value][bit] += second_alpha_e;
-        self.z_const_acc += first_e + second_e;
+        self.comb[Z_CONST_POS] += second_e;
     }
 
     fn finish(mut self) -> Vec<F128> {
@@ -849,13 +816,11 @@ impl<'a> ReverseTranspose<'a> {
                     }
                 }
                 ReverseWordOp::Constant(value) => {
-                    let mut const_weight = F128::ZERO;
                     for (i, weight) in q.into_iter().enumerate() {
                         if (value >> i) & 1 == 1 {
-                            const_weight += weight;
+                            self.comb[Z_CONST_POS] += weight;
                         }
                     }
-                    self.z_const_acc += const_weight;
                 }
                 ReverseWordOp::XorRot { x, y, rotation } => {
                     for (i, weight) in q.into_iter().enumerate() {
@@ -880,7 +845,6 @@ impl<'a> ReverseTranspose<'a> {
                 }
             }
         }
-        self.comb[Z_CONST_POS] += self.z_const_acc;
         self.comb
     }
 }
@@ -898,26 +862,13 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
 
         // Rows whose A side is the input itself and whose B side is one.
         let e0 = eq_inner[Z_CONST_POS];
-        reverse.z_const_acc += alpha * e0 + e0;
+        reverse.comb[Z_CONST_POS] += alpha * e0 + e0;
         let input_emit = |reverse: &mut ReverseTranspose<'_>, base: usize, len: usize| {
-            let mut s = base;
-            let end = base + len;
-            let mut z_acc = F128::ZERO;
-            while s + 1 < end {
-                let e_0 = reverse.eq_inner[s];
-                let e_1 = reverse.eq_inner[s + 1];
-                let [alpha_e_0, alpha_e_1] = mul_alpha_pair(reverse.alpha, [e_0, e_1]);
-                reverse.comb[s] += alpha_e_0;
-                reverse.comb[s + 1] += alpha_e_1;
-                z_acc += e_0 + e_1;
-                s += 2;
-            }
-            if s < end {
+            for s in base..base + len {
                 let e = reverse.eq_inner[s];
                 reverse.comb[s] += reverse.alpha * e;
-                z_acc += e;
+                reverse.comb[Z_CONST_POS] += e;
             }
-            reverse.z_const_acc += z_acc;
         };
         input_emit(&mut reverse, CV_BASE, 8 * WORD_BITS);
         input_emit(&mut reverse, M_BASE, 16 * WORD_BITS);
@@ -1692,11 +1643,6 @@ pub(crate) mod witgen_simd {
     const ELIDE_B_TAIL_CHUNK: usize = 59;
     /// Leading skippable chunks of b's MAX prefix: words 0..32.
     const ELIDE_B_PREFIX_CHUNKS: usize = 4;
-    /// The last non-tokened z/a chunk: words 480..488.  On the exact ranked
-    /// all-elide path only words 480/481 carry data; 482..487 are zero.
-    const RANKED_SPARSE_TAIL_CHUNK: usize = ELIDE_ZERO_CHUNK - 1;
-    const RANKED_SPARSE_TAIL_WORD: usize = 8 * RANKED_SPARSE_TAIL_CHUNK;
-    const ZERO_FILL_WORD: usize = USEFUL_BITS.div_ceil(32);
     const BLOCK_BYTES: usize = U32_PER_BLOCK * 4; // 2048
     const ZERO_TAIL_BYTE: usize = ELIDE_ZERO_CHUNK * 32; // 1952
     const B_TAIL_BYTE: usize = ELIDE_B_TAIL_CHUNK * 32; // 1888
@@ -1720,16 +1666,6 @@ pub(crate) mod witgen_simd {
         // ...and skipped b-prefix words end at or before the MAX prefix's
         // last word (36).
         assert!(8 * ELIDE_B_PREFIX_CHUNKS <= 36);
-        // Ranked sparse-tail drain reads exactly words 480..483 from z's
-        // stage, supplies 484..487 from a zero register, then relies on the
-        // token for chunks 61..64.  Only words 482/483 therefore need an
-        // explicit stage zero-fill.  z/a's final two live words are equal.
-        assert!(RANKED_SPARSE_TAIL_CHUNK == 60);
-        assert!(RANKED_SPARSE_TAIL_WORD == 480);
-        assert!(ZERO_FILL_WORD == 482);
-        assert!(LAST_WORD + 1 == ZERO_FILL_WORD);
-        assert!(ZERO_FILL_WORD + 2 == RANKED_SPARSE_TAIL_WORD + 4);
-        assert!(RANKED_SPARSE_TAIL_CHUNK + 1 == ELIDE_ZERO_CHUNK);
     };
 
     /// Provenance-tag layout version: bump on ANY change to the witness
@@ -1892,43 +1828,6 @@ pub(crate) mod witgen_simd {
         z_nt_enabled: bool,
     ) -> bool {
         nt_enabled && defer_ranked_stripe && z_nt_enabled
-    }
-
-    /// Exact production gate for omitting dead L1-stage writes.  This is
-    /// deliberately narrower than constant-region elision: the sparse tail
-    /// publisher is NT-only and is reachable solely in the protected ranked
-    /// worker with a live deferred Metal stream and all three provenance
-    /// tokens.  Every cold, killed, partial, non-ranked, or generic PCS call
-    /// retains the incumbent full-stage path.
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    fn select_ranked_dead_stage(
-        ranked_worker: bool,
-        full_shape: bool,
-        n_blocks_log: usize,
-        pcs_params: Option<&flock_core::pcs::PcsParams>,
-        live_stream: bool,
-        defer_ranked_stripe: bool,
-        z_nt: bool,
-        ab_nt: bool,
-        elide: [bool; 3],
-    ) -> bool {
-        cfg!(target_os = "macos")
-            && ranked_worker
-            && full_shape
-            && n_blocks_log == 18
-            && pcs_params.is_some_and(|p| {
-                p.m == 32
-                    && p.log_inv_rate == 1
-                    && p.log_batch_size == 6
-                    && p.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
-                    && p.merkle_hash == flock_core::merkle::HashKind::Blake3
-            })
-            && live_stream
-            && defer_ranked_stripe
-            && z_nt
-            && ab_nt
-            && elide == [true; 3]
     }
 
     type V4 = uint32x4_t;
@@ -2126,38 +2025,6 @@ pub(crate) mod witgen_simd {
         }
     }
 
-    /// Publish z/a chunk 60 from a single structure load.  At the all-elide
-    /// ranked shape their words 480/481 are byte-identical; z words 482/483
-    /// were explicitly zeroed and words 484..487 are supplied here without
-    /// touching either L1 stage.  Chunks 61..63 remain token-owned.
-    #[inline(always)]
-    unsafe fn dump_ranked_sparse_za_tail_nt(stage_z: *const V4, z: *mut u32, a: *mut u32) {
-        const {
-            assert!(RANKED_SPARSE_TAIL_WORD + 8 == 8 * ELIDE_ZERO_CHUNK);
-            assert!(ZERO_FILL_WORD == RANKED_SPARSE_TAIL_WORD + 2);
-        }
-        unsafe {
-            let x = vld4q_u32(stage_z.add(RANKED_SPARSE_TAIL_WORD) as *const u32);
-            let zero = vdupq_n_u32(0);
-            let z0 = z.add(RANKED_SPARSE_TAIL_WORD);
-            let z1 = z.add(U32_PER_BLOCK + RANKED_SPARSE_TAIL_WORD);
-            let z2 = z.add(2 * U32_PER_BLOCK + RANKED_SPARSE_TAIL_WORD);
-            let z3 = z.add(3 * U32_PER_BLOCK + RANKED_SPARSE_TAIL_WORD);
-            let a0 = a.add(RANKED_SPARSE_TAIL_WORD);
-            let a1 = a.add(U32_PER_BLOCK + RANKED_SPARSE_TAIL_WORD);
-            let a2 = a.add(2 * U32_PER_BLOCK + RANKED_SPARSE_TAIL_WORD);
-            let a3 = a.add(3 * U32_PER_BLOCK + RANKED_SPARSE_TAIL_WORD);
-            store_nt_pair(x.0, zero, z0);
-            store_nt_pair(x.1, zero, z1);
-            store_nt_pair(x.2, zero, z2);
-            store_nt_pair(x.3, zero, z3);
-            store_nt_pair(x.0, zero, a0);
-            store_nt_pair(x.1, zero, a1);
-            store_nt_pair(x.2, zero, a2);
-            store_nt_pair(x.3, zero, a3);
-        }
-    }
-
     /// Stream-sequential field push at absolute bit position `$pos`: computes
     /// all four monomorphization consts at the call site. BACK is the
     /// straddle back-shift `room = 32 − USED` (clamped to the legal immediate
@@ -2226,7 +2093,6 @@ pub(crate) mod witgen_simd {
                 z_nt,
                 ab_nt,
                 [false; 3],
-                false,
             )
         }
     }
@@ -2266,13 +2132,8 @@ pub(crate) mod witgen_simd {
         z_nt: bool,
         ab_nt: bool,
         elide: [bool; 3],
-        ranked_dead_stage: bool,
     ) {
         unsafe {
-            debug_assert!(
-                !ranked_dead_stage || (z_nt && ab_nt && elide == [true; 3]),
-                "ranked dead-stage path requires all-elide NT publication"
-            );
             let (cv_v, m, tlo, thi, blen, flags) = match inputs {
                 QuadInput::Blocks(inputs) => {
                     // Ordinary callers retain the incumbent AoS gather and
@@ -2390,12 +2251,7 @@ pub(crate) mod witgen_simd {
             let maxv = vdupq_n_u32(u32::MAX);
             // b prefix words 0..36 = MAX (the out_lo slot is MAX too — the
             // scalar writes MAX over MAX, so b needs no out_lo pass).
-            let b_prefix_start = if ranked_dead_stage {
-                8 * ELIDE_B_PREFIX_CHUNKS
-            } else {
-                0
-            };
-            for w in b_prefix_start..36usize {
+            for w in 0..36usize {
                 vst1q_u32(bs.add(w) as *mut u32, maxv);
             }
             // Message region words 16..36: word16 = 1|m0<<1, then
@@ -2519,20 +2375,14 @@ pub(crate) mod witgen_simd {
             wb.finish();
 
             // ---- zero fill, words 482..512 (finish() 241..256 semantics) ----
+            const ZF: usize = USEFUL_BITS.div_ceil(32); // 482
             const {
-                assert!(U32_PER_BLOCK - ZERO_FILL_WORD == 30);
+                assert!(U32_PER_BLOCK - ZF == 30);
             }
-            if ranked_dead_stage {
-                // The sparse publisher's sole stage read spans words
-                // 480..483.  finish() wrote 480/481; only 482/483 remain.
-                vst1q_u32(zs.add(ZERO_FILL_WORD) as *mut u32, zero);
-                vst1q_u32(zs.add(ZERO_FILL_WORD + 1) as *mut u32, zero);
-            } else {
-                for w in 0..30usize {
-                    vst1q_u32(zs.add(ZERO_FILL_WORD + w) as *mut u32, zero);
-                    vst1q_u32(ast.add(ZERO_FILL_WORD + w) as *mut u32, zero);
-                    vst1q_u32(bs.add(ZERO_FILL_WORD + w) as *mut u32, zero);
-                }
+            for w in 0..30usize {
+                vst1q_u32(zs.add(ZF + w) as *mut u32, zero);
+                vst1q_u32(ast.add(ZF + w) as *mut u32, zero);
+                vst1q_u32(bs.add(ZF + w) as *mut u32, zero);
             }
 
             // ---- out_lo slot, words 8..16 (z/a only) ----
@@ -2543,36 +2393,17 @@ pub(crate) mod witgen_simd {
             }
 
             // ---- drain stages: per-block 2 KiB ascending bursts ----
-            if ranked_dead_stage {
-                // Exact all-elide/NT arm.  Dense chunks never touch an
-                // uninitialized stage word; chunk 60 is reconstructed from
-                // z[480..483] plus a zero register and shared with a.
-                dump_range::<true>(zs, z, 0, RANKED_SPARSE_TAIL_CHUNK);
-                dump_range::<true>(ast, a, 0, RANKED_SPARSE_TAIL_CHUNK);
-                #[cfg(debug_assertions)]
-                {
-                    let z480 = vld1q_u32(zs.add(RANKED_SPARSE_TAIL_WORD) as *const u32);
-                    let a480 = vld1q_u32(ast.add(RANKED_SPARSE_TAIL_WORD) as *const u32);
-                    let z481 = vld1q_u32(zs.add(RANKED_SPARSE_TAIL_WORD + 1) as *const u32);
-                    let a481 = vld1q_u32(ast.add(RANKED_SPARSE_TAIL_WORD + 1) as *const u32);
-                    debug_assert_eq!(vminvq_u32(vceqq_u32(z480, a480)), u32::MAX);
-                    debug_assert_eq!(vminvq_u32(vceqq_u32(z481, a481)), u32::MAX);
-                }
-                dump_ranked_sparse_za_tail_nt(zs, z, a);
-                dump_range::<true>(bs, b, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK);
+            if z_nt {
+                dump_elide::<true>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
             } else {
-                if z_nt {
-                    dump_elide::<true>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
-                } else {
-                    dump_elide::<false>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
-                }
-                if ab_nt {
-                    dump_elide::<true>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
-                    dump_elide::<true>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
-                } else {
-                    dump_elide::<false>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
-                    dump_elide::<false>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
-                }
+                dump_elide::<false>(zs, z, elide[0], false, ELIDE_ZERO_CHUNK);
+            }
+            if ab_nt {
+                dump_elide::<true>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
+                dump_elide::<true>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
+            } else {
+                dump_elide::<false>(ast, a, elide[1], false, ELIDE_ZERO_CHUNK);
+                dump_elide::<false>(bs, b, elide[2], elide[2], ELIDE_B_TAIL_CHUNK);
             }
         }
     }
@@ -2666,7 +2497,6 @@ pub(crate) mod witgen_simd {
         if stream.is_some() && n_total != 1 << 18 {
             stream = None;
         }
-        let live_stream = stream.is_some();
         // Omit the eager L1-hot transpose only when the exact streamed Metal
         // lease was actually acquired. A warmup/failure/non-ranked miss keeps
         // the ordinary stripe so no fallback can observe an absent buffer.
@@ -2699,17 +2529,6 @@ pub(crate) mod witgen_simd {
         // the full 512 MiB ranked buffer. The per-band release fence below is
         // the same visibility boundary used by the cached-store path.
         let z_nt = select_z_nt(nt, defer_ranked_stripe, z_nt_enabled());
-        let ranked_dead_stage = select_ranked_dead_stage(
-            crate::seed_pipe::is_ranked_worker(),
-            n_blocks == n_total,
-            n_blocks_log,
-            stream_params,
-            live_stream,
-            defer_ranked_stripe,
-            z_nt,
-            nt,
-            elide,
-        );
 
         let process_group = |g: usize| {
             // SAFETY: each scheduled group index occurs exactly once. Every
@@ -2748,7 +2567,6 @@ pub(crate) mod witgen_simd {
                                 z_nt,
                                 nt,
                                 elide,
-                                ranked_dead_stage,
                             );
                         }
                         continue;
@@ -2790,7 +2608,6 @@ pub(crate) mod witgen_simd {
                         z_nt,
                         nt,
                         elide,
-                        ranked_dead_stage,
                     );
                 }
             }
@@ -3630,7 +3447,6 @@ impl Blake3Setup {
         // The warm publish below and the spawn-free kickoff stay: their
         // mechanisms are contention-free.
         let (proof, commitment, claim) = self.prove_fast_inner(blocks, challenger);
-        flock_core::cpu_keepalive::pool_spin_release();
         if call == 0 {
             let (proof, commitment) = warm_publish_path(proof, commitment);
             // Still untimed: prove here, against the wrapper's own warm-up
@@ -3693,9 +3509,7 @@ impl Blake3Setup {
             crate::seed_pipe::BENCH_DOMAIN,
             HashKind::Blake3,
         );
-        let out = setup.prove_fast_inner(blocks, &mut challenger);
-        flock_core::cpu_keepalive::pool_spin_release();
-        out
+        setup.prove_fast_inner(blocks, &mut challenger)
     }
 
     fn prove_fast_inner<Ch: Challenger>(
@@ -3724,22 +3538,12 @@ impl Blake3Setup {
                 };
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
-                flock_core::tmark::mark("witgen start");
                 let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck, gpu_first_pass) =
                     generate_witness_with_ab_packed_and_lincheck_streamed(
                         blocks,
                         self.n_blocks_log(),
                         &self.pcs_params,
                     );
-                flock_core::tmark::mark("witgen end");
-                // Witness work is all handed out; the hot pool spin (ready→seed
-                // gap + witness phase) ends here.
-                flock_core::cpu_keepalive::pool_spin_release();
-                let identity_prefix_witness = Some(
-                    Blake3IdentityPrefixWitness::from_row_major_generator(
-                        &z_packed, &a_packed_f128, &b_packed_f128,
-                    ),
-                );
                 if phase_timing {
                     let wall = t_wit.elapsed().as_secs_f64() * 1e3;
                     let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
@@ -3765,7 +3569,6 @@ impl Blake3Setup {
                                 lc_circuit,
                                 codeword,
                                 stream,
-                                identity_prefix_witness,
                                 challenger,
                             )
                         }
@@ -3778,12 +3581,11 @@ impl Blake3Setup {
                             lc_circuit,
                             codeword,
                             stream,
-                            identity_prefix_witness,
                             challenger,
                         ),
                     };
                 }
-                return crate::prover::prove_fast_ligerito_from_witness_with_identity_prefix(
+                return crate::prover::prove_fast_ligerito_from_witness(
                     &self.r1cs,
                     &self.pcs_params,
                     z_packed,
@@ -3793,7 +3595,6 @@ impl Blake3Setup {
                         .expect("non-streamed witness fallback must materialize lincheck stripe"),
                     lc_circuit,
                     codeword,
-                    identity_prefix_witness,
                     challenger,
                 );
             }
@@ -3801,11 +3602,6 @@ impl Blake3Setup {
             let t_wit = std::time::Instant::now();
             let (codeword, (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck)) =
                 self.generate_witness_ab_with_rate2_codeword(blocks);
-            let identity_prefix_witness = Some(
-                Blake3IdentityPrefixWitness::from_row_major_generator(
-                    &z_packed, &a_packed_f128, &b_packed_f128,
-                ),
-            );
             if phase_timing {
                 let wall = t_wit.elapsed().as_secs_f64() * 1e3;
                 let cpu = crate::prover::process_cpu_ms() - cpu_wit.unwrap_or(0.0);
@@ -3824,7 +3620,6 @@ impl Blake3Setup {
                 z_packed_lincheck,
                 lc_circuit,
                 codeword,
-                identity_prefix_witness,
                 challenger,
             );
         }
@@ -3832,14 +3627,8 @@ impl Blake3Setup {
             flock_core::pcs::prefault_codeword_during(&self.pcs_params, || {
                 self.generate_witness_ab(blocks)
             });
-        let identity_prefix_witness =
-            (self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor).then(|| {
-                Blake3IdentityPrefixWitness::from_row_major_generator(
-                    &z_packed, &a_packed_f128, &b_packed_f128,
-                )
-            });
         let lc_circuit = self.lincheck_circuit();
-        crate::prover::prove_fast_ligerito_from_witness_with_identity_prefix(
+        crate::prover::prove_fast_ligerito_from_witness(
             &self.r1cs,
             &self.pcs_params,
             z_packed,
@@ -3848,7 +3637,6 @@ impl Blake3Setup {
             z_packed_lincheck,
             lc_circuit,
             codeword,
-            identity_prefix_witness,
             challenger,
         )
     }
@@ -4828,7 +4616,6 @@ mod tests {
                         z_nt,
                         ab_nt,
                         [true; 3],
-                        z_nt && ab_nt,
                     );
                 }
                 assert_eq!(ze, zq, "elided z diverged z_nt={z_nt} ab_nt={ab_nt}");
@@ -4900,7 +4687,6 @@ mod tests {
                     false,
                     false,
                     [false; 3],
-                    false,
                 );
             }
             assert_eq!(zs, za, "seeded z diverged init={init:#x} first={first}");
@@ -5026,7 +4812,6 @@ mod tests {
                 z_lincheck,
                 circuit,
                 hot_codeword,
-                None,
                 &mut hot_challenger,
             );
 

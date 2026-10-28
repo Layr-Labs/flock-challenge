@@ -38,39 +38,6 @@ pub fn transpose_8_u64s_to_64_bytes(lanes: &[u64; 8], out: &mut [u8]) {
     crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes(input, out64);
 }
 
-/// [`transpose_8_u64s_to_64_bytes`] of the eight words `base[l * stride]`,
-/// `l = 0..8`, read straight into vector lanes (`ldr d` + `ld1 {v.d}[1]` per
-/// lane pair) instead of through general registers. Same output bytes.
-///
-/// # Safety
-/// `base.add(l * stride)` must be valid for an 8-byte read for every `l < 8`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-pub unsafe fn transpose_8_strided_u64s_to_64_bytes(base: *const u64, stride: usize, out: &mut [u8; 64]) {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn lane_pair(lo: *const u64, hi: *const u64) -> uint8x16_t {
-        // SAFETY: the caller's contract covers both 8-byte reads.
-        unsafe { vreinterpretq_u8_u64(vcombine_u64(vld1_u64(lo), vld1_u64(hi))) }
-    }
-
-    // SAFETY: the caller guarantees all eight reads; `out` is 64 writable bytes.
-    unsafe {
-        let v0 = lane_pair(base, base.add(stride));
-        let v1 = lane_pair(base.add(2 * stride), base.add(3 * stride));
-        let v2 = lane_pair(base.add(4 * stride), base.add(5 * stride));
-        let v3 = lane_pair(base.add(6 * stride), base.add(7 * stride));
-        let [y0, y1, y2, y3] =
-            crate::zerocheck::univariate_skip_optimized::bit_transpose_64bytes_neon_regs(v0, v1, v2, v3);
-        let out_ptr = out.as_mut_ptr();
-        vst1q_u8(out_ptr, vreinterpretq_u8_u64(y0));
-        vst1q_u8(out_ptr.add(16), vreinterpretq_u8_u64(y1));
-        vst1q_u8(out_ptr.add(32), vreinterpretq_u8_u64(y2));
-        vst1q_u8(out_ptr.add(48), vreinterpretq_u8_u64(y3));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,34 +89,6 @@ mod tests {
             transpose_8_u64s_to_64_bytes(&lanes, &mut fast);
             transpose_8_u64s_to_64_bytes_scalar(&lanes, &mut oracle);
             assert_eq!(fast, oracle, "lanes={lanes:?}");
-        }
-    }
-
-    /// The strided lane-load entry matches the array entry bit-for-bit.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn strided_transpose_matches_array_transpose() {
-        let mut state = 0x0DDB_A11C_AFE5_7EEDu64;
-        let mut next = || {
-            state = state.wrapping_add(0x9E3779B97F4A7C15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-            z ^ (z >> 31)
-        };
-        for stride in [1usize, 2, 3, 7, 64, 256] {
-            let words: Vec<u64> = (0..8 * stride + 5).map(|_| next()).collect();
-            for word in 0..stride.min(5) {
-                let lanes: [u64; 8] = std::array::from_fn(|l| words[l * stride + word]);
-                let mut expected = [0u8; 64];
-                transpose_8_u64s_to_64_bytes(&lanes, &mut expected);
-                let mut actual = [0u8; 64];
-                // SAFETY: the highest read is 7 * stride + word < words.len().
-                unsafe {
-                    transpose_8_strided_u64s_to_64_bytes(words.as_ptr().add(word), stride, &mut actual)
-                };
-                assert_eq!(actual, expected, "stride={stride} word={word}");
-            }
         }
     }
 
