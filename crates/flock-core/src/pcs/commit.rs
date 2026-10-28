@@ -60,6 +60,12 @@ impl PcsParams {
         self.log_msg_len() - self.log_batch_size
     }
     /// Codeword size (log) per sub-NTT.
+/// `k_code` is the per-sub-NTT codeword size in log form: the message
+/// dimension `log_dim` plus the redundancy `log_inv_rate`. The Merkle tree
+/// therefore holds `2^k_code` leaves per sub-NTT, one position per leaf,
+/// with all batch lanes packed into that leaf. Raising `log_inv_rate` adds
+/// one doubling of positions per bit, while `log_dim` follows `m` minus the
+/// packing width and batch size through the helpers above.
     pub fn k_code(&self) -> usize {
         self.log_dim() + self.log_inv_rate
     }
