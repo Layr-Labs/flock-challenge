@@ -73,6 +73,12 @@ static inline void transpose_block4(const uint8_t *i0, const uint8_t *i1,
   }
 }
 
+// Two-state round interleave: every G2 issues the v0[a] and v1[a] updates
+// adjacently, then v0[d] and v1[d], and so on down the column, so each
+// round carries two independent add/XOR/rotate chains and a P-core stalls
+// on neither state's latency. Interleaving a third state adds only live
+// values without a new chain to hide behind: the scheduling win is fully
+// captured by this pair, and more states buy only register pressure.
 #define G2(a, b, c, d, x, y)                                                \
   do {                                                                        \
     v0[a] = vaddq_u32(vaddq_u32(v0[a], v0[b]), m0[x]);                        \
