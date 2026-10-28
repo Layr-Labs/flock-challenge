@@ -520,6 +520,9 @@ pub(super) unsafe fn fold_banked_slots4<const BANKS: usize>(
     unsafe {
         debug_assert!(input.len() >= 4 * BANKS);
         let zero = vdupq_n_u64(0);
+        if BANKS % 2 == 0 {
+            return fold_banked_slots4_schoolbook::<BANKS>(weight, input);
+        }
         let mut acc = [KaratsubaNeon {
             ll: zero,
             hh: zero,
@@ -587,6 +590,110 @@ pub(super) unsafe fn fold_banked_slots4<const BANKS: usize>(
 
         let low = reduce_wide_pair(karatsuba_to_wide(acc[0]), karatsuba_to_wide(acc[1]));
         let high = reduce_wide_pair(karatsuba_to_wide(acc[2]), karatsuba_to_wide(acc[3]));
+        [
+            transmute::<uint64x2_t, F128>(low[0]),
+            transmute::<uint64x2_t, F128>(low[1]),
+            transmute::<uint64x2_t, F128>(high[0]),
+            transmute::<uint64x2_t, F128>(high[1]),
+        ]
+    }
+}
+
+/// `[v.hi, v.lo]` as one `EXT`, kept opaque so LLVM cannot turn the
+/// matching-lane products below back into lane `DUP`s.
+#[inline(always)]
+unsafe fn swap_halves(v: uint64x2_t) -> uint64x2_t {
+    let out: uint64x2_t;
+    // SAFETY: register-only lane rotate; no memory, stack or flags.
+    unsafe {
+        core::arch::asm!(
+            "ext {out:v}.16b, {v:v}.16b, {v:v}.16b, #8",
+            v = in(vreg) v,
+            out = lateout(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// `x * w` and `x * w'` for two banks, XORed into one schoolbook
+/// `(ll, cross, hh)` accumulator: eight matching-lane PMULLs against the
+/// weights and their swapped copies, and four EOR3s.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn tri_acc_two_banks(
+    ll: &mut uint64x2_t,
+    cross: &mut uint64x2_t,
+    hh: &mut uint64x2_t,
+    x0: uint64x2_t,
+    w0: uint64x2_t,
+    w0_sw: uint64x2_t,
+    x1: uint64x2_t,
+    w1: uint64x2_t,
+    w1_sw: uint64x2_t,
+) {
+    unsafe {
+        let x0p = vreinterpretq_p64_u64(x0);
+        let x1p = vreinterpretq_p64_u64(x1);
+        let lo = |a: uint64x2_t, b: uint64x2_t| pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+        let hi = |a: poly64x2_t, b: uint64x2_t| {
+            transmute::<u128, uint64x2_t>(vmull_high_p64(a, vreinterpretq_p64_u64(b)))
+        };
+        *ll = xor3_u64(*ll, lo(x0, w0), lo(x1, w1));
+        *hh = xor3_u64(*hh, hi(x0p, w0), hi(x1p, w1));
+        *cross = xor3_u64(*cross, lo(x0, w0_sw), hi(x0p, w0_sw));
+        *cross = xor3_u64(*cross, lo(x1, w1_sw), hi(x1p, w1_sw));
+    }
+}
+
+/// [`fold_banked_slots4`] for an even bank count: schoolbook products with
+/// one swapped copy per weight shared by the four slots, two banks per step
+/// so each accumulator update is one EOR3 of two products. The four outputs
+/// are the same deferred-reduction sums (same products, XOR reassociated).
+#[inline(always)]
+unsafe fn fold_banked_slots4_schoolbook<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    input: &[F128],
+) -> [F128; 4] {
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut ll = [zero; 4];
+        let mut cross = [zero; 4];
+        let mut hh = [zero; 4];
+
+        let w = weight.as_ptr();
+        let x = input.as_ptr();
+        let mut bank = 0usize;
+        while bank < BANKS {
+            let w0 = vld1q_u64(w.add(bank).cast::<u64>());
+            let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
+            let w0_sw = swap_halves(w0);
+            let w1_sw = swap_halves(w1);
+            for slot in 0..4 {
+                let row = x.add(slot * BANKS + bank);
+                let x0 = vld1q_u64(row.cast::<u64>());
+                let x1 = vld1q_u64(row.add(1).cast::<u64>());
+                tri_acc_two_banks(
+                    &mut ll[slot],
+                    &mut cross[slot],
+                    &mut hh[slot],
+                    x0,
+                    w0,
+                    w0_sw,
+                    x1,
+                    w1,
+                    w1_sw,
+                );
+            }
+            bank += 2;
+        }
+
+        let wide = |slot: usize| WideNeon {
+            lo: veorq_u64(ll[slot], vextq_u64::<1>(zero, cross[slot])),
+            hi: veorq_u64(hh[slot], vextq_u64::<1>(cross[slot], zero)),
+        };
+        let low = reduce_wide_pair(wide(0), wide(1));
+        let high = reduce_wide_pair(wide(2), wide(3));
         [
             transmute::<uint64x2_t, F128>(low[0]),
             transmute::<uint64x2_t, F128>(low[1]),
