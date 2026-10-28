@@ -8054,7 +8054,19 @@ fn sample_distinct_queries<Ch: Challenger>(
 }
 
 /// Build a single octopus multi-proof for all `queries` against `tree`.
+const MULTIPROOF_PAR_MIN_SIBLINGS: usize = 512;
+const MULTIPROOF_PAR_CHUNK: usize = 64;
+
 fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) -> Vec<Hash> {
+    use rayon::prelude::*;
+    let indices = merkle::merkle_multi_proof_sibling_indices(block_len, queries);
+    if indices.len() >= MULTIPROOF_PAR_MIN_SIBLINGS {
+        return indices
+            .par_iter()
+            .with_min_len(MULTIPROOF_PAR_CHUNK)
+            .map(|&i| tree[i])
+            .collect();
+    }
     merkle::merkle_multi_proof(tree, block_len, queries)
 }
 
@@ -8880,17 +8892,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     if trace {
         t_opens += _t.elapsed();
     }
-    // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
-    // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
-    // levels stay dense).
-    let sks_vks_n1 = eval_sk_at_vks(n1);
     let _t = std::time::Instant::now();
     let use_c2 = c2::enabled(
         use_lazy_l1_ood,
         std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
     );
-    // Cache owned residues while the borrowed committed L0 codeword is live.
-    // Unsupported geometry takes the unchanged complete induction below.
     let sparse_l0 = use_c2.then(|| {
         c2::Dual::new(
             n1 + log_inv_rate_0,
@@ -8904,6 +8910,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let full_l0 = if use_c2 {
         None
     } else {
+        let sks_vks_n1 = eval_sk_at_vks(n1);
         Some(induce_sumcheck_poly_auto_with_ranked_msg(
             n1,
             log_inv_rate_0,
@@ -9230,7 +9237,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         } else {
             wtns_prev.tree = Vec::new();
         }
-        let sks_vks_i = eval_sk_at_vks(n_next);
         let use_l2_pruned_sparse_ntt = ranked_l2_pruned_sparse_ntt_enabled(
             config,
             log_n,
@@ -9287,6 +9293,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     use_l2_factored_final5,
                 )
             } else {
+                let sks_vks_i = eval_sk_at_vks(n_next);
                 induce_sumcheck_poly(
                     n_next,
                     &sks_vks_i,
