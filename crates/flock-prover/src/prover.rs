@@ -325,6 +325,11 @@ pub fn prove_ligerito<Ch: Challenger>(
         pcs_open,
     };
     let claim = R1csClaim { ab, c };
+    if crate::seed_pipe::is_timed_speculative_prove() {
+        std::mem::forget(s_hat_v_ab);
+        std::mem::forget(s_hat_v_c);
+        std::mem::forget(prover_data);
+    }
     (proof, commitment, claim)
 }
 
@@ -593,6 +598,11 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         pcs_open,
     };
     let claim = R1csClaim { ab, c };
+    if crate::seed_pipe::is_timed_speculative_prove() {
+        std::mem::forget(s_hat_v_ab);
+        std::mem::forget(s_hat_v_c);
+        std::mem::forget(prover_data);
+    }
     (proof, commitment, claim)
 }
 
@@ -658,52 +668,51 @@ fn fill_deferred_lincheck_stripe_group(
 ) {
     let group_start = group * group_f128;
     let z_group = &z_packed[group_start..group_start + group_f128];
-    // SAFETY: F128 is repr(C) as two little-endian u64 halves; this is the
-    // same read-only view used by the eager witness transpose.
     let z_u64: &[u64] =
         unsafe { std::slice::from_raw_parts(z_group.as_ptr().cast::<u64>(), z_group.len() * 2) };
+    #[cfg(not(target_arch = "aarch64"))]
     let mut transposed = [0u8; 64];
-    // Every read below is `lane * u64_per_block + word` with `lane < 8` and
-    // `word < useful_words <= u64_per_block`, inside the group's 8 blocks.
     assert!(useful_words <= u64_per_block && z_u64.len() == 8 * u64_per_block);
     for word in 0..useful_words {
-        // aarch64: the eight lane words go from memory straight into vector
-        // lanes, not through general registers; same bytes as the array path.
         #[cfg(target_arch = "aarch64")]
-        // SAFETY: bounded by the assert above.
+        if word & 15 == 0 {
+            let ahead = word + 32;
+            if ahead < u64_per_block {
+                for lane in 0..8 {
+                    unsafe {
+                        core::arch::asm!(
+                            "prfm pldl1keep, [{addr}]",
+                            addr = in(reg) z_u64.as_ptr().add(lane * u64_per_block + ahead),
+                            options(nostack, preserves_flags, readonly)
+                        );
+                    }
+                }
+            }
+        }
+        let dst = &mut stripe[word * 64..word * 64 + 64];
+        #[cfg(target_arch = "aarch64")]
         unsafe {
-            flock_core::bits::transpose_8_strided_u64s_to_64_bytes(
+            let [y0, y1, y2, y3] = flock_core::bits::transpose_8_strided_u64s_to_regs(
                 z_u64.as_ptr().add(word),
                 u64_per_block,
-                &mut transposed,
+            );
+            core::arch::asm!(
+                "stnp {y0:q}, {y1:q}, [{dst}]",
+                "stnp {y2:q}, {y3:q}, [{dst}, #32]",
+                dst = in(reg) dst.as_mut_ptr(),
+                y0 = in(vreg) y0,
+                y1 = in(vreg) y1,
+                y2 = in(vreg) y2,
+                y3 = in(vreg) y3,
+                options(nostack, preserves_flags)
             );
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
             let lanes: [u64; 8] = std::array::from_fn(|lane| z_u64[lane * u64_per_block + word]);
             flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
+            dst.copy_from_slice(&transposed);
         }
-        let dst = &mut stripe[word * 64..word * 64 + 64];
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            // The stripe is not read until after commit+zerocheck, so use the
-            // same cache-bypassing store flavor as the eager SIMD witness
-            // path. `ldp/stnp` permit these 64-byte slices and the stack
-            // temporary without an extra alignment contract.
-            core::arch::asm!(
-                "ldp {t0:q}, {t1:q}, [{src}]",
-                "stnp {t0:q}, {t1:q}, [{dst}]",
-                "ldp {t0:q}, {t1:q}, [{src}, #32]",
-                "stnp {t0:q}, {t1:q}, [{dst}, #32]",
-                src = in(reg) transposed.as_ptr(),
-                dst = in(reg) dst.as_mut_ptr(),
-                t0 = out(vreg) _,
-                t1 = out(vreg) _,
-                options(nostack)
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        dst.copy_from_slice(&transposed);
     }
     // The ranked padded fold never observes the tail. Keeping the honest
     // full-stripe contract in tests catches accidental selector widening.
