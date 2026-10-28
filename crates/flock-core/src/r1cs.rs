@@ -147,6 +147,8 @@ impl BlockR1cs {
         1usize << self.k_log
     }
     /// Total witness length = 2^m.
+    /// `2^m`, derived from the stored exponent `m` on each call rather than
+    /// stored beside it, so the two can never disagree.
     pub fn n(&self) -> usize {
         1usize << self.m
     }
