@@ -43,13 +43,56 @@ static POOL: Mutex<Vec<PoolEntry>> = Mutex::new(Vec::new());
 static LINCHECK_ACC_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 static LINCHECK_EQ_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 static LINCHECK_Z_VEC_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
-static SPARSE_NTT_DATA_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
+static SPARSE_NTT_DATA_SCRATCH: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
+static C2_RESIDUES_SCRATCH: Mutex<Option<Vec<[F128; 16]>>> = Mutex::new(None);
+
+/// Take an uninitialized `[F128; 16]` vector of length `len` for `c2::Dual`.
+pub fn take_c2_residues(len: usize) -> Vec<[F128; 16]> {
+    if let Ok(mut guard) = C2_RESIDUES_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= len {
+                unsafe { v.set_len(len) };
+                return v;
+            }
+            *guard = Some(v);
+        }
+    }
+    let mut v = Vec::with_capacity(len.max(256));
+    unsafe { v.set_len(len) };
+    v
+}
+
+/// Return a `c2::Dual` residues buffer to `C2_RESIDUES_SCRATCH`.
+pub fn give_c2_residues(mut v: Vec<[F128; 16]>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    v.clear();
+    if let Ok(mut guard) = C2_RESIDUES_SCRATCH.lock() {
+        if guard.as_ref().map_or(true, |old| v.capacity() >= old.capacity()) {
+            *guard = Some(v);
+        }
+    }
+}
 
 /// Take an uninitialized `F128` vector of length `len` for `transpose_forward_ntt_sparse_impl`.
 pub fn take_sparse_ntt_data(len: usize) -> Vec<F128> {
-    if let Ok(mut guard) = SPARSE_NTT_DATA_SCRATCH.lock() {
-        if let Some(mut v) = guard.take() {
-            if v.capacity() >= len {
+    if len >= 256 {
+        if let Ok(mut guard) = SPARSE_NTT_DATA_SCRATCH.lock() {
+            let mut best: Option<usize> = None;
+            for (i, v) in guard.iter().enumerate() {
+                if v.capacity() >= len {
+                    let replace = match best {
+                        None => true,
+                        Some(j) => v.capacity() < guard[j].capacity(),
+                    };
+                    if replace {
+                        best = Some(i);
+                    }
+                }
+            }
+            if let Some(i) = best {
+                let mut v = guard.swap_remove(i);
                 unsafe { v.set_len(len) };
                 return v;
             }
@@ -60,13 +103,16 @@ pub fn take_sparse_ntt_data(len: usize) -> Vec<F128> {
 
 /// Return a `transpose_forward_ntt_sparse_impl` buffer to `SPARSE_NTT_DATA_SCRATCH`.
 pub fn give_sparse_ntt_data(mut v: Vec<F128>) {
-    if v.capacity() < 65_536 {
+    let cap = v.capacity();
+    if cap < 256 {
         return;
     }
     v.clear();
     if let Ok(mut guard) = SPARSE_NTT_DATA_SCRATCH.lock() {
-        if guard.as_ref().map_or(true, |old| v.capacity() > old.capacity()) {
-            *guard = Some(v);
+        if let Some(slot) = guard.iter_mut().find(|old| old.capacity() == cap) {
+            *slot = v;
+        } else if guard.len() < 12 {
+            guard.push(v);
         }
     }
 }
