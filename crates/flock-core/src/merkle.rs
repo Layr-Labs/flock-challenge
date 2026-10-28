@@ -1,3 +1,50 @@
+//! Binary Merkle tree over a selectable hash — SHA-256 (using four-way
+//! hardware SHA interleaving on supported ARM and x86-64 targets) or BLAKE3.
+//!
+//! The choice is a *runtime* one, carried by [`HashKind`] and threaded
+//! from the PCS parameters / Ligerito config down to the two primitives
+//! ([`hash_leaf`] and [`hash_pair`]). Everything else in this module — tree
+//! layout, path extraction, multi-proof assembly and verification — is
+//! hash-agnostic: both hashes produce 32-byte digests, so the proof format is
+//! identical either way and only the digest *values* differ.
+//!
+//! Dispatch granularity is one branch per *batch* of hashes — a whole level
+//! run for BLAKE3, four nodes for SHA-256 — not per byte, so carrying the
+//! choice at runtime costs nothing measurable.
+//!
+//! Layout for `num_leaves = 2^k` leaves:
+//!   tree[0..num_leaves]                              = leaf hashes (level k)
+//!   tree[num_leaves..3·num_leaves/2]                 = level k−1
+//!   ...
+//!   tree[2·num_leaves − 2..2·num_leaves − 1]         = root (level 0)
+//!
+//! Total nodes: `2·num_leaves − 1`. The flat layout keeps the tree contiguous
+//! in memory for cheap Merkle-path extraction later.
+//!
+//! SHA-256 uses the [`sha2`] crate. On aarch64 with the `sha2` target feature
+//! (set implicitly by `target-cpu=native` on M-series), the crate uses
+//! `sha256h`/`sha256h2`/`sha256su0`/`sha256su1` ARM crypto extension
+//! instructions; this is detected at runtime by [`cpufeatures`].
+//!
+//! BLAKE3 uses the [`blake3`] crate and BLAKE3's own tree semantics: a leaf is
+//! a non-root chaining value, an internal node is a PARENT-flagged compression
+//! of its two children. Both go through the crate's SIMD compression entry
+//! point in [`BLAKE3_BATCH`]-wide calls, so the batch always fills the widest
+//! vector the machine has (4 under NEON, 8 under AVX2, 16 under AVX-512) —
+//! see the note above [`blake3_hash_many`] for why that API and how it is
+//! kept honest.
+//!
+//! Which hash is faster is size- and target-dependent. On a target with the
+//! ARM SHA-2 or x86 SHA-NI extensions, SHA-256 wins: its two compressions per
+//! internal node run on a dedicated hardware unit, against BLAKE3's one in the
+//! vector units. `benches/merkle.rs` measures both;
+//! `benches/blake3_node_probe.rs` breaks the BLAKE3 side down per node shape.
+//!
+//! Domain separation differs between the two. BLAKE3's PARENT flag separates
+//! leaf and internal pre-images inherently. The SHA-256 construction does
+//! **not** — it has no leaf/internal tag, so it is open to second-preimage
+//! attacks via interpretation collision, and a production PCS commit should
+//! prepend `0x00`/`0x01` (or equivalent) before relying on it.
 
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
@@ -29,18 +76,40 @@ const SHA256_IV: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
+/// 4-way interleaved SHA-256 using ARM crypto-extension intrinsics.
+///
+/// The M-series SHA unit is pipelined: a single dependent compress
+/// chain runs at ~21 ns/compress, while interleaved independent
+/// streams sustain ~16 ns/compress on real (distinct) data — a ~1.35×
+/// throughput win, measured on M4 Max at m=30. The `sha2` crate hashes
+/// one stream at a time, so bulk Merkle hashing (independent leaves /
+/// independent nodes within a level) leaves that on the table.
+///
+/// Digests are byte-identical to `Sha256::digest`.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
 #[path = "merkle/aarch64.rs"]
 mod sha256x4;
 
+/// Four SHA-256 streams interleaved across the x86 SHA-NI pipeline.
+///
+/// SHA-NI accelerates one stream but retains a dependent state chain. Running
+/// four independent states round-for-round exposes enough instruction-level
+/// parallelism for bulk Merkle leaves and same-level parent nodes.
 #[cfg(all(target_arch = "x86_64", target_feature = "sha"))]
 #[path = "merkle/x86_64.rs"]
 mod sha256x4;
 
+/// Apple AArch64 BLAKE3 kernels specialized for the ranked Merkle geometry.
+/// The 1 KiB leaf path interleaves two four-lane states round-by-round, while
+/// parent nodes use three four-lane states. Every other target retains the
+/// upstream `blake3::platform::hash_many` path.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[path = "merkle/blake3_neon_apple.rs"]
 mod blake3_neon_apple;
 
+/// Global Merkle hash call/compression counters, enabled with
+/// `--features hash-count` (e.g. by `benches/verifier_hash_count.rs`).
+/// Relaxed atomics — exact totals, no ordering guarantees across threads.
 #[cfg(feature = "hash-count")]
 pub mod hash_count {
     use super::HashKind;
@@ -50,11 +119,17 @@ pub mod hash_count {
     pub static LEAF_COMPRESSIONS: AtomicU64 = AtomicU64::new(0);
     pub static PAIR_CALLS: AtomicU64 = AtomicU64::new(0);
 
+    /// SHA-256 compression count for a one-shot hash of `len` bytes:
+    /// ceil((len + 9) / 64) — payload + 0x80 pad + 8-byte length.
     #[inline]
     pub fn sha256_blocks(len: usize) -> u64 {
         ((len + 9).div_ceil(64)) as u64
     }
 
+    /// BLAKE3 compression count for a one-shot hash of `len` bytes: one
+    /// compression per 64-byte block (a final partial block still costs one,
+    /// and the empty input costs one), plus one parent compression per
+    /// internal node of the chunk tree — `c − 1` for `c` 1 KiB chunks.
     #[inline]
     pub fn blake3_blocks(len: usize) -> u64 {
         let blocks = (len.div_ceil(64)).max(1) as u64;
@@ -62,6 +137,7 @@ pub mod hash_count {
         blocks + (chunks - 1)
     }
 
+    /// Compression count for a one-shot hash of `len` bytes under `kind`.
     #[inline]
     pub fn blocks(kind: HashKind, len: usize) -> u64 {
         match kind {
@@ -76,6 +152,9 @@ pub mod hash_count {
         PAIR_CALLS.store(0, Relaxed);
     }
 
+    /// (leaf_calls, leaf_compressions, pair_calls). A pair hash is
+    /// 2 compressions under SHA-256 (64 B payload + padding block) and
+    /// 1 under BLAKE3 (a single 64-byte block, no length padding).
     pub fn snapshot() -> (u64, u64, u64) {
         (
             LEAF_CALLS.load(Relaxed),
@@ -85,18 +164,51 @@ pub mod hash_count {
     }
 }
 
+// ---------------------------------------------------------------------------
+// BLAKE3 tree primitives.
+//
+// The BLAKE3 Merkle tree uses BLAKE3's *own* tree semantics rather than
+// `blake3::hash` over concatenated bytes:
+//
+//   leaf   = Hasher::new().update(leaf_bytes).finalize_non_root()
+//   parent = merge_subtrees_non_root(left_cv, right_cv, Mode::Hash)
+//
+// Two reasons. First, correctness: these are non-root chaining values, which is
+// what interior tree nodes are supposed to be, and BLAKE3's PARENT flag gives
+// leaf/parent domain separation for free — the property this module's header
+// notes the SHA-256 construction lacks. Second, speed: both map onto BLAKE3's
+// batched compression entry point, which is ~2× the scalar API (measured by
+// `benches/blake3_node_probe.rs`).
+//
+// The two functions below are the *specification* — stable, public `blake3`
+// API. The `blake3_hash_many_*` paths are optimizations that must agree with
+// them bit-for-bit; `blake3_batched_matches_scalar_spec` in this module's
+// tests is what holds them to it.
+//
+// NOTE — this deliberately differs from the sibling implementation on
+// TomWambsgans/flock `blake3-pcs`, which defines a leaf as `blake3::hash(x)`
+// and a parent as `blake3::hash(l ‖ r)` (root-flagged one-shot hashes). That
+// contract is simpler and reproducible with plain `blake3::hash`; this one
+// buys leaf/parent domain separation instead, which the SHA-256 construction
+// lacks. The two produce *different digests* — a tree built under one does not
+// verify under the other, so the choice has to be made once, project-wide.
+// Both batch equally well, so it is not a performance trade.
+// ---------------------------------------------------------------------------
 
+/// Non-root chaining value of one BLAKE3 leaf, of any length.
 #[inline]
 fn blake3_leaf_cv(data: &[u8]) -> Hash {
     use blake3::hazmat::HasherExt;
     blake3::Hasher::new().update(data).finalize_non_root()
 }
 
+/// BLAKE3 parent-node chaining value of two children.
 #[inline]
 fn blake3_parent_cv(left: &Hash, right: &Hash) -> Hash {
     blake3::hazmat::merge_subtrees_non_root(left, right, blake3::hazmat::Mode::Hash)
 }
 
+/// Hash one leaf of arbitrary byte length.
 #[inline]
 pub fn hash_leaf(data: &[u8], kind: HashKind) -> Hash {
     #[cfg(feature = "hash-count")]
@@ -111,6 +223,7 @@ pub fn hash_leaf(data: &[u8], kind: HashKind) -> Hash {
     }
 }
 
+/// Hash a pair of children into a parent node (64 B → 32 B).
 #[inline]
 pub fn hash_pair(left: &Hash, right: &Hash, kind: HashKind) -> Hash {
     #[cfg(feature = "hash-count")]
@@ -126,6 +239,11 @@ pub fn hash_pair(left: &Hash, right: &Hash, kind: HashKind) -> Hash {
     }
 }
 
+/// SHA-256 of four equal-length inputs, four-way interleaved across the
+/// hardware SHA unit where the target supports it.
+///
+/// Digests are byte-identical to `Sha256::digest` either way; the fallback
+/// exists so callers need not repeat the `cfg` test.
 #[cfg(any(
     all(target_arch = "aarch64", target_feature = "sha2"),
     all(target_arch = "x86_64", target_feature = "sha")
@@ -146,24 +264,57 @@ fn sha256_hash4(inputs: [&[u8]; 4], outs: &mut [Hash]) {
     }
 }
 
+// --- BLAKE3 batched compression -------------------------------------------
+//
+// `blake3::platform` is `#[doc(hidden)]` and labelled "undocumented and
+// unstable". We depend on it deliberately: it is the only way to reach the
+// crate's SIMD-batched compression (4-way under NEON, 8/16-way under
+// AVX2/AVX-512), worth ~2× over the scalar API on our node shapes, and the
+// alternative — hand-writing a 4-way NEON BLAKE3 alongside `merkle/aarch64.rs`
+// — is a great deal more code to own and audit.
+//
+// The exposure is bounded: every batched result is checked against the stable
+// `hazmat` spec above in this module's tests, so a semantic change in a
+// `blake3` update fails the suite rather than silently altering commitments,
+// and an API removal fails the build. Nothing here is reachable if the
+// equality does not hold.
 
+/// BLAKE3's IV — the key words for unkeyed hashing. Fixed by the spec.
 const BLAKE3_IV: [u32; 8] = [
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
 ];
 
+/// BLAKE3 domain flags, fixed by the spec.
 const BLAKE3_CHUNK_START: u8 = 1;
 const BLAKE3_CHUNK_END: u8 = 2;
 const BLAKE3_PARENT: u8 = 4;
 const BLAKE3_ROOT: u8 = 8;
 
+/// Cached SIMD platform. `Platform::detect()` is cheap but not free, and the
+/// tree build reaches the batched path once per [`BLAKE3_BATCH`] nodes.
 fn blake3_platform() -> blake3::platform::Platform {
     use std::sync::OnceLock;
     static PLATFORM: OnceLock<blake3::platform::Platform> = OnceLock::new();
     *PLATFORM.get_or_init(blake3::platform::Platform::detect)
 }
 
+/// Inputs handed to `hash_many` per call.
+///
+/// Sized to the widest `simd_degree` that exists — 4 under NEON, 8 under AVX2,
+/// 16 under AVX-512 — so the batch fills the machine's vector rather than
+/// leaving lanes idle. This is portability insurance, not a local win: swept
+/// over 4/8/16/64/256 on an M4 Max (NEON, degree 4) the spread was ~1-5%, i.e.
+/// inside run-to-run noise, with 16 marginally best. It should matter on an
+/// AVX-512 host, where a 4-input call can only ever fill a quarter of the
+/// vector; that has not been measured here.
 const BLAKE3_BATCH: usize = 16;
 
+/// Drive `hash_many` over `data`, a run of `out.len()` contiguous `N`-byte
+/// messages, in [`BLAKE3_BATCH`]-wide calls. `flags`/`start`/`end` select the
+/// node type (chunk vs parent).
+///
+/// Allocation-free: the pointer array lives on the stack, so unlike a
+/// `Vec`-per-call formulation this costs nothing per batch.
 #[inline]
 fn blake3_hash_many<const N: usize>(
     data: &[u8],
@@ -179,13 +330,27 @@ fn blake3_hash_many<const N: usize>(
         .zip(data.chunks(BLAKE3_BATCH * N))
     {
         let n = outs.len();
+        // Fill a stack array of input pointers. Slot 0 seeds the array so the
+        // unused tail (never passed to `hash_many`, which sees `&inputs[..n]`)
+        // holds a valid reference rather than uninitialized memory.
         let first: &[u8; N] = msgs[..N].try_into().unwrap();
         let mut inputs: [&[u8; N]; BLAKE3_BATCH] = [first; BLAKE3_BATCH];
+        // Scalar pointer-bump fill. The `black_box` keeps LLVM from
+        // vectorizing this loop into a `<2 x i64>` induction whose pooled
+        // start constant this toolchain once emitted as a *different
+        // function's* literal (LLVM constant-pool symbol collision), feeding
+        // garbage pointers to `hash_many` — see notes/merkle-oob.md.
         let mut p: *const u8 = msgs.as_ptr();
         for slot in inputs[..n].iter_mut() {
+            // SAFETY: `msgs` is exactly `n * N` bytes (`data` is chunked in
+            // step with `out` and `data.len() == out.len() * N`), so `p`
+            // addresses a full `N`-byte message for every slot.
             *slot = unsafe { &*core::hint::black_box(p).cast::<[u8; N]>() };
             p = p.wrapping_add(N);
         }
+        // SAFETY: `Hash` is `[u8; 32]`, so `outs` is exactly `n * 32` bytes of
+        // initialized, contiguous, unpadded storage — the amount `hash_many`
+        // writes for `n` inputs.
         let out_bytes: &mut [u8] =
             unsafe { core::slice::from_raw_parts_mut(outs.as_mut_ptr() as *mut u8, n * 32) };
         plat.hash_many(
@@ -201,6 +366,14 @@ fn blake3_hash_many<const N: usize>(
     }
 }
 
+/// Batched BLAKE3 leaves: `out.len()` messages of `leaf_size` bytes, laid out
+/// contiguously in `data`. Equivalent to [`blake3_leaf_cv`] per leaf.
+///
+/// The batched entry point compresses whole 64-byte blocks of a single chunk,
+/// so it applies only when `leaf_size` is a multiple of 64 and at most
+/// `CHUNK_LEN` (1024) — which covers the real commit geometry, where a leaf is
+/// `16 << log_batch_size` bytes. Returns `false` for any other size, leaving
+/// the caller to hash leaves one at a time.
 fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> bool {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     if leaf_size == 1024 {
@@ -230,14 +403,20 @@ fn blake3_hash_many_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash]) -> b
             }
         };
     }
+    // Leaf sizes are `16 << log_batch_size`, so only powers of two arise.
     dispatch!(64, 128, 256, 512, 1024)
 }
 
+/// Whether [`blake3_hash_many_leaves`] can batch this leaf size. Must list
+/// exactly the sizes that function dispatches on — `blake3_batch_dispatch_agrees`
+/// holds the two together.
 #[inline]
 fn blake3_leaf_size_is_batchable(leaf_size: usize) -> bool {
     matches!(leaf_size, 64 | 128 | 256 | 512 | 1024)
 }
 
+/// Batched BLAKE3 parent nodes: `data` is `out.len()` contiguous 64-byte
+/// (left ‖ right) child pairs. Equivalent to [`blake3_parent_cv`] per node.
 #[inline]
 fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -251,9 +430,17 @@ fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
     blake3_hash_many::<64>(data, out, BLAKE3_PARENT, 0, 0);
 }
 
+/// Register-resident BLAKE3 PoW nonce scan (Apple AArch64): smallest nonce in
+/// `start .. start + len` whose grind hash has `bits` (1..=32) leading zero
+/// bits. See `blake3_neon_apple::pow_scan_reg`.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub(crate) use blake3_neon_apple::pow_scan_reg as blake3_pow_scan_reg;
 
+/// Batched BLAKE3 PoW grind blocks: `data` is `out.len()` contiguous
+/// 64-byte single-chunk pre-images, hashed with `CHUNK_START | CHUNK_END |
+/// ROOT` — byte-identical to `blake3::hash` on each block. Uses the
+/// twelve-way kernel on Apple AArch64, upstream `hash_many` elsewhere and
+/// for the tail.
 #[inline]
 pub(crate) fn blake3_hash_many_pow(data: &[u8], out: &mut [Hash]) {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -279,6 +466,12 @@ pub(crate) fn blake3_hash_many_pow(data: &[u8], out: &mut [Hash]) {
     );
 }
 
+/// Hash a run of `out.len()` equal-size leaves from `data` under `kind`.
+///
+/// The two hashes batch differently, so they take different shapes here:
+/// SHA-256's kernel is inherently four-wide, while BLAKE3 wants the widest
+/// batch the machine offers. Both are rayon-parallel and both are
+/// byte-identical to calling [`hash_leaf`] on each leaf.
 fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     {
@@ -291,11 +484,20 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
     }
     match kind {
         HashKind::Blake3 if blake3_leaf_size_is_batchable(leaf_size) => {
+            // Chunk-queue dispatch instead of a static rayon split so the
+            // efficiency-core helper pool (when present) can drain leaves
+            // alongside the main pool — see `epool`. Chunk `i` writes only
+            // `out[i*C..(i+1)*C]`, so output is byte-identical to the static
+            // split regardless of which pool claims which chunk.
             let n = out.len();
             let out_base = crate::epool::SyncPtr(out.as_mut_ptr());
             crate::epool::run_hetero_chunks(n.div_ceil(BLAKE3_LEAF_QUEUE_CHUNK), |i| {
                 let start = i * BLAKE3_LEAF_QUEUE_CHUNK;
                 let end = (start + BLAKE3_LEAF_QUEUE_CHUNK).min(n);
+                // SAFETY: `Hash` is `[u8; 32]` (Copy, no padding); the queue
+                // hands out each `i` exactly once and the `[start, end)`
+                // ranges are pairwise disjoint and in-bounds (`end <= n`),
+                // so each closure holds the only `&mut` into its range.
                 let outs = unsafe {
                     core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
                 };
@@ -330,6 +532,14 @@ fn hash_leaves(data: &[u8], leaf_size: usize, out: &mut [Hash], kind: HashKind) 
     }
 }
 
+/// Hash one already-partitioned run of ranked 1 KiB BLAKE3 leaves without
+/// starting another Rayon/E-core scheduling region.
+///
+/// The ranked NTT-to-Merkle pipeline calls this from jobs that are themselves
+/// distributed across the P-core pool or handed to the existing E-core helper
+/// pool. Keeping this helper scheduling-free avoids a nested barrier per 1 MiB
+/// finalized NTT subtree while preserving the exact twelve-way leaf kernel and
+/// hash-count semantics used by [`hash_leaves`].
 pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
     const LEAF_SIZE: usize = 1024;
     assert_eq!(data.len(), out.len() * LEAF_SIZE);
@@ -346,19 +556,46 @@ pub(crate) fn hash_ranked_blake3_leaf_chunk(data: &[u8], out: &mut [Hash]) {
     assert!(batched, "ranked 1 KiB leaves must use the batched kernel");
 }
 
+/// Hash one scheduling-free run of BLAKE3 parent nodes. Ranked NTT completion
+/// jobs use this after hashing their cache-hot leaves; the run is deliberately
+/// capped at the serial cutoff so it cannot open a nested Rayon/E-core region.
 pub(crate) fn hash_ranked_blake3_parent_chunk(read: &[Hash], write: &mut [Hash]) {
     assert_eq!(read.len(), 2 * write.len());
     assert!(write.len() <= 1024);
     hash_pairs_level(read, write, HashKind::Blake3);
 }
 
+/// Leaves per queue chunk in the batched BLAKE3 leaf path (see `epool`).
+/// A multiple of 12 so every full chunk runs entirely through the twelve-way
+/// kernel with no per-chunk tail; small enough (240 KiB of input at the
+/// ranked 1 KiB leaves) that the worst-case tail wait — the last chunk
+/// claimed by an efficiency core — is a fraction of a millisecond, while an
+/// atomic claim per 240 leaves stays far below dispatch noise.
 const BLAKE3_LEAF_QUEUE_CHUNK: usize = 240;
 
+/// Parents per queue chunk in the batched BLAKE3 parent path (see `epool`).
+/// Must be a multiple of 12 so every full group runs entirely through the
+/// twelve-way parent kernel (`hash_complete_parent_groups`) with no 4-wide
+/// tail. The previous static-rayon group size of 1024 = 12·85 + 4 dropped a
+/// 4-node remainder onto the slower path in *every* task; 1020 = 12·85
+/// eliminates that remainder. A full chunk is 1020 nodes × 64 B of children
+/// ≈ 64 KiB of input — one atomic claim amortises cleanly and an E-core tail
+/// is still sub-millisecond.
 const BLAKE3_PARENT_QUEUE_CHUNK: usize = 1020;
 
+/// Hash one internal level: `write[i] = hash_pair(read[2i], read[2i+1])`.
+///
+/// Children are contiguous 64-byte spans of the level below, so both hashes
+/// read them zero-copy. Small upper levels can't fill the cores, so a rayon
+/// dispatch per level costs more than the hashing itself (~3× at the top of a
+/// 2^18 tree); those are hashed serially — still SIMD-batched — and only the
+/// wide lower levels fan out through the same efficiency-core-aware chunk
+/// queue the leaf path uses.
 fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
     #[cfg(feature = "hash-count")]
     hash_count::PAIR_CALLS.fetch_add(write.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: `Hash` is `[u8; 32]`, so a slice of `n` hashes is exactly `32n`
+    // initialized bytes with no padding.
     let read_bytes: &[u8] =
         unsafe { core::slice::from_raw_parts(read.as_ptr() as *const u8, read.len() * 32) };
     const SERIAL_LEVEL_NODES: usize = 1024;
@@ -369,12 +606,23 @@ fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
             if serial {
                 blake3_hash_many_parents(read_bytes, write);
             } else {
+                // Chunk-queue dispatch so the efficiency-core helper pool can
+                // drain parent nodes alongside the main pool — same contract
+                // as the leaf path. Chunk `i` writes only
+                // `write[i*C..(i+1)*C]`, so output is byte-identical to a
+                // static rayon split regardless of claim order.
                 let n = write.len();
                 let out_base = crate::epool::SyncPtr(write.as_mut_ptr());
                 let read_base = read_bytes.as_ptr() as usize;
                 crate::epool::run_hetero_chunks(n.div_ceil(BLAKE3_PARENT_QUEUE_CHUNK), |i| {
                     let start = i * BLAKE3_PARENT_QUEUE_CHUNK;
                     let end = (start + BLAKE3_PARENT_QUEUE_CHUNK).min(n);
+                    // SAFETY: `Hash` is `[u8; 32]` (Copy, no padding); the
+                    // queue hands out each `i` exactly once and the
+                    // `[start, end)` ranges are pairwise disjoint and
+                    // in-bounds, so each closure holds the only `&mut` into
+                    // its output range. The read side is immutable for the
+                    // whole level.
                     let outs = unsafe {
                         core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
                     };
@@ -425,11 +673,20 @@ fn hash_pairs_level(read: &[Hash], write: &mut [Hash], kind: HashKind) {
     }
 }
 
+/// Compute the Merkle root of `data` split into `num_leaves` equal-sized leaves.
+///
+/// Multi-threaded via rayon. `num_leaves` must be a power of two and divide
+/// `data.len()`. Returns the 32-byte root. The intermediate tree is allocated
+/// and dropped; if you need it for path opening, use [`merkle_tree`] instead.
 pub fn merkle_root(data: &[u8], num_leaves: usize, kind: HashKind) -> Hash {
     let tree = merkle_tree(data, num_leaves, kind);
     tree[tree.len() - 1]
 }
 
+/// [`merkle_tree`] into caller-provided (typically pooled) tree storage.
+/// `tree.len()` must be `2 * num_leaves - 1`; contents may be uninitialized
+/// (every node is written before it is read, exactly as in [`merkle_tree`]).
+/// Byte-identical output to [`merkle_tree`].
 pub(crate) fn merkle_tree_into(
     mut tree: Vec<Hash>,
     data: &[u8],
@@ -444,6 +701,8 @@ pub(crate) fn merkle_tree_into(
     merkle_tree_from_prehashed_leaves(tree, num_leaves, kind)
 }
 
+/// Compute the full Merkle tree (flat layout, see module docs) for `data`
+/// split into `num_leaves` equal-sized leaves, hashed under `kind`.
 pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> {
     assert!(
         num_leaves.is_power_of_two() && num_leaves > 0,
@@ -457,13 +716,20 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> 
 
     let leaf_size = data.len() / num_leaves;
     let total_nodes = 2 * num_leaves - 1;
+    // Uninit alloc — every node is written exactly once before being read:
+    // leaves at step 1, then each internal level reads the level below (which
+    // was just written) and writes itself.
     let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
 
+    // 1. Leaves — fully parallel, SIMD-batched across leaves where possible.
     hash_leaves(data, leaf_size, &mut tree[..num_leaves], kind);
 
     merkle_tree_from_prehashed_leaves(tree, num_leaves, kind)
 }
 
+/// Complete a flat tree whose first `num_leaves` slots already contain leaf
+/// hashes. The vector must have the normal `2*num_leaves-1` allocation; every
+/// remaining slot is written level-by-level before it is read.
 pub(crate) fn merkle_tree_from_prehashed_leaves(
     tree: Vec<Hash>,
     num_leaves: usize,
@@ -472,6 +738,11 @@ pub(crate) fn merkle_tree_from_prehashed_leaves(
     merkle_tree_from_prehashed_level(tree, num_leaves, kind, 0)
 }
 
+/// Complete a flat tree whose leaf level and the first
+/// `prehashed_parent_levels` internal levels are already initialized.
+///
+/// The ranked NTT pipeline builds aligned local subtrees while their leaves
+/// are cache-hot, then calls this helper to finish only the small shared top.
 pub(crate) fn merkle_tree_from_prehashed_level(
     mut tree: Vec<Hash>,
     num_leaves: usize,
@@ -482,6 +753,7 @@ pub(crate) fn merkle_tree_from_prehashed_level(
     assert_eq!(tree.len(), 2 * num_leaves - 1);
     assert!(prehashed_parent_levels <= num_leaves.trailing_zeros() as usize);
 
+    // Internal levels — parallel within a level, sequential across levels.
     let mut read_start = 0usize;
     let mut read_len = num_leaves;
     for _ in 0..prehashed_parent_levels {
@@ -490,6 +762,8 @@ pub(crate) fn merkle_tree_from_prehashed_level(
     }
     while read_len > 1 {
         let next_len = read_len >> 1;
+        // Split the buffer at the end of the current level so we get two
+        // non-overlapping mutable slices: `read` (input) and `write` (output).
         let (read, rest) = tree[read_start..].split_at_mut(read_len);
         let write = &mut rest[..next_len];
 
@@ -502,6 +776,8 @@ pub(crate) fn merkle_tree_from_prehashed_level(
     tree
 }
 
+/// Sequential (single-threaded) version of [`merkle_tree`]. Used for
+/// benchmark comparison and as the test oracle.
 pub fn merkle_tree_sequential(data: &[u8], num_leaves: usize, kind: HashKind) -> Vec<Hash> {
     assert!(num_leaves.is_power_of_two() && num_leaves > 0);
     assert_eq!(data.len() % num_leaves, 0);
@@ -528,7 +804,18 @@ pub fn merkle_tree_sequential(data: &[u8], num_leaves: usize, kind: HashKind) ->
     tree
 }
 
+// ---------------------------------------------------------------------------
+// Merkle path opening and verification.
+// ---------------------------------------------------------------------------
 
+/// Build an opening proof for leaf `index`: the sibling hashes from the leaf
+/// level up to (but not including) the root.
+///
+/// `tree` must be the flat tree produced by [`merkle_tree`] or
+/// [`merkle_tree_sequential`] for `num_leaves` leaves. The returned vector has
+/// length `log2(num_leaves)`.
+///
+/// Verify with [`verify_merkle_proof`].
 pub fn merkle_proof(tree: &[Hash], num_leaves: usize, index: usize) -> Vec<Hash> {
     assert!(num_leaves.is_power_of_two() && num_leaves > 0);
     assert!(index < num_leaves);
@@ -550,6 +837,8 @@ pub fn merkle_proof(tree: &[Hash], num_leaves: usize, index: usize) -> Vec<Hash>
     proof
 }
 
+/// Verify a Merkle opening: recomputes the root from `leaf_hash`, the path,
+/// and the leaf index. Returns true iff the recomputed root matches `root`.
 pub fn verify_merkle_proof(
     root: &Hash,
     leaf_hash: &Hash,
@@ -560,6 +849,7 @@ pub fn verify_merkle_proof(
     let mut acc = *leaf_hash;
     let mut idx = index;
     for sibling in proof {
+        // If idx is even, our node is the LEFT child; sibling is on the RIGHT.
         let (left, right) = if idx & 1 == 0 {
             (acc, *sibling)
         } else {
@@ -571,7 +861,21 @@ pub fn verify_merkle_proof(
     &acc == root
 }
 
+// ---------------------------------------------------------------------------
+// Multi-proof (Octopus / batched opening): one shared proof for multiple leaf
+// positions, deduplicating siblings that lie on multiple paths.
+// ---------------------------------------------------------------------------
 
+/// Build a Merkle multi-proof for `positions`. Returns the sibling hashes
+/// needed to verify ALL positions against the root, in the canonical
+/// bottom-up sorted-by-position traversal order.
+///
+/// `positions` need not be sorted or unique; the function sorts + dedupes
+/// internally. For `q` queries in a tree of depth `d`, the output is at
+/// most `q · d` hashes (matching `q` independent paths) and typically much
+/// smaller (siblings shared across multiple paths are emitted once).
+///
+/// Verify with [`verify_merkle_multi_proof`].
 pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize]) -> Vec<Hash> {
     assert!(num_leaves.is_power_of_two() && num_leaves > 0);
     assert_eq!(tree.len(), 2 * num_leaves - 1);
@@ -590,21 +894,26 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     let mut level_len = num_leaves;
 
     while level_len > 1 {
-        let mut written = 0;
+        let mut next = Vec::with_capacity(active.len());
         let mut i = 0;
         while i < active.len() {
             let p = active[i];
             let sib_active = i + 1 < active.len() && active[i + 1] == (p ^ 1);
             if sib_active {
+                // Both children active — no sibling hash needed; both fold into
+                // the same parent.
                 i += 2;
             } else {
+                // Sibling not in active set; emit it.
                 proof.push(tree[level_start + (p ^ 1)]);
                 i += 1;
             }
-            active[written] = p >> 1;
-            written += 1;
+            next.push(p >> 1);
         }
-        active.truncate(written);
+        // `next` is sorted-unique by construction: the input was sorted-unique;
+        // consecutive sibling pairs (handled above) collapse to one; otherwise
+        // p >> 1 preserves strict ordering.
+        active = next;
         level_start += level_len;
         level_len >>= 1;
     }
@@ -612,45 +921,12 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     proof
 }
 
-pub fn merkle_multi_proof_sibling_indices(num_leaves: usize, positions: &[usize]) -> Vec<usize> {
-    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
-
-    if positions.is_empty() || num_leaves == 1 {
-        return Vec::new();
-    }
-
-    let mut active: Vec<usize> = positions.to_vec();
-    active.sort_unstable();
-    active.dedup();
-    debug_assert!(active.iter().all(|&p| p < num_leaves));
-
-    let mut indices = Vec::with_capacity(active.len() * (num_leaves.trailing_zeros() as usize));
-    let mut level_start = 0usize;
-    let mut level_len = num_leaves;
-
-    while level_len > 1 {
-        let mut written = 0;
-        let mut i = 0;
-        while i < active.len() {
-            let p = active[i];
-            let sib_active = i + 1 < active.len() && active[i + 1] == (p ^ 1);
-            if sib_active {
-                i += 2;
-            } else {
-                indices.push(level_start + (p ^ 1));
-                i += 1;
-            }
-            active[written] = p >> 1;
-            written += 1;
-        }
-        active.truncate(written);
-        level_start += level_len;
-        level_len >>= 1;
-    }
-
-    indices
-}
-
+/// Verify a Merkle multi-proof produced by [`merkle_multi_proof`].
+///
+/// `sorted_unique_positions` and `leaf_hashes` must be aligned and sorted:
+/// `leaf_hashes[i]` is the hash of the leaf at `sorted_unique_positions[i]`,
+/// and the position list is strictly ascending. Returns true iff the
+/// reconstructed root equals `root` and the proof is consumed exactly.
 pub fn verify_merkle_multi_proof(
     root: &Hash,
     num_leaves: usize,
@@ -666,8 +942,10 @@ pub fn verify_merkle_multi_proof(
         return false;
     }
     if sorted_unique_positions.is_empty() {
+        // Vacuous; nothing to verify. Treat as "ok" iff the proof is empty.
         return proof.is_empty();
     }
+    // Verify the position list is sorted strictly ascending + in range.
     for (i, &p) in sorted_unique_positions.iter().enumerate() {
         if p >= num_leaves {
             return false;
@@ -676,6 +954,7 @@ pub fn verify_merkle_multi_proof(
             return false;
         }
     }
+    // Edge case: 1-leaf tree, no proof needed.
     if num_leaves == 1 {
         return proof.is_empty() && leaf_hashes[0] == *root;
     }
@@ -696,6 +975,8 @@ pub fn verify_merkle_multi_proof(
             let sib_active = i + 1 < active.len() && active[i + 1].0 == (p ^ 1);
             let (left, right) = if sib_active {
                 let (_, h_sib) = active[i + 1];
+                // Sorted strictly ascending → active[i+1].0 = p + 1 (= p ^ 1
+                // since p is even when p ^ 1 = p + 1). So p is LEFT child.
                 debug_assert_eq!(p & 1, 0);
                 i += 2;
                 (h, h_sib)
@@ -713,6 +994,8 @@ pub fn verify_merkle_multi_proof(
         level_len >>= 1;
     }
 
+    // After the loop, `active` has exactly one element (the root). Reject
+    // any leftover proof bytes.
     if proof_iter.next().is_some() {
         return false;
     }
@@ -723,10 +1006,14 @@ pub fn verify_merkle_multi_proof(
 mod tests {
     use super::*;
 
+    /// Every structural test runs against both hashes: the tree, path and
+    /// multi-proof logic is hash-agnostic, so anything true of one must hold
+    /// for the other.
     const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
 
     #[test]
     fn two_leaves_matches_hand_computation() {
+        // Two 8-byte leaves: [0,1,2,3,4,5,6,7] and [8,9,10,11,12,13,14,15].
         let data: Vec<u8> = (0..16).collect();
         for kind in KINDS {
             let tree = merkle_tree(&data, 2, kind);
@@ -742,11 +1029,15 @@ mod tests {
         }
     }
 
+    /// The primitives must agree with the reference APIs of the underlying
+    /// crates — this is what pins the digests to the real hash functions
+    /// rather than merely to themselves.
     #[test]
     fn primitives_match_reference_implementations() {
         use blake3::hazmat::HasherExt;
         let data: Vec<u8> = (0..=255u8).cycle().take(3000).collect();
 
+        // SHA-256: a plain one-shot digest.
         assert_eq!(
             hash_leaf(&data, HashKind::Sha256),
             <[u8; 32]>::from(Sha256::digest(&data))
@@ -759,6 +1050,7 @@ mod tests {
             "sha256 pair hash is the digest of the concatenation"
         );
 
+        // BLAKE3: non-root chaining values, per BLAKE3's own tree semantics.
         assert_eq!(
             hash_leaf(&data, HashKind::Blake3),
             blake3::Hasher::new().update(&data).finalize_non_root()
@@ -767,6 +1059,8 @@ mod tests {
             hash_pair(&l, &r, HashKind::Blake3),
             blake3::hazmat::merge_subtrees_non_root(&l, &r, blake3::hazmat::Mode::Hash)
         );
+        // Deliberately NOT `blake3::hash` — that is the root finalization, and
+        // interior tree nodes must not be root hashes.
         assert_ne!(
             hash_leaf(&data, HashKind::Blake3),
             *blake3::hash(&data).as_bytes(),
@@ -774,6 +1068,10 @@ mod tests {
         );
     }
 
+    /// BLAKE3's PARENT flag domain-separates internal nodes from leaves, so a
+    /// parent hash is not reproducible as a leaf hash of the concatenation.
+    /// This is the second-preimage-via-reinterpretation gap that the SHA-256
+    /// construction (see module header) still has.
     #[test]
     fn blake3_separates_leaf_and_parent_domains() {
         let (l, r) = ([7u8; 32], [9u8; 32]);
@@ -783,19 +1081,28 @@ mod tests {
             hash_leaf(&cat, HashKind::Blake3),
             "PARENT flag must separate the two domains"
         );
+        // The SHA-256 construction does not have this property. Asserted so the
+        // difference is recorded rather than assumed either way.
         assert_eq!(
             hash_pair(&l, &r, HashKind::Sha256),
             hash_leaf(&cat, HashKind::Sha256),
         );
     }
 
+    /// The batched BLAKE3 path (`blake3::platform`, an unstable API) must agree
+    /// bit-for-bit with the stable `hazmat` spec. This is what makes depending
+    /// on that API safe: if a `blake3` update changes its semantics, this fails
+    /// rather than silently changing every commitment we produce.
     #[test]
     fn blake3_batched_matches_scalar_spec() {
+        // Counts straddle both the Apple twelve-way kernel width and the
+        // upstream 16-input call width. Width and tail bugs show up here.
         let counts = [
             1usize, 4, 5, 11, 12, 13, 15, 16, 17, 23, 24, 25, 47, 48, 49, 63, 64, 65, 127, 128,
             129, 200,
         ];
 
+        // Parents.
         for n in counts {
             for seed in [0, 1, 0xA11C_E5EE_D15C, u64::MAX] {
                 let children = random_data(n, 64, seed);
@@ -813,6 +1120,7 @@ mod tests {
             }
         }
 
+        // Leaves, at every size the batched path claims to handle.
         for leaf_size in [64usize, 128, 256, 512, 1024] {
             for n in counts {
                 let data: Vec<u8> = (0..=255u8).cycle().take(n * leaf_size).collect();
@@ -832,6 +1140,10 @@ mod tests {
         }
     }
 
+    /// The cheap `blake3_leaf_size_is_batchable` predicate — which decides
+    /// which code path `hash_leaves` takes — must agree exactly with what
+    /// `blake3_hash_many_leaves` actually dispatches on. If they drift, leaves
+    /// either silently take the slow path or hit an unreachable arm.
     #[test]
     fn blake3_batch_dispatch_agrees() {
         for leaf_size in [
@@ -848,6 +1160,8 @@ mod tests {
         }
     }
 
+    /// The whole point of the option: the two hashes must actually produce
+    /// different commitments.
     #[test]
     fn the_two_kinds_produce_different_roots() {
         let data = random_data(64, 32, 11);
@@ -871,9 +1185,11 @@ mod tests {
 
     #[test]
     fn parallel_matches_sequential() {
+        // Use a non-trivial size: 1024 leaves × 64 B = 64 KB.
         let n_leaves = 1024;
         let leaf_size = 64;
         let mut data = vec![0u8; n_leaves * leaf_size];
+        // Fill with a deterministic pattern.
         for (i, b) in data.iter_mut().enumerate() {
             *b = ((i.wrapping_mul(0x9E3779B9)) & 0xff) as u8;
         }
@@ -884,6 +1200,11 @@ mod tests {
         }
     }
 
+    /// Leaf sizes chosen to hit every SHA-256 tail shape in the 4-way
+    /// interleaved path: rem = 0 (block-aligned), rem < 56 (one tail block),
+    /// and rem ≥ 56 (two tail blocks). Also a non-multiple-of-4 leaf count
+    /// for the remainder fallback, and — for BLAKE3 — leaf sizes either side
+    /// of its 1 KiB chunk boundary, where its internal chunk tree kicks in.
     #[test]
     fn parallel_matches_sequential_tail_shapes() {
         for (n_leaves, leaf_size) in [
@@ -943,6 +1264,7 @@ mod tests {
         }
         for kind in KINDS {
             let r0 = merkle_root(&data, n_leaves, kind);
+            // Flip one bit deep in the buffer.
             data[n_leaves * leaf_size - 1] ^= 0x01;
             let r1 = merkle_root(&data, n_leaves, kind);
             assert_ne!(r0, r1, "{kind}: single-bit change should change the root");
@@ -953,6 +1275,7 @@ mod tests {
     #[test]
     fn power_of_two_assertion() {
         let data = vec![0u8; 64];
+        // Should not panic for power-of-two leaf counts.
         for kind in KINDS {
             let _ = merkle_root(&data, 1, kind);
             let _ = merkle_root(&data, 2, kind);
@@ -992,6 +1315,8 @@ mod tests {
         }
     }
 
+    /// A proof built under one hash must not verify under the other — the
+    /// hash choice is part of what the root commits to.
     #[test]
     fn merkle_proof_rejects_the_other_hash() {
         let (n_leaves, leaf_size) = (16, 8);
@@ -1026,6 +1351,8 @@ mod tests {
             let leaf_hash = hash_leaf(&data[0..leaf_size], kind);
             let proof = merkle_proof(&tree, n_leaves, 0);
 
+            // Same proof, but claim it's for index 1 → should fail (different
+            // sibling structure).
             assert!(
                 !verify_merkle_proof(&root, &leaf_hash, 1, &proof, kind),
                 "{kind}"
@@ -1044,6 +1371,7 @@ mod tests {
 
             let leaf_hash = hash_leaf(&data[0..leaf_size], kind);
             let mut proof = merkle_proof(&tree, n_leaves, 0);
+            // Flip a byte in the first sibling.
             proof[0][0] ^= 1;
             assert!(
                 !verify_merkle_proof(&root, &leaf_hash, 0, &proof, kind),
@@ -1062,6 +1390,11 @@ mod tests {
         data
     }
 
+    /// The hetero chunk-queue leaf dispatch, driven with a forced helper
+    /// pool through the exact production closure shape, is byte-identical to
+    /// the main-pool-only path (which `blake3_batched_matches_scalar_spec`
+    /// ties to the scalar specification). Covers chunk-boundary counts and
+    /// jobs on both sides of the helper-engagement threshold.
     #[test]
     fn blake3_leaf_queue_with_helper_matches_plain() {
         let helper = rayon::ThreadPoolBuilder::new()
@@ -1088,6 +1421,8 @@ mod tests {
                 &|i| {
                     let start = i * BLAKE3_LEAF_QUEUE_CHUNK;
                     let end = (start + BLAKE3_LEAF_QUEUE_CHUNK).min(n);
+                    // SAFETY: same contract as the production call site —
+                    // disjoint in-bounds ranges, each chunk claimed once.
                     let outs = unsafe {
                         core::slice::from_raw_parts_mut(out_base.ptr().add(start), end - start)
                     };
@@ -1153,6 +1488,8 @@ mod tests {
 
     #[test]
     fn multi_proof_sibling_pair_emits_no_hashes_at_leaf_level() {
+        // Sibling pair (0,1) at the leaf level shares its parent → no leaf-level
+        // sibling is needed; one sibling per remaining level.
         let n_leaves = 8;
         let leaf_size = 4;
         let data = random_data(n_leaves, leaf_size, 7);
@@ -1184,6 +1521,8 @@ mod tests {
 
     #[test]
     fn multi_proof_full_query_set_is_root_only() {
+        // Every leaf queried → the verifier already knows everything, so the
+        // multi-proof should be empty.
         let n_leaves = 16;
         let leaf_size = 8;
         let data = random_data(n_leaves, leaf_size, 99);
@@ -1402,12 +1741,17 @@ mod tests {
 
 #[cfg(test)]
 mod leaf_kernel_bench {
+    // Diagnostics-only microbench: single-thread ns/compression of the
+    // 8-wide NEON leaf kernel on L2-resident data. Run with:
+    //   cargo test --profile challenge -p flock-core --lib \
+    //     leaf_kernel_bench -- --ignored --nocapture
     #[test]
     #[ignore]
     fn leaf_kernel_single_thread_ns_per_compression() {
         const LEAVES: usize = 4096; // 4 MiB input, fits M-series L2
         let data: Vec<u8> = (0..LEAVES * 1024).map(|i| (i * 31 % 251) as u8).collect();
         let mut out = vec![[0u8; 32]; LEAVES];
+        // warm
         for _ in 0..3 {
             super::blake3_neon_apple::hash_complete_groups(&data, &mut out);
         }
@@ -1432,11 +1776,14 @@ mod leaf_kernel_bench {
 
 #[cfg(test)]
 mod leaf_pass_bench {
+    // Diagnostics-only: full merkle_tree wall on a ranked-shape 512 MiB
+    // codeword, main pool + epool, min of N. Mirrors the unfused commit pass.
     #[test]
     #[ignore]
     fn merkle_tree_ranked_shape_wall() {
         const LEAVES: usize = 1 << 19; // 512 MiB
         let data: Vec<u8> = vec![0xA5u8; LEAVES * 1024];
+        // warm
         let mut tree = super::merkle_tree(&data, LEAVES, super::HashKind::Blake3);
         let mut best = f64::INFINITY;
         for _ in 0..9 {

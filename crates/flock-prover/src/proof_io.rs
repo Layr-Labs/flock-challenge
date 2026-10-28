@@ -804,9 +804,6 @@ impl<'a> GatherBundle<'a> {
             }
             std::io::IoSlice::advance_slices(&mut rest, n);
         }
-        if crate::seed_pipe::is_ranked_worker() {
-            std::mem::forget(slices);
-        }
         Ok(())
     }
 

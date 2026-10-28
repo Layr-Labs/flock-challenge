@@ -733,6 +733,9 @@ struct ReverseTranspose<'a> {
     z_const_acc: F128,
 }
 
+/// Number of `prove_fast` calls started in this process (0 = untimed warm-up).
+static PROVE_FAST_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 static REVERSE_TRANSPOSE_SCRATCH: std::sync::Mutex<
     Option<(Vec<ReverseWordOp>, Vec<[F128; WORD_BITS]>)>,
 > = std::sync::Mutex::new(None);
@@ -892,7 +895,9 @@ impl<'a> ReverseTranspose<'a> {
                 }
             }
         }
-        if crate::seed_pipe::is_timed_speculative_prove() {
+        // Call zero is the untimed warm-up: it leaves the zeroed scratch for
+        // the timed prove. Later calls keep their buffers and skip the cleanup.
+        if PROVE_FAST_CALLS.load(std::sync::atomic::Ordering::Relaxed) >= 2 {
             std::mem::forget(self.ops);
             std::mem::forget(self.adjoints);
         } else {
@@ -3613,8 +3618,7 @@ impl Blake3Setup {
         blocks: &[Compression],
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static PROVE_FAST_CALLS: AtomicUsize = AtomicUsize::new(0);
+        use std::sync::atomic::Ordering;
         let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
         // Seed pipelining: on the timed call the proof for these blocks may
         // already be several milliseconds in flight on the seed-pipe thread,

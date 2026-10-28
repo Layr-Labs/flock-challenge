@@ -8944,56 +8944,51 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_queries_0 = config.queries[0];
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
+    let _t = std::time::Instant::now();
+    let opened_rows_0: Vec<Vec<F128>> = {
+        use rayon::prelude::*;
+        // Indexed parallel collect is order-preserving: bit-identical to
+        // the serial map; each row copy is independent of the challenger.
+        queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect()
+    };
+    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
+    if trace {
+        t_opens += _t.elapsed();
+    }
+    // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
+    // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
+    // levels stay dense).
+    let sks_vks_n1 = eval_sk_at_vks(n1);
+    let _t = std::time::Instant::now();
     let use_c2 = c2::enabled(
         use_lazy_l1_ood,
         std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
     );
-    let open_l0 = || {
-        use rayon::prelude::*;
-        rayon::join(
-            || merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0),
-            || queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect::<Vec<Vec<F128>>>(),
+    // Cache owned residues while the borrowed committed L0 codeword is live.
+    // Unsupported geometry takes the unchanged complete induction below.
+    let sparse_l0 = use_c2.then(|| {
+        c2::Dual::new(
+            n1 + log_inv_rate_0,
+            log_inv_rate_0,
+            &r_lane_fold,
+            &queries_0,
+            &alpha_0,
+            l0_row,
         )
-    };
-    let _t = std::time::Instant::now();
-    let ((merkle_proof_0, opened_rows_0), sparse_l0, full_l0) = if use_c2 {
-        let l0_depth = if config.recursive_ks.first().copied() == Some(3) {
-            3
-        } else {
-            2
-        };
-        let (dual, opened) = rayon::join(
-            || {
-                c2::Dual::new_sync(
-                    l0_depth,
-                    n1 + log_inv_rate_0,
-                    log_inv_rate_0,
-                    &r_lane_fold,
-                    &queries_0,
-                    &alpha_0,
-                    l0_row,
-                )
-            },
-            open_l0,
-        );
-        (opened, Some(dual), None)
+    });
+    let full_l0 = if use_c2 {
+        None
     } else {
-        let opened = open_l0();
-        if trace {
-            t_opens += _t.elapsed();
-        }
-        let sks_vks_n1 = eval_sk_at_vks(n1);
-        let full = induce_sumcheck_poly_auto_with_ranked_msg(
+        Some(induce_sumcheck_poly_auto_with_ranked_msg(
             n1,
             log_inv_rate_0,
             &sks_vks_n1,
-            &opened.1,
+            &opened_rows_0,
             &r_lane_fold,
             &queries_0,
             &alpha_0,
             sc_prover.f(),
-        );
-        (opened, None, Some(full))
+        ))
     };
     if trace {
         eprintln!("  C2 selected={use_c2}");
@@ -9092,18 +9087,16 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            let (merkle_proof_last, opened_rows_last): (Vec<Hash>, Vec<Vec<F128>>) = {
+            let opened_rows_last: Vec<Vec<F128>> = {
                 use rayon::prelude::*;
-                rayon::join(
-                    || merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last),
-                    || {
-                        queries_last
-                            .par_iter()
-                            .map(|&q| wtns_prev.row(q).to_vec())
-                            .collect()
-                    },
-                )
+                // Order-preserving parallel collect — bit-identical.
+                queries_last
+                    .par_iter()
+                    .map(|&q| wtns_prev.row(q).to_vec())
+                    .collect()
             };
+            let merkle_proof_last =
+                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             if trace {
                 t_opens += _t.elapsed();
             }
@@ -9280,41 +9273,17 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let num_queries_i = config.queries[i + 1];
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
-        let use_deep_c2 = use_c2
-            && config.recursive_ks.get(i + 1).copied() == Some(3)
-            && n_next > 3;
-        let open_i = || {
-            use rayon::prelude::*;
-            rayon::join(
-                || merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i),
-                || {
-                    queries_i
-                        .par_iter()
-                        .map(|&q| wtns_prev.row(q).to_vec())
-                        .collect::<Vec<Vec<F128>>>()
-                },
-            )
-        };
         let _t = std::time::Instant::now();
-        let ((merkle_proof_i, opened_rows_i), sparse_deep_i) = if use_deep_c2 {
-            let (dual, opened) = rayon::join(
-                || {
-                    c2::Dual::new_sync(
-                        3,
-                        n_next + config.log_inv_rates[i + 1],
-                        config.log_inv_rates[i + 1],
-                        &level_rs,
-                        &queries_i,
-                        &alpha_i,
-                        |q| wtns_prev.row(q),
-                    )
-                },
-                open_i,
-            );
-            (opened, Some(dual))
-        } else {
-            (open_i(), None)
+        let opened_rows_i: Vec<Vec<F128>> = {
+            use rayon::prelude::*;
+            // Order-preserving parallel collect — bit-identical.
+            queries_i
+                .par_iter()
+                .map(|&q| wtns_prev.row(q).to_vec())
+                .collect()
         };
+        let merkle_proof_i =
+            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
             t_opens += _t.elapsed();
         }
@@ -9336,83 +9305,75 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         } else {
             wtns_prev.tree = Vec::new();
         }
-        let full_deep_i = if sparse_deep_i.is_none() {
-            let use_l2_pruned_sparse_ntt = ranked_l2_pruned_sparse_ntt_enabled(
-                config,
-                log_n,
-                i,
-                n_next,
-                sc_prover.f().len(),
-                level_rs.len(),
-                queries_i.len(),
-                config.log_inv_rates[i + 1],
-                alpha_i.len(),
-                direct_fold8_mode,
-            );
-            let _t = std::time::Instant::now();
-            let induced =
-                if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
-                    induce_sumcheck_poly_via_ntt(
-                        n_next,
-                        config.log_inv_rates[i + 1],
-                        &opened_rows_i,
-                        &level_rs,
-                        &queries_i,
-                        &alpha_i,
-                    )
-                } else if use_l2_pruned_sparse_ntt {
-                    let log_d = n_next + config.log_inv_rates[i + 1];
-                    let prefix_k = 8usize.min(log_d - 3);
-                    let use_l2_fused_densify = ranked_l2_fused_densify_enabled(
-                        use_l2_pruned_sparse_ntt,
-                        log_d,
-                        prefix_k,
-                        queries_i.len(),
-                    );
-                    let use_l2_fused_final5 = ranked_l2_fused_final5_enabled(
-                        use_l2_fused_densify,
-                        log_d,
-                        prefix_k,
-                        queries_i.len(),
-                    );
-                    let use_l2_factored_final5 = ranked_l2_factored_final5_enabled(
-                        use_l2_fused_final5,
-                        log_d,
-                        prefix_k,
-                        queries_i.len(),
-                    );
-                    induce_sumcheck_poly_via_pruned_rate8_ntt(
-                        n_next,
-                        config.log_inv_rates[i + 1],
-                        &opened_rows_i,
-                        &level_rs,
-                        &queries_i,
-                        &alpha_i,
-                        use_l2_fused_densify,
-                        use_l2_fused_final5,
-                        use_l2_factored_final5,
-                    )
-                } else {
-                    let sks_vks_i = eval_sk_at_vks(n_next);
-                    induce_sumcheck_poly(
-                        n_next,
-                        &sks_vks_i,
-                        &opened_rows_i,
-                        &level_rs,
-                        &queries_i,
-                        &alpha_i,
-                    )
-                };
-            if trace {
-                t_induce += _t.elapsed();
-            }
-            Some(induced)
-        } else {
-            if trace {
-                t_induce += _t.elapsed();
-            }
-            None
-        };
+        let sks_vks_i = eval_sk_at_vks(n_next);
+        let use_l2_pruned_sparse_ntt = ranked_l2_pruned_sparse_ntt_enabled(
+            config,
+            log_n,
+            i,
+            n_next,
+            sc_prover.f().len(),
+            level_rs.len(),
+            queries_i.len(),
+            config.log_inv_rates[i + 1],
+            alpha_i.len(),
+            direct_fold8_mode,
+        );
+        let _t = std::time::Instant::now();
+        let (basis_i_induced, enforced_sum_i) =
+            if n_next == 16 && config.log_inv_rates[i + 1] == 2 && queries_i.len() == 106 {
+                induce_sumcheck_poly_via_ntt(
+                    n_next,
+                    config.log_inv_rates[i + 1],
+                    &opened_rows_i,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                )
+            } else if use_l2_pruned_sparse_ntt {
+                let log_d = n_next + config.log_inv_rates[i + 1];
+                let prefix_k = 8usize.min(log_d - 3);
+                let use_l2_fused_densify = ranked_l2_fused_densify_enabled(
+                    use_l2_pruned_sparse_ntt,
+                    log_d,
+                    prefix_k,
+                    queries_i.len(),
+                );
+                let use_l2_fused_final5 = ranked_l2_fused_final5_enabled(
+                    use_l2_fused_densify,
+                    log_d,
+                    prefix_k,
+                    queries_i.len(),
+                );
+                let use_l2_factored_final5 = ranked_l2_factored_final5_enabled(
+                    use_l2_fused_final5,
+                    log_d,
+                    prefix_k,
+                    queries_i.len(),
+                );
+                induce_sumcheck_poly_via_pruned_rate8_ntt(
+                    n_next,
+                    config.log_inv_rates[i + 1],
+                    &opened_rows_i,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                    use_l2_fused_densify,
+                    use_l2_fused_final5,
+                    use_l2_factored_final5,
+                )
+            } else {
+                induce_sumcheck_poly(
+                    n_next,
+                    &sks_vks_i,
+                    &opened_rows_i,
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                )
+            };
+        if trace {
+            t_induce += _t.elapsed();
+        }
 
         // Pushed after the induce so the opened rows move instead of being
         // cloned; they are dead to the prover past the induce call.
@@ -9422,20 +9383,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         });
 
         let _t = std::time::Instant::now();
-        let intro_msg_i = if let Some((dual, enforced_sum_i)) = sparse_deep_i {
-            let (pending, msg) = c2::Pending::introduce(dual, enforced_sum_i, &mut sc_prover);
-            pending_c2 = Some(pending);
-            msg
-        } else {
-            let (basis_i_induced, enforced_sum_i) = full_deep_i.expect("deep induction");
-            sc_prover.introduce_new(basis_i_induced, enforced_sum_i)
-        };
+        let intro_msg_i = sc_prover.introduce_new(basis_i_induced, enforced_sum_i);
         challenger.observe_f128(intro_msg_i.u_0);
         challenger.observe_f128(intro_msg_i.u_2);
         let beta_i = challenger.sample_f128();
-        if let Some(pending) = pending_c2.as_mut() {
-            pending.glue(beta_i, &mut sc_prover);
-        } else if use_lazy_l2_ood || use_lazy_l3_ood || use_lazy_l4_ood {
+        if use_lazy_l2_ood || use_lazy_l3_ood || use_lazy_l4_ood {
             sc_prover.glue_deferred_into_lazy_ood_fold(beta_i);
         } else {
             sc_prover.glue(beta_i);

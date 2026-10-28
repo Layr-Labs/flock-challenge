@@ -1274,6 +1274,22 @@ pub(crate) fn gpu_leaf_vec4_enabled() -> bool {
     *ON.get_or_init(|| gpu_leaf_vec4_value_enabled(std::env::var_os(ENV_LEAF_VEC4).as_deref()))
 }
 
+/// Kill switch for the two-tiles-per-thread g4 NTT pass
+/// (`ntt_fused_reg4g4x2`): `FLOCK_NO_GPU_G4X2` (any value) keeps
+/// `ntt_fused_reg4g4`. Both kernels write the same bytes.
+pub(crate) fn gpu_g4x2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_G4X2").is_none())
+}
+
+/// Kill switch for the tabled ranked final NTT pass (`ntt_final_t3`):
+/// `FLOCK_NO_GPU_FINAL_T3` (any value) keeps `ntt_pass5_mixed`. Both kernels
+/// write the same bytes.
+pub(crate) fn gpu_final_t3_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_T3").is_none())
+}
+
 #[cfg(test)]
 mod leaf_vec4_gate_tests {
     use std::ffi::OsStr;
@@ -3423,7 +3439,8 @@ static inline uint zero_root_raw_twiddle(uint compact) {
 }
 
 // The production kernel and test exporter call this exact same builder.
-// Static threadgroup memory is 44 bases + 704 table entries = 11,968 B.
+// The tables take 44 bases + 704 entries = 11,968 B of threadgroup memory
+// (the production kernel adds a 4,096 B residency pad).
 static inline void build_zero_root_tabs(
     device const uint4* twiddles,
     threadgroup uint4* bases,
@@ -3471,7 +3488,19 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
     constexpr uint LOG_G = 2u;
     threadgroup uint4 bases[11u * 4u];
     threadgroup uint4 tabs[11u * 64u];
+    // Residency only, never read: 4,096 B, so the group allocates 16,064 B
+    // of threadgroup memory and five groups share a core instead of six.
+    // Sixteen live F128 columns per lane want the lower residency: measured
+    // on an M4 GPU, 25.2 ms per full pass versus 36.7 ms at 11,968 B (six
+    // groups up to 13.5 KiB, five from 13.8 KiB at 25.2 ms, four from
+    // 16.8 KiB at 25.5 ms, three at 21.6 KiB at 31.1 ms).
+    threadgroup uint4 pad[256u];
     build_zero_root_tabs(twiddles, bases, tabs, lid);
+    if (P.log_d == 77u) {          // unreachable; keeps `pad` allocated
+        pad[lid % 256u] = tabs[lid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tabs[lid] ^= pad[(lid + 1u) % 256u];
+    }
 
     const uint lane = lid & 63u;
     const uint r_base = tgid << LOG_G;
@@ -3549,6 +3578,411 @@ kernel void export_from_z_zero_root_tabs(
     build_zero_root_tabs(twiddles, bases, tabs, lid);
     for (uint ei = lid; ei < 11u * 64u; ei += 64u) {
         out[ei] = tabs[ei];
+    }
+}
+"#;
+
+    /// The f = 4, s > 2 NTT pass with two tiles per thread: the group of
+    /// `ntt_fused_reg4g4` (64 threads, four same-B tiles per group, LOG_G = 2,
+    /// the same table build), but each lane holds two tiles' columns in
+    /// registers and multiplies both by each live twiddle table in one
+    /// interleaved pass, two rounds of two tiles. Its never-read residency
+    /// pad is larger than the one-tile kernel's (six groups per core, not
+    /// eight); the pad changes residency only, never a byte of output.
+    /// Every tile sees the same butterflies, in the same order, over the same
+    /// tables, so the output is bit-identical. Its own library, so a compile
+    /// failure leaves `ntt_fused_reg4g4` in place.
+    const NTT_G4X2_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NttParams {
+    uint log_d;   // log2 of positions
+    uint l;       // first fused layer
+    uint f;       // number of fused layers (1..=4)
+    uint s;       // log_d - l - f
+};
+
+static inline uint4 gf_mulx(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// gf_mul_byte16 of two values by the same table, the two Horner chains
+// interleaved step by step. Each chain is gf_mul_byte16's own sequence.
+static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,
+                                    threadgroup const uint4* tab,
+                                    thread uint4& ra, thread uint4& rb)
+{
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        a ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
+        b ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
+    }
+    ra = a;
+    rb = b;
+}
+
+// The 64-thread table build of ntt_fused_reg4g4 (gf_build_byte16), unchanged.
+static inline void gf_build_byte16(
+    threadgroup uint4* tabB, device const uint4* twiddles, uint idx, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;        // 0: b*tw          1: b*(tw*x^8)
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;          // owns entry bits 2..3
+    const uint cc = u >> 2;          // owns entry bits 5..7
+    uint4 g = twiddles[idx];
+    if (t != 0u) {
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+    }
+    uint4 e0 = g;
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);   // entry (cc << 5) | (aa << 2)
+    const uint o1 = o0 + 16u;                //   ... | 16
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// One f=4 sub-layer over both register tiles `ea` and `eb`. J must be a
+// literal so the butterfly indices stay compile-time and both arrays stay in
+// registers.
+#define NTT_G4X2_SUBLAYER(J)                                                   \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint NC   = 1u << j;                                         \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        for (uint c = 0; c < NC; c++) {                                        \
+            gf_build_byte16(tabB, twiddles,                                    \
+                            (1u << (P.l + j)) - 1u + (B << j) + c, lid);       \
+            for (uint bb = 0; bb < BPER; bb++) {                               \
+                const uint b   = c * BPER + bb;                                \
+                const uint low = b & ((1u << bpos) - 1u);                      \
+                const uint eu  = ((b >> bpos) << (bpos + 1u)) | low;           \
+                const uint ev  = eu | (1u << bpos);                            \
+                uint4 pa;                                                      \
+                uint4 pb;                                                      \
+                gf_mul_byte16_x2(ea[ev], eb[ev], &tabB[0], pa, pb);            \
+                const uint4 na = ea[eu] ^ pa;                                  \
+                const uint4 nb = eb[eu] ^ pb;                                  \
+                ea[eu] = na;                                                   \
+                ea[ev] ^= na;                                                  \
+                eb[eu] = nb;                                                   \
+                eb[ev] ^= nb;                                                  \
+            }                                                                  \
+        }                                                                      \
+    }
+
+// ntt_fused_reg4g4's group (64 threads, four same-B tiles, LOG_G = 2, the
+// same 8 KiB table plus a larger never-read residency pad), but each lane
+// holds two tiles' columns at once and multiplies both by each live table
+// in one interleaved pass: two rounds of two tiles instead of four rounds
+// of one. Same butterflies, same order, same tables: bit-identical output.
+[[max_total_threads_per_threadgroup(64)]]
+kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
+                               device const uint4* twiddles      [[buffer(1)]],
+                               constant NttParams& P             [[buffer(2)]],
+                               uint tgid [[threadgroup_position_in_grid]],
+                               uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F     = 4u;
+    constexpr uint NF    = 1u << F;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 tabB[512u];      // 8,192 B: the live twiddle's tables
+    // Residency only, never read: 4,544 B, so the group allocates 12,736 B
+    // of threadgroup memory and six groups (12 SIMD groups) share a core
+    // instead of eight. Two register tiles per lane want the lower
+    // residency: measured on an M4 GPU, 34.7 ms per 1 GiB pass versus
+    // 39.0 ms with the one-tile kernel's 1,984 B pad (residency probe:
+    // 8 groups/core at 10,176 B, 7 at 10.7-11.2 KiB, 6 at 12.2-13.2 KiB,
+    // 5 at 14.3 KiB and above, which is slower again).
+    threadgroup uint4 pad[284u];
+
+    const uint lane = lid;
+    const uint B = tgid >> (P.s - LOG_G);
+    const uint r_base = (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;
+
+    for (uint it = 0; it < 2u; it++) {
+        const uint ra = r_base + (it << 1);
+        const uint rb = ra + 1u;
+        const uint pa = (B << (P.log_d - P.l)) + ra;
+        const uint pb = (B << (P.log_d - P.l)) + rb;
+        uint4 ea[NF];
+        uint4 eb[NF];
+        for (uint e = 0; e < NF; e++) {
+            ea[e] = data[((pa + (e << P.s)) << 6) + lane];
+            eb[e] = data[((pb + (e << P.s)) << 6) + lane];
+        }
+        NTT_G4X2_SUBLAYER(0u)
+        NTT_G4X2_SUBLAYER(1u)
+        NTT_G4X2_SUBLAYER(2u)
+        NTT_G4X2_SUBLAYER(3u)
+        if (P.log_d == 77u) {          /* unreachable; keeps `pad` allocated */
+            pad[lid % 284u] = ea[0];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ea[0] ^= pad[(lid + 1u) % 284u];
+        }
+        for (uint e = 0; e < NF; e++) {
+            data[((pa + (e << P.s)) << 6) + lane] = ea[e];
+            data[((pb + (e << P.s)) << 6) + lane] = eb[e];
+        }
+    }
+}
+"#;
+
+    /// The ranked final NTT pass (l = log_d - 4, s = 0) with byte tables for
+    /// sub-layers 0..2 and the short-twiddle Horner for sub-layer 3 only.
+    /// `ntt_pass5_mixed` Horners sub-layers 2 and 3 over their short
+    /// twiddles (< 2^40 and < 2^20), which is ALU-bound: on an M4 GPU the
+    /// pass costs 34.1 ms per 1 GiB with those two sub-layers and 21.4 ms
+    /// (its memory floor) without them. Tabling sub-layer 2 too (four more
+    /// gf_build_byte16 rebuilds) and running each table's butterflies as two
+    /// interleaved Horner chains measured 31.2 ms. Every butterfly, its
+    /// order and its exact field product are unchanged, so the output is
+    /// bit-identical. Its own library: a compile failure keeps
+    /// `ntt_pass5_mixed`.
+    const NTT_FINAL_T3_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NttParams {
+    uint log_d;   // log2 of positions
+    uint l;       // first fused layer
+    uint f;       // number of fused layers (1..=4)
+    uint s;       // log_d - l - f
+};
+
+static inline uint4 gf_mulx(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 gf_shl4(uint4 a) {
+    uint h = a.w >> 28;
+    uint4 r;
+    r.w = (a.w << 4) | (a.z >> 28);
+    r.z = (a.z << 4) | (a.y >> 28);
+    r.y = (a.y << 4) | (a.x >> 28);
+    r.x = (a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+static inline uint4 gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// Two gf_mul_byte16 products by the same byte tables, the Horner chains
+// interleaved step by step; each chain is gf_mul_byte16's own sequence.
+static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,
+                                    threadgroup const uint4* tab,
+                                    thread uint4& ra, thread uint4& rb)
+{
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        a ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
+        b ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
+    }
+    ra = a;
+    rb = b;
+}
+
+// gf_build_byte16 of the main library, unchanged: rebuild the live
+// twiddle's two byte tables (tab[b] = b*tw, tab[256 + b] = (b*x^8)*tw)
+// between a leading barrier (retires the previous table's readers) and a
+// trailing one (publishes the new table). 64 threads.
+static inline void gf_build_byte16(
+    threadgroup uint4* tabB, device const uint4* twiddles, uint idx, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;
+    const uint cc = u >> 2;
+    uint4 g = twiddles[idx];
+    if (t != 0u) {
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+    }
+    uint4 e0 = g;
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);
+    const uint o1 = o0 + 16u;
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// One table sub-layer (J, C): rebuild twiddle (J, C)'s byte tables, then
+// spend them on its (8 >> J) butterflies, two interleaved products at a
+// time. J and C must be literals so every butterfly index is compile-time
+// and elems[] stays in registers.
+#define NTT_T3_SUBLAYER(J, C)                                                  \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint c    = (C);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        gf_build_byte16(tabB, twiddles,                                        \
+                        (1u << (P.l + j)) - 1u + (B << j) + c, lid);           \
+        for (uint bb = 0; bb < BPER; bb += 2u) {                               \
+            const uint b0  = c * BPER + bb;                                    \
+            const uint b1  = b0 + 1u;                                          \
+            const uint eu0 = ((b0 >> bpos) << (bpos + 1u))                     \
+                           | (b0 & ((1u << bpos) - 1u));                       \
+            const uint eu1 = ((b1 >> bpos) << (bpos + 1u))                     \
+                           | (b1 & ((1u << bpos) - 1u));                       \
+            const uint ev0 = eu0 | (1u << bpos);                               \
+            const uint ev1 = eu1 | (1u << bpos);                               \
+            uint4 p0;                                                          \
+            uint4 p1;                                                          \
+            gf_mul_byte16_x2(elems[ev0], elems[ev1], &tabB[0], p0, p1);        \
+            const uint4 n0 = elems[eu0] ^ p0;                                  \
+            const uint4 n1 = elems[eu1] ^ p1;                                  \
+            elems[eu0] = n0;                                                   \
+            elems[ev0] ^= n0;                                                  \
+            elems[eu1] = n1;                                                   \
+            elems[ev1] ^= n1;                                                  \
+        }                                                                      \
+    }
+
+// Ranked final pass (l = log_d - 4, s = 0, one tile per 64-thread group).
+// Sub-layers 0..2 multiply through byte tables rebuilt per twiddle (7
+// rebuilds); sub-layer 3 Horners over its short (< 2^20) twiddle exactly as
+// ntt_pass5_mixed does. Same butterflies, same order, exact field products:
+// bit-identical to ntt_pass5_mixed. Dispatch is restricted by
+// pass5_mixed_ok().
+kernel void ntt_final_t3(device uint4* data                [[buffer(0)]],
+                         device const uint4* twiddles      [[buffer(1)]],
+                         constant NttParams& P             [[buffer(2)]],
+                         uint tgid [[threadgroup_position_in_grid]],
+                         uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u, NF = 1u << F;
+    constexpr uint NNIB = 5u;      // sub-layer 3: twiddle < 2^20
+    threadgroup uint4 tabB[512u];  // the live twiddle's two byte tables
+    threadgroup uint  nibB[8u * NNIB];
+
+    const uint lane = lid & 63u;
+    const uint B = tgid >> P.s;
+    const uint r = tgid & ((1u << P.s) - 1u);
+    const uint pos_base = (B << (P.log_d - P.l)) + r;
+
+    if (lid < 8u * NNIB) {
+        uint cB = lid / NNIB, qB = lid % NNIB;
+        uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cB];
+        nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;
+    }
+    // nibB is published by the first table build's barriers.
+
+    uint4 elems[NF];
+    for (uint e = 0; e < NF; e++) {
+        elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];
+    }
+    NTT_T3_SUBLAYER(0u, 0u)
+    NTT_T3_SUBLAYER(1u, 0u)
+    NTT_T3_SUBLAYER(1u, 1u)
+    NTT_T3_SUBLAYER(2u, 0u)
+    NTT_T3_SUBLAYER(2u, 1u)
+    NTT_T3_SUBLAYER(2u, 2u)
+    NTT_T3_SUBLAYER(2u, 3u)
+    {
+        constexpr uint j = 3u;
+        constexpr uint bpos = F - 1u - j;
+        for (uint b = 0; b < (NF >> 1); b++) {
+            uint low = b & ((1u << bpos) - 1u);
+            uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+            uint ev = eu | (1u << bpos);
+            uint c = eu >> (F - j);
+            threadgroup const uint* nb = &nibB[c * NNIB];
+            uint4 V0 = elems[ev];
+            uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+            uint4 acc = uint4(0u);
+            for (int q = (int)NNIB - 1; q >= 0; q--) {
+                acc = gf_shl4(acc);
+                uint n = nb[q];
+                if (n & 1u) acc ^= V0;
+                if (n & 2u) acc ^= V1;
+                if (n & 4u) acc ^= V2;
+                if (n & 8u) acc ^= V3;
+            }
+            uint4 nu = elems[eu] ^ acc;
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+    for (uint e = 0; e < NF; e++) {
+        data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];
     }
 }
 "#;
@@ -3796,6 +4230,16 @@ kernel void blake3_pow_scan(
         /// incumbent pipelines (both emit bit-identical trees).
         pub(crate) pso_leaf_v4: Id,
         pub(crate) pso_parent3_v4: Id,
+        /// Supplemental two-tiles-per-thread g4 NTT pass. `NIL` when its
+        /// compile failed, its pipeline cannot run 64-thread groups, or
+        /// `FLOCK_NO_GPU_G4X2` is set; the NTT encoders then keep
+        /// `pso_ntt4g4`, which writes the same bytes.
+        pub(crate) pso_ntt4g4x2: Id,
+        /// Supplemental ranked final pass (`ntt_final_t3`). `NIL` when its
+        /// compile failed, its pipeline cannot run 64-thread groups, or
+        /// `FLOCK_NO_GPU_FINAL_T3` is set; the NTT encoders then keep
+        /// `pso_ntt5mix`, which writes the same bytes.
+        pub(crate) pso_ntt5t3: Id,
         /// Supplemental PCS Fiat--Shamir BLAKE3 nonce scanner.  Its single
         /// shared result word is protected because `Gpu` itself is global.
         pub(crate) pso_pow: Id,
@@ -4297,6 +4741,145 @@ kernel void blake3_pow_scan(
                 } else {
                     (NIL, NIL)
                 };
+                // Supplemental two-tiles-per-thread g4 NTT pass, its own
+                // library. Any failure, or a pipeline that cannot run a
+                // 64-thread group, leaves NIL and the encoders keep
+                // `ntt_fused_reg4g4`.
+                let pso_ntt4g4x2 = if super::gpu_g4x2_enabled() {
+                    (|| -> Result<Id, String> {
+                        let src = api.nsstring(NTT_G4X2_MSL_SOURCE)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "g4x2 shader compile failed: {}",
+                                api.error_string(err)
+                            ));
+                        }
+                        let ns = api.nsstring("ntt_fused_reg4g4x2")?;
+                        let f: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            library,
+                            c"newFunctionWithName:",
+                            ns
+                        );
+                        if f.is_null() {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            return Err("g4x2 kernel not found".into());
+                        }
+                        let mut pso_err: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            f,
+                            &mut pso_err
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        if pso.is_null() {
+                            return Err(format!("g4x2 pipeline: {}", api.error_string(pso_err)));
+                        }
+                        let max_threads: u64 = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> u64,
+                            pso,
+                            c"maxTotalThreadsPerThreadgroup"
+                        );
+                        if max_threads < 64 {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                            return Err(format!("g4x2 pipeline allows {max_threads} threads"));
+                        }
+                        Ok(pso)
+                    })()
+                    .unwrap_or_else(|e| {
+                        if debug_enabled() {
+                            eprintln!("[gpu-commit] {e}; keeping ntt_fused_reg4g4");
+                        }
+                        NIL
+                    })
+                } else {
+                    NIL
+                };
+                // Supplemental ranked final pass, its own library. Any
+                // failure, or a pipeline that cannot run a 64-thread group,
+                // leaves NIL and the encoders keep `ntt_pass5_mixed`.
+                let pso_ntt5t3 = if super::gpu_final_t3_enabled() {
+                    (|| -> Result<Id, String> {
+                        let src = api.nsstring(NTT_FINAL_T3_MSL_SOURCE)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "final-t3 shader compile failed: {}",
+                                api.error_string(err)
+                            ));
+                        }
+                        let ns = api.nsstring("ntt_final_t3")?;
+                        let f: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            library,
+                            c"newFunctionWithName:",
+                            ns
+                        );
+                        if f.is_null() {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            return Err("final-t3 kernel not found".into());
+                        }
+                        let mut pso_err: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            f,
+                            &mut pso_err
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        if pso.is_null() {
+                            return Err(format!("final-t3 pipeline: {}", api.error_string(pso_err)));
+                        }
+                        let max_threads: u64 = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> u64,
+                            pso,
+                            c"maxTotalThreadsPerThreadgroup"
+                        );
+                        if max_threads < 64 {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                            return Err(format!("final-t3 pipeline allows {max_threads} threads"));
+                        }
+                        Ok(pso)
+                    })()
+                    .unwrap_or_else(|e| {
+                        if debug_enabled() {
+                            eprintln!("[gpu-commit] {e}; keeping ntt_pass5_mixed");
+                        }
+                        NIL
+                    })
+                } else {
+                    NIL
+                };
                 Ok(Gpu {
                     api,
                     device,
@@ -4317,6 +4900,8 @@ kernel void blake3_pow_scan(
                     pso_leaf_parent3,
                     pso_leaf_v4,
                     pso_parent3_v4,
+                    pso_ntt4g4x2,
+                    pso_ntt5t3,
                     pso_pow,
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
@@ -4873,13 +5458,21 @@ kernel void blake3_pow_scan(
                 // loses badly because each lane keeps 16 F128s live.
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
+                    4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
+                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                    }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
                     }
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
-                        (gpu.pso_ntt5mix, 64u64, 1u64 << (log_d - f))
+                        let pso = if gpu.pso_ntt5t3.is_null() {
+                            gpu.pso_ntt5mix
+                        } else {
+                            gpu.pso_ntt5t3
+                        };
+                        (pso, 64u64, 1u64 << (log_d - f))
                     }
                     // s < 2 (the final pass): no same-B tiles exist to
                     // share, so spend the same occupancy currency the other
@@ -4934,13 +5527,21 @@ kernel void blake3_pow_scan(
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
+                    4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
+                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                    }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
                     }
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
-                        (gpu.pso_ntt5mix, 64u64, 1u64 << (log_d - f))
+                        let pso = if gpu.pso_ntt5t3.is_null() {
+                            gpu.pso_ntt5mix
+                        } else {
+                            gpu.pso_ntt5t3
+                        };
+                        (pso, 64u64, 1u64 << (log_d - f))
                     }
                     // s < 2 (the final pass): no same-B tiles exist to
                     // share, so spend the same occupancy currency the other
@@ -5932,7 +6533,9 @@ kernel void blake3_pow_scan(
                 encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                gpu.commit_and_wait(cb)?;
+                record_pure_gpu_arm(gpu, cb);
+                Ok(())
             })();
             gpu.pool_pop(pool);
             r
@@ -5957,7 +6560,9 @@ kernel void blake3_pow_scan(
                 encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                gpu.commit_and_wait(cb)?;
+                record_pure_gpu_arm(gpu, cb);
+                Ok(())
             })();
             gpu.pool_pop(pool);
             r
@@ -6112,12 +6717,100 @@ kernel void blake3_pow_scan(
                 let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
                 let suffix_leaf_start = prefix_leaves;
                 let suffix_leaves = n_leaves - prefix_leaves;
+                // S1: the GPU hashes the CPU suffix's leaves and subtree
+                // parents. The CPU still finishes the suffix NTT (same
+                // kernels, same order, a no-op chunk callback), then queues
+                // one more command buffer that runs the same
+                // `encode_merkle_subtree` kernels the GPU prefix uses over
+                // the suffix's aligned subtrees. Same leaf bytes, same BLAKE3
+                // tree, same flat-tree slots, so the root is unchanged.
+                if hybrid_gpu_suffix_hash_enabled() {
+                    let t_cpu_ntt = std::time::Instant::now();
+                    ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                        data,
+                        64,
+                        4,
+                        log_d,
+                        16 - k_cpu16,
+                        16,
+                        |_elem_offset: usize, _chunk: &[F128]| {},
+                    );
+                    let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
+                    let cb3 = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb3)?;
+                    let mut sstart = suffix_leaf_start;
+                    while sstart < n_leaves {
+                        let mut size = 1usize << (n_leaves - sstart).ilog2();
+                        while sstart % size != 0 {
+                            size >>= 1;
+                        }
+                        encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size);
+                        sstart += size;
+                    }
+                    gpu.end_encoding(enc);
+                    gpu.commit_async(cb3);
+                    // Same queue: cb3 runs after cb2, so waiting for cb3
+                    // also covers cb2; wait for both explicitly anyway.
+                    if super::hybrid_cb2_spin_enabled() {
+                        gpu.yield_wait_cb_until(
+                            cb2,
+                            std::time::Instant::now() + std::time::Duration::from_millis(4),
+                        )?;
+                        gpu.yield_wait_cb_until(
+                            cb3,
+                            std::time::Instant::now() + std::time::Duration::from_millis(4),
+                        )?;
+                    } else {
+                        gpu.wait_cb(cb2)?;
+                        gpu.wait_cb(cb3)?;
+                    }
+                    // Arms for the sweep's split selection. cb3 queues behind
+                    // both cb2 and the CPU NTT, so this split's window is
+                    // max(cb2, cpu NTT) + cb3: price the GPU arm as cb2's
+                    // start to cb3's end and the CPU arm as the NTT wall.
+                    let (cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
+                    let (cb3_s, cb3_e) = cb_gpu_interval(gpu, cb3);
+                    record_hybrid_arms(k_cpu16, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
+                    if window_trace_enabled() {
+                        eprintln!(
+                            "[gpu-window] cb3 (gpu suffix merkle, k={k_cpu16}): gpu dur {:.2} ms, \
+                             cb2 gpu dur {:.2} ms, cpu ntt {cpu_ntt_ms:.2} ms, cb2 start to cb3 end {:.2} ms",
+                            (cb3_e - cb3_s) * 1e3,
+                            (cb2_e - cb2_s) * 1e3,
+                            (cb3_e - cb2_s) * 1e3
+                        );
+                    }
+                    let mut level_start = 0usize;
+                    let mut level_len = n_leaves;
+                    while level_len > 16 {
+                        level_start += level_len;
+                        level_len /= 2;
+                    }
+                    while level_len > 1 {
+                        let write_start = level_start + level_len;
+                        let read = core::slice::from_raw_parts(
+                            tree_base.ptr().add(level_start),
+                            level_len,
+                        );
+                        let write = core::slice::from_raw_parts_mut(
+                            tree_base.ptr().add(write_start),
+                            level_len / 2,
+                        );
+                        crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                        level_start = write_start;
+                        level_len /= 2;
+                    }
+                    return Ok(());
+                }
                 let deep_pipeline = hybrid_cpu_suffix_deep_pipeline_enabled();
                 let local_parent_levels = if deep_pipeline {
                     hybrid_local_parent_levels()
                 } else {
                     0
                 };
+                // Start of the CPU arm's concurrent work, for
+                // `record_hybrid_arms`.
+                let t_cpu_suffix = std::time::Instant::now();
                 if deep_pipeline {
                     // Publish and hash each finalized layer-10 chunk, then
                     // build its local parent levels before the leaf hashes
@@ -6246,6 +6939,9 @@ kernel void blake3_pow_scan(
                 // parents; the 15 nodes above it are recomputed here,
                 // covering every decomposition boundary for any k.
                 let t_wait_cb2 = window_trace_enabled().then(std::time::Instant::now);
+                // The CPU arm is done; this is its wall against the GPU prefix.
+                let cpu_arm_ms = t_cpu_suffix.elapsed().as_secs_f64() * 1e3;
+
                 // The warmup tuner balances the split so the GPU prefix and
                 // the CPU suffix finish together: the residual wait here is
                 // typically sub-millisecond, which the blocking wait rounds
@@ -6272,6 +6968,12 @@ kernel void blake3_pow_scan(
                         t.elapsed().as_secs_f64() * 1e3,
                     );
                 }
+                // Both arms of this sample, for the sweep's split selection:
+                // the CPU suffix's wall against the GPU prefix's own command
+                // buffer interval. Positions are fixed per arm, so the split
+                // only decides who writes which range.
+                let (gpu_s, gpu_e) = cb_gpu_interval(gpu, cb2);
+                record_hybrid_arms(k_cpu16, (gpu_e - gpu_s) * 1e3, cpu_arm_ms);
                 let mut level_start = 0usize;
                 let mut level_len = n_leaves;
                 while level_len > 16 {
@@ -6337,6 +7039,169 @@ kernel void blake3_pow_scan(
     /// Warmup-sweep-published CPU share (sentinel `usize::MAX` = not tuned).
     static TUNED_HYBRID_K: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    /// Per-split arm walls sampled by the ranked split sweep: one
+    /// `(k, gpu_ms, cpu_ms)` row per sample.
+    ///
+    /// The commit window is `max(gpu prefix, cpu suffix)` plus a `k`-independent
+    /// tail, so the two arms are what price a split. The sweep's own score is
+    /// instead the graph arm's host wall under the A/B join, which a contended
+    /// host inflates by 20-50% sample to sample: measured here, its
+    /// per-candidate means came out monotone in `k` while the timed window's
+    /// best `k` was 2, 3 and 4 on three consecutive rounds, and it picked
+    /// `k = 0` every time at 8.6-26.4% over the round's best split.
+    fn hybrid_arm_samples() -> &'static std::sync::Mutex<Vec<(usize, f64, f64)>> {
+        static S: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, f64, f64)>>> =
+            std::sync::OnceLock::new();
+        S.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// Largest split this selection will publish. The hybrid graph needs `k`
+    /// in `1..16`; past this plateau the CPU suffix is so long that the
+    /// GPU-only graph (`k = 0`) is the answer, and `k = 0` is sampled too.
+    const ARM_SPLIT_MAX_K: usize = 8;
+
+    /// How much the arms' winner must beat the sweep's own split's arm window
+    /// before it replaces it: 3% of the commit window. Comfortably above the
+    /// ±1 ms repeat the GPU timestamps showed and well below the 8-26%
+    /// mistune the sweep was measured to produce.
+    const ARM_SPLIT_MARGIN: f64 = 0.03;
+
+    /// Set while the ranked sweep runs the samples that may price a split.
+    ///
+    /// Only those samples count: a graph run outside the sweep (the winner's
+    /// byte verify, or a timed prove) runs without the A/B replay beside it
+    /// and would look faster than the split really is.
+    static HYBRID_ARM_RECORDING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn hybrid_arm_recording() -> bool {
+        HYBRID_ARM_RECORDING.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Scope guard for [`HYBRID_ARM_RECORDING`].
+    ///
+    /// Held only across `collect_ranked_exact_samples`: while it is live each
+    /// hybrid sample records its own GPU-prefix and CPU-suffix walls, and when
+    /// it drops recording stops. Arms measured anywhere else (the byte-check
+    /// commit, a timed prove) therefore never price a split; only samples taken
+    /// beside the A/B replay, under the same contention, take part.
+    struct ArmRecordScope;
+
+    impl ArmRecordScope {
+        fn enter() -> Self {
+            HYBRID_ARM_RECORDING.store(true, std::sync::atomic::Ordering::Relaxed);
+            ArmRecordScope
+        }
+    }
+
+    impl Drop for ArmRecordScope {
+        fn drop(&mut self) {
+            HYBRID_ARM_RECORDING.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// `FLOCK_NO_HYBRID_ARM_SPLIT=1` keeps the sweep's join-wall pick,
+    /// restoring the incumbent behaviour for a same-binary comparison.
+    fn hybrid_arm_split_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_ARM_SPLIT").is_none())
+    }
+
+    /// One split's arm walls during the sweep.
+    ///
+    /// `k = 0` runs the whole graph on the GPU, so its single arm is the
+    /// command buffer's GPU span and its CPU arm is empty (recorded as 0).
+    fn record_hybrid_arms(k: usize, gpu_ms: f64, cpu_ms: f64) {
+        if !hybrid_arm_recording() || k > ARM_SPLIT_MAX_K {
+            return;
+        }
+        if !(gpu_ms.is_finite() && gpu_ms > 0.0) || !(cpu_ms.is_finite() && cpu_ms >= 0.0) {
+            return;
+        }
+        if let Ok(mut v) = hybrid_arm_samples().lock() {
+            v.push((k, gpu_ms, cpu_ms));
+        }
+    }
+
+    /// Record the pure-GPU graph's own GPU span as the `k = 0` arm.
+    ///
+    /// At `k = 0` no work runs on the CPU, so the command buffer's GPU
+    /// interval is that split's whole arm phase - directly comparable with a
+    /// hybrid split's `max(gpu prefix, cpu suffix)`. Without it the sweep
+    /// could not price `k = 0` against the hybrid splits at all, and `k = 0`
+    /// is exactly what a mistuned sweep picks.
+    unsafe fn record_pure_gpu_arm(gpu: &Gpu, cb: Id) {
+        if !hybrid_arm_recording() {
+            return;
+        }
+        let (s, e) = unsafe { cb_gpu_interval(gpu, cb) };
+        record_hybrid_arms(0, (e - s) * 1e3, 0.0);
+    }
+
+    /// `max(gpu, cpu)` of one split's cheapest sample, or `NaN` when the
+    /// split was never sampled.
+    ///
+    /// The minimum over samples of the sample's own `max(arm)`, not a mean or
+    /// a median: a competing process can only ever ADD time, so every sample
+    /// over-estimates that split's window and its cheapest sample is the
+    /// tightest estimate. Taking each arm's minimum separately would pair one
+    /// sample's cheap GPU arm with another's cheap CPU arm and price a window
+    /// no single run ever showed, so the two arms are always read from the
+    /// same sample. The sweep gives each split two samples, and the median of
+    /// two is their mean, which one spike moves by half the spike.
+    fn arm_window_ms(samples: &[(usize, f64, f64)], k: usize) -> f64 {
+        let mut best = f64::INFINITY;
+        let mut n = 0usize;
+        for s in samples.iter().filter(|s| s.0 == k) {
+            best = best.min(s.1.max(s.2));
+            n += 1;
+        }
+        if n == 0 {
+            return f64::NAN;
+        }
+        best
+    }
+
+    /// The split the arms price best, or `None` to keep `swept`.
+    ///
+    /// Only sampled splits take part, so this can never invent one. The CPU
+    /// suffix's cost grows with `k` and the GPU prefix's falls, so the
+    /// minimiser of `max(gpu, cpu)` sits where the two cross. Ascending scan
+    /// with a strict `<` resolves a tie toward the smaller split, matching the
+    /// tuner's own preference for leaving work on the GPU.
+    ///
+    /// Two guards keep the change strictly a replacement, never a gamble: the
+    /// sweep's own split must be priced by the same arms, and the winner must
+    /// beat it by [`ARM_SPLIT_MARGIN`].
+    fn split_from_arms(samples: &[(usize, f64, f64)], swept: usize) -> Option<usize> {
+        if !hybrid_arm_split_enabled() || samples.is_empty() {
+            return None;
+        }
+        let swept_window = arm_window_ms(samples, swept);
+        if !swept_window.is_finite() {
+            return None;
+        }
+        let mut ks: Vec<usize> = samples.iter().map(|s| s.0).collect();
+        ks.sort_unstable();
+        ks.dedup();
+        let mut best: Option<(usize, f64)> = None;
+        for k in ks {
+            let window = arm_window_ms(samples, k);
+            if !window.is_finite() {
+                continue;
+            }
+            if best.is_none_or(|(_, bw)| window < bw) {
+                best = Some((k, window));
+            }
+        }
+        let (k, window) = best?;
+        if k == swept || window > swept_window * (1.0 - ARM_SPLIT_MARGIN) {
+            return None;
+        }
+        Some(k)
+    }
 
     /// CPU reference-commit wall from the cache-miss warmup. Cache
     /// publication waits for the exact-contention winner, so no cache-hit
@@ -6455,9 +7320,11 @@ kernel void blake3_pow_scan(
     /// ranked runner. With F2 graph-arm scoring the mid-basin point k=2 is
     /// informative again — it was invisible when join-max scoring collapsed
     /// AB-dominated samples — so it re-enters between pure-GPU and k=3.
-    /// Four candidates × 2 reverse-order samples is still well inside the
-    /// 10-minute job wall at ~120 workers.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 4] = [0, 2, 3, 5];
+    /// k=4 fills the gap between k=3 and the default: a GPU-heavy host whose
+    /// balanced split sits between the two otherwise rounds to one side.
+    /// Five candidates × 2 reverse-order samples, all in the untimed warmup,
+    /// is still well inside the 10-minute job wall at ~120 workers.
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 5] = [0, 2, 3, 4, 5];
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
@@ -6923,27 +7790,62 @@ kernel void blake3_pow_scan(
         let reprime = || unsafe {
             run_from_z_first_pass(ctx.gpu, ctx.z_buf, ctx.staging, ctx.tw_buf, params.k_code())
         };
-        let samples = match collect_ranked_exact_samples(reprime, sample) {
-            Ok(samples) => samples,
-            Err(e) => {
-                if dbg {
-                    eprintln!(
-                        "[gpu-commit] broad exact-AB tune failed ({e}); pinning verified k=0"
-                    );
+        let samples = {
+            // Only the sweep's own samples price a split: they are the only
+            // graph runs taken beside the A/B replay, which is what makes the
+            // window's two arms comparable across candidates.
+            if let Ok(mut v) = hybrid_arm_samples().lock() {
+                v.clear();
+            }
+            let _recording = ArmRecordScope::enter();
+            match collect_ranked_exact_samples(reprime, sample) {
+                Ok(samples) => samples,
+                Err(e) => {
+                    if dbg {
+                        eprintln!(
+                            "[gpu-commit] broad exact-AB tune failed ({e}); pinning verified k=0"
+                        );
+                    }
+                    finish_ranked_exact_contention_tune(params, cpu_tree, 0);
+                    return;
                 }
-                finish_ranked_exact_contention_tune(params, cpu_tree, 0);
-                return;
             }
         };
         let Some(means) = mean_ranked_exact_samples(samples) else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
-        let Some(chosen) = choose_hybrid_k(&RANKED_EXACT_TUNE_CANDIDATES, &means, DEFAULT_HYBRID_K)
+        let Some(swept) = choose_hybrid_k(&RANKED_EXACT_TUNE_CANDIDATES, &means, DEFAULT_HYBRID_K)
         else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
+        // Re-price the sweep's candidates from the two arms each one measured,
+        // keeping the sweep's pick unless the arms clearly beat it. The arms
+        // are the commit window's own `max(gpu, cpu)`; the sweep ranks the
+        // candidates by a host wall taken beside the A/B replay, which on a
+        // contended host scatters by 20-50% per sample and is what mistunes
+        // the split. Every candidate the arms can choose is one the sweep
+        // already ran, so this can neither invent a split nor pick one the
+        // sweep's own byte verify did not cover.
+        let arm_samples = hybrid_arm_samples()
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let chosen = match split_from_arms(&arm_samples, swept) {
+            Some(k) => k,
+            None => swept,
+        };
+        if dbg {
+            let arms: Vec<String> = RANKED_EXACT_TUNE_CANDIDATES
+                .iter()
+                .map(|k| format!("k={k}:{:.1}ms", arm_window_ms(&arm_samples, *k)))
+                .collect();
+            eprintln!(
+                "[gpu-commit] split from arms: k={chosen} over swept k={swept} | {}",
+                arms.join(" "),
+            );
+        }
 
         let verified = unsafe {
             if chosen == 0 {
@@ -7015,6 +7917,14 @@ kernel void blake3_pow_scan(
     /// chunk before eviction. `FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP=1` restores the
     /// original all-layer streaming suffix plus separate leaf-hash pass for an
     /// exact same-binary comparison.
+    /// S1 kill switch: `FLOCK_NO_HYBRID_GPU_SUFFIX_HASH=1` restores the CPU
+    /// suffix leaf/parent hashing.
+    fn hybrid_gpu_suffix_hash_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_GPU_SUFFIX_HASH").is_none())
+    }
+
     fn hybrid_cpu_suffix_deep_pipeline_enabled() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
@@ -7170,10 +8080,15 @@ kernel void blake3_pow_scan(
     }
 
     fn warmup_cache_msl_fnv() -> u64 {
-        warmup_cache_msl_fnv_for(
+        let key = warmup_cache_msl_fnv_for(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
-        )
+        );
+        if super::gpu_g4x2_enabled() {
+            key ^ fnv1a64(NTT_G4X2_MSL_SOURCE).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
+        } else {
+            key
+        }
     }
 
     #[cfg(test)]
@@ -10315,6 +11230,93 @@ kernel void lc_fold_stripes_factored_b4(
     }
 
     #[cfg(test)]
+    mod hybrid_balance_tests {
+        use super::{ARM_SPLIT_MARGIN, arm_window_ms, split_from_arms};
+
+        #[test]
+        fn arm_window_is_the_slower_arm_of_the_cheapest_sample() {
+            // Per sample, max(120, 40) = 120 and max(118, 44) = 118. The
+            // cheaper sample prices the split; pairing each arm's own minimum
+            // would have claimed 118 for a window no run ever showed.
+            let s = [(3usize, 120.0, 40.0), (3, 118.0, 44.0)];
+            assert_eq!(arm_window_ms(&s, 3), 118.0);
+            // An unsampled split has no window, so it can never be chosen.
+            assert!(arm_window_ms(&s, 4).is_nan());
+        }
+
+        #[test]
+        fn the_balanced_arms_win_over_a_mistuned_sweep_pick() {
+            // The measured shape: the GPU arm falls with k and the CPU arm
+            // rises, so the window bottoms out where they cross - here k=5 at
+            // 124 ms. The sweep ranked by a join wall and picked k=2, whose
+            // GPU arm alone (142 ms) already exceeds k=5's whole window.
+            let s = [
+                (2usize, 142.0, 36.0),
+                (3, 134.0, 93.0),
+                (4, 126.0, 116.0),
+                (5, 115.0, 124.0),
+            ];
+            assert_eq!(arm_window_ms(&s, 2), 142.0);
+            assert_eq!(arm_window_ms(&s, 5), 124.0);
+            assert_eq!(split_from_arms(&s, 2), Some(5));
+        }
+
+        #[test]
+        fn a_balanced_sweep_pick_is_left_alone() {
+            // k=4's window is already the best in the table.
+            let s = [(2usize, 142.0, 36.0), (4, 126.0, 116.0), (5, 130.0, 118.0)];
+            assert_eq!(split_from_arms(&s, 4), None);
+        }
+
+        #[test]
+        fn the_margin_keeps_a_near_tie_on_the_sweep_pick() {
+            // k=4 beats k=3 by 1 ms of a 120 ms window: inside the margin.
+            let s = [(3usize, 121.0, 118.0), (4, 120.0, 120.0)];
+            assert!(1.0 / 120.0 < ARM_SPLIT_MARGIN);
+            assert_eq!(split_from_arms(&s, 3), None);
+            // Widen the same gap past the margin and it wins.
+            let s = [(3usize, 140.0, 118.0), (4, 120.0, 120.0)];
+            assert_eq!(split_from_arms(&s, 3), Some(4));
+        }
+
+        #[test]
+        fn the_pure_gpu_split_is_priced_and_can_be_displaced() {
+            // k=0's single GPU arm is the whole graph. It was what the mistuned
+            // sweep picked every round; here the hybrid split beats it.
+            let s = [(0usize, 152.0, 0.0), (2, 142.0, 36.0), (4, 126.0, 116.0)];
+            assert_eq!(arm_window_ms(&s, 0), 152.0);
+            assert_eq!(split_from_arms(&s, 0), Some(4));
+            // And when nothing hybrid beats it by the margin, it stands.
+            let s = [(0usize, 120.0, 0.0), (2, 142.0, 36.0), (4, 119.0, 120.0)];
+            assert_eq!(split_from_arms(&s, 0), None);
+        }
+
+        #[test]
+        fn an_unmeasured_sweep_pick_is_left_alone() {
+            let s = [(2usize, 142.0, 36.0), (4, 126.0, 116.0)];
+            assert_eq!(split_from_arms(&s, 3), None);
+            assert_eq!(split_from_arms(&[], 3), None);
+        }
+
+        #[test]
+        fn one_spiked_sample_cannot_move_the_split() {
+            // k=3's second CPU sample spiked 4x. The floor ignores it; a mean
+            // or a median-of-two would have handed the split to k=2.
+            let s = [(2usize, 142.0, 36.0), (3, 134.0, 93.0), (3, 134.0, 372.0)];
+            assert_eq!(arm_window_ms(&s, 3), 134.0);
+            assert_eq!(split_from_arms(&s, 2), Some(3));
+        }
+
+        #[test]
+        fn splits_outside_the_sampled_range_are_ignored() {
+            // Only sampled splits can take part; k=9 was never run.
+            let s = [(4usize, 126.0, 116.0), (2, 142.0, 36.0)];
+            assert_eq!(split_from_arms(&s, 2), Some(4));
+            assert!(arm_window_ms(&s, 9).is_nan());
+        }
+    }
+
+    #[cfg(test)]
     mod split_select_tests {
         use super::{
             DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k, choose_hybrid_k_with,
@@ -10324,7 +11326,7 @@ kernel void lc_fold_stripes_factored_b4(
 
         #[test]
         fn trimmed_candidate_set_is_stable() {
-            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, C);
+            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, [0, 2, 3, 4, 5]);
         }
 
         #[test]
@@ -10341,13 +11343,14 @@ kernel void lc_fold_stripes_factored_b4(
                 },
             )
             .unwrap();
-            // Forward 0,2,3,5 then reverse 5,3,2,0 — each preceded by reprime.
+            // Forward 0,2,3,4,5 then reverse 5,4,3,2,0 — each preceded by reprime.
             assert_eq!(
                 *events.borrow(),
-                [-1, 0, -1, 2, -1, 3, -1, 5, -1, 5, -1, 3, -1, 2, -1, 0]
+                [-1, 0, -1, 2, -1, 3, -1, 4, -1, 5, -1, 5, -1, 4, -1, 3, -1, 2, -1, 0]
             );
             assert_eq!(samples[0], [0.0, 0.0]);
-            assert_eq!(samples[3], [5.0, 5.0]);
+            assert_eq!(samples[3], [4.0, 4.0]);
+            assert_eq!(samples[4], [5.0, 5.0]);
         }
 
         #[test]
@@ -10466,7 +11469,7 @@ kernel void lc_fold_stripes_factored_b4(
                 state ^= state << 17;
                 grid[(state % grid.len() as u64) as usize]
             };
-            let sets: [&[usize]; 2] = [&C, &[0, 2, 3, 4, 5, 6, 7, 8]];
+            let sets: [&[usize]; 3] = [&C, &RANKED_EXACT_TUNE_CANDIDATES, &[0, 2, 3, 4, 5, 6, 7, 8]];
             for set in sets {
                 for &tie in &[0.005, 0.015, 0.02, 0.05] {
                     for &keep in &[false, true] {
@@ -10481,7 +11484,7 @@ kernel void lc_fold_stripes_factored_b4(
                                 assert_eq!(k, DEFAULT_HYBRID_K, "{ms:?} tie={tie} keep");
                                 continue;
                             }
-                            // set[0] == 0 in both candidate sets.
+                            // set[0] == 0 in every candidate set.
                             let zero_in_band = ms[0] <= limit;
                             let zero_passes = ms[0] <= ms[d] * (1.0 - 0.04);
                             if zero_in_band && zero_passes {
@@ -14632,9 +15635,10 @@ mod tests {
                 "incumbent first pass mismatch"
             );
             assert_eq!(candidate_first, incumbent_first);
+            // 11,968 B of tables plus the kernel's 4,096 B residency pad.
             assert_eq!(
                 gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root).0,
-                11_968,
+                16_064,
                 "candidate static threadgroup footprint"
             );
 
