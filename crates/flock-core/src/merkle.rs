@@ -292,6 +292,9 @@ const BLAKE3_ROOT: u8 = 8;
 
 /// Cached SIMD platform. `Platform::detect()` is cheap but not free, and the
 /// tree build reaches the batched path once per [`BLAKE3_BATCH`] nodes.
+///
+/// The `OnceLock` makes detection happen at most once per process, which is
+/// the whole of a benchmark trial: every trial is a fresh worker process.
 fn blake3_platform() -> blake3::platform::Platform {
     use std::sync::OnceLock;
     static PLATFORM: OnceLock<blake3::platform::Platform> = OnceLock::new();

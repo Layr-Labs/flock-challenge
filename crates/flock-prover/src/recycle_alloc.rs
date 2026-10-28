@@ -1,9 +1,10 @@
 //! Recycling global allocator for the prover process.
 //!
-//! Blocks at least 32 KiB are parked on exact-size freelists rather than
-//! returned to libmalloc. The ranked worker performs an untimed warm proof
-//! with the same allocation pattern, so the timed proof reuses resident pages
-//! for large allocations not already handled by the typed scratch pools.
+//! Blocks of at least 16 KiB (`RECYCLE_MIN`) are parked on exact-size
+//! freelists rather than returned to libmalloc. The ranked worker performs an
+//! untimed warm proof with the same allocation pattern, so the timed proof
+//! reuses resident pages for large allocations not already handled by the
+//! typed scratch pools.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;

@@ -93,6 +93,9 @@ pub fn shift_mle(a: &[F128], b: &[F128]) -> F128 {
 
     let mut acc = F128::ZERO;
     for j in 0..n {
+        // At boolean points this factor is one exactly when bit j goes 0 → 1
+        // and zero otherwise; the pre and eqsuf weights make the fold's sum one
+        // exactly for the successor pair and zero otherwise.
         let mid = (F128::ONE + a[j]) * b[j]; // bit j flips 0 → 1
         acc += pre[j] * mid * eqsuf[j + 1]; // eqsuf[j+1] = Π_{l>j} eq
     }

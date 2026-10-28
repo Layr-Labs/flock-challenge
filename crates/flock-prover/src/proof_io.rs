@@ -14,9 +14,10 @@
 //! ```
 //!
 //! Versioning is here to make schema changes detectable cleanly: bump
-//! `VERSION` whenever a payload field is added/removed/reordered. Forward
+//! `VERSION` whenever a payload field is added, removed or reordered. Forward
 //! compatibility is NOT promised — `from_bytes` of a different version is
-//! rejected (`UnsupportedVersion`).
+//! rejected (`UnsupportedVersion`), which is why the version byte is checked
+//! before any payload field is read.
 //!
 //! ## Round-trip example
 //! ```ignore
@@ -87,6 +88,12 @@ const FLAVOR_R1CS_LIGERITO: u8 = 2;
 const FLAVOR_CHAIN_LIGERITO: u8 = 3;
 
 /// Header size = 5-byte magic + 1-byte version + 1-byte flavor.
+/// Header length is fixed at seven bytes: five magic bytes spelling `FLOCK`,
+/// one version byte currently pinned at four, and one flavor byte selecting
+/// the R1CS or chain bundle. Readers check exactly this prefix first, so bad
+/// magic, unsupported versions, unknown flavors, and truncated inputs fail
+/// before any payload bytes are parsed. The payload starts at byte seven and
+/// keeps the same header layout for both bundle flavors.
 const HEADER_LEN: usize = 7;
 
 /// Errors from `from_bytes` / `read_from_file`.
