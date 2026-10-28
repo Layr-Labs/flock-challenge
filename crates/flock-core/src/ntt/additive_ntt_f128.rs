@@ -1093,35 +1093,69 @@ impl AdditiveNttF128 {
             // passes instead of fused-3 + single.
             if layer + 2 < stop_layer && stop_layer - layer != 4 && block_size >= 8 {
                 let eighth = block_size >> 3;
-                for local in 0..num_blocks {
-                    let abs = abs_first + local;
-                    let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-                    tw[0] = self.twiddle(layer, abs);
-                    for s in 0..2 {
-                        tw[1 + s] = self.twiddle(layer + 1, 2 * abs + s);
-                    }
-                    for s in 0..4 {
-                        tw[3 + s] = self.twiddle(layer + 2, 4 * abs + s);
-                    }
+                // Cap flattened multi-block dispatch at 32 MiB (4 * 524,288 F128s)
+                // so layer-4 64 MiB blocks run 1 at a time in L2+SLC while
+                // layer-7 8 MiB blocks run 4 at a time (32 MiB) inside the
+                // M3 Max 32 MiB P-cluster L2 cache.
+                const MAX_FUSED3_ELEMS: usize = 4 * 524_288;
+                let max_chunk = (MAX_FUSED3_ELEMS / block_elems).clamp(1, 4);
+                let tail = if eighth.is_multiple_of(2) {
+                    odd_tail
+                } else {
+                    0
+                };
+                let mut local = 0;
+                while local < num_blocks {
+                    let chunk_blocks = (num_blocks - local).min(max_chunk);
                     let start = local * block_elems;
-                    let slice =
-                        &mut data[range_base_elem + start..range_base_elem + start + block_elems];
-                    // `eighth` even ⇒ every row group stays inside one
-                    // position parity, so the static zero tail survives.
-                    let tail = if eighth.is_multiple_of(2) {
-                        odd_tail
+                    let slice = &mut data[range_base_elem + start
+                        ..range_base_elem + start + chunk_blocks * block_elems];
+                    if chunk_blocks == 1 {
+                        let abs = abs_first + local;
+                        let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                        tw[0] = self.twiddle(layer, abs);
+                        for s in 0..2 {
+                            tw[1 + s] = self.twiddle(layer + 1, 2 * abs + s);
+                        }
+                        for s in 0..4 {
+                            tw[3 + s] = self.twiddle(layer + 2, 4 * abs + s);
+                        }
+                        if tw[0] == F128::ZERO && tw[1] == F128::ZERO && tw[3] == F128::ZERO {
+                            butterfly_interleaved_fused_3layer_par_rows::<true>(
+                                slice, &tw, eighth, num_ntts, tail,
+                            );
+                        } else {
+                            butterfly_interleaved_fused_3layer_par_rows::<false>(
+                                slice, &tw, eighth, num_ntts, tail,
+                            );
+                        }
                     } else {
-                        0
-                    };
-                    if tw[0] == F128::ZERO && tw[1] == F128::ZERO && tw[3] == F128::ZERO {
-                        butterfly_interleaved_fused_3layer_par_rows::<true>(
-                            slice, &tw, eighth, num_ntts, tail,
-                        );
-                    } else {
-                        butterfly_interleaved_fused_3layer_par_rows::<false>(
-                            slice, &tw, eighth, num_ntts, tail,
+                        let mut tws = [[F128 { lo: 0, hi: 0 }; 7]; 4];
+                        let mut zero_root = [false; 4];
+                        for c in 0..chunk_blocks {
+                            let abs = abs_first + local + c;
+                            let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                            tw[0] = self.twiddle(layer, abs);
+                            for s in 0..2 {
+                                tw[1 + s] = self.twiddle(layer + 1, 2 * abs + s);
+                            }
+                            for s in 0..4 {
+                                tw[3 + s] = self.twiddle(layer + 2, 4 * abs + s);
+                            }
+                            zero_root[c] =
+                                tw[0] == F128::ZERO && tw[1] == F128::ZERO && tw[3] == F128::ZERO;
+                            tws[c] = tw;
+                        }
+                        butterfly_interleaved_fused_3layer_range_par_rows(
+                            slice,
+                            &tws[..chunk_blocks],
+                            &zero_root[..chunk_blocks],
+                            eighth,
+                            num_ntts,
+                            tail,
                         );
                     }
+                    local += chunk_blocks;
                 }
                 layer += 3;
             } else if layer + 1 < stop_layer && block_size >= 4 {
@@ -1208,33 +1242,46 @@ impl AdditiveNttF128 {
         // explicit tail.
         let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
 
-        // Two fused radix-8 passes.  Unlike the old all-layer range driver,
-        // this is the last streaming traversal of the complete suffix.
-        self.forward_transform_interleaved_block_range(
-            data,
-            num_ntts,
-            start_layer,
-            DEEP_LAYER,
-            b_start,
-            b_end,
-            odd_tail,
-        );
-
-        // Every layer-4 block contains 2^(10-4) independent layer-10
-        // sub-NTTs.  Preserve their absolute indices so all deeper twiddles
-        // match the unsplit transform exactly.
-        let sub_start = b_start << (DEEP_LAYER - start_layer);
-        let sub_end = b_end << (DEEP_LAYER - start_layer);
-        self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
-            data,
-            num_ntts,
-            DEEP_LAYER,
-            log_d,
-            sub_start,
-            sub_end,
-            odd_tail,
-            &finish_chunk,
-        );
+        // Interleave per 64 MiB layer-4 block and 32 MiB 4-block layer-7 half
+        // so each 32 MiB chunk completes layers 7..10 and immediately runs
+        // layers 10..20 + Merkle leaf hashing while hot in the 32 MiB P-cluster L2.
+        const MID_LAYER: usize = 7;
+        for b in b_start..b_end {
+            self.forward_transform_interleaved_block_range(
+                data,
+                num_ntts,
+                start_layer,
+                MID_LAYER,
+                b,
+                b + 1,
+                odd_tail,
+            );
+            for half in 0..2 {
+                let l7_start = (b << (MID_LAYER - start_layer)) + (half << 2);
+                let l7_end = l7_start + 4;
+                self.forward_transform_interleaved_block_range(
+                    data,
+                    num_ntts,
+                    MID_LAYER,
+                    DEEP_LAYER,
+                    l7_start,
+                    l7_end,
+                    odd_tail,
+                );
+                let sub_start = l7_start << (DEEP_LAYER - MID_LAYER);
+                let sub_end = l7_end << (DEEP_LAYER - MID_LAYER);
+                self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                    data,
+                    num_ntts,
+                    DEEP_LAYER,
+                    log_d,
+                    sub_start,
+                    sub_end,
+                    odd_tail,
+                    &finish_chunk,
+                );
+            }
+        }
     }
 
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
@@ -2437,6 +2484,66 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
                 }
             };
         });
+    }
+}
+
+#[inline]
+fn butterfly_interleaved_fused_3layer_range_par_rows(
+    data: &mut [F128],
+    twiddles: &[[F128; 7]],
+    zero_root: &[bool],
+    eighth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+) {
+    use rayon::prelude::*;
+    const PARALLEL_JOB_THRESHOLD: usize = 256;
+
+    let num_blocks = twiddles.len();
+    let block_elems = 8 * eighth * num_ntts;
+    debug_assert_eq!(data.len(), num_blocks * block_elems);
+    debug_assert_eq!(zero_root.len(), num_blocks);
+    debug_assert!(eighth.is_power_of_two());
+    debug_assert!(odd_tail == 0 || eighth.is_multiple_of(2));
+    let base = data.as_mut_ptr() as usize;
+    let eighth_log = eighth.trailing_zeros() as usize;
+    let eighth_mask = eighth - 1;
+    let job = |job: usize| {
+        let block = job >> eighth_log;
+        let r = job & eighth_mask;
+        let lanes = if r & 1 == 1 {
+            num_ntts - odd_tail
+        } else {
+            num_ntts
+        };
+        unsafe {
+            let block_base = (base as *mut F128).add(block * block_elems);
+            if zero_root[block] {
+                kernels::butterfly_fused_3layer_zero_root_row(
+                    block_base,
+                    eighth,
+                    num_ntts,
+                    lanes,
+                    r,
+                    &twiddles[block],
+                )
+            } else {
+                kernels::butterfly_fused_3layer_row(
+                    block_base,
+                    eighth,
+                    num_ntts,
+                    lanes,
+                    r,
+                    &twiddles[block],
+                )
+            }
+        }
+    };
+    let n_jobs = num_blocks * eighth;
+    if n_jobs < PARALLEL_JOB_THRESHOLD {
+        (0..n_jobs).for_each(job);
+    } else {
+        (0..n_jobs).into_par_iter().for_each(job);
     }
 }
 
