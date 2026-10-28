@@ -8869,51 +8869,50 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_queries_0 = config.queries[0];
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    let _t = std::time::Instant::now();
-    let opened_rows_0: Vec<Vec<F128>> = {
-        use rayon::prelude::*;
-        // Indexed parallel collect is order-preserving: bit-identical to
-        // the serial map; each row copy is independent of the challenger.
-        queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect()
-    };
-    let merkle_proof_0 = merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0);
-    if trace {
-        t_opens += _t.elapsed();
-    }
-    // Induce basis_0 from wtns_0 opens. L0 dominates the induce phase, where the
-    // sparse-prefix Fᵀ-NTT path wins; the dispatcher auto-selects it (deeper
-    // levels stay dense).
-    let sks_vks_n1 = eval_sk_at_vks(n1);
-    let _t = std::time::Instant::now();
     let use_c2 = c2::enabled(
         use_lazy_l1_ood,
         std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
     );
-    // Cache owned residues while the borrowed committed L0 codeword is live.
-    // Unsupported geometry takes the unchanged complete induction below.
-    let sparse_l0 = use_c2.then(|| {
-        c2::Dual::new(
-            n1 + log_inv_rate_0,
-            log_inv_rate_0,
-            &r_lane_fold,
-            &queries_0,
-            &alpha_0,
-            l0_row,
+    let open_l0 = || {
+        use rayon::prelude::*;
+        rayon::join(
+            || merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0),
+            || queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect::<Vec<Vec<F128>>>(),
         )
-    });
-    let full_l0 = if use_c2 {
-        None
+    };
+    let _t = std::time::Instant::now();
+    let ((merkle_proof_0, opened_rows_0), sparse_l0, full_l0) = if use_c2 {
+        let (dual, opened) = rayon::join(
+            || {
+                c2::Dual::new(
+                    n1 + log_inv_rate_0,
+                    log_inv_rate_0,
+                    &r_lane_fold,
+                    &queries_0,
+                    &alpha_0,
+                    l0_row,
+                )
+            },
+            open_l0,
+        );
+        (opened, Some(dual), None)
     } else {
-        Some(induce_sumcheck_poly_auto_with_ranked_msg(
+        let opened = open_l0();
+        if trace {
+            t_opens += _t.elapsed();
+        }
+        let sks_vks_n1 = eval_sk_at_vks(n1);
+        let full = induce_sumcheck_poly_auto_with_ranked_msg(
             n1,
             log_inv_rate_0,
             &sks_vks_n1,
-            &opened_rows_0,
+            &opened.1,
             &r_lane_fold,
             &queries_0,
             &alpha_0,
             sc_prover.f(),
-        ))
+        );
+        (opened, None, Some(full))
     };
     if trace {
         eprintln!("  C2 selected={use_c2}");
@@ -9012,16 +9011,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            let opened_rows_last: Vec<Vec<F128>> = {
+            let (merkle_proof_last, opened_rows_last): (Vec<Hash>, Vec<Vec<F128>>) = {
                 use rayon::prelude::*;
-                // Order-preserving parallel collect — bit-identical.
-                queries_last
-                    .par_iter()
-                    .map(|&q| wtns_prev.row(q).to_vec())
-                    .collect()
+                rayon::join(
+                    || merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last),
+                    || {
+                        queries_last
+                            .par_iter()
+                            .map(|&q| wtns_prev.row(q).to_vec())
+                            .collect()
+                    },
+                )
             };
-            let merkle_proof_last =
-                merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last);
             if trace {
                 t_opens += _t.elapsed();
             }
@@ -9199,16 +9200,18 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
         let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let _t = std::time::Instant::now();
-        let opened_rows_i: Vec<Vec<F128>> = {
+        let (merkle_proof_i, opened_rows_i): (Vec<Hash>, Vec<Vec<F128>>) = {
             use rayon::prelude::*;
-            // Order-preserving parallel collect — bit-identical.
-            queries_i
-                .par_iter()
-                .map(|&q| wtns_prev.row(q).to_vec())
-                .collect()
+            rayon::join(
+                || merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i),
+                || {
+                    queries_i
+                        .par_iter()
+                        .map(|&q| wtns_prev.row(q).to_vec())
+                        .collect()
+                },
+            )
         };
-        let merkle_proof_i =
-            merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i);
         if trace {
             t_opens += _t.elapsed();
         }
@@ -9230,7 +9233,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         } else {
             wtns_prev.tree = Vec::new();
         }
-        let sks_vks_i = eval_sk_at_vks(n_next);
         let use_l2_pruned_sparse_ntt = ranked_l2_pruned_sparse_ntt_enabled(
             config,
             log_n,
@@ -9287,6 +9289,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     use_l2_factored_final5,
                 )
             } else {
+                let sks_vks_i = eval_sk_at_vks(n_next);
                 induce_sumcheck_poly(
                     n_next,
                     &sks_vks_i,
