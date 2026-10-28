@@ -1269,6 +1269,14 @@ pub(crate) fn gpu_leaf_vec4_enabled() -> bool {
     *ON.get_or_init(|| gpu_leaf_vec4_value_enabled(std::env::var_os(ENV_LEAF_VEC4).as_deref()))
 }
 
+/// Kill switch for the two-tiles-per-thread g4 NTT pass
+/// (`ntt_fused_reg4g4x2`): `FLOCK_NO_GPU_G4X2` (any value) keeps
+/// `ntt_fused_reg4g4`. Both kernels write the same bytes.
+pub(crate) fn gpu_g4x2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_G4X2").is_none())
+}
+
 #[cfg(test)]
 mod leaf_vec4_gate_tests {
     use std::ffi::OsStr;
@@ -3548,6 +3556,184 @@ kernel void export_from_z_zero_root_tabs(
 }
 "#;
 
+    /// The f = 4, s > 2 NTT pass with two tiles per thread: the group of
+    /// `ntt_fused_reg4g4` (64 threads, four same-B tiles per group, LOG_G = 2,
+    /// the same table build and the same threadgroup allocation), but each
+    /// lane holds two tiles' columns in registers and multiplies both by each
+    /// live twiddle table in one interleaved pass, two rounds of two tiles.
+    /// Every tile sees the same butterflies, in the same order, over the same
+    /// tables, so the output is bit-identical. Its own library, so a compile
+    /// failure leaves `ntt_fused_reg4g4` in place.
+    const NTT_G4X2_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NttParams {
+    uint log_d;   // log2 of positions
+    uint l;       // first fused layer
+    uint f;       // number of fused layers (1..=4)
+    uint s;       // log_d - l - f
+};
+
+static inline uint4 gf_mulx(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// gf_mul_byte16 of two values by the same table, the two Horner chains
+// interleaved step by step. Each chain is gf_mul_byte16's own sequence.
+static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,
+                                    threadgroup const uint4* tab,
+                                    thread uint4& ra, thread uint4& rb)
+{
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        a ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
+        b ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
+    }
+    ra = a;
+    rb = b;
+}
+
+// The 64-thread table build of ntt_fused_reg4g4 (gf_build_byte16), unchanged.
+static inline void gf_build_byte16(
+    threadgroup uint4* tabB, device const uint4* twiddles, uint idx, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;        // 0: b*tw          1: b*(tw*x^8)
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;          // owns entry bits 2..3
+    const uint cc = u >> 2;          // owns entry bits 5..7
+    uint4 g = twiddles[idx];
+    if (t != 0u) {
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+    }
+    uint4 e0 = g;
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);   // entry (cc << 5) | (aa << 2)
+    const uint o1 = o0 + 16u;                //   ... | 16
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// One f=4 sub-layer over both register tiles `ea` and `eb`. J must be a
+// literal so the butterfly indices stay compile-time and both arrays stay in
+// registers.
+#define NTT_G4X2_SUBLAYER(J)                                                   \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint NC   = 1u << j;                                         \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        for (uint c = 0; c < NC; c++) {                                        \
+            gf_build_byte16(tabB, twiddles,                                    \
+                            (1u << (P.l + j)) - 1u + (B << j) + c, lid);       \
+            for (uint bb = 0; bb < BPER; bb++) {                               \
+                const uint b   = c * BPER + bb;                                \
+                const uint low = b & ((1u << bpos) - 1u);                      \
+                const uint eu  = ((b >> bpos) << (bpos + 1u)) | low;           \
+                const uint ev  = eu | (1u << bpos);                            \
+                uint4 pa;                                                      \
+                uint4 pb;                                                      \
+                gf_mul_byte16_x2(ea[ev], eb[ev], &tabB[0], pa, pb);            \
+                const uint4 na = ea[eu] ^ pa;                                  \
+                const uint4 nb = eb[eu] ^ pb;                                  \
+                ea[eu] = na;                                                   \
+                ea[ev] ^= na;                                                  \
+                eb[eu] = nb;                                                   \
+                eb[ev] ^= nb;                                                  \
+            }                                                                  \
+        }                                                                      \
+    }
+
+// ntt_fused_reg4g4's group (64 threads, four same-B tiles, LOG_G = 2, the
+// same 8 KiB table plus the same never-read residency pad), but each lane
+// holds two tiles' columns at once and multiplies both by each live table
+// in one interleaved pass: two rounds of two tiles instead of four rounds
+// of one. Same butterflies, same order, same tables: bit-identical output.
+[[max_total_threads_per_threadgroup(64)]]
+kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
+                               device const uint4* twiddles      [[buffer(1)]],
+                               constant NttParams& P             [[buffer(2)]],
+                               uint tgid [[threadgroup_position_in_grid]],
+                               uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F     = 4u;
+    constexpr uint NF    = 1u << F;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 tabB[512u];      // 8,192 B: the live twiddle's tables
+    threadgroup uint4 pad[124u];       // 1,984 B: residency only, never read
+
+    const uint lane = lid;
+    const uint B = tgid >> (P.s - LOG_G);
+    const uint r_base = (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;
+
+    for (uint it = 0; it < 2u; it++) {
+        const uint ra = r_base + (it << 1);
+        const uint rb = ra + 1u;
+        const uint pa = (B << (P.log_d - P.l)) + ra;
+        const uint pb = (B << (P.log_d - P.l)) + rb;
+        uint4 ea[NF];
+        uint4 eb[NF];
+        for (uint e = 0; e < NF; e++) {
+            ea[e] = data[((pa + (e << P.s)) << 6) + lane];
+            eb[e] = data[((pb + (e << P.s)) << 6) + lane];
+        }
+        NTT_G4X2_SUBLAYER(0u)
+        NTT_G4X2_SUBLAYER(1u)
+        NTT_G4X2_SUBLAYER(2u)
+        NTT_G4X2_SUBLAYER(3u)
+        if (P.log_d == 77u) {          /* unreachable; keeps `pad` allocated */
+            pad[lid % 124u] = ea[0];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ea[0] ^= pad[(lid + 1u) % 124u];
+        }
+        for (uint e = 0; e < NF; e++) {
+            data[((pa + (e << P.s)) << 6) + lane] = ea[e];
+            data[((pb + (e << P.s)) << 6) + lane] = eb[e];
+        }
+    }
+}
+"#;
+
     // One BLAKE3 compression per nonce.  The protocol hashes the exact
     // 64-byte single-chunk message `state_digest || nonce_le || 24*0`; ROOT is
     // therefore set together with CHUNK_START/CHUNK_END.  Each dispatch owns
@@ -3791,6 +3977,11 @@ kernel void blake3_pow_scan(
         /// incumbent pipelines (both emit bit-identical trees).
         pub(crate) pso_leaf_v4: Id,
         pub(crate) pso_parent3_v4: Id,
+        /// Supplemental two-tiles-per-thread g4 NTT pass. `NIL` when its
+        /// compile failed, its pipeline cannot run 64-thread groups, or
+        /// `FLOCK_NO_GPU_G4X2` is set; the NTT encoders then keep
+        /// `pso_ntt4g4`, which writes the same bytes.
+        pub(crate) pso_ntt4g4x2: Id,
         /// Supplemental PCS Fiat--Shamir BLAKE3 nonce scanner.  Its single
         /// shared result word is protected because `Gpu` itself is global.
         pub(crate) pso_pow: Id,
@@ -4292,6 +4483,76 @@ kernel void blake3_pow_scan(
                 } else {
                     (NIL, NIL)
                 };
+                // Supplemental two-tiles-per-thread g4 NTT pass, its own
+                // library. Any failure, or a pipeline that cannot run a
+                // 64-thread group, leaves NIL and the encoders keep
+                // `ntt_fused_reg4g4`.
+                let pso_ntt4g4x2 = if super::gpu_g4x2_enabled() {
+                    (|| -> Result<Id, String> {
+                        let src = api.nsstring(NTT_G4X2_MSL_SOURCE)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!(
+                                "g4x2 shader compile failed: {}",
+                                api.error_string(err)
+                            ));
+                        }
+                        let ns = api.nsstring("ntt_fused_reg4g4x2")?;
+                        let f: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            library,
+                            c"newFunctionWithName:",
+                            ns
+                        );
+                        if f.is_null() {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            return Err("g4x2 kernel not found".into());
+                        }
+                        let mut pso_err: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            f,
+                            &mut pso_err
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        if pso.is_null() {
+                            return Err(format!("g4x2 pipeline: {}", api.error_string(pso_err)));
+                        }
+                        let max_threads: u64 = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> u64,
+                            pso,
+                            c"maxTotalThreadsPerThreadgroup"
+                        );
+                        if max_threads < 64 {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                            return Err(format!("g4x2 pipeline allows {max_threads} threads"));
+                        }
+                        Ok(pso)
+                    })()
+                    .unwrap_or_else(|e| {
+                        if debug_enabled() {
+                            eprintln!("[gpu-commit] {e}; keeping ntt_fused_reg4g4");
+                        }
+                        NIL
+                    })
+                } else {
+                    NIL
+                };
                 Ok(Gpu {
                     api,
                     device,
@@ -4312,6 +4573,7 @@ kernel void blake3_pow_scan(
                     pso_leaf_parent3,
                     pso_leaf_v4,
                     pso_parent3_v4,
+                    pso_ntt4g4x2,
                     pso_pow,
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
@@ -4868,6 +5130,9 @@ kernel void blake3_pow_scan(
                 // loses badly because each lane keeps 16 F128s live.
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
+                    4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
+                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                    }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
                     }
@@ -4929,6 +5194,9 @@ kernel void blake3_pow_scan(
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
+                    4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
+                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                    }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
                     }
@@ -6107,6 +6375,80 @@ kernel void blake3_pow_scan(
                 let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
                 let suffix_leaf_start = prefix_leaves;
                 let suffix_leaves = n_leaves - prefix_leaves;
+                // S1: the GPU hashes the CPU suffix's leaves and subtree
+                // parents. The CPU still finishes the suffix NTT (same
+                // kernels, same order, a no-op chunk callback), then queues
+                // one more command buffer that runs the same
+                // `encode_merkle_subtree` kernels the GPU prefix uses over
+                // the suffix's aligned subtrees. Same leaf bytes, same BLAKE3
+                // tree, same flat-tree slots, so the root is unchanged.
+                if hybrid_gpu_suffix_hash_enabled() {
+                    ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                        data,
+                        64,
+                        4,
+                        log_d,
+                        16 - k_cpu16,
+                        16,
+                        |_elem_offset: usize, _chunk: &[F128]| {},
+                    );
+                    let cb3 = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb3)?;
+                    let mut sstart = suffix_leaf_start;
+                    while sstart < n_leaves {
+                        let mut size = 1usize << (n_leaves - sstart).ilog2();
+                        while sstart % size != 0 {
+                            size >>= 1;
+                        }
+                        encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size);
+                        sstart += size;
+                    }
+                    gpu.end_encoding(enc);
+                    gpu.commit_async(cb3);
+                    // Same queue: cb3 runs after cb2, so waiting for cb3
+                    // also covers cb2; wait for both explicitly anyway.
+                    if super::hybrid_cb2_spin_enabled() {
+                        gpu.yield_wait_cb_until(
+                            cb2,
+                            std::time::Instant::now() + std::time::Duration::from_millis(4),
+                        )?;
+                        gpu.yield_wait_cb_until(
+                            cb3,
+                            std::time::Instant::now() + std::time::Duration::from_millis(4),
+                        )?;
+                    } else {
+                        gpu.wait_cb(cb2)?;
+                        gpu.wait_cb(cb3)?;
+                    }
+                    if window_trace_enabled() {
+                        let (s, e) = cb_gpu_interval(gpu, cb3);
+                        eprintln!(
+                            "[gpu-window] cb3 (gpu suffix merkle, k={k_cpu16}): gpu dur {:.2} ms",
+                            (e - s) * 1e3
+                        );
+                    }
+                    let mut level_start = 0usize;
+                    let mut level_len = n_leaves;
+                    while level_len > 16 {
+                        level_start += level_len;
+                        level_len /= 2;
+                    }
+                    while level_len > 1 {
+                        let write_start = level_start + level_len;
+                        let read = core::slice::from_raw_parts(
+                            tree_base.ptr().add(level_start),
+                            level_len,
+                        );
+                        let write = core::slice::from_raw_parts_mut(
+                            tree_base.ptr().add(write_start),
+                            level_len / 2,
+                        );
+                        crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                        level_start = write_start;
+                        level_len /= 2;
+                    }
+                    return Ok(());
+                }
                 let deep_pipeline = hybrid_cpu_suffix_deep_pipeline_enabled();
                 let local_parent_levels = if deep_pipeline {
                     hybrid_local_parent_levels()
@@ -6450,9 +6792,11 @@ kernel void blake3_pow_scan(
     /// ranked runner. With F2 graph-arm scoring the mid-basin point k=2 is
     /// informative again — it was invisible when join-max scoring collapsed
     /// AB-dominated samples — so it re-enters between pure-GPU and k=3.
-    /// Four candidates × 2 reverse-order samples is still well inside the
-    /// 10-minute job wall at ~120 workers.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 4] = [0, 2, 3, 5];
+    /// k=4 fills the gap between k=3 and the default: a GPU-heavy host whose
+    /// balanced split sits between the two otherwise rounds to one side.
+    /// Five candidates × 2 reverse-order samples, all in the untimed warmup,
+    /// is still well inside the 10-minute job wall at ~120 workers.
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 5] = [0, 2, 3, 4, 5];
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
@@ -7010,6 +7354,14 @@ kernel void blake3_pow_scan(
     /// chunk before eviction. `FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP=1` restores the
     /// original all-layer streaming suffix plus separate leaf-hash pass for an
     /// exact same-binary comparison.
+    /// S1 kill switch: `FLOCK_NO_HYBRID_GPU_SUFFIX_HASH=1` restores the CPU
+    /// suffix leaf/parent hashing.
+    fn hybrid_gpu_suffix_hash_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_GPU_SUFFIX_HASH").is_none())
+    }
+
     fn hybrid_cpu_suffix_deep_pipeline_enabled() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
@@ -7165,10 +7517,15 @@ kernel void blake3_pow_scan(
     }
 
     fn warmup_cache_msl_fnv() -> u64 {
-        warmup_cache_msl_fnv_for(
+        let key = warmup_cache_msl_fnv_for(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
-        )
+        );
+        if super::gpu_g4x2_enabled() {
+            key ^ fnv1a64(NTT_G4X2_MSL_SOURCE).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
+        } else {
+            key
+        }
     }
 
     #[cfg(test)]
@@ -10319,7 +10676,7 @@ kernel void lc_fold_stripes_factored_b4(
 
         #[test]
         fn trimmed_candidate_set_is_stable() {
-            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, C);
+            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, [0, 2, 3, 4, 5]);
         }
 
         #[test]
@@ -10336,13 +10693,14 @@ kernel void lc_fold_stripes_factored_b4(
                 },
             )
             .unwrap();
-            // Forward 0,2,3,5 then reverse 5,3,2,0 — each preceded by reprime.
+            // Forward 0,2,3,4,5 then reverse 5,4,3,2,0 — each preceded by reprime.
             assert_eq!(
                 *events.borrow(),
-                [-1, 0, -1, 2, -1, 3, -1, 5, -1, 5, -1, 3, -1, 2, -1, 0]
+                [-1, 0, -1, 2, -1, 3, -1, 4, -1, 5, -1, 5, -1, 4, -1, 3, -1, 2, -1, 0]
             );
             assert_eq!(samples[0], [0.0, 0.0]);
-            assert_eq!(samples[3], [5.0, 5.0]);
+            assert_eq!(samples[3], [4.0, 4.0]);
+            assert_eq!(samples[4], [5.0, 5.0]);
         }
 
         #[test]
@@ -10461,7 +10819,7 @@ kernel void lc_fold_stripes_factored_b4(
                 state ^= state << 17;
                 grid[(state % grid.len() as u64) as usize]
             };
-            let sets: [&[usize]; 2] = [&C, &[0, 2, 3, 4, 5, 6, 7, 8]];
+            let sets: [&[usize]; 3] = [&C, &RANKED_EXACT_TUNE_CANDIDATES, &[0, 2, 3, 4, 5, 6, 7, 8]];
             for set in sets {
                 for &tie in &[0.005, 0.015, 0.02, 0.05] {
                     for &keep in &[false, true] {
@@ -10476,7 +10834,7 @@ kernel void lc_fold_stripes_factored_b4(
                                 assert_eq!(k, DEFAULT_HYBRID_K, "{ms:?} tie={tie} keep");
                                 continue;
                             }
-                            // set[0] == 0 in both candidate sets.
+                            // set[0] == 0 in every candidate set.
                             let zero_in_band = ms[0] <= limit;
                             let zero_passes = ms[0] <= ms[d] * (1.0 - 0.04);
                             if zero_in_band && zero_passes {
