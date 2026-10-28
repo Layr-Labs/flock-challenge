@@ -1,9 +1,23 @@
 //! Recycling global allocator for the prover process.
 //!
-//! Blocks at least 32 KiB are parked on exact-size freelists rather than
+//! Blocks at least 16 KiB are parked on exact-size freelists rather than
 //! returned to libmalloc. The ranked worker performs an untimed warm proof
 //! with the same allocation pattern, so the timed proof reuses resident pages
 //! for large allocations not already handled by the typed scratch pools.
+//!
+//! Class table size. A census of the worker after its warm-up (one proof at
+//! log size 18, ten threads) found the previous 512-entry table completely
+//! occupied by exact sizes between 16 KiB and 34 KiB: 512 keys, 484 non-empty
+//! heads, and no size of 1 MiB or more registered at all. Every later exact
+//! size (the multi-megabyte NTT, Merkle and open buffers) therefore failed to
+//! register, was allocated and freed through libmalloc on every proof, and
+//! each failed lookup walked the full table: 31,300 `pop` calls made
+//! 10,343,242 slot probes and found a block 10,026 times. With an 8192-entry
+//! table the same run registers 3,362 sizes (seven of them 1 MiB or larger,
+//! the largest 28 MiB), probes 47,624 slots and finds a block 25,373 times.
+//! The table is a static array of 24-byte classes, so the larger table costs
+//! 192 KiB of process memory and nothing else; hashing, collision resolution,
+//! the exact-size keys and the intrusive freelists are unchanged.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
@@ -14,7 +28,7 @@ use std::sync::atomic::{
 
 const RECYCLE_MIN: usize = 16 * 1024;
 const MAX_ALIGN: usize = 16;
-const MAX_CLASSES: usize = 512;
+const MAX_CLASSES: usize = 8192;
 
 struct Class {
     size: AtomicUsize,
@@ -28,9 +42,13 @@ const EMPTY: Class = Class {
 };
 static CLASSES: [Class; MAX_CLASSES] = [EMPTY; MAX_CLASSES];
 
+const _: () = assert!(MAX_CLASSES == 1 << CLASS_BITS);
+const CLASS_BITS: u32 = 13;
+
 #[inline]
 fn class_slot(size: usize) -> usize {
-    (size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) % MAX_CLASSES
+    // Top `CLASS_BITS` bits of the Fibonacci hash, as before (then 9 bits).
+    (size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - CLASS_BITS)) % MAX_CLASSES
 }
 
 #[inline]
