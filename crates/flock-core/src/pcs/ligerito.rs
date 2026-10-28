@@ -4029,6 +4029,14 @@ fn scatter_active_windows(
     let window_mask = window_len - 1;
     let mut arena = vec![F128::ZERO; groups.len() * window_len];
     for (arena_index, group) in groups.iter().enumerate() {
+        if group.input_end - group.input_start == 1 {
+            // Singleton window: stays zero here; `transform_active_windows`
+            // expands its one input directly (see `expand_singleton_window`).
+            // Group mates share the window index but carry distinct positions
+            // (sorted distinct queries), so a length-1 group holds exactly one
+            // nonzero.
+            continue;
+        }
         let window = &mut arena[arena_index * window_len..(arena_index + 1) * window_len];
         for input_index in group.input_start..group.input_end {
             window[positions[input_index] & window_mask] += values[input_index];
@@ -4064,20 +4072,73 @@ fn transform_active_window(
     }
 }
 
+/// Singleton-window prefix shortcut: a window holding exactly one nonzero input
+/// at `local_pos` expands it through the `prefix_k` layers directly
+/// (`2^k - 1` products) instead of the dense `k * 2^(k-1)` butterflies of
+/// [`transform_active_window`]. Skipped all-zero pairs are exact identities
+/// (`0 + 0 = 0`, `twiddle * 0 + 0 = 0`), so the window is bit-identical to the
+/// dense transform. The window must be all zero on entry (left so by
+/// [`scatter_active_windows`]).
+fn expand_singleton_window(
+    ntt: &AdditiveNttF128,
+    window: &mut [F128],
+    window_index: usize,
+    prefix_k: usize,
+    log_d: usize,
+    local_pos: usize,
+    value: F128,
+) {
+    debug_assert!(window.iter().all(|&x| x == F128::ZERO));
+    window[local_pos] = value;
+    for s in 0..prefix_k {
+        let layer = log_d - 1 - s;
+        let half = 1usize << s;
+        let block_size = half << 1;
+        // Aligned power-of-two blocks nest, so the one block of this size
+        // holding the seed covers every nonzero the previous layer wrote.
+        let block = local_pos / block_size;
+        let twiddle = ntt.twiddle(layer, (window_index << (prefix_k - s - 1)) + block);
+        let base = block * block_size;
+        for row in 0..half {
+            let top = window[base + row];
+            let bottom = window[base + row + half];
+            let sum = top + bottom;
+            window[base + row] = sum;
+            window[base + row + half] = twiddle * sum + bottom;
+        }
+    }
+}
+
 fn transform_active_windows(
     ntt: &AdditiveNttF128,
     arena: &mut [F128],
     groups: &[ActiveWindow],
+    positions: &[usize],
+    values: &[F128],
     prefix_k: usize,
     log_d: usize,
 ) {
     use rayon::prelude::*;
     let window_len = 1usize << prefix_k;
+    let window_mask = window_len - 1;
     arena
         .par_chunks_mut(window_len)
         .zip(groups.par_iter())
         .for_each(|(window, group)| {
-            transform_active_window(ntt, window, group.window_index, prefix_k, log_d);
+            if group.input_end - group.input_start == 1 {
+                let input = group.input_start;
+                expand_singleton_window(
+                    ntt,
+                    window,
+                    group.window_index,
+                    prefix_k,
+                    log_d,
+                    positions[input] & window_mask,
+                    values[input],
+                );
+            } else {
+                transform_active_window(ntt, window, group.window_index, prefix_k, log_d);
+            }
         });
 }
 
@@ -4795,7 +4856,7 @@ fn transpose_forward_ntt_sparse_rate8_low_eighth(
     let prefix_k = 8usize.min(log_d - 3);
     let groups = group_sorted_positions(positions, prefix_k);
     let mut arena = scatter_active_windows(&groups, positions, values, prefix_k);
-    transform_active_windows(ntt, &mut arena, &groups, prefix_k, log_d);
+    transform_active_windows(ntt, &mut arena, &groups, positions, values, prefix_k, log_d);
 
     let (mut data, mut remaining) = if use_l2_fused_densify {
         assert_eq!(log_d, 16, "ranked L2 fused densify requires log_d=16");
@@ -4916,7 +4977,7 @@ fn transpose_forward_ntt_sparse_impl(
 
     let mut arena = scatter_active_windows(&groups, positions, values, k);
 
-    transform_active_windows(ntt, &mut arena, &groups, k, log_d);
+    transform_active_windows(ntt, &mut arena, &groups, positions, values, k, log_d);
 
     let use_fused_densify = use_ranked_fused_densify_first(log_d, k, positions.len());
     let (mut data, dense_prefix_k) = if use_fused_densify {
@@ -15216,7 +15277,7 @@ mod tests {
             let ntt = AdditiveNttF128::standard(log_d);
             let groups = group_sorted_positions(&positions, PREFIX_K);
             let mut arena = scatter_active_windows(&groups, &positions, &values, PREFIX_K);
-            transform_active_windows(&ntt, &mut arena, &groups, PREFIX_K, log_d);
+            transform_active_windows(&ntt, &mut arena, &groups, &positions, &values, PREFIX_K, log_d);
 
             let mut expected = densify_active_windows(&arena, &groups, log_d, PREFIX_K);
             let first_layer = log_d - PREFIX_K - 3;
@@ -15298,7 +15359,7 @@ mod tests {
         let ntt = AdditiveNttF128::standard(LOG_D);
         let groups = group_sorted_positions(&positions, PREFIX_K);
         let mut arena = scatter_active_windows(&groups, &positions, &values, PREFIX_K);
-        transform_active_windows(&ntt, &mut arena, &groups, PREFIX_K, LOG_D);
+        transform_active_windows(&ntt, &mut arena, &groups, &positions, &values, PREFIX_K, LOG_D);
 
         let mut control = densify_active_windows(&arena, &groups, LOG_D, PREFIX_K);
         let first_layer = LOG_D - PREFIX_K - 3;
@@ -15375,7 +15436,7 @@ mod tests {
             let ntt = AdditiveNttF128::standard(log_d);
             let groups = group_sorted_positions(&positions, PREFIX_K);
             let mut arena = scatter_active_windows(&groups, &positions, &values, PREFIX_K);
-            transform_active_windows(&ntt, &mut arena, &groups, PREFIX_K, log_d);
+            transform_active_windows(&ntt, &mut arena, &groups, &positions, &values, PREFIX_K, log_d);
             let first_layer = log_d - PREFIX_K - 3;
 
             let mut active_blocks = 0usize;
