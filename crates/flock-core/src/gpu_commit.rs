@@ -541,6 +541,31 @@ fn zc_r2_horner_weights(eq_lo: &[F128], lo_size: usize) -> bool {
     true
 }
 
+// Match the current two-edge nibble fold, including nonlinear banks and
+// nonzero entries at zero. The destination can be fresh Metal storage.
+fn zc_r2_expand_byte_table(nib: &[F128], dst: &mut [core::mem::MaybeUninit<F128>]) {
+    debug_assert_eq!(nib.len(), 256);
+    debug_assert_eq!(dst.len(), 2048);
+    for j in 0..8 {
+        for h in 0..16 {
+            let high = nib[j * 32 + 16 + h];
+            for l in 0..16 {
+                dst[j * 256 + 16 * h + l].write(nib[j * 32 + l] + high);
+            }
+        }
+    }
+}
+
+fn zc_r2_byte_limits_fit(usage: (u64, u64, u64), device_shared: u64, dimensions: [u64; 3]) -> bool {
+    usage.0 == 32768
+        && usage.1 == 32
+        && usage.2 >= 256
+        && device_shared >= 32768
+        && dimensions[0] >= 256
+        && dimensions[1] >= 1
+        && dimensions[2] >= 1
+}
+
 pub(crate) fn gpu_zc_r2_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_R2).is_none());
@@ -5104,7 +5129,6 @@ kernel void blake3_pow_scan(
             }
         }
 
-        #[cfg(test)]
         pub(crate) unsafe fn pipeline_resources(&self, pso: Id) -> (u64, u64, u64) {
             unsafe {
                 let static_tg: u64 = send!(
@@ -12705,6 +12729,72 @@ kernel void zc_r2_products_horner(
 
 "#;
 
+    const ZC_R2_BYTE_MSL_SOURCE: &str = r#"
+static inline uint4 zc_r2_fold8_byte(uint lo, uint hi, threadgroup const uint4* byte_tab) {
+    uint4 acc = uint4(0u);
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (lo >> (8u * j)) & 0xffu;
+        acc ^= byte_tab[j * 256u + b];
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (hi >> (8u * j)) & 0xffu;
+        acc ^= byte_tab[(j + 4u) * 256u + b];
+    }
+    return acc;
+}
+
+kernel void zc_r2_products_horner_byte(
+    device const uint4* a_in  [[buffer(0)]],
+    device const uint4* b_in  [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* byte_tab_dev [[buffer(4)]],
+    device uint4*       partials    [[buffer(5)]],
+    constant ZcR2Params& p          [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup ulong4 red[1024];
+    threadgroup uint4* byte_tab = reinterpret_cast<threadgroup uint4*>(red);
+    for (uint i = lid; i < 2048u; i += 256u) {
+        byte_tab[i] = byte_tab_dev[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint hi_chunk = tgid >> 2;
+    uint window = ((tgid & 3u) << 6) | (lid >> 2);
+    uint small_class = lid & 3u;
+    U320k h1 = {0ul, 0ul, 0ul, 0ul, 0ul};
+    U320k hi = {0ul, 0ul, 0ul, 0ul, 0ul};
+    for (uint step = 0u; step < p.xpt; step++) {
+        if (step != 0u) {
+            zc_r2_horner_shift(h1);
+            zc_r2_horner_shift(hi);
+        }
+        uint medium = 15u - step;
+        uint x_lo = (window << 6) | (medium << 2) | small_class;
+        uint pair_idx = hi_chunk * p.lo_size + x_lo;
+        // A padded term is zero, but the Horner shifts must still occur.
+        if ((pair_idx & p.mask) >= p.useful) { continue; }
+        uint4 ar = a_in[pair_idx];
+        uint4 br = b_in[pair_idx];
+        uint4 a0 = zc_r2_fold8_byte(ar.x, ar.y, byte_tab);
+        uint4 a1 = zc_r2_fold8_byte(ar.z, ar.w, byte_tab);
+        uint4 b0 = zc_r2_fold8_byte(br.x, br.y, byte_tab);
+        uint4 b1 = zc_r2_fold8_byte(br.z, br.w, byte_tab);
+        zc_r2_horner_add(h1, clmul128(a1, b1));
+        zc_r2_horner_add(hi, clmul128(a0 ^ a1, b0 ^ b1));
+    }
+    uint4 e = eq_lo[window * 4u + small_class];
+    U256k m1 = clmul128(e, zc_r2_horner_reduce(h1));
+    U256k mi = clmul128(e, zc_r2_horner_reduce(hi));
+    ulong4 acc1 = ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
+    ulong4 acci = ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid);
+}
+"#;
+
     fn zc_r2_msl_source(incumbent: bool) -> std::borrow::Cow<'static, str> {
         if incumbent {
             std::borrow::Cow::Owned(format!(
@@ -12712,6 +12802,78 @@ kernel void zc_r2_products_horner(
             ))
         } else {
             std::borrow::Cow::Borrowed(ZC_R2_MSL_SOURCE)
+        }
+    }
+
+    unsafe fn zc_r2_byte_pipeline(gpu: &Gpu) -> Result<Id, String> {
+        unsafe {
+            let source = format!(
+                "{}\n{ZC_R2_BYTE_MSL_SOURCE}",
+                zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled())
+            );
+            let src = gpu.api.nsstring(&source)?;
+            let name = gpu.api.nsstring("zc_r2_products_horner_byte")?;
+            let mut err: Id = NIL;
+            let library: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newLibraryWithSource:options:error:",
+                src,
+                NIL,
+                &mut err
+            );
+            if library.is_null() {
+                return Err(format!("zc-r2 byte compile: {}", gpu.api.error_string(err)));
+            }
+            let function: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                library,
+                c"newFunctionWithName:",
+                name
+            );
+            if function.is_null() {
+                gpu.release(library);
+                return Err("zc-r2 byte kernel not found".into());
+            }
+            let pso: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newComputePipelineStateWithFunction:error:",
+                function,
+                &mut err
+            );
+            gpu.release(function);
+            gpu.release(library);
+            if pso.is_null() {
+                return Err(format!(
+                    "zc-r2 byte pipeline: {}",
+                    gpu.api.error_string(err)
+                ));
+            }
+            let device_shared: u64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> u64,
+                gpu.device,
+                c"maxThreadgroupMemoryLength"
+            );
+            let dimensions: MtlSize = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> MtlSize,
+                gpu.device,
+                c"maxThreadsPerThreadgroup"
+            );
+            if !super::zc_r2_byte_limits_fit(
+                gpu.pipeline_resources(pso),
+                device_shared,
+                [dimensions.width, dimensions.height, dimensions.depth],
+            ) {
+                gpu.release(pso);
+                return Err("zc-r2 byte pipeline limits declined".into());
+            }
+            Ok(pso)
         }
     }
 
@@ -12771,6 +12933,9 @@ kernel void zc_r2_horner_oracle(
     struct ZcR2 {
         pso: Id,
         horner_pso: Id,
+        /// Optional four-group byte pipeline and 32 KiB expanded table.
+        byte_pso: Id,
+        byte_buf: Id,
         /// Persistent small buffers: nibble table (4 KiB), eq_lo, eq_hi,
         /// reduced partials. Sized on first use for the ranked shape.
         nib_buf: Id,
@@ -12954,12 +13119,38 @@ kernel void zc_r2_horner_oracle(
                 gpu.release(library);
                 built
             })();
+            let built = built.and_then(|(pso, horner_pso)| {
+                let nib_buf = match gpu.new_buffer(256 * 16) {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        gpu.release(horner_pso);
+                        gpu.release(pso);
+                        return Err(e);
+                    }
+                };
+                let (byte_pso, byte_buf) = if super::gpu_zc_r2_horner_enabled() {
+                    match zc_r2_byte_pipeline(gpu) {
+                        Ok(byte_pso) => match gpu.new_buffer(2048 * 16) {
+                            Ok(byte_buf) => (byte_pso, byte_buf),
+                            Err(_) => {
+                                gpu.release(byte_pso);
+                                (NIL, NIL)
+                            }
+                        },
+                        Err(_) => (NIL, NIL),
+                    }
+                } else {
+                    (NIL, NIL)
+                };
+                Ok((pso, horner_pso, nib_buf, byte_pso, byte_buf))
+            });
             gpu.pool_pop(pool);
-            let (pso, horner_pso) = built?;
-            let nib_buf = gpu.new_buffer(256 * 16)?;
+            let (pso, horner_pso, nib_buf, byte_pso, byte_buf) = built?;
             Ok(ZcR2 {
                 pso,
                 horner_pso,
+                byte_pso,
+                byte_buf,
                 nib_buf,
                 eq_lo_buf: NIL,
                 eq_lo_cap: 0,
@@ -12997,6 +13188,8 @@ kernel void zc_r2_horner_oracle(
         pub chunks: usize,
         calibration: bool,
         horner: bool,
+        byte: bool,
+        table_buf: Id,
         lo_size: usize,
         mask: u32,
         useful: u32,
@@ -13023,6 +13216,71 @@ kernel void zc_r2_horner_oracle(
         pub(crate) fn uses_horner(&self) -> bool {
             self.horner
         }
+
+        #[cfg(test)]
+        pub(crate) fn uses_byte_table(&self) -> bool {
+            self.byte
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) struct ZcR2ByteDecline {
+        pso: Id,
+        buf: Id,
+    }
+
+    #[cfg(test)]
+    impl Drop for ZcR2ByteDecline {
+        fn drop(&mut self) {
+            let mut state = zc_r2_state().unwrap().lock().unwrap();
+            if !self.pso.is_null() {
+                assert!(state.byte_pso.is_null());
+                state.byte_pso = self.pso;
+            }
+            if !self.buf.is_null() {
+                assert!(state.byte_buf.is_null());
+                state.byte_buf = self.buf;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_decline_byte(pso: bool, buffer: bool) -> ZcR2ByteDecline {
+        let gpu = gpu().unwrap();
+        let mut state = zc_r2_state().unwrap().lock().unwrap();
+        unsafe { zc_r2_drain_prefetch(gpu, &mut state) };
+        assert!(!state.byte_pso.is_null() && !state.byte_buf.is_null());
+        ZcR2ByteDecline {
+            pso: if pso {
+                std::mem::replace(&mut state.byte_pso, NIL)
+            } else {
+                NIL
+            },
+            buf: if buffer {
+                std::mem::replace(&mut state.byte_buf, NIL)
+            } else {
+                NIL
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_physical_partials(job: &ZcR2Job) -> Vec<[F128; 4]> {
+        let gpu = gpu().unwrap();
+        unsafe {
+            gpu.wait_cb(job.cb).unwrap();
+            let state = zc_r2_state().unwrap().lock().unwrap();
+            std::slice::from_raw_parts(
+                gpu.buffer_contents(state.part_buf).cast::<[F128; 4]>(),
+                job.chunks * if job.horner { 4 } else { 1 },
+            )
+            .to_vec()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_primer_pending() -> bool {
+        !zc_r2_state().unwrap().lock().unwrap().prefetch_cb.is_null()
     }
 
     /// Result of draining the round-two products arm.
@@ -13048,6 +13306,8 @@ kernel void zc_r2_horner_oracle(
         mask: u32,
         useful: u32,
         horner: bool,
+        byte: bool,
+        table_buf: Id,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -13063,16 +13323,27 @@ kernel void zc_r2_horner_oracle(
                 mask,
                 useful,
             };
-            let pb =
-                std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
             let cb = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb)?;
-            gpu.set_pipeline(enc, if horner { state.horner_pso } else { state.pso });
+            gpu.set_pipeline(
+                enc,
+                if byte {
+                    state.byte_pso
+                } else if horner {
+                    state.horner_pso
+                } else {
+                    state.pso
+                },
+            );
             gpu.set_buffer(enc, a_buf, 0, 0);
             gpu.set_buffer(enc, b_buf, 0, 1);
             gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
             gpu.set_buffer(enc, state.eq_hi_buf, 0, 3);
-            gpu.set_buffer(enc, state.nib_buf, 0, 4);
+            gpu.set_buffer(enc, table_buf, 0, 4);
             gpu.set_buffer(enc, state.part_buf, 0, 5);
             gpu.set_bytes(enc, pb, 6);
             gpu.dispatch(enc, (chunks * if horner { 4 } else { 1 }) as u64, 256);
@@ -13195,7 +13466,7 @@ kernel void zc_r2_horner_oracle(
     /// command buffer. The queue executes it after the fold's dispatches —
     /// i.e. in the measured GPU idle — wiring the wrapped pages and holding
     /// the clock. Its output (leading partials lanes, computed against the
-    /// stale/uninitialized nibble table) is never read: the real dispatch
+    /// stale/uninitialized fold table) is never read: the real dispatch
     /// rewrites every lane its drain consumes.
     ///
     /// Shape gates mirror `launch_zc_r2_products` exactly, so this never
@@ -13267,6 +13538,8 @@ kernel void zc_r2_horner_oracle(
                 }
                 let a_buf = zc_r2_wrap(&mut state, gpu, a_packed)?;
                 let b_buf = zc_r2_wrap(&mut state, gpu, b_packed)?;
+                let byte = horner && !state.byte_pso.is_null() && !state.byte_buf.is_null();
+                let table_buf = if byte { state.byte_buf } else { state.nib_buf };
                 let cb = zc_r2_submit(
                     gpu,
                     &state,
@@ -13277,6 +13550,8 @@ kernel void zc_r2_horner_oracle(
                     pair_in_block_mask as u32,
                     useful_pairs_inclusive as u32,
                     horner,
+                    byte,
+                    table_buf,
                 )?;
                 state.prefetch_cb = cb;
                 Ok(())
@@ -13381,6 +13656,20 @@ kernel void zc_r2_horner_oracle(
                     *nib.add(j * 32 + 16 + n) = table_data[j * 256 + (n << 4)];
                 }
             }
+            let byte = horner && !state.byte_pso.is_null() && !state.byte_buf.is_null();
+            let table_buf = if byte {
+                super::zc_r2_expand_byte_table(
+                    std::slice::from_raw_parts(nib, 256),
+                    std::slice::from_raw_parts_mut(
+                        gpu.buffer_contents(state.byte_buf)
+                            .cast::<core::mem::MaybeUninit<F128>>(),
+                        2048,
+                    ),
+                );
+                state.byte_buf
+            } else {
+                state.nib_buf
+            };
             // eq_lo / eq_hi / partials buffers (grown once, reused).
             zc_r2_upload_eq_lo(gpu, &mut state, eq_lo, horner).ok()?;
             let need_hi = hi_size * 16;
@@ -13418,6 +13707,8 @@ kernel void zc_r2_horner_oracle(
                 pair_in_block_mask as u32,
                 useful_pairs_inclusive as u32,
                 horner,
+                byte,
+                table_buf,
             )
             .ok()?;
             Some(ZcR2Job {
@@ -13427,6 +13718,8 @@ kernel void zc_r2_horner_oracle(
                 chunks,
                 calibration,
                 horner,
+                byte,
+                table_buf,
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
@@ -13564,6 +13857,8 @@ kernel void zc_r2_horner_oracle(
                     job.mask,
                     job.useful,
                     job.horner,
+                    job.byte,
+                    job.table_buf,
                 ) else {
                     break;
                 };
@@ -17545,23 +17840,64 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         }
     }
 
-    /// Round-two products arm oracle: the GPU's per-chunk reduced partials
-    /// must equal the CPU's `(eq_hi · p1, eq_hi · pinf)` bit-for-bit, on a
-    /// linear byte table (the real `UniSkipFoldTable` is F2-linear by
-    /// construction — the nibble decomposition the kernel uses depends on
-    /// it), including padded pairs. Exercises calibration (whose internal
-    /// equality check must pass and publish a share without poisoning) and
-    /// the timed prefix path.
     #[test]
-    fn gpu_zc_r2_products_match_cpu_oracle() {
-        for (lo_size, hi_size, fixed_weights) in
-            [(512, 64, false), (16_384, 8, true), (16_384, 8, false)]
-        {
-            zc_r2_products_case(lo_size, hi_size, fixed_weights);
+    fn gpu_zc_r2_byte_table_expansion_and_limits() {
+        let nib: Vec<F128> = (0..256)
+            .map(|i| F128::new((i * i + 17) as u64, (i * 71 + 3) as u64))
+            .collect();
+        let mut table = vec![core::mem::MaybeUninit::uninit(); 2048];
+        zc_r2_expand_byte_table(&nib, &mut table);
+        for j in 0..8 {
+            assert_ne!(nib[j * 32], F128::ZERO);
+            assert_ne!(nib[j * 32 + 3], nib[j * 32 + 1] + nib[j * 32 + 2]);
+            for h in 0..16 {
+                for l in 0..16 {
+                    assert_eq!(
+                        unsafe { table[j * 256 + 16 * h + l].assume_init() },
+                        nib[j * 32 + l] + nib[j * 32 + 16 + h],
+                    );
+                }
+            }
+        }
+        assert!(zc_r2_byte_limits_fit((32768, 32, 256), 32768, [256, 1, 1]));
+        for (usage, shared, dimensions) in [
+            ((32767, 32, 256), 32768, [256, 1, 1]),
+            ((32769, 32, 256), 32768, [256, 1, 1]),
+            ((32768, 16, 256), 32768, [256, 1, 1]),
+            ((32768, 32, 255), 32768, [256, 1, 1]),
+            ((32768, 32, 256), 32767, [256, 1, 1]),
+            ((32768, 32, 256), 32768, [255, 1, 1]),
+            ((32768, 32, 256), 32768, [256, 0, 1]),
+            ((32768, 32, 256), 32768, [256, 1, 0]),
+        ] {
+            assert!(!zc_r2_byte_limits_fit(usage, shared, dimensions));
         }
     }
 
-    fn zc_r2_products_case(lo_size: usize, hi_size: usize, fixed_weights: bool) {
+    /// Round-two products arm oracle: the GPU's per-chunk reduced partials
+    /// must equal all four parity-split CPU values, including every physical
+    /// Horner group. Check linear tables and arbitrary nonlinear, nonzero-zero
+    /// banks using the exact current two-edge nibble fold. Cover calibration,
+    /// replay, padding, primer drain, changed inputs, and byte-resource decline.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_zc_r2_products_match_cpu_oracle() {
+        assert!(
+            gpu_zc_r2_horner_enabled(),
+            "oracle requires the default Horner control"
+        );
+        for (lo_size, hi_size, fixed_weights, nonlinear) in [
+            (512, 64, false, false),
+            (16_384, 8, true, false),
+            (16_384, 8, false, false),
+            (16_384, 8, true, true),
+        ] {
+            zc_r2_products_case(lo_size, hi_size, fixed_weights, nonlinear);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn zc_r2_products_case(lo_size: usize, hi_size: usize, fixed_weights: bool, nonlinear: bool) {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
             *rng ^= *rng << 13;
@@ -17577,7 +17913,8 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         }
         let mut rng = 0x9E3779B97F4A7C15u64;
 
-        // F2-linear byte table from a random 64-element basis.
+        // Linear banks retain the incumbent fixture. The extra fixture has
+        // arbitrary banks, nonzero zero entries, and nonlinear nibble edges.
         let mut table_data = vec![F128::ZERO; 8 * 256];
         for j in 0..8 {
             let basis: Vec<F128> = (0..8).map(|_| rand_f128(&mut rng)).collect();
@@ -17591,10 +17928,23 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 table_data[j * 256 + v] = acc;
             }
         }
+        if nonlinear {
+            for value in &mut table_data {
+                *value = rand_f128(&mut rng);
+            }
+            for j in 0..8 {
+                assert_ne!(table_data[j * 256], F128::ZERO);
+                assert_ne!(
+                    table_data[j * 256 + 3],
+                    table_data[j * 256 + 1] + table_data[j * 256 + 2],
+                );
+            }
+        }
         let fold_row = |table_data: &[F128], code: u64| -> F128 {
             let mut acc = F128::ZERO;
             for j in 0..8 {
-                acc += table_data[j * 256 + ((code >> (8 * j)) & 0xff) as usize];
+                let byte = ((code >> (8 * j)) & 0xff) as usize;
+                acc += table_data[j * 256 + (byte & 15)] + table_data[j * 256 + (byte & 0xf0)];
             }
             acc
         };
@@ -17603,16 +17953,27 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // Test the ranked seven-pair tail and a generic padded block.
         // The padded inputs contain random data, which must be ignored.
         let mask = if fixed_weights { 127usize } else { 4095usize };
-        let useful = if fixed_weights { 121usize } else { 3900usize };
+        let useful = if nonlinear {
+            128usize
+        } else if fixed_weights {
+            121usize
+        } else {
+            3900usize
+        };
 
-        let mut a_packed = vec![0u8; n_pairs * 16];
-        let mut b_packed = vec![0u8; n_pairs * 16];
+        // The state retains these no-copy wraps for the process lifetime.
+        let a_packed = leak_page_aligned(n_pairs * 16);
+        let b_packed = leak_page_aligned(n_pairs * 16);
         for byte in a_packed.iter_mut() {
             *byte = (xs(&mut rng) & 0xff) as u8;
         }
         for byte in b_packed.iter_mut() {
             *byte = (xs(&mut rng) & 0xff) as u8;
         }
+        // Explicit zero/high/low-edge bytes join the random full-width rows.
+        a_packed[..32].fill(0);
+        b_packed[..16].fill(0xf0);
+        b_packed[16..32].fill(0x0f);
         let mut eq_lo: Vec<F128> = (0..lo_size).map(|_| rand_f128(&mut rng)).collect();
         if fixed_weights {
             for window in 0..256 {
@@ -17636,10 +17997,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                          table_data: &[F128],
                          eq_lo: &[F128],
                          eq_hi: &[F128]| {
+            let groups = if fixed_weights { 4 } else { 1 };
             let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
+            let mut physical: Vec<[F128; 4]> = Vec::with_capacity(hi_size * groups);
             for x_hi in 0..hi_size {
-                // [p1_even, pinf_even, p1_odd, pinf_odd]
-                let mut acc = [F256Unreduced::ZERO; 4];
+                // [p1_even, pinf_even, p1_odd, pinf_odd] per physical group.
+                let mut acc = vec![[F256Unreduced::ZERO; 4]; groups];
                 for x_lo in 0..lo_size {
                     let pair_idx = x_hi * lo_size + x_lo;
                     if (pair_idx & mask) >= useful {
@@ -17653,15 +18016,24 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                     let b0 = fold_row(table_data, read(&b_packed, 2 * pair_idx));
                     let b1 = fold_row(table_data, read(&b_packed, 2 * pair_idx + 1));
                     let base = 2 * (x_lo & 1);
-                    acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                    acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+                    let group = x_lo / (lo_size / groups);
+                    acc[group][base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
+                    acc[group][base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
                 }
                 let eq_h = eq_hi[x_hi];
-                cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
+                let mut merged = [F128::ZERO; 4];
+                for group in acc {
+                    let lanes = std::array::from_fn(|i| eq_h * group[i].reduce());
+                    for i in 0..4 {
+                        merged[i] += lanes[i];
+                    }
+                    physical.push(lanes);
+                }
+                cpu_split.push(merged);
             }
-            cpu_split
+            (cpu_split, physical)
         };
-        let cpu_split = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        let (cpu_split, physical) = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
         let cpu_partials: Vec<(F128, F128)> = cpu_split
             .iter()
             .map(|v| (v[0] + v[2], v[1] + v[3]))
@@ -17674,6 +18046,13 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
 
         // Calibration probe: internal equality oracle + share publication.
         imp::zc_r2_test_reset();
+        imp::stage_zc_r2_idle_fill(
+            &a_packed, &b_packed, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+        );
+        assert!(
+            imp::zc_r2_test_primer_pending(),
+            "default primer must stage"
+        );
         let job = imp::launch_zc_r2_products(
             &a_packed,
             &b_packed,
@@ -17689,6 +18068,13 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(
             job.uses_horner(),
             fixed_weights && gpu_zc_r2_horner_enabled()
+        );
+        assert_eq!(job.uses_byte_table(), fixed_weights);
+        let groups = if fixed_weights { 4 } else { 1 };
+        assert_eq!(
+            imp::zc_r2_test_physical_partials(&job),
+            physical[..job.chunks * groups],
+            "calibration physical groups",
         );
         assert!(job.is_calibration());
         assert_eq!(job.cpu_split(), 0);
@@ -17719,6 +18105,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             job2.uses_horner(),
             fixed_weights && gpu_zc_r2_horner_enabled()
         );
+        assert_eq!(job2.uses_byte_table(), fixed_weights);
+        assert_eq!(
+            imp::zc_r2_test_physical_partials(&job2),
+            physical[..job2.chunks * groups],
+            "prefix physical groups",
+        );
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
@@ -17746,10 +18138,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             eq_lo.as_ptr(),
             eq_hi.as_ptr(),
         );
-        for byte in &mut a_packed {
+        for byte in a_packed.iter_mut() {
             *byte ^= 0x5b;
         }
-        for byte in &mut b_packed {
+        for byte in b_packed.iter_mut() {
             *byte ^= 0xa7;
         }
         for value in table_data
@@ -17770,11 +18162,19 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             )
         );
         assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
-        let changed = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        let (changed, changed_physical) =
+            reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
         assert_ne!(
             &changed[..prefix],
             &cpu_split[..prefix],
             "changed prefix must change the oracle"
+        );
+        imp::stage_zc_r2_idle_fill(
+            &a_packed, &b_packed, &eq_lo, &eq_hi, lo_size, hi_size, mask, useful,
+        );
+        assert!(
+            imp::zc_r2_test_primer_pending(),
+            "changed-input primer must stage"
         );
         let job3 = imp::launch_zc_r2_products(
             &a_packed,
@@ -17792,6 +18192,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             job3.uses_horner(),
             fixed_weights && gpu_zc_r2_horner_enabled()
         );
+        assert_eq!(job3.uses_byte_table(), fixed_weights);
+        assert_eq!(
+            imp::zc_r2_test_physical_partials(&job3),
+            changed_physical[..job3.chunks * groups],
+            "changed-input physical groups",
+        );
         assert!(!job3.is_calibration());
         assert_eq!(job3.cpu_split(), prefix);
         match imp::zc_r2_wait(job3, None, None, 0.0, hi_size) {
@@ -17801,6 +18207,58 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             }
             _ => panic!("changed-input drain must return prefix partials"),
         }
+        if fixed_weights {
+            // Exercise the real selection with either optional resource absent.
+            // The guard restores retained handles. It adds no production knob.
+            for (pso, buffer) in [(true, false), (false, true), (true, true)] {
+                let _decline = imp::zc_r2_test_decline_byte(pso, buffer);
+                let fallback = imp::launch_zc_r2_products(
+                    &a_packed,
+                    &b_packed,
+                    &table_data,
+                    &eq_lo,
+                    &eq_hi,
+                    lo_size,
+                    hi_size,
+                    mask,
+                    useful,
+                )
+                .expect("byte decline must retain the nibble Horner launch");
+                assert!(fallback.uses_horner());
+                assert!(!fallback.uses_byte_table());
+                assert_eq!(fallback.cpu_split(), prefix);
+                assert_eq!(
+                    imp::zc_r2_test_physical_partials(&fallback),
+                    changed_physical[..fallback.chunks * groups],
+                    "fallback physical groups",
+                );
+                match imp::zc_r2_wait(fallback, None, None, 0.0, hi_size) {
+                    imp::ZcR2Result::Prefix(vals) => assert_eq!(vals, changed[..prefix]),
+                    _ => panic!("byte decline must return exact nibble partials"),
+                }
+            }
+            let restored = imp::launch_zc_r2_products(
+                &a_packed,
+                &b_packed,
+                &table_data,
+                &eq_lo,
+                &eq_hi,
+                lo_size,
+                hi_size,
+                mask,
+                useful,
+            )
+            .expect("restored byte launch must succeed");
+            assert!(restored.uses_byte_table());
+            match imp::zc_r2_wait(restored, None, None, 0.0, hi_size) {
+                imp::ZcR2Result::Prefix(vals) => assert_eq!(vals, changed[..prefix]),
+                _ => panic!("restored byte drain must return prefix partials"),
+            }
+        }
+        eprintln!(
+            "[zc-r2-byte-oracle] lo={lo_size} hi={hi_size} fixed={fixed_weights} nonlinear={nonlinear} byte={fixed_weights} physical_outputs=PASS changed=PASS primer=PASS fallback={}",
+            if fixed_weights { "PASS" } else { "not-needed" },
+        );
         imp::zc_r2_test_reset();
     }
 
