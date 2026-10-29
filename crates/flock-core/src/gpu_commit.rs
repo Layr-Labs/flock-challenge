@@ -13810,6 +13810,40 @@ kernel void zc_r2_horner_oracle(
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
     ) -> Option<ZcR2Job> {
+        launch_zc_r2_products_inner::<false>(
+            a_packed, b_packed, table_data, eq_lo, eq_hi, lo_size, hi_size,
+            pair_in_block_mask, useful_pairs_inclusive,
+        )
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn launch_zc_r2_products_with_horner_eq(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_data: &[F128],
+        eq: crate::zerocheck::multilinear::R2HornerEq<'_>,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+    ) -> Option<ZcR2Job> {
+        let (eq_lo, eq_hi, lo_size, hi_size) = eq.parts();
+        launch_zc_r2_products_inner::<true>(
+            a_packed, b_packed, table_data, eq_lo, eq_hi, lo_size, hi_size,
+            pair_in_block_mask, useful_pairs_inclusive,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_zc_r2_products_inner<const PROVED_HORNER: bool>(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_data: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+    ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
             return None;
@@ -13844,8 +13878,9 @@ kernel void zc_r2_horner_oracle(
         if chunks == 0 {
             return None;
         }
-        let horner =
-            super::gpu_zc_r2_horner_enabled() && super::zc_r2_horner_weights(eq_lo, lo_size);
+        let horner = super::gpu_zc_r2_horner_enabled()
+            && ((PROVED_HORNER && lo_size == 16_384 && eq_lo.len() == lo_size)
+                || super::zc_r2_horner_weights(eq_lo, lo_size));
         let gpu = gpu().ok()?;
         let state_mutex = zc_r2_state()?;
         // Deliberately NOT poison-tolerant: the grow sequences below
@@ -15521,7 +15556,9 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 /// Zerocheck round-two products GPU arm (see `ENV_NO_GPU_ZC_R2`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+pub(crate) use imp::{
+    ZcR2Job, ZcR2Result, launch_zc_r2_products, launch_zc_r2_products_with_horner_eq, zc_r2_wait,
+};
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
