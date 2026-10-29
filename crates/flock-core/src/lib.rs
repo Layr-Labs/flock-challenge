@@ -296,3 +296,5 @@ fn linux_physical_cores() -> Option<usize> {
     }
     (!cores.is_empty()).then_some(cores.len())
 }
+
+// Redraw r2 of e-man07 aa6d87a3 (kshitij-hash S10 d57bc39e + zerocheck factored-B4 fold).
