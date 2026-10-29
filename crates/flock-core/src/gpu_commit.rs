@@ -13160,8 +13160,8 @@ kernel void zc_r2_products_horner(
     uint tgid [[threadgroup_position_in_grid]],
     uint lid  [[thread_index_in_threadgroup]])
 {
-    threadgroup uint4 nib[256];
     threadgroup ulong4 red[256];
+    threadgroup uint4* nib = reinterpret_cast<threadgroup uint4*>(red);
     nib[lid] = nib_tab_dev[lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -13194,6 +13194,8 @@ kernel void zc_r2_products_horner(
     U256k mi = clmul128(e, zc_r2_horner_reduce(hi));
     ulong4 acc1 = ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
     ulong4 acci = ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+    // Retire every table reader before the reducer reuses the same storage.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid);
 }
 
@@ -18132,9 +18134,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_products_horner").unwrap();
             let old_usage = gpu.pipeline_resources(ordinary);
             let usage = gpu.pipeline_resources(horner);
-            assert_eq!(old_usage.0, usage.0, "shared-memory use changed");
-            assert_eq!(old_usage.1, usage.1, "SIMD width changed");
-            assert!(usage.2 >= 256, "Horner production group no longer fits");
+            assert_eq!(old_usage.0, 12_288, "ordinary storage must stay unchanged");
+            assert_eq!(usage.0, 8_192, "Horner table and reduction must share storage");
+            assert!(
+                old_usage.2 >= 256 && usage.2 >= 256,
+                "both production groups must fit"
+            );
             for repeat in 0..2 {
                 std::ptr::write_bytes(gpu.buffer_contents(out_buf), 0xA5, output_bytes);
                 let cb = gpu.command_buffer().unwrap();
