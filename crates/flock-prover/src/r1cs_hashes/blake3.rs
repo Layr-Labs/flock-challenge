@@ -182,6 +182,13 @@ pub const G_MSG_IDX: [[usize; 2]; N_G_PER_ROUND] = [
 /// bits 15,409..15,872 have A=B=Z=0. Scalar output writers and the shared
 /// SIMD `oh!` publisher emit these values before joining. This is a value
 /// guarantee, independent of the separate statement mask/padding check.
+/// Separately, the fast writers set B=1 in every G's two lin-id intervals
+/// `[GS_BASE + G_STRIDE*g + REC_LIN0, GS_BASE + G_STRIDE*(g+1))`.
+/// Both scalar `rb` records and SIMD lin-id records emit all ones there;
+/// padding blocks use the same complete writer. All guarded bits lie in the
+/// freshly written dense B dump `[128, 1888)`, outside scratch-elided ranges.
+/// These intervals contain all static-B Horner guard bits; this guarantee
+/// does not follow from the prefix statement.
 ///
 /// The constructor is private and used only after witness generation joins.
 /// Addresses/lengths bind the receipt to the owned buffers moved immediately
@@ -204,6 +211,10 @@ impl Blake3IdentityPrefixWitness {
 
     pub(crate) fn matches(&self, z: &[F128], a: &[F128], b: &[F128]) -> bool {
         self.buffers == Self::identities(z, a, b)
+    }
+
+    pub(crate) fn matches_b(&self, b: &[F128]) -> bool {
+        self.buffers[2] == (b.as_ptr() as usize, b.len())
     }
 }
 
