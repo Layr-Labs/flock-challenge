@@ -7561,13 +7561,6 @@ kernel void blake3_pow_scan(
             .map(|s| (s.1, s.2))
     }
 
-    /// GPU-arm saving per moved sub-block relative to a whole sixteenth's
-    /// saving: the boundary sixteenth's layers 4..8 stay on the GPU and its
-    /// suffix leaves are still hashed by the GPU's cb3.
-    const FINE_GPU_SHARE: f64 = 0.65;
-    /// CPU-arm cost per moved sub-block relative to a whole sixteenth's
-    /// cost (the boundary sub-blocks add a separate layer-8 pair).
-    const FINE_CPU_SHARE: f64 = 1.15;
     /// The fine split must beat the chosen split's measured window by this.
     const FINE_MARGIN: f64 = 0.01;
 
@@ -7603,47 +7596,47 @@ kernel void blake3_pow_scan(
             .map(|s| (s.1, s.2, s.3))
     }
 
-    /// Refine the chosen split `k` to `k' + 16 * m`: interpolate cb2 (GPU
-    /// prefix), the CPU suffix and cb3 (suffix hashing) between the sampled
-    /// splits `k'` (GPU prefix the slower arm) and `k' + 1`, and take the `m`
-    /// minimising `max(cb2, cpu) + cb3`. Keeps `k` unless the prediction beats
-    /// `k`'s own measured window by [`FINE_MARGIN`]. The verify that follows
-    /// byte-checks whatever this returns. `FLOCK_NO_HYBRID_FINE=1` disables.
-    fn fine_split_from_arms(samples: &[(usize, f64, f64, f64)], k: usize) -> usize {
+    /// Fine candidates to measure around the chosen split `k`: the base is
+    /// `k` when `k`'s GPU prefix (cb2) is its slower arm, else `k - 1`; the
+    /// candidates are that base plus `m = 4, 8, 12` layer-8 sub-blocks.
+    /// Empty when `k` was not sampled, the base would be 0, or fine splits
+    /// are disabled (`FLOCK_NO_HYBRID_FINE=1`).
+    fn fine_candidates(samples: &[(usize, f64, f64, f64)], k: usize) -> Vec<usize> {
         if k == 0 || k >= 16 || std::env::var_os("FLOCK_NO_HYBRID_FINE").is_some()
             || !hybrid_gpu_suffix_hash_enabled()
         {
-            return k;
+            return Vec::new();
         }
-        let Some((gk, ck, hk)) = fine_triple(samples, k) else { return k };
+        let Some((gk, ck, _)) = fine_triple(samples, k) else { return Vec::new() };
         let base = if gk > ck { k } else { k - 1 };
-        if base == 0 || base + 1 >= 16 {
+        if base == 0 || base >= 15 {
+            return Vec::new();
+        }
+        [4usize, 8, 12].iter().map(|m| base + 16 * m).collect()
+    }
+
+    /// Measured window of split `k`: the cheapest sample's
+    /// `max(cb2, cpu) + cb3`, or `NaN` when unsampled.
+    fn fine_window(samples: &[(usize, f64, f64, f64)], k: usize) -> f64 {
+        fine_triple(samples, k).map_or(f64::NAN, |(g, c, h)| g.max(c) + h)
+    }
+
+    /// Pick among measured fine candidates: the smallest measured window,
+    /// adopted only if it beats `k`'s own measured window by
+    /// [`FINE_MARGIN`]; otherwise `k`.
+    fn choose_fine_split(samples: &[(usize, f64, f64, f64)], k: usize, cands: &[usize]) -> usize {
+        let base = fine_window(samples, k);
+        if !base.is_finite() {
             return k;
         }
-        let (Some((g0, c0, h0)), Some((g1, c1, h1))) =
-            (fine_triple(samples, base), fine_triple(samples, base + 1))
-        else {
-            return k;
-        };
-        let (dg, dc) = (g0 - g1, c1 - c0);
-        if !(g0 > c0 && dg > 0.0 && dc > 0.0) {
-            return k;
-        }
-        let mut best = (0usize, f64::INFINITY);
-        for m in 1..16usize {
-            let t = m as f64 / 16.0;
-            let w = (g0 - FINE_GPU_SHARE * dg * t).max(c0 + FINE_CPU_SHARE * dc * t)
-                + h0 + (h1 - h0).max(0.0) * t;
-            if w < best.1 {
-                best = (m, w);
+        let mut best = (k, f64::INFINITY);
+        for &c in cands {
+            let w = fine_window(samples, c);
+            if w.is_finite() && w < best.1 {
+                best = (c, w);
             }
         }
-        let k_window = gk.max(ck) + hk;
-        if best.1 < k_window * (1.0 - FINE_MARGIN) {
-            base + 16 * best.0
-        } else {
-            k
-        }
+        if best.1 < base * (1.0 - FINE_MARGIN) { best.0 } else { k }
     }
 
     /// CPU reference-commit wall from the cache-miss warmup. Cache
@@ -8283,8 +8276,42 @@ kernel void blake3_pow_scan(
             Some(k) => k,
             None => swept,
         };
+        // Fine stage: measure base + m sub-blocks for m = 4, 8, 12 (two
+        // reverse-order passes beside the same A/B replay) and keep the best
+        // measured window only if it beats the chosen split's.
+        let sweep_fine = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
+        let fine_cands = fine_candidates(&sweep_fine, chosen);
+        if !fine_cands.is_empty() {
+            let _recording = ArmRecordScope::enter();
+            let mut ok = true;
+            for pass in 0..2 {
+                let order: Vec<usize> = if pass == 0 {
+                    fine_cands.clone()
+                } else {
+                    fine_cands.iter().rev().copied().collect()
+                };
+                for kf in order {
+                    if reprime().is_err() || sample(kf).is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            if !ok {
+                // A failed fine sample leaves the staging state unknown;
+                // restore it for the verify below.
+                let _ = reprime();
+            }
+        }
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
-        let chosen = fine_split_from_arms(&fine_samples, chosen);
+        let chosen = if fine_cands.is_empty() {
+            chosen
+        } else {
+            choose_fine_split(&fine_samples, chosen, &fine_cands)
+        };
         if dbg {
             let rows: Vec<String> = fine_samples
                 .iter()
@@ -11689,32 +11716,31 @@ kernel void lc_fold_stripes_factored_b4(
     mod hybrid_balance_tests {
         use super::{ARM_SPLIT_MARGIN, arm_window_ms, split_from_arms};
 
-        // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
+        // Fine split: measured candidates around the chosen split.
         #[test]
-        fn fine_split_interpolates_between_bracketing_splits() {
+        fn fine_candidates_bracket_the_slower_arm() {
             let s = [(3, 50.4, 44.4, 1.0), (4, 46.2, 48.2, 1.3)];
-            let k = super::fine_split_from_arms(&s, 3);
-            let (base, m) = super::decode_hybrid_split(k);
-            assert_eq!(base, 3);
-            assert!((1..16).contains(&m), "m = {m}");
-            assert!(super::hybrid_split_valid(k));
+            assert_eq!(super::fine_candidates(&s, 3), vec![3 + 64, 3 + 128, 3 + 192]);
+            assert_eq!(super::fine_candidates(&s, 4), vec![3 + 64, 3 + 128, 3 + 192]);
+            assert!(super::fine_candidates(&s, 0).is_empty());
+            assert!(super::fine_candidates(&s, 5).is_empty());
         }
 
         #[test]
-        fn fine_split_from_a_cpu_bound_pick_steps_down() {
-            let s = [(3, 50.4, 44.4, 1.0), (4, 44.0, 52.0, 1.3)];
-            let (base, m) = super::decode_hybrid_split(super::fine_split_from_arms(&s, 4));
-            assert_eq!(base, 3);
-            assert!(m >= 1);
-        }
-
-        #[test]
-        fn fine_split_needs_both_neighbours_and_a_real_gain() {
-            assert_eq!(super::fine_split_from_arms(&[(3, 50.4, 44.4, 1.0)], 3), 3);
-            // Already balanced at k: no predicted gain beats the margin.
-            let s = [(3, 47.0, 46.9, 1.0), (4, 43.0, 51.0, 1.3)];
-            assert_eq!(super::fine_split_from_arms(&s, 3), 3);
-            assert_eq!(super::fine_split_from_arms(&[], 0), 0);
+        fn the_best_measured_fine_split_needs_the_margin() {
+            let s = [
+                (3, 50.4, 44.4, 1.0),
+                (67, 48.0, 45.0, 1.1),
+                (131, 47.0, 49.5, 1.2),
+                (195, 46.5, 52.0, 1.3),
+            ];
+            let c = [67, 131, 195];
+            assert_eq!(super::choose_fine_split(&s, 3, &c), 67);
+            // Within 1% of k's own window: keep k.
+            let s2 = [(3, 50.0, 44.0, 1.0), (67, 49.8, 45.0, 1.0)];
+            assert_eq!(super::choose_fine_split(&s2, 3, &[67]), 3);
+            // k unsampled: keep k.
+            assert_eq!(super::choose_fine_split(&s[1..], 3, &c), 3);
         }
 
         #[test]
