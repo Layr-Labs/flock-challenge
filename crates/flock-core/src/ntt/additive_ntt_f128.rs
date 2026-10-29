@@ -1117,7 +1117,7 @@ impl AdditiveNttF128 {
                 let range =
                     &mut data[range_base_elem..range_base_elem + num_blocks * block_elems];
                 butterfly_interleaved_fused_3layer_range_par_rows(
-                    range, &twiddles, eighth, num_ntts, tail,
+                    range, &twiddles, eighth, num_ntts, tail, abs_first,
                 );
                 layer += 3;
             } else if layer + 1 < stop_layer && block_size >= 4 {
@@ -2487,14 +2487,17 @@ fn butterfly_interleaved_fused_3layer_par_rows<const ZERO_ROOT: bool>(
 /// every `(block, row group)` of the range runs in one indexed Rayon region
 /// instead of one blocking region per block. The ranked hybrid suffix covers
 /// `k` layer-4 blocks then `8k` layer-7 blocks, which per-block regions turned
-/// into `9k` sequential fork/join barriers. Per-block zero-root selection and
-/// the odd-position zero-lane skip match the per-block driver exactly.
+/// into `9k` sequential fork/join barriers. Absolute block zero keeps its
+/// zero-root specialization; other blocks use the exact general kernel.
+/// The caller supplies tuples generated for absolute blocks `abs_first..`
+/// and their children. The odd-position zero-lane skip is unchanged.
 fn butterfly_interleaved_fused_3layer_range_par_rows(
     data: &mut [F128],
     twiddles: &[[F128; 7]],
     eighth: usize,
     num_ntts: usize,
     odd_tail: usize,
+    abs_first: usize,
 ) {
     use rayon::prelude::*;
     const PARALLEL_JOB_THRESHOLD: usize = 256;
@@ -2503,14 +2506,20 @@ fn butterfly_interleaved_fused_3layer_range_par_rows(
     let block_elems = 8 * eighth * num_ntts;
     debug_assert_eq!(data.len(), num_blocks * block_elems);
     debug_assert!(odd_tail == 0 || eighth.is_multiple_of(2));
-    let zero_root: Vec<bool> = twiddles
-        .iter()
-        .map(|t| t[0] == F128::ZERO && t[1] == F128::ZERO && t[3] == F128::ZERO)
-        .collect();
+    // The block-range caller derives eighth from a power-of-two block of at least eight rows.
+    debug_assert!(eighth.is_power_of_two());
+    let block_shift = eighth.trailing_zeros();
+    let row_mask = eighth - 1;
+    // Every generated tree has zero twiddles at absolute block zero.
+    // Other zero twiddles from custom bases use the exact general kernel.
+    let zero_root_block = if abs_first == 0 { 0 } else { usize::MAX };
+    let n_jobs = num_blocks * eighth;
+    // Empty ranges do not read or initialize the process row policy.
+    let use_neon = n_jobs != 0 && kernels::vector_resident_rows();
     let base = data.as_mut_ptr() as usize;
-    let job = |job: usize| {
-        let block = job / eighth;
-        let r = job % eighth;
+    let job = move |job: usize| {
+        let block = job >> block_shift;
+        let r = job & row_mask;
         let lanes = if r & 1 == 1 {
             num_ntts - odd_tail
         } else {
@@ -2520,28 +2529,29 @@ fn butterfly_interleaved_fused_3layer_range_par_rows(
         // block, so concurrent jobs never alias.
         unsafe {
             let block_base = (base as *mut F128).add(block * block_elems);
-            if zero_root[block] {
-                kernels::butterfly_fused_3layer_zero_root_row(
+            if block == zero_root_block {
+                kernels::butterfly_fused_3layer_zero_root_row_with_policy(
                     block_base,
                     eighth,
                     num_ntts,
                     lanes,
                     r,
                     &twiddles[block],
+                    use_neon,
                 )
             } else {
-                kernels::butterfly_fused_3layer_row(
+                kernels::butterfly_fused_3layer_row_with_policy(
                     block_base,
                     eighth,
                     num_ntts,
                     lanes,
                     r,
                     &twiddles[block],
+                    use_neon,
                 )
             }
         }
     };
-    let n_jobs = num_blocks * eighth;
     if n_jobs < PARALLEL_JOB_THRESHOLD {
         (0..n_jobs).for_each(job);
     } else {
@@ -3778,6 +3788,62 @@ mod block_range_equivalence {
             );
         }
         assert_eq!(full, split, "layer-4 split diverges");
+    }
+
+    #[test]
+    fn block_range_parallel_suffix_matches_scalar() {
+        let (log_d, start_layer, num_ntts) = (12usize, 2usize, 4usize);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let src: Vec<F128> = (0..(1usize << log_d) * num_ntts)
+            .map(|i| {
+                let word = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                F128::new(word, word.rotate_left(29) ^ 0xd1b5_4a32_d192_ed03)
+            })
+            .collect();
+        let mut full = src.clone();
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut full, num_ntts, start_layer);
+        let block_elems = (1usize << (log_d - start_layer)) * num_ntts;
+        for (b_start, b_end) in [(0usize, 4usize), (1, 4), (1, 3), (3, 4)] {
+            let mut got = src.clone();
+            ntt.forward_transform_interleaved_block_range(
+                &mut got, num_ntts, start_layer, log_d, b_start, b_end, 0,
+            );
+            let start = b_start * block_elems;
+            let end = b_end * block_elems;
+            assert_eq!(&got[..start], &src[..start]);
+            assert_eq!(&got[start..end], &full[start..end]);
+            assert_eq!(&got[end..], &src[end..]);
+        }
+    }
+
+    #[test]
+    fn block_range_custom_basis_matches_scalar() {
+        let (log_d, start_layer, num_ntts) = (6usize, 1usize, 2usize);
+        let custom: Vec<F128> = (0..log_d)
+            .map(|i| F128::new(1u64 << (i + 3), 1u64 << i))
+            .collect();
+        for basis in [custom, vec![F128::ZERO; log_d]] {
+            let cached = AdditiveNttF128::new(&basis);
+            let mut fallback = cached.clone();
+            fallback.precomputed_twiddles = None;
+            for ntt in [cached, fallback] {
+                let src: Vec<F128> = (0..(1usize << log_d) * num_ntts)
+                    .map(|i| F128::new(i as u64 + 1, (i as u64).wrapping_mul(0x9e37_79b9)))
+                    .collect();
+                let mut full = src.clone();
+                ntt.forward_transform_interleaved_scalar_from_layer(&mut full, num_ntts, start_layer);
+                let block_elems = (1usize << (log_d - start_layer)) * num_ntts;
+                for (b_start, b_end) in [(0usize, 2usize), (1, 2)] {
+                    let mut got = src.clone();
+                    ntt.forward_transform_interleaved_block_range(
+                        &mut got, num_ntts, start_layer, log_d, b_start, b_end, 0,
+                    );
+                    let start = b_start * block_elems;
+                    assert_eq!(&got[..start], &src[..start]);
+                    assert_eq!(&got[start..], &full[start..]);
+                }
+            }
+        }
     }
 
     #[test]

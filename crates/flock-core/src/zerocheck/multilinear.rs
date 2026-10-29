@@ -704,19 +704,20 @@ pub fn round_pair_naive(a_mlv: &[F128], b_mlv: &[F128], r: &[F128]) -> (F128, F1
     let eq_remaining = build_eq(&r[1..]);
     assert_eq!(eq_remaining.len(), half);
 
-    let mut g_one = F128::ZERO;
-    let mut g_inf = F128::ZERO;
+    // Reduction is F2-linear, so reduce each sum only after the loop.
+    let mut g_one = F256Unreduced::ZERO;
+    let mut g_inf = F256Unreduced::ZERO;
     for x_prime in 0..half {
         let a0 = a_mlv[2 * x_prime];
         let a1 = a_mlv[2 * x_prime + 1];
         let b0 = b_mlv[2 * x_prime];
         let b1 = b_mlv[2 * x_prime + 1];
         let eq_x = eq_remaining[x_prime];
-        g_one += eq_x * a1 * b1;
+        g_one ^= eq_x.mul_unreduced(a1 * b1);
         // Char-2: (a_1 − a_0)(b_1 − b_0) = (a_0 + a_1)(b_0 + b_1).
-        g_inf += eq_x * (a0 + a1) * (b0 + b1);
+        g_inf ^= eq_x.mul_unreduced((a0 + a1) * (b0 + b1));
     }
-    (r[0] * g_one, g_inf)
+    (r[0] * g_one.reduce(), g_inf.reduce())
 }
 
 // ---------------------------------------------------------------------------
@@ -4301,6 +4302,38 @@ mod tests {
             uni_skip_fold_and_round_pair_naive(&b, &a, m, k_skip, z, &mlv_challenges);
         assert_eq!(m1_ab, m1_ba);
         assert_eq!(minf_ab, minf_ba);
+    }
+
+    #[test]
+    fn round_pair_deferred_matches_reduced_parent() {
+        let mut rng = Rng::new(0xDEF3_22ED);
+        for log_n in [1usize, 2, 3, 8, 13] {
+            let a = rng.f128_vec(1usize << log_n);
+            let b = rng.f128_vec(1usize << log_n);
+            for mode in 0..4 {
+                let r: Vec<F128> = (0..log_n)
+                    .map(|i| match mode {
+                        0 => F128::ZERO,
+                        1 => F128::ONE,
+                        2 if i & 1 == 0 => F128::ZERO,
+                        2 => F128::ONE,
+                        _ => rng.f128(),
+                    })
+                    .collect();
+                let eq = build_eq(&r[1..]);
+                let mut want = (F128::ZERO, F128::ZERO);
+                for (i, &weight) in eq.iter().enumerate() {
+                    want.0 += weight * a[2 * i + 1] * b[2 * i + 1];
+                    want.1 += weight * (a[2 * i] + a[2 * i + 1]) * (b[2 * i] + b[2 * i + 1]);
+                }
+                want.0 = r[0] * want.0;
+                assert_eq!(
+                    round_pair_naive(&a, &b, &r),
+                    want,
+                    "log_n={log_n} mode={mode}"
+                );
+            }
+        }
     }
 
     // ----------------------------------------------------------------------

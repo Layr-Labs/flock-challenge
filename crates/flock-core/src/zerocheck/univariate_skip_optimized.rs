@@ -2400,6 +2400,10 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
     use rayon::prelude::*;
 
     debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
+    // Only the immutable factory table guarantees row b = x^b * row 0.
+    let derive_rows = CONVERT_TABLE_CACHE
+        .get()
+        .is_some_and(|table| core::ptr::eq(convert, table.as_slice()));
     // Fully overwritten below (one write per slot before any read), so an
     // uninitialized scratch buffer is sound and skips a zeroing pass.
     let mut tables = crate::scratch::take_f128(eq_top_scaled.len() * CONVERT_TABLE_SIZE);
@@ -2407,8 +2411,78 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
         .par_chunks_mut(CONVERT_TABLE_SIZE)
         .zip(eq_top_scaled.par_iter())
         .for_each(|(slot, scale)| {
-            for (out, base) in slot.iter_mut().zip(convert.iter()) {
-                *out = *base * *scale;
+            if derive_rows {
+                // Scaled images of the eight binary carry masks.
+                let deltas = [
+                    *scale,
+                    convert[3] * *scale,
+                    convert[7] * *scale,
+                    convert[15] * *scale,
+                    convert[31] * *scale,
+                    convert[63] * *scale,
+                    convert[127] * *scale,
+                    convert[255] * *scale,
+                ];
+                let mut base = F128::ZERO;
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                let output: &mut [F128; CONVERT_TABLE_SIZE] =
+                    slot.try_into().expect("complete canonical convert image");
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                // SAFETY: both initialized u64 values are in bounds for this load.
+                let reduction = unsafe { core::arch::aarch64::vld1q_u64([0x87, 1].as_ptr()) };
+                for byte in 0usize..256 {
+                    if byte != 0 {
+                        base += deltas[byte.trailing_zeros() as usize];
+                    }
+                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                    // SAFETY: F128 is repr(C), with initialized lo/hi u64 lanes.
+                    // Each store writes one disjoint entry of the complete image:
+                    // bank * 256 + byte <= 15 * 256 + 255 = 4095. No pointer escapes.
+                    unsafe {
+                        use core::arch::aarch64::*;
+
+                        let mut value = core::mem::transmute::<F128, uint64x2_t>(base);
+                        let dst = output.as_mut_ptr().add(byte);
+                        vst1q_u64(dst.cast(), value);
+                        macro_rules! next_bank {
+                            ($bank:literal) => {{
+                                let sign = vshrq_n_s64::<63>(vreinterpretq_s64_u64(value));
+                                let carry = vreinterpretq_u64_s64(vextq_s64::<1>(sign, sign));
+                                value =
+                                    veorq_u64(vshlq_n_u64::<1>(value), vandq_u64(carry, reduction));
+                                vst1q_u64(dst.add($bank * 256).cast(), value);
+                            }};
+                        }
+                        next_bank!(1);
+                        next_bank!(2);
+                        next_bank!(3);
+                        next_bank!(4);
+                        next_bank!(5);
+                        next_bank!(6);
+                        next_bank!(7);
+                        next_bank!(8);
+                        next_bank!(9);
+                        next_bank!(10);
+                        next_bank!(11);
+                        next_bank!(12);
+                        next_bank!(13);
+                        next_bank!(14);
+                        next_bank!(15);
+                    }
+                    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+                    {
+                        let mut value = base;
+                        slot[byte] = value;
+                        for bank in 1..16 {
+                            value = mul_by_x(value);
+                            slot[bank * 256 + byte] = value;
+                        }
+                    }
+                }
+            } else {
+                for (out, base) in slot.iter_mut().zip(convert.iter()) {
+                    *out = *base * *scale;
+                }
             }
         });
     tables
@@ -6173,6 +6247,33 @@ mod tests {
             }
         }
         crate::scratch::give_f128(tables);
+    }
+
+    #[test]
+    fn ab_eq_fold_tables_match_all_parent_products() {
+        let mut rng = Rng::new(0xAB_E9_4096);
+        let scales = [F128::ZERO, F128::ONE, rng.f128(), rng.f128()];
+        let mut altered_convert = convert_table().to_vec();
+        altered_convert[256] = F128::ONE;
+        let custom_convert = rng.f128_vec(CONVERT_TABLE_SIZE);
+        for convert in [
+            convert_table(),
+            altered_convert.as_slice(),
+            custom_convert.as_slice(),
+        ] {
+            let tables = build_ab_eq_fold_tables(&scales, convert);
+            assert_eq!(tables.len(), scales.len() * CONVERT_TABLE_SIZE);
+            for (w, scale) in scales.iter().enumerate() {
+                for i in 0..CONVERT_TABLE_SIZE {
+                    assert_eq!(
+                        tables[w * CONVERT_TABLE_SIZE + i],
+                        convert[i] * *scale,
+                        "T[{w}][{i}]"
+                    );
+                }
+            }
+            crate::scratch::give_f128(tables);
+        }
     }
 
     /// End-to-end producer gate for the fold: the banked drain must return
