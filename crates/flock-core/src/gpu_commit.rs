@@ -13275,11 +13275,39 @@ kernel void zc_r2_products_horner(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint hi_chunk = tgid >> 2;
-    uint window = ((tgid & 3u) << 6) | (lid >> 2);
-    uint small_class = lid & 3u;
+    // xpt bit 31 marks this PSO's width-32 map; low bits keep the step count.
+    bool handoff = (p.xpt & 0x80000000u) != 0u
+        && (p.xpt & 0x7fffffffu) == 16u && p.mask == 127u && p.useful == 121u;
+    uint rid = handoff
+        ? 8u * (lid & 31u) + 4u * ((lid >> 5u) & 1u) + (lid >> 6u)
+        : lid;
+    uint window = ((tgid & 3u) << 6) | (rid >> 2);
+    uint small_class = rid & 3u;
     U320k h1 = {0ul, 0ul, 0ul, 0ul, 0ul};
     U320k hi = {0ul, 0ul, 0ul, 0ul, 0ul};
-    for (uint step = 0u; step < p.xpt; step++) {
+    for (uint step = 0u; step < (p.xpt & 0x7fffffffu); step++) {
+        if (handoff && step == 2u) {
+            // The lower 4 KiB remains the live nibble table.
+            threadgroup uint4* handoff_slots = nib + 256u;
+            uint4 v1 = zc_r2_horner_reduce(h1);
+            uint4 vi = zc_r2_horner_reduce(hi);
+            handoff_slots[rid] = v1;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            v1 = handoff_slots[lid];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            handoff_slots[rid] = vi;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            vi = handoff_slots[lid];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            h1.r0 = (ulong(v1.y) << 32) | v1.x;
+            h1.r1 = (ulong(v1.w) << 32) | v1.z;
+            h1.r2 = 0ul; h1.r3 = 0ul; h1.r4 = 0ul;
+            hi.r0 = (ulong(vi.y) << 32) | vi.x;
+            hi.r1 = (ulong(vi.w) << 32) | vi.z;
+            hi.r2 = 0ul; hi.r3 = 0ul; hi.r4 = 0ul;
+            window = ((tgid & 3u) << 6) | (lid >> 2);
+            small_class = lid & 3u;
+        }
         if (step != 0u) {
             zc_r2_horner_shift(h1);
             zc_r2_horner_shift(hi);
@@ -13376,6 +13404,8 @@ kernel void zc_r2_horner_oracle(
     struct ZcR2 {
         pso: Id,
         horner_pso: Id,
+        /// This PSO's static shared bytes, SIMD width and thread capacity.
+        horner_resources: (u64, u64, u64),
         /// Persistent small buffers: nibble table (4 KiB), eq_lo, eq_hi,
         /// reduced partials. Sized on first use for the ranked shape.
         nib_buf: Id,
@@ -13444,7 +13474,11 @@ kernel void zc_r2_horner_oracle(
             )
             .to_vec();
             let pso = if job.horner { state.horner_pso } else { state.pso };
-            (parts, gpu.pipeline_resources(pso))
+            let usage = gpu.pipeline_resources(pso);
+            if job.horner {
+                assert_eq!(usage, state.horner_resources, "own Horner PSO properties");
+            }
+            (parts, usage)
         }
     }
 
@@ -13581,10 +13615,36 @@ kernel void zc_r2_horner_oracle(
             })();
             gpu.pool_pop(pool);
             let (pso, horner_pso) = built?;
+            let horner_resources = (
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    horner_pso,
+                    c"staticThreadgroupMemoryLength"
+                ),
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    horner_pso,
+                    c"threadExecutionWidth"
+                ),
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    horner_pso,
+                    c"maxTotalThreadsPerThreadgroup"
+                ),
+            );
+            if horner_resources.2 < 256 {
+                gpu.release(horner_pso);
+                gpu.release(pso);
+                return Err("zc-r2 Horner PSO cannot run 256 threads".into());
+            }
             let nib_buf = gpu.new_buffer(256 * 16)?;
             Ok(ZcR2 {
                 pso,
                 horner_pso,
+                horner_resources,
                 nib_buf,
                 eq_lo_buf: NIL,
                 eq_lo_cap: 0,
@@ -13684,7 +13744,11 @@ kernel void zc_r2_horner_oracle(
             }
             let params = P {
                 lo_size: lo_size as u32,
-                xpt: if horner { 16 } else { (lo_size / 256) as u32 },
+                xpt: if horner {
+                    16 | if state.horner_resources.1 == 32 { 0x8000_0000 } else { 0 }
+                } else {
+                    (lo_size / 256) as u32
+                },
                 mask,
                 useful,
             };
@@ -18439,6 +18503,9 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 "actual production PSO shared storage"
             );
             assert!(usage.2 >= 256, "the production group must fit");
+            if job.uses_horner() {
+                assert_eq!(usage.1, 32, "this oracle must exercise width-32 admission");
+            }
             assert_eq!(actual.len(), job.chunks * groups);
             assert_eq!(actual, expected[..actual.len()], "raw physical partials");
             eprintln!(
@@ -18590,6 +18657,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 assert_eq!(&vals[..], &changed[..prefix], "same-address changed input");
             }
             _ => panic!("changed-input drain must return prefix partials"),
+        }
+        if fixed_weights {
+            eprintln!(
+                "[zc-r2-alias-handoff] own_pso=PASS width=32 mask={mask} useful={useful} handoff={} physical=PASS calibration=PASS prefix=PASS changed=PASS",
+                mask == 127 && useful == 121,
+            );
         }
         imp::zc_r2_test_reset();
     }
