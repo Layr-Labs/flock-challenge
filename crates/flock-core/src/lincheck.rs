@@ -2200,6 +2200,8 @@ mod tests {
             (18, 10, 1 << 10), // dense
             (20, 10, 597),     // padded, non-byte-aligned
             (22, 14, 15_409),  // padded, non-byte-aligned (k=16384)
+            (20, 4, 1 << 4),   // dense, 16 claims -> 64 sub-claims
+            (21, 6, 50),       // padded, 8 claims -> 32 sub-claims
         ];
         for &(m, k_log, useful_bits) in cases {
             assert!(
@@ -2224,6 +2226,22 @@ mod tests {
             let got =
                 partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
             assert_eq!(want, got, "m={m} k_log={k_log} useful={useful_bits}");
+            // Claim-range split (GPU prefix + CPU suffix shape): every suffix
+            // XOR its complementary prefix reproduces the whole fold.
+            let n_claims = oblock_claim_count(m, k_log);
+            for claim_lo in [1, n_claims / 3, n_claims - 1] {
+                if claim_lo == 0 || claim_lo >= n_claims {
+                    continue;
+                }
+                let suffix = partial_fold_packed_z_neon_oblock_padded_suffix(
+                    &z_packed, m, k_log, useful_bits, &eq, claim_lo,
+                );
+                let prefix = partial_fold_packed_z_neon_oblock_padded_range(
+                    &z_packed, m, k_log, useful_bits, &eq, 0, claim_lo,
+                );
+                let joined: Vec<F128> = suffix.iter().zip(&prefix).map(|(a, b)| *a + *b).collect();
+                assert_eq!(want, joined, "m={m} k_log={k_log} claim_lo={claim_lo}");
+            }
         }
     }
 

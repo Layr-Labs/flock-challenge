@@ -670,6 +670,28 @@ fn fill_deferred_lincheck_stripe_group(
     // `word < useful_words <= u64_per_block`, inside the group's 8 blocks.
     assert!(useful_words <= u64_per_block && z_u64.len() == 8 * u64_per_block);
     for word in 0..useful_words {
+        // aarch64: one 128-byte line covers sixteen word positions, so issue
+        // the eight lane prefetches once per line, eight lines ahead. Every
+        // address is `lane * u64_per_block + word + 128` with the offset kept
+        // below `u64_per_block`, inside the group. The fill is latency-bound
+        // at the ranked size (eight streams, 2 KiB apart), so the hints only
+        // start the same loads earlier; no byte of the stripe changes.
+        #[cfg(target_arch = "aarch64")]
+        if word & 15 == 0 {
+            let ahead = word + 128;
+            if ahead < u64_per_block {
+                for lane in 0..8 {
+                    // SAFETY: the address is inside the slice the assert above bounds.
+                    unsafe {
+                        core::arch::asm!(
+                            "prfm pldl1keep, [{addr}]",
+                            addr = in(reg) z_u64.as_ptr().add(lane * u64_per_block + ahead),
+                            options(nostack, preserves_flags, readonly)
+                        );
+                    }
+                }
+            }
+        }
         let dst = &mut stripe[word * 64..word * 64 + 64];
         // aarch64: the eight lane words go from memory straight into vector
         // lanes, the transpose stays in registers, and the four result

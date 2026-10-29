@@ -2400,6 +2400,9 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
     use rayon::prelude::*;
 
     debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
+    let derive_rows = CONVERT_TABLE_CACHE
+        .get()
+        .is_some_and(|table| core::ptr::eq(convert, table.as_slice()));
     // Fully overwritten below (one write per slot before any read), so an
     // uninitialized scratch buffer is sound and skips a zeroing pass.
     let mut tables = crate::scratch::take_f128(eq_top_scaled.len() * CONVERT_TABLE_SIZE);
@@ -2407,8 +2410,33 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
         .par_chunks_mut(CONVERT_TABLE_SIZE)
         .zip(eq_top_scaled.par_iter())
         .for_each(|(slot, scale)| {
-            for (out, base) in slot.iter_mut().zip(convert.iter()) {
-                *out = *base * *scale;
+            if derive_rows {
+                let deltas = [
+                    *scale,
+                    convert[3] * *scale,
+                    convert[7] * *scale,
+                    convert[15] * *scale,
+                    convert[31] * *scale,
+                    convert[63] * *scale,
+                    convert[127] * *scale,
+                    convert[255] * *scale,
+                ];
+                let mut base = F128::ZERO;
+                for byte in 0usize..256 {
+                    if byte != 0 {
+                        base += deltas[byte.trailing_zeros() as usize];
+                    }
+                    let mut value = base;
+                    slot[byte] = value;
+                    for bank in 1..16 {
+                        value = mul_by_x(value);
+                        slot[bank * 256 + byte] = value;
+                    }
+                }
+            } else {
+                for (out, base) in slot.iter_mut().zip(convert.iter()) {
+                    *out = *base * *scale;
+                }
             }
         });
     tables
