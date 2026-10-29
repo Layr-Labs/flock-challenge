@@ -1150,13 +1150,14 @@ mod from_z_zero_root_gate_tests {
         }
 
         const GROUPS: usize = 1 << (20 - 6);
-        const INCUMBENT_BUILD_MULX: usize = 15 * (0 + 4 + 8 + 12) + 15 * 64 * 4;
-        const COMPACT_BUILD_MULX: usize = 11 * (0 + 4 + 8 + 12) + 11 * 64 * 4;
-        assert_eq!(INCUMBENT_BUILD_MULX, 4_200);
-        assert_eq!(COMPACT_BUILD_MULX, 3_080);
+        // Exclude the old loop's unused fourth shift from executable savings.
+        const OLD_COMPACT_BUILD_MULX: usize = 11 * (0 + 4 + 8 + 12) + 11 * 64 * 3;
+        const PAIRED_BUILD_MULX: usize = 11 * (0 + 4 + 8 + 12) + 11 * 32 * 3;
+        assert_eq!(OLD_COMPACT_BUILD_MULX, 2_376);
+        assert_eq!(PAIRED_BUILD_MULX, 1_320);
         assert_eq!(
-            (INCUMBENT_BUILD_MULX - COMPACT_BUILD_MULX) * GROUPS,
-            18_350_080
+            (OLD_COMPACT_BUILD_MULX - PAIRED_BUILD_MULX) * GROUPS,
+            17_301_504
         );
 
         // Layer zero is already a copy. In layers 1..3 the zero root occurs
@@ -3459,19 +3460,24 @@ static inline void build_zero_root_tabs(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {
-        uint compact = ei >> 6;
-        uint sub = ei & 63u;
-        uint nibble = sub & 15u;
-        uint4 p = bases[(compact << 2) | (sub >> 4)];
-        uint4 value = uint4(0u);
-        for (uint bit = 0u; bit < 4u; bit++) {
-            if ((nibble >> bit) & 1u) {
-                value ^= p;
+    // Each producer writes nibble n and n|8 from one three-shift chain.
+    // All 64 threads still reach both barriers; 32 producers cover all banks.
+    if (lid < 32u) {
+        uint bank = lid >> 3;
+        uint nibble = lid & 7u;
+        for (uint compact = 0u; compact < NTW; compact++) {
+            uint4 p = bases[(compact << 2) | bank];
+            uint4 value = uint4(0u);
+            for (uint bit = 0u; bit < 3u; bit++) {
+                if ((nibble >> bit) & 1u) {
+                    value ^= p;
+                }
+                p = gf_mulx_zero_root(p);
             }
-            p = gf_mulx_zero_root(p);
+            uint index = compact * 64u + bank * 16u + nibble;
+            tabs[index] = value;
+            tabs[index + 8u] = value ^ p;
         }
-        tabs[ei] = value;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
@@ -3581,6 +3587,69 @@ kernel void export_from_z_zero_root_tabs(
     }
 }
 "#;
+
+    #[cfg(test)]
+    pub(crate) fn zero_root_pair_test_source() -> String {
+        let mut source = FROM_Z_ZERO_ROOT_MSL_SOURCE.to_owned();
+        // Exact pre-pair builder from 70417ff, kept separate from production.
+        source.push_str(
+            r#"
+static inline void build_zero_root_tabs_old(
+    device const uint4* twiddles,
+    threadgroup uint4* bases,
+    threadgroup uint4* tabs,
+    uint lid)
+{
+    constexpr uint NTW = 11u;
+    if (lid < NTW * 4u) {
+        uint compact = lid >> 2;
+        uint bank = lid & 3u;
+        uint4 p = twiddles[zero_root_raw_twiddle(compact)];
+        for (uint m = 0u; m < bank * 4u; m++) {
+            p = gf_mulx_zero_root(p);
+        }
+        bases[lid] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint ei = lid; ei < NTW * 64u; ei += 64u) {
+        uint compact = ei >> 6;
+        uint sub = ei & 63u;
+        uint nibble = sub & 15u;
+        uint4 p = bases[(compact << 2) | (sub >> 4)];
+        uint4 value = uint4(0u);
+        for (uint bit = 0u; bit < 4u; bit++) {
+            if ((nibble >> bit) & 1u) {
+                value ^= p;
+            }
+            p = gf_mulx_zero_root(p);
+        }
+        tabs[ei] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+#define EXPORT_ZERO_ROOT_TABLES(NAME, BUILDER) \
+kernel void NAME( \
+    device const uint4* twiddles [[buffer(0)]], \
+    device uint4* out [[buffer(1)]], \
+    uint tgid [[threadgroup_position_in_grid]], \
+    uint lid [[thread_index_in_threadgroup]]) \
+{ \
+    threadgroup uint4 bases[11u * 4u]; \
+    threadgroup uint4 tabs[11u * 64u]; \
+    BUILDER(twiddles + tgid * 15u, bases, tabs, lid); \
+    for (uint ei = lid; ei < 11u * 64u; ei += 64u) { \
+        out[tgid * 11u * 64u + ei] = tabs[ei]; \
+    } \
+}
+
+EXPORT_ZERO_ROOT_TABLES(export_zero_root_paired, build_zero_root_tabs)
+EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
+"#,
+        );
+        source
+    }
 
     /// The f = 4, s > 2 NTT pass with two tiles per thread: the group of
     /// `ntt_fused_reg4g4` (64 threads, four same-B tiles per group, LOG_G = 2,
@@ -15484,6 +15553,130 @@ mod tests {
                 data, expect,
                 "GPU NTT mismatch at log_d={log_d} start={start_layer}"
             );
+        }
+    }
+
+    /// Check the exact production builder against the old 64-producer builder
+    /// and independent CPU field products, then reuse the same input addresses.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_from_z_paired_tables_match_old_builder_basis_and_reuse() {
+        const RAW: [usize; 11] = [2, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14];
+        const CASES: usize = 132;
+        const ENTRIES: usize = 11 * 64;
+        let mut rng = Rng::new(0x5041_4952_5441_4238);
+        let mut twiddles = rng.vec(CASES * 15);
+        for case in 0..128 {
+            for raw in 0..15 {
+                // Each raw selector spans every basis bit, including bit127;
+                // different selectors have different values in each case.
+                let bit = (case + 13 * raw) % 128;
+                twiddles[case * 15 + raw] = if bit < 64 {
+                    F128::new(1u64 << bit, 0)
+                } else {
+                    F128::new(0, 1u64 << (bit - 64))
+                };
+            }
+        }
+        for (case, value) in [
+            F128::ZERO,
+            F128::new(u64::MAX, u64::MAX),
+            F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            twiddles[(128 + case) * 15..(129 + case) * 15].fill(value);
+        }
+        let reference = |values: &[F128]| -> Vec<F128> {
+            let mut out = Vec::with_capacity(CASES * ENTRIES);
+            for case in 0..CASES {
+                for raw in RAW {
+                    for bank in 0..4 {
+                        for nibble in 0..16 {
+                            out.push(
+                                values[case * 15 + raw]
+                                    * F128::new((nibble as u64) << (bank * 4), 0),
+                            );
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let gpu = imp::gpu().expect("paired table oracle requires real Metal");
+        unsafe {
+            let pool = gpu.pool_push();
+            assert!(
+                !gpu.pso_ntt4zg4_zero_root.is_null(),
+                "current production zero-root PSO must exist"
+            );
+            let production_usage = gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root);
+            assert_eq!(production_usage.0, 16_064, "current residency pad must stay");
+            assert!(production_usage.2 >= 64, "current production group must fit");
+            let source = imp::zero_root_pair_test_source();
+            let paired =
+                imp::compile_supplemental_pipeline(gpu, &source, "export_zero_root_paired")
+                    .unwrap();
+            let old = imp::compile_supplemental_pipeline(gpu, &source, "export_zero_root_old")
+                .unwrap();
+            for pso in [paired, old] {
+                let usage = gpu.pipeline_resources(pso);
+                assert_eq!(usage.0, 11_968, "threadgroup storage must stay unchanged");
+                assert!(usage.2 >= 64, "the production group must fit");
+            }
+            let input_bytes = core::mem::size_of_val(twiddles.as_slice());
+            let output_bytes = CASES * ENTRIES * 16;
+            let input = gpu.new_buffer(input_bytes).unwrap();
+            let paired_out = gpu.new_buffer(output_bytes).unwrap();
+            let old_out = gpu.new_buffer(output_bytes).unwrap();
+            let addresses = (twiddles.as_ptr(), gpu.buffer_contents(input));
+            let mut previous = Vec::new();
+            for repeat in 0..2 {
+                if repeat != 0 {
+                    for (index, value) in twiddles.iter_mut().enumerate() {
+                        *value = crate::field::mul_by_x(*value)
+                            + F128::new((index as u64).wrapping_mul(0x9e37_79b9) | 1, 0x7ff0_8001);
+                    }
+                }
+                assert_eq!(addresses, (twiddles.as_ptr(), gpu.buffer_contents(input)));
+                let expected = reference(&twiddles);
+                if repeat != 0 {
+                    assert_ne!(expected, previous, "the changed table oracle must differ");
+                }
+                std::ptr::copy_nonoverlapping(
+                    twiddles.as_ptr().cast::<u8>(),
+                    gpu.buffer_contents(input),
+                    input_bytes,
+                );
+                std::ptr::write_bytes(gpu.buffer_contents(paired_out), 0xa5, output_bytes);
+                std::ptr::write_bytes(gpu.buffer_contents(old_out), 0x5a, output_bytes);
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                for (pso, out) in [(paired, paired_out), (old, old_out)] {
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, input, 0, 0);
+                    gpu.set_buffer(enc, out, 0, 1);
+                    gpu.dispatch(enc, CASES as u64, 64);
+                }
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                for (name, out) in [("paired", paired_out), ("old", old_out)] {
+                    let actual = core::slice::from_raw_parts(
+                        gpu.buffer_contents(out).cast::<F128>(),
+                        expected.len(),
+                    );
+                    assert_eq!(actual, expected.as_slice(), "{name}, repeat={repeat}");
+                }
+                previous = expected;
+            }
+            eprintln!(
+                "[zero-root-pair] checked {CASES} full table images twice on real Metal; production={production_usage:?}"
+            );
+            for object in [paired, old, input, paired_out, old_out] {
+                gpu.release(object);
+            }
+            gpu.pool_pop(pool);
         }
     }
 

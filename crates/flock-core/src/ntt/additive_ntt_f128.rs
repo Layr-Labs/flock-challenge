@@ -847,26 +847,26 @@ impl AdditiveNttF128 {
             // is in the validated source/destination geometry.
             unsafe {
                 let dst_block = (dst as *mut F128).add(block * block_elems);
-                for row in row_start..row_end {
-                    if block == 0 {
-                        kernels::butterfly_fused_3layer_zero_root_from_src_row(
-                            src as *const F128,
-                            dst_block,
-                            eighth,
-                            num_ntts,
-                            row,
-                            &twiddles[block],
-                        );
-                    } else {
-                        kernels::butterfly_fused_3layer_from_src_row(
-                            src as *const F128,
-                            dst_block,
-                            eighth,
-                            num_ntts,
-                            row,
-                            &twiddles[block],
-                        );
-                    }
+                if block == 0 {
+                    kernels::butterfly_fused_3layer_zero_root_from_src_rows(
+                        src as *const F128,
+                        dst_block,
+                        eighth,
+                        num_ntts,
+                        row_start,
+                        row_end,
+                        &twiddles[block],
+                    );
+                } else {
+                    kernels::butterfly_fused_3layer_from_src_rows(
+                        src as *const F128,
+                        dst_block,
+                        eighth,
+                        num_ntts,
+                        row_start,
+                        row_end,
+                        &twiddles[block],
+                    );
                 }
             }
         };

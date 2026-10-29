@@ -286,54 +286,29 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
     }
 }
 
-/// Out-of-place fused-three-layer row for recursive from-message transforms.
+/// Out-of-place fused-three-layer tile for recursive from-message transforms.
 ///
 /// # Safety
-/// Row/lane geometry must be valid for both pointers and concurrent calls
-/// must own disjoint destination row groups.
+/// Both pointers must cover `8 * eighth * num_ntts` elements, with initialized
+/// source data, `num_ntts == 8`, and `row_start <= row_end <= eighth`.
+/// Source and destination must not overlap. Concurrent calls must own
+/// disjoint destination row groups for the whole call.
 #[inline]
-pub(super) unsafe fn butterfly_fused_3layer_from_src_row(
+pub(super) unsafe fn butterfly_fused_3layer_from_src_rows(
     src: *const F128,
     dst: *mut F128,
     eighth: usize,
     num_ntts: usize,
-    r: usize,
+    row_start: usize,
+    row_end: usize,
     twiddles: &[F128; 7],
 ) {
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
     unsafe {
         if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_from_src_row(src, dst, eighth, num_ntts, r, twiddles);
-            return;
-        }
-    }
-
-    // SAFETY: forwarded caller contract.
-    unsafe {
-        portable::butterfly_fused_3layer_from_src_row(src, dst, eighth, num_ntts, r, twiddles);
-    }
-}
-
-/// Zero-root specialization of [`butterfly_fused_3layer_from_src_row`].
-///
-/// # Safety
-/// As the general form, plus `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
-#[inline]
-pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
-    src: *const F128,
-    dst: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    r: usize,
-    twiddles: &[F128; 7],
-) {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
-    unsafe {
-        if vector_resident_rows() {
-            aarch64::butterfly_fused_3layer_zero_root_from_src_row(
-                src, dst, eighth, num_ntts, r, twiddles,
+            aarch64::butterfly_fused_3layer_from_src_rows(
+                src, dst, eighth, num_ntts, row_start, row_end, twiddles,
             );
             return;
         }
@@ -341,9 +316,44 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
 
     // SAFETY: forwarded caller contract.
     unsafe {
-        portable::butterfly_fused_3layer_zero_root_from_src_row(
-            src, dst, eighth, num_ntts, r, twiddles,
-        );
+        for r in row_start..row_end {
+            portable::butterfly_fused_3layer_from_src_row(src, dst, eighth, num_ntts, r, twiddles);
+        }
+    }
+}
+
+/// Zero-root specialization of [`butterfly_fused_3layer_from_src_rows`].
+///
+/// # Safety
+/// As the general form, plus `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_rows(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    row_start: usize,
+    row_end: usize,
+    twiddles: &[F128; 7],
+) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_3layer_zero_root_from_src_rows(
+                src, dst, eighth, num_ntts, row_start, row_end, twiddles,
+            );
+            return;
+        }
+    }
+
+    // SAFETY: forwarded caller contract.
+    unsafe {
+        for r in row_start..row_end {
+            portable::butterfly_fused_3layer_zero_root_from_src_row(
+                src, dst, eighth, num_ntts, r, twiddles,
+            );
+        }
     }
 }
 
@@ -720,6 +730,84 @@ mod aarch64_row_tests {
             }
             assert_eq!(got0, want0, "dual dst0 mismatch at eighth={eighth} num_ntts={num_ntts}");
             assert_eq!(got1, want1, "dual dst1 mismatch at eighth={eighth} num_ntts={num_ntts}");
+        }
+    }
+
+    /// Source tiles must equal the unchanged portable eager row chain.
+    /// Whole-buffer comparisons check both allocation guards and rows outside
+    /// the selected tile. Dense and zero sources start with poisoned output.
+    #[test]
+    fn neon_from_src_tiles_match_portable_with_guards() {
+        const NUM_NTTS: usize = 8;
+        const GUARD: usize = 3;
+        let poison = F128::new(0xA5A5_A5A5_A5A5_A5A5, 0x5A5A_5A5A_5A5A_5A5A);
+        let mut state = 0x534F_5552_4345_5449;
+        // 1024 and 8192 are the L2 and L1 eighths. Other cases cover
+        // one row, three rows, a full tile, tails, and a nonzero start.
+        for &(eighth, row_start, row_end) in &[
+            (1usize, 0usize, 1usize),
+            (3, 0, 3),
+            (7, 2, 5),
+            (131, 0, 128),
+            (131, 128, 131),
+            (129, 128, 129),
+            (1024, 896, 1024),
+            (8192, 8064, 8192),
+        ] {
+            for zero_root in [false, true] {
+                for zero_source in [false, true] {
+                    let (mut src, tw) = fixture(&mut state, eighth, NUM_NTTS, zero_root);
+                    if zero_source {
+                        src.fill(F128::ZERO);
+                    }
+                    let mut want = vec![poison; src.len() + 2 * GUARD];
+                    let mut got = want.clone();
+                    // SAFETY: both guarded output regions and src cover
+                    // 8 * eighth * NUM_NTTS elements; the row range is valid.
+                    // Outputs do not overlap src; zero-root twiddles hold.
+                    unsafe {
+                        let want_ptr = want.as_mut_ptr().add(GUARD);
+                        let got_ptr = got.as_mut_ptr().add(GUARD);
+                        for r in row_start..row_end {
+                            if zero_root {
+                                portable::butterfly_fused_3layer_zero_root_from_src_row(
+                                    src.as_ptr(), want_ptr, eighth, NUM_NTTS, r, &tw,
+                                );
+                            } else {
+                                portable::butterfly_fused_3layer_from_src_row(
+                                    src.as_ptr(), want_ptr, eighth, NUM_NTTS, r, &tw,
+                                );
+                            }
+                        }
+                        if zero_root {
+                            aarch64::butterfly_fused_3layer_zero_root_from_src_rows(
+                                src.as_ptr(),
+                                got_ptr,
+                                eighth,
+                                NUM_NTTS,
+                                row_start,
+                                row_end,
+                                &tw,
+                            );
+                        } else {
+                            aarch64::butterfly_fused_3layer_from_src_rows(
+                                src.as_ptr(),
+                                got_ptr,
+                                eighth,
+                                NUM_NTTS,
+                                row_start,
+                                row_end,
+                                &tw,
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        got, want,
+                        "source tile mismatch at eighth={eighth} rows={row_start}..{row_end} \
+                         zero_root={zero_root} zero_source={zero_source}"
+                    );
+                }
+            }
         }
     }
 
