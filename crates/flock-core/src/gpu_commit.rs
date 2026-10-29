@@ -1272,27 +1272,26 @@ mod parent3_gate_tests {
     }
 }
 
-/// Strict kill switch for the vectorized (uint4 load/store) Merkle tree
-/// kernels: only exact value `1` disables them, restoring the incumbent
-/// scalar-load `leaf_hash`/`parent_hash3` pipelines from the untouched
+/// Vectorized (uint4 load/store) Merkle tree kernels default on; set
+/// `FLOCK_LEAF_VEC4=0` to restore the scalar-load pipelines from the untouched
 /// embedded metallib. The vec4 variants change ONLY the memory access width
 /// (64 uint4 loads per 1 KiB leaf instead of 256 scalar loads — the leaf
 /// pass re-reads the full 1 GiB codeword and is request-count-bound, not
 /// bandwidth-bound); the BLAKE3 message schedule, compression, and output
 /// layout are word-identical, so the chaining values are bit-exact by
 /// construction and the warmup dual-run byte compare enforces it at runtime.
-/// DEMOTED TO OPT-IN by ranked n=2 evidence (submissions 508ecb2e /
+/// Historical context: DEMOTED TO OPT-IN by ranked n=2 evidence (submissions 508ecb2e /
 /// 31338634): two draws of the default-on tree scored 1,538,763 / 1,536,713
 /// with p10s agreeing to 0.016% (0.1691142 / 0.1691409), both below the same
 /// content's seven-sample third-party band (1,538,490–1,543,023, p10 ~0.1686)
 /// — a consistent ~+0.28% p10 shift that local M4 A/Bs could not see (leaf
-/// pass 12.56 ms both arms). The kernels remain word-identical and bit-exact
-/// (warmup dual-run byte compare); set `FLOCK_LEAF_VEC4=1` (exact string) for
-/// runner-matched A/B.
+/// pass 12.56 ms both arms). A later full-prover A/B on the current source
+/// favors vec4 locally; the default is retested on the ranked runner. Set
+/// `FLOCK_LEAF_VEC4=0` for a same-binary comparison.
 pub const ENV_LEAF_VEC4: &str = "FLOCK_LEAF_VEC4";
 
 fn gpu_leaf_vec4_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
+    value.is_none() || value == Some(std::ffi::OsStr::new("1"))
 }
 
 pub(crate) fn gpu_leaf_vec4_enabled() -> bool {
@@ -1321,10 +1320,11 @@ mod leaf_vec4_gate_tests {
     use std::ffi::OsStr;
 
     #[test]
-    fn default_off_exact_one_opt_in() {
+    fn default_on_explicit_zero_rolls_back() {
         assert_eq!(super::ENV_LEAF_VEC4, "FLOCK_LEAF_VEC4");
+        assert!(super::gpu_leaf_vec4_value_enabled(None));
         assert!(super::gpu_leaf_vec4_value_enabled(Some(OsStr::new("1"))));
-        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+        for value in [Some(""), Some("0"), Some("01"), Some("true")] {
             assert!(!super::gpu_leaf_vec4_value_enabled(value.map(OsStr::new)));
         }
     }
