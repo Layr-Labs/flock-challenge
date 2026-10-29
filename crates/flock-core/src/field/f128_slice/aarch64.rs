@@ -757,6 +757,77 @@ pub(super) unsafe fn fold_bank_major_128x64_rows2(
     }
 }
 
+/// Fixed 64-bank by 128-lane bank-major fold for `collapse_s_hat_v_fold8`.
+/// Four adjacent lanes share each of the 64 weight loads; twelve raw Karatsuba
+/// components stay live in NEON registers across the complete 64-bank scan,
+/// followed by two paired reductions and four write-only output stores.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `input` must contain exactly
+/// 64 consecutive rows of 128 [`F128`] values, and `output` must have length 128.
+#[inline(never)]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_bank_major_64x128_rows4(
+    weight: &[F128; 64],
+    input: &[F128],
+    output: &mut [F128],
+) {
+    unsafe {
+        debug_assert_eq!(input.len(), 64 * 128);
+        debug_assert_eq!(output.len(), 128);
+        let zero = vdupq_n_u64(0);
+        let wp = weight.as_ptr();
+        let xp = input.as_ptr();
+        let out = output.as_mut_ptr();
+
+        let mut lane = 0usize;
+        while lane < 128 {
+            let mut acc0 = KaratsubaNeon {
+                ll: zero,
+                hh: zero,
+                mm: zero,
+            };
+            let mut acc1 = KaratsubaNeon {
+                ll: zero,
+                hh: zero,
+                mm: zero,
+            };
+            let mut acc2 = KaratsubaNeon {
+                ll: zero,
+                hh: zero,
+                mm: zero,
+            };
+            let mut acc3 = KaratsubaNeon {
+                ll: zero,
+                hh: zero,
+                mm: zero,
+            };
+
+            let mut bank = 0usize;
+            let mut row = xp.add(lane);
+            while bank < 64 {
+                let wk = vld1q_u64(wp.add(bank).cast::<u64>());
+                let x0 = vld1q_u64(row.cast::<u64>());
+                let x1 = vld1q_u64(row.add(1).cast::<u64>());
+                let x2 = vld1q_u64(row.add(2).cast::<u64>());
+                let x3 = vld1q_u64(row.add(3).cast::<u64>());
+                xor_karatsuba_const_pair(&mut acc0, &mut acc1, x0, x1, wk);
+                xor_karatsuba_const_pair(&mut acc2, &mut acc3, x2, x3, wk);
+                bank += 1;
+                row = row.add(128);
+            }
+
+            let r01 = reduce_wide_pair(karatsuba_to_wide(acc0), karatsuba_to_wide(acc1));
+            let r23 = reduce_wide_pair(karatsuba_to_wide(acc2), karatsuba_to_wide(acc3));
+            vst1q_u64(out.add(lane).cast::<u64>(), r01[0]);
+            vst1q_u64(out.add(lane + 1).cast::<u64>(), r01[1]);
+            vst1q_u64(out.add(lane + 2).cast::<u64>(), r23[0]);
+            vst1q_u64(out.add(lane + 3).cast::<u64>(), r23[1]);
+            lane += 4;
+        }
+    }
+}
+
 /// Deferred-reduction round-zero message `(u_0, u_2)` over paired slots.
 ///
 /// Bitwise-identical to the scalar pair loop: both accumulate
