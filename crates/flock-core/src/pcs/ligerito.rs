@@ -3243,8 +3243,8 @@ fn transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
         .map(|row_pair| {
             let even_row = 2 * row_pair;
             let odd_row = even_row + 1;
-            let mut local_u_0 = F128::ZERO;
-            let mut local_u_2 = F128::ZERO;
+            let mut local_u_0 = crate::field::F256Unreduced::ZERO;
+            let mut local_u_2 = crate::field::F256Unreduced::ZERO;
             // SAFETY: every job owns the 16 distinct inputs for its paired
             // rows and the eight retained outputs at those same row offsets.
             unsafe {
@@ -3258,17 +3258,25 @@ fn transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
                     *ptr.add(even_index + 1) = odd[segment];
                     let f_0 = f[even_index];
                     let f_1 = f[even_index + 1];
-                    local_u_0 += f_0 * even[segment];
-                    local_u_2 += (f_0 + f_1) * (even[segment] + odd[segment]);
+                    local_u_0 ^= f_0.mul_unreduced(even[segment]);
+                    local_u_2 ^= (f_0 + f_1).mul_unreduced(even[segment] + odd[segment]);
                 }
             }
             (local_u_0, local_u_2)
         })
         .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a_0, a_2), (b_0, b_2)| (a_0 + b_0, a_2 + b_2),
+            || {
+                (
+                    crate::field::F256Unreduced::ZERO,
+                    crate::field::F256Unreduced::ZERO,
+                )
+            },
+            |(a_0, a_2), (b_0, b_2)| (a_0 ^ b_0, a_2 ^ b_2),
         );
-    SumcheckMessage { u_0, u_2 }
+    SumcheckMessage {
+        u_0: u_0.reduce(),
+        u_2: u_2.reduce(),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3279,10 +3287,6 @@ struct L0FactoredFinal3Constants {
     b: F128,
 }
 
-/// Five-product composition of the retained layers-2,1,0 transpose row.
-/// The ordinary butterfly control spends four layer-2 and four layer-1
-/// products. Standard additive-NTT identities eliminate the zero twiddles
-/// and share `A*p1`, `(A+D)*p3`, and `D*p2` across retained outputs.
 #[inline(always)]
 fn l0_factored_final3_retained_row(
     values: [F128; 8],
@@ -3312,10 +3316,6 @@ fn l0_factored_final3_retained_row(
     ]
 }
 
-/// Exact ranked child of
-/// [`transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg`].
-/// Only the retained-row algebra changes; paired row ownership, stores, the
-/// ordinary message products, and reduction order stay byte-identical.
 fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
     ntt: &AdditiveNttF128,
     data: &mut [F128],
@@ -3355,8 +3355,8 @@ fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
         .map(|row_pair| {
             let even_row = 2 * row_pair;
             let odd_row = even_row + 1;
-            let mut local_u_0 = F128::ZERO;
-            let mut local_u_2 = F128::ZERO;
+            let mut local_u_0 = crate::field::F256Unreduced::ZERO;
+            let mut local_u_2 = crate::field::F256Unreduced::ZERO;
             // SAFETY: every job owns the 16 distinct inputs for its paired
             // rows and the eight retained outputs at those same row offsets.
             unsafe {
@@ -3375,17 +3375,25 @@ fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
                     *ptr.add(even_index + 1) = odd[segment];
                     let f_0 = f[even_index];
                     let f_1 = f[even_index + 1];
-                    local_u_0 += f_0 * even[segment];
-                    local_u_2 += (f_0 + f_1) * (even[segment] + odd[segment]);
+                    local_u_0 ^= f_0.mul_unreduced(even[segment]);
+                    local_u_2 ^= (f_0 + f_1).mul_unreduced(even[segment] + odd[segment]);
                 }
             }
             (local_u_0, local_u_2)
         })
         .reduce(
-            || (F128::ZERO, F128::ZERO),
-            |(a_0, a_2), (b_0, b_2)| (a_0 + b_0, a_2 + b_2),
+            || {
+                (
+                    crate::field::F256Unreduced::ZERO,
+                    crate::field::F256Unreduced::ZERO,
+                )
+            },
+            |(a_0, a_2), (b_0, b_2)| (a_0 ^ b_0, a_2 ^ b_2),
         );
-    SumcheckMessage { u_0, u_2 }
+    SumcheckMessage {
+        u_0: u_0.reduce(),
+        u_2: u_2.reduce(),
+    }
 }
 
 /// Transposed forward additive NTT, `Fᵀ`, in place over `2^log_d` coefficients.
@@ -4750,30 +4758,33 @@ fn transpose_forward_ntt_final_5layer_factored_tile(
 
         let delta_r = constants.delta * r;
 
-        let ap = constants.a[0] * p_i[0]
-            + constants.a[1] * p_i[1]
-            + constants.a[2] * p_i[2];
-        let bp = constants.b[0] * p_i[0]
-            + constants.b[1] * p_i[1]
-            + constants.b[2] * p_i[2];
-        let gp = constants.g[0] * p_i[0]
-            + constants.g[1] * p_i[1]
-            + constants.g[2] * p_i[2];
-        let er = constants.e[0] * r_i[0]
-            + constants.e[1] * r_i[1]
-            + constants.e[2] * r_i[2];
-        let bd = constants.b[0] * d_i[0]
-            + constants.b[1] * d_i[1]
-            + constants.b[2] * d_i[2];
-        let hp = constants.h[0] * p_ij[0]
-            + constants.h[1] * p_ij[1]
-            + constants.h[2] * p_ij[2];
+        let ap = (constants.a[0].mul_unreduced(p_i[0])
+            ^ constants.a[1].mul_unreduced(p_i[1])
+            ^ constants.a[2].mul_unreduced(p_i[2]))
+        .reduce();
+        let bp = (constants.b[0].mul_unreduced(p_i[0])
+            ^ constants.b[1].mul_unreduced(p_i[1])
+            ^ constants.b[2].mul_unreduced(p_i[2]))
+        .reduce();
+        let gp_er_bd_hp = (constants.g[0].mul_unreduced(p_i[0])
+            ^ constants.g[1].mul_unreduced(p_i[1])
+            ^ constants.g[2].mul_unreduced(p_i[2])
+            ^ constants.e[0].mul_unreduced(r_i[0])
+            ^ constants.e[1].mul_unreduced(r_i[1])
+            ^ constants.e[2].mul_unreduced(r_i[2])
+            ^ constants.b[0].mul_unreduced(d_i[0])
+            ^ constants.b[1].mul_unreduced(d_i[1])
+            ^ constants.b[2].mul_unreduced(d_i[2])
+            ^ constants.h[0].mul_unreduced(p_ij[0])
+            ^ constants.h[1].mul_unreduced(p_ij[1])
+            ^ constants.h[2].mul_unreduced(p_ij[2]))
+        .reduce();
 
         let values = [
             p,
             d + delta_r + ap,
             r + bp,
-            b1 + delta_r + gp + er + bd + hp,
+            b1 + delta_r + gp_er_bd_hp,
         ];
         let row = row_start + local_row;
         // SAFETY: the caller assigns one disjoint 8-row tile. Each tile

@@ -44,11 +44,14 @@ pub const ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT: &str = "FLOCK_NO_ZC_AB_OUTPUT_WINDOW_
 
 #[inline]
 fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && r1cs.m == 32
         && r1cs.k_log >= pcs::LOG_PACKING + 2
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
-        && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
+        && *ENABLED.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+                && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
+        })
 }
 
 /// Whether the c-claim ships its four-bank sufficient statistic instead of the
@@ -325,6 +328,11 @@ pub fn prove_ligerito<Ch: Challenger>(
         pcs_open,
     };
     let claim = R1csClaim { ab, c };
+    if crate::seed_pipe::is_timed_speculative_prove() {
+        std::mem::forget(s_hat_v_ab);
+        std::mem::forget(s_hat_v_c);
+        std::mem::forget(prover_data);
+    }
     (proof, commitment, claim)
 }
 
@@ -542,7 +550,6 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let stash_pool = (crate::proof_io::pre_encode_enabled() && rayon::current_num_threads() > 1)
         .then(flock_core::epool::helper_pool)
         .flatten();
-    let claims = [ab, c];
     let pcs_open = match stash_pool {
         Some(pool) => pool.in_place_scope(|s| {
             s.spawn(|_| {
@@ -557,7 +564,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
                     z_packed,
                     &prover_data,
                     &commitment,
-                    &claims,
+                    &[ab.clone(), c.clone()],
                     &[pre_ab, pre_c],
                     &padding,
                     &lig_config,
@@ -570,7 +577,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
                 z_packed,
                 &prover_data,
                 &commitment,
-                &claims,
+                &[ab.clone(), c.clone()],
                 &[pre_ab, pre_c],
                 &padding,
                 &lig_config,
@@ -578,7 +585,6 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             )
         }),
     };
-    let [ab, c] = claims;
     flock_core::tmark::mark("open returned");
     if phase_timing {
         let wall = t_open.elapsed().as_secs_f64() * 1e3;
@@ -595,6 +601,11 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         pcs_open,
     };
     let claim = R1csClaim { ab, c };
+    if crate::seed_pipe::is_timed_speculative_prove() {
+        std::mem::forget(s_hat_v_ab);
+        std::mem::forget(s_hat_v_c);
+        std::mem::forget(prover_data);
+    }
     (proof, commitment, claim)
 }
 
@@ -660,32 +671,34 @@ fn fill_deferred_lincheck_stripe_group(
 ) {
     let group_start = group * group_f128;
     let z_group = &z_packed[group_start..group_start + group_f128];
-    // SAFETY: F128 is repr(C) as two little-endian u64 halves; this is the
-    // same read-only view used by the eager witness transpose.
     let z_u64: &[u64] =
         unsafe { std::slice::from_raw_parts(z_group.as_ptr().cast::<u64>(), z_group.len() * 2) };
     #[cfg(not(target_arch = "aarch64"))]
     let mut transposed = [0u8; 64];
-    // Every read below is `lane * u64_per_block + word` with `lane < 8` and
-    // `word < useful_words <= u64_per_block`, inside the group's 8 blocks.
     assert!(useful_words <= u64_per_block && z_u64.len() == 8 * u64_per_block);
     for word in 0..useful_words {
-        let dst = &mut stripe[word * 64..word * 64 + 64];
-        // aarch64: the eight lane words go from memory straight into vector
-        // lanes, the transpose stays in registers, and the four result
-        // registers are stored directly; same bytes as the array path.
         #[cfg(target_arch = "aarch64")]
-        // SAFETY: the reads are bounded by the assert above; `dst` is 64
-        // writable bytes.
+        if word & 15 == 0 {
+            let ahead = word + 32;
+            if ahead < u64_per_block {
+                for lane in 0..8 {
+                    unsafe {
+                        core::arch::asm!(
+                            "prfm pldl1keep, [{addr}]",
+                            addr = in(reg) z_u64.as_ptr().add(lane * u64_per_block + ahead),
+                            options(nostack, preserves_flags, readonly)
+                        );
+                    }
+                }
+            }
+        }
+        let dst = &mut stripe[word * 64..word * 64 + 64];
+        #[cfg(target_arch = "aarch64")]
         unsafe {
             let [y0, y1, y2, y3] = flock_core::bits::transpose_8_strided_u64s_to_regs(
                 z_u64.as_ptr().add(word),
                 u64_per_block,
             );
-            // The stripe is not read until after commit+zerocheck, so use the
-            // same cache-bypassing store flavor as the eager SIMD witness
-            // path. `stnp` permits these 64-byte slices without an extra
-            // alignment contract.
             core::arch::asm!(
                 "stnp {y0:q}, {y1:q}, [{dst}]",
                 "stnp {y2:q}, {y3:q}, [{dst}, #32]",
@@ -710,21 +723,18 @@ fn fill_deferred_lincheck_stripe_group(
     stripe[useful_words * 64..].fill(0);
 }
 
-/// The deferred stripe fill as a chunk job: returns the job count and the job
-/// closure, so the closure can outlive one dispatch call and be shared by the
-/// helper pool and main-pool help drains. Job `j` writes exactly the stripe
-/// groups `j*64..(j+1)*64` (clamped), each one disjoint `k`-byte range, and
-/// reads only `z_packed`.
-///
-/// The closure writes through a raw pointer to `z_lincheck`: the caller must
-/// keep that buffer alive and untouched until every job has completed.
-fn deferred_lincheck_stripe_job<'a>(
-    z_packed: &'a [F128],
+/// Materialize a BLAKE3-style lincheck stripe from immutable row-major packed
+/// `z`, dispatching coarse, pairwise-disjoint stripe slabs through `dispatch`.
+/// Production calls only the asserted ranked geometry below; compact
+/// congruent shapes give the exact fill oracle a cheap unit-test surface.
+fn fill_deferred_lincheck_stripe_with_dispatch(
+    z_packed: &[F128],
     z_lincheck: &mut [u8],
     m: usize,
     k_log: usize,
     useful_bits: usize,
-) -> (usize, impl Fn(usize) + Sync + use<'a>) {
+    dispatch: impl FnOnce(usize, &(dyn Fn(usize) + Sync)) -> bool,
+) -> bool {
     assert!(k_log >= 7, "packed block must contain whole F128 words");
     assert!(
         m >= k_log + 3,
@@ -743,7 +753,7 @@ fn deferred_lincheck_stripe_job<'a>(
     let n_groups = z_lincheck.len() / k;
     let n_jobs = n_groups.div_ceil(DEFERRED_STRIPE_GROUPS_PER_JOB);
     let stripe_base = flock_core::epool::SyncPtr(z_lincheck.as_mut_ptr());
-    let job = move |job: usize| {
+    dispatch(n_jobs, &|job| {
         let group_start = job * DEFERRED_STRIPE_GROUPS_PER_JOB;
         let group_end = (group_start + DEFERRED_STRIPE_GROUPS_PER_JOB).min(n_groups);
         for group in group_start..group_end {
@@ -760,28 +770,11 @@ fn deferred_lincheck_stripe_job<'a>(
                 useful_words,
             );
         }
-    };
-    (n_jobs, job)
+    })
 }
 
-/// Materialize a BLAKE3-style lincheck stripe from immutable row-major packed
-/// `z`, dispatching coarse, pairwise-disjoint stripe slabs through `dispatch`.
-/// Production calls only the asserted ranked geometry below; compact
-/// congruent shapes give the exact fill oracle a cheap unit-test surface.
-fn fill_deferred_lincheck_stripe_with_dispatch(
-    z_packed: &[F128],
-    z_lincheck: &mut [u8],
-    m: usize,
-    k_log: usize,
-    useful_bits: usize,
-    dispatch: impl FnOnce(usize, &(dyn Fn(usize) + Sync)) -> bool,
-) -> bool {
-    let (n_jobs, job) = deferred_lincheck_stripe_job(z_packed, z_lincheck, m, k_log, useful_bits);
-    dispatch(n_jobs, &job)
-}
-
-/// Sequential reference fill (the test oracle for the dispatched shapes).
-#[cfg(test)]
+/// Safe sequential fallback if the utility pool becomes unavailable after the
+/// witness driver selected deferred materialization.
 fn fill_deferred_lincheck_stripe(
     z_packed: &[F128],
     z_lincheck: &mut [u8],
@@ -844,97 +837,6 @@ mod deferred_stripe_tests {
         ));
         assert_eq!(helper_actual, expected);
     }
-
-    /// Slow efficiency cores: the helper-only broadcast runs on a pool whose
-    /// workers sleep before every chunk (a test-side delay, only in this test),
-    /// while main-pool workers help drain the same queue as the AB arm does in
-    /// production. The bytes must equal the canonical stripe, every job must
-    /// complete exactly once, and the main pool must have claimed jobs.
-    #[test]
-    fn deferred_fill_help_drain_with_slow_helper_matches_canonical_stripe() {
-        const M: usize = 20;
-        const K_LOG: usize = 8;
-        let z: Vec<F128> = (0..1usize << (M - 7))
-            .map(|i| {
-                let x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                F128::new(x ^ x.rotate_left(17), (!x).rotate_right(11))
-            })
-            .collect();
-        let expected = pack_z_lincheck_from_packed(&z, M, K_LOG);
-        let helper = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .thread_name(|i| format!("slow-ecore-test-{i}"))
-            .build()
-            .unwrap();
-        let main = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
-        for delay_us in [0u64, 20_000] {
-            let mut stripe = vec![0xa5u8; expected.len()];
-            let (n_jobs, job) = deferred_lincheck_stripe_job(&z, &mut stripe, M, K_LOG, 1 << K_LOG);
-            assert!(n_jobs >= 4, "test shape needs several jobs, got {n_jobs}");
-            let runs: Vec<std::sync::atomic::AtomicUsize> =
-                (0..n_jobs).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
-            let helper_started = std::sync::atomic::AtomicBool::new(false);
-            let delayed = |i: usize| {
-                let on_slow_helper = std::thread::current()
-                    .name()
-                    .is_some_and(|name| name.starts_with("slow-ecore-test-"));
-                if on_slow_helper {
-                    helper_started.store(true, std::sync::atomic::Ordering::Release);
-                    if delay_us > 0 {
-                        std::thread::sleep(std::time::Duration::from_micros(delay_us));
-                    }
-                }
-                runs[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                job(i);
-            };
-            let queue = flock_core::epool::HelpQueue::new(n_jobs, &delayed);
-            let ready = std::sync::atomic::AtomicBool::new(false);
-            std::thread::scope(|scope| {
-                let owner = scope.spawn(|| {
-                    assert!(flock_core::epool::run_queue_with_helper_only(
-                        &queue,
-                        4,
-                        Some(&helper),
-                    ));
-                    queue.wait_done();
-                    ready.store(true, std::sync::atomic::Ordering::Release);
-                });
-                // Main-pool help, as the AB queue's workers run it. With the
-                // delay, start helping only once a slow helper holds a job,
-                // so the two sides really interleave.
-                if delay_us > 0 {
-                    while !helper_started.load(std::sync::atomic::Ordering::Acquire) {
-                        std::thread::yield_now();
-                    }
-                }
-                main.install(|| {
-                    use rayon::prelude::*;
-                    (0..4).into_par_iter().with_max_len(1).for_each(|_| queue.help());
-                });
-                owner.join().unwrap();
-            });
-            assert!(ready.load(std::sync::atomic::Ordering::Acquire));
-            assert!(
-                runs.iter()
-                    .all(|r| r.load(std::sync::atomic::Ordering::Relaxed) == 1),
-                "every stripe job runs exactly once (delay {delay_us} us)"
-            );
-            if delay_us > 0 {
-                assert!(
-                    queue.main_claims() > 0,
-                    "main-pool helpers must claim stripe jobs from a slow helper pool"
-                );
-                assert!(
-                    queue.main_claims() < n_jobs,
-                    "the slow helper pool must also have run jobs"
-                );
-            }
-            assert_eq!(stripe, expected, "delay {delay_us} us");
-        }
-    }
 }
 
 /// Build the witness commitment and the challenge-independent half of
@@ -980,10 +882,8 @@ where
             return;
         }
         // SAFETY: the acquire above pairs with the fill worker's
-        // release-store, which follows `HelpQueue::wait_done`'s acquire of
-        // every chunk's release completion, i.e. the last stripe write by
-        // any thread; the buffer is not written again until after
-        // zerocheck consumed the stash.
+        // release-store, which follows its last stripe write; the buffer
+        // is not written again until after zerocheck consumed the stash.
         let stripe: &[u8] =
             unsafe { std::slice::from_raw_parts(stripe_ptr as *const u8, stripe_len) };
         flock_core::zerocheck::stage_commit_tail_fill(forked, r1cs, commitment, stripe, padding);
@@ -999,7 +899,6 @@ fn commit_with_round1_ab_precompute(
     commit_codeword: CommitCodeword,
     tail_fill: Option<CommitTailFillHook<'_>>,
     identity_prefix_contract: Option<Round1PinnedOnePrefixStatement>,
-    stripe_help: Option<&(dyn Fn() + Sync)>,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -1013,13 +912,8 @@ fn commit_with_round1_ab_precompute(
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
 
-    // `stripe_help` (deferred-stripe proves only): each main-pool worker of
-    // the AB queue drains leftover stripe chunks once the AB queue is empty.
-    // The AB queue's helper broadcast is queued behind the stripe's on the
-    // efficiency-core pool, so this arm cannot finish before the stripe does;
-    // helping moves the stripe's remainder onto otherwise idle P-workers.
     let precompute_ab = || {
-        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_with_tail(
+        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded(
             a_packed,
             b_packed,
             pcs_params.m,
@@ -1027,7 +921,6 @@ fn commit_with_round1_ab_precompute(
             inv_table,
             padding,
             identity_prefix_contract,
-            stripe_help,
         )
     };
     let precompute_ab_replay = || {
@@ -1191,8 +1084,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
     );
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
-    let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>,
-                      stripe_help: Option<&(dyn Fn() + Sync)>| {
+    let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>| {
         let cpu0 = phase_timing.then(process_cpu_ms);
         let t_commit = std::time::Instant::now();
         let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
@@ -1204,7 +1096,6 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             commit_codeword,
             tail_fill,
             identity_prefix_contract,
-            stripe_help,
         );
         if phase_timing {
             let wall = t_commit.elapsed().as_secs_f64() * 1e3;
@@ -1237,7 +1128,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 stripe.as_ptr() as usize,
                 stripe.len(),
             );
-            (run_commit(hook, None), stripe)
+            (run_commit(hook), stripe)
         }
         LincheckStripeInput::DeferredRanked => {
             assert_eq!(r1cs.m, 32);
@@ -1265,8 +1156,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 .unwrap_or(DEFER_STRIPE_EPOOL_THREADS_DEFAULT);
             // Commit-tail fill (`FLOCK_NO_COMMIT_TAIL_FILL=1` kills): the
             // hook stages only after acquiring `stripe_ready`, whose paired
-            // release follows the last stripe write by any thread (see
-            // `HelpQueue::wait_done` below).
+            // release follows the fill worker's last stripe write.
             let stripe_ready = std::sync::atomic::AtomicBool::new(false);
             let stripe_ptr = stripe.as_ptr() as usize;
             let stripe_len = stripe.len();
@@ -1278,38 +1168,35 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 stripe_ptr,
                 stripe_len,
             );
-            // One shared chunk queue for the stripe. The E-workers own it
-            // (helper-only broadcast, as before); main-pool workers that
-            // finish the AB precompute queue help drain what is left, so a
-            // slow efficiency cluster delays the commit window by at most the
-            // chunks it already holds, not the whole stripe remainder. Each
-            // job index is claimed exactly once from one cursor and writes
-            // only its own groups, so the bytes do not depend on who ran it.
-            // `stripe` is not touched again until after the scope below.
-            let (n_stripe_jobs, stripe_job_fn) =
-                deferred_lincheck_stripe_job(&z_packed, &mut stripe, m, k_log, useful_bits);
-            let stripe_queue = flock_core::epool::HelpQueue::new(n_stripe_jobs, &stripe_job_fn);
-            let stripe_help = || stripe_queue.help();
             let pre = std::thread::scope(|scope| {
                 let stripe_ready = &stripe_ready;
-                let stripe_queue = &stripe_queue;
-                let stripe_job = scope.spawn(move || {
+                let stripe_job = scope.spawn(|| {
                     let started = std::time::Instant::now();
-                    let filled_on_epool =
-                        flock_core::epool::run_helper_only_queue(stripe_queue, epool_workers);
+                    let filled_on_epool = fill_deferred_lincheck_stripe_with_dispatch(
+                        &z_packed,
+                        &mut stripe,
+                        m,
+                        k_log,
+                        useful_bits,
+                        |n_jobs, job| {
+                            flock_core::epool::run_helper_only_chunks(n_jobs, epool_workers, job)
+                        },
+                    );
                     if !filled_on_epool {
-                        // No helper pool: drain the same queue here (main-pool
-                        // help may already own some chunks).
-                        stripe_queue.drain_inline();
+                        fill_deferred_lincheck_stripe(
+                            &z_packed,
+                            &mut stripe,
+                            m,
+                            k_log,
+                            useful_bits,
+                        );
                     }
-                    // Chunks claimed by main-pool helpers may still be running
-                    // after the broadcast returns; wait for every completion
-                    // (Release per chunk, Acquire here) before publishing.
-                    stripe_queue.wait_done();
+                    // Last stripe write is above; the release-store publishes
+                    // the bytes to the commit arm's tail-fill hook (acquire).
                     stripe_ready.store(true, std::sync::atomic::Ordering::Release);
                     if phase_timing {
                         eprintln!(
-                            "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={} main_help_jobs={}",
+                            "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={}",
                             started.elapsed().as_secs_f64() * 1e3,
                             if filled_on_epool {
                                 "epool"
@@ -1317,14 +1204,10 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                                 "sequential"
                             },
                             if filled_on_epool { epool_workers } else { 0 },
-                            stripe_queue.main_claims(),
                         );
                     }
                 });
-                let pre = run_commit(tail_fill_hook, Some(&stripe_help));
-                // The calling thread is idle until the join; help first (one
-                // relaxed load when the queue is already exhausted).
-                stripe_queue.help();
+                let pre = run_commit(tail_fill_hook);
                 let join_started = std::time::Instant::now();
                 // Spin-family completion, prover side: this is the last timed
                 // production join in the prove path (the gpu_commit.rs joins
@@ -1623,7 +1506,6 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
-        None,
         None,
         None,
     );
