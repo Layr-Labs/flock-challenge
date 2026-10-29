@@ -5575,6 +5575,7 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
+            let mut bound_pso = NIL;
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 // Register-resident specializations for the production pass
                 // widths; the generic staged kernel covers the rest. At
@@ -5610,7 +5611,10 @@ kernel void blake3_pow_scan(
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
                 };
-                gpu.set_pipeline(enc, pso);
+                if pso != bound_pso {
+                    gpu.set_pipeline(enc, pso);
+                    bound_pso = pso;
+                }
                 let p = NttParams {
                     log_d: log_d as u32,
                     l: l as u32,
@@ -5650,6 +5654,7 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
+            let mut bound_pso = NIL;
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
@@ -5679,7 +5684,10 @@ kernel void blake3_pow_scan(
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
                 };
-                gpu.set_pipeline(enc, pso);
+                if pso != bound_pso {
+                    gpu.set_pipeline(enc, pso);
+                    bound_pso = pso;
+                }
                 let p = NttParams {
                     log_d: log_d as u32,
                     l: l as u32,
@@ -5723,6 +5731,7 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
+            let mut bound_pso = NIL;
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 if l < l_from || l >= l_to {
                     continue;
@@ -5751,7 +5760,10 @@ kernel void blake3_pow_scan(
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
                 };
-                gpu.set_pipeline(enc, pso);
+                if pso != bound_pso {
+                    gpu.set_pipeline(enc, pso);
+                    bound_pso = pso;
+                }
                 let p = NttParams {
                     log_d: log_d as u32,
                     l: l as u32,
@@ -13705,6 +13717,7 @@ kernel void zc_r2_horner_oracle(
         hi_size: usize,
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
+        fixed_horner_weights: bool,
     ) {
         if !zc_r2_idle_fill_viable() {
             return;
@@ -13719,8 +13732,11 @@ kernel void zc_r2_horner_oracle(
         {
             return;
         }
-        let horner =
-            super::gpu_zc_r2_horner_enabled() && super::zc_r2_horner_weights(eq_lo, lo_size);
+        // The sole caller derives this proof from the same immutable point
+        // used to build eq_lo. Unsupported points keep the full table check.
+        let horner = super::gpu_zc_r2_horner_enabled()
+            && ((fixed_horner_weights && lo_size == 16_384)
+                || super::zc_r2_horner_weights(eq_lo, lo_size));
         let Ok(gpu) = gpu() else { return };
         let Some(state_mutex) = zc_r2_state() else {
             return;
