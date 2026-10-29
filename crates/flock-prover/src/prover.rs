@@ -206,12 +206,20 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
         .iter()
         .map(|c| quirky_x_outer_full(&c.point))
         .collect();
-    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    let pair_refs;
+    let other_refs: Vec<&[F128]>;
+    let x_refs: &[&[F128]] = if let [a, b] = x_fulls.as_slice() {
+        pair_refs = [a.as_slice(), b.as_slice()];
+        &pair_refs
+    } else {
+        other_refs = x_fulls.iter().map(|v| v.as_slice()).collect();
+        &other_refs
+    };
     let out = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         prover_data,
         commitment,
-        &x_refs,
+        x_refs,
         precomputed_s_hat_v,
         &[],
         padding,

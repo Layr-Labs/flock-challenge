@@ -1122,6 +1122,16 @@ impl AdditiveNttF128 {
                 layer += 3;
             } else if layer + 1 < stop_layer && block_size >= 4 {
                 let quarter = block_size >> 2;
+                // Only the ranked fine boundary uses the odd-lane skip here.
+                let tail = if log_d == 20
+                    && num_ntts == 64
+                    && start_layer == 8
+                    && stop_layer == 10
+                {
+                    odd_tail
+                } else {
+                    0
+                };
                 for local in 0..num_blocks {
                     let abs = abs_first + local;
                     let start = local * block_elems;
@@ -1132,6 +1142,7 @@ impl AdditiveNttF128 {
                         self.twiddle(layer + 1, 2 * abs + 1),
                         quarter,
                         num_ntts,
+                        tail,
                     );
                 }
                 layer += 2;
@@ -1595,6 +1606,7 @@ impl AdditiveNttF128 {
                         t_inner_b,
                         quarter,
                         num_ntts,
+                        0,
                     );
                 }
                 layer += 2;
@@ -2223,6 +2235,8 @@ fn butterfly_interleaved_block_par_rows(
 /// `a=r`, `b=r+quarter`, `c=r+2*quarter`, `d=r+3*quarter`. Layer L
 /// butterflies `(a,c)` and `(b,d)`; layer L+1 then butterflies `(a,b)` (in
 /// the new top sub-block) and `(c,d)` (in the new bottom sub-block).
+/// A nonzero `odd_tail` requires zero trailing lanes at odd positions and
+/// an even `quarter`, so all four rows in a group have the same parity.
 #[inline]
 fn butterfly_interleaved_fused_2layer_par_rows(
     block: &mut [F128],
@@ -2231,24 +2245,72 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     t_inner_b: F128,
     quarter: usize,
     num_ntts: usize,
+    odd_tail: usize,
 ) {
     use rayon::prelude::*;
     const PARALLEL_ROW_THRESHOLD: usize = 256;
     let stride = quarter * num_ntts;
+    debug_assert!(num_ntts > 0 && odd_tail < num_ntts);
     debug_assert_eq!(block.len(), 4 * stride);
-
-    let do_one = |row_a: &mut [F128],
-                  row_b: &mut [F128],
-                  row_c: &mut [F128],
-                  row_d: &mut [F128]| {
-        kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
-    };
+    debug_assert!(odd_tail == 0 || quarter.is_multiple_of(2));
 
     // Split the block into four quarters, then zip row-wise. Each rayon task
     // processes one quarter-row index = 4 logical rows of work.
     let (top_half, bot_half) = block.split_at_mut(2 * stride);
     let (q1, q2) = top_half.split_at_mut(stride);
     let (q3, q4) = bot_half.split_at_mut(stride);
+
+    if odd_tail == 0 {
+        let do_one = |row_a: &mut [F128],
+                      row_b: &mut [F128],
+                      row_c: &mut [F128],
+                      row_d: &mut [F128]| {
+            kernels::butterfly_fused_2layer(
+                row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b,
+            );
+        };
+        if quarter < PARALLEL_ROW_THRESHOLD {
+            for r in 0..quarter {
+                let off = r * num_ntts;
+                let (q1r, q1_rest) = q1[off..].split_at_mut(num_ntts);
+                let _ = q1_rest;
+                let (q2r, _) = q2[off..].split_at_mut(num_ntts);
+                let (q3r, _) = q3[off..].split_at_mut(num_ntts);
+                let (q4r, _) = q4[off..].split_at_mut(num_ntts);
+                do_one(q1r, q2r, q3r, q4r);
+            }
+        } else {
+            q1.par_chunks_mut(num_ntts)
+                .zip(q2.par_chunks_mut(num_ntts))
+                .zip(q3.par_chunks_mut(num_ntts))
+                .zip(q4.par_chunks_mut(num_ntts))
+                .for_each(|(((row_a, row_b), row_c), row_d)| {
+                    do_one(row_a, row_b, row_c, row_d);
+                });
+        }
+        return;
+    }
+
+    let do_one = |r: usize,
+                  row_a: &mut [F128],
+                  row_b: &mut [F128],
+                  row_c: &mut [F128],
+                  row_d: &mut [F128]| {
+        let lanes = if r & 1 == 1 {
+            num_ntts - odd_tail
+        } else {
+            num_ntts
+        };
+        kernels::butterfly_fused_2layer(
+            &mut row_a[..lanes],
+            &mut row_b[..lanes],
+            &mut row_c[..lanes],
+            &mut row_d[..lanes],
+            t_outer,
+            t_inner_a,
+            t_inner_b,
+        );
+    };
 
     if quarter < PARALLEL_ROW_THRESHOLD {
         for r in 0..quarter {
@@ -2258,15 +2320,16 @@ fn butterfly_interleaved_fused_2layer_par_rows(
             let (q2r, _) = q2[off..].split_at_mut(num_ntts);
             let (q3r, _) = q3[off..].split_at_mut(num_ntts);
             let (q4r, _) = q4[off..].split_at_mut(num_ntts);
-            do_one(q1r, q2r, q3r, q4r);
+            do_one(r, q1r, q2r, q3r, q4r);
         }
     } else {
         q1.par_chunks_mut(num_ntts)
             .zip(q2.par_chunks_mut(num_ntts))
             .zip(q3.par_chunks_mut(num_ntts))
             .zip(q4.par_chunks_mut(num_ntts))
-            .for_each(|(((row_a, row_b), row_c), row_d)| {
-                do_one(row_a, row_b, row_c, row_d);
+            .enumerate()
+            .for_each(|(r, (((row_a, row_b), row_c), row_d))| {
+                do_one(r, row_a, row_b, row_c, row_d);
             });
     }
 }
@@ -3738,6 +3801,85 @@ mod twiddle_structure_check {
 #[cfg(test)]
 mod block_range_equivalence {
     use super::*;
+
+    #[test]
+    fn fine_boundary_odd_tail_matches_dense_layer_oracle() {
+        const GUARD: usize = 3;
+        let poison = F128::new(0xA5A5_A5A5_A5A5_A5A5, 0x5A5A_5A5A_5A5A_5A5A);
+        let ntt = AdditiveNttF128::standard(20);
+        let mut state = 0x4649_4E45_5441_494Cu64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut check = |quarter: usize, num_ntts: usize, tail: usize, abs: usize| {
+            let stride = quarter * num_ntts;
+            let len = 4 * stride;
+            let mut source = vec![poison; len + 2 * GUARD];
+            for (r, row) in source[GUARD..GUARD + len]
+                .chunks_exact_mut(num_ntts)
+                .enumerate()
+            {
+                for (lane, value) in row.iter_mut().enumerate() {
+                    *value = if r & 1 == 1 && lane >= num_ntts - tail {
+                        F128::ZERO
+                    } else {
+                        // Even-position tail lanes must stay nonzero.
+                        F128::new(next() | 1, next())
+                    };
+                }
+            }
+            let t_outer = ntt.twiddle(8, abs);
+            let t_inner_a = ntt.twiddle(9, 2 * abs);
+            let t_inner_b = ntt.twiddle(9, 2 * abs + 1);
+            let mut want = source.clone();
+            let mut got = source;
+
+            // Parent-equivalent dense arithmetic: two ordinary full-lane
+            // layers. This oracle does not use the changed fused helper.
+            let whole = &mut want[GUARD..GUARD + len];
+            butterfly_interleaved_block(whole, t_outer, 2 * quarter, num_ntts);
+            let (top, bot) = whole.split_at_mut(2 * stride);
+            butterfly_interleaved_block(top, t_inner_a, quarter, num_ntts);
+            butterfly_interleaved_block(bot, t_inner_b, quarter, num_ntts);
+            butterfly_interleaved_fused_2layer_par_rows(
+                &mut got[GUARD..GUARD + len],
+                t_outer,
+                t_inner_a,
+                t_inner_b,
+                quarter,
+                num_ntts,
+                tail,
+            );
+            assert_eq!(
+                got, want,
+                "quarter={quarter} width={num_ntts} tail={tail} abs={abs}"
+            );
+        };
+
+        // Sequential and parallel paths, dense controls and odd quarters.
+        for (quarter, width, tail) in [
+            (1, 5, 0),
+            (2, 8, 0),
+            (2, 8, 7),
+            (4, 64, 7),
+            (255, 5, 0),
+            (256, 64, 7),
+            (1024, 64, 0),
+        ] {
+            check(quarter, width, tail, 1);
+        }
+        // Every selected physical block for four actual fine boundaries.
+        // Each fixture is one 4 MiB block, not a full 1 GiB codeword.
+        for (b_start, fine_m) in [(1usize, 1usize), (12, 4), (15, 9), (1, 15)] {
+            let sb_end = b_start << 4;
+            for abs in sb_end - fine_m..sb_end {
+                check(1024, 64, 7, abs);
+            }
+        }
+    }
 
     #[test]
     fn block_range_matches_full_transform() {
