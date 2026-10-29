@@ -3921,9 +3921,11 @@ static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,
                                     threadgroup const uint4* tab,
                                     thread uint4& ra, thread uint4& rb)
 {
-    uint4 a = uint4(0u);
-    uint4 b = uint4(0u);
-    for (int i = 7; i >= 0; i--) {
+    const uint ha_top = va.w >> 16;
+    const uint hb_top = vb.w >> 16;
+    uint4 a = tab[ha_top & 255u] ^ tab[256u + (ha_top >> 8)];
+    uint4 b = tab[hb_top & 255u] ^ tab[256u + (hb_top >> 8)];
+    for (int i = 6; i >= 0; i--) {
         a = gf_shl16(a);
         b = gf_shl16(b);
         uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
