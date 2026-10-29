@@ -47,18 +47,19 @@ static SPARSE_NTT_DATA_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 
 /// Take an uninitialized `F128` vector of length `len` for `transpose_forward_ntt_sparse_impl`.
 pub fn take_sparse_ntt_data(len: usize) -> Vec<F128> {
-    if len >= 65_536 {
-        if let Ok(mut guard) = SPARSE_NTT_DATA_SCRATCH.lock() {
-            if let Some(mut v) = guard.take() {
-                if v.capacity() >= len {
-                    unsafe { v.set_len(len) };
-                    return v;
-                }
-                *guard = Some(v);
+    if let Ok(mut guard) = SPARSE_NTT_DATA_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= len {
+                unsafe { v.set_len(len) };
+                return v;
             }
+            *guard = Some(v);
         }
     }
-    crate::alloc_uninit_vec(len)
+    let cap = len.max(262_144);
+    let mut v = crate::alloc_uninit_vec(cap);
+    unsafe { v.set_len(len) };
+    v
 }
 
 /// Return a `transpose_forward_ntt_sparse_impl` buffer to `SPARSE_NTT_DATA_SCRATCH`.

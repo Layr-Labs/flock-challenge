@@ -31,13 +31,6 @@ pub enum VerifyError {
 /// run their body via `verifier_pool().install(..)`. Any `par_iter` reached from
 /// there uses this 1-thread pool and collapses onto a single worker, without
 /// touching the prover's use of the global pool.
-/// The pool exists so shared `par_*` helpers collapse to one worker under
-/// verification: the same code runs multithreaded on the prover side and
-/// serial here, with no forked copies to keep in sync. One thread keeps
-/// reported verify times honest single-core numbers, matching comparable
-/// systems. The 64 MiB stack exists because the deep recursive Ligerito
-/// verifier overflows a default ~2 MiB rayon worker stack, unlike the
-/// 8 MiB main thread the prover enjoys.
 fn verifier_pool() -> &'static rayon::ThreadPool {
     use std::sync::OnceLock;
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
