@@ -356,22 +356,6 @@ pub(crate) fn gpu_lincheck_enabled() -> bool {
     *ON
 }
 
-/// Exact same-binary rollback for routing the zerocheck fold arm through the
-/// factored byte-table B4 pipeline (the lincheck arm's 6+2-bit table
-/// builder). `FLOCK_NO_ZC_FACTORED_B4=1` keeps zerocheck on the incumbent
-/// `lc_fold_stripes` B4 pipeline. Both kernels produce bit-identical
-/// partials; the factored builder only cuts the per-block table rebuild.
-pub const ENV_NO_ZC_FACTORED_B4: &str = "FLOCK_NO_ZC_FACTORED_B4";
-
-#[cfg_attr(
-    not(all(target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)]
-pub(crate) fn zc_factored_b4_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_FACTORED_B4).as_deref() != Some(std::ffi::OsStr::new("1")))
-}
-
 /// Exact same-binary rollback for the supplemental factored byte-table B4
 /// builder used by the lincheck fold arm. `FLOCK_NO_LINCHECK_FACTORED_B4=1`
 /// skips the candidate source compile and keeps the incumbent B4 pipeline;
@@ -11620,13 +11604,6 @@ kernel void lc_fold_stripes_factored_b4(
             // exact rollback or candidate-init failure; only an incumbent B4
             // failure keeps the arm CPU-only.
             let (pso_fold, block, kernel, byte_fold, factored_b4) = match arm {
-                FoldArm::Zc
-                    if super::zc_byte_fold_enabled()
-                        && super::zc_factored_b4_enabled()
-                        && !state.pso_lc_factored_b4.is_null() =>
-                {
-                    (state.pso_lc_factored_b4, 4, "byte-b4-factored", true, true)
-                }
                 FoldArm::Zc if super::zc_byte_fold_enabled() && !state.pso_lc_fold.is_null() => {
                     (state.pso_lc_fold, 4, "byte-b4", true, false)
                 }
@@ -13880,7 +13857,7 @@ kernel void zc_r2_horner_oracle(
                 std::ptr::copy_nonoverlapping(
                     eq_hi.as_ptr().cast::<u8>(),
                     gpu.buffer_contents(state.eq_hi_buf),
-                    need_hi,
+                    ZC_IDLE_FILL_PRIMER_CHUNKS.min(hi_size) * 16,
                 );
                 let need_part = hi_size * 64 * if horner { 4 } else { 1 };
                 if state.part_cap < need_part {
@@ -14019,7 +13996,7 @@ kernel void zc_r2_horner_oracle(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             // Four F128 per physical group, merged per logical hi chunk
             // after completion: [p1_even, pinf_even, p1_odd, pinf_odd].
@@ -14767,7 +14744,7 @@ kernel void zc_t3_products(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             let need_part = hi_size * 32;
             if state.part_cap < need_part {
@@ -15465,7 +15442,7 @@ kernel void zc_loop_products(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             let need_part = hi_size * 32;
             if state.part_cap < need_part {
@@ -18672,6 +18649,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// anchors+deltas compact representation with an F2-linear scaled
     /// table. Exercises calibration (internal equality oracle + share
     /// publication without poisoning) and the timed prefix path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_zc_t3_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
@@ -18806,6 +18784,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// per-chunk reduced partials must equal the CPU's fused round
     /// (`fold_pairs` + message) bit-for-bit. Exercises calibration and the
     /// timed prefix path on real Metal.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_zc_loop_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
