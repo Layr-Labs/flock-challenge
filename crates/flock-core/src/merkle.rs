@@ -992,10 +992,8 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     let mut proof = Vec::new();
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
-    let mut next = Vec::with_capacity(active.len());
-
     while level_len > 1 {
-        next.clear();
+        let mut next_len = 0usize;
         let mut i = 0;
         while i < active.len() {
             let p = active[i];
@@ -1009,12 +1007,14 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
                 proof.push(tree[level_start + (p ^ 1)]);
                 i += 1;
             }
-            next.push(p >> 1);
+            // The output cursor cannot pass the consumed input indices.
+            active[next_len] = p >> 1;
+            next_len += 1;
         }
-        // `next` is sorted-unique by construction: the input was sorted-unique;
+        // The written prefix is sorted-unique: the input was sorted-unique;
         // consecutive sibling pairs (handled above) collapse to one; otherwise
         // p >> 1 preserves strict ordering.
-        core::mem::swap(&mut active, &mut next);
+        active.truncate(next_len);
         level_start += level_len;
         level_len >>= 1;
     }

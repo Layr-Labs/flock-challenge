@@ -14157,7 +14157,12 @@ kernel void zc_r2_horner_oracle(
             if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
                 return poison(job.cb);
             }
-            let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+            let debug = super::gpu_zc_r2_debug();
+            let first_wall = if job.calibration || debug {
+                zc_fold_gpu_wall_ms(gpu, job.cb)
+            } else {
+                0.0
+            };
             let state_mutex = match zc_r2_state() {
                 Some(s) => s,
                 None => return poison(job.cb),
@@ -14192,7 +14197,7 @@ kernel void zc_r2_horner_oracle(
             }
             if !job.calibration {
                 gpu.release(job.cb);
-                if super::gpu_zc_r2_debug() {
+                if debug {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
                          cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms horner={}",
