@@ -165,16 +165,149 @@ unsafe fn mul_two_const_sum_vec2(
     }
 }
 
+#[derive(Clone, Copy)]
+struct TriNeon {
+    ll: uint64x2_t,
+    cross: uint64x2_t,
+    hh: uint64x2_t,
+}
+
+#[inline(always)]
+unsafe fn tri_zero() -> TriNeon {
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        TriNeon {
+            ll: zero,
+            cross: zero,
+            hh: zero,
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn tri_to_wide(value: TriNeon) -> WideNeon {
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        WideNeon {
+            lo: veorq_u64(value.ll, vextq_u64::<1>(zero, value.cross)),
+            hi: veorq_u64(value.hh, vextq_u64::<1>(value.cross, zero)),
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn xor_tri(acc: &mut TriNeon, value: TriNeon) {
+    unsafe {
+        acc.ll = veorq_u64(acc.ll, value.ll);
+        acc.cross = veorq_u64(acc.cross, value.cross);
+        acc.hh = veorq_u64(acc.hh, value.hh);
+    }
+}
+
+#[inline(always)]
+#[target_feature(enable = "aes")]
+unsafe fn fused_pmull_lo_acc(acc: uint64x2_t, a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    let out: uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "pmull {o:v}.1q, {a:v}.1d, {b:v}.1d",
+            "eor {o:v}.16b, {o:v}.16b, {c:v}.16b",
+            a = in(vreg) a,
+            b = in(vreg) b,
+            c = in(vreg) acc,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+#[inline(always)]
+#[target_feature(enable = "aes")]
+unsafe fn fused_pmull_hi_acc(acc: uint64x2_t, a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    let out: uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "pmull2 {o:v}.1q, {a:v}.2d, {b:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {c:v}.16b",
+            a = in(vreg) a,
+            b = in(vreg) b,
+            c = in(vreg) acc,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+#[inline(always)]
+#[target_feature(enable = "aes")]
+unsafe fn fused_cross_acc(acc: uint64x2_t, a_sw: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    let out: uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "pmull {p:v}.1q, {t:v}.1d, {b:v}.1d",
+            "eor {p:v}.16b, {p:v}.16b, {c:v}.16b",
+            "pmull2 {o:v}.1q, {t:v}.2d, {b:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {p:v}.16b",
+            t = in(vreg) a_sw,
+            b = in(vreg) b,
+            c = in(vreg) acc,
+            p = out(vreg) _,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+#[inline(always)]
+#[target_feature(enable = "aes")]
+unsafe fn cross_sum_q(x: uint64x2_t, y: uint64x2_t) -> uint64x2_t {
+    let out: uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "pmull {p:v}.1q, {x:v}.1d, {y:v}.1d",
+            "pmull2 {o:v}.1q, {x:v}.2d, {y:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {p:v}.16b",
+            x = in(vreg) x,
+            y = in(vreg) y,
+            p = out(vreg) _,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+#[inline(always)]
+#[target_feature(enable = "aes")]
+unsafe fn tri_acc_sw(acc: &mut TriNeon, a: uint64x2_t, a_sw: uint64x2_t, b: uint64x2_t) {
+    unsafe {
+        acc.ll = fused_pmull_lo_acc(acc.ll, a, b);
+        acc.hh = fused_pmull_hi_acc(acc.hh, a, b);
+        acc.cross = fused_cross_acc(acc.cross, a_sw, b);
+    }
+}
+
+#[inline(always)]
+#[target_feature(enable = "aes")]
+unsafe fn tri_acc(acc: &mut TriNeon, a: uint64x2_t, b: uint64x2_t) {
+    unsafe {
+        tri_acc_sw(acc, a, swap_halves(a), b);
+    }
+}
+
 #[inline]
 #[target_feature(enable = "aes")]
 unsafe fn mul_unreduced(a: uint64x2_t, b: uint64x2_t) -> WideNeon {
     unsafe {
         let ll = pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
-        let hh = pmull(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b));
-        let a_mid = veorq_u64(a, vextq_u64::<1>(a, a));
-        let b_mid = veorq_u64(b, vextq_u64::<1>(b, b));
-        let middle = pmull(vgetq_lane_u64::<0>(a_mid), vgetq_lane_u64::<0>(b_mid));
-        let cross = xor3_u64(middle, ll, hh);
+        let hh = transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(a),
+            vreinterpretq_p64_u64(b),
+        ));
+        let cross = cross_sum_q(swap_halves(a), b);
         let zero = vdupq_n_u64(0);
         WideNeon {
             lo: veorq_u64(ll, vextq_u64::<1>(zero, cross)),
@@ -375,15 +508,18 @@ pub(super) unsafe fn round0_and_round1_lookahead(
             i += 4;
         }
 
-        let red = |value: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(value));
-        let c0 = red(a_c0);
-        let c2 = red(a_c2);
-        let c3 = red(a_c3);
-        let c5 = red(a_c5);
-        let c1 = red(a_c1_endpoint) + c0 + c2;
-        let c4 = red(a_c4_endpoint) + c3 + c5;
-        let u0 = c0 + red(a_u0_second);
-        let u2 = c2 + red(a_u2_second);
+        let [c0_q, c2_q] = reduce_wide_pair(a_c0, a_c2);
+        let [c3_q, c5_q] = reduce_wide_pair(a_c3, a_c5);
+        let [c1e_q, c4e_q] = reduce_wide_pair(a_c1_endpoint, a_c4_endpoint);
+        let [u0s_q, u2s_q] = reduce_wide_pair(a_u0_second, a_u2_second);
+        let c0 = transmute::<uint64x2_t, F128>(c0_q);
+        let c2 = transmute::<uint64x2_t, F128>(c2_q);
+        let c3 = transmute::<uint64x2_t, F128>(c3_q);
+        let c5 = transmute::<uint64x2_t, F128>(c5_q);
+        let c1 = transmute::<uint64x2_t, F128>(c1e_q) + c0 + c2;
+        let c4 = transmute::<uint64x2_t, F128>(c4e_q) + c3 + c5;
+        let u0 = c0 + transmute::<uint64x2_t, F128>(u0s_q);
+        let u2 = c2 + transmute::<uint64x2_t, F128>(u2s_q);
         ((u0, u2), [c0, c1, c2, c3, c4, c5])
     }
 }
@@ -411,11 +547,10 @@ pub(super) unsafe fn fold_banked_slot<const BANKS: usize>(
 ) -> F128 {
     unsafe {
         debug_assert!(input.len() >= BANKS);
-        let zero = vdupq_n_u64(0);
-        let mut a0 = WideNeon { lo: zero, hi: zero };
-        let mut a1 = WideNeon { lo: zero, hi: zero };
-        let mut a2 = WideNeon { lo: zero, hi: zero };
-        let mut a3 = WideNeon { lo: zero, hi: zero };
+        let mut a0 = tri_zero();
+        let mut a1 = tri_zero();
+        let mut a2 = tri_zero();
+        let mut a3 = tri_zero();
 
         let w = weight.as_ptr();
         let x = input.as_ptr();
@@ -430,23 +565,23 @@ pub(super) unsafe fn fold_banked_slot<const BANKS: usize>(
             let x1 = vld1q_u64(x.add(k + 1).cast::<u64>());
             let x2 = vld1q_u64(x.add(k + 2).cast::<u64>());
             let x3 = vld1q_u64(x.add(k + 3).cast::<u64>());
-            xor_wide(&mut a0, mul_unreduced(w0, x0));
-            xor_wide(&mut a1, mul_unreduced(w1, x1));
-            xor_wide(&mut a2, mul_unreduced(w2, x2));
-            xor_wide(&mut a3, mul_unreduced(w3, x3));
+            tri_acc(&mut a0, w0, x0);
+            tri_acc(&mut a1, w1, x1);
+            tri_acc(&mut a2, w2, x2);
+            tri_acc(&mut a3, w3, x3);
             k += 4;
         }
         while k < BANKS {
             let wk = vld1q_u64(w.add(k).cast::<u64>());
             let xk = vld1q_u64(x.add(k).cast::<u64>());
-            xor_wide(&mut a0, mul_unreduced(wk, xk));
+            tri_acc(&mut a0, wk, xk);
             k += 1;
         }
 
-        xor_wide(&mut a0, a1);
-        xor_wide(&mut a2, a3);
-        xor_wide(&mut a0, a2);
-        transmute::<uint64x2_t, F128>(reduce_wide(a0))
+        xor_tri(&mut a0, a1);
+        xor_tri(&mut a2, a3);
+        xor_tri(&mut a0, a2);
+        transmute::<uint64x2_t, F128>(reduce_wide(tri_to_wide(a0)))
     }
 }
 
@@ -465,17 +600,8 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
 ) -> [F128; 2] {
     unsafe {
         debug_assert!(input.len() >= 2 * BANKS);
-        let zero = vdupq_n_u64(0);
-        let mut first = KaratsubaNeon {
-            ll: zero,
-            hh: zero,
-            mm: zero,
-        };
-        let mut second = KaratsubaNeon {
-            ll: zero,
-            hh: zero,
-            mm: zero,
-        };
+        let mut first = tri_zero();
+        let mut second = tri_zero();
 
         let w = weight.as_ptr();
         let x0 = input.as_ptr();
@@ -485,22 +611,28 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
         while bank < main {
             let w0 = vld1q_u64(w.add(bank).cast::<u64>());
             let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
+            let w0_sw = swap_halves(w0);
+            let w1_sw = swap_halves(w1);
             let x00 = vld1q_u64(x0.add(bank).cast::<u64>());
             let x10 = vld1q_u64(x1.add(bank).cast::<u64>());
             let x01 = vld1q_u64(x0.add(bank + 1).cast::<u64>());
             let x11 = vld1q_u64(x1.add(bank + 1).cast::<u64>());
-            xor_karatsuba_const_pair(&mut first, &mut second, x00, x10, w0);
-            xor_karatsuba_const_pair(&mut first, &mut second, x01, x11, w1);
+            tri_acc_sw(&mut first, w0, w0_sw, x00);
+            tri_acc_sw(&mut second, w0, w0_sw, x10);
+            tri_acc_sw(&mut first, w1, w1_sw, x01);
+            tri_acc_sw(&mut second, w1, w1_sw, x11);
             bank += 2;
         }
         if bank < BANKS {
             let wk = vld1q_u64(w.add(bank).cast::<u64>());
+            let wk_sw = swap_halves(wk);
             let first_x = vld1q_u64(x0.add(bank).cast::<u64>());
             let second_x = vld1q_u64(x1.add(bank).cast::<u64>());
-            xor_karatsuba_const_pair(&mut first, &mut second, first_x, second_x, wk);
+            tri_acc_sw(&mut first, wk, wk_sw, first_x);
+            tri_acc_sw(&mut second, wk, wk_sw, second_x);
         }
 
-        let reduced = reduce_wide_pair(karatsuba_to_wide(first), karatsuba_to_wide(second));
+        let reduced = reduce_wide_pair(tri_to_wide(first), tri_to_wide(second));
         [
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -616,50 +748,17 @@ unsafe fn swap_halves(v: uint64x2_t) -> uint64x2_t {
     out
 }
 
-/// `x * w` and `x * w'` for two banks, XORed into one schoolbook
-/// `(ll, cross, hh)` accumulator: eight matching-lane PMULLs against the
-/// weights and their swapped copies, and four EOR3s.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn tri_acc_two_banks(
-    ll: &mut uint64x2_t,
-    cross: &mut uint64x2_t,
-    hh: &mut uint64x2_t,
-    x0: uint64x2_t,
-    w0: uint64x2_t,
-    w0_sw: uint64x2_t,
-    x1: uint64x2_t,
-    w1: uint64x2_t,
-    w1_sw: uint64x2_t,
-) {
-    unsafe {
-        let x0p = vreinterpretq_p64_u64(x0);
-        let x1p = vreinterpretq_p64_u64(x1);
-        let lo = |a: uint64x2_t, b: uint64x2_t| pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
-        let hi = |a: poly64x2_t, b: uint64x2_t| {
-            transmute::<u128, uint64x2_t>(vmull_high_p64(a, vreinterpretq_p64_u64(b)))
-        };
-        *ll = xor3_u64(*ll, lo(x0, w0), lo(x1, w1));
-        *hh = xor3_u64(*hh, hi(x0p, w0), hi(x1p, w1));
-        *cross = xor3_u64(*cross, lo(x0, w0_sw), hi(x0p, w0_sw));
-        *cross = xor3_u64(*cross, lo(x1, w1_sw), hi(x1p, w1_sw));
-    }
-}
-
 /// [`fold_banked_slots4`] for an even bank count: schoolbook products with
 /// one swapped copy per weight shared by the four slots, two banks per step
-/// so each accumulator update is one EOR3 of two products. The four outputs
-/// are the same deferred-reduction sums (same products, XOR reassociated).
+/// using macro-fused PMULL+EOR accumulation.
 #[inline(always)]
+#[target_feature(enable = "aes")]
 unsafe fn fold_banked_slots4_schoolbook<const BANKS: usize>(
     weight: &[F128; BANKS],
     input: &[F128],
 ) -> [F128; 4] {
     unsafe {
-        let zero = vdupq_n_u64(0);
-        let mut ll = [zero; 4];
-        let mut cross = [zero; 4];
-        let mut hh = [zero; 4];
+        let mut acc = [tri_zero(); 4];
 
         let w = weight.as_ptr();
         let x = input.as_ptr();
@@ -673,27 +772,14 @@ unsafe fn fold_banked_slots4_schoolbook<const BANKS: usize>(
                 let row = x.add(slot * BANKS + bank);
                 let x0 = vld1q_u64(row.cast::<u64>());
                 let x1 = vld1q_u64(row.add(1).cast::<u64>());
-                tri_acc_two_banks(
-                    &mut ll[slot],
-                    &mut cross[slot],
-                    &mut hh[slot],
-                    x0,
-                    w0,
-                    w0_sw,
-                    x1,
-                    w1,
-                    w1_sw,
-                );
+                tri_acc_sw(&mut acc[slot], w0, w0_sw, x0);
+                tri_acc_sw(&mut acc[slot], w1, w1_sw, x1);
             }
             bank += 2;
         }
 
-        let wide = |slot: usize| WideNeon {
-            lo: veorq_u64(ll[slot], vextq_u64::<1>(zero, cross[slot])),
-            hi: veorq_u64(hh[slot], vextq_u64::<1>(cross[slot], zero)),
-        };
-        let low = reduce_wide_pair(wide(0), wide(1));
-        let high = reduce_wide_pair(wide(2), wide(3));
+        let low = reduce_wide_pair(tri_to_wide(acc[0]), tri_to_wide(acc[1]));
+        let high = reduce_wide_pair(tri_to_wide(acc[2]), tri_to_wide(acc[3]));
         [
             transmute::<uint64x2_t, F128>(low[0]),
             transmute::<uint64x2_t, F128>(low[1]),
@@ -704,7 +790,7 @@ unsafe fn fold_banked_slots4_schoolbook<const BANKS: usize>(
 }
 
 /// Fixed 128-bank by 64-lane bank-major fold for the ranked zerocheck AB
-/// completion. Adjacent lanes share a weight load; six raw Karatsuba
+/// completion. Adjacent lanes share a weight load; six raw TriNeon
 /// components stay live across the complete bank scan, followed by one
 /// paired reduction and two write-only output stores.
 ///
@@ -720,36 +806,29 @@ pub(super) unsafe fn fold_bank_major_128x64_rows2(
 ) {
     unsafe {
         debug_assert_eq!(input.len(), 128 * 64);
-        let zero = vdupq_n_u64(0);
         let wp = weight.as_ptr();
         let xp = input.as_ptr();
         let out = output.as_mut_ptr();
 
         let mut lane = 0usize;
         while lane < 64 {
-            let mut first = KaratsubaNeon {
-                ll: zero,
-                hh: zero,
-                mm: zero,
-            };
-            let mut second = KaratsubaNeon {
-                ll: zero,
-                hh: zero,
-                mm: zero,
-            };
+            let mut first = tri_zero();
+            let mut second = tri_zero();
 
             let mut bank = 0usize;
             let mut row = xp.add(lane);
             while bank < 128 {
                 let wk = vld1q_u64(wp.add(bank).cast::<u64>());
+                let wk_sw = swap_halves(wk);
                 let first_x = vld1q_u64(row.cast::<u64>());
                 let second_x = vld1q_u64(row.add(1).cast::<u64>());
-                xor_karatsuba_const_pair(&mut first, &mut second, first_x, second_x, wk);
+                tri_acc_sw(&mut first, wk, wk_sw, first_x);
+                tri_acc_sw(&mut second, wk, wk_sw, second_x);
                 bank += 1;
                 row = row.add(64);
             }
 
-            let reduced = reduce_wide_pair(karatsuba_to_wide(first), karatsuba_to_wide(second));
+            let reduced = reduce_wide_pair(tri_to_wide(first), tri_to_wide(second));
             vst1q_u64(out.add(lane).cast::<u64>(), reduced[0]);
             vst1q_u64(out.add(lane + 1).cast::<u64>(), reduced[1]);
             lane += 2;
@@ -772,11 +851,10 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
         debug_assert_eq!(witness.len(), basis.len());
         debug_assert!(witness.len().is_multiple_of(2));
 
-        let zero = vdupq_n_u64(0);
-        let mut u0_a = WideNeon { lo: zero, hi: zero };
-        let mut u0_b = WideNeon { lo: zero, hi: zero };
-        let mut u2_a = WideNeon { lo: zero, hi: zero };
-        let mut u2_b = WideNeon { lo: zero, hi: zero };
+        let mut u0_a = tri_zero();
+        let mut u0_b = tri_zero();
+        let mut u2_a = tri_zero();
+        let mut u2_b = tri_zero();
 
         let n = witness.len();
         let main = n & !3;
@@ -792,16 +870,10 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
             let b1 = vld1q_u64(bp.add(i + 1).cast::<u64>());
             let b2 = vld1q_u64(bp.add(i + 2).cast::<u64>());
             let b3 = vld1q_u64(bp.add(i + 3).cast::<u64>());
-            xor_wide(&mut u0_a, mul_unreduced(a0, b0));
-            xor_wide(&mut u0_b, mul_unreduced(a2, b2));
-            xor_wide(
-                &mut u2_a,
-                mul_unreduced(veorq_u64(a0, a1), veorq_u64(b0, b1)),
-            );
-            xor_wide(
-                &mut u2_b,
-                mul_unreduced(veorq_u64(a2, a3), veorq_u64(b2, b3)),
-            );
+            tri_acc(&mut u0_a, a0, b0);
+            tri_acc(&mut u0_b, a2, b2);
+            tri_acc(&mut u2_a, veorq_u64(a0, a1), veorq_u64(b0, b1));
+            tri_acc(&mut u2_b, veorq_u64(a2, a3), veorq_u64(b2, b3));
             i += 4;
         }
         while i < n {
@@ -809,29 +881,23 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
             let a1 = vld1q_u64(wp.add(i + 1).cast::<u64>());
             let b0 = vld1q_u64(bp.add(i).cast::<u64>());
             let b1 = vld1q_u64(bp.add(i + 1).cast::<u64>());
-            xor_wide(&mut u0_a, mul_unreduced(a0, b0));
-            xor_wide(
-                &mut u2_a,
-                mul_unreduced(veorq_u64(a0, a1), veorq_u64(b0, b1)),
-            );
+            tri_acc(&mut u0_a, a0, b0);
+            tri_acc(&mut u2_a, veorq_u64(a0, a1), veorq_u64(b0, b1));
             i += 2;
         }
 
-        xor_wide(&mut u0_a, u0_b);
-        xor_wide(&mut u2_a, u2_b);
-        let red = |value: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(value));
-        (red(u0_a), red(u2_a))
+        xor_tri(&mut u0_a, u0_b);
+        xor_tri(&mut u2_a, u2_b);
+        let [r0, r2] = reduce_wide_pair(tri_to_wide(u0_a), tri_to_wide(u2_a));
+        (
+            transmute::<uint64x2_t, F128>(r0),
+            transmute::<uint64x2_t, F128>(r2),
+        )
     }
 }
 
 /// Deferred-reduction sufficient statistics for a factorized LSB equality
-/// basis. Each tail value multiplies the even and odd witness values. Their
-/// product streams remain in raw Karatsuba form until the end; after reducing,
-/// `s = a + odd` recovers the pair-sum statistic by F2-linearity.
-///
-/// Six independent `ll`/`hh`/`mm` accumulator chains expose PMULL throughput.
-/// Each field product uses three-PMULL Karatsuba instead of the six PMULLs
-/// (product plus reduction) in the scalar `F128::mul` path.
+/// basis. Each tail value multiplies the even and odd witness values.
 ///
 /// # Safety
 /// Requires the `aes` target feature. `f.len()` must equal
@@ -841,17 +907,8 @@ pub(super) unsafe fn round0_factorized_eq(f: &[F128], eq_tail: &[F128]) -> (F128
     unsafe {
         debug_assert_eq!(f.len(), 2 * eq_tail.len());
 
-        let zero = vdupq_n_u64(0);
-        let mut a = KaratsubaNeon {
-            ll: zero,
-            hh: zero,
-            mm: zero,
-        };
-        let mut odd = KaratsubaNeon {
-            ll: zero,
-            hh: zero,
-            mm: zero,
-        };
+        let mut a = tri_zero();
+        let mut odd = tri_zero();
 
         let fp = f.as_ptr();
         let wp = eq_tail.as_ptr();
@@ -864,20 +921,25 @@ pub(super) unsafe fn round0_factorized_eq(f: &[F128], eq_tail: &[F128]) -> (F128
             let f_11 = vld1q_u64(fp.add(2 * j + 3).cast::<u64>());
             let w_0 = vld1q_u64(wp.add(j).cast::<u64>());
             let w_1 = vld1q_u64(wp.add(j + 1).cast::<u64>());
+            let w_0_sw = swap_halves(w_0);
+            let w_1_sw = swap_halves(w_1);
 
-            xor_karatsuba_const_pair(&mut a, &mut odd, f_00, f_01, w_0);
-            xor_karatsuba_const_pair(&mut a, &mut odd, f_10, f_11, w_1);
+            tri_acc_sw(&mut a, w_0, w_0_sw, f_00);
+            tri_acc_sw(&mut odd, w_0, w_0_sw, f_01);
+            tri_acc_sw(&mut a, w_1, w_1_sw, f_10);
+            tri_acc_sw(&mut odd, w_1, w_1_sw, f_11);
             j += 2;
         }
         if j < eq_tail.len() {
             let f_0 = vld1q_u64(fp.add(2 * j).cast::<u64>());
             let f_1 = vld1q_u64(fp.add(2 * j + 1).cast::<u64>());
             let w = vld1q_u64(wp.add(j).cast::<u64>());
-            xor_karatsuba_const_pair(&mut a, &mut odd, f_0, f_1, w);
+            let w_sw = swap_halves(w);
+            tri_acc_sw(&mut a, w, w_sw, f_0);
+            tri_acc_sw(&mut odd, w, w_sw, f_1);
         }
 
-        let a_reduced = reduce_wide(karatsuba_to_wide(a));
-        let odd_reduced = reduce_wide(karatsuba_to_wide(odd));
+        let [a_reduced, odd_reduced] = reduce_wide_pair(tri_to_wide(a), tri_to_wide(odd));
         let s_reduced = veorq_u64(a_reduced, odd_reduced);
         (transmute(a_reduced), transmute(s_reduced))
     }
@@ -980,10 +1042,9 @@ pub(super) unsafe fn fold_two_and_msg(
     r: F128,
 ) -> (F128, F128) {
     unsafe {
-        let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
-        let mut u0 = WideNeon { lo: zero, hi: zero };
-        let mut u2 = WideNeon { lo: zero, hi: zero };
+        let mut u0 = tri_zero();
+        let mut u2 = tri_zero();
         let mut t = 0;
         while t < nf.len() {
             let source = 2 * (base + t);
@@ -1010,25 +1071,23 @@ pub(super) unsafe fn fold_two_and_msg(
             vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
             vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
 
-            xor_wide(&mut u0, mul_unreduced(f0, b0));
-            xor_wide(&mut u2, mul_unreduced(veorq_u64(f0, f1), veorq_u64(b0, b1)));
+            tri_acc(&mut u0, f0, b0);
+            tri_acc(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
+        let [r0, r2] = reduce_wide_pair(tri_to_wide(u0), tri_to_wide(u2));
         (
-            transmute::<uint64x2_t, F128>(reduce_wide(u0)),
-            transmute::<uint64x2_t, F128>(reduce_wide(u2)),
+            transmute::<uint64x2_t, F128>(r0),
+            transmute::<uint64x2_t, F128>(r2),
         )
     }
 }
 
-/// In-place DirectFold8 counterpart of [`fold_two_and_msg`]. The arithmetic
-/// and reduction order intentionally mirror that kernel exactly.
+/// In-place DirectFold8 counterpart of [`fold_two_and_msg`].
 ///
 /// # Safety
 /// Requires the `aes` target feature and equal input lengths divisible by
-/// four. Each iteration loads source slots `2t..2t+4` from both states before
-/// writing output slots `t..t+2`. All earlier writes end below every later
-/// source read, so folding into the lower half cannot clobber unread input.
+/// four.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn fold_two_and_msg_in_place(
     f: &mut [F128],
@@ -1039,10 +1098,9 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
         let f_ptr = f.as_mut_ptr();
         let b_ptr = b.as_mut_ptr();
         let half = f.len() / 2;
-        let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
-        let mut u0 = WideNeon { lo: zero, hi: zero };
-        let mut u2 = WideNeon { lo: zero, hi: zero };
+        let mut u0 = tri_zero();
+        let mut u2 = tri_zero();
         let mut t = 0;
         while t < half {
             let source = 2 * t;
@@ -1069,31 +1127,20 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
             vst1q_u64(b_ptr.add(t).cast::<u64>(), b0);
             vst1q_u64(b_ptr.add(t + 1).cast::<u64>(), b1);
 
-            xor_wide(&mut u0, mul_unreduced(f0, b0));
-            xor_wide(&mut u2, mul_unreduced(veorq_u64(f0, f1), veorq_u64(b0, b1)));
+            tri_acc(&mut u0, f0, b0);
+            tri_acc(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
+        let [r0, r2] = reduce_wide_pair(tri_to_wide(u0), tri_to_wide(u2));
         (
-            transmute::<uint64x2_t, F128>(reduce_wide(u0)),
-            transmute::<uint64x2_t, F128>(reduce_wide(u2)),
+            transmute::<uint64x2_t, F128>(r0),
+            transmute::<uint64x2_t, F128>(r2),
         )
     }
 }
 
 /// Fold two polynomials, inject a scaled folded-domain basis addend, and
 /// accumulate the next sumcheck message over the corrected outputs.
-///
-/// The addend is consumed before `nb` is stored and before either message
-/// product is formed. For each adjacent output pair, the ordinary `r * delta`
-/// and correction `scale * addend` products stay unreduced until their
-/// Karatsuba components have been combined, so all four products share one
-/// lane-paired reduction without a second traversal of `nf` and `nb`.
-///
-/// # Safety
-/// Requires the `aes` target feature. The architecture-selecting wrapper
-/// checks equal polynomial/output lengths, even output alignment, global
-/// source coverage for `[base, base + nf.len())`, and local addend coverage
-/// for `[0, nf.len())`.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
     f: &[F128],
@@ -1106,11 +1153,10 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
     scale: F128,
 ) -> (F128, F128) {
     unsafe {
-        let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
         let scale_q = transmute::<F128, uint64x2_t>(scale);
-        let mut u0 = WideNeon { lo: zero, hi: zero };
-        let mut u2 = WideNeon { lo: zero, hi: zero };
+        let mut u0 = tri_zero();
+        let mut u2 = tri_zero();
         let mut t = 0usize;
         while t < nf.len() {
             let source = 2 * (base + t);
@@ -1145,33 +1191,20 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
             vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
             vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
 
-            xor_wide(&mut u0, mul_unreduced(f0, b0));
-            xor_wide(&mut u2, mul_unreduced(veorq_u64(f0, f1), veorq_u64(b0, b1)));
+            tri_acc(&mut u0, f0, b0);
+            tri_acc(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
+        let [r0, r2] = reduce_wide_pair(tri_to_wide(u0), tri_to_wide(u2));
         (
-            transmute::<uint64x2_t, F128>(reduce_wide(u0)),
-            transmute::<uint64x2_t, F128>(reduce_wide(u2)),
+            transmute::<uint64x2_t, F128>(r0),
+            transmute::<uint64x2_t, F128>(r2),
         )
     }
 }
 
 /// Fold two incumbent polynomials, consume an input-domain deferred basis,
 /// inject a scaled chunk-local addend, and accumulate the next message.
-///
-/// For each two-output loop iteration, the correction arithmetic consists of
-/// twelve field products: two for the witness fold, eight for the corrected
-/// basis fold, and two for the message. All use three-PMULL Karatsuba. The
-/// four corrected-basis terms are paired as two calls to
-/// [`mul_two_const_sum_vec2`], sharing one vector reduction across both
-/// outputs. Separate witness, corrected-basis, and cache-hot message loops
-/// keep every loop spill-free without adding logical input/output traffic.
-///
-/// # Safety
-/// Requires the `aes` target feature. The architecture-selecting wrapper
-/// checks equal input domains, global source coverage for
-/// `[base, base + nf.len())`, exact local-addend/output coverage, and even
-/// output/base alignment. `alpha_r` must equal `alpha * r`.
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend(
@@ -1229,9 +1262,6 @@ pub(super) unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_adden
             let partial_b0 = veorq_u64(b_even0, incumbent_and_deferred_even[0]);
             let partial_b1 = veorq_u64(b_even1, incumbent_and_deferred_even[1]);
 
-            // Reload the deferred evens after the first product-sum helper. This
-            // keeps their odd partners and the two partial outputs from being
-            // simultaneously live across the helper's PMULL fan-out.
             let deferred_even0 = vld1q_u64(deferred_basis.as_ptr().add(source).cast::<u64>());
             let deferred_odd0 = vld1q_u64(deferred_basis.as_ptr().add(source + 1).cast::<u64>());
             let deferred_even1 = vld1q_u64(deferred_basis.as_ptr().add(source + 2).cast::<u64>());
@@ -1253,27 +1283,22 @@ pub(super) unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_adden
             t += 2;
         }
 
-        // The ranked caller supplies one `eq_lo`-sized output pair: 2,048
-        // entries per chunk at L1/L2 and 1,024 at L3. Scan the just-written
-        // 64 KiB or 32 KiB working set while it is cache-hot, keeping the four
-        // wide message accumulators out of the substantially higher-pressure
-        // corrected-fold loop above.
-        let zero = vdupq_n_u64(0);
-        let mut u0 = WideNeon { lo: zero, hi: zero };
-        let mut u2 = WideNeon { lo: zero, hi: zero };
+        let mut u0 = tri_zero();
+        let mut u2 = tri_zero();
         let mut t = 0usize;
         while t < nf.len() {
             let f0 = vld1q_u64(nf.as_ptr().add(t).cast::<u64>());
             let f1 = vld1q_u64(nf.as_ptr().add(t + 1).cast::<u64>());
             let b0 = vld1q_u64(nb.as_ptr().add(t).cast::<u64>());
             let b1 = vld1q_u64(nb.as_ptr().add(t + 1).cast::<u64>());
-            xor_wide(&mut u0, mul_unreduced(f0, b0));
-            xor_wide(&mut u2, mul_unreduced(veorq_u64(f0, f1), veorq_u64(b0, b1)));
+            tri_acc(&mut u0, f0, b0);
+            tri_acc(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
+        let [r0, r2] = reduce_wide_pair(tri_to_wide(u0), tri_to_wide(u2));
         (
-            transmute::<uint64x2_t, F128>(reduce_wide(u0)),
-            transmute::<uint64x2_t, F128>(reduce_wide(u2)),
+            transmute::<uint64x2_t, F128>(r0),
+            transmute::<uint64x2_t, F128>(r2),
         )
     }
 }
@@ -1297,11 +1322,6 @@ pub(super) unsafe fn fold2_two_and_msgs(
     r_b: F128,
     nt_stores: bool,
 ) -> (F128, F128, [F128; 6]) {
-    // `nt_stores` is decided once per fold round by the driver (round output
-    // past LLC size ⇒ the w arrays are not read until the next fold pair's
-    // barrier ⇒ `stnp` elides write-allocate RFO reads). Per-chunk callers
-    // must not decide this from their sub-slice length. (Resample draw 2 of
-    // this re-land; mechanism unchanged — see submission note.)
     #[inline(always)]
     unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
         unsafe {
@@ -1318,10 +1338,6 @@ pub(super) unsafe fn fold2_two_and_msgs(
         let zero = vdupq_n_u64(0);
         let ra_q = transmute::<F128, uint64x2_t>(r_a);
         let rb_q = transmute::<F128, uint64x2_t>(r_b);
-        // Accumulators: a_u0a = c0 (also u_0 term 1), a_u0b = u_0 term 2,
-        // a_u2a = c2 (also u_2 term 1), a_u2b = u_2 term 2. a_c1/a_c4
-        // hold the complementary endpoint products for Karatsuba recovery;
-        // a_c3/a_c5 hold the other lookahead endpoint products.
         let mut a_u0a = WideNeon { lo: zero, hi: zero };
         let mut a_u0b = WideNeon { lo: zero, hi: zero };
         let mut a_u2a = WideNeon { lo: zero, hi: zero };
@@ -1346,7 +1362,6 @@ pub(super) unsafe fn fold2_two_and_msgs(
                 let be1 = vld1q_u64(b.as_ptr().add(src + 2).cast::<u64>());
                 let bo1 = vld1q_u64(b.as_ptr().add(src + 3).cast::<u64>());
 
-                // First bind at r_a: v = even ^ r_a*(even^odd), two v per poly.
                 let pf = mul_const_vec2(ra_q, veorq_u64(fe0, fo0), veorq_u64(fe1, fo1));
                 let vf0 = veorq_u64(fe0, pf[0]);
                 let vf1 = veorq_u64(fe1, pf[1]);
@@ -1354,7 +1369,6 @@ pub(super) unsafe fn fold2_two_and_msgs(
                 let vb0 = veorq_u64(be0, pb[0]);
                 let vb1 = veorq_u64(be1, pb[1]);
 
-                // Second bind at r_b, both polynomials in one paired multiply.
                 let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
                 let wq_f = veorq_u64(vf0, pw[0]);
                 let wq_b = veorq_u64(vb0, pw[1]);
@@ -1366,28 +1380,20 @@ pub(super) unsafe fn fold2_two_and_msgs(
                 w_regs_b[q] = wq_b;
             }
             if nt_stores {
-                // The four group outputs are adjacent: two 32-byte pair
-                // stores per polynomial. Same values as the per-q stores —
-                // only the cacheability hint differs.
                 store_pair_nt(wf.as_mut_ptr().add(t), w_regs_f[0], w_regs_f[1]);
                 store_pair_nt(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
                 store_pair_nt(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
                 store_pair_nt(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
             }
-            // Direct message over pairs (w0,w1), (w2,w3); lookahead over the
-            // quad. Shared products accumulated once.
             let s0f = veorq_u64(w_regs_f[0], w_regs_f[1]);
             let s0b = veorq_u64(w_regs_b[0], w_regs_b[1]);
             let s1f = veorq_u64(w_regs_f[2], w_regs_f[3]);
             let s1b = veorq_u64(w_regs_b[2], w_regs_b[3]);
-            xor_wide(&mut a_u0a, mul_unreduced(w_regs_f[0], w_regs_b[0])); // = c0 + u0 term
+            xor_wide(&mut a_u0a, mul_unreduced(w_regs_f[0], w_regs_b[0]));
             xor_wide(&mut a_u0b, mul_unreduced(w_regs_f[2], w_regs_b[2]));
-            xor_wide(&mut a_u2a, mul_unreduced(s0f, s0b)); // = c2 + u2 term
+            xor_wide(&mut a_u2a, mul_unreduced(s0f, s0b));
             xor_wide(&mut a_u2b, mul_unreduced(s1f, s1b));
-            // c1's cross term is recovered after reduction as
-            // w1f*w1b ^ c0 ^ c2: one product instead of the direct two.
             xor_wide(&mut a_c1, mul_unreduced(w_regs_f[1], w_regs_b[1]));
-            // e = w0 + w2, o = w1 + w3, se = e + o
             let e_f = veorq_u64(w_regs_f[0], w_regs_f[2]);
             let o_f = veorq_u64(w_regs_f[1], w_regs_f[3]);
             let e_b = veorq_u64(w_regs_b[0], w_regs_b[2]);
@@ -1395,29 +1401,27 @@ pub(super) unsafe fn fold2_two_and_msgs(
             let se_f = veorq_u64(e_f, o_f);
             let se_b = veorq_u64(e_b, o_b);
             xor_wide(&mut a_c3, mul_unreduced(e_f, e_b));
-            // c4 uses the same Karatsuba identity with the odd aggregate as
-            // the complementary endpoint.
             xor_wide(&mut a_c4, mul_unreduced(o_f, o_b));
             xor_wide(&mut a_c5, mul_unreduced(se_f, se_b));
             t += 4;
         }
-        let red = |w: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(w));
-        let c0 = red(a_u0a);
-        let c2v = red(a_u2a);
-        let c1 = red(a_c1) + c0 + c2v;
-        let c3 = red(a_c3);
-        let c5 = red(a_c5);
-        let c4 = red(a_c4) + c3 + c5;
-        let u_0 = c0 + red(a_u0b);
-        let u_2 = c2v + red(a_u2b);
+        let [c0_q, c2_q] = reduce_wide_pair(a_u0a, a_u2a);
+        let [c3_q, c5_q] = reduce_wide_pair(a_c3, a_c5);
+        let [c1_q, c4_q] = reduce_wide_pair(a_c1, a_c4);
+        let [u0b_q, u2b_q] = reduce_wide_pair(a_u0b, a_u2b);
+        let c0 = transmute::<uint64x2_t, F128>(c0_q);
+        let c2v = transmute::<uint64x2_t, F128>(c2_q);
+        let c1 = transmute::<uint64x2_t, F128>(c1_q) + c0 + c2v;
+        let c3 = transmute::<uint64x2_t, F128>(c3_q);
+        let c5 = transmute::<uint64x2_t, F128>(c5_q);
+        let c4 = transmute::<uint64x2_t, F128>(c4_q) + c3 + c5;
+        let u_0 = c0 + transmute::<uint64x2_t, F128>(u0b_q);
+        let u_2 = c2v + transmute::<uint64x2_t, F128>(u2b_q);
         (u_0, u_2, [c0, c1, c2v, c3, c4, c5])
     }
 }
 
-/// Final two-challenge Ligerito fold. This is the direct-message-only sibling
-/// of [`fold2_two_and_msgs`]: after the last initial-lane pair there is no
-/// following lookahead to evaluate, so retaining its four extra endpoint
-/// products and wide accumulators is dead work.
+/// Final two-challenge Ligerito fold.
 ///
 /// # Safety
 /// Caller guarantees PMULL and: `f.len() == b.len()`, `wf.len() == wb.len()`,
@@ -1449,10 +1453,8 @@ pub(super) unsafe fn fold2_two_and_msg(
         let zero = vdupq_n_u64(0);
         let ra_q = transmute::<F128, uint64x2_t>(r_a);
         let rb_q = transmute::<F128, uint64x2_t>(r_b);
-        let mut a_u0a = WideNeon { lo: zero, hi: zero };
-        let mut a_u0b = WideNeon { lo: zero, hi: zero };
-        let mut a_u2a = WideNeon { lo: zero, hi: zero };
-        let mut a_u2b = WideNeon { lo: zero, hi: zero };
+        let mut a_u0 = tri_zero();
+        let mut a_u2 = tri_zero();
 
         let mut w_regs_f = [zero; 4];
         let mut w_regs_b = [zero; 4];
@@ -1497,15 +1499,18 @@ pub(super) unsafe fn fold2_two_and_msg(
             let s0b = veorq_u64(w_regs_b[0], w_regs_b[1]);
             let s1f = veorq_u64(w_regs_f[2], w_regs_f[3]);
             let s1b = veorq_u64(w_regs_b[2], w_regs_b[3]);
-            xor_wide(&mut a_u0a, mul_unreduced(w_regs_f[0], w_regs_b[0]));
-            xor_wide(&mut a_u0b, mul_unreduced(w_regs_f[2], w_regs_b[2]));
-            xor_wide(&mut a_u2a, mul_unreduced(s0f, s0b));
-            xor_wide(&mut a_u2b, mul_unreduced(s1f, s1b));
+            tri_acc(&mut a_u0, w_regs_f[0], w_regs_b[0]);
+            tri_acc(&mut a_u0, w_regs_f[2], w_regs_b[2]);
+            tri_acc(&mut a_u2, s0f, s0b);
+            tri_acc(&mut a_u2, s1f, s1b);
             t += 4;
         }
 
-        let red = |w: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(w));
-        (red(a_u0a) + red(a_u0b), red(a_u2a) + red(a_u2b))
+        let [r0, r2] = reduce_wide_pair(tri_to_wide(a_u0), tri_to_wide(a_u2));
+        (
+            transmute::<uint64x2_t, F128>(r0),
+            transmute::<uint64x2_t, F128>(r2),
+        )
     }
 }
 
