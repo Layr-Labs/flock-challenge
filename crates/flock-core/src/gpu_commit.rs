@@ -3788,6 +3788,18 @@ static inline void gf_build_byte16(
         for (uint c = 0; c < NC; c++) {                                        \
             gf_build_byte16(tabB, twiddles,                                    \
                             (1u << (P.l + j)) - 1u + (B << j) + c, lid);       \
+            /* The host table has ZERO at every layer's block zero. */        \
+            if (B == 0u && c == 0u) {                                         \
+                for (uint bb = 0; bb < BPER; bb++) {                           \
+                    const uint b   = c * BPER + bb;                            \
+                    const uint low = b & ((1u << bpos) - 1u);                  \
+                    const uint eu  = ((b >> bpos) << (bpos + 1u)) | low;       \
+                    const uint ev  = eu | (1u << bpos);                        \
+                    ea[ev] ^= ea[eu];                                          \
+                    eb[ev] ^= eb[eu];                                          \
+                }                                                              \
+                continue;                                                      \
+            }                                                                  \
             for (uint bb = 0; bb < BPER; bb++) {                               \
                 const uint b   = c * BPER + bb;                                \
                 const uint low = b & ((1u << bpos) - 1u);                      \
