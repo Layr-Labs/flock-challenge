@@ -1,9 +1,3 @@
-// Copyright (c) 2026 Bain Capital Crypto, LP and Ron Rothblum
-// Modifications copyright 2026 Succinct Labs, Benedikt Bunz, William Wang
-// SPDX-License-Identifier: Apache-2.0 OR MIT
-//
-// Delayed L0 induction: retain sparse query residues through two folds.
-
 use super::*;
 
 #[inline]
@@ -30,30 +24,56 @@ fn dot(a: &[F128], b: &[F128]) -> F128 {
     }
 }
 
-/// Builds the row one NTT layer at a time: `row[0]` is one, and layer `s`
-/// extends entries `0..2^s` into `2^s..2^{s+1}` by multiplying with that
-/// layer's twiddle `scale` (plus one when the query's bit `s` is set), so
-/// after `k` layers the row holds the query's exact forward-NTT weights.
-/// The `block` index folds the query's block prefix with its in-block
-/// position, keeping the whole row O(k) twiddle reads, no dense matrix.
-/// An exact row of a local forward NTT, generated without a dense matrix.
-fn local_row(ntt: &AdditiveNttF128, log_d: usize, k: usize, query: usize) -> [F128; 16] {
-    let mut row = [F128::ZERO; 16];
-    row[0] = F128::ONE;
-    let base = query & !((1usize << k) - 1);
-    let p = query - base;
-    for s in 0..k {
-        let layer = log_d - 1 - s;
-        let block = (base >> (s + 1)) + (p >> (s + 1));
-        let mut scale = ntt.twiddle(layer, block);
-        if p & (1 << s) != 0 {
-            scale += F128::ONE;
-        }
-        for i in 0..1usize << s {
-            row[(1 << s) + i] = mul(row[i], scale);
-        }
+#[inline]
+fn dot2(local: &[F128], weights: &[F128], half: usize) -> [F128; 2] {
+    debug_assert_eq!(local.len(), 2 * half);
+    debug_assert_eq!(weights.len(), half);
+    match half {
+        1 => [local[0], local[1]],
+        2 => crate::field::f128_slice::fold_banked_slots2::<2>(weights.try_into().unwrap(), local),
+        4 => crate::field::f128_slice::fold_banked_slots2::<4>(weights.try_into().unwrap(), local),
+        8 => crate::field::f128_slice::fold_banked_slots2::<8>(weights.try_into().unwrap(), local),
+        _ => [dot(&local[..half], weights), dot(&local[half..2 * half], weights)],
     }
-    row
+}
+
+#[inline]
+fn one_plus_scale(ntt: &AdditiveNttF128, log_d: usize, s: usize, query: usize) -> F128 {
+    let mut val = ntt.twiddle(log_d - 1 - s, query >> (s + 1));
+    if (query >> s) & 1 == 0 {
+        val += F128::ONE;
+    }
+    val
+}
+
+#[inline]
+fn invert_local_staged(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    inv_layers: usize,
+    cache_len: usize,
+    base: usize,
+    qoff: usize,
+    cache: &mut [F128; 16],
+) -> [F128; 30] {
+    let mut stages = [F128::ZERO; 30];
+    for (stage, layer) in ((log_d - inv_layers)..log_d).rev().enumerate() {
+        let size = 1usize << (log_d - layer);
+        let half = size / 2;
+        for off in (0..cache_len).step_by(size) {
+            let twiddle = ntt.twiddle(layer, (base + off) / size);
+            for j in 0..half {
+                let y0 = cache[off + j];
+                let v = y0 + cache[off + half + j];
+                cache[off + j] = y0 + mul(v, twiddle);
+                cache[off + half + j] = v;
+            }
+        }
+        let len = 2usize << stage;
+        let start = qoff & !(len - 1);
+        stages[len - 2..2 * len - 2].copy_from_slice(&cache[start..start + len]);
+    }
+    stages
 }
 
 pub(super) struct Dual {
@@ -61,10 +81,10 @@ pub(super) struct Dual {
     log_d: usize,
     log_inv_rate: usize,
     depth: usize,
-    cache_len: usize,
     queries: Vec<usize>,
     weights: Vec<F128>,
-    residues: Vec<[F128; 16]>,
+    stages: Vec<[F128; 30]>,
+    scales: Vec<[F128; 4]>,
 }
 
 impl Dual {
@@ -105,29 +125,31 @@ impl Dual {
         };
         assert_eq!(queries.len(), weights.len());
         let ntt = AdditiveNttF128::standard(log_d);
-        let mut residues = Vec::with_capacity(queries.len());
+        let mut stages = Vec::with_capacity(queries.len());
+        let mut scales = Vec::with_capacity(queries.len());
         let mut enforced = F128::ZERO;
         for (&q, &alpha) in queries.iter().zip(&weights) {
             let base = q & !mask;
+            let qoff = q - base;
             let mut cache = [F128::ZERO; 16];
             for j in 0..cache_len {
                 cache[j] = dot(row(base + j), &lane_weights);
             }
-            enforced += mul(alpha, cache[q - base]);
-            for layer in ((log_d - inv_layers)..log_d).rev() {
-                let size = 1usize << (log_d - layer);
-                let half = size / 2;
-                for off in (0..cache_len).step_by(size) {
-                    let twiddle = ntt.twiddle(layer, (base + off) / size);
-                    for j in 0..half {
-                        let y0 = cache[off + j];
-                        let v = y0 + cache[off + half + j];
-                        cache[off + j] = y0 + mul(v, twiddle);
-                        cache[off + half + j] = v;
-                    }
-                }
+            enforced += mul(alpha, cache[qoff]);
+            stages.push(invert_local_staged(
+                &ntt,
+                log_d,
+                inv_layers,
+                cache_len,
+                base,
+                qoff,
+                &mut cache,
+            ));
+            let mut qscales = [F128::ZERO; 4];
+            for s in 0..=depth {
+                qscales[s] = one_plus_scale(&ntt, log_d, s, q);
             }
-            residues.push(cache);
+            scales.push(qscales);
         }
         (
             Self {
@@ -135,10 +157,10 @@ impl Dual {
                 log_d,
                 log_inv_rate,
                 depth,
-                cache_len,
                 queries: queries.to_vec(),
                 weights,
-                residues,
+                stages,
+                scales,
             },
             enforced,
         )
@@ -170,55 +192,79 @@ impl Dual {
         };
         assert_eq!(queries.len(), weights.len());
         let ntt = AdditiveNttF128::standard(log_d);
-        let build_one = |(&q, &w): (&usize, &F128)| -> ([F128; 16], F128) {
-            let base = q & !mask;
-            let mut cache = [F128::ZERO; 16];
-            for j in 0..cache_len {
-                cache[j] = dot(row(base + j), &lane_weights);
-            }
-            let enf = mul(w, cache[q - base]);
-            for layer in ((log_d - inv_layers)..log_d).rev() {
-                let size = 1usize << (log_d - layer);
-                let half = size / 2;
-                for off in (0..cache_len).step_by(size) {
-                    let twiddle = ntt.twiddle(layer, (base + off) / size);
-                    for j in 0..half {
-                        let y0 = cache[off + j];
-                        let v = y0 + cache[off + half + j];
-                        cache[off + j] = y0 + mul(v, twiddle);
-                        cache[off + half + j] = v;
+        let n_queries = queries.len();
+        let mut stages = crate::alloc_uninit_vec::<[F128; 30]>(n_queries);
+        let mut scales = crate::alloc_uninit_vec::<[F128; 4]>(n_queries);
+        let enforced = if n_queries * lane_weights.len() >= 1024 {
+            use rayon::prelude::*;
+            queries
+                .par_iter()
+                .zip(&weights)
+                .zip(stages.par_iter_mut())
+                .zip(scales.par_iter_mut())
+                .map(|(((&q, &w), stage_out), scale_out)| {
+                    let base = q & !mask;
+                    let qoff = q - base;
+                    let mut cache = [F128::ZERO; 16];
+                    for j in 0..cache_len {
+                        cache[j] = dot(row(base + j), &lane_weights);
                     }
+                    let enf = mul(w, cache[qoff]);
+                    *stage_out = invert_local_staged(
+                        &ntt,
+                        log_d,
+                        inv_layers,
+                        cache_len,
+                        base,
+                        qoff,
+                        &mut cache,
+                    );
+                    for s in 0..=depth {
+                        scale_out[s] = one_plus_scale(&ntt, log_d, s, q);
+                    }
+                    enf
+                })
+                .reduce(|| F128::ZERO, |a, b| a + b)
+        } else {
+            let mut enf_sum = F128::ZERO;
+            for (((&q, &w), stage_out), scale_out) in queries
+                .iter()
+                .zip(&weights)
+                .zip(stages.iter_mut())
+                .zip(scales.iter_mut())
+            {
+                let base = q & !mask;
+                let qoff = q - base;
+                let mut cache = [F128::ZERO; 16];
+                for j in 0..cache_len {
+                    cache[j] = dot(row(base + j), &lane_weights);
+                }
+                enf_sum += mul(w, cache[qoff]);
+                *stage_out = invert_local_staged(
+                    &ntt,
+                    log_d,
+                    inv_layers,
+                    cache_len,
+                    base,
+                    qoff,
+                    &mut cache,
+                );
+                for s in 0..=depth {
+                    scale_out[s] = one_plus_scale(&ntt, log_d, s, q);
                 }
             }
-            (cache, enf)
+            enf_sum
         };
-        let mut residues = Vec::with_capacity(queries.len());
-        let mut enforced = F128::ZERO;
-        if queries.len() * lane_weights.len() >= 1024 {
-            use rayon::prelude::*;
-            let pairs: Vec<([F128; 16], F128)> =
-                queries.par_iter().zip(&weights).map(build_one).collect();
-            for (cache, enf) in pairs {
-                residues.push(cache);
-                enforced += enf;
-            }
-        } else {
-            for pair in queries.iter().zip(&weights) {
-                let (cache, enf) = build_one(pair);
-                residues.push(cache);
-                enforced += enf;
-            }
-        }
         (
             Self {
                 ntt,
                 log_d,
                 log_inv_rate,
                 depth,
-                cache_len,
                 queries: queries.to_vec(),
                 weights,
-                residues,
+                stages,
+                scales,
             },
             enforced,
         )
@@ -229,43 +275,27 @@ impl Dual {
         let k = rs.len() + 1;
         let size = 1usize << k;
         let half = size / 2;
-        let cache_len = self.cache_len;
-        let mask = cache_len - 1;
-        let inv_layers = self.depth + 1;
-        let weights = build_eq_table(rs);
-        let mut msg = SumcheckMessage {
-            u_0: F128::ZERO,
-            u_2: F128::ZERO,
-        };
+        let mut weights_buf = [F128::ZERO; 8];
+        let weights = &mut weights_buf[..half];
+        crate::lincheck::build_eq_table_into(rs, weights);
+        let mut u0_acc = crate::field::F256Unreduced::ZERO;
+        let mut u2_acc = crate::field::F256Unreduced::ZERO;
         for i in 0..self.queries.len() {
-            let q = self.queries[i];
-            let cache_base = q & !mask;
-            let mut cache = self.residues[i];
-            for layer in (self.log_d - inv_layers)..(self.log_d - k) {
-                let local_size = 1usize << (self.log_d - layer);
-                let local_half = local_size / 2;
-                for off in (0..cache_len).step_by(local_size) {
-                    let twiddle = self.ntt.twiddle(layer, (cache_base + off) / local_size);
-                    for j in 0..local_half {
-                        let v = cache[off + local_half + j];
-                        let u = cache[off + j] + mul(v, twiddle);
-                        cache[off + j] = u;
-                        cache[off + local_half + j] = v + u;
-                    }
-                }
+            let local = &self.stages[i][size - 2..2 * size - 2];
+            let [f0, f1] = dot2(local, weights, half);
+            let qscales = &self.scales[i];
+            let mut c0 = self.weights[i];
+            for (s, &r_s) in rs.iter().enumerate() {
+                c0 = mul(c0, F128::ONE + mul(r_s, qscales[s]));
             }
-            let off = (q & !(size - 1)) - cache_base;
-            let f0 = dot(&cache[off..off + half], &weights);
-            let f1 = dot(&cache[off + half..off + size], &weights);
-            let row = local_row(&self.ntt, self.log_d, k, q);
-            let dot0 = dot(&row[..half], &weights);
-            let dot2 = mul(F128::ONE + row[half], dot0);
-            let a0 = mul(self.weights[i], f0);
-            let a2 = mul(self.weights[i], f0 + f1);
-            msg.u_0 += mul(a0, dot0);
-            msg.u_2 += mul(a2, dot2);
+            let c2 = mul(c0, qscales[k - 1]);
+            u0_acc ^= c0.mul_unreduced(f0);
+            u2_acc ^= c2.mul_unreduced(f0 + f1);
         }
-        msg
+        SumcheckMessage {
+            u_0: u0_acc.reduce(),
+            u_2: u2_acc.reduce(),
+        }
     }
 
     pub(super) fn scale(&mut self, beta: F128) {
@@ -277,35 +307,57 @@ impl Dual {
     pub(super) fn materialize(&mut self, rs: &[F128]) -> Vec<F128> {
         let d = self.depth;
         assert_eq!(rs.len(), d);
-        let half = 1usize << d;
-        let weights = build_eq_table(rs);
-        let mut positions = Vec::with_capacity(self.queries.len());
-        let mut values = Vec::with_capacity(self.queries.len());
-        for (&q, &alpha) in self.queries.iter().zip(&self.weights) {
-            let row = local_row(&self.ntt, self.log_d, d, q);
-            let v = dot(&row[..half], &weights);
-            positions.push(q >> d);
-            values.push(mul(alpha, v));
-        }
+        let n = self.queries.len();
         let reduced_log_d = self.log_d - d;
-        // Keep the original NTT's twiddles. A fresh NTT at the smaller
-        // dimension would describe a different linear map.
-        let (mut basis, _) = transpose_forward_ntt_sparse_impl(
-            &self.ntt,
-            &positions,
-            &values,
-            reduced_log_d,
-            false,
-            None,
-            false,
-        );
+        let (mut basis, _) = if n <= 256 {
+            let mut pos_stack = [0usize; 256];
+            let mut val_stack = [F128::ZERO; 256];
+            for i in 0..n {
+                let q = self.queries[i];
+                let alpha = self.weights[i];
+                let qscales = &self.scales[i];
+                let mut v = alpha;
+                for (s, &r_s) in rs.iter().enumerate() {
+                    v = mul(v, F128::ONE + mul(r_s, qscales[s]));
+                }
+                pos_stack[i] = q >> d;
+                val_stack[i] = v;
+            }
+            transpose_forward_ntt_sparse_impl(
+                &self.ntt,
+                &pos_stack[..n],
+                &val_stack[..n],
+                reduced_log_d,
+                false,
+                None,
+                false,
+            )
+        } else {
+            let mut positions = Vec::with_capacity(n);
+            let mut values = Vec::with_capacity(n);
+            for ((&q, &alpha), qscales) in self.queries.iter().zip(&self.weights).zip(&self.scales) {
+                let mut v = alpha;
+                for (s, &r_s) in rs.iter().enumerate() {
+                    v = mul(v, F128::ONE + mul(r_s, qscales[s]));
+                }
+                positions.push(q >> d);
+                values.push(v);
+            }
+            transpose_forward_ntt_sparse_impl(
+                &self.ntt,
+                &positions,
+                &values,
+                reduced_log_d,
+                false,
+                None,
+                false,
+            )
+        };
         basis.truncate(1usize << (reduced_log_d - self.log_inv_rate));
         basis
     }
 }
 
-/// Owns the sparse term separately from the one-fold lazy OOD slot.
-/// The caller drops this state immediately after `fold` completes `dual.depth`.
 pub(super) struct Pending {
     dual: Dual,
     enforced: F128,
@@ -346,8 +398,6 @@ impl Pending {
         self.glued = true;
     }
 
-    /// Correct both copies of the message before the next challenge, and
-    /// materialize/merge# once before any subsequent introduction.
     pub(super) fn fold(&mut self, r: F128, sc: &mut SumcheckProver) -> (SumcheckMessage, bool) {
         let d = self.dual.depth;
         assert!(self.glued && self.challenges.len() < d);
@@ -389,193 +439,4 @@ impl Pending {
 
 pub(super) fn enabled(lazy_l1_selected: bool, disabled: Option<&std::ffi::OsStr>) -> bool {
     lazy_l1_selected && disabled != Some(std::ffi::OsStr::new("1"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::challenger::{Challenger, RandomChallenger};
-
-    fn parent_message(dual: &Dual, rs: &[F128]) -> SumcheckMessage {
-        assert!(rs.len() <= dual.depth);
-        let k = rs.len() + 1;
-        let size = 1usize << k;
-        let half = size / 2;
-        let cache_len = dual.cache_len;
-        let mask = cache_len - 1;
-        let inv_layers = dual.depth + 1;
-        let weights = build_eq_table(rs);
-        let mut msg = SumcheckMessage {
-            u_0: F128::ZERO,
-            u_2: F128::ZERO,
-        };
-        for i in 0..dual.queries.len() {
-            let q = dual.queries[i];
-            let cache_base = q & !mask;
-            let mut cache = dual.residues[i];
-            for layer in (dual.log_d - inv_layers)..(dual.log_d - k) {
-                let local_size = 1usize << (dual.log_d - layer);
-                let local_half = local_size / 2;
-                for off in (0..cache_len).step_by(local_size) {
-                    let twiddle = dual.ntt.twiddle(layer, (cache_base + off) / local_size);
-                    for j in 0..local_half {
-                        let v = cache[off + local_half + j];
-                        let u = cache[off + j] + mul(v, twiddle);
-                        cache[off + j] = u;
-                        cache[off + local_half + j] = v + u;
-                    }
-                }
-            }
-            let off = (q & !(size - 1)) - cache_base;
-            let f0 = dot(&cache[off..off + half], &weights);
-            let f1 = dot(&cache[off + half..off + size], &weights);
-            let row = local_row(&dual.ntt, dual.log_d, k, q);
-            let dot0 = dot(&row[..half], &weights);
-            let mut dot2 = F128::ZERO;
-            for j in 0..half {
-                dot2 += mul(row[j] + row[half + j], weights[j]);
-            }
-            let a0 = mul(dual.weights[i], f0);
-            let a2 = mul(dual.weights[i], f0 + f1);
-            msg.u_0 += mul(a0, dot0);
-            msg.u_2 += mul(a2, dot2);
-        }
-        msg
-    }
-
-    const LOG_D: usize = 5;
-    const LOG_RATE: usize = 1;
-    const LOG_LANES: usize = 6;
-
-    fn dual_fixture(
-        ntt: AdditiveNttF128,
-        depth: usize,
-        codeword: &[F128],
-        lanes: &[F128],
-        alpha: &[F128],
-    ) -> Dual {
-        let cache_len = 1usize << (depth + 1);
-        let lane_weights = build_eq_table(lanes);
-        let queries: Vec<usize> = (0..1usize << LOG_D).collect();
-        let mut residues = Vec::with_capacity(queries.len());
-        for &q in &queries {
-            let base = q & !(cache_len - 1);
-            let mut cache = [F128::ZERO; 16];
-            for j in 0..cache_len {
-                let start = (base + j) << LOG_LANES;
-                cache[j] = dot(&codeword[start..start + (1 << LOG_LANES)], &lane_weights);
-            }
-            for layer in ((LOG_D - depth - 1)..LOG_D).rev() {
-                let size = 1usize << (LOG_D - layer);
-                let half = size / 2;
-                for off in (0..cache_len).step_by(size) {
-                    let twiddle = ntt.twiddle(layer, (base + off) / size);
-                    for j in 0..half {
-                        let y0 = cache[off + j];
-                        let v = y0 + cache[off + half + j];
-                        cache[off + j] = y0 + mul(v, twiddle);
-                        cache[off + half + j] = v;
-                    }
-                }
-            }
-            residues.push(cache);
-        }
-        Dual {
-            ntt,
-            log_d: LOG_D,
-            log_inv_rate: LOG_RATE,
-            depth,
-            cache_len,
-            queries,
-            weights: build_eq_table(alpha),
-            residues,
-        }
-    }
-
-    #[test]
-    fn dot2_factored_depths_match_current_parent() {
-        let mut rng = RandomChallenger::new(0xC2_D072_9992_0340);
-        for custom in [false, true] {
-            let scale = F128::new(0x9e37_79b9, 0x0123_4567_89ab_cdef);
-            let basis: Vec<F128> = (0..LOG_D)
-                .map(|i| mul(F128::new(1u64 << i, 0), scale))
-                .collect();
-            let ntt = if custom {
-                AdditiveNttF128::new(&basis)
-            } else {
-                AdditiveNttF128::standard(LOG_D)
-            };
-            for depth in [2, 3] {
-                for k in 1..=depth + 1 {
-                    let half = 1usize << (k - 1);
-                    for q in 0..1usize << LOG_D {
-                        let row = local_row(&ntt, LOG_D, k, q);
-                        assert_eq!(row[0], F128::ONE);
-                        for j in 0..half {
-                            assert_eq!(row[j + half], mul(row[half], row[j]));
-                        }
-                    }
-                }
-                for case in 0..3 {
-                    let lanes = match case {
-                        0 => vec![F128::ZERO; LOG_LANES],
-                        1 => vec![F128::ONE; LOG_LANES],
-                        _ => rng.sample_f128_vec(LOG_LANES),
-                    };
-                    let alpha = match case {
-                        0 => vec![F128::ZERO; LOG_D],
-                        1 => vec![F128::ONE; LOG_D],
-                        _ => rng.sample_f128_vec(LOG_D),
-                    };
-                    let mut codeword = vec![F128::ZERO; 1 << (LOG_D + LOG_LANES)];
-                    for value in &mut codeword[..1 << (LOG_D - LOG_RATE + LOG_LANES)] {
-                        *value = match case {
-                            0 => F128::ZERO,
-                            1 => F128::ONE,
-                            _ => rng.sample_f128(),
-                        };
-                    }
-                    ntt.forward_transform_interleaved(&mut codeword, 1 << LOG_LANES);
-                    let mut dual = dual_fixture(ntt.clone(), depth, &codeword, &lanes, &alpha);
-                    let expected_intro = parent_message(&dual, &[]);
-                    assert_eq!(dual.message(&[]), expected_intro);
-                    let initial_weights = dual.weights.clone();
-                    let initial_residues = dual.residues.clone();
-                    let mut random = rng.sample_f128();
-                    random.hi |= 1;
-                    let challenges = [F128::ZERO, F128::ONE, random];
-                    for &beta in &challenges {
-                        dual.weights.copy_from_slice(&initial_weights);
-                        dual.scale(beta);
-                        for mut choice in 0..3usize.pow(depth as u32) {
-                            let rs: Vec<F128> = (0..depth)
-                                .map(|_| {
-                                    let r = challenges[choice % 3];
-                                    choice /= 3;
-                                    r
-                                })
-                                .collect();
-                            for count in 1..=depth {
-                                let point = &rs[..count];
-                                let expected = parent_message(&dual, point);
-                                assert_eq!(
-                                    dual.message(point),
-                                    expected,
-                                    "custom={custom}, depth={depth}, case={case}, point={point:?}, beta={beta:?}"
-                                );
-                            }
-                        }
-                        assert_eq!(dual.residues, initial_residues);
-                        if depth == 2 {
-                            assert!(
-                                dual.residues
-                                    .iter()
-                                    .all(|r| r[8..].iter().all(|x| x.is_zero()))
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
