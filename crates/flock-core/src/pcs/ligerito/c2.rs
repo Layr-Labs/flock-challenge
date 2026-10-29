@@ -37,8 +37,8 @@ fn dot(a: &[F128], b: &[F128]) -> F128 {
 /// The `block` index folds the query's block prefix with its in-block
 /// position, keeping the whole row O(k) twiddle reads, no dense matrix.
 /// An exact row of a local forward NTT, generated without a dense matrix.
-fn local_row(ntt: &AdditiveNttF128, log_d: usize, k: usize, query: usize) -> [F128; 16] {
-    let mut row = [F128::ZERO; 16];
+#[inline(always)]
+fn local_row(ntt: &AdditiveNttF128, log_d: usize, k: usize, query: usize, row: &mut [F128; 16]) {
     row[0] = F128::ONE;
     let base = query & !((1usize << k) - 1);
     let p = query - base;
@@ -49,11 +49,12 @@ fn local_row(ntt: &AdditiveNttF128, log_d: usize, k: usize, query: usize) -> [F1
         if p & (1 << s) != 0 {
             scale += F128::ONE;
         }
-        for i in 0..1usize << s {
-            row[(1 << s) + i] = mul(row[i], scale);
+        let width = 1usize << s;
+        let (lower, upper) = row.split_at_mut(width);
+        for (dst, value) in upper[..width].iter_mut().zip(lower) {
+            *dst = mul(*value, scale);
         }
     }
-    row
 }
 
 pub(super) struct Dual {
@@ -257,7 +258,8 @@ impl Dual {
             let off = (q & !(size - 1)) - cache_base;
             let f0 = dot(&cache[off..off + half], &weights);
             let f1 = dot(&cache[off + half..off + size], &weights);
-            let row = local_row(&self.ntt, self.log_d, k, q);
+            let mut row = [F128::ZERO; 16];
+            local_row(&self.ntt, self.log_d, k, q, &mut row);
             let dot0 = dot(&row[..half], &weights);
             let dot2 = mul(F128::ONE + row[half], dot0);
             let a0 = mul(self.weights[i], f0);
@@ -282,7 +284,8 @@ impl Dual {
         let mut positions = Vec::with_capacity(self.queries.len());
         let mut values = Vec::with_capacity(self.queries.len());
         for (&q, &alpha) in self.queries.iter().zip(&self.weights) {
-            let row = local_row(&self.ntt, self.log_d, d, q);
+            let mut row = [F128::ZERO; 16];
+            local_row(&self.ntt, self.log_d, d, q, &mut row);
             let v = dot(&row[..half], &weights);
             positions.push(q >> d);
             values.push(mul(alpha, v));
@@ -429,12 +432,29 @@ mod tests {
             let off = (q & !(size - 1)) - cache_base;
             let f0 = dot(&cache[off..off + half], &weights);
             let f1 = dot(&cache[off + half..off + size], &weights);
-            let row = local_row(&dual.ntt, dual.log_d, k, q);
+            let row = {
+                let ntt = &dual.ntt;
+                let log_d = dual.log_d;
+                let query = q;
+                let mut row = [F128::ZERO; 16];
+                row[0] = F128::ONE;
+                let base = query & !((1usize << k) - 1);
+                let p = query - base;
+                for s in 0..k {
+                    let layer = log_d - 1 - s;
+                    let block = (base >> (s + 1)) + (p >> (s + 1));
+                    let mut scale = ntt.twiddle(layer, block);
+                    if p & (1 << s) != 0 {
+                        scale += F128::ONE;
+                    }
+                    for i in 0..1usize << s {
+                        row[(1 << s) + i] = mul(row[i], scale);
+                    }
+                }
+                row
+            };
             let dot0 = dot(&row[..half], &weights);
-            let mut dot2 = F128::ZERO;
-            for j in 0..half {
-                dot2 += mul(row[j] + row[half + j], weights[j]);
-            }
+            let dot2 = mul(F128::ONE + row[half], dot0);
             let a0 = mul(dual.weights[i], f0);
             let a2 = mul(dual.weights[i], f0 + f1);
             msg.u_0 += mul(a0, dot0);
@@ -509,7 +529,8 @@ mod tests {
                 for k in 1..=depth + 1 {
                     let half = 1usize << (k - 1);
                     for q in 0..1usize << LOG_D {
-                        let row = local_row(&ntt, LOG_D, k, q);
+                        let mut row = [F128::ZERO; 16];
+                        local_row(&ntt, LOG_D, k, q, &mut row);
                         assert_eq!(row[0], F128::ONE);
                         for j in 0..half {
                             assert_eq!(row[j + half], mul(row[half], row[j]));

@@ -5575,7 +5575,8 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
-            for (l, f) in super::plan_passes(log_d, start_layer) {
+            for l in (start_layer..log_d).step_by(4) {
+                let f = (log_d - l).min(4);
                 // Register-resident specializations for the production pass
                 // widths; the generic staged kernel covers the rest. At
                 // production passes with s >= 2, one 64-thread group builds
@@ -5650,7 +5651,8 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
-            for (l, f) in super::plan_passes(log_d, start_layer) {
+            for l in (start_layer..log_d).step_by(4) {
+                let f = (log_d - l).min(4);
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
@@ -5723,7 +5725,8 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
-            for (l, f) in super::plan_passes(log_d, start_layer) {
+            for l in (start_layer..log_d).step_by(4) {
+                let f = (log_d - l).min(4);
                 if l < l_from || l >= l_to {
                     continue;
                 }
