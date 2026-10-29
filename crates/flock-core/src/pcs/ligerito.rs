@@ -3422,6 +3422,30 @@ fn small_ntt_min_jobs(elems_per_job: usize) -> usize {
 /// Field elements per rayon job in the transpose-NTT layer kernels.
 const SMALL_NTT_MIN_ELEMS: usize = 4096;
 
+fn transpose_forward_ntt_root_xor(data: &mut [F128], n_threads: usize) {
+    use rayon::prelude::*;
+
+    let block_size = data.len();
+    let half = block_size >> 1;
+    // At layer zero, twiddle(0, 0) is zero: (a, b) maps to (a + b, b).
+    if n_threads == 1 {
+        data.par_chunks_mut(block_size)
+            .with_min_len(small_ntt_min_jobs(block_size))
+            .for_each(|chunk| {
+                let (top, bottom) = chunk.split_at_mut(half);
+                for (top, bottom) in top.iter_mut().zip(bottom.iter()) {
+                    *top += *bottom;
+                }
+            });
+    } else {
+        let (top, bottom) = data.split_at_mut(half);
+        top.par_iter_mut()
+            .zip(bottom.par_iter())
+            .with_min_len(small_ntt_min_jobs(2))
+            .for_each(|(top, bottom)| *top += *bottom);
+    }
+}
+
 fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
     use rayon::prelude::*;
     debug_assert_eq!(data.len(), 1usize << log_d);
@@ -3434,6 +3458,10 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
         remaining -= 3;
     }
     for layer in (0..remaining).rev() {
+        if layer == 0 {
+            transpose_forward_ntt_root_xor(data, n_threads);
+            continue;
+        }
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let bsh = block_size >> 1;
@@ -4403,6 +4431,10 @@ fn transpose_forward_ntt_dense_suffix_impl(
         remaining -= 3;
     }
     for layer in (0..remaining).rev() {
+        if layer == 0 {
+            transpose_forward_ntt_root_xor(data, n_threads);
+            continue;
+        }
         let num_blocks = 1usize << layer;
         let block_size = 1usize << (log_d - layer);
         let half = block_size >> 1;
