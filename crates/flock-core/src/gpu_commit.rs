@@ -7423,8 +7423,8 @@ kernel void blake3_pow_scan(
 
     /// Scope guard for [`HYBRID_ARM_RECORDING`].
     ///
-    /// Held only across `collect_ranked_exact_samples`: while it is live each
-    /// hybrid sample records its own GPU-prefix and CPU-suffix walls, and when
+    /// Held only across the coarse and fine contention samples: each hybrid
+    /// sample records its own GPU-prefix and CPU-suffix walls, and when
     /// it drops recording stops. Arms measured anywhere else (the byte-check
     /// commit, a timed prove) therefore never price a split; only samples taken
     /// beside the A/B replay, under the same contention, take part.
@@ -7801,6 +7801,42 @@ kernel void blake3_pow_scan(
             *mean = (a + b) * 0.5;
         }
         Some(means)
+    }
+
+    /// Confirm a predicted fine split with the same host score as its coarse
+    /// incumbent. Each draw restores canonical staging outside its timer.
+    fn measure_ranked_fine_split<E>(
+        coarse: usize,
+        fine: usize,
+        coarse_means: &[f64; RANKED_EXACT_TUNE_CANDIDATES.len()],
+        mut reprime: impl FnMut() -> Result<(), E>,
+        mut sample: impl FnMut(usize) -> Result<f64, E>,
+    ) -> Result<usize, E> {
+        if fine == coarse {
+            return Ok(coarse);
+        }
+        let i = RANKED_EXACT_TUNE_CANDIDATES
+            .iter()
+            .position(|&k| k == coarse)
+            .expect("coarse split is a sweep candidate");
+        let coarse_ms = coarse_means[i];
+        if !coarse_ms.is_finite() || coarse_ms <= 0.0 {
+            return Ok(coarse);
+        }
+        reprime()?;
+        let a = sample(fine)?;
+        reprime()?;
+        let b = sample(fine)?;
+        if a.is_finite()
+            && b.is_finite()
+            && a > 0.0
+            && b > 0.0
+            && (a + b) * 0.5 < coarse_ms * (1.0 - FINE_MARGIN)
+        {
+            Ok(fine)
+        } else {
+            Ok(coarse)
+        }
     }
 
     #[inline]
@@ -8245,7 +8281,7 @@ kernel void blake3_pow_scan(
                 v.clear();
             }
             let _recording = ArmRecordScope::enter();
-            match collect_ranked_exact_samples(reprime, sample) {
+            match collect_ranked_exact_samples(&reprime, &sample) {
                 Ok(samples) => samples,
                 Err(e) => {
                     if dbg {
@@ -8279,12 +8315,30 @@ kernel void blake3_pow_scan(
             .lock()
             .map(|v| v.clone())
             .unwrap_or_default();
-        let chosen = match split_from_arms(&arm_samples, swept) {
+        let coarse_chosen = match split_from_arms(&arm_samples, swept) {
             Some(k) => k,
             None => swept,
         };
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
-        let chosen = fine_split_from_arms(&fine_samples, chosen);
+        let fine_candidate = fine_split_from_arms(&fine_samples, coarse_chosen);
+        // Create the cached event before either fine timer. A failed setup or
+        // sample keeps the coarse incumbent; the final byte check still runs.
+        let chosen = if fine_candidate == coarse_chosen
+            || unsafe { gpu.fine_split_event() }.is_null()
+        {
+            coarse_chosen
+        } else {
+            let _recording = ArmRecordScope::enter();
+            match measure_ranked_fine_split(coarse_chosen, fine_candidate, &means, &reprime, &sample) {
+                Ok(k) => k,
+                Err(e) => {
+                    if dbg {
+                        eprintln!("[gpu-commit] fine exact-AB tune failed ({e}); keeping k={coarse_chosen}");
+                    }
+                    coarse_chosen
+                }
+            }
+        };
         if dbg {
             let rows: Vec<String> = fine_samples
                 .iter()
@@ -8507,18 +8561,21 @@ kernel void blake3_pow_scan(
     // -----------------------------------------------------------------------
 
     const WARMUP_CACHE_MAGIC_V2: u64 = 0x464C_4B5F_574C_4332; // "FLK_WLC2"
-    // V3 excludes V2 entries published before calibration was deferred; such
-    // entries can contain the usize::MAX untuned sentinel. The canonical
-    // reprime kill switch deliberately returns to the incumbent V2 cache.
+    // V4 excludes entries that could publish an unmeasured fine split. The
+    // canonical reprime kill switch retains the incumbent V2 cache.
     // (Redraw marker AUTO-1, 2026-08-02 11:19: automated same-binary redraw while the promoted bar remains the disclosed marker-only resample at 1,357,262.51. Latest account draws: 1319797.87332625 / 1317557.71279261 / 1342891.19447755. Content change required for per-account resubmission.)
-    const WARMUP_CACHE_MAGIC_V3: u64 = 0x464C_4B5F_574C_4333; // "FLK_WLC3"
+    const WARMUP_CACHE_MAGIC_V4: u64 = 0x464C_4B5F_574C_4334; // "FLK_WLC4"
+
+    fn warmup_cache_policy(canonical_reprime: bool) -> (u64, u32) {
+        if canonical_reprime {
+            (WARMUP_CACHE_MAGIC_V4, 4)
+        } else {
+            (WARMUP_CACHE_MAGIC_V2, 2)
+        }
+    }
 
     fn warmup_cache_magic() -> u64 {
-        if hybrid_tune_canonical_reprime_enabled() {
-            WARMUP_CACHE_MAGIC_V3
-        } else {
-            WARMUP_CACHE_MAGIC_V2
-        }
+        warmup_cache_policy(hybrid_tune_canonical_reprime_enabled()).0
     }
 
     /// Cache key component tying entries to both the exact GPU source and
@@ -8549,6 +8606,15 @@ kernel void blake3_pow_scan(
 
     #[cfg(test)]
     mod zero_root_cache_key_tests {
+        #[test]
+        fn measured_fine_policy_excludes_old_cache_and_keeps_rollback() {
+            let measured = super::warmup_cache_policy(true);
+            let old_unmeasured = (0x464C_4B5F_574C_4333, 3);
+            assert_ne!(measured.0, old_unmeasured.0);
+            assert_ne!(measured.1, old_unmeasured.1);
+            assert_eq!(super::warmup_cache_policy(false), (0x464C_4B5F_574C_4332, 2));
+        }
+
         #[test]
         fn supplemental_source_and_mode_have_a_distinct_fingerprint() {
             let incumbent = super::warmup_cache_msl_fnv_for(false, false);
@@ -8600,11 +8666,7 @@ kernel void blake3_pow_scan(
     }
 
     fn warmup_cache_path() -> std::path::PathBuf {
-        let version = if hybrid_tune_canonical_reprime_enabled() {
-            3
-        } else {
-            2
-        };
+        let (_, version) = warmup_cache_policy(hybrid_tune_canonical_reprime_enabled());
         super::shared_cache_dir().join(format!("flock-warmup-latch-v{version}.bin"))
     }
 
@@ -8628,7 +8690,11 @@ kernel void blake3_pow_scan(
         let latch_on = take_u64(&bytes)? == 1;
         let tuned_k = take_u64(&bytes)? as usize;
         let cpu_wall_ms = f64::from_bits(take_u64(&bytes)?);
-        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || !hybrid_split_valid(tuned_k) {
+        if !cpu_wall_ms.is_finite()
+            || cpu_wall_ms <= 0.0
+            || !hybrid_split_valid(tuned_k)
+            || (tuned_k >= 16 && std::env::var_os("FLOCK_NO_HYBRID_FINE").is_some())
+        {
             return None;
         }
         let root_bytes = bytes.get(off..)?;
@@ -8653,6 +8719,12 @@ kernel void blake3_pow_scan(
         cpu_wall_ms: f64,
         cpu_tree: &[Hash],
     ) {
+        // A forced fine split has not passed the contention measurement gate.
+        if hybrid_tune_canonical_reprime_enabled()
+            && hybrid_cpu_split_override().is_some_and(|k| k >= 16)
+        {
+            return;
+        }
         if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || !hybrid_split_valid(tuned_k) {
             return;
         }
@@ -8692,7 +8764,7 @@ kernel void blake3_pow_scan(
         cpu_tree: &[Hash],
         k: usize,
     ) {
-        debug_assert!(RANKED_EXACT_TUNE_CANDIDATES.contains(&k));
+        debug_assert!(hybrid_split_valid(k));
         TUNED_HYBRID_K.store(k, std::sync::atomic::Ordering::Release);
         if super::warmup_latch_cache_enabled() {
             let cpu_wall_ms = f64::from_bits(
@@ -11814,7 +11886,7 @@ kernel void lc_fold_stripes_factored_b4(
     mod split_select_tests {
         use super::{
             DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k, choose_hybrid_k_with,
-            collect_ranked_exact_samples, mean_ranked_exact_samples,
+            collect_ranked_exact_samples, mean_ranked_exact_samples, measure_ranked_fine_split,
         };
         const C: [usize; 4] = [0, 2, 3, 5];
 
@@ -11854,6 +11926,96 @@ kernel void lc_fold_stripes_factored_b4(
             assert_eq!(mean_ranked_exact_samples(samples).unwrap()[1], 100.0);
             samples[1][1] = f64::NAN;
             assert!(mean_ranked_exact_samples(samples).is_none());
+        }
+
+        #[test]
+        fn measured_fine_uses_its_incumbents_host_mean_and_gain_margin() {
+            let means = [200.0, 150.0, 100.0, 98.0, 130.0];
+            let fine = 3 + 16 * 4;
+            let margin = means[3] * (1.0 - super::FINE_MARGIN);
+            // Fine's base is 3, but its incumbent is 4 with a 98 ms mean.
+            // 97.5 ms beats base 3 by 1%, but does not beat incumbent 4.
+            for (draws, expected) in [
+                ([97.0, 98.0], 4),
+                ([96.0, 96.0], fine),
+                ([98.0, 98.0], 4),
+                ([99.0, 99.0], 4),
+                ([margin, margin], 4),
+                ([90.0, 106.0], 4),
+            ] {
+                let mut draws = draws.into_iter();
+                assert_eq!(
+                    measure_ranked_fine_split(4, fine, &means, || Ok::<(), ()>(()), |k| {
+                        assert_eq!(k, fine);
+                        Ok(draws.next().unwrap())
+                    }),
+                    Ok(expected)
+                );
+            }
+        }
+
+        #[test]
+        fn measured_fine_rejects_invalid_host_scores() {
+            let fine = 3 + 16 * 4;
+            for invalid in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+                let mut means = [100.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
+                means[3] = invalid;
+                assert_eq!(
+                    measure_ranked_fine_split::<()>(4, fine, &means, || panic!(), |_| panic!()),
+                    Ok(4)
+                );
+                means[3] = 100.0;
+                for draws in [[invalid, 90.0], [90.0, invalid]] {
+                    let mut draws = draws.into_iter();
+                    assert_eq!(
+                        measure_ranked_fine_split(4, fine, &means, || Ok::<(), ()>(()), |_| {
+                            Ok(draws.next().unwrap())
+                        }),
+                        Ok(4)
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn measured_fine_draws_are_reprimed_and_stop_on_error() {
+            let fine = 3 + 16 * 4;
+            let means = [100.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
+            let events = std::cell::RefCell::new(Vec::new());
+            assert_eq!(
+                measure_ranked_fine_split(
+                    4,
+                    fine,
+                    &means,
+                    || {
+                        events.borrow_mut().push(0);
+                        Ok::<(), ()>(())
+                    },
+                    |k| {
+                        events.borrow_mut().push(k);
+                        Ok(90.0)
+                    },
+                ),
+                Ok(fine)
+            );
+            assert_eq!(*events.borrow(), [0, fine, 0, fine]);
+            assert_eq!(
+                measure_ranked_fine_split::<()>(4, 4, &means, || panic!(), |_| panic!()),
+                Ok(4)
+            );
+            for fail_at in 0..4 {
+                let calls = std::cell::Cell::new(0);
+                let step = || {
+                    let n = calls.get();
+                    calls.set(n + 1);
+                    if n == fail_at { Err(()) } else { Ok(()) }
+                };
+                assert_eq!(
+                    measure_ranked_fine_split(4, fine, &means, step, |_| step().map(|()| 90.0)),
+                    Err(())
+                );
+                assert_eq!(calls.get(), fail_at + 1);
+            }
         }
 
         #[test]
