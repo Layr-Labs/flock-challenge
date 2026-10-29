@@ -1917,7 +1917,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    // Every kernel writes all eight values before use; each drain reuses its
+    // initialized private output without a per-chunk reset.
+    crate::epool::run_hetero_chunks_stateful(hi_size, || [F128::ZERO; 8], |out, x_hi| {
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and both partial slots.
         let (anchors, deltas) = unsafe {
@@ -1928,7 +1930,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         };
         let pair_idx_base = x_hi * lo_size;
         let row_base = pair_idx_base * 2;
-        let mut out = [F128::ZERO; 8];
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -2014,7 +2015,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         #[cfg(not(target_arch = "aarch64"))]
         {
             let anchors = unsafe { std::slice::from_raw_parts_mut(anchors, anchor_chunk_size) };
-            out = round2_lookahead_chunk_scalar(
+            *out = round2_lookahead_chunk_scalar(
                 a_packed,
                 b_packed,
                 table,
