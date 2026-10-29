@@ -1541,19 +1541,17 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
     debug_assert_eq!(low_point.len(), 6);
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = build_eq(low_point);
-    let mut out = crate::alloc_uninit_f128_vec(n_packed);
-    let w0 = low_eq[0];
-    for (dst, &src) in out.iter_mut().zip(&s_hat_v_fold8[..n_packed]) {
-        *dst = w0 * src;
-    }
-    for bank in 1..64 {
+    let mut acc = [crate::field::F256Unreduced::ZERO; 1 << LOG_PACKING];
+    for bank in 0..64 {
         let w = low_eq[bank];
-        for (dst, &src) in out
-            .iter_mut()
-            .zip(&s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed])
-        {
-            *dst += w * src;
+        let src_bank = &s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed];
+        for (dst, &src) in acc.iter_mut().zip(src_bank) {
+            *dst ^= w.mul_unreduced(src);
         }
+    }
+    let mut out = crate::alloc_uninit_f128_vec(n_packed);
+    for (dst, slot) in out.iter_mut().zip(&acc) {
+        *dst = slot.reduce();
     }
     out
 }
@@ -1632,11 +1630,11 @@ pub fn claim_check(weights: &[F128], s_hat_v: &[F128]) -> F128 {
 /// Standard inner product `Σ_i a[i] · b[i]` over F_{2^128}.
 pub fn inner_product(a: &[F128], b: &[F128]) -> F128 {
     assert_eq!(a.len(), b.len());
-    let mut acc = F128::ZERO;
+    let mut acc = crate::field::F256Unreduced::ZERO;
     for (&x, &y) in a.iter().zip(b.iter()) {
-        acc += x * y;
+        acc ^= x.mul_unreduced(y);
     }
-    acc
+    acc.reduce()
 }
 
 /// **TensorAlgebra transpose** (a.k.a. "bit transpose" of `s_hat_v`).
@@ -3290,22 +3288,36 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                         // Compute `a_state` into an uninitialized buffer first,
                         // then reuse the owned `fold8` allocation for `w_state`.
                         let mut a_state = crate::alloc_uninit_f128_vec(64 * n_packed);
-                        let mut transposed = [F128::ZERO; 1 << LOG_PACKING];
-                        for e in 0..64 {
-                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-                            tensor_algebra_transpose_into(bank, &mut transposed);
-                            for (bit, &value) in transposed.iter().enumerate() {
-                                a_state[bit * 64 + e] = value;
+                        let mut transposed = [[F128::ZERO; 1 << LOG_PACKING]; 8];
+                        for eg in 0..8 {
+                            let e_base = eg * 8;
+                            for lane in 0..8 {
+                                let e = e_base + lane;
+                                let bank = &fold8[e * n_packed..(e + 1) * n_packed];
+                                tensor_algebra_transpose_into(bank, &mut transposed[lane]);
+                            }
+                            for bit in 0..n_packed {
+                                let dst = &mut a_state[bit * 64 + e_base..bit * 64 + e_base + 8];
+                                for lane in 0..8 {
+                                    dst[lane] = transposed[lane][bit];
+                                }
                             }
                         }
                         let mut w_state = crate::alloc_uninit_f128_vec(64 * n_packed);
-                        for d_low in 0..64 {
-                            let scale = low_eq[d_low];
-                            let mut basis_product = scale;
-                            w_state[d_low] = fold_one_slot(basis_product, &table);
+                        for dg in 0..8 {
+                            let d_base = dg * 8;
+                            let mut basis_products: [F128; 8] =
+                                low_eq[d_base..d_base + 8].try_into().unwrap();
+                            let dst0 = &mut w_state[d_base..d_base + 8];
+                            for lane in 0..8 {
+                                dst0[lane] = fold_one_slot(basis_products[lane], &table);
+                            }
                             for bit in 1..n_packed {
-                                basis_product = mul_by_x(basis_product);
-                                w_state[bit * 64 + d_low] = fold_one_slot(basis_product, &table);
+                                let dst = &mut w_state[bit * 64 + d_base..bit * 64 + d_base + 8];
+                                for lane in 0..8 {
+                                    basis_products[lane] = mul_by_x(basis_products[lane]);
+                                    dst[lane] = fold_one_slot(basis_products[lane], &table);
+                                }
                             }
                         }
                         let round0 = super::round0_deferred(&a_state, &w_state);
