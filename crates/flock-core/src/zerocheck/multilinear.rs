@@ -262,6 +262,26 @@ fn take_or_build_r2_eq(challenges: &[F128], n_hi: usize) -> SplitEqGhash {
     SplitEqGhash::with_n_hi(challenges, n_hi)
 }
 
+/// Read-only Eq view whose fixed-medium property was proved at the private
+/// lookahead call. The field is private so arbitrary Eq values cannot enter
+/// the trusted GPU launch through a public constructor.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct R2HornerEq<'a> {
+    eq: &'a SplitEqGhash,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> R2HornerEq<'a> {
+    pub(crate) fn parts(self) -> (&'a [F128], &'a [F128], usize, usize) {
+        (
+            &self.eq.lo,
+            &self.eq.hi,
+            1usize << self.eq.n_lo,
+            1usize << self.eq.n_hi,
+        )
+    }
+}
+
 fn round2_pair_skip(padding: &PaddingSpec, k_skip: usize) -> (usize, usize) {
     if padding.k_log <= k_skip + 1 {
         return (0, usize::MAX);
@@ -1886,17 +1906,36 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // odd-parity halves on those chunks (the GPU's sums are not parity-split),
     // which is what makes `W1`/`W2` recoverable everywhere.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
-        a_packed,
-        b_packed,
-        &table.data,
-        eq_lo,
-        eq_hi,
-        lo_size,
-        hi_size,
-        pair_in_block_mask,
-        useful_pairs_inclusive,
-    );
+    let gpu_job = if horner_weights
+        && eq.n_lo == 14
+        && eq.n_hi == COMPACT_RECONSTRUCTION_N_HI
+        && eq.lo.len() == lo_size
+        && eq.hi.len() == hi_size
+    {
+        // take_or_build returned this exact point's Eq, and only shared
+        // borrows exist since then. The existing CPU predicate proves its
+        // medium weights; this borrow remains live through the GPU upload.
+        crate::gpu_commit::launch_zc_r2_products_with_horner_eq(
+            a_packed,
+            b_packed,
+            &table.data,
+            R2HornerEq { eq: &eq },
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+        )
+    } else {
+        crate::gpu_commit::launch_zc_r2_products(
+            a_packed,
+            b_packed,
+            &table.data,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+        )
+    };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
     // The GPU arm now returns its round-two products parity-split, so on an
@@ -1910,14 +1949,18 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
-    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    // Every hi callback writes both fields before the synchronous drain returns.
+    let mut partials: Vec<(F128, F128)> = crate::alloc_uninit_vec(hi_size);
     // [p1_odd, pinf_odd, W0, W3, W4, W5], eq_hi-weighted, one slot per chunk.
-    let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
+    // Every hi callback writes all six fields before the synchronous drain returns.
+    let mut la_partials: Vec<[F128; 6]> = crate::alloc_uninit_vec(hi_size);
     let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
     let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    // Every kernel writes all eight values before use; each drain reuses its
+    // initialized private output without a per-chunk reset.
+    crate::epool::run_hetero_chunks_stateful(hi_size, || [F128::ZERO; 8], |out, x_hi| {
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and both partial slots.
         let (anchors, deltas) = unsafe {
@@ -1928,7 +1971,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         };
         let pair_idx_base = x_hi * lo_size;
         let row_base = pair_idx_base * 2;
-        let mut out = [F128::ZERO; 8];
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -2014,7 +2056,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         #[cfg(not(target_arch = "aarch64"))]
         {
             let anchors = unsafe { std::slice::from_raw_parts_mut(anchors, anchor_chunk_size) };
-            out = round2_lookahead_chunk_scalar(
+            *out = round2_lookahead_chunk_scalar(
                 a_packed,
                 b_packed,
                 table,

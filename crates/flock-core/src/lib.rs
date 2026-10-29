@@ -38,6 +38,8 @@ pub mod permutation;
 pub mod proof;
 pub mod r1cs;
 pub mod scratch;
+pub mod stage_ir;
+pub use stage_ir as gf2_kernels;
 pub mod tmark;
 pub mod verifier;
 pub mod zerocheck;
