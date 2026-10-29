@@ -13059,7 +13059,7 @@ static inline uint4 zc_r2_fold8(uint lo, uint hi, threadgroup const uint4* nib) 
 static inline void zc_r2_write_partials(
     ulong4 acc1, ulong4 acci, threadgroup ulong4* red,
     device const uint4* eq_hi, device uint4* partials,
-    uint hi_chunk, uint output_group, uint lid)
+    uint hi_chunk, uint output_group, uint lid, bool weight_hi)
 {
     // Both mappings keep x_lo parity equal to lid parity. Stop before
     // s == 1 so even and odd partials remain separate.
@@ -13085,11 +13085,19 @@ static inline void zc_r2_write_partials(
         U256k u1o; u1o.r0 = chunk1o.x; u1o.r1 = chunk1o.y; u1o.r2 = chunk1o.z; u1o.r3 = chunk1o.w;
         U256k uie; uie.r0 = chunkie.x; uie.r1 = chunkie.y; uie.r2 = chunkie.z; uie.r3 = chunkie.w;
         U256k uio; uio.r0 = chunkio.x; uio.r1 = chunkio.y; uio.r2 = chunkio.z; uio.r3 = chunkio.w;
-        uint4 e = eq_hi[hi_chunk];
-        partials[output_group * 4u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
-        partials[output_group * 4u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
-        partials[output_group * 4u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
-        partials[output_group * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+        if (weight_hi) {
+            uint4 e = eq_hi[hi_chunk];
+            partials[output_group * 4u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
+            partials[output_group * 4u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
+            partials[output_group * 4u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
+            partials[output_group * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+        } else {
+            // The host merges four Horner groups before applying their common weight.
+            partials[output_group * 4u]      = gf_reduce(u1e);
+            partials[output_group * 4u + 1u] = gf_reduce(uie);
+            partials[output_group * 4u + 2u] = gf_reduce(u1o);
+            partials[output_group * 4u + 3u] = gf_reduce(uio);
+        }
     }
 }
 
@@ -13143,12 +13151,13 @@ kernel void zc_r2_products(
         acci ^= ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
     }
 
-    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, tgid, tgid, lid);
+    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, tgid, tgid, lid, true);
 }
 
 // Four physical groups per logical hi chunk. Each thread owns one
 // (sampled window, small-bit class) and all sixteen medium weights.
 // eq_lo contains lambda[window * 4 + class], verified on the host.
+// The host applies eq_hi after merging these four groups.
 kernel void zc_r2_products_horner(
     device const uint4* a_in  [[buffer(0)]],
     device const uint4* b_in  [[buffer(1)]],
@@ -13194,7 +13203,7 @@ kernel void zc_r2_products_horner(
     U256k mi = clmul128(e, zc_r2_horner_reduce(hi));
     ulong4 acc1 = ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
     ulong4 acci = ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
-    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid);
+    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid, false);
 }
 
 "#;
@@ -13516,6 +13525,25 @@ kernel void zc_r2_horner_oracle(
         #[cfg(test)]
         pub(crate) fn uses_horner(&self) -> bool {
             self.horner
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_physical_partials(job: &ZcR2Job) -> Vec<[F128; 4]> {
+        let gpu = gpu().unwrap();
+        unsafe {
+            gpu.wait_cb(job.cb).unwrap();
+            let state = zc_r2_state().unwrap().lock().unwrap();
+            let pso = if job.horner { state.horner_pso } else { state.pso };
+            let usage = gpu.pipeline_resources(pso);
+            assert_eq!(usage.0, 12_288, "current production shared storage");
+            assert!(usage.2 >= 256, "the production group must fit");
+            eprintln!("[zc-r2-eq-hi-resources] horner={} resources={usage:?}", job.horner);
+            std::slice::from_raw_parts(
+                gpu.buffer_contents(state.part_buf).cast::<[F128; 4]>(),
+                job.chunks * if job.horner { 4 } else { 1 },
+            )
+            .to_vec()
         }
     }
 
@@ -13978,6 +14006,13 @@ kernel void zc_r2_horner_oracle(
                 }
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
+            // Horner wire partials omit eq_hi. Its initialized upload stays
+            // fixed through this drain and all replays under the state lock.
+            let hi_weights = if job.horner {
+                gpu.buffer_contents(state.eq_hi_buf).cast::<F128>()
+            } else {
+                std::ptr::null_mut()
+            };
             let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
             let groups = if job.horner { 4 } else { 1 };
             for c in 0..job.chunks {
@@ -13991,6 +14026,12 @@ kernel void zc_r2_horner_oracle(
                 for group in 1..groups {
                     for lane in 0..4 {
                         merged[lane] += *parts.add((c * groups + group) * 4 + lane);
+                    }
+                }
+                if job.horner {
+                    let weight = *hi_weights.add(c);
+                    for value in &mut merged {
+                        *value = weight * *value;
                     }
                 }
                 out.push(merged);
@@ -18171,15 +18212,27 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// equality check must pass and publish a share without poisoning) and
     /// the timed prefix path.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_zc_r2_products_match_cpu_oracle() {
-        for (lo_size, hi_size, fixed_weights) in
-            [(512, 64, false), (16_384, 8, true), (16_384, 8, false)]
-        {
-            zc_r2_products_case(lo_size, hi_size, fixed_weights);
+        assert!(gpu_zc_r2_horner_enabled(), "oracle requires Horner enabled");
+        for (lo_size, hi_size, fixed_weights, mask, useful) in [
+            (512, 64, false, 4095, 3900),
+            (16_384, 8, true, 127, 121),
+            (16_384, 8, false, 4095, 3900),
+            (16_384, 8, true, 16_383, 61),
+        ] {
+            zc_r2_products_case(lo_size, hi_size, fixed_weights, mask, useful);
         }
     }
 
-    fn zc_r2_products_case(lo_size: usize, hi_size: usize, fixed_weights: bool) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn zc_r2_products_case(
+        lo_size: usize,
+        hi_size: usize,
+        fixed_weights: bool,
+        mask: usize,
+        useful: usize,
+    ) {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
             *rng ^= *rng << 13;
@@ -18218,13 +18271,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         };
 
         let n_pairs = lo_size * hi_size;
-        // Test the ranked seven-pair tail and a generic padded block.
-        // The padded inputs contain random data, which must be ignored.
-        let mask = if fixed_weights { 127usize } else { 4095usize };
-        let useful = if fixed_weights { 121usize } else { 3900usize };
-
-        let mut a_packed = vec![0u8; n_pairs * 16];
-        let mut b_packed = vec![0u8; n_pairs * 16];
+        // Keep no-copy backing aligned and alive for the state's cached wraps.
+        // Padding cases include the ranked tail and three inactive Horner groups.
+        let a_packed = leak_page_aligned(n_pairs * 16);
+        let b_packed = leak_page_aligned(n_pairs * 16);
         for byte in a_packed.iter_mut() {
             *byte = (xs(&mut rng) & 0xff) as u8;
         }
@@ -18245,19 +18295,22 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         }
         assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
         let mut eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
+        eq_hi[0] = F128::ZERO;
+        eq_hi[1] = F128::ONE;
 
-        // CPU reference partials, exactly the driver's non-aarch64 shape, kept
-        // split by x_lo parity so the arm's parity contract is checked and not
-        // just the sum a wrong split could still reproduce.
+        // Follow the parent output order: weight each physical group before
+        // merging. Separate raw sums check the unweighted Horner wire format.
+        let groups = if fixed_weights { 4 } else { 1 };
         let reference = |a_packed: &[u8],
                          b_packed: &[u8],
                          table_data: &[F128],
                          eq_lo: &[F128],
                          eq_hi: &[F128]| {
             let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
+            let mut physical: Vec<[F128; 4]> = Vec::with_capacity(hi_size * groups);
             for x_hi in 0..hi_size {
                 // [p1_even, pinf_even, p1_odd, pinf_odd]
-                let mut acc = [F256Unreduced::ZERO; 4];
+                let mut group_acc = vec![[F256Unreduced::ZERO; 4]; groups];
                 for x_lo in 0..lo_size {
                     let pair_idx = x_hi * lo_size + x_lo;
                     if (pair_idx & mask) >= useful {
@@ -18271,15 +18324,34 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                     let b0 = fold_row(table_data, read(&b_packed, 2 * pair_idx));
                     let b1 = fold_row(table_data, read(&b_packed, 2 * pair_idx + 1));
                     let base = 2 * (x_lo & 1);
-                    acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                    acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+                    let m1 = eq_lo[x_lo].mul_unreduced(a1 * b1);
+                    let mi = eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+                    let group = x_lo / (lo_size / groups);
+                    group_acc[group][base] ^= m1;
+                    group_acc[group][base + 1] ^= mi;
                 }
                 let eq_h = eq_hi[x_hi];
-                cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
+                let mut parent = [F128::ZERO; 4];
+                for values in &group_acc {
+                    for i in 0..4 {
+                        parent[i] += eq_h * values[i].reduce();
+                    }
+                }
+                cpu_split.push(parent);
+                for values in group_acc {
+                    physical.push(std::array::from_fn(|i| {
+                        let value = values[i].reduce();
+                        if fixed_weights { value } else { eq_h * value }
+                    }));
+                }
             }
-            cpu_split
+            (cpu_split, physical)
         };
-        let cpu_split = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        let (cpu_split, physical) = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        assert_eq!(cpu_split[0], [F128::ZERO; 4]);
+        if fixed_weights {
+            assert!(physical[..4].iter().flatten().any(|&value| value != F128::ZERO));
+        }
         let cpu_partials: Vec<(F128, F128)> = cpu_split
             .iter()
             .map(|v| (v[0] + v[2], v[1] + v[3]))
@@ -18307,6 +18379,11 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(
             job.uses_horner(),
             fixed_weights && gpu_zc_r2_horner_enabled()
+        );
+        assert_eq!(
+            imp::zc_r2_test_physical_partials(&job),
+            physical[..job.chunks * groups],
+            "physical calibration outputs",
         );
         assert!(job.is_calibration());
         assert_eq!(job.cpu_split(), 0);
@@ -18337,6 +18414,11 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             job2.uses_horner(),
             fixed_weights && gpu_zc_r2_horner_enabled()
         );
+        assert_eq!(
+            imp::zc_r2_test_physical_partials(&job2),
+            physical[..job2.chunks * groups],
+            "physical prefix outputs",
+        );
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
@@ -18364,10 +18446,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             eq_lo.as_ptr(),
             eq_hi.as_ptr(),
         );
-        for byte in &mut a_packed {
+        for byte in a_packed.iter_mut() {
             *byte ^= 0x5b;
         }
-        for byte in &mut b_packed {
+        for byte in b_packed.iter_mut() {
             *byte ^= 0xa7;
         }
         for value in table_data
@@ -18377,6 +18459,8 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         {
             *value = crate::field::mul_by_x(*value);
         }
+        eq_hi[0] = F128::ONE;
+        eq_hi[1] = F128::ZERO;
         assert_eq!(
             addresses,
             (
@@ -18388,7 +18472,8 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             )
         );
         assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
-        let changed = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        let (changed, changed_physical) =
+            reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
         assert_ne!(
             &changed[..prefix],
             &cpu_split[..prefix],
@@ -18410,6 +18495,11 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             job3.uses_horner(),
             fixed_weights && gpu_zc_r2_horner_enabled()
         );
+        assert_eq!(
+            imp::zc_r2_test_physical_partials(&job3),
+            changed_physical[..job3.chunks * groups],
+            "physical changed-input outputs",
+        );
         assert!(!job3.is_calibration());
         assert_eq!(job3.cpu_split(), prefix);
         match imp::zc_r2_wait(job3, None, None, 0.0, hi_size) {
@@ -18419,6 +18509,9 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             }
             _ => panic!("changed-input drain must return prefix partials"),
         }
+        eprintln!(
+            "[zc-r2-eq-hi-oracle] lo={lo_size} hi={hi_size} horner={fixed_weights} mask={mask} useful={useful} physical=PASS weighted=PASS changed=PASS zero-one-weights=PASS",
+        );
         imp::zc_r2_test_reset();
     }
 
