@@ -3048,6 +3048,23 @@ fn transpose_forward_ntt_fused_3layer(
         values[b] = twiddle * sum + values[b];
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    #[inline(always)]
+    fn butterfly_pair(values: &mut [F128; 8], top: usize, bottom: usize, twiddle: F128) {
+        let sums = [
+            values[top] + values[bottom],
+            values[top + 1] + values[bottom + 1],
+        ];
+        // SAFETY: this branch requires AES and little-endian F128 limb order.
+        let products = unsafe {
+            crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(twiddle, sums)
+        };
+        values[top] = sums[0];
+        values[top + 1] = sums[1];
+        values[bottom] += products[0];
+        values[bottom + 1] += products[1];
+    }
+
     let num_blocks = 1usize << layer;
     let block_size = 1usize << (log_d - layer);
     let eighth = block_size >> 3;
@@ -3092,12 +3109,23 @@ fn transpose_forward_ntt_fused_3layer(
             for pair in 0..4 {
                 butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
             }
-            for half in 0..2 {
-                butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
-                butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            {
+                for half in 0..2 {
+                    butterfly_pair(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
+                }
+                butterfly_pair(&mut values, 0, 4, tw[0]);
+                butterfly_pair(&mut values, 2, 6, tw[0]);
             }
-            for i in 0..4 {
-                butterfly(&mut values, i, i + 4, tw[0]);
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+            {
+                for half in 0..2 {
+                    butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
+                    butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
+                }
+                for i in 0..4 {
+                    butterfly(&mut values, i, i + 4, tw[0]);
+                }
             }
             for (i, &value) in values.iter().enumerate() {
                 *ptr.add(base + i * eighth) = value;
