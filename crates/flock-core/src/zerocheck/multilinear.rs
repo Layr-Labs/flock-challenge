@@ -833,11 +833,13 @@ impl UniSkipFoldTable {
     /// would write, at the cost of 64 field multiplications.
     pub(crate) fn scaled_linear(&self, rho: F128) -> Vec<F128> {
         assert_eq!(self.data.len(), self.n_chunks * 256);
-        let mut scaled = self.data.clone();
+        // Every bank writes its base and basis before rebuilding all other slots.
+        let mut scaled = crate::alloc_uninit_f128_vec(self.data.len());
         for chunk in 0..self.n_chunks {
             let base = chunk * 256;
+            scaled[base] = self.data[base];
             for bit in 0..8 {
-                scaled[base + (1 << bit)] = rho * scaled[base + (1 << bit)];
+                scaled[base + (1 << bit)] = rho * self.data[base + (1 << bit)];
             }
             for value in 3usize..256 {
                 if value.is_power_of_two() {
