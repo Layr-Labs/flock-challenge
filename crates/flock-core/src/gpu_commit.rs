@@ -5600,6 +5600,7 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
+            let mut bound_pso = NIL;
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 // Register-resident specializations for the production pass
                 // widths; the generic staged kernel covers the rest. At
@@ -5635,7 +5636,10 @@ kernel void blake3_pow_scan(
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
                 };
-                gpu.set_pipeline(enc, pso);
+                if pso != bound_pso {
+                    gpu.set_pipeline(enc, pso);
+                    bound_pso = pso;
+                }
                 let p = NttParams {
                     log_d: log_d as u32,
                     l: l as u32,
@@ -5675,6 +5679,7 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
+            let mut bound_pso = NIL;
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
@@ -5704,7 +5709,10 @@ kernel void blake3_pow_scan(
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
                 };
-                gpu.set_pipeline(enc, pso);
+                if pso != bound_pso {
+                    gpu.set_pipeline(enc, pso);
+                    bound_pso = pso;
+                }
                 let p = NttParams {
                     log_d: log_d as u32,
                     l: l as u32,
@@ -5748,6 +5756,7 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
+            let mut bound_pso = NIL;
             for (l, f) in super::plan_passes(log_d, start_layer) {
                 if l < l_from || l >= l_to {
                     continue;
@@ -5776,7 +5785,10 @@ kernel void blake3_pow_scan(
                     3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
                     _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
                 };
-                gpu.set_pipeline(enc, pso);
+                if pso != bound_pso {
+                    gpu.set_pipeline(enc, pso);
+                    bound_pso = pso;
+                }
                 let p = NttParams {
                     log_d: log_d as u32,
                     l: l as u32,
@@ -5796,7 +5808,8 @@ kernel void blake3_pow_scan(
 
     /// Encode leaves + all parent levels of ONE aligned subtree
     /// (`subtree_leaves` a power of two, `leaf_start` aligned to it), writing
-    /// into the subtree's slots of the GLOBAL flat tree layout.
+    /// into the subtree's slots of the GLOBAL flat tree layout. A stop of 16
+    /// leaves the shared top to the hybrid CPU join; 1 completes the subtree.
     pub(crate) unsafe fn encode_merkle_subtree(
         gpu: &Gpu,
         enc: Id,
@@ -5805,6 +5818,7 @@ kernel void blake3_pow_scan(
         n_leaves_total: usize,
         leaf_start: usize,
         subtree_leaves: usize,
+        stop_at_level_len: usize,
     ) {
         unsafe {
             encode_merkle_subtree_impl(
@@ -5815,6 +5829,7 @@ kernel void blake3_pow_scan(
                 n_leaves_total,
                 leaf_start,
                 subtree_leaves,
+                stop_at_level_len,
                 super::select_gpu_parent3(n_leaves_total, super::gpu_parent3_enabled()),
             )
         }
@@ -5828,10 +5843,12 @@ kernel void blake3_pow_scan(
         n_leaves_total: usize,
         leaf_start: usize,
         subtree_leaves: usize,
+        stop_at_level_len: usize,
         parent3: bool,
     ) {
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
+        debug_assert!(matches!(stop_at_level_len, 1 | 16));
         unsafe {
             // Vectorized-kernel swap: identical dispatch geometry and output
             // bytes; NIL (kill switch / compile failure) keeps the incumbent.
@@ -5892,6 +5909,8 @@ kernel void blake3_pow_scan(
             // Consume three parent levels per dispatch while all three local
             // ranges contain whole 256-child groups. Each output retains its
             // ordinary global flat-tree slot, so opening is unchanged.
+            // The minimum 32 local outputs imply at least 32 global nodes,
+            // so this pass cannot cross either supported stop (1 or 16).
             if parent3 {
                 gpu.set_pipeline(enc, pso_parent3);
                 while local_len >= 256 {
@@ -5922,7 +5941,7 @@ kernel void blake3_pow_scan(
             }
 
             gpu.set_pipeline(enc, gpu.pso_parent);
-            while local_len > 1 {
+            while local_len > 1 && level_len > stop_at_level_len {
                 let write_level_start = level_start + level_len;
                 let n_out = local_len / 2;
                 gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
@@ -6906,7 +6925,7 @@ kernel void blake3_pow_scan(
                 while start % size != 0 {
                     size >>= 1;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size, 16);
                 start += size;
             }
             gpu.end_encoding(enc);
@@ -6960,7 +6979,7 @@ kernel void blake3_pow_scan(
                 while start % size != 0 {
                     size >>= 1;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size, 16);
                 start += size;
             }
             gpu.end_encoding(enc);
@@ -7082,7 +7101,7 @@ kernel void blake3_pow_scan(
                         while sstart % size != 0 {
                             size >>= 1;
                         }
-                        encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size);
+                        encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size, 16);
                         sstart += size;
                     }
                     gpu.end_encoding(enc);
@@ -13275,11 +13294,39 @@ kernel void zc_r2_products_horner(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint hi_chunk = tgid >> 2;
-    uint window = ((tgid & 3u) << 6) | (lid >> 2);
-    uint small_class = lid & 3u;
+    // xpt bit 31 marks this PSO's width-32 map; low bits keep the step count.
+    bool handoff = (p.xpt & 0x80000000u) != 0u
+        && (p.xpt & 0x7fffffffu) == 16u && p.mask == 127u && p.useful == 121u;
+    uint rid = handoff
+        ? 8u * (lid & 31u) + 4u * ((lid >> 5u) & 1u) + (lid >> 6u)
+        : lid;
+    uint window = ((tgid & 3u) << 6) | (rid >> 2);
+    uint small_class = rid & 3u;
     U320k h1 = {0ul, 0ul, 0ul, 0ul, 0ul};
     U320k hi = {0ul, 0ul, 0ul, 0ul, 0ul};
-    for (uint step = 0u; step < p.xpt; step++) {
+    for (uint step = 0u; step < (p.xpt & 0x7fffffffu); step++) {
+        if (handoff && step == 2u) {
+            // The lower 4 KiB remains the live nibble table.
+            threadgroup uint4* handoff_slots = nib + 256u;
+            uint4 v1 = zc_r2_horner_reduce(h1);
+            uint4 vi = zc_r2_horner_reduce(hi);
+            handoff_slots[rid] = v1;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            v1 = handoff_slots[lid];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            handoff_slots[rid] = vi;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            vi = handoff_slots[lid];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            h1.r0 = (ulong(v1.y) << 32) | v1.x;
+            h1.r1 = (ulong(v1.w) << 32) | v1.z;
+            h1.r2 = 0ul; h1.r3 = 0ul; h1.r4 = 0ul;
+            hi.r0 = (ulong(vi.y) << 32) | vi.x;
+            hi.r1 = (ulong(vi.w) << 32) | vi.z;
+            hi.r2 = 0ul; hi.r3 = 0ul; hi.r4 = 0ul;
+            window = ((tgid & 3u) << 6) | (lid >> 2);
+            small_class = lid & 3u;
+        }
         if (step != 0u) {
             zc_r2_horner_shift(h1);
             zc_r2_horner_shift(hi);
@@ -13376,6 +13423,8 @@ kernel void zc_r2_horner_oracle(
     struct ZcR2 {
         pso: Id,
         horner_pso: Id,
+        /// This PSO's static shared bytes, SIMD width and thread capacity.
+        horner_resources: (u64, u64, u64),
         /// Persistent small buffers: nibble table (4 KiB), eq_lo, eq_hi,
         /// reduced partials. Sized on first use for the ranked shape.
         nib_buf: Id,
@@ -13444,7 +13493,11 @@ kernel void zc_r2_horner_oracle(
             )
             .to_vec();
             let pso = if job.horner { state.horner_pso } else { state.pso };
-            (parts, gpu.pipeline_resources(pso))
+            let usage = gpu.pipeline_resources(pso);
+            if job.horner {
+                assert_eq!(usage, state.horner_resources, "own Horner PSO properties");
+            }
+            (parts, usage)
         }
     }
 
@@ -13581,10 +13634,36 @@ kernel void zc_r2_horner_oracle(
             })();
             gpu.pool_pop(pool);
             let (pso, horner_pso) = built?;
+            let horner_resources = (
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    horner_pso,
+                    c"staticThreadgroupMemoryLength"
+                ),
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    horner_pso,
+                    c"threadExecutionWidth"
+                ),
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    horner_pso,
+                    c"maxTotalThreadsPerThreadgroup"
+                ),
+            );
+            if horner_resources.2 < 256 {
+                gpu.release(horner_pso);
+                gpu.release(pso);
+                return Err("zc-r2 Horner PSO cannot run 256 threads".into());
+            }
             let nib_buf = gpu.new_buffer(256 * 16)?;
             Ok(ZcR2 {
                 pso,
                 horner_pso,
+                horner_resources,
                 nib_buf,
                 eq_lo_buf: NIL,
                 eq_lo_cap: 0,
@@ -13684,7 +13763,11 @@ kernel void zc_r2_horner_oracle(
             }
             let params = P {
                 lo_size: lo_size as u32,
-                xpt: if horner { 16 } else { (lo_size / 256) as u32 },
+                xpt: if horner {
+                    16 | if state.horner_resources.1 == 32 { 0x8000_0000 } else { 0 }
+                } else {
+                    (lo_size / 256) as u32
+                },
                 mask,
                 useful,
             };
@@ -13836,6 +13919,7 @@ kernel void zc_r2_horner_oracle(
         hi_size: usize,
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
+        fixed_horner_weights: bool,
     ) {
         if !zc_r2_idle_fill_viable() {
             return;
@@ -13850,8 +13934,11 @@ kernel void zc_r2_horner_oracle(
         {
             return;
         }
-        let horner =
-            super::gpu_zc_r2_horner_enabled() && super::zc_r2_horner_weights(eq_lo, lo_size);
+        // The sole caller derives this proof from the same immutable point
+        // used to build eq_lo. Unsupported points keep the full table check.
+        let horner = super::gpu_zc_r2_horner_enabled()
+            && ((fixed_horner_weights && lo_size == 16_384)
+                || super::zc_r2_horner_weights(eq_lo, lo_size));
         let Ok(gpu) = gpu() else { return };
         let Some(state_mutex) = zc_r2_state() else {
             return;
@@ -13880,7 +13967,7 @@ kernel void zc_r2_horner_oracle(
                 std::ptr::copy_nonoverlapping(
                     eq_hi.as_ptr().cast::<u8>(),
                     gpu.buffer_contents(state.eq_hi_buf),
-                    need_hi,
+                    ZC_IDLE_FILL_PRIMER_CHUNKS.min(hi_size) * 16,
                 );
                 let need_part = hi_size * 64 * if horner { 4 } else { 1 };
                 if state.part_cap < need_part {
@@ -14019,7 +14106,7 @@ kernel void zc_r2_horner_oracle(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             // Four F128 per physical group, merged per logical hi chunk
             // after completion: [p1_even, pinf_even, p1_odd, pinf_odd].
@@ -14767,7 +14854,7 @@ kernel void zc_t3_products(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             let need_part = hi_size * 32;
             if state.part_cap < need_part {
@@ -15465,7 +15552,7 @@ kernel void zc_loop_products(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             let need_part = hi_size * 32;
             if state.part_cap < need_part {
@@ -16765,6 +16852,17 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_parent3_subtree_layout_matches_cpu_compact() {
+        gpu_parent3_subtree_case(1);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_hybrid_merkle_cutoff_matches_cpu_compact() {
+        gpu_parent3_subtree_case(16);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_parent3_subtree_case(stop_at_level_len: usize) {
         use super::imp;
 
         const N_LEAVES: usize = 1 << 10;
@@ -16803,6 +16901,7 @@ mod tests {
                 N_LEAVES,
                 LEAF_START,
                 SUBTREE_LEAVES,
+                stop_at_level_len,
                 true,
             );
             gpu.end_encoding(enc);
@@ -16827,7 +16926,7 @@ mod tests {
             let end = start + local_len;
             assert_eq!(&initial[start..end], &expect[start..end]);
             affected[start..end].fill(true);
-            if local_len == 1 {
+            if local_len == 1 || level_len == stop_at_level_len {
                 break;
             }
             level_start += level_len;
@@ -16838,10 +16937,27 @@ mod tests {
         assert!(
             initial
                 .iter()
-                .zip(affected)
-                .all(|(node, touched)| touched || *node == SENTINEL),
+                .zip(&affected)
+                .all(|(node, touched)| *touched || *node == SENTINEL),
             "parent3 subtree encoder wrote outside its owned flat-tree ranges",
         );
+        if stop_at_level_len == 16 {
+            // Supply the other owner's retained nodes, then let the existing
+            // CPU path fill the sentinel top. Compare every flat-tree slot.
+            let retained_end = 2 * N_LEAVES - 16;
+            for i in 0..retained_end {
+                if !affected[i] {
+                    initial[i] = expect[i];
+                }
+            }
+            let completed = crate::merkle::merkle_tree_from_prehashed_level(
+                initial,
+                N_LEAVES,
+                crate::merkle::HashKind::Blake3,
+                N_LEAVES.ilog2() as usize - 4,
+            );
+            assert_eq!(completed, expect);
+        }
     }
 
     #[test]
@@ -18439,6 +18555,9 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 "actual production PSO shared storage"
             );
             assert!(usage.2 >= 256, "the production group must fit");
+            if job.uses_horner() {
+                assert_eq!(usage.1, 32, "this oracle must exercise width-32 admission");
+            }
             assert_eq!(actual.len(), job.chunks * groups);
             assert_eq!(actual, expected[..actual.len()], "raw physical partials");
             eprintln!(
@@ -18590,6 +18709,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 assert_eq!(&vals[..], &changed[..prefix], "same-address changed input");
             }
             _ => panic!("changed-input drain must return prefix partials"),
+        }
+        if fixed_weights {
+            eprintln!(
+                "[zc-r2-alias-handoff] own_pso=PASS width=32 mask={mask} useful={useful} handoff={} physical=PASS calibration=PASS prefix=PASS changed=PASS",
+                mask == 127 && useful == 121,
+            );
         }
         imp::zc_r2_test_reset();
     }
