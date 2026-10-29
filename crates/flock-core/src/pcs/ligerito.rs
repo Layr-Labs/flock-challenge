@@ -6936,17 +6936,10 @@ fn materialize_direct_fold4(
     assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
     assert!(packed_witness.len().is_multiple_of(16));
 
-    let fold_weight: [F128; 16] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges.iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
-        }
-        weight
-    });
+    // The equality table uses the same little-endian bank order. Build
+    // both children from one product instead of recomputing each path.
+    let mut fold_weight = [F128::ZERO; 16];
+    crate::lincheck::build_eq_table_into(&challenges, &mut fold_weight);
     let direct_tables: Vec<Vec<F128>> = claims
         .iter()
         .map(|claim| {
@@ -7067,17 +7060,10 @@ fn materialize_direct_fold8(
     assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
     assert!(packed_witness.len().is_multiple_of(64));
 
-    let fold_weight: [F128; 64] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges.iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
-        }
-        weight
-    });
+    // The equality table uses the same little-endian bank order. Build
+    // both children from one product instead of recomputing each path.
+    let mut fold_weight = [F128::ZERO; 64];
+    crate::lincheck::build_eq_table_into(&challenges, &mut fold_weight);
     let direct_tables: Vec<Vec<F128>> = claims
         .iter()
         .map(|claim| {
@@ -7093,6 +7079,7 @@ fn materialize_direct_fold8(
     assert!(claims.iter().all(|claim| {
         claim.eq_lo.len() == block_len && claim.eq_hi.len() * block_len == out_len
     }));
+    let batch_lookup = std::env::var_os("FLOCK_NO_FOLD8_BATCH_LOOKUP").is_none();
     let deferred_reduce = super::use_fold_deferred_reduce();
     // On Apple AArch64, adjacent slots share the same 64 fold weights. Keep
     // their product sums independent while loading each weight only once.
@@ -7156,13 +7143,21 @@ fn materialize_direct_fold8(
                 f_out[slot + 2] = folded_f[2];
                 f_out[slot + 3] = folded_f[3];
 
-                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                let direct1 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
-                let direct2 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 2], scratch);
-                let direct3 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 3], scratch);
+                let [direct0, direct1, direct2, direct3] = if batch_lookup {
+                    super::ring_switch::fold_four_slots(
+                        [
+                            first_claim.eq_lo[slot],
+                            first_claim.eq_lo[slot + 1],
+                            first_claim.eq_lo[slot + 2],
+                            first_claim.eq_lo[slot + 3],
+                        ],
+                        scratch,
+                    )
+                } else {
+                    std::array::from_fn(|i| {
+                        super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + i], scratch)
+                    })
+                };
                 if has_ordinary {
                     let folded_b = crate::field::f128_slice::fold_banked_slots4::<64>(
                         &fold_weight,
@@ -7220,8 +7215,26 @@ fn materialize_direct_fold8(
         }
         for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
             super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
-            for (slot, out) in b_out.iter_mut().enumerate() {
-                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+            if batch_lookup {
+                for (i, out) in b_out.chunks_exact_mut(4).enumerate() {
+                    let slot = i * 4;
+                    let d = super::ring_switch::fold_four_slots(
+                        [
+                            claim.eq_lo[slot],
+                            claim.eq_lo[slot + 1],
+                            claim.eq_lo[slot + 2],
+                            claim.eq_lo[slot + 3],
+                        ],
+                        scratch,
+                    );
+                    for lane in 0..4 {
+                        out[lane] += d[lane];
+                    }
+                }
+            } else {
+                for (slot, out) in b_out.iter_mut().enumerate() {
+                    *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                }
             }
         }
         super::round0_deferred(f_out, b_out)
