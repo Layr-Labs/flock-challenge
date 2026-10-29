@@ -44,6 +44,36 @@ static LINCHECK_ACC_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 static LINCHECK_EQ_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 static LINCHECK_Z_VEC_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 static SPARSE_NTT_DATA_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
+static C2_RESIDUES_SCRATCH: Mutex<Option<Vec<[F128; 16]>>> = Mutex::new(None);
+
+/// Take an uninitialized `[F128; 16]` vector of length `len` for `c2::Dual`.
+pub fn take_c2_residues(len: usize) -> Vec<[F128; 16]> {
+    if let Ok(mut guard) = C2_RESIDUES_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= len {
+                unsafe { v.set_len(len) };
+                return v;
+            }
+            *guard = Some(v);
+        }
+    }
+    let mut v = Vec::with_capacity(len.max(256));
+    unsafe { v.set_len(len) };
+    v
+}
+
+/// Return a `c2::Dual` residues buffer to `C2_RESIDUES_SCRATCH`.
+pub fn give_c2_residues(mut v: Vec<[F128; 16]>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    v.clear();
+    if let Ok(mut guard) = C2_RESIDUES_SCRATCH.lock() {
+        if guard.as_ref().map_or(true, |old| v.capacity() >= old.capacity()) {
+            *guard = Some(v);
+        }
+    }
+}
 
 /// Take an uninitialized `F128` vector of length `len` for `transpose_forward_ntt_sparse_impl`.
 pub fn take_sparse_ntt_data(len: usize) -> Vec<F128> {
