@@ -2612,7 +2612,21 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
     }
 
     let fold4_n_hi = fold4_n_hi_from_env();
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], fold4_n_hi);
+    let r_outer = &r[k_skip + N_INNER..];
+    let n_hi = fold4_n_hi.min(r_outer.len());
+    let n_lo = r_outer.len() - n_hi;
+    let bank_bits = fold.bank_bits(n_lo);
+    let eq = if bank_bits.is_some() {
+        // The folded arm builds its low factors below and never reads eq.lo.
+        SplitEqGhash {
+            n_lo,
+            n_hi,
+            lo: Vec::new(),
+            hi: build_eq(&r_outer[n_lo..]),
+        }
+    } else {
+        SplitEqGhash::with_n_hi(r_outer, fold4_n_hi)
+    };
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -2622,7 +2636,7 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
 
     let mut partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(hi_size);
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    match fold.bank_bits(eq.n_lo) {
+    match bank_bits {
         None => {
             let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
             crate::epool::run_hetero_chunks(hi_size, |x_hi| {

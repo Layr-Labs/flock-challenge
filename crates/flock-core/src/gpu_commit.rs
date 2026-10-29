@@ -4028,9 +4028,8 @@ kernel void ntt_final_t3(device uint4* data                [[buffer(0)]],
     threadgroup uint  nibB[8u * NNIB];
 
     const uint lane = lid & 63u;
-    const uint B = tgid >> P.s;
-    const uint r = tgid & ((1u << P.s) - 1u);
-    const uint pos_base = (B << (P.log_d - P.l)) + r;
+    const uint B = tgid;
+    const uint pos_base = tgid << 4;
 
     if (lid < 8u * NNIB) {
         uint cB = lid / NNIB, qB = lid % NNIB;
@@ -13685,7 +13684,7 @@ kernel void zc_r2_horner_oracle(
         lo_size: usize,
         mask: u32,
         useful: u32,
-        submitted: std::time::Instant,
+        submitted: Option<std::time::Instant>,
     }
 
     // SAFETY: the command buffer handle is only waited/released from the
@@ -14119,7 +14118,7 @@ kernel void zc_r2_horner_oracle(
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
-                submitted: std::time::Instant::now(),
+                submitted: super::gpu_zc_r2_debug().then(std::time::Instant::now),
             })
         }
     }
@@ -14192,13 +14191,13 @@ kernel void zc_r2_horner_oracle(
             }
             if !job.calibration {
                 gpu.release(job.cb);
-                if super::gpu_zc_r2_debug() {
+                if let Some(submitted) = job.submitted {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
                          cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms horner={}",
                         job.chunks,
                         hi_size,
-                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                        submitted.elapsed().as_secs_f64() * 1e3,
                         job.horner,
                     );
                 }
