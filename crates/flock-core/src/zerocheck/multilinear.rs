@@ -1973,6 +1973,17 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         skip_dead,
                         out.as_mut_ptr(),
                     );
+                    let eq_h = eq_hi[x_hi];
+                    *partials_base.ptr().add(x_hi) = (F128::ZERO, F128::ZERO);
+                    *la_base.ptr().add(x_hi) = [
+                        F128::ZERO,
+                        F128::ZERO,
+                        eq_h * out[4],
+                        eq_h * out[5],
+                        eq_h * out[6],
+                        eq_h * out[7],
+                    ];
+                    return;
                 } else if odd_on_gpu {
                     fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
                         t,
