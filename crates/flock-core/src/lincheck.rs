@@ -1236,6 +1236,30 @@ fn sparse_row_fold_alpha_batched(
     out
 }
 
+#[inline]
+fn sumcheck_chunk(n: usize) -> usize {
+    let threads = rayon::current_num_threads().max(1);
+    n.div_ceil(threads).max(64)
+}
+
+#[inline]
+fn sumcheck_round_eval_slice(
+    clo: &[F128],
+    chi: &[F128],
+    zlo: &[F128],
+    zhi: &[F128],
+) -> (crate::field::F256Unreduced, crate::field::F256Unreduced) {
+    let mut e1 = crate::field::F256Unreduced::ZERO;
+    let mut einf = crate::field::F256Unreduced::ZERO;
+    for i in 0..clo.len() {
+        let ch = chi[i];
+        let zh = zhi[i];
+        e1 ^= ch.mul_unreduced(zh);
+        einf ^= (ch + clo[i]).mul_unreduced(zh + zlo[i]);
+    }
+    (e1, einf)
+}
+
 /// One round of product-sumcheck on `(c, z)`: compute `(q(1), q(∞))` =
 /// `(Σ c_hi·z_hi, Σ (c_hi+c_lo)·(z_hi+z_lo))` over the top-bit split. The
 /// `len()` of `c` and `z` is even; `half = len/2`.
@@ -1246,22 +1270,23 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
     let (clo, chi) = c.split_at(half);
     let (zlo, zhi) = z.split_at(half);
     if half < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
-        for i in 0..half {
-            e1 += chi[i] * zhi[i];
-            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
-        }
-        return (e1, einf);
+        let (e1, einf) = sumcheck_round_eval_slice(clo, chi, zlo, zhi);
+        return (e1.reduce(), einf.reduce());
     }
-    (0..half)
-        .into_par_iter()
-        .map(|i| {
-            let e1_i = chi[i] * zhi[i];
-            let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
-            (e1_i, einf_i)
+    let chunk = sumcheck_chunk(half);
+    let (e1, einf) = clo
+        .par_chunks(chunk)
+        .zip(chi.par_chunks(chunk))
+        .zip(zlo.par_chunks(chunk))
+        .zip(zhi.par_chunks(chunk))
+        .map(|(((clo_c, chi_c), zlo_c), zhi_c)| {
+            sumcheck_round_eval_slice(clo_c, chi_c, zlo_c, zhi_c)
         })
-        .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+        .reduce(
+            || (crate::field::F256Unreduced::ZERO, crate::field::F256Unreduced::ZERO),
+            |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+        );
+    (e1.reduce(), einf.reduce())
 }
 
 /// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
@@ -1269,20 +1294,90 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
 fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
     use rayon::prelude::*;
     let half = v.len() / 2;
-    if half < SUMCHECK_PAR_THRESHOLD {
-        for i in 0..half {
-            v[i] = v[i] + r * (v[i + half] + v[i]);
+    let bind_slice = |lo: &mut [F128], hi: &[F128]| {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        {
+            use crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon;
+            let pairs = lo.len() & !1;
+            let mut i = 0usize;
+            while i < pairs {
+                let d0 = hi[i] + lo[i];
+                let d1 = hi[i + 1] + lo[i + 1];
+                let prod = unsafe { ghash_mul_const_vec2_neon(r, [d0, d1]) };
+                lo[i] += prod[0];
+                lo[i + 1] += prod[1];
+                i += 2;
+            }
+            while i < lo.len() {
+                lo[i] = lo[i] + r * (hi[i] + lo[i]);
+                i += 1;
+            }
         }
-    } else {
-        let (lo, hi) = v.split_at_mut(half);
-        let hi = &hi[..half];
-        lo.par_iter_mut()
-            .zip(hi.par_iter())
-            .for_each(|(lo_i, &hi_i)| {
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        {
+            for (lo_i, &hi_i) in lo.iter_mut().zip(hi.iter()) {
                 *lo_i = *lo_i + r * (hi_i + *lo_i);
-            });
+            }
+        }
+    };
+    let (lo, hi) = v.split_at_mut(half);
+    let hi = &hi[..half];
+    if half < SUMCHECK_PAR_THRESHOLD {
+        bind_slice(lo, hi);
+    } else {
+        let chunk = sumcheck_chunk(half);
+        lo.par_chunks_mut(chunk)
+            .zip(hi.par_chunks(chunk))
+            .for_each(|(lo_c, hi_c)| bind_slice(lo_c, hi_c));
     }
     v.truncate(half);
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn bind_both_and_eval_chunk(
+    cq0: &mut [F128],
+    cq1: &mut [F128],
+    cq2: &[F128],
+    cq3: &[F128],
+    zq0: &mut [F128],
+    zq1: &mut [F128],
+    zq2: &[F128],
+    zq3: &[F128],
+    r: F128,
+) -> (crate::field::F256Unreduced, crate::field::F256Unreduced) {
+    let mut e1 = crate::field::F256Unreduced::ZERO;
+    let mut einf = crate::field::F256Unreduced::ZERO;
+    for i in 0..cq0.len() {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        let (lo, hi, zlo, zhi) = {
+            use crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon;
+            let c_prod =
+                unsafe { ghash_mul_const_vec2_neon(r, [cq2[i] + cq0[i], cq3[i] + cq1[i]]) };
+            let z_prod =
+                unsafe { ghash_mul_const_vec2_neon(r, [zq2[i] + zq0[i], zq3[i] + zq1[i]]) };
+            (
+                cq0[i] + c_prod[0],
+                cq1[i] + c_prod[1],
+                zq0[i] + z_prod[0],
+                zq1[i] + z_prod[1],
+            )
+        };
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        let (lo, hi, zlo, zhi) = (
+            cq0[i] + r * (cq2[i] + cq0[i]),
+            cq1[i] + r * (cq3[i] + cq1[i]),
+            zq0[i] + r * (zq2[i] + zq0[i]),
+            zq1[i] + r * (zq3[i] + zq1[i]),
+        );
+        cq0[i] = lo;
+        cq1[i] = hi;
+        zq0[i] = zlo;
+        zq1[i] = zhi;
+        e1 ^= hi.mul_unreduced(zhi);
+        einf ^= (hi + lo).mul_unreduced(zhi + zlo);
+    }
+    (e1, einf)
 }
 
 /// **Fused fold + next-round evaluation.** Binds the top variable of *both*
@@ -1331,42 +1426,28 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq2, zq3) = z_hi.split_at(half2);
 
     let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
-        for i in 0..half2 {
-            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
-            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
-            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
-            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
-            cq0[i] = lo;
-            cq1[i] = hi;
-            zq0[i] = zlo;
-            zq1[i] = zhi;
-            e1 += hi * zhi;
-            einf += (hi + lo) * (zhi + zlo);
-        }
-        (e1, einf)
+        let (e1, einf) =
+            bind_both_and_eval_chunk(cq0, cq1, cq2, cq3, zq0, zq1, zq2, zq3, r);
+        (e1.reduce(), einf.reduce())
     } else {
-        cq0.par_iter_mut()
-            .zip(cq1.par_iter_mut())
-            .zip(cq2.par_iter())
-            .zip(cq3.par_iter())
-            .zip(zq0.par_iter_mut())
-            .zip(zq1.par_iter_mut())
-            .zip(zq2.par_iter())
-            .zip(zq3.par_iter())
+        let chunk = sumcheck_chunk(half2);
+        let (e1, einf) = cq0
+            .par_chunks_mut(chunk)
+            .zip(cq1.par_chunks_mut(chunk))
+            .zip(cq2.par_chunks(chunk))
+            .zip(cq3.par_chunks(chunk))
+            .zip(zq0.par_chunks_mut(chunk))
+            .zip(zq1.par_chunks_mut(chunk))
+            .zip(zq2.par_chunks(chunk))
+            .zip(zq3.par_chunks(chunk))
             .map(|(((((((c0, c1), c2), c3), z0), z1), z2), z3)| {
-                let lo = *c0 + r * (*c2 + *c0);
-                let hi = *c1 + r * (*c3 + *c1);
-                let zlo = *z0 + r * (*z2 + *z0);
-                let zhi = *z1 + r * (*z3 + *z1);
-                *c0 = lo;
-                *c1 = hi;
-                *z0 = zlo;
-                *z1 = zhi;
-                (hi * zhi, (hi + lo) * (zhi + zlo))
+                bind_both_and_eval_chunk(c0, c1, c2, c3, z0, z1, z2, z3, r)
             })
-            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+            .reduce(
+                || (crate::field::F256Unreduced::ZERO, crate::field::F256Unreduced::ZERO),
+                |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+            );
+        (e1.reduce(), einf.reduce())
     };
 
     comb.truncate(half);
@@ -1425,7 +1506,7 @@ pub fn prove_padded<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim) {
-    let (proof, claim, _) = prove_padded_inner(
+    let (proof, claim, _, _) = prove_padded_inner(
         z_packed,
         m,
         k_log,
@@ -1433,10 +1514,17 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        ZCaptureMode::None,
         challenger,
     );
     (proof, claim)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ZCaptureMode {
+    None,
+    PreSumcheck,
+    RankedFold8Tail,
 }
 
 /// Variant of [`prove_padded`] that also returns the **pre-sumcheck** z_vec
@@ -1458,7 +1546,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Vec<F128>) {
-    let (proof, claim, captured) = prove_padded_inner(
+    let (proof, claim, captured, _) = prove_padded_inner(
         z_packed,
         m,
         k_log,
@@ -1466,13 +1554,48 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        ZCaptureMode::PreSumcheck,
         challenger,
     );
     (
         proof,
         claim,
         captured.expect("capture=true must produce z_vec"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_mode<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture: ZCaptureMode,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>, ZCaptureMode) {
+    assert!(
+        capture != ZCaptureMode::None,
+        "capture mode must not be None"
+    );
+    let (proof, claim, captured, actual) = prove_padded_inner(
+        z_packed,
+        m,
+        k_log,
+        k_skip,
+        useful_bits,
+        circuit,
+        x_ab,
+        capture,
+        challenger,
+    );
+    (
+        proof,
+        claim,
+        captured.expect("a capture mode must produce z_vec"),
+        actual,
     )
 }
 
@@ -1485,9 +1608,9 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture: ZCaptureMode,
     challenger: &mut Ch,
-) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
+) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>, ZCaptureMode) {
     let k = 1usize << k_log;
     let n_log = m - k_log;
     assert!(m >= k_log);
@@ -1572,22 +1695,31 @@ fn prove_padded_inner<Ch: Challenger>(
         }
         z_vec
     };
-    let ((mut comb_vec, eq_inner), mut z_vec) =
+    let ((mut comb_vec, mut eq_inner), mut z_vec) =
         if std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some() {
             (comb_branch(), z_branch())
         } else {
             rayon::join(comb_branch, z_branch)
         };
-    // 3b. Optional capture: copy the pre-sumcheck z_vec into the dead eq_inner
-    //     allocation for downstream reuse (PCS open's AB-claim s_hat_v skipping
-    //     fold_1b_rows), avoiding a fresh 2^k_log F128 allocation.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec && eq_inner.len() == z_vec.len() {
-        let mut cap = eq_inner;
+    let fold8_ready = capture == ZCaptureMode::RankedFold8Tail
+        && inner_rest_len == 8
+        && z_vec.len() == (1usize << crate::pcs::LOG_PACKING) << 7;
+    let actual_capture = if fold8_ready {
+        ZCaptureMode::RankedFold8Tail
+    } else if capture == ZCaptureMode::None {
+        ZCaptureMode::None
+    } else {
+        ZCaptureMode::PreSumcheck
+    };
+    let mut captured_z_vec: Option<Vec<F128>> = if fold8_ready {
+        None
+    } else if capture != ZCaptureMode::None && eq_inner.len() == z_vec.len() {
+        let mut cap = std::mem::take(&mut eq_inner);
         cap.copy_from_slice(&z_vec);
         Some(cap)
     } else {
-        crate::scratch::give_lincheck_eq(eq_inner);
-        if capture_z_vec {
+        crate::scratch::give_lincheck_eq(std::mem::take(&mut eq_inner));
+        if capture != ZCaptureMode::None {
             Some(z_vec.clone())
         } else {
             None
@@ -1625,6 +1757,17 @@ fn prove_padded_inner<Ch: Challenger>(
             } else {
                 // Final round: just fold z_vec to z_partial (comb_vec is dead).
                 sumcheck_bind_top_in_place_par(&mut z_vec, r);
+            }
+            if fold8_ready && t == 0 {
+                debug_assert_eq!(z_vec.len(), 64usize << crate::pcs::LOG_PACKING);
+                let mut cap = std::mem::take(&mut eq_inner);
+                if cap.capacity() >= z_vec.len() {
+                    cap.clear();
+                    cap.extend_from_slice(&z_vec);
+                } else {
+                    cap = z_vec.clone();
+                }
+                captured_z_vec = Some(cap);
             }
         }
     }
@@ -1666,7 +1809,7 @@ fn prove_padded_inner<Ch: Challenger>(
         r_inner_rest,
         w,
     };
-    (proof, claim, captured_z_vec)
+    (proof, claim, captured_z_vec, actual_capture)
 }
 
 /// Verify a lincheck proof. Walks the challenger in lockstep with `prove`,
