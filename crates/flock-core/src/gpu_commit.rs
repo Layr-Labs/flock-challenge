@@ -7774,14 +7774,70 @@ kernel void blake3_pow_scan(
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
     /// either end of the search range. Selection consumes the mean rather
     /// than a noise-sensitive minimum.
+    fn adaptive_tune_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ADAPTIVE_TUNE").is_none())
+    }
+
+    fn lean_tune_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LEAN_TUNE").is_none())
+    }
+
     fn collect_ranked_exact_samples<E>(
         mut reprime: impl FnMut() -> Result<(), E>,
         mut sample: impl FnMut(usize) -> Result<f64, E>,
     ) -> Result<[[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()], E> {
         let mut walls = [[0.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+        // Adaptive lean sweep: sample the middle candidates first and walk
+        // outward only toward the side that is improving. Unsampled
+        // candidates carry a huge finite wall, so the selection, the k=0 gate
+        // and the arm re-pricing (which only sees sampled splits) can never
+        // pick them. Candidates are `[0, 2, 3, 4, 5]`: sample 3, 2, 4; add
+        // 0 when 2 is the best of those, or 5 when 4 is.
+        // `FLOCK_NO_ADAPTIVE_TUNE=1` samples every candidate.
+        if adaptive_tune_enabled() && RANKED_EXACT_TUNE_CANDIDATES == [0, 2, 3, 4, 5] {
+            const UNSAMPLED: f64 = 1.0e9;
+            for w in walls.iter_mut() {
+                *w = [UNSAMPLED, UNSAMPLED];
+            }
+            for i in [2usize, 1, 3] {
+                reprime()?;
+                let v = sample(RANKED_EXACT_TUNE_CANDIDATES[i])?;
+                walls[i] = [v, v];
+            }
+            let best = [1usize, 2, 3]
+                .into_iter()
+                .min_by(|&a, &b| walls[a][0].total_cmp(&walls[b][0]))
+                .unwrap();
+            let edge = match best {
+                1 => Some(0usize),
+                3 => Some(4usize),
+                _ => None,
+            };
+            if let Some(i) = edge {
+                reprime()?;
+                let v = sample(RANKED_EXACT_TUNE_CANDIDATES[i])?;
+                walls[i] = [v, v];
+            }
+            return Ok(walls);
+        }
         for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES.iter().enumerate() {
             reprime()?;
             walls[i][0] = sample(k)?;
+        }
+        // Lean sweep: one pass. Every one of the ~120 ranked workers runs
+        // this sweep in its warmup, and each sample pairs a commit graph with
+        // a full A/B replay on every performance core, so the second pass is
+        // most of the warmup's energy; on the ranked runner that sustained
+        // load drives a thermal slowdown across the measured trials. The
+        // second slot repeats the first so the selection code is unchanged.
+        // `FLOCK_NO_LEAN_TUNE=1` restores the reverse second pass.
+        if lean_tune_enabled() {
+            for w in walls.iter_mut() {
+                w[1] = w[0];
+            }
+            return Ok(walls);
         }
         for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES.iter().enumerate().rev() {
             reprime()?;
@@ -11837,14 +11893,12 @@ kernel void lc_fold_stripes_factored_b4(
                 },
             )
             .unwrap();
-            // Forward 0,2,3,4,5 then reverse 5,4,3,2,0 — each preceded by reprime.
-            assert_eq!(
-                *events.borrow(),
-                [-1, 0, -1, 2, -1, 3, -1, 4, -1, 5, -1, 5, -1, 4, -1, 3, -1, 2, -1, 0]
-            );
+            // Adaptive lean sweep with walls == k: 3, 2, 4 are sampled; 2 is
+            // the best of those, so 0 is added. 5 is never sampled.
+            assert_eq!(*events.borrow(), [-1, 3, -1, 2, -1, 4, -1, 0]);
             assert_eq!(samples[0], [0.0, 0.0]);
             assert_eq!(samples[3], [4.0, 4.0]);
-            assert_eq!(samples[4], [5.0, 5.0]);
+            assert_eq!(samples[4], [1.0e9, 1.0e9]);
         }
 
         #[test]
