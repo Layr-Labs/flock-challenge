@@ -3082,7 +3082,11 @@ fn round1_identity_prefix_ab_recovery(
     assert_eq!(k_log, 14, "identity-prefix recovery fixes 16,384-bit blocks");
     assert!(c_inner.len() >= 1_024);
     assert!(r.len() >= k_log);
-    let eq_inner = build_eq(&r[K_SKIP..k_log]);
+    // Only indices 0..16 are read, so all four high index bits are zero.
+    let high_zero_weight = r[K_SKIP + 4..k_log]
+        .iter()
+        .fold(F128::ONE, |weight, &ri| weight * (F128::ONE + ri));
+    let eq_inner = build_eq_scaled(&r[K_SKIP..K_SKIP + 4], high_zero_weight);
     let mut recovered_s = [F128::ZERO; ELL];
     for t in 0..16 {
         let weight = eq_inner[t];
@@ -7143,6 +7147,57 @@ mod tests {
                     "partial_c bank {s} mismatch at n_b_med={n_b_med}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn identity_prefix_recovery_matches_full_eq_reference() {
+        const K_LOG: usize = 14;
+        let mut rng = Rng::new(0x1D3E_0516);
+        let inv_table = make_inv_table();
+        let mut c_inner = rng.f128_vec(16 * ELL);
+        for value in &mut c_inner {
+            value.hi |= 1u64 << 63;
+        }
+        let mut cases = vec![vec![F128::ZERO; K_LOG], vec![F128::ONE; K_LOG]];
+        for vertex in 0usize..16 {
+            let mut r = vec![F128::ZERO; K_LOG];
+            for bit in 0..4 {
+                r[K_SKIP + bit] = if vertex & (1 << bit) == 0 {
+                    F128::ZERO
+                } else {
+                    F128::ONE
+                };
+            }
+            cases.push(r);
+        }
+        for high in 0..4 {
+            let mut r = rng.f128_vec(K_LOG);
+            r[K_SKIP + 4 + high] = F128::ONE;
+            cases.push(r);
+        }
+        for _ in 0..4 {
+            cases.push(rng.f128_vec(K_LOG));
+        }
+
+        let c_s_inv_reference = c_s_f128().inv();
+        for (case, r) in cases.iter().enumerate() {
+            // The original algorithm builds all 256 weights, then consumes 16.
+            let full_eq = build_eq(&r[K_SKIP..K_LOG]);
+            assert_eq!(full_eq.len(), 256);
+            let mut expected_s = [F128::ZERO; ELL];
+            for t in 0..16 {
+                for lane in 0..ELL {
+                    expected_s[lane] += full_eq[t] * c_inner[ELL * t + lane];
+                }
+            }
+            for value in &mut expected_s {
+                *value *= c_s_inv_reference;
+            }
+            let expected = ntt_extend_f128_vec_ghash(&expected_s, &inv_table);
+            let got = round1_identity_prefix_ab_recovery(&c_inner, r, K_LOG, &inv_table);
+            assert_eq!(got.len(), ELL);
+            assert_eq!(got, expected, "identity-prefix recovery case {case}");
         }
     }
 
