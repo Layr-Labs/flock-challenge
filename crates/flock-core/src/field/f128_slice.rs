@@ -215,6 +215,35 @@ pub(crate) fn fold_bank_major_128x64_rows2(
     }
 }
 
+/// Fold a 64-bank by 128-lane bank-major matrix into its 128 lane sums.
+#[inline]
+pub(crate) fn fold_bank_major_64x128_rows4(
+    weight: &[F128; 64],
+    input: &[F128],
+    output: &mut [F128],
+) {
+    assert_eq!(input.len(), 64 * 128);
+    assert_eq!(output.len(), 128);
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    unsafe {
+        aarch64::fold_bank_major_64x128_rows4(weight, input, output)
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let mut acc = [super::F256Unreduced::ZERO; 128];
+        for (bank, &w) in weight.iter().enumerate() {
+            for (dst, &src) in acc.iter_mut().zip(&input[bank * 128..(bank + 1) * 128]) {
+                *dst ^= w.mul_unreduced(src);
+            }
+        }
+        for (dst, src) in output.iter_mut().zip(acc.iter()) {
+            *dst = src.reduce();
+        }
+    }
+}
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where

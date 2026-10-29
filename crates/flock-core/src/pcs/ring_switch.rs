@@ -1540,21 +1540,11 @@ pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128])
     debug_assert_eq!(s_hat_v_fold8.len(), 64 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 6);
     let n_packed = 1usize << LOG_PACKING;
-    let low_eq = build_eq(low_point);
+    let low_eq: [F128; 64] = build_eq(low_point)
+        .try_into()
+        .expect("six-coordinate eq has sixty-four entries");
     let mut out = crate::alloc_uninit_f128_vec(n_packed);
-    let w0 = low_eq[0];
-    for (dst, &src) in out.iter_mut().zip(&s_hat_v_fold8[..n_packed]) {
-        *dst = w0 * src;
-    }
-    for bank in 1..64 {
-        let w = low_eq[bank];
-        for (dst, &src) in out
-            .iter_mut()
-            .zip(&s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed])
-        {
-            *dst += w * src;
-        }
-    }
+    crate::field::f128_slice::fold_bank_major_64x128_rows4(&low_eq, s_hat_v_fold8, &mut out);
     out
 }
 
@@ -1632,11 +1622,11 @@ pub fn claim_check(weights: &[F128], s_hat_v: &[F128]) -> F128 {
 /// Standard inner product `Σ_i a[i] · b[i]` over F_{2^128}.
 pub fn inner_product(a: &[F128], b: &[F128]) -> F128 {
     assert_eq!(a.len(), b.len());
-    let mut acc = F128::ZERO;
+    let mut acc = crate::field::F256Unreduced::ZERO;
     for (&x, &y) in a.iter().zip(b.iter()) {
-        acc += x * y;
+        acc ^= x.mul_unreduced(y);
     }
-    acc
+    acc.reduce()
 }
 
 /// **TensorAlgebra transpose** (a.k.a. "bit transpose" of `s_hat_v`).
@@ -3026,30 +3016,46 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     let t = std::time::Instant::now();
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
-    // Fill precomputed slots first.
-    for d in 0..dense_suffixes.len() {
-        if let Some(p) = precomputed_s_hat_v.get(dense_to_orig[d]).copied().flatten() {
-            dense_s_hat_v[d] = if p.len() == 64 * n_packed {
-                assert!(
-                    dense_suffixes[d].len() >= 6,
-                    "sixty-four-bank s_hat_v requires at least six suffix coordinates"
-                );
-                collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6])
-            } else if p.len() == 16 * n_packed {
-                assert!(
-                    dense_suffixes[d].len() >= 4,
-                    "sixteen-bank s_hat_v requires at least four suffix coordinates"
-                );
-                collapse_s_hat_v_fold4(p, &dense_suffixes[d][..4])
-            } else if p.len() == 4 * n_packed {
-                assert!(
-                    dense_suffixes[d].len() >= 2,
-                    "four-bank s_hat_v requires at least two suffix coordinates"
-                );
-                collapse_s_hat_v_quad(p, &dense_suffixes[d][..2])
-            } else {
-                p.to_vec()
-            };
+    let collapse_precomputed = |p: &[F128], suffix: &[F128]| -> Vec<F128> {
+        if p.len() == 64 * n_packed {
+            assert!(
+                suffix.len() >= 6,
+                "sixty-four-bank s_hat_v requires at least six suffix coordinates"
+            );
+            collapse_s_hat_v_fold8(p, &suffix[..6])
+        } else if p.len() == 16 * n_packed {
+            assert!(
+                suffix.len() >= 4,
+                "sixteen-bank s_hat_v requires at least four suffix coordinates"
+            );
+            collapse_s_hat_v_fold4(p, &suffix[..4])
+        } else if p.len() == 4 * n_packed {
+            assert!(
+                suffix.len() >= 2,
+                "four-bank s_hat_v requires at least two suffix coordinates"
+            );
+            collapse_s_hat_v_quad(p, &suffix[..2])
+        } else {
+            p.to_vec()
+        }
+    };
+    if dense_suffixes.len() == 2
+        && precomputed_s_hat_v.get(dense_to_orig[0]).copied().flatten().is_some()
+        && precomputed_s_hat_v.get(dense_to_orig[1]).copied().flatten().is_some()
+    {
+        let p0 = precomputed_s_hat_v[dense_to_orig[0]].unwrap();
+        let p1 = precomputed_s_hat_v[dense_to_orig[1]].unwrap();
+        let (v0, v1) = rayon::join(
+            || collapse_precomputed(p0, dense_suffixes[0]),
+            || collapse_precomputed(p1, dense_suffixes[1]),
+        );
+        dense_s_hat_v[0] = v0;
+        dense_s_hat_v[1] = v1;
+    } else {
+        for d in 0..dense_suffixes.len() {
+            if let Some(p) = precomputed_s_hat_v.get(dense_to_orig[d]).copied().flatten() {
+                dense_s_hat_v[d] = collapse_precomputed(p, dense_suffixes[d]);
+            }
         }
     }
     for s in 0..sparse_suffixes.len() {
@@ -3290,27 +3296,46 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                         // Compute `a_state` into an uninitialized buffer first,
                         // then reuse the owned `fold8` allocation for `w_state`.
                         let mut a_state = crate::alloc_uninit_f128_vec(64 * n_packed);
-                        let mut transposed = [F128::ZERO; 1 << LOG_PACKING];
-                        for e in 0..64 {
-                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-                            tensor_algebra_transpose_into(bank, &mut transposed);
-                            for (bit, &value) in transposed.iter().enumerate() {
-                                a_state[bit * 64 + e] = value;
-                            }
-                        }
                         let mut w_state = crate::alloc_uninit_f128_vec(64 * n_packed);
-                        for d_low in 0..64 {
-                            let scale = low_eq[d_low];
-                            let mut basis_product = scale;
-                            w_state[d_low] = fold_one_slot(basis_product, &table);
-                            for bit in 1..n_packed {
-                                basis_product = mul_by_x(basis_product);
-                                w_state[bit * 64 + d_low] = fold_one_slot(basis_product, &table);
-                            }
-                        }
-                        let round0 = super::round0_deferred(&a_state, &w_state);
+                        let a_addr = a_state.as_mut_ptr() as usize;
+                        let w_addr = w_state.as_mut_ptr() as usize;
                         let tail = &suffix[6..];
-                        let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
+                        let (_, (eq_lo, eq_hi)) = rayon::join(
+                            || {
+                                (0..8usize).into_par_iter().for_each(|chunk| {
+                                    let base = chunk * 8;
+                                    let mut transposed = [[F128::ZERO; 1 << LOG_PACKING]; 8];
+                                    for k in 0..8 {
+                                        let e = base + k;
+                                        let bank = &fold8[e * n_packed..(e + 1) * n_packed];
+                                        tensor_algebra_transpose_into(bank, &mut transposed[k]);
+                                    }
+                                    let mut basis_products: [F128; 8] =
+                                        std::array::from_fn(|k| low_eq[base + k]);
+                                    unsafe {
+                                        let a_ptr = a_addr as *mut F128;
+                                        let w_ptr = w_addr as *mut F128;
+                                        for k in 0..8 {
+                                            *a_ptr.add(base + k) = transposed[k][0];
+                                            *w_ptr.add(base + k) =
+                                                fold_one_slot(basis_products[k], &table);
+                                        }
+                                        for bit in 1..n_packed {
+                                            let a_row = a_ptr.add(bit * 64 + base);
+                                            let w_row = w_ptr.add(bit * 64 + base);
+                                            for k in 0..8 {
+                                                *a_row.add(k) = transposed[k][bit];
+                                                basis_products[k] = mul_by_x(basis_products[k]);
+                                                *w_row.add(k) =
+                                                    fold_one_slot(basis_products[k], &table);
+                                            }
+                                        }
+                                    }
+                                });
+                            },
+                            || build_eq_split(tail, deferred_split_n_lo(tail.len())),
+                        );
+                        let round0 = super::round0_deferred(&a_state, &w_state);
                         Some(DirectFold8Factors {
                             eq_lo,
                             eq_hi,

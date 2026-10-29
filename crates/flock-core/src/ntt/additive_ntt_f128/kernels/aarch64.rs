@@ -517,25 +517,16 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
     }
 }
 
-/// Out-of-place radix-8 tile used by recursive from-message commitments.
+/// Out-of-place radix-8 row used by recursive from-message commitments.
 /// Values are staged as one contiguous lane run per output row before the
 /// non-temporal stores, avoiding a read-for-ownership of the stale codeword.
-/// Twiddles and the 1 KiB stage are retained across the tile's row groups.
-///
-/// # Safety
-/// Source and destination must be disjoint allocations that each cover
-/// `8 * eighth * num_ntts` elements. The source must be initialized,
-/// `num_ntts == 8`, and `row_start <= row_end <= eighth`. The caller must
-/// own every selected destination row until this call returns. For the
-/// zero-root form, twiddles 0, 1 and 3 must be zero.
 #[target_feature(enable = "aes")]
-unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
+unsafe fn butterfly_fused_3layer_from_src_row_impl<const ZERO_ROOT: bool>(
     src: *const F128,
     dst: *mut F128,
     eighth: usize,
     num_ntts: usize,
-    row_start: usize,
-    row_end: usize,
+    r: usize,
     twiddles: &[F128; 7],
 ) {
     use core::arch::aarch64::*;
@@ -555,9 +546,6 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
 
     unsafe {
         debug_assert_eq!(num_ntts, 8);
-        // The caller guarantees eight lanes; keep the width constant in release builds.
-        let num_ntts = 8;
-        debug_assert!(row_start <= row_end && row_end <= eighth);
         if ZERO_ROOT {
             debug_assert_eq!(twiddles[0], F128::ZERO);
             debug_assert_eq!(twiddles[1], F128::ZERO);
@@ -566,47 +554,45 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
         let mut stage = [core::mem::MaybeUninit::<F128>::uninit(); 64];
+        let off = r * num_ntts;
         let step = eighth * num_ntts;
 
-        for r in row_start..row_end {
-            let off = r * num_ntts;
-            for lane in 0..num_ntts {
-                let src_base = src.add(off + lane);
-                let mut v: [uint64x2_t; 8] =
-                    core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
+        for lane in 0..num_ntts {
+            let src_base = src.add(off + lane);
+            let mut v: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
 
-                if ZERO_ROOT {
-                    fused3_zero_root_q(&mut v, t[2], t[4], t[5], t[6]);
-                } else {
-                    fused3_general_q(&mut v, &t);
-                }
-
-                for (i, value) in v.iter().enumerate() {
-                    vst1q_u64(
-                        stage.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
-                        *value,
-                    );
-                }
+            if ZERO_ROOT {
+                fused3_zero_root_q(&mut v, t[2], t[4], t[5], t[6]);
+            } else {
+                fused3_general_q(&mut v, &t);
             }
 
-            // All 64 stage values are initialized above before this drain.
-            // Drain each 128 B row before the next group reuses the stage.
-            for i in 0..8 {
-                let src_row = stage.as_ptr().add(i * num_ntts);
-                let dst_row = dst.add(off + i * step);
-                let mut lane = 0;
-                while lane < num_ntts {
-                    let x = vld1q_u64(src_row.add(lane).cast::<u64>());
-                    let y = vld1q_u64(src_row.add(lane + 1).cast::<u64>());
-                    store_pair_nt(dst_row.add(lane), x, y);
-                    lane += 2;
-                }
+            for (i, value) in v.iter().enumerate() {
+                vst1q_u64(
+                    stage.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
+                    *value,
+                );
+            }
+        }
+
+        // Every destination row is a short contiguous burst (128 B for the
+        // ranked recursive geometry), so the stale allocation is written
+        // without an RFO read.
+        for i in 0..8 {
+            let src_row = stage.as_ptr().add(i * num_ntts);
+            let dst_row = dst.add(off + i * step);
+            let mut lane = 0;
+            while lane < num_ntts {
+                let x = vld1q_u64(src_row.add(lane).cast::<u64>());
+                let y = vld1q_u64(src_row.add(lane + 1).cast::<u64>());
+                store_pair_nt(dst_row.add(lane), x, y);
+                lane += 2;
             }
         }
     }
 }
 
-#[cfg(test)]
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn butterfly_fused_3layer_from_src_row(
     src: *const F128,
@@ -617,13 +603,10 @@ pub(super) unsafe fn butterfly_fused_3layer_from_src_row(
     twiddles: &[F128; 7],
 ) {
     unsafe {
-        butterfly_fused_3layer_from_src_rows_impl::<false>(
-            src, dst, eighth, num_ntts, r, r + 1, twiddles,
-        );
+        butterfly_fused_3layer_from_src_row_impl::<false>(src, dst, eighth, num_ntts, r, twiddles);
     }
 }
 
-#[cfg(test)]
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
     src: *const F128,
@@ -634,43 +617,7 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
     twiddles: &[F128; 7],
 ) {
     unsafe {
-        butterfly_fused_3layer_from_src_rows_impl::<true>(
-            src, dst, eighth, num_ntts, r, r + 1, twiddles,
-        );
-    }
-}
-
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_from_src_rows(
-    src: *const F128,
-    dst: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    row_start: usize,
-    row_end: usize,
-    twiddles: &[F128; 7],
-) {
-    unsafe {
-        butterfly_fused_3layer_from_src_rows_impl::<false>(
-            src, dst, eighth, num_ntts, row_start, row_end, twiddles,
-        );
-    }
-}
-
-#[target_feature(enable = "aes")]
-pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_rows(
-    src: *const F128,
-    dst: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    row_start: usize,
-    row_end: usize,
-    twiddles: &[F128; 7],
-) {
-    unsafe {
-        butterfly_fused_3layer_from_src_rows_impl::<true>(
-            src, dst, eighth, num_ntts, row_start, row_end, twiddles,
-        );
+        butterfly_fused_3layer_from_src_row_impl::<true>(src, dst, eighth, num_ntts, r, twiddles);
     }
 }
 

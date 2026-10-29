@@ -44,6 +44,66 @@ static LINCHECK_ACC_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 static LINCHECK_EQ_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 static LINCHECK_Z_VEC_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 static SPARSE_NTT_DATA_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
+static C2_STAGES_SCRATCH: Mutex<Option<Vec<[F128; 30]>>> = Mutex::new(None);
+static C2_SCALES_SCRATCH: Mutex<Option<Vec<[F128; 4]>>> = Mutex::new(None);
+
+/// Take an uninitialized `[F128; 30]` vector of length `len` for `c2::Dual`.
+pub fn take_c2_stages(len: usize) -> Vec<[F128; 30]> {
+    if let Ok(mut guard) = C2_STAGES_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= len {
+                unsafe { v.set_len(len) };
+                return v;
+            }
+            *guard = Some(v);
+        }
+    }
+    let mut v = Vec::with_capacity(len.max(256));
+    unsafe { v.set_len(len) };
+    v
+}
+
+/// Return a `c2::Dual` stages buffer to `C2_STAGES_SCRATCH`.
+pub fn give_c2_stages(mut v: Vec<[F128; 30]>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    v.clear();
+    if let Ok(mut guard) = C2_STAGES_SCRATCH.lock() {
+        if guard.as_ref().map_or(true, |old| v.capacity() >= old.capacity()) {
+            *guard = Some(v);
+        }
+    }
+}
+
+/// Take an uninitialized `[F128; 4]` vector of length `len` for `c2::Dual`.
+pub fn take_c2_scales(len: usize) -> Vec<[F128; 4]> {
+    if let Ok(mut guard) = C2_SCALES_SCRATCH.lock() {
+        if let Some(mut v) = guard.take() {
+            if v.capacity() >= len {
+                unsafe { v.set_len(len) };
+                return v;
+            }
+            *guard = Some(v);
+        }
+    }
+    let mut v = Vec::with_capacity(len.max(256));
+    unsafe { v.set_len(len) };
+    v
+}
+
+/// Return a `c2::Dual` scales buffer to `C2_SCALES_SCRATCH`.
+pub fn give_c2_scales(mut v: Vec<[F128; 4]>) {
+    if v.capacity() == 0 {
+        return;
+    }
+    v.clear();
+    if let Ok(mut guard) = C2_SCALES_SCRATCH.lock() {
+        if guard.as_ref().map_or(true, |old| v.capacity() >= old.capacity()) {
+            *guard = Some(v);
+        }
+    }
+}
 
 /// Take an uninitialized `F128` vector of length `len` for `transpose_forward_ntt_sparse_impl`.
 pub fn take_sparse_ntt_data(len: usize) -> Vec<F128> {
