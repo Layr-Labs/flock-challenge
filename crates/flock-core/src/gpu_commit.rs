@@ -13289,8 +13289,10 @@ kernel void zc_r2_products_horner(
         if (handoff && step == 2u) {
             // The lower 4 KiB remains the live nibble table.
             threadgroup uint4* handoff_slots = nib + 256u;
-            uint4 v1 = zc_r2_horner_reduce(h1);
-            uint4 vi = zc_r2_horner_reduce(hi);
+            U256k p1 = {h1.r0, h1.r1, h1.r2, h1.r3};
+            U256k pi = {hi.r0, hi.r1, hi.r2, hi.r3};
+            uint4 v1 = gf_reduce(p1);
+            uint4 vi = gf_reduce(pi);
             handoff_slots[rid] = v1;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             v1 = handoff_slots[lid];
