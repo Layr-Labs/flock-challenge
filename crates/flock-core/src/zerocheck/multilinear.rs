@@ -172,6 +172,14 @@ fn zc_r2_odd_offload_enabled() -> bool {
     *ON
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn r2_pre_stage_fixed_horner_weights(point: &[F128], lo_size: usize) -> bool {
+    point.len() == 25
+        && lo_size == 16_384
+        && point[2..6]
+            == crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash()
+}
+
 /// ZC-window GPU idle fill (see `gpu_commit::ENV_NO_ZC_IDLE_FILL`): stage
 /// round two's GPU-arm window setup while the ZC C-fold's GPU prefix is in
 /// flight. Everything staged derives from inputs bound BEFORE the fold
@@ -198,12 +206,16 @@ pub(crate) fn stage_round2_gpu_window_from_r1_challenges(
         return;
     }
     let n_pairs = (1usize << (m - k_skip)) / 2;
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + 1..], COMPACT_RECONSTRUCTION_N_HI);
+    let point = &r[k_skip + 1..];
+    let eq = SplitEqGhash::with_n_hi(point, COMPACT_RECONSTRUCTION_N_HI);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     if lo_size * hi_size != n_pairs {
         return;
     }
+    // Eq bits 2..5 are the fixed medium coordinates. Their ratios are
+    // gamma^(1,2,4,8), so the just-built low table has geometric weights.
+    let fixed_horner_weights = r2_pre_stage_fixed_horner_weights(point, lo_size);
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
     crate::gpu_commit::stage_zc_r2_idle_fill(
         a_packed,
@@ -214,6 +226,7 @@ pub(crate) fn stage_round2_gpu_window_from_r1_challenges(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        fixed_horner_weights,
     );
     // The upload above copies eq.lo/eq.hi into persistent GPU buffers, so the
     // CPU-side tables are free to be re-used by the round-two sweep.
@@ -4017,6 +4030,43 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn r2_pre_stage_point_proves_full_horner_weights() {
+        let mut rng = Rng::new(0x52_32_48_4f);
+        for trial in 0..4 {
+            let mut point = match trial {
+                0 => vec![F128::ZERO; 25],
+                1 => vec![F128::ONE; 25],
+                _ => rng.f128_vec(25),
+            };
+            point[2..6].copy_from_slice(
+                &crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash(),
+            );
+            let eq = SplitEqGhash::with_n_hi(&point, COMPACT_RECONSTRUCTION_N_HI);
+            assert_eq!(eq.n_lo, 14);
+            assert!(r2_pre_stage_fixed_horner_weights(&point, eq.lo.len()));
+            for window in 0..256 {
+                for class in 0..4 {
+                    let mut weight = eq.lo[(window << 6) | class];
+                    for medium in 1..16 {
+                        weight = crate::field::mul_by_x(weight);
+                        assert_eq!(eq.lo[(window << 6) | (medium << 2) | class], weight);
+                    }
+                }
+            }
+            for medium in 2..6 {
+                point[medium] += F128::ONE;
+                assert!(!r2_pre_stage_fixed_horner_weights(&point, 16_384));
+                point[medium] += F128::ONE;
+            }
+            assert!(!r2_pre_stage_fixed_horner_weights(&point, 8192));
+            assert!(!r2_pre_stage_fixed_horner_weights(&point[..24], 16_384));
+            point.push(F128::ZERO);
+            assert!(!r2_pre_stage_fixed_horner_weights(&point, 16_384));
+        }
+    }
 
     #[test]
     fn apple_lookahead_inverse_reuse_selector_is_literal_and_fail_closed() {

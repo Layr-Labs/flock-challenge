@@ -999,9 +999,69 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
     tail: Option<&(dyn Fn() + Sync)>,
 ) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_body(
+    precompute_round1_ab_inner_packed_padded_body::<false>(
         a_packed,
         b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        ab_compact_store_enabled(),
+        true,
+        identity_prefix,
+        tail,
+    )
+}
+
+/// Generator proof for the static-B Horner guards in one exact packed buffer.
+/// This proves no A values or identity-prefix omission preconditions.
+pub struct Round1Blake3GuardedB<'b> {
+    b_packed: &'b [u8],
+}
+
+impl<'b> Round1Blake3GuardedB<'b> {
+    /// Borrow the B buffer whose generator proves the round-one guard bits.
+    ///
+    /// # Safety
+    /// `b_packed` must hold complete row-major 16,384-bit BLAKE3 blocks.
+    /// Every block must match all static-B Horner guard masks for arms
+    /// 3..=28. The generated B=1 intervals
+    /// `[1153 + 250*g + 186, 1153 + 250*g + 250)`, `g` in `0..56`,
+    /// contain every guarded bit. All producer writes must have joined, and
+    /// the proof must name this exact buffer with no intervening mutation.
+    pub unsafe fn from_blake3_generated(b_packed: &'b [F128]) -> Self {
+        // SAFETY: F128 is repr(C) as two u64 halves, with no padding.
+        // The byte view has the same extent and lifetime as the typed borrow.
+        let b_packed = unsafe {
+            std::slice::from_raw_parts(
+                b_packed.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(b_packed),
+            )
+        };
+        Self { b_packed }
+    }
+}
+
+/// [`precompute_round1_ab_inner_packed_padded_with_tail`] with a separate
+/// generator proof for the exact borrowed B buffer's static guard bits.
+#[allow(clippy::too_many_arguments)]
+pub fn precompute_round1_ab_inner_packed_padded_with_tail_trusted_b(
+    a_packed: &[u8],
+    guarded_b: &Round1Blake3GuardedB<'_>,
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    tail: Option<&(dyn Fn() + Sync)>,
+) -> Round1AbInner {
+    assert!(m >= 14, "guarded B requires complete BLAKE3 blocks");
+    assert_eq!(padding.k_log, 14);
+    assert_eq!(padding.useful_bits_per_block, 15_409);
+    precompute_round1_ab_inner_packed_padded_body::<true>(
+        a_packed,
+        guarded_b.b_packed,
         m,
         k_skip,
         inv_table,
@@ -1026,9 +1086,38 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
     padding: &PaddingSpec,
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
 ) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_body(
+    precompute_round1_ab_inner_packed_padded_body::<false>(
         a_packed,
         b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        false,
+        false,
+        identity_prefix,
+        None,
+    )
+}
+
+/// [`precompute_round1_ab_inner_packed_padded_for_exact_tune`] with the
+/// exact B buffer's generator proof, as in the trusted normal entry.
+pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune_trusted_b(
+    a_packed: &[u8],
+    guarded_b: &Round1Blake3GuardedB<'_>,
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+) -> Round1AbInner {
+    assert!(m >= 14, "guarded B requires complete BLAKE3 blocks");
+    assert_eq!(padding.k_log, 14);
+    assert_eq!(padding.useful_bits_per_block, 15_409);
+    precompute_round1_ab_inner_packed_padded_body::<true>(
+        a_packed,
+        guarded_b.b_packed,
         m,
         k_skip,
         inv_table,
@@ -1057,14 +1146,14 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     compact: bool,
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
 ) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_body(
+    precompute_round1_ab_inner_packed_padded_body::<false>(
         a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true, identity_prefix,
         None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn precompute_round1_ab_inner_packed_padded_body(
+fn precompute_round1_ab_inner_packed_padded_body<const TRUST_STATIC_B: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     m: usize,
@@ -1179,7 +1268,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
             // per-chunk OnceLock probe, temporary buffer, or per-row bounce
             // branches; the kill-switch arm retains the exact old behavior.
             if nt && ab_pre_nt_direct_enabled() {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
+                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true, TRUST_STATIC_B>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1195,7 +1284,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     tail,
                 );
             } else {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
+                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false, TRUST_STATIC_B>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1212,7 +1301,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                 );
             }
         } else {
-            precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+            precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_PROCESS }, false, TRUST_STATIC_B>(
                 a_packed,
                 b_packed,
                 inv_table,
@@ -1240,7 +1329,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         .for_each_init(
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
             |(a_col, b_col), (x_outer, out_outer)| {
-                precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+                precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false, TRUST_STATIC_B>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1331,7 +1420,11 @@ fn zc_ab_pre_hetero_enabled() -> bool {
 /// both `nt` and the process-wide direct-store kill switch.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
+fn precompute_ab_hetero<
+    const FAST_POLICY: u8,
+    const FORCE_DIRECT: bool,
+    const TRUST_STATIC_B: bool,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -1377,8 +1470,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 // this chunk is transformed; the hint addresses are inside
                 // the two packed slices because `next + 1 < n_chunks`.
                 #[cfg(target_arch = "aarch64")]
-                if offset + 8 < slab_len {
-                    let next = (x_outer + 8) * OUTER_BYTES;
+                if offset + 32 < slab_len {
+                    let next = (x_outer + 32) * OUTER_BYTES;
                     for line in 0..8 {
                         // SAFETY: `next + 1023 < a_packed.len()` by the guard.
                         unsafe {
@@ -1402,7 +1495,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                         OUTER_BYTES,
                     )
                 };
-                precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT>(
+                precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT, TRUST_STATIC_B>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1429,7 +1522,11 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
 /// hetero queue and the incumbent `par_chunks_mut` cannot diverge.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
+fn precompute_ab_one_chunk<
+    const FAST_POLICY: u8,
+    const FORCE_DIRECT: bool,
+    const TRUST_STATIC_B: bool,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -1491,16 +1588,34 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     let (run_lo, run_hi) = (ab_end, ab_end);
     #[cfg(target_arch = "aarch64")]
     if let Some((_, _, partials)) = static_run {
-        kernels::aarch64::bstatic_horner_window_rows(
-            within_hash_outer,
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            partials,
-            out_outer,
-            direct,
-        );
+        if TRUST_STATIC_B {
+            // SAFETY: only the guarded-B entries select this const arm.
+            // Their token proves every selected window guard for this
+            // exact immutable B slice. The kernel retains its bounds checks.
+            unsafe {
+                kernels::aarch64::bstatic_horner_window_rows_trusted_b(
+                    within_hash_outer,
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    partials,
+                    out_outer,
+                    direct,
+                );
+            }
+        } else {
+            kernels::aarch64::bstatic_horner_window_rows(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        }
     }
     for b_med in (first_b_med..run_lo).chain(run_hi..ab_end) {
         let dst: &mut [u8; 64] = if nt && !direct {
@@ -2400,6 +2515,10 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
     use rayon::prelude::*;
 
     debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
+    // Only the immutable factory table guarantees row b = x^b * row 0.
+    let derive_rows = CONVERT_TABLE_CACHE
+        .get()
+        .is_some_and(|table| core::ptr::eq(convert, table.as_slice()));
     // Fully overwritten below (one write per slot before any read), so an
     // uninitialized scratch buffer is sound and skips a zeroing pass.
     let mut tables = crate::scratch::take_f128(eq_top_scaled.len() * CONVERT_TABLE_SIZE);
@@ -2407,8 +2526,81 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
         .par_chunks_mut(CONVERT_TABLE_SIZE)
         .zip(eq_top_scaled.par_iter())
         .for_each(|(slot, scale)| {
-            for (out, base) in slot.iter_mut().zip(convert.iter()) {
-                *out = *base * *scale;
+            if derive_rows {
+                // Scaled images of the eight binary carry masks.
+                let deltas = [
+                    *scale,
+                    convert[3] * *scale,
+                    convert[7] * *scale,
+                    convert[15] * *scale,
+                    convert[31] * *scale,
+                    convert[63] * *scale,
+                    convert[127] * *scale,
+                    convert[255] * *scale,
+                ];
+                let mut base = F128::ZERO;
+                slot[0] = base;
+                for byte in 1usize..256 {
+                    base += deltas[byte.trailing_zeros() as usize];
+                    slot[byte] = base;
+                }
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                // SAFETY: `slot` has `CONVERT_TABLE_SIZE = 4096` initialized/valid `F128` slots,
+                // bank 0 (`slot[0..256]`) is initialized above, and each subsequent bank `1..16`
+                // reads 256 contiguous `F128` elements from `bank - 1` and writes 256 contiguous
+                // `F128` elements to `bank`.
+                unsafe {
+                    use core::arch::aarch64::*;
+
+                    let reduction = vld1q_u64([0x87, 1].as_ptr());
+                    let ptr = slot.as_mut_ptr();
+                    for bank in 1usize..16 {
+                        let src_base = ptr.add((bank - 1) * 256);
+                        let dst_base = ptr.add(bank * 256);
+                        let mut i = 0usize;
+                        while i < 256 {
+                            let v0 = vld1q_u64(src_base.add(i).cast());
+                            let v1 = vld1q_u64(src_base.add(i + 1).cast());
+                            let v2 = vld1q_u64(src_base.add(i + 2).cast());
+                            let v3 = vld1q_u64(src_base.add(i + 3).cast());
+
+                            let s0 = vshrq_n_s64::<63>(vreinterpretq_s64_u64(v0));
+                            let s1 = vshrq_n_s64::<63>(vreinterpretq_s64_u64(v1));
+                            let s2 = vshrq_n_s64::<63>(vreinterpretq_s64_u64(v2));
+                            let s3 = vshrq_n_s64::<63>(vreinterpretq_s64_u64(v3));
+
+                            let c0 = vreinterpretq_u64_s64(vextq_s64::<1>(s0, s0));
+                            let c1 = vreinterpretq_u64_s64(vextq_s64::<1>(s1, s1));
+                            let c2 = vreinterpretq_u64_s64(vextq_s64::<1>(s2, s2));
+                            let c3 = vreinterpretq_u64_s64(vextq_s64::<1>(s3, s3));
+
+                            let r0 = veorq_u64(vshlq_n_u64::<1>(v0), vandq_u64(c0, reduction));
+                            let r1 = veorq_u64(vshlq_n_u64::<1>(v1), vandq_u64(c1, reduction));
+                            let r2 = veorq_u64(vshlq_n_u64::<1>(v2), vandq_u64(c2, reduction));
+                            let r3 = veorq_u64(vshlq_n_u64::<1>(v3), vandq_u64(c3, reduction));
+
+                            vst1q_u64(dst_base.add(i).cast(), r0);
+                            vst1q_u64(dst_base.add(i + 1).cast(), r1);
+                            vst1q_u64(dst_base.add(i + 2).cast(), r2);
+                            vst1q_u64(dst_base.add(i + 3).cast(), r3);
+                            i += 4;
+                        }
+                    }
+                }
+                #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+                {
+                    for bank in 1usize..16 {
+                        let src_offset = (bank - 1) * 256;
+                        let dst_offset = bank * 256;
+                        for i in 0usize..256 {
+                            slot[dst_offset + i] = mul_by_x(slot[src_offset + i]);
+                        }
+                    }
+                }
+            } else {
+                for (out, base) in slot.iter_mut().zip(convert.iter()) {
+                    *out = *base * *scale;
+                }
             }
         });
     tables
@@ -2590,8 +2782,9 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                 rayon::current_num_threads(),
                 zc_ab_bank_deferred_enabled(),
             );
-            crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-                let mut partial = [F128::ZERO; ELL];
+            // Both bank finish paths overwrite every lane before reading it.
+            // Keep one partial per draining worker instead of clearing it per job.
+            crate::epool::run_hetero_chunks_stateful(hi_size, || [F128::ZERO; ELL], |partial, x_hi| {
                 AB_EQ_FOLD_BANKS.with(|cell| {
                     let mut banks = cell.borrow_mut();
                     if banks.len() != bank_len {
@@ -2612,13 +2805,13 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                         bank_bits,
                         bank_deferred,
                         &mut banks,
-                        &mut partial,
+                        partial,
                     );
                 });
                 // SAFETY: each queue index owns one disjoint output slot and
                 // the synchronous queue join publishes all writes before
                 // reduction.
-                unsafe { *partials_base.ptr().add(x_hi) = partial };
+                unsafe { *partials_base.ptr().add(x_hi) = *partial };
             });
             crate::scratch::give_f128(tables);
         }
@@ -4439,7 +4632,7 @@ mod tests {
         let mut cached = [0u8; OUTER_BYTES];
         let mut cached_a_col = [F8::ZERO; ELL];
         let mut cached_b_col = [F8::ZERO; ELL];
-        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false, false>(
             &a_packed,
             &b_packed,
             &inv_table,
@@ -4459,7 +4652,7 @@ mod tests {
         let mut direct = [0u8; OUTER_BYTES];
         let mut direct_a_col = [F8::ZERO; ELL];
         let mut direct_b_col = [F8::ZERO; ELL];
-        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
+        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true, false>(
             &a_packed,
             &b_packed,
             &inv_table,
@@ -6125,16 +6318,19 @@ mod tests {
     #[test]
     fn ab_bank_deferred_finish_matches_scalar_collapse() {
         let mut rng = Rng::new(0xABBA_1280_0064);
+        let sentinel = F128::new(0xdead_beef_dead_beef, 0xfeed_face_feed_face);
+        let mut reused_scalar = [sentinel; ELL];
+        let mut reused_deferred = [sentinel; ELL];
         for trial in 0..16 {
             let eq_bot = rng.f128_vec(128);
             let banks = rng.f128_vec(128 * ELL);
             let eq_hi = if trial == 0 { F128::ZERO } else { rng.f128() };
-            let sentinel = F128::new(0xdead_beef_dead_beef, 0xfeed_face_feed_face);
             let mut scalar = [sentinel; ELL];
-            let mut deferred = [sentinel; ELL];
             finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, false, &mut scalar);
-            finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, true, &mut deferred);
-            assert_eq!(deferred, scalar, "trial={trial}");
+            finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, false, &mut reused_scalar);
+            finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, true, &mut reused_deferred);
+            assert_eq!(reused_scalar, scalar, "scalar reuse trial={trial}");
+            assert_eq!(reused_deferred, scalar, "deferred reuse trial={trial}");
         }
     }
 
@@ -6173,6 +6369,33 @@ mod tests {
             }
         }
         crate::scratch::give_f128(tables);
+    }
+
+    #[test]
+    fn ab_eq_fold_tables_match_all_parent_products() {
+        let mut rng = Rng::new(0xAB_E9_4096);
+        let scales = [F128::ZERO, F128::ONE, rng.f128(), rng.f128()];
+        let mut altered_convert = convert_table().to_vec();
+        altered_convert[256] = F128::ONE;
+        let custom_convert = rng.f128_vec(CONVERT_TABLE_SIZE);
+        for convert in [
+            convert_table(),
+            altered_convert.as_slice(),
+            custom_convert.as_slice(),
+        ] {
+            let tables = build_ab_eq_fold_tables(&scales, convert);
+            assert_eq!(tables.len(), scales.len() * CONVERT_TABLE_SIZE);
+            for (w, scale) in scales.iter().enumerate() {
+                for i in 0..CONVERT_TABLE_SIZE {
+                    assert_eq!(
+                        tables[w * CONVERT_TABLE_SIZE + i],
+                        convert[i] * *scale,
+                        "T[{w}][{i}]"
+                    );
+                }
+            }
+            crate::scratch::give_f128(tables);
+        }
     }
 
     /// End-to-end producer gate for the fold: the banked drain must return
