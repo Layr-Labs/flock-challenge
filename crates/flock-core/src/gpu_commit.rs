@@ -5723,7 +5723,8 @@ kernel void blake3_pow_scan(
             } else {
                 2usize
             };
-            for (l, f) in super::plan_passes(log_d, start_layer) {
+            for l in (start_layer..log_d).step_by(4) {
+                let f = (log_d - l).min(4);
                 if l < l_from || l >= l_to {
                     continue;
                 }
@@ -7081,18 +7082,20 @@ kernel void blake3_pow_scan(
                     // both cb2 and the CPU NTT, so this split's window is
                     // max(cb2, cpu NTT) + cb3: price the GPU arm as cb2's
                     // start to cb3's end and the CPU arm as the NTT wall.
-                    let (cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
-                    let (cb3_s, cb3_e) = cb_gpu_interval(gpu, cb3);
-                    record_hybrid_arms(k_split, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
-                    record_fine_arms(k_split, (cb2_e - cb2_s) * 1e3, cpu_ntt_ms, (cb3_e - cb3_s) * 1e3);
-                    if window_trace_enabled() {
-                        eprintln!(
-                            "[gpu-window] cb3 (gpu suffix merkle, k={k_cpu16}, m={fine_m}): gpu dur {:.2} ms, \
-                             cb2 gpu dur {:.2} ms, cpu ntt {cpu_ntt_ms:.2} ms, cb2 start to cb3 end {:.2} ms",
-                            (cb3_e - cb3_s) * 1e3,
-                            (cb2_e - cb2_s) * 1e3,
-                            (cb3_e - cb2_s) * 1e3
-                        );
+                    if hybrid_arm_recording() || window_trace_enabled() {
+                        let (cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
+                        let (cb3_s, cb3_e) = cb_gpu_interval(gpu, cb3);
+                        record_hybrid_arms(k_split, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
+                        record_fine_arms(k_split, (cb2_e - cb2_s) * 1e3, cpu_ntt_ms, (cb3_e - cb3_s) * 1e3);
+                        if window_trace_enabled() {
+                            eprintln!(
+                                "[gpu-window] cb3 (gpu suffix merkle, k={k_cpu16}, m={fine_m}): gpu dur {:.2} ms, \
+                                 cb2 gpu dur {:.2} ms, cpu ntt {cpu_ntt_ms:.2} ms, cb2 start to cb3 end {:.2} ms",
+                                (cb3_e - cb3_s) * 1e3,
+                                (cb2_e - cb2_s) * 1e3,
+                                (cb3_e - cb2_s) * 1e3
+                            );
+                        }
                     }
                     if fine_m > 0 {
                         // The boundary sixteenth is split between the GPU's
@@ -13160,8 +13163,8 @@ kernel void zc_r2_products_horner(
     uint tgid [[threadgroup_position_in_grid]],
     uint lid  [[thread_index_in_threadgroup]])
 {
-    threadgroup uint4 nib[256];
     threadgroup ulong4 red[256];
+    threadgroup uint4* nib = reinterpret_cast<threadgroup uint4*>(red);
     nib[lid] = nib_tab_dev[lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -13194,6 +13197,8 @@ kernel void zc_r2_products_horner(
     U256k mi = clmul128(e, zc_r2_horner_reduce(hi));
     ulong4 acc1 = ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
     ulong4 acci = ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+    // Retire every table reader before the reducer reuses the same storage.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid);
 }
 
@@ -13315,6 +13320,26 @@ kernel void zc_r2_horner_oracle(
     #[cfg(test)]
     pub(crate) fn zc_r2_test_set_share(share: usize) {
         ZC_R2_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read raw physical groups through the production job and selected PSO.
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_physical_partials(
+        job: &ZcR2Job,
+    ) -> (Vec<[F128; 4]>, (u64, u64, u64)) {
+        let gpu = gpu().expect("physical partial oracle requires real Metal");
+        unsafe { gpu.wait_cb(job.cb).expect("physical partial job must complete") };
+        let state = zc_r2_state().expect("R2 state must exist").lock().unwrap();
+        let groups = if job.horner { 4 } else { 1 };
+        unsafe {
+            let parts = core::slice::from_raw_parts(
+                gpu.buffer_contents(state.part_buf).cast::<[F128; 4]>(),
+                job.chunks * groups,
+            )
+            .to_vec();
+            let pso = if job.horner { state.horner_pso } else { state.pso };
+            (parts, gpu.pipeline_resources(pso))
+        }
     }
 
     /// Ratio-gate override (`FLOCK_ZC_R2_GPU_FORCE_RATIO=<f64>`).
@@ -17294,6 +17319,50 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         );
     }
 
+    #[test]
+    fn fine_prefix_pass_range_matches_parent_plan() {
+        fn check(log_d: usize, start: usize) {
+            let parent = plan_passes(log_d, start);
+            let candidate: Vec<_> = (start..log_d)
+                .step_by(4)
+                .map(|l| (l, (log_d - l).min(4)))
+                .collect();
+            assert_eq!(candidate, parent, "log={log_d} start={start}");
+            for (from, to) in [
+                (0, 0),
+                (0, usize::MAX),
+                (4, 8),
+                (8, log_d),
+                (start, start),
+                (log_d, 0),
+                (log_d, log_d.saturating_add(1)),
+                (usize::MAX, usize::MAX),
+            ] {
+                let tuples = |passes: &[(usize, usize)]| {
+                    passes
+                        .iter()
+                        .copied()
+                        .filter(|&(l, _)| l >= from && l < to)
+                        .map(|(l, f)| (l, f, log_d - l - f))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(tuples(&candidate), tuples(&parent));
+            }
+        }
+        for log_d in 0usize..=64 {
+            for start in (0..=log_d + 1).chain([usize::MAX]) {
+                check(log_d, start);
+            }
+        }
+        for (log_d, start) in [
+            (usize::MAX, usize::MAX - 5),
+            (usize::MAX, usize::MAX),
+            (usize::MAX - 1, usize::MAX),
+        ] {
+            check(log_d, start);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Zerocheck round-1 C fold: GPU prefix vs CPU oracle.
     // -----------------------------------------------------------------------
@@ -18132,9 +18201,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_products_horner").unwrap();
             let old_usage = gpu.pipeline_resources(ordinary);
             let usage = gpu.pipeline_resources(horner);
-            assert_eq!(old_usage.0, usage.0, "shared-memory use changed");
-            assert_eq!(old_usage.1, usage.1, "SIMD width changed");
-            assert!(usage.2 >= 256, "Horner production group no longer fits");
+            assert_eq!(old_usage.0, 12_288, "ordinary storage must stay unchanged");
+            assert_eq!(usage.0, 8_192, "Horner table and reduction must share storage");
+            assert!(
+                old_usage.2 >= 256 && usage.2 >= 256,
+                "both production groups must fit"
+            );
             for repeat in 0..2 {
                 std::ptr::write_bytes(gpu.buffer_contents(out_buf), 0xA5, output_bytes);
                 let cb = gpu.command_buffer().unwrap();
@@ -18171,15 +18243,27 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// equality check must pass and publish a share without poisoning) and
     /// the timed prefix path.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_zc_r2_products_match_cpu_oracle() {
-        for (lo_size, hi_size, fixed_weights) in
-            [(512, 64, false), (16_384, 8, true), (16_384, 8, false)]
-        {
-            zc_r2_products_case(lo_size, hi_size, fixed_weights);
+        assert!(gpu_zc_r2_horner_enabled(), "the Horner alias route must run");
+        for (lo_size, hi_size, fixed_weights, mask, useful) in [
+            (512, 64, false, 4095, 3900),
+            (16_384, 8, true, 127, 121),
+            (16_384, 8, true, 16_383, 61),
+            (16_384, 8, false, 4095, 3900),
+        ] {
+            zc_r2_products_case(lo_size, hi_size, fixed_weights, mask, useful);
         }
     }
 
-    fn zc_r2_products_case(lo_size: usize, hi_size: usize, fixed_weights: bool) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn zc_r2_products_case(
+        lo_size: usize,
+        hi_size: usize,
+        fixed_weights: bool,
+        mask: usize,
+        useful: usize,
+    ) {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
             *rng ^= *rng << 13;
@@ -18218,13 +18302,11 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         };
 
         let n_pairs = lo_size * hi_size;
-        // Test the ranked seven-pair tail and a generic padded block.
-        // The padded inputs contain random data, which must be ignored.
-        let mask = if fixed_weights { 127usize } else { 4095usize };
-        let useful = if fixed_weights { 121usize } else { 3900usize };
-
-        let mut a_packed = vec![0u8; n_pairs * 16];
-        let mut b_packed = vec![0u8; n_pairs * 16];
+        // Random padded bytes must be ignored. The sparse Horner case has
+        // only one active window and three wholly inactive physical groups.
+        // The production state caches these no-copy wraps for the process.
+        let a_packed = leak_page_aligned(n_pairs * 16);
+        let b_packed = leak_page_aligned(n_pairs * 16);
         for byte in a_packed.iter_mut() {
             *byte = (xs(&mut rng) & 0xff) as u8;
         }
@@ -18246,40 +18328,59 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
         let mut eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
 
-        // CPU reference partials, exactly the driver's non-aarch64 shape, kept
-        // split by x_lo parity so the arm's parity contract is checked and not
-        // just the sum a wrong split could still reproduce.
+        // CPU field reference, with each physical Horner partition kept
+        // separate so a wrong group, parity or eq_hi slot cannot hide in a sum.
         let reference = |a_packed: &[u8],
                          b_packed: &[u8],
                          table_data: &[F128],
                          eq_lo: &[F128],
-                         eq_hi: &[F128]| {
-            let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
+                         eq_hi: &[F128],
+                         groups: usize| {
+            let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size * groups);
             for x_hi in 0..hi_size {
-                // [p1_even, pinf_even, p1_odd, pinf_odd]
-                let mut acc = [F256Unreduced::ZERO; 4];
-                for x_lo in 0..lo_size {
-                    let pair_idx = x_hi * lo_size + x_lo;
-                    if (pair_idx & mask) >= useful {
-                        continue;
+                for group in 0..groups {
+                    let mut acc = [F256Unreduced::ZERO; 4];
+                    for x_lo in group * lo_size / groups..(group + 1) * lo_size / groups {
+                        let pair_idx = x_hi * lo_size + x_lo;
+                        if (pair_idx & mask) >= useful {
+                            continue;
+                        }
+                        let read = |packed: &[u8], row: usize| -> u64 {
+                            u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
+                        };
+                        let a0 = fold_row(table_data, read(a_packed, 2 * pair_idx));
+                        let a1 = fold_row(table_data, read(a_packed, 2 * pair_idx + 1));
+                        let b0 = fold_row(table_data, read(b_packed, 2 * pair_idx));
+                        let b1 = fold_row(table_data, read(b_packed, 2 * pair_idx + 1));
+                        let base = 2 * (x_lo & 1);
+                        acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
+                        acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
                     }
-                    let read = |packed: &[u8], row: usize| -> u64 {
-                        u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
-                    };
-                    let a0 = fold_row(table_data, read(&a_packed, 2 * pair_idx));
-                    let a1 = fold_row(table_data, read(&a_packed, 2 * pair_idx + 1));
-                    let b0 = fold_row(table_data, read(&b_packed, 2 * pair_idx));
-                    let b1 = fold_row(table_data, read(&b_packed, 2 * pair_idx + 1));
-                    let base = 2 * (x_lo & 1);
-                    acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                    acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+                    let eq_h = eq_hi[x_hi];
+                    cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
                 }
-                let eq_h = eq_hi[x_hi];
-                cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
             }
             cpu_split
         };
-        let cpu_split = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        let cpu_split = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, 1);
+        let groups = if fixed_weights { 4 } else { 1 };
+        let cpu_physical = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, groups);
+        let check_physical = |job: &imp::ZcR2Job, expected: &[[F128; 4]]| {
+            let (actual, usage) = imp::zc_r2_test_physical_partials(job);
+            assert_eq!(
+                usage.0,
+                if job.uses_horner() { 8_192 } else { 12_288 },
+                "actual production PSO shared storage"
+            );
+            assert!(usage.2 >= 256, "the production group must fit");
+            assert_eq!(actual.len(), job.chunks * groups);
+            assert_eq!(actual, expected[..actual.len()], "raw physical partials");
+            eprintln!(
+                "[zc-r2-alias] horner={} physical_groups={} resources={usage:?}",
+                job.uses_horner(),
+                actual.len()
+            );
+        };
         let cpu_partials: Vec<(F128, F128)> = cpu_split
             .iter()
             .map(|v| (v[0] + v[2], v[1] + v[3]))
@@ -18310,6 +18411,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         );
         assert!(job.is_calibration());
         assert_eq!(job.cpu_split(), 0);
+        check_physical(&job, &cpu_physical);
         let res = imp::zc_r2_wait(job, Some(&cpu_partials), Some(&cpu_la), 50.0, hi_size);
         assert!(matches!(res, imp::ZcR2Result::Calibrated));
         let (tuned, poisoned) = imp::zc_r2_test_state();
@@ -18340,6 +18442,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
+        check_physical(&job2, &cpu_physical);
         match imp::zc_r2_wait(job2, None, None, 0.0, hi_size) {
             imp::ZcR2Result::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);
@@ -18364,10 +18467,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             eq_lo.as_ptr(),
             eq_hi.as_ptr(),
         );
-        for byte in &mut a_packed {
+        for byte in a_packed.iter_mut() {
             *byte ^= 0x5b;
         }
-        for byte in &mut b_packed {
+        for byte in b_packed.iter_mut() {
             *byte ^= 0xa7;
         }
         for value in table_data
@@ -18388,7 +18491,9 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             )
         );
         assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
-        let changed = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        let changed = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, 1);
+        let changed_physical =
+            reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, groups);
         assert_ne!(
             &changed[..prefix],
             &cpu_split[..prefix],
@@ -18412,6 +18517,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         );
         assert!(!job3.is_calibration());
         assert_eq!(job3.cpu_split(), prefix);
+        check_physical(&job3, &changed_physical);
         match imp::zc_r2_wait(job3, None, None, 0.0, hi_size) {
             imp::ZcR2Result::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);

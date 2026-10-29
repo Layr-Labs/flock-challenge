@@ -259,11 +259,10 @@ impl Dual {
             let f1 = dot(&cache[off + half..off + size], &weights);
             let row = local_row(&self.ntt, self.log_d, k, q);
             let dot0 = dot(&row[..half], &weights);
-            let dot2 = mul(F128::ONE + row[half], dot0);
-            let a0 = mul(self.weights[i], f0);
-            let a2 = mul(self.weights[i], f0 + f1);
-            msg.u_0 += mul(a0, dot0);
-            msg.u_2 += mul(a2, dot2);
+            let a0 = mul(self.weights[i], dot0);
+            let a2 = mul(F128::ONE + row[half], f0 + f1);
+            msg.u_0 += mul(a0, f0);
+            msg.u_2 += mul(a0, a2);
         }
         msg
     }
@@ -431,10 +430,7 @@ mod tests {
             let f1 = dot(&cache[off + half..off + size], &weights);
             let row = local_row(&dual.ntt, dual.log_d, k, q);
             let dot0 = dot(&row[..half], &weights);
-            let mut dot2 = F128::ZERO;
-            for j in 0..half {
-                dot2 += mul(row[j] + row[half + j], weights[j]);
-            }
+            let dot2 = mul(F128::ONE + row[half], dot0);
             let a0 = mul(dual.weights[i], f0);
             let a2 = mul(dual.weights[i], f0 + f1);
             msg.u_0 += mul(a0, dot0);
@@ -493,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn dot2_factored_depths_match_current_parent() {
+    fn shared_weight_product_matches_current_parent() {
         let mut rng = RandomChallenger::new(0xC2_D072_9992_0340);
         for custom in [false, true] {
             let scale = F128::new(0x9e37_79b9, 0x0123_4567_89ab_cdef);
@@ -538,15 +534,18 @@ mod tests {
                     ntt.forward_transform_interleaved(&mut codeword, 1 << LOG_LANES);
                     let mut dual = dual_fixture(ntt.clone(), depth, &codeword, &lanes, &alpha);
                     let expected_intro = parent_message(&dual, &[]);
-                    assert_eq!(dual.message(&[]), expected_intro);
+                    let actual_intro = dual.message(&[]);
+                    assert_eq!(actual_intro, expected_intro);
                     let initial_weights = dual.weights.clone();
                     let initial_residues = dual.residues.clone();
+                    let initial_queries = dual.queries.clone();
                     let mut random = rng.sample_f128();
                     random.hi |= 1;
                     let challenges = [F128::ZERO, F128::ONE, random];
                     for &beta in &challenges {
                         dual.weights.copy_from_slice(&initial_weights);
                         dual.scale(beta);
+                        let scaled_weights = dual.weights.clone();
                         for mut choice in 0..3usize.pow(depth as u32) {
                             let rs: Vec<F128> = (0..depth)
                                 .map(|_| {
@@ -555,17 +554,22 @@ mod tests {
                                     r
                                 })
                                 .collect();
+                            let mut expected_transcript = vec![expected_intro.clone()];
+                            let mut actual_transcript = vec![actual_intro.clone()];
                             for count in 1..=depth {
                                 let point = &rs[..count];
-                                let expected = parent_message(&dual, point);
+                                expected_transcript.push(parent_message(&dual, point));
+                                actual_transcript.push(dual.message(point));
                                 assert_eq!(
-                                    dual.message(point),
-                                    expected,
+                                    actual_transcript,
+                                    expected_transcript,
                                     "custom={custom}, depth={depth}, case={case}, point={point:?}, beta={beta:?}"
                                 );
                             }
                         }
                         assert_eq!(dual.residues, initial_residues);
+                        assert_eq!(dual.queries, initial_queries);
+                        assert_eq!(dual.weights, scaled_weights);
                         if depth == 2 {
                             assert!(
                                 dual.residues
