@@ -5100,6 +5100,13 @@ fn transpose_forward_ntt_sparse_hashmap_impl(
 pub(crate) struct LigeroWitness {
     pub mat: Vec<F128>,
     pub tree: Vec<Hash>,
+    /// Zero-copy flat tree `(address, node count)` inside the persistent GPU
+    /// L1 tree buffer, set only by [`ligero_commit_with_tree_view`] when the
+    /// overlapped L1 Merkle session completes (then `tree` stays empty). The
+    /// buffer is next written by the following prove's L1 commit, so the
+    /// witness must be dropped before that — the ranked open drops it at the
+    /// end of its first recursive level.
+    tree_view: Option<(usize, usize)>,
     pub block_len: usize,
     pub num_interleaved: usize,
 }
@@ -5135,7 +5142,20 @@ impl LigeroWitness {
 
     #[inline]
     pub fn root(&self) -> Hash {
-        self.tree[self.tree.len() - 1]
+        let nodes = self.nodes();
+        nodes[nodes.len() - 1]
+    }
+
+    /// The flat Merkle tree, wherever it lives (owned or the GPU view).
+    #[inline]
+    pub(crate) fn nodes(&self) -> &[Hash] {
+        match self.tree_view {
+            // SAFETY: see the `tree_view` field contract — the address spans
+            // `len` initialized hashes of a drained, process-persistent Metal
+            // shared buffer that nothing writes while this witness lives.
+            Some((addr, len)) => unsafe { core::slice::from_raw_parts(addr as *const Hash, len) },
+            None => &self.tree,
+        }
     }
 }
 
@@ -5156,6 +5176,27 @@ pub(crate) fn ligero_commit(
     ntt: &AdditiveNttF128,
     kind: HashKind,
 ) -> LigeroWitness {
+    ligero_commit_select(
+        poly,
+        log_msg_cols,
+        log_num_interleaved,
+        log_inv_rate,
+        ntt,
+        kind,
+        false,
+    )
+}
+
+/// Shared dispatch of [`ligero_commit`] / [`ligero_commit_with_tree_view`].
+fn ligero_commit_select(
+    poly: &[F128],
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+    ntt: &AdditiveNttF128,
+    kind: HashKind,
+    allow_tree_view: bool,
+) -> LigeroWitness {
     let level_opt_out = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
         (16, 3, 2) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1"),
         (13, 3, 3) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2"),
@@ -5170,7 +5211,7 @@ pub(crate) fn ligero_commit(
     )) && recursive_from_message_shape
         && level_enabled
         && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none();
-    ligero_commit_impl(
+    ligero_commit_impl_view(
         poly,
         log_msg_cols,
         log_num_interleaved,
@@ -5178,11 +5219,46 @@ pub(crate) fn ligero_commit(
         ntt,
         kind,
         fuse_from_message,
+        allow_tree_view,
+    )
+}
+
+/// Kill switch for the subtree-parallel recursive Merkle builder
+/// (`FLOCK_NO_PCS_SUBTREE=1`, exact).
+fn recursive_subtree_merkle_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NO_PCS_SUBTREE").map_or(true, |v| v != "1")
+    });
+    *ON
+}
+
+/// [`ligero_commit`] whose overlapped-L1 GPU tree may be returned as a
+/// zero-copy view (`LigeroWitness::tree_view`) instead of a 16 MiB copy-out.
+/// Same codeword, same tree bytes, same root; only where the nodes live
+/// differs. Callers must read the tree through [`LigeroWitness::nodes`] and
+/// drop the witness before the next L1-shape commit.
+pub(crate) fn ligero_commit_with_tree_view(
+    poly: &[F128],
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+    ntt: &AdditiveNttF128,
+    kind: HashKind,
+) -> LigeroWitness {
+    ligero_commit_select(
+        poly,
+        log_msg_cols,
+        log_num_interleaved,
+        log_inv_rate,
+        ntt,
+        kind,
+        std::env::var("FLOCK_NO_L1_TREE_VIEW").map_or(true, |v| v != "1"),
     )
 }
 
 /// Implementation split so the exact matrix/tree oracle can force the new
 /// path independently of target-feature and environment dispatch.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn ligero_commit_impl(
     poly: &[F128],
@@ -5192,6 +5268,29 @@ fn ligero_commit_impl(
     ntt: &AdditiveNttF128,
     kind: HashKind,
     fuse_from_message: bool,
+) -> LigeroWitness {
+    ligero_commit_impl_view(
+        poly,
+        log_msg_cols,
+        log_num_interleaved,
+        log_inv_rate,
+        ntt,
+        kind,
+        fuse_from_message,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ligero_commit_impl_view(
+    poly: &[F128],
+    log_msg_cols: usize,
+    log_num_interleaved: usize,
+    log_inv_rate: usize,
+    ntt: &AdditiveNttF128,
+    kind: HashKind,
+    fuse_from_message: bool,
+    allow_tree_view: bool,
 ) -> LigeroWitness {
     let msg_cols = 1usize << log_msg_cols;
     let num_interleaved = 1usize << log_num_interleaved;
@@ -5300,15 +5399,27 @@ fn ligero_commit_impl(
     // returns the bit-identical flat tree or `None` for the exact CPU path
     // (kill switch `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, non-Blake3 hashes,
     // other shapes, and every GPU failure).
+    let mut tree_view: Option<(usize, usize)> = None;
     let gpu_tree = if race_ran {
         raced_tree
     } else if let Some(session) = overlap_session {
         // Drain the overlapped leaf pass; any failure falls back to the
         // incumbent whole-tree offload (then the CPU builder) — exact same
-        // bytes either way.
-        session
-            .finish()
-            .or_else(|| crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len))
+        // bytes either way. A view caller skips the copy-out and reads the
+        // drained tree buffer in place.
+        if allow_tree_view {
+            match session.finish_view() {
+                Some(view) => {
+                    tree_view = Some(view);
+                    Some(Vec::new())
+                }
+                None => crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len),
+            }
+        } else {
+            session
+                .finish()
+                .or_else(|| crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len))
+        }
     } else if matches!(kind, HashKind::Blake3) && leaf_size_bytes == 128 {
         crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
     } else {
@@ -5319,12 +5430,38 @@ fn ligero_commit_impl(
         // Pooled tree storage for the CPU builder (the GPU offload's
         // copy-out is pooled inside `gpu_recursive_merkle_blake3`): same
         // fault/munmap argument, byte-identical output.
-        None => merkle::merkle_tree_into(
-            crate::scratch::take_hash_tree(2 * block_len - 1),
-            data_bytes,
-            block_len,
-            kind,
-        ),
+        None => {
+            // Recursive 128-byte-leaf trees (2^10..2^16 leaves, L2..L5 on the
+            // ranked shape) are built as 64 aligned subtrees (32 at 2^10) in
+            // one P+E chunk queue instead of a leaf pass plus one parallel
+            // region per wide level and a serial tail: same kernels per node,
+            // byte-identical tree. A/B-CONTROL: FLOCK_NO_PCS_SUBTREE=1.
+            let lb = block_len.trailing_zeros() as usize;
+            let sub_log = if recursive_subtree_merkle_enabled()
+                && (10..=16).contains(&lb)
+                && leaf_size_bytes == 128
+            {
+                (lb - 6).clamp(5, 10)
+            } else {
+                0
+            };
+            if sub_log > 0 {
+                merkle::merkle_tree_into_subtrees(
+                    crate::scratch::take_hash_tree(2 * block_len - 1),
+                    data_bytes,
+                    block_len,
+                    kind,
+                    sub_log,
+                )
+            } else {
+                merkle::merkle_tree_into(
+                    crate::scratch::take_hash_tree(2 * block_len - 1),
+                    data_bytes,
+                    block_len,
+                    kind,
+                )
+            }
+        }
     };
     let merkle_elapsed = merkle_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
 
@@ -5350,6 +5487,7 @@ fn ligero_commit_impl(
     LigeroWitness {
         mat,
         tree,
+        tree_view,
         block_len,
         num_interleaved,
     }
@@ -8272,6 +8410,7 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
     let wtns_0 = LigeroWitness {
         mat: l0_codeword,
         tree: l0_tree,
+        tree_view: None,
         block_len,
         num_interleaved,
     };
@@ -8872,7 +9011,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // previous `sc_prover.f().to_vec()` materialized a second 2^(n1) copy
     // (8 MiB at the ranked shape) on the timed path only to drop it after
     // the commit.
-    let wtns_1 = ligero_commit(
+    let wtns_1 = ligero_commit_with_tree_view(
         sc_prover.f(),
         log_msg_cols_1,
         log_num_interleaved_1,
@@ -9095,7 +9234,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let (merkle_proof_last, opened_rows_last): (Vec<Hash>, Vec<Vec<F128>>) = {
                 use rayon::prelude::*;
                 rayon::join(
-                    || merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_last),
+                    || merkle_multi_proof_for(wtns_prev.nodes(), wtns_prev.block_len, &queries_last),
                     || {
                         queries_last
                             .par_iter()
@@ -9286,7 +9425,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let open_i = || {
             use rayon::prelude::*;
             rayon::join(
-                || merkle_multi_proof_for(&wtns_prev.tree, wtns_prev.block_len, &queries_i),
+                || merkle_multi_proof_for(wtns_prev.nodes(), wtns_prev.block_len, &queries_i),
                 || {
                     queries_i
                         .par_iter()
