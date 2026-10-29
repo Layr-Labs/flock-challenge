@@ -725,11 +725,10 @@ fn speculative_publish_enabled() -> bool {
     )
 }
 
-fn ranked_proof_path() -> Option<PathBuf> {
+fn ranked_proof_path() -> Option<&'static Path> {
     // Process args are fixed for the process lifetime, so the scan result is
-    // cached in a `OnceLock` and each timed call pays one clone (a single
-    // alloc, no syscall): `publish_speculative_result` resolves this path
-    // once per ranked trial inside the harness-measured seed→proof window.
+    // cached in a `OnceLock`. Borrow its immutable path so publication needs
+    // no path allocation or copy.
     // Proof-irrelevant by the same argument as `is_ranked_worker` — a pure
     // argv selector touching no witness/commitment/Fiat–Shamir state.
     static CACHED: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -741,7 +740,7 @@ fn ranked_proof_path() -> Option<PathBuf> {
             let path = PathBuf::from(std::env::args_os().nth(3)?);
             (!path.as_os_str().is_empty()).then_some(path)
         })
-        .clone()
+        .as_deref()
 }
 
 /// Sibling temporary name: distinct from the wrapper's `{proof}.tmp`, and on
