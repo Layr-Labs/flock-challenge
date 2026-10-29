@@ -738,6 +738,22 @@ pub fn commit_tail_fill_enabled() -> bool {
 /// products GPU arm.
 pub const ENV_NO_GPU_ZC_T3: &str = "FLOCK_NO_GPU_ZC_T3";
 
+/// Kill switch for the zerocheck cascade K pass GPU arm.
+pub const ENV_NO_GPU_ZC_K45: &str = "FLOCK_NO_GPU_ZC_K45";
+
+pub(crate) fn gpu_zc_k45_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_K45).is_none());
+    *ON
+}
+
+/// Diagnostic trace for the K45 arm (`FLOCK_ZC_K45_GPU_DEBUG=1`).
+pub(crate) fn gpu_zc_k45_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_K45_GPU_DEBUG").is_some());
+    *ON
+}
+
 pub(crate) fn gpu_zc_t3_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_T3).is_none());
@@ -15489,6 +15505,892 @@ kernel void zc_loop_products(
             ZcLoopResult::Calibrated
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Zerocheck cascade K pass GPU arm (see `ENV_NO_GPU_ZC_K45`).
+    //
+    // `fold2_compact_and_round45_into` binds ρ₁ and ρ₂ in one pass over the
+    // compact round-two state and emits the round-four message plus the
+    // deferred round-five aggregates. It ran CPU-only while the GPU idled.
+    // Unlike the products-only arms above, this arm owns its chunks
+    // completely: for the measured prefix of hi-chunks the GPU writes the
+    // composed `a_out`/`b_out` entries (no-copy wraps of the CPU tables) and
+    // the eight raw per-chunk slots of the NEON kernel; the CPU skips those
+    // chunks entirely and applies the same eq_hi / κ weighting to the GPU
+    // slots that it applies to its own.
+    //
+    // Bit-exactness: the two composed byte tables (λ₁ = ρ₁(1+ρ₂),
+    // λ₃ = ρ₁ρ₂) and the ρ₂ multiply are F2-linear, so all three go through
+    // nibble tables; the w-weighting and the eight products use the
+    // oracle-proven emulated clmul; every accumulation is an order-free
+    // XOR of reduced values. Dead padding pairs (121..128 of each 128-pair
+    // block, unwritten by round two) are read as zeros, exactly as the
+    // NEON DEAD_TAIL branch forms them. Calibration compares every probe
+    // output and slot against the CPU before any share is published.
+    // -----------------------------------------------------------------------
+
+    const ZC_K45_MSL_KERNEL: &str = r#"
+struct ZcK45Params { uint lo_size; uint xpt; uint dead; uint pad; uint4 rho2; };
+
+static inline uint4 zc_k45_fold8(uint lo, uint hi, threadgroup const uint4* nib) {
+    uint4 acc = uint4(0u);
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (lo >> (8u * j)) & 0xffu;
+        acc ^= nib[j * 32u + (b & 15u)] ^ nib[j * 32u + 16u + (b >> 4u)];
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint b = (hi >> (8u * j)) & 0xffu;
+        acc ^= nib[(j + 4u) * 32u + (b & 15u)] ^ nib[(j + 4u) * 32u + 16u + (b >> 4u)];
+    }
+    return acc;
+}
+
+// v -> rho2 * v via 32 nibble banks (entry [k*16 + n] = rho2 * (n << 4k)).
+static inline uint4 zc_k45_mul_rho(uint4 v, threadgroup const uint4* rt) {
+    uint4 acc = uint4(0u);
+    for (uint w = 0u; w < 4u; w++) {
+        uint x = v[w];
+        for (uint q = 0u; q < 8u; q++) {
+            acc ^= rt[(w * 8u + q) * 16u + ((x >> (4u * q)) & 15u)];
+        }
+    }
+    return acc;
+}
+
+static inline uint4 zc_k45_mul(uint4 a, uint4 b) { return gf_reduce(clmul128(a, b)); }
+
+// Residency prestage: binds the K arm's no-copy views ahead of the pass so
+// their mapping cost lands during round two instead of the K critical path.
+kernel void zc_k45_touch(
+    device const uint4* x0 [[buffer(0)]],
+    device const uint4* x1 [[buffer(1)]],
+    device uint4*       y0 [[buffer(2)]],
+    device uint4*       y1 [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    if (tid == 0xffffffffu) { y0[0] = x0[0]; y1[0] = x1[0]; }
+}
+
+// One threadgroup per hi-chunk (256 threads, xpt round-five groups per
+// thread). A round-five group t is four K outputs = eight compact pairs.
+// Writes the chunk's a/b outputs and eight raw slots
+// [p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5'] (all
+// w-weighted, unweighted by eq_hi), i.e. the NEON kernel's `out`.
+kernel void zc_k45_fold(
+    device const uint4* anchors [[buffer(0)]],
+    device const uint4* deltas  [[buffer(1)]],
+    device const uint4* eq_lo   [[buffer(2)]],
+    device const uint4* tabs    [[buffer(3)]],
+    device uint4*       a_out   [[buffer(4)]],
+    device uint4*       b_out   [[buffer(5)]],
+    device uint4*       slots   [[buffer(6)]],
+    constant ZcK45Params& p     [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 nib1[256];
+    threadgroup uint4 nib3[256];
+#ifndef K45_RHO_CLMUL
+    threadgroup uint4 rt[512];
+    rt[lid] = tabs[512u + lid];
+    rt[256u + lid] = tabs[768u + lid];
+#endif
+    threadgroup uint4 red[256];
+    nib1[lid] = tabs[lid];
+    nib3[lid] = tabs[256u + lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint4 acc[8];
+    for (uint s = 0u; s < 8u; s++) { acc[s] = uint4(0u); }
+    uint out_chunk = 2u * p.lo_size;
+    for (uint k = 0u; k < p.xpt; k++) {
+        uint t = k * 256u + lid;
+        uint4 av[4];
+        uint4 bv[4];
+        for (uint lane = 0u; lane < 4u; lane++) {
+            uint g_local = 4u * t + lane;
+            uint g = tgid * out_chunk + g_local;
+            uint4 anc_a0 = anchors[4u * g];
+            uint4 anc_b0 = anchors[4u * g + 1u];
+            uint4 anc_a1 = anchors[4u * g + 2u];
+            uint4 anc_b1 = anchors[4u * g + 3u];
+            uint4 d0 = deltas[2u * g];
+            uint4 d1 = deltas[2u * g + 1u];
+            if (p.dead != 0u) {
+                if (((2u * g) & 127u) >= 121u) { anc_a0 = uint4(0u); anc_b0 = uint4(0u); d0 = uint4(0u); }
+                if (((2u * g + 1u) & 127u) >= 121u) { anc_a1 = uint4(0u); anc_b1 = uint4(0u); d1 = uint4(0u); }
+            }
+#ifdef K45_RHO_CLMUL
+            uint4 ra = zc_k45_mul(p.rho2, anc_a0 ^ anc_a1);
+            uint4 rb = zc_k45_mul(p.rho2, anc_b0 ^ anc_b1);
+#else
+            uint4 ra = zc_k45_mul_rho(anc_a0 ^ anc_a1, rt);
+            uint4 rb = zc_k45_mul_rho(anc_b0 ^ anc_b1, rt);
+#endif
+            uint4 a = anc_a0 ^ ra
+                    ^ zc_k45_fold8(d0.x, d0.y, nib1) ^ zc_k45_fold8(d1.x, d1.y, nib3);
+            uint4 b = anc_b0 ^ rb
+                    ^ zc_k45_fold8(d0.z, d0.w, nib1) ^ zc_k45_fold8(d1.z, d1.w, nib3);
+            a_out[g] = a;
+            b_out[g] = b;
+            av[lane] = a;
+            bv[lane] = b;
+        }
+#ifdef K45_NO_PRODUCTS
+        acc[0] ^= av[0] ^ av[1] ^ av[2] ^ av[3] ^ bv[0] ^ bv[1] ^ bv[2] ^ bv[3];
+        continue;
+#endif
+#ifndef K45_NO_HORNER
+        {
+            // Medium-constant weights: inside each aligned block of eight
+            // round-five groups, eq_lo[2t+1] = w_base * x^(2*(t&7)), and
+            // t&7 == lid&7. Raw products, shifted by the lane's exponent,
+            // reduce-scatter across the 8 lanes; lane s then owns slot s
+            // of the block and pays one weight multiply.
+            U256k pr[8];
+            uint4 ea = av[0] ^ av[2], eb = bv[0] ^ bv[2];
+            uint4 oa = av[1] ^ av[3], ob = bv[1] ^ bv[3];
+            pr[0] = clmul128(av[1], bv[1]);
+            pr[1] = clmul128(av[0] ^ av[1], bv[0] ^ bv[1]);
+            pr[2] = clmul128(av[3], bv[3]);
+            pr[3] = clmul128(av[2] ^ av[3], bv[2] ^ bv[3]);
+            pr[4] = clmul128(av[2], bv[2]);
+            pr[5] = clmul128(ea, eb);
+            pr[6] = clmul128(oa, ob);
+            pr[7] = clmul128(ea ^ oa, eb ^ ob);
+            uint e = 2u * (lid & 7u);
+            ulong h[8][5];
+            for (uint q = 0u; q < 8u; q++) {
+                ulong l0 = pr[q].r0, l1 = pr[q].r1, l2 = pr[q].r2, l3 = pr[q].r3;
+                if (e == 0u) {
+                    h[q][0] = l0; h[q][1] = l1; h[q][2] = l2; h[q][3] = l3; h[q][4] = 0ul;
+                } else {
+                    uint ce = 64u - e;
+                    h[q][0] = l0 << e;
+                    h[q][1] = (l1 << e) | (l0 >> ce);
+                    h[q][2] = (l2 << e) | (l1 >> ce);
+                    h[q][3] = (l3 << e) | (l2 >> ce);
+                    h[q][4] = l3 >> ce;
+                }
+            }
+            // Reduce-scatter over lane bits 2, 1, 0 (slot = lid & 7).
+            for (uint m = 4u, c = 8u; m > 0u; m >>= 1u, c >>= 1u) {
+                bool up = (lid & m) != 0u;
+                uint hc = c >> 1u;
+                for (uint i = 0u; i < hc; i++) {
+                    for (uint l = 0u; l < 5u; l++) {
+                        ulong lo_v = h[i][l], hi_v = h[i + hc][l];
+                        ulong send = up ? lo_v : hi_v;
+                        ulong keep = up ? hi_v : lo_v;
+                        uint2 r = simd_shuffle_xor(as_type<uint2>(send), ushort(m));
+                        h[i][l] = keep ^ as_type<ulong>(r);
+                    }
+                }
+            }
+            uint4 w_base = eq_lo[2u * (t & ~7u) + 1u];
+            U256k hp;
+            ulong top = h[0][4];
+            hp.r0 = h[0][0] ^ top ^ (top << 2) ^ (top << 4) ^ (top << 14);
+            hp.r1 = h[0][1]; hp.r2 = h[0][2]; hp.r3 = h[0][3];
+            acc[0] ^= zc_k45_mul(w_base, gf_reduce(hp));
+            continue;
+        }
+#endif
+        uint4 w = eq_lo[2u * t + 1u];
+        uint4 a0w = zc_k45_mul(w, av[0]);
+        uint4 a1w = zc_k45_mul(w, av[1]);
+        uint4 a2w = zc_k45_mul(w, av[2]);
+        uint4 a3w = zc_k45_mul(w, av[3]);
+        acc[0] ^= zc_k45_mul(a1w, bv[1]);
+        acc[1] ^= zc_k45_mul(a0w ^ a1w, bv[0] ^ bv[1]);
+        acc[2] ^= zc_k45_mul(a3w, bv[3]);
+        acc[3] ^= zc_k45_mul(a2w ^ a3w, bv[2] ^ bv[3]);
+        acc[4] ^= zc_k45_mul(a2w, bv[2]);
+        uint4 e_aw = a0w ^ a2w, e_b = bv[0] ^ bv[2];
+        uint4 o_aw = a1w ^ a3w, o_b = bv[1] ^ bv[3];
+        acc[5] ^= zc_k45_mul(e_aw, e_b);
+        acc[6] ^= zc_k45_mul(o_aw, o_b);
+        acc[7] ^= zc_k45_mul(e_aw ^ o_aw, e_b ^ o_b);
+    }
+
+#ifndef K45_NO_HORNER
+    red[lid] = acc[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint h = 128u; h >= 8u; h >>= 1u) {
+        if (lid < h) { red[lid] ^= red[lid + h]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid < 8u) { slots[tgid * 8u + lid] = red[lid]; }
+    return;
+#endif
+    for (uint s = 0u; s < 8u; s++) {
+        red[lid] = acc[s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint h = 128u; h > 0u; h >>= 1u) {
+            if (lid < h) { red[lid] ^= red[lid + h]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lid == 0u) { slots[tgid * 8u + s] = red[0]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+"#;
+
+    /// Process-lifetime Metal state for the K45 arm.
+    struct ZcK45 {
+        pso: Id,
+        touch_pso: Id,
+        /// Private queue: the shared queue is still draining earlier
+        /// committed work when the K pass starts.
+        queue: Id,
+        /// nib(λ₁) 256 | nib(λ₃) 256 | ρ₂ nibble banks 512 (uint4 each).
+        tab_buf: Id,
+        eq_lo_buf: Id,
+        eq_lo_cap: usize,
+        slot_buf: Id,
+        slot_cap: usize,
+        /// GPU-private probe outputs for the calibration prove.
+        probe_a: Id,
+        probe_b: Id,
+        probe_cap: usize,
+        /// Cached no-copy wraps `(ptr, len, buf)`.
+        wraps: Vec<(usize, usize, Id)>,
+    }
+
+    // SAFETY: same argument as `ZcR2`.
+    unsafe impl Send for ZcK45 {}
+
+    static ZC_K45_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcK45>>> =
+        std::sync::OnceLock::new();
+    static ZC_K45_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+    static ZC_K45_POISONED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Ratio override (`FLOCK_ZC_K45_GPU_FORCE_RATIO=<f64>`).
+    fn zc_k45_forced_ratio() -> Option<f64> {
+        static V: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_ZC_K45_GPU_FORCE_RATIO")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+        });
+        *V
+    }
+
+    /// The GPU owns its chunks outright (no CPU residue), so the balanced
+    /// split is `g* = hi / (1 + ratio)`; ratios beyond 8 disable the arm.
+    pub(crate) fn zc_k45_gate_share(ratio: f64, hi_size: usize) -> usize {
+        if !ratio.is_finite() || ratio <= 0.0 || ratio >= 8.0 {
+            return 0;
+        }
+        let g = (hi_size as f64 / (1.0 + ratio)).round() as usize;
+        g.min(hi_size)
+    }
+
+    fn zc_k45_init(gpu: &'static Gpu) -> Result<ZcK45, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<[Id; 2], String> {
+                let defs: String = std::env::var("FLOCK_ZC_K45_DEFS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|d| !d.is_empty())
+                    .map(|d| format!("#define {d} 1\n"))
+                    .collect();
+                let full = format!("{defs}{ZC_T3_MSL_SOURCE}\n{ZC_K45_MSL_KERNEL}");
+                let src = gpu.api.nsstring(&full)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "zc-k45 shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let mut psos = [NIL; 2];
+                for (slot, name) in psos.iter_mut().zip(["zc_k45_fold", "zc_k45_touch"]) {
+                    let ns = gpu.api.nsstring(name)?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        return Err(format!("{name} kernel not found"));
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    if pso.is_null() {
+                        send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        return Err(format!("{name} pipeline: {}", gpu.api.error_string(perr)));
+                    }
+                    *slot = pso;
+                }
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                Ok(psos)
+            })();
+            gpu.pool_pop(pool);
+            let [pso, touch_pso] = built?;
+            let tab_buf = gpu.new_buffer(1024 * 16)?;
+            let queue: Id = if std::env::var_os("FLOCK_ZC_K45_SHARED_QUEUE").is_some() {
+                gpu.queue
+            } else {
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newCommandQueue")
+            };
+            if queue.is_null() {
+                return Err("zc-k45 newCommandQueue failed".into());
+            }
+            Ok(ZcK45 {
+                pso,
+                touch_pso,
+                queue,
+                tab_buf,
+                eq_lo_buf: NIL,
+                eq_lo_cap: 0,
+                slot_buf: NIL,
+                slot_cap: 0,
+                probe_a: NIL,
+                probe_b: NIL,
+                probe_cap: 0,
+                wraps: Vec::new(),
+            })
+        }
+    }
+
+    fn zc_k45_state() -> Option<&'static std::sync::Mutex<ZcK45>> {
+        ZC_K45_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match zc_k45_init(gpu) {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if super::gpu_zc_k45_debug() {
+                            eprintln!("[zc-k45] init failed: {e}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    unsafe fn zc_k45_wrap(
+        state: &mut ZcK45,
+        gpu: &Gpu,
+        ptr: *const u8,
+        len: usize,
+    ) -> Result<Id, String> {
+        let addr = ptr as usize;
+        if let Some(&(_, _, buf)) = state.wraps.iter().find(|&&(p, l, _)| p == addr && l == len) {
+            return Ok(buf);
+        }
+        if crate::scratch::f128_range_overlaps_pin(addr, len) {
+            return Err("wrap declined: range aliases a pinned Metal view".into());
+        }
+        let t = std::time::Instant::now();
+        let buf = unsafe { gpu.wrap_buffer(ptr.cast_mut(), len)? };
+        if super::gpu_zc_k45_debug() {
+            eprintln!(
+                "[zc-k45] new wrap {addr:#x} len={len} in {:.2}ms (cache {})",
+                t.elapsed().as_secs_f64() * 1e3,
+                state.wraps.len()
+            );
+        }
+        state.wraps.push((addr, len, buf));
+        Ok(buf)
+    }
+
+    pub(crate) struct ZcK45Job {
+        cb: Id,
+        pub chunks: usize,
+        calibration: bool,
+        submitted: std::time::Instant,
+        host_s: f64,
+        // Replay arguments for calibration pricing.
+        bufs: [Id; 2],
+        lo_size: usize,
+        dead: bool,
+        rho2: F128,
+    }
+
+    // SAFETY: same argument as `ZcR2Job`.
+    unsafe impl Send for ZcK45Job {}
+
+    impl ZcK45Job {
+        /// Leading chunks the CPU must skip (the GPU writes them). Zero
+        /// during calibration: the CPU runs every chunk, the GPU probe goes
+        /// to private buffers and is compared, then discarded.
+        pub(crate) fn cpu_split(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    pub(crate) enum ZcK45Result {
+        Calibrated,
+        /// Raw eight slots per GPU chunk.
+        Prefix(Vec<[F128; 8]>),
+        Failed,
+    }
+
+    fn zc_k45_host_s() -> f64 {
+        unsafe extern "C" {
+            fn mach_absolute_time() -> u64;
+        }
+        // Apple Silicon timebase is 125/3 ns per tick.
+        (unsafe { mach_absolute_time() }) as f64 * 125.0 / 3.0 * 1e-9
+    }
+
+    unsafe fn zc_k45_submit(
+        gpu: &Gpu,
+        state: &ZcK45,
+        bufs: [Id; 2],
+        out: [Id; 2],
+        chunks: usize,
+        lo_size: usize,
+        dead: bool,
+        rho2: F128,
+    ) -> Result<Id, String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                lo_size: u32,
+                xpt: u32,
+                dead: u32,
+                pad: u32,
+                rho2: F128,
+            }
+            let params = P {
+                lo_size: lo_size as u32,
+                xpt: (lo_size / 512) as u32,
+                dead: u32::from(dead),
+                pad: 0,
+                rho2,
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            let cb: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, state.queue, c"commandBuffer");
+            if cb.is_null() {
+                return Err("zc-k45 commandBuffer failed".into());
+            }
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, state.pso);
+            gpu.set_buffer(enc, bufs[0], 0, 0);
+            gpu.set_buffer(enc, bufs[1], 0, 1);
+            gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
+            gpu.set_buffer(enc, state.tab_buf, 0, 3);
+            gpu.set_buffer(enc, out[0], 0, 4);
+            gpu.set_buffer(enc, out[1], 0, 5);
+            gpu.set_buffer(enc, state.slot_buf, 0, 6);
+            gpu.set_bytes(enc, pb, 7);
+            gpu.dispatch(enc, chunks as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// Chunk count the next launch will use (`None` = arm off), from the
+    /// same tuned state `launch_zc_k45` reads.
+    fn zc_k45_planned_chunks(hi_size: usize) -> Option<(usize, bool)> {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_zc_k45_enabled() || ZC_K45_POISONED.load(Ordering::Relaxed) || hi_size < 8 {
+            return None;
+        }
+        let tuned = ZC_K45_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        if tuned == usize::MAX {
+            Some(((hi_size / 32).clamp(8, 64), true))
+        } else {
+            Some((tuned.min(hi_size), false))
+        }
+    }
+
+    /// Wrap the prefix views the next K launch will bind and make them
+    /// resident with an empty dispatch on the arm's private queue, so the
+    /// mapping latency overlaps round two. `views` = `(ptr, bytes per chunk,
+    /// is_output)`; outputs are skipped on the calibration prove (it writes
+    /// probe buffers). Best effort: any failure just leaves the cost to
+    /// the launch.
+    pub(crate) fn zc_k45_prestage(views: &[(*const u8, usize, bool)], hi_size: usize) {
+        let Some((chunks, calibration)) = zc_k45_planned_chunks(hi_size) else {
+            return;
+        };
+        let Ok(gpu) = gpu() else { return };
+        let Some(state_mutex) = zc_k45_state() else { return };
+        let Ok(mut state) = state_mutex.lock() else { return };
+        let mut bufs = Vec::with_capacity(views.len());
+        for &(ptr, chunk_bytes, is_output) in views {
+            if is_output && calibration {
+                continue;
+            }
+            match unsafe { zc_k45_wrap(&mut state, gpu, ptr, chunks * chunk_bytes) } {
+                Ok(b) => bufs.push(b),
+                Err(_) => return,
+            }
+        }
+        if bufs.is_empty() {
+            return;
+        }
+        unsafe {
+            let pool = gpu.pool_push();
+            let cb: Id =
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, state.queue, c"commandBuffer");
+            if !cb.is_null() {
+                if let Ok(enc) = gpu.compute_encoder(cb) {
+                    gpu.set_pipeline(enc, state.touch_pso);
+                    for i in 0..4 {
+                        gpu.set_buffer(enc, bufs[i.min(bufs.len() - 1)], 0, i);
+                    }
+                    gpu.dispatch(enc, 1, 1);
+                    gpu.end_encoding(enc);
+                    gpu.commit_async(cb);
+                }
+            }
+            gpu.pool_pop(pool);
+        }
+        if super::gpu_zc_k45_debug() {
+            eprintln!("[zc-k45] prestaged {} views for {chunks} chunks", bufs.len());
+        }
+    }
+
+    /// Launch the K45 prefix. `None` = the whole pass stays on the CPU.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_k45(
+        anchors: &[F128],
+        deltas: &[u8],
+        table_l1: &[F128],
+        table_l3: &[F128],
+        rho2: F128,
+        eq_lo: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        dead: bool,
+        medium_weights: bool,
+        a_out: &mut [F128],
+        b_out: &mut [F128],
+    ) -> Option<ZcK45Job> {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_zc_k45_enabled() || ZC_K45_POISONED.load(Ordering::Relaxed) {
+            return None;
+        }
+        // The default kernel's Horner weighting is exact only when the
+        // round-five weights' low three variables are the protocol medium
+        // constants (always, at the ranked shape).
+        if !medium_weights {
+            return None;
+        }
+        let out_chunk = 2 * lo_size;
+        if table_l1.len() != 8 * 256
+            || table_l3.len() != 8 * 256
+            || lo_size < 512
+            || !lo_size.is_multiple_of(512)
+            || hi_size < 8
+            || anchors.len() != 4 * out_chunk * hi_size
+            || deltas.len() != 32 * out_chunk * hi_size
+            || a_out.len() != out_chunk * hi_size
+            || b_out.len() != out_chunk * hi_size
+            || eq_lo.len() != lo_size
+        {
+            return None;
+        }
+        let tuned = ZC_K45_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let chunks = if calibration {
+            (hi_size / 32).clamp(8, 64)
+        } else {
+            tuned.min(hi_size)
+        };
+        if chunks == 0 {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_k45_state()?;
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("zc-k45 launch", false);
+                return None;
+            }
+        };
+        unsafe {
+            let tab = gpu.buffer_contents(state.tab_buf).cast::<F128>();
+            for j in 0..8 {
+                for n in 0..16 {
+                    *tab.add(j * 32 + n) = table_l1[j * 256 + n];
+                    *tab.add(j * 32 + 16 + n) = table_l1[j * 256 + (n << 4)];
+                    *tab.add(256 + j * 32 + n) = table_l3[j * 256 + n];
+                    *tab.add(256 + j * 32 + 16 + n) = table_l3[j * 256 + (n << 4)];
+                }
+            }
+            // ρ₂ nibble banks: bank k (nibble k of the 128-bit LE value).
+            for k in 0..32usize {
+                for n in 0..16u128 {
+                    let bits = n << (4 * k);
+                    let v = F128::new(bits as u64, (bits >> 64) as u64);
+                    *tab.add(512 + k * 16 + n as usize) = rho2 * v;
+                }
+            }
+            let need_lo = lo_size * 16;
+            if state.eq_lo_cap < need_lo {
+                if state.eq_lo_cap > 0 {
+                    gpu.release(state.eq_lo_buf);
+                }
+                state.eq_lo_buf = gpu.new_buffer(need_lo).ok()?;
+                state.eq_lo_cap = need_lo;
+            }
+            std::ptr::copy_nonoverlapping(
+                eq_lo.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.eq_lo_buf),
+                need_lo,
+            );
+            let need_slots = hi_size * 8 * 16;
+            if state.slot_cap < need_slots {
+                if state.slot_cap > 0 {
+                    gpu.release(state.slot_buf);
+                }
+                state.slot_buf = gpu.new_buffer(need_slots).ok()?;
+                state.slot_cap = need_slots;
+            }
+            // Wrap only the GPU-owned prefix: mapping a fresh no-copy view
+            // costs GPU start latency in proportion to its length (~20 ms
+            // for the whole 1.5 GiB compact state on an M5 Pro).
+            let n_prefix = chunks * out_chunk;
+            let anchors_buf = zc_k45_wrap(
+                &mut state,
+                gpu,
+                anchors.as_ptr().cast::<u8>(),
+                n_prefix * 4 * 16,
+            )
+            .ok()?;
+            let deltas_buf =
+                zc_k45_wrap(&mut state, gpu, deltas.as_ptr(), n_prefix * 32).ok()?;
+            let out = if calibration {
+                let need = chunks * out_chunk * 16;
+                if state.probe_cap < need {
+                    if state.probe_cap > 0 {
+                        gpu.release(state.probe_a);
+                        gpu.release(state.probe_b);
+                    }
+                    state.probe_a = gpu.new_buffer(need).ok()?;
+                    state.probe_b = gpu.new_buffer(need).ok()?;
+                    state.probe_cap = need;
+                }
+                [state.probe_a, state.probe_b]
+            } else {
+                let a_buf =
+                    zc_k45_wrap(&mut state, gpu, a_out.as_ptr().cast::<u8>(), n_prefix * 16)
+                        .ok()?;
+                let b_buf =
+                    zc_k45_wrap(&mut state, gpu, b_out.as_ptr().cast::<u8>(), n_prefix * 16)
+                        .ok()?;
+                [a_buf, b_buf]
+            };
+            let bufs = [anchors_buf, deltas_buf];
+            let cb = zc_k45_submit(gpu, &state, bufs, out, chunks, lo_size, dead, rho2).ok()?;
+            Some(ZcK45Job {
+                cb,
+                chunks,
+                calibration,
+                submitted: std::time::Instant::now(),
+                host_s: zc_k45_host_s(),
+                bufs,
+                lo_size,
+                dead,
+                rho2,
+            })
+        }
+    }
+
+    /// Drain the K45 arm. On calibration `cpu` carries the CPU's raw slots
+    /// and outputs for the probed chunks (compared exactly, then priced).
+    pub(crate) fn zc_k45_wait(
+        job: ZcK45Job,
+        cpu: Option<(&[[F128; 8]], &[F128], &[F128])>,
+        cpu_wall_ms: f64,
+        hi_size: usize,
+    ) -> ZcK45Result {
+        use std::sync::atomic::Ordering;
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return ZcK45Result::Failed,
+        };
+        let poison = |cb: Id| {
+            ZC_K45_POISONED.store(true, Ordering::Relaxed);
+            ZC_K45_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(cb) };
+            ZcK45Result::Failed
+        };
+        unsafe {
+            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+                return poison(job.cb);
+            }
+            let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+            if super::gpu_zc_k45_debug() {
+                let start: f64 = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> f64, job.cb, c"GPUStartTime");
+                eprintln!(
+                    "[zc-k45] start delay {:.2}ms (calib={})",
+                    (start - job.host_s) * 1e3,
+                    job.calibration
+                );
+            }
+            let state_mutex = match zc_k45_state() {
+                Some(s) => s,
+                None => return poison(job.cb),
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    note_poisoned_lock("zc-k45 wait", false);
+                    return poison(job.cb);
+                }
+            };
+            let slots = gpu.buffer_contents(state.slot_buf).cast::<F128>();
+            let mut out = Vec::with_capacity(job.chunks);
+            for c in 0..job.chunks {
+                let mut s = [F128::ZERO; 8];
+                for (k, v) in s.iter_mut().enumerate() {
+                    *v = *slots.add(c * 8 + k);
+                }
+                out.push(s);
+            }
+            if !job.calibration {
+                gpu.release(job.cb);
+                // Re-balance on every timed prove from both arms' measured
+                // per-chunk walls under real contention (the calibration
+                // prove is cold and over-prices the CPU). Half-step toward
+                // the balanced share; never below one chunk once enabled.
+                let drain_ms = job.submitted.elapsed().as_secs_f64() * 1e3;
+                let cpu_chunks = hi_size.saturating_sub(job.chunks);
+                if first_wall > 0.0 && cpu_wall_ms > 0.0 && cpu_chunks > 0 {
+                    let u_gpu = first_wall.max(drain_ms.min(first_wall * 2.0)) / job.chunks as f64;
+                    let u_cpu = cpu_wall_ms / cpu_chunks as f64;
+                    let target = zc_k45_gate_share(u_gpu / u_cpu, hi_size);
+                    let next = ((job.chunks + target) / 2).max(usize::from(target > 0));
+                    ZC_K45_TUNED.store(next, Ordering::Relaxed);
+                }
+                if super::gpu_zc_k45_debug() {
+                    eprintln!(
+                        "[zc-k45] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
+                         submit-to-drain={drain_ms:.2}ms cpu={cpu_wall_ms:.2}ms next={}",
+                        job.chunks,
+                        hi_size,
+                        ZC_K45_TUNED.load(Ordering::Relaxed),
+                    );
+                }
+                return ZcK45Result::Prefix(out);
+            }
+
+            // ---- Calibration (warmup prove, once per process) ----
+            let Some((cpu_slots, cpu_a, cpu_b)) = cpu else {
+                return poison(job.cb);
+            };
+            let n_out = job.chunks * 2 * job.lo_size;
+            let pa = gpu.buffer_contents(state.probe_a).cast::<F128>();
+            let pb = gpu.buffer_contents(state.probe_b).cast::<F128>();
+            let outputs_match = cpu_a.len() >= n_out
+                && cpu_b.len() >= n_out
+                && (0..n_out).all(|i| *pa.add(i) == cpu_a[i] && *pb.add(i) == cpu_b[i]);
+            if !outputs_match || cpu_slots.len() < job.chunks || out[..] != cpu_slots[..job.chunks]
+            {
+                if super::gpu_zc_k45_debug() {
+                    eprintln!(
+                        "[zc-k45] CALIBRATION MISMATCH (outputs_match={outputs_match}) gpu={first_wall:.2}ms — poisoned"
+                    );
+                }
+                return poison(job.cb);
+            }
+            let mut walls = [0.0f64; 3];
+            walls[0] = first_wall.max(0.0);
+            let mut n_walls = usize::from(walls[0] > 0.0);
+            let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
+            gpu.release(job.cb);
+            while n_walls < walls.len() {
+                let Ok(cb2) = zc_k45_submit(
+                    gpu,
+                    &state,
+                    job.bufs,
+                    [state.probe_a, state.probe_b],
+                    job.chunks,
+                    job.lo_size,
+                    job.dead,
+                    job.rho2,
+                ) else {
+                    break;
+                };
+                let w = if gpu.wait_cb(cb2).is_ok() {
+                    zc_fold_gpu_wall_ms(gpu, cb2)
+                } else {
+                    0.0
+                };
+                gpu.release(cb2);
+                if w <= 0.0 {
+                    break;
+                }
+                walls[n_walls] = w;
+                n_walls += 1;
+                let prev_min = w_min;
+                w_min = w_min.min(w);
+                if n_walls >= 2 && w > 0.95 * prev_min {
+                    break;
+                }
+            }
+            drop(state);
+            let u_gpu = if n_walls > 0 && w_min < f64::MAX {
+                w_min / job.chunks as f64
+            } else {
+                f64::INFINITY
+            };
+            let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+            let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
+                let measured = u_gpu / u_cpu;
+                let ratio = zc_k45_forced_ratio().unwrap_or(measured);
+                let g = zc_k45_gate_share(ratio, hi_size);
+                if super::gpu_zc_k45_debug() {
+                    eprintln!("[zc-k45] gate replay walls: {:?}", &walls[..n_walls]);
+                    eprintln!(
+                        "[zc-k45] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
+                         ratio={measured:.3} -> share {g}/{hi_size}"
+                    );
+                }
+                g
+            } else {
+                0
+            };
+            ZC_K45_TUNED.store(share, Ordering::Relaxed);
+            ZcK45Result::Calibrated
+        }
+    }
 }
 
 // Test-harness entry points (copy-in/copy-out); production goes through
@@ -15537,6 +16439,10 @@ pub(crate) use imp::{ZcT3Job, ZcT3Result, launch_zc_t3_products, zc_t3_wait};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcLoopJob, ZcLoopResult, launch_zc_loop_products, zc_loop_wait};
+
+/// Zerocheck cascade K pass GPU arm (see `ENV_NO_GPU_ZC_K45`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{ZcK45Result, launch_zc_k45, zc_k45_prestage, zc_k45_wait};
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {

@@ -1828,6 +1828,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         deltas,
         dead_tail: false,
     };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if k_pass_only {
+        prestage_k45_inputs(
+            compact.anchors.as_ptr(),
+            compact.deltas.full_overwrite_ptr().cast_const(),
+            n_pairs,
+        );
+    }
 
     let n_vars = mlv_challenges.len() - 1;
     let eq = take_or_build_r2_eq(&mlv_challenges[1..], lookahead_n_hi(n_vars));
@@ -2409,6 +2417,43 @@ fn cascade_k_pass_n_hi(n_vars: usize) -> usize {
     COMPACT_RECONSTRUCTION_N_HI.min(n_vars.saturating_sub(1))
 }
 
+/// `(lo_size, hi_size)` of the cascade K pass over `n_groups` outputs —
+/// the same split [`fold2_compact_and_round45_into`] derives.
+pub(crate) fn cascade_k_pass_geometry(n_groups: usize) -> (usize, usize) {
+    let n_vars = (n_groups.trailing_zeros() as usize).saturating_sub(1);
+    let hi_size = 1usize << cascade_k_pass_n_hi(n_vars);
+    (n_groups / (2 * hi_size), hi_size)
+}
+
+/// Prestage the K45 GPU arm's input views (compact anchors/deltas) while
+/// round two runs; see `gpu_commit::zc_k45_prestage`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn prestage_k45_inputs(anchors: *const F128, deltas: *const u8, n_pairs: usize) {
+    let (lo_size, hi_size) = cascade_k_pass_geometry(n_pairs / 2);
+    let out_chunk = 2 * lo_size;
+    crate::gpu_commit::zc_k45_prestage(
+        &[
+            (anchors.cast::<u8>(), out_chunk * 64, false),
+            (deltas, out_chunk * 32, false),
+        ],
+        hi_size,
+    );
+}
+
+/// Prestage the K45 GPU arm's output views; see [`prestage_k45_inputs`].
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn prestage_k45_outputs(a_out: &[F128], b_out: &[F128]) {
+    let (lo_size, hi_size) = cascade_k_pass_geometry(a_out.len());
+    let out_chunk = 2 * lo_size;
+    crate::gpu_commit::zc_k45_prestage(
+        &[
+            (a_out.as_ptr().cast::<u8>(), out_chunk * 16, true),
+            (b_out.as_ptr().cast::<u8>(), out_chunk * 16, true),
+        ],
+        hi_size,
+    );
+}
+
 /// Cascade K pass: [`fold2_compact_and_round4_into`] **plus** the deferred
 /// round-five coefficients, in the same single pass over the compact state.
 ///
@@ -2494,6 +2539,38 @@ pub(crate) fn fold2_compact_and_round45_into(
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
 
+    // GPU K45 arm: the GPU owns a measured prefix of hi-chunks outright
+    // (outputs + raw slots); the CPU skips those chunks and weights the
+    // GPU's slots exactly as it weights its own. Calibration (first prove
+    // of the process) runs every chunk on the CPU and compares the probe.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = crate::gpu_commit::launch_zc_k45(
+        &compact.anchors,
+        &compact.deltas,
+        &table_l1,
+        &table_l3,
+        rho2,
+        eq_lo,
+        lo_size,
+        hi_size,
+        compact.dead_tail,
+        r_next4.len() >= 5
+            && r_next4[2..5]
+                == crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash()[1..4],
+        a_out,
+        b_out,
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let (gpu_prefix, probe_chunks) = match gpu_job.as_ref() {
+        Some(j) if j.is_calibration() => (0, j.chunks),
+        Some(j) => (j.cpu_split(), 0),
+        None => (0, 0),
+    };
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let (gpu_prefix, probe_chunks) = (0usize, 0usize);
+    let mut probe_slots: Vec<[F128; 8]> = vec![[F128::ZERO; 8]; probe_chunks];
+    let probe_base = crate::epool::SyncPtr(probe_slots.as_mut_ptr());
+
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     // [p1_odd, pinf_odd, W0', W3', W4', W5'], eq_hi-weighted, one per chunk.
     let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
@@ -2501,7 +2578,26 @@ pub(crate) fn fold2_compact_and_round45_into(
     let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    let finish_chunk = |x_hi: usize, outv: &[F128; 8]| {
+        let eq_h = eq_hi[x_hi];
+        // `outv[0..2]` carry the even round-4 pairs on the odd lane's weight;
+        // κ restores `eq₄(2y')` exactly (field arithmetic, no rounding).
+        let p1 = kappa * outv[0] + outv[2];
+        let pinf = kappa * outv[1] + outv[3];
+        // SAFETY: exclusive owner of both partial slots (see above).
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            *la_base.ptr().add(x_hi) = [
+                eq_h * outv[2],
+                eq_h * outv[3],
+                eq_h * outv[4],
+                eq_h * outv[5],
+                eq_h * outv[6],
+                eq_h * outv[7],
+            ];
+        }
+    };
+    let cpu_chunk = |x_hi: usize| {
         // SAFETY: exclusive per-chunk ownership; the queue join publishes the
         // writes before the reduction below reads them.
         let (a_ptr, b_ptr) = unsafe {
@@ -2558,25 +2654,89 @@ pub(crate) fn fold2_compact_and_round45_into(
             );
         }
 
-        let eq_h = eq_hi[x_hi];
-        // `outv[0..2]` carry the even round-4 pairs on the odd lane's weight;
-        // κ restores `eq₄(2y')` exactly (field arithmetic, no rounding).
-        let p1 = kappa * outv[0] + outv[2];
-        let pinf = kappa * outv[1] + outv[3];
-        // SAFETY: exclusive owner of both partial slots (see above).
-        unsafe {
-            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
-            *la_base.ptr().add(x_hi) = [
-                eq_h * outv[2],
-                eq_h * outv[3],
-                eq_h * outv[4],
-                eq_h * outv[5],
-                eq_h * outv[6],
-                eq_h * outv[7],
-            ];
+        if x_hi < probe_chunks {
+            // SAFETY: slot x_hi is written by this chunk only.
+            unsafe { *probe_base.ptr().add(x_hi) = outv };
         }
-    });
+        finish_chunk(x_hi, &outv);
+    };
+    let t_cpu = std::time::Instant::now();
+    crate::epool::run_hetero_chunks(hi_size - gpu_prefix, |i| cpu_chunk(gpu_prefix + i));
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        use crate::gpu_commit::ZcK45Result;
+        let mut cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
+        if probe_chunks > 0 {
+            // The calibration prove is the worker's cold warm-up (first-touch
+            // faults on a_out/b_out): price the CPU from a warm replay of a
+            // quarter of the chunks instead. The replay rewrites identical
+            // values into the same slots.
+            let replay = (hi_size / 4).max(1);
+            let t_replay = std::time::Instant::now();
+            crate::epool::run_hetero_chunks(replay, |i| cpu_chunk(hi_size - replay + i));
+            cpu_ms = t_replay.elapsed().as_secs_f64() * 1e3 * hi_size as f64 / replay as f64;
+        }
+        let calib = if probe_chunks > 0 {
+            // SAFETY: the CPU sweep has joined; nothing else writes a/b now.
+            Some(unsafe {
+                (
+                    &probe_slots[..],
+                    std::slice::from_raw_parts(a_base.ptr().cast_const(), out_chunk * probe_chunks),
+                    std::slice::from_raw_parts(b_base.ptr().cast_const(), out_chunk * probe_chunks),
+                )
+            })
+        } else {
+            None
+        };
+        match crate::gpu_commit::zc_k45_wait(job, calib, cpu_ms, hi_size) {
+            ZcK45Result::Prefix(slots) if slots.len() == gpu_prefix => {
+                for (x_hi, outv) in slots.iter().enumerate() {
+                    finish_chunk(x_hi, outv);
+                }
+            }
+            ZcK45Result::Calibrated => {}
+            _ => {
+                // GPU failed after the CPU skipped its prefix: redo it exactly.
+                if gpu_prefix > 0 {
+                    crate::epool::run_hetero_chunks(gpu_prefix, cpu_chunk);
+                }
+            }
+        }
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = t_cpu;
 
+    if std::env::var_os("FLOCK_EB_STATS").is_some() {
+        let np = compact.len();
+        let anc = &compact.anchors;
+        let dl: &[u8] = &compact.deltas;
+        let one = F128::ONE;
+        let (mut bdeg, mut bone, mut azero, mut dead) = (0usize, 0usize, 0usize, 0usize);
+        let (mut line_bdeg, mut lines) = (0usize, 0usize);
+        let (mut a_d0, mut b_d0) = (0usize, 0usize);
+        let mut bvals = std::collections::HashMap::<(u64, u64), usize>::new();
+        for l in 0..np / 8 {
+            let mut all = true;
+            for p in 8 * l..8 * l + 8 {
+                if compact.dead_tail && (p & 127) >= 121 { dead += 1; all = false; continue; }
+                let db = &dl[16 * p + 8..16 * p + 16];
+                let da = &dl[16 * p..16 * p + 8];
+                let dbz = db.iter().all(|&x| x == 0);
+                let daz = da.iter().all(|&x| x == 0);
+                if daz { a_d0 += 1; }
+                if dbz { b_d0 += 1; }
+                if dbz { bdeg += 1; } else { all = false; }
+                if dbz && anc[2 * p + 1] == one { bone += 1; }
+                if daz && anc[2 * p] == F128::ZERO { azero += 1; }
+                if p % 64 == 0 { *bvals.entry((anc[2*p+1].lo, anc[2*p+1].hi)).or_default() += 1; }
+            }
+            lines += 1;
+            if all { line_bdeg += 1; }
+        }
+        let mut top: Vec<_> = bvals.into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("[eb-stats] pairs={np} dead={dead} b_delta0={b_d0} a_delta0={a_d0} b_const={bdeg} b_one={bone} a_zero={azero} lines8={lines} lines_all_bconst={line_bdeg} top_b_anchor={:?}", &top[..top.len().min(4)]);
+    }
     let (sum1, sum_inf) = partials
         .iter()
         .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
