@@ -638,6 +638,115 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
     }
 }
 
+/// Load four 64-byte message blocks spaced `stride` bytes apart and transpose
+/// them into word-major lanes (lane `j` = block `j`), exactly as
+/// [`transpose_parent4`] does for contiguous blocks.
+#[inline(always)]
+unsafe fn transpose_block4_strided(base: *const u8, stride: usize, out: &mut [uint32x4_t; 16]) {
+    unsafe {
+        for word_vec in 0..4 {
+            let word_offset = word_vec * 16;
+            let mut rows = [
+                vreinterpretq_u32_u8(vld1q_u8(base.add(word_offset))),
+                vreinterpretq_u32_u8(vld1q_u8(base.add(stride + word_offset))),
+                vreinterpretq_u32_u8(vld1q_u8(base.add(2 * stride + word_offset))),
+                vreinterpretq_u32_u8(vld1q_u8(base.add(3 * stride + word_offset))),
+            ];
+            transpose4(&mut rows);
+            out[word_vec * 4..word_vec * 4 + 4].copy_from_slice(&rows);
+        }
+    }
+}
+
+/// Hash complete groups of twelve contiguous 128-byte Merkle leaves: each
+/// leaf is one two-block BLAKE3 chunk (counter zero, `CHUNK_START` on block
+/// zero, `CHUNK_END` on block one, no `ROOT`), i.e. the same chaining value
+/// upstream `hash_many::<128>` returns for the recursive-commit leaf shape.
+/// Three independent four-lane states per round, as in the parent kernel.
+/// Returns the number of outputs written; the caller hashes the tail.
+pub(super) fn hash_complete_leaf128_groups(data: &[u8], out: &mut [[u8; 32]]) -> usize {
+    debug_assert_eq!(data.len(), out.len() * 128);
+    let groups = out.len() / 12;
+    if groups == 0 {
+        return 0;
+    }
+
+    unsafe {
+        let zero = vdupq_n_u32(0);
+        let iv = [
+            vdupq_n_u32(IV[0]),
+            vdupq_n_u32(IV[1]),
+            vdupq_n_u32(IV[2]),
+            vdupq_n_u32(IV[3]),
+            vdupq_n_u32(IV[4]),
+            vdupq_n_u32(IV[5]),
+            vdupq_n_u32(IV[6]),
+            vdupq_n_u32(IV[7]),
+        ];
+        let block_len = vdupq_n_u32(64);
+        let start_flags = vdupq_n_u32(1);
+        let end_flags = vdupq_n_u32(2);
+        let init0 = [
+            iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], iv[6], iv[7], iv[0], iv[1], iv[2], iv[3],
+            zero, zero, block_len, start_flags,
+        ];
+        for group in 0..groups {
+            let input = data.as_ptr().add(group * 12 * 128);
+            let mut m0 = [zero; 16];
+            let mut m1 = [zero; 16];
+            let mut m2 = [zero; 16];
+
+            // Block zero of each leaf (bytes 0..64), CHUNK_START.
+            transpose_block4_strided(input, 128, &mut m0);
+            transpose_block4_strided(input.add(4 * 128), 128, &mut m1);
+            transpose_block4_strided(input.add(8 * 128), 128, &mut m2);
+            let mut v0 = init0;
+            let mut v1 = init0;
+            let mut v2 = init0;
+            for schedule in &MSG_SCHEDULE {
+                round3(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
+            }
+            // Chaining value h' = v[0..8] ^ v[8..16], then block one with
+            // CHUNK_END under that chaining value.
+            let next = |v: &[uint32x4_t; 16]| -> [uint32x4_t; 16] {
+                [
+                    veorq_u32(v[0], v[8]),
+                    veorq_u32(v[1], v[9]),
+                    veorq_u32(v[2], v[10]),
+                    veorq_u32(v[3], v[11]),
+                    veorq_u32(v[4], v[12]),
+                    veorq_u32(v[5], v[13]),
+                    veorq_u32(v[6], v[14]),
+                    veorq_u32(v[7], v[15]),
+                    iv[0],
+                    iv[1],
+                    iv[2],
+                    iv[3],
+                    zero,
+                    zero,
+                    block_len,
+                    end_flags,
+                ]
+            };
+            v0 = next(&v0);
+            v1 = next(&v1);
+            v2 = next(&v2);
+            transpose_block4_strided(input.add(64), 128, &mut m0);
+            transpose_block4_strided(input.add(4 * 128 + 64), 128, &mut m1);
+            transpose_block4_strided(input.add(8 * 128 + 64), 128, &mut m2);
+            for schedule in &MSG_SCHEDULE {
+                round3(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
+            }
+
+            let output = out.as_mut_ptr().cast::<u8>().add(group * 12 * 32);
+            store_cv4(&mut v0, output);
+            store_cv4(&mut v1, output.add(4 * 32));
+            store_cv4(&mut v2, output.add(8 * 32));
+        }
+    }
+    groups * 12
+}
+
 /// Shared driver: hash complete groups of twelve contiguous 64-byte blocks
 /// with the given BLAKE3 domain `flags`. Returns the number of outputs
 /// written; the caller handles the tail through upstream `hash_many`.

@@ -98,6 +98,8 @@ use kernels::aarch64::{
     fold2_and_message_lookahead_aarch64, fold2_compact_and_round4_chunk_neon_8,
     fold2_compact_and_round45_chunk_neon_8,
 };
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+use kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::{
     fold2_and_message_lookahead_normal_expanded_aarch64,
@@ -128,6 +130,14 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 #[cfg(target_arch = "aarch64")]
 fn r2_degen_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
+}
+
+/// Kill switch for the fused cascade K kernel
+/// (`fold2_compact_and_round45_chunk_neon_8_fused`): `FLOCK_NO_ZC_K_FUSED=1`
+/// restores the one-body compact kernel. Same stores and slots either way.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn cascade_k_fused_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_ZC_K_FUSED").is_none_or(|v| v != *"1")
 }
 
 /// Kill switch for the ranked BLAKE3 periodic-padding schedule in round two:
@@ -2030,6 +2040,19 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         }
 
         let eq_h = eq_hi[x_hi];
+        if even_on_gpu {
+            unsafe {
+                *la_base.ptr().add(x_hi) = [
+                    F128::ZERO,
+                    F128::ZERO,
+                    eq_h * out[4],
+                    eq_h * out[5],
+                    eq_h * out[6],
+                    eq_h * out[7],
+                ];
+            }
+            return;
+        }
         // `out[0..2]` carry the even lane on the odd lane's weight; κ restores
         // `eq₂(2y)` exactly (field arithmetic, no rounding).
         let p1 = kappa * out[0] + out[2];
@@ -2493,6 +2516,10 @@ pub(crate) fn fold2_compact_and_round45_into(
     );
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let fused_k = cascade_k_fused_enabled();
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
+    let fused_k = false;
 
     let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
     // [p1_odd, pinf_odd, W0', W3', W4', W5'], eq_hi-weighted, one per chunk.
@@ -2518,34 +2545,27 @@ pub(crate) fn fold2_compact_and_round45_into(
         unsafe {
             let anchors = compact.anchors.as_ptr().add(2 * pair_base);
             let deltas = compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2);
-            if compact.dead_tail {
-                fold2_compact_and_round45_chunk_neon_8::<true>(
-                    table_l1.as_ptr().cast::<u8>(),
-                    table_l3.as_ptr().cast::<u8>(),
-                    rho2,
-                    anchors,
-                    deltas,
-                    a_ptr,
-                    b_ptr,
-                    eq_lo.as_ptr(),
-                    lo_size,
-                    degen,
-                    outv.as_mut_ptr(),
-                );
-            } else {
-                fold2_compact_and_round45_chunk_neon_8::<false>(
-                    table_l1.as_ptr().cast::<u8>(),
-                    table_l3.as_ptr().cast::<u8>(),
-                    rho2,
-                    anchors,
-                    deltas,
-                    a_ptr,
-                    b_ptr,
-                    eq_lo.as_ptr(),
-                    lo_size,
-                    degen,
-                    outv.as_mut_ptr(),
-                );
+            let (t1, t3) = (
+                table_l1.as_ptr().cast::<u8>(),
+                table_l3.as_ptr().cast::<u8>(),
+            );
+            let eq_ptr = eq_lo.as_ptr();
+            let out_ptr = outv.as_mut_ptr();
+            match (fused_k, compact.dead_tail) {
+                #[cfg(target_feature = "sha3")]
+                (true, true) => fold2_compact_and_round45_chunk_neon_8_fused::<true>(
+                    t1, t3, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                ),
+                #[cfg(target_feature = "sha3")]
+                (true, false) => fold2_compact_and_round45_chunk_neon_8_fused::<false>(
+                    t1, t3, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                ),
+                (_, true) => fold2_compact_and_round45_chunk_neon_8::<true>(
+                    t1, t3, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                ),
+                (_, false) => fold2_compact_and_round45_chunk_neon_8::<false>(
+                    t1, t3, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                ),
             }
         }
 

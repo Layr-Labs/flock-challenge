@@ -2503,14 +2503,18 @@ fn butterfly_interleaved_fused_3layer_range_par_rows(
     let block_elems = 8 * eighth * num_ntts;
     debug_assert_eq!(data.len(), num_blocks * block_elems);
     debug_assert!(odd_tail == 0 || eighth.is_multiple_of(2));
+    // The block-range caller derives eighth from a power-of-two block of at least eight rows.
+    debug_assert!(eighth.is_power_of_two());
+    let block_shift = eighth.trailing_zeros();
+    let row_mask = eighth - 1;
     let zero_root: Vec<bool> = twiddles
         .iter()
         .map(|t| t[0] == F128::ZERO && t[1] == F128::ZERO && t[3] == F128::ZERO)
         .collect();
     let base = data.as_mut_ptr() as usize;
-    let job = |job: usize| {
-        let block = job / eighth;
-        let r = job % eighth;
+    let job = move |job: usize| {
+        let block = job >> block_shift;
+        let r = job & row_mask;
         let lanes = if r & 1 == 1 {
             num_ntts - odd_tail
         } else {
@@ -3778,6 +3782,32 @@ mod block_range_equivalence {
             );
         }
         assert_eq!(full, split, "layer-4 split diverges");
+    }
+
+    #[test]
+    fn block_range_parallel_suffix_matches_scalar() {
+        let (log_d, start_layer, num_ntts) = (12usize, 2usize, 4usize);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let src: Vec<F128> = (0..(1usize << log_d) * num_ntts)
+            .map(|i| {
+                let word = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                F128::new(word, word.rotate_left(29) ^ 0xd1b5_4a32_d192_ed03)
+            })
+            .collect();
+        let mut full = src.clone();
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut full, num_ntts, start_layer);
+        let block_elems = (1usize << (log_d - start_layer)) * num_ntts;
+        for (b_start, b_end) in [(0usize, 4usize), (1, 4), (1, 3), (3, 4)] {
+            let mut got = src.clone();
+            ntt.forward_transform_interleaved_block_range(
+                &mut got, num_ntts, start_layer, log_d, b_start, b_end, 0,
+            );
+            let start = b_start * block_elems;
+            let end = b_end * block_elems;
+            assert_eq!(&got[..start], &src[..start]);
+            assert_eq!(&got[start..end], &full[start..end]);
+            assert_eq!(&got[end..], &src[end..]);
+        }
     }
 
     #[test]
