@@ -5771,7 +5771,8 @@ kernel void blake3_pow_scan(
 
     /// Encode leaves + all parent levels of ONE aligned subtree
     /// (`subtree_leaves` a power of two, `leaf_start` aligned to it), writing
-    /// into the subtree's slots of the GLOBAL flat tree layout.
+    /// into the subtree's slots of the GLOBAL flat tree layout. A stop of 16
+    /// leaves the shared top to the hybrid CPU join; 1 completes the subtree.
     pub(crate) unsafe fn encode_merkle_subtree(
         gpu: &Gpu,
         enc: Id,
@@ -5780,6 +5781,7 @@ kernel void blake3_pow_scan(
         n_leaves_total: usize,
         leaf_start: usize,
         subtree_leaves: usize,
+        stop_at_level_len: usize,
     ) {
         unsafe {
             encode_merkle_subtree_impl(
@@ -5790,6 +5792,7 @@ kernel void blake3_pow_scan(
                 n_leaves_total,
                 leaf_start,
                 subtree_leaves,
+                stop_at_level_len,
                 super::select_gpu_parent3(n_leaves_total, super::gpu_parent3_enabled()),
             )
         }
@@ -5803,10 +5806,12 @@ kernel void blake3_pow_scan(
         n_leaves_total: usize,
         leaf_start: usize,
         subtree_leaves: usize,
+        stop_at_level_len: usize,
         parent3: bool,
     ) {
         debug_assert!(subtree_leaves.is_power_of_two());
         debug_assert_eq!(leaf_start % subtree_leaves, 0);
+        debug_assert!(matches!(stop_at_level_len, 1 | 16));
         unsafe {
             // Vectorized-kernel swap: identical dispatch geometry and output
             // bytes; NIL (kill switch / compile failure) keeps the incumbent.
@@ -5867,6 +5872,8 @@ kernel void blake3_pow_scan(
             // Consume three parent levels per dispatch while all three local
             // ranges contain whole 256-child groups. Each output retains its
             // ordinary global flat-tree slot, so opening is unchanged.
+            // The minimum 32 local outputs imply at least 32 global nodes,
+            // so this pass cannot cross either supported stop (1 or 16).
             if parent3 {
                 gpu.set_pipeline(enc, pso_parent3);
                 while local_len >= 256 {
@@ -5897,7 +5904,7 @@ kernel void blake3_pow_scan(
             }
 
             gpu.set_pipeline(enc, gpu.pso_parent);
-            while local_len > 1 {
+            while local_len > 1 && level_len > stop_at_level_len {
                 let write_level_start = level_start + level_len;
                 let n_out = local_len / 2;
                 gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
@@ -6881,7 +6888,7 @@ kernel void blake3_pow_scan(
                 while start % size != 0 {
                     size >>= 1;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size, 16);
                 start += size;
             }
             gpu.end_encoding(enc);
@@ -6935,7 +6942,7 @@ kernel void blake3_pow_scan(
                 while start % size != 0 {
                     size >>= 1;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size, 16);
                 start += size;
             }
             gpu.end_encoding(enc);
@@ -7057,7 +7064,7 @@ kernel void blake3_pow_scan(
                         while sstart % size != 0 {
                             size >>= 1;
                         }
-                        encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size);
+                        encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size, 16);
                         sstart += size;
                     }
                     gpu.end_encoding(enc);
@@ -16630,6 +16637,17 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_parent3_subtree_layout_matches_cpu_compact() {
+        gpu_parent3_subtree_case(1);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_hybrid_merkle_cutoff_matches_cpu_compact() {
+        gpu_parent3_subtree_case(16);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_parent3_subtree_case(stop_at_level_len: usize) {
         use super::imp;
 
         const N_LEAVES: usize = 1 << 10;
@@ -16668,6 +16686,7 @@ mod tests {
                 N_LEAVES,
                 LEAF_START,
                 SUBTREE_LEAVES,
+                stop_at_level_len,
                 true,
             );
             gpu.end_encoding(enc);
@@ -16692,7 +16711,7 @@ mod tests {
             let end = start + local_len;
             assert_eq!(&initial[start..end], &expect[start..end]);
             affected[start..end].fill(true);
-            if local_len == 1 {
+            if local_len == 1 || level_len == stop_at_level_len {
                 break;
             }
             level_start += level_len;
@@ -16703,10 +16722,27 @@ mod tests {
         assert!(
             initial
                 .iter()
-                .zip(affected)
-                .all(|(node, touched)| touched || *node == SENTINEL),
+                .zip(&affected)
+                .all(|(node, touched)| *touched || *node == SENTINEL),
             "parent3 subtree encoder wrote outside its owned flat-tree ranges",
         );
+        if stop_at_level_len == 16 {
+            // Supply the other owner's retained nodes, then let the existing
+            // CPU path fill the sentinel top. Compare every flat-tree slot.
+            let retained_end = 2 * N_LEAVES - 16;
+            for i in 0..retained_end {
+                if !affected[i] {
+                    initial[i] = expect[i];
+                }
+            }
+            let completed = crate::merkle::merkle_tree_from_prehashed_level(
+                initial,
+                N_LEAVES,
+                crate::merkle::HashKind::Blake3,
+                N_LEAVES.ilog2() as usize - 4,
+            );
+            assert_eq!(completed, expect);
+        }
     }
 
     #[test]

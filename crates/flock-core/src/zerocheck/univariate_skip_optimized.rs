@@ -2590,8 +2590,9 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                 rayon::current_num_threads(),
                 zc_ab_bank_deferred_enabled(),
             );
-            crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-                let mut partial = [F128::ZERO; ELL];
+            // Both bank finish paths overwrite every lane before reading it.
+            // Keep one partial per draining worker instead of clearing it per job.
+            crate::epool::run_hetero_chunks_stateful(hi_size, || [F128::ZERO; ELL], |partial, x_hi| {
                 AB_EQ_FOLD_BANKS.with(|cell| {
                     let mut banks = cell.borrow_mut();
                     if banks.len() != bank_len {
@@ -2612,13 +2613,13 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                         bank_bits,
                         bank_deferred,
                         &mut banks,
-                        &mut partial,
+                        partial,
                     );
                 });
                 // SAFETY: each queue index owns one disjoint output slot and
                 // the synchronous queue join publishes all writes before
                 // reduction.
-                unsafe { *partials_base.ptr().add(x_hi) = partial };
+                unsafe { *partials_base.ptr().add(x_hi) = *partial };
             });
             crate::scratch::give_f128(tables);
         }
@@ -6125,16 +6126,19 @@ mod tests {
     #[test]
     fn ab_bank_deferred_finish_matches_scalar_collapse() {
         let mut rng = Rng::new(0xABBA_1280_0064);
+        let sentinel = F128::new(0xdead_beef_dead_beef, 0xfeed_face_feed_face);
+        let mut reused_scalar = [sentinel; ELL];
+        let mut reused_deferred = [sentinel; ELL];
         for trial in 0..16 {
             let eq_bot = rng.f128_vec(128);
             let banks = rng.f128_vec(128 * ELL);
             let eq_hi = if trial == 0 { F128::ZERO } else { rng.f128() };
-            let sentinel = F128::new(0xdead_beef_dead_beef, 0xfeed_face_feed_face);
             let mut scalar = [sentinel; ELL];
-            let mut deferred = [sentinel; ELL];
             finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, false, &mut scalar);
-            finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, true, &mut deferred);
-            assert_eq!(deferred, scalar, "trial={trial}");
+            finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, false, &mut reused_scalar);
+            finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, true, &mut reused_deferred);
+            assert_eq!(reused_scalar, scalar, "scalar reuse trial={trial}");
+            assert_eq!(reused_deferred, scalar, "deferred reuse trial={trial}");
         }
     }
 
