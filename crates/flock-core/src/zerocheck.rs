@@ -800,6 +800,18 @@ fn prove_packed_padded_inner<C: Challenger>(
     // only the cascade K pass will read may skip its dead padding pairs.
     let use_cascade = use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
 
+    // K outputs are allocated ahead of round two (cascade route only) so the
+    // K45 GPU arm can map its output views while round two runs.
+    let mut k_outs: Option<(Vec<F128>, Vec<F128>)> = None;
+    if use_cascade {
+        let n_groups = (1usize << (m - k_skip)) / 4;
+        let a = crate::scratch::take_f128_unpinned(n_groups);
+        let b = crate::scratch::take_f128_unpinned(n_groups);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        crate::zerocheck::multilinear::prestage_k45_outputs(&a, &b);
+        k_outs = Some((a, b));
+    }
+
     let (compact_mlv, msg_1, msg_inf, lookahead) = if use_lookahead {
         let (compact, m1, mi, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
             a_packed,
@@ -943,8 +955,13 @@ fn prove_packed_padded_inner<C: Challenger>(
         // Unpinned: these become the loop-round arm's no-copy wrap targets
         // next round, and the pinned slots already carry process-lifetime
         // Metal views (see `fold_compact_and_compute_round_pair`).
-        let mut a_out = crate::scratch::take_f128_unpinned(n_groups);
-        let mut b_out = crate::scratch::take_f128_unpinned(n_groups);
+        let (mut a_out, mut b_out) = match k_outs.take() {
+            Some((a, b)) if a.len() == n_groups => (a, b),
+            _ => (
+                crate::scratch::take_f128_unpinned(n_groups),
+                crate::scratch::take_f128_unpinned(n_groups),
+            ),
+        };
         if use_cascade {
             let (m4_1, m4_inf, la5) = fold2_compact_and_round45_into(
                 &compact_mlv,
