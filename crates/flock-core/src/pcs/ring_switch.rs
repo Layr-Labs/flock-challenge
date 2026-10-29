@@ -2018,6 +2018,23 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     xor3_f128(q0, q1, q2)
 }
 
+/// Evaluate four byte-table lookups with independent accumulators.
+#[inline(always)]
+pub(crate) fn fold_four_slots(elems: [F128; 4], tables: &[F128]) -> [F128; 4] {
+    debug_assert_eq!(tables.len(), FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    let bytes: [[u8; 16]; 4] = std::array::from_fn(|i| unsafe {
+        std::mem::transmute([elems[i].lo.to_le(), elems[i].hi.to_le()])
+    });
+    let mut acc = [F128::ZERO; 4];
+    for k in 0..16 {
+        for lane in 0..4 {
+            // SAFETY: k < 16, and each index is an unsigned byte.
+            acc[lane] += unsafe { *tables.get_unchecked(k * 256 + bytes[lane][k] as usize) };
+        }
+    }
+    acc
+}
+
 /// Total length of a fold byte table (`build_fold_byte_table` output).
 pub(crate) const FOLD_TABLE_LEN: usize = FOLD_N_BYTES * FOLD_TABLE_SIZE;
 
@@ -4465,6 +4482,19 @@ mod tests {
             }
         }
         assert_eq!(factors.products, product_oracle);
+    }
+
+    #[test]
+    fn fold_four_slots_matches_individual_lookups() {
+        let mut rng = Rng::new(0xF01D_4004);
+        for _ in 0..64 {
+            let generators: Vec<F128> = (0..128).map(|_| rng.f128()).collect();
+            let table = build_fold_byte_table(&generators);
+            let elems: [F128; 4] = std::array::from_fn(|_| rng.f128());
+            let got = fold_four_slots(elems, &table);
+            let want = std::array::from_fn(|i| fold_one_slot(elems[i], &table));
+            assert_eq!(got, want);
+        }
     }
 
     #[test]
