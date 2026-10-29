@@ -3071,7 +3071,10 @@ fn transpose_forward_ntt_fused_3layer(
     // even for the final few large blocks without opening nested parallel
     // regions, which caused long-tail scheduler stalls in this phase.
     let data_ptr = data.as_mut_ptr() as usize;
-    (0..num_blocks * eighth).into_par_iter().for_each(|job| {
+    (0..num_blocks * eighth)
+        .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(8))
+        .for_each(|job| {
         // `eighth` is always a power of two. Spell out the quotient/remainder
         // so rustc does not emit UDIV+MSUB in every eight-value row job.
         let block = job >> eighth_log;
@@ -3138,7 +3141,10 @@ fn transpose_forward_ntt_fused_final_3layer_low_half(
     }
 
     let data_ptr = data.as_mut_ptr() as usize;
-    (0..eighth).into_par_iter().for_each(|row| {
+    (0..eighth)
+        .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(8))
+        .for_each(|row| {
         let mut values = [F128::ZERO; 8];
         // SAFETY: each row owns the eight positions `row + i*eighth`.
         // Different rows never overlap. Only positions i=0..4 are written;
@@ -3393,6 +3399,29 @@ fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
 /// `s=a+b; top=s; bot=t·s+b`, applied in **reverse** layer order. (Baseline:
 /// one parallel sweep per layer.) Three adjacent layers are fused so each
 /// eight-value row group crosses memory once instead of three times.
+/// Minimum rayon job count for the transpose-NTT layer kernels, given how
+/// many field elements one job touches. Each layer's butterflies are
+/// independent and exact, so the split cannot change any value; it only stops
+/// rayon from cutting a small transform (the recursive-level C2
+/// materializations are 2^9..2^17 elements) into per-element tasks whose
+/// scheduling costs more than the work. `FLOCK_NO_SMALL_NTT_MIN_LEN=1` (exact
+/// '1') restores the unbounded split.
+#[inline]
+fn small_ntt_min_jobs(elems_per_job: usize) -> usize {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_SMALL_NTT_MIN_LEN").as_deref() != Some(std::ffi::OsStr::new("1"))
+    });
+    if on {
+        (SMALL_NTT_MIN_ELEMS / elems_per_job.max(1)).max(1)
+    } else {
+        1
+    }
+}
+
+/// Field elements per rayon job in the transpose-NTT layer kernels.
+const SMALL_NTT_MIN_ELEMS: usize = 4096;
+
 fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize) {
     use rayon::prelude::*;
     debug_assert_eq!(data.len(), 1usize << log_d);
@@ -3410,6 +3439,7 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
         let bsh = block_size >> 1;
         if num_blocks >= n_threads {
             data.par_chunks_mut(block_size)
+                .with_min_len(small_ntt_min_jobs(block_size))
                 .enumerate()
                 .for_each(|(block, chunk)| {
                     let t = ntt.twiddle(layer, block);
@@ -3429,6 +3459,7 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
                 let (top, bot) = chunk.split_at_mut(bsh);
                 top.par_iter_mut()
                     .zip(bot.par_iter_mut())
+                    .with_min_len(small_ntt_min_jobs(2))
                     .for_each(|(a_ref, b_ref)| {
                         let a = *a_ref;
                         let b = *b_ref;
@@ -4377,6 +4408,7 @@ fn transpose_forward_ntt_dense_suffix_impl(
         let half = block_size >> 1;
         if num_blocks >= n_threads {
             data.par_chunks_mut(block_size)
+                .with_min_len(small_ntt_min_jobs(block_size))
                 .enumerate()
                 .for_each(|(block, chunk)| {
                     let twiddle = ntt.twiddle(layer, block);
@@ -4396,6 +4428,7 @@ fn transpose_forward_ntt_dense_suffix_impl(
                 let (top, bottom) = chunk.split_at_mut(half);
                 top.par_iter_mut()
                     .zip(bottom.par_iter_mut())
+                    .with_min_len(small_ntt_min_jobs(2))
                     .for_each(|(top, bottom)| {
                         let a = *top;
                         let b = *bottom;
@@ -4433,7 +4466,10 @@ fn transpose_forward_ntt_single_layer_flat(
         .collect();
     let data_ptr = data.as_mut_ptr() as usize;
 
-    (0..num_blocks * half).into_par_iter().for_each(|job| {
+    (0..num_blocks * half)
+        .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(2))
+        .for_each(|job| {
         let block = job >> half_log;
         let row = job & row_mask;
         let top_index = block * block_size + row;
@@ -5061,6 +5097,7 @@ fn transpose_forward_ntt_sparse_hashmap_impl(
     let windows: Vec<(usize, Vec<F128>)> = windows.into_iter().collect();
     let processed: Vec<(usize, Vec<F128>)> = windows
         .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(window_len))
         .map(|(window_index, mut window)| {
             transform_active_window(ntt, &mut window, window_index, prefix_k, log_d);
             (window_index, window)
