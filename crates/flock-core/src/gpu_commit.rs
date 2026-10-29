@@ -13113,12 +13113,13 @@ static inline U256k clmul128(uint4 a, uint4 b) {
 }
 
 // Reduce a 255-bit product mod x^128 + x^7 + x^2 + x + 1.
+template <bool product = false>
 static inline uint4 gf_reduce(U256k p) {
     ulong h0 = p.r2, h1 = p.r3;
     ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
     ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
              ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    ulong ov = (product ? 0ul : (h1 >> 63)) ^ (h1 >> 62) ^ (h1 >> 57);
     t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
     ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
     return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
@@ -13178,8 +13179,12 @@ static inline void zc_r2_write_partials(
         if (lid < s) { red[lid] ^= red[lid + s]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    ulong4 chunk1e = red[0];
-    ulong4 chunk1o = red[1];
+    ulong4 chunk1e;
+    ulong4 chunk1o;
+    if (lid == 0u) {
+        chunk1e = red[0];
+        chunk1o = red[1];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     red[lid] = acci;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -13195,10 +13200,11 @@ static inline void zc_r2_write_partials(
         U256k uie; uie.r0 = chunkie.x; uie.r1 = chunkie.y; uie.r2 = chunkie.z; uie.r3 = chunkie.w;
         U256k uio; uio.r0 = chunkio.x; uio.r1 = chunkio.y; uio.r2 = chunkio.z; uio.r3 = chunkio.w;
         uint4 e = eq_hi[hi_chunk];
-        partials[output_group * 4u]      = gf_reduce(clmul128(e, gf_reduce(u1e)));
-        partials[output_group * 4u + 1u] = gf_reduce(clmul128(e, gf_reduce(uie)));
-        partials[output_group * 4u + 2u] = gf_reduce(clmul128(e, gf_reduce(u1o)));
-        partials[output_group * 4u + 3u] = gf_reduce(clmul128(e, gf_reduce(uio)));
+        // Raw products and their XOR sums have degree at most 254.
+        partials[output_group * 4u]      = gf_reduce<true>(clmul128(e, gf_reduce<true>(u1e)));
+        partials[output_group * 4u + 1u] = gf_reduce<true>(clmul128(e, gf_reduce<true>(uie)));
+        partials[output_group * 4u + 2u] = gf_reduce<true>(clmul128(e, gf_reduce<true>(u1o)));
+        partials[output_group * 4u + 3u] = gf_reduce<true>(clmul128(e, gf_reduce<true>(uio)));
     }
 }
 
@@ -13289,8 +13295,10 @@ kernel void zc_r2_products_horner(
         if (handoff && step == 2u) {
             // The lower 4 KiB remains the live nibble table.
             threadgroup uint4* handoff_slots = nib + 256u;
-            uint4 v1 = zc_r2_horner_reduce(h1);
-            uint4 vi = zc_r2_horner_reduce(hi);
+            U256k p1 = {h1.r0, h1.r1, h1.r2, h1.r3};
+            U256k pi = {hi.r0, hi.r1, hi.r2, hi.r3};
+            uint4 v1 = gf_reduce(p1);
+            uint4 vi = gf_reduce(pi);
             handoff_slots[rid] = v1;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             v1 = handoff_slots[lid];
