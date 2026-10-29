@@ -1950,7 +1950,23 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 let t = table.data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
-                if full {
+                if full && horner_weights {
+                    fold_round2_compact_chunk_neon_full_horner_8(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        skip_dead,
+                        out.as_mut_ptr(),
+                    );
+                } else if full {
                     fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                         t,
                         ap,
@@ -2182,6 +2198,495 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     };
 
     (compact, mlv_challenges[0] * sum1, sum_inf, la)
+}
+
+/// Full CPU round two under the existing fixed-medium weight guard.
+/// Eight owned output sums are reset here and updated only at unit boundaries.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+unsafe fn fold_round2_compact_chunk_neon_full_horner_8(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    skip_dead: bool,
+    out: *mut F128,
+) {
+    use core::arch::aarch64::*;
+
+    #[derive(Clone, Copy)]
+    struct WideNeon {
+        lo: uint64x2_t,
+        hi: uint64x2_t,
+    }
+
+    #[inline(always)]
+    unsafe fn zero_q() -> uint64x2_t {
+        let z;
+        unsafe {
+            core::arch::asm!("movi {z:v}.16b, #0", z = out(vreg) z,
+            options(nomem, nostack, preserves_flags));
+        }
+        z
+    }
+
+    #[inline(always)]
+    unsafe fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+        unsafe {
+            #[cfg(target_feature = "sha3")]
+            {
+                veor3q_u64(a, b, c)
+            }
+            #[cfg(not(target_feature = "sha3"))]
+            {
+                veorq_u64(veorq_u64(a, b), c)
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn store_anchor_pair_nt(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn bank_load_q<const SHIFT: u32>(
+        bank: *const u8,
+        row: u64,
+    ) -> core::arch::aarch64::uint64x2_t {
+        let out: core::arch::aarch64::uint64x2_t;
+        // SAFETY: the byte index is at most 255, so the 16-byte load stays inside
+        // the caller's 4 KiB bank; the asm only reads that memory.
+        unsafe {
+            core::arch::asm!(
+                "ubfx {idx}, {row}, #{shift}, #8",
+                "ldr {out:q}, [{bank}, {idx}, lsl #4]",
+                shift = const SHIFT,
+                row = in(reg) row,
+                bank = in(reg) bank,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+        out
+    }
+
+    #[inline(always)]
+    unsafe fn fold_two_codes(
+        table_data: *const u8,
+        row0: u64,
+        row1: u64,
+    ) -> (uint64x2_t, uint64x2_t) {
+        unsafe {
+            const STRIDE: usize = 256 * 16;
+            let mut acc0 = bank_load_q::<0>(table_data, row0);
+            let mut acc1 = bank_load_q::<0>(table_data, row1);
+            // Keep each pair of loads and its accumulator update together.
+            // Independent pure loads otherwise keep all 16 table values live.
+            macro_rules! step_impl {
+                ($c0:literal, $c1:literal, $xor0:literal, $xor1:literal) => {
+                    // SAFETY: each byte index is at most 255. Both banks have
+                    // 256 initialized q entries. Only the accumulators change.
+                    core::arch::asm!(
+                        "ubfx {idx}, {row0}, #{shift0}, #8",
+                        "ldr {tmp0:q}, [{bank0}, {idx}, lsl #4]",
+                        "ubfx {idx}, {row0}, #{shift1}, #8",
+                        "ldr {tmp1:q}, [{bank1}, {idx}, lsl #4]",
+                        $xor0,
+                        "ubfx {idx}, {row1}, #{shift0}, #8",
+                        "ldr {tmp0:q}, [{bank0}, {idx}, lsl #4]",
+                        "ubfx {idx}, {row1}, #{shift1}, #8",
+                        "ldr {tmp1:q}, [{bank1}, {idx}, lsl #4]",
+                        $xor1,
+                        shift0 = const 8 * $c0,
+                        shift1 = const 8 * $c1,
+                        bank0 = in(reg) table_data.add($c0 * STRIDE),
+                        bank1 = in(reg) table_data.add($c1 * STRIDE),
+                        row0 = in(reg) row0,
+                        row1 = in(reg) row1,
+                        acc0 = inout(vreg) acc0,
+                        acc1 = inout(vreg) acc1,
+                        idx = out(reg) _,
+                        tmp0 = out(vreg) _,
+                        tmp1 = out(vreg) _,
+                        options(pure, readonly, nostack, preserves_flags),
+                    );
+                };
+            }
+            macro_rules! step {
+                ($c0:literal, $c1:literal) => {
+                    #[cfg(target_feature = "sha3")]
+                    step_impl!(
+                        $c0, $c1,
+                        "eor3 {acc0:v}.16b, {acc0:v}.16b, {tmp0:v}.16b, {tmp1:v}.16b",
+                        "eor3 {acc1:v}.16b, {acc1:v}.16b, {tmp0:v}.16b, {tmp1:v}.16b"
+                    );
+                    #[cfg(not(target_feature = "sha3"))]
+                    step_impl!(
+                        $c0, $c1,
+                        "eor {acc0:v}.16b, {acc0:v}.16b, {tmp0:v}.16b\neor {acc0:v}.16b, {acc0:v}.16b, {tmp1:v}.16b",
+                        "eor {acc1:v}.16b, {acc1:v}.16b, {tmp0:v}.16b\neor {acc1:v}.16b, {acc1:v}.16b, {tmp1:v}.16b"
+                    );
+                };
+            }
+            step!(1, 2);
+            step!(3, 4);
+            step!(5, 6);
+            acc0 = veorq_u64(acc0, bank_load_q::<56>(table_data.add(7 * STRIDE), row0));
+            acc1 = veorq_u64(acc1, bank_load_q::<56>(table_data.add(7 * STRIDE), row1));
+            (acc0, acc1)
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn shift_tops(
+        top: &mut uint16x8_t,
+        h0: uint64x2_t,
+        h1: uint64x2_t,
+        h2: uint64x2_t,
+        h3: uint64x2_t,
+        h4: uint64x2_t,
+        h5: uint64x2_t,
+        h6: uint64x2_t,
+        h7: uint64x2_t,
+    ) {
+        unsafe {
+            // Degree269 needs14 top bits. Narrow each old high limb to its
+            // high16 bits, then insert bit15 into the corresponding top lane.
+            // The memory barrier consumes old high limbs before row gathers.
+            core::arch::asm!(
+                "zip2 {c0:v}.2d, {h0:v}.2d, {h1:v}.2d",
+                "shrn {c0:v}.2s, {c0:v}.2d, #32",
+                "zip2 {c1:v}.2d, {h2:v}.2d, {h3:v}.2d",
+                "shrn2 {c0:v}.4s, {c1:v}.2d, #32",
+                "shrn {c0:v}.4h, {c0:v}.4s, #16",
+                "zip2 {c1:v}.2d, {h4:v}.2d, {h5:v}.2d",
+                "shrn {c1:v}.2s, {c1:v}.2d, #32",
+                "zip2 {c2:v}.2d, {h6:v}.2d, {h7:v}.2d",
+                "shrn2 {c1:v}.4s, {c2:v}.2d, #32",
+                "shrn2 {c0:v}.8h, {c1:v}.4s, #16",
+                "shl {top:v}.8h, {top:v}.8h, #1",
+                "sri {top:v}.8h, {c0:v}.8h, #15",
+                h0 = in(vreg) h0, h1 = in(vreg) h1,
+                h2 = in(vreg) h2, h3 = in(vreg) h3,
+                h4 = in(vreg) h4, h5 = in(vreg) h5,
+                h6 = in(vreg) h6, h7 = in(vreg) h7,
+                top = inout(vreg) *top,
+                c0 = out(vreg) _, c1 = out(vreg) _, c2 = out(vreg) _,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn shift_pair(a: &mut WideNeon, b: &mut WideNeon, zero: uint64x2_t) {
+        unsafe {
+            a.hi = vsriq_n_u64::<63>(vshlq_n_u64::<1>(a.hi), vextq_u64::<1>(a.lo, a.hi));
+            b.hi = vsriq_n_u64::<63>(vshlq_n_u64::<1>(b.hi), vextq_u64::<1>(b.lo, b.hi));
+            a.lo = vsriq_n_u64::<63>(vshlq_n_u64::<1>(a.lo), vextq_u64::<1>(zero, a.lo));
+            b.lo = vsriq_n_u64::<63>(vshlq_n_u64::<1>(b.lo), vextq_u64::<1>(zero, b.lo));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn reduce_pair(
+        mut a: WideNeon,
+        mut b: WideNeon,
+        top: uint64x2_t,
+    ) -> (uint64x2_t, uint64x2_t) {
+        unsafe {
+            let zero = vdupq_n_u64(0);
+            // x^256 = 1 + x^2 + x^4 + x^14 modulo x^128+x^7+x^2+x+1.
+            // Each top limb has at most 14 bits, so this cannot overflow.
+            let folded = veorq_u64(
+                xor3_u64(top, vshlq_n_u64::<2>(top), vshlq_n_u64::<4>(top)),
+                vshlq_n_u64::<14>(top),
+            );
+            a.lo = veorq_u64(a.lo, vzip1q_u64(folded, zero));
+            b.lo = veorq_u64(b.lo, vzip2q_u64(folded, zero));
+            (reduce_wide_q(a), reduce_wide_q(b))
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn reduce_wide_q(value: WideNeon) -> core::arch::aarch64::uint64x2_t {
+        use core::arch::aarch64::*;
+        unsafe {
+            let zero = vdupq_n_u64(0);
+            let hi = value.hi;
+            let shift1 = veorq_u64(
+                vshlq_n_u64::<1>(hi),
+                vextq_u64::<1>(zero, vshrq_n_u64::<63>(hi)),
+            );
+            let shift2 = veorq_u64(
+                vshlq_n_u64::<2>(hi),
+                vextq_u64::<1>(zero, vshrq_n_u64::<62>(hi)),
+            );
+            let shift7 = veorq_u64(
+                vshlq_n_u64::<7>(hi),
+                vextq_u64::<1>(zero, vshrq_n_u64::<57>(hi)),
+            );
+            let folded = xor3_u64(hi, shift1, veorq_u64(shift2, shift7));
+
+            // Only r3 (the high lane) can overflow the 128-bit fold. Move it to
+            // the low lane so the correction lands in result coefficient 0.
+            let r3 = vextq_u64::<1>(hi, zero);
+            let ov = xor3_u64(
+                vshrq_n_u64::<63>(r3),
+                vshrq_n_u64::<62>(r3),
+                vshrq_n_u64::<57>(r3),
+            );
+            let corr = xor3_u64(
+                ov,
+                vshlq_n_u64::<1>(ov),
+                veorq_u64(vshlq_n_u64::<2>(ov), vshlq_n_u64::<7>(ov)),
+            );
+            xor3_u64(value.lo, folded, corr)
+        }
+    }
+
+    // Three Karatsuba PMULLs; the B sum dies before it becomes the zero lane.
+    // Only three early-clobber q temporaries are live beyond the operands.
+    #[inline(always)]
+    unsafe fn acc(dst: &mut WideNeon, a: uint64x2_t, b: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "ext {swap:v}.16b, {a:v}.16b, {a:v}.16b, #8",
+                "eor {swap:v}.16b, {swap:v}.16b, {a:v}.16b",
+                "ext {cross:v}.16b, {b:v}.16b, {b:v}.16b, #8",
+                "eor {cross:v}.16b, {cross:v}.16b, {b:v}.16b",
+                "pmull {tmp:v}.1q, {a:v}.1d, {b:v}.1d",
+                "eor {lo:v}.16b, {lo:v}.16b, {tmp:v}.16b",
+                "pmull {swap:v}.1q, {swap:v}.1d, {cross:v}.1d",
+                "eor {swap:v}.16b, {swap:v}.16b, {tmp:v}.16b",
+                "pmull2 {cross:v}.1q, {a:v}.2d, {b:v}.2d",
+                "eor {hi:v}.16b, {hi:v}.16b, {cross:v}.16b",
+                "eor {swap:v}.16b, {swap:v}.16b, {cross:v}.16b",
+                "movi {cross:v}.16b, #0",
+                "ext {tmp:v}.16b, {cross:v}.16b, {swap:v}.16b, #8",
+                "ext {swap:v}.16b, {swap:v}.16b, {cross:v}.16b, #8",
+                "eor {lo:v}.16b, {lo:v}.16b, {tmp:v}.16b",
+                "eor {hi:v}.16b, {hi:v}.16b, {swap:v}.16b",
+                a = in(vreg) a, b = in(vreg) b,
+                lo = inout(vreg) dst.lo, hi = inout(vreg) dst.hi,
+                swap = out(vreg) _, cross = out(vreg) _, tmp = out(vreg) _,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn add_output(out: *mut F128, value: F128) {
+        unsafe {
+            let value = core::mem::transmute::<F128, uint64x2_t>(value);
+            // Keep outer sums in their owned output backing, not loop-carried q values.
+            core::arch::asm!(
+                "ldr {tmp:q}, [{out}]",
+                "eor {tmp:v}.16b, {tmp:v}.16b, {value:v}.16b",
+                "str {tmp:q}, [{out}]",
+                out = in(reg) out, value = in(vreg) value, tmp = out(vreg) _,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn finish_pair(out: *mut F128, a: WideNeon, b: WideNeon, top: uint64x2_t, lambda: F128) {
+        unsafe {
+            let (a, b) = reduce_pair(a, b, top);
+            add_output(out, lambda * core::mem::transmute::<uint64x2_t, F128>(a));
+            add_output(
+                out.add(1),
+                lambda * core::mem::transmute::<uint64x2_t, F128>(b),
+            );
+        }
+    }
+
+    unsafe {
+        // Own all eight sums: no prior caller output value is read.
+        let z = zero_q();
+        for i in 0..8 {
+            vst1q_u64(out.add(i).cast::<u64>(), z);
+        }
+        let mut b_ones = vld1q_u64(table_data.add(255 * 16).cast::<u64>());
+        for j in 1..8 {
+            b_ones = veorq_u64(
+                b_ones,
+                vld1q_u64(table_data.add(j * 256 * 16 + 255 * 16).cast::<u64>()),
+            );
+        }
+        let ones_is_one = vgetq_lane_u64::<0>(b_ones) == 1 && vgetq_lane_u64::<1>(b_ones) == 0;
+        let aligned_padding = pair_in_block_mask == 127
+            && useful_pairs_inclusive == 121
+            && (pair_idx_base & 127) == 0
+            && lo_size.is_multiple_of(128);
+        for first in (0..lo_size / 2).step_by(32) {
+            for t in 0..2 {
+                let z = zero_q();
+                let mut e1 = WideNeon { lo: z, hi: z };
+                let mut ei = e1;
+                let mut o1 = e1;
+                let mut oi = e1;
+                let mut w0 = e1;
+                let mut w3 = e1;
+                let mut w4 = e1;
+                let mut w5 = e1;
+                let mut tops = vreinterpretq_u16_u64(z);
+                let b_end = if aligned_padding && (first & 63) == 32 {
+                    15 - t
+                } else {
+                    16
+                };
+                let zero_pair = |x_lo: usize| {
+                    if !skip_dead {
+                        let z = zero_q();
+                        store_anchor_pair_nt(anchors.add(2 * x_lo), z, z);
+                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), z);
+                    }
+                };
+                for b in (b_end..16).rev() {
+                    let x_lo = 2 * (first + 2 * b + t);
+                    zero_pair(x_lo);
+                    zero_pair(x_lo + 1);
+                }
+                for b in (0..b_end).rev() {
+                    {
+                        let z = zero_q();
+                        shift_tops(
+                            &mut tops, e1.hi, ei.hi, o1.hi, oi.hi, w0.hi, w3.hi, w4.hi, w5.hi,
+                        );
+                        shift_pair(&mut e1, &mut ei, z);
+                        shift_pair(&mut o1, &mut oi, z);
+                        shift_pair(&mut w0, &mut w3, z);
+                        shift_pair(&mut w4, &mut w5, z);
+                    }
+                    let u = first + 2 * b + t;
+                    let x0 = 2 * u;
+                    let x1 = x0 + 1;
+                    let pad0 =
+                        ((pair_idx_base + x0) & pair_in_block_mask) >= useful_pairs_inclusive;
+                    let pad1 =
+                        ((pair_idx_base + x1) & pair_in_block_mask) >= useful_pairs_inclusive;
+                    if pad0 & pad1 {
+                        zero_pair(x0);
+                        zero_pair(x1);
+                        continue;
+                    }
+                    let codes = |x_lo: usize, pad: bool| {
+                        if pad {
+                            zero_pair(x_lo);
+                            return (0u64, 0u64, 0u64, 0u64, false);
+                        }
+                        let ap = a_packed.add(2 * x_lo * 8).cast::<u64>();
+                        let bp = b_packed.add(2 * x_lo * 8).cast::<u64>();
+                        let ae = u64::from_le(core::ptr::read_unaligned(ap));
+                        let ao = u64::from_le(core::ptr::read_unaligned(ap.add(1)));
+                        let be = u64::from_le(core::ptr::read_unaligned(bp));
+                        let bo = u64::from_le(core::ptr::read_unaligned(bp.add(1)));
+                        let delta =
+                            core::mem::transmute::<[u64; 2], uint64x2_t>([ae ^ ao, be ^ bo]);
+                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta);
+                        (ae, ao, be, bo, degen && (be & bo) == u64::MAX)
+                    };
+                    let (a0c, a1c, b0c, b1c, deg0) = codes(x0, pad0);
+                    let (a0, b0, a1, b1) = if pad0 {
+                        let z = zero_q();
+                        (z, z, z, z)
+                    } else if deg0 {
+                        let (a0, a1) = fold_two_codes(table_data, a0c, a1c);
+                        (a0, b_ones, a1, b_ones)
+                    } else {
+                        let (a0, b0) = fold_two_codes(table_data, a0c, b0c);
+                        let (a1, b1) = fold_two_codes(table_data, a1c, b1c);
+                        (a0, b0, a1, b1)
+                    };
+                    if !pad0 {
+                        store_anchor_pair_nt(anchors.add(2 * x0), a0, b0);
+                        if deg0 && ones_is_one {
+                            e1.lo = veorq_u64(e1.lo, a1);
+                        } else {
+                            acc(&mut e1, a1, b1);
+                        }
+                        if !deg0 {
+                            acc(&mut ei, veorq_u64(a0, a1), veorq_u64(b0, b1));
+                        }
+                    }
+                    let (a2c, a3c, b2c, b3c, deg1) = codes(x1, pad1);
+                    let (a3, b3, a2_seed) = if pad1 {
+                        let z = zero_q();
+                        (z, z, z)
+                    } else if deg1 {
+                        let (a3, a2) = fold_two_codes(table_data, a3c, a2c);
+                        (a3, b_ones, a2)
+                    } else {
+                        let (a3, b3) = fold_two_codes(table_data, a3c, b3c);
+                        (a3, b3, a3)
+                    };
+                    if !pad1 {
+                        if deg1 && ones_is_one {
+                            o1.lo = veorq_u64(o1.lo, a3);
+                        } else {
+                            acc(&mut o1, a3, b3);
+                        }
+                    }
+                    let all_b1 = deg0 & deg1 & ones_is_one;
+                    let oa = veorq_u64(a1, a3);
+                    let ob = veorq_u64(b1, b3);
+                    if !all_b1 {
+                        acc(&mut w4, oa, ob);
+                    }
+                    let (a2, b2) = if pad1 {
+                        let z = zero_q();
+                        (z, z)
+                    } else if deg1 {
+                        (a2_seed, b_ones)
+                    } else {
+                        fold_two_codes(table_data, a2c, b2c)
+                    };
+                    if !pad1 {
+                        store_anchor_pair_nt(anchors.add(2 * x1), a2, b2);
+                    }
+                    if all_b1 {
+                        w0.lo = veorq_u64(w0.lo, a2);
+                        continue;
+                    }
+                    if !pad1 {
+                        acc(&mut w0, a2, b2);
+                        if !deg1 {
+                            acc(&mut oi, veorq_u64(a2, a3), veorq_u64(b2, b3));
+                        }
+                    }
+                    let ea = veorq_u64(a0, a2);
+                    let eb = veorq_u64(b0, b2);
+                    acc(&mut w3, ea, eb);
+                    acc(&mut w5, veorq_u64(ea, oa), veorq_u64(eb, ob));
+                }
+                let lambda = *eq_lo.add(2 * (first + t) + 1);
+                let low = vmovl_u16(vget_low_u16(tops));
+                finish_pair(out, e1, ei, vmovl_u32(vget_low_u32(low)), lambda);
+                finish_pair(out.add(2), o1, oi, vmovl_high_u32(low), lambda);
+                let high = vmovl_high_u16(tops);
+                finish_pair(out.add(4), w0, w3, vmovl_u32(vget_low_u32(high)), lambda);
+                finish_pair(out.add(6), w4, w5, vmovl_high_u32(high), lambda);
+            }
+        }
+    }
 }
 
 /// Portable reference for one lookahead round-two chunk (non-AArch64 builds).
@@ -4872,6 +5377,123 @@ mod tests {
         crate::scratch::give_f128(standard_held);
         crate::scratch::give_f128(lookahead_held);
         crate::scratch::clear();
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn full_horner_all_outputs_match_generic_with_poison() {
+        const LO: usize = 256;
+        let mut state = 0x4655_4c4c_484f_5238u64;
+        let mut next = || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let z = F128::new(next(), next());
+        let scale = F128::new(next(), next());
+        let poison = F128::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210);
+        for scaled in [false, true] {
+            let mut table = UniSkipFoldTable::new(6, z);
+            if scaled {
+                table.data = table.scaled_linear(scale);
+            }
+            for weights in 0..2 {
+                let mut r: Vec<F128> = (0..8).map(|_| F128::new(next(), next())).collect();
+                r[2..6].copy_from_slice(
+                    &crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash(),
+                );
+                if weights == 1 {
+                    r[0] = F128::ONE;
+                    r[1] = F128::ZERO;
+                }
+                let eq_lo = build_eq(&r);
+                for payload in 0..5 {
+                    let mut a: Vec<u8> = (0..16 * LO).map(|_| next() as u8).collect();
+                    let mut b: Vec<u8> = (0..16 * LO).map(|_| next() as u8).collect();
+                    for u in 0..LO / 2 {
+                        for pair in 0..2 {
+                            let b1 = match payload {
+                                1 => true,
+                                2 => pair == 0,
+                                3 => pair == 1,
+                                4 => u % 3 == 0 || (u % 3 == 1 && pair == 1),
+                                _ => false,
+                            };
+                            if b1 {
+                                b[(2 * u + pair) * 16..(2 * u + pair + 1) * 16].fill(0xff);
+                            }
+                        }
+                    }
+                    // Retain the ranked49-bit boundary row and its zero tail.
+                    for base in [0usize, 2048] {
+                        for packed in [&mut a, &mut b] {
+                            packed[base + 1926] &= 1;
+                            packed[base + 1927..base + 1936].fill(0);
+                        }
+                    }
+                    for (mask, useful) in [(usize::MAX, usize::MAX), (127, 121)] {
+                        for degen in [false, true] {
+                            for skip_dead in [false, true] {
+                                let mut expected_anchors = vec![poison; 2 * LO];
+                                let mut expected_deltas = vec![0xa5u8; 16 * LO];
+                                let mut expected = [poison; 8];
+                                unsafe {
+                                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                                        table.data.as_ptr().cast(),
+                                        a.as_ptr(),
+                                        b.as_ptr(),
+                                        expected_anchors.as_mut_ptr(),
+                                        expected_deltas.as_mut_ptr(),
+                                        eq_lo.as_ptr(),
+                                        LO,
+                                        0,
+                                        mask,
+                                        useful,
+                                        degen,
+                                        true,
+                                        skip_dead,
+                                        expected.as_mut_ptr(),
+                                    );
+                                }
+                                let mut actual_anchors = vec![poison; 2 * LO];
+                                let mut actual_deltas = vec![0xa5u8; 16 * LO];
+                                let mut actual = [F128::new(u64::MAX, u64::MAX); 8];
+                                for prior in [poison, F128::ONE] {
+                                    actual.fill(prior);
+                                    actual_anchors.fill(poison);
+                                    actual_deltas.fill(0xa5);
+                                    unsafe {
+                                        fold_round2_compact_chunk_neon_full_horner_8(
+                                            table.data.as_ptr().cast(),
+                                            a.as_ptr(),
+                                            b.as_ptr(),
+                                            actual_anchors.as_mut_ptr(),
+                                            actual_deltas.as_mut_ptr(),
+                                            eq_lo.as_ptr(),
+                                            LO,
+                                            0,
+                                            mask,
+                                            useful,
+                                            degen,
+                                            skip_dead,
+                                            actual.as_mut_ptr(),
+                                        );
+                                    }
+                                    assert_eq!(
+                                        actual, expected,
+                                        "sums scaled={scaled} weights={weights} payload={payload} mask={mask} degen={degen} skip={skip_dead}"
+                                    );
+                                    assert_eq!(actual_anchors, expected_anchors);
+                                    assert_eq!(actual_deltas, expected_deltas);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// T1 — the core oracle. Round-two message identical, and the deferred
