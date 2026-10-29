@@ -32,6 +32,7 @@ use flock_core::pcs::{self, Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::{BlockR1cs, Round1PinnedOnePrefixStatement};
 use flock_core::zerocheck;
+use flock_core::zerocheck::univariate_skip_optimized::Round1Blake3GuardedB;
 use crate::r1cs_hashes::blake3::Blake3IdentityPrefixWitness;
 
 /// Exact rollback for C1. A cleared ranked-worker environment selects the
@@ -999,6 +1000,7 @@ fn commit_with_round1_ab_precompute(
     commit_codeword: CommitCodeword,
     tail_fill: Option<CommitTailFillHook<'_>>,
     identity_prefix_contract: Option<Round1PinnedOnePrefixStatement>,
+    guarded_b: Option<&Round1Blake3GuardedB<'_>>,
     stripe_help: Option<&(dyn Fn() + Sync)>,
 ) -> (
     (Commitment, pcs::ProverData),
@@ -1019,6 +1021,18 @@ fn commit_with_round1_ab_precompute(
     // efficiency-core pool, so this arm cannot finish before the stripe does;
     // helping moves the stripe's remainder onto otherwise idle P-workers.
     let precompute_ab = || {
+        if let Some(guarded_b) = guarded_b {
+            return zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_with_tail_trusted_b(
+                a_packed,
+                guarded_b,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+                identity_prefix_contract,
+                stripe_help,
+            );
+        }
         zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_with_tail(
             a_packed,
             b_packed,
@@ -1031,6 +1045,17 @@ fn commit_with_round1_ab_precompute(
         )
     };
     let precompute_ab_replay = || {
+        if let Some(guarded_b) = guarded_b {
+            return zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune_trusted_b(
+                a_packed,
+                guarded_b,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+                identity_prefix_contract,
+            );
+        }
         zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune(
             a_packed,
             b_packed,
@@ -1190,6 +1215,26 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let identity_prefix_contract = ranked_identity_prefix_omission_contract(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
     );
+    let guarded_b = if r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
+        && r1cs.m >= crate::r1cs_hashes::blake3::K_LOG
+        && r1cs.k_log == crate::r1cs_hashes::blake3::K_LOG
+        && r1cs.useful_bits == crate::r1cs_hashes::blake3::USEFUL_BITS
+        && identity_prefix_witness
+            .as_ref()
+            .is_some_and(|witness| witness.matches_b(&b_packed_f128))
+    {
+        // SAFETY: the private receipt is minted only after the fast row-major
+        // writers join and prove every G lin-id B interval is all ones. These
+        // owned buffers move directly here with no intervening B or raw-alias
+        // write. matches_b binds that proof to this exact allocation and full
+        // length; address equality alone is not the value proof. The token
+        // keeps B immutably borrowed through normal precompute and replay.
+        Some(unsafe {
+            Round1Blake3GuardedB::from_blake3_generated(&b_packed_f128)
+        })
+    } else {
+        None
+    };
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>,
                       stripe_help: Option<&(dyn Fn() + Sync)>| {
@@ -1204,6 +1249,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             commit_codeword,
             tail_fill,
             identity_prefix_contract,
+            guarded_b.as_ref(),
             stripe_help,
         );
         if phase_timing {
@@ -1623,6 +1669,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
+        None,
         None,
         None,
         None,
