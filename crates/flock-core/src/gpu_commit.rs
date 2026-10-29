@@ -3092,32 +3092,147 @@ constant uint B3_PERM[16] = {
 #define B3_CHUNK_END   2u
 #define B3_PARENT      4u
 
+// Fully unrolled BLAKE3 compression: the seven rounds' message schedule
+// (BLAKE3 permutation applied 0..6 times) is resolved at generation time, so
+// every message word and state word is a named register and no thread array
+// is dynamically indexed; right-rotations by 16/12/8/7 are `rotate` (left)
+// by 16/20/24/25. Same function as the loop form: bit-identical CVs.
 static void b3_compress(thread uint* cv, thread const uint* m_in,
                         uint block_len, uint flags) {
-    uint v[16];
-    uint m[16];
-    for (int i = 0; i < 8; i++) v[i] = cv[i];
-    for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
-    v[12] = 0u; v[13] = 0u; v[14] = block_len; v[15] = flags;
-    for (int i = 0; i < 16; i++) m[i] = m_in[i];
-    for (int r = 0; r < 7; r++) {
-        #define G(a,b,c,d,x,y) \
-            v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
-            v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
-        G(0,4,8,12,  m[0], m[1]);  G(1,5,9,13,  m[2], m[3]);
-        G(2,6,10,14, m[4], m[5]);  G(3,7,11,15, m[6], m[7]);
-        G(0,5,10,15, m[8], m[9]);  G(1,6,11,12, m[10],m[11]);
-        G(2,7,8,13,  m[12],m[13]); G(3,4,9,14,  m[14],m[15]);
-        #undef G
-        if (r < 6) {
-            uint t[16];
-            for (int i = 0; i < 16; i++) t[i] = m[B3_PERM[i]];
-            for (int i = 0; i < 16; i++) m[i] = t[i];
-        }
-    }
-    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
+    uint v0 = cv[0], v1 = cv[1], v2 = cv[2], v3 = cv[3];
+    uint v4 = cv[4], v5 = cv[5], v6 = cv[6], v7 = cv[7];
+    uint v8 = B3_IV[0], v9 = B3_IV[1], v10 = B3_IV[2], v11 = B3_IV[3];
+    uint v12 = 0u, v13 = 0u, v14 = block_len, v15 = flags;
+    uint m0 = m_in[0];
+    uint m1 = m_in[1];
+    uint m2 = m_in[2];
+    uint m3 = m_in[3];
+    uint m4 = m_in[4];
+    uint m5 = m_in[5];
+    uint m6 = m_in[6];
+    uint m7 = m_in[7];
+    uint m8 = m_in[8];
+    uint m9 = m_in[9];
+    uint m10 = m_in[10];
+    uint m11 = m_in[11];
+    uint m12 = m_in[12];
+    uint m13 = m_in[13];
+    uint m14 = m_in[14];
+    uint m15 = m_in[15];
+    v0 = v0 + v4 + m0; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m1; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m2; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m3; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m4; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m5; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m6; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m7; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m8; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m9; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m10; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m11; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m12; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m13; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m14; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m15; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m2; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m6; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m3; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m10; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m7; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m0; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m4; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m13; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m1; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m11; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m12; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m5; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m9; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m14; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m15; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m8; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m3; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m4; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m10; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m12; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m13; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m2; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m7; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m14; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m6; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m5; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m9; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m0; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m11; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m15; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m8; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m1; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m10; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m7; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m12; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m9; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m14; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m3; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m13; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m15; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m4; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m0; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m11; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m2; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m5; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m8; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m1; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m6; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m12; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m13; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m9; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m11; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m15; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m10; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m14; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m8; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m7; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m2; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m5; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m3; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m0; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m1; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m6; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m4; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m9; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m14; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m11; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m5; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m8; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m12; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m15; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m1; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m13; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m3; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m0; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m10; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m2; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m6; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m4; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m7; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m11; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m15; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m5; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m0; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m1; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m9; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m8; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m6; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m14; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m10; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m2; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m12; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m3; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m4; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m7; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m13; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    cv[0] = v0 ^ v8; cv[1] = v1 ^ v9; cv[2] = v2 ^ v10; cv[3] = v3 ^ v11;
+    cv[4] = v4 ^ v12; cv[5] = v5 ^ v13; cv[6] = v6 ^ v14; cv[7] = v7 ^ v15;
 }
 
 // See main MSL comment: leaf hash + parent_hash3 ladder, bit-identical.
@@ -7008,6 +7123,93 @@ kernel void blake3_pow_scan(
                 // the suffix's aligned subtrees. Same leaf bytes, same BLAKE3
                 // tree, same flat-tree slots, so the root is unchanged.
                 if hybrid_gpu_suffix_hash_enabled() {
+                    // Progressive suffix hashing: split the CPU-owned leaf
+                    // range into aligned regions of at most 2^14 leaves; the
+                    // CPU NTT's chunk callback counts each region's finished
+                    // leaves, and the thread that completes a region commits
+                    // that region's Merkle subtree on the GPU queue at once
+                    // (same `encode_merkle_subtree` kernels, same slots). On
+                    // the serial queue these run after cb2, so a GPU-bound
+                    // split is unchanged, while a CPU-bound split no longer
+                    // waits for one whole-suffix cb3 after its last chunk.
+                    // Regions whose dispatch failed fall back to one cb3.
+                    // `FLOCK_NO_PROGRESSIVE_SUFFIX_HASH=1` restores the
+                    // single-cb3 path exactly.
+                    let progressive = progressive_suffix_hash_enabled();
+                    let mut units: Vec<(usize, usize)> = Vec::new();
+                    {
+                        let mut st = suffix_leaf_start;
+                        while st < n_leaves {
+                            let mut size =
+                                (1usize << (n_leaves - st).ilog2()).min(PROGRESSIVE_UNIT_LEAVES);
+                            while st % size != 0 {
+                                size >>= 1;
+                            }
+                            units.push((st, size));
+                            st += size;
+                        }
+                    }
+                    let remaining: Vec<std::sync::atomic::AtomicUsize> = units
+                        .iter()
+                        .map(|u| std::sync::atomic::AtomicUsize::new(u.1))
+                        .collect();
+                    let dispatched: Vec<std::sync::atomic::AtomicBool> = units
+                        .iter()
+                        .map(|_| std::sync::atomic::AtomicBool::new(false))
+                        .collect();
+                    let unit_cbs: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+                    let gpu_addr = gpu as *const Gpu as usize;
+                    let staging_addr = staging as usize;
+                    let tree_addr = tree_buf as usize;
+                    let on_chunk = |elem_offset: usize, chunk: &[F128]| {
+                        if !progressive {
+                            return;
+                        }
+                        let leaf_start = elem_offset / 64;
+                        let leaf_len = chunk.len() / 64;
+                        let i = units.partition_point(|u| u.0 + u.1 <= leaf_start);
+                        if i >= units.len() || leaf_start + leaf_len > units[i].0 + units[i].1 {
+                            return;
+                        }
+                        let left = remaining[i]
+                            .fetch_sub(leaf_len, std::sync::atomic::Ordering::AcqRel);
+                        if left != leaf_len {
+                            return;
+                        }
+                        // SAFETY: the region's last chunk is final (the NTT
+                        // calls back after a chunk's last write; AcqRel on the
+                        // counter orders every other chunk's writes before
+                        // this commit). The subtree slots are disjoint from
+                        // the GPU prefix's and from every other region's.
+                        unsafe {
+                            let gpu = &*(gpu_addr as *const Gpu);
+                            let pool = gpu.pool_push();
+                            let r = (|| -> Result<Id, String> {
+                                let cb = gpu.command_buffer()?;
+                                let enc = gpu.compute_encoder(cb)?;
+                                encode_merkle_subtree(
+                                    gpu,
+                                    enc,
+                                    staging_addr as Id,
+                                    tree_addr as Id,
+                                    n_leaves,
+                                    units[i].0,
+                                    units[i].1,
+                                );
+                                gpu.end_encoding(enc);
+                                let cb = gpu.retain(cb);
+                                gpu.commit_async(cb);
+                                Ok(cb)
+                            })();
+                            gpu.pool_pop(pool);
+                            if let Ok(cb) = r {
+                                dispatched[i].store(true, std::sync::atomic::Ordering::Release);
+                                if let Ok(mut v) = unit_cbs.lock() {
+                                    v.push(cb as usize);
+                                }
+                            }
+                        }
+                    };
                     let t_cpu_ntt = std::time::Instant::now();
                     if fine_m == 0 {
                         ntt.forward_transform_interleaved_ranked_block_range_and_then(
@@ -7017,7 +7219,7 @@ kernel void blake3_pow_scan(
                             log_d,
                             16 - k_cpu16,
                             16,
-                            |_elem_offset: usize, _chunk: &[F128]| {},
+                            on_chunk,
                         );
                     } else {
                         // The boundary sixteenth's layers 4..8 are the GPU's
@@ -7045,81 +7247,110 @@ kernel void blake3_pow_scan(
                                 }
                                 Ok(())
                             },
-                            |_elem_offset: usize, _chunk: &[F128]| {},
+                            on_chunk,
                         )?;
                     }
                     let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
-                    let cb3 = gpu.command_buffer()?;
-                    let enc = gpu.compute_encoder(cb3)?;
-                    let mut sstart = suffix_leaf_start;
-                    while sstart < n_leaves {
-                        let mut size = 1usize << (n_leaves - sstart).ilog2();
-                        while sstart % size != 0 {
-                            size >>= 1;
+                    // Any region not dispatched progressively goes into one
+                    // trailing cb3, exactly as the incumbent encodes it.
+                    let pending: Vec<usize> = (0..units.len())
+                        .filter(|&i| !dispatched[i].load(std::sync::atomic::Ordering::Acquire))
+                        .collect();
+                    let cb3 = if pending.is_empty() {
+                        None
+                    } else {
+                        let cb3 = gpu.command_buffer()?;
+                        let enc = gpu.compute_encoder(cb3)?;
+                        for &i in &pending {
+                            encode_merkle_subtree(
+                                gpu, enc, staging, tree_buf, n_leaves, units[i].0, units[i].1,
+                            );
                         }
-                        encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size);
-                        sstart += size;
-                    }
-                    gpu.end_encoding(enc);
-                    gpu.commit_async(cb3);
-                    // Same queue: cb3 runs after cb2, so waiting for cb3
-                    // also covers cb2; wait for both explicitly anyway.
+                        gpu.end_encoding(enc);
+                        gpu.commit_async(cb3);
+                        Some(cb3)
+                    };
+                    let unit_cbs: Vec<Id> = unit_cbs
+                        .into_inner()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| a as Id)
+                        .collect();
                     if super::hybrid_cb2_spin_enabled() {
                         gpu.yield_wait_cb_until(
                             cb2,
                             std::time::Instant::now() + std::time::Duration::from_millis(4),
                         )?;
-                        gpu.yield_wait_cb_until(
-                            cb3,
-                            std::time::Instant::now() + std::time::Duration::from_millis(4),
-                        )?;
                     } else {
                         gpu.wait_cb(cb2)?;
-                        gpu.wait_cb(cb3)?;
                     }
-                    // Arms for the sweep's split selection. cb3 queues behind
-                    // both cb2 and the CPU NTT, so this split's window is
-                    // max(cb2, cpu NTT) + cb3: price the GPU arm as cb2's
-                    // start to cb3's end and the CPU arm as the NTT wall.
+                    let mut tail: Option<(f64, f64)> = None;
+                    let mut wait_err: Option<String> = None;
+                    for &cb in unit_cbs.iter().chain(cb3.iter()) {
+                        if let Err(e) = gpu.wait_cb(cb) {
+                            wait_err.get_or_insert(e);
+                            continue;
+                        }
+                        let (s0, e0) = cb_gpu_interval(gpu, cb);
+                        if tail.is_none_or(|(_, te)| e0 > te) {
+                            tail = Some((s0, e0));
+                        }
+                    }
+                    for &cb in &unit_cbs {
+                        gpu.release(cb);
+                    }
+                    if let Some(e) = wait_err {
+                        return Err(e);
+                    }
+                    // Arms for the sweep's split selection: the window is
+                    // cb2's start to the last suffix-hash buffer's end; the
+                    // fine arms' third term is that last buffer's own span.
                     let (cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
-                    let (cb3_s, cb3_e) = cb_gpu_interval(gpu, cb3);
+                    let (cb3_s, cb3_e) = tail.unwrap_or((cb2_e, cb2_e));
                     record_hybrid_arms(k_split, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
                     record_fine_arms(k_split, (cb2_e - cb2_s) * 1e3, cpu_ntt_ms, (cb3_e - cb3_s) * 1e3);
                     if window_trace_enabled() {
                         eprintln!(
                             "[gpu-window] cb3 (gpu suffix merkle, k={k_cpu16}, m={fine_m}): gpu dur {:.2} ms, \
-                             cb2 gpu dur {:.2} ms, cpu ntt {cpu_ntt_ms:.2} ms, cb2 start to cb3 end {:.2} ms",
+                             cb2 gpu dur {:.2} ms, cpu ntt {cpu_ntt_ms:.2} ms, cb2 start to cb3 end {:.2} ms \
+                             [suffix units {} progressive {}]",
                             (cb3_e - cb3_s) * 1e3,
                             (cb2_e - cb2_s) * 1e3,
-                            (cb3_e - cb2_s) * 1e3
+                            (cb3_e - cb2_s) * 1e3,
+                            units.len(),
+                            unit_cbs.len()
                         );
                     }
-                    if fine_m > 0 {
-                        // The boundary sixteenth is split between the GPU's
-                        // and the suffix's aligned subtrees, so no subtree
-                        // spans it: rebuild its four levels above the
-                        // 256th-level roots (16 -> 8 -> 4 -> 2 -> 1 node).
-                        let b = 16 - k_cpu16 - 1;
-                        let mut ls = 0usize;
-                        let mut ll = n_leaves;
-                        while ll > 256 {
-                            ls += ll;
-                            ll /= 2;
-                        }
-                        let mut lo = b * 16;
-                        let mut cnt = 16usize;
-                        while ll > 16 {
-                            let ws = ls + ll;
-                            let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + lo), cnt);
-                            let write = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(ws + lo / 2),
-                                cnt / 2,
-                            );
-                            crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                            ls = ws;
-                            ll /= 2;
-                            lo /= 2;
-                            cnt /= 2;
+                    if fine_m > 0 || progressive {
+                        // No subtree spans a CPU-touched sixteenth any more
+                        // (regions are at most 2^14 leaves; the fine split's
+                        // boundary sixteenth is shared with the GPU): rebuild
+                        // each such sixteenth's four levels above its 256th-
+                        // level roots (16 -> 8 -> 4 -> 2 -> 1 node).
+                        let first_s = prefix_leaves / (n_leaves / 16);
+                        for b in first_s..16 {
+                            let mut ls = 0usize;
+                            let mut ll = n_leaves;
+                            while ll > 256 {
+                                ls += ll;
+                                ll /= 2;
+                            }
+                            let mut lo = b * 16;
+                            let mut cnt = 16usize;
+                            while ll > 16 {
+                                let ws = ls + ll;
+                                let read =
+                                    core::slice::from_raw_parts(tree_base.ptr().add(ls + lo), cnt);
+                                let write = core::slice::from_raw_parts_mut(
+                                    tree_base.ptr().add(ws + lo / 2),
+                                    cnt / 2,
+                                );
+                                crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                                ls = ws;
+                                ll /= 2;
+                                lo /= 2;
+                                cnt /= 2;
+                            }
                         }
                     }
                     let mut level_start = 0usize;
@@ -8375,6 +8606,15 @@ kernel void blake3_pow_scan(
     /// exact same-binary comparison.
     /// S1 kill switch: `FLOCK_NO_HYBRID_GPU_SUFFIX_HASH=1` restores the CPU
     /// suffix leaf/parent hashing.
+    /// Largest progressive suffix-hash region (leaves); see the suffix-hash
+    /// path of [`run_commit_graph_from_z_hybrid_impl`].
+    const PROGRESSIVE_UNIT_LEAVES: usize = 1 << 14;
+
+    fn progressive_suffix_hash_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_PROGRESSIVE_SUFFIX_HASH").is_none())
+    }
+
     fn hybrid_gpu_suffix_hash_enabled() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
@@ -12130,35 +12370,147 @@ constant uchar B3_PERM[16] = {2,6,3,10,7,0,4,13,1,11,12,5,9,14,15,8};
 #define B3_CHUNK_END   2u
 #define B3_PARENT      4u
 
+// Fully unrolled BLAKE3 compression: the seven rounds' message schedule
+// (BLAKE3 permutation applied 0..6 times) is resolved at generation time, so
+// every message word and state word is a named register and no thread array
+// is dynamically indexed; right-rotations by 16/12/8/7 are `rotate` (left)
+// by 16/20/24/25. Same function as the loop form: bit-identical CVs.
 static void b3_compress(thread uint* cv, thread const uint* m_in,
                         uint block_len, uint flags) {
-    uint v[16];
-    uint m[16];
-    for (int i = 0; i < 8; i++) v[i] = cv[i];
-    for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
-    v[12] = 0u;
-    v[13] = 0u;
-    v[14] = block_len;
-    v[15] = flags;
-    for (int i = 0; i < 16; i++) m[i] = m_in[i];
-    for (int r = 0; r < 7; r++) {
-        #define G(a,b,c,d,x,y) \
-            v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
-            v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
-        G(0,4,8,12,  m[0], m[1]);  G(1,5,9,13,  m[2], m[3]);
-        G(2,6,10,14, m[4], m[5]);  G(3,7,11,15, m[6], m[7]);
-        G(0,5,10,15, m[8], m[9]);  G(1,6,11,12, m[10],m[11]);
-        G(2,7,8,13,  m[12],m[13]); G(3,4,9,14,  m[14],m[15]);
-        #undef G
-        if (r < 6) {
-            uint t[16];
-            for (int i = 0; i < 16; i++) t[i] = m[B3_PERM[i]];
-            for (int i = 0; i < 16; i++) m[i] = t[i];
-        }
-    }
-    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
+    uint v0 = cv[0], v1 = cv[1], v2 = cv[2], v3 = cv[3];
+    uint v4 = cv[4], v5 = cv[5], v6 = cv[6], v7 = cv[7];
+    uint v8 = B3_IV[0], v9 = B3_IV[1], v10 = B3_IV[2], v11 = B3_IV[3];
+    uint v12 = 0u, v13 = 0u, v14 = block_len, v15 = flags;
+    uint m0 = m_in[0];
+    uint m1 = m_in[1];
+    uint m2 = m_in[2];
+    uint m3 = m_in[3];
+    uint m4 = m_in[4];
+    uint m5 = m_in[5];
+    uint m6 = m_in[6];
+    uint m7 = m_in[7];
+    uint m8 = m_in[8];
+    uint m9 = m_in[9];
+    uint m10 = m_in[10];
+    uint m11 = m_in[11];
+    uint m12 = m_in[12];
+    uint m13 = m_in[13];
+    uint m14 = m_in[14];
+    uint m15 = m_in[15];
+    v0 = v0 + v4 + m0; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m1; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m2; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m3; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m4; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m5; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m6; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m7; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m8; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m9; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m10; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m11; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m12; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m13; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m14; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m15; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m2; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m6; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m3; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m10; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m7; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m0; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m4; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m13; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m1; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m11; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m12; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m5; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m9; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m14; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m15; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m8; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m3; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m4; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m10; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m12; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m13; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m2; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m7; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m14; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m6; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m5; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m9; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m0; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m11; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m15; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m8; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m1; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m10; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m7; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m12; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m9; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m14; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m3; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m13; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m15; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m4; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m0; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m11; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m2; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m5; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m8; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m1; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m6; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m12; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m13; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m9; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m11; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m15; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m10; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m14; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m8; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m7; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m2; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m5; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m3; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m0; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m1; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m6; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m4; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m9; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m14; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m11; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m5; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m8; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m12; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m15; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m1; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m13; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m3; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m0; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m10; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m2; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m6; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m4; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m7; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    v0 = v0 + v4 + m11; v12 = rotate(v12 ^ v0, 16u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 20u);
+    v0 = v0 + v4 + m15; v12 = rotate(v12 ^ v0, 24u); v8 = v8 + v12; v4 = rotate(v4 ^ v8, 25u);
+    v1 = v1 + v5 + m5; v13 = rotate(v13 ^ v1, 16u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 20u);
+    v1 = v1 + v5 + m0; v13 = rotate(v13 ^ v1, 24u); v9 = v9 + v13; v5 = rotate(v5 ^ v9, 25u);
+    v2 = v2 + v6 + m1; v14 = rotate(v14 ^ v2, 16u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 20u);
+    v2 = v2 + v6 + m9; v14 = rotate(v14 ^ v2, 24u); v10 = v10 + v14; v6 = rotate(v6 ^ v10, 25u);
+    v3 = v3 + v7 + m8; v15 = rotate(v15 ^ v3, 16u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 20u);
+    v3 = v3 + v7 + m6; v15 = rotate(v15 ^ v3, 24u); v11 = v11 + v15; v7 = rotate(v7 ^ v11, 25u);
+    v0 = v0 + v5 + m14; v15 = rotate(v15 ^ v0, 16u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 20u);
+    v0 = v0 + v5 + m10; v15 = rotate(v15 ^ v0, 24u); v10 = v10 + v15; v5 = rotate(v5 ^ v10, 25u);
+    v1 = v1 + v6 + m2; v12 = rotate(v12 ^ v1, 16u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 20u);
+    v1 = v1 + v6 + m12; v12 = rotate(v12 ^ v1, 24u); v11 = v11 + v12; v6 = rotate(v6 ^ v11, 25u);
+    v2 = v2 + v7 + m3; v13 = rotate(v13 ^ v2, 16u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 20u);
+    v2 = v2 + v7 + m4; v13 = rotate(v13 ^ v2, 24u); v8 = v8 + v13; v7 = rotate(v7 ^ v8, 25u);
+    v3 = v3 + v4 + m7; v14 = rotate(v14 ^ v3, 16u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 20u);
+    v3 = v3 + v4 + m13; v14 = rotate(v14 ^ v3, 24u); v9 = v9 + v14; v4 = rotate(v4 ^ v9, 25u);
+    cv[0] = v0 ^ v8; cv[1] = v1 ^ v9; cv[2] = v2 ^ v10; cv[3] = v3 ^ v11;
+    cv[4] = v4 ^ v12; cv[5] = v5 ^ v13; cv[6] = v6 ^ v14; cv[7] = v7 ^ v15;
 }
 
 kernel void leaf_hash128(device const uint* codeword [[buffer(0)]],
