@@ -1377,8 +1377,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 // this chunk is transformed; the hint addresses are inside
                 // the two packed slices because `next + 1 < n_chunks`.
                 #[cfg(target_arch = "aarch64")]
-                if offset + 8 < slab_len {
-                    let next = (x_outer + 8) * OUTER_BYTES;
+                if offset + 32 < slab_len {
+                    let next = (x_outer + 32) * OUTER_BYTES;
                     for line in 0..8 {
                         // SAFETY: `next + 1023 < a_packed.len()` by the guard.
                         unsafe {
