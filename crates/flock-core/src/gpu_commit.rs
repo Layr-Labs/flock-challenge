@@ -5212,6 +5212,64 @@ kernel void blake3_pow_scan(
             }
         }
 
+        /// Process-wide MTLSharedEvent for the fine hybrid split, created on
+        /// first use and never released.
+        pub(crate) unsafe fn fine_split_event(&self) -> Id {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static EV: AtomicUsize = AtomicUsize::new(0);
+            let p = EV.load(Ordering::Acquire);
+            if p != 0 {
+                return p as Id;
+            }
+            let ev: Id = unsafe {
+                send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    self.device,
+                    c"newSharedEvent"
+                )
+            };
+            if ev.is_null() {
+                return ev;
+            }
+            match EV.compare_exchange(0, ev as usize, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => ev,
+                Err(other) => other as Id,
+            }
+        }
+
+        /// Encode a command-buffer-level signal of `ev` to `value` between
+        /// two encoders of `cb`.
+        pub(crate) unsafe fn encode_signal_event(&self, cb: Id, ev: Id, value: u64) {
+            unsafe {
+                send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel, Id, u64),
+                    cb,
+                    c"encodeSignalEvent:value:",
+                    ev,
+                    value
+                );
+            }
+        }
+
+        /// Raw `MTLCommandBufferStatus` of a committed buffer.
+        pub(crate) unsafe fn cb_status(&self, cb: Id) -> u64 {
+            unsafe { send!(self.api, unsafe extern "C" fn(Id, Sel) -> u64, cb, c"status") }
+        }
+
+        /// Current `signaledValue` of a shared event.
+        pub(crate) unsafe fn event_signaled_value(&self, ev: Id) -> u64 {
+            unsafe {
+                send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    ev,
+                    c"signaledValue"
+                )
+            }
+        }
+
         /// Wait for a previously `commit_async`ed buffer and check status.
         pub(crate) unsafe fn wait_cb(&self, cb: Id) -> Result<(), String> {
             unsafe {
@@ -5635,6 +5693,78 @@ kernel void blake3_pow_scan(
                 gpu.set_bytes(enc, bytes, 2);
                 debug_assert_eq!(groups % 16, 0);
                 gpu.dispatch(enc, groups / 16 * prefix16, tpg);
+            }
+        }
+    }
+
+    /// Fine hybrid split: encode the passes with first layer in
+    /// `[l_from, l_to)` over the position prefix of `num / den` of the
+    /// codeword (`den` a power of two dividing every pass's group count).
+    /// Valid for passes with `l >= log2(den)` because every kernel derives
+    /// its block index from the high bits of `tgid`. Pipeline selection is
+    /// the same as [`encode_ntt_passes_prefix`].
+    pub(crate) unsafe fn encode_ntt_passes_prefix_frac(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        log_d: usize,
+        start_layer: usize,
+        l_from: usize,
+        l_to: usize,
+        num: u64,
+        den: u64,
+    ) {
+        unsafe {
+            gpu.set_buffer(enc, data_buf, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+                0usize
+            } else {
+                2usize
+            };
+            for (l, f) in super::plan_passes(log_d, start_layer) {
+                if l < l_from || l >= l_to {
+                    continue;
+                }
+                debug_assert!(1u64 << l >= den, "fine prefix finer than the pass's blocks");
+                let s = log_d - l - f;
+                let (pso, tpg, groups) = match f {
+                    4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
+                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                    }
+                    4 if share_log > 0 && s >= share_log => {
+                        (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
+                    }
+                    4 if super::pass_tune_enabled()
+                        && super::gpu_mixed_final_selected(log_d, l, f) =>
+                    {
+                        let pso = if gpu.pso_ntt5t3.is_null() {
+                            gpu.pso_ntt5mix
+                        } else {
+                            gpu.pso_ntt5t3
+                        };
+                        (pso, 64u64, 1u64 << (log_d - f))
+                    }
+                    4 if super::pass_tune_enabled() => (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f)),
+                    4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
+                    3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
+                    _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
+                };
+                gpu.set_pipeline(enc, pso);
+                let p = NttParams {
+                    log_d: log_d as u32,
+                    l: l as u32,
+                    f: f as u32,
+                    s: s as u32,
+                };
+                let bytes = core::slice::from_raw_parts(
+                    (&p as *const NttParams).cast::<u8>(),
+                    core::mem::size_of::<NttParams>(),
+                );
+                gpu.set_bytes(enc, bytes, 2);
+                debug_assert_eq!(groups % den, 0);
+                gpu.dispatch(enc, groups / den * num, tpg);
             }
         }
     }
@@ -6311,7 +6441,7 @@ kernel void blake3_pow_scan(
             0
         } else {
             match hybrid_cpu_sixteenths() {
-                k @ 1..=15 => k,
+                k if k % 16 != 0 && k < 256 => k,
                 _ => 0,
             }
         };
@@ -6700,6 +6830,26 @@ kernel void blake3_pow_scan(
     /// Factored out so the streamed first pass can pre-encode and commit it
     /// immediately behind the final streamed tile, removing the host
     /// wait/encode bubble between first-pass completion and prefix start.
+    /// Event value the CPU arm waits for before its fine sub-blocks (the
+    /// GPU's layer-4 pass over the boundary sixteenth is then complete).
+    static FINE_SPLIT_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static FINE_SPLIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Decode a hybrid split value: `k_split = k_cpu16 + 16 * m`, where the
+    /// CPU owns the last `k_cpu16` sixteenths plus the last `m` of the 16
+    /// layer-8 sub-blocks (256ths) of the sixteenth just before them.
+    #[inline]
+    pub(crate) fn decode_hybrid_split(k_split: usize) -> (usize, usize) {
+        (k_split % 16, k_split / 16)
+    }
+
+    /// GPU-owned prefix in 256ths of the position range for a split.
+    #[inline]
+    pub(crate) fn hybrid_prefix256(k_split: usize) -> usize {
+        let (k, m) = decode_hybrid_split(k_split);
+        16 * (16 - k) - m
+    }
+
     unsafe fn encode_hybrid_prefix_cb2(
         gpu: &Gpu,
         staging: Id,
@@ -6707,9 +6857,15 @@ kernel void blake3_pow_scan(
         tree_buf: Id,
         log_d: usize,
         n_leaves: usize,
-        k_cpu16: usize,
+        k_split: usize,
     ) -> Result<Id, String> {
-        debug_assert!((1..16).contains(&k_cpu16));
+        let (k_cpu16, m) = decode_hybrid_split(k_split);
+        debug_assert!((1..16).contains(&k_cpu16) && m < 16);
+        if m > 0 {
+            return unsafe {
+                encode_hybrid_prefix_cb2_fine(gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_split)
+            };
+        }
         unsafe {
             let prefix16 = (16 - k_cpu16) as u64;
             let cb2 = gpu.command_buffer()?;
@@ -6733,6 +6889,60 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// [`encode_hybrid_prefix_cb2`] for a fine split (`m > 0`): encoder 1
+    /// runs the layer-4 pass over the GPU's sixteenths INCLUDING the boundary
+    /// sixteenth, then the command buffer signals the fine-split event so the
+    /// CPU may start the boundary sixteenth's last `m` layer-8 sub-blocks;
+    /// encoder 2 runs the layer-8+ passes and the aligned Merkle subtrees
+    /// over the GPU's 256ths only.
+    /// True once `cb` has failed (`MTLCommandBufferStatusError`).
+    #[inline]
+    unsafe fn gpu_cb_failed(gpu: &Gpu, cb: Id) -> bool {
+        unsafe { gpu.cb_status(cb) == 5 }
+    }
+
+    unsafe fn encode_hybrid_prefix_cb2_fine(
+        gpu: &Gpu,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        k_split: usize,
+    ) -> Result<Id, String> {
+        let (k_cpu16, m) = decode_hybrid_split(k_split);
+        debug_assert!(log_d == 20 && (1..16).contains(&k_cpu16) && (1..16).contains(&m));
+        unsafe {
+            let ev = gpu.fine_split_event();
+            if ev.is_null() {
+                return Err("newSharedEvent failed".into());
+            }
+            let prefix16 = (16 - k_cpu16) as u64;
+            let prefix256 = hybrid_prefix256(k_split) as u64;
+            let cb2 = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb2)?;
+            encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 4, 8, prefix16, 16);
+            gpu.end_encoding(enc);
+            let v = FINE_SPLIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            gpu.encode_signal_event(cb2, ev, v);
+            FINE_SPLIT_WAIT.store(v, std::sync::atomic::Ordering::Release);
+            let enc = gpu.compute_encoder(cb2)?;
+            encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 8, log_d, prefix256, 256);
+            let prefix_leaves = prefix256 as usize * (n_leaves / 256);
+            let mut start = 0usize;
+            while start < prefix_leaves {
+                let mut size = 1usize << (prefix_leaves - start).ilog2();
+                while start % size != 0 {
+                    size >>= 1;
+                }
+                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                start += size;
+            }
+            gpu.end_encoding(enc);
+            Ok(cb2)
+        }
+    }
+
     unsafe fn run_commit_graph_from_z_hybrid_impl(
         gpu: &Gpu,
         z_buf: Id,
@@ -6741,12 +6951,16 @@ kernel void blake3_pow_scan(
         tree_buf: Id,
         log_d: usize,
         n_leaves: usize,
-        k_cpu16: usize,
+        k_split: usize,
         first_pass_done: bool,
         pre_cb2: Option<Id>,
     ) -> Result<(), String> {
         use rayon::prelude::*;
-        debug_assert!((1..16).contains(&k_cpu16));
+        let (k_cpu16, fine_m) = decode_hybrid_split(k_split);
+        debug_assert!((1..16).contains(&k_cpu16) && fine_m < 16);
+        if fine_m > 0 && !hybrid_gpu_suffix_hash_enabled() {
+            return Err("fine hybrid split requires the GPU suffix hash path".into());
+        }
         unsafe {
             let pool = gpu.pool_push();
             let r = (|| {
@@ -6763,13 +6977,13 @@ kernel void blake3_pow_scan(
                     Some(cb2) => cb2,
                     None => {
                         let cb2 = encode_hybrid_prefix_cb2(
-                            gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16,
+                            gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_split,
                         )?;
                         gpu.commit_async(cb2);
                         cb2
                     }
                 };
-                let prefix_leaves = (16 - k_cpu16) * (n_leaves / 16);
+                let prefix_leaves = hybrid_prefix256(k_split) * (n_leaves / 256);
 
                 // CPU: suffix NTT completion + leaves + subtree parents.
                 // The twiddle table is deterministic per log_d; built once per
@@ -6795,15 +7009,45 @@ kernel void blake3_pow_scan(
                 // tree, same flat-tree slots, so the root is unchanged.
                 if hybrid_gpu_suffix_hash_enabled() {
                     let t_cpu_ntt = std::time::Instant::now();
-                    ntt.forward_transform_interleaved_ranked_block_range_and_then(
-                        data,
-                        64,
-                        4,
-                        log_d,
-                        16 - k_cpu16,
-                        16,
-                        |_elem_offset: usize, _chunk: &[F128]| {},
-                    );
+                    if fine_m == 0 {
+                        ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                            data,
+                            64,
+                            4,
+                            log_d,
+                            16 - k_cpu16,
+                            16,
+                            |_elem_offset: usize, _chunk: &[F128]| {},
+                        );
+                    } else {
+                        // The boundary sixteenth's layers 4..8 are the GPU's
+                        // (cb2's first encoder): its event gates this arm's
+                        // last `fine_m` layer-8 sub-blocks of that sixteenth.
+                        let ev = gpu.fine_split_event();
+                        let want = FINE_SPLIT_WAIT.load(std::sync::atomic::Ordering::Acquire);
+                        ntt.forward_transform_interleaved_ranked_fine_range_and_then(
+                            data,
+                            64,
+                            16 - k_cpu16,
+                            fine_m,
+                            || {
+                                let mut spins = 0u32;
+                                while gpu.event_signaled_value(ev) < want {
+                                    if gpu_cb_failed(gpu, cb2) {
+                                        return Err("fine split: GPU prefix failed before layer-4 signal".into());
+                                    }
+                                    spins = spins.wrapping_add(1);
+                                    if spins % 64 == 0 {
+                                        std::thread::yield_now();
+                                    } else {
+                                        core::hint::spin_loop();
+                                    }
+                                }
+                                Ok(())
+                            },
+                            |_elem_offset: usize, _chunk: &[F128]| {},
+                        )?;
+                    }
                     let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
                     let cb3 = gpu.command_buffer()?;
                     let enc = gpu.compute_encoder(cb3)?;
@@ -6839,15 +7083,44 @@ kernel void blake3_pow_scan(
                     // start to cb3's end and the CPU arm as the NTT wall.
                     let (cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
                     let (cb3_s, cb3_e) = cb_gpu_interval(gpu, cb3);
-                    record_hybrid_arms(k_cpu16, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
+                    record_hybrid_arms(k_split, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
+                    record_fine_arms(k_split, (cb2_e - cb2_s) * 1e3, cpu_ntt_ms, (cb3_e - cb3_s) * 1e3);
                     if window_trace_enabled() {
                         eprintln!(
-                            "[gpu-window] cb3 (gpu suffix merkle, k={k_cpu16}): gpu dur {:.2} ms, \
+                            "[gpu-window] cb3 (gpu suffix merkle, k={k_cpu16}, m={fine_m}): gpu dur {:.2} ms, \
                              cb2 gpu dur {:.2} ms, cpu ntt {cpu_ntt_ms:.2} ms, cb2 start to cb3 end {:.2} ms",
                             (cb3_e - cb3_s) * 1e3,
                             (cb2_e - cb2_s) * 1e3,
                             (cb3_e - cb2_s) * 1e3
                         );
+                    }
+                    if fine_m > 0 {
+                        // The boundary sixteenth is split between the GPU's
+                        // and the suffix's aligned subtrees, so no subtree
+                        // spans it: rebuild its four levels above the
+                        // 256th-level roots (16 -> 8 -> 4 -> 2 -> 1 node).
+                        let b = 16 - k_cpu16 - 1;
+                        let mut ls = 0usize;
+                        let mut ll = n_leaves;
+                        while ll > 256 {
+                            ls += ll;
+                            ll /= 2;
+                        }
+                        let mut lo = b * 16;
+                        let mut cnt = 16usize;
+                        while ll > 16 {
+                            let ws = ls + ll;
+                            let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + lo), cnt);
+                            let write = core::slice::from_raw_parts_mut(
+                                tree_base.ptr().add(ws + lo / 2),
+                                cnt / 2,
+                            );
+                            crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                            ls = ws;
+                            ll /= 2;
+                            lo /= 2;
+                            cnt /= 2;
+                        }
                     }
                     let mut level_start = 0usize;
                     let mut level_len = n_leaves;
@@ -7272,6 +7545,107 @@ kernel void blake3_pow_scan(
         Some(k)
     }
 
+    /// A storable hybrid split: a plain sixteenths count `0..16`, or a fine
+    /// split `k + 16 * m` with `k, m` in `1..16`.
+    #[inline]
+    fn hybrid_split_valid(k_split: usize) -> bool {
+        k_split < 16 || (k_split < 256 && k_split % 16 != 0)
+    }
+
+    /// The cheapest sample's `(gpu, cpu)` arms for split `k`.
+    fn arm_pair(samples: &[(usize, f64, f64)], k: usize) -> Option<(f64, f64)> {
+        samples
+            .iter()
+            .filter(|s| s.0 == k && s.1.is_finite() && s.2.is_finite())
+            .min_by(|a, b| a.1.max(a.2).total_cmp(&b.1.max(b.2)))
+            .map(|s| (s.1, s.2))
+    }
+
+    /// GPU-arm saving per moved sub-block relative to a whole sixteenth's
+    /// saving: the boundary sixteenth's layers 4..8 stay on the GPU and its
+    /// suffix leaves are still hashed by the GPU's cb3.
+    const FINE_GPU_SHARE: f64 = 0.65;
+    /// CPU-arm cost per moved sub-block relative to a whole sixteenth's
+    /// cost (the boundary sub-blocks add a separate layer-8 pair).
+    const FINE_CPU_SHARE: f64 = 1.15;
+    /// The fine split must beat the chosen split's measured window by this.
+    const FINE_MARGIN: f64 = 0.01;
+
+    /// Per-sample `(k_split, cb2 GPU ms, CPU suffix ms, cb3 GPU ms)` from the
+    /// GPU-suffix-hash path, recorded beside [`record_hybrid_arms`]. Unlike
+    /// the hybrid arms (whose GPU arm runs to cb3's end and so includes any
+    /// wait on the CPU), cb2's own duration is the GPU prefix's work alone,
+    /// which is what interpolating a split needs.
+    fn fine_arm_samples() -> &'static std::sync::Mutex<Vec<(usize, f64, f64, f64)>> {
+        static V: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, f64, f64, f64)>>> =
+            std::sync::OnceLock::new();
+        V.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn record_fine_arms(k_split: usize, cb2_ms: f64, cpu_ms: f64, cb3_ms: f64) {
+        if !hybrid_arm_recording() || k_split > ARM_SPLIT_MAX_K {
+            return;
+        }
+        if !(cb2_ms.is_finite() && cb2_ms > 0.0 && cpu_ms.is_finite() && cpu_ms > 0.0 && cb3_ms.is_finite()) {
+            return;
+        }
+        if let Ok(mut v) = fine_arm_samples().lock() {
+            v.push((k_split, cb2_ms, cpu_ms, cb3_ms));
+        }
+    }
+
+    /// The `(cb2, cpu, cb3)` of split `k`'s cheapest fine sample.
+    fn fine_triple(samples: &[(usize, f64, f64, f64)], k: usize) -> Option<(f64, f64, f64)> {
+        samples
+            .iter()
+            .filter(|s| s.0 == k)
+            .min_by(|a, b| (a.1.max(a.2) + a.3).total_cmp(&(b.1.max(b.2) + b.3)))
+            .map(|s| (s.1, s.2, s.3))
+    }
+
+    /// Refine the chosen split `k` to `k' + 16 * m`: interpolate cb2 (GPU
+    /// prefix), the CPU suffix and cb3 (suffix hashing) between the sampled
+    /// splits `k'` (GPU prefix the slower arm) and `k' + 1`, and take the `m`
+    /// minimising `max(cb2, cpu) + cb3`. Keeps `k` unless the prediction beats
+    /// `k`'s own measured window by [`FINE_MARGIN`]. The verify that follows
+    /// byte-checks whatever this returns. `FLOCK_NO_HYBRID_FINE=1` disables.
+    fn fine_split_from_arms(samples: &[(usize, f64, f64, f64)], k: usize) -> usize {
+        if k == 0 || k >= 16 || std::env::var_os("FLOCK_NO_HYBRID_FINE").is_some()
+            || !hybrid_gpu_suffix_hash_enabled()
+        {
+            return k;
+        }
+        let Some((gk, ck, hk)) = fine_triple(samples, k) else { return k };
+        let base = if gk > ck { k } else { k - 1 };
+        if base == 0 || base + 1 >= 16 {
+            return k;
+        }
+        let (Some((g0, c0, h0)), Some((g1, c1, h1))) =
+            (fine_triple(samples, base), fine_triple(samples, base + 1))
+        else {
+            return k;
+        };
+        let (dg, dc) = (g0 - g1, c1 - c0);
+        if !(g0 > c0 && dg > 0.0 && dc > 0.0) {
+            return k;
+        }
+        let mut best = (0usize, f64::INFINITY);
+        for m in 1..16usize {
+            let t = m as f64 / 16.0;
+            let w = (g0 - FINE_GPU_SHARE * dg * t).max(c0 + FINE_CPU_SHARE * dc * t)
+                + h0 + (h1 - h0).max(0.0) * t;
+            if w < best.1 {
+                best = (m, w);
+            }
+        }
+        let k_window = gk.max(ck) + hk;
+        if best.1 < k_window * (1.0 - FINE_MARGIN) {
+            base + 16 * best.0
+        } else {
+            k
+        }
+    }
+
     /// CPU reference-commit wall from the cache-miss warmup. Cache
     /// publication waits for the exact-contention winner, so no cache-hit
     /// worker can observe the untuned sentinel.
@@ -7291,7 +7665,8 @@ kernel void blake3_pow_scan(
             std::env::var("FLOCK_HYBRID_CPU_BLOCKS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .filter(|k| *k < 16)
+                // `k + 16 * m` pins a fine split (m in 1..16, k in 1..16).
+                .filter(|k| *k < 16 || (*k < 256 && *k % 16 != 0))
         })
     }
 
@@ -7866,6 +8241,9 @@ kernel void blake3_pow_scan(
             if let Ok(mut v) = hybrid_arm_samples().lock() {
                 v.clear();
             }
+            if let Ok(mut v) = fine_arm_samples().lock() {
+                v.clear();
+            }
             let _recording = ArmRecordScope::enter();
             match collect_ranked_exact_samples(reprime, sample) {
                 Ok(samples) => samples,
@@ -7905,6 +8283,15 @@ kernel void blake3_pow_scan(
             Some(k) => k,
             None => swept,
         };
+        let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
+        let chosen = fine_split_from_arms(&fine_samples, chosen);
+        if dbg {
+            let rows: Vec<String> = fine_samples
+                .iter()
+                .map(|s| format!("k={}:{:.1}/{:.1}/{:.1}", s.0, s.1, s.2, s.3))
+                .collect();
+            eprintln!("[gpu-commit] fine split: chosen {chosen} | cb2/cpu/cb3 {}", rows.join(" "));
+        }
         if dbg {
             let arms: Vec<String> = RANKED_EXACT_TUNE_CANDIDATES
                 .iter()
@@ -8241,7 +8628,7 @@ kernel void blake3_pow_scan(
         let latch_on = take_u64(&bytes)? == 1;
         let tuned_k = take_u64(&bytes)? as usize;
         let cpu_wall_ms = f64::from_bits(take_u64(&bytes)?);
-        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || tuned_k >= 16 {
+        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || !hybrid_split_valid(tuned_k) {
             return None;
         }
         let root_bytes = bytes.get(off..)?;
@@ -8266,7 +8653,7 @@ kernel void blake3_pow_scan(
         cpu_wall_ms: f64,
         cpu_tree: &[Hash],
     ) {
-        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || tuned_k >= 16 {
+        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || !hybrid_split_valid(tuned_k) {
             return;
         }
         let cpu_root: Hash = if latch_on {
@@ -11302,6 +11689,44 @@ kernel void lc_fold_stripes_factored_b4(
     mod hybrid_balance_tests {
         use super::{ARM_SPLIT_MARGIN, arm_window_ms, split_from_arms};
 
+        // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
+        #[test]
+        fn fine_split_interpolates_between_bracketing_splits() {
+            let s = [(3, 50.4, 44.4, 1.0), (4, 46.2, 48.2, 1.3)];
+            let k = super::fine_split_from_arms(&s, 3);
+            let (base, m) = super::decode_hybrid_split(k);
+            assert_eq!(base, 3);
+            assert!((1..16).contains(&m), "m = {m}");
+            assert!(super::hybrid_split_valid(k));
+        }
+
+        #[test]
+        fn fine_split_from_a_cpu_bound_pick_steps_down() {
+            let s = [(3, 50.4, 44.4, 1.0), (4, 44.0, 52.0, 1.3)];
+            let (base, m) = super::decode_hybrid_split(super::fine_split_from_arms(&s, 4));
+            assert_eq!(base, 3);
+            assert!(m >= 1);
+        }
+
+        #[test]
+        fn fine_split_needs_both_neighbours_and_a_real_gain() {
+            assert_eq!(super::fine_split_from_arms(&[(3, 50.4, 44.4, 1.0)], 3), 3);
+            // Already balanced at k: no predicted gain beats the margin.
+            let s = [(3, 47.0, 46.9, 1.0), (4, 43.0, 51.0, 1.3)];
+            assert_eq!(super::fine_split_from_arms(&s, 3), 3);
+            assert_eq!(super::fine_split_from_arms(&[], 0), 0);
+        }
+
+        #[test]
+        fn split_validity() {
+            assert!(super::hybrid_split_valid(0) && super::hybrid_split_valid(15));
+            assert!(super::hybrid_split_valid(3 + 16 * 4));
+            assert!(!super::hybrid_split_valid(16) && !super::hybrid_split_valid(32));
+            assert!(!super::hybrid_split_valid(256 + 3));
+            assert_eq!(super::hybrid_prefix256(3 + 16 * 4), 16 * 13 - 4);
+            assert_eq!(super::hybrid_prefix256(5), 16 * 11);
+        }
+
         #[test]
         fn arm_window_is_the_slower_arm_of_the_cheapest_sample() {
             // Per sample, max(120, 40) = 120 and max(118, 44) = 118. The
@@ -12735,8 +13160,8 @@ kernel void zc_r2_products_horner(
     uint tgid [[threadgroup_position_in_grid]],
     uint lid  [[thread_index_in_threadgroup]])
 {
+    threadgroup uint4 nib[256];
     threadgroup ulong4 red[256];
-    threadgroup uint4* nib = reinterpret_cast<threadgroup uint4*>(red);
     nib[lid] = nib_tab_dev[lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -12769,8 +13194,6 @@ kernel void zc_r2_products_horner(
     U256k mi = clmul128(e, zc_r2_horner_reduce(hi));
     ulong4 acc1 = ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
     ulong4 acci = ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
-    // Retire every table reader before the reducer reuses the same storage.
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid);
 }
 
@@ -12892,26 +13315,6 @@ kernel void zc_r2_horner_oracle(
     #[cfg(test)]
     pub(crate) fn zc_r2_test_set_share(share: usize) {
         ZC_R2_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Read raw physical groups through the production job and selected PSO.
-    #[cfg(test)]
-    pub(crate) fn zc_r2_test_physical_partials(
-        job: &ZcR2Job,
-    ) -> (Vec<[F128; 4]>, (u64, u64, u64)) {
-        let gpu = gpu().expect("physical partial oracle requires real Metal");
-        unsafe { gpu.wait_cb(job.cb).expect("physical partial job must complete") };
-        let state = zc_r2_state().expect("R2 state must exist").lock().unwrap();
-        let groups = if job.horner { 4 } else { 1 };
-        unsafe {
-            let parts = core::slice::from_raw_parts(
-                gpu.buffer_contents(state.part_buf).cast::<[F128; 4]>(),
-                job.chunks * groups,
-            )
-            .to_vec();
-            let pso = if job.horner { state.horner_pso } else { state.pso };
-            (parts, gpu.pipeline_resources(pso))
-        }
     }
 
     /// Ratio-gate override (`FLOCK_ZC_R2_GPU_FORCE_RATIO=<f64>`).
@@ -17729,12 +18132,9 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_products_horner").unwrap();
             let old_usage = gpu.pipeline_resources(ordinary);
             let usage = gpu.pipeline_resources(horner);
-            assert_eq!(old_usage.0, 12_288, "ordinary storage must stay unchanged");
-            assert_eq!(usage.0, 8_192, "Horner table and reduction must share storage");
-            assert!(
-                old_usage.2 >= 256 && usage.2 >= 256,
-                "both production groups must fit"
-            );
+            assert_eq!(old_usage.0, usage.0, "shared-memory use changed");
+            assert_eq!(old_usage.1, usage.1, "SIMD width changed");
+            assert!(usage.2 >= 256, "Horner production group no longer fits");
             for repeat in 0..2 {
                 std::ptr::write_bytes(gpu.buffer_contents(out_buf), 0xA5, output_bytes);
                 let cb = gpu.command_buffer().unwrap();
@@ -17771,27 +18171,15 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// equality check must pass and publish a share without poisoning) and
     /// the timed prefix path.
     #[test]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_zc_r2_products_match_cpu_oracle() {
-        assert!(gpu_zc_r2_horner_enabled(), "the Horner alias route must run");
-        for (lo_size, hi_size, fixed_weights, mask, useful) in [
-            (512, 64, false, 4095, 3900),
-            (16_384, 8, true, 127, 121),
-            (16_384, 8, true, 16_383, 61),
-            (16_384, 8, false, 4095, 3900),
-        ] {
-            zc_r2_products_case(lo_size, hi_size, fixed_weights, mask, useful);
+        for (lo_size, hi_size, fixed_weights) in
+            [(512, 64, false), (16_384, 8, true), (16_384, 8, false)]
+        {
+            zc_r2_products_case(lo_size, hi_size, fixed_weights);
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn zc_r2_products_case(
-        lo_size: usize,
-        hi_size: usize,
-        fixed_weights: bool,
-        mask: usize,
-        useful: usize,
-    ) {
+    fn zc_r2_products_case(lo_size: usize, hi_size: usize, fixed_weights: bool) {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
             *rng ^= *rng << 13;
@@ -17830,11 +18218,13 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         };
 
         let n_pairs = lo_size * hi_size;
-        // Random padded bytes must be ignored. The sparse Horner case has
-        // only one active window and three wholly inactive physical groups.
-        // The production state caches these no-copy wraps for the process.
-        let a_packed = leak_page_aligned(n_pairs * 16);
-        let b_packed = leak_page_aligned(n_pairs * 16);
+        // Test the ranked seven-pair tail and a generic padded block.
+        // The padded inputs contain random data, which must be ignored.
+        let mask = if fixed_weights { 127usize } else { 4095usize };
+        let useful = if fixed_weights { 121usize } else { 3900usize };
+
+        let mut a_packed = vec![0u8; n_pairs * 16];
+        let mut b_packed = vec![0u8; n_pairs * 16];
         for byte in a_packed.iter_mut() {
             *byte = (xs(&mut rng) & 0xff) as u8;
         }
@@ -17856,59 +18246,40 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
         let mut eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
 
-        // CPU field reference, with each physical Horner partition kept
-        // separate so a wrong group, parity or eq_hi slot cannot hide in a sum.
+        // CPU reference partials, exactly the driver's non-aarch64 shape, kept
+        // split by x_lo parity so the arm's parity contract is checked and not
+        // just the sum a wrong split could still reproduce.
         let reference = |a_packed: &[u8],
                          b_packed: &[u8],
                          table_data: &[F128],
                          eq_lo: &[F128],
-                         eq_hi: &[F128],
-                         groups: usize| {
-            let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size * groups);
+                         eq_hi: &[F128]| {
+            let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
             for x_hi in 0..hi_size {
-                for group in 0..groups {
-                    let mut acc = [F256Unreduced::ZERO; 4];
-                    for x_lo in group * lo_size / groups..(group + 1) * lo_size / groups {
-                        let pair_idx = x_hi * lo_size + x_lo;
-                        if (pair_idx & mask) >= useful {
-                            continue;
-                        }
-                        let read = |packed: &[u8], row: usize| -> u64 {
-                            u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
-                        };
-                        let a0 = fold_row(table_data, read(a_packed, 2 * pair_idx));
-                        let a1 = fold_row(table_data, read(a_packed, 2 * pair_idx + 1));
-                        let b0 = fold_row(table_data, read(b_packed, 2 * pair_idx));
-                        let b1 = fold_row(table_data, read(b_packed, 2 * pair_idx + 1));
-                        let base = 2 * (x_lo & 1);
-                        acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                        acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+                // [p1_even, pinf_even, p1_odd, pinf_odd]
+                let mut acc = [F256Unreduced::ZERO; 4];
+                for x_lo in 0..lo_size {
+                    let pair_idx = x_hi * lo_size + x_lo;
+                    if (pair_idx & mask) >= useful {
+                        continue;
                     }
-                    let eq_h = eq_hi[x_hi];
-                    cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
+                    let read = |packed: &[u8], row: usize| -> u64 {
+                        u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
+                    };
+                    let a0 = fold_row(table_data, read(&a_packed, 2 * pair_idx));
+                    let a1 = fold_row(table_data, read(&a_packed, 2 * pair_idx + 1));
+                    let b0 = fold_row(table_data, read(&b_packed, 2 * pair_idx));
+                    let b1 = fold_row(table_data, read(&b_packed, 2 * pair_idx + 1));
+                    let base = 2 * (x_lo & 1);
+                    acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
+                    acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
                 }
+                let eq_h = eq_hi[x_hi];
+                cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
             }
             cpu_split
         };
-        let cpu_split = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, 1);
-        let groups = if fixed_weights { 4 } else { 1 };
-        let cpu_physical = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, groups);
-        let check_physical = |job: &imp::ZcR2Job, expected: &[[F128; 4]]| {
-            let (actual, usage) = imp::zc_r2_test_physical_partials(job);
-            assert_eq!(
-                usage.0,
-                if job.uses_horner() { 8_192 } else { 12_288 },
-                "actual production PSO shared storage"
-            );
-            assert!(usage.2 >= 256, "the production group must fit");
-            assert_eq!(actual.len(), job.chunks * groups);
-            assert_eq!(actual, expected[..actual.len()], "raw physical partials");
-            eprintln!(
-                "[zc-r2-alias] horner={} physical_groups={} resources={usage:?}",
-                job.uses_horner(),
-                actual.len()
-            );
-        };
+        let cpu_split = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
         let cpu_partials: Vec<(F128, F128)> = cpu_split
             .iter()
             .map(|v| (v[0] + v[2], v[1] + v[3]))
@@ -17939,7 +18310,6 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         );
         assert!(job.is_calibration());
         assert_eq!(job.cpu_split(), 0);
-        check_physical(&job, &cpu_physical);
         let res = imp::zc_r2_wait(job, Some(&cpu_partials), Some(&cpu_la), 50.0, hi_size);
         assert!(matches!(res, imp::ZcR2Result::Calibrated));
         let (tuned, poisoned) = imp::zc_r2_test_state();
@@ -17970,7 +18340,6 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
-        check_physical(&job2, &cpu_physical);
         match imp::zc_r2_wait(job2, None, None, 0.0, hi_size) {
             imp::ZcR2Result::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);
@@ -17995,10 +18364,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             eq_lo.as_ptr(),
             eq_hi.as_ptr(),
         );
-        for byte in a_packed.iter_mut() {
+        for byte in &mut a_packed {
             *byte ^= 0x5b;
         }
-        for byte in b_packed.iter_mut() {
+        for byte in &mut b_packed {
             *byte ^= 0xa7;
         }
         for value in table_data
@@ -18019,9 +18388,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             )
         );
         assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
-        let changed = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, 1);
-        let changed_physical =
-            reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, groups);
+        let changed = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
         assert_ne!(
             &changed[..prefix],
             &cpu_split[..prefix],
@@ -18045,7 +18412,6 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         );
         assert!(!job3.is_calibration());
         assert_eq!(job3.cpu_split(), prefix);
-        check_physical(&job3, &changed_physical);
         match imp::zc_r2_wait(job3, None, None, 0.0, hi_size) {
             imp::ZcR2Result::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);
