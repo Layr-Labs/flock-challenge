@@ -3089,15 +3089,30 @@ fn transpose_forward_ntt_fused_3layer(
                 *value = *ptr.add(base + i * eighth);
             }
             let tw = &twiddles[block];
-            for pair in 0..4 {
-                butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
-            }
-            for half in 0..2 {
-                butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
-                butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
-            }
-            for i in 0..4 {
-                butterfly(&mut values, i, i + 4, tw[0]);
+            if block == 0 {
+                // Factory twiddles 0, 1, and 3 are zero at absolute block zero.
+                values[0] = values[0] + values[1];
+                butterfly(&mut values, 2, 3, tw[4]);
+                butterfly(&mut values, 4, 5, tw[5]);
+                butterfly(&mut values, 6, 7, tw[6]);
+                values[0] = values[0] + values[2];
+                values[1] = values[1] + values[3];
+                butterfly(&mut values, 4, 6, tw[2]);
+                butterfly(&mut values, 5, 7, tw[2]);
+                for i in 0..4 {
+                    values[i] = values[i] + values[i + 4];
+                }
+            } else {
+                for pair in 0..4 {
+                    butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
+                }
+                for half in 0..2 {
+                    butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
+                    butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
+                }
+                for i in 0..4 {
+                    butterfly(&mut values, i, i + 4, tw[0]);
+                }
             }
             for (i, &value) in values.iter().enumerate() {
                 *ptr.add(base + i * eighth) = value;
