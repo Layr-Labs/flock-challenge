@@ -1030,6 +1030,33 @@ unsafe fn fold_row_code_q(table_data: *const u8, row: u64) -> core::arch::aarch6
     }
 }
 
+/// `[lo, hi]` as one q register, built from two general registers with
+/// `fmov` + `ins` (no memory access).
+///
+/// The round-two producers already hold each row code in a general register
+/// (it feeds the `ubfx` lookups). From the plain `[a0 ^ a1, b0 ^ b1]` array
+/// LLVM instead re-loads both packed row pairs as q registers and rebuilds
+/// the delta pair with `zip1`/`zip2`/`eor` — two extra loads per pair in a
+/// loop bound by its load/store issue (32 table gathers per pair). The
+/// opaque asm keeps the value on the register path.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn q_from_gprs(lo: u64, hi: u64) -> core::arch::aarch64::uint64x2_t {
+    let out: core::arch::aarch64::uint64x2_t;
+    // SAFETY: register-only moves; reads and writes no memory.
+    unsafe {
+        core::arch::asm!(
+            "fmov {out:d}, {lo}",
+            "mov {out:v}.d[1], {hi}",
+            lo = in(reg) lo,
+            hi = in(reg) hi,
+            out = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
 /// Returns `true` iff a 128-bit vector is all-zero.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -1312,7 +1339,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
 /// Returns the four folded rows plus whether the b≡1 shortcut was taken.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn r2_pair_fold_and_store(
+unsafe fn r2_pair_fold_and_store<const DEFER_DELTA: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -1329,6 +1356,7 @@ unsafe fn r2_pair_fold_and_store(
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
     bool,
+    core::arch::aarch64::uint64x2_t,
 ) {
     use core::arch::aarch64::*;
 
@@ -1348,13 +1376,14 @@ unsafe fn r2_pair_fold_and_store(
     unsafe {
         let zero = vdupq_n_u64(0);
         if padded {
+            debug_assert!(!DEFER_DELTA, "deferred delta stores are for live pairs only");
             // `skip_dead`: the cascade K pass treats padded pairs as known
             // zeros and never reads their slots, so the zero stores are dead.
             if !skip_dead {
                 store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
                 vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
             }
-            return (zero, zero, zero, zero, false);
+            return (zero, zero, zero, zero, false, zero);
         }
 
         let row0 = 2 * x_lo;
@@ -1376,17 +1405,24 @@ unsafe fn r2_pair_fold_and_store(
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
             let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-            return (a0, a1, b_ones, b_ones, true);
+            if !DEFER_DELTA {
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            }
+            return (a0, a1, b_ones, b_ones, true, delta_pair);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-        let delta_pair =
-            core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-        (a0, a1, b0, b1, false)
+        let delta_pair = if DEFER_DELTA {
+            q_from_gprs(a0_code ^ a1_code, b0_code ^ b1_code)
+        } else {
+            core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code])
+        };
+        if !DEFER_DELTA {
+            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        }
+        (a0, a1, b0, b1, false, delta_pair)
     }
 }
 
@@ -1433,6 +1469,7 @@ unsafe fn r2_pair_fold_and_store(
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const FULL: bool,
     const ODD_ON_GPU: bool,
+    const NT_DELTA: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -1507,14 +1544,34 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let pad0 = $pad0;
                 let pad1 = $pad1;
 
-                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
-                    skip_dead,
-                );
-                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
-                    table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
-                    skip_dead,
-                );
+                // Both pairs live: their two 16-byte delta slots are adjacent
+                // (x_lo0 is even), so one 32-byte non-temporal `stnp` writes
+                // the same bytes the two per-pair `st1` stores would, without
+                // pulling the destination lines into the cache first.
+                let ((a0, a1, b0, b1, deg0, _), (a2, a3, b2, b3, deg1, _)) =
+                    if NT_DELTA && !pad0 && !pad1 {
+                        let p0 = r2_pair_fold_and_store::<true>(
+                            table_data, a_packed, b_packed, anchors, deltas, x_lo0, false,
+                            degen, b_ones, skip_dead,
+                        );
+                        let p1 = r2_pair_fold_and_store::<true>(
+                            table_data, a_packed, b_packed, anchors, deltas, x_lo1, false,
+                            degen, b_ones, skip_dead,
+                        );
+                        store_anchor_pair_nt(deltas.add(x_lo0 * 16).cast::<F128>(), p0.5, p1.5);
+                        (p0, p1)
+                    } else {
+                        (
+                            r2_pair_fold_and_store::<false>(
+                                table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0,
+                                degen, b_ones, skip_dead,
+                            ),
+                            r2_pair_fold_and_store::<false>(
+                                table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1,
+                                degen, b_ones, skip_dead,
+                            ),
+                        )
+                    };
 
                 // The odd lane's weight drives the whole group; see the doc above.
                 let w = vld1q_u64(eq_lo.add(x_lo1).cast::<u64>());
@@ -1629,7 +1686,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 /// odd rows are folded only as `a1 ^ a3` and `b1 ^ b3`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8(
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const NT_DELTA: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -1811,13 +1868,14 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8(
                     // One pair: fold and store its even rows, hand back its odd
                     // row codes. A padded pair keeps its zero store and reads as
                     // all-zero codes.
-                    let pair = |x_lo: usize, pad: bool| {
+                    // `defer`: the caller writes this pair's delta (see below).
+                    let pair = |x_lo: usize, pad: bool, defer: bool| {
                         if pad {
                             if !skip_dead {
                                 store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
                                 vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
                             }
-                            return (zero, zero, 0u64, 0u64, false);
+                            return (zero, zero, 0u64, 0u64, false, zero);
                         }
                         let a_row = a_packed.add(2 * x_lo * 8).cast::<u64>();
                         let b_row = b_packed.add(2 * x_lo * 8).cast::<u64>();
@@ -1832,15 +1890,32 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8(
                             fold_two_row_codes_q(table_data, a_even, b_even)
                         };
                         store_anchor_pair_nt(anchors.add(2 * x_lo), a, b);
-                        let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
-                            a_even ^ a_odd,
-                            b_even ^ b_odd,
-                        ]);
-                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
-                        (a, b, a_odd, b_odd, deg)
+                        let delta_pair = if NT_DELTA {
+                            q_from_gprs(a_even ^ a_odd, b_even ^ b_odd)
+                        } else {
+                            core::mem::transmute::<[u64; 2], uint64x2_t>([
+                                a_even ^ a_odd,
+                                b_even ^ b_odd,
+                            ])
+                        };
+                        if !defer {
+                            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+                        }
+                        (a, b, a_odd, b_odd, deg, delta_pair)
                     };
-                    let (a0, b0, a1c, b1c, deg0) = pair(x_lo0, pad0);
-                    let (a2, b2, a3c, b3c, deg1) = pair(x_lo1, pad1);
+                    // Both pairs live: their two 16-byte delta slots are
+                    // adjacent (x_lo0 is even), so one 32-byte non-temporal
+                    // `stnp` writes the bytes the two per-pair `st1` stores
+                    // would, without pulling the lines into the cache first.
+                    let ((a0, b0, a1c, b1c, deg0, _), (a2, b2, a3c, b3c, deg1, _)) =
+                        if NT_DELTA && !pad0 && !pad1 {
+                            let p0 = pair(x_lo0, false, true);
+                            let p1 = pair(x_lo1, false, true);
+                            store_anchor_pair_nt(deltas.add(x_lo0 * 16).cast::<F128>(), p0.5, p1.5);
+                            (p0, p1)
+                        } else {
+                            (pair(x_lo0, pad0, false), pair(x_lo1, pad1, false))
+                        };
                     if pad0 & pad1 {
                         continue;
                     }
@@ -3534,14 +3609,47 @@ mod tests {
                     for (degen, skip_dead) in
                         [(false, false), (true, false), (false, true), (true, true)]
                     {
-                        let run = |horner: bool| {
+                        let run = |horner: bool, nt: bool| {
                             let poison = F128::new(u64::MAX, u64::MAX);
                             let mut anchors = vec![poison; 2 * LO_SIZE];
                             let mut deltas = vec![0xa5u8; 16 * LO_SIZE];
                             let mut out = [poison; 8];
                             unsafe {
-                                if horner {
-                                    fold_round2_compact_chunk_neon_horner_8(
+                                if horner && nt {
+                                    fold_round2_compact_chunk_neon_horner_8::<true>(
+                                        table.data.as_ptr().cast::<u8>(),
+                                        a_packed.as_ptr(),
+                                        b_packed.as_ptr(),
+                                        anchors.as_mut_ptr(),
+                                        deltas.as_mut_ptr(),
+                                        eq_lo.as_ptr(),
+                                        LO_SIZE,
+                                        0,
+                                        mask,
+                                        useful,
+                                        degen,
+                                        skip_dead,
+                                        out.as_mut_ptr(),
+                                    );
+                                } else if nt {
+                                    fold_round2_compact_chunk_neon_lookahead_8::<true, false, true>(
+                                        table.data.as_ptr().cast::<u8>(),
+                                        a_packed.as_ptr(),
+                                        b_packed.as_ptr(),
+                                        anchors.as_mut_ptr(),
+                                        deltas.as_mut_ptr(),
+                                        eq_lo.as_ptr(),
+                                        LO_SIZE,
+                                        0,
+                                        mask,
+                                        useful,
+                                        degen,
+                                        true,
+                                        skip_dead,
+                                        out.as_mut_ptr(),
+                                    );
+                                } else if horner {
+                                    fold_round2_compact_chunk_neon_horner_8::<false>(
                                         table.data.as_ptr().cast::<u8>(),
                                         a_packed.as_ptr(),
                                         b_packed.as_ptr(),
@@ -3557,7 +3665,7 @@ mod tests {
                                         out.as_mut_ptr(),
                                     );
                                 } else {
-                                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                                    fold_round2_compact_chunk_neon_lookahead_8::<true, false, false>(
                                         table.data.as_ptr().cast::<u8>(),
                                         a_packed.as_ptr(),
                                         b_packed.as_ptr(),
@@ -3577,22 +3685,30 @@ mod tests {
                             }
                             (anchors, deltas, out)
                         };
-                        let cpu = run(false);
-                        let horner = run(true);
-                        assert_eq!(
-                            horner.0, cpu.0,
-                            "anchor mismatch at {z_case}/{challenge_case}"
-                        );
-                        assert_eq!(
-                            horner.1, cpu.1,
-                            "delta mismatch at {z_case}/{challenge_case}"
-                        );
-                        assert_eq!(&horner.2[..4], &[F128::ZERO; 4]);
-                        assert_eq!(
-                            &horner.2[4..],
-                            &cpu.2[4..],
-                            "sum mismatch at {z_case}/{challenge_case}"
-                        );
+                        // Incumbent store flavor (per-pair `st1` deltas) is
+                        // the reference for both kernels' merged `stnp` flavor.
+                        let cpu = run(false, false);
+                        let cpu_nt = run(false, true);
+                        assert_eq!(cpu_nt.0, cpu.0, "NT anchor mismatch at {z_case}/{challenge_case}");
+                        assert_eq!(cpu_nt.1, cpu.1, "NT delta mismatch at {z_case}/{challenge_case}");
+                        assert_eq!(cpu_nt.2, cpu.2, "NT sum mismatch at {z_case}/{challenge_case}");
+                        for nt in [false, true] {
+                            let horner = run(true, nt);
+                            assert_eq!(
+                                horner.0, cpu.0,
+                                "anchor mismatch at {z_case}/{challenge_case}/{nt}"
+                            );
+                            assert_eq!(
+                                horner.1, cpu.1,
+                                "delta mismatch at {z_case}/{challenge_case}/{nt}"
+                            );
+                            assert_eq!(&horner.2[..4], &[F128::ZERO; 4]);
+                            assert_eq!(
+                                &horner.2[4..],
+                                &cpu.2[4..],
+                                "sum mismatch at {z_case}/{challenge_case}/{nt}"
+                            );
+                        }
                     }
                 }
             }
@@ -4279,37 +4395,60 @@ mod tests {
             .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
             .collect();
 
-        let run = |periodic_padding: bool, skip_dead: bool| {
+        let run_nt = |periodic_padding: bool, skip_dead: bool, nt: bool| {
             let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
             let mut anchors = vec![poison; 2 * LO_SIZE];
             let mut deltas = vec![0xa5u8; 2 * LO_SIZE * N_CHUNKS];
             let mut out = [poison; 8];
+            macro_rules! call {
+                ($nt:literal) => {
+                    fold_round2_compact_chunk_neon_lookahead_8::<true, false, $nt>(
+                        table.as_ptr().cast::<u8>(),
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        anchors.as_mut_ptr(),
+                        deltas.as_mut_ptr(),
+                        eq_lo.as_ptr(),
+                        LO_SIZE,
+                        0,
+                        127,
+                        121,
+                        true,
+                        periodic_padding,
+                        skip_dead,
+                        out.as_mut_ptr(),
+                    )
+                };
+            }
             unsafe {
-                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                    table.as_ptr().cast::<u8>(),
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    anchors.as_mut_ptr(),
-                    deltas.as_mut_ptr(),
-                    eq_lo.as_ptr(),
-                    LO_SIZE,
-                    0,
-                    127,
-                    121,
-                    true,
-                    periodic_padding,
-                    skip_dead,
-                    out.as_mut_ptr(),
-                );
+                if nt {
+                    call!(true);
+                } else {
+                    call!(false);
+                }
             }
             (anchors, deltas, out)
         };
+        let run = |periodic_padding: bool, skip_dead: bool| run_nt(periodic_padding, skip_dead, false);
 
         let periodic = run(true, false);
         let generic = run(false, false);
         assert_eq!(periodic.0, generic.0, "anchor schedule mismatch");
         assert_eq!(periodic.1, generic.1, "delta schedule mismatch");
         assert_eq!(periodic.2, generic.2, "message/lookahead mismatch");
+
+        // The merged non-temporal delta store writes exactly the incumbent
+        // per-pair bytes on every schedule, dense or dead-pair-skipping
+        // (where padded slots must stay untouched).
+        for periodic_padding in [true, false] {
+            for skip_dead in [false, true] {
+                let incumbent = run_nt(periodic_padding, skip_dead, false);
+                let merged = run_nt(periodic_padding, skip_dead, true);
+                assert_eq!(merged.0, incumbent.0, "NT anchors {periodic_padding}/{skip_dead}");
+                assert_eq!(merged.1, incumbent.1, "NT deltas {periodic_padding}/{skip_dead}");
+                assert_eq!(merged.2, incumbent.2, "NT sums {periodic_padding}/{skip_dead}");
+            }
+        }
 
         // Dead-pair skip: both schedules leave every padded slot untouched
         // (poison survives), write the live slots identically to the dense

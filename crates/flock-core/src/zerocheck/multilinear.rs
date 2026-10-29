@@ -139,6 +139,16 @@ fn r2_periodic_padding_enabled() -> bool {
     std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
 }
 
+/// Kill switch for the round-two merged non-temporal delta store:
+/// `FLOCK_NO_ZC_R2_NT_DELTA=1` restores the per-pair cached `st1` delta
+/// stores (and the incumbent delta construction). Store flavor only: the
+/// compact state, the message and the lookahead are bit-identical either
+/// way. Read once per phase call.
+#[cfg(target_arch = "aarch64")]
+fn r2_nt_delta_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_ZC_R2_NT_DELTA").is_none_or(|v| v != *"1")
+}
+
 /// Kill switch for the round-two dead-pair skip: `FLOCK_NO_R2_DEADPAIR_SKIP=1`
 /// restores the zero-filled padding slots and the cascade K pass's blind
 /// read of them. Bit-identical either way: the skipped slots hold structural
@@ -1849,6 +1859,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let degen = r2_degen_enabled();
     #[cfg(target_arch = "aarch64")]
     let periodic_padding = r2_periodic_padding_enabled();
+    #[cfg(target_arch = "aarch64")]
+    let nt_delta = r2_nt_delta_enabled();
     // Dead-pair skip. The K pass substitutes zeros for pairs 121..128 of
     // each 128-pair block, which equals the dense state only because the
     // fold table's index-0 entries are zero (`scaled_linear` copies them).
@@ -1940,73 +1952,56 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 let t = table.data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
-                if full {
-                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        skip_dead,
-                        out.as_mut_ptr(),
-                    );
-                } else if odd_on_gpu && horner_weights {
-                    fold_round2_compact_chunk_neon_horner_8(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        skip_dead,
-                        out.as_mut_ptr(),
-                    );
-                } else if odd_on_gpu {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        skip_dead,
-                        out.as_mut_ptr(),
-                    );
-                } else {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        skip_dead,
-                        out.as_mut_ptr(),
-                    );
+                // One kernel call per (shape, store flavor); the macro keeps the
+                // argument list in one place for both NT_DELTA arms.
+                macro_rules! la {
+                    ($full:literal, $odd:literal, $nt:literal) => {
+                        fold_round2_compact_chunk_neon_lookahead_8::<$full, $odd, $nt>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            periodic_padding,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        )
+                    };
+                }
+                macro_rules! horner {
+                    ($nt:literal) => {
+                        fold_round2_compact_chunk_neon_horner_8::<$nt>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        )
+                    };
+                }
+                match (full, odd_on_gpu && horner_weights, odd_on_gpu, nt_delta) {
+                    (true, _, _, true) => la!(true, false, true),
+                    (true, _, _, false) => la!(true, false, false),
+                    (false, true, _, true) => horner!(true),
+                    (false, true, _, false) => horner!(false),
+                    (false, false, true, true) => la!(false, true, true),
+                    (false, false, true, false) => la!(false, true, false),
+                    (false, false, false, true) => la!(false, false, true),
+                    (false, false, false, false) => la!(false, false, false),
                 }
             }
         }
@@ -2097,7 +2092,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
                     unsafe {
-                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false, true>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
