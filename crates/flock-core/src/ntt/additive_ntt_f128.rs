@@ -1233,53 +1233,6 @@ impl AdditiveNttF128 {
         );
     }
 
-    /// Fine hybrid split in one schedule: layers 4..10 over the full
-    /// layer-4 blocks `[b_start, 16)`, then (after `wait_boundary` confirms
-    /// the GPU finished layers 4..8 of block `b_start - 1`) layers 8..10 over
-    /// that block's last `fine_m` layer-8 sub-blocks, then ONE deep-pair pass
-    /// over the contiguous layer-10 range covering both. Absolute twiddles:
-    /// bit-identical to the unsplit transform.
-    pub(crate) fn forward_transform_interleaved_ranked_fine_range_and_then<F, W>(
-        &self,
-        data: &mut [F128],
-        num_ntts: usize,
-        b_start: usize,
-        fine_m: usize,
-        wait_boundary: W,
-        finish_chunk: F,
-    ) -> Result<(), String>
-    where
-        F: Fn(usize, &[F128]) + Sync + Send,
-        W: FnOnce() -> Result<(), String>,
-    {
-        const DEEP_LAYER: usize = 10;
-        let log_d = log2_pow2(data.len() / num_ntts);
-        assert_eq!(log_d, 20, "ranked fine split requires log_d=20");
-        assert_eq!(num_ntts, 64, "ranked fine split requires 64 lanes");
-        assert!((1..16).contains(&b_start) && (1..16).contains(&fine_m));
-        let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
-        self.forward_transform_interleaved_block_range(
-            data, num_ntts, 4, DEEP_LAYER, b_start, 16, odd_tail,
-        );
-        let sb_end = b_start << 4;
-        let sb_start = sb_end - fine_m;
-        wait_boundary()?;
-        self.forward_transform_interleaved_block_range(
-            data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
-        );
-        self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
-            data,
-            num_ntts,
-            DEEP_LAYER,
-            log_d,
-            sb_start << (DEEP_LAYER - 8),
-            16 << (DEEP_LAYER - 4),
-            odd_tail,
-            &finish_chunk,
-        );
-        Ok(())
-    }
-
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
     /// `finish_chunk` exactly as the unsplit transform does.
     #[inline]
