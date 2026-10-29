@@ -686,6 +686,15 @@ impl L1MerkleOverlap {
     pub(crate) fn finish(self) -> Option<Vec<crate::merkle::Hash>> {
         self.inner.finish()
     }
+
+    /// [`Self::finish`] without the copy-out: on success returns the flat
+    /// tree as `(address, node count)` inside the process-persistent L1 tree
+    /// buffer (shared storage, every command buffer drained). The view stays
+    /// valid until the next 2^18-leaf recursive Merkle dispatch, i.e. the next
+    /// prove's L1 commit; the caller must drop it before then.
+    pub(crate) fn finish_view(self) -> Option<(usize, usize)> {
+        self.inner.finish_view()
+    }
 }
 
 /// Kill switch for the zerocheck C-fold-window GPU idle fill
@@ -12534,6 +12543,23 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         /// dispatches then parent dispatches against the tracked tree
         /// buffer), so `finish` needs no parent round trip of its own.
         parents_encoded: bool,
+        /// Lowest per-batch local parent depth encoded so far: every batch
+        /// hashes the parent levels lying entirely inside each of its aligned
+        /// leaf ranges right behind that range's leaves, so all nodes of
+        /// levels `1..=local_levels` exist once the leaves tile the tree and
+        /// the cover-completing batch only appends the levels above.
+        local_levels: Option<usize>,
+    }
+
+    /// Off by default (incumbent shape: leaves only per batch, every parent
+    /// level behind the cover-completing batch). `FLOCK_L1_LOCAL_PARENTS=1`
+    /// (exact) opts in to per-batch local parent levels; it measured faster
+    /// on an M4 GPU but has no grader measurement yet.
+    fn l1_local_parents_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_L1_LOCAL_PARENTS").is_ok_and(|v| v == "1")
+        });
+        *ON
     }
 
     /// `true` iff the sorted `ranges` tile `[0, num_leaves)` exactly.
@@ -12721,23 +12747,65 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             // stream's behind-the-final-tile idiom, both in production).
             let encode_parents = inner.covered_leaves == self.num_leaves
                 && l1_ranges_cover_exactly(&mut inner.ranges, self.num_leaves);
+            let log_n = self.num_leaves.trailing_zeros() as usize;
+            let local = l1_local_parents_enabled();
+            // Per-range local depth: the levels whose every node's leaf span
+            // lies inside `[s, s + n)` (both multiples of 2^depth).
+            let range_levels = |s: usize, n: usize| -> usize {
+                if local {
+                    ((s | n).trailing_zeros() as usize).min(log_n)
+                } else {
+                    0
+                }
+            };
+            let batch_min = coalesced.iter().map(|&(s, n)| range_levels(s, n)).min();
+            let local_levels = match (inner.local_levels, batch_min) {
+                (Some(a), Some(b)) => a.min(b),
+                (a, b) => a.or(b).unwrap_or(0),
+            };
             let result = unsafe {
                 let pool = self.gpu.pool_push();
                 let result = (|| -> Result<Id, String> {
                     let cb = self.gpu.command_buffer()?;
                     let enc = self.gpu.compute_encoder(cb)?;
-                    self.gpu.set_pipeline(enc, self.pso_leaf128);
                     for &(leaf_start, n) in &coalesced {
+                        self.gpu.set_pipeline(enc, self.pso_leaf128);
                         // Offsetting both bindings makes local id map to
                         // global leaf `leaf_start + id` in the proven kernel.
                         self.gpu.set_buffer(enc, self.data_buf, leaf_start * 128, 0);
                         self.gpu.set_buffer(enc, self.tree_buf, leaf_start * 32, 1);
                         self.gpu.dispatch(enc, (n / 256) as u64, 256);
+                        // This range's own subtree levels, encoded behind its
+                        // leaves (same kernel, same flat-tree slots as the
+                        // whole-tree parent chain; the serial encoder orders
+                        // each level after the one it reads).
+                        let depth = range_levels(leaf_start, n);
+                        if depth > 0 {
+                            self.gpu.set_pipeline(enc, self.pso_parent);
+                        }
+                        let mut read_level = 0usize;
+                        let mut level_len = self.num_leaves;
+                        for l in 1..=depth {
+                            let write_level = read_level + level_len;
+                            let read_off = read_level + (leaf_start >> (l - 1));
+                            let write_off = write_level + (leaf_start >> l);
+                            let n_out = (n >> l) as u64;
+                            self.gpu.set_buffer(enc, self.tree_buf, read_off * 32, 0);
+                            self.gpu.set_buffer(enc, self.tree_buf, write_off * 32, 1);
+                            let tpg = (n_out & n_out.wrapping_neg()).min(256);
+                            self.gpu.dispatch(enc, n_out / tpg, tpg);
+                            read_level = write_level;
+                            level_len >>= 1;
+                        }
                     }
                     if encode_parents {
                         self.gpu.set_pipeline(enc, self.pso_parent);
                         let mut read_start = 0usize;
                         let mut read_len = self.num_leaves;
+                        for _ in 0..local_levels {
+                            read_start += read_len;
+                            read_len >>= 1;
+                        }
                         while read_len > 1 {
                             let write_start = read_start + read_len;
                             let n_out = read_len / 2;
@@ -12764,6 +12832,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     inner.cbs.push(cb);
                     inner.batches += 1;
                     inner.parents_encoded = encode_parents;
+                    inner.local_levels = Some(local_levels);
                 }
                 Err(e) => self.fail(&format!("leaf submit failed ({e})")),
             }
@@ -12774,6 +12843,16 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         /// out. `None` on any failure — the caller then runs the incumbent
         /// whole-tree path (exact same bytes).
         pub(crate) fn finish(self) -> Option<Vec<Hash>> {
+            self.finish_inner(true).map(|(tree, _)| tree)
+        }
+
+        /// [`Self::finish`] minus the 16 MiB copy-out (see the public
+        /// `L1MerkleOverlap::finish_view`).
+        pub(crate) fn finish_view(self) -> Option<(usize, usize)> {
+            self.finish_inner(false).map(|(_, view)| view)
+        }
+
+        fn finish_inner(self, copy_out: bool) -> Option<(Vec<Hash>, (usize, usize))> {
             let debug = super::gpu_zc_r2_debug();
             let ntt_wall_ms = self.started.elapsed().as_secs_f64() * 1e3;
             let mut inner = {
@@ -12861,13 +12940,20 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 }
             }
             let total_nodes = 2 * self.num_leaves - 1;
+            let view = (
+                unsafe { self.gpu.buffer_contents(self.tree_buf) } as usize,
+                total_nodes,
+            );
+            if !copy_out {
+                return Some((Vec::new(), view));
+            }
             let mut tree: Vec<Hash> = crate::scratch::take_hash_tree(total_nodes);
             unsafe {
                 let dst = core::slice::from_raw_parts_mut(
                     tree.as_mut_ptr().cast::<u8>(),
                     total_nodes * 32,
                 );
-                copy_bytes_parallel(self.gpu.buffer_contents(self.tree_buf), dst);
+                copy_bytes_parallel(view.0 as *const u8, dst);
             }
             if debug {
                 // "since-begin" ≈ the NTT wall for latched sessions (begin
@@ -12882,7 +12968,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     self.started.elapsed().as_secs_f64() * 1e3 - ntt_wall_ms,
                 );
             }
-            Some(tree)
+            Some((tree, view))
         }
     }
 
@@ -13160,8 +13246,8 @@ kernel void zc_r2_products_horner(
     uint tgid [[threadgroup_position_in_grid]],
     uint lid  [[thread_index_in_threadgroup]])
 {
-    threadgroup uint4 nib[256];
     threadgroup ulong4 red[256];
+    threadgroup uint4* nib = reinterpret_cast<threadgroup uint4*>(red);
     nib[lid] = nib_tab_dev[lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -13194,6 +13280,8 @@ kernel void zc_r2_products_horner(
     U256k mi = clmul128(e, zc_r2_horner_reduce(hi));
     ulong4 acc1 = ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
     ulong4 acci = ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+    // Retire every table reader before the reducer reuses the same storage.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid);
 }
 
@@ -13315,6 +13403,26 @@ kernel void zc_r2_horner_oracle(
     #[cfg(test)]
     pub(crate) fn zc_r2_test_set_share(share: usize) {
         ZC_R2_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read raw physical groups through the production job and selected PSO.
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_physical_partials(
+        job: &ZcR2Job,
+    ) -> (Vec<[F128; 4]>, (u64, u64, u64)) {
+        let gpu = gpu().expect("physical partial oracle requires real Metal");
+        unsafe { gpu.wait_cb(job.cb).expect("physical partial job must complete") };
+        let state = zc_r2_state().expect("R2 state must exist").lock().unwrap();
+        let groups = if job.horner { 4 } else { 1 };
+        unsafe {
+            let parts = core::slice::from_raw_parts(
+                gpu.buffer_contents(state.part_buf).cast::<[F128; 4]>(),
+                job.chunks * groups,
+            )
+            .to_vec();
+            let pso = if job.horner { state.horner_pso } else { state.pso };
+            (parts, gpu.pipeline_resources(pso))
+        }
     }
 
     /// Ratio-gate override (`FLOCK_ZC_R2_GPU_FORCE_RATIO=<f64>`).
@@ -15562,6 +15670,10 @@ mod imp {
         pub(crate) fn chunk_ready(&self, _offset_elems: usize, _len_elems: usize) {}
 
         pub(crate) fn finish(self) -> Option<Vec<crate::merkle::Hash>> {
+            None
+        }
+
+        pub(crate) fn finish_view(self) -> Option<(usize, usize)> {
             None
         }
     }
@@ -18132,9 +18244,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 imp::compile_supplemental_pipeline(gpu, &source, "zc_r2_products_horner").unwrap();
             let old_usage = gpu.pipeline_resources(ordinary);
             let usage = gpu.pipeline_resources(horner);
-            assert_eq!(old_usage.0, usage.0, "shared-memory use changed");
-            assert_eq!(old_usage.1, usage.1, "SIMD width changed");
-            assert!(usage.2 >= 256, "Horner production group no longer fits");
+            assert_eq!(old_usage.0, 12_288, "ordinary storage must stay unchanged");
+            assert_eq!(usage.0, 8_192, "Horner table and reduction must share storage");
+            assert!(
+                old_usage.2 >= 256 && usage.2 >= 256,
+                "both production groups must fit"
+            );
             for repeat in 0..2 {
                 std::ptr::write_bytes(gpu.buffer_contents(out_buf), 0xA5, output_bytes);
                 let cb = gpu.command_buffer().unwrap();
@@ -18171,15 +18286,27 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// equality check must pass and publish a share without poisoning) and
     /// the timed prefix path.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_zc_r2_products_match_cpu_oracle() {
-        for (lo_size, hi_size, fixed_weights) in
-            [(512, 64, false), (16_384, 8, true), (16_384, 8, false)]
-        {
-            zc_r2_products_case(lo_size, hi_size, fixed_weights);
+        assert!(gpu_zc_r2_horner_enabled(), "the Horner alias route must run");
+        for (lo_size, hi_size, fixed_weights, mask, useful) in [
+            (512, 64, false, 4095, 3900),
+            (16_384, 8, true, 127, 121),
+            (16_384, 8, true, 16_383, 61),
+            (16_384, 8, false, 4095, 3900),
+        ] {
+            zc_r2_products_case(lo_size, hi_size, fixed_weights, mask, useful);
         }
     }
 
-    fn zc_r2_products_case(lo_size: usize, hi_size: usize, fixed_weights: bool) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn zc_r2_products_case(
+        lo_size: usize,
+        hi_size: usize,
+        fixed_weights: bool,
+        mask: usize,
+        useful: usize,
+    ) {
         use crate::field::F256Unreduced;
         fn xs(rng: &mut u64) -> u64 {
             *rng ^= *rng << 13;
@@ -18218,13 +18345,11 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         };
 
         let n_pairs = lo_size * hi_size;
-        // Test the ranked seven-pair tail and a generic padded block.
-        // The padded inputs contain random data, which must be ignored.
-        let mask = if fixed_weights { 127usize } else { 4095usize };
-        let useful = if fixed_weights { 121usize } else { 3900usize };
-
-        let mut a_packed = vec![0u8; n_pairs * 16];
-        let mut b_packed = vec![0u8; n_pairs * 16];
+        // Random padded bytes must be ignored. The sparse Horner case has
+        // only one active window and three wholly inactive physical groups.
+        // The production state caches these no-copy wraps for the process.
+        let a_packed = leak_page_aligned(n_pairs * 16);
+        let b_packed = leak_page_aligned(n_pairs * 16);
         for byte in a_packed.iter_mut() {
             *byte = (xs(&mut rng) & 0xff) as u8;
         }
@@ -18246,40 +18371,59 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
         let mut eq_hi: Vec<F128> = (0..hi_size).map(|_| rand_f128(&mut rng)).collect();
 
-        // CPU reference partials, exactly the driver's non-aarch64 shape, kept
-        // split by x_lo parity so the arm's parity contract is checked and not
-        // just the sum a wrong split could still reproduce.
+        // CPU field reference, with each physical Horner partition kept
+        // separate so a wrong group, parity or eq_hi slot cannot hide in a sum.
         let reference = |a_packed: &[u8],
                          b_packed: &[u8],
                          table_data: &[F128],
                          eq_lo: &[F128],
-                         eq_hi: &[F128]| {
-            let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size);
+                         eq_hi: &[F128],
+                         groups: usize| {
+            let mut cpu_split: Vec<[F128; 4]> = Vec::with_capacity(hi_size * groups);
             for x_hi in 0..hi_size {
-                // [p1_even, pinf_even, p1_odd, pinf_odd]
-                let mut acc = [F256Unreduced::ZERO; 4];
-                for x_lo in 0..lo_size {
-                    let pair_idx = x_hi * lo_size + x_lo;
-                    if (pair_idx & mask) >= useful {
-                        continue;
+                for group in 0..groups {
+                    let mut acc = [F256Unreduced::ZERO; 4];
+                    for x_lo in group * lo_size / groups..(group + 1) * lo_size / groups {
+                        let pair_idx = x_hi * lo_size + x_lo;
+                        if (pair_idx & mask) >= useful {
+                            continue;
+                        }
+                        let read = |packed: &[u8], row: usize| -> u64 {
+                            u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
+                        };
+                        let a0 = fold_row(table_data, read(a_packed, 2 * pair_idx));
+                        let a1 = fold_row(table_data, read(a_packed, 2 * pair_idx + 1));
+                        let b0 = fold_row(table_data, read(b_packed, 2 * pair_idx));
+                        let b1 = fold_row(table_data, read(b_packed, 2 * pair_idx + 1));
+                        let base = 2 * (x_lo & 1);
+                        acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
+                        acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
                     }
-                    let read = |packed: &[u8], row: usize| -> u64 {
-                        u64::from_le_bytes(packed[row * 8..row * 8 + 8].try_into().unwrap())
-                    };
-                    let a0 = fold_row(table_data, read(&a_packed, 2 * pair_idx));
-                    let a1 = fold_row(table_data, read(&a_packed, 2 * pair_idx + 1));
-                    let b0 = fold_row(table_data, read(&b_packed, 2 * pair_idx));
-                    let b1 = fold_row(table_data, read(&b_packed, 2 * pair_idx + 1));
-                    let base = 2 * (x_lo & 1);
-                    acc[base] ^= eq_lo[x_lo].mul_unreduced(a1 * b1);
-                    acc[base + 1] ^= eq_lo[x_lo].mul_unreduced((a0 + a1) * (b0 + b1));
+                    let eq_h = eq_hi[x_hi];
+                    cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
                 }
-                let eq_h = eq_hi[x_hi];
-                cpu_split.push(std::array::from_fn(|i| eq_h * acc[i].reduce()));
             }
             cpu_split
         };
-        let cpu_split = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        let cpu_split = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, 1);
+        let groups = if fixed_weights { 4 } else { 1 };
+        let cpu_physical = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, groups);
+        let check_physical = |job: &imp::ZcR2Job, expected: &[[F128; 4]]| {
+            let (actual, usage) = imp::zc_r2_test_physical_partials(job);
+            assert_eq!(
+                usage.0,
+                if job.uses_horner() { 8_192 } else { 12_288 },
+                "actual production PSO shared storage"
+            );
+            assert!(usage.2 >= 256, "the production group must fit");
+            assert_eq!(actual.len(), job.chunks * groups);
+            assert_eq!(actual, expected[..actual.len()], "raw physical partials");
+            eprintln!(
+                "[zc-r2-alias] horner={} physical_groups={} resources={usage:?}",
+                job.uses_horner(),
+                actual.len()
+            );
+        };
         let cpu_partials: Vec<(F128, F128)> = cpu_split
             .iter()
             .map(|v| (v[0] + v[2], v[1] + v[3]))
@@ -18310,6 +18454,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         );
         assert!(job.is_calibration());
         assert_eq!(job.cpu_split(), 0);
+        check_physical(&job, &cpu_physical);
         let res = imp::zc_r2_wait(job, Some(&cpu_partials), Some(&cpu_la), 50.0, hi_size);
         assert!(matches!(res, imp::ZcR2Result::Calibrated));
         let (tuned, poisoned) = imp::zc_r2_test_state();
@@ -18340,6 +18485,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert!(!job2.is_calibration());
         let prefix = job2.cpu_split();
         assert_eq!(prefix, hi_size / 2);
+        check_physical(&job2, &cpu_physical);
         match imp::zc_r2_wait(job2, None, None, 0.0, hi_size) {
             imp::ZcR2Result::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);
@@ -18364,10 +18510,10 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             eq_lo.as_ptr(),
             eq_hi.as_ptr(),
         );
-        for byte in &mut a_packed {
+        for byte in a_packed.iter_mut() {
             *byte ^= 0x5b;
         }
-        for byte in &mut b_packed {
+        for byte in b_packed.iter_mut() {
             *byte ^= 0xa7;
         }
         for value in table_data
@@ -18388,7 +18534,9 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             )
         );
         assert_eq!(zc_r2_horner_weights(&eq_lo, lo_size), fixed_weights);
-        let changed = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi);
+        let changed = reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, 1);
+        let changed_physical =
+            reference(&a_packed, &b_packed, &table_data, &eq_lo, &eq_hi, groups);
         assert_ne!(
             &changed[..prefix],
             &cpu_split[..prefix],
@@ -18412,6 +18560,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         );
         assert!(!job3.is_calibration());
         assert_eq!(job3.cpu_split(), prefix);
+        check_physical(&job3, &changed_physical);
         match imp::zc_r2_wait(job3, None, None, 0.0, hi_size) {
             imp::ZcR2Result::Prefix(vals) => {
                 assert_eq!(vals.len(), prefix);
@@ -18454,6 +18603,25 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             &ntt,
             crate::merkle::HashKind::Blake3,
         );
+        // Zero-copy view arm (still latched ON): the drained persistent
+        // tree buffer must hold exactly the copied tree. Compared and dropped
+        // before the sync arm rewrites that buffer.
+        {
+            let w_view = crate::pcs::ligerito::ligero_commit_with_tree_view(
+                &poly,
+                16,
+                3,
+                2,
+                &ntt,
+                crate::merkle::HashKind::Blake3,
+            );
+            assert!(w_view.tree.is_empty(), "L1 view arm copied the tree out");
+            assert!(
+                w_view.nodes() == w_overlap.tree.as_slice(),
+                "L1 tree view diverges from the copied overlap tree"
+            );
+            assert_eq!(w_view.root(), w_overlap.root());
+        }
         super::l1_overlap_latch_force(super::L1_OVERLAP_OFF);
         let w_sync = crate::pcs::ligerito::ligero_commit(
             &poly,
@@ -18481,6 +18649,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// anchors+deltas compact representation with an F2-linear scaled
     /// table. Exercises calibration (internal equality oracle + share
     /// publication without poisoning) and the timed prefix path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_zc_t3_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
@@ -18615,6 +18784,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// per-chunk reduced partials must equal the CPU's fused round
     /// (`fold_pairs` + message) bit-for-bit. Exercises calibration and the
     /// timed prefix path on real Metal.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_zc_loop_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;

@@ -1910,9 +1910,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
-    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let mut partials: Vec<(F128, F128)> = crate::alloc_uninit_vec(hi_size);
     // [p1_odd, pinf_odd, W0, W3, W4, W5], eq_hi-weighted, one slot per chunk.
-    let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
+    let mut la_partials: Vec<[F128; 6]> = crate::alloc_uninit_vec(hi_size);
     let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
     let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -1973,6 +1973,17 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         skip_dead,
                         out.as_mut_ptr(),
                     );
+                    let eq_h = eq_hi[x_hi];
+                    *partials_base.ptr().add(x_hi) = (F128::ZERO, F128::ZERO);
+                    *la_base.ptr().add(x_hi) = [
+                        F128::ZERO,
+                        F128::ZERO,
+                        eq_h * out[4],
+                        eq_h * out[5],
+                        eq_h * out[6],
+                        eq_h * out[7],
+                    ];
+                    return;
                 } else if odd_on_gpu {
                     fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
                         t,
