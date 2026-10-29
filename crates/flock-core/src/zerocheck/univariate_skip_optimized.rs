@@ -999,9 +999,69 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
     tail: Option<&(dyn Fn() + Sync)>,
 ) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_body(
+    precompute_round1_ab_inner_packed_padded_body::<false>(
         a_packed,
         b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        ab_compact_store_enabled(),
+        true,
+        identity_prefix,
+        tail,
+    )
+}
+
+/// Generator proof for the static-B Horner guards in one exact packed buffer.
+/// This proves no A values or identity-prefix omission preconditions.
+pub struct Round1Blake3GuardedB<'b> {
+    b_packed: &'b [u8],
+}
+
+impl<'b> Round1Blake3GuardedB<'b> {
+    /// Borrow the B buffer whose generator proves the round-one guard bits.
+    ///
+    /// # Safety
+    /// `b_packed` must hold complete row-major 16,384-bit BLAKE3 blocks.
+    /// Every block must match all static-B Horner guard masks for arms
+    /// 3..=28. The generated B=1 intervals
+    /// `[1153 + 250*g + 186, 1153 + 250*g + 250)`, `g` in `0..56`,
+    /// contain every guarded bit. All producer writes must have joined, and
+    /// the proof must name this exact buffer with no intervening mutation.
+    pub unsafe fn from_blake3_generated(b_packed: &'b [F128]) -> Self {
+        // SAFETY: F128 is repr(C) as two u64 halves, with no padding.
+        // The byte view has the same extent and lifetime as the typed borrow.
+        let b_packed = unsafe {
+            std::slice::from_raw_parts(
+                b_packed.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(b_packed),
+            )
+        };
+        Self { b_packed }
+    }
+}
+
+/// [`precompute_round1_ab_inner_packed_padded_with_tail`] with a separate
+/// generator proof for the exact borrowed B buffer's static guard bits.
+#[allow(clippy::too_many_arguments)]
+pub fn precompute_round1_ab_inner_packed_padded_with_tail_trusted_b(
+    a_packed: &[u8],
+    guarded_b: &Round1Blake3GuardedB<'_>,
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    tail: Option<&(dyn Fn() + Sync)>,
+) -> Round1AbInner {
+    assert!(m >= 14, "guarded B requires complete BLAKE3 blocks");
+    assert_eq!(padding.k_log, 14);
+    assert_eq!(padding.useful_bits_per_block, 15_409);
+    precompute_round1_ab_inner_packed_padded_body::<true>(
+        a_packed,
+        guarded_b.b_packed,
         m,
         k_skip,
         inv_table,
@@ -1026,9 +1086,38 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
     padding: &PaddingSpec,
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
 ) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_body(
+    precompute_round1_ab_inner_packed_padded_body::<false>(
         a_packed,
         b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        false,
+        false,
+        identity_prefix,
+        None,
+    )
+}
+
+/// [`precompute_round1_ab_inner_packed_padded_for_exact_tune`] with the
+/// exact B buffer's generator proof, as in the trusted normal entry.
+pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune_trusted_b(
+    a_packed: &[u8],
+    guarded_b: &Round1Blake3GuardedB<'_>,
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+) -> Round1AbInner {
+    assert!(m >= 14, "guarded B requires complete BLAKE3 blocks");
+    assert_eq!(padding.k_log, 14);
+    assert_eq!(padding.useful_bits_per_block, 15_409);
+    precompute_round1_ab_inner_packed_padded_body::<true>(
+        a_packed,
+        guarded_b.b_packed,
         m,
         k_skip,
         inv_table,
@@ -1057,14 +1146,14 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     compact: bool,
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
 ) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_body(
+    precompute_round1_ab_inner_packed_padded_body::<false>(
         a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true, identity_prefix,
         None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn precompute_round1_ab_inner_packed_padded_body(
+fn precompute_round1_ab_inner_packed_padded_body<const TRUST_STATIC_B: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     m: usize,
@@ -1179,7 +1268,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
             // per-chunk OnceLock probe, temporary buffer, or per-row bounce
             // branches; the kill-switch arm retains the exact old behavior.
             if nt && ab_pre_nt_direct_enabled() {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
+                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true, TRUST_STATIC_B>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1195,7 +1284,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     tail,
                 );
             } else {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
+                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false, TRUST_STATIC_B>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1212,7 +1301,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                 );
             }
         } else {
-            precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+            precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_PROCESS }, false, TRUST_STATIC_B>(
                 a_packed,
                 b_packed,
                 inv_table,
@@ -1240,7 +1329,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         .for_each_init(
             || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
             |(a_col, b_col), (x_outer, out_outer)| {
-                precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+                precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false, TRUST_STATIC_B>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1331,7 +1420,11 @@ fn zc_ab_pre_hetero_enabled() -> bool {
 /// both `nt` and the process-wide direct-store kill switch.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
+fn precompute_ab_hetero<
+    const FAST_POLICY: u8,
+    const FORCE_DIRECT: bool,
+    const TRUST_STATIC_B: bool,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -1402,7 +1495,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                         OUTER_BYTES,
                     )
                 };
-                precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT>(
+                precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT, TRUST_STATIC_B>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -1429,7 +1522,11 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
 /// hetero queue and the incumbent `par_chunks_mut` cannot diverge.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
+fn precompute_ab_one_chunk<
+    const FAST_POLICY: u8,
+    const FORCE_DIRECT: bool,
+    const TRUST_STATIC_B: bool,
+>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -1491,16 +1588,34 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     let (run_lo, run_hi) = (ab_end, ab_end);
     #[cfg(target_arch = "aarch64")]
     if let Some((_, _, partials)) = static_run {
-        kernels::aarch64::bstatic_horner_window_rows(
-            within_hash_outer,
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            partials,
-            out_outer,
-            direct,
-        );
+        if TRUST_STATIC_B {
+            // SAFETY: only the guarded-B entries select this const arm.
+            // Their token proves every selected window guard for this
+            // exact immutable B slice. The kernel retains its bounds checks.
+            unsafe {
+                kernels::aarch64::bstatic_horner_window_rows_trusted_b(
+                    within_hash_outer,
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    partials,
+                    out_outer,
+                    direct,
+                );
+            }
+        } else {
+            kernels::aarch64::bstatic_horner_window_rows(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        }
     }
     for b_med in (first_b_med..run_lo).chain(run_hi..ab_end) {
         let dst: &mut [u8; 64] = if nt && !direct {
@@ -4439,7 +4554,7 @@ mod tests {
         let mut cached = [0u8; OUTER_BYTES];
         let mut cached_a_col = [F8::ZERO; ELL];
         let mut cached_b_col = [F8::ZERO; ELL];
-        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false, false>(
             &a_packed,
             &b_packed,
             &inv_table,
@@ -4459,7 +4574,7 @@ mod tests {
         let mut direct = [0u8; OUTER_BYTES];
         let mut direct_a_col = [F8::ZERO; ELL];
         let mut direct_b_col = [F8::ZERO; ELL];
-        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
+        precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true, false>(
             &a_packed,
             &b_packed,
             &inv_table,
