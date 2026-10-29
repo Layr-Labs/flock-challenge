@@ -13705,6 +13705,7 @@ kernel void zc_r2_horner_oracle(
         hi_size: usize,
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
+        fixed_horner_weights: bool,
     ) {
         if !zc_r2_idle_fill_viable() {
             return;
@@ -13719,8 +13720,11 @@ kernel void zc_r2_horner_oracle(
         {
             return;
         }
-        let horner =
-            super::gpu_zc_r2_horner_enabled() && super::zc_r2_horner_weights(eq_lo, lo_size);
+        // The sole caller derives this proof from the same immutable point
+        // used to build eq_lo. Unsupported points keep the full table check.
+        let horner = super::gpu_zc_r2_horner_enabled()
+            && ((fixed_horner_weights && lo_size == 16_384)
+                || super::zc_r2_horner_weights(eq_lo, lo_size));
         let Ok(gpu) = gpu() else { return };
         let Some(state_mutex) = zc_r2_state() else {
             return;

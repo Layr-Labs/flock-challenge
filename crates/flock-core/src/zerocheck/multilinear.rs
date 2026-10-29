@@ -162,6 +162,60 @@ fn zc_r2_odd_offload_enabled() -> bool {
     *ON
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn r2_pre_stage_fixed_horner_weights(point: &[F128], lo_size: usize) -> bool {
+    point.len() == 25
+        && lo_size == 16_384
+        && point[2..6]
+            == crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// The four medium factors are scale * gamma^medium; all other bits keep
+// their original order in the ten-coordinate base.
+fn build_r2_pre_stage_eq(point: &[F128]) -> (SplitEqGhash, bool) {
+    use rayon::prelude::*;
+
+    let n_hi = COMPACT_RECONSTRUCTION_N_HI.min(point.len());
+    let n_lo = point.len() - n_hi;
+    let fixed_horner_weights = n_lo == 14 && r2_pre_stage_fixed_horner_weights(point, 16_384);
+    if !fixed_horner_weights {
+        return (SplitEqGhash::with_n_hi(point, COMPACT_RECONSTRUCTION_N_HI), false);
+    }
+    let base_point = [
+        point[0], point[1], point[6], point[7], point[8],
+        point[9], point[10], point[11], point[12], point[13],
+    ];
+    let scale = (F128::ONE + point[2]) * (F128::ONE + point[3])
+        * (F128::ONE + point[4]) * (F128::ONE + point[5]);
+    let lo = {
+        let base = crate::zerocheck::univariate_skip::build_eq_scaled(&base_point, scale);
+        let mut lo = crate::alloc_uninit_f128_vec(1usize << n_lo);
+        let dst = crate::epool::SyncPtr(lo.as_mut_ptr());
+        (0..256usize).into_par_iter().for_each(|window| {
+            let mut values = [
+                base[window * 4], base[window * 4 + 1],
+                base[window * 4 + 2], base[window * 4 + 3],
+            ];
+            // Each window owns 64 slots. Raw writes initialize every slot;
+            // the synchronous Rayon join precedes any read or base drop.
+            let out = unsafe { dst.ptr().add(window * 64) };
+            for class in 0..4 {
+                unsafe { out.add(class).write(values[class]) };
+            }
+            for medium in 1..16 {
+                for class in 0..4 {
+                    values[class] = crate::field::mul_by_x(values[class]);
+                    unsafe { out.add(medium * 4 + class).write(values[class]) };
+                }
+            }
+        });
+        lo
+    }; // The 16 KiB base is dropped before upload or stash.
+    let hi = build_eq(&point[n_lo..]);
+    (SplitEqGhash { n_lo, n_hi, lo, hi }, true)
+}
+
 /// ZC-window GPU idle fill (see `gpu_commit::ENV_NO_ZC_IDLE_FILL`): stage
 /// round two's GPU-arm window setup while the ZC C-fold's GPU prefix is in
 /// flight. Everything staged derives from inputs bound BEFORE the fold
@@ -188,7 +242,8 @@ pub(crate) fn stage_round2_gpu_window_from_r1_challenges(
         return;
     }
     let n_pairs = (1usize << (m - k_skip)) / 2;
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + 1..], COMPACT_RECONSTRUCTION_N_HI);
+    let point = &r[k_skip + 1..];
+    let (eq, fixed_horner_weights) = build_r2_pre_stage_eq(point);
     let lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     if lo_size * hi_size != n_pairs {
@@ -204,6 +259,7 @@ pub(crate) fn stage_round2_gpu_window_from_r1_challenges(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        fixed_horner_weights,
     );
     // The upload above copies eq.lo/eq.hi into persistent GPU buffers, so the
     // CPU-side tables are free to be re-used by the round-two sweep.
@@ -3999,6 +4055,84 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn r2_pre_stage_point_proves_full_horner_weights() {
+        let mut rng = Rng::new(0x52_32_48_4f);
+        for trial in 0..4 {
+            let mut point = match trial {
+                0 => vec![F128::ZERO; 25],
+                1 => vec![F128::ONE; 25],
+                _ => rng.f128_vec(25),
+            };
+            point[2..6].copy_from_slice(
+                &crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash(),
+            );
+            let eq = SplitEqGhash::with_n_hi(&point, COMPACT_RECONSTRUCTION_N_HI);
+            assert_eq!(eq.n_lo, 14);
+            assert!(r2_pre_stage_fixed_horner_weights(&point, eq.lo.len()));
+            for window in 0..256 {
+                for class in 0..4 {
+                    let mut weight = eq.lo[(window << 6) | class];
+                    for medium in 1..16 {
+                        weight = crate::field::mul_by_x(weight);
+                        assert_eq!(eq.lo[(window << 6) | (medium << 2) | class], weight);
+                    }
+                }
+            }
+            for medium in 2..6 {
+                point[medium] += F128::ONE;
+                assert!(!r2_pre_stage_fixed_horner_weights(&point, 16_384));
+                point[medium] += F128::ONE;
+            }
+            assert!(!r2_pre_stage_fixed_horner_weights(&point, 8192));
+            assert!(!r2_pre_stage_fixed_horner_weights(&point[..24], 16_384));
+            point.push(F128::ZERO);
+            assert!(!r2_pre_stage_fixed_horner_weights(&point, 16_384));
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn r2_pre_stage_specialized_eq_matches_generic_and_order() {
+        let mut rng = Rng::new(0x52_32_45_51);
+        for trial in 0..5 {
+            let mut point = match trial {
+                0 => vec![F128::ZERO; 25],
+                1 => vec![F128::ONE; 25],
+                2 => (0..25).map(|i| if i % 2 == 0 { F128::ZERO } else { F128::ONE }).collect(),
+                _ => rng.f128_vec(25),
+            };
+            point[2..6].copy_from_slice(
+                &crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash(),
+            );
+            let expected = SplitEqGhash::with_n_hi(&point, COMPACT_RECONSTRUCTION_N_HI);
+            let (actual, fixed) = build_r2_pre_stage_eq(&point);
+            assert!(fixed);
+            assert_eq!((actual.n_lo, actual.n_hi), (expected.n_lo, expected.n_hi));
+            assert_eq!(actual.lo, expected.lo, "low order trial={trial}");
+            assert_eq!(actual.hi, expected.hi, "high order trial={trial}");
+            for medium in 2..6 {
+                point[medium] += F128::ONE;
+                let (fallback, fixed) = build_r2_pre_stage_eq(&point);
+                let expected = SplitEqGhash::with_n_hi(&point, COMPACT_RECONSTRUCTION_N_HI);
+                assert!(!fixed);
+                assert_eq!(fallback.lo, expected.lo);
+                assert_eq!(fallback.hi, expected.hi);
+                point[medium] += F128::ONE;
+            }
+        }
+        for len in [24, 26] {
+            let point = rng.f128_vec(len);
+            let (actual, fixed) = build_r2_pre_stage_eq(&point);
+            let expected = SplitEqGhash::with_n_hi(&point, COMPACT_RECONSTRUCTION_N_HI);
+            assert!(!fixed);
+            assert_eq!((actual.n_lo, actual.n_hi), (expected.n_lo, expected.n_hi));
+            assert_eq!(actual.lo, expected.lo);
+            assert_eq!(actual.hi, expected.hi);
+        }
+    }
 
     #[test]
     fn apple_lookahead_inverse_reuse_selector_is_literal_and_fail_closed() {
