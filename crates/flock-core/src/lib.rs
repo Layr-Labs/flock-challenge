@@ -296,3 +296,5 @@ fn linux_physical_cores() -> Option<usize> {
     }
     (!cores.is_empty()).then_some(cores.len())
 }
+
+// Draw label S9-r2: a resubmission of an earlier tree; no code change.
