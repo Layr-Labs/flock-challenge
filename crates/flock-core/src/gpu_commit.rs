@@ -8205,30 +8205,41 @@ kernel void blake3_pow_scan(
                 }
             }
         };
-        // Score by the graph arm alone under exact AB contention, not by the
-        // join wall. The AB replay is k-independent; when it outlasts the
-        // graph the join wall contains no information about k (wayfinder F2).
-        // Minimising the graph arm is never wrong: where the graph is
-        // critical it minimises the join too; where it is not, a shorter
-        // graph is free. `FLOCK_HYBRID_SCORE_JOIN_WALL=1` restores the
-        // incumbent join-max objective for same-binary comparison.
+        // Score each sample by its slower arm, `max(graph, AB replay)`, both
+        // timed inside the same join. The AB replay is NOT k-independent: the
+        // hybrid's CPU suffix runs on the same performance cores, so a larger
+        // CPU share lengthens the AB arm. Where the graph is critical this is
+        // the graph arm (the previous objective); where the AB arm bounds the
+        // window (measured: arm 58.2 ms vs window 58.3 ms, graph 41-53 ms) a
+        // split that shortens the graph by loading the CPU can lengthen the
+        // real critical path, and only the max sees it.
+        // `FLOCK_HYBRID_SCORE_GRAPH_ARM=1` restores the graph-arm objective;
+        // `FLOCK_HYBRID_SCORE_JOIN_WALL=1` the older join-wall objective.
         let sample = |k: usize| -> Result<f64, String> {
             let score_join = std::env::var_os("FLOCK_HYBRID_SCORE_JOIN_WALL").is_some();
+            let graph_only = std::env::var_os("FLOCK_HYBRID_SCORE_GRAPH_ARM").is_some();
             let t0 = std::time::Instant::now();
-            let (graph_arm, ()) = rayon::join(
+            let (graph_arm, ab_ms) = rayon::join(
                 || {
                     let tg = std::time::Instant::now();
                     let r = timed_graph(k);
                     (r, tg.elapsed().as_secs_f64() * 1e3)
                 },
-                || replay_ab(),
+                || {
+                    let ta = std::time::Instant::now();
+                    replay_ab();
+                    ta.elapsed().as_secs_f64() * 1e3
+                },
             );
             let (graph, graph_ms) = graph_arm;
             graph?;
+            record_ab_arm(k, graph_ms, ab_ms);
             Ok(if score_join {
                 t0.elapsed().as_secs_f64() * 1e3
-            } else {
+            } else if graph_only {
                 graph_ms
+            } else {
+                graph_ms.max(ab_ms)
             })
         };
         let reprime = || unsafe {
@@ -8242,6 +8253,9 @@ kernel void blake3_pow_scan(
                 v.clear();
             }
             if let Ok(mut v) = fine_arm_samples().lock() {
+                v.clear();
+            }
+            if let Ok(mut v) = ab_arm_samples().lock() {
                 v.clear();
             }
             let _recording = ArmRecordScope::enter();
@@ -8279,12 +8293,30 @@ kernel void blake3_pow_scan(
             .lock()
             .map(|v| v.clone())
             .unwrap_or_default();
-        let chosen = match split_from_arms(&arm_samples, swept) {
-            Some(k) => k,
-            None => swept,
+        // AB-bound sweep pick: the AB replay outlasted the graph at the
+        // swept split, so the arm re-pricing (graph arms only) and the fine
+        // refinement (which moves work onto the CPU) would only lengthen the
+        // critical AB arm. Keep the sweep's own max-of-arms choice.
+        let ab_bound = swept > 0 && ab_bound_at(swept);
+        let chosen = if ab_bound {
+            swept
+        } else {
+            match split_from_arms(&arm_samples, swept) {
+                Some(k) => k,
+                None => swept,
+            }
         };
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
-        let chosen = fine_split_from_arms(&fine_samples, chosen);
+        let chosen = if ab_bound { chosen } else { fine_split_from_arms(&fine_samples, chosen) };
+        if dbg {
+            let v = ab_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
+            let rows: Vec<String> =
+                v.iter().map(|s| format!("k{}:g{:.1}/ab{:.1}", s.0, s.1, s.2)).collect();
+            eprintln!(
+                "[gpu-commit] ab-arm objective: swept k={swept} ab_bound={ab_bound} chosen={chosen} | {}",
+                rows.join(" ")
+            );
+        }
         if dbg {
             let rows: Vec<String> = fine_samples
                 .iter()
@@ -8375,6 +8407,40 @@ kernel void blake3_pow_scan(
     /// exact same-binary comparison.
     /// S1 kill switch: `FLOCK_NO_HYBRID_GPU_SUFFIX_HASH=1` restores the CPU
     /// suffix leaf/parent hashing.
+    /// Per-sample `(k, graph ms, AB replay ms)` from the ranked sweep.
+    fn ab_arm_samples() -> &'static std::sync::Mutex<Vec<(usize, f64, f64)>> {
+        static V: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, f64, f64)>>> =
+            std::sync::OnceLock::new();
+        V.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn record_ab_arm(k: usize, graph_ms: f64, ab_ms: f64) {
+        if graph_ms.is_finite() && ab_ms.is_finite() {
+            if let Ok(mut v) = ab_arm_samples().lock() {
+                v.push((k, graph_ms, ab_ms));
+            }
+        }
+    }
+
+    /// True when, at split `k`, the AB replay's mean wall is at least the
+    /// graph arm's mean wall over the sweep's samples (the AB arm bounds the
+    /// commit window there).
+    fn ab_bound_at(k: usize) -> bool {
+        let v = ab_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
+        ab_bound_from(&v, k)
+    }
+
+    fn ab_bound_from(v: &[(usize, f64, f64)], k: usize) -> bool {
+        let rows: Vec<&(usize, f64, f64)> = v.iter().filter(|s| s.0 == k).collect();
+        if rows.is_empty() {
+            return false;
+        }
+        let n = rows.len() as f64;
+        let g = rows.iter().map(|s| s.1).sum::<f64>() / n;
+        let a = rows.iter().map(|s| s.2).sum::<f64>() / n;
+        a >= g
+    }
+
     fn hybrid_gpu_suffix_hash_enabled() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
@@ -11688,6 +11754,17 @@ kernel void lc_fold_stripes_factored_b4(
     #[cfg(test)]
     mod hybrid_balance_tests {
         use super::{ARM_SPLIT_MARGIN, arm_window_ms, split_from_arms};
+
+        #[test]
+        fn ab_bound_compares_mean_arms_at_the_split() {
+            let v = [(2, 57.6, 58.2), (2, 61.6, 54.9), (3, 62.1, 62.5), (3, 63.0, 54.2), (0, 57.8, 50.8)];
+            assert!(!super::ab_bound_from(&v, 2)); // means 59.6 vs 56.55
+            assert!(!super::ab_bound_from(&v, 3)); // 62.55 vs 58.35
+            assert!(!super::ab_bound_from(&v, 0));
+            let w = [(2, 50.0, 58.0), (2, 52.0, 57.0)];
+            assert!(super::ab_bound_from(&w, 2));
+            assert!(!super::ab_bound_from(&w, 4)); // unsampled
+        }
 
         // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
         #[test]
