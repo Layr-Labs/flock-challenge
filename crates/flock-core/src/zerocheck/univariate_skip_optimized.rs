@@ -2400,6 +2400,10 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
     use rayon::prelude::*;
 
     debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
+    // Only the immutable factory table guarantees row b = x^b * row 0.
+    let derive_rows = CONVERT_TABLE_CACHE
+        .get()
+        .is_some_and(|table| core::ptr::eq(convert, table.as_slice()));
     // Fully overwritten below (one write per slot before any read), so an
     // uninitialized scratch buffer is sound and skips a zeroing pass.
     let mut tables = crate::scratch::take_f128(eq_top_scaled.len() * CONVERT_TABLE_SIZE);
@@ -2407,8 +2411,34 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
         .par_chunks_mut(CONVERT_TABLE_SIZE)
         .zip(eq_top_scaled.par_iter())
         .for_each(|(slot, scale)| {
-            for (out, base) in slot.iter_mut().zip(convert.iter()) {
-                *out = *base * *scale;
+            if derive_rows {
+                // Scaled images of the eight binary carry masks.
+                let deltas = [
+                    *scale,
+                    convert[3] * *scale,
+                    convert[7] * *scale,
+                    convert[15] * *scale,
+                    convert[31] * *scale,
+                    convert[63] * *scale,
+                    convert[127] * *scale,
+                    convert[255] * *scale,
+                ];
+                let mut base = F128::ZERO;
+                for byte in 0usize..256 {
+                    if byte != 0 {
+                        base += deltas[byte.trailing_zeros() as usize];
+                    }
+                    let mut value = base;
+                    slot[byte] = value;
+                    for bank in 1..16 {
+                        value = mul_by_x(value);
+                        slot[bank * 256 + byte] = value;
+                    }
+                }
+            } else {
+                for (out, base) in slot.iter_mut().zip(convert.iter()) {
+                    *out = *base * *scale;
+                }
             }
         });
     tables
@@ -6173,6 +6203,33 @@ mod tests {
             }
         }
         crate::scratch::give_f128(tables);
+    }
+
+    #[test]
+    fn ab_eq_fold_tables_match_all_parent_products() {
+        let mut rng = Rng::new(0xAB_E9_4096);
+        let scales = [F128::ZERO, F128::ONE, rng.f128(), rng.f128()];
+        let mut altered_convert = convert_table().to_vec();
+        altered_convert[256] = F128::ONE;
+        let custom_convert = rng.f128_vec(CONVERT_TABLE_SIZE);
+        for convert in [
+            convert_table(),
+            altered_convert.as_slice(),
+            custom_convert.as_slice(),
+        ] {
+            let tables = build_ab_eq_fold_tables(&scales, convert);
+            assert_eq!(tables.len(), scales.len() * CONVERT_TABLE_SIZE);
+            for (w, scale) in scales.iter().enumerate() {
+                for i in 0..CONVERT_TABLE_SIZE {
+                    assert_eq!(
+                        tables[w * CONVERT_TABLE_SIZE + i],
+                        convert[i] * *scale,
+                        "T[{w}][{i}]"
+                    );
+                }
+            }
+            crate::scratch::give_f128(tables);
+        }
     }
 
     /// End-to-end producer gate for the fold: the banked drain must return
