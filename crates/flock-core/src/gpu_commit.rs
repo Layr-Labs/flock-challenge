@@ -13880,7 +13880,7 @@ kernel void zc_r2_horner_oracle(
                 std::ptr::copy_nonoverlapping(
                     eq_hi.as_ptr().cast::<u8>(),
                     gpu.buffer_contents(state.eq_hi_buf),
-                    need_hi,
+                    ZC_IDLE_FILL_PRIMER_CHUNKS.min(hi_size) * 16,
                 );
                 let need_part = hi_size * 64 * if horner { 4 } else { 1 };
                 if state.part_cap < need_part {
@@ -14019,7 +14019,7 @@ kernel void zc_r2_horner_oracle(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             // Four F128 per physical group, merged per logical hi chunk
             // after completion: [p1_even, pinf_even, p1_odd, pinf_odd].
@@ -14767,7 +14767,7 @@ kernel void zc_t3_products(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             let need_part = hi_size * 32;
             if state.part_cap < need_part {
@@ -15465,7 +15465,7 @@ kernel void zc_loop_products(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             let need_part = hi_size * 32;
             if state.part_cap < need_part {
