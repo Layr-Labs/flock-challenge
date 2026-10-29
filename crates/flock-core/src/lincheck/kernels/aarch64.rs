@@ -766,22 +766,10 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     if n_claims == 0 {
         return vec![F128::ZERO; k];
     }
-    let mut partials = crate::scratch::take_f128(n_claims * k);
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(n_claims, |c| {
-        let claim = c + claim_lo;
-        let tile_lo = claim * TILES_PER_CLAIM;
-        let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
-        // SAFETY: the queue hands out each claim index exactly once; claim
-        // `c` exclusively owns `partials[c·k .. (c+1)·k]`, and zeroes the
-        // `[0..useful)` prefix below before any read. The queue join publishes
-        // all writes before the reduction reads them.
-        let partial = unsafe { std::slice::from_raw_parts_mut(partials_base.ptr().add(c * k), k) };
-        // SAFETY: F128 is Copy and all-zero bytes are valid F128::ZERO; only
-        // `[0..useful)` is ever read or written by the tile loops.
-        unsafe {
-            std::ptr::write_bytes(partial.as_mut_ptr(), 0, useful);
-        }
+    // Fold tiles `[tile_lo, tile_hi)` into the length-k accumulator at
+    // `partial` (only `[0..useful)` is read or written; the caller zeroed it).
+    // Shared by both claim schedules below, so they cannot drift apart.
+    let fold_tiles = |partial: *mut F128, tile_lo: usize, tile_hi: usize| {
         // TILE_T × 256 F128 tables, L1-resident on stack, built once per tile.
         let mut tables_uninit = core::mem::MaybeUninit::<[[F128; 256]; TILE_T]>::uninit();
         let tables_ptr = tables_uninit.as_mut_ptr() as *const u8;
@@ -804,13 +792,7 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
             if block16 {
                 while bs + 16 <= useful {
                     unsafe {
-                        process_block16_neon_single_sha3(
-                            z_base,
-                            k,
-                            bs,
-                            tables_ptr,
-                            partial.as_mut_ptr().add(bs),
-                        );
+                        process_block16_neon_single_sha3(z_base, k, bs, tables_ptr, partial.add(bs));
                     }
                     bs += 16;
                 }
@@ -819,40 +801,140 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
             let _ = block16;
             while bs < useful {
                 unsafe {
-                    process_block_neon_single::<TILE_T>(
-                        z_base,
-                        k,
-                        bs,
-                        tables_ptr,
-                        partial.as_mut_ptr().add(bs),
-                    );
+                    process_block_neon_single::<TILE_T>(z_base, k, bs, tables_ptr, partial.add(bs));
                 }
                 bs += BLOCK_K;
             }
         }
-    });
-    let n_workers = n_claims;
+    };
 
-    // XOR-reduce the per-worker partials in ONE parallel pass over column bands:
-    // each worker owns a band of the output, copies partial 0, and XORs the
-    // remaining `n_workers - 1` partials, so the band lands in registers/L1
-    // once and is written without an up-front zero-fill of `out`.
-    let band = useful.div_ceil(rayon::current_num_threads().max(1)).max(1024);
-    let mut out = crate::scratch::take_lincheck_z_vec(k);
-    out[useful..k].fill(F128::ZERO);
-    out[..useful]
-        .par_chunks_mut(band)
-        .enumerate()
-        .for_each(|(bi, dst)| {
-            let lo = bi * band;
-            dst.copy_from_slice(&partials[lo..lo + dst.len()]);
-            for w in 1..n_workers {
-                let src = &partials[w * k + lo..w * k + lo + dst.len()];
-                for (o, s) in dst.iter_mut().zip(src.iter()) {
-                    *o += *s;
+    // XOR-reduce `parts` (each `[0..useful)` valid) in ONE parallel pass over
+    // column bands: each worker owns a band of the output, copies partial 0,
+    // and XORs the rest, so the band lands in registers/L1 once and is written
+    // without an up-front zero-fill of `out`.
+    let reduce = |parts: &[&[F128]]| -> Vec<F128> {
+        let band = useful.div_ceil(rayon::current_num_threads().max(1)).max(1024);
+        let mut out = crate::scratch::take_lincheck_z_vec(k);
+        out[useful..k].fill(F128::ZERO);
+        out[..useful]
+            .par_chunks_mut(band)
+            .enumerate()
+            .for_each(|(bi, dst)| {
+                let lo = bi * band;
+                dst.copy_from_slice(&parts[0][lo..lo + dst.len()]);
+                for part in &parts[1..] {
+                    let src = &part[lo..lo + dst.len()];
+                    for (o, s) in dst.iter_mut().zip(src.iter()) {
+                        *o += *s;
+                    }
                 }
-            }
-        });
+            });
+        out
+    };
+
+    if lincheck_worker_partials_enabled() {
+        // Worker-owned partials over fine sub-claims. The claim range (the
+        // unit the GPU prefix split is expressed in) is unchanged, but the
+        // CPU queue hands out `SUB_CLAIM_TILES`-tile sub-claims and each
+        // worker accumulates every sub-claim it runs into ONE private
+        // length-k partial, taken from a per-drain slot table on its first
+        // claim. A 64-tile claim is several milliseconds on an efficiency
+        // core, so the drain used to wait for whichever helper claimed one
+        // near the end; a quarter-size claim cuts that join tail, and the
+        // reduction reads one partial per participating worker instead of
+        // one per claim.
+        //
+        // Exact: every tile's contribution is XORed into exactly one partial
+        // and the partials are XOR-summed. GF(2^128) addition is XOR
+        // (associative and commutative), so the result does not depend on
+        // the tile -> worker assignment or the summation order; it equals
+        // the per-claim schedule bit for bit. `FLOCK_NO_LINCHECK_WORKER_PARTIALS=1`
+        // (exact '1') restores the per-claim schedule.
+        const SUB_CLAIM_TILES: usize = 16;
+        let tile_lo_all = claim_lo * TILES_PER_CLAIM;
+        let tile_hi_all = (claim_hi * TILES_PER_CLAIM).min(n_tiles);
+        let n_sub = (tile_hi_all - tile_lo_all).div_ceil(SUB_CLAIM_TILES);
+        let max_slots = rayon::current_num_threads()
+            + crate::epool::helper_pool().map_or(0, |pool| pool.current_num_threads());
+        let mut partials = crate::scratch::take_f128(max_slots * k);
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        let next_slot = std::sync::atomic::AtomicUsize::new(0);
+        // Defensive: a participant beyond the slot table (not expected: only
+        // main-pool and helper-pool threads drain the queue) gets its own
+        // allocation. Moving the Vec into the list never moves its buffer.
+        let overflow: std::sync::Mutex<Vec<Vec<F128>>> = std::sync::Mutex::new(Vec::new());
+        crate::epool::run_hetero_chunks_stateful(
+            n_sub,
+            || None::<crate::epool::SyncPtr<F128>>,
+            |slot, sub| {
+                let partial = slot
+                    .get_or_insert_with(|| {
+                        let i = next_slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let ptr = if i < max_slots {
+                            // SAFETY: slot `i` is handed out exactly once;
+                            // it owns `partials[i·k .. (i+1)·k]`.
+                            unsafe { partials_base.ptr().add(i * k) }
+                        } else {
+                            let mut own: Vec<F128> = crate::alloc_uninit_vec(k);
+                            let ptr = own.as_mut_ptr();
+                            overflow.lock().unwrap_or_else(|e| e.into_inner()).push(own);
+                            ptr
+                        };
+                        // SAFETY: all-zero bytes are F128::ZERO; only
+                        // `[0..useful)` is ever read or written.
+                        unsafe { std::ptr::write_bytes(ptr, 0, useful) };
+                        crate::epool::SyncPtr(ptr)
+                    })
+                    .ptr();
+                let tile_lo = tile_lo_all + sub * SUB_CLAIM_TILES;
+                let tile_hi = (tile_lo + SUB_CLAIM_TILES).min(tile_hi_all);
+                fold_tiles(partial, tile_lo, tile_hi);
+            },
+        );
+        // The queue join published every slot write.
+        let n_used = next_slot.load(std::sync::atomic::Ordering::Relaxed).min(max_slots);
+        let overflow = overflow.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut parts: Vec<&[F128]> = (0..n_used)
+            .map(|i| &partials[i * k..i * k + useful])
+            .collect();
+        parts.extend(overflow.iter().map(|own| &own[..useful]));
+        let out = reduce(&parts);
+        drop(parts);
+        crate::scratch::give_f128(partials);
+        return out;
+    }
+
+    let mut partials = crate::scratch::take_f128(n_claims * k);
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    crate::epool::run_hetero_chunks(n_claims, |c| {
+        let claim = c + claim_lo;
+        let tile_lo = claim * TILES_PER_CLAIM;
+        let tile_hi = ((claim + 1) * TILES_PER_CLAIM).min(n_tiles);
+        // SAFETY: the queue hands out each claim index exactly once; claim
+        // `c` exclusively owns `partials[c·k .. (c+1)·k]`, and zeroes the
+        // `[0..useful)` prefix below before any read. The queue join publishes
+        // all writes before the reduction reads them.
+        let partial = unsafe { partials_base.ptr().add(c * k) };
+        // SAFETY: F128 is Copy and all-zero bytes are valid F128::ZERO; only
+        // `[0..useful)` is ever read or written by the tile loops.
+        unsafe {
+            std::ptr::write_bytes(partial, 0, useful);
+        }
+        fold_tiles(partial, tile_lo, tile_hi);
+    });
+    let parts: Vec<&[F128]> = (0..n_claims).map(|c| &partials[c * k..c * k + useful]).collect();
+    let out = reduce(&parts);
+    drop(parts);
     crate::scratch::give_f128(partials);
     out
+}
+
+/// Worker-owned partials over quarter-claims in the oblock fold (default on;
+/// `FLOCK_NO_LINCHECK_WORKER_PARTIALS=1`, exact `"1"`, restores the per-claim
+/// partial schedule). Read once per process.
+fn lincheck_worker_partials_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FLOCK_NO_LINCHECK_WORKER_PARTIALS").ok().as_deref() != Some("1")
+    })
 }
