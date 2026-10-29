@@ -7,8 +7,9 @@
 // so the scheduler and register allocator see one basic block exactly like
 // the generic h4 kernel. A row whose static bytes do not all match runs the
 // generic h4 kernel instead (cold), so the output is bit-identical for any
-// witness. Each live arm is its own monomorphized body; a window's static
-// rows can run as one unrolled sequence of direct calls (no per-row jump).
+// witness. The separate trusted window entry skips these guards only with
+// the caller's proof of the same B masks. Each live arm is its own
+// monomorphized body; a window's static rows can run as one unrolled sequence of direct calls (no per-row jump).
 //
 // Included by kernels/aarch64.rs via include!.
 
@@ -28,10 +29,16 @@ fn bstatic_horner_fallback(
 }
 
 /// One static-B arm `BLK = w * 16 + b_med` (3..=28) in the h4 Horner layout.
+///
+/// # Safety
+/// `BLK` must be in 3..=28. The caller must prove that
+/// `chunk_byte_base + (BLK % 16 + 1) * 64`
+/// does not overflow and is within both packed input slices. If
+/// `TRUST_STATIC_B`, every `(b_word & MASK) == EXPECTED` in this arm must hold.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 #[allow(clippy::too_many_lines)]
-fn bstatic_horner_blk<const BLK: usize>(
+unsafe fn bstatic_horner_blk<const BLK: usize, const TRUST_STATIC_B: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -44,7 +51,6 @@ fn bstatic_horner_blk<const BLK: usize>(
     use core::arch::aarch64::*;
     let b_med = BLK % 16;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-    assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
     let plain = inv_table.data_ptr();
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
@@ -116,7 +122,7 @@ fn bstatic_horner_blk<const BLK: usize>(
         let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
         let acc = match BLK {
             3 => {
-                if ((!bw!(1) & 0x0000ffffffffffff) | (!bw!(4) & 0xffff000000000000) | (!bw!(5) & 0x000000ffffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(1) & 0x0000ffffffffffff) | (!bw!(4) & 0xffff000000000000) | (!bw!(5) & 0x000000ffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -135,7 +141,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             4 => {
-                if ((!bw!(0) & 0xffff000000000000) | (!bw!(1) & 0x000000ffffffffff) | (!bw!(4) & 0xffffff0000000000) | (!bw!(5) & 0x00000000ffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0xffff000000000000) | (!bw!(1) & 0x000000ffffffffff) | (!bw!(4) & 0xffffff0000000000) | (!bw!(5) & 0x00000000ffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -154,7 +160,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             5 => {
-                if ((!bw!(0) & 0xffffffff00000000) | (!bw!(1) & 0x0000000000ffffff) | (!bw!(4) & 0xffffffffff000000) | (!bw!(5) & 0x000000000000ffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0xffffffff00000000) | (!bw!(1) & 0x0000000000ffffff) | (!bw!(4) & 0xffffffffff000000) | (!bw!(5) & 0x000000000000ffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -173,7 +179,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             6 => {
-                if ((!bw!(0) & 0xffffffffff000000) | (!bw!(1) & 0x000000000000ffff) | (!bw!(4) & 0xffffffffffff0000)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0xffffffffff000000) | (!bw!(1) & 0x000000000000ffff) | (!bw!(4) & 0xffffffffffff0000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -192,7 +198,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             7 => {
-                if ((!bw!(0) & 0xffffffffffffff00) | (!bw!(4) & 0x00ffffffffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0xffffffffffffff00) | (!bw!(4) & 0x00ffffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -211,7 +217,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             8 => {
-                if ((!bw!(0) & 0x00ffffffffffffff) | (!bw!(4) & 0x0000ffffffffffff) | (!bw!(7) & 0xffff000000000000)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0x00ffffffffffffff) | (!bw!(4) & 0x0000ffffffffffff) | (!bw!(7) & 0xffff000000000000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -230,7 +236,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             9 => {
-                if ((!bw!(0) & 0x000000ffffffffff) | (!bw!(3) & 0xffffff0000000000) | (!bw!(4) & 0x00000000ffffffff) | (!bw!(7) & 0xffffff0000000000)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0x000000ffffffffff) | (!bw!(3) & 0xffffff0000000000) | (!bw!(4) & 0x00000000ffffffff) | (!bw!(7) & 0xffffff0000000000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -249,7 +255,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             10 => {
-                if ((!bw!(0) & 0x00000000ffffffff) | (!bw!(3) & 0xffffffff00000000) | (!bw!(4) & 0x0000000000ffffff) | (!bw!(7) & 0xffffffffff000000)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0x00000000ffffffff) | (!bw!(3) & 0xffffffff00000000) | (!bw!(4) & 0x0000000000ffffff) | (!bw!(7) & 0xffffffffff000000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -268,7 +274,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             11 => {
-                if ((!bw!(0) & 0x000000000000ffff) | (!bw!(3) & 0xffffffffffff0000) | (!bw!(7) & 0xffffffffffff0000)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0x000000000000ffff) | (!bw!(3) & 0xffffffffffff0000) | (!bw!(7) & 0xffffffffffff0000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -287,7 +293,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             12 => {
-                if ((!bw!(3) & 0xffffffffffffff00) | (!bw!(7) & 0x00ffffffffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(3) & 0xffffffffffffff00) | (!bw!(7) & 0x00ffffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -306,7 +312,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             13 => {
-                if ((!bw!(3) & 0x0000ffffffffffff) | (!bw!(7) & 0x0000ffffffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(3) & 0x0000ffffffffffff) | (!bw!(7) & 0x0000ffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -325,7 +331,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             14 => {
-                if ((!bw!(2) & 0xffff000000000000) | (!bw!(3) & 0x000000ffffffffff) | (!bw!(6) & 0xffffff0000000000) | (!bw!(7) & 0x00000000ffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(2) & 0xffff000000000000) | (!bw!(3) & 0x000000ffffffffff) | (!bw!(6) & 0xffffff0000000000) | (!bw!(7) & 0x00000000ffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -344,7 +350,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             15 => {
-                if ((!bw!(2) & 0xffffffff00000000) | (!bw!(3) & 0x0000000000ffffff) | (!bw!(6) & 0xffffffff00000000) | (!bw!(7) & 0x0000000000ffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(2) & 0xffffffff00000000) | (!bw!(3) & 0x0000000000ffffff) | (!bw!(6) & 0xffffffff00000000) | (!bw!(7) & 0x0000000000ffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -363,7 +369,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             16 => {
-                if ((!bw!(2) & 0xffffffffff000000) | (!bw!(3) & 0x000000000000ffff) | (!bw!(6) & 0xffffffffffff0000)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(2) & 0xffffffffff000000) | (!bw!(3) & 0x000000000000ffff) | (!bw!(6) & 0xffffffffffff0000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -382,7 +388,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             17 => {
-                if ((!bw!(2) & 0xffffffffffffff00) | (!bw!(6) & 0xffffffffffffff00)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(2) & 0xffffffffffffff00) | (!bw!(6) & 0xffffffffffffff00)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -401,7 +407,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             18 => {
-                if ((!bw!(2) & 0x00ffffffffffffff) | (!bw!(6) & 0x0000ffffffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(2) & 0x00ffffffffffffff) | (!bw!(6) & 0x0000ffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -420,7 +426,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             19 => {
-                if ((!bw!(1) & 0xffff000000000000) | (!bw!(2) & 0x000000ffffffffff) | (!bw!(5) & 0xffff000000000000) | (!bw!(6) & 0x000000ffffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(1) & 0xffff000000000000) | (!bw!(2) & 0x000000ffffffffff) | (!bw!(5) & 0xffff000000000000) | (!bw!(6) & 0x000000ffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -439,7 +445,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             20 => {
-                if ((!bw!(1) & 0xffffff0000000000) | (!bw!(2) & 0x00000000ffffffff) | (!bw!(5) & 0xffffffff00000000) | (!bw!(6) & 0x0000000000ffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(1) & 0xffffff0000000000) | (!bw!(2) & 0x00000000ffffffff) | (!bw!(5) & 0xffffffff00000000) | (!bw!(6) & 0x0000000000ffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -458,7 +464,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             21 => {
-                if ((!bw!(1) & 0xffffffffff000000) | (!bw!(2) & 0x000000000000ffff) | (!bw!(5) & 0xffffffffff000000) | (!bw!(6) & 0x000000000000ffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(1) & 0xffffffffff000000) | (!bw!(2) & 0x000000000000ffff) | (!bw!(5) & 0xffffffffff000000) | (!bw!(6) & 0x000000000000ffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -477,7 +483,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             22 => {
-                if ((!bw!(1) & 0xffffffffffff0000) | (!bw!(5) & 0xffffffffffffff00)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(1) & 0xffffffffffff0000) | (!bw!(5) & 0xffffffffffffff00)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -496,7 +502,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             23 => {
-                if ((!bw!(1) & 0x00ffffffffffffff) | (!bw!(5) & 0x00ffffffffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(1) & 0x00ffffffffffffff) | (!bw!(5) & 0x00ffffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -515,7 +521,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             24 => {
-                if ((!bw!(1) & 0x0000ffffffffffff) | (!bw!(4) & 0xffff000000000000) | (!bw!(5) & 0x000000ffffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(1) & 0x0000ffffffffffff) | (!bw!(4) & 0xffff000000000000) | (!bw!(5) & 0x000000ffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -534,7 +540,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             25 => {
-                if ((!bw!(0) & 0xffffff0000000000) | (!bw!(1) & 0x00000000ffffffff) | (!bw!(4) & 0xffffff0000000000) | (!bw!(5) & 0x00000000ffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0xffffff0000000000) | (!bw!(1) & 0x00000000ffffffff) | (!bw!(4) & 0xffffff0000000000) | (!bw!(5) & 0x00000000ffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -553,7 +559,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             26 => {
-                if ((!bw!(0) & 0xffffffff00000000) | (!bw!(1) & 0x0000000000ffffff) | (!bw!(4) & 0xffffffffff000000) | (!bw!(5) & 0x000000000000ffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0xffffffff00000000) | (!bw!(1) & 0x0000000000ffffff) | (!bw!(4) & 0xffffffffff000000) | (!bw!(5) & 0x000000000000ffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -572,7 +578,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             27 => {
-                if ((!bw!(0) & 0xffffffffffff0000) | (!bw!(4) & 0xffffffffffff0000)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0xffffffffffff0000) | (!bw!(4) & 0xffffffffffff0000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -591,7 +597,7 @@ fn bstatic_horner_blk<const BLK: usize>(
                 acc
             }
             28 => {
-                if ((!bw!(0) & 0xffffffffffffff00) | (!bw!(4) & 0x00ffffffffffffff)) != 0 {
+                if !TRUST_STATIC_B && ((!bw!(0) & 0xffffffffffffff00) | (!bw!(4) & 0x00ffffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
@@ -638,33 +644,41 @@ pub(crate) fn shift_reduce_inner_ab_bstatic_horner(
     if w > 1 || b_med >= 16 {
         return false;
     }
-    match w * 16 + b_med {
-        3 => bstatic_horner_blk::<3>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        4 => bstatic_horner_blk::<4>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        5 => bstatic_horner_blk::<5>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        6 => bstatic_horner_blk::<6>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        7 => bstatic_horner_blk::<7>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        8 => bstatic_horner_blk::<8>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        9 => bstatic_horner_blk::<9>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        10 => bstatic_horner_blk::<10>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        11 => bstatic_horner_blk::<11>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        12 => bstatic_horner_blk::<12>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        13 => bstatic_horner_blk::<13>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        14 => bstatic_horner_blk::<14>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        15 => bstatic_horner_blk::<15>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        16 => bstatic_horner_blk::<16>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        17 => bstatic_horner_blk::<17>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        18 => bstatic_horner_blk::<18>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        19 => bstatic_horner_blk::<19>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        20 => bstatic_horner_blk::<20>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        21 => bstatic_horner_blk::<21>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        22 => bstatic_horner_blk::<22>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        23 => bstatic_horner_blk::<23>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        24 => bstatic_horner_blk::<24>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        25 => bstatic_horner_blk::<25>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        26 => bstatic_horner_blk::<26>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        27 => bstatic_horner_blk::<27>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
-        28 => bstatic_horner_blk::<28>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store),
+    let blk = w * 16 + b_med;
+    if !(3..=28).contains(&blk) {
+        return false;
+    }
+    let required_end = chunk_byte_base
+        .checked_add((b_med + 1) * N_CHUNKS * 8)
+        .expect("static-B row end overflow");
+    assert!(required_end <= a_packed.len() && required_end <= b_packed.len());
+    match blk {
+        3 => unsafe { bstatic_horner_blk::<3, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        4 => unsafe { bstatic_horner_blk::<4, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        5 => unsafe { bstatic_horner_blk::<5, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        6 => unsafe { bstatic_horner_blk::<6, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        7 => unsafe { bstatic_horner_blk::<7, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        8 => unsafe { bstatic_horner_blk::<8, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        9 => unsafe { bstatic_horner_blk::<9, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        10 => unsafe { bstatic_horner_blk::<10, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        11 => unsafe { bstatic_horner_blk::<11, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        12 => unsafe { bstatic_horner_blk::<12, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        13 => unsafe { bstatic_horner_blk::<13, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        14 => unsafe { bstatic_horner_blk::<14, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        15 => unsafe { bstatic_horner_blk::<15, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        16 => unsafe { bstatic_horner_blk::<16, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        17 => unsafe { bstatic_horner_blk::<17, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        18 => unsafe { bstatic_horner_blk::<18, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        19 => unsafe { bstatic_horner_blk::<19, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        20 => unsafe { bstatic_horner_blk::<20, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        21 => unsafe { bstatic_horner_blk::<21, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        22 => unsafe { bstatic_horner_blk::<22, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        23 => unsafe { bstatic_horner_blk::<23, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        24 => unsafe { bstatic_horner_blk::<24, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        25 => unsafe { bstatic_horner_blk::<25, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        26 => unsafe { bstatic_horner_blk::<26, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        27 => unsafe { bstatic_horner_blk::<27, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
+        28 => unsafe { bstatic_horner_blk::<28, false>(a_packed, b_packed, inv_table, chunk_byte_base, partials, out, nt_store) },
         _ => return false,
     }
     true
@@ -690,14 +704,71 @@ pub(crate) fn bstatic_horner_window_rows(
     out_outer: &mut [u8],
     nt_store: bool,
 ) {
+    // SAFETY: the false specialization checks every static-B guard.
+    unsafe {
+        bstatic_horner_window_rows_body::<false>(
+            w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store,
+        );
+    }
+}
+
+/// The same window and bounds checks, with a caller proof of the static-B masks.
+///
+/// # Safety
+/// If the window bounds checks pass, each selected row must satisfy every
+/// `(b_word & MASK) == EXPECTED` condition in its generated arm. The proof
+/// must apply to the current B bytes and remain valid for the whole call.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn bstatic_horner_window_rows_trusted_b(
+    w: usize,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    partials: &'static [[u8; 64]; 248],
+    out_outer: &mut [u8],
+    nt_store: bool,
+) {
+    // SAFETY: the caller supplies the static-B value proof.
+    unsafe {
+        bstatic_horner_window_rows_body::<true>(
+            w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store,
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn bstatic_horner_window_rows_body<const TRUST_STATIC_B: bool>(
+    w: usize,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    partials: &'static [[u8; 64]; 248],
+    out_outer: &mut [u8],
+    nt_store: bool,
+) {
     assert!(w <= 1 && out_outer.len() >= 16 * 64);
+    let required_rows = if w == 0 { 16 } else { 13 };
+    let required_end = chunk_byte_base
+        .checked_add(required_rows * N_CHUNKS * 8)
+        .expect("static-B window end overflow");
+    assert!(required_end <= a_packed.len() && required_end <= b_packed.len());
     let out = out_outer.as_mut_ptr();
     macro_rules! rows {
         ($($blk:literal),*) => {{
             $(
                 // SAFETY: `$blk % 16 < 16` and `out_outer` holds 16 rows of 64 bytes.
                 let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
-                bstatic_horner_blk::<$blk>(a_packed, b_packed, inv_table, chunk_byte_base, partials, dst, nt_store);
+                // SAFETY: the window check covers its largest row, and
+                // every listed arm is within that checked input range. The
+                // caller supplies the value proof when TRUST_STATIC_B is true.
+                unsafe {
+                    bstatic_horner_blk::<$blk, TRUST_STATIC_B>(a_packed, b_packed, inv_table, chunk_byte_base, partials, dst, nt_store);
+                }
             )*
         }};
     }
@@ -705,5 +776,146 @@ pub(crate) fn bstatic_horner_window_rows(
         rows!(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     } else {
         rows!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
+mod bstatic_window_bounds_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn bstatic_window_exact_bounds_outputs_and_guard_fallback() {
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let partials = bstatic_partials(table);
+        for (w, lo, hi) in [(0usize, 3usize, 16usize), (1, 0, 13)] {
+            let base = 64;
+            let end = base + hi * 64;
+            let a: Vec<u8> = (0..end).map(|i| (i * 37 + 11) as u8).collect();
+            let mut b: Vec<u8> = (0..end).map(|i| (i * 19 + 7) as u8).collect();
+            for b_med in lo..hi {
+                for k in 0..8 {
+                    let at = base + b_med * 64 + k * 8;
+                    let word = u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+                    let (mask, expected) = BSTATIC_MASKS[w * 16 + b_med][k];
+                    b[at..at + 8].copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                }
+            }
+            for break_guard in [false, true] {
+                let mut input_b = b.clone();
+                if break_guard {
+                    let (k, &(mask, _)) = BSTATIC_MASKS[w * 16 + lo]
+                        .iter().enumerate().find(|(_, (mask, _))| *mask != 0).unwrap();
+                    let bit = mask.trailing_zeros() as usize;
+                    input_b[base + lo * 64 + k * 8 + bit / 8] ^= 1 << (bit % 8);
+                }
+                for nt_store in [false, true] {
+                    let mut expected = vec![0xa5u8; 16 * 64 + 32];
+                    let mut actual = expected.clone();
+                    for b_med in lo..hi {
+                        shift_reduce_inner_ab_fused_neon_h4(
+                            &a, &input_b, table, base, b_med,
+                            (&mut expected[16 + b_med * 64..16 + (b_med + 1) * 64]).try_into().unwrap(),
+                            nt_store,
+                        );
+                    }
+                    bstatic_horner_window_rows(
+                        w, &a, &input_b, table, base, partials,
+                        &mut actual[16..16 + 16 * 64], nt_store,
+                    );
+                    assert_eq!(actual, expected, "w={w} guard={break_guard} nt={nt_store}");
+                    if !break_guard {
+                        let mut trusted = vec![0xa5u8; 16 * 64 + 32];
+                        // SAFETY: the fixture sets every static mask above.
+                        unsafe {
+                            bstatic_horner_window_rows_trusted_b(
+                                w, &a, &input_b, table, base, partials,
+                                &mut trusted[16..16 + 16 * 64], nt_store,
+                            );
+                        }
+                        assert_eq!(trusted, expected, "trusted w={w} nt={nt_store}");
+                    }
+                }
+            }
+            for (a_len, b_len) in [(end - 1, end), (end, end - 1)] {
+                let mut out = [0xa5u8; 16 * 64];
+                assert!(catch_unwind(AssertUnwindSafe(|| {
+                    bstatic_horner_window_rows(
+                        w, &a[..a_len], &b[..b_len], table, base, partials, &mut out, false,
+                    );
+                })).is_err());
+                assert_eq!(out, [0xa5; 16 * 64], "short input wrote output for w={w}");
+                assert!(catch_unwind(AssertUnwindSafe(|| {
+                    // SAFETY: the failed bounds check returns before the value proof is used.
+                    unsafe {
+                        bstatic_horner_window_rows_trusted_b(
+                            w, &a[..a_len], &b[..b_len], table, base, partials, &mut out, false,
+                        );
+                    }
+                })).is_err());
+                assert_eq!(out, [0xa5; 16 * 64], "trusted short input wrote output for w={w}");
+            }
+            let mut out = [0xa5u8; 16 * 64];
+            assert!(catch_unwind(AssertUnwindSafe(|| {
+                bstatic_horner_window_rows(
+                    w, &[], &[], table, usize::MAX, partials, &mut out, false,
+                );
+            })).is_err());
+            assert_eq!(out, [0xa5; 16 * 64]);
+            assert!(catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY: the overflow check returns before the value proof is used.
+                unsafe {
+                    bstatic_horner_window_rows_trusted_b(
+                        w, &[], &[], table, usize::MAX, partials, &mut out, false,
+                    );
+                }
+            })).is_err());
+            assert_eq!(out, [0xa5; 16 * 64]);
+        }
+    }
+
+    #[test]
+    fn bstatic_per_row_bounds_and_unsupported_returns_are_preserved() {
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let partials = bstatic_partials(table);
+        for (w, b_med) in [(0usize, 3usize), (0, 15), (1, 0), (1, 12)] {
+            let base = 64;
+            let end = base + (b_med + 1) * 64;
+            let a = vec![0x59u8; end];
+            let b = vec![0x36u8; end];
+            let mut expected = [0xa5u8; 64];
+            let mut actual = expected;
+            shift_reduce_inner_ab_fused_neon_h4(&a, &b, table, base, b_med, &mut expected, false);
+            assert!(shift_reduce_inner_ab_bstatic_horner(
+                &a, &b, table, base, b_med, w, partials, &mut actual, false,
+            ));
+            assert_eq!(actual, expected);
+            for (a_len, b_len) in [(end - 1, end), (end, end - 1)] {
+                let mut out = [0xa5u8; 64];
+                assert!(catch_unwind(AssertUnwindSafe(|| {
+                    shift_reduce_inner_ab_bstatic_horner(
+                        &a[..a_len], &b[..b_len], table, base, b_med, w, partials, &mut out, false,
+                    );
+                })).is_err());
+                assert_eq!(out, [0xa5; 64]);
+            }
+            let mut out = [0xa5u8; 64];
+            assert!(catch_unwind(AssertUnwindSafe(|| {
+                shift_reduce_inner_ab_bstatic_horner(
+                    &[], &[], table, usize::MAX, b_med, w, partials, &mut out, false,
+                );
+            })).is_err());
+            assert_eq!(out, [0xa5; 64]);
+        }
+        for (w, b_med) in [
+            (0usize, 0usize), (0, 1), (0, 2), (1, 13), (1, 14), (1, 15),
+            (2, 0), (usize::MAX, 0), (0, usize::MAX),
+        ] {
+            let mut out = [0xa5u8; 64];
+            assert!(!shift_reduce_inner_ab_bstatic_horner(
+                &[], &[], table, usize::MAX, b_med, w, partials, &mut out, false,
+            ));
+            assert_eq!(out, [0xa5; 64]);
+        }
     }
 }
