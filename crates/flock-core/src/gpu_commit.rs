@@ -18672,6 +18672,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// anchors+deltas compact representation with an F2-linear scaled
     /// table. Exercises calibration (internal equality oracle + share
     /// publication without poisoning) and the timed prefix path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_zc_t3_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;
@@ -18806,6 +18807,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// per-chunk reduced partials must equal the CPU's fused round
     /// (`fold_pairs` + message) bit-for-bit. Exercises calibration and the
     /// timed prefix path on real Metal.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn gpu_zc_loop_products_match_cpu_oracle() {
         use crate::field::F256Unreduced;

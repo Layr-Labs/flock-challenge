@@ -209,9 +209,6 @@ fn blake3_parent_cv(left: &Hash, right: &Hash) -> Hash {
 }
 
 /// Hash one leaf of arbitrary byte length.
-///
-/// The leaf is a non-root chaining value of the hash selected by `kind`; the
-/// ranked commit geometry feeds this the same leaf bytes under either choice.
 #[inline]
 pub fn hash_leaf(data: &[u8], kind: HashKind) -> Hash {
     #[cfg(feature = "hash-count")]
@@ -995,9 +992,10 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     let mut proof = Vec::new();
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
+    let mut next = Vec::with_capacity(active.len());
 
     while level_len > 1 {
-        let mut next = Vec::with_capacity(active.len());
+        next.clear();
         let mut i = 0;
         while i < active.len() {
             let p = active[i];
@@ -1016,7 +1014,7 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
         // `next` is sorted-unique by construction: the input was sorted-unique;
         // consecutive sibling pairs (handled above) collapse to one; otherwise
         // p >> 1 preserves strict ordering.
-        active = next;
+        core::mem::swap(&mut active, &mut next);
         level_start += level_len;
         level_len >>= 1;
     }
@@ -1884,7 +1882,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "aarch64", target_os = "macos"))]
 mod leaf_kernel_bench {
     // Diagnostics-only microbench: single-thread ns/compression of the
     // 8-wide NEON leaf kernel on L2-resident data. Run with:

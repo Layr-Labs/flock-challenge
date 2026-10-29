@@ -2546,7 +2546,7 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
 
-    let mut partials = vec![[F128::ZERO; ELL]; hi_size];
+    let mut partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(hi_size);
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     match fold.bank_bits(eq.n_lo) {
         None => {
