@@ -192,10 +192,29 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     r: usize,
     twiddles: &[F128; 7],
 ) {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    // SAFETY: forwarded caller contract.
     unsafe {
-        if vector_resident_rows() {
+        butterfly_fused_3layer_row_with_policy(
+            ptr, eighth, num_ntts, lanes, r, twiddles, vector_resident_rows(),
+        );
+    }
+}
+
+/// Same row contract as [`butterfly_fused_3layer_row`], with a saved row policy.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_row_with_policy(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+    use_neon: bool,
+) {
+    if use_neon {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+        unsafe {
             aarch64::butterfly_fused_3layer_row(ptr, eighth, num_ntts, lanes, r, twiddles);
             return;
         }
@@ -238,12 +257,18 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
 /// same binary, so a candidate/control pair differs only in this dispatch —
 /// not in compilation or source revision. Read once per process; the ranked
 /// harness sets its environment before the worker starts.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
-fn vector_resident_rows() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_NEON_ROWS").is_none())
+pub(super) fn vector_resident_rows() -> bool {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_NEON_ROWS").is_none())
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        false
+    }
 }
 
 /// Rate-1/2 first-pass row kernel: one load of the radix-8 row group from
@@ -371,10 +396,29 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
     r: usize,
     twiddles: &[F128; 7],
 ) {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+    // SAFETY: forwarded caller contract.
     unsafe {
-        if vector_resident_rows() {
+        butterfly_fused_3layer_zero_root_row_with_policy(
+            ptr, eighth, num_ntts, lanes, r, twiddles, vector_resident_rows(),
+        );
+    }
+}
+
+/// Same row contract as [`butterfly_fused_3layer_zero_root_row`], with a saved row policy.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_zero_root_row_with_policy(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    twiddles: &[F128; 7],
+    use_neon: bool,
+) {
+    if use_neon {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+        unsafe {
             aarch64::butterfly_fused_3layer_zero_root_row(
                 ptr, eighth, num_ntts, lanes, r, twiddles,
             );

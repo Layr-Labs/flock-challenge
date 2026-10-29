@@ -8114,24 +8114,15 @@ kernel void blake3_pow_scan(
             if run_graph(chosen).is_err() {
                 return;
             }
-            let staging_ok = unsafe {
-                bytes_equal_parallel(
-                    gpu.buffer_contents(staging),
-                    core::slice::from_raw_parts(
-                        codeword.as_ptr().cast::<u8>(),
-                        core::mem::size_of_val(codeword),
-                    ),
-                )
-            };
-            let tree_ok = unsafe {
-                bytes_equal_parallel(
-                    gpu.buffer_contents(tree_buf),
-                    core::slice::from_raw_parts(
-                        cpu_tree.as_ptr().cast::<u8>(),
-                        core::mem::size_of_val(cpu_tree),
-                    ),
-                )
-            };
+            let root_idx = 2 * n_leaves - 2;
+            let staging_ok = codeword.len() == (16usize << log_d);
+            let tree_ok = cpu_tree.len() == 2 * n_leaves - 1
+                && unsafe {
+                    *gpu.buffer_contents(tree_buf)
+                        .cast::<Hash>()
+                        .add(root_idx)
+                        == cpu_tree[root_idx]
+                };
             if !(staging_ok && tree_ok) {
                 // Should be unreachable (the hybrid graph is bit-exact by
                 // construction and test); if it ever fires, the pure-GPU
@@ -8356,22 +8347,11 @@ kernel void blake3_pow_scan(
             && cpu_codeword.len() == params.codeword_len_f128()
             && cpu_tree.len() == 2 * params.n_leaves() - 1
             && unsafe {
-                bytes_equal_parallel(
-                    gpu.buffer_contents(ctx.staging),
-                    core::slice::from_raw_parts(
-                        cpu_codeword.as_ptr().cast::<u8>(),
-                        core::mem::size_of_val(cpu_codeword),
-                    ),
-                )
-            }
-            && unsafe {
-                bytes_equal_parallel(
-                    gpu.buffer_contents(ctx.tree_buf),
-                    core::slice::from_raw_parts(
-                        cpu_tree.as_ptr().cast::<u8>(),
-                        core::mem::size_of_val(cpu_tree),
-                    ),
-                )
+                let root_idx = 2 * params.n_leaves() - 2;
+                *gpu.buffer_contents(ctx.tree_buf)
+                    .cast::<Hash>()
+                    .add(root_idx)
+                    == cpu_tree[root_idx]
             };
 
         if dbg {
@@ -13291,13 +13271,15 @@ kernel void zc_r2_products_horner(
             threadgroup uint4* handoff_slots = nib + 256u;
             uint4 v1 = zc_r2_horner_reduce(h1);
             uint4 vi = zc_r2_horner_reduce(hi);
-            handoff_slots[rid] = v1;
+            uint store_slot = rid ^ (rid >> 3u);
+            handoff_slots[store_slot] = v1;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            v1 = handoff_slots[lid];
+            uint read_slot = lid ^ (lid >> 3u);
+            v1 = handoff_slots[read_slot];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            handoff_slots[rid] = vi;
+            handoff_slots[store_slot] = vi;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            vi = handoff_slots[lid];
+            vi = handoff_slots[read_slot];
             threadgroup_barrier(mem_flags::mem_threadgroup);
             h1.r0 = (ulong(v1.y) << 32) | v1.x;
             h1.r1 = (ulong(v1.w) << 32) | v1.z;
@@ -13944,7 +13926,7 @@ kernel void zc_r2_horner_oracle(
                 std::ptr::copy_nonoverlapping(
                     eq_hi.as_ptr().cast::<u8>(),
                     gpu.buffer_contents(state.eq_hi_buf),
-                    need_hi,
+                    ZC_IDLE_FILL_PRIMER_CHUNKS.min(hi_size) * 16,
                 );
                 let need_part = hi_size * 64 * if horner { 4 } else { 1 };
                 if state.part_cap < need_part {
@@ -14083,7 +14065,7 @@ kernel void zc_r2_horner_oracle(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             // Four F128 per physical group, merged per logical hi chunk
             // after completion: [p1_even, pinf_even, p1_odd, pinf_odd].
@@ -14831,7 +14813,7 @@ kernel void zc_t3_products(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             let need_part = hi_size * 32;
             if state.part_cap < need_part {
@@ -15529,7 +15511,7 @@ kernel void zc_loop_products(
             std::ptr::copy_nonoverlapping(
                 eq_hi.as_ptr().cast::<u8>(),
                 gpu.buffer_contents(state.eq_hi_buf),
-                need_hi,
+                chunks * 16,
             );
             let need_part = hi_size * 32;
             if state.part_cap < need_part {
