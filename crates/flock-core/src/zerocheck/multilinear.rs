@@ -2420,15 +2420,15 @@ pub(crate) fn fold2_compact_and_round4_into(
 // reassociation.
 // ---------------------------------------------------------------------------
 
-/// Local eq split for the cascaded K pass. Identical to [`COMPACT_RECONSTRUCTION_N_HI`] at
-/// the ranked shape; clamped so the lo half always keeps at least one
+/// Local eq split for the cascaded K pass. Use nine high variables at the
+/// ranked shape; clamp so the lo half always keeps at least one
 /// variable, because the sweep consumes round-4 pairs two at a time (one
 /// round-five group) inside a chunk — the same clamp [`lookahead_n_hi`]
 /// applies to the round-2 sweep. Any admissible value is bit-identical (the
 /// split is an exact lo/hi tensor factorisation).
 #[inline]
 fn cascade_k_pass_n_hi(n_vars: usize) -> usize {
-    COMPACT_RECONSTRUCTION_N_HI.min(n_vars.saturating_sub(1))
+    9.min(n_vars.saturating_sub(1))
 }
 
 /// Cascade K pass: [`fold2_compact_and_round4_into`] **plus** the deferred
