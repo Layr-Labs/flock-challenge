@@ -12574,13 +12574,10 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         local_levels: Option<usize>,
     }
 
-    /// Off by default (incumbent shape: leaves only per batch, every parent
-    /// level behind the cover-completing batch). `FLOCK_L1_LOCAL_PARENTS=1`
-    /// (exact) opts in to per-batch local parent levels; it measured faster
-    /// on an M4 GPU but has no grader measurement yet.
+    /// the cover-completing batch only appends the levels above.
     fn l1_local_parents_enabled() -> bool {
         static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var("FLOCK_L1_LOCAL_PARENTS").is_ok_and(|v| v == "1")
+            std::env::var("FLOCK_L1_LOCAL_PARENTS").map_or(true, |v| v != "0")
         });
         *ON
     }
