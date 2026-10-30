@@ -1480,6 +1480,21 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
         let mut w4 = tri_zero;
         let mut w5 = tri_zero;
 
+        // Row weighting `w * a`: the cascade K pass's fused PMULL+EOR
+        // schoolbook product with `0x87` hoisted into a register, the same
+        // field value as `mul_sw_q` in fewer issue slots.
+        #[cfg(target_feature = "sha3")]
+        let k87 = vdupq_n_u64(0x87);
+        macro_rules! wmul {
+            ($w:expr, $w_sw:expr, $a:expr) => {{
+                #[cfg(target_feature = "sha3")]
+                let v = mul_sw_fused_q($w, $w_sw, $a, k87);
+                #[cfg(not(target_feature = "sha3"))]
+                let v = mul_sw_q($w, $w_sw, $a);
+                v
+            }};
+        }
+
         let ones_bytes = [0xFFu8; 8];
         let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
         let ones_is_one = is_zero_q(veorq_u64(
@@ -1531,15 +1546,25 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                     }
                     tri_acc_sw(&mut w0, w, w_sw, a2);
                 } else {
-                    let a0w = mul_sw_q(w, w_sw, a0);
-                    let a1w = mul_sw_q(w, w_sw, a1);
+                    let a0w = wmul!(w, w_sw, a0);
+                    let a1w = wmul!(w, w_sw, a1);
                     let (a2w, a3w) = if pad1 {
                         (zero, zero)
                     } else {
-                        (mul_sw_q(w, w_sw, a2), mul_sw_q(w, w_sw, a3))
+                        (wmul!(w, w_sw, a2), wmul!(w, w_sw, a3))
                     };
                     macro_rules! acc {
                         ($acc:expr, $a:expr, $b:expr) => {{
+                            // The GPU-shared (`!FULL`) body keeps fewer live
+                            // accumulators and measures faster with them updated
+                            // in place; the full body keeps the all-fused form.
+                            #[cfg(target_feature = "sha3")]
+                            if FULL {
+                                tri_acc_q(&mut $acc, $a, $b);
+                            } else {
+                                tri_acc_q_crossfused(&mut $acc, $a, $b);
+                            }
+                            #[cfg(not(target_feature = "sha3"))]
                             tri_acc_q(&mut $acc, $a, $b);
                         }};
                     }
