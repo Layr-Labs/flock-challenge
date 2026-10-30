@@ -4152,9 +4152,15 @@ fn transform_active_windows(
     use rayon::prelude::*;
     let window_len = 1usize << prefix_k;
     let window_mask = window_len - 1;
+    let grain = if cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && prefix_k == 8
+        && matches!((log_d, positions.len()), (15, 106) | (13, 71))
+        && std::env::var_os("FLOCK_NO_C2_WINDOW_GRAIN").is_none()
+    { 32 } else { 1 };
     arena
         .par_chunks_mut(window_len)
         .zip(groups.par_iter())
+        .with_min_len(grain)
         .for_each(|(window, group)| {
             if group.input_end - group.input_start == 1 {
                 let input = group.input_start;
@@ -4172,6 +4178,43 @@ fn transform_active_windows(
             }
         });
 }
+
+#[cfg(test)]
+fn transform_active_windows_grain(
+    ntt: &AdditiveNttF128,
+    arena: &mut [F128],
+    groups: &[ActiveWindow],
+    positions: &[usize],
+    values: &[F128],
+    prefix_k: usize,
+    log_d: usize,
+    grain: usize,
+) {
+    use rayon::prelude::*;
+    let window_len = 1usize << prefix_k;
+    let window_mask = window_len - 1;
+    arena
+        .par_chunks_mut(window_len)
+        .zip(groups.par_iter())
+        .with_min_len(grain)
+        .for_each(|(window, group)| {
+            if group.input_end - group.input_start == 1 {
+                let input = group.input_start;
+                expand_singleton_window(
+                    ntt,
+                    window,
+                    group.window_index,
+                    prefix_k,
+                    log_d,
+                    positions[input] & window_mask,
+                    values[input],
+                );
+            } else {
+                transform_active_window(ntt, window, group.window_index, prefix_k, log_d);
+            }
+        });
+}
+
 
 const INACTIVE_WINDOW: usize = usize::MAX;
 
@@ -15127,6 +15170,37 @@ mod tests {
                 transpose_forward_ntt(&ntt, &mut dense, log_d);
                 let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn c2_window_grain_paired_timing() {
+        use crate::challenger::Challenger;
+        use std::time::Instant;
+        for (log_d, nq) in [(17usize,218usize), (15,106), (13,71)] {
+            let ntt = AdditiveNttF128::standard(log_d + 3);
+            let mut rng = crate::challenger::RandomChallenger::new(0x42 ^ log_d as u64);
+            let mut positions: Vec<usize> = (0..nq).map(|_| (rng.sample_f128().lo as usize) % (1 << log_d)).collect();
+            positions.sort_unstable(); let values = rng.sample_f128_vec(nq);
+            let groups = group_sorted_positions(&positions,8);
+            let base = scatter_active_windows(&groups, &positions, &values, 8);
+            for grain in [2usize,4,8,16,32] {
+                let mut diffs=Vec::new();
+                for i in 0..100 {
+                    let mut a=base.clone(); let mut b=base.clone();
+                    let (ta,tb) = if i%2==0 {
+                        let t=Instant::now(); transform_active_windows_grain(&ntt,&mut a,&groups,&positions,&values,8,log_d,1); let ta=t.elapsed().as_nanos();
+                        let t=Instant::now(); transform_active_windows_grain(&ntt,&mut b,&groups,&positions,&values,8,log_d,grain); (ta,t.elapsed().as_nanos())
+                    } else {
+                        let t=Instant::now(); transform_active_windows_grain(&ntt,&mut b,&groups,&positions,&values,8,log_d,grain); let tb=t.elapsed().as_nanos();
+                        let t=Instant::now(); transform_active_windows_grain(&ntt,&mut a,&groups,&positions,&values,8,log_d,1); (t.elapsed().as_nanos(),tb)
+                    };
+                    assert_eq!(a,b); diffs.push((tb as f64-ta as f64)/1000.0);
+                }
+                diffs.sort_by(|a,b| a.total_cmp(b));
+                println!("log={log_d} groups={} grain={grain} delta_us={:.2} wins={}",groups.len(),diffs[50],diffs.iter().filter(|v| **v<0.0).count());
             }
         }
     }
