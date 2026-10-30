@@ -2428,7 +2428,7 @@ pub(crate) fn fold2_compact_and_round4_into(
 /// split is an exact lo/hi tensor factorisation).
 #[inline]
 fn cascade_k_pass_n_hi(n_vars: usize) -> usize {
-    COMPACT_RECONSTRUCTION_N_HI.min(n_vars.saturating_sub(1))
+    10.min(n_vars.saturating_sub(1))
 }
 
 /// Cascade K pass: [`fold2_compact_and_round4_into`] **plus** the deferred
