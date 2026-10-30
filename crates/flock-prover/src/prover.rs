@@ -678,6 +678,14 @@ fn fill_deferred_lincheck_stripe_group(
         // SAFETY: the reads are bounded by the assert above; `dst` is 64
         // writable bytes.
         unsafe {
+            // Prefetch ahead in each input lane, keeping every hint within
+            // the useful part of this group.
+            if word % 8 == 0 && word + 16 < useful_words {
+                for lane in 0..8 {
+                    let address = z_u64.as_ptr().add(lane * u64_per_block + word + 16);
+                    core::arch::asm!("prfm pldl1keep, [{p}]", p=in(reg) address, options(nostack, readonly, preserves_flags));
+                }
+            }
             let [y0, y1, y2, y3] = flock_core::bits::transpose_8_strided_u64s_to_regs(
                 z_u64.as_ptr().add(word),
                 u64_per_block,
