@@ -1356,6 +1356,15 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         );
     }
 
+    #[cfg(target_arch = "aarch64")]
+    // The ranked direct-store path uses a shorter lead to keep the working
+    // set closer to its consuming core. Retain the original lead for other
+    // shapes and for the explicit comparison switch.
+    let prefetch_distance = if FAST_POLICY == kernels::AB_FAST_POLICY_FORCE_FAST
+        && FORCE_DIRECT
+        && std::env::var_os("FLOCK_NO_AB_PREFETCH_DISTANCE2").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    { 2 } else { 8 };
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     // Process each queue-owned slab monotonically. This removes permutation
     // generation and maximizes spatial locality; queue-level heterogeneity still
@@ -1377,8 +1386,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 // this chunk is transformed; the hint addresses are inside
                 // the two packed slices because `next + 1 < n_chunks`.
                 #[cfg(target_arch = "aarch64")]
-                if offset + 8 < slab_len {
-                    let next = (x_outer + 8) * OUTER_BYTES;
+                if offset + prefetch_distance < slab_len {
+                    let next = (x_outer + prefetch_distance) * OUTER_BYTES;
                     for line in 0..8 {
                         // SAFETY: `next + 1023 < a_packed.len()` by the guard.
                         unsafe {
