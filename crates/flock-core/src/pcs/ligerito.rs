@@ -3426,6 +3426,22 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
     use rayon::prelude::*;
     debug_assert_eq!(data.len(), 1usize << log_d);
     debug_assert!(log_d <= ntt.log_domain_size());
+    if data.len() <= SMALL_NTT_MIN_ELEMS && small_ntt_min_jobs(1) > 1 {
+        for layer in (0..log_d).rev() {
+            let block_size = 1usize << (log_d - layer);
+            let bsh = block_size >> 1;
+            for (block, chunk) in data.chunks_exact_mut(block_size).enumerate() {
+                let t = ntt.twiddle(layer, block);
+                let (top, bot) = chunk.split_at_mut(bsh);
+                for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
+                    let s = *a_ref + *b_ref;
+                    *a_ref = s;
+                    *b_ref = t * s + *b_ref;
+                }
+            }
+        }
+        return;
+    }
     let n_threads = rayon::current_num_threads().max(1);
     let mut remaining = log_d;
     while remaining >= 3 {
