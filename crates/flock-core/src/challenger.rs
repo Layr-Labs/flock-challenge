@@ -455,13 +455,13 @@ impl Challenger for FsChallenger {
         // Nonces per rayon task in the parallel search. Large enough to amortize
         // task dispatch and to let the BLAKE3 batch run many `hash_many` calls
         // per task, small enough to keep cancellation granular once an earlier
-        // task has found a match. 960 = 20 full 48-nonce batches, so a chunk
+        // task has found a match. 480 = 10 full 48-nonce batches, so a chunk
         // has no ragged tail batch on the twelve-way kernel; the block math
         // below uses `div_ceil`/saturating adds and requires no power of two.
         // Chunk partition does not affect the emitted nonce: chunks are
         // scanned/`find_first`ed in ascending order and each returns its
         // smallest match, so the result stays the globally smallest.
-        const GRIND_CHUNK: u64 = 960;
+        const GRIND_CHUNK: u64 = 480;
         let cpu_scan = || {
             if bits == 0 {
                 0

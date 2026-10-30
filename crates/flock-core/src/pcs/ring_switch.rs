@@ -2002,20 +2002,15 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
             *tables_ptr.add(15 * FOLD_TABLE_SIZE + hi_bytes[7] as usize),
         )
     };
-    // Level 1: 8 pair sums.
-    let p0 = l0 + l1;
-    let p1 = l2 + l3;
-    let p2 = l4 + l5;
-    let p3 = l6 + l7;
-    let p4 = h0 + h1;
-    let p5 = h2 + h3;
-    let p6 = h4 + h5;
-    let p7 = h6 + h7;
-    // Levels 2–3: three-input nodes reduce the 16-load tree from depth 4 to 3.
-    let q0 = xor3_f128(p0, p1, p2);
-    let q1 = xor3_f128(p3, p4, p5);
-    let q2 = p6 + p7;
-    xor3_f128(q0, q1, q2)
+    // Keep the tree balanced while using three-input XOR where available.
+    let q0 = xor3_f128(l0, l1, l2);
+    let q1 = xor3_f128(l3, l4, l5);
+    let q2 = xor3_f128(l6, l7, h0);
+    let q3 = xor3_f128(h1, h2, h3);
+    let q4 = xor3_f128(h4, h5, h6);
+    let r0 = xor3_f128(q0, q1, q2);
+    let r1 = xor3_f128(q3, q4, h7);
+    r0 + r1
 }
 
 /// Total length of a fold byte table (`build_fold_byte_table` output).
