@@ -2423,34 +2423,43 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
                     convert[127] * *scale,
                     convert[255] * *scale,
                 ];
-                let mut base = F128::ZERO;
                 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-                let output: &mut [F128; CONVERT_TABLE_SIZE] =
-                    slot.try_into().expect("complete canonical convert image");
-                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-                // SAFETY: both initialized u64 values are in bounds for this load.
-                let reduction = unsafe { core::arch::aarch64::vld1q_u64([0x87, 1].as_ptr()) };
-                for byte in 0usize..256 {
-                    if byte != 0 {
-                        base += deltas[byte.trailing_zeros() as usize];
-                    }
-                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-                    // SAFETY: F128 is repr(C), with initialized lo/hi u64 lanes.
-                    // Each store writes one disjoint entry of the complete image:
-                    // bank * 256 + byte <= 15 * 256 + 255 = 4095. No pointer escapes.
-                    unsafe {
-                        use core::arch::aarch64::*;
+                // SAFETY: each ST2 writes two adjacent F128 entries. The largest
+                // start is 15 * 256 + 254 = 4094 in the complete 4096-entry image.
+                // F128 has initialized lo/hi u64 lanes; no pointer escapes.
+                unsafe {
+                    use core::arch::aarch64::*;
 
-                        let mut value = core::mem::transmute::<F128, uint64x2_t>(base);
+                    let output: &mut [F128; CONVERT_TABLE_SIZE] =
+                        slot.try_into().expect("complete canonical convert image");
+                    let scale_vec = core::mem::transmute::<F128, uint64x2_t>(*scale);
+                    let reduction = vdupq_n_u64(0x87);
+                    let mut base = vdupq_n_u64(0);
+                    for byte in (0usize..256).step_by(2) {
+                        if byte != 0 {
+                            let delta = core::mem::transmute::<F128, uint64x2_t>(
+                                deltas[byte.trailing_zeros() as usize],
+                            );
+                            // Clear the carry mask's bit zero for the even-byte step.
+                            base = veorq_u64(veorq_u64(base, delta), scale_vec);
+                        }
+                        let odd = veorq_u64(base, scale_vec);
+                        let mut lo = vzip1q_u64(base, odd);
+                        let mut hi = vzip2q_u64(base, odd);
                         let dst = output.as_mut_ptr().add(byte);
-                        vst1q_u64(dst.cast(), value);
+                        vst2q_u64(dst.cast(), uint64x2x2_t(lo, hi));
                         macro_rules! next_bank {
                             ($bank:literal) => {{
-                                let sign = vshrq_n_s64::<63>(vreinterpretq_s64_u64(value));
-                                let carry = vreinterpretq_u64_s64(vextq_s64::<1>(sign, sign));
-                                value =
-                                    veorq_u64(vshlq_n_u64::<1>(value), vandq_u64(carry, reduction));
-                                vst1q_u64(dst.add($bank * 256).cast(), value);
+                                let top = vandq_u64(
+                                    vreinterpretq_u64_s64(vshrq_n_s64::<63>(
+                                        vreinterpretq_s64_u64(hi),
+                                    )),
+                                    reduction,
+                                );
+                                let carry = vshrq_n_u64::<63>(lo);
+                                hi = vsliq_n_u64::<1>(carry, hi);
+                                lo = veorq_u64(vshlq_n_u64::<1>(lo), top);
+                                vst2q_u64(dst.add($bank * 256).cast(), uint64x2x2_t(lo, hi));
                             }};
                         }
                         next_bank!(1);
@@ -2469,8 +2478,14 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
                         next_bank!(14);
                         next_bank!(15);
                     }
-                    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
-                    {
+                }
+                #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+                {
+                    let mut base = F128::ZERO;
+                    for byte in 0usize..256 {
+                        if byte != 0 {
+                            base += deltas[byte.trailing_zeros() as usize];
+                        }
                         let mut value = base;
                         slot[byte] = value;
                         for bank in 1..16 {
