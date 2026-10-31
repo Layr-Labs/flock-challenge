@@ -3246,6 +3246,7 @@ fn transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
     let data_ptr = data.as_mut_ptr() as usize;
     let (u_0, u_2) = (0..eighth / 2)
         .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(16))
         .map(|row_pair| {
             let even_row = 2 * row_pair;
             let odd_row = even_row + 1;
@@ -3358,6 +3359,7 @@ fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
     let data_ptr = data.as_mut_ptr() as usize;
     let (u_0, u_2) = (0..eighth / 2)
         .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(16))
         .map(|row_pair| {
             let even_row = 2 * row_pair;
             let odd_row = even_row + 1;
@@ -3426,6 +3428,22 @@ fn transpose_forward_ntt(ntt: &AdditiveNttF128, data: &mut [F128], log_d: usize)
     use rayon::prelude::*;
     debug_assert_eq!(data.len(), 1usize << log_d);
     debug_assert!(log_d <= ntt.log_domain_size());
+    if data.len() <= SMALL_NTT_MIN_ELEMS && small_ntt_min_jobs(1) > 1 {
+        for layer in (0..log_d).rev() {
+            let block_size = 1usize << (log_d - layer);
+            let bsh = block_size >> 1;
+            for (block, chunk) in data.chunks_exact_mut(block_size).enumerate() {
+                let t = ntt.twiddle(layer, block);
+                let (top, bot) = chunk.split_at_mut(bsh);
+                for (a_ref, b_ref) in top.iter_mut().zip(bot.iter_mut()) {
+                    let s = *a_ref + *b_ref;
+                    *a_ref = s;
+                    *b_ref = t * s + *b_ref;
+                }
+            }
+        }
+        return;
+    }
     let n_threads = rayon::current_num_threads().max(1);
     let mut remaining = log_d;
     while remaining >= 3 {
@@ -4505,7 +4523,10 @@ fn transpose_forward_ntt_final_3layer_low_eighth_xor(data: &[F128]) -> Vec<F128>
     let data_ptr = data.as_ptr() as usize;
     let mut retained = Vec::<F128>::with_capacity(eighth);
     let retained_ptr = retained.as_mut_ptr() as usize;
-    (0..eighth).into_par_iter().for_each(|row| {
+    (0..eighth)
+        .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(8))
+        .for_each(|row| {
         // SAFETY: the input is immutable for the whole parallel region;
         // every job reads eight in-bounds coset positions and initializes
         // its own unique output slot. `retained` keeps length zero until the
