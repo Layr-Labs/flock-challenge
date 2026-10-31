@@ -58,6 +58,21 @@ const MSG_SCHEDULE: [[u8; 16]; 7] = [
     [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
 ];
 
+// Leaf byte offsets are computed at compile time; parent words retain their indices.
+const LEAF_MSG_SCHEDULE: [[u8; 16]; 7] = {
+    let mut offsets = MSG_SCHEDULE;
+    let mut row = 0;
+    while row < 7 {
+        let mut word = 0;
+        while word < 16 {
+            offsets[row][word] *= 16;
+            word += 1;
+        }
+        row += 1;
+    }
+    offsets
+};
+
 #[inline(always)]
 unsafe fn rotate16(x: uint32x4_t) -> uint32x4_t {
     unsafe { vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(x))) }
@@ -140,7 +155,7 @@ unsafe fn store_cv4(state: &mut [uint32x4_t; 16], out: *mut u8) {
 }
 
 #[inline(always)]
-unsafe fn round3(
+unsafe fn round3<const BYTE_OFFSETS: bool>(
     v0: &mut [uint32x4_t; 16],
     v1: &mut [uint32x4_t; 16],
     v2: &mut [uint32x4_t; 16],
@@ -149,14 +164,23 @@ unsafe fn round3(
     m2: &[uint32x4_t; 16],
     schedule: &[u8; 16],
 ) {
+    macro_rules! message {
+        ($m:ident, $index:ident) => {
+            if BYTE_OFFSETS {
+                $m.as_ptr().byte_add($index).read()
+            } else {
+                *$m.get_unchecked($index)
+            }
+        };
+    }
     macro_rules! g3 {
         ($a:literal, $b:literal, $c:literal, $d:literal, $x:expr, $y:expr) => {{
             let x = $x as usize;
             let y = $y as usize;
             unsafe {
-                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), *m0.get_unchecked(x));
-                v1[$a] = vaddq_u32(vaddq_u32(v1[$a], v1[$b]), *m1.get_unchecked(x));
-                v2[$a] = vaddq_u32(vaddq_u32(v2[$a], v2[$b]), *m2.get_unchecked(x));
+                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), message!(m0, x));
+                v1[$a] = vaddq_u32(vaddq_u32(v1[$a], v1[$b]), message!(m1, x));
+                v2[$a] = vaddq_u32(vaddq_u32(v2[$a], v2[$b]), message!(m2, x));
                 v0[$d] = rotate16(veorq_u32(v0[$d], v0[$a]));
                 v1[$d] = rotate16(veorq_u32(v1[$d], v1[$a]));
                 v2[$d] = rotate16(veorq_u32(v2[$d], v2[$a]));
@@ -166,9 +190,9 @@ unsafe fn round3(
                 v0[$b] = rotate12(veorq_u32(v0[$b], v0[$c]));
                 v1[$b] = rotate12(veorq_u32(v1[$b], v1[$c]));
                 v2[$b] = rotate12(veorq_u32(v2[$b], v2[$c]));
-                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), *m0.get_unchecked(y));
-                v1[$a] = vaddq_u32(vaddq_u32(v1[$a], v1[$b]), *m1.get_unchecked(y));
-                v2[$a] = vaddq_u32(vaddq_u32(v2[$a], v2[$b]), *m2.get_unchecked(y));
+                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), message!(m0, y));
+                v1[$a] = vaddq_u32(vaddq_u32(v1[$a], v1[$b]), message!(m1, y));
+                v2[$a] = vaddq_u32(vaddq_u32(v2[$a], v2[$b]), message!(m2, y));
                 v0[$d] = rotate8(veorq_u32(v0[$d], v0[$a]));
                 v1[$d] = rotate8(veorq_u32(v1[$d], v1[$a]));
                 v2[$d] = rotate8(veorq_u32(v2[$d], v2[$a]));
@@ -703,8 +727,8 @@ pub(super) fn hash_complete_leaf128_groups(data: &[u8], out: &mut [[u8; 32]]) ->
             let mut v0 = init0;
             let mut v1 = init0;
             let mut v2 = init0;
-            for schedule in &MSG_SCHEDULE {
-                round3(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
+            for schedule in &LEAF_MSG_SCHEDULE {
+                round3::<true>(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
             }
             // Chaining value h' = v[0..8] ^ v[8..16], then block one with
             // CHUNK_END under that chaining value.
@@ -734,8 +758,8 @@ pub(super) fn hash_complete_leaf128_groups(data: &[u8], out: &mut [[u8; 32]]) ->
             transpose_block4_strided(input.add(64), 128, &mut m0);
             transpose_block4_strided(input.add(4 * 128 + 64), 128, &mut m1);
             transpose_block4_strided(input.add(8 * 128 + 64), 128, &mut m2);
-            for schedule in &MSG_SCHEDULE {
-                round3(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
+            for schedule in &LEAF_MSG_SCHEDULE {
+                round3::<true>(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
             }
 
             let output = out.as_mut_ptr().cast::<u8>().add(group * 12 * 32);
@@ -800,7 +824,7 @@ fn hash_complete_groups_flags(data: &[u8], out: &mut [[u8; 32]], flags: u32) -> 
             let mut v1 = init;
             let mut v2 = init;
             for schedule in &MSG_SCHEDULE {
-                round3(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
+                round3::<false>(&mut v0, &mut v1, &mut v2, &m0, &m1, &m2, schedule);
             }
 
             let output = out.as_mut_ptr().cast::<u8>().add(group * 12 * 32);

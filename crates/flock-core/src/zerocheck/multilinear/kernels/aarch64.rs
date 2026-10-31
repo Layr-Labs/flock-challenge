@@ -2592,8 +2592,13 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused<const DEAD_TAI
                 // Lanes 1..3 are zero: (w·a0)·b0 into pinf_even, W3' and W5'.
                 let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
                 let a0w = mul_sw_fused_q(w, swap_halves_q(w), av0, k87);
+                // All three slots add the same raw product.
+                let (ll, cross, hh) = clmul_products_q(a0w, bv0);
                 for slot in [1usize, 5, 7] {
-                    tri_acc_q_crossfused(&mut acc.0[slot], a0w, bv0);
+                    let t = &mut acc.0[slot];
+                    t.ll = veorq_u64(t.ll, ll);
+                    t.cross = veorq_u64(t.cross, cross);
+                    t.hh = veorq_u64(t.hh, hh);
                 }
             }
         } else {
