@@ -1266,10 +1266,15 @@ fn precompute_round1_ab_inner_packed_padded_body(
 }
 
 /// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
-/// shape exposes roughly sixty-four scheduling waves on the ten-thread worker.
+/// shape exposes roughly 128 scheduling waves on the ten-thread worker. At the
+/// ranked shape this arm bounds the commit window (the GPU graph lands first),
+/// so the queue's finishing tail is commit-window time: one 819-chunk job is
+/// ~0.8 ms of a single worker, and halving the job length halves the spread
+/// between the last two jobs. Job ownership is unchanged (each job still
+/// writes one disjoint monotonic slab), so every output byte is identical.
 #[inline]
 fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
-    n_chunks.div_ceil(640).max(1)
+    n_chunks.div_ceil(1280).max(1)
 }
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
