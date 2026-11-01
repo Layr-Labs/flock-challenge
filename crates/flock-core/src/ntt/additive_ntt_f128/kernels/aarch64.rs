@@ -814,7 +814,7 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
 /// as `uint64x2_t` and the products leave as `uint64x2_t`, so no lane ever
 /// visits a general-purpose register.
 #[inline(always)]
-unsafe fn mul_low_pair_q(
+unsafe fn mul_low_pair_q<const DIRECT: bool>(
     v0: core::arch::aarch64::uint64x2_t,
     v1: core::arch::aarch64::uint64x2_t,
     ts0: core::arch::aarch64::uint64x2_t,
@@ -825,6 +825,23 @@ unsafe fn mul_low_pair_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
+        if DIRECT {
+            // With t.hi == 0 the product is ll + x^64*hl. Keep each
+            // product in its own vector and use the existing exact x^64
+            // fold instead of packing, shift-folding and unpacking lanes.
+            let lo0 = pmull_ll(v0, ts0);
+            let hi0 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(v0),
+                vreinterpretq_p64_u64(ts0),
+            ));
+            let lo1 = pmull_ll(v1, ts1);
+            let hi1 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(v1),
+                vreinterpretq_p64_u64(ts1),
+            ));
+            return (fold_x64_into(lo0, hi0), fold_x64_into(lo1, hi1));
+        }
+
         // With t.hi == 0 each product needs only ll = v.lo·t.lo and
         // hl = v.hi·t.lo; `vmull_high_p64` reads v.hi in place.
         let p0_ll = pmull_ll(v0, ts0);
@@ -865,9 +882,9 @@ unsafe fn mul_low_pair_q(
 }
 
 /// Fused two-layer butterfly specialized for three low-limb-only twiddles.
-/// Two products are issued together at each stage, using four PMULLs instead
-/// of twelve for the pair under the generic Binius field multiplier, and —
-/// like [`butterfly_fused_2layer`] below — the four row values and every
+/// The default kernel shares a pending polynomial half across both layers.
+/// Its eager direct-reduction and shift-reduction alternatives remain available.
+/// Like [`butterfly_fused_2layer`] below, the four row values and every
 /// intermediate stay in `uint64x2_t` across both layers, so the butterfly
 /// XORs are `veorq_u64` rather than scalar `u64` pairs. Same multiplies,
 /// same butterfly order, bit-identical output.
@@ -878,6 +895,44 @@ unsafe fn mul_low_pair_q(
 #[target_feature(enable = "aes")]
 #[inline]
 pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    static DIRECT: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_LOW_PMULL").is_none());
+    static LAZY: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_LOW_LAZY").is_none());
+    static DEBUG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_LOW_PMULL_DEBUG").is_some());
+    let direct = *DIRECT;
+    let lazy = direct && *LAZY;
+    if *DEBUG {
+        static HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let hits = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if hits.is_power_of_two() {
+            eprintln!("[ntt-low-pmull] direct={direct} lazy={lazy} blocks={hits}");
+        }
+    }
+    unsafe {
+        if lazy {
+            butterfly_fused_2layer_low_lazy(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+        } else if direct {
+            butterfly_fused_2layer_low_impl::<true>(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+        } else {
+            butterfly_fused_2layer_low_impl::<false>(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+        }
+    }
+}
+
+#[target_feature(enable = "aes")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn butterfly_fused_2layer_low_impl<const DIRECT: bool>(
     a: &mut [F128],
     b: &mut [F128],
     c: &mut [F128],
@@ -908,14 +963,14 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
             let mut xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
 
             // Layer L: (a,c) and (b,d) share t_outer.
-            let (o0, o1) = mul_low_pair_q(xc, xd, to, to);
+            let (o0, o1) = mul_low_pair_q::<DIRECT>(xc, xd, to, to);
             xa = veorq_u64(xa, o0);
             xc = veorq_u64(xc, xa);
             xb = veorq_u64(xb, o1);
             xd = veorq_u64(xd, xb);
 
             // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
-            let (i0, i1) = mul_low_pair_q(xb, xd, ta, tb);
+            let (i0, i1) = mul_low_pair_q::<DIRECT>(xb, xd, ta, tb);
             xa = veorq_u64(xa, i0);
             xb = veorq_u64(xb, xa);
             xc = veorq_u64(xc, i1);
@@ -925,6 +980,88 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
             vst1q_u64((&raw mut b[lane]).cast::<u64>(), xb);
             vst1q_u64((&raw mut c[lane]).cast::<u64>(), xc);
             vst1q_u64((&raw mut d[lane]).cast::<u64>(), xd);
+        }
+    }
+}
+
+// Carry the x^64 half of the first outer product until the inner layer.
+// The two descendants share that pending half. The other outer product
+// must be reduced before it becomes an inner-layer multiplicand.
+#[inline(always)]
+unsafe fn butterfly_low_lazy_q(
+    u: core::arch::aarch64::uint64x2_t,
+    v: core::arch::aarch64::uint64x2_t,
+    t: core::arch::aarch64::uint64x2_t,
+    p: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let hi = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(v),
+            vreinterpretq_p64_u64(t),
+        ));
+        let nu = fused_pmull_lo_acc(u, v, t);
+        (nu, veorq_u64(v, nu), veorq_u64(hi, p))
+    }
+}
+
+#[inline(always)]
+unsafe fn butterfly_low_fold_q(
+    u: core::arch::aarch64::uint64x2_t,
+    v: core::arch::aarch64::uint64x2_t,
+    t: core::arch::aarch64::uint64x2_t,
+    p: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let (nu, _, mid) = butterfly_low_lazy_q(u, v, t, p);
+        let fu = fold_x64_into(nu, mid);
+        (fu, veorq_u64(v, fu))
+    }
+}
+
+#[target_feature(enable = "aes")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn butterfly_fused_2layer_low_lazy(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), c.len());
+    debug_assert_eq!(a.len(), d.len());
+    debug_assert_eq!(t_outer.hi | t_inner_a.hi | t_inner_b.hi, 0);
+    unsafe {
+        use core::arch::aarch64::*;
+        let to = vdupq_n_u64(t_outer.lo);
+        let ta = vdupq_n_u64(t_inner_a.lo);
+        let tb = vdupq_n_u64(t_inner_b.lo);
+        let zero = vdupq_n_u64(0);
+        for lane in 0..a.len() {
+            let xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
+            let xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
+            let xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
+            let xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
+            let (na, nc, p) = butterfly_low_lazy_q(xa, xc, to, zero);
+            let (nb, nd) = butterfly_low_fold_q(xb, xd, to, zero);
+            let (fa, fb) = butterfly_low_fold_q(na, nb, ta, p);
+            let (fc, fd) = butterfly_low_fold_q(nc, nd, tb, p);
+            vst1q_u64((&raw mut a[lane]).cast::<u64>(), fa);
+            vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb);
+            vst1q_u64((&raw mut c[lane]).cast::<u64>(), fc);
+            vst1q_u64((&raw mut d[lane]).cast::<u64>(), fd);
         }
     }
 }
@@ -1138,5 +1275,100 @@ pub(super) unsafe fn butterfly_fused_2layer_rows(
                 tb,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod low_pmull_tests {
+    use super::*;
+
+    fn scalar_mul(a: F128, b: F128) -> F128 {
+        let mut x = a.lo as u128 | ((a.hi as u128) << 64);
+        let mut y = b.lo as u128 | ((b.hi as u128) << 64);
+        let mut z = 0u128;
+        for _ in 0..128 {
+            if y & 1 != 0 {
+                z ^= x;
+            }
+            let carry = x >> 127;
+            x = (x << 1) ^ (carry * 0x87);
+            y >>= 1;
+        }
+        F128::new(z as u64, (z >> 64) as u64)
+    }
+
+    fn random(s: &mut u64) -> u64 {
+        *s = s.wrapping_add(0x9e3779b97f4a7c15);
+        let mut x = *s;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^ (x >> 31)
+    }
+
+    #[test]
+    fn low_pair_matches_independent_polynomial_oracle() {
+        let mut cases = 0;
+        let mut modes_seen = [0usize; 3];
+        for seed in 0..16u64 {
+            for n in [1usize, 2, 3, 31, 64, 129, 257] {
+                let mut state = 0xbe51d7a33 ^ seed;
+                let input: Vec<F128> = (0..4 * n)
+                    .map(|_| F128::new(random(&mut state), random(&mut state)))
+                    .collect();
+                let sets = [
+                    [F128::ZERO; 3],
+                    [F128::ONE; 3],
+                    [F128::new(u64::MAX, 0); 3],
+                    core::array::from_fn(|_| F128::new(random(&mut state), 0)),
+                ];
+                for t in sets {
+                    let mut expected = vec![F128::ZERO; 4 * n];
+                    for i in 0..n {
+                        let a = input[i] + scalar_mul(input[2 * n + i], t[0]);
+                        let c = input[2 * n + i] + a;
+                        let b = input[n + i] + scalar_mul(input[3 * n + i], t[0]);
+                        let d = input[3 * n + i] + b;
+                        let aa = a + scalar_mul(b, t[1]);
+                        let bb = b + aa;
+                        let cc = c + scalar_mul(d, t[2]);
+                        let dd = d + cc;
+                        expected[i] = aa;
+                        expected[n + i] = bb;
+                        expected[2 * n + i] = cc;
+                        expected[3 * n + i] = dd;
+                    }
+                    for mode in 0..3 {
+                        modes_seen[mode] += 1;
+                        let mut actual = input.clone();
+                        let (a, rest) = actual.split_at_mut(n);
+                        let (b, rest) = rest.split_at_mut(n);
+                        let (c, d) = rest.split_at_mut(n);
+                        unsafe {
+                            if mode == 2 {
+                                butterfly_fused_2layer_low_lazy(a, b, c, d, t[0], t[1], t[2]);
+                            } else if mode == 1 {
+                                butterfly_fused_2layer_low_impl::<true>(
+                                    a, b, c, d, t[0], t[1], t[2],
+                                );
+                            } else {
+                                butterfly_fused_2layer_low_impl::<false>(
+                                    a, b, c, d, t[0], t[1], t[2],
+                                );
+                            }
+                        }
+                        for (actual, expected) in actual.iter().zip(&expected) {
+                            assert_eq!(
+                                (actual.lo, actual.hi),
+                                (expected.lo, expected.hi),
+                                "seed={seed}, lanes={n}, mode={mode}"
+                            );
+                        }
+                    }
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 448);
+        assert_eq!(modes_seen, [448; 3]);
     }
 }
