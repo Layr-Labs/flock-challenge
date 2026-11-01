@@ -2514,6 +2514,12 @@ fn butterfly_interleaved_fused_3layer_range_par_rows(
     // Other zero twiddles from custom bases use the exact general kernel.
     let zero_root_block = if abs_first == 0 { 0 } else { usize::MAX };
     let n_jobs = num_blocks * eighth;
+    // Only a nonempty range with at least two rows can select an odd row.
+    let odd_lanes = if n_jobs != 0 && eighth > 1 {
+        num_ntts - odd_tail
+    } else {
+        num_ntts
+    };
     // Empty ranges do not read or initialize the process row policy.
     let use_neon = n_jobs != 0 && kernels::vector_resident_rows();
     let base = data.as_mut_ptr() as usize;
@@ -2521,7 +2527,7 @@ fn butterfly_interleaved_fused_3layer_range_par_rows(
         let block = job >> block_shift;
         let r = job & row_mask;
         let lanes = if r & 1 == 1 {
-            num_ntts - odd_tail
+            odd_lanes
         } else {
             num_ntts
         };
