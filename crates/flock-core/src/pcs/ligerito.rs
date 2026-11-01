@@ -3246,6 +3246,7 @@ fn transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
     let data_ptr = data.as_mut_ptr() as usize;
     let (u_0, u_2) = (0..eighth / 2)
         .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(16))
         .map(|row_pair| {
             let even_row = 2 * row_pair;
             let odd_row = even_row + 1;
@@ -3358,6 +3359,7 @@ fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
     let data_ptr = data.as_mut_ptr() as usize;
     let (u_0, u_2) = (0..eighth / 2)
         .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(16))
         .map(|row_pair| {
             let even_row = 2 * row_pair;
             let odd_row = even_row + 1;
@@ -4851,6 +4853,7 @@ fn transpose_forward_ntt_final_5layer_low_eighth_factored(
 
     (0..quarter / L2_FACTORED_FINAL5_ROW_TILE)
         .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(32 * L2_FACTORED_FINAL5_ROW_TILE))
         .for_each(|tile| {
             transpose_forward_ntt_final_5layer_factored_tile(
                 data_ptr,

@@ -616,6 +616,22 @@ unsafe fn swap_halves(v: uint64x2_t) -> uint64x2_t {
     out
 }
 
+/// Keep the complete 128-bit input live as a SIMD register rather than
+/// letting LLVM split each bank input into narrow loads plus lane duplicates.
+/// This emits no machine instructions and preserves every bit of `v`.
+#[inline(always)]
+unsafe fn keep_full_q(mut v: uint64x2_t) -> uint64x2_t {
+    // SAFETY: a register-only, instruction-free compiler constraint.
+    unsafe {
+        core::arch::asm!(
+            "/* {0:v} */",
+            inout(vreg) v,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    v
+}
+
 /// `x * w` and `x * w'` for two banks, XORed into one schoolbook
 /// `(ll, cross, hh)` accumulator: eight matching-lane PMULLs against the
 /// weights and their swapped copies, and four EOR3s.
@@ -671,8 +687,8 @@ unsafe fn fold_banked_slots4_schoolbook<const BANKS: usize>(
             let w1_sw = swap_halves(w1);
             for slot in 0..4 {
                 let row = x.add(slot * BANKS + bank);
-                let x0 = vld1q_u64(row.cast::<u64>());
-                let x1 = vld1q_u64(row.add(1).cast::<u64>());
+                let x0 = keep_full_q(vld1q_u64(row.cast::<u64>()));
+                let x1 = keep_full_q(vld1q_u64(row.add(1).cast::<u64>()));
                 tri_acc_two_banks(
                     &mut ll[slot],
                     &mut cross[slot],
