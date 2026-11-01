@@ -7608,7 +7608,7 @@ kernel void blake3_pow_scan(
     }
 
     fn record_fine_arms(k_split: usize, cb2_ms: f64, cpu_ms: f64, cb3_ms: f64) {
-        if !hybrid_arm_recording() || k_split > ARM_SPLIT_MAX_K {
+        if !hybrid_arm_recording() || !hybrid_split_valid(k_split) {
             return;
         }
         if !(cb2_ms.is_finite() && cb2_ms > 0.0 && cpu_ms.is_finite() && cpu_ms > 0.0 && cb3_ms.is_finite()) {
@@ -7668,6 +7668,40 @@ kernel void blake3_pow_scan(
             base + 16 * best.0
         } else {
             k
+        }
+    }
+
+    /// Admit a predicted fractional split only after two actual samples of
+    /// each split, in coarse/fine/fine/coarse order under the same contention.
+    #[cfg_attr(test, inline(never))]
+    fn measured_fine_split(
+        samples: &[(usize, f64, f64, f64)], coarse: usize, predicted: usize,
+    ) -> usize {
+        if samples.len() != 4 || coarse >= 16 || predicted < 16
+            || !hybrid_split_valid(predicted)
+        {
+            return coarse;
+        }
+        let mean_window = |split| -> Option<f64> {
+            let mut mean = 0.0;
+            let mut count = 0;
+            for &(k, gpu, cpu, hash) in samples {
+                if k != split { continue; }
+                if !gpu.is_finite() || gpu <= 0.0 || !cpu.is_finite() || cpu <= 0.0
+                    || !hash.is_finite() || hash < 0.0
+                {
+                    return None;
+                }
+                let window = gpu.max(cpu) + hash;
+                if !window.is_finite() { return None; }
+                mean += window / 2.0;
+                count += 1;
+            }
+            (count == 2 && mean.is_finite()).then_some(mean)
+        };
+        match (mean_window(coarse), mean_window(predicted)) {
+            (Some(old), Some(new)) if new < old * (1.0 - FINE_MARGIN) => predicted,
+            _ => coarse,
         }
     }
 
@@ -8309,7 +8343,33 @@ kernel void blake3_pow_scan(
             None => swept,
         };
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
-        let chosen = fine_split_from_arms(&fine_samples, chosen);
+        let coarse = chosen;
+        let predicted = fine_split_from_arms(&fine_samples, coarse);
+        let chosen = if predicted != coarse
+            && std::env::var_os("FLOCK_NO_HYBRID_FINE_MEASURE").is_none()
+        {
+            let measured = (|| -> Result<Vec<(usize, f64, f64, f64)>, String> {
+                fine_arm_samples().lock()
+                    .map_err(|_| "fine sample lock poisoned".to_string())?.clear();
+                let _recording = ArmRecordScope::enter();
+                for k in [coarse, predicted, predicted, coarse] {
+                    // Restore the same immutable transform input before every
+                    // replay. No previous candidate's output becomes an input.
+                    reprime()?;
+                    sample(k)?;
+                }
+                Ok(fine_arm_samples().lock()
+                    .map_err(|_| "fine sample lock poisoned".to_string())?.clone())
+            })();
+            let selected = measured.as_ref()
+                .map_or(coarse, |rows| measured_fine_split(rows, coarse, predicted));
+            if dbg {
+                eprintln!("[gpu-commit] measured fine: coarse={coarse} predicted={predicted} selected={selected} samples={measured:?}");
+            }
+            selected
+        } else {
+            predicted
+        };
         if dbg {
             let rows: Vec<String> = fine_samples
                 .iter()
@@ -11720,6 +11780,42 @@ kernel void lc_fold_stripes_factored_b4(
     #[cfg(test)]
     mod hybrid_balance_tests {
         use super::{ARM_SPLIT_MARGIN, arm_window_ms, split_from_arms};
+
+        #[test]
+        fn measured_fine_rejects_optimistic_prediction_and_accepts_real_gain() {
+            let coarse = 5;
+            let fine = 4 + 16 * 12;
+            let mut rows = [(coarse, 52.0, 47.0, 2.0), (fine, 51.0, 61.0, 2.0),
+                (fine, 52.0, 60.0, 2.0), (coarse, 53.0, 46.0, 2.0)];
+            assert_eq!(super::measured_fine_split(&rows, coarse, fine), coarse);
+            rows[1] = (fine, 49.0, 49.0, 2.0);
+            rows[2] = (fine, 50.0, 49.0, 2.0);
+            assert_eq!(super::measured_fine_split(&rows, coarse, fine), fine);
+            rows.reverse();
+            assert_eq!(super::measured_fine_split(&rows, coarse, fine), fine);
+            rows[1] = (fine, 52.8, 49.0, 2.0);
+            rows[2] = (fine, 52.8, 49.0, 2.0);
+            assert_eq!(super::measured_fine_split(&rows, coarse, fine), coarse);
+        }
+
+        #[test]
+        fn measured_fine_requires_complete_finite_samples() {
+            let (coarse, fine) = (5, 196);
+            let rows = [(coarse, 52.0, 47.0, 2.0), (fine, 49.0, 49.0, 2.0),
+                (fine, 50.0, 49.0, 2.0), (coarse, 53.0, 46.0, 2.0)];
+            assert_eq!(super::measured_fine_split(&rows[..3], coarse, fine), coarse);
+            for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+                for lane in 0..3 {
+                    let mut broken = rows;
+                    match lane { 0 => broken[1].1 = bad, 1 => broken[1].2 = bad,
+                        _ => broken[1].3 = if bad == 0.0 { -1.0 } else { bad } }
+                    assert_eq!(super::measured_fine_split(&broken, coarse, fine), coarse);
+                }
+            }
+            let mut broken = rows; broken[2].0 = coarse;
+            assert_eq!(super::measured_fine_split(&broken, coarse, fine), coarse);
+            assert_eq!(super::measured_fine_split(&rows, coarse, 16), coarse);
+        }
 
         // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
         #[test]
