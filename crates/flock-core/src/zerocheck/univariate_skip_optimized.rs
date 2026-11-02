@@ -3039,12 +3039,46 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     let retained_hi_eq = build_eq(&inner_tail[2..6]);
     let n_packed = 1usize << crate::pcs::LOG_PACKING;
     let mut quad = vec![F128::ZERO; 4 * n_packed];
-    for q in 0..16 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            for packed in 0..n_packed {
-                quad[dst + packed] += retained_hi_eq[q] * fold8[src + packed];
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        debug_assert_eq!(n_packed % 4, 0);
+        for q in 0..16 {
+            let w = retained_hi_eq[q];
+            for e in 0..4 {
+                let src = &fold8[(e + 4 * q) * n_packed..(e + 4 * q + 1) * n_packed];
+                let dst = &mut quad[e * n_packed..(e + 1) * n_packed];
+                let mut packed = 0;
+                while packed < n_packed {
+                    let prod0 = unsafe {
+                        crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                            w,
+                            [src[packed], src[packed + 1]],
+                        )
+                    };
+                    let prod1 = unsafe {
+                        crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                            w,
+                            [src[packed + 2], src[packed + 3]],
+                        )
+                    };
+                    dst[packed] += prod0[0];
+                    dst[packed + 1] += prod0[1];
+                    dst[packed + 2] += prod1[0];
+                    dst[packed + 3] += prod1[1];
+                    packed += 4;
+                }
+            }
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        for q in 0..16 {
+            for e in 0..4 {
+                let src = (e + 4 * q) * n_packed;
+                let dst = e * n_packed;
+                for packed in 0..n_packed {
+                    quad[dst + packed] += retained_hi_eq[q] * fold8[src + packed];
+                }
             }
         }
     }
@@ -3084,15 +3118,67 @@ fn round1_identity_prefix_ab_recovery(
     assert!(r.len() >= k_log);
     let eq_inner = build_eq(&r[K_SKIP..k_log]);
     let mut recovered_s = [F128::ZERO; ELL];
-    for t in 0..16 {
-        let weight = eq_inner[t];
-        for lane in 0..ELL {
-            recovered_s[lane] += weight * c_inner[ELL * t + lane];
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        debug_assert_eq!(ELL % 4, 0);
+        for t in 0..16 {
+            let weight = eq_inner[t];
+            let crow = &c_inner[ELL * t..ELL * (t + 1)];
+            let mut lane = 0;
+            while lane < ELL {
+                let prod0 = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                        weight,
+                        [crow[lane], crow[lane + 1]],
+                    )
+                };
+                let prod1 = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                        weight,
+                        [crow[lane + 2], crow[lane + 3]],
+                    )
+                };
+                recovered_s[lane] += prod0[0];
+                recovered_s[lane + 1] += prod0[1];
+                recovered_s[lane + 2] += prod1[0];
+                recovered_s[lane + 3] += prod1[1];
+                lane += 4;
+            }
+        }
+        let c_s_inv = c_s_inv_f128();
+        let mut lane = 0;
+        while lane < ELL {
+            let prod0 = unsafe {
+                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                    c_s_inv,
+                    [recovered_s[lane], recovered_s[lane + 1]],
+                )
+            };
+            let prod1 = unsafe {
+                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                    c_s_inv,
+                    [recovered_s[lane + 2], recovered_s[lane + 3]],
+                )
+            };
+            recovered_s[lane] = prod0[0];
+            recovered_s[lane + 1] = prod0[1];
+            recovered_s[lane + 2] = prod1[0];
+            recovered_s[lane + 3] = prod1[1];
+            lane += 4;
         }
     }
-    let c_s_inv = c_s_inv_f128();
-    for value in &mut recovered_s {
-        *value *= c_s_inv;
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        for t in 0..16 {
+            let weight = eq_inner[t];
+            for lane in 0..ELL {
+                recovered_s[lane] += weight * c_inner[ELL * t + lane];
+            }
+        }
+        let c_s_inv = c_s_inv_f128();
+        for value in &mut recovered_s {
+            *value *= c_s_inv;
+        }
     }
     ntt_extend_f128_vec_ghash(&recovered_s, inv_table)
 }
