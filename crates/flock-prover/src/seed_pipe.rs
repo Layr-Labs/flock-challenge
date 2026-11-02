@@ -73,8 +73,10 @@
 //!
 //! # Safety rails
 //!
-//! - Arms only in the ranked worker (argv shape) and only once.
-//! - `FLOCK_NO_SEED_PIPE=1` disables it — the exact A/B control.
+//! - Arms only in the ranked worker (argv shape), only once, and only with
+//!   explicit opt-in (`FLOCK_SEED_PIPE=1`): the duplicate-prove speculation
+//!   loses under sustained/heat-soaked load. Opt-in vs unset is the exact
+//!   A/B control; `FLOCK_NO_SEED_PIPE=1` also disables.
 //! - The speculative publication target is pre-opened (and its write machinery
 //!   pre-warmed at full scale) during the untimed ready→seed gap;
 //!   `FLOCK_NO_PREOPEN_PUBLISH=1` restores the incumbent create-at-publish
@@ -1015,7 +1017,16 @@ pub(crate) fn verify_generator_at_warmup(log2_size: u32, warmup_blocks: &[Compre
 /// `Blake3Setup` reference; keeping that unsafety at the call site lets this
 /// module stay free of prover types.
 pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compression]) -> ProveOut) {
-    if std::env::var_os("FLOCK_NO_SEED_PIPE").is_some() || !is_ranked_worker() {
+    // Default-off for the ranked environment: the speculative thread runs a
+    // duplicate full prove ("min of two" wall win, ~2x energy/trial). Cool
+    // burst: -2.6% wall. Heat-soaked/sustained (the ranked 120-trial shape):
+    // +2.4% wall locally, worse on loaded runners via oversubscription.
+    // Opt back in locally with `FLOCK_SEED_PIPE=1` for A/B; the ranked
+    // runner's clean env keeps it off. (`FLOCK_NO_SEED_PIPE=1` also off.)
+    if std::env::var_os("FLOCK_SEED_PIPE").is_none()
+        || std::env::var_os("FLOCK_NO_SEED_PIPE").is_some()
+        || !is_ranked_worker()
+    {
         return;
     }
     if ARMED.swap(true, Ordering::SeqCst) {

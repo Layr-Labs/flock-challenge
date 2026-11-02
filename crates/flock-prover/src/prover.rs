@@ -1651,9 +1651,22 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
-        zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
-            a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
-        )
+        if ranked_lincheck_c_reuse_enabled(r1cs) {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c(
+                a_packed,
+                b_packed,
+                c_packed,
+                &z_packed_lincheck,
+                r1cs.m,
+                &padding,
+                ab_inner,
+                challenger,
+            )
+        } else {
+            zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab(
+                a_packed, b_packed, c_packed, r1cs.m, &padding, ab_inner, challenger,
+            )
+        }
     };
     t.zerocheck_s = t0.elapsed().as_secs_f64();
     flock_core::scratch::give_f128(a_packed_f128);
