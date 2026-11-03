@@ -658,7 +658,7 @@ fn fill_deferred_lincheck_stripe_group(
     u64_per_block: usize,
     useful_words: usize,
 ) {
-    let group_start = group * group_f128;
+    let group_start = group_f128 * group;
     let z_group = &z_packed[group_start..group_start + group_f128];
     // SAFETY: F128 is repr(C) as two little-endian u64 halves; this is the
     // same read-only view used by the eager witness transpose.
