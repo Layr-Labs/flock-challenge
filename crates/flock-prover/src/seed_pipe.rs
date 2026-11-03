@@ -849,9 +849,6 @@ fn preopen_publish_file(proof_path: &Path) -> Option<PreopenedPublish> {
             file.write_all(&pattern[..n])?;
             remaining -= n;
         }
-        // Park the fd as a fresh create would: empty, offset 0. Publication
-        // then pays only write + close + rename.
-        file.set_len(0)?;
         file.seek(io::SeekFrom::Start(0))?;
         Ok(PreopenedPublish {
             file: Some(file),
@@ -897,6 +894,8 @@ where
         .ok_or_else(|| io::Error::other("pre-opened publish fd already consumed"));
     let result = match file {
         Ok(mut file) => fill(&mut file).and_then(|()| {
+            let published = file.stream_position()?;
+            file.set_len(published)?;
             flock_core::tmark::mark("written");
             // Every byte is in the file (and the shared buffer cache) once
             // `write_all` returns, at its final length, so the rename alone
