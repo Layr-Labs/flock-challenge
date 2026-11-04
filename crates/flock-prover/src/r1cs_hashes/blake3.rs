@@ -3730,6 +3730,10 @@ impl Blake3Setup {
         blocks: &[Compression],
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if self.n_blocks == (1 << 18) && self.use_ranked_rate2_hot_codeword() {
+            flock_core::gpu_commit::prepare_k_split();
+        }
         assert_eq!(blocks.len(), self.n_blocks);
         let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
         if self.use_ranked_rate2_hot_codeword() {

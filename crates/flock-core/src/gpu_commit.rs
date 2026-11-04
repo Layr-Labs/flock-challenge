@@ -1960,6 +1960,23 @@ mod imp {
     use std::ffi::c_void;
     use std::sync::OnceLock;
 
+    // Experimental K arm: retain a conservative history of ordinary no-copy
+    // mappings, and track active K mappings exclusively. A retired ordinary
+    // mapping stays in the ledger because a command buffer may still retain
+    // it after its owner releases it. This may decline a valid optimization,
+    // but never admits an uncertain overlapping view.
+    #[derive(Clone, Copy)]
+    struct KWrapRecord { addr: usize, len: usize, object: usize, exclusive: bool }
+    static K_WRAP_LEDGER: std::sync::Mutex<Vec<KWrapRecord>> = std::sync::Mutex::new(Vec::new());
+    static K_WRAP_OVERFLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn k_experiment_enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(||std::env::var_os("FLOCK_NO_K_GPU").as_deref()!=Some(std::ffi::OsStr::new("1")))
+    }
+    fn k_ranges_overlap(a: usize, alen: usize, b: usize, blen: usize) -> bool {
+        a < b.saturating_add(blen) && b < a.saturating_add(alen)
+    }
+
     // -----------------------------------------------------------------------
     // Minimal Objective-C / Metal FFI (dlopen + objc_msgSend, no crate deps).
     // -----------------------------------------------------------------------
@@ -4028,9 +4045,8 @@ kernel void ntt_final_t3(device uint4* data                [[buffer(0)]],
     threadgroup uint  nibB[8u * NNIB];
 
     const uint lane = lid & 63u;
-    const uint B = tgid >> P.s;
-    const uint r = tgid & ((1u << P.s) - 1u);
-    const uint pos_base = (B << (P.log_d - P.l)) + r;
+    const uint B = tgid;
+    const uint pos_base = tgid << 4;
 
     if (lid < 8u * NNIB) {
         uint cB = lid / NNIB, qB = lid % NNIB;
@@ -5041,6 +5057,35 @@ kernel void blake3_pow_scan(
         /// Returns Err when the pointer/length do not satisfy Metal's page
         /// requirements (caller falls back to a copy or to the CPU).
         pub(crate) unsafe fn wrap_buffer(&self, ptr: *mut u8, len: usize) -> Result<Id, String> {
+            if !k_experiment_enabled() {return unsafe {self.wrap_buffer_raw(ptr,len)};}
+            let mut ledger=K_WRAP_LEDGER.lock().unwrap_or_else(|p|p.into_inner());
+            if ledger.iter().any(|r|r.exclusive && k_ranges_overlap(ptr as usize,len,r.addr,r.len)) {
+                return Err("no-copy range overlaps an active K mapping".into());
+            }
+            let b=unsafe {self.wrap_buffer_raw(ptr,len)}?;
+            if ledger.len() < 8192 {
+                ledger.push(KWrapRecord{addr:ptr as usize,len,object:b as usize,exclusive:false});
+            } else {
+                // Preserve safety without unbounded growth in long-lived processes.
+                K_WRAP_OVERFLOW.store(true,std::sync::atomic::Ordering::Release);
+            }
+            Ok(b)
+        }
+
+        unsafe fn wrap_buffer_k_exclusive(&self, ptr: *mut u8, len: usize) -> Result<Id, String> {
+            let mut ledger=K_WRAP_LEDGER.lock().unwrap_or_else(|p|p.into_inner());
+            if K_WRAP_OVERFLOW.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("K mapping ledger capacity exceeded".into());
+            }
+            if ledger.iter().any(|r|k_ranges_overlap(ptr as usize,len,r.addr,r.len)) {
+                return Err("K mapping overlaps a current or retired no-copy view".into());
+            }
+            let b=unsafe {self.wrap_buffer_raw(ptr,len)}?;
+            ledger.push(KWrapRecord{addr:ptr as usize,len,object:b as usize,exclusive:true});
+            Ok(b)
+        }
+
+        unsafe fn wrap_buffer_raw(&self, ptr: *mut u8, len: usize) -> Result<Id, String> {
             let page = 16384usize;
             if ptr as usize % page != 0 || len % page != 0 || len == 0 {
                 return Err(format!(
@@ -5080,13 +5125,14 @@ kernel void blake3_pow_scan(
 
         pub(crate) unsafe fn release(&self, obj: Id) {
             if !obj.is_null() {
+                let mut ledger = if k_experiment_enabled() {
+                    Some(K_WRAP_LEDGER.lock().unwrap_or_else(|p|p.into_inner()))
+                } else { None };
                 unsafe {
-                    send!(
-                        self.api,
-                        unsafe extern "C" fn(Id, Sel) -> Id,
-                        obj,
-                        c"release"
-                    );
+                    send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, obj, c"release");
+                }
+                if let Some(records)=ledger.as_mut() {
+                    records.retain(|r|!(r.exclusive && r.object==obj as usize));
                 }
             }
         }
@@ -13178,8 +13224,12 @@ static inline void zc_r2_write_partials(
         if (lid < s) { red[lid] ^= red[lid + s]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    ulong4 chunk1e = red[0];
-    ulong4 chunk1o = red[1];
+    ulong4 chunk1e;
+    ulong4 chunk1o;
+    if (lid == 0u) {
+        chunk1e = red[0];
+        chunk1o = red[1];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     red[lid] = acci;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -13289,8 +13339,10 @@ kernel void zc_r2_products_horner(
         if (handoff && step == 2u) {
             // The lower 4 KiB remains the live nibble table.
             threadgroup uint4* handoff_slots = nib + 256u;
-            uint4 v1 = zc_r2_horner_reduce(h1);
-            uint4 vi = zc_r2_horner_reduce(hi);
+            U256k p1 = {h1.r0, h1.r1, h1.r2, h1.r3};
+            U256k pi = {hi.r0, hi.r1, hi.r2, hi.r3};
+            uint4 v1 = gf_reduce(p1);
+            uint4 vi = gf_reduce(pi);
             handoff_slots[rid] = v1;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             v1 = handoff_slots[lid];
@@ -13685,7 +13737,7 @@ kernel void zc_r2_horner_oracle(
         lo_size: usize,
         mask: u32,
         useful: u32,
-        submitted: std::time::Instant,
+        submitted: Option<std::time::Instant>,
     }
 
     // SAFETY: the command buffer handle is only waited/released from the
@@ -14119,7 +14171,7 @@ kernel void zc_r2_horner_oracle(
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
-                submitted: std::time::Instant::now(),
+                submitted: super::gpu_zc_r2_debug().then(std::time::Instant::now),
             })
         }
     }
@@ -14192,13 +14244,13 @@ kernel void zc_r2_horner_oracle(
             }
             if !job.calibration {
                 gpu.release(job.cb);
-                if super::gpu_zc_r2_debug() {
+                if let Some(submitted) = job.submitted {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
                          cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms horner={}",
                         job.chunks,
                         hi_size,
-                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                        submitted.elapsed().as_secs_f64() * 1e3,
                         job.horner,
                     );
                 }
@@ -15684,7 +15736,357 @@ kernel void zc_loop_products(
             ZcLoopResult::Calibrated
         }
     }
+    const K_SPLIT_GF_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// 32x32 -> 64 carry-less multiply via 4-bit-spaced masked integer multiplies.
+static inline ulong clmul32_incumbent(uint a, uint b) {
+    const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
+                M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
+    ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
+          a2 = a & 0x44444444u, a3 = a & 0x88888888u;
+    ulong b0 = b & 0x11111111u, b1 = b & 0x22222222u,
+          b2 = b & 0x44444444u, b3 = b & 0x88888888u;
+    ulong r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
+    ulong r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
+    ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
+    ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
+    return r0 | r1 | r2 | r3;
 }
+
+// Each aligned plane has eight coefficients in radix 16. An ordinary
+// product's coefficient is at most eight, so carries cannot cross a radix-16
+// digit. Masking its low bits therefore gives the exact polynomial product.
+static inline ulong clmul_plane_pair(uint a0, uint a1, uint b0, uint b1) {
+    const ulong MASK = 0x1111111111111111UL;
+    ulong p0 = (ulong(a0) * ulong(b0)) & MASK;
+    ulong p2 = (ulong(a1) * ulong(b1)) & MASK;
+    ulong pm = (ulong(a0 ^ a1) * ulong(b0 ^ b1)) & MASK;
+    return p0 ^ ((pm ^ p0 ^ p2) << 1) ^ (p2 << 2);
+}
+
+// Two Karatsuba levels use nine integer products rather than sixteen.
+// The aligned inputs occupy bits 0,4,...,28; the final product ends at bit 62.
+static inline ulong clmul32(uint a, uint b) {
+#ifdef FLOCK_ZC_R2_CLMUL_INCUMBENT
+    return clmul32_incumbent(a, b);
+#else
+    const uint MASK = 0x11111111u;
+    uint a0 = a & MASK, a1 = (a >> 1) & MASK;
+    uint a2 = (a >> 2) & MASK, a3 = (a >> 3) & MASK;
+    uint b0 = b & MASK, b1 = (b >> 1) & MASK;
+    uint b2 = (b >> 2) & MASK, b3 = (b >> 3) & MASK;
+    ulong lo = clmul_plane_pair(a0, a1, b0, b1);
+    ulong hi = clmul_plane_pair(a2, a3, b2, b3);
+    ulong mid = clmul_plane_pair(a0 ^ a2, a1 ^ a3, b0 ^ b2, b1 ^ b3);
+    return lo ^ ((mid ^ lo ^ hi) << 2) ^ (hi << 4);
+#endif
+}
+
+struct U128k { ulong lo; ulong hi; };
+struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+
+static inline U128k clmul64(ulong a, ulong b) {
+    uint al = uint(a), ah = uint(a >> 32);
+    uint bl = uint(b), bh = uint(b >> 32);
+    ulong p_lo = clmul32(al, bl);
+    ulong p_hi = clmul32(ah, bh);
+    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
+    U128k r;
+    r.lo = p_lo ^ (p_mid << 32);
+    r.hi = p_hi ^ (p_mid >> 32);
+    return r;
+}
+
+static inline U256k clmul128(uint4 a, uint4 b) {
+    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
+    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
+    U128k p0 = clmul64(al, bl);
+    U128k p2 = clmul64(ah, bh);
+    U128k pm = clmul64(al ^ ah, bl ^ bh);
+    pm.lo ^= p0.lo ^ p2.lo;
+    pm.hi ^= p0.hi ^ p2.hi;
+    U256k r;
+    r.r0 = p0.lo;
+    r.r1 = p0.hi ^ pm.lo;
+    r.r2 = p2.lo ^ pm.hi;
+    r.r3 = p2.hi;
+    return r;
+}
+
+// Reduce a 255-bit product mod x^128 + x^7 + x^2 + x + 1.
+static inline uint4 gf_reduce(U256k p) {
+    ulong h0 = p.r2, h1 = p.r3;
+    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
+    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+}
+
+"#;
+    const K_SPLIT_MSL: &str = r#"
+static inline uint4 kmul(uint4 x, uint4 y) { return gf_reduce(clmul128(x,y)); }
+kernel void k_group_split_live(device const uint4* anchors [[buffer(0)]],
+                          device const ulong* delta [[buffer(1)]],
+                          device const uint4* t1 [[buffer(2)]],
+                          device const uint4* t3 [[buffer(3)]],
+                          device const uint4* rho [[buffer(4)]],
+                          device const uint4* eq_lo [[buffer(5)]],
+                          device uint4* output_a [[buffer(6)]],
+                          device uint4* output_b [[buffer(7)]],
+                          device uint4* partials [[buffer(8)]],
+                          uint id [[thread_position_in_grid]],
+                          uint lid [[thread_index_in_threadgroup]],
+                          uint tgid [[threadgroup_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint simd [[simdgroup_index_in_threadgroup]],
+                          uint width [[threads_per_simdgroup]]) {
+    threadgroup uint4 simd_sums[8*32];
+    uint4 vals[8];
+    uint4 a[4], b[4], aw[4];
+    for (uint k=0;k<4;k++) {
+        uint i=id*16+k*4;
+        bool dead=(id & 15u)==15u;
+        uint4 av=uint4(0),bv=uint4(0);
+        if (!dead || k==0u) {
+            uint4 a0=anchors[i], b0=anchors[i+1];
+            ulong da0=delta[i], db0=delta[i+1];
+            if (dead) {
+                av=a0 ^ kmul(rho[0],a0);bv=b0 ^ kmul(rho[0],b0);
+                for (uint j=0;j<8;j++) {
+                    av ^= t1[j*256+uint(da0&255ul)];bv ^= t1[j*256+uint(db0&255ul)];
+                    da0 >>= 8;db0 >>= 8;
+                }
+            } else {
+                uint4 a1=anchors[i+2],b1=anchors[i+3];
+                ulong da1=delta[i+2],db1=delta[i+3];
+                av=a0 ^ kmul(rho[0],a0^a1);bv=b0 ^ kmul(rho[0],b0^b1);
+                for (uint j=0;j<8;j++) {
+                    av ^= t1[j*256+uint(da0&255ul)] ^ t3[j*256+uint(da1&255ul)];
+                    bv ^= t1[j*256+uint(db0&255ul)] ^ t3[j*256+uint(db1&255ul)];
+                    da0 >>= 8;db0 >>= 8;da1 >>= 8;db1 >>= 8;
+                }
+            }
+        }
+        a[k]=av; b[k]=bv; aw[k]=kmul(eq_lo[2u*(id & 2047u)+1u],av);
+        output_a[id*4+k]=av; output_b[id*4+k]=bv;
+    }
+    vals[0]  = kmul(aw[1],b[1]);
+    vals[1]  = kmul(aw[0]^aw[1],b[0]^b[1]);
+    vals[2] = kmul(aw[3],b[3]);
+    vals[3] = kmul(aw[2]^aw[3],b[2]^b[3]);
+    vals[4] = kmul(aw[2],b[2]);
+    vals[5] = kmul(aw[0]^aw[2],b[0]^b[2]);
+    vals[6] = kmul(aw[1]^aw[3],b[1]^b[3]);
+    vals[7] = kmul(aw[0]^aw[1]^aw[2]^aw[3],b[0]^b[1]^b[2]^b[3]);
+    for (uint slot=0;slot<8;slot++) {
+        uint4 v=vals[slot];
+        uint4 reduced=uint4(simd_xor(v.x),simd_xor(v.y),simd_xor(v.z),simd_xor(v.w));
+        if (lane==0) simd_sums[slot*32+simd]=reduced;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd==0) {
+        uint count=(256u+width-1u)/width;
+        for (uint slot=0;slot<8;slot++) {
+            uint4 v=lane<count ? simd_sums[slot*32+lane] : uint4(0u);
+            uint4 reduced=uint4(simd_xor(v.x),simd_xor(v.y),simd_xor(v.z),simd_xor(v.w));
+            if (lane==0) partials[tgid*8u+slot]=reduced;
+        }
+    }
+}
+"#;
+    // Experimental K prefix arm. Each worker calibrates against the
+    // full CPU result on its first proof; any uncertainty falls back to CPU.
+    const K_SPLIT_GROUPS: usize = 1 << 19;
+    const K_SPLIT_CPU_CHUNKS: usize = 256;
+    static K_SPLIT_TUNED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    struct KSplitState { pso: Id, t1: Id, t3: Id, rho: Id, eq: Id, parts: Id }
+    unsafe impl Send for KSplitState {}
+    static K_SPLIT_STATE: OnceLock<Option<std::sync::Mutex<KSplitState>>> = OnceLock::new();
+
+    fn k_split_state() -> Option<&'static std::sync::Mutex<KSplitState>> {
+        K_SPLIT_STATE.get_or_init(|| {
+            let gpu=gpu().ok()?;
+            unsafe {
+                let pool=gpu.pool_push();
+                let mut resources=Vec::new();
+                let built=(|| -> Result<KSplitState,String> {
+                    let src=format!("{}\n{}",K_SPLIT_GF_MSL,K_SPLIT_MSL);
+                    let pso=compile_supplemental_pipeline(gpu,&src,"k_group_split_live")?;resources.push(pso);
+                    let width:usize=send!(gpu.api,unsafe extern "C" fn(Id,Sel)->u64,pso,c"threadExecutionWidth") as usize;
+                    let max_threads:usize=send!(gpu.api,unsafe extern "C" fn(Id,Sel)->u64,pso,c"maxTotalThreadsPerThreadgroup") as usize;
+                    if width<16 || width>256 || 256%width!=0 || 256/width>32 || max_threads<256 {return Err("unsupported K GPU execution width".into());}
+                    let t1=gpu.new_buffer(2048*16)?;resources.push(t1);
+                    let t3=gpu.new_buffer(2048*16)?;resources.push(t3);
+                    let rho=gpu.new_buffer(16)?;resources.push(rho);
+                    let eq=gpu.new_buffer(4096*16)?;resources.push(eq);
+                    let parts=gpu.new_buffer((K_SPLIT_GROUPS/256)*8*16)?;resources.push(parts);
+                    Ok(KSplitState{pso,t1,t3,rho,eq,parts})
+                })();
+                if built.is_err(){for b in resources.into_iter().rev(){gpu.release(b);}}
+                gpu.pool_pop(pool);
+                built.ok().map(std::sync::Mutex::new)
+            }
+        }).as_ref()
+    }
+
+    pub fn prepare_k_split() {
+        if k_experiment_enabled() {let _=k_split_state();}
+    }
+    pub(crate) struct KSplitJob {
+        gpu: &'static Gpu,
+        state: std::sync::MutexGuard<'static,KSplitState>,
+        cb: Id,
+        owned: Vec<Id>,
+        a_gpu: Id,
+        b_gpu: Id,
+        calibration: bool,
+    }
+    impl KSplitJob {
+        pub(crate) fn cpu_prefix(&self) -> usize {if self.calibration {0} else {K_SPLIT_CPU_CHUNKS}}
+    }
+    impl Drop for KSplitJob {
+        fn drop(&mut self) { unsafe {
+            // If the CPU unwinds, wait before freeing buffers and letting its
+            // borrowed backing allocations escape. wait_cb returns only after
+            // the command buffer reaches a terminal status.
+            if !self.cb.is_null() {let _=self.gpu.wait_cb(self.cb);self.gpu.release(self.cb);self.cb=NIL;}
+            for b in self.owned.drain(..).rev(){self.gpu.release(b);}
+        }}
+    }
+    pub(crate) enum KSplitResult { Calibrated, Accelerated, Failed }
+
+    pub(crate) unsafe fn launch_k_split(
+        anchors: *const F128, anchors_len: usize, deltas: *const u8, deltas_len: usize,
+        table1: &[F128], table3: &[F128], rho: F128, eq_lo: &[F128],
+        a_out: *mut F128, b_out: *mut F128, out_len: usize,
+        lo_size: usize, hi_size: usize, dead_tail: bool,
+    ) -> Option<KSplitJob> {
+        use std::sync::atomic::Ordering;
+        if !k_experiment_enabled() || K_SPLIT_TUNED.load(Ordering::Acquire)==2 || !dead_tail
+            || lo_size!=4096 || hi_size!=2048 || table1.len()!=2048 || table3.len()!=2048
+            || eq_lo.len()!=lo_size || out_len!=hi_size*lo_size*2
+            || anchors_len!=out_len*4 || deltas_len!=out_len*32 {return None;}
+        let calibration=K_SPLIT_TUNED.load(Ordering::Acquire)==0;
+        let debug=std::env::var_os("FLOCK_K_GPU_DEBUG").is_some();
+        let start=std::time::Instant::now();
+        let gpu=gpu().ok()?;
+        let state=k_split_state()?.try_lock().ok()?;
+        let pool=unsafe {gpu.pool_push()};
+        let mut owned=Vec::new();
+        let result=(|| -> Result<KSplitJob,String> { unsafe {
+            // Map only the prefix the shader can access. Mapping whole
+            // multi-gigabyte arenas causes expensive first-GPU-touch wiring.
+            let anchors_bytes=K_SPLIT_GROUPS*16*16;
+            let deltas_bytes=K_SPLIT_GROUPS*16*8;
+            let output_bytes=K_SPLIT_GROUPS*4*16;
+            let ranges=[(anchors as usize,anchors_bytes),(deltas as usize,deltas_bytes),
+                        (a_out as usize,output_bytes),(b_out as usize,output_bytes)];
+            for &(ptr,len) in &ranges {
+                if ptr%16384!=0 || len%16384!=0 || crate::scratch::f128_range_overlaps_pin(ptr,len) {
+                    return Err("K range is unaligned or pinned".into());
+                }
+            }
+            let wrap_start=std::time::Instant::now();
+            let abuf=gpu.wrap_buffer_k_exclusive(anchors.cast_mut().cast::<u8>(),anchors_bytes)?;owned.push(abuf);
+            let dbuf=gpu.wrap_buffer_k_exclusive(deltas.cast_mut(),deltas_bytes)?;owned.push(dbuf);
+            let agpu=if calibration {gpu.new_buffer(K_SPLIT_GROUPS*4*16)?} else {gpu.wrap_buffer_k_exclusive(a_out.cast::<u8>(),output_bytes)?};owned.push(agpu);
+            let bgpu=if calibration {gpu.new_buffer(K_SPLIT_GROUPS*4*16)?} else {gpu.wrap_buffer_k_exclusive(b_out.cast::<u8>(),output_bytes)?};owned.push(bgpu);
+            let wrap_ms=wrap_start.elapsed().as_secs_f64()*1000.0;
+            std::ptr::copy_nonoverlapping(table1.as_ptr().cast::<u8>(),gpu.buffer_contents(state.t1),2048*16);
+            std::ptr::copy_nonoverlapping(table3.as_ptr().cast::<u8>(),gpu.buffer_contents(state.t3),2048*16);
+            std::ptr::copy_nonoverlapping((&raw const rho).cast::<u8>(),gpu.buffer_contents(state.rho),16);
+            std::ptr::copy_nonoverlapping(eq_lo.as_ptr().cast::<u8>(),gpu.buffer_contents(state.eq),4096*16);
+            let cb=gpu.command_buffer()?;let enc=gpu.compute_encoder(cb)?;gpu.set_pipeline(enc,state.pso);
+            for (i,b) in [abuf,dbuf,state.t1,state.t3,state.rho,state.eq,agpu,bgpu,state.parts].into_iter().enumerate() {gpu.set_buffer(enc,b,0,i);}
+            gpu.dispatch(enc,(K_SPLIT_GROUPS/256) as u64,256);gpu.end_encoding(enc);
+            let cb=gpu.retain(cb);gpu.commit_async(cb);
+            // Construct the guard immediately after commit: even a panic in
+            // diagnostic output must wait for GPU completion before unwinding.
+            let job=KSplitJob{gpu,state,cb,owned:std::mem::take(&mut owned),a_gpu:agpu,b_gpu:bgpu,calibration};
+            if debug {eprintln!("[k-split-launch] calibration={} wrap_ms={:.3} total_ms={:.3} ledger={}",calibration,wrap_ms,start.elapsed().as_secs_f64()*1000.0,K_WRAP_LEDGER.lock().unwrap_or_else(|p|p.into_inner()).len());}
+            Ok(job)
+        }})();
+        if result.is_err(){
+            if debug {eprintln!("[k-split-launch] declined: {:?}",result.as_ref().err());}
+            unsafe {for b in owned.into_iter().rev(){gpu.release(b);}}
+        }
+        unsafe {gpu.pool_pop(pool);}
+        result.ok()
+    }
+
+    /// The output pointers must remain valid for the prefix until completion.
+    pub(crate) unsafe fn finish_k_split(mut job: KSplitJob, a_out: *const F128, b_out: *const F128,
+                                  eq_hi: &[F128], parts: &mut [[F128;8]]) -> KSplitResult {
+        use std::sync::atomic::Ordering;
+        unsafe {
+            let wait_start=std::time::Instant::now();
+            let result=job.gpu.wait_cb(job.cb);
+            if std::env::var_os("FLOCK_K_GPU_DEBUG").is_some(){
+                eprintln!("[k-split-finish] calibration={} wait_ms={:.3} gpu_ms={:.3}",job.calibration,wait_start.elapsed().as_secs_f64()*1000.0,zc_fold_gpu_wall_ms(job.gpu,job.cb));
+            }
+            job.gpu.release(job.cb);job.cb=NIL;
+            if result.is_err() {K_SPLIT_TUNED.store(2,Ordering::Release);return KSplitResult::Failed;}
+            let gpu_parts=job.gpu.buffer_contents(job.state.parts).cast::<F128>();
+            if job.calibration {
+                let a=std::slice::from_raw_parts(job.gpu.buffer_contents(job.a_gpu).cast::<F128>(),K_SPLIT_GROUPS*4);
+                let b=std::slice::from_raw_parts(job.gpu.buffer_contents(job.b_gpu).cast::<F128>(),K_SPLIT_GROUPS*4);
+                // Do not create output references until the command has
+                // completed; the accelerated path writes these allocations.
+                let a_cpu=std::slice::from_raw_parts(a_out,a.len());
+                let b_cpu=std::slice::from_raw_parts(b_out,b.len());
+                if a!=a_cpu || b!=b_cpu {K_SPLIT_TUNED.store(2,Ordering::Release);return KSplitResult::Failed;}
+            }
+            for chunk in 0..K_SPLIT_CPU_CHUNKS {
+                let mut sums=[F128::ZERO;8];
+                for sub in 0..8 {for k in 0..8 {sums[k]+=*gpu_parts.add((chunk*8+sub)*8+k);}}
+                let weighted=sums.map(|v|eq_hi[chunk]*v);
+                if job.calibration {
+                    if weighted!=parts[chunk] {K_SPLIT_TUNED.store(2,Ordering::Release);return KSplitResult::Failed;}
+                } else {parts[chunk]=weighted;}
+            }
+            if job.calibration {K_SPLIT_TUNED.store(1,Ordering::Release);KSplitResult::Calibrated}
+            else {KSplitResult::Accelerated}
+        }
+    }
+    #[cfg(test)]
+    mod k_wrap_safety_tests {
+        use super::*;
+        #[test]
+        fn exclusive_mapping_rejects_overlaps_and_retired_views() {
+            assert!(k_experiment_enabled(), "run this test without FLOCK_NO_K_GPU");
+            let gpu=gpu().expect("mapping test requires Metal");
+            let mut a=vec![F128::ZERO;1<<16];
+            let mut b=vec![F128::ZERO;1<<16];
+            let len=a.len()*16;
+            assert_eq!((a.as_ptr() as usize)%16384,0);
+            assert_eq!((b.as_ptr() as usize)%16384,0);
+            unsafe {
+                let pool=gpu.pool_push();
+                let ordinary=gpu.wrap_buffer(a.as_mut_ptr().cast::<u8>(),len).unwrap();
+                assert!(gpu.wrap_buffer_k_exclusive(a.as_mut_ptr().cast::<u8>(),len).is_err());
+                gpu.release(ordinary);
+                // A retired ordinary mapping remains conservatively blocked.
+                assert!(gpu.wrap_buffer_k_exclusive(a.as_mut_ptr().cast::<u8>(),len).is_err());
+                let exclusive=gpu.wrap_buffer_k_exclusive(b.as_mut_ptr().cast::<u8>(),len).unwrap();
+                assert!(gpu.wrap_buffer(b.as_mut_ptr().cast::<u8>(),len).is_err());
+                gpu.release(exclusive);
+                // K mappings are released only after their command completes.
+                let ordinary=gpu.wrap_buffer(b.as_mut_ptr().cast::<u8>(),len).unwrap();
+                gpu.release(ordinary);gpu.pool_pop(pool);
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{launch_k_split, finish_k_split, KSplitResult};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use imp::prepare_k_split;
 
 // Test-harness entry points (copy-in/copy-out); production goes through
 // `commit_l0_or_fallback` above.
