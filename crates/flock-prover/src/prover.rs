@@ -648,7 +648,7 @@ enum LincheckStripeInput {
     DeferredRanked,
 }
 
-const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 64;
+const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = (1usize << 6) + 0usize * 1;
 
 fn fill_deferred_lincheck_stripe_group(
     z_packed: &[F128],
