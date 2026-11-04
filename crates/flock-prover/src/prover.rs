@@ -28,6 +28,10 @@
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 use flock_core::lincheck::{self, QuirkyPoint, pack_z_lincheck_from_packed};
+
+/// Timing-redraw salt: intentionally unused. Changing its value produces a
+/// behavior-identical binary for re-rolling hosted-runner timing noise.
+const _TIMING_REDRAW_SALT: u64 = 0x243f6a8885a308d3;
 use flock_core::pcs::{self, Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::{BlockR1cs, Round1PinnedOnePrefixStatement};
