@@ -1480,6 +1480,21 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
         let mut w4 = tri_zero;
         let mut w5 = tri_zero;
 
+        // Row weighting `w * a`: the cascade K pass's fused PMULL+EOR
+        // schoolbook product with `0x87` hoisted into a register, the same
+        // field value as `mul_sw_q` in fewer issue slots.
+        #[cfg(target_feature = "sha3")]
+        let k87 = vdupq_n_u64(0x87);
+        macro_rules! wmul {
+            ($w:expr, $w_sw:expr, $a:expr) => {{
+                #[cfg(target_feature = "sha3")]
+                let v = mul_sw_fused_q($w, $w_sw, $a, k87);
+                #[cfg(not(target_feature = "sha3"))]
+                let v = mul_sw_q($w, $w_sw, $a);
+                v
+            }};
+        }
+
         let ones_bytes = [0xFFu8; 8];
         let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
         let ones_is_one = is_zero_q(veorq_u64(
@@ -1531,15 +1546,25 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                     }
                     tri_acc_sw(&mut w0, w, w_sw, a2);
                 } else {
-                    let a0w = mul_sw_q(w, w_sw, a0);
-                    let a1w = mul_sw_q(w, w_sw, a1);
+                    let a0w = wmul!(w, w_sw, a0);
+                    let a1w = wmul!(w, w_sw, a1);
                     let (a2w, a3w) = if pad1 {
                         (zero, zero)
                     } else {
-                        (mul_sw_q(w, w_sw, a2), mul_sw_q(w, w_sw, a3))
+                        (wmul!(w, w_sw, a2), wmul!(w, w_sw, a3))
                     };
                     macro_rules! acc {
                         ($acc:expr, $a:expr, $b:expr) => {{
+                            // The GPU-shared (`!FULL`) body keeps fewer live
+                            // accumulators and measures faster with them updated
+                            // in place; the full body keeps the all-fused form.
+                            #[cfg(target_feature = "sha3")]
+                            if FULL {
+                                tri_acc_q(&mut $acc, $a, $b);
+                            } else {
+                                tri_acc_q_crossfused(&mut $acc, $a, $b);
+                            }
+                            #[cfg(not(target_feature = "sha3"))]
                             tri_acc_q(&mut $acc, $a, $b);
                         }};
                     }
@@ -2458,10 +2483,9 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused<const DEAD_TAI
         debug_assert!(out_pairs >= 2 && out_pairs.is_multiple_of(2));
         let n5 = out_pairs / 2;
 
-        // One dense lane `g`: the incumbent's a/b values (and its `b_flat`
-        // bookkeeping), each `rho2` product fused with its addends.
+        // One dense lane `g`: each `rho2` product is fused with its addends.
         macro_rules! fold_lane {
-            ($g:expr, $b_flat:ident) => {{
+            ($g:expr) => {{
                 let g = $g;
                 let ap = anchors.add(4 * g).cast::<u64>();
                 let anc_a0 = vld1q_u64(ap);
@@ -2488,11 +2512,9 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused<const DEAD_TAI
                     if is_zero_q(bd) {
                         anc_b0
                     } else {
-                        $b_flat = false;
                         mul_sw_fused_xor3_q(rho2_q, rho2_sw, bd, k87, anc_b0, zero)
                     }
                 } else {
-                    $b_flat = false;
                     mul_sw_fused_xor3_q(
                         rho2_q,
                         rho2_sw,
@@ -2509,23 +2531,21 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused<const DEAD_TAI
         macro_rules! k_group {
             ($t:expr) => {{
                 let t = $t;
-                let mut b_flat = true;
-                let (a0, b0) = fold_lane!(4 * t, b_flat);
-                let (a1, b1) = fold_lane!(4 * t + 1, b_flat);
+                let (a0, b0) = fold_lane!(4 * t);
+                let (a1, b1) = fold_lane!(4 * t + 1);
                 store_pair_nt(a_out.add(4 * t), a0, a1);
                 store_pair_nt(b_out.add(4 * t), b0, b1);
-                let (a2, b2) = fold_lane!(4 * t + 2, b_flat);
-                let (a3, b3) = fold_lane!(4 * t + 3, b_flat);
+                let (a2, b2) = fold_lane!(4 * t + 2);
+                let (a3, b3) = fold_lane!(4 * t + 3);
                 store_pair_nt(a_out.add(4 * t + 2), a2, a3);
                 store_pair_nt(b_out.add(4 * t + 2), b2, b3);
                 // The odd round-4 pair's weight drives the whole group.
                 let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
                 let acc = &mut acc.0;
-                if b_flat
-                    && is_zero_q(vorrq_u64(
-                        vorrq_u64(veorq_u64(b0, one_q), veorq_u64(b1, one_q)),
-                        vorrq_u64(veorq_u64(b2, one_q), veorq_u64(b3, one_q)),
-                    ))
+                if is_zero_q(vorrq_u64(
+                    vorrq_u64(veorq_u64(b0, one_q), veorq_u64(b1, one_q)),
+                    vorrq_u64(veorq_u64(b2, one_q), veorq_u64(b3, one_q)),
+                ))
                 {
                     // b ≡ 1: the three surviving products are w·a1, w·a3, w·a2.
                     tri_acc_q_crossfused(&mut acc[0], w, a1);
@@ -2592,8 +2612,13 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused<const DEAD_TAI
                 // Lanes 1..3 are zero: (w·a0)·b0 into pinf_even, W3' and W5'.
                 let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
                 let a0w = mul_sw_fused_q(w, swap_halves_q(w), av0, k87);
+                // All three slots add the same raw product.
+                let (ll, cross, hh) = clmul_products_q(a0w, bv0);
                 for slot in [1usize, 5, 7] {
-                    tri_acc_q_crossfused(&mut acc.0[slot], a0w, bv0);
+                    let t = &mut acc.0[slot];
+                    t.ll = veorq_u64(t.ll, ll);
+                    t.cross = veorq_u64(t.cross, cross);
+                    t.hh = veorq_u64(t.hh, hh);
                 }
             }
         } else {
