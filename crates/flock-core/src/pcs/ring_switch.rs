@@ -1400,10 +1400,43 @@ pub fn s_hat_v_fold4_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
             || vec![F128::ZERO; 16 * n_packed],
             |mut acc, (k, &weight)| {
                 let base = 16 * k * n_packed;
-                for bank in 0..16 {
-                    let block = &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
-                    for packed in 0..n_packed {
-                        acc[bank * n_packed + packed] += weight * block[packed];
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                {
+                    debug_assert_eq!(n_packed % 4, 0);
+                    for bank in 0..16 {
+                        let block =
+                            &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
+                        let acc_bank = &mut acc[bank * n_packed..(bank + 1) * n_packed];
+                        let mut packed = 0;
+                        while packed < n_packed {
+                            let prod0 = unsafe {
+                                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                                    weight,
+                                    [block[packed], block[packed + 1]],
+                                )
+                            };
+                            let prod1 = unsafe {
+                                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                                    weight,
+                                    [block[packed + 2], block[packed + 3]],
+                                )
+                            };
+                            acc_bank[packed] += prod0[0];
+                            acc_bank[packed + 1] += prod0[1];
+                            acc_bank[packed + 2] += prod1[0];
+                            acc_bank[packed + 3] += prod1[1];
+                            packed += 4;
+                        }
+                    }
+                }
+                #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+                {
+                    for bank in 0..16 {
+                        let block =
+                            &z_vec[base + bank * n_packed..base + (bank + 1) * n_packed];
+                        for packed in 0..n_packed {
+                            acc[bank * n_packed + packed] += weight * block[packed];
+                        }
                     }
                 }
                 acc
@@ -1429,13 +1462,67 @@ pub(crate) fn collapse_s_hat_v_quad(s_hat_v_quad: &[F128], low_point: &[F128]) -
     debug_assert_eq!(low_point.len(), 2);
     let low_eq = build_eq(low_point);
     let n_packed = 1usize << LOG_PACKING;
-    let mut out = vec![F128::ZERO; n_packed];
-    for q in 0..4 {
-        for b in 0..n_packed {
-            out[b] += low_eq[q] * s_hat_v_quad[q * n_packed + b];
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        debug_assert_eq!(n_packed % 4, 0);
+        let mut out = vec![F128::ZERO; n_packed];
+        let w0 = low_eq[0];
+        let mut i = 0;
+        while i < n_packed {
+            let prod0 = unsafe {
+                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                    w0,
+                    [s_hat_v_quad[i], s_hat_v_quad[i + 1]],
+                )
+            };
+            let prod1 = unsafe {
+                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                    w0,
+                    [s_hat_v_quad[i + 2], s_hat_v_quad[i + 3]],
+                )
+            };
+            out[i] = prod0[0];
+            out[i + 1] = prod0[1];
+            out[i + 2] = prod1[0];
+            out[i + 3] = prod1[1];
+            i += 4;
         }
+        for q in 1..4 {
+            let w = low_eq[q];
+            let bank_src = &s_hat_v_quad[q * n_packed..(q + 1) * n_packed];
+            let mut i = 0;
+            while i < n_packed {
+                let prod0 = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                        w,
+                        [bank_src[i], bank_src[i + 1]],
+                    )
+                };
+                let prod1 = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                        w,
+                        [bank_src[i + 2], bank_src[i + 3]],
+                    )
+                };
+                out[i] += prod0[0];
+                out[i + 1] += prod0[1];
+                out[i + 2] += prod1[0];
+                out[i + 3] += prod1[1];
+                i += 4;
+            }
+        }
+        return out;
     }
-    out
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        let mut out = vec![F128::ZERO; n_packed];
+        for q in 0..4 {
+            for b in 0..n_packed {
+                out[b] += low_eq[q] * s_hat_v_quad[q * n_packed + b];
+            }
+        }
+        out
+    }
 }
 
 /// Collapse the sixteen-bank direct-fold4 intake under the first four suffix
@@ -1445,13 +1532,67 @@ pub(crate) fn collapse_s_hat_v_fold4(s_hat_v_fold4: &[F128], low_point: &[F128])
     debug_assert_eq!(low_point.len(), 4);
     let n_packed = 1usize << LOG_PACKING;
     let low_eq = build_eq(low_point);
-    let mut out = vec![F128::ZERO; n_packed];
-    for bank in 0..16 {
-        for packed in 0..n_packed {
-            out[packed] += low_eq[bank] * s_hat_v_fold4[bank * n_packed + packed];
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        debug_assert_eq!(n_packed % 4, 0);
+        let mut out = vec![F128::ZERO; n_packed];
+        let w0 = low_eq[0];
+        let mut i = 0;
+        while i < n_packed {
+            let prod0 = unsafe {
+                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                    w0,
+                    [s_hat_v_fold4[i], s_hat_v_fold4[i + 1]],
+                )
+            };
+            let prod1 = unsafe {
+                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                    w0,
+                    [s_hat_v_fold4[i + 2], s_hat_v_fold4[i + 3]],
+                )
+            };
+            out[i] = prod0[0];
+            out[i + 1] = prod0[1];
+            out[i + 2] = prod1[0];
+            out[i + 3] = prod1[1];
+            i += 4;
         }
+        for bank in 1..16 {
+            let w = low_eq[bank];
+            let bank_src = &s_hat_v_fold4[bank * n_packed..(bank + 1) * n_packed];
+            let mut i = 0;
+            while i < n_packed {
+                let prod0 = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                        w,
+                        [bank_src[i], bank_src[i + 1]],
+                    )
+                };
+                let prod1 = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                        w,
+                        [bank_src[i + 2], bank_src[i + 3]],
+                    )
+                };
+                out[i] += prod0[0];
+                out[i + 1] += prod0[1];
+                out[i + 2] += prod1[0];
+                out[i + 3] += prod1[1];
+                i += 4;
+            }
+        }
+        return out;
     }
-    out
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        let mut out = vec![F128::ZERO; n_packed];
+        for bank in 0..16 {
+            for packed in 0..n_packed {
+                out[packed] += low_eq[bank] * s_hat_v_fold4[bank * n_packed + packed];
+            }
+        }
+        out
+    }
 }
 
 /// Sixty-four-bank sufficient statistic for the direct-fold8 PCS opening. The

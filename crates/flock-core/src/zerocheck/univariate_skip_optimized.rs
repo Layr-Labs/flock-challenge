@@ -1269,7 +1269,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
 /// shape exposes roughly sixty-four scheduling waves on the ten-thread worker.
 #[inline]
 fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
-    n_chunks.div_ceil(640).max(1)
+    n_chunks.div_ceil(1280).max(1)
 }
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
@@ -2423,34 +2423,43 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
                     convert[127] * *scale,
                     convert[255] * *scale,
                 ];
-                let mut base = F128::ZERO;
                 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-                let output: &mut [F128; CONVERT_TABLE_SIZE] =
-                    slot.try_into().expect("complete canonical convert image");
-                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-                // SAFETY: both initialized u64 values are in bounds for this load.
-                let reduction = unsafe { core::arch::aarch64::vld1q_u64([0x87, 1].as_ptr()) };
-                for byte in 0usize..256 {
-                    if byte != 0 {
-                        base += deltas[byte.trailing_zeros() as usize];
-                    }
-                    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-                    // SAFETY: F128 is repr(C), with initialized lo/hi u64 lanes.
-                    // Each store writes one disjoint entry of the complete image:
-                    // bank * 256 + byte <= 15 * 256 + 255 = 4095. No pointer escapes.
-                    unsafe {
-                        use core::arch::aarch64::*;
+                // SAFETY: each ST2 writes two adjacent F128 entries. The largest
+                // start is 15 * 256 + 254 = 4094 in the complete 4096-entry image.
+                // F128 has initialized lo/hi u64 lanes; no pointer escapes.
+                unsafe {
+                    use core::arch::aarch64::*;
 
-                        let mut value = core::mem::transmute::<F128, uint64x2_t>(base);
+                    let output: &mut [F128; CONVERT_TABLE_SIZE] =
+                        slot.try_into().expect("complete canonical convert image");
+                    let scale_vec = core::mem::transmute::<F128, uint64x2_t>(*scale);
+                    let reduction = vdupq_n_u64(0x87);
+                    let mut base = vdupq_n_u64(0);
+                    for byte in (0usize..256).step_by(2) {
+                        if byte != 0 {
+                            let delta = core::mem::transmute::<F128, uint64x2_t>(
+                                deltas[byte.trailing_zeros() as usize],
+                            );
+                            // Clear the carry mask's bit zero for the even-byte step.
+                            base = veorq_u64(veorq_u64(base, delta), scale_vec);
+                        }
+                        let odd = veorq_u64(base, scale_vec);
+                        let mut lo = vzip1q_u64(base, odd);
+                        let mut hi = vzip2q_u64(base, odd);
                         let dst = output.as_mut_ptr().add(byte);
-                        vst1q_u64(dst.cast(), value);
+                        vst2q_u64(dst.cast(), uint64x2x2_t(lo, hi));
                         macro_rules! next_bank {
                             ($bank:literal) => {{
-                                let sign = vshrq_n_s64::<63>(vreinterpretq_s64_u64(value));
-                                let carry = vreinterpretq_u64_s64(vextq_s64::<1>(sign, sign));
-                                value =
-                                    veorq_u64(vshlq_n_u64::<1>(value), vandq_u64(carry, reduction));
-                                vst1q_u64(dst.add($bank * 256).cast(), value);
+                                let top = vandq_u64(
+                                    vreinterpretq_u64_s64(vshrq_n_s64::<63>(
+                                        vreinterpretq_s64_u64(hi),
+                                    )),
+                                    reduction,
+                                );
+                                let carry = vshrq_n_u64::<63>(lo);
+                                hi = vsliq_n_u64::<1>(carry, hi);
+                                lo = veorq_u64(vshlq_n_u64::<1>(lo), top);
+                                vst2q_u64(dst.add($bank * 256).cast(), uint64x2x2_t(lo, hi));
                             }};
                         }
                         next_bank!(1);
@@ -2469,8 +2478,14 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
                         next_bank!(14);
                         next_bank!(15);
                     }
-                    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
-                    {
+                }
+                #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+                {
+                    let mut base = F128::ZERO;
+                    for byte in 0usize..256 {
+                        if byte != 0 {
+                            base += deltas[byte.trailing_zeros() as usize];
+                        }
                         let mut value = base;
                         slot[byte] = value;
                         for bank in 1..16 {
@@ -2612,7 +2627,21 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
     }
 
     let fold4_n_hi = fold4_n_hi_from_env();
-    let eq = SplitEqGhash::with_n_hi(&r[k_skip + N_INNER..], fold4_n_hi);
+    let r_outer = &r[k_skip + N_INNER..];
+    let n_hi = fold4_n_hi.min(r_outer.len());
+    let n_lo = r_outer.len() - n_hi;
+    let bank_bits = fold.bank_bits(n_lo);
+    let eq = if bank_bits.is_some() {
+        // The folded arm builds its low factors below and never reads eq.lo.
+        SplitEqGhash {
+            n_lo,
+            n_hi,
+            lo: Vec::new(),
+            hi: build_eq(&r_outer[n_lo..]),
+        }
+    } else {
+        SplitEqGhash::with_n_hi(r_outer, fold4_n_hi)
+    };
     let big_lo_size = 1usize << eq.n_lo;
     let hi_size = 1usize << eq.n_hi;
     let n_lo_and_inner = eq.n_lo + N_INNER;
@@ -2622,7 +2651,7 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
 
     let mut partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(hi_size);
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    match fold.bank_bits(eq.n_lo) {
+    match bank_bits {
         None => {
             let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
             crate::epool::run_hetero_chunks(hi_size, |x_hi| {
@@ -3039,12 +3068,46 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     let retained_hi_eq = build_eq(&inner_tail[2..6]);
     let n_packed = 1usize << crate::pcs::LOG_PACKING;
     let mut quad = vec![F128::ZERO; 4 * n_packed];
-    for q in 0..16 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            for packed in 0..n_packed {
-                quad[dst + packed] += retained_hi_eq[q] * fold8[src + packed];
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        debug_assert_eq!(n_packed % 4, 0);
+        for q in 0..16 {
+            let w = retained_hi_eq[q];
+            for e in 0..4 {
+                let src = &fold8[(e + 4 * q) * n_packed..(e + 4 * q + 1) * n_packed];
+                let dst = &mut quad[e * n_packed..(e + 1) * n_packed];
+                let mut packed = 0;
+                while packed < n_packed {
+                    let prod0 = unsafe {
+                        crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                            w,
+                            [src[packed], src[packed + 1]],
+                        )
+                    };
+                    let prod1 = unsafe {
+                        crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                            w,
+                            [src[packed + 2], src[packed + 3]],
+                        )
+                    };
+                    dst[packed] += prod0[0];
+                    dst[packed + 1] += prod0[1];
+                    dst[packed + 2] += prod1[0];
+                    dst[packed + 3] += prod1[1];
+                    packed += 4;
+                }
+            }
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        for q in 0..16 {
+            for e in 0..4 {
+                let src = (e + 4 * q) * n_packed;
+                let dst = e * n_packed;
+                for packed in 0..n_packed {
+                    quad[dst + packed] += retained_hi_eq[q] * fold8[src + packed];
+                }
             }
         }
     }
@@ -3084,15 +3147,67 @@ fn round1_identity_prefix_ab_recovery(
     assert!(r.len() >= k_log);
     let eq_inner = build_eq(&r[K_SKIP..k_log]);
     let mut recovered_s = [F128::ZERO; ELL];
-    for t in 0..16 {
-        let weight = eq_inner[t];
-        for lane in 0..ELL {
-            recovered_s[lane] += weight * c_inner[ELL * t + lane];
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        debug_assert_eq!(ELL % 4, 0);
+        for t in 0..16 {
+            let weight = eq_inner[t];
+            let crow = &c_inner[ELL * t..ELL * (t + 1)];
+            let mut lane = 0;
+            while lane < ELL {
+                let prod0 = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                        weight,
+                        [crow[lane], crow[lane + 1]],
+                    )
+                };
+                let prod1 = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                        weight,
+                        [crow[lane + 2], crow[lane + 3]],
+                    )
+                };
+                recovered_s[lane] += prod0[0];
+                recovered_s[lane + 1] += prod0[1];
+                recovered_s[lane + 2] += prod1[0];
+                recovered_s[lane + 3] += prod1[1];
+                lane += 4;
+            }
+        }
+        let c_s_inv = c_s_inv_f128();
+        let mut lane = 0;
+        while lane < ELL {
+            let prod0 = unsafe {
+                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                    c_s_inv,
+                    [recovered_s[lane], recovered_s[lane + 1]],
+                )
+            };
+            let prod1 = unsafe {
+                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                    c_s_inv,
+                    [recovered_s[lane + 2], recovered_s[lane + 3]],
+                )
+            };
+            recovered_s[lane] = prod0[0];
+            recovered_s[lane + 1] = prod0[1];
+            recovered_s[lane + 2] = prod1[0];
+            recovered_s[lane + 3] = prod1[1];
+            lane += 4;
         }
     }
-    let c_s_inv = c_s_inv_f128();
-    for value in &mut recovered_s {
-        *value *= c_s_inv;
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+    {
+        for t in 0..16 {
+            let weight = eq_inner[t];
+            for lane in 0..ELL {
+                recovered_s[lane] += weight * c_inner[ELL * t + lane];
+            }
+        }
+        let c_s_inv = c_s_inv_f128();
+        for value in &mut recovered_s {
+            *value *= c_s_inv;
+        }
     }
     ntt_extend_f128_vec_ghash(&recovered_s, inv_table)
 }
