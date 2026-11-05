@@ -29,7 +29,7 @@ fn bstatic_horner_fallback(
 
 /// One static-B arm `BLK = w * 16 + b_med` (3..=28) in the h4 Horner layout.
 #[cfg(target_arch = "aarch64")]
-#[inline(never)]
+#[inline(always)]
 #[allow(clippy::too_many_lines)]
 fn bstatic_horner_blk<const BLK: usize>(
     a_packed: &[u8],
