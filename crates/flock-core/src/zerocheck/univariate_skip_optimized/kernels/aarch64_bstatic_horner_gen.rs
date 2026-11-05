@@ -31,14 +31,13 @@ fn bstatic_horner_fallback(
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 #[allow(clippy::too_many_lines)]
-fn bstatic_horner_blk<const BLK: usize>(
+fn bstatic_horner_blk_impl<const BLK: usize, const NT_STORE: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
     chunk_byte_base: usize,
     partials: &'static [[u8; 64]; 248],
     out: &mut [u8; 64],
-    nt_store: bool,
 ) {
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
@@ -117,7 +116,7 @@ fn bstatic_horner_blk<const BLK: usize>(
         let acc = match BLK {
             3 => {
                 if ((!bw!(1) & 0x0000ffffffffffff) | (!bw!(4) & 0xffff000000000000) | (!bw!(5) & 0x000000ffffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -136,7 +135,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             4 => {
                 if ((!bw!(0) & 0xffff000000000000) | (!bw!(1) & 0x000000ffffffffff) | (!bw!(4) & 0xffffff0000000000) | (!bw!(5) & 0x00000000ffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -155,7 +154,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             5 => {
                 if ((!bw!(0) & 0xffffffff00000000) | (!bw!(1) & 0x0000000000ffffff) | (!bw!(4) & 0xffffffffff000000) | (!bw!(5) & 0x000000000000ffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -174,7 +173,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             6 => {
                 if ((!bw!(0) & 0xffffffffff000000) | (!bw!(1) & 0x000000000000ffff) | (!bw!(4) & 0xffffffffffff0000)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -193,7 +192,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             7 => {
                 if ((!bw!(0) & 0xffffffffffffff00) | (!bw!(4) & 0x00ffffffffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -212,7 +211,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             8 => {
                 if ((!bw!(0) & 0x00ffffffffffffff) | (!bw!(4) & 0x0000ffffffffffff) | (!bw!(7) & 0xffff000000000000)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -231,7 +230,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             9 => {
                 if ((!bw!(0) & 0x000000ffffffffff) | (!bw!(3) & 0xffffff0000000000) | (!bw!(4) & 0x00000000ffffffff) | (!bw!(7) & 0xffffff0000000000)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_s!(9, 3, [(0, 1), (2, 3)], [4]));
@@ -250,7 +249,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             10 => {
                 if ((!bw!(0) & 0x00000000ffffffff) | (!bw!(3) & 0xffffffff00000000) | (!bw!(4) & 0x0000000000ffffff) | (!bw!(7) & 0xffffffffff000000)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_s!(10, 3, [(0, 1), (2, 3)], []));
@@ -269,7 +268,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             11 => {
                 if ((!bw!(0) & 0x000000000000ffff) | (!bw!(3) & 0xffffffffffff0000) | (!bw!(7) & 0xffffffffffff0000)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_s!(11, 3, [(0, 1)], []));
@@ -288,7 +287,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             12 => {
                 if ((!bw!(3) & 0xffffffffffffff00) | (!bw!(7) & 0x00ffffffffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_s!(12, 3, [], [0]));
@@ -307,7 +306,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             13 => {
                 if ((!bw!(3) & 0x0000ffffffffffff) | (!bw!(7) & 0x0000ffffffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_s!(13, 3, [(6, 7)], []));
@@ -326,7 +325,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             14 => {
                 if ((!bw!(2) & 0xffff000000000000) | (!bw!(3) & 0x000000ffffffffff) | (!bw!(6) & 0xffffff0000000000) | (!bw!(7) & 0x00000000ffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_s!(14, 3, [(5, 6)], [7]));
@@ -345,7 +344,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             15 => {
                 if ((!bw!(2) & 0xffffffff00000000) | (!bw!(3) & 0x0000000000ffffff) | (!bw!(6) & 0xffffffff00000000) | (!bw!(7) & 0x0000000000ffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_s!(15, 3, [(3, 4), (5, 6)], [7]));
@@ -364,7 +363,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             16 => {
                 if ((!bw!(2) & 0xffffffffff000000) | (!bw!(3) & 0x000000000000ffff) | (!bw!(6) & 0xffffffffffff0000)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_s!(16, 3, [(2, 3), (4, 5), (6, 7)], []));
@@ -383,7 +382,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             17 => {
                 if ((!bw!(2) & 0xffffffffffffff00) | (!bw!(6) & 0xffffffffffffff00)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -402,7 +401,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             18 => {
                 if ((!bw!(2) & 0x00ffffffffffffff) | (!bw!(6) & 0x0000ffffffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -421,7 +420,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             19 => {
                 if ((!bw!(1) & 0xffff000000000000) | (!bw!(2) & 0x000000ffffffffff) | (!bw!(5) & 0xffff000000000000) | (!bw!(6) & 0x000000ffffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -440,7 +439,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             20 => {
                 if ((!bw!(1) & 0xffffff0000000000) | (!bw!(2) & 0x00000000ffffffff) | (!bw!(5) & 0xffffffff00000000) | (!bw!(6) & 0x0000000000ffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -459,7 +458,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             21 => {
                 if ((!bw!(1) & 0xffffffffff000000) | (!bw!(2) & 0x000000000000ffff) | (!bw!(5) & 0xffffffffff000000) | (!bw!(6) & 0x000000000000ffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -478,7 +477,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             22 => {
                 if ((!bw!(1) & 0xffffffffffff0000) | (!bw!(5) & 0xffffffffffffff00)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -497,7 +496,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             23 => {
                 if ((!bw!(1) & 0x00ffffffffffffff) | (!bw!(5) & 0x00ffffffffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -516,7 +515,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             24 => {
                 if ((!bw!(1) & 0x0000ffffffffffff) | (!bw!(4) & 0xffff000000000000) | (!bw!(5) & 0x000000ffffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -535,7 +534,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             25 => {
                 if ((!bw!(0) & 0xffffff0000000000) | (!bw!(1) & 0x00000000ffffffff) | (!bw!(4) & 0xffffff0000000000) | (!bw!(5) & 0x00000000ffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -554,7 +553,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             26 => {
                 if ((!bw!(0) & 0xffffffff00000000) | (!bw!(1) & 0x0000000000ffffff) | (!bw!(4) & 0xffffffffff000000) | (!bw!(5) & 0x000000000000ffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -573,7 +572,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             27 => {
                 if ((!bw!(0) & 0xffffffffffff0000) | (!bw!(4) & 0xffffffffffff0000)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -592,7 +591,7 @@ fn bstatic_horner_blk<const BLK: usize>(
             }
             28 => {
                 if ((!bw!(0) & 0xffffffffffffff00) | (!bw!(4) & 0x00ffffffffffffff)) != 0 {
-                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+                    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, NT_STORE);
                     return;
                 }
                 let lo3 = prods!(plain, plain_sw, 3, bimg_g!(3));
@@ -615,7 +614,21 @@ fn bstatic_horner_blk<const BLK: usize>(
         let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
         let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[5]));
         let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
-        store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
+        store_row_64(out.as_mut_ptr(), NT_STORE, r0, r1, r2, r3);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn bstatic_horner_blk<const BLK: usize>(
+    a_packed: &[u8], b_packed: &[u8], inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize, partials: &'static [[u8; 64]; 248],
+    out: &mut [u8; 64], nt_store: bool,
+) {
+    if nt_store {
+        bstatic_horner_blk_impl::<BLK, true>(a_packed,b_packed,inv_table,chunk_byte_base,partials,out);
+    } else {
+        bstatic_horner_blk_impl::<BLK, false>(a_packed,b_packed,inv_table,chunk_byte_base,partials,out);
     }
 }
 
@@ -680,7 +693,7 @@ pub(crate) const BSTATIC_HORNER_WINDOW_ROWS: [(usize, usize); 2] = [(3, 16), (0,
 /// row `b_med` to `out_outer[b_med * 64..][..64]`.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bstatic_horner_window_rows(
+fn bstatic_horner_window_rows_impl<const NT_STORE: bool>(
     w: usize,
     a_packed: &[u8],
     b_packed: &[u8],
@@ -688,7 +701,6 @@ pub(crate) fn bstatic_horner_window_rows(
     chunk_byte_base: usize,
     partials: &'static [[u8; 64]; 248],
     out_outer: &mut [u8],
-    nt_store: bool,
 ) {
     assert!(w <= 1 && out_outer.len() >= 16 * 64);
     let out = out_outer.as_mut_ptr();
@@ -697,7 +709,7 @@ pub(crate) fn bstatic_horner_window_rows(
             $(
                 // SAFETY: `$blk % 16 < 16` and `out_outer` holds 16 rows of 64 bytes.
                 let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
-                bstatic_horner_blk::<$blk>(a_packed, b_packed, inv_table, chunk_byte_base, partials, dst, nt_store);
+                bstatic_horner_blk_impl::<$blk, NT_STORE>(a_packed, b_packed, inv_table, chunk_byte_base, partials, dst);
             )*
         }};
     }
@@ -705,5 +717,20 @@ pub(crate) fn bstatic_horner_window_rows(
         rows!(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     } else {
         rows!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bstatic_horner_window_rows(
+    w: usize, a_packed: &[u8], b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8, chunk_byte_base: usize,
+    partials: &'static [[u8; 64]; 248], out_outer: &mut [u8], nt_store: bool,
+) {
+    if nt_store {
+        bstatic_horner_window_rows_impl::<true>(w,a_packed,b_packed,inv_table,chunk_byte_base,partials,out_outer);
+    } else {
+        bstatic_horner_window_rows_impl::<false>(w,a_packed,b_packed,inv_table,chunk_byte_base,partials,out_outer);
     }
 }
