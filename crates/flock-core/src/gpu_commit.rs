@@ -4028,9 +4028,8 @@ kernel void ntt_final_t3(device uint4* data                [[buffer(0)]],
     threadgroup uint  nibB[8u * NNIB];
 
     const uint lane = lid & 63u;
-    const uint B = tgid >> P.s;
-    const uint r = tgid & ((1u << P.s) - 1u);
-    const uint pos_base = (B << (P.log_d - P.l)) + r;
+    const uint B = tgid;
+    const uint pos_base = tgid << 4;
 
     if (lid < 8u * NNIB) {
         uint cB = lid / NNIB, qB = lid % NNIB;
@@ -13178,8 +13177,12 @@ static inline void zc_r2_write_partials(
         if (lid < s) { red[lid] ^= red[lid + s]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    ulong4 chunk1e = red[0];
-    ulong4 chunk1o = red[1];
+    ulong4 chunk1e;
+    ulong4 chunk1o;
+    if (lid == 0u) {
+        chunk1e = red[0];
+        chunk1o = red[1];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     red[lid] = acci;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -13289,15 +13292,19 @@ kernel void zc_r2_products_horner(
         if (handoff && step == 2u) {
             // The lower 4 KiB remains the live nibble table.
             threadgroup uint4* handoff_slots = nib + 256u;
-            uint4 v1 = zc_r2_horner_reduce(h1);
-            uint4 vi = zc_r2_horner_reduce(hi);
-            handoff_slots[rid] = v1;
+            U256k p1 = {h1.r0, h1.r1, h1.r2, h1.r3};
+            U256k pi = {hi.r0, hi.r1, hi.r2, hi.r3};
+            uint4 v1 = gf_reduce(p1);
+            uint4 vi = gf_reduce(pi);
+            uint store_slot = rid ^ (rid >> 3u);
+            uint read_slot = lid ^ (lid >> 3u);
+            handoff_slots[store_slot] = v1;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            v1 = handoff_slots[lid];
+            v1 = handoff_slots[read_slot];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            handoff_slots[rid] = vi;
+            handoff_slots[store_slot] = vi;
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            vi = handoff_slots[lid];
+            vi = handoff_slots[read_slot];
             threadgroup_barrier(mem_flags::mem_threadgroup);
             h1.r0 = (ulong(v1.y) << 32) | v1.x;
             h1.r1 = (ulong(v1.w) << 32) | v1.z;
@@ -13685,7 +13692,7 @@ kernel void zc_r2_horner_oracle(
         lo_size: usize,
         mask: u32,
         useful: u32,
-        submitted: std::time::Instant,
+        submitted: Option<std::time::Instant>,
     }
 
     // SAFETY: the command buffer handle is only waited/released from the
@@ -14119,7 +14126,7 @@ kernel void zc_r2_horner_oracle(
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
-                submitted: std::time::Instant::now(),
+                submitted: super::gpu_zc_r2_debug().then(std::time::Instant::now),
             })
         }
     }
@@ -14192,13 +14199,13 @@ kernel void zc_r2_horner_oracle(
             }
             if !job.calibration {
                 gpu.release(job.cb);
-                if super::gpu_zc_r2_debug() {
+                if let Some(submitted) = job.submitted {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
                          cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms horner={}",
                         job.chunks,
                         hi_size,
-                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                        submitted.elapsed().as_secs_f64() * 1e3,
                         job.horner,
                     );
                 }
