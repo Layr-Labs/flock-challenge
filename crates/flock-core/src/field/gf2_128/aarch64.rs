@@ -144,17 +144,15 @@ pub unsafe fn ghash_mul_karatsuba_barrett(a: F128, b: F128) -> F128 {
 pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     // SAFETY: function carries the aes target feature.
     unsafe {
-        let zero = vdupq_n_u64(0);
         let c87 = vdupq_n_u64(0x87);
 
         let t0 = pmull(a.lo, b.lo);
         let t1a = pmull(a.lo, b.hi);
         let t1b = pmull(a.hi, b.lo);
         let t2 = pmull(a.hi, b.hi);
-        let t1_cross = veorq_u64(t1a, t1b);
 
-        // First reduce: t1 = t1 + x^64 · t2 (mod p).
-        let s2 = veorq_u64(t1_cross, vextq_u64::<1>(zero, t2));
+        // Put t0.high in the middle low lane; its high lane stays unchanged.
+        let s2 = xor3_u64(t1a, t1b, vextq_u64::<1>(t0, t2));
         let t1: uint64x2_t;
         core::arch::asm!(
             "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
@@ -166,8 +164,8 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
             options(pure, nomem, nostack, preserves_flags),
         );
 
-        // Second reduce: t0 = t0 + x^64 · t1 (mod p).
-        let s1 = veorq_u64(t0, vextq_u64::<1>(zero, t1));
+        // The corrected low lane lets ZIP form the final base without zero.
+        let s1 = vzip1q_u64(t0, t1);
         let out: uint64x2_t;
         core::arch::asm!(
             "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
