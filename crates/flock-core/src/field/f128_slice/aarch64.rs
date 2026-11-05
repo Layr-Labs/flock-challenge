@@ -1119,7 +1119,7 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
             let f_even1 = vld1q_u64(f.as_ptr().add(source + 2).cast::<u64>());
             let f_odd1 = vld1q_u64(f.as_ptr().add(source + 3).cast::<u64>());
             let folded_f =
-                mul_const_vec2(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
             let f0 = veorq_u64(f_even0, folded_f[0]);
             let f1 = veorq_u64(f_even1, folded_f[1]);
 
@@ -1129,7 +1129,7 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
             let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
             let addend0 = vld1q_u64(basis_addend.as_ptr().add(t).cast::<u64>());
             let addend1 = vld1q_u64(basis_addend.as_ptr().add(t + 1).cast::<u64>());
-            let folded_b_with_addend = mul_two_const_sum_vec2(
+            let folded_b_with_addend = mul_two_const_sum_vec2_pmred(
                 r_q,
                 veorq_u64(b_even0, b_odd0),
                 veorq_u64(b_even1, b_odd1),
@@ -1623,6 +1623,117 @@ mod tests {
                     "lane=1 case={case}"
                 );
             }
+        }
+    }
+}
+
+// Reduce a 256-bit polynomial using carry-less multiplication by x^7+x^2+x+1.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn reduce_pmred(lo: uint64x2_t, hi: uint64x2_t) -> uint64x2_t {
+    unsafe {
+        let p0 = pmull(vgetq_lane_u64::<0>(hi), 0x87);
+        let p1 = pmull(vgetq_lane_u64::<1>(hi), 0x87);
+        let correction = pmull(vgetq_lane_u64::<1>(p1), 0x87);
+        let low = vgetq_lane_u64::<0>(lo) ^ vgetq_lane_u64::<0>(p0) ^ vgetq_lane_u64::<0>(correction);
+        let high = vgetq_lane_u64::<1>(lo) ^ vgetq_lane_u64::<1>(p0) ^ vgetq_lane_u64::<0>(p1) ^ vgetq_lane_u64::<1>(correction);
+        vcombine_u64(vcreate_u64(low), vcreate_u64(high))
+    }
+}
+
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn mul_const_vec2_pmred(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint64x2_t; 2] {
+    unsafe {
+        let r_lo = vgetq_lane_u64::<0>(r);
+        let r_hi = vgetq_lane_u64::<1>(r);
+        let r_mid = veorq_u64(r, vextq_u64::<1>(r, r));
+        let x0_mid = veorq_u64(x0, vextq_u64::<1>(x0, x0));
+        let x1_mid = veorq_u64(x1, vextq_u64::<1>(x1, x1));
+
+        let p0_ll = pmull(vgetq_lane_u64::<0>(x0), r_lo);
+        let p0_hh = pmull(vgetq_lane_u64::<1>(x0), r_hi);
+        let p0_mm = pmull(vgetq_lane_u64::<0>(x0_mid), vgetq_lane_u64::<0>(r_mid));
+        let p1_ll = pmull(vgetq_lane_u64::<0>(x1), r_lo);
+        let p1_hh = pmull(vgetq_lane_u64::<1>(x1), r_hi);
+        let p1_mm = pmull(vgetq_lane_u64::<0>(x1_mid), vgetq_lane_u64::<0>(r_mid));
+        let c0 = xor3_u64(p0_mm, p0_ll, p0_hh);
+        let c1 = xor3_u64(p1_mm, p1_ll, p1_hh);
+
+        let zero = vdupq_n_u64(0);
+        let lo0 = veorq_u64(p0_ll, vextq_u64::<1>(zero, c0));
+        let hi0 = veorq_u64(p0_hh, vextq_u64::<1>(c0, zero));
+        let lo1 = veorq_u64(p1_ll, vextq_u64::<1>(zero, c1));
+        let hi1 = veorq_u64(p1_hh, vextq_u64::<1>(c1, zero));
+        [reduce_pmred(lo0,hi0), reduce_pmred(lo1,hi1)]
+    }
+}
+
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn mul_two_const_sum_vec2_pmred(
+    c: uint64x2_t,
+    x0: uint64x2_t,
+    x1: uint64x2_t,
+    d: uint64x2_t,
+    y0: uint64x2_t,
+    y1: uint64x2_t,
+) -> [uint64x2_t; 2] {
+    unsafe {
+        let c_lo = vgetq_lane_u64::<0>(c);
+        let c_hi = vgetq_lane_u64::<1>(c);
+        let c_mid = c_lo ^ c_hi;
+        let d_lo = vgetq_lane_u64::<0>(d);
+        let d_hi = vgetq_lane_u64::<1>(d);
+        let d_mid = d_lo ^ d_hi;
+
+        let x0_lo = vgetq_lane_u64::<0>(x0);
+        let x0_hi = vgetq_lane_u64::<1>(x0);
+        let y0_lo = vgetq_lane_u64::<0>(y0);
+        let y0_hi = vgetq_lane_u64::<1>(y0);
+        let p0_ll = veorq_u64(pmull(x0_lo, c_lo), pmull(y0_lo, d_lo));
+        let p0_hh = veorq_u64(pmull(x0_hi, c_hi), pmull(y0_hi, d_hi));
+        let p0_mm = veorq_u64(pmull(x0_lo ^ x0_hi, c_mid), pmull(y0_lo ^ y0_hi, d_mid));
+
+        let x1_lo = vgetq_lane_u64::<0>(x1);
+        let x1_hi = vgetq_lane_u64::<1>(x1);
+        let y1_lo = vgetq_lane_u64::<0>(y1);
+        let y1_hi = vgetq_lane_u64::<1>(y1);
+        let p1_ll = veorq_u64(pmull(x1_lo, c_lo), pmull(y1_lo, d_lo));
+        let p1_hh = veorq_u64(pmull(x1_hi, c_hi), pmull(y1_hi, d_hi));
+        let p1_mm = veorq_u64(pmull(x1_lo ^ x1_hi, c_mid), pmull(y1_lo ^ y1_hi, d_mid));
+
+        let cross0 = xor3_u64(p0_mm, p0_ll, p0_hh);
+        let cross1 = xor3_u64(p1_mm, p1_ll, p1_hh);
+
+        let zero = vdupq_n_u64(0);
+        let lo0 = veorq_u64(p0_ll, vextq_u64::<1>(zero, cross0));
+        let hi0 = veorq_u64(p0_hh, vextq_u64::<1>(cross0, zero));
+        let lo1 = veorq_u64(p1_ll, vextq_u64::<1>(zero, cross1));
+        let hi1 = veorq_u64(p1_hh, vextq_u64::<1>(cross1, zero));
+        [reduce_pmred(lo0,hi0), reduce_pmred(lo1,hi1)]
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn pmred_matches_shift_reduction_for_wide_values() {
+    let mut x = 0x9e3779b97f4a7c15u64;
+    let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+    for i in 0..16388 {
+        let words = match i {
+            0 => [0, 0, 0, 0],
+            1 => [u64::MAX; 4],
+            2 => [0, 0, 0, 1 << 63],
+            3 => [u64::MAX, 0, u64::MAX, 0],
+            _ => [next(), next(), next(), next()],
+        };
+        unsafe {
+            let lo = vcombine_u64(vcreate_u64(words[0]), vcreate_u64(words[1]));
+            let hi = vcombine_u64(vcreate_u64(words[2]), vcreate_u64(words[3]));
+            let got: [u64; 2] = transmute(reduce_pmred(lo, hi));
+            let expected: [u64; 2] = transmute(reduce_wide(WideNeon { lo, hi }));
+            assert_eq!(got, expected, "wide reduction case {i}");
         }
     }
 }
