@@ -186,6 +186,56 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     }
 }
 
+///
+/// # Safety
+#[inline(always)]
+pub unsafe fn ghash_mul_add_q(acc: uint64x2_t, a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let c87 = vdupq_n_u64(0x87);
+        let a_p = vreinterpretq_p64_u64(a);
+        let b_sw = vextq_u64::<1>(b, b);
+
+        let t0 = transmute::<u128, uint64x2_t>(vmull_p64(
+            vgetq_lane_u64::<0>(a),
+            vgetq_lane_u64::<0>(b),
+        ));
+        let t1a = transmute::<u128, uint64x2_t>(vmull_p64(
+            vgetq_lane_u64::<0>(a),
+            vgetq_lane_u64::<0>(b_sw),
+        ));
+        let t1b = transmute::<u128, uint64x2_t>(vmull_high_p64(a_p, vreinterpretq_p64_u64(b_sw)));
+        let t2 = transmute::<u128, uint64x2_t>(vmull_high_p64(a_p, vreinterpretq_p64_u64(b)));
+        let t1_cross = veorq_u64(t1a, t1b);
+
+        // First reduce: t1 = t1 + x^64 · t2 (mod p).
+        let s2 = veorq_u64(t1_cross, vextq_u64::<1>(zero, t2));
+        let t1: uint64x2_t;
+        core::arch::asm!(
+            "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+            m = in(vreg) t2,
+            c = in(vreg) c87,
+            s = in(vreg) s2,
+            o = out(vreg) t1,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+
+        let s1 = xor3_u64(t0, acc, vextq_u64::<1>(zero, t1));
+        let out: uint64x2_t;
+        core::arch::asm!(
+            "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+            m = in(vreg) t1,
+            c = in(vreg) c87,
+            s = in(vreg) s1,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        out
+    }
+}
+
 /// Batch multiply 2× F128 in parallel via Karatsuba 6-PMULL.
 ///
 /// Strategy: 6 Karatsuba PMULLs (3 per product: ll, hh, and (a_lo^a_hi)·(b_lo^b_hi)),

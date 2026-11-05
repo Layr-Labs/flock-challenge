@@ -478,6 +478,30 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn mul_add_q_matches_scalar() {
+        use core::arch::aarch64::*;
+        let mut rng = Rng::new(10);
+        for _ in 0..128 {
+            let acc = rng.next_f128();
+            let a = rng.next_f128();
+            let b = rng.next_f128();
+            let out = unsafe {
+                let q = aarch64::ghash_mul_add_q(
+                    vld1q_u64((&raw const acc).cast::<u64>()),
+                    vld1q_u64((&raw const a).cast::<u64>()),
+                    vld1q_u64((&raw const b).cast::<u64>()),
+                );
+                F128 {
+                    lo: vgetq_lane_u64::<0>(q),
+                    hi: vgetq_lane_u64::<1>(q),
+                }
+            };
+            assert_eq!(out, acc + software::ghash_mul(a, b));
+        }
+    }
+
     #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
     #[test]
     fn all_x86_variants_agree() {
