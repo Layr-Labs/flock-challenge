@@ -590,7 +590,7 @@ impl Challenger for FsChallenger {
             }
         };
         let nonce = if kind == HashKind::Blake3
-            && bits >= GPU_GRIND_MIN_BITS
+            && bits >= gpu_grind_floor_bits()
             && !GPU_GRIND_FAILED.load(std::sync::atomic::Ordering::Relaxed)
         {
             match GPU_GRIND_LATCH.get().copied() {
@@ -648,7 +648,16 @@ impl Challenger for FsChallenger {
                         // unchanged — only the estimator over the repeats moves.
                         let cpu_est = cpu_1_time.min(cpu_2_time);
                         let gpu_est = gpu_1_time.min(gpu_2_time);
-                        let projected_gpu = gpu_est.mul_f64(GPU_GRIND_BLOCK_OVERDRAW);
+                        // A wide dispatch spans four expected-work blocks and
+                        // early-exits past its first hit, so an unbounded grind
+                        // costs ~0.93 of a calibration-sized block instead of
+                        // 1.582 blocks; price it at one block.
+                        let overdraw = if grind_wide_enabled() {
+                            1.0
+                        } else {
+                            GPU_GRIND_BLOCK_OVERDRAW
+                        };
+                        let projected_gpu = gpu_est.mul_f64(overdraw);
                         // Keep the gain on the two-sample scale the
                         // GPU_GRIND_MIN_TWO_SAMPLE_GAIN constant was set for: the
                         // two-pass total is estimated as twice the best pass, so
@@ -741,6 +750,13 @@ const GPU_GRIND_CALIBRATION_LENGTHS: [u32; 7] = [
     1 << 14,
 ];
 const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
+/// Wide grind policy (`FLOCK_NO_GRIND_WIDE=1` restores the incumbent
+/// 14-bit floor with one-expected-work hybrid blocks). A GPU round trip
+/// carries a fixed submit cost that the two-pool CPU scan does not, so
+/// only the 17..19-bit L0 grinds go to Metal, each as one
+/// four-expected-work dispatch.
+const GPU_GRIND_WIDE_MIN_BITS: u32 = 17;
+const GPU_GRIND_WIDE_EXTRA_BITS: u32 = 2;
 // Two-sample engagement margin for the Metal grind arm. The min-of-two
 // estimator already prices one-sided calibration contention (a draw can only
 // be slowed by contention, never sped up), so a 1.5 ms protected margin
@@ -1007,14 +1023,34 @@ fn run_cpu_window_after_persistent_gpu(
 
 fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, String> {
     debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
-    let block_len = 1u32 << bits.min(24);
-    let hybrid = grind_hybrid_enabled() && rayon::current_num_threads() > 1;
+    // Wide policy: one dispatch covers 2^GPU_GRIND_WIDE_EXTRA_BITS expected-
+    // work blocks, so it misses with probability e^-4 (1.8%) instead of e^-1
+    // (37%). The kernel's early exit (`id >= best`) retires the lanes past
+    // the first hit, so the extra width costs little; with misses this rare
+    // the CPU next-block prefetch only adds its abort latency, so the wide
+    // walk is the plain ascending GPU block loop. Same smallest-nonce rule.
+    let wide = grind_wide_enabled();
+    let block_len = if wide {
+        1u32 << (bits + GPU_GRIND_WIDE_EXTRA_BITS).min(24)
+    } else {
+        1u32 << bits.min(24)
+    };
+    let hybrid = !wide && grind_hybrid_enabled() && rayon::current_num_threads() > 1;
     let mut start = 0u64;
     loop {
         if !hybrid {
-            if let Some(nonce) =
-                crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, block_len, bits)?
-            {
+            let t_iter = grind_trace_enabled().then(std::time::Instant::now);
+            let found =
+                crate::gpu_commit::gpu_blake3_pow_scan(state_digest, start, block_len, bits)?;
+            if let Some(t) = t_iter {
+                eprintln!(
+                    "[grind] bits={bits} block=2^{} gpu_hit={} serial iter_wall={:.3} ms",
+                    block_len.trailing_zeros(),
+                    found.is_some(),
+                    t.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            if let Some(nonce) = found {
                 return Ok(nonce);
             }
             start = start
@@ -1161,6 +1197,24 @@ fn grind_relay_enabled() -> bool {
         GRIND_RELAY_DEFAULT
             && std::env::var(ENV_NO_GRIND_RELAY).map(|v| v != "1").unwrap_or(true)
     })
+}
+
+/// `FLOCK_NO_GRIND_WIDE=1` restores the incumbent GPU grind shape: every
+/// grind of at least `GPU_GRIND_MIN_BITS` on Metal, one expected-work block
+/// per dispatch plus the CPU next-block prefetch. Nonces are identical
+/// either way (ascending blocks, smallest match per block).
+fn grind_wide_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_WIDE").is_none())
+}
+
+/// Smallest grind (in bits) that the Metal arm takes.
+fn gpu_grind_floor_bits() -> u32 {
+    if grind_wide_enabled() {
+        GPU_GRIND_WIDE_MIN_BITS
+    } else {
+        GPU_GRIND_MIN_BITS
+    }
 }
 
 /// `FLOCK_NO_GRIND_HYBRID` kills the CPU-prefetch arm of the GPU grind,
@@ -1417,6 +1471,16 @@ mod tests {
         assert_eq!(GPU_GRIND_CALIBRATION_BITS, 19);
         let exact_geometric = 1.0 / (1.0 - (-1.0f64).exp());
         assert!((GPU_GRIND_BLOCK_OVERDRAW - exact_geometric).abs() < 1e-12);
+    }
+
+    /// The wide policy must keep the warm proof's 19-bit calibration grind
+    /// on the latch path, and its widened ranked blocks (17..19 bits) must
+    /// stay below the 2^24 single-dispatch cap.
+    #[test]
+    fn gpu_grind_wide_policy_keeps_calibration_reachable() {
+        assert!(GPU_GRIND_WIDE_MIN_BITS >= GPU_GRIND_MIN_BITS);
+        assert!(GPU_GRIND_WIDE_MIN_BITS <= GPU_GRIND_CALIBRATION_BITS);
+        assert!(GPU_GRIND_CALIBRATION_BITS + GPU_GRIND_WIDE_EXTRA_BITS <= 24);
     }
 
     /// A completed persistent-worker hit owns the earlier nonce block, so an
