@@ -11687,7 +11687,14 @@ kernel void lc_fold_stripes_factored_b4(
                         stripes_per_chunk: stripe_hi
                             .div_ceil(ZC_FOLD_CHUNKS)
                             .next_multiple_of(block),
-                        i_groups: k / ZC_FOLD_COLS_PER_TG,
+                        // Dispatch only column groups holding a useful
+                        // column. Identical to `k / 1024` for every full
+                        // stripe (useful > k - 1024); a root-compacted stripe
+                        // (`lincheck::RootStripe`, 11_313 of 16_384) skips 4
+                        // dead groups. Partial/output columns past the last
+                        // dispatched group are then never written; the only
+                        // such caller's `expand` reads columns < n_roots only.
+                        i_groups: useful.div_ceil(ZC_FOLD_COLS_PER_TG).max(1),
                     };
                     Ok((zc_fold_submit(gpu, state, &plan)?, plan))
                 })();
