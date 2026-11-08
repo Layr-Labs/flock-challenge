@@ -1931,11 +1931,34 @@ pub(crate) fn max_twiddle_bits(log_d: usize, layer: usize) -> u32 {
 }
 
 /// Correctness gate for the mixed final-pass kernel's 40/20-bit hard bounds.
+/// `ntt_final_t3` also relies on it for its narrow byte-table entries:
+/// layer `l + 2` < 2^41 keeps sub-layer 2's products below 2^56 (64-bit
+/// entries), and it implies layer `l + 1` < 2^82 (sub-layer 1's 96-bit
+/// entries), see `final_t3_narrow_tables_follow_from_the_gate`.
 pub(crate) fn pass5_mixed_ok(log_d: usize, l: usize, f: usize) -> bool {
     f == 4
         && l + 4 == log_d
         && max_twiddle_bits(log_d, l + 2) <= 40
         && max_twiddle_bits(log_d, l + 3) <= 20
+}
+
+#[cfg(test)]
+mod final_t3_narrow_table_tests {
+    #[test]
+    fn final_t3_narrow_tables_follow_from_the_gate() {
+        let mut gated = 0;
+        for log_d in 4..40usize {
+            let l = log_d - 4;
+            if !super::pass5_mixed_ok(log_d, l, 4) {
+                continue;
+            }
+            gated += 1;
+            // (b * x^8) * tw has degree < 15 + bits(tw).
+            assert!(15 + super::max_twiddle_bits(log_d, l + 2) <= 64);
+            assert!(15 + super::max_twiddle_bits(log_d, l + 1) <= 96);
+        }
+        assert!(gated > 0 && super::pass5_mixed_ok(20, 16, 4));
+    }
 }
 
 /// Pure selector shared by both full and hybrid-prefix dispatch sites.
@@ -3935,6 +3958,143 @@ static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,
     rb = b;
 }
 
+
+// Sub-layer 2 (layer log_d - 2, twiddles < 2^41 by pass5_mixed_ok): the
+// same two byte tables, stored as 64-bit entries. Every product b*tw and
+// (b*x^8)*tw has degree < 56, so no reduction applies and the entry's upper
+// two words are zero; the Horner step XORs the lookup into acc.xy only.
+// Same exact field product, half the table bytes per lookup and per build.
+static inline ulong u2l(uint4 v) { return ulong(v.x) | (ulong(v.y) << 32); }
+static inline uint2 l2u(ulong v) { return uint2(uint(v), uint(v >> 32)); }
+
+static inline void gf_mul_short2_x2(uint4 va, uint4 vb,
+                                    threadgroup const uint2* tab,
+                                    thread uint4& ra, thread uint4& rb)
+{
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        a.xy ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
+        b.xy ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
+    }
+    ra = a;
+    rb = b;
+}
+
+static inline void gf_build_short2_one(
+    threadgroup uint2* tab2, ulong g, uint t, uint aa, uint cc)
+{
+    if (t != 0u) { g <<= 8; }
+    const ulong e0 = g, e1 = g << 1, e2 = g << 2, e3 = g << 3;
+    const ulong f0 = g << 4, f1 = g << 5, f2 = g << 6, f3 = g << 7;
+    ulong A = 0;
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const ulong L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    ulong C = 0;
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const ulong H0 = C, H1 = C ^ f0;
+    threadgroup uint2* dst = &tab2[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);
+    const uint o1 = o0 + 16u;
+    dst[o0 + 0u] = l2u(L0 ^ H0);
+    dst[o0 + 1u] = l2u(L1 ^ H0);
+    dst[o0 + 2u] = l2u(L2 ^ H0);
+    dst[o0 + 3u] = l2u(L3 ^ H0);
+    dst[o1 + 0u] = l2u(L0 ^ H1);
+    dst[o1 + 1u] = l2u(L1 ^ H1);
+    dst[o1 + 2u] = l2u(L2 ^ H1);
+    dst[o1 + 3u] = l2u(L3 ^ H1);
+}
+
+// Build the 64-bit tables of two consecutive twiddles at once (tab2[0..512)
+// and tab2[512..1024)), so sub-layer 2's four tables cost two barrier pairs.
+static inline void gf_build_short2_pair(
+    threadgroup uint2* tab2, device const uint4* twiddles, uint idx, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;
+    const uint cc = u >> 2;
+    gf_build_short2_one(tab2, u2l(twiddles[idx]), t, aa, cc);
+    gf_build_short2_one(tab2 + 512u, u2l(twiddles[idx + 1u]), t, aa, cc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+
+// Sub-layer 1 (layer log_d - 3, twiddles < 2^74 whenever pass5_mixed_ok
+// holds): byte-table entries have degree < 96, so their top word is zero.
+// Store bits 0..63 in a uint2 array and bits 64..95 in a uint array (12 B
+// per entry instead of 16); exact same products.
+static inline void gf_mul_mid3_x2(uint4 va, uint4 vb,
+                                  threadgroup const uint2* t2,
+                                  threadgroup const uint* t1,
+                                  thread uint4& ra, thread uint4& rb)
+{
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        const uint la = ha & 255u, ua = 256u + (ha >> 8);
+        const uint lb = hb & 255u, ub = 256u + (hb >> 8);
+        a.xy ^= t2[la] ^ t2[ua];
+        a.z  ^= t1[la] ^ t1[ua];
+        b.xy ^= t2[lb] ^ t2[ub];
+        b.z  ^= t1[lb] ^ t1[ub];
+    }
+    ra = a;
+    rb = b;
+}
+
+static inline void gf_build_mid3(
+    threadgroup uint2* t2, threadgroup uint* t1, device const uint4* twiddles, uint idx, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;
+    const uint cc = u >> 2;
+    uint4 g = twiddles[idx];
+    if (t != 0u) {
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+    }
+    uint4 e0 = g;
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    const uint base = t << 8;
+    const uint o0 = base + (cc << 5) + (aa << 2);
+    const uint o1 = o0 + 16u;
+    uint4 v;
+    v = L0 ^ H0; t2[o0 + 0u] = v.xy; t1[o0 + 0u] = v.z;
+    v = L1 ^ H0; t2[o0 + 1u] = v.xy; t1[o0 + 1u] = v.z;
+    v = L2 ^ H0; t2[o0 + 2u] = v.xy; t1[o0 + 2u] = v.z;
+    v = L3 ^ H0; t2[o0 + 3u] = v.xy; t1[o0 + 3u] = v.z;
+    v = L0 ^ H1; t2[o1 + 0u] = v.xy; t1[o1 + 0u] = v.z;
+    v = L1 ^ H1; t2[o1 + 1u] = v.xy; t1[o1 + 1u] = v.z;
+    v = L2 ^ H1; t2[o1 + 2u] = v.xy; t1[o1 + 2u] = v.z;
+    v = L3 ^ H1; t2[o1 + 3u] = v.xy; t1[o1 + 3u] = v.z;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 // gf_build_byte16 of the main library, unchanged: rebuild the live
 // twiddle's two byte tables (tab[b] = b*tw, tab[256 + b] = (b*x^8)*tw)
 // between a leading barrier (retires the previous table's readers) and a
@@ -4010,12 +4170,94 @@ static inline void gf_build_byte16(
         }                                                                      \
     }
 
+#define NTT_T3_MID(J, C)                                                  \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint c    = (C);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        gf_build_mid3(tab2, tab1, twiddles,                                   \
+                        (1u << (P.l + j)) - 1u + (B << j) + c, lid);           \
+        for (uint bb = 0; bb < BPER; bb += 2u) {                               \
+            const uint b0  = c * BPER + bb;                                    \
+            const uint b1  = b0 + 1u;                                          \
+            const uint eu0 = ((b0 >> bpos) << (bpos + 1u))                     \
+                           | (b0 & ((1u << bpos) - 1u));                       \
+            const uint eu1 = ((b1 >> bpos) << (bpos + 1u))                     \
+                           | (b1 & ((1u << bpos) - 1u));                       \
+            const uint ev0 = eu0 | (1u << bpos);                               \
+            const uint ev1 = eu1 | (1u << bpos);                               \
+            uint4 p0;                                                          \
+            uint4 p1;                                                          \
+            gf_mul_mid3_x2(elems[ev0], elems[ev1], tab2, tab1, p0, p1);       \
+            const uint4 n0 = elems[eu0] ^ p0;                                  \
+            const uint4 n1 = elems[eu1] ^ p1;                                  \
+            elems[eu0] = n0;                                                   \
+            elems[ev0] ^= n0;                                                  \
+            elems[eu1] = n1;                                                   \
+            elems[ev1] ^= n1;                                                  \
+        }                                                                      \
+    }
+
+#define NTT_T3_SHORT_PAIR(J, C0)                                               \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        gf_build_short2_pair(tab2, twiddles,                                   \
+                        (1u << (P.l + j)) - 1u + (B << j) + (C0), lid);        \
+        {   constexpr uint c = (C0); threadgroup const uint2* tabc = tab2;      \
+        for (uint bb = 0; bb < BPER; bb += 2u) {                               \
+            const uint b0  = c * BPER + bb;                                    \
+            const uint b1  = b0 + 1u;                                          \
+            const uint eu0 = ((b0 >> bpos) << (bpos + 1u))                     \
+                           | (b0 & ((1u << bpos) - 1u));                       \
+            const uint eu1 = ((b1 >> bpos) << (bpos + 1u))                     \
+                           | (b1 & ((1u << bpos) - 1u));                       \
+            const uint ev0 = eu0 | (1u << bpos);                               \
+            const uint ev1 = eu1 | (1u << bpos);                               \
+            uint4 p0;                                                          \
+            uint4 p1;                                                          \
+            gf_mul_short2_x2(elems[ev0], elems[ev1], tabc, p0, p1);        \
+            const uint4 n0 = elems[eu0] ^ p0;                                  \
+            const uint4 n1 = elems[eu1] ^ p1;                                  \
+            elems[eu0] = n0;                                                   \
+            elems[ev0] ^= n0;                                                  \
+            elems[eu1] = n1;                                                   \
+            elems[ev1] ^= n1;                                                  \
+        }                                                                      \
+        }                                                                      \
+        {   constexpr uint c = (C0) + 1u; threadgroup const uint2* tabc = tab2 + 512u; \
+        for (uint bb = 0; bb < BPER; bb += 2u) {                               \
+            const uint b0  = c * BPER + bb;                                    \
+            const uint b1  = b0 + 1u;                                          \
+            const uint eu0 = ((b0 >> bpos) << (bpos + 1u))                     \
+                           | (b0 & ((1u << bpos) - 1u));                       \
+            const uint eu1 = ((b1 >> bpos) << (bpos + 1u))                     \
+                           | (b1 & ((1u << bpos) - 1u));                       \
+            const uint ev0 = eu0 | (1u << bpos);                               \
+            const uint ev1 = eu1 | (1u << bpos);                               \
+            uint4 p0;                                                          \
+            uint4 p1;                                                          \
+            gf_mul_short2_x2(elems[ev0], elems[ev1], tabc, p0, p1);        \
+            const uint4 n0 = elems[eu0] ^ p0;                                  \
+            const uint4 n1 = elems[eu1] ^ p1;                                  \
+            elems[eu0] = n0;                                                   \
+            elems[ev0] ^= n0;                                                  \
+            elems[eu1] = n1;                                                   \
+            elems[ev1] ^= n1;                                                  \
+        }                                                                      \
+        }                                                                      \
+    }
+
 // Ranked final pass (l = log_d - 4, s = 0, one tile per 64-thread group).
-// Sub-layers 0..2 multiply through byte tables rebuilt per twiddle (7
-// rebuilds); sub-layer 3 Horners over its short (< 2^20) twiddle exactly as
-// ntt_pass5_mixed does. Same butterflies, same order, exact field products:
-// bit-identical to ntt_pass5_mixed. Dispatch is restricted by
-// pass5_mixed_ok().
+// Sub-layers 0..2 multiply through byte tables rebuilt per twiddle: 128-bit
+// entries for sub-layer 0, 96-bit split entries for sub-layer 1 and 64-bit
+// entries built two twiddles at a time for sub-layer 2 (the narrower
+// entries are exact because those twiddles are short); sub-layer 3 Horners
+// over its short (< 2^20) twiddle exactly as ntt_pass5_mixed does. Same
+// butterflies, same order, exact field products: bit-identical to
+// ntt_pass5_mixed. Dispatch is restricted by pass5_mixed_ok().
 kernel void ntt_final_t3(device uint4* data                [[buffer(0)]],
                          device const uint4* twiddles      [[buffer(1)]],
                          constant NttParams& P             [[buffer(2)]],
@@ -4026,11 +4268,15 @@ kernel void ntt_final_t3(device uint4* data                [[buffer(0)]],
     constexpr uint NNIB = 5u;      // sub-layer 3: twiddle < 2^20
     threadgroup uint4 tabB[512u];  // the live twiddle's two byte tables
     threadgroup uint  nibB[8u * NNIB];
+    // Narrow-entry views of tabB: sub-layer 1 uses tab2[0..512) (bits 0..63)
+    // plus tab1[0..512) (bits 64..95); sub-layer 2 uses tab2[0..1024) for
+    // two twiddles' 64-bit tables.
+    threadgroup uint2* tab2 = (threadgroup uint2*)tabB;
+    threadgroup uint* tab1 = (threadgroup uint*)(tabB + 256u);
 
     const uint lane = lid & 63u;
-    const uint B = tgid >> P.s;
-    const uint r = tgid & ((1u << P.s) - 1u);
-    const uint pos_base = (B << (P.log_d - P.l)) + r;
+    const uint B = tgid;
+    const uint pos_base = tgid << 4;
 
     if (lid < 8u * NNIB) {
         uint cB = lid / NNIB, qB = lid % NNIB;
@@ -4044,12 +4290,10 @@ kernel void ntt_final_t3(device uint4* data                [[buffer(0)]],
         elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];
     }
     NTT_T3_SUBLAYER(0u, 0u)
-    NTT_T3_SUBLAYER(1u, 0u)
-    NTT_T3_SUBLAYER(1u, 1u)
-    NTT_T3_SUBLAYER(2u, 0u)
-    NTT_T3_SUBLAYER(2u, 1u)
-    NTT_T3_SUBLAYER(2u, 2u)
-    NTT_T3_SUBLAYER(2u, 3u)
+    NTT_T3_MID(1u, 0u)
+    NTT_T3_MID(1u, 1u)
+    NTT_T3_SHORT_PAIR(2u, 0u)
+    NTT_T3_SHORT_PAIR(2u, 2u)
     {
         constexpr uint j = 3u;
         constexpr uint bpos = F - 1u - j;
@@ -4118,7 +4362,7 @@ static inline bool pow_has_leading_zero_bits(uint cv0, uint bits) {
     return (cv0 & mask) == 0u;
 }
 
-static inline uint pow_compress0(thread const uint* state, uint nonce_lo, uint nonce_hi) {
+static inline uint pow_compress0(constant uint* state, uint nonce_lo, uint nonce_hi) {
     uint v[16];
     uint m[16];
     uint mm[16];
@@ -7619,6 +7863,18 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// The fine split is OPT-IN: `FLOCK_HYBRID_FINE=1` restores it,
+    /// `FLOCK_NO_HYBRID_FINE` still forces it off. Without it the tuner keeps
+    /// the coarse split it chose. The split never changes proof bytes. Read
+    /// once, at tune time.
+    fn hybrid_fine_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_HYBRID_FINE").is_some()
+                && std::env::var_os("FLOCK_NO_HYBRID_FINE").is_none()
+        })
+    }
+
     /// The `(cb2, cpu, cb3)` of split `k`'s cheapest fine sample.
     fn fine_triple(samples: &[(usize, f64, f64, f64)], k: usize) -> Option<(f64, f64, f64)> {
         samples
@@ -7633,11 +7889,10 @@ kernel void blake3_pow_scan(
     /// splits `k'` (GPU prefix the slower arm) and `k' + 1`, and take the `m`
     /// minimising `max(cb2, cpu) + cb3`. Keeps `k` unless the prediction beats
     /// `k`'s own measured window by [`FINE_MARGIN`]. The verify that follows
-    /// byte-checks whatever this returns. `FLOCK_NO_HYBRID_FINE=1` disables.
+    /// byte-checks whatever this returns. Only consulted when
+    /// [`hybrid_fine_enabled`] (opt-in).
     fn fine_split_from_arms(samples: &[(usize, f64, f64, f64)], k: usize) -> usize {
-        if k == 0 || k >= 16 || std::env::var_os("FLOCK_NO_HYBRID_FINE").is_some()
-            || !hybrid_gpu_suffix_hash_enabled()
-        {
+        if k == 0 || k >= 16 || !hybrid_gpu_suffix_hash_enabled() {
             return k;
         }
         let Some((gk, ck, hk)) = fine_triple(samples, k) else { return k };
@@ -8309,7 +8564,11 @@ kernel void blake3_pow_scan(
             None => swept,
         };
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
-        let chosen = fine_split_from_arms(&fine_samples, chosen);
+        let chosen = if hybrid_fine_enabled() {
+            fine_split_from_arms(&fine_samples, chosen)
+        } else {
+            chosen
+        };
         if dbg {
             let rows: Vec<String> = fine_samples
                 .iter()
@@ -11687,7 +11946,14 @@ kernel void lc_fold_stripes_factored_b4(
                         stripes_per_chunk: stripe_hi
                             .div_ceil(ZC_FOLD_CHUNKS)
                             .next_multiple_of(block),
-                        i_groups: k / ZC_FOLD_COLS_PER_TG,
+                        // Dispatch only column groups holding a useful
+                        // column. Identical to `k / 1024` for every full
+                        // stripe (useful > k - 1024); a root-compacted stripe
+                        // (`lincheck::RootStripe`, 11_313 of 16_384) skips 4
+                        // dead groups. Partial/output columns past the last
+                        // dispatched group are then never written; the only
+                        // such caller's `expand` reads columns < n_roots only.
+                        i_groups: useful.div_ceil(ZC_FOLD_COLS_PER_TG).max(1),
                     };
                     Ok((zc_fold_submit(gpu, state, &plan)?, plan))
                 })();
@@ -13178,8 +13444,12 @@ static inline void zc_r2_write_partials(
         if (lid < s) { red[lid] ^= red[lid + s]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    ulong4 chunk1e = red[0];
-    ulong4 chunk1o = red[1];
+    ulong4 chunk1e;
+    ulong4 chunk1o;
+    if (lid == 0u) {
+        chunk1e = red[0];
+        chunk1o = red[1];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     red[lid] = acci;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -13289,8 +13559,10 @@ kernel void zc_r2_products_horner(
         if (handoff && step == 2u) {
             // The lower 4 KiB remains the live nibble table.
             threadgroup uint4* handoff_slots = nib + 256u;
-            uint4 v1 = zc_r2_horner_reduce(h1);
-            uint4 vi = zc_r2_horner_reduce(hi);
+            U256k p1 = {h1.r0, h1.r1, h1.r2, h1.r3};
+            U256k pi = {hi.r0, hi.r1, hi.r2, hi.r3};
+            uint4 v1 = gf_reduce(p1);
+            uint4 vi = gf_reduce(pi);
             handoff_slots[rid] = v1;
             threadgroup_barrier(mem_flags::mem_threadgroup);
             v1 = handoff_slots[lid];
@@ -13685,7 +13957,7 @@ kernel void zc_r2_horner_oracle(
         lo_size: usize,
         mask: u32,
         useful: u32,
-        submitted: std::time::Instant,
+        submitted: Option<std::time::Instant>,
     }
 
     // SAFETY: the command buffer handle is only waited/released from the
@@ -14119,7 +14391,7 @@ kernel void zc_r2_horner_oracle(
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
-                submitted: std::time::Instant::now(),
+                submitted: super::gpu_zc_r2_debug().then(std::time::Instant::now),
             })
         }
     }
@@ -14192,13 +14464,13 @@ kernel void zc_r2_horner_oracle(
             }
             if !job.calibration {
                 gpu.release(job.cb);
-                if super::gpu_zc_r2_debug() {
+                if let Some(submitted) = job.submitted {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
                          cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms horner={}",
                         job.chunks,
                         hi_size,
-                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                        submitted.elapsed().as_secs_f64() * 1e3,
                         job.horner,
                     );
                 }
