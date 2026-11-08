@@ -213,6 +213,16 @@ fn use_ranked_deep_pair_fusion(
         && n_top == 10
 }
 
+/// Fused-pair deep tail for every non-ranked-L0 deep subtree (recursive
+/// commits L1..L5 and CPU fallbacks); `FLOCK_NO_DEEP_SUBTREE_PAIRS=1` restores
+/// the single-layer sweep. Same butterflies and twiddles either way.
+#[inline]
+fn deep_subtree_pairs_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DEEP_SUBTREE_PAIRS").is_none());
+    *ON
+}
+
 /// The standard dimension-20 basis has low-limb-only twiddles throughout the
 /// final two layers. This permits a two-PMULL product on AArch64 instead of the
 /// generic six-PMULL field multiply. Keep the dispatch tied to the exact
@@ -1747,6 +1757,17 @@ impl AdditiveNttF128 {
         log_d: usize,
         sub_idx: usize,
     ) {
+        if deep_subtree_pairs_enabled() {
+            self.forward_transform_interleaved_deep_subtree_pairs(
+                sub_data,
+                num_ntts,
+                start_layer,
+                n_top,
+                log_d,
+                sub_idx,
+            );
+            return;
+        }
         for layer in n_top.max(start_layer)..log_d {
             let layer_in_sub = layer - n_top;
             let num_blocks_in_sub = 1usize << layer_in_sub;
@@ -1762,6 +1783,75 @@ impl AdditiveNttF128 {
                 butterfly_interleaved_block(block, twiddle, block_size_half, num_ntts);
             }
         }
+    }
+
+    /// Fused-pair form of [`Self::forward_transform_interleaved_deep_subtree`]
+    /// (ported from the x86 record's deep tail): the same butterflies, same
+    /// twiddles, same per-row order, but two layers per sweep over the
+    /// cache-resident sub-transform, so each row is loaded/stored once per two
+    /// layers. With an odd layer count the FIRST layer runs alone, which leaves
+    /// the final pair on the standard basis's low-limb twiddles; any pair
+    /// whose three twiddles have a zero high limb takes the 2-PMULL kernel
+    /// (an exact specialization of the general multiply). Recursive L1
+    /// (13 deep layers) goes from 13 sweeps to 7, L2 (10) from 10 to 5.
+    #[inline(always)]
+    fn forward_transform_interleaved_deep_subtree_pairs(
+        &self,
+        sub_data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        n_top: usize,
+        log_d: usize,
+        sub_idx: usize,
+    ) {
+        let mut layer = n_top.max(start_layer);
+        if layer < log_d && (log_d - layer) % 2 == 1 {
+            let layer_in_sub = layer - n_top;
+            let num_blocks_in_sub = 1usize << layer_in_sub;
+            let block_size = 1usize << (log_d - layer);
+            let block_bytes = block_size * num_ntts;
+            for block_in_sub in 0..num_blocks_in_sub {
+                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                let twiddle = self.twiddle(layer, global_block);
+                let block_start = block_in_sub * block_bytes;
+                butterfly_interleaved_block(
+                    &mut sub_data[block_start..block_start + block_bytes],
+                    twiddle,
+                    block_size >> 1,
+                    num_ntts,
+                );
+            }
+            layer += 1;
+        }
+        while layer + 1 < log_d {
+            let layer_in_sub = layer - n_top;
+            let num_blocks_in_sub = 1usize << layer_in_sub;
+            let block_size = 1usize << (log_d - layer);
+            let quarter = block_size >> 2;
+            let block_bytes = block_size * num_ntts;
+            for block_in_sub in 0..num_blocks_in_sub {
+                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                let t_outer = self.twiddle(layer, global_block);
+                let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
+                let t_inner_b = self.twiddle(layer + 1, 2 * global_block + 1);
+                let block_start = block_in_sub * block_bytes;
+                let block = &mut sub_data[block_start..block_start + block_bytes];
+                if t_outer.hi == 0
+                    && t_inner_a.hi == 0
+                    && t_inner_b.hi == 0
+                {
+                    butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
+                        block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                    );
+                } else {
+                    butterfly_interleaved_fused_2layer_rows_seq(
+                        block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts, 0,
+                    );
+                }
+            }
+            layer += 2;
+        }
+        debug_assert_eq!(layer, log_d.max(n_top.max(start_layer)));
     }
 
     /// Finish layers `n_top..log_d` two at a time inside independent
@@ -2514,6 +2604,12 @@ fn butterfly_interleaved_fused_3layer_range_par_rows(
     // Other zero twiddles from custom bases use the exact general kernel.
     let zero_root_block = if abs_first == 0 { 0 } else { usize::MAX };
     let n_jobs = num_blocks * eighth;
+    // Only a nonempty range with at least two rows can select an odd row.
+    let odd_lanes = if n_jobs != 0 && eighth > 1 {
+        num_ntts - odd_tail
+    } else {
+        num_ntts
+    };
     // Empty ranges do not read or initialize the process row policy.
     let use_neon = n_jobs != 0 && kernels::vector_resident_rows();
     let base = data.as_mut_ptr() as usize;
@@ -2521,7 +2617,7 @@ fn butterfly_interleaved_fused_3layer_range_par_rows(
         let block = job >> block_shift;
         let r = job & row_mask;
         let lanes = if r & 1 == 1 {
-            num_ntts - odd_tail
+            odd_lanes
         } else {
             num_ntts
         };
@@ -3234,6 +3330,52 @@ mod tests {
                 start_layer,
             );
             assert_eq!(got, want, "log_d={log_d} rate_log={start_layer}");
+        }
+    }
+
+    /// The fused-pair deep subtree (odd-layer lead + low-twiddle pairs) at the
+    /// exact recursive L1 (log_d 18) and L2 (log_d 16) geometries, with and
+    /// without the P+E helper queue, against the scalar interleaved oracle.
+    #[test]
+    fn recursive_deep_subtree_pairs_match_scalar_oracle() {
+        const NUM_NTTS: usize = 8;
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("deep-pairs-helper-test-{i}"))
+            .build()
+            .unwrap();
+        let mut rng = Rng::new(0xDEE9_9A12_5EED_0001);
+        for (log_d, start_layer) in [(18usize, 2usize), (16, 3), (13, 2), (12, 3)] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let msg_len = (1usize << (log_d - start_layer)) * NUM_NTTS;
+            let msg = rand_vec(&mut rng, msg_len);
+            let mut want = vec![F128::ZERO; msg_len << start_layer];
+            for replica in want.chunks_mut(msg_len) {
+                replica.copy_from_slice(&msg);
+            }
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut want, NUM_NTTS, start_layer);
+            // The P+E helper route is gated (and debug-asserted) to the two
+            // production shapes; the smaller shapes take the Rayon route.
+            let exact_shape = matches!((log_d, start_layer), (18, 2) | (16, 3));
+            let helpers: &[Option<&rayon::ThreadPool>] =
+                if exact_shape { &[None, Some(&helper)] } else { &[None] };
+            for &helper in helpers {
+                let poison = F128::new(0xA5A5_A5A5_A5A5_A5A5, 0x5A5A_5A5A_5A5A_5A5A);
+                let mut got = vec![poison; msg_len << start_layer];
+                ntt.forward_transform_interleaved_from_message_fused3_with_helper(
+                    &msg,
+                    &mut got,
+                    NUM_NTTS,
+                    start_layer,
+                    log_d,
+                    helper,
+                );
+                assert!(
+                    got == want,
+                    "log_d={log_d} start={start_layer} helper={}",
+                    helper.is_some()
+                );
+            }
         }
     }
 

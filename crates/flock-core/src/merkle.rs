@@ -1249,7 +1249,7 @@ mod tests {
     /// equal the per-leaf chunk chaining value and upstream `hash_many`.
     #[test]
     fn blake3_leaf128_kernel_matches_upstream() {
-        for (n, seed) in [(1usize, 1u64), (11, 2), (12, 3), (13, 4), (24, 5), (37, 6), (1024, 7), (4096 + 5, 8)] {
+        for (n, seed) in [(1usize, 1u64), (11, 2), (12, 3), (13, 4), (15, 40), (16, 41), (17, 42), (24, 5), (37, 6), (1024, 7), (4096 + 5, 8)] {
             let data = random_data(n, 128, seed);
             let mut got = vec![[0u8; 32]; n];
             assert!(blake3_hash_many_leaves(&data, 128, &mut got));
