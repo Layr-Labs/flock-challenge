@@ -678,6 +678,14 @@ fn fill_deferred_lincheck_stripe_group(
         // SAFETY: the reads are bounded by the assert above; `dst` is 64
         // writable bytes.
         unsafe {
+            // Prefetch ahead in each input lane, keeping every hint within
+            // the useful part of this group.
+            if word % 16 == 0 && word + 16 < useful_words {
+                for lane in 0..8 {
+                    let address = z_u64.as_ptr().add(lane * u64_per_block + word + 16);
+                    core::arch::asm!("prfm pldl1keep, [{p}]", p=in(reg) address, options(nostack, readonly, preserves_flags));
+                }
+            }
             let [y0, y1, y2, y3] = flock_core::bits::transpose_8_strided_u64s_to_regs(
                 z_u64.as_ptr().add(word),
                 u64_per_block,
@@ -710,6 +718,95 @@ fn fill_deferred_lincheck_stripe_group(
     stripe[useful_words * 64..].fill(0);
 }
 
+/// Root-compacted sibling of [`fill_deferred_lincheck_stripe_group`]: writes
+/// the group's 177 root rows (`r1cs_hashes::blake3::RootRow`) instead of its
+/// 241 useful words. Row `j`'s eight lane words are
+/// `(w[lo] & lo_mask) | (w[lo + 1] & hi_mask)`; a full row (all 64 bits from
+/// one word) takes the incumbent strided-transpose fast path. Bytes past row
+/// 177 of the group are never read (every fold runs over `N_ROOT_COLS`).
+fn fill_root_lincheck_stripe_group(
+    z_packed: &[F128],
+    stripe: &mut [u8],
+    group: usize,
+    group_f128: usize,
+    u64_per_block: usize,
+    rows: &[crate::r1cs_hashes::blake3::RootRow],
+) {
+    let group_start = group * group_f128;
+    let z_group = &z_packed[group_start..group_start + group_f128];
+    // SAFETY: F128 is repr(C) as two little-endian u64 halves.
+    let z_u64: &[u64] =
+        unsafe { std::slice::from_raw_parts(z_group.as_ptr().cast::<u64>(), z_group.len() * 2) };
+    assert!(z_u64.len() == 8 * u64_per_block && rows.len() * 64 <= stripe.len());
+    // Words each lane reads: through the last row's `lo_word`, plus one when
+    // that row also takes bits from the next word.
+    #[cfg(target_arch = "aarch64")]
+    let read_words = rows
+        .last()
+        .map_or(0, |row| row.lo_word + 1 + usize::from(row.hi_mask != 0));
+    #[cfg(target_arch = "aarch64")]
+    let mut prefetched_line = usize::MAX;
+    for (j, row) in rows.iter().enumerate() {
+        let full = row.lo_mask == u64::MAX;
+        // Reads stay inside the group: lo_word (+1 iff hi_mask != 0) < u64_per_block.
+        assert!(row.lo_word + usize::from(row.hi_mask != 0) < u64_per_block);
+        let lanes: [u64; 8] = if full {
+            [0; 8]
+        } else {
+            std::array::from_fn(|lane| {
+                let base = lane * u64_per_block + row.lo_word;
+                let hi = if row.hi_mask != 0 { z_u64[base + 1] & row.hi_mask } else { 0 };
+                (z_u64[base] & row.lo_mask) | hi
+            })
+        };
+        let dst = &mut stripe[j * 64..j * 64 + 64];
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: the strided reads are bounded by the asserts above (or read
+        // the 8-word local array with stride 1); `dst` is 64 writable bytes.
+        unsafe {
+            // Prefetch each input lane 16 words ahead, once per 16-word line,
+            // keeping every hint within the words this group reads.
+            let ahead = row.lo_word + 16;
+            if ahead < read_words && ahead / 16 != prefetched_line {
+                prefetched_line = ahead / 16;
+                for lane in 0..8 {
+                    let address = z_u64.as_ptr().add(lane * u64_per_block + ahead);
+                    core::arch::asm!("prfm pldl1keep, [{p}]", p=in(reg) address, options(nostack, readonly, preserves_flags));
+                }
+            }
+            let [y0, y1, y2, y3] = if full {
+                flock_core::bits::transpose_8_strided_u64s_to_regs(
+                    z_u64.as_ptr().add(row.lo_word),
+                    u64_per_block,
+                )
+            } else {
+                flock_core::bits::transpose_8_strided_u64s_to_regs(lanes.as_ptr(), 1)
+            };
+            core::arch::asm!(
+                "stnp {y0:q}, {y1:q}, [{dst}]",
+                "stnp {y2:q}, {y3:q}, [{dst}, #32]",
+                dst = in(reg) dst.as_mut_ptr(),
+                y0 = in(vreg) y0,
+                y1 = in(vreg) y1,
+                y2 = in(vreg) y2,
+                y3 = in(vreg) y3,
+                options(nostack, preserves_flags)
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let lanes: [u64; 8] = if full {
+                std::array::from_fn(|lane| z_u64[lane * u64_per_block + row.lo_word])
+            } else {
+                lanes
+            };
+            let mut transposed = [0u8; 64];
+            flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
+            dst.copy_from_slice(&transposed);
+        }
+    }
+}
+
 /// The deferred stripe fill as a chunk job: returns the job count and the job
 /// closure, so the closure can outlive one dispatch call and be shared by the
 /// helper pool and main-pool help drains. Job `j` writes exactly the stripe
@@ -724,6 +821,7 @@ fn deferred_lincheck_stripe_job<'a>(
     m: usize,
     k_log: usize,
     useful_bits: usize,
+    root_rows: Option<&'static [crate::r1cs_hashes::blake3::RootRow]>,
 ) -> (usize, impl Fn(usize) + Sync + use<'a>) {
     assert!(k_log >= 7, "packed block must contain whole F128 words");
     assert!(
@@ -751,14 +849,26 @@ fn deferred_lincheck_stripe_job<'a>(
             // groups, and each group maps to one disjoint k-byte stripe.
             let stripe =
                 unsafe { std::slice::from_raw_parts_mut(stripe_base.ptr().add(group * k), k) };
-            fill_deferred_lincheck_stripe_group(
-                z_packed,
-                stripe,
-                group,
-                group_f128,
-                u64_per_block,
-                useful_words,
-            );
+            match root_rows {
+                Some(rows) => {
+                    fill_root_lincheck_stripe_group(
+                        z_packed,
+                        stripe,
+                        group,
+                        group_f128,
+                        u64_per_block,
+                        rows,
+                    );
+                }
+                None => fill_deferred_lincheck_stripe_group(
+                    z_packed,
+                    stripe,
+                    group,
+                    group_f128,
+                    u64_per_block,
+                    useful_words,
+                ),
+            }
         }
     };
     (n_jobs, job)
@@ -776,7 +886,8 @@ fn fill_deferred_lincheck_stripe_with_dispatch(
     useful_bits: usize,
     dispatch: impl FnOnce(usize, &(dyn Fn(usize) + Sync)) -> bool,
 ) -> bool {
-    let (n_jobs, job) = deferred_lincheck_stripe_job(z_packed, z_lincheck, m, k_log, useful_bits);
+    let (n_jobs, job) =
+        deferred_lincheck_stripe_job(z_packed, z_lincheck, m, k_log, useful_bits, None);
     dispatch(n_jobs, &job)
 }
 
@@ -872,7 +983,8 @@ mod deferred_stripe_tests {
             .unwrap();
         for delay_us in [0u64, 20_000] {
             let mut stripe = vec![0xa5u8; expected.len()];
-            let (n_jobs, job) = deferred_lincheck_stripe_job(&z, &mut stripe, M, K_LOG, 1 << K_LOG);
+            let (n_jobs, job) =
+                deferred_lincheck_stripe_job(&z, &mut stripe, M, K_LOG, 1 << K_LOG, None);
             assert!(n_jobs >= 4, "test shape needs several jobs, got {n_jobs}");
             let runs: Vec<std::sync::atomic::AtomicUsize> =
                 (0..n_jobs).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
@@ -1222,6 +1334,10 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // Deferred fill is shorter than commit+AB at the target shape, so moving
     // this join earlier adds no measured tail while eliminating C's 32-bank
     // row-major drain.
+    // Root-compacted stripe registration (ranked deferred path only); held
+    // until lincheck has consumed the stripe.
+    let mut root_stripe_registration: Option<flock_core::lincheck::RootStripeRegistration> =
+        None;
     let (pre_zerocheck, z_packed_lincheck) = match z_packed_lincheck {
         LincheckStripeInput::Ready(stripe) => {
             // The stripe is fully materialized, so the tail fill can stage
@@ -1245,6 +1361,16 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             assert_eq!(r1cs.useful_bits, 15_409);
             let (m, k_log, useful_bits) = (r1cs.m, r1cs.k_log, r1cs.useful_bits);
             let mut stripe = flock_core::scratch::take_u8(1usize << (m - 3));
+            // Root stripe (`FLOCK_NO_ROOT_STRIPE=1` restores the full 241-row
+            // stripe): store only the 11,313 root columns; every stripe fold
+            // consults the registration and expands its result exactly.
+            let root_rows = crate::r1cs_hashes::blake3::root_stripe_rows();
+            if root_rows.is_some() {
+                root_stripe_registration = Some(flock_core::lincheck::register_root_stripe(
+                    &stripe,
+                    crate::r1cs_hashes::blake3::root_stripe_descriptor(),
+                ));
+            }
             // E4 (all four E-workers), revisited 2026-08-05. The E3 default
             // was tuned in the GPU-bound-window regime (welttowelt `4e30884`
             // +0.95% ranked over E2; "E4 steals bandwidth from commit" was
@@ -1287,7 +1413,14 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             // only its own groups, so the bytes do not depend on who ran it.
             // `stripe` is not touched again until after the scope below.
             let (n_stripe_jobs, stripe_job_fn) =
-                deferred_lincheck_stripe_job(&z_packed, &mut stripe, m, k_log, useful_bits);
+                deferred_lincheck_stripe_job(
+                    &z_packed,
+                    &mut stripe,
+                    m,
+                    k_log,
+                    useful_bits,
+                    root_rows,
+                );
             let stripe_queue = flock_core::epool::HelpQueue::new(n_stripe_jobs, &stripe_job_fn);
             let stripe_help = || stripe_queue.help();
             let pre = std::thread::scope(|scope| {
@@ -1446,6 +1579,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
     // m = 32) so the next prove reuses its resident pages.
     flock_core::tmark::mark("lc returned");
+    drop(root_stripe_registration);
     flock_core::scratch::give_u8(z_packed_lincheck);
 
     let ab = ZClaim {

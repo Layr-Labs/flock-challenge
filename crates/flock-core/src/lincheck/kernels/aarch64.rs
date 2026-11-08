@@ -694,7 +694,9 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
     let block16 = TILE_T == 8
         && m == 32
         && k_log == 14
-        && useful_bits == 15_409
+        // 11_313 = the ranked BLAKE3 root stripe width
+        // (`lincheck::RootStripe`).
+        && (useful_bits == 15_409 || useful_bits == 11_313)
         && std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none();
     oblock_padded_tiled_impl::<TILE_T>(
         z_packed,
