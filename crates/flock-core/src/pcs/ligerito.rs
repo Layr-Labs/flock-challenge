@@ -3030,6 +3030,44 @@ pub(crate) fn induce_sumcheck_poly(
     (basis_poly, enforced_sum)
 }
 
+///
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn transpose_radix8_row_q(ptr: *mut F128, base: usize, eighth: usize, tw: &[F128; 7]) {
+    use crate::field::gf2_128::aarch64::ghash_mul_add_q;
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let mut v: [uint64x2_t; 8] =
+            core::array::from_fn(|i| vld1q_u64(ptr.add(base + i * eighth).cast::<u64>()));
+        let t: [uint64x2_t; 7] = core::array::from_fn(|i| vld1q_u64((&raw const tw[i]).cast::<u64>()));
+
+        for pair in 0..4 {
+            let (a, b) = (2 * pair, 2 * pair + 1);
+            let s = veorq_u64(v[a], v[b]);
+            v[b] = ghash_mul_add_q(v[b], s, t[3 + pair]);
+            v[a] = s;
+        }
+        for half in 0..2 {
+            for j in 0..2 {
+                let (a, b) = (4 * half + j, 4 * half + j + 2);
+                let s = veorq_u64(v[a], v[b]);
+                v[b] = ghash_mul_add_q(v[b], s, t[1 + half]);
+                v[a] = s;
+            }
+        }
+        for i in 0..4 {
+            let s = veorq_u64(v[i], v[i + 4]);
+            v[i + 4] = ghash_mul_add_q(v[i + 4], s, t[0]);
+            v[i] = s;
+        }
+
+        for (i, &value) in v.iter().enumerate() {
+            vst1q_u64(ptr.add(base + i * eighth).cast::<u64>(), value);
+        }
+    }
+}
+
 /// Apply three consecutive transpose layers in one read/write pass. `layer`
 /// is the lowest (root-most) of the three; the transpose executes forward
 /// layers `layer+2`, `layer+1`, then `layer`.
@@ -3041,6 +3079,7 @@ fn transpose_forward_ntt_fused_3layer(
 ) {
     use rayon::prelude::*;
 
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
     #[inline(always)]
     fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
         let sum = values[a] + values[b];
@@ -3080,10 +3119,15 @@ fn transpose_forward_ntt_fused_3layer(
         let block = job >> eighth_log;
         let row = job & row_mask;
         let base = block * block_size + row;
-        let mut values = [F128::ZERO; 8];
         // SAFETY: each `(block,row)` owns the eight distinct positions
         // `base + i*eighth`, and different jobs never overlap.
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         unsafe {
+            transpose_radix8_row_q(data_ptr as *mut F128, base, eighth, &twiddles[block]);
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        unsafe {
+            let mut values = [F128::ZERO; 8];
             let ptr = data_ptr as *mut F128;
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *ptr.add(base + i * eighth);
@@ -3246,6 +3290,7 @@ fn transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg(
     let data_ptr = data.as_mut_ptr() as usize;
     let (u_0, u_2) = (0..eighth / 2)
         .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(16))
         .map(|row_pair| {
             let even_row = 2 * row_pair;
             let odd_row = even_row + 1;
@@ -3358,6 +3403,7 @@ fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
     let data_ptr = data.as_mut_ptr() as usize;
     let (u_0, u_2) = (0..eighth / 2)
         .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(16))
         .map(|row_pair| {
             let even_row = 2 * row_pair;
             let odd_row = even_row + 1;
@@ -4505,7 +4551,10 @@ fn transpose_forward_ntt_final_3layer_low_eighth_xor(data: &[F128]) -> Vec<F128>
     let data_ptr = data.as_ptr() as usize;
     let mut retained = Vec::<F128>::with_capacity(eighth);
     let retained_ptr = retained.as_mut_ptr() as usize;
-    (0..eighth).into_par_iter().for_each(|row| {
+    (0..eighth)
+        .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(8))
+        .for_each(|row| {
         // SAFETY: the input is immutable for the whole parallel region;
         // every job reads eight in-bounds coset positions and initializes
         // its own unique output slot. `retained` keeps length zero until the
