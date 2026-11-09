@@ -125,75 +125,6 @@ use std::sync::atomic::AtomicBool;
 
 mod kernels;
 
-/// Root-compacted lincheck stripe (prover-side layout only; proof bytes and
-/// transcript are unchanged).
-///
-/// For a circuit whose witness satisfies `z[i] = (A_0 z)[i]` on every row
-/// with `B_0[i] = {const}` (the BLAKE3 lin-id rows: each G's `b_new`/`d_new`
-/// word and the 512 output bits), those dependent columns are XOR
-/// combinations of the remaining "root" columns in EVERY instance. The outer
-/// fold `ẑ(i, x) = Σ_o eq(x, o)·z[i, o]` is GF(2)-linear in each column, so
-/// the folded dependent columns are the same XOR combinations of the folded
-/// roots — exactly, for any eq table. A root stripe therefore stores only the
-/// root columns, packed into stripe columns `[0, n_roots)`, every stripe fold
-/// runs over `n_roots` columns instead of `useful_bits`, and `expand`
-/// rebuilds the full length-`k` fold in place (scatter roots to their
-/// original columns, evaluate the XOR DAG, zero the padding columns).
-#[derive(Clone, Copy)]
-pub struct RootStripe {
-    /// Root columns stored, compacted, at stripe columns `[0, n_roots)`.
-    pub n_roots: usize,
-    /// In-place expansion of a length-`k` fold over the compacted stripe
-    /// (entries `[0, n_roots)` meaningful, the rest arbitrary) into the fold
-    /// over the original `k` columns.
-    pub expand: fn(&mut [F128]),
-}
-
-/// The live root stripe, keyed by the stripe buffer's (address, length). At
-/// most one ranked prove runs at a time; the registration is scoped by
-/// [`RootStripeRegistration`].
-static ROOT_STRIPE: std::sync::Mutex<Option<(usize, usize, RootStripe)>> =
-    std::sync::Mutex::new(None);
-
-/// Scope guard for [`register_root_stripe`]; clears the registration on drop.
-pub struct RootStripeRegistration {
-    key: (usize, usize),
-}
-
-impl Drop for RootStripeRegistration {
-    fn drop(&mut self) {
-        let mut guard = ROOT_STRIPE.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_some_and(|(p, l, _)| (p, l) == self.key) {
-            *guard = None;
-        }
-    }
-}
-
-/// Declare `stripe` a root-compacted stripe until the returned guard drops.
-/// Every stripe fold (zerocheck round-one C, its commit-tail GPU prefix, and
-/// the lincheck AB fold) consults [`root_stripe_for`] with the buffer it
-/// reads, so an unregistered (full) stripe keeps the incumbent path exactly.
-pub fn register_root_stripe(stripe: &[u8], roots: RootStripe) -> RootStripeRegistration {
-    let key = (stripe.as_ptr() as usize, stripe.len());
-    *ROOT_STRIPE.lock().unwrap_or_else(|e| e.into_inner()) = Some((key.0, key.1, roots));
-    RootStripeRegistration { key }
-}
-
-/// The root layout of `stripe`, if it was registered as root-compacted.
-pub fn root_stripe_for(stripe: &[u8]) -> Option<RootStripe> {
-    let key = (stripe.as_ptr() as usize, stripe.len());
-    let guard = ROOT_STRIPE.lock().unwrap_or_else(|e| e.into_inner());
-    guard.and_then(|(p, l, roots)| ((p, l) == key).then_some(roots))
-}
-
-/// Fold width for a stripe: the registered root count, else `useful_bits`.
-pub(crate) fn stripe_fold_useful(stripe: &[u8], useful_bits: usize) -> (usize, Option<RootStripe>) {
-    match root_stripe_for(stripe) {
-        Some(roots) => (roots.n_roots, Some(roots)),
-        None => (useful_bits, None),
-    }
-}
-
 #[cfg(target_arch = "x86_64")]
 pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 #[cfg(target_arch = "aarch64")]
@@ -1625,19 +1556,13 @@ fn prove_padded_inner<Ch: Challenger>(
             None
         };
         let eq_x_outer = build_z_fold_eq_table(m, k_log, k_skip, useful_bits, &x_ab.x_outer);
-        // Root stripe: fold the compacted root columns only, then rebuild
-        // the dependent columns exactly (see `RootStripe`).
-        let (fold_useful, roots) = stripe_fold_useful(z_packed, useful_bits);
-        let mut z_vec = partial_fold_packed_z_best_gpu_split(
+        let z_vec = partial_fold_packed_z_best_gpu_split(
             z_packed,
             m,
             k_log,
-            fold_useful,
+            useful_bits,
             eq_x_outer.as_slice(),
         );
-        if let Some(roots) = roots {
-            (roots.expand)(&mut z_vec);
-        }
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",

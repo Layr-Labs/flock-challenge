@@ -2522,13 +2522,13 @@ pub(crate) fn fold2_compact_and_round45_into(
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
     let fused_k = false;
 
-    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
-    // [p1_odd, pinf_odd, W0', W3', W4', W5'], eq_hi-weighted, one per chunk.
-    let mut la_partials: Vec<[F128; 6]> = vec![[F128::ZERO; 6]; hi_size];
+    // Weight each kernel output once. The odd-lane terms are shared by the
+    // round-4 result and round-5 lookahead; kappa is common to all chunks and
+    // can be applied after summing their even-lane terms.
+    let mut partials: Vec<[F128; 8]> = vec![[F128::ZERO; 8]; hi_size];
     let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
     let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: exclusive per-chunk ownership; the queue join publishes the
         // writes before the reduction below reads them.
@@ -2580,44 +2580,29 @@ pub(crate) fn fold2_compact_and_round45_into(
         }
 
         let eq_h = eq_hi[x_hi];
-        // `outv[0..2]` carry the even round-4 pairs on the odd lane's weight;
-        // κ restores `eq₄(2y')` exactly (field arithmetic, no rounding).
-        let p1 = kappa * outv[0] + outv[2];
-        let pinf = kappa * outv[1] + outv[3];
-        // SAFETY: exclusive owner of both partial slots (see above).
+        // SAFETY: each queue job owns its partial slot exclusively.
         unsafe {
-            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
-            *la_base.ptr().add(x_hi) = [
-                eq_h * outv[2],
-                eq_h * outv[3],
-                eq_h * outv[4],
-                eq_h * outv[5],
-                eq_h * outv[6],
-                eq_h * outv[7],
-            ];
+            *partials_base.ptr().add(x_hi) = outv.map(|v| eq_h * v);
         }
     });
 
-    let (sum1, sum_inf) = partials
-        .iter()
-        .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
-            (s1 + c1, sinf + cinf)
-        });
-    let mut agg = [F128::ZERO; 6];
-    for slot in &la_partials {
+    let mut agg = [F128::ZERO; 8];
+    for slot in &partials {
         for (a, v) in agg.iter_mut().zip(slot.iter()) {
             *a += *v;
         }
     }
+    let sum1 = kappa * agg[0] + agg[2];
+    let sum_inf = kappa * agg[1] + agg[3];
     // Every aggregate was accumulated on the odd lane's weight `r'·eq₅`, so a
     // single `r'⁻¹` puts all six back on `eq₅`.
     let r_inv = retained_r_inv.unwrap_or_else(|| r_par.inv());
-    let w1 = r_inv * agg[0];
-    let w2 = r_inv * agg[1];
-    let w0 = r_inv * agg[2];
-    let w3 = r_inv * agg[3];
-    let w4 = r_inv * agg[4];
-    let w5 = r_inv * agg[5];
+    let w1 = r_inv * agg[2];
+    let w2 = r_inv * agg[3];
+    let w0 = r_inv * agg[4];
+    let w3 = r_inv * agg[5];
+    let w4 = r_inv * agg[6];
+    let w5 = r_inv * agg[7];
     let la5 = Round3Lookahead {
         c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
     };
@@ -3100,28 +3085,25 @@ pub(crate) fn fold2_plain_and_round67_into(
             .collect()
     };
 
-    let mut sum1 = F128::ZERO;
-    let mut sum_inf = F128::ZERO;
-    let mut agg = [F128::ZERO; 6];
+    let mut agg = [F128::ZERO; 8];
     for (x_hi, outv) in partials.iter().enumerate() {
         let eq_h = eq_hi[x_hi];
-        // `outv[0..2]` carry the even round-6 pairs on the odd lane's weight;
-        // κ restores `eq₆(2y'')` exactly (field arithmetic, no rounding).
-        sum1 += eq_h * (kappa * outv[0] + outv[2]);
-        sum_inf += eq_h * (kappa * outv[1] + outv[3]);
-        for (aslot, &v) in agg.iter_mut().zip(outv[2..].iter()) {
+        // The odd terms are shared by the round-6 sum and round-7 lookahead.
+        for (aslot, &v) in agg.iter_mut().zip(outv.iter()) {
             *aslot += eq_h * v;
         }
     }
+    let sum1 = kappa * agg[0] + agg[2];
+    let sum_inf = kappa * agg[1] + agg[3];
     // Every aggregate was accumulated on the odd lane's weight `r''·eq₇`, so
     // a single `r''⁻¹` puts all six back on `eq₇`.
     let r_inv = retained_r_inv.unwrap_or_else(|| r_par.inv());
-    let w1 = r_inv * agg[0];
-    let w2 = r_inv * agg[1];
-    let w0 = r_inv * agg[2];
-    let w3 = r_inv * agg[3];
-    let w4 = r_inv * agg[4];
-    let w5 = r_inv * agg[5];
+    let w1 = r_inv * agg[2];
+    let w2 = r_inv * agg[3];
+    let w0 = r_inv * agg[4];
+    let w3 = r_inv * agg[5];
+    let w4 = r_inv * agg[6];
+    let w5 = r_inv * agg[7];
     let la7 = Round3Lookahead {
         c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
     };

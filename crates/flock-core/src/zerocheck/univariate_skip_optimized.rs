@@ -2792,7 +2792,6 @@ pub(crate) fn stage_c_prelude_for_tail_fill(
         if !ranked_c_fold_shape(m, k_log) {
             return false;
         }
-        let (useful_bits, _) = crate::lincheck::stripe_fold_useful(c_lincheck, useful_bits);
         crate::gpu_commit::stage_zerocheck_c_fold_prefix(c_lincheck, m, k_log, useful_bits, r)
     }
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -2846,14 +2845,13 @@ pub(crate) fn round1_c_prelude(
         } else {
             crate::gpu_commit::FoldEqTable::Owned(crate::lincheck::build_eq_table(&r[k_log..]))
         };
-        let (fold_useful, _) = crate::lincheck::stripe_fold_useful(c_lincheck, useful_bits);
         let gpu = ranked_c_fold_shape(m, k_log)
             .then(|| {
                 crate::gpu_commit::launch_zerocheck_c_fold(
                     c_lincheck,
                     m,
                     k_log,
-                    fold_useful,
+                    useful_bits,
                     eq_outer.as_slice(),
                 )
             })
@@ -2890,28 +2888,6 @@ fn round1_c_inner_fold(
         gpu,
         submitted,
     } = prelude;
-    // Root stripe: fold the compacted root columns, then rebuild the full
-    // inner fold exactly (`lincheck::RootStripe`).
-    let (useful_bits, roots) = crate::lincheck::stripe_fold_useful(c_lincheck, useful_bits);
-    let mut out = round1_c_inner_fold_columns(
-        eq_outer, gpu, submitted, c_lincheck, m, k_log, useful_bits,
-    );
-    if let Some(roots) = roots {
-        (roots.expand)(&mut out);
-    }
-    out
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn round1_c_inner_fold_columns(
-    eq_outer: crate::gpu_commit::FoldEqTable,
-    gpu: Option<crate::gpu_commit::ZcFoldJob>,
-    submitted: std::time::Instant,
-    c_lincheck: &[u8],
-    m: usize,
-    k_log: usize,
-    useful_bits: usize,
-) -> Vec<F128> {
     if let Some(job) = gpu {
         let claim_lo = job.claim_lo();
         let head_ms = submitted.elapsed().as_secs_f64() * 1e3;
@@ -2966,18 +2942,13 @@ fn round1_c_inner_fold(
     k_log: usize,
     useful_bits: usize,
 ) -> Vec<F128> {
-    let (useful_bits, roots) = crate::lincheck::stripe_fold_useful(c_lincheck, useful_bits);
-    let mut out = crate::lincheck::partial_fold_packed_z_best(
+    crate::lincheck::partial_fold_packed_z_best(
         c_lincheck,
         m,
         k_log,
         useful_bits,
         &prelude.eq_outer,
-    );
-    if let Some(roots) = roots {
-        (roots.expand)(&mut out);
-    }
-    out
+    )
 }
 
 /// Derive the exact legacy C round-one message and its existing RingSwitch
