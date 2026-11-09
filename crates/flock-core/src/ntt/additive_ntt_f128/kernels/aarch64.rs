@@ -443,6 +443,14 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
         let z6 = vld1q_u64((&raw const t_zero[6]).cast::<u64>());
         let g: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const t_gen[i]).cast::<u64>()));
+        let ext = use_const_ext();
+        let (pz2, pz4, pz5, pz6) = (
+            three_coeffs(z2),
+            three_coeffs(z4),
+            three_coeffs(z5),
+            three_coeffs(z6),
+        );
+        let pg: [Prep; 7] = core::array::from_fn(|i| three_coeffs(g[i]));
 
         // Two 8 KiB staging tiles (8 rows × ≤64 lanes × 16 B): L1-resident,
         // written per lane, read back once for the sequential row bursts.
@@ -464,7 +472,11 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
             // `butterfly_fused_3layer_zero_root_row`, but keeps v[0]).
             {
                 let mut v = loaded;
-                fused3_zero_root_q(&mut v, z2, z4, z5, z6);
+                if ext {
+                    fused3_zero_root_prepared_q(&mut v, pz2, pz4, pz5, pz6);
+                } else {
+                    fused3_zero_root_q(&mut v, z2, z4, z5, z6);
+                }
                 for (i, value) in v.iter().enumerate() {
                     vst1q_u64(
                         stage0.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
@@ -476,7 +488,11 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
             // Block 1: general chain (mirrors `butterfly_fused_3layer_row`).
             {
                 let mut v = loaded;
-                fused3_general_q(&mut v, &g);
+                if ext {
+                    fused3_prepared_q(&mut v, &pg);
+                } else {
+                    fused3_general_q(&mut v, &g);
+                }
                 for (i, value) in v.iter().enumerate() {
                     vst1q_u64(
                         stage1.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
@@ -565,6 +581,8 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
         }
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
+        let ext = use_const_ext();
+        let prep: [Prep; 7] = core::array::from_fn(|i| three_coeffs(t[i]));
         let mut stage = [core::mem::MaybeUninit::<F128>::uninit(); 64];
         let step = eighth * num_ntts;
 
@@ -575,7 +593,13 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
                 let mut v: [uint64x2_t; 8] =
                     core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
 
-                if ZERO_ROOT {
+                if ext {
+                    if ZERO_ROOT {
+                        fused3_zero_root_prepared_q(&mut v, prep[2], prep[4], prep[5], prep[6]);
+                    } else {
+                        fused3_prepared_q(&mut v, &prep);
+                    }
+                } else if ZERO_ROOT {
                     fused3_zero_root_q(&mut v, t[2], t[4], t[5], t[6]);
                 } else {
                     fused3_general_q(&mut v, &t);
@@ -804,6 +828,61 @@ fn use_three_const_fold() -> bool {
     }
     enabled
 }
+/// Extension of the fixed-twiddle (prepared) radix-8 arithmetic to the
+/// kernels h10 left on the split-multiply path: zero-root rows (in place and
+/// from source), the general from-source rows used by the recursive
+/// from-message commits, the rate-1/2 dual first pass, and the single-layer
+/// block. Same field values, canonical outputs: bit-identical.
+/// `FLOCK_NO_NTT_CONST_EXT=1` restores the split-multiply kernels.
+#[inline]
+fn use_const_ext() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_CONST_EXT").is_none());
+    *ON
+}
+
+type Prep = (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+);
+
+/// Prepared twin of [`fused3_zero_root_q`] (twiddles 0, 1, 3 zero).
+#[inline(always)]
+unsafe fn fused3_zero_root_prepared_q(
+    v: &mut [core::arch::aarch64::uint64x2_t; 8],
+    t2: Prep,
+    t4: Prep,
+    t5: Prep,
+    t6: Prep,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let zero = vdupq_n_u64(0);
+        for i in 0..4 {
+            v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
+        }
+        for i in 0..2 {
+            v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
+        }
+        let (a, b, p4) = three_lazy(v[4], v[6], t2, zero);
+        v[4] = a;
+        v[6] = b;
+        let (a, b) = three_fold(v[5], v[7], t2, zero);
+        v[5] = a;
+        v[7] = b;
+        v[1] = butterfly_zero_q(v[0], v[1]);
+        let (a, b) = three_fold(v[2], v[3], t4, zero);
+        v[2] = a;
+        v[3] = b;
+        let (a, b) = three_fold(v[4], v[5], t5, p4);
+        v[4] = a;
+        v[5] = b;
+        let (a, b) = three_fold(v[6], v[7], t6, p4);
+        v[6] = a;
+        v[7] = b;
+    }
+}
+
 #[target_feature(enable = "aes")]
 #[inline]
 unsafe fn butterfly_fused_3layer_row_with_const_q(
@@ -918,7 +997,17 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
             let mut v: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
 
-            fused3_zero_root_q(&mut v, t2, t4, t5, t6);
+            if use_const_ext() {
+                fused3_zero_root_prepared_q(
+                    &mut v,
+                    three_coeffs(t2),
+                    three_coeffs(t4),
+                    three_coeffs(t5),
+                    three_coeffs(t6),
+                );
+            } else {
+                fused3_zero_root_q(&mut v, t2, t4, t5, t6);
+            }
 
             // v[0] is unchanged by all three layers; skip its store.
             for (i, value) in v.iter().enumerate().skip(1) {
@@ -1248,6 +1337,23 @@ pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: us
 
     debug_assert!(half >= 2);
     debug_assert_eq!(chunk.len(), 2 * half);
+    if use_const_ext() {
+        use core::arch::aarch64::*;
+        unsafe {
+            let t = vld1q_u64((&raw const twiddle).cast::<u64>());
+            let prep = three_coeffs(t);
+            let zero = vdupq_n_u64(0);
+            let base = chunk.as_mut_ptr();
+            for idx0 in 0..half {
+                let pu = base.add(idx0).cast::<u64>();
+                let pv = base.add(idx0 + half).cast::<u64>();
+                let (nu, nv) = three_fold(vld1q_u64(pu), vld1q_u64(pv), prep, zero);
+                vst1q_u64(pu, nu);
+                vst1q_u64(pv, nv);
+            }
+        }
+        return;
+    }
     let mut idx0 = 0;
     while idx0 < half {
         let idx1 = idx0 + half;
@@ -1280,6 +1386,176 @@ pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: us
         chunk[idx0 + 1] = new_u_b;
         chunk[idx1 + 1] = new_v_b;
         idx0 += 2;
+    }
+}
+
+/// Prepared-twiddle single-layer row butterfly (`FLOCK_NO_NTT_ROW_PAIR_PREP=1`
+/// restores the portable per-lane chain).
+#[inline]
+pub(super) fn use_row_pair_prepared() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_ROW_PAIR_PREP").is_none());
+    *ON
+}
+
+/// Single-layer butterfly of two interleaved rows sharing one twiddle:
+/// `top' = top + bot * twiddle`, `bot' = bot + top'`, lane by lane.
+///
+/// The row pair shares its twiddle across every lane, so the fixed-twiddle
+/// coefficients ([`three_coeffs`]) are prepared once per call and each lane
+/// costs four data PMULLs plus one fold, all in the vector register file.
+/// The portable form this replaces runs the generic field multiply per lane
+/// and repacks every product through a `{ lo, hi }` struct. Lanes stay
+/// independent (one product per lane), so consecutive lanes still overlap in
+/// the out-of-order window. Same GF(2^128) products, canonical outputs:
+/// bit-identical to `portable::butterfly_row_pair`.
+///
+/// # Safety
+/// Requires the `aes` target feature; `top` and `bot` must have equal length.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
+    use core::arch::aarch64::*;
+
+    debug_assert_eq!(top.len(), bot.len());
+    let lanes = top.len().min(bot.len());
+    unsafe {
+        let t = vld1q_u64((&raw const twiddle).cast::<u64>());
+        let (t_lo, t_mid) = three_coeffs(t);
+        let pt = top.as_mut_ptr();
+        let pb = bot.as_mut_ptr();
+        for lane in 0..lanes {
+            let pu = pt.add(lane).cast::<u64>();
+            let pv = pb.add(lane).cast::<u64>();
+            let u = vld1q_u64(pu);
+            let v = vld1q_u64(pv);
+            // L = u + v.lo * t.lo + v.hi * R.lo, M = v.lo * t.hi + v.hi * (t.lo + R.hi).
+            let l = fused_pmull_hi_acc(fused_pmull_lo_acc(u, v, t_lo), v, t_lo);
+            let m = cross_sum_q(v, t_mid);
+            let nu = fold_x64_into(l, m);
+            vst1q_u64(pu, nu);
+            vst1q_u64(pv, veorq_u64(v, nu));
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_pair_probe {
+    use super::*;
+
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn rand_f128(state: &mut u64) -> F128 {
+        F128 {
+            lo: splitmix(state),
+            hi: splitmix(state),
+        }
+    }
+
+    /// Vector-resident row butterfly on the split multiply (six PMULLs per
+    /// lane): the comparison point for the prepared form.
+    #[target_feature(enable = "aes")]
+    unsafe fn row_pair_split(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
+        use core::arch::aarch64::*;
+        unsafe {
+            let t = vld1q_u64((&raw const twiddle).cast::<u64>());
+            for lane in 0..top.len() {
+                let pu = top.as_mut_ptr().add(lane).cast::<u64>();
+                let pv = bot.as_mut_ptr().add(lane).cast::<u64>();
+                let (nu, nv) = butterfly_fold_zero_q(vld1q_u64(pu), vld1q_u64(pv), t);
+                vst1q_u64(pu, nu);
+                vst1q_u64(pv, nv);
+            }
+        }
+    }
+
+    /// All three forms agree bit for bit when the whole block is one call.
+    #[test]
+    fn whole_block_call_matches_per_row_portable() {
+        let mut state = 0x424C_4F43_4B5F_5250;
+        for &(rows_half, lanes) in &[(1usize, 8usize), (3, 8), (4096, 8), (64, 64), (5, 7)] {
+            let n = rows_half * lanes;
+            let top: Vec<F128> = (0..n).map(|_| rand_f128(&mut state)).collect();
+            let bot: Vec<F128> = (0..n).map(|_| rand_f128(&mut state)).collect();
+            let twiddle = rand_f128(&mut state);
+
+            let (mut want_top, mut want_bot) = (top.clone(), bot.clone());
+            for (tr, br) in want_top
+                .chunks_exact_mut(lanes)
+                .zip(want_bot.chunks_exact_mut(lanes))
+            {
+                super::super::portable::butterfly_row_pair(tr, br, twiddle);
+            }
+
+            let (mut got_top, mut got_bot) = (top.clone(), bot.clone());
+            // SAFETY: equal-length halves; the module is compiled with `aes`.
+            unsafe { butterfly_row_pair(&mut got_top, &mut got_bot, twiddle) };
+            assert_eq!(got_top, want_top, "rows_half={rows_half} lanes={lanes}");
+            assert_eq!(got_bot, want_bot, "rows_half={rows_half} lanes={lanes}");
+
+            let (mut split_top, mut split_bot) = (top, bot);
+            // SAFETY: as above.
+            unsafe { row_pair_split(&mut split_top, &mut split_bot, twiddle) };
+            assert_eq!(split_top, want_top);
+            assert_eq!(split_bot, want_bot);
+        }
+    }
+
+    /// Local timing probe (not a correctness test). Shapes: the recursive-L1
+    /// lead layer (4096 row pairs of 8 lanes per 1 MiB sub-transform), an
+    /// L1-resident block, and the 64-lane interleaving. Run with
+    /// `cargo test --profile challenge -p flock-core --lib neon_row_pair_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn neon_row_pair_timing() {
+        let mut state = 0x5449_4D45_5F52_4F57;
+        for &(rows_half, lanes) in &[(4096usize, 8usize), (64, 8), (64, 64), (4096, 64)] {
+            let n = rows_half * lanes;
+            let base_top: Vec<F128> = (0..n).map(|_| rand_f128(&mut state)).collect();
+            let base_bot: Vec<F128> = (0..n).map(|_| rand_f128(&mut state)).collect();
+            let twiddle = rand_f128(&mut state);
+            let reps = ((1usize << 25) / n).max(1);
+            let names = ["portable/row", "split/row", "prepared/row", "prepared/block"];
+            let mut best = [f64::MAX; 4];
+            for _trial in 0..15 {
+                for which in 0..4 {
+                    let (mut top, mut bot) = (base_top.clone(), base_bot.clone());
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..reps {
+                        if which == 3 {
+                            // SAFETY: equal-length halves; `aes` via cfg.
+                            unsafe { butterfly_row_pair(&mut top, &mut bot, twiddle) };
+                        } else {
+                            for (tr, br) in
+                                top.chunks_exact_mut(lanes).zip(bot.chunks_exact_mut(lanes))
+                            {
+                                match which {
+                                    0 => super::super::portable::butterfly_row_pair(tr, br, twiddle),
+                                    // SAFETY: equal-length rows; `aes` via cfg.
+                                    1 => unsafe { row_pair_split(tr, br, twiddle) },
+                                    _ => unsafe { butterfly_row_pair(tr, br, twiddle) },
+                                }
+                            }
+                        }
+                        std::hint::black_box((&mut top, &mut bot));
+                    }
+                    let ns = t0.elapsed().as_secs_f64() * 1e9 / (reps * n) as f64;
+                    best[which] = best[which].min(ns);
+                }
+            }
+            let line: Vec<String> = (0..4)
+                .map(|i| format!("{} {:.3} ({:+.1}%)", names[i], best[i], (best[i] / best[0] - 1.0) * 100.0))
+                .collect();
+            eprintln!(
+                "[row-pair-timing] rows_half={rows_half} lanes={lanes} ns/butterfly (best of 15): {}",
+                line.join(", ")
+            );
+        }
     }
 }
 
