@@ -8499,6 +8499,108 @@ kernel void blake3_pow_scan(
         }
     }
 
+    // -----------------------------------------------------------------------
+    // C11 residency pin (kill: exactly `FLOCK_NO_GPU_RESIDENCY_FIX=1`).
+    //
+    // The IOGPU wired-memory collector (`iogpu.dynamic_lwm`) unwires GPU
+    // allocations that sit idle for roughly a second. Under the ranked
+    // Seatbelt profile the warmup tail after the latched commit is ~1 s long,
+    // so the timed prove's first streamed band paid a re-wire of the commit
+    // buffers (z wrap 512 MiB, staging 1 GiB, tree, twiddles: 25-37 ms on an
+    // M2 Pro, measured with Metal System Trace). Binding them in keep-warm
+    // encoders does not count as use. An explicit MTLResidencySet
+    // (macOS 15+) attached to the commit queue keeps exactly these
+    // allocations resident. State only: no data is read or written, and no
+    // seed-dependent work moves. Any missing API or error is a silent no-op.
+    // -----------------------------------------------------------------------
+
+    pub(crate) fn residency_fix_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_GPU_RESIDENCY_FIX").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+        })
+    }
+
+    /// The process-lifetime residency set (0 = none). Owned +1 reference.
+    static RESIDENCY_SET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn pin_latched_residency(gpu: &Gpu, latched: &Latched) {
+        use std::sync::atomic::Ordering;
+        if !residency_fix_enabled() || RESIDENCY_SET.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        let dbg = std::env::var_os("FLOCK_RESIDENCY_DEBUG").is_some();
+        unsafe {
+            let sel_new_set = (gpu.api.sel_register)(c"newResidencySetWithDescriptor:error:".as_ptr().cast());
+            let device_ok: bool = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Sel) -> bool,
+                gpu.device,
+                c"respondsToSelector:",
+                sel_new_set
+            );
+            let sel_add = (gpu.api.sel_register)(c"addResidencySet:".as_ptr().cast());
+            let queue_ok: bool = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Sel) -> bool,
+                gpu.queue,
+                c"respondsToSelector:",
+                sel_add
+            );
+            let cls = (gpu.api.get_class)(c"MTLResidencySetDescriptor".as_ptr().cast());
+            if !device_ok || !queue_ok || cls.is_null() {
+                if dbg {
+                    eprintln!("[residency] unavailable (device={device_ok} queue={queue_ok} class={})", !cls.is_null());
+                }
+                return;
+            }
+            let pool = gpu.pool_push();
+            let desc: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, cls, c"new");
+            if desc.is_null() {
+                gpu.pool_pop(pool);
+                return;
+            }
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel, u64), desc, c"setInitialCapacity:", 8u64);
+            let mut err: Id = NIL;
+            let set: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newResidencySetWithDescriptor:error:",
+                desc,
+                &mut err
+            );
+            gpu.release(desc);
+            if set.is_null() {
+                if dbg {
+                    eprintln!("[residency] newResidencySetWithDescriptor failed");
+                }
+                gpu.pool_pop(pool);
+                return;
+            }
+            let mut n = 0usize;
+            for buf in [latched.tw_buf, latched.tree_buf, latched.staging]
+                .into_iter()
+                .chain(latched.wraps.iter().map(|w| w.2))
+            {
+                if !buf.is_null() {
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel, Id), set, c"addAllocation:", buf);
+                    n += 1;
+                }
+            }
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel), set, c"commit");
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel), set, c"requestResidency");
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel, Id), gpu.queue, c"addResidencySet:", set);
+            RESIDENCY_SET.store(set as usize, Ordering::Release);
+            if dbg {
+                let bytes: u64 = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> u64, set, c"allocatedSize");
+                eprintln!("[residency] pinned {n} allocations, {:.1} MiB", bytes as f64 / (1 << 20) as f64);
+            }
+            gpu.pool_pop(pool);
+        }
+    }
+
     struct WarmupRun {
         latched: Latched,
         gpu_tree: Vec<Hash>,
@@ -8927,6 +9029,7 @@ kernel void blake3_pow_scan(
                             );
                         }
                         let tree = run.gpu_tree;
+                        pin_latched_residency(gpu, &run.latched);
                         *latch = LatchState::On(run.latched);
                         keepwarm_arm();
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
@@ -8993,6 +9096,7 @@ kernel void blake3_pow_scan(
                         );
                     }
                     let tree = run.gpu_tree;
+                    pin_latched_residency(gpu, &run.latched);
                     *latch = LatchState::On(run.latched);
                     keepwarm_arm();
                     return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
@@ -9105,6 +9209,7 @@ kernel void blake3_pow_scan(
                 &codeword,
                 &cpu_tree,
             );
+            pin_latched_residency(gpu, &run.latched);
             *latch = LatchState::On(run.latched);
             keepwarm_arm();
         } else {
