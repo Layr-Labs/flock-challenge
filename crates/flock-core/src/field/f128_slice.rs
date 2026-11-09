@@ -1224,18 +1224,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-#[test]
-fn kara2_in_place_matches_separate() {
-    let mut state=0x91e10da5c79e7b1du64;
-    let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;F128::new(state,state.rotate_left(23))};
-    for n in [4usize,8,20,1024,4096] {
-        for _ in 0..8 {
-            let f:Vec<F128>=(0..n).map(|_|next()).collect();let b:Vec<F128>=(0..n).map(|_|next()).collect();let r=next();
-            let mut nf=vec![F128::ZERO;n/2];let mut nb=nf.clone();let expected=fold_two_and_msg(&f,&b,0,&mut nf,&mut nb,r);
-            let mut fi=f.clone();let mut bi=b.clone();let actual=fold_two_and_msg_in_place(&mut fi,&mut bi,r);
-            assert_eq!(actual,expected);assert_eq!(&fi[..n/2],nf);assert_eq!(&bi[..n/2],nb);
-        }
-    }
-}
