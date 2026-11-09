@@ -501,7 +501,13 @@ unsafe fn reduce_wide_q(value: WideNeon) -> core::arch::aarch64::uint64x2_t {
     use core::arch::aarch64::*;
     unsafe {
         let zero = vdupq_n_u64(0);
-        let hi = value.hi;
+        let r3 = vextq_u64::<1>(value.hi, zero);
+        let ov = xor3_u64(
+            vshrq_n_u64::<63>(r3),
+            vshrq_n_u64::<62>(r3),
+            vshrq_n_u64::<57>(r3),
+        );
+        let hi = veorq_u64(value.hi, ov);
         let shift1 = veorq_u64(
             vshlq_n_u64::<1>(hi),
             vextq_u64::<1>(zero, vshrq_n_u64::<63>(hi)),
@@ -515,21 +521,7 @@ unsafe fn reduce_wide_q(value: WideNeon) -> core::arch::aarch64::uint64x2_t {
             vextq_u64::<1>(zero, vshrq_n_u64::<57>(hi)),
         );
         let folded = xor3_u64(hi, shift1, veorq_u64(shift2, shift7));
-
-        // Only r3 (the high lane) can overflow the 128-bit fold. Move it to
-        // the low lane so the correction lands in result coefficient 0.
-        let r3 = vextq_u64::<1>(hi, zero);
-        let ov = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
-            vshrq_n_u64::<57>(r3),
-        );
-        let corr = xor3_u64(
-            ov,
-            vshlq_n_u64::<1>(ov),
-            veorq_u64(vshlq_n_u64::<2>(ov), vshlq_n_u64::<7>(ov)),
-        );
-        xor3_u64(value.lo, folded, corr)
+        veorq_u64(value.lo, folded)
     }
 }
 

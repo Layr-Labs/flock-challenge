@@ -227,8 +227,14 @@ pub unsafe fn ghash_mul_vec2_neon(a: [F128; 2], b: [F128; 2]) -> [F128; 2] {
 
         // Vectorised GHASH reduction: fold (r2, r3) into (r0, r1) mod p,
         // where p = x^128 + x^7 + x^2 + x + 1. r(x) = x^7 + x^2 + x + 1.
-        // Each shift produces (lo_part, overflow); the overflow goes into
-        // the next-higher word.
+        let r2 = veorq_u64(
+            r2,
+            xor3_u64(
+                vshrq_n_u64::<63>(r3),
+                vshrq_n_u64::<62>(r3),
+                vshrq_n_u64::<57>(r3),
+            ),
+        );
         let s1_lo = vshlq_n_u64::<1>(r2);
         let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
         let s2_lo = vshlq_n_u64::<2>(r2);
@@ -239,19 +245,7 @@ pub unsafe fn ghash_mul_vec2_neon(a: [F128; 2], b: [F128; 2]) -> [F128; 2] {
         let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
         let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
 
-        // Bits of r3 that overflowed past position 127 in the three shifts.
-        let ov = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
-            vshrq_n_u64::<57>(r3),
-        );
-        let corr = xor3_u64(
-            ov,
-            vshlq_n_u64::<1>(ov),
-            veorq_u64(vshlq_n_u64::<2>(ov), vshlq_n_u64::<7>(ov)),
-        );
-
-        let final_lo = xor3_u64(r0, t_lo, corr);
+        let final_lo = veorq_u64(r0, t_lo);
         let final_hi = veorq_u64(r1, t_hi);
 
         // Unpack: lane 0 → mul0, lane 1 → mul1.
@@ -372,10 +366,14 @@ pub unsafe fn ghash_mul_const_vec2_neon(c: F128, b: [F128; 2]) -> [F128; 2] {
         let r2 = veorq_u64(hh_lo, c_hi);
         let r3 = vzip2q_u64(p0_hh, p1_hh);
 
-        // Vectorised GHASH reduction: fold (r2, r3) into (r0, r1) mod p,
-        // where p = x^128 + x^7 + x^2 + x + 1. r(x) = x^7 + x^2 + x + 1.
-        // Each shift produces (lo_part, overflow); the overflow goes into
-        // the next-higher word.
+        let r2 = veorq_u64(
+            r2,
+            xor3_u64(
+                vshrq_n_u64::<63>(r3),
+                vshrq_n_u64::<62>(r3),
+                vshrq_n_u64::<57>(r3),
+            ),
+        );
         let s1_lo = vshlq_n_u64::<1>(r2);
         let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
         let s2_lo = vshlq_n_u64::<2>(r2);
@@ -386,19 +384,7 @@ pub unsafe fn ghash_mul_const_vec2_neon(c: F128, b: [F128; 2]) -> [F128; 2] {
         let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
         let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
 
-        // Bits of r3 that overflowed past position 127 in the three shifts.
-        let ov = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
-            vshrq_n_u64::<57>(r3),
-        );
-        let corr = xor3_u64(
-            ov,
-            vshlq_n_u64::<1>(ov),
-            veorq_u64(vshlq_n_u64::<2>(ov), vshlq_n_u64::<7>(ov)),
-        );
-
-        let final_lo = xor3_u64(r0, t_lo, corr);
+        let final_lo = veorq_u64(r0, t_lo);
         let final_hi = veorq_u64(r1, t_hi);
 
         // Unpack: lane 0 → mul0, lane 1 → mul1.

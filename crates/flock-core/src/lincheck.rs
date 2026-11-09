@@ -179,6 +179,20 @@ pub fn register_root_stripe(stripe: &[u8], roots: RootStripe) -> RootStripeRegis
     RootStripeRegistration { key }
 }
 
+/// Replace the descriptor of the live registration for the buffer at
+/// `(addr, len)` (a producer that had to fall back to a wider root layout
+/// re-declares it before publishing the stripe). Returns whether it matched.
+pub fn replace_root_stripe(addr: usize, len: usize, roots: RootStripe) -> bool {
+    let mut guard = ROOT_STRIPE.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_mut() {
+        Some((p, l, current)) if (*p, *l) == (addr, len) => {
+            *current = roots;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The root layout of `stripe`, if it was registered as root-compacted.
 pub fn root_stripe_for(stripe: &[u8]) -> Option<RootStripe> {
     let key = (stripe.as_ptr() as usize, stripe.len());
