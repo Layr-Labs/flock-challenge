@@ -574,10 +574,15 @@ where
 /// owner must call [`HelpQueue::wait_done`] before publishing the output: each
 /// completed chunk bumps `done` with `Release`, and the `Acquire` load that
 /// sees `done == n_chunks` therefore happens after every chunk's writes.
+///
 pub struct HelpQueue<'a> {
     next: AtomicUsize,
     done: AtomicUsize,
     main_claims: AtomicUsize,
+    main_active: AtomicUsize,
+    main_ns: AtomicU64,
+    main_cnt: AtomicU64,
+    guard_on: bool,
     n_chunks: usize,
     f: &'a (dyn Fn(usize) + Sync),
 }
@@ -588,6 +593,10 @@ impl<'a> HelpQueue<'a> {
             next: AtomicUsize::new(0),
             done: AtomicUsize::new(0),
             main_claims: AtomicUsize::new(0),
+            main_active: AtomicUsize::new(0),
+            main_ns: AtomicU64::new(0),
+            main_cnt: AtomicU64::new(0),
+            guard_on: tail_guard_enabled(),
             n_chunks,
             f,
         }
@@ -608,13 +617,77 @@ impl<'a> HelpQueue<'a> {
         }
     }
 
+    fn drain_main(&self) -> usize {
+        if !self.guard_on {
+            return self.drain();
+        }
+        let mut ran = 0usize;
+        loop {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            if i >= self.n_chunks {
+                return ran;
+            }
+            let started = std::time::Instant::now();
+            (self.f)(i);
+            let ns = started.elapsed().as_nanos() as u64;
+            self.done.fetch_add(1, Ordering::Release);
+            self.main_ns.fetch_add(ns, Ordering::Relaxed);
+            self.main_cnt.fetch_add(1, Ordering::Relaxed);
+            ran += 1;
+        }
+    }
+
+    /// Whether a helper whose average chunk time is `own_ns` (0 = unknown)
+    #[inline]
+    fn helper_may_claim(&self, own_ns: u64) -> bool {
+        if own_ns == 0 {
+            return true;
+        }
+        let active = self.main_active.load(Ordering::SeqCst) as u64;
+        if active == 0 {
+            return true;
+        }
+        let cnt = self.main_cnt.load(Ordering::Relaxed);
+        if cnt == 0 {
+            return true;
+        }
+        let t_main = self.main_ns.load(Ordering::Relaxed) / cnt;
+        let remaining = self.n_chunks.saturating_sub(self.next.load(Ordering::Relaxed)) as u64;
+        own_ns.saturating_mul(active) <= remaining.saturating_mul(t_main)
+    }
+
+    fn drain_helper(&self) -> usize {
+        if !self.guard_on {
+            return self.drain();
+        }
+        let mut ran = 0usize;
+        let mut own_ns = 0u64;
+        loop {
+            if !self.helper_may_claim(own_ns) {
+                return ran;
+            }
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            if i >= self.n_chunks {
+                return ran;
+            }
+            let started = std::time::Instant::now();
+            (self.f)(i);
+            let ns = (started.elapsed().as_nanos() as u64).max(1);
+            self.done.fetch_add(1, Ordering::Release);
+            own_ns = if own_ns == 0 { ns } else { (own_ns + ns) / 2 };
+            ran += 1;
+        }
+    }
+
     /// Help drain from a thread that has nothing else to do. Costs one relaxed
     /// load when the queue is already exhausted.
     pub fn help(&self) {
         if self.next.load(Ordering::Relaxed) >= self.n_chunks {
             return;
         }
-        let ran = self.drain();
+        self.main_active.fetch_add(1, Ordering::SeqCst);
+        let ran = self.drain_main();
+        self.main_active.fetch_sub(1, Ordering::SeqCst);
         if ran > 0 {
             self.main_claims.fetch_add(ran, Ordering::Relaxed);
         }
@@ -675,7 +748,7 @@ pub fn run_queue_with_helper_only(
         if context.index() >= max_workers {
             return;
         }
-        let ran = queue.drain();
+        let ran = queue.drain_helper();
         EPOOL_HELPER_CHUNKS.fetch_add(ran, Ordering::Relaxed);
     });
     true
