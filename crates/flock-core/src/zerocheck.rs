@@ -582,13 +582,46 @@ fn prove_packed_padded_inner<C: Challenger>(
             }
             let cpu_ab = crate::pcs::commit::commit_cpu_ms();
             let t_ab = std::time::Instant::now();
-            let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
-                ab_inner,
-                m,
-                k_skip,
-                &r,
-                padding,
-            );
+            let run_ab = || {
+                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                    ab_inner,
+                    m,
+                    k_skip,
+                    &r,
+                    padding,
+                )
+            };
+            // Phase-level gate for the round-one AB GPU arm (warm-up only;
+            // same protocol as the round-two gate; the call is pure).
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let ab = if crate::gpu_commit::arm_gate_pending(1) {
+                let first = run_ab();
+                if crate::gpu_commit::arm_gate_armed(1) {
+                    drop(first);
+                    let modes = [(true, true), (true, false), (false, false)];
+                    let mut best = [f64::MAX; 3];
+                    for i in 0..6 {
+                        let (on, res) = modes[i % 3];
+                        crate::gpu_commit::arm_gate_mode(1, on, res);
+                        let t = std::time::Instant::now();
+                        drop(run_ab());
+                        best[i % 3] = best[i % 3].min(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                    let keep = crate::gpu_commit::arm_gate_decide(1, best[0], best[1], best[2]);
+                    let t = std::time::Instant::now();
+                    let real = run_ab();
+                    if keep {
+                        crate::gpu_commit::arm_gate_recheck(1, t.elapsed().as_secs_f64() * 1e3, best[2]);
+                    }
+                    real
+                } else {
+                    first
+                }
+            } else {
+                run_ab()
+            };
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let ab = run_ab();
             if zc_timing {
                 eprintln!(
                     "[zc-timing] round1 AB completion: {:.2} ms cpu={:.1}",
@@ -801,17 +834,57 @@ fn prove_packed_padded_inner<C: Challenger>(
     let use_cascade = use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
 
     let (compact_mlv, msg_1, msg_inf, lookahead) = if use_lookahead {
-        let (compact, m1, mi, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
-            a_packed,
-            b_packed,
-            m,
-            k_skip,
-            &fold_table,
-            &mlv_arg,
-            padding,
-            compact_deltas,
-            use_cascade,
-        );
+        let run = |backing: Option<crate::scratch::ScratchBytes>| {
+            uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+                a_packed,
+                b_packed,
+                m,
+                k_skip,
+                &fold_table,
+                &mlv_arg,
+                padding,
+                backing,
+                use_cascade,
+            )
+        };
+        // Phase-level gate for the round-two full GPU arm (untimed warm-up
+        // only; `FLOCK_NO_ARM_GATE=1` skips): calibrate, then run the real
+        // phase interleaved ON+residency / ON / OFF twice each on the
+        // warm-up data, keep the arm only if its best wall beats OFF by
+        // >= 3%, and re-check on the real call. Every trial recycles its
+        // anchors (same tagged allocation) and hands its delta backing to
+        // the next, so peak memory is that of a single call.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let (compact, m1, mi, la) = if crate::gpu_commit::arm_gate_pending(2) {
+            let mut backing = compact_deltas;
+            let first = run(backing.take());
+            backing = Some(first.0.into_deltas_backing());
+            if crate::gpu_commit::arm_gate_armed(2) {
+                let modes = [(true, true), (true, false), (false, false)];
+                let mut best = [f64::MAX; 3];
+                for i in 0..6 {
+                    let (on, res) = modes[i % 3];
+                    crate::gpu_commit::arm_gate_mode(2, on, res);
+                    let t = std::time::Instant::now();
+                    let trial = run(backing.take());
+                    best[i % 3] = best[i % 3].min(t.elapsed().as_secs_f64() * 1e3);
+                    backing = Some(trial.0.into_deltas_backing());
+                }
+                let keep = crate::gpu_commit::arm_gate_decide(2, best[0], best[1], best[2]);
+                let t = std::time::Instant::now();
+                let real = run(backing.take());
+                if keep {
+                    crate::gpu_commit::arm_gate_recheck(2, t.elapsed().as_secs_f64() * 1e3, best[2]);
+                }
+                real
+            } else {
+                run(backing.take())
+            }
+        } else {
+            run(compact_deltas)
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let (compact, m1, mi, la) = run(compact_deltas);
         (compact, m1, mi, Some(la))
     } else {
         let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(

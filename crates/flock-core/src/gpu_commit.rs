@@ -7863,16 +7863,13 @@ kernel void blake3_pow_scan(
         }
     }
 
-    /// The fine split is OPT-IN: `FLOCK_HYBRID_FINE=1` restores it,
-    /// `FLOCK_NO_HYBRID_FINE` still forces it off. Without it the tuner keeps
-    /// the coarse split it chose. The split never changes proof bytes. Read
-    /// once, at tune time.
+    /// The fine split is on by default again (the tuner measures the fine
+    /// sub-block arms in the untimed warm-up and keeps the coarse split when
+    /// no fine candidate beats it); `FLOCK_NO_HYBRID_FINE` forces it off.
+    /// The split never changes proof bytes. Read once, at tune time.
     fn hybrid_fine_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var_os("FLOCK_HYBRID_FINE").is_some()
-                && std::env::var_os("FLOCK_NO_HYBRID_FINE").is_none()
-        })
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_FINE").is_none())
     }
 
     /// The `(cb2, cpu, cb3)` of split `k`'s cheapest fine sample.
@@ -14575,6 +14572,1550 @@ kernel void zc_r2_horner_oracle(
         }
     }
 
+
+    // -----------------------------------------------------------------------
+    // Zerocheck round-two FULL GPU arm (`FLOCK_NO_R2_GPU_FULL=1` kills).
+    //
+    // For a self-calibrated chunk prefix the GPU writes the compact anchors
+    // and deltas straight into the CPU's buffers (cached no-copy wraps, no
+    // extra memory) and returns the eight per-chunk lookahead aggregates; the
+    // CPU sweep skips those chunks entirely. The warm-up probe runs into a
+    // small scratch region and is compared byte-for-byte (anchors, deltas)
+    // and value-for-value (partials, lookahead state) against the CPU's own
+    // outputs for the same chunks before any share is published.
+    // -----------------------------------------------------------------------
+
+    const ZC_R2_FULL_MSL: &str = r#"
+// ---------------------------------------------------------------------------
+// FULL round-two arm (FLOCK_NO_R2_GPU_FULL kills): for a chunk prefix the GPU
+// writes every compact anchor/delta byte AND the eight w-weighted per-chunk
+// aggregates of the CPU lookahead kernel, so the CPU skips those chunks.
+// Values: same byte-table fold, exact emulated clmul + canonical reduction,
+// XOR (order-independent) accumulation of reduced terms; the host applies the
+// same kappa / r1^-1 constants as for CPU chunks.
+// ---------------------------------------------------------------------------
+struct ZcR2FullParams { uint lo_size; uint mask; uint useful; uint flags; uint chunk0; };
+
+static inline uint4 zc_r2_mulr(uint4 x, uint4 y) { return gf_reduce(clmul128(x, y)); }
+
+static inline uint4 zc_r2_simd_xor(uint4 v) {
+    for (ushort s = 16; s > 0; s >>= 1) {
+        v ^= simd_shuffle_xor(v, s);
+    }
+    return v;
+}
+
+// One threadgroup (256 threads) per hi chunk; thread `lid` owns round-three
+// groups u = lid, lid + 256, ... (pairs 2u, 2u+1). Outputs per chunk (index
+// tgid, relative to `chunk0`): eight reduced F128
+// `eq_hi * [p1_even, pinf_even, p1_odd, pinf_odd, W0, W3, W4, W5]`, all on the
+// odd-lane weight w = eq_lo[2u+1] exactly as the NEON lookahead kernel.
+// `anchors`/`deltas` are indexed relative to the dispatch's first chunk.
+kernel void zc_r2_full(
+    device const uint4* a_in   [[buffer(0)]],
+    device const uint4* b_in   [[buffer(1)]],
+    device const uint4* eq_lo  [[buffer(2)]],
+    device const uint4* eq_hi  [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       outs   [[buffer(5)]],
+    device uint4*       anchors [[buffer(6)]],
+    device uint4*       deltas  [[buffer(7)]],
+    constant ZcR2FullParams& p [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]],
+    uint sl   [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint4 nib[256];
+    threadgroup uint4 red[8 * 8];
+    nib[lid] = nib_tab_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint chunk = p.chunk0 + tgid;
+    const bool write_pad = (p.flags & 1u) == 0u;
+    const uint n_groups = p.lo_size >> 1;
+    const uint4 z = uint4(0u);
+    uint4 acc0 = z, acc1 = z, acc2 = z, acc3 = z, acc4 = z, acc5 = z, acc6 = z, acc7 = z;
+
+    for (uint u = lid; u < n_groups; u += 256u) {
+        uint x0 = 2u * u;
+        uint gp0 = chunk * p.lo_size + x0;
+        uint gp1 = gp0 + 1u;
+        uint rel0 = tgid * p.lo_size + x0;
+        uint rel1 = rel0 + 1u;
+        bool pad0 = (gp0 & p.mask) >= p.useful;
+        bool pad1 = (gp1 & p.mask) >= p.useful;
+        uint4 a0 = z, a1 = z, b0 = z, b1 = z, a2 = z, a3 = z, b2 = z, b3 = z;
+        if (!pad0) {
+            uint4 ar = a_in[gp0];
+            uint4 br = b_in[gp0];
+            a0 = zc_r2_fold8(ar.x, ar.y, nib);
+            a1 = zc_r2_fold8(ar.z, ar.w, nib);
+            b0 = zc_r2_fold8(br.x, br.y, nib);
+            b1 = zc_r2_fold8(br.z, br.w, nib);
+            anchors[2u * rel0] = a0;
+            anchors[2u * rel0 + 1u] = b0;
+            deltas[rel0] = uint4(ar.x ^ ar.z, ar.y ^ ar.w, br.x ^ br.z, br.y ^ br.w);
+        } else if (write_pad) {
+            anchors[2u * rel0] = z;
+            anchors[2u * rel0 + 1u] = z;
+            deltas[rel0] = z;
+        }
+        if (!pad1) {
+            uint4 ar = a_in[gp1];
+            uint4 br = b_in[gp1];
+            a2 = zc_r2_fold8(ar.x, ar.y, nib);
+            a3 = zc_r2_fold8(ar.z, ar.w, nib);
+            b2 = zc_r2_fold8(br.x, br.y, nib);
+            b3 = zc_r2_fold8(br.z, br.w, nib);
+            anchors[2u * rel1] = a2;
+            anchors[2u * rel1 + 1u] = b2;
+            deltas[rel1] = uint4(ar.x ^ ar.z, ar.y ^ ar.w, br.x ^ br.z, br.y ^ br.w);
+        } else if (write_pad) {
+            anchors[2u * rel1] = z;
+            anchors[2u * rel1 + 1u] = z;
+            deltas[rel1] = z;
+        }
+        if (pad0 && pad1) { continue; }
+        uint4 w = eq_lo[x0 + 1u];
+        uint4 a0w = pad0 ? z : zc_r2_mulr(w, a0);
+        uint4 a1w = pad0 ? z : zc_r2_mulr(w, a1);
+        uint4 a2w = pad1 ? z : zc_r2_mulr(w, a2);
+        uint4 a3w = pad1 ? z : zc_r2_mulr(w, a3);
+        if (!pad0) {
+            acc0 ^= zc_r2_mulr(a1w, b1);
+            acc1 ^= zc_r2_mulr(a0w ^ a1w, b0 ^ b1);
+        }
+        if (!pad1) {
+            acc2 ^= zc_r2_mulr(a3w, b3);
+            acc3 ^= zc_r2_mulr(a2w ^ a3w, b2 ^ b3);
+            acc4 ^= zc_r2_mulr(a2w, b2);
+        }
+        uint4 eaw = a0w ^ a2w, eb = b0 ^ b2;
+        uint4 oaw = a1w ^ a3w, ob = b1 ^ b3;
+        acc5 ^= zc_r2_mulr(eaw, eb);
+        acc6 ^= zc_r2_mulr(oaw, ob);
+        acc7 ^= zc_r2_mulr(eaw ^ oaw, eb ^ ob);
+    }
+
+    acc0 = zc_r2_simd_xor(acc0); acc1 = zc_r2_simd_xor(acc1);
+    acc2 = zc_r2_simd_xor(acc2); acc3 = zc_r2_simd_xor(acc3);
+    acc4 = zc_r2_simd_xor(acc4); acc5 = zc_r2_simd_xor(acc5);
+    acc6 = zc_r2_simd_xor(acc6); acc7 = zc_r2_simd_xor(acc7);
+    if (sl == 0u) {
+        red[sg * 8u + 0u] = acc0; red[sg * 8u + 1u] = acc1;
+        red[sg * 8u + 2u] = acc2; red[sg * 8u + 3u] = acc3;
+        red[sg * 8u + 4u] = acc4; red[sg * 8u + 5u] = acc5;
+        red[sg * 8u + 6u] = acc6; red[sg * 8u + 7u] = acc7;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 8u) {
+        uint4 v = z;
+        for (uint s = 0u; s < 8u; s++) { v ^= red[s * 8u + lid]; }
+        outs[tgid * 8u + lid] = zc_r2_mulr(eq_hi[chunk], v);
+    }
+}
+
+// Horner twin of `zc_r2_full` for the protocol-constant medium weights
+// (host-verified: eq_lo[(win<<6)|(m<<2)|c] = eq_lo[(win<<6)|c] * x^m). Thread
+// unit = (window, half): pairs x0 = (win<<6)|(m<<2)|(2h), x0+1 over the 16
+// medium steps; the eight raw products are Horner-accumulated unreduced
+// and weighted once by lambda[win*4 + 2h + 1] (eq_lo uploaded as lambda).
+kernel void zc_r2_full_horner(
+    device const uint4* a_in   [[buffer(0)]],
+    device const uint4* b_in   [[buffer(1)]],
+    device const uint4* eq_lo  [[buffer(2)]],
+    device const uint4* eq_hi  [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       outs   [[buffer(5)]],
+    device uint4*       anchors [[buffer(6)]],
+    device uint4*       deltas  [[buffer(7)]],
+    constant ZcR2FullParams& p [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]],
+    uint sl   [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint4 nib[256];
+    threadgroup uint4 red[8 * 8];
+    nib[lid] = nib_tab_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint chunk = p.chunk0 + tgid;
+    const bool write_pad = (p.flags & 1u) == 0u;
+    const uint n_units = (p.lo_size >> 6) * 2u;
+    const uint4 z = uint4(0u);
+    uint4 acc0 = z, acc1 = z, acc2 = z, acc3 = z, acc4 = z, acc5 = z, acc6 = z, acc7 = z;
+
+    for (uint unit = lid; unit < n_units; unit += 256u) {
+        uint window = unit >> 1;
+        uint h = unit & 1u;
+        U320k H0 = {0ul,0ul,0ul,0ul,0ul}, H1 = H0, H2 = H0, H3 = H0, H4 = H0, H5 = H0, H6 = H0, H7 = H0;
+        for (uint step = 0u; step < 16u; step++) {
+            if (step != 0u) {
+                zc_r2_horner_shift(H0); zc_r2_horner_shift(H1);
+                zc_r2_horner_shift(H2); zc_r2_horner_shift(H3);
+                zc_r2_horner_shift(H4); zc_r2_horner_shift(H5);
+                zc_r2_horner_shift(H6); zc_r2_horner_shift(H7);
+            }
+            uint m = 15u - step;
+            uint x0 = (window << 6) | (m << 2) | (h << 1);
+            uint gp0 = chunk * p.lo_size + x0;
+            uint gp1 = gp0 + 1u;
+            uint rel0 = tgid * p.lo_size + x0;
+            uint rel1 = rel0 + 1u;
+            bool pad0 = (gp0 & p.mask) >= p.useful;
+            bool pad1 = (gp1 & p.mask) >= p.useful;
+            uint4 a0 = z, a1 = z, b0 = z, b1 = z, a2 = z, a3 = z, b2 = z, b3 = z;
+            if (!pad0) {
+                uint4 ar = a_in[gp0];
+                uint4 br = b_in[gp0];
+                a0 = zc_r2_fold8(ar.x, ar.y, nib);
+                a1 = zc_r2_fold8(ar.z, ar.w, nib);
+                b0 = zc_r2_fold8(br.x, br.y, nib);
+                b1 = zc_r2_fold8(br.z, br.w, nib);
+                anchors[2u * rel0] = a0;
+                anchors[2u * rel0 + 1u] = b0;
+                deltas[rel0] = uint4(ar.x ^ ar.z, ar.y ^ ar.w, br.x ^ br.z, br.y ^ br.w);
+            } else if (write_pad) {
+                anchors[2u * rel0] = z;
+                anchors[2u * rel0 + 1u] = z;
+                deltas[rel0] = z;
+            }
+            if (!pad1) {
+                uint4 ar = a_in[gp1];
+                uint4 br = b_in[gp1];
+                a2 = zc_r2_fold8(ar.x, ar.y, nib);
+                a3 = zc_r2_fold8(ar.z, ar.w, nib);
+                b2 = zc_r2_fold8(br.x, br.y, nib);
+                b3 = zc_r2_fold8(br.z, br.w, nib);
+                anchors[2u * rel1] = a2;
+                anchors[2u * rel1 + 1u] = b2;
+                deltas[rel1] = uint4(ar.x ^ ar.z, ar.y ^ ar.w, br.x ^ br.z, br.y ^ br.w);
+            } else if (write_pad) {
+                anchors[2u * rel1] = z;
+                anchors[2u * rel1 + 1u] = z;
+                deltas[rel1] = z;
+            }
+            if (pad0 && pad1) { continue; }
+            if (!pad0) {
+                zc_r2_horner_add(H0, clmul128(a1, b1));
+                zc_r2_horner_add(H1, clmul128(a0 ^ a1, b0 ^ b1));
+            }
+            if (!pad1) {
+                zc_r2_horner_add(H2, clmul128(a3, b3));
+                zc_r2_horner_add(H3, clmul128(a2 ^ a3, b2 ^ b3));
+                zc_r2_horner_add(H4, clmul128(a2, b2));
+            }
+            uint4 ea = a0 ^ a2, eb = b0 ^ b2, oa = a1 ^ a3, ob = b1 ^ b3;
+            zc_r2_horner_add(H5, clmul128(ea, eb));
+            zc_r2_horner_add(H6, clmul128(oa, ob));
+            zc_r2_horner_add(H7, clmul128(ea ^ oa, eb ^ ob));
+        }
+        uint4 base = eq_lo[window * 4u + 2u * h + 1u];
+        acc0 ^= zc_r2_mulr(base, zc_r2_horner_reduce(H0));
+        acc1 ^= zc_r2_mulr(base, zc_r2_horner_reduce(H1));
+        acc2 ^= zc_r2_mulr(base, zc_r2_horner_reduce(H2));
+        acc3 ^= zc_r2_mulr(base, zc_r2_horner_reduce(H3));
+        acc4 ^= zc_r2_mulr(base, zc_r2_horner_reduce(H4));
+        acc5 ^= zc_r2_mulr(base, zc_r2_horner_reduce(H5));
+        acc6 ^= zc_r2_mulr(base, zc_r2_horner_reduce(H6));
+        acc7 ^= zc_r2_mulr(base, zc_r2_horner_reduce(H7));
+    }
+
+    acc0 = zc_r2_simd_xor(acc0); acc1 = zc_r2_simd_xor(acc1);
+    acc2 = zc_r2_simd_xor(acc2); acc3 = zc_r2_simd_xor(acc3);
+    acc4 = zc_r2_simd_xor(acc4); acc5 = zc_r2_simd_xor(acc5);
+    acc6 = zc_r2_simd_xor(acc6); acc7 = zc_r2_simd_xor(acc7);
+    if (sl == 0u) {
+        red[sg * 8u + 0u] = acc0; red[sg * 8u + 1u] = acc1;
+        red[sg * 8u + 2u] = acc2; red[sg * 8u + 3u] = acc3;
+        red[sg * 8u + 4u] = acc4; red[sg * 8u + 5u] = acc5;
+        red[sg * 8u + 6u] = acc6; red[sg * 8u + 7u] = acc7;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 8u) {
+        uint4 v = z;
+        for (uint s = 0u; s < 8u; s++) { v ^= red[s * 8u + lid]; }
+        outs[tgid * 8u + lid] = zc_r2_mulr(eq_hi[chunk], v);
+    }
+}
+"#;
+
+    struct ZcR2Full {
+        pso: Id,
+        /// Horner twin (`NIL` if it failed to build).
+        horner_pso: Id,
+        nib_buf: Id,
+        eq_lo_buf: Id,
+        eq_lo_cap: usize,
+        eq_hi_buf: Id,
+        eq_hi_cap: usize,
+        out_buf: Id,
+        out_cap: usize,
+        wraps: Vec<(usize, usize, Id)>,
+    }
+    // SAFETY: handles only touched under the state mutex.
+    unsafe impl Send for ZcR2Full {}
+
+    static ZC_R2_FULL_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcR2Full>>> =
+        std::sync::OnceLock::new();
+    /// `usize::MAX` = uncalibrated, `0` = off for this process.
+    static ZC_R2_FULL_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    fn zc_r2_full_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R2_GPU_FULL").is_none());
+        *ON
+    }
+
+    fn zc_r2_full_init(gpu: &'static Gpu) -> Result<ZcR2Full, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<(Id, Id), String> {
+                let source = format!(
+                    "{}{}",
+                    zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled()),
+                    ZC_R2_FULL_MSL
+                );
+                let src = gpu.api.nsstring(&source)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "zc-r2-full compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let make = |name: &str| -> Result<Id, String> {
+                    let ns = gpu.api.nsstring(name)?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err(format!("{name} kernel not found"));
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    gpu.release(f);
+                    if pso.is_null() {
+                        return Err(format!("{name} pipeline: {}", gpu.api.error_string(perr)));
+                    }
+                    Ok(pso)
+                };
+                let plain = make("zc_r2_full");
+                let horner = make("zc_r2_full_horner");
+                gpu.release(library);
+                let plain = plain?;
+                Ok((plain, horner.unwrap_or(NIL)))
+            })();
+            gpu.pool_pop(pool);
+            let (pso, horner_pso) = built?;
+            let horner_pso = if horner_pso.is_null() {
+                NIL
+            } else {
+                let w: u64 = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    horner_pso,
+                    c"threadExecutionWidth"
+                );
+                let mt: u64 = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    horner_pso,
+                    c"maxTotalThreadsPerThreadgroup"
+                );
+                if w != 32 || mt < 256 {
+                    gpu.release(horner_pso);
+                    NIL
+                } else {
+                    horner_pso
+                }
+            };
+            let width: u64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> u64,
+                pso,
+                c"threadExecutionWidth"
+            );
+            let max_threads: u64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> u64,
+                pso,
+                c"maxTotalThreadsPerThreadgroup"
+            );
+            if width != 32 || max_threads < 256 {
+                gpu.release(pso);
+                return Err(format!("zc-r2-full PSO width {width} max {max_threads}"));
+            }
+            Ok(ZcR2Full {
+                pso,
+                horner_pso,
+                nib_buf: gpu.new_buffer(256 * 16)?,
+                eq_lo_buf: NIL,
+                eq_lo_cap: 0,
+                eq_hi_buf: NIL,
+                eq_hi_cap: 0,
+                out_buf: NIL,
+                out_cap: 0,
+                wraps: Vec::new(),
+            })
+        }
+    }
+
+    fn zc_r2_full_state() -> Option<&'static std::sync::Mutex<ZcR2Full>> {
+        ZC_R2_FULL_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match zc_r2_full_init(gpu) {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!("[zc-r2-full] init failed: {e}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    unsafe fn zc_r2_full_wrap(
+        state: &mut ZcR2Full,
+        gpu: &Gpu,
+        ptr: *mut u8,
+        len: usize,
+    ) -> Result<Id, String> {
+        let key = ptr as usize;
+        if let Some(&(_, _, buf)) = state.wraps.iter().find(|&&(p, l, _)| p == key && l == len) {
+            return Ok(buf);
+        }
+        let t = std::time::Instant::now();
+        let buf = unsafe { gpu.wrap_buffer(ptr, len)? };
+        if super::gpu_zc_r2_debug() {
+            eprintln!(
+                "[zc-r2-full] wrap miss {key:#x} len {} MiB ({:.2} ms)",
+                len >> 20,
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        state.wraps.push((key, len, buf));
+        Ok(buf)
+    }
+
+    unsafe fn zc_r2_grow(gpu: &Gpu, buf: &mut Id, cap: &mut usize, need: usize) -> Result<(), String> {
+        if *cap < need {
+            if *cap > 0 {
+                unsafe { gpu.release(*buf) };
+            }
+            *buf = unsafe { gpu.new_buffer(need)? };
+            *cap = need;
+        }
+        Ok(())
+    }
+
+    /// Keep the full arm's bound allocations resident on the command queue
+    /// (MTLResidencySet, macOS 15+) so the timed submission does not pay
+    /// per-commit residency for the wrapped prefix/inputs (measured ~7 ms
+    /// queue delay on M5 Pro without it). `FLOCK_NO_R2_FULL_RESIDENCY=1`
+    /// skips. Best-effort: unavailable API or any failure leaves the arm as is.
+    /// Build a residency set for an arm's bound allocations and request
+    /// residency once. It is NOT added to the command queue (which would
+    /// affect every other submission, e.g. the L0 commit graph); the arm
+    /// attaches it per command buffer with `useResidencySet:` and only while
+    /// its phase gate keeps residency on. Returns `NIL` when unavailable.
+    fn zc_arm_build_residency(gpu: &Gpu, bufs: &[Id]) -> Id {
+        if std::env::var_os("FLOCK_NO_R2_FULL_RESIDENCY").is_some() {
+            return NIL;
+        }
+        unsafe {
+            let sel_new_set =
+                (gpu.api.sel_register)(c"newResidencySetWithDescriptor:error:".as_ptr().cast());
+            let device_ok: bool = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Sel) -> bool,
+                gpu.device,
+                c"respondsToSelector:",
+                sel_new_set
+            );
+            let cls = (gpu.api.get_class)(c"MTLResidencySetDescriptor".as_ptr().cast());
+            if !device_ok || cls.is_null() {
+                if super::gpu_zc_r2_debug() {
+                    eprintln!("[zc-arm] residency set unavailable");
+                }
+                return NIL;
+            }
+            let pool = gpu.pool_push();
+            let desc: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, cls, c"new");
+            if desc.is_null() {
+                gpu.pool_pop(pool);
+                return NIL;
+            }
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel, u64), desc, c"setInitialCapacity:", 8u64);
+            let mut err: Id = NIL;
+            let set: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newResidencySetWithDescriptor:error:",
+                desc,
+                &mut err
+            );
+            gpu.release(desc);
+            if set.is_null() {
+                gpu.pool_pop(pool);
+                return NIL;
+            }
+            for &buf in bufs {
+                if !buf.is_null() {
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel, Id), set, c"addAllocation:", buf);
+                }
+            }
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel), set, c"commit");
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel), set, c"requestResidency");
+            gpu.pool_pop(pool);
+            set
+        }
+    }
+
+    /// Attach an arm's residency set to one command buffer (no-op for NIL
+    /// or when the command buffer lacks `useResidencySet:`).
+    unsafe fn zc_arm_use_residency(gpu: &Gpu, cb: Id, set: Id) {
+        if set.is_null() {
+            return;
+        }
+        unsafe {
+            let sel = (gpu.api.sel_register)(c"useResidencySet:".as_ptr().cast());
+            let ok: bool =
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel, Sel) -> bool, cb, c"respondsToSelector:", sel);
+            if ok {
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel, Id), cb, c"useResidencySet:", set);
+            }
+        }
+    }
+
+    // ---- phase-level arm gates (driven by warm-up trials in zerocheck.rs) ----
+    /// Per arm: forced trial mode (0 none, 1 off, 2 on), residency off flag,
+    /// the arm's residency set, decided flag.
+    pub(crate) struct ArmGate {
+        force: std::sync::atomic::AtomicU8,
+        res_off: std::sync::atomic::AtomicBool,
+        res_set: std::sync::atomic::AtomicUsize,
+        decided: std::sync::atomic::AtomicBool,
+    }
+    impl ArmGate {
+        const fn new() -> Self {
+            Self {
+                force: std::sync::atomic::AtomicU8::new(0),
+                res_off: std::sync::atomic::AtomicBool::new(false),
+                res_set: std::sync::atomic::AtomicUsize::new(0),
+                decided: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn forced_off(&self) -> bool {
+            self.force.load(std::sync::atomic::Ordering::Relaxed) == 1
+        }
+        fn res(&self) -> Id {
+            if self.res_off.load(std::sync::atomic::Ordering::Relaxed) {
+                NIL
+            } else {
+                self.res_set.load(std::sync::atomic::Ordering::Relaxed) as Id
+            }
+        }
+    }
+    static R2_GATE: ArmGate = ArmGate::new();
+    static R1_GATE: ArmGate = ArmGate::new();
+
+    fn arm_gate(arm: u8) -> (&'static ArmGate, &'static std::sync::atomic::AtomicUsize) {
+        if arm == 2 { (&R2_GATE, &ZC_R2_FULL_TUNED) } else { (&R1_GATE, &ZC_R1_AB_TUNED) }
+    }
+
+    /// Whether warm-up trials should run for `arm` (2 = round-two full arm,
+    /// 1 = round-one AB arm): gate enabled, undecided, arm not off.
+    pub(crate) fn arm_gate_pending(arm: u8) -> bool {
+        let (g, tuned) = arm_gate(arm);
+        std::env::var_os("FLOCK_NO_ARM_GATE").is_none()
+            && !g.decided.load(std::sync::atomic::Ordering::Relaxed)
+            && tuned.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
+    /// Whether the arm is calibrated in (share > 0).
+    pub(crate) fn arm_gate_armed(arm: u8) -> bool {
+        let t = arm_gate(arm).1.load(std::sync::atomic::Ordering::Relaxed);
+        t != 0 && t != usize::MAX
+    }
+
+    /// Set the trial mode: arm on/off and residency on/off.
+    pub(crate) fn arm_gate_mode(arm: u8, on: bool, residency: bool) {
+        let (g, _) = arm_gate(arm);
+        g.force.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+        g.res_off.store(!residency, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Decide from trial minima (keep arm only if >= 3% faster than OFF;
+    /// keep residency only if >= 3% faster than the arm without it).
+    pub(crate) fn arm_gate_decide(arm: u8, on_res: f64, on_nores: f64, off: f64) -> bool {
+        use std::sync::atomic::Ordering;
+        let (g, tuned) = arm_gate(arm);
+        g.force.store(0, Ordering::Relaxed);
+        let has_res = g.res_set.load(Ordering::Relaxed) != 0;
+        let use_res = has_res && on_res <= 0.97 * on_nores;
+        g.res_off.store(!use_res, Ordering::Relaxed);
+        let best_on = if use_res { on_res } else { on_nores };
+        let keep = best_on <= 0.97 * off;
+        if !keep {
+            tuned.store(0, Ordering::Relaxed);
+        }
+        g.decided.store(true, Ordering::Relaxed);
+        if std::env::var_os("FLOCK_ZC_TIMING").is_some() || super::gpu_zc_r2_debug() {
+            eprintln!(
+                "[arm-gate] {} trials on+res={on_res:.2}ms on={on_nores:.2}ms off={off:.2}ms (res set {}) -> arm={} residency={}",
+                if arm == 2 { "r2-full" } else { "r1-ab" },
+                if has_res { "built" } else { "none" },
+                if keep { "ON" } else { "OFF" },
+                if keep && use_res { "ON" } else { "OFF" },
+            );
+        }
+        keep
+    }
+
+    /// Re-check on the warm-up's real (timed-like) call: off if it lost to
+    /// the OFF trial minimum.
+    pub(crate) fn arm_gate_recheck(arm: u8, real_ms: f64, off_min: f64) {
+        use std::sync::atomic::Ordering;
+        let (_, tuned) = arm_gate(arm);
+        let keep = real_ms <= off_min;
+        if !keep {
+            tuned.store(0, Ordering::Relaxed);
+        }
+        if std::env::var_os("FLOCK_ZC_TIMING").is_some() || super::gpu_zc_r2_debug() {
+            eprintln!(
+                "[arm-gate] {} recheck real={real_ms:.2}ms vs off={off_min:.2}ms -> {}",
+                if arm == 2 { "r2-full" } else { "r1-ab" },
+                if keep { "keep" } else { "OFF" }
+            );
+        }
+    }
+
+    pub(crate) struct ZcR2FullJob {
+        cb: Id,
+        pub chunks: usize,
+        calibration: bool,
+        lo_size: usize,
+        /// Calibration-only scratch outputs (anchors, deltas), released at wait.
+        cal_bufs: Option<(Id, Id)>,
+        a_buf: Id,
+        b_buf: Id,
+        params: [u32; 5],
+        horner: bool,
+        /// Compact buffer bases, for pre-wrapping the timed prefix ranges.
+        out_ptrs: (usize, usize),
+        submitted: std::time::Instant,
+    }
+    // SAFETY: waited/released from the launching thread only.
+    unsafe impl Send for ZcR2FullJob {}
+
+    impl ZcR2FullJob {
+        /// Leading chunks the CPU must skip (0 while calibrating).
+        pub(crate) fn cpu_skip(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    pub(crate) enum ZcR2FullResult {
+        Calibrated,
+        /// Per prefix chunk: `eq_hi * [p1_even, pinf_even, p1_odd, pinf_odd,
+        /// W0, W3, W4, W5]` on the odd-lane weight (same as CPU `out`).
+        Prefix(Vec<[F128; 8]>),
+        /// Metal failed: the CPU must redo the whole prefix (anchors,
+        /// deltas, partials). The arm is off for the process.
+        Failed,
+    }
+
+    unsafe fn zc_r2_full_submit(
+        gpu: &Gpu,
+        state: &ZcR2Full,
+        a_buf: Id,
+        b_buf: Id,
+        anchors: (Id, usize),
+        deltas: (Id, usize),
+        params: [u32; 5],
+        chunks: usize,
+        horner: bool,
+    ) -> Result<Id, String> {
+        unsafe {
+            let pb = std::slice::from_raw_parts(params.as_ptr().cast::<u8>(), 20);
+            let cb = gpu.command_buffer()?;
+            zc_arm_use_residency(gpu, cb, R2_GATE.res());
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, if horner { state.horner_pso } else { state.pso });
+            gpu.set_buffer(enc, a_buf, 0, 0);
+            gpu.set_buffer(enc, b_buf, 0, 1);
+            gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
+            gpu.set_buffer(enc, state.eq_hi_buf, 0, 3);
+            gpu.set_buffer(enc, state.nib_buf, 0, 4);
+            gpu.set_buffer(enc, state.out_buf, 0, 5);
+            gpu.set_buffer(enc, anchors.0, anchors.1, 6);
+            gpu.set_buffer(enc, deltas.0, deltas.1, 7);
+            gpu.set_bytes(enc, pb, 8);
+            gpu.dispatch(enc, chunks as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// Launch the full arm. `anchors`/`deltas` are the compact output
+    /// buffers (whole, page-aligned); the timed prefix writes chunks
+    /// `[0, g)` of them in place. Returns `None` when the arm is off,
+    /// unavailable or the buffers cannot be wrapped (incumbent path).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_r2_full(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_data: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+        skip_dead: bool,
+        anchors: (*mut F128, usize),
+        deltas: (*mut u8, usize),
+    ) -> Option<ZcR2FullJob> {
+        use std::sync::atomic::Ordering;
+        if !zc_r2_full_enabled() || !super::gpu_zc_r2_enabled() {
+            return None;
+        }
+        if table_data.len() != 8 * 256
+            || lo_size < 512
+            || !lo_size.is_multiple_of(512)
+            || hi_size < 32
+            || eq_lo.len() != lo_size
+            || eq_hi.len() != hi_size
+            || anchors.1 != 2 * lo_size * hi_size
+            || deltas.1 != 16 * lo_size * hi_size
+            || hi_size * lo_size > u32::MAX as usize
+        {
+            return None;
+        }
+        let tuned = ZC_R2_FULL_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 || R2_GATE.forced_off() {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        let chunks = if calibration {
+            (hi_size / 64).clamp(8, 32)
+        } else {
+            tuned.min(hi_size)
+        };
+        let gpu = gpu().ok()?;
+        // Share the products arm's cached views of the packed inputs (one
+        // no-copy view per range process-wide).
+        let (a_buf, b_buf) = {
+            let mut ps = zc_r2_state()?.lock().ok()?;
+            unsafe {
+                (
+                    zc_r2_wrap(&mut ps, gpu, a_packed).ok()?,
+                    zc_r2_wrap(&mut ps, gpu, b_packed).ok()?,
+                )
+            }
+        };
+        let state_mutex = zc_r2_full_state()?;
+        let mut state = state_mutex.lock().ok()?;
+        unsafe {
+            let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
+            for j in 0..8 {
+                for n in 0..16 {
+                    *nib.add(j * 32 + n) = table_data[j * 256 + n];
+                    *nib.add(j * 32 + 16 + n) = table_data[j * 256 + (n << 4)];
+                }
+            }
+            let st = &mut *state;
+            let horner = !st.horner_pso.is_null()
+                && std::env::var_os("FLOCK_NO_R2_GPU_FULL_HORNER").is_none()
+                && super::zc_r2_horner_weights(eq_lo, lo_size);
+            zc_r2_grow(gpu, &mut st.eq_lo_buf, &mut st.eq_lo_cap, lo_size * 16).ok()?;
+            let eq_dst = gpu.buffer_contents(st.eq_lo_buf).cast::<F128>();
+            if horner {
+                for window in 0..lo_size / 64 {
+                    for class in 0..4 {
+                        *eq_dst.add(window * 4 + class) = eq_lo[(window << 6) | class];
+                    }
+                }
+            } else {
+                std::ptr::copy_nonoverlapping(eq_lo.as_ptr(), eq_dst, lo_size);
+            }
+            zc_r2_grow(gpu, &mut st.eq_hi_buf, &mut st.eq_hi_cap, hi_size * 16).ok()?;
+            std::ptr::copy_nonoverlapping(
+                eq_hi.as_ptr(),
+                gpu.buffer_contents(st.eq_hi_buf).cast::<F128>(),
+                hi_size,
+            );
+            zc_r2_grow(gpu, &mut st.out_buf, &mut st.out_cap, hi_size * 8 * 16).ok()?;
+            // Timed: wrap only the prefix the GPU writes (cached by exact
+            // range; the warm-up calibration pre-wraps the same ranges), so
+            // the command buffer's residency covers g/hi of the 1.5 GiB.
+            // Calibration binds scratch and only checks alignment, so no
+            // overlapping view of the compact buffers is ever created.
+            let aligned = (anchors.0 as usize) % 16384 == 0 && (deltas.0 as usize) % 16384 == 0;
+            let (anc, del) = if calibration {
+                if aligned { (Ok(NIL), Ok(NIL)) } else { (Err("unaligned".to_string()), Ok(NIL)) }
+            } else {
+                (
+                    zc_r2_full_wrap(st, gpu, anchors.0.cast::<u8>(), chunks * lo_size * 32),
+                    zc_r2_full_wrap(st, gpu, deltas.0, chunks * lo_size * 16),
+                )
+            };
+            let (anc, del) = match (anc, del) {
+                (Ok(a), Ok(d)) => (a, d),
+                (a, d) => {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[zc-r2-full] wrap failed: anchors {:?} deltas {:?}",
+                            a.err(),
+                            d.err()
+                        );
+                    }
+                    ZC_R2_FULL_TUNED.store(0, Ordering::Relaxed);
+                    return None;
+                }
+            };
+            let params = [
+                lo_size as u32,
+                pair_in_block_mask as u32,
+                useful_pairs_inclusive as u32,
+                u32::from(skip_dead),
+                0u32,
+            ];
+            let diag_scratch = !calibration && std::env::var_os("FLOCK_R2_FULL_DIAG_SCRATCH").is_some();
+            let (cal_bufs, abind, dbind) = if calibration || diag_scratch {
+                let ca = gpu.new_buffer(chunks * lo_size * 32).ok()?;
+                let cd = match gpu.new_buffer(chunks * lo_size * 16) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        gpu.release(ca);
+                        return None;
+                    }
+                };
+                (Some((ca, cd)), (ca, 0usize), (cd, 0usize))
+            } else {
+                (None, (anc, 0usize), (del, 0usize))
+            };
+            let cb = match zc_r2_full_submit(gpu, st, a_buf, b_buf, abind, dbind, params, chunks, horner) {
+                Ok(cb) => cb,
+                Err(_) => {
+                    if let Some((ca, cd)) = cal_bufs {
+                        gpu.release(ca);
+                        gpu.release(cd);
+                    }
+                    return None;
+                }
+            };
+            Some(ZcR2FullJob {
+                cb,
+                chunks,
+                calibration,
+                lo_size,
+                cal_bufs,
+                a_buf,
+                b_buf,
+                params,
+                horner,
+                out_ptrs: (anchors.0 as usize, deltas.0 as usize),
+                submitted: std::time::Instant::now(),
+            })
+        }
+    }
+
+    /// Calibration-time CPU reference for the probe chunks.
+    pub(crate) struct ZcR2FullCheck<'a> {
+        pub anchors: &'a [F128],
+        pub deltas: &'a [u8],
+        pub partials: &'a [(F128, F128)],
+        pub la: &'a [[F128; 6]],
+        pub kappa: F128,
+        pub skip_dead: bool,
+        pub mask: usize,
+        pub useful: usize,
+        /// Wall of the CPU sweep over all `hi_size` chunks.
+        pub cpu_wall_ms: f64,
+        /// Products-arm share published by its own calibration (0 = off).
+        pub products_share: usize,
+    }
+
+    pub(crate) fn zc_r2_full_products_share() -> usize {
+        ZC_R2_TUNED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn zc_r2_full_wait(
+        job: ZcR2FullJob,
+        check: Option<ZcR2FullCheck<'_>>,
+        hi_size: usize,
+    ) -> ZcR2FullResult {
+        use std::sync::atomic::Ordering;
+        let Ok(gpu) = gpu() else {
+            ZC_R2_FULL_TUNED.store(0, Ordering::Relaxed);
+            return ZcR2FullResult::Failed;
+        };
+        let fail = |job: &ZcR2FullJob, why: &str| {
+            if super::gpu_zc_r2_debug() {
+                eprintln!("[zc-r2-full] {why} — arm off");
+            }
+            ZC_R2_FULL_TUNED.store(0, Ordering::Relaxed);
+            unsafe {
+                gpu.release(job.cb);
+                if let Some((ca, cd)) = job.cal_bufs {
+                    gpu.release(ca);
+                    gpu.release(cd);
+                }
+            }
+            ZcR2FullResult::Failed
+        };
+        if unsafe { gpu.wait_cb(job.cb) }.is_err() {
+            return fail(&job, "command buffer failed");
+        }
+        let first_wall = unsafe { zc_fold_gpu_wall_ms(gpu, job.cb) };
+        let Some(state_mutex) = zc_r2_full_state() else {
+            return fail(&job, "state missing");
+        };
+        let Ok(state) = state_mutex.lock() else {
+            return fail(&job, "state poisoned");
+        };
+        let outs: Vec<[F128; 8]> = unsafe {
+            let p = gpu.buffer_contents(state.out_buf).cast::<F128>();
+            (0..job.chunks)
+                .map(|c| std::array::from_fn(|i| *p.add(c * 8 + i)))
+                .collect()
+        };
+        if !job.calibration {
+            if let Some((ca, cd)) = job.cal_bufs {
+                unsafe {
+                    gpu.release(ca);
+                    gpu.release(cd);
+                }
+            }
+            if super::gpu_zc_r2_debug() {
+                let (gs, ge): (f64, f64) = unsafe {
+                    (
+                        send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> f64, job.cb, c"GPUStartTime"),
+                        send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> f64, job.cb, c"GPUEndTime"),
+                    )
+                };
+                let now = {
+                    unsafe extern "C" {
+                        fn mach_absolute_time() -> u64;
+                    }
+                    // Apple Silicon timebase is 125/3 ns per tick.
+                    (unsafe { mach_absolute_time() }) as f64 * 125.0 / 3.0 * 1e-9
+                };
+                let since_submit = job.submitted.elapsed().as_secs_f64();
+                let submit_t = now - since_submit;
+                eprintln!(
+                    "[zc-r2-full] timed prefix {}/{hi_size}: gpu={first_wall:.2}ms submit-to-drain={:.2}ms                      queue-delay={:.2}ms end-to-drain={:.2}ms",
+                    job.chunks,
+                    since_submit * 1e3,
+                    (gs - submit_t) * 1e3,
+                    (now - ge) * 1e3,
+                );
+            }
+            unsafe { gpu.release(job.cb) };
+            return ZcR2FullResult::Prefix(outs);
+        }
+        let Some(chk) = check else {
+            drop(state);
+            return fail(&job, "calibration without CPU reference");
+        };
+        // ---- equality oracle on the probe chunks ----
+        let lo = job.lo_size;
+        let (ca, cd) = job.cal_bufs.expect("calibration buffers");
+        let (ganc, gdel) = unsafe {
+            (
+                std::slice::from_raw_parts(
+                    gpu.buffer_contents(ca).cast::<F128>(),
+                    job.chunks * lo * 2,
+                ),
+                std::slice::from_raw_parts(gpu.buffer_contents(cd), job.chunks * lo * 16),
+            )
+        };
+        for pair in 0..job.chunks * lo {
+            if chk.skip_dead && (pair & chk.mask) >= chk.useful {
+                continue;
+            }
+            if ganc[2 * pair] != chk.anchors[2 * pair]
+                || ganc[2 * pair + 1] != chk.anchors[2 * pair + 1]
+                || gdel[16 * pair..16 * pair + 16] != chk.deltas[16 * pair..16 * pair + 16]
+            {
+                drop(state);
+                return fail(&job, &format!("ANCHOR/DELTA MISMATCH at pair {pair}"));
+            }
+        }
+        for (c, g) in outs.iter().enumerate() {
+            let p1 = chk.kappa * g[0] + g[2];
+            let pinf = chk.kappa * g[1] + g[3];
+            if (p1, pinf) != chk.partials[c] || g[2..8] != chk.la[c][..] {
+                drop(state);
+                return fail(&job, &format!("AGGREGATE MISMATCH at chunk {c}"));
+            }
+        }
+        // ---- pricing: replay the probe to a plateau, take the minimum ----
+        let mut w_min = if first_wall > 0.0 { first_wall } else { f64::MAX };
+        let mut walls = vec![first_wall];
+        for _ in 0..4 {
+            let Ok(cb2) = (unsafe {
+                zc_r2_full_submit(gpu, &state, job.a_buf, job.b_buf, (ca, 0), (cd, 0), job.params, job.chunks, job.horner)
+            }) else {
+                break;
+            };
+            let w = if unsafe { gpu.wait_cb(cb2) }.is_ok() {
+                unsafe { zc_fold_gpu_wall_ms(gpu, cb2) }
+            } else {
+                0.0
+            };
+            unsafe { gpu.release(cb2) };
+            if w <= 0.0 {
+                break;
+            }
+            walls.push(w);
+            let prev = w_min;
+            w_min = w_min.min(w);
+            if walls.len() >= 3 && w > 0.95 * prev {
+                break;
+            }
+        }
+        drop(state);
+        unsafe {
+            gpu.release(job.cb);
+            gpu.release(ca);
+            gpu.release(cd);
+        }
+        let u_gpu = if w_min < f64::MAX { w_min / job.chunks as f64 } else { f64::INFINITY };
+        let u_cpu = chk.cpu_wall_ms / hi_size.max(1) as f64;
+        let hi = hi_size as f64;
+        let share = if u_gpu.is_finite() && u_cpu > 0.0 {
+            // Both arms finish together: (hi - g) u_cpu = g u_gpu.
+            let g = (hi * u_cpu / (u_cpu + u_gpu)).round() as usize;
+            let full_pred = g as f64 * u_gpu;
+            // Products-arm prediction. Its gate assumes a GPU-covered chunk
+            // still costs the CPU 0.55 of a full one; timed traces measure
+            // ~0.86 (the CPU keeps every fold, store and lookahead product),
+            // so price it with the measured fraction: CPU-bound wall
+            // `(hi - 0.14 g_p) u_cpu`.
+            let gp = chk.products_share.min(hi_size) as f64;
+            let products_pred = (hi - 0.14 * gp) * u_cpu;
+            let forced = std::env::var_os("FLOCK_R2_GPU_FULL_FORCE").is_some();
+            let use_full = g > 0 && (forced || full_pred < products_pred);
+            if super::gpu_zc_r2_debug() {
+                eprintln!(
+                    "[zc-r2-full] calib horner={} walls {walls:?} u_gpu={u_gpu:.4} u_cpu={u_cpu:.4} -> g={g}/{hi_size} \
+                     full_pred={full_pred:.2}ms products_pred={products_pred:.2}ms use_full={use_full}",
+                    job.horner
+                );
+            }
+            if use_full { g.min(hi_size) } else { 0 }
+        } else {
+            0
+        };
+        if share > 0 {
+            // Pre-wrap the exact prefix ranges the timed prove will bind.
+            if let Some(m) = zc_r2_full_state() {
+                if let Ok(mut st) = m.lock() {
+                    let lo = job.lo_size;
+                    let wa = unsafe {
+                        zc_r2_full_wrap(&mut st, gpu, job.out_ptrs.0 as *mut u8, share * lo * 32)
+                    };
+                    let wd = unsafe {
+                        zc_r2_full_wrap(&mut st, gpu, job.out_ptrs.1 as *mut u8, share * lo * 16)
+                    };
+                    match (wa, wd) {
+                        (Ok(wa), Ok(wd)) => {
+                            let set = zc_arm_build_residency(
+                                gpu,
+                                &[
+                                    job.a_buf, job.b_buf, wa, wd, st.eq_lo_buf, st.eq_hi_buf,
+                                    st.out_buf, st.nib_buf,
+                                ],
+                            );
+                            R2_GATE.res_set.store(set as usize, Ordering::Relaxed);
+                        }
+                        _ => {
+                            ZC_R2_FULL_TUNED.store(0, Ordering::Relaxed);
+                            return ZcR2FullResult::Calibrated;
+                        }
+                    }
+                }
+            }
+        }
+        ZC_R2_FULL_TUNED.store(share, Ordering::Relaxed);
+        ZcR2FullResult::Calibrated
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Zerocheck round-one AB completion GPU arm (`FLOCK_NO_R1_GPU_AB=1`).
+    // Self-calibrated x_hi prefix; warm-up 4-chunk exactness probe against
+    // the CPU's own per-chunk partials (auto-off on mismatch); the timed
+    // prove binds a cached prefix view of the AB backing pinned in a
+    // residency set. Output: one reduced [F128; 64] partial per chunk.
+    // -----------------------------------------------------------------------
+
+    const ZC_R1_AB_MSL: &str = r#"
+// ---------------------------------------------------------------------------
+// Round-one AB completion GPU arm (FLOCK_NO_R1_GPU_AB kills): for a prefix of
+// x_hi chunks the GPU evaluates exactly the CPU's banked eq-fold —
+// bank[u][lane] = XOR_w T_w[b][byte] (eq_top-scaled tables, nibble-split by
+// F2-linearity), then sum_u eq_bot[u]*bank[u][lane], times eq_hi[chunk].
+// Four threadgroups per chunk (u quarters); thread = (lane, 8 u's).
+// ---------------------------------------------------------------------------
+struct ZcR1AbParams { uint chunk0; uint n_w; uint within_mask; uint fe0; uint fe1; uint fe2; uint fe3; uint pad; };
+
+kernel void zc_r1_ab(
+    device const uchar* ab      [[buffer(0)]],
+    device const uint4* tabs    [[buffer(1)]],
+    device const uint4* eq_bot  [[buffer(2)]],
+    device const uint4* eq_hi   [[buffer(3)]],
+    device uint4*       outs    [[buffer(4)]],
+    constant ZcR1AbParams& p    [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 T[512];
+    const uint chunk_rel = tgid >> 2;
+    const uint q = tgid & 3u;
+    const uint chunk = p.chunk0 + chunk_rel;
+    const uint lane = lid & 63u;
+    const uint us = lid >> 6;
+    const uint4 z = uint4(0u);
+    uint4 acc[8];
+    for (uint j = 0u; j < 8u; j++) { acc[j] = z; }
+    uint fe[4] = { p.fe0, p.fe1, p.fe2, p.fe3 };
+    for (uint w = 0u; w < p.n_w; w++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        T[lid] = tabs[w * 512u + lid];
+        T[lid + 256u] = tabs[w * 512u + lid + 256u];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0u; j < 8u; j++) {
+            uint u = q * 32u + us * 8u + j;
+            uint x_outer_lo = (w << 7) | u;
+            uint x_outer = (chunk << 12) | x_outer_lo;
+            uint f = fe[x_outer & p.within_mask];
+            uint first = f & 255u;
+            uint end = f >> 8;
+            uint in_rel = p.pad != 0u ? chunk_rel % p.pad : chunk_rel;
+            ulong base = ulong(in_rel << 12 | x_outer_lo) * 1024ul + lane;
+            uint4 v = z;
+            for (uint b = first; b < end; b++) {
+                uint byte = ab[base + b * 64u];
+                v ^= T[b * 32u + (byte & 15u)] ^ T[b * 32u + 16u + (byte >> 4)];
+            }
+            acc[j] ^= v;
+        }
+    }
+    uint4 part = z;
+    for (uint j = 0u; j < 8u; j++) {
+        uint u = q * 32u + us * 8u + j;
+        part ^= gf_reduce(clmul128(eq_bot[u], acc[j]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    T[lid] = part;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (us == 0u) {
+        uint4 s = T[lane] ^ T[lane + 64u] ^ T[lane + 128u] ^ T[lane + 192u];
+        outs[tgid * 64u + lane] = gf_reduce(clmul128(eq_hi[chunk], s));
+    }
+}
+"#;
+
+    struct ZcR1Ab {
+        pso: Id,
+        tabs_buf: Id,
+        eq_bot_buf: Id,
+        eq_hi_buf: Id,
+        out_buf: Id,
+        wraps: Vec<(usize, usize, Id)>,
+    }
+    // SAFETY: handles only touched under the state mutex.
+    unsafe impl Send for ZcR1Ab {}
+
+    static ZC_R1_AB_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcR1Ab>>> =
+        std::sync::OnceLock::new();
+    static ZC_R1_AB_TUNED: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    const R1AB_N_W: usize = 32;
+    const R1AB_N_U: usize = 128;
+    const R1AB_HI: usize = 128;
+    const R1AB_CHUNK_BYTES: usize = 4096 * 1024;
+
+    fn zc_r1_ab_state() -> Option<&'static std::sync::Mutex<ZcR1Ab>> {
+        ZC_R1_AB_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                let r = (|| -> Result<ZcR1Ab, String> {
+                    unsafe {
+                        let pool = gpu.pool_push();
+                        let built = (|| -> Result<Id, String> {
+                            let source = format!(
+                                "{}{}",
+                                zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled()),
+                                ZC_R1_AB_MSL
+                            );
+                            let src = gpu.api.nsstring(&source)?;
+                            let mut err: Id = NIL;
+                            let library: Id = send!(
+                                gpu.api,
+                                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                                gpu.device,
+                                c"newLibraryWithSource:options:error:",
+                                src,
+                                NIL,
+                                &mut err
+                            );
+                            if library.is_null() {
+                                return Err(format!("compile: {}", gpu.api.error_string(err)));
+                            }
+                            let ns = gpu.api.nsstring("zc_r1_ab")?;
+                            let f: Id = send!(
+                                gpu.api,
+                                unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                                library,
+                                c"newFunctionWithName:",
+                                ns
+                            );
+                            gpu.release(library);
+                            if f.is_null() {
+                                return Err("zc_r1_ab not found".into());
+                            }
+                            let mut perr: Id = NIL;
+                            let pso: Id = send!(
+                                gpu.api,
+                                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                gpu.device,
+                                c"newComputePipelineStateWithFunction:error:",
+                                f,
+                                &mut perr
+                            );
+                            gpu.release(f);
+                            if pso.is_null() {
+                                return Err(format!("pipeline: {}", gpu.api.error_string(perr)));
+                            }
+                            Ok(pso)
+                        })();
+                        gpu.pool_pop(pool);
+                        let pso = built?;
+                        let mt: u64 = send!(
+                            gpu.api,
+                            unsafe extern "C" fn(Id, Sel) -> u64,
+                            pso,
+                            c"maxTotalThreadsPerThreadgroup"
+                        );
+                        if mt < 256 {
+                            gpu.release(pso);
+                            return Err(format!("max threads {mt}"));
+                        }
+                        Ok(ZcR1Ab {
+                            pso,
+                            tabs_buf: gpu.new_buffer(R1AB_N_W * 512 * 16)?,
+                            eq_bot_buf: gpu.new_buffer(R1AB_N_U * 16)?,
+                            eq_hi_buf: gpu.new_buffer(R1AB_HI * 16)?,
+                            out_buf: gpu.new_buffer(R1AB_HI * 4 * 64 * 16)?,
+                            wraps: Vec::new(),
+                        })
+                    }
+                })();
+                match r {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!("[zc-r1-ab] init failed: {e}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    pub(crate) struct ZcR1AbJob {
+        cb: Id,
+        pub chunks: usize,
+        calibration: bool,
+        probe_buf: Id,
+        ab_ptr: usize,
+        params: [u32; 8],
+        submitted: std::time::Instant,
+    }
+    // SAFETY: waited/released from the launching thread only.
+    unsafe impl Send for ZcR1AbJob {}
+
+    impl ZcR1AbJob {
+        pub(crate) fn cpu_skip(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+        pub(crate) fn is_calibration(&self) -> bool {
+            self.calibration
+        }
+    }
+
+    pub(crate) enum ZcR1AbResult {
+        Calibrated,
+        Prefix(Vec<[F128; 64]>),
+        Failed,
+    }
+
+    unsafe fn zc_r1_ab_submit(
+        gpu: &Gpu,
+        st: &ZcR1Ab,
+        ab: Id,
+        params: [u32; 8],
+        chunks: usize,
+    ) -> Result<Id, String> {
+        unsafe {
+            let pb = std::slice::from_raw_parts(params.as_ptr().cast::<u8>(), 32);
+            let cb = gpu.command_buffer()?;
+            zc_arm_use_residency(gpu, cb, R1_GATE.res());
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, st.pso);
+            gpu.set_buffer(enc, ab, 0, 0);
+            gpu.set_buffer(enc, st.tabs_buf, 0, 1);
+            gpu.set_buffer(enc, st.eq_bot_buf, 0, 2);
+            gpu.set_buffer(enc, st.eq_hi_buf, 0, 3);
+            gpu.set_buffer(enc, st.out_buf, 0, 4);
+            gpu.set_bytes(enc, pb, 5);
+            gpu.dispatch(enc, (chunks * 4) as u64, 256);
+            gpu.end_encoding(enc);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        }
+    }
+
+    /// Launch the round-one AB GPU arm. `tables` are the CPU's eq_top-scaled
+    /// convert tables (`32 x 4096` F128), `fe[within] = first | end << 8`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_r1_ab(
+        ab_inner: &[u8],
+        tables: &[F128],
+        eq_bot: &[F128],
+        eq_hi: &[F128],
+        hi_size: usize,
+        n_lo: usize,
+        bank_bits: usize,
+        within_mask: usize,
+        fe: &[u32],
+    ) -> Option<ZcR1AbJob> {
+        use std::sync::atomic::Ordering;
+        if std::env::var_os("FLOCK_NO_R1_GPU_AB").is_some() || !super::gpu_zc_r2_enabled() {
+            return None;
+        }
+        if hi_size != R1AB_HI
+            || n_lo != 12
+            || bank_bits != 7
+            || tables.len() != R1AB_N_W * 4096
+            || eq_bot.len() != R1AB_N_U
+            || eq_hi.len() != hi_size
+            || ab_inner.len() != hi_size * R1AB_CHUNK_BYTES
+            || within_mask > 3
+            || fe.len() != within_mask + 1
+        {
+            return None;
+        }
+        let tuned = ZC_R1_AB_TUNED.load(Ordering::Relaxed);
+        if tuned == 0 || R1_GATE.forced_off() {
+            return None;
+        }
+        let calibration = tuned == usize::MAX;
+        // Calibration: 32 real chunks through the same whole-backing view the
+        // timed prove uses (one view per allocation, streamed from DRAM like
+        // the timed run); every probe output is compared with the CPU's.
+        const PROBE: usize = 32;
+        let chunks = if calibration { PROBE } else { tuned.min(hi_size) };
+        let gpu = gpu().ok()?;
+        let mut st = zc_r1_ab_state()?.lock().ok()?;
+        unsafe {
+            let t = gpu.buffer_contents(st.tabs_buf).cast::<F128>();
+            for w in 0..R1AB_N_W {
+                for b in 0..16 {
+                    for n in 0..16 {
+                        *t.add(w * 512 + b * 32 + n) = tables[w * 4096 + b * 256 + n];
+                        *t.add(w * 512 + b * 32 + 16 + n) = tables[w * 4096 + b * 256 + (n << 4)];
+                    }
+                }
+            }
+            std::ptr::copy_nonoverlapping(eq_bot.as_ptr(), gpu.buffer_contents(st.eq_bot_buf).cast::<F128>(), R1AB_N_U);
+            std::ptr::copy_nonoverlapping(eq_hi.as_ptr(), gpu.buffer_contents(st.eq_hi_buf).cast::<F128>(), hi_size);
+            let mut params = [0u32; 8];
+            params[1] = R1AB_N_W as u32;
+            params[2] = within_mask as u32;
+            for (i, &f) in fe.iter().enumerate() {
+                params[3 + i] = f;
+            }
+            let ab_ptr = ab_inner.as_ptr() as usize;
+            if ab_ptr % 16384 != 0 {
+                ZC_R1_AB_TUNED.store(0, Ordering::Relaxed);
+                return None;
+            }
+            let len = ab_inner.len();
+            let ab_buf = match st.wraps.iter().find(|&&(p, l, _)| p == ab_ptr && l == len) {
+                Some(&(_, _, b)) => b,
+                None => {
+                    let b = gpu.wrap_buffer(ab_inner.as_ptr().cast_mut(), len).ok()?;
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!("[zc-r1-ab] wrap miss {ab_ptr:#x} {} MiB", len >> 20);
+                    }
+                    st.wraps.push((ab_ptr, len, b));
+                    b
+                }
+            };
+            let probe_buf = if calibration { ab_buf } else { NIL };
+            let cb = match zc_r1_ab_submit(gpu, &st, ab_buf, params, chunks) {
+                Ok(cb) => cb,
+                Err(_) => return None,
+            };
+            Some(ZcR1AbJob {
+                cb,
+                chunks,
+                calibration,
+                probe_buf,
+                ab_ptr,
+                params,
+                submitted: std::time::Instant::now(),
+            })
+        }
+    }
+
+    pub(crate) fn zc_r1_ab_wait(
+        job: ZcR1AbJob,
+        cpu_partials: Option<&[[F128; 64]]>,
+        cpu_wall_ms: f64,
+        hi_size: usize,
+    ) -> ZcR1AbResult {
+        use std::sync::atomic::Ordering;
+        let Ok(gpu) = gpu() else {
+            ZC_R1_AB_TUNED.store(0, Ordering::Relaxed);
+            return ZcR1AbResult::Failed;
+        };
+        let fail = |job: &ZcR1AbJob, why: &str| {
+            if super::gpu_zc_r2_debug() {
+                eprintln!("[zc-r1-ab] {why} — arm off");
+            }
+            ZC_R1_AB_TUNED.store(0, Ordering::Relaxed);
+            unsafe { gpu.release(job.cb) };
+            ZcR1AbResult::Failed
+        };
+        if unsafe { gpu.wait_cb(job.cb) }.is_err() {
+            return fail(&job, "command buffer failed");
+        }
+        let first_wall = unsafe { zc_fold_gpu_wall_ms(gpu, job.cb) };
+        let Some(m) = zc_r1_ab_state() else {
+            return fail(&job, "state");
+        };
+        let Ok(mut st) = m.lock() else {
+            return fail(&job, "state lock");
+        };
+        let vals: Vec<[F128; 64]> = unsafe {
+            let o = gpu.buffer_contents(st.out_buf).cast::<F128>();
+            (0..job.chunks)
+                .map(|c| {
+                    std::array::from_fn(|lane| {
+                        *o.add((4 * c) * 64 + lane)
+                            + *o.add((4 * c + 1) * 64 + lane)
+                            + *o.add((4 * c + 2) * 64 + lane)
+                            + *o.add((4 * c + 3) * 64 + lane)
+                    })
+                })
+                .collect()
+        };
+        if !job.calibration {
+            if super::gpu_zc_r2_debug() {
+                eprintln!(
+                    "[zc-r1-ab] timed prefix {}/{hi_size}: gpu={first_wall:.2}ms submit-to-drain={:.2}ms cpu-sweep={cpu_wall_ms:.2}ms",
+                    job.chunks,
+                    job.submitted.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            unsafe { gpu.release(job.cb) };
+            return ZcR1AbResult::Prefix(vals);
+        }
+        let Some(cpu) = cpu_partials else {
+            drop(st);
+            return fail(&job, "no CPU reference");
+        };
+        for c in 0..job.chunks {
+            if vals[c] != cpu[c] {
+                drop(st);
+                return fail(&job, &format!("MISMATCH at chunk {c}"));
+            }
+        }
+        let mut w_min = if first_wall > 0.0 { first_wall } else { f64::MAX };
+        let mut walls = vec![first_wall];
+        for _ in 0..4 {
+            let Ok(cb2) = (unsafe { zc_r1_ab_submit(gpu, &st, job.probe_buf, job.params, job.chunks) }) else {
+                break;
+            };
+            let w = if unsafe { gpu.wait_cb(cb2) }.is_ok() { unsafe { zc_fold_gpu_wall_ms(gpu, cb2) } } else { 0.0 };
+            unsafe { gpu.release(cb2) };
+            if w <= 0.0 {
+                break;
+            }
+            walls.push(w);
+            let prev = w_min;
+            w_min = w_min.min(w);
+            if walls.len() >= 3 && w > 0.95 * prev {
+                break;
+            }
+        }
+        unsafe { gpu.release(job.cb) };
+        let u_gpu = if w_min < f64::MAX { w_min / job.chunks as f64 } else { f64::INFINITY };
+        let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+        let share = if u_gpu.is_finite() && u_cpu > 0.0 {
+            ((hi_size as f64) * u_cpu / (u_cpu + u_gpu)).round() as usize
+        } else {
+            0
+        }
+        .min(hi_size - 1);
+        if super::gpu_zc_r2_debug() {
+            eprintln!(
+                "[zc-r1-ab] calib walls {walls:?} u_gpu={u_gpu:.4} u_cpu={u_cpu:.4} -> share {share}/{hi_size}"
+            );
+        }
+        if share > 0 {
+            let set = zc_arm_build_residency(
+                gpu,
+                &[job.probe_buf, st.tabs_buf, st.eq_bot_buf, st.eq_hi_buf, st.out_buf],
+            );
+            R1_GATE.res_set.store(set as usize, Ordering::Relaxed);
+        }
+        ZC_R1_AB_TUNED.store(share, Ordering::Relaxed);
+        ZcR1AbResult::Calibrated
+    }
+
     // -----------------------------------------------------------------------
     // Zerocheck first-tail-round (T3) compact-reconstruction products GPU
     // arm (see `ENV_NO_GPU_ZC_T3`).
@@ -15991,6 +17532,25 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+
+/// Zerocheck round-two FULL GPU arm (see `FLOCK_NO_R2_GPU_FULL`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{
+    ZcR2FullCheck, ZcR2FullJob, ZcR2FullResult, launch_zc_r2_full, zc_r2_full_products_share,
+    zc_r2_full_wait,
+};
+
+/// Zerocheck round-one AB completion GPU arm (see `FLOCK_NO_R1_GPU_AB`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use imp::{ZcR1AbJob, ZcR1AbResult, launch_zc_r1_ab, zc_r1_ab_wait};
+
+/// Phase-level warm-up gates for the round-one/two GPU arms.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{
+    arm_gate_armed, arm_gate_decide, arm_gate_mode, arm_gate_pending, arm_gate_recheck,
+};
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

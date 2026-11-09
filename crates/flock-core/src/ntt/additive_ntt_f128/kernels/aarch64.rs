@@ -443,6 +443,14 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
         let z6 = vld1q_u64((&raw const t_zero[6]).cast::<u64>());
         let g: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const t_gen[i]).cast::<u64>()));
+        let ext = use_const_ext();
+        let (pz2, pz4, pz5, pz6) = (
+            three_coeffs(z2),
+            three_coeffs(z4),
+            three_coeffs(z5),
+            three_coeffs(z6),
+        );
+        let pg: [Prep; 7] = core::array::from_fn(|i| three_coeffs(g[i]));
 
         // Two 8 KiB staging tiles (8 rows × ≤64 lanes × 16 B): L1-resident,
         // written per lane, read back once for the sequential row bursts.
@@ -464,7 +472,11 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
             // `butterfly_fused_3layer_zero_root_row`, but keeps v[0]).
             {
                 let mut v = loaded;
-                fused3_zero_root_q(&mut v, z2, z4, z5, z6);
+                if ext {
+                    fused3_zero_root_prepared_q(&mut v, pz2, pz4, pz5, pz6);
+                } else {
+                    fused3_zero_root_q(&mut v, z2, z4, z5, z6);
+                }
                 for (i, value) in v.iter().enumerate() {
                     vst1q_u64(
                         stage0.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
@@ -476,7 +488,11 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
             // Block 1: general chain (mirrors `butterfly_fused_3layer_row`).
             {
                 let mut v = loaded;
-                fused3_general_q(&mut v, &g);
+                if ext {
+                    fused3_prepared_q(&mut v, &pg);
+                } else {
+                    fused3_general_q(&mut v, &g);
+                }
                 for (i, value) in v.iter().enumerate() {
                     vst1q_u64(
                         stage1.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
@@ -565,6 +581,8 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
         }
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
+        let ext = use_const_ext();
+        let prep: [Prep; 7] = core::array::from_fn(|i| three_coeffs(t[i]));
         let mut stage = [core::mem::MaybeUninit::<F128>::uninit(); 64];
         let step = eighth * num_ntts;
 
@@ -575,7 +593,13 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
                 let mut v: [uint64x2_t; 8] =
                     core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
 
-                if ZERO_ROOT {
+                if ext {
+                    if ZERO_ROOT {
+                        fused3_zero_root_prepared_q(&mut v, prep[2], prep[4], prep[5], prep[6]);
+                    } else {
+                        fused3_prepared_q(&mut v, &prep);
+                    }
+                } else if ZERO_ROOT {
                     fused3_zero_root_q(&mut v, t[2], t[4], t[5], t[6]);
                 } else {
                     fused3_general_q(&mut v, &t);
@@ -804,6 +828,61 @@ fn use_three_const_fold() -> bool {
     }
     enabled
 }
+/// Extension of the fixed-twiddle (prepared) radix-8 arithmetic to the
+/// kernels h10 left on the split-multiply path: zero-root rows (in place and
+/// from source), the general from-source rows used by the recursive
+/// from-message commits, the rate-1/2 dual first pass, and the single-layer
+/// block. Same field values, canonical outputs: bit-identical.
+/// `FLOCK_NO_NTT_CONST_EXT=1` restores the split-multiply kernels.
+#[inline]
+fn use_const_ext() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_CONST_EXT").is_none());
+    *ON
+}
+
+type Prep = (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+);
+
+/// Prepared twin of [`fused3_zero_root_q`] (twiddles 0, 1, 3 zero).
+#[inline(always)]
+unsafe fn fused3_zero_root_prepared_q(
+    v: &mut [core::arch::aarch64::uint64x2_t; 8],
+    t2: Prep,
+    t4: Prep,
+    t5: Prep,
+    t6: Prep,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let zero = vdupq_n_u64(0);
+        for i in 0..4 {
+            v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
+        }
+        for i in 0..2 {
+            v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
+        }
+        let (a, b, p4) = three_lazy(v[4], v[6], t2, zero);
+        v[4] = a;
+        v[6] = b;
+        let (a, b) = three_fold(v[5], v[7], t2, zero);
+        v[5] = a;
+        v[7] = b;
+        v[1] = butterfly_zero_q(v[0], v[1]);
+        let (a, b) = three_fold(v[2], v[3], t4, zero);
+        v[2] = a;
+        v[3] = b;
+        let (a, b) = three_fold(v[4], v[5], t5, p4);
+        v[4] = a;
+        v[5] = b;
+        let (a, b) = three_fold(v[6], v[7], t6, p4);
+        v[6] = a;
+        v[7] = b;
+    }
+}
+
 #[target_feature(enable = "aes")]
 #[inline]
 unsafe fn butterfly_fused_3layer_row_with_const_q(
@@ -918,7 +997,17 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
             let mut v: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
 
-            fused3_zero_root_q(&mut v, t2, t4, t5, t6);
+            if use_const_ext() {
+                fused3_zero_root_prepared_q(
+                    &mut v,
+                    three_coeffs(t2),
+                    three_coeffs(t4),
+                    three_coeffs(t5),
+                    three_coeffs(t6),
+                );
+            } else {
+                fused3_zero_root_q(&mut v, t2, t4, t5, t6);
+            }
 
             // v[0] is unchanged by all three layers; skip its store.
             for (i, value) in v.iter().enumerate().skip(1) {
@@ -1248,6 +1337,23 @@ pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: us
 
     debug_assert!(half >= 2);
     debug_assert_eq!(chunk.len(), 2 * half);
+    if use_const_ext() {
+        use core::arch::aarch64::*;
+        unsafe {
+            let t = vld1q_u64((&raw const twiddle).cast::<u64>());
+            let prep = three_coeffs(t);
+            let zero = vdupq_n_u64(0);
+            let base = chunk.as_mut_ptr();
+            for idx0 in 0..half {
+                let pu = base.add(idx0).cast::<u64>();
+                let pv = base.add(idx0 + half).cast::<u64>();
+                let (nu, nv) = three_fold(vld1q_u64(pu), vld1q_u64(pv), prep, zero);
+                vst1q_u64(pu, nu);
+                vst1q_u64(pv, nv);
+            }
+        }
+        return;
+    }
     let mut idx0 = 0;
     while idx0 < half {
         let idx1 = idx0 + half;
