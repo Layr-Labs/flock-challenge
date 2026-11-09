@@ -867,6 +867,10 @@ impl UniSkipFoldTable {
 /// the schedule-tuned global split.
 const COMPACT_RECONSTRUCTION_N_HI: usize = 11;
 
+/// Provenance tag for the round-two compact anchor allocation (address
+/// stability across proves; see [`UniSkipCompactFold::recycle`]).
+const R2_ANCHORS_TAG: u64 = 0x5232_414E_4348_0001;
+
 /// Compact materialization of the first multilinear level.
 ///
 /// For each adjacent post-URM row pair this keeps the folded even-row anchor
@@ -907,6 +911,10 @@ impl UniSkipCompactFold {
     /// Return both large buffers to their process-wide scratch pools.
     pub fn recycle(self) {
         let Self { anchors, deltas, .. } = self;
+        // Tag the anchor allocation so the next round two takes the same
+        // address back (the full GPU arm's cached no-copy view of its prefix
+        // then needs no fresh GPU page mapping). Choice of pooled buffer only.
+        crate::scratch::stage_f128_release_token(&anchors, R2_ANCHORS_TAG, Vec::new());
         crate::scratch::give_f128(anchors);
         deltas.recycle();
     }
@@ -1837,7 +1845,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         "donated compact delta backing has the wrong byte length"
     );
     let mut compact = UniSkipCompactFold {
-        anchors: crate::scratch::take_f128(2 * n_pairs),
+        anchors: crate::scratch::take_f128_with_token(2 * n_pairs, R2_ANCHORS_TAG).0,
         deltas,
         dead_tail: false,
     };
@@ -1898,8 +1906,12 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // the *summed* `(p1, pinf)` for its prefix. The CPU keeps producing the
     // odd-parity halves on those chunks (the GPU's sums are not parity-split),
     // which is what makes `W1`/`W2` recoverable everywhere.
+    // FULL GPU arm (`FLOCK_NO_R2_GPU_FULL=1` kills): when calibrated in, the
+    // GPU writes the compact state and aggregates for a chunk prefix and the
+    // CPU skips it; the products arm is then not launched. While calibrating
+    // (warm-up) both arms run their probes beside the full CPU sweep.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
+    let full_job = crate::gpu_commit::launch_zc_r2_full(
         a_packed,
         b_packed,
         &table.data,
@@ -1909,7 +1921,30 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        skip_dead,
+        (compact.anchors.as_mut_ptr(), compact.anchors.len()),
+        (compact.deltas.full_overwrite_ptr(), deltas_len),
     );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let full_prefix = full_job.as_ref().map_or(0, |j| j.cpu_skip());
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let full_prefix = 0usize;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = if full_prefix > 0 {
+        None
+    } else {
+        crate::gpu_commit::launch_zc_r2_products(
+        a_packed,
+        b_packed,
+        &table.data,
+        eq_lo,
+        eq_hi,
+        lo_size,
+        hi_size,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+        )
+    };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
     // The GPU arm now returns its round-two products parity-split, so on an
@@ -1930,7 +1965,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    let cpu_chunk = |x_hi: usize| {
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and both partial slots.
         let (anchors, deltas) = unsafe {
@@ -2070,7 +2105,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 eq_h * out[7],
             ];
         }
-    });
+    };
+    crate::epool::run_hetero_chunks(hi_size - full_prefix, |i| cpu_chunk(full_prefix + i));
 
     // Drain the GPU products arm. The arm returns `[p1_even, pinf_even,
     // p1_odd, pinf_odd]`; XORing the parities back together reproduces the
@@ -2147,6 +2183,109 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         la_partials[x_hi][0] = eq_h * out[2];
                         la_partials[x_hi][1] = eq_h * out[3];
                     }
+                }
+            }
+        }
+    }
+
+    // Drain the FULL arm: adopt its prefix aggregates, check it against the
+    // CPU on the warm-up probe, or redo its prefix on the CPU after a
+    // failure (the CPU kernel rewrites every anchor/delta byte it owns).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = full_job {
+        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        if crate::gpu_commit::gpu_zc_r2_debug() && !job.is_calibration() {
+            eprintln!("[zc-r2-full] cpu sweep {:.2} ms over {} chunks", cpu_wall_ms, hi_size - full_prefix);
+        }
+        let check = job.is_calibration().then(|| crate::gpu_commit::ZcR2FullCheck {
+            anchors: &compact.anchors,
+            deltas: unsafe {
+                std::slice::from_raw_parts(deltas_base.ptr().cast_const(), deltas_len)
+            },
+            partials: &partials,
+            la: &la_partials,
+            kappa,
+            skip_dead,
+            mask: pair_in_block_mask,
+            useful: useful_pairs_inclusive,
+            cpu_wall_ms,
+            products_share: crate::gpu_commit::zc_r2_full_products_share(),
+        });
+        match crate::gpu_commit::zc_r2_full_wait(job, check, hi_size) {
+            crate::gpu_commit::ZcR2FullResult::Calibrated => {}
+            crate::gpu_commit::ZcR2FullResult::Prefix(vals) => {
+                for (x_hi, g) in vals.iter().enumerate() {
+                    partials[x_hi] = (kappa * g[0] + g[2], kappa * g[1] + g[3]);
+                    la_partials[x_hi] = [g[2], g[3], g[4], g[5], g[6], g[7]];
+                }
+                // Debug-only full-prefix oracle (`FLOCK_R2_FULL_VERIFY=1`):
+                // recompute every GPU chunk on the CPU into scratch and
+                // compare anchors, deltas and both partial vectors.
+                if std::env::var_os("FLOCK_R2_FULL_VERIFY").is_some() {
+                    let mut scr_a = vec![F128::ZERO; anchor_chunk_size];
+                    let mut scr_d = vec![0u8; delta_chunk_size];
+                    let mut bad = None;
+                    for x_hi in 0..full_prefix {
+                        let pair_idx_base = x_hi * lo_size;
+                        let row_base = pair_idx_base * 2;
+                        let mut out = [F128::ZERO; 8];
+                        unsafe {
+                            fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                                table.data.as_ptr().cast::<u8>(),
+                                a_packed.as_ptr().add(row_base * n_chunks),
+                                b_packed.as_ptr().add(row_base * n_chunks),
+                                scr_a.as_mut_ptr(),
+                                scr_d.as_mut_ptr(),
+                                eq_lo.as_ptr(),
+                                lo_size,
+                                pair_idx_base,
+                                pair_in_block_mask,
+                                useful_pairs_inclusive,
+                                degen,
+                                periodic_padding,
+                                false,
+                                out.as_mut_ptr(),
+                            );
+                        }
+                        let eq_h = eq_hi[x_hi];
+                        let p = (eq_h * (kappa * out[0] + out[2]), eq_h * (kappa * out[1] + out[3]));
+                        let la: [F128; 6] = std::array::from_fn(|i| eq_h * out[2 + i]);
+                        let ga = &compact.anchors[x_hi * anchor_chunk_size..(x_hi + 1) * anchor_chunk_size];
+                        let gd = unsafe {
+                            std::slice::from_raw_parts(
+                                deltas_base.ptr().cast_const().add(x_hi * delta_chunk_size),
+                                delta_chunk_size,
+                            )
+                        };
+                        let mut ok = p == partials[x_hi] && la == la_partials[x_hi];
+                        for x_lo in 0..lo_size {
+                            let pair = pair_idx_base + x_lo;
+                            if skip_dead && (pair & pair_in_block_mask) >= useful_pairs_inclusive {
+                                continue;
+                            }
+                            if ga[2 * x_lo] != scr_a[2 * x_lo]
+                                || ga[2 * x_lo + 1] != scr_a[2 * x_lo + 1]
+                                || gd[16 * x_lo..16 * x_lo + 16] != scr_d[16 * x_lo..16 * x_lo + 16]
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if !ok {
+                            bad = Some(x_hi);
+                            break;
+                        }
+                    }
+                    eprintln!(
+                        "[zc-r2-full] verify {} prefix chunks: {}",
+                        full_prefix,
+                        bad.map_or("ALL IDENTICAL".to_string(), |c| format!("MISMATCH at chunk {c}"))
+                    );
+                }
+            }
+            crate::gpu_commit::ZcR2FullResult::Failed => {
+                for x_hi in 0..full_prefix {
+                    cpu_chunk(x_hi);
                 }
             }
         }
