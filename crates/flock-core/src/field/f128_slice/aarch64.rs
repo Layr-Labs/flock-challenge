@@ -65,6 +65,7 @@ unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint
         let r2 = veorq_u64(vzip1q_u64(p0_hh, p1_hh), vzip2q_u64(c0, c1));
         let r3 = vzip2q_u64(p0_hh, p1_hh);
 
+        let r2 = veorq_u64(r2, r3_overflow(r3));
         let s1_lo = vshlq_n_u64::<1>(r2);
         let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
         let s2_lo = vshlq_n_u64::<2>(r2);
@@ -73,17 +74,7 @@ unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
         let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
         let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
-            vshrq_n_u64::<57>(r3),
-        );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
-            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
-        );
-        let out_lo = xor3_u64(r0, t_lo, correction);
+        let out_lo = veorq_u64(r0, t_lo);
         let out_hi = veorq_u64(r1, t_hi);
         [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
     }
@@ -141,6 +132,7 @@ unsafe fn mul_two_const_sum_vec2(
         let r2 = veorq_u64(vzip1q_u64(p0_hh, p1_hh), vzip2q_u64(cross0, cross1));
         let r3 = vzip2q_u64(p0_hh, p1_hh);
 
+        let r2 = veorq_u64(r2, r3_overflow(r3));
         let s1_lo = vshlq_n_u64::<1>(r2);
         let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
         let s2_lo = vshlq_n_u64::<2>(r2);
@@ -149,17 +141,7 @@ unsafe fn mul_two_const_sum_vec2(
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
         let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
         let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
-            vshrq_n_u64::<57>(r3),
-        );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
-            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
-        );
-        let out_lo = xor3_u64(r0, t_lo, correction);
+        let out_lo = veorq_u64(r0, t_lo);
         let out_hi = veorq_u64(r1, t_hi);
         [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
     }
@@ -247,10 +229,21 @@ unsafe fn xor_wide(acc: &mut WideNeon, value: WideNeon) {
 }
 
 #[inline(always)]
+unsafe fn r3_overflow(r3: uint64x2_t) -> uint64x2_t {
+    unsafe {
+        xor3_u64(
+            vshrq_n_u64::<63>(r3),
+            vshrq_n_u64::<62>(r3),
+            vshrq_n_u64::<57>(r3),
+        )
+    }
+}
+
+#[inline(always)]
 unsafe fn reduce_wide(value: WideNeon) -> uint64x2_t {
     unsafe {
         let zero = vdupq_n_u64(0);
-        let high = value.hi;
+        let high = veorq_u64(value.hi, r3_overflow(vextq_u64::<1>(value.hi, zero)));
         let shift1 = veorq_u64(
             vshlq_n_u64::<1>(high),
             vextq_u64::<1>(zero, vshrq_n_u64::<63>(high)),
@@ -264,18 +257,7 @@ unsafe fn reduce_wide(value: WideNeon) -> uint64x2_t {
             vextq_u64::<1>(zero, vshrq_n_u64::<57>(high)),
         );
         let folded = xor3_u64(high, shift1, veorq_u64(shift2, shift7));
-        let high_word = vextq_u64::<1>(high, zero);
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(high_word),
-            vshrq_n_u64::<62>(high_word),
-            vshrq_n_u64::<57>(high_word),
-        );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
-            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
-        );
-        xor3_u64(value.lo, folded, correction)
+        veorq_u64(value.lo, folded)
     }
 }
 
@@ -287,6 +269,7 @@ unsafe fn reduce_wide_pair(first: WideNeon, second: WideNeon) -> [uint64x2_t; 2]
         let r2 = vzip1q_u64(first.hi, second.hi);
         let r3 = vzip2q_u64(first.hi, second.hi);
 
+        let r2 = veorq_u64(r2, r3_overflow(r3));
         let s1_lo = vshlq_n_u64::<1>(r2);
         let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
         let s2_lo = vshlq_n_u64::<2>(r2);
@@ -295,17 +278,7 @@ unsafe fn reduce_wide_pair(first: WideNeon, second: WideNeon) -> [uint64x2_t; 2]
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
         let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
         let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
-            vshrq_n_u64::<57>(r3),
-        );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
-            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
-        );
-        let out_lo = xor3_u64(r0, t_lo, correction);
+        let out_lo = veorq_u64(r0, t_lo);
         let out_hi = veorq_u64(r1, t_hi);
         [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
     }
