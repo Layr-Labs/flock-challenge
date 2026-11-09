@@ -1044,7 +1044,8 @@ impl flock_core::lincheck::LincheckCircuit for Blake3LincheckCircuit {
 // and the lincheck AB fold) read and look up 26.6% fewer columns, and
 // [`expand_root_fold`] rebuilds the dependent folded columns with the same
 // word DAG that [`Blake3LincheckCircuit::fold_alpha_batched`] walks in
-// reverse.
+// reverse. (Ported from the x86 record's `LinearFoldPlan`; the Mac version
+// reuses this module's DAG instead of a separate node list.)
 
 /// Root columns: every useful column except the lin-id ones.
 pub(crate) const N_ROOT_COLS: usize =
@@ -1077,14 +1078,37 @@ struct RootPlan {
     /// Original column of compacted root `r` (strictly increasing).
     cols: Box<[u16]>,
     rows: Box<[RootRow]>,
+    /// Whether the `block_len`/`flags` input columns are omitted (rebuilt as
+    /// constants by the expansion; see [`FIXED_INPUT_ROOT_PLAN`]).
+    fixed_inputs: bool,
 }
 
-fn build_root_plan() -> RootPlan {
+/// `block_len` and `flags` of every ranked compression (benchmark contract:
+/// `block_len = 64`, `flags = 11`). Only the fixed-input root stripe relies on
+/// them, and its fill verifies them on every instance it reads.
+pub(crate) const FIXED_BLOCK_LEN: u32 = 64;
+pub(crate) const FIXED_FLAGS: u32 = 11;
+
+/// Columns of the `block_len` and `flags` input words (1089..1153): one
+/// 64-wide run, so dropping it keeps every later root on its bit lane.
+fn is_fixed_input_column(col: usize) -> bool {
+    (BLEN_BASE..FLAGS_BASE + WORD_BITS).contains(&col)
+}
+
+/// Fixed-input root count: 11,249 <= 11 * 1024, one fewer GPU column group.
+pub(crate) const N_FIXED_INPUT_ROOT_COLS: usize = N_ROOT_COLS - 2 * WORD_BITS;
+const _: () = assert!(N_FIXED_INPUT_ROOT_COLS == 11_249);
+const _: () = assert!(FLAGS_BASE == BLEN_BASE + WORD_BITS);
+
+fn build_root_plan(fixed_inputs: bool) -> RootPlan {
     let cols: Vec<u16> = (0..USEFUL_BITS)
-        .filter(|&c| !is_lin_id_column(c))
+        .filter(|&c| !is_lin_id_column(c) && !(fixed_inputs && is_fixed_input_column(c)))
         .map(|c| c as u16)
         .collect();
-    assert_eq!(cols.len(), N_ROOT_COLS);
+    assert_eq!(
+        cols.len(),
+        if fixed_inputs { N_FIXED_INPUT_ROOT_COLS } else { N_ROOT_COLS }
+    );
     let rows = cols
         .chunks(64)
         .map(|chunk| {
@@ -1102,18 +1126,55 @@ fn build_root_plan() -> RootPlan {
             RootRow { lo_word, lo_mask, hi_mask }
         })
         .collect();
-    RootPlan { cols: cols.into_boxed_slice(), rows }
+    RootPlan { cols: cols.into_boxed_slice(), rows, fixed_inputs }
 }
 
-static ROOT_PLAN: std::sync::LazyLock<RootPlan> = std::sync::LazyLock::new(build_root_plan);
+static ROOT_PLAN: std::sync::LazyLock<RootPlan> = std::sync::LazyLock::new(|| build_root_plan(false));
+
+/// The ranked root stripe without the `block_len`/`flags` columns (x86 record
+/// does the same): 176 rows, 11,249 columns.
+static FIXED_INPUT_ROOT_PLAN: std::sync::LazyLock<RootPlan> =
+    std::sync::LazyLock::new(|| build_root_plan(true));
+
+/// `(word, mask, expected)` triples over a block's packed u64 words that hold
+/// exactly when the block's `block_len`/`flags` equal [`FIXED_BLOCK_LEN`] /
+/// [`FIXED_FLAGS`]. Derived from the column layout, not hand-coded.
+pub(crate) static FIXED_INPUT_CHECKS: std::sync::LazyLock<Box<[(usize, u64, u64)]>> =
+    std::sync::LazyLock::new(|| {
+        let mut checks: Vec<(usize, u64, u64)> = Vec::new();
+        for (base, value) in [(BLEN_BASE, FIXED_BLOCK_LEN), (FLAGS_BASE, FIXED_FLAGS)] {
+            for i in 0..WORD_BITS {
+                let (word, bit) = ((base + i) / 64, (base + i) % 64);
+                let idx = match checks.iter().position(|c| c.0 == word) {
+                    Some(idx) => idx,
+                    None => {
+                        checks.push((word, 0, 0));
+                        checks.len() - 1
+                    }
+                };
+                checks[idx].1 |= 1 << bit;
+                checks[idx].2 |= u64::from((value >> i) & 1) << bit;
+            }
+        }
+        checks.into_boxed_slice()
+    });
 
 /// Rows of the ranked root stripe (`N_ROOT_COLS.div_ceil(64)` = 177), or
 /// `None` under `FLOCK_NO_ROOT_STRIPE=1` (exact control: full 241-row stripe
-/// and full-width folds). Initialized once during the untimed warm-up.
+/// and full-width folds). Forced once in the untimed warm-up.
 pub(crate) fn root_stripe_rows() -> Option<&'static [RootRow]> {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ROOT_STRIPE").is_none());
     (*ON).then(|| &*ROOT_PLAN.rows)
+}
+
+/// Rows of the fixed-input root stripe (176), or `None` when the root stripe
+/// is off or under `FLOCK_NO_FIXED_INPUT_ROOTS=1` (then the 177-row stripe).
+pub(crate) fn fixed_input_root_stripe_rows() -> Option<&'static [RootRow]> {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FIXED_INPUT_ROOTS").is_none());
+    root_stripe_rows()?;
+    (*ON).then(|| &*FIXED_INPUT_ROOT_PLAN.rows)
 }
 
 /// The `RootStripe` descriptor of the 177-row stripe.
@@ -1124,15 +1185,31 @@ pub(crate) fn root_stripe_descriptor() -> flock_core::lincheck::RootStripe {
     }
 }
 
+/// The `RootStripe` descriptor of the 176-row fixed-input stripe.
+pub(crate) fn fixed_input_root_stripe_descriptor() -> flock_core::lincheck::RootStripe {
+    flock_core::lincheck::RootStripe {
+        n_roots: N_FIXED_INPUT_ROOT_COLS,
+        expand: expand_fixed_input_root_fold,
+    }
+}
+
 /// [`expand_root_fold_with`] for the 177-row stripe.
 pub(crate) fn expand_root_fold(v: &mut [F128]) {
     expand_root_fold_with(&ROOT_PLAN, v);
 }
 
+/// [`expand_root_fold_with`] for the fixed-input stripe: `block_len`/`flags`
+/// are the same constants in every instance (verified by the fill), so their
+/// folded columns are those constant bits times the folded constant column.
+pub(crate) fn expand_fixed_input_root_fold(v: &mut [F128]) {
+    expand_root_fold_with(&FIXED_INPUT_ROOT_PLAN, v);
+}
+
 /// In place: `v[..plan.cols.len()]` holds a fold over the compacted roots
 /// (the rest is arbitrary); afterwards `v` is the fold over the original `K`
-/// columns — roots scattered back, lin-id columns rebuilt by the forward word
-/// DAG, padding columns zero. Exact: the fold is GF(2)-linear per column and every
+/// columns — roots scattered back, fixed inputs (if omitted) rebuilt from the
+/// folded constant column, lin-id columns rebuilt by the forward word DAG,
+/// padding columns zero. Exact: the fold is GF(2)-linear per column and every
 /// lin-id column is the XOR of its DAG inputs in every instance of an honest
 /// witness (the constant contributes the folded constant column).
 fn expand_root_fold_with(plan: &RootPlan, v: &mut [F128]) {
@@ -1145,6 +1222,14 @@ fn expand_root_fold_with(plan: &RootPlan, v: &mut [F128]) {
         v[cols[r] as usize] = v[r];
     }
     v[USEFUL_BITS..].fill(F128::ZERO);
+    if plan.fixed_inputs {
+        let one = v[Z_CONST_POS];
+        for i in 0..WORD_BITS {
+            let bit = |value: u32| if (value >> i) & 1 == 1 { one } else { F128::ZERO };
+            v[BLEN_BASE + i] = bit(FIXED_BLOCK_LEN);
+            v[FLAGS_BASE + i] = bit(FIXED_FLAGS);
+        }
+    }
 
     let one = v[Z_CONST_POS];
     let leaf = |v: &[F128], base: usize| -> W { std::array::from_fn(|i| v[base + i]) };
@@ -1667,6 +1752,20 @@ fn build_block_witness_ab_packed_into(
 /// writers can publish complete u64s without a destination read-modify-write.
 /// The only out-of-order region is the aligned `out_lo` slot, reserved while
 /// the compression runs and overwritten once the final state is known.
+/// Test-only: the packed `z` words (`K / 64`) of one compression's witness.
+#[cfg(test)]
+pub(crate) fn test_block_witness_z(
+    cv: &[u32; 8],
+    m: &[u32; 16],
+    counter: u64,
+    block_len: u32,
+    flags: u32,
+) -> Vec<u64> {
+    let (mut z, mut a, mut b) = (vec![0u64; K / 64], vec![0u64; K / 64], vec![0u64; K / 64]);
+    build_block_witness_ab_stream_into(cv, m, counter, block_len, flags, &mut z, &mut a, &mut b);
+    z
+}
+
 fn build_block_witness_ab_stream_into(
     cv: &[u32; 8],
     m: &[u32; 16],
@@ -3858,7 +3957,10 @@ impl Blake3Setup {
             // Build the root-stripe plan (and read its kill switch) here,
             // outside every timed interval.
             let _ = root_stripe_rows();
+            let _ = fixed_input_root_stripe_rows();
             let _ = ROOT_PLAN.cols.len();
+            let _ = FIXED_INPUT_ROOT_PLAN.cols.len();
+            let _ = FIXED_INPUT_CHECKS.len();
             if self.n_blocks.is_power_of_two() {
                 crate::seed_pipe::verify_generator_at_warmup(
                     self.n_blocks.trailing_zeros(),
@@ -4527,6 +4629,70 @@ mod tests {
         }
         expand_root_fold(&mut v);
         assert!(v == full, "expanded root fold differs from the full fold");
+    }
+
+    /// Fixed-input root stripe (176 rows): gather, exact expansion on
+    /// witnesses with the ranked `block_len`/`flags`, and the fill's input
+    /// check accepts exactly those blocks.
+    #[test]
+    fn fixed_input_root_stripe_matches_full_fold_and_checks_inputs() {
+        let mut rng = Rng::new(0xF1ED_0B1E_2007);
+        let f128 = |rng: &mut Rng| {
+            let w = [rng.next_u32(), rng.next_u32(), rng.next_u32(), rng.next_u32()];
+            F128::new(
+                (w[0] as u64) | ((w[1] as u64) << 32),
+                (w[2] as u64) | ((w[3] as u64) << 32),
+            )
+        };
+        let plan = &*FIXED_INPUT_ROOT_PLAN;
+        assert!(plan.fixed_inputs);
+        assert_eq!(plan.rows.len(), 176);
+        assert_eq!(FIXED_BLOCK_LEN, 64);
+        assert_eq!(FIXED_FLAGS, CHUNK_START | CHUNK_END | ROOT);
+        let checks_pass = |z: &[u64]| {
+            FIXED_INPUT_CHECKS.iter().all(|&(word, mask, want)| z[word] & mask == want)
+        };
+        let witness = |cv: &[u32; 8], m: &[u32; 16], counter: u64, bl: u32, fl: u32| {
+            let mut z = vec![0u64; K / 64];
+            let mut a = vec![0u64; K / 64];
+            let mut b = vec![0u64; K / 64];
+            build_block_witness_ab_stream_into(cv, m, counter, bl, fl, &mut z, &mut a, &mut b);
+            z
+        };
+        let mut full = vec![F128::ZERO; K];
+        for _ in 0..24 {
+            let cv: [u32; 8] = std::array::from_fn(|_| rng.next_u32());
+            let m: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let counter = (rng.next_u32() as u64) | ((rng.next_u32() as u64) << 32);
+            let z = witness(&cv, &m, counter, FIXED_BLOCK_LEN, FIXED_FLAGS);
+            assert!(checks_pass(&z), "fixed inputs must pass the fill check");
+            // Any other block_len or flags must fail it.
+            for (bl, fl) in [(63, FIXED_FLAGS), (FIXED_BLOCK_LEN, 10), (64 | (1 << 31), 11), (64, 11 | (1 << 31))] {
+                assert!(!checks_pass(&witness(&cv, &m, counter, bl, fl)), "bl={bl} fl={fl}");
+            }
+            let bit = |c: usize| (z[c / 64] >> (c % 64)) & 1 == 1;
+            for (j, row) in plan.rows.iter().enumerate() {
+                let hi = if row.hi_mask != 0 { z[row.lo_word + 1] & row.hi_mask } else { 0 };
+                let word = (z[row.lo_word] & row.lo_mask) | hi;
+                for lane in 0..64 {
+                    let r = 64 * j + lane;
+                    let want = r < plan.cols.len() && bit(plan.cols[r] as usize);
+                    assert_eq!((word >> lane) & 1 == 1, want, "row {j} lane {lane}");
+                }
+            }
+            let weight = f128(&mut rng);
+            for c in 0..K {
+                if bit(c) {
+                    full[c] += weight;
+                }
+            }
+        }
+        let mut v: Vec<F128> = (0..K).map(|_| f128(&mut rng)).collect();
+        for (r, &col) in plan.cols.iter().enumerate() {
+            v[r] = full[col as usize];
+        }
+        expand_fixed_input_root_fold(&mut v);
+        assert!(v == full, "expanded fixed-input root fold differs from the full fold");
     }
 
     /// BLAKE3 chunk flags (subset).

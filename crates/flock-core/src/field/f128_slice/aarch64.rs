@@ -65,6 +65,7 @@ unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint
         let r2 = veorq_u64(vzip1q_u64(p0_hh, p1_hh), vzip2q_u64(c0, c1));
         let r3 = vzip2q_u64(p0_hh, p1_hh);
 
+        let r2 = veorq_u64(r2, r3_overflow(r3));
         let s1_lo = vshlq_n_u64::<1>(r2);
         let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
         let s2_lo = vshlq_n_u64::<2>(r2);
@@ -73,17 +74,7 @@ unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
         let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
         let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
-            vshrq_n_u64::<57>(r3),
-        );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
-            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
-        );
-        let out_lo = xor3_u64(r0, t_lo, correction);
+        let out_lo = veorq_u64(r0, t_lo);
         let out_hi = veorq_u64(r1, t_hi);
         [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
     }
@@ -141,6 +132,7 @@ unsafe fn mul_two_const_sum_vec2(
         let r2 = veorq_u64(vzip1q_u64(p0_hh, p1_hh), vzip2q_u64(cross0, cross1));
         let r3 = vzip2q_u64(p0_hh, p1_hh);
 
+        let r2 = veorq_u64(r2, r3_overflow(r3));
         let s1_lo = vshlq_n_u64::<1>(r2);
         let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
         let s2_lo = vshlq_n_u64::<2>(r2);
@@ -149,17 +141,7 @@ unsafe fn mul_two_const_sum_vec2(
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
         let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
         let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
-            vshrq_n_u64::<57>(r3),
-        );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
-            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
-        );
-        let out_lo = xor3_u64(r0, t_lo, correction);
+        let out_lo = veorq_u64(r0, t_lo);
         let out_hi = veorq_u64(r1, t_hi);
         [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
     }
@@ -247,10 +229,21 @@ unsafe fn xor_wide(acc: &mut WideNeon, value: WideNeon) {
 }
 
 #[inline(always)]
+unsafe fn r3_overflow(r3: uint64x2_t) -> uint64x2_t {
+    unsafe {
+        xor3_u64(
+            vshrq_n_u64::<63>(r3),
+            vshrq_n_u64::<62>(r3),
+            vshrq_n_u64::<57>(r3),
+        )
+    }
+}
+
+#[inline(always)]
 unsafe fn reduce_wide(value: WideNeon) -> uint64x2_t {
     unsafe {
         let zero = vdupq_n_u64(0);
-        let high = value.hi;
+        let high = veorq_u64(value.hi, r3_overflow(vextq_u64::<1>(value.hi, zero)));
         let shift1 = veorq_u64(
             vshlq_n_u64::<1>(high),
             vextq_u64::<1>(zero, vshrq_n_u64::<63>(high)),
@@ -264,18 +257,7 @@ unsafe fn reduce_wide(value: WideNeon) -> uint64x2_t {
             vextq_u64::<1>(zero, vshrq_n_u64::<57>(high)),
         );
         let folded = xor3_u64(high, shift1, veorq_u64(shift2, shift7));
-        let high_word = vextq_u64::<1>(high, zero);
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(high_word),
-            vshrq_n_u64::<62>(high_word),
-            vshrq_n_u64::<57>(high_word),
-        );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
-            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
-        );
-        xor3_u64(value.lo, folded, correction)
+        veorq_u64(value.lo, folded)
     }
 }
 
@@ -287,6 +269,7 @@ unsafe fn reduce_wide_pair(first: WideNeon, second: WideNeon) -> [uint64x2_t; 2]
         let r2 = vzip1q_u64(first.hi, second.hi);
         let r3 = vzip2q_u64(first.hi, second.hi);
 
+        let r2 = veorq_u64(r2, r3_overflow(r3));
         let s1_lo = vshlq_n_u64::<1>(r2);
         let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
         let s2_lo = vshlq_n_u64::<2>(r2);
@@ -295,17 +278,7 @@ unsafe fn reduce_wide_pair(first: WideNeon, second: WideNeon) -> [uint64x2_t; 2]
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
         let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
         let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-        let overflow = xor3_u64(
-            vshrq_n_u64::<63>(r3),
-            vshrq_n_u64::<62>(r3),
-            vshrq_n_u64::<57>(r3),
-        );
-        let correction = xor3_u64(
-            overflow,
-            vshlq_n_u64::<1>(overflow),
-            veorq_u64(vshlq_n_u64::<2>(overflow), vshlq_n_u64::<7>(overflow)),
-        );
-        let out_lo = xor3_u64(r0, t_lo, correction);
+        let out_lo = veorq_u64(r0, t_lo);
         let out_hi = veorq_u64(r1, t_hi);
         [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
     }
@@ -333,14 +306,14 @@ pub(super) unsafe fn round0_and_round1_lookahead(
         debug_assert!(witness.len().is_multiple_of(4));
 
         let zero = vdupq_n_u64(0);
-        let mut a_c0 = WideNeon { lo: zero, hi: zero };
-        let mut a_c1_endpoint = WideNeon { lo: zero, hi: zero };
-        let mut a_c2 = WideNeon { lo: zero, hi: zero };
-        let mut a_u0_second = WideNeon { lo: zero, hi: zero };
-        let mut a_u2_second = WideNeon { lo: zero, hi: zero };
-        let mut a_c3 = WideNeon { lo: zero, hi: zero };
-        let mut a_c4_endpoint = WideNeon { lo: zero, hi: zero };
-        let mut a_c5 = WideNeon { lo: zero, hi: zero };
+        let mut a_c0 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut a_c1_endpoint = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut a_c2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut a_u0_second = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut a_u2_second = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut a_c3 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut a_c4_endpoint = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut a_c5 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
 
         let mut i = 0usize;
         while i < witness.len() {
@@ -357,11 +330,11 @@ pub(super) unsafe fn round0_and_round1_lookahead(
             let sb0 = veorq_u64(b0, b1);
             let sa1 = veorq_u64(a2, a3);
             let sb1 = veorq_u64(b2, b3);
-            xor_wide(&mut a_c0, mul_unreduced(a0, b0));
-            xor_wide(&mut a_c1_endpoint, mul_unreduced(a1, b1));
-            xor_wide(&mut a_c2, mul_unreduced(sa0, sb0));
-            xor_wide(&mut a_u0_second, mul_unreduced(a2, b2));
-            xor_wide(&mut a_u2_second, mul_unreduced(sa1, sb1));
+            xor_karatsuba_variable(&mut a_c0, a0, b0);
+            xor_karatsuba_variable(&mut a_c1_endpoint, a1, b1);
+            xor_karatsuba_variable(&mut a_c2, sa0, sb0);
+            xor_karatsuba_variable(&mut a_u0_second, a2, b2);
+            xor_karatsuba_variable(&mut a_u2_second, sa1, sb1);
 
             let even_a = veorq_u64(a0, a2);
             let even_b = veorq_u64(b0, b2);
@@ -369,21 +342,21 @@ pub(super) unsafe fn round0_and_round1_lookahead(
             let odd_b = veorq_u64(b1, b3);
             let sum_a = veorq_u64(even_a, odd_a);
             let sum_b = veorq_u64(even_b, odd_b);
-            xor_wide(&mut a_c3, mul_unreduced(even_a, even_b));
-            xor_wide(&mut a_c4_endpoint, mul_unreduced(odd_a, odd_b));
-            xor_wide(&mut a_c5, mul_unreduced(sum_a, sum_b));
+            xor_karatsuba_variable(&mut a_c3, even_a, even_b);
+            xor_karatsuba_variable(&mut a_c4_endpoint, odd_a, odd_b);
+            xor_karatsuba_variable(&mut a_c5, sum_a, sum_b);
             i += 4;
         }
 
         let red = |value: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(value));
-        let c0 = red(a_c0);
-        let c2 = red(a_c2);
-        let c3 = red(a_c3);
-        let c5 = red(a_c5);
-        let c1 = red(a_c1_endpoint) + c0 + c2;
-        let c4 = red(a_c4_endpoint) + c3 + c5;
-        let u0 = c0 + red(a_u0_second);
-        let u2 = c2 + red(a_u2_second);
+        let c0 = red(karatsuba_to_wide(a_c0));
+        let c2 = red(karatsuba_to_wide(a_c2));
+        let c3 = red(karatsuba_to_wide(a_c3));
+        let c5 = red(karatsuba_to_wide(a_c5));
+        let c1 = red(karatsuba_to_wide(a_c1_endpoint)) + c0 + c2;
+        let c4 = red(karatsuba_to_wide(a_c4_endpoint)) + c3 + c5;
+        let u0 = c0 + red(karatsuba_to_wide(a_u0_second));
+        let u2 = c2 + red(karatsuba_to_wide(a_u2_second));
         ((u0, u2), [c0, c1, c2, c3, c4, c5])
     }
 }
@@ -412,10 +385,10 @@ pub(super) unsafe fn fold_banked_slot<const BANKS: usize>(
     unsafe {
         debug_assert!(input.len() >= BANKS);
         let zero = vdupq_n_u64(0);
-        let mut a0 = WideNeon { lo: zero, hi: zero };
-        let mut a1 = WideNeon { lo: zero, hi: zero };
-        let mut a2 = WideNeon { lo: zero, hi: zero };
-        let mut a3 = WideNeon { lo: zero, hi: zero };
+        let mut a0 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut a1 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut a2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut a3 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
 
         let w = weight.as_ptr();
         let x = input.as_ptr();
@@ -430,23 +403,24 @@ pub(super) unsafe fn fold_banked_slot<const BANKS: usize>(
             let x1 = vld1q_u64(x.add(k + 1).cast::<u64>());
             let x2 = vld1q_u64(x.add(k + 2).cast::<u64>());
             let x3 = vld1q_u64(x.add(k + 3).cast::<u64>());
-            xor_wide(&mut a0, mul_unreduced(w0, x0));
-            xor_wide(&mut a1, mul_unreduced(w1, x1));
-            xor_wide(&mut a2, mul_unreduced(w2, x2));
-            xor_wide(&mut a3, mul_unreduced(w3, x3));
+            xor_karatsuba_variable(&mut a0, w0, x0);
+            xor_karatsuba_variable(&mut a1, w1, x1);
+            xor_karatsuba_variable(&mut a2, w2, x2);
+            xor_karatsuba_variable(&mut a3, w3, x3);
             k += 4;
         }
         while k < BANKS {
             let wk = vld1q_u64(w.add(k).cast::<u64>());
             let xk = vld1q_u64(x.add(k).cast::<u64>());
-            xor_wide(&mut a0, mul_unreduced(wk, xk));
+            xor_karatsuba_variable(&mut a0, wk, xk);
             k += 1;
         }
 
-        xor_wide(&mut a0, a1);
-        xor_wide(&mut a2, a3);
-        xor_wide(&mut a0, a2);
-        transmute::<uint64x2_t, F128>(reduce_wide(a0))
+        let mut wide = karatsuba_to_wide(a0);
+        xor_wide(&mut wide, karatsuba_to_wide(a1));
+        xor_wide(&mut wide, karatsuba_to_wide(a2));
+        xor_wide(&mut wide, karatsuba_to_wide(a3));
+        transmute::<uint64x2_t, F128>(reduce_wide(wide))
     }
 }
 
@@ -773,10 +747,10 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
         debug_assert!(witness.len().is_multiple_of(2));
 
         let zero = vdupq_n_u64(0);
-        let mut u0_a = WideNeon { lo: zero, hi: zero };
-        let mut u0_b = WideNeon { lo: zero, hi: zero };
-        let mut u2_a = WideNeon { lo: zero, hi: zero };
-        let mut u2_b = WideNeon { lo: zero, hi: zero };
+        let mut u0_a = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut u0_b = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut u2_a = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut u2_b = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
 
         let n = witness.len();
         let main = n & !3;
@@ -792,16 +766,10 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
             let b1 = vld1q_u64(bp.add(i + 1).cast::<u64>());
             let b2 = vld1q_u64(bp.add(i + 2).cast::<u64>());
             let b3 = vld1q_u64(bp.add(i + 3).cast::<u64>());
-            xor_wide(&mut u0_a, mul_unreduced(a0, b0));
-            xor_wide(&mut u0_b, mul_unreduced(a2, b2));
-            xor_wide(
-                &mut u2_a,
-                mul_unreduced(veorq_u64(a0, a1), veorq_u64(b0, b1)),
-            );
-            xor_wide(
-                &mut u2_b,
-                mul_unreduced(veorq_u64(a2, a3), veorq_u64(b2, b3)),
-            );
+            xor_karatsuba_variable(&mut u0_a, a0, b0);
+            xor_karatsuba_variable(&mut u0_b, a2, b2);
+            xor_karatsuba_variable(&mut u2_a, veorq_u64(a0, a1), veorq_u64(b0, b1));
+            xor_karatsuba_variable(&mut u2_b, veorq_u64(a2, a3), veorq_u64(b2, b3));
             i += 4;
         }
         while i < n {
@@ -809,17 +777,15 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
             let a1 = vld1q_u64(wp.add(i + 1).cast::<u64>());
             let b0 = vld1q_u64(bp.add(i).cast::<u64>());
             let b1 = vld1q_u64(bp.add(i + 1).cast::<u64>());
-            xor_wide(&mut u0_a, mul_unreduced(a0, b0));
-            xor_wide(
-                &mut u2_a,
-                mul_unreduced(veorq_u64(a0, a1), veorq_u64(b0, b1)),
-            );
+            xor_karatsuba_variable(&mut u0_a, a0, b0);
+            xor_karatsuba_variable(&mut u2_a, veorq_u64(a0, a1), veorq_u64(b0, b1));
             i += 2;
         }
 
-        xor_wide(&mut u0_a, u0_b);
-        xor_wide(&mut u2_a, u2_b);
-        let red = |value: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(value));
+        for (left,right) in [(&mut u0_a,u0_b),(&mut u2_a,u2_b)] {
+            left.ll=veorq_u64(left.ll,right.ll); left.hh=veorq_u64(left.hh,right.hh); left.mm=veorq_u64(left.mm,right.mm);
+        }
+        let red = |value: KaratsubaNeon| transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(value)));
         (red(u0_a), red(u2_a))
     }
 }
@@ -982,8 +948,8 @@ pub(super) unsafe fn fold_two_and_msg(
     unsafe {
         let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
-        let mut u0 = WideNeon { lo: zero, hi: zero };
-        let mut u2 = WideNeon { lo: zero, hi: zero };
+        let mut u0 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut u2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut t = 0;
         while t < nf.len() {
             let source = 2 * (base + t);
@@ -997,11 +963,11 @@ pub(super) unsafe fn fold_two_and_msg(
             let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
 
             let folded_f =
-                mul_const_vec2(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
             let f0 = veorq_u64(f_even0, folded_f[0]);
             let f1 = veorq_u64(f_even1, folded_f[1]);
             let folded_b =
-                mul_const_vec2(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
+                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
             let b0 = veorq_u64(b_even0, folded_b[0]);
             let b1 = veorq_u64(b_even1, folded_b[1]);
 
@@ -1010,13 +976,13 @@ pub(super) unsafe fn fold_two_and_msg(
             vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
             vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
 
-            xor_wide(&mut u0, mul_unreduced(f0, b0));
-            xor_wide(&mut u2, mul_unreduced(veorq_u64(f0, f1), veorq_u64(b0, b1)));
+            xor_karatsuba_variable(&mut u0, f0, b0);
+            xor_karatsuba_variable(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
         (
-            transmute::<uint64x2_t, F128>(reduce_wide(u0)),
-            transmute::<uint64x2_t, F128>(reduce_wide(u2)),
+            transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(u0))),
+            transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(u2))),
         )
     }
 }
@@ -1041,8 +1007,8 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
         let half = f.len() / 2;
         let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
-        let mut u0 = WideNeon { lo: zero, hi: zero };
-        let mut u2 = WideNeon { lo: zero, hi: zero };
+        let mut u0 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut u2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut t = 0;
         while t < half {
             let source = 2 * t;
@@ -1056,11 +1022,11 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
             let b_odd1 = vld1q_u64(b_ptr.add(source + 3).cast::<u64>());
 
             let folded_f =
-                mul_const_vec2(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
             let f0 = veorq_u64(f_even0, folded_f[0]);
             let f1 = veorq_u64(f_even1, folded_f[1]);
             let folded_b =
-                mul_const_vec2(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
+                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
             let b0 = veorq_u64(b_even0, folded_b[0]);
             let b1 = veorq_u64(b_even1, folded_b[1]);
 
@@ -1069,13 +1035,13 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
             vst1q_u64(b_ptr.add(t).cast::<u64>(), b0);
             vst1q_u64(b_ptr.add(t + 1).cast::<u64>(), b1);
 
-            xor_wide(&mut u0, mul_unreduced(f0, b0));
-            xor_wide(&mut u2, mul_unreduced(veorq_u64(f0, f1), veorq_u64(b0, b1)));
+            xor_karatsuba_variable(&mut u0, f0, b0);
+            xor_karatsuba_variable(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
         (
-            transmute::<uint64x2_t, F128>(reduce_wide(u0)),
-            transmute::<uint64x2_t, F128>(reduce_wide(u2)),
+            transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(u0))),
+            transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(u2))),
         )
     }
 }
@@ -1109,8 +1075,8 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
         let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
         let scale_q = transmute::<F128, uint64x2_t>(scale);
-        let mut u0 = WideNeon { lo: zero, hi: zero };
-        let mut u2 = WideNeon { lo: zero, hi: zero };
+        let mut u0 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut u2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut t = 0usize;
         while t < nf.len() {
             let source = 2 * (base + t);
@@ -1119,7 +1085,7 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
             let f_even1 = vld1q_u64(f.as_ptr().add(source + 2).cast::<u64>());
             let f_odd1 = vld1q_u64(f.as_ptr().add(source + 3).cast::<u64>());
             let folded_f =
-                mul_const_vec2(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
             let f0 = veorq_u64(f_even0, folded_f[0]);
             let f1 = veorq_u64(f_even1, folded_f[1]);
 
@@ -1129,7 +1095,7 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
             let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
             let addend0 = vld1q_u64(basis_addend.as_ptr().add(t).cast::<u64>());
             let addend1 = vld1q_u64(basis_addend.as_ptr().add(t + 1).cast::<u64>());
-            let folded_b_with_addend = mul_two_const_sum_vec2(
+            let folded_b_with_addend = mul_two_const_sum_vec2_pmred(
                 r_q,
                 veorq_u64(b_even0, b_odd0),
                 veorq_u64(b_even1, b_odd1),
@@ -1145,13 +1111,13 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
             vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
             vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
 
-            xor_wide(&mut u0, mul_unreduced(f0, b0));
-            xor_wide(&mut u2, mul_unreduced(veorq_u64(f0, f1), veorq_u64(b0, b1)));
+            xor_karatsuba_variable(&mut u0, f0, b0);
+            xor_karatsuba_variable(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
         (
-            transmute::<uint64x2_t, F128>(reduce_wide(u0)),
-            transmute::<uint64x2_t, F128>(reduce_wide(u2)),
+            transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(u0))),
+            transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(u2))),
         )
     }
 }
@@ -1624,5 +1590,128 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+// Reduce a 256-bit polynomial using carry-less multiplication by x^7+x^2+x+1.
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn reduce_pmred(lo: uint64x2_t, hi: uint64x2_t) -> uint64x2_t {
+    unsafe {
+        let p0 = pmull(vgetq_lane_u64::<0>(hi), 0x87);
+        let p1 = pmull(vgetq_lane_u64::<1>(hi), 0x87);
+        let correction = pmull(vgetq_lane_u64::<1>(p1), 0x87);
+        let low = vgetq_lane_u64::<0>(lo) ^ vgetq_lane_u64::<0>(p0) ^ vgetq_lane_u64::<0>(correction);
+        let high = vgetq_lane_u64::<1>(lo) ^ vgetq_lane_u64::<1>(p0) ^ vgetq_lane_u64::<0>(p1) ^ vgetq_lane_u64::<1>(correction);
+        vcombine_u64(vcreate_u64(low), vcreate_u64(high))
+    }
+}
+
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn mul_const_vec2_pmred(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint64x2_t; 2] {
+    unsafe {
+        let r_lo = vgetq_lane_u64::<0>(r);
+        let r_hi = vgetq_lane_u64::<1>(r);
+        let r_mid = veorq_u64(r, vextq_u64::<1>(r, r));
+        let x0_mid = veorq_u64(x0, vextq_u64::<1>(x0, x0));
+        let x1_mid = veorq_u64(x1, vextq_u64::<1>(x1, x1));
+
+        let p0_ll = pmull(vgetq_lane_u64::<0>(x0), r_lo);
+        let p0_hh = pmull(vgetq_lane_u64::<1>(x0), r_hi);
+        let p0_mm = pmull(vgetq_lane_u64::<0>(x0_mid), vgetq_lane_u64::<0>(r_mid));
+        let p1_ll = pmull(vgetq_lane_u64::<0>(x1), r_lo);
+        let p1_hh = pmull(vgetq_lane_u64::<1>(x1), r_hi);
+        let p1_mm = pmull(vgetq_lane_u64::<0>(x1_mid), vgetq_lane_u64::<0>(r_mid));
+        let c0 = xor3_u64(p0_mm, p0_ll, p0_hh);
+        let c1 = xor3_u64(p1_mm, p1_ll, p1_hh);
+
+        let zero = vdupq_n_u64(0);
+        let lo0 = veorq_u64(p0_ll, vextq_u64::<1>(zero, c0));
+        let hi0 = veorq_u64(p0_hh, vextq_u64::<1>(c0, zero));
+        let lo1 = veorq_u64(p1_ll, vextq_u64::<1>(zero, c1));
+        let hi1 = veorq_u64(p1_hh, vextq_u64::<1>(c1, zero));
+        [reduce_pmred(lo0,hi0), reduce_pmred(lo1,hi1)]
+    }
+}
+
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn mul_two_const_sum_vec2_pmred(
+    c: uint64x2_t,
+    x0: uint64x2_t,
+    x1: uint64x2_t,
+    d: uint64x2_t,
+    y0: uint64x2_t,
+    y1: uint64x2_t,
+) -> [uint64x2_t; 2] {
+    unsafe {
+        let c_lo = vgetq_lane_u64::<0>(c);
+        let c_hi = vgetq_lane_u64::<1>(c);
+        let c_mid = c_lo ^ c_hi;
+        let d_lo = vgetq_lane_u64::<0>(d);
+        let d_hi = vgetq_lane_u64::<1>(d);
+        let d_mid = d_lo ^ d_hi;
+
+        let x0_lo = vgetq_lane_u64::<0>(x0);
+        let x0_hi = vgetq_lane_u64::<1>(x0);
+        let y0_lo = vgetq_lane_u64::<0>(y0);
+        let y0_hi = vgetq_lane_u64::<1>(y0);
+        let p0_ll = veorq_u64(pmull(x0_lo, c_lo), pmull(y0_lo, d_lo));
+        let p0_hh = veorq_u64(pmull(x0_hi, c_hi), pmull(y0_hi, d_hi));
+        let p0_mm = veorq_u64(pmull(x0_lo ^ x0_hi, c_mid), pmull(y0_lo ^ y0_hi, d_mid));
+
+        let x1_lo = vgetq_lane_u64::<0>(x1);
+        let x1_hi = vgetq_lane_u64::<1>(x1);
+        let y1_lo = vgetq_lane_u64::<0>(y1);
+        let y1_hi = vgetq_lane_u64::<1>(y1);
+        let p1_ll = veorq_u64(pmull(x1_lo, c_lo), pmull(y1_lo, d_lo));
+        let p1_hh = veorq_u64(pmull(x1_hi, c_hi), pmull(y1_hi, d_hi));
+        let p1_mm = veorq_u64(pmull(x1_lo ^ x1_hi, c_mid), pmull(y1_lo ^ y1_hi, d_mid));
+
+        let cross0 = xor3_u64(p0_mm, p0_ll, p0_hh);
+        let cross1 = xor3_u64(p1_mm, p1_ll, p1_hh);
+
+        let zero = vdupq_n_u64(0);
+        let lo0 = veorq_u64(p0_ll, vextq_u64::<1>(zero, cross0));
+        let hi0 = veorq_u64(p0_hh, vextq_u64::<1>(cross0, zero));
+        let lo1 = veorq_u64(p1_ll, vextq_u64::<1>(zero, cross1));
+        let hi1 = veorq_u64(p1_hh, vextq_u64::<1>(cross1, zero));
+        [reduce_pmred(lo0,hi0), reduce_pmred(lo1,hi1)]
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn pmred_matches_shift_reduction_for_wide_values() {
+    let mut x = 0x9e3779b97f4a7c15u64;
+    let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+    for i in 0..16388 {
+        let words = match i {
+            0 => [0, 0, 0, 0],
+            1 => [u64::MAX; 4],
+            2 => [0, 0, 0, 1 << 63],
+            3 => [u64::MAX, 0, u64::MAX, 0],
+            _ => [next(), next(), next(), next()],
+        };
+        unsafe {
+            let lo = vcombine_u64(vcreate_u64(words[0]), vcreate_u64(words[1]));
+            let hi = vcombine_u64(vcreate_u64(words[2]), vcreate_u64(words[3]));
+            let got: [u64; 2] = transmute(reduce_pmred(lo, hi));
+            let expected: [u64; 2] = transmute(reduce_wide(WideNeon { lo, hi }));
+            assert_eq!(got, expected, "wide reduction case {i}");
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn xor_karatsuba_variable(acc: &mut KaratsubaNeon, a: uint64x2_t, b: uint64x2_t) {
+    unsafe {
+        let amid = veorq_u64(a, vextq_u64::<1>(a, a));
+        let bmid = veorq_u64(b, vextq_u64::<1>(b, b));
+        acc.ll = veorq_u64(acc.ll, pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b)));
+        acc.hh = veorq_u64(acc.hh, pmull(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b)));
+        acc.mm = veorq_u64(acc.mm, pmull(vgetq_lane_u64::<0>(amid), vgetq_lane_u64::<0>(bmid)));
     }
 }
