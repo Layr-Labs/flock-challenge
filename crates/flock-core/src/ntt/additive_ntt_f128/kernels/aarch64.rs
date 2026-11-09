@@ -618,7 +618,13 @@ pub(super) unsafe fn butterfly_fused_3layer_from_src_row(
 ) {
     unsafe {
         butterfly_fused_3layer_from_src_rows_impl::<false>(
-            src, dst, eighth, num_ntts, r, r + 1, twiddles,
+            src,
+            dst,
+            eighth,
+            num_ntts,
+            r,
+            r + 1,
+            twiddles,
         );
     }
 }
@@ -635,7 +641,13 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
 ) {
     unsafe {
         butterfly_fused_3layer_from_src_rows_impl::<true>(
-            src, dst, eighth, num_ntts, r, r + 1, twiddles,
+            src,
+            dst,
+            eighth,
+            num_ntts,
+            r,
+            r + 1,
+            twiddles,
         );
     }
 }
@@ -674,6 +686,152 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_rows(
     }
 }
 
+// Fixed-twiddle coefficients shared across the generic radix-8 row.
+#[inline(always)]
+unsafe fn three_coeffs(
+    t: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let r = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(t),
+            vreinterpretq_p64_u64(vdupq_n_u64(0x87)),
+        ));
+        let lo = vzip1q_u64(t, r);
+        let mid = veorq_u64(vextq_u64::<1>(t, t), vzip2q_u64(vdupq_n_u64(0), r));
+        (lo, mid)
+    }
+}
+#[inline(always)]
+unsafe fn three_lazy(
+    u: core::arch::aarch64::uint64x2_t,
+    v: core::arch::aarch64::uint64x2_t,
+    t: (
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+    ),
+    p: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let nu = fused_pmull_hi_acc(fused_pmull_lo_acc(u, v, t.0), v, t.0);
+        let mid = fused_pmull_hi_acc(fused_pmull_lo_acc(p, v, t.1), v, t.1);
+        (nu, veorq_u64(v, nu), mid)
+    }
+}
+#[inline(always)]
+unsafe fn three_fold(
+    u: core::arch::aarch64::uint64x2_t,
+    v: core::arch::aarch64::uint64x2_t,
+    t: (
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+    ),
+    p: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let (nu, _, mid) = three_lazy(u, v, t, p);
+        let fu = fold_x64_into(nu, mid);
+        (fu, veorq_u64(v, fu))
+    }
+}
+#[inline(always)]
+unsafe fn fused3_prepared_q(
+    v: &mut [core::arch::aarch64::uint64x2_t; 8],
+    t: &[(
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+    ); 7],
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let zero = vdupq_n_u64(0);
+        let (a, b, p0) = three_lazy(v[0], v[4], t[0], zero);
+        v[0] = a;
+        v[4] = b;
+        let (a, b, p1) = three_lazy(v[1], v[5], t[0], zero);
+        v[1] = a;
+        v[5] = b;
+        for i in 2..4 {
+            let (a, b) = three_fold(v[i], v[i + 4], t[0], zero);
+            v[i] = a;
+            v[i + 4] = b;
+        }
+        let (a, b, q0) = three_lazy(v[0], v[2], t[1], p0);
+        v[0] = a;
+        v[2] = b;
+        let (a, b) = three_fold(v[1], v[3], t[1], p1);
+        v[1] = a;
+        v[3] = b;
+        let (a, b, q4) = three_lazy(v[4], v[6], t[2], p0);
+        v[4] = a;
+        v[6] = b;
+        let (a, b) = three_fold(v[5], v[7], t[2], p1);
+        v[5] = a;
+        v[7] = b;
+        for (s, pending) in [q0, q0, q4, q4].into_iter().enumerate() {
+            let (a, b) = three_fold(v[2 * s], v[2 * s + 1], t[3 + s], pending);
+            v[2 * s] = a;
+            v[2 * s + 1] = b;
+        }
+    }
+}
+
+#[inline]
+fn use_three_const_fold() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_THREE_CONST_FOLD").is_none());
+    static DEBUG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_THREE_CONST_FOLD_DEBUG").is_some());
+    let enabled = *ON;
+    if *DEBUG {
+        static HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let hits = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if hits.is_power_of_two() || hits.is_multiple_of(64) {
+            eprintln!("[ntt-three-const-fold] enabled={enabled} groups={hits}");
+        }
+    }
+    enabled
+}
+#[target_feature(enable = "aes")]
+#[inline]
+unsafe fn butterfly_fused_3layer_row_with_const_q(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    t: &[(
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+    ); 7],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        for lane in 0..lanes {
+            let base = ptr.add(r * num_ntts + lane);
+            let step = eighth * num_ntts;
+            let mut v: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
+            fused3_prepared_q(&mut v, t);
+            for (i, value) in v.into_iter().enumerate() {
+                vst1q_u64(base.add(i * step).cast::<u64>(), value);
+            }
+        }
+    }
+}
+
 /// Vector-resident twin of `portable::butterfly_fused_3layer_row`.
 ///
 /// # Safety
@@ -692,7 +850,12 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
     unsafe {
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, lanes, r, &t);
+        if use_three_const_fold() {
+            let prepared = core::array::from_fn(|i| three_coeffs(t[i]));
+            butterfly_fused_3layer_row_with_const_q(ptr, eighth, num_ntts, lanes, r, &prepared);
+        } else {
+            butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, lanes, r, &t);
+        }
     }
 }
 
@@ -711,8 +874,17 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     unsafe {
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        for r in row_start..row_end {
-            butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
+        if use_three_const_fold() {
+            let prepared = core::array::from_fn(|i| three_coeffs(t[i]));
+            for r in row_start..row_end {
+                butterfly_fused_3layer_row_with_const_q(
+                    ptr, eighth, num_ntts, num_ntts, r, &prepared,
+                );
+            }
+        } else {
+            for r in row_start..row_end {
+                butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
+            }
         }
     }
 }
@@ -814,7 +986,7 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
 /// as `uint64x2_t` and the products leave as `uint64x2_t`, so no lane ever
 /// visits a general-purpose register.
 #[inline(always)]
-unsafe fn mul_low_pair_q(
+unsafe fn mul_low_pair_q<const DIRECT: bool>(
     v0: core::arch::aarch64::uint64x2_t,
     v1: core::arch::aarch64::uint64x2_t,
     ts0: core::arch::aarch64::uint64x2_t,
@@ -825,6 +997,23 @@ unsafe fn mul_low_pair_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
+        if DIRECT {
+            // With t.hi == 0 the product is ll + x^64*hl. Keep each
+            // product in its own vector and use the existing exact x^64
+            // fold instead of packing, shift-folding and unpacking lanes.
+            let lo0 = pmull_ll(v0, ts0);
+            let hi0 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(v0),
+                vreinterpretq_p64_u64(ts0),
+            ));
+            let lo1 = pmull_ll(v1, ts1);
+            let hi1 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(v1),
+                vreinterpretq_p64_u64(ts1),
+            ));
+            return (fold_x64_into(lo0, hi0), fold_x64_into(lo1, hi1));
+        }
+
         // With t.hi == 0 each product needs only ll = v.lo·t.lo and
         // hl = v.hi·t.lo; `vmull_high_p64` reads v.hi in place.
         let p0_ll = pmull_ll(v0, ts0);
@@ -865,9 +1054,9 @@ unsafe fn mul_low_pair_q(
 }
 
 /// Fused two-layer butterfly specialized for three low-limb-only twiddles.
-/// Two products are issued together at each stage, using four PMULLs instead
-/// of twelve for the pair under the generic Binius field multiplier, and —
-/// like [`butterfly_fused_2layer`] below — the four row values and every
+/// The default kernel shares a pending polynomial half across both layers.
+/// Its eager direct-reduction and shift-reduction alternatives remain available.
+/// Like [`butterfly_fused_2layer`] below, the four row values and every
 /// intermediate stay in `uint64x2_t` across both layers, so the butterfly
 /// XORs are `veorq_u64` rather than scalar `u64` pairs. Same multiplies,
 /// same butterfly order, bit-identical output.
@@ -878,6 +1067,44 @@ unsafe fn mul_low_pair_q(
 #[target_feature(enable = "aes")]
 #[inline]
 pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    static DIRECT: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_LOW_PMULL").is_none());
+    static LAZY: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_LOW_LAZY").is_none());
+    static DEBUG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_LOW_PMULL_DEBUG").is_some());
+    let direct = *DIRECT;
+    let lazy = direct && *LAZY;
+    if *DEBUG {
+        static HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let hits = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if hits.is_power_of_two() {
+            eprintln!("[ntt-low-pmull] direct={direct} lazy={lazy} blocks={hits}");
+        }
+    }
+    unsafe {
+        if lazy {
+            butterfly_fused_2layer_low_lazy(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+        } else if direct {
+            butterfly_fused_2layer_low_impl::<true>(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+        } else {
+            butterfly_fused_2layer_low_impl::<false>(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+        }
+    }
+}
+
+#[target_feature(enable = "aes")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn butterfly_fused_2layer_low_impl<const DIRECT: bool>(
     a: &mut [F128],
     b: &mut [F128],
     c: &mut [F128],
@@ -908,14 +1135,14 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
             let mut xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
 
             // Layer L: (a,c) and (b,d) share t_outer.
-            let (o0, o1) = mul_low_pair_q(xc, xd, to, to);
+            let (o0, o1) = mul_low_pair_q::<DIRECT>(xc, xd, to, to);
             xa = veorq_u64(xa, o0);
             xc = veorq_u64(xc, xa);
             xb = veorq_u64(xb, o1);
             xd = veorq_u64(xd, xb);
 
             // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
-            let (i0, i1) = mul_low_pair_q(xb, xd, ta, tb);
+            let (i0, i1) = mul_low_pair_q::<DIRECT>(xb, xd, ta, tb);
             xa = veorq_u64(xa, i0);
             xb = veorq_u64(xb, xa);
             xc = veorq_u64(xc, i1);
@@ -925,6 +1152,88 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
             vst1q_u64((&raw mut b[lane]).cast::<u64>(), xb);
             vst1q_u64((&raw mut c[lane]).cast::<u64>(), xc);
             vst1q_u64((&raw mut d[lane]).cast::<u64>(), xd);
+        }
+    }
+}
+
+// Carry the x^64 half of the first outer product until the inner layer.
+// The two descendants share that pending half. The other outer product
+// must be reduced before it becomes an inner-layer multiplicand.
+#[inline(always)]
+unsafe fn butterfly_low_lazy_q(
+    u: core::arch::aarch64::uint64x2_t,
+    v: core::arch::aarch64::uint64x2_t,
+    t: core::arch::aarch64::uint64x2_t,
+    p: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let hi = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(v),
+            vreinterpretq_p64_u64(t),
+        ));
+        let nu = fused_pmull_lo_acc(u, v, t);
+        (nu, veorq_u64(v, nu), veorq_u64(hi, p))
+    }
+}
+
+#[inline(always)]
+unsafe fn butterfly_low_fold_q(
+    u: core::arch::aarch64::uint64x2_t,
+    v: core::arch::aarch64::uint64x2_t,
+    t: core::arch::aarch64::uint64x2_t,
+    p: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let (nu, _, mid) = butterfly_low_lazy_q(u, v, t, p);
+        let fu = fold_x64_into(nu, mid);
+        (fu, veorq_u64(v, fu))
+    }
+}
+
+#[target_feature(enable = "aes")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn butterfly_fused_2layer_low_lazy(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), c.len());
+    debug_assert_eq!(a.len(), d.len());
+    debug_assert_eq!(t_outer.hi | t_inner_a.hi | t_inner_b.hi, 0);
+    unsafe {
+        use core::arch::aarch64::*;
+        let to = vdupq_n_u64(t_outer.lo);
+        let ta = vdupq_n_u64(t_inner_a.lo);
+        let tb = vdupq_n_u64(t_inner_b.lo);
+        let zero = vdupq_n_u64(0);
+        for lane in 0..a.len() {
+            let xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
+            let xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
+            let xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
+            let xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
+            let (na, nc, p) = butterfly_low_lazy_q(xa, xc, to, zero);
+            let (nb, nd) = butterfly_low_fold_q(xb, xd, to, zero);
+            let (fa, fb) = butterfly_low_fold_q(na, nb, ta, p);
+            let (fc, fd) = butterfly_low_fold_q(nc, nd, tb, p);
+            vst1q_u64((&raw mut a[lane]).cast::<u64>(), fa);
+            vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb);
+            vst1q_u64((&raw mut c[lane]).cast::<u64>(), fc);
+            vst1q_u64((&raw mut d[lane]).cast::<u64>(), fd);
         }
     }
 }
@@ -1014,6 +1323,130 @@ pub(super) unsafe fn butterfly_block_pair(chunk: &mut [F128], t_a: F128, t_b: F1
     chunk[3] = new_v_b;
 }
 
+// For a fixed t, precompute R = t.hi * 0x87. Then v*t is represented as
+// L + x^64*M with L = v.lo*t.lo + v.hi*R.lo and
+// M = v.lo*t.hi + v.hi*(t.lo + R.hi). One x^64 fold completes reduction.
+// The existing pending-half butterfly invariant applies to this representation.
+#[inline(always)]
+unsafe fn const_coeffs(
+    t: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let r = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(t),
+            vreinterpretq_p64_u64(vdupq_n_u64(0x87)),
+        ));
+        let lo = vzip1q_u64(t, r);
+        let mid = veorq_u64(vextq_u64::<1>(t, t), vzip2q_u64(vdupq_n_u64(0), r));
+        (lo, mid)
+    }
+}
+
+#[inline(always)]
+unsafe fn const_lazy(
+    u: core::arch::aarch64::uint64x2_t,
+    v: core::arch::aarch64::uint64x2_t,
+    t: (
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+    ),
+    p: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let nu = fused_pmull_hi_acc(fused_pmull_lo_acc(u, v, t.0), v, t.0);
+        let mid = fused_pmull_hi_acc(fused_pmull_lo_acc(p, v, t.1), v, t.1);
+        (nu, veorq_u64(v, nu), mid)
+    }
+}
+
+#[inline(always)]
+unsafe fn const_fold(
+    u: core::arch::aarch64::uint64x2_t,
+    v: core::arch::aarch64::uint64x2_t,
+    t: (
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+    ),
+    p: core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let (nu, _, mid) = const_lazy(u, v, t, p);
+        let fu = fold_x64_into(nu, mid);
+        (fu, veorq_u64(v, fu))
+    }
+}
+
+#[target_feature(enable = "aes")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn butterfly_fused_2layer_row_with_const_q(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    to: (
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+    ),
+    ta: (
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+    ),
+    tb: (
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+    ),
+) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let zero = vdupq_n_u64(0);
+        for lane in 0..a.len() {
+            let xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
+            let xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
+            let xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
+            let xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
+            let (na, nc, p) = const_lazy(xa, xc, to, zero);
+            let (nb, nd) = const_fold(xb, xd, to, zero);
+            let (fa, fb) = const_fold(na, nb, ta, p);
+            let (fc, fd) = const_fold(nc, nd, tb, p);
+            vst1q_u64((&raw mut a[lane]).cast::<u64>(), fa);
+            vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb);
+            vst1q_u64((&raw mut c[lane]).cast::<u64>(), fc);
+            vst1q_u64((&raw mut d[lane]).cast::<u64>(), fd);
+        }
+    }
+}
+
+#[inline]
+fn use_const_fold() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_CONST_FOLD").is_none());
+    static DEBUG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_CONST_FOLD_DEBUG").is_some());
+    let enabled = *ON;
+    if *DEBUG {
+        static HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let hits = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if hits.is_power_of_two() {
+            eprintln!("[ntt-const-fold] enabled={enabled} blocks={hits}");
+        }
+    }
+    enabled
+}
+
 /// Vector-resident twin of `portable::butterfly_fused_2layer` — the deep
 /// fused-pair chain held in q registers end to end.
 ///
@@ -1085,7 +1518,19 @@ pub(super) unsafe fn butterfly_fused_2layer(
         let to = vld1q_u64((&raw const t_outer).cast::<u64>());
         let ta = vld1q_u64((&raw const t_inner_a).cast::<u64>());
         let tb = vld1q_u64((&raw const t_inner_b).cast::<u64>());
-        butterfly_fused_2layer_row_with_q(a, b, c, d, to, ta, tb);
+        if use_const_fold() {
+            butterfly_fused_2layer_row_with_const_q(
+                a,
+                b,
+                c,
+                d,
+                const_coeffs(to),
+                const_coeffs(ta),
+                const_coeffs(tb),
+            );
+        } else {
+            butterfly_fused_2layer_row_with_q(a, b, c, d, to, ta, tb);
+        }
     }
 }
 
@@ -1106,11 +1551,143 @@ pub(super) unsafe fn butterfly_fused_2layer_rows(
     num_ntts: usize,
     odd_tail: usize,
 ) {
+    unsafe {
+        if use_const_fold() {
+            butterfly_fused_2layer_rows_impl::<true>(
+                block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts, odd_tail,
+            );
+        } else {
+            butterfly_fused_2layer_rows_impl::<false>(
+                block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts, odd_tail,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod three_const_fold_tests {
+    use super::*;
+    fn next(s: &mut u64) -> u64 {
+        *s = s.wrapping_add(0x9e3779b97f4a7c15);
+        let mut x = *s;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^ (x >> 31)
+    }
+    fn scalar_mul(a: F128, b: F128) -> F128 {
+        let mut x = (a.lo as u128) | ((a.hi as u128) << 64);
+        let mut y = (b.lo as u128) | ((b.hi as u128) << 64);
+        let mut z = 0u128;
+        for _ in 0..128 {
+            if y & 1 != 0 {
+                z ^= x;
+            }
+            let carry = x >> 127;
+            x = (x << 1) ^ (carry * 0x87);
+            y >>= 1;
+        }
+        F128::new(z as u64, (z >> 64) as u64)
+    }
+    #[test]
+    fn row_matches_independent_polynomial_oracle() {
+        let mut seen = [0usize; 2];
+        for seed in 0..16u64 {
+            for n in [1usize, 2, 3, 31, 64, 129, 257] {
+                let mut state = 0xbe51d7a33 ^ seed;
+                let input: Vec<_> = (0..8 * n)
+                    .map(|_| F128::new(next(&mut state), next(&mut state)))
+                    .collect();
+                let sets = [
+                    [F128::ZERO; 7],
+                    [F128::ONE; 7],
+                    [F128::new(u64::MAX, 0); 7],
+                    [F128::new(u64::MAX, u64::MAX); 7],
+                    core::array::from_fn(|_| F128::new(0, next(&mut state))),
+                    core::array::from_fn(|_| F128::new(next(&mut state), next(&mut state))),
+                ];
+                for t in sets {
+                    let mut expected = input.clone();
+                    for layer in 0..3 {
+                        let stride = 4 >> layer;
+                        for block in 0..1usize << layer {
+                            let tw = t[(1 << layer) - 1 + block];
+                            for row in 0..stride {
+                                for lane in 0..n {
+                                    let u = (2 * stride * block + row) * n + lane;
+                                    let v = u + stride * n;
+                                    let nu = expected[u] + scalar_mul(expected[v], tw);
+                                    expected[v] += nu;
+                                    expected[u] = nu;
+                                }
+                            }
+                        }
+                    }
+                    for mode in 0..2 {
+                        seen[mode] += 1;
+                        let mut actual = input.clone();
+                        unsafe {
+                            use core::arch::aarch64::*;
+                            let tv: [uint64x2_t; 7] = core::array::from_fn(|i| {
+                                vld1q_u64((&raw const t[i]).cast::<u64>())
+                            });
+                            if mode == 1 {
+                                let prepared = core::array::from_fn(|i| three_coeffs(tv[i]));
+                                butterfly_fused_3layer_row_with_const_q(
+                                    actual.as_mut_ptr(),
+                                    1,
+                                    n,
+                                    n,
+                                    0,
+                                    &prepared,
+                                );
+                            } else {
+                                butterfly_fused_3layer_row_with_q(
+                                    actual.as_mut_ptr(),
+                                    1,
+                                    n,
+                                    n,
+                                    0,
+                                    &tv,
+                                );
+                            }
+                        }
+                        for (a, b) in actual.iter().zip(&expected) {
+                            assert_eq!(
+                                (a.lo, a.hi),
+                                (b.lo, b.hi),
+                                "seed={seed},lanes={n},mode={mode}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, [672; 2]);
+    }
+}
+
+#[target_feature(enable = "aes")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn butterfly_fused_2layer_rows_impl<const PREPARED: bool>(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+) {
     use core::arch::aarch64::*;
     unsafe {
         let to = vld1q_u64((&raw const t_outer).cast::<u64>());
         let ta = vld1q_u64((&raw const t_inner_a).cast::<u64>());
         let tb = vld1q_u64((&raw const t_inner_b).cast::<u64>());
+        let prepared = if PREPARED {
+            Some((const_coeffs(to), const_coeffs(ta), const_coeffs(tb)))
+        } else {
+            None
+        };
         let stride = quarter * num_ntts;
         let (top_half, bot_half) = block.split_at_mut(2 * stride);
         let (q1, q2) = top_half.split_at_mut(stride);
@@ -1128,15 +1705,225 @@ pub(super) unsafe fn butterfly_fused_2layer_rows(
             } else {
                 num_ntts
             };
-            butterfly_fused_2layer_row_with_q(
-                &mut row_a[..lanes],
-                &mut row_b[..lanes],
-                &mut row_c[..lanes],
-                &mut row_d[..lanes],
-                to,
-                ta,
-                tb,
-            );
+            if let Some((to, ta, tb)) = prepared {
+                butterfly_fused_2layer_row_with_const_q(
+                    &mut row_a[..lanes],
+                    &mut row_b[..lanes],
+                    &mut row_c[..lanes],
+                    &mut row_d[..lanes],
+                    to,
+                    ta,
+                    tb,
+                );
+            } else {
+                butterfly_fused_2layer_row_with_q(
+                    &mut row_a[..lanes],
+                    &mut row_b[..lanes],
+                    &mut row_c[..lanes],
+                    &mut row_d[..lanes],
+                    to,
+                    ta,
+                    tb,
+                );
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod const_fold_tests {
+    use super::*;
+
+    fn scalar_mul(a: F128, b: F128) -> F128 {
+        let mut x = a.lo as u128 | ((a.hi as u128) << 64);
+        let mut y = b.lo as u128 | ((b.hi as u128) << 64);
+        let mut z = 0u128;
+        for _ in 0..128 {
+            if y & 1 != 0 {
+                z ^= x;
+            }
+            let carry = x >> 127;
+            x = (x << 1) ^ (carry * 0x87);
+            y >>= 1;
+        }
+        F128::new(z as u64, (z >> 64) as u64)
+    }
+
+    fn random(s: &mut u64) -> u64 {
+        *s = s.wrapping_add(0x9e3779b97f4a7c15);
+        let mut x = *s;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^ (x >> 31)
+    }
+
+    #[test]
+    fn full_pair_matches_independent_polynomial_oracle() {
+        let mut cases = 0;
+        let mut modes_seen = [0usize; 2];
+        for seed in 0..16u64 {
+            for n in [1usize, 2, 3, 31, 64, 129, 257] {
+                let mut state = 0xbe51d7a33 ^ seed;
+                let input: Vec<F128> = (0..4 * n)
+                    .map(|_| F128::new(random(&mut state), random(&mut state)))
+                    .collect();
+                let sets = [
+                    [F128::ZERO; 3],
+                    [F128::ONE; 3],
+                    [F128::new(u64::MAX, 0); 3],
+                    [F128::new(u64::MAX, u64::MAX); 3],
+                    core::array::from_fn(|_| F128::new(0, random(&mut state))),
+                    core::array::from_fn(|_| F128::new(random(&mut state), random(&mut state))),
+                ];
+                for t in sets {
+                    let mut expected = vec![F128::ZERO; 4 * n];
+                    for i in 0..n {
+                        let a = input[i] + scalar_mul(input[2 * n + i], t[0]);
+                        let c = input[2 * n + i] + a;
+                        let b = input[n + i] + scalar_mul(input[3 * n + i], t[0]);
+                        let d = input[3 * n + i] + b;
+                        let aa = a + scalar_mul(b, t[1]);
+                        let bb = b + aa;
+                        let cc = c + scalar_mul(d, t[2]);
+                        let dd = d + cc;
+                        expected[i] = aa;
+                        expected[n + i] = bb;
+                        expected[2 * n + i] = cc;
+                        expected[3 * n + i] = dd;
+                    }
+                    for mode in 0..2 {
+                        modes_seen[mode] += 1;
+                        let mut actual = input.clone();
+                        let (a, rest) = actual.split_at_mut(n);
+                        let (b, rest) = rest.split_at_mut(n);
+                        let (c, d) = rest.split_at_mut(n);
+                        unsafe {
+                            use core::arch::aarch64::*;
+                            let to = vld1q_u64((&raw const t[0]).cast::<u64>());
+                            let ta = vld1q_u64((&raw const t[1]).cast::<u64>());
+                            let tb = vld1q_u64((&raw const t[2]).cast::<u64>());
+                            if mode == 1 {
+                                butterfly_fused_2layer_row_with_const_q(
+                                    a,
+                                    b,
+                                    c,
+                                    d,
+                                    const_coeffs(to),
+                                    const_coeffs(ta),
+                                    const_coeffs(tb),
+                                );
+                            } else {
+                                butterfly_fused_2layer_row_with_q(a, b, c, d, to, ta, tb);
+                            }
+                        }
+                        for (actual, expected) in actual.iter().zip(&expected) {
+                            assert_eq!(
+                                (actual.lo, actual.hi),
+                                (expected.lo, expected.hi),
+                                "seed={seed}, lanes={n}, mode={mode}"
+                            );
+                        }
+                    }
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 672);
+        assert_eq!(modes_seen, [672; 2]);
+    }
+}
+
+#[cfg(test)]
+mod low_pmull_tests {
+    use super::*;
+
+    fn scalar_mul(a: F128, b: F128) -> F128 {
+        let mut x = a.lo as u128 | ((a.hi as u128) << 64);
+        let mut y = b.lo as u128 | ((b.hi as u128) << 64);
+        let mut z = 0u128;
+        for _ in 0..128 {
+            if y & 1 != 0 {
+                z ^= x;
+            }
+            let carry = x >> 127;
+            x = (x << 1) ^ (carry * 0x87);
+            y >>= 1;
+        }
+        F128::new(z as u64, (z >> 64) as u64)
+    }
+
+    fn random(s: &mut u64) -> u64 {
+        *s = s.wrapping_add(0x9e3779b97f4a7c15);
+        let mut x = *s;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^ (x >> 31)
+    }
+
+    #[test]
+    fn low_pair_matches_independent_polynomial_oracle() {
+        let mut cases = 0;
+        let mut modes_seen = [0usize; 3];
+        for seed in 0..16u64 {
+            for n in [1usize, 2, 3, 31, 64, 129, 257] {
+                let mut state = 0xbe51d7a33 ^ seed;
+                let input: Vec<F128> = (0..4 * n)
+                    .map(|_| F128::new(random(&mut state), random(&mut state)))
+                    .collect();
+                let sets = [
+                    [F128::ZERO; 3],
+                    [F128::ONE; 3],
+                    [F128::new(u64::MAX, 0); 3],
+                    core::array::from_fn(|_| F128::new(random(&mut state), 0)),
+                ];
+                for t in sets {
+                    let mut expected = vec![F128::ZERO; 4 * n];
+                    for i in 0..n {
+                        let a = input[i] + scalar_mul(input[2 * n + i], t[0]);
+                        let c = input[2 * n + i] + a;
+                        let b = input[n + i] + scalar_mul(input[3 * n + i], t[0]);
+                        let d = input[3 * n + i] + b;
+                        let aa = a + scalar_mul(b, t[1]);
+                        let bb = b + aa;
+                        let cc = c + scalar_mul(d, t[2]);
+                        let dd = d + cc;
+                        expected[i] = aa;
+                        expected[n + i] = bb;
+                        expected[2 * n + i] = cc;
+                        expected[3 * n + i] = dd;
+                    }
+                    for mode in 0..3 {
+                        modes_seen[mode] += 1;
+                        let mut actual = input.clone();
+                        let (a, rest) = actual.split_at_mut(n);
+                        let (b, rest) = rest.split_at_mut(n);
+                        let (c, d) = rest.split_at_mut(n);
+                        unsafe {
+                            if mode == 2 {
+                                butterfly_fused_2layer_low_lazy(a, b, c, d, t[0], t[1], t[2]);
+                            } else if mode == 1 {
+                                butterfly_fused_2layer_low_impl::<true>(
+                                    a, b, c, d, t[0], t[1], t[2],
+                                );
+                            } else {
+                                butterfly_fused_2layer_low_impl::<false>(
+                                    a, b, c, d, t[0], t[1], t[2],
+                                );
+                            }
+                        }
+                        for (actual, expected) in actual.iter().zip(&expected) {
+                            assert_eq!(
+                                (actual.lo, actual.hi),
+                                (expected.lo, expected.hi),
+                                "seed={seed}, lanes={n}, mode={mode}"
+                            );
+                        }
+                    }
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 448);
+        assert_eq!(modes_seen, [448; 3]);
     }
 }
