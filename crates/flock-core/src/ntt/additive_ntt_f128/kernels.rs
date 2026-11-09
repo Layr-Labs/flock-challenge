@@ -31,6 +31,14 @@ pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F1
         x86_64::butterfly_row_pair(top, bot, twiddle);
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_row_pair(top, bot, twiddle);
+            return;
+        }
+    }
+
     #[cfg(not(all(
         target_arch = "x86_64",
         target_feature = "avx512f",
@@ -521,6 +529,26 @@ mod aarch64_row_tests {
             tw[3] = F128::ZERO;
         }
         (buf, tw)
+    }
+
+    #[test]
+    fn neon_row_pair_matches_portable() {
+        let mut state = 0x524F_5750_4149_5200;
+        for num_ntts in [1usize, 5, 64] {
+            for low_only in [false, true] {
+                let top: Vec<F128> = (0..num_ntts).map(|_| rand_f128(&mut state)).collect();
+                let bot: Vec<F128> = (0..num_ntts).map(|_| rand_f128(&mut state)).collect();
+                let mut twiddle = rand_f128(&mut state);
+                if low_only {
+                    twiddle.hi = 0;
+                }
+                let (mut want_top, mut want_bot) = (top.clone(), bot.clone());
+                portable::butterfly_row_pair(&mut want_top, &mut want_bot, twiddle);
+                let (mut got_top, mut got_bot) = (top, bot);
+                unsafe { aarch64::butterfly_row_pair(&mut got_top, &mut got_bot, twiddle) };
+                assert!(got_top == want_top && got_bot == want_bot, "num_ntts={num_ntts}");
+            }
+        }
     }
 
     /// The vector-resident radix-8 row kernel must be **bit-identical** to the

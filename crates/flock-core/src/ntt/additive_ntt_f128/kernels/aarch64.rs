@@ -929,6 +929,27 @@ pub(super) unsafe fn butterfly_fused_2layer_low_twiddles(
     }
 }
 
+///
+/// # Safety
+/// Requires the `aes` target feature.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
+    use core::arch::aarch64::*;
+
+    debug_assert_eq!(top.len(), bot.len());
+    let bot = &mut bot[..top.len()];
+    unsafe {
+        let t = vld1q_u64((&raw const twiddle).cast::<u64>());
+        for (u_ref, v_ref) in top.iter_mut().zip(bot.iter_mut()) {
+            let u = vld1q_u64((&raw const *u_ref).cast::<u64>());
+            let v = vld1q_u64((&raw const *v_ref).cast::<u64>());
+            let (nu, nv) = butterfly_fold_zero_q(u, v, t);
+            vst1q_u64((&raw mut *u_ref).cast::<u64>(), nu);
+            vst1q_u64((&raw mut *v_ref).cast::<u64>(), nv);
+        }
+    }
+}
+
 /// Process two butterflies at a time within a block sharing one twiddle.
 ///
 /// # Safety
