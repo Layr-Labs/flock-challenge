@@ -3030,6 +3030,40 @@ pub(crate) fn induce_sumcheck_poly(
     (basis_poly, enforced_sum)
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+fn transpose_butterfly_pair(
+    values: &mut [F128; 8],
+    a: [usize; 2],
+    b: [usize; 2],
+    twiddles: [F128; 2],
+) {
+    let sums = [values[a[0]] + values[b[0]], values[a[1]] + values[b[1]]];
+    let products =
+        unsafe { crate::field::gf2_128::aarch64::ghash_mul_vec2_neon(twiddles, sums) };
+    values[b[0]] = products[0] + values[b[0]];
+    values[b[1]] = products[1] + values[b[1]];
+    values[a[0]] = sums[0];
+    values[a[1]] = sums[1];
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+fn transpose_butterfly_pair_shared(
+    values: &mut [F128; 8],
+    a: [usize; 2],
+    b: [usize; 2],
+    twiddle: F128,
+) {
+    let sums = [values[a[0]] + values[b[0]], values[a[1]] + values[b[1]]];
+    let products =
+        unsafe { crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(twiddle, sums) };
+    values[b[0]] = products[0] + values[b[0]];
+    values[b[1]] = products[1] + values[b[1]];
+    values[a[0]] = sums[0];
+    values[a[1]] = sums[1];
+}
+
 /// Apply three consecutive transpose layers in one read/write pass. `layer`
 /// is the lowest (root-most) of the three; the transpose executes forward
 /// layers `layer+2`, `layer+1`, then `layer`.
@@ -3041,6 +3075,7 @@ fn transpose_forward_ntt_fused_3layer(
 ) {
     use rayon::prelude::*;
 
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     #[inline(always)]
     fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
         let sum = values[a] + values[b];
@@ -3089,15 +3124,27 @@ fn transpose_forward_ntt_fused_3layer(
                 *value = *ptr.add(base + i * eighth);
             }
             let tw = &twiddles[block];
-            for pair in 0..4 {
-                butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                transpose_butterfly_pair(&mut values, [0, 2], [1, 3], [tw[3], tw[4]]);
+                transpose_butterfly_pair(&mut values, [4, 6], [5, 7], [tw[5], tw[6]]);
+                transpose_butterfly_pair_shared(&mut values, [0, 1], [2, 3], tw[1]);
+                transpose_butterfly_pair_shared(&mut values, [4, 5], [6, 7], tw[2]);
+                transpose_butterfly_pair_shared(&mut values, [0, 1], [4, 5], tw[0]);
+                transpose_butterfly_pair_shared(&mut values, [2, 3], [6, 7], tw[0]);
             }
-            for half in 0..2 {
-                butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
-                butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
-            }
-            for i in 0..4 {
-                butterfly(&mut values, i, i + 4, tw[0]);
+            #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+            {
+                for pair in 0..4 {
+                    butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
+                }
+                for half in 0..2 {
+                    butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
+                    butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
+                }
+                for i in 0..4 {
+                    butterfly(&mut values, i, i + 4, tw[0]);
+                }
             }
             for (i, &value) in values.iter().enumerate() {
                 *ptr.add(base + i * eighth) = value;
@@ -3121,6 +3168,7 @@ fn transpose_forward_ntt_fused_final_3layer_low_half(
     #[cfg(test)]
     TEST_TRUNCATED_FINAL_NTT_HITS.with(|hits| hits.set(hits.get() + 1));
 
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     #[inline(always)]
     fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
         let sum = values[a] + values[b];
@@ -3154,17 +3202,37 @@ fn transpose_forward_ntt_fused_final_3layer_low_half(
             for (i, value) in values.iter_mut().enumerate() {
                 *value = *ptr.add(row + i * eighth);
             }
-            for pair in 0..4 {
-                butterfly(&mut values, 2 * pair, 2 * pair + 1, layer_2_twiddles[pair]);
-            }
-            for half in 0..2 {
-                butterfly(&mut values, 4 * half, 4 * half + 2, layer_1_twiddles[half]);
-                butterfly(
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                transpose_butterfly_pair(
                     &mut values,
-                    4 * half + 1,
-                    4 * half + 3,
-                    layer_1_twiddles[half],
+                    [0, 2],
+                    [1, 3],
+                    [layer_2_twiddles[0], layer_2_twiddles[1]],
                 );
+                transpose_butterfly_pair(
+                    &mut values,
+                    [4, 6],
+                    [5, 7],
+                    [layer_2_twiddles[2], layer_2_twiddles[3]],
+                );
+                transpose_butterfly_pair_shared(&mut values, [0, 1], [2, 3], layer_1_twiddles[0]);
+                transpose_butterfly_pair_shared(&mut values, [4, 5], [6, 7], layer_1_twiddles[1]);
+            }
+            #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+            {
+                for pair in 0..4 {
+                    butterfly(&mut values, 2 * pair, 2 * pair + 1, layer_2_twiddles[pair]);
+                }
+                for half in 0..2 {
+                    butterfly(&mut values, 4 * half, 4 * half + 2, layer_1_twiddles[half]);
+                    butterfly(
+                        &mut values,
+                        4 * half + 1,
+                        4 * half + 3,
+                        layer_1_twiddles[half],
+                    );
+                }
             }
             for i in 0..4 {
                 *ptr.add(row + i * eighth) = values[i] + values[i + 4];
