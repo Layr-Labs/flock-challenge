@@ -2698,15 +2698,16 @@ pub enum RsEqInd {
     },
 }
 
-/// Whether a caller-proved dead deferred basis may skip its factor build.
-/// Read once per process and outside every fold loop.
-#[inline]
+/// Build fold8 factors serially unless FLOCK_OP_RS_PAR is exactly 1.
 fn rs_fold8_par_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("FLOCK_NO_OP_RS_PAR").map_or(true, |v| v != "1"));
+        std::sync::LazyLock::new(|| std::env::var("FLOCK_OP_RS_PAR").map_or(false, |v| v == "1"));
     *ON
 }
 
+/// Whether a caller-proved dead deferred basis may skip its factor build.
+/// Read once per process and outside every fold loop.
+#[inline]
 fn rs_elide_dead_basis_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_ELIDE_DEAD_BASIS").is_none());
