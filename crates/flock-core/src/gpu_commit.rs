@@ -1303,6 +1303,14 @@ pub(crate) fn gpu_leaf_vec4_enabled() -> bool {
 /// Kill switch for the two-tiles-per-thread g4 NTT pass
 /// (`ntt_fused_reg4g4x2`): `FLOCK_NO_GPU_G4X2` (any value) keeps
 /// `ntt_fused_reg4g4`. Both kernels write the same bytes.
+/// Kill switch for the g4x2 twiddle prefetch (`NTT_G4X2_TWL_MSL_SOURCE`):
+/// `FLOCK_NO_GPU_TW_PREFETCH` (any value) keeps `NTT_G4X2_MSL_SOURCE`. Both
+/// write the same bytes.
+pub(crate) fn gpu_tw_prefetch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_TW_PREFETCH").is_none())
+}
+
 pub(crate) fn gpu_g4x2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_G4X2").is_none())
@@ -3709,7 +3717,17 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// Every tile sees the same butterflies, in the same order, over the same
     /// tables, so the output is bit-identical. Its own library, so a compile
     /// failure leaves `ntt_fused_reg4g4` in place.
-    const NTT_G4X2_MSL_SOURCE: &str = r#"
+    /// The g4x2 library source in use: the twiddle-prefetch form unless
+    /// `FLOCK_NO_GPU_TW_PREFETCH` is set.
+    pub(crate) fn g4x2_msl_source() -> &'static str {
+        if super::gpu_tw_prefetch_enabled() {
+            NTT_G4X2_TWL_MSL_SOURCE
+        } else {
+            NTT_G4X2_MSL_SOURCE
+        }
+    }
+
+    pub(crate) const NTT_G4X2_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
@@ -3877,6 +3895,243 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
             pad[lid % 284u] = ea[0];
             threadgroup_barrier(mem_flags::mem_threadgroup);
             ea[0] ^= pad[(lid + 1u) % 284u];
+        }
+        for (uint e = 0; e < NF; e++) {
+            data[((pa + (e << P.s)) << 6) + lane] = ea[e];
+            data[((pb + (e << P.s)) << 6) + lane] = eb[e];
+        }
+    }
+}
+"#;
+
+    /// `NTT_G4X2_MSL_SOURCE` with the twiddle prefetch: each group loads its
+    /// 15 twiddles (and their x^8 multiples) into threadgroup memory once,
+    /// before the first table build, and every build reads them from there.
+    /// Same tables, same butterflies in the same order: bit-identical.
+    /// Measured on an M5 Pro GPU, isolated 1 GiB pass (gn_table_probe,
+    /// median of 9): 12.75 -> 12.37 ms (l=4), 13.12 -> 12.50 (l=8),
+    /// 13.47 -> 12.86 (l=12). Kill switch `FLOCK_NO_GPU_TW_PREFETCH`.
+    pub(crate) const NTT_G4X2_TWL_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NttParams {
+    uint log_d;   // log2 of positions
+    uint l;       // first fused layer
+    uint f;       // number of fused layers (1..=4)
+    uint s;       // log_d - l - f
+};
+
+static inline uint4 gf_mulx(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// gf_mul_byte16 of two values by the same table, the two Horner chains
+// interleaved step by step. Each chain is gf_mul_byte16's own sequence.
+static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,
+                                    threadgroup const uint4* tab,
+                                    thread uint4& ra, thread uint4& rb)
+{
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        a ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
+        b ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
+    }
+    ra = a;
+    rb = b;
+}
+
+// The 64-thread table build of ntt_fused_reg4g4 (gf_build_byte16), unchanged.
+static inline void gf_build_byte16(
+    threadgroup uint4* tabB, device const uint4* twiddles, uint idx, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;        // 0: b*tw          1: b*(tw*x^8)
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;          // owns entry bits 2..3
+    const uint cc = u >> 2;          // owns entry bits 5..7
+    uint4 g = twiddles[idx];
+    if (t != 0u) {
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+    }
+    uint4 e0 = g;
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);   // entry (cc << 5) | (aa << 2)
+    const uint o1 = o0 + 16u;                //   ... | 16
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// gf_build_byte16 with the twiddle (k = 2^j - 1 + c, the tile's k-th
+// twiddle in breadth-first order) and its x^8 multiple read from the group's
+// threadgroup copy `twl` instead of device memory: the same table entries,
+// the same two barriers, but no dependent device load and no 8-step mulx
+// chain between them.
+static inline void gf_build_byte16_twl(
+    threadgroup uint4* tabB, threadgroup const uint4* twl, uint k, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;        // 0: b*tw          1: b*(tw*x^8)
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;          // owns entry bits 2..3
+    const uint cc = u >> 2;          // owns entry bits 5..7
+    uint4 e0 = twl[(t << 4) + k];
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);   // entry (cc << 5) | (aa << 2)
+    const uint o1 = o0 + 16u;                //   ... | 16
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// One f=4 sub-layer over both register tiles `ea` and `eb`. J must be a
+// literal so the butterfly indices stay compile-time and both arrays stay in
+// registers.
+#define NTT_G4X2_SUBLAYER(J)                                                   \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint NC   = 1u << j;                                         \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        for (uint c = 0; c < NC; c++) {                                        \
+            gf_build_byte16_twl(tabB, twl, (1u << j) - 1u + c, lid);           \
+            for (uint bb = 0; bb < BPER; bb++) {                               \
+                const uint b   = c * BPER + bb;                                \
+                const uint low = b & ((1u << bpos) - 1u);                      \
+                const uint eu  = ((b >> bpos) << (bpos + 1u)) | low;           \
+                const uint ev  = eu | (1u << bpos);                            \
+                uint4 pa;                                                      \
+                uint4 pb;                                                      \
+                gf_mul_byte16_x2(ea[ev], eb[ev], &tabB[0], pa, pb);            \
+                const uint4 na = ea[eu] ^ pa;                                  \
+                const uint4 nb = eb[eu] ^ pb;                                  \
+                ea[eu] = na;                                                   \
+                ea[ev] ^= na;                                                  \
+                eb[eu] = nb;                                                   \
+                eb[ev] ^= nb;                                                  \
+            }                                                                  \
+        }                                                                      \
+    }
+
+// ntt_fused_reg4g4's group (64 threads, four same-B tiles, LOG_G = 2, the
+// same 8 KiB table plus a larger never-read residency pad), but each lane
+// holds two tiles' columns at once and multiplies both by each live table
+// in one interleaved pass: two rounds of two tiles instead of four rounds
+// of one. Same butterflies, same order, same tables: bit-identical output.
+[[max_total_threads_per_threadgroup(64)]]
+kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
+                               device const uint4* twiddles      [[buffer(1)]],
+                               constant NttParams& P             [[buffer(2)]],
+                               uint tgid [[threadgroup_position_in_grid]],
+                               uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F     = 4u;
+    constexpr uint NF    = 1u << F;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 tabB[512u];      // 8,192 B: the live twiddle's tables
+    // The group's 15 twiddles (twl[k], k = 2^j - 1 + c) and their x^8
+    // multiples (twl[16 + k]), loaded once per group; 512 B taken from the
+    // pad below so the group still allocates 12,736 B.
+    threadgroup uint4 twl[32u];
+    // Residency only, never read: 4,544 B, so the group allocates 12,736 B
+    // of threadgroup memory and six groups (12 SIMD groups) share a core
+    // instead of eight. Two register tiles per lane want the lower
+    // residency: measured on an M4 GPU, 34.7 ms per 1 GiB pass versus
+    // 39.0 ms with the one-tile kernel's 1,984 B pad (residency probe:
+    // 8 groups/core at 10,176 B, 7 at 10.7-11.2 KiB, 6 at 12.2-13.2 KiB,
+    // 5 at 14.3 KiB and above, which is slower again).
+    threadgroup uint4 pad[252u];
+
+    const uint lane = lid;
+    const uint B = tgid >> (P.s - LOG_G);
+    const uint r_base = (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;
+
+    // Published by the first table build's leading barrier.
+    if (lid < 15u) {
+        const uint q  = lid + 1u;
+        const uint jj = 31u - clz(q);
+        const uint cj = q - (1u << jj);
+        uint4 g = twiddles[(1u << (P.l + jj)) - 1u + (B << jj) + cj];
+        twl[lid] = g;
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+        twl[16u + lid] = g;
+    }
+
+    for (uint it = 0; it < 2u; it++) {
+        const uint ra = r_base + (it << 1);
+        const uint rb = ra + 1u;
+        const uint pa = (B << (P.log_d - P.l)) + ra;
+        const uint pb = (B << (P.log_d - P.l)) + rb;
+        uint4 ea[NF];
+        uint4 eb[NF];
+        for (uint e = 0; e < NF; e++) {
+            ea[e] = data[((pa + (e << P.s)) << 6) + lane];
+            eb[e] = data[((pb + (e << P.s)) << 6) + lane];
+        }
+        NTT_G4X2_SUBLAYER(0u)
+        NTT_G4X2_SUBLAYER(1u)
+        NTT_G4X2_SUBLAYER(2u)
+        NTT_G4X2_SUBLAYER(3u)
+        if (P.log_d == 77u) {          /* unreachable; keeps `pad` allocated */
+            pad[lid % 252u] = ea[0];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ea[0] ^= pad[(lid + 1u) % 252u];
         }
         for (uint e = 0; e < NF; e++) {
             data[((pa + (e << P.s)) << 6) + lane] = ea[e];
@@ -5085,7 +5340,7 @@ kernel void blake3_pow_scan(
                 // `ntt_fused_reg4g4`.
                 let pso_ntt4g4x2 = if super::gpu_g4x2_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(NTT_G4X2_MSL_SOURCE)?;
+                        let src = api.nsstring(g4x2_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -5721,13 +5976,13 @@ kernel void blake3_pow_scan(
     /// streamed, and blocking/reprime dispatch goes through this helper, so
     /// the candidate and exact rollback cannot silently diverge by path.
     #[derive(Clone, Copy)]
-    struct FromZFirstPassPlan {
+    pub(crate) struct FromZFirstPassPlan {
         grouped: bool,
         zero_root: bool,
     }
 
     impl FromZFirstPassPlan {
-        fn new(log_d: usize) -> Self {
+        pub(crate) fn new(log_d: usize) -> Self {
             let grouped = super::pass_tune_enabled();
             Self {
                 grouped,
@@ -5735,7 +5990,7 @@ kernel void blake3_pow_scan(
             }
         }
 
-        unsafe fn encode_range(
+        pub(crate) unsafe fn encode_range(
             self,
             gpu: &Gpu,
             enc: Id,
@@ -8822,7 +9077,7 @@ kernel void blake3_pow_scan(
             super::gpu_leaf_vec4_enabled(),
         );
         if super::gpu_g4x2_enabled() {
-            key ^ fnv1a64(NTT_G4X2_MSL_SOURCE).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
+            key ^ fnv1a64(g4x2_msl_source()).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
         } else {
             key
         }
@@ -17589,6 +17844,479 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 let t12 = time_pass(pso, 12);
                 eprintln!("{label}: l=8 {t8:.2} ms, l=12 {t12:.2} ms");
                 gpu.release(pso);
+            }
+            gpu.release(data_buf);
+            gpu.release(tw_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    /// NT lane work-accounting probe: GPU interval of every production
+    /// commit stage at the ranked shape, each in its own command buffer:
+    /// the from-z first pass (layers 0..3), each fused pass of layers
+    /// 4..20, and the leaf+parent Merkle graph. Diagnostic only; run with
+    /// `--ignored --nocapture nt_stage_probe`.
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn nt_stage_probe() {
+        use super::imp;
+        let log_d = 20usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x5EED);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = (64usize << log_d) * 16;
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let z_buf = gpu.new_buffer(data_bytes / 2).unwrap();
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            let tree_buf = gpu.new_buffer((2 * n_leaves - 1) * 32).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            let zin = rng.vec(32 << log_d);
+            std::ptr::copy_nonoverlapping(
+                zin.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(z_buf),
+                data_bytes / 2,
+            );
+            std::ptr::write_bytes(gpu.buffer_contents(data_buf), 0x3C, data_bytes);
+            let run = |f: &dyn Fn(imp::Id)| -> f64 {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                f(enc);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            };
+            let mut rows: Vec<Vec<f64>> = Vec::new();
+            for _ in 0..7 {
+                let mut r = Vec::new();
+                r.push(run(&|enc| {
+                    imp::FromZFirstPassPlan::new(log_d).encode_range(
+                        gpu, enc, data_buf, tw_buf, z_buf, log_d, 0, 1usize << (log_d - 4),
+                    )
+                }));
+                for l in [4usize, 8, 12, 16] {
+                    r.push(run(&|enc| {
+                        imp::encode_ntt_passes_prefix_frac(
+                            gpu, enc, data_buf, tw_buf, log_d, 4, l, l + 1, 16, 16,
+                        )
+                    }));
+                }
+                r.push(run(&|enc| imp::encode_merkle(gpu, enc, data_buf, tree_buf, n_leaves)));
+                eprintln!(
+                    "nt-stage: first {:.2} | p4 {:.2} p8 {:.2} p12 {:.2} p16 {:.2} | merkle {:.2} ms",
+                    r[0], r[1], r[2], r[3], r[4], r[5]
+                );
+                rows.push(r);
+            }
+            // Memory floor of a 4-layer pass: the production g4 tile access
+            // pattern (4 same-B tiles of 16 strided positions x 64 lanes per
+            // 64-thread group), loads + stores, no field math.
+            const COPY_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+struct NttParams { uint log_d; uint l; uint f; uint s; };
+kernel void nt_copy_pass(device uint4* data [[buffer(0)]],
+                         constant NttParams& P [[buffer(2)]],
+                         uint tgid [[threadgroup_position_in_grid]],
+                         uint lid [[thread_index_in_threadgroup]]) {
+    const uint B = tgid >> (P.s - 2u);
+    const uint r_base = (tgid & ((1u << (P.s - 2u)) - 1u)) << 2u;
+    for (uint rr = 0; rr < 4u; rr++) {
+        const uint p = (B << (P.log_d - P.l)) + r_base + rr;
+        uint4 e[16];
+        for (uint k = 0; k < 16u; k++) { e[k] = data[((p + (k << P.s)) << 6) + lid]; }
+        for (uint k = 0; k < 16u; k++) { e[k] ^= e[(k + 1u) & 15u].yzwx; }
+        for (uint k = 0; k < 16u; k++) { data[((p + (k << P.s)) << 6) + lid] = e[k]; }
+    }
+}
+"#;
+            let copy_pso = imp::compile_supplemental_pipeline(gpu, COPY_MSL, "nt_copy_pass").unwrap();
+            for l in [4usize, 8, 12] {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    best = best.min(run(&|enc| {
+                        gpu.set_pipeline(enc, copy_pso);
+                        gpu.set_buffer(enc, data_buf, 0, 0);
+                        let p = imp::NttParams {
+                            log_d: log_d as u32,
+                            l: l as u32,
+                            f: 4,
+                            s: (log_d - l - 4) as u32,
+                        };
+                        let bytes = core::slice::from_raw_parts(
+                            (&p as *const imp::NttParams).cast::<u8>(),
+                            core::mem::size_of::<imp::NttParams>(),
+                        );
+                        gpu.set_bytes(enc, bytes, 2);
+                        gpu.dispatch(enc, 1u64 << (log_d - 4 - 2), 64);
+                    }));
+                }
+                eprintln!("nt-stage copy-floor l={l}: {best:.2} ms (no field math)");
+            }
+            gpu.release(copy_pso);
+            // Cache-resident compute time of the production passes: the
+            // same pass over a 1/256 prefix (4 MiB), 256 times in one
+            // command buffer, so DRAM is (mostly) out of the picture.
+            for den in [64u64, 256] {
+                for l in [8usize, 12, 16] {
+                    let mut best = f64::MAX;
+                    for _ in 0..5 {
+                        best = best.min(run(&|enc| {
+                            for _ in 0..den {
+                                imp::encode_ntt_passes_prefix_frac(
+                                    gpu, enc, data_buf, tw_buf, log_d, 4, l, l + 1, 1, den,
+                                );
+                            }
+                        }));
+                    }
+                    eprintln!(
+                        "nt-stage cache-resident 1/{den} x{den} l={l}: {best:.2} ms per 1 GiB-equivalent"
+                    );
+                }
+            }
+            let names = ["first", "p4", "p8", "p12", "p16", "merkle"];
+            let mut line = String::new();
+            for (i, n) in names.iter().enumerate() {
+                let mut v: Vec<f64> = rows.iter().skip(2).map(|r| r[i]).collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                line += &format!("{n}={:.2} ", v[v.len() / 2]);
+            }
+            eprintln!("nt-stage median: {line}");
+            gpu.release(data_buf);
+            gpu.release(z_buf);
+            gpu.release(tw_buf);
+            gpu.release(tree_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    /// GN lane: table-build share of the g4x2 pass. Variants of the
+    /// production `ntt_fused_reg4g4x2` (timing only, outputs invalid except
+    /// mode 0): 0 production; 1 builds only (no multiply lookups); 2 one
+    /// build per group, every multiply through it; 3 neither (XOR
+    /// butterflies only). Run with `--ignored --nocapture gn_table_probe`.
+    /// Per-SIMD-group table build (each 32-lane simdgroup builds its own
+    /// 8 KiB copy of the same table; simdgroup barriers only).
+    const GN_SIMD_BUILD: &str = r#"static inline void gf_build_simd(
+    threadgroup uint4* tabB, device const uint4* twiddles, uint idx, uint lid)
+{
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;
+    const uint cc = u >> 2;
+    uint4 g = twiddles[idx];
+    for (uint t = 0; t < 2u; t++) {
+        if (t != 0u) {
+            for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+        }
+        uint4 e0 = g;
+        uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+        uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+        uint4 A = uint4(0u);
+        if (aa & 1u) { A ^= e2; }
+        if (aa & 2u) { A ^= e3; }
+        const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+        uint4 C = uint4(0u);
+        if (cc & 1u) { C ^= f1; }
+        if (cc & 2u) { C ^= f2; }
+        if (cc & 4u) { C ^= f3; }
+        const uint4 H0 = C, H1 = C ^ f0;
+        threadgroup uint4* dst = &tabB[t << 8];
+        const uint o0 = (cc << 5) + (aa << 2);
+        const uint o1 = o0 + 16u;
+        dst[o0 + 0u] = L0 ^ H0;
+        dst[o0 + 1u] = L1 ^ H0;
+        dst[o0 + 2u] = L2 ^ H0;
+        dst[o0 + 3u] = L3 ^ H0;
+        dst[o1 + 0u] = L0 ^ H1;
+        dst[o1 + 1u] = L1 ^ H1;
+        dst[o1 + 2u] = L2 ^ H1;
+        dst[o1 + 3u] = L3 ^ H1;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+// Twiddle prefetch: the group's 15 twiddles (and their x^8 multiples) are
+// loaded once into threadgroup memory; the first build's leading barrier
+// publishes them. Builds then read g from twl, no device load, no 8 mulx.
+#define GN_TWL_FILL                                                          \
+    if (lid < 15u) {                                                         \
+        const uint q = lid + 1u;                                             \
+        const uint jj = 31u - clz(q);                                        \
+        const uint cc0 = q - (1u << jj);                                     \
+        uint4 g = twiddles[(1u << (P.l + jj)) - 1u + (B << jj) + cc0];       \
+        twl[lid] = g;                                                        \
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }                    \
+        twl[16u + lid] = g;                                                  \
+    }
+static inline void gf_build_pre(
+    threadgroup uint4* tabB, threadgroup const uint4* twl, uint k, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;
+    const uint cc = u >> 2;
+    uint4 e0 = twl[(t << 4) + k];
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);
+    const uint o1 = o0 + 16u;
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+#define GN_TWL8_FILL                                                         \
+    if (lid < 30u) {                                                         \
+        const uint tt = lid / 15u;                                           \
+        const uint kk = lid - tt * 15u;                                      \
+        const uint q = kk + 1u;                                              \
+        const uint jj = 31u - clz(q);                                        \
+        const uint cc0 = q - (1u << jj);                                     \
+        uint4 g = twiddles[(1u << (P.l + jj)) - 1u + (B << jj) + cc0];       \
+        if (tt != 0u) { for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); } }  \
+        threadgroup uint4* o = &twl8[((tt << 4) + kk) << 3];                 \
+        for (uint m = 0; m < 8u; m++) { o[m] = g; g = gf_mulx(g); }          \
+    }
+static inline void gf_build_pre8(
+    threadgroup uint4* tabB, threadgroup const uint4* twl8, uint k, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;
+    const uint cc = u >> 2;
+    threadgroup const uint4* m8 = &twl8[((t << 4) + k) << 3];
+    const uint4 e0 = m8[0], e1 = m8[1], f0 = m8[4];
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= m8[2]; }
+    if (aa & 2u) { A ^= m8[3]; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= m8[5]; }
+    if (cc & 2u) { C ^= m8[6]; }
+    if (cc & 4u) { C ^= m8[7]; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);
+    const uint o1 = o0 + 16u;
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+// One f=4 sub-layer over both"#;
+
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gn_table_probe() {
+        use super::imp;
+        let log_d = 20usize;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let base = imp::NTT_G4X2_MSL_SOURCE
+            .replace("ntt_fused_reg4g4x2(", "gnp(")
+            .replace(
+                "            gf_build_byte16(tabB, twiddles,",
+                "            GN_BUILD(tabB, twiddles,",
+            )
+            .replace(
+                "gf_mul_byte16_x2(ea[ev], eb[ev], &tabB[0], pa, pb);",
+                "GN_MUL(ea[ev], eb[ev], &tabB[0], pa, pb);",
+            )
+            .replace(
+                "    for (uint it = 0; it < 2u; it++) {",
+                "    GN_PRE\n    for (uint it = 0; it < 2u; it++) {",
+            )
+            .replace(
+                "    threadgroup uint4 tabB[512u];",
+                "#ifdef GN_TWL\n    threadgroup uint4 twl[32u];\n#endif\n#ifdef GN_TWL8\n    threadgroup uint4 twl8[256u];\n#endif\n#ifdef GN_SIMD\n    threadgroup uint4 tabB_all[1024u];\n    threadgroup uint4* tabB = &tabB_all[(lid >> 5) << 9];\n#else\n    threadgroup uint4 tabB[512u];\n#endif\n#ifndef PADN\n#define PADN 284u\n#endif",
+            )
+            .replace("pad[284u]", "pad[PADN]")
+            .replace("% 284u", "% PADN")
+            .replace("// One f=4 sub-layer over both", GN_SIMD_BUILD);
+        assert!(base.contains("GN_BUILD") && base.contains("GN_MUL") && base.contains("GN_PRE"));
+        let modes = [
+            "#define GN_BUILD(a,b,c,d) gf_build_byte16(a,b,c,d)\n#define GN_MUL(a,b,t,ra,rb) gf_mul_byte16_x2(a,b,t,ra,rb)\n#define GN_PRE\n",
+            "#define GN_BUILD(a,b,c,d) gf_build_byte16(a,b,c,d)\n#define GN_MUL(a,b,t,ra,rb) { ra = (a) ^ (t)[lid]; rb = (b) ^ (t)[lid + 64u]; }\n#define GN_PRE\n",
+            "#define GN_BUILD(a,b,c,d)\n#define GN_MUL(a,b,t,ra,rb) gf_mul_byte16_x2(a,b,t,ra,rb)\n#define GN_PRE gf_build_byte16(tabB, twiddles, (1u << P.l) - 1u + B, lid);\n",
+            "#define GN_BUILD(a,b,c,d)\n#define GN_MUL(a,b,t,ra,rb) { ra = (a); rb = (b); }\n#define GN_PRE\n",
+            "#define GN_SIMD 1\n#define PADN 1u\n#define GN_BUILD(a,b,c,d) gf_build_simd(a,b,c,d)\n#define GN_MUL(a,b,t,ra,rb) gf_mul_byte16_x2(a,b,t,ra,rb)\n#define GN_PRE\n",
+            "#define GN_SIMD 1\n#define PADN 256u\n#define GN_BUILD(a,b,c,d) gf_build_simd(a,b,c,d)\n#define GN_MUL(a,b,t,ra,rb) gf_mul_byte16_x2(a,b,t,ra,rb)\n#define GN_PRE\n",
+            "#define GN_TWL 1\n#define PADN 252u\n#define GN_BUILD(a,b,cidx,d) gf_build_pre(a, twl, (1u << j) - 1u + c, d)\n#define GN_MUL(a,b,t,ra,rb) gf_mul_byte16_x2(a,b,t,ra,rb)\n#define GN_PRE GN_TWL_FILL\n",
+            "#define GN_TWL 1\n#define PADN 284u\n#define GN_BUILD(a,b,cidx,d) gf_build_pre(a, twl, (1u << j) - 1u + c, d)\n#define GN_MUL(a,b,t,ra,rb) gf_mul_byte16_x2(a,b,t,ra,rb)\n#define GN_PRE GN_TWL_FILL\n",
+            "#define GN_TWL8 1\n#define PADN 28u\n#define GN_BUILD(a,b,cidx,d) gf_build_pre8(a, twl8, (1u << j) - 1u + c, d)\n#define GN_MUL(a,b,t,ra,rb) gf_mul_byte16_x2(a,b,t,ra,rb)\n#define GN_PRE GN_TWL8_FILL\n",
+            "#define GN_TWL8 1\n#define PADN 1u\n#define GN_BUILD(a,b,cidx,d) gf_build_pre8(a, twl8, (1u << j) - 1u + c, d)\n#define GN_MUL(a,b,t,ra,rb) gf_mul_byte16_x2(a,b,t,ra,rb)\n#define GN_PRE GN_TWL8_FILL\n",
+        ];
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = (64usize << log_d) * 16;
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let tw_buf = gpu
+                .new_buffer(core::mem::size_of_val(twiddles.as_slice()))
+                .unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            std::ptr::write_bytes(gpu.buffer_contents(data_buf), 0x3C, data_bytes);
+            let psos: Vec<imp::Id> = modes
+                .iter()
+                .map(|m| {
+                    let src = base.replacen(
+                        "using namespace metal;\n",
+                        &format!("using namespace metal;\n{m}"),
+                        1,
+                    );
+                    imp::compile_supplemental_pipeline(gpu, &src, "gnp").unwrap()
+                })
+                .collect();
+            let run = |pso: imp::Id, l: usize| -> f64 {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, data_buf, 0, 0);
+                gpu.set_buffer(enc, tw_buf, 0, 1);
+                let p = imp::NttParams {
+                    log_d: log_d as u32,
+                    l: l as u32,
+                    f: 4,
+                    s: (log_d - l - 4) as u32,
+                };
+                let bytes = core::slice::from_raw_parts(
+                    (&p as *const imp::NttParams).cast::<u8>(),
+                    core::mem::size_of::<imp::NttParams>(),
+                );
+                gpu.set_bytes(enc, bytes, 2);
+                gpu.dispatch(enc, 1u64 << (log_d - 4 - 2), 64);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            };
+            let fill = || {
+                let w = core::slice::from_raw_parts_mut(
+                    gpu.buffer_contents(data_buf).cast::<u64>(),
+                    data_bytes / 8,
+                );
+                let mut x = 0x1234_5678_9ABC_DEF1u64;
+                for v in w.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *v = x;
+                }
+            };
+            let digest = || {
+                let w = core::slice::from_raw_parts(
+                    gpu.buffer_contents(data_buf).cast::<u64>(),
+                    data_bytes / 8,
+                );
+                w.iter().fold(0u64, |a, &v| a.rotate_left(7) ^ v)
+            };
+            {
+                let twl = imp::compile_supplemental_pipeline(
+                    gpu,
+                    imp::NTT_G4X2_TWL_MSL_SOURCE,
+                    "ntt_fused_reg4g4x2",
+                )
+                .unwrap();
+                for l in [4usize, 8, 12] {
+                    fill();
+                    run(psos[0], l);
+                    let d0 = digest();
+                    fill();
+                    run(twl, l);
+                    let d1 = digest();
+                    eprintln!("gn-table exact production-twl l={l}: {}", d0 == d1);
+                    assert_eq!(d0, d1);
+                }
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                for _ in 0..9 {
+                    for l in [4usize, 8, 12] {
+                        a.push(run(psos[0], l));
+                        b.push(run(twl, l));
+                    }
+                }
+                let sa: f64 = a.iter().sum::<f64>() / 9.0;
+                let sb: f64 = b.iter().sum::<f64>() / 9.0;
+                eprintln!("gn-table production p4+p8+p12 mean: base {sa:.2} twl {sb:.2} ms");
+                gpu.release(twl);
+            }
+            for &cmp in &[6usize, 8, 9] {
+                for l in [4usize, 8, 12] {
+                    fill();
+                    run(psos[0], l);
+                    let d0 = digest();
+                    fill();
+                    run(psos[cmp], l);
+                    let d1 = digest();
+                    eprintln!("gn-table exact mode{cmp} l={l}: {}", d0 == d1);
+                    assert_eq!(d0, d1);
+                }
+            }
+            for l in [4usize, 8, 12] {
+                let mut t: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
+                for _ in 0..9 {
+                    for (i, &pso) in psos.iter().enumerate() {
+                        t[i].push(run(pso, l));
+                    }
+                }
+                let med: Vec<f64> = t
+                    .iter_mut()
+                    .map(|v| {
+                        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        v[v.len() / 2]
+                    })
+                    .collect();
+                eprintln!(
+                    "gn-table l={l}: prod {:.2} | builds-only {:.2} | one-build {:.2} | neither {:.2} | simd-pad1 {:.2} | simd-pad256 {:.2} | twl-pad252 {:.2} | twl-pad284 {:.2} | twl8-pad28 {:.2} | twl8-pad1 {:.2} ms (median of 9)",
+                    med[0], med[1], med[2], med[3], med[4], med[5], med[6], med[7], med[8], med[9]
+                );
+            }
+            for p in psos {
+                gpu.release(p);
             }
             gpu.release(data_buf);
             gpu.release(tw_buf);
