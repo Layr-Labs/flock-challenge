@@ -1485,16 +1485,12 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     if let Some(producer) = producer {
         // Deferred A/B rows: each job produces its units one at a time into
         // a worker-local scratch and transforms them from there, so the
-        // precompute never streams A/B back from DRAM.  Jobs keep the plain
-        // drain's size, rounded down to whole units; every chunk still
-        // writes only its own disjoint 1 KiB of output, so the bytes are
-        // identical to the plain drain's.
         let unit_bytes = producer.unit_bytes;
         let unit_chunks = unit_bytes / OUTER_BYTES;
         assert!(unit_chunks > 0 && unit_bytes.is_multiple_of(OUTER_BYTES));
         assert!(n_chunks.is_multiple_of(unit_chunks));
         let n_units = n_chunks / unit_chunks;
-        let units_per_job = (chunks_per_job / unit_chunks).max(1);
+        let units_per_job = (chunks_per_job / (2 * unit_chunks)).max(1);
         let n_jobs = n_units.div_ceil(units_per_job);
         crate::epool::run_hetero_chunks_stateful_with_tail(
             n_jobs,
