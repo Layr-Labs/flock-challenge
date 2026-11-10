@@ -1107,6 +1107,56 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
     )
 }
 
+/// Exact-contention replay of the produced precompute: the full-write
+/// scratch arm of [`precompute_round1_ab_inner_packed_padded_for_exact_tune`]
+/// with the rows coming from `producer`, so the replay costs what the timed
+/// arm costs.  The buffers must already be complete; the producer rewrites
+/// them with the same bytes.  Falls back to the plain replay when the fused
+/// producer path or the two-pool queue is switched off.
+///
+/// # Safety
+/// As [`precompute_round1_ab_inner_packed_padded_produced`]; in addition no
+/// other reader of the buffers may run during the call.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn precompute_round1_ab_inner_packed_padded_produced_for_exact_tune(
+    a_packed: *const u8,
+    b_packed: *const u8,
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    producer: Round1AbProducer<'_>,
+) -> Round1AbInner {
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    let total_bytes = (1usize << m) / 8;
+    assert!(producer.unit_bytes > 0 && producer.unit_bytes.is_multiple_of(OUTER_BYTES));
+    assert!(total_bytes.is_multiple_of(producer.unit_bytes));
+    let fused = zc_ab_producer_fused_enabled() && zc_ab_pre_hetero_enabled();
+    // SAFETY: the buffers are complete and live for the call; on the fused
+    // path the body does not read through these slices.
+    let (a_packed, b_packed) = unsafe {
+        (
+            core::slice::from_raw_parts(a_packed, total_bytes),
+            core::slice::from_raw_parts(b_packed, total_bytes),
+        )
+    };
+    precompute_round1_ab_inner_packed_padded_body(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        false,
+        false,
+        identity_prefix,
+        None,
+        fused.then_some(producer),
+    )
+}
+
 /// Produce every deferred A/B unit without a scratch copy (the non-fused
 /// control and every route that does not run the two-pool queue).
 fn produce_all_ab_units(producer: Round1AbProducer<'_>, n_units: usize) {
@@ -1122,6 +1172,293 @@ fn produce_all_ab_units(producer: Round1AbProducer<'_>, n_units: usize) {
         },
         None,
     );
+}
+
+/// How the prover hands deferred A/B rows to the round-one AB precompute:
+/// a bare producer (the precompute arm runs every job) or an early-start
+/// object some of whose jobs may already have run.
+pub enum Round1AbSource<'a> {
+    Producer(Round1AbProducer<'a>),
+    Early(Round1AbEarly<'a>),
+    /// The buffers are complete (nothing was deferred), and the producer is
+    /// offered only so that the untimed exact-contention replay can run the
+    /// arm the timed proofs run: produce the rows and transform them from
+    /// the scratch.  Producing rewrites the same bytes.
+    ReplayOnly(Round1AbProducer<'a>),
+}
+
+/// The produced round-one AB precompute as an object whose jobs can start
+/// before the precompute arm does.
+///
+/// With deferred A/B rows ([`Round1AbProducer`]) a job needs nothing from the
+/// witness: its rows come from the producer.  The ranked witness window is
+/// bound by memory traffic, so its workers stall on stores for most of it;
+/// they can run jobs of this queue in that time ([`Self::run_one`]).  The
+/// precompute arm later drains whatever is left ([`Self::finish`]).  Jobs are
+/// claimed from one atomic cursor, each exactly once, and every job writes
+/// only its own disjoint output, so the result is byte-identical to
+/// [`precompute_round1_ab_inner_packed_padded_produced`] whatever the split.
+pub struct Round1AbEarly<'a> {
+    produce: Box<dyn Fn(usize, *mut u8, *mut u8) + Send + Sync + 'a>,
+    unit_bytes: usize,
+    storage: Vec<F128>,
+    out: crate::epool::SyncPtr<u8>,
+    representation: Round1AbRepresentation,
+    includes_output_window: Option<bool>,
+    inv_table: &'a InvNttTableByteSingleGf8,
+    within_outer_mask: usize,
+    b_med_counts: Vec<u8>,
+    blake3_static_layout: bool,
+    static_b_context: Option<kernels::StaticBContext>,
+    nt: bool,
+    compact: bool,
+    /// Queue instantiation, resolved once as in the plain body: 0 = process
+    /// policy, 1 = forced fast policy, 2 = forced fast policy with direct
+    /// non-temporal stores.
+    arm: u8,
+    unit_chunks: usize,
+    n_units: usize,
+    units_per_job: usize,
+    n_jobs: usize,
+    cursor: std::sync::atomic::AtomicUsize,
+    early_jobs: std::sync::atomic::AtomicUsize,
+}
+
+/// Worker-local state of [`Round1AbEarly`] jobs.
+pub struct Round1AbEarlyState {
+    a_col: [F8; ELL],
+    b_col: [F8; ELL],
+    scratch: AbUnitScratch,
+}
+
+impl<'a> Round1AbEarly<'a> {
+    /// Set the precompute up exactly as the plain body does before its queue
+    /// starts.  `None` when the fused producer path is switched off or the
+    /// two-pool queue is: the caller then keeps the plain entry points.
+    pub fn new(
+        m: usize,
+        k_skip: usize,
+        inv_table: &'a InvNttTableByteSingleGf8,
+        padding: &PaddingSpec,
+        identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+        unit_bytes: usize,
+        produce: Box<dyn Fn(usize, *mut u8, *mut u8) + Send + Sync + 'a>,
+    ) -> Option<Self> {
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        if !(zc_ab_producer_fused_enabled() && zc_ab_pre_hetero_enabled()) {
+            return None;
+        }
+        assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
+        assert!(m >= k_skip + N_INNER);
+        let total_bytes = (1usize << m) / 8;
+        assert_eq!(inv_table.k, k_skip);
+        assert_eq!(total_bytes % core::mem::size_of::<F128>(), 0);
+        assert!(unit_bytes > 0 && unit_bytes.is_multiple_of(OUTER_BYTES));
+        assert!(total_bytes.is_multiple_of(unit_bytes));
+
+        let representation = if let Some(statement) = identity_prefix {
+            assert!(m >= padding.k_log, "C1 requires complete blocks");
+            assert_eq!(padding.k_log, 14, "C1 requires 16,384-bit blocks");
+            assert_eq!(padding.useful_bits_per_block, 15_409);
+            Round1AbRepresentation::Blake3IdentityPrefixOmitted {
+                output_window: statement.includes_output_window(),
+            }
+        } else {
+            Round1AbRepresentation::Complete
+        };
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+        let blake3_static_layout = padding.k_log == 14 && padding.useful_bits_per_block == 15_409;
+        let static_b_context = kernels::prepare_static_b_context(inv_table, blake3_static_layout);
+
+        // Storage, provenance and the compact decision: the plain body's.
+        let storage_len = total_bytes / core::mem::size_of::<F128>();
+        let (mut storage, token_hit) =
+            crate::scratch::take_f128_with_token(storage_len, AB_COMPACT_R2_FULL_INIT_TAG);
+        if token_hit {
+            AB_COMPACT_BACKING_TOKEN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            AB_COMPACT_BACKING_TOKEN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: `storage` is exclusively owned and exposes exactly
+            // `total_bytes`; zero is a valid object representation for F128.
+            unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
+        }
+        if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+            let (hits, misses) = ab_compact_backing_token_counts();
+            eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
+        }
+        let nt = ab_pre_nt_enabled();
+        let compact = ab_compact_store_enabled() && token_hit;
+
+        let n_chunks = total_bytes / OUTER_BYTES;
+        let ranked_fast_policy = ranked_ab_pre_fast_policy_hoist_shape(
+            m,
+            k_skip,
+            n_chunks,
+            padding.k_log,
+            padding.useful_bits_per_block,
+            rayon::current_num_threads(),
+            crate::epool::helper_pool().map_or(0, rayon::ThreadPool::current_num_threads),
+            kernels::static_b_context_is_prepared(static_b_context),
+            zc_ab_pre_fast_policy_hoist_enabled(),
+        ) && kernels::fast_shift_reduce_enabled();
+        let arm = if !ranked_fast_policy {
+            0
+        } else if nt && ab_pre_nt_direct_enabled() {
+            2
+        } else {
+            1
+        };
+
+        let unit_chunks = unit_bytes / OUTER_BYTES;
+        let n_units = n_chunks / unit_chunks;
+        let units_per_job = (ab_pre_chunks_per_job(n_chunks) / unit_chunks).max(1);
+        let out = crate::epool::SyncPtr(storage.as_mut_ptr().cast::<u8>());
+        Some(Self {
+            produce,
+            unit_bytes,
+            storage,
+            out,
+            representation,
+            includes_output_window: identity_prefix.map(Round1PinnedOnePrefixStatement::includes_output_window),
+            inv_table,
+            within_outer_mask,
+            b_med_counts,
+            blake3_static_layout,
+            static_b_context,
+            nt,
+            compact,
+            arm,
+            unit_chunks,
+            n_units,
+            units_per_job,
+            n_jobs: n_units.div_ceil(units_per_job),
+            cursor: std::sync::atomic::AtomicUsize::new(0),
+            early_jobs: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// The identity-prefix statement this precompute was set up with, as
+    /// `includes_output_window` (`None` = complete representation).
+    pub fn identity_prefix_output_window(&self) -> Option<bool> {
+        self.includes_output_window
+    }
+
+    pub fn n_jobs(&self) -> usize {
+        self.n_jobs
+    }
+
+    /// Jobs run through [`Self::run_one`] so far.
+    pub fn early_jobs(&self) -> usize {
+        self.early_jobs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn new_state(&self) -> Round1AbEarlyState {
+        Round1AbEarlyState {
+            a_col: [F8::ZERO; ELL],
+            b_col: [F8::ZERO; ELL],
+            scratch: AbUnitScratch::new(self.unit_bytes),
+        }
+    }
+
+    /// Claim one job and run it on the calling thread.  `false` when the
+    /// queue is exhausted.  Callable concurrently from any thread.
+    pub fn run_one(&self, state: &mut Round1AbEarlyState) -> bool {
+        if !self.claim_and_run(state) {
+            return false;
+        }
+        self.early_jobs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    #[inline]
+    fn claim_and_run(&self, state: &mut Round1AbEarlyState) -> bool {
+        // Cheap exhaustion check first so idle tickets do not push the
+        // cursor far past the end.
+        if self.cursor.load(std::sync::atomic::Ordering::Relaxed) >= self.n_jobs {
+            return false;
+        }
+        let job = self.cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if job >= self.n_jobs {
+            return false;
+        }
+        match self.arm {
+            0 => self.run_job::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(state, job),
+            1 => self.run_job::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(state, job),
+            _ => self.run_job::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(state, job),
+        }
+        true
+    }
+
+    /// One queue job: the produced arm of [`precompute_ab_hetero`].
+    #[inline(always)]
+    fn run_job<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
+        &self,
+        state: &mut Round1AbEarlyState,
+        job: usize,
+    ) {
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        if FORCE_DIRECT {
+            assert!(self.nt, "FORCE_DIRECT requires the non-temporal AB-precompute mode");
+        }
+        let unit_start = job * self.units_per_job;
+        let unit_end = (unit_start + self.units_per_job).min(self.n_units);
+        let Round1AbEarlyState { a_col, b_col, scratch } = state;
+        for unit in unit_start..unit_end {
+            let (a_unit, b_unit) = scratch.fill(|a, b| (self.produce)(unit, a, b));
+            for local in 0..self.unit_chunks {
+                let x_outer = unit * self.unit_chunks + local;
+                // SAFETY: this job owns the output of its units, and the
+                // storage outlives `self`.
+                let out_outer = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        self.out.ptr().add(x_outer * OUTER_BYTES),
+                        OUTER_BYTES,
+                    )
+                };
+                precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT>(
+                    a_unit,
+                    b_unit,
+                    self.inv_table,
+                    self.within_outer_mask,
+                    &self.b_med_counts,
+                    self.blake3_static_layout,
+                    self.static_b_context,
+                    self.nt,
+                    self.compact,
+                    self.representation,
+                    x_outer,
+                    local * OUTER_BYTES,
+                    out_outer,
+                    a_col,
+                    b_col,
+                );
+            }
+        }
+    }
+
+    /// Drain every job not yet claimed through the two-pool queue and return
+    /// the completed transform.  `tail` as in
+    /// [`precompute_round1_ab_inner_packed_padded_with_tail`].  Every early
+    /// [`Self::run_one`] call must have returned before this is called.
+    pub fn finish(self, tail: Option<&(dyn Fn() + Sync)>) -> Round1AbInner {
+        let claimed = self.cursor.load(std::sync::atomic::Ordering::Acquire).min(self.n_jobs);
+        // One ticket per unclaimed job; a ticket runs whichever job the
+        // cursor hands it.
+        crate::epool::run_hetero_chunks_stateful_with_tail(
+            self.n_jobs - claimed,
+            || self.new_state(),
+            |state, _ticket| {
+                let ran = self.claim_and_run(state);
+                debug_assert!(ran, "one ticket per unclaimed job");
+            },
+            tail,
+        );
+        assert!(self.cursor.load(std::sync::atomic::Ordering::Acquire) >= self.n_jobs);
+        Round1AbInner {
+            storage: self.storage,
+            representation: self.representation,
+        }
+    }
 }
 
 /// Full-write scratch arm for the untimed exact-contention replay. It never
@@ -5432,6 +5769,108 @@ mod tests {
                     want[base..base + live],
                     got[base..base + live],
                     "x_outer={x_outer} scratch={with_scratch_expected}"
+                );
+            }
+        }
+    }
+
+    /// Early-start AB precompute: any split between jobs run early from
+    /// several threads and jobs drained by `finish` gives the plain
+    /// precompute's live rows, produces every unit exactly once and leaves
+    /// the buffers complete.
+    #[test]
+    fn ab_precompute_early_object_matches_plain() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        let m = 20usize;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let mut rng = Rng::new(0xEA_21_AB);
+        let total_bits = 1usize << m;
+        let mut a = rng.bits(total_bits);
+        let mut b = rng.bits(total_bits);
+        for blk in 0..(total_bits >> padding.k_log) {
+            for j in padding.useful_bits_per_block..(1 << padding.k_log) {
+                a[(blk << padding.k_log) + j] = false;
+                b[(blk << padding.k_log) + j] = false;
+            }
+        }
+        let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
+        let total = a_p.len();
+        let table = make_inv_table();
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+        let plain =
+            precompute_round1_ab_inner_packed_padded(&a_p, &b_p, m, K_SKIP, &table, &padding, None);
+        let unit_bytes = 8 * OUTER_BYTES;
+        let n_units = total / unit_bytes;
+        // (early threads, early jobs per thread); the last case asks for
+        // more early jobs than exist.
+        for (threads, per_thread) in [(0usize, 0usize), (1, 1), (3, 2), (4, usize::MAX)] {
+            let mut a_t = vec![0x33u8; total];
+            let mut b_t = vec![0x44u8; total];
+            let (a_dst, b_dst) = (
+                crate::epool::SyncPtr(a_t.as_mut_ptr()),
+                crate::epool::SyncPtr(b_t.as_mut_ptr()),
+            );
+            let calls: Vec<AtomicU32> = (0..n_units).map(|_| AtomicU32::new(0)).collect();
+            let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8| {
+                calls[unit].fetch_add(1, Ordering::Relaxed);
+                let range = unit * unit_bytes..(unit + 1) * unit_bytes;
+                // SAFETY: disjoint unit ranges; scratch per the contract.
+                unsafe {
+                    let (src_a, src_b) = (&a_p[range.clone()], &b_p[range.clone()]);
+                    core::ptr::copy_nonoverlapping(src_a.as_ptr(), a_dst.ptr().add(range.start), unit_bytes);
+                    core::ptr::copy_nonoverlapping(src_b.as_ptr(), b_dst.ptr().add(range.start), unit_bytes);
+                    assert!(!a_scratch.is_null() && !b_scratch.is_null());
+                    core::ptr::copy_nonoverlapping(src_a.as_ptr(), a_scratch, unit_bytes);
+                    core::ptr::copy_nonoverlapping(src_b.as_ptr(), b_scratch, unit_bytes);
+                }
+            };
+            let early = Round1AbEarly::new(
+                m,
+                K_SKIP,
+                &table,
+                &padding,
+                None,
+                unit_bytes,
+                Box::new(produce),
+            )
+            .expect("fused producer path is the default");
+            assert!(early.n_jobs() > 4, "the shape must expose several jobs");
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    let early = &early;
+                    scope.spawn(move || {
+                        let mut state = early.new_state();
+                        let mut ran = 0usize;
+                        while ran < per_thread && early.run_one(&mut state) {
+                            ran += 1;
+                        }
+                    });
+                }
+            });
+            let ran_early = early.early_jobs();
+            if per_thread == usize::MAX {
+                assert_eq!(ran_early, early.n_jobs());
+            } else {
+                assert_eq!(ran_early, threads * per_thread);
+            }
+            let out = early.finish(None);
+            assert!(calls.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+            assert_eq!(a_t, a_p);
+            assert_eq!(b_t, b_p);
+            let (want, got) = (plain.as_bytes(), out.as_bytes());
+            assert_eq!(want.len(), got.len());
+            for x_outer in 0..want.len() / OUTER_BYTES {
+                let live = b_med_counts[x_outer & within_outer_mask] as usize * 64;
+                let base = x_outer * OUTER_BYTES;
+                assert_eq!(
+                    want[base..base + live],
+                    got[base..base + live],
+                    "x_outer={x_outer} early threads={threads} per_thread={per_thread}"
                 );
             }
         }

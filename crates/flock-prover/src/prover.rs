@@ -122,6 +122,30 @@ fn ranked_identity_prefix_omission_contract(
     r1cs.round1_pinned_one_prefix_statement()
 }
 
+/// The identity-prefix statement [`ranked_identity_prefix_omission_contract`]
+/// will return for a witness minted by the ranked row-major generator,
+/// computable before the witness exists: the contract's remaining input is
+/// a pointer-identity receipt for the generator's own buffers.  The early
+/// AB precompute is set up with it; the prover asserts that the contract it
+/// computes later is the same.
+pub(crate) fn ranked_identity_prefix_statement_for_generator(
+    r1cs: &BlockR1cs,
+) -> Option<Round1PinnedOnePrefixStatement> {
+    if !ranked_lincheck_c_reuse_enabled(r1cs)
+        || std::env::var_os(ENV_NO_ZC_AB_IDENTITY_PREFIX_OMIT).as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    {
+        return None;
+    }
+    if std::env::var_os(ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT).as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+        && let Some(statement) = r1cs.round1_pinned_one_prefix_and_output_statement()
+    {
+        return Some(statement);
+    }
+    r1cs.round1_pinned_one_prefix_statement()
+}
+
 fn precompute_ab_s_hat_v(
     r1cs: &BlockR1cs,
     z_vec: &[F128],
@@ -347,7 +371,7 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_identity_prefix(
         r1cs, pcs_params, z_packed, a_packed_f128, b_packed_f128,
-        z_packed_lincheck, lincheck_circuit, prefaulted_codeword, None, challenger,
+        z_packed_lincheck, lincheck_circuit, prefaulted_codeword, None, None, challenger,
     )
 }
 
@@ -364,6 +388,7 @@ pub(crate) fn prove_fast_ligerito_from_witness_with_identity_prefix<Ch: Challeng
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
+    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbSource<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let commit_codeword = match prefaulted_codeword {
@@ -380,7 +405,7 @@ pub(crate) fn prove_fast_ligerito_from_witness_with_identity_prefix<Ch: Challeng
         lincheck_circuit,
         commit_codeword,
         identity_prefix_witness,
-        None,
+        ab_producer,
         challenger,
     )
 }
@@ -431,6 +456,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
+    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbSource<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -443,7 +469,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
         identity_prefix_witness,
-        None,
+        ab_producer,
         challenger,
     )
 }
@@ -472,7 +498,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
-    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
+    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbSource<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -501,7 +527,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
-    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
+    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbSource<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let lig_config = pcs_params
@@ -1204,7 +1230,7 @@ fn commit_with_round1_ab_precompute(
     tail_fill: Option<CommitTailFillHook<'_>>,
     identity_prefix_contract: Option<Round1PinnedOnePrefixStatement>,
     stripe_help: Option<&(dyn Fn() + Sync)>,
-    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
+    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbSource<'_>>,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -1223,26 +1249,48 @@ fn commit_with_round1_ab_precompute(
     // The AB queue's helper broadcast is queued behind the stripe's on the
     // efficiency-core pool, so this arm cannot finish before the stripe does;
     // helping moves the stripe's remainder onto otherwise idle P-workers.
+    // The untimed exact-contention replay runs the arm the timed proofs run:
+    // with a producer at hand it produces the rows and transforms them from
+    // the scratch (the buffers are complete by then; the rows are rewritten
+    // with the same bytes).  An early-start object owns its producer and is
+    // never present on the call that tunes (nothing is deferred there).
+    let replay_producer = {
+        use zerocheck::univariate_skip_optimized::Round1AbSource;
+        match &ab_producer {
+            Some(Round1AbSource::Producer(producer))
+            | Some(Round1AbSource::ReplayOnly(producer)) => Some(*producer),
+            Some(Round1AbSource::Early(_)) | None => None,
+        }
+    };
     let precompute_ab = || {
-        if let Some(producer) = ab_producer {
+        use zerocheck::univariate_skip_optimized::Round1AbSource;
+        match ab_producer {
+            // Deferred A/B rows whose precompute may already have run some
+            // jobs inside the witness window: drain the rest.  Every unit
+            // is produced by the time this returns.
+            Some(Round1AbSource::Early(early)) => return early.finish(stripe_help),
             // Deferred A/B rows: this arm is their only writer, and it has
             // produced every unit by the time it returns (the replay below
             // and round two read complete buffers).
             // SAFETY: both buffers are live, `2^m / 8` bytes long, and
             // written only by the producer during this call.
-            return unsafe {
-                zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_produced(
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
-                    pcs_params.m,
-                    k_skip,
-                    inv_table,
-                    padding,
-                    identity_prefix_contract,
-                    stripe_help,
-                    producer,
-                )
-            };
+            Some(Round1AbSource::Producer(producer)) => {
+                return unsafe {
+                    zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_produced(
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        pcs_params.m,
+                        k_skip,
+                        inv_table,
+                        padding,
+                        identity_prefix_contract,
+                        stripe_help,
+                        producer,
+                    )
+                };
+            }
+            // Complete buffers: the plain precompute.
+            Some(Round1AbSource::ReplayOnly(_)) | None => {}
         }
         zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_with_tail(
             a_packed,
@@ -1256,6 +1304,22 @@ fn commit_with_round1_ab_precompute(
         )
     };
     let precompute_ab_replay = || {
+        if let Some(producer) = replay_producer {
+            // SAFETY: the join below has returned before the replay runs, so
+            // both buffers are complete and nothing else reads them.
+            return unsafe {
+                zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_produced_for_exact_tune(
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    pcs_params.m,
+                    k_skip,
+                    inv_table,
+                    padding,
+                    identity_prefix_contract,
+                    producer,
+                )
+            };
+        }
         zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune(
             a_packed,
             b_packed,
@@ -1411,13 +1475,21 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
-    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
+    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbSource<'_>>,
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
     let identity_prefix_contract = ranked_identity_prefix_omission_contract(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
     );
+    if let Some(zerocheck::univariate_skip_optimized::Round1AbSource::Early(early)) = &ab_producer {
+        // The early precompute was set up before the witness existed.
+        assert_eq!(
+            early.identity_prefix_output_window(),
+            identity_prefix_contract.map(Round1PinnedOnePrefixStatement::includes_output_window),
+            "early AB precompute and the prover disagree on the identity-prefix statement"
+        );
+    }
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>,
                       stripe_help: Option<&(dyn Fn() + Sync)>| {
