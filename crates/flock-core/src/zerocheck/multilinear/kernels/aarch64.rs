@@ -899,16 +899,28 @@ unsafe fn bank_load_q<const SHIFT: u32>(
     // SAFETY: the byte index is at most 255, so the 16-byte load stays inside
     // the caller's 4 KiB bank; the asm only reads that memory.
     unsafe {
-        core::arch::asm!(
-            "ubfx {idx}, {row}, #{shift}, #8",
-            "ldr {out:q}, [{bank}, {idx}, lsl #4]",
-            shift = const SHIFT,
-            row = in(reg) row,
-            bank = in(reg) bank,
-            idx = out(reg) _,
-            out = lateout(vreg) out,
-            options(pure, readonly, nostack, preserves_flags),
-        );
+        if SHIFT == 0 {
+            core::arch::asm!(
+                "ubfiz {off}, {row}, #4, #8",
+                "ldr {out:q}, [{bank}, {off}]",
+                row = in(reg) row,
+                bank = in(reg) bank,
+                off = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else {
+            core::arch::asm!(
+                "ubfx {idx}, {row}, #{shift}, #8",
+                "ldr {out:q}, [{bank}, {idx}, lsl #4]",
+                shift = const SHIFT,
+                row = in(reg) row,
+                bank = in(reg) bank,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
     }
     out
 }
