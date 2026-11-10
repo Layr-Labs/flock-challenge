@@ -483,7 +483,7 @@ impl TailGuard {
         }
         let t_main = self.main_ns.load(Ordering::Relaxed) / cnt;
         let remaining = n_chunks.saturating_sub(next) as u64;
-        own_ns.saturating_mul(self.main_threads) <= remaining.saturating_mul(t_main)
+        helper_beats_main_drain(own_ns, self.main_threads, remaining, t_main)
     }
 
     /// Run helper chunk `i`, updating the helper's own average.
@@ -498,6 +498,16 @@ impl TailGuard {
         let ns = (started.elapsed().as_nanos() as u64).max(1);
         *own_ns = if *own_ns == 0 { ns } else { (*own_ns + ns) / 2 };
     }
+}
+
+///
+#[inline]
+fn helper_beats_main_drain(own_ns: u64, width: u64, remaining: u64, t_main: u64) -> bool {
+    let horizon = remaining
+        .saturating_sub(1)
+        .saturating_mul(2)
+        .saturating_add(width);
+    own_ns.saturating_mul(width).saturating_mul(2) <= horizon.saturating_mul(t_main)
 }
 
 pub fn run_hetero_chunks<F>(n_chunks: usize, f: F)
@@ -583,6 +593,7 @@ pub struct HelpQueue<'a> {
     main_ns: AtomicU64,
     main_cnt: AtomicU64,
     guard_on: bool,
+    main_width: u64,
     n_chunks: usize,
     f: &'a (dyn Fn(usize) + Sync),
 }
@@ -597,6 +608,7 @@ impl<'a> HelpQueue<'a> {
             main_ns: AtomicU64::new(0),
             main_cnt: AtomicU64::new(0),
             guard_on: tail_guard_enabled(),
+            main_width: rayon::current_num_threads() as u64,
             n_chunks,
             f,
         }
@@ -653,7 +665,8 @@ impl<'a> HelpQueue<'a> {
         }
         let t_main = self.main_ns.load(Ordering::Relaxed) / cnt;
         let remaining = self.n_chunks.saturating_sub(self.next.load(Ordering::Relaxed)) as u64;
-        own_ns.saturating_mul(active) <= remaining.saturating_mul(t_main)
+        let width = active.max(self.main_width);
+        helper_beats_main_drain(own_ns, width, remaining, t_main)
     }
 
     fn drain_helper(&self) -> usize {
