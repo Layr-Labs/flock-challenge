@@ -524,9 +524,8 @@ pub(super) fn accumulate_convert_ab(
 /// current chunk's high `x_lo` bits, and `bank` is the accumulator for its low
 /// `x_lo` bits; the caller applies `eq_bot[u]` to each bank once per `x_hi`
 /// band. Same gathers as the incumbent, zero GHASH multiplies.
-///
 #[inline]
-pub(super) fn accumulate_convert_ab_nomul<const STORE: bool>(
+pub(super) fn accumulate_convert_ab_nomul(
     chunk_ab_bytes: &[[u8; 64]; 16],
     first_b_med: usize,
     n_b_med: usize,
@@ -538,18 +537,7 @@ pub(super) fn accumulate_convert_ab_nomul<const STORE: bool>(
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
     // every table-selected load and every bank slot drained.
     unsafe {
-        aarch64::accumulate_convert_ab_nomul::<STORE>(
-            chunk_ab_bytes,
-            first_b_med,
-            n_b_med,
-            convert,
-            bank,
-        );
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    if STORE {
-        bank.fill(super::F128::ZERO);
+        aarch64::accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
     }
 
     #[cfg(all(
@@ -572,6 +560,67 @@ pub(super) fn accumulate_convert_ab_nomul<const STORE: bool>(
         )
     )))]
     portable::accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+}
+
+/// [`accumulate_convert_ab_nomul`] over the derived table image (row `b` is
+/// `x^b · row 0` bit-for-bit): gathers only the first eight `b_med` tables
+/// and lifts the high half by `x^8`. Same bank values. Non-AArch64 builds use
+/// the plain kernel.
+#[inline]
+pub(super) fn accumulate_convert_ab_nomul_x8(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    n_b_med: usize,
+    convert: &[super::F128],
+    bank: &mut [super::F128; 64],
+) {
+    assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; fixed arrays cover every
+    // load and drained slot, and every table index stays in the first 32 KiB.
+    unsafe {
+        aarch64::accumulate_convert_ab_nomul_x8(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+}
+
+/// Split-bank form of [`accumulate_convert_ab_nomul_x8`]: the high `b_med`
+/// half drains un-lifted into `bank_hi` (`bank_lo + x^8 · bank_hi` is the
+/// incumbent bank).
+#[inline]
+pub(super) fn accumulate_convert_ab_nomul_x8_split(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    n_b_med: usize,
+    convert: &[super::F128],
+    bank_lo: &mut [super::F128; 64],
+    bank_hi: &mut [super::F128; 64],
+) {
+    assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as `accumulate_convert_ab_nomul_x8`; both banks are fixed arrays.
+    unsafe {
+        aarch64::accumulate_convert_ab_nomul_x8_split(
+            chunk_ab_bytes, first_b_med, n_b_med, convert, bank_lo, bank_hi,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = bank_hi;
+        accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank_lo);
+        unreachable!("split x8 completion is AArch64-only");
+    }
+}
+
+/// `x^8 · v` (see the AArch64 kernel's `mul_x8_q`), portable.
+pub(super) fn mul_x8_f128(v: super::F128) -> super::F128 {
+    let o = v.hi >> 56;
+    let red = o ^ (o << 1) ^ (o << 2) ^ (o << 7);
+    super::F128 {
+        lo: (v.lo << 8) ^ red,
+        hi: (v.hi << 8) | (v.lo >> 56),
+    }
 }
 
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
