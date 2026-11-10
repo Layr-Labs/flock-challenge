@@ -1845,6 +1845,30 @@ unsafe fn horner_absorb(
     }
 }
 
+/// First Horner step after the seed: `acc = acc·x ⊕ lo ⊕ hi` with no carry.
+/// The seed is the XOR of two raw 8×8 carry-less products, so every lane has
+/// degree at most 14 and bit 15 is zero; the carry term of [`horner_absorb`]
+/// is identically zero there, and this form is bit-identical to it.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn horner_absorb_first(
+    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
+    lo: &[core::arch::aarch64::uint16x8_t; 8],
+    hi: &[core::arch::aarch64::uint16x8_t; 8],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        for i in 0..8 {
+            debug_assert_eq!(vmaxvq_u16(vshrq_n_u16::<15>(acc[i])), 0);
+            acc[i] = vreinterpretq_u16_u8(xor3_u8(
+                vreinterpretq_u8_u16(vshlq_n_u16::<1>(acc[i])),
+                vreinterpretq_u8_u16(lo[i]),
+                vreinterpretq_u8_u16(hi[i]),
+            ));
+        }
+    }
+}
+
 /// Kill switch for the Horner / scaled-table kernel:
 /// `FLOCK_NO_FAST_SHIFT_REDUCE=1` restores [`shift_reduce_inner_ab_fused_neon`].
 /// Output is bit-identical either way.
@@ -1924,7 +1948,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
 
         let lo2 = products!(plain, plain_sw, 2);
         let hi2 = products!(scaled, scaled_sw, 6);
-        horner_absorb(&mut acc, &lo2, &hi2, carry_not);
+        horner_absorb_first(&mut acc, &lo2, &hi2);
 
         let lo1 = products!(plain, plain_sw, 1);
         let hi1 = products!(scaled, scaled_sw, 5);
@@ -2082,7 +2106,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
         let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
         let lo2 = products!(plain, plain_sw, 2);
         let hi2 = products!(scaled, scaled_sw, 6);
-        horner_absorb(&mut acc, &lo2, &hi2, carry_not);
+        horner_absorb_first(&mut acc, &lo2, &hi2);
         let lo1 = products!(plain, plain_sw, 1);
         let hi1 = products!(scaled, scaled_sw, 5);
         horner_absorb(&mut acc, &lo1, &hi1, carry_not);

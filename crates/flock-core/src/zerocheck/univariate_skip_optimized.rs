@@ -1011,7 +1011,117 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
         true,
         identity_prefix,
         tail,
+        None,
     )
+}
+
+/// Producer of deferred packed A/B rows for the round-one AB precompute.
+///
+/// A witness generator may hand the prover A/B buffers whose rows are not
+/// written yet, together with this producer.  The buffers are cut into
+/// units of `unit_bytes` bytes of A (and the same range of B); a multiple of
+/// the precompute's 1 KiB outer chunk.  `produce(unit, a_scratch, b_scratch)`
+/// must materialise unit `unit` of both buffers (bytes
+/// `unit * unit_bytes .. (unit + 1) * unit_bytes`), exactly as the eager
+/// generator would have left them, and, when the scratch pointers are
+/// non-null, also write those same `unit_bytes` bytes of A to `a_scratch`
+/// and of B to `b_scratch`.  It must be callable concurrently for distinct
+/// units from any thread.
+///
+/// The precompute calls it exactly once per unit before it returns, so both
+/// buffers are complete for every later reader (zerocheck round two).  On
+/// the fused path the transform of a unit reads the scratch copy, which is
+/// still in L1, instead of streaming the rows back from DRAM.
+#[derive(Clone, Copy)]
+pub struct Round1AbProducer<'a> {
+    pub unit_bytes: usize,
+    pub produce: &'a (dyn Fn(usize, *mut u8, *mut u8) + Sync),
+}
+
+/// Same-binary control for the fused producer path: with exactly
+/// `FLOCK_NO_ZC_AB_PRODUCER_FUSED=1` every unit is produced up front (no
+/// scratch) and the incumbent precompute then reads the buffers.
+pub const ENV_NO_ZC_AB_PRODUCER_FUSED: &str = "FLOCK_NO_ZC_AB_PRODUCER_FUSED";
+
+fn zc_ab_producer_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_ZC_AB_PRODUCER_FUSED).as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// [`precompute_round1_ab_inner_packed_padded_with_tail`] for A/B buffers
+/// whose rows are deferred to `producer` (see [`Round1AbProducer`]).  The
+/// output is byte-identical to producing every unit first and then calling
+/// the plain function.
+///
+/// # Safety
+/// `a_packed` / `b_packed` must each be valid for `2^m / 8` bytes for the
+/// duration of the call, and nothing but `producer` may write them during
+/// it.  They are raw pointers because the producer writes the buffers
+/// while the precompute runs; shared slices are formed only over ranges
+/// whose production has completed.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
+    a_packed: *const u8,
+    b_packed: *const u8,
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    tail: Option<&(dyn Fn() + Sync)>,
+    producer: Round1AbProducer<'_>,
+) -> Round1AbInner {
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    let total_bytes = (1usize << m) / 8;
+    assert!(producer.unit_bytes > 0 && producer.unit_bytes.is_multiple_of(OUTER_BYTES));
+    assert!(total_bytes.is_multiple_of(producer.unit_bytes));
+    let fused = zc_ab_producer_fused_enabled() && zc_ab_pre_hetero_enabled();
+    if !fused {
+        produce_all_ab_units(producer, total_bytes / producer.unit_bytes);
+    }
+    // SAFETY: on the fused path the body never reads through these slices
+    // (every row comes from the producer's scratch); otherwise every unit
+    // was produced above and the buffers are no longer written.
+    let (a_packed, b_packed) = unsafe {
+        (
+            core::slice::from_raw_parts(a_packed, total_bytes),
+            core::slice::from_raw_parts(b_packed, total_bytes),
+        )
+    };
+    precompute_round1_ab_inner_packed_padded_body(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        ab_compact_store_enabled(),
+        true,
+        identity_prefix,
+        tail,
+        fused.then_some(producer),
+    )
+}
+
+/// Produce every deferred A/B unit without a scratch copy (the non-fused
+/// control and every route that does not run the two-pool queue).
+fn produce_all_ab_units(producer: Round1AbProducer<'_>, n_units: usize) {
+    const UNITS_PER_JOB: usize = 64;
+    crate::epool::run_hetero_chunks_stateful_with_tail(
+        n_units.div_ceil(UNITS_PER_JOB),
+        || (),
+        |_, job| {
+            let start = job * UNITS_PER_JOB;
+            for unit in start..(start + UNITS_PER_JOB).min(n_units) {
+                (producer.produce)(unit, core::ptr::null_mut(), core::ptr::null_mut());
+            }
+        },
+        None,
+    );
 }
 
 /// Full-write scratch arm for the untimed exact-contention replay. It never
@@ -1038,6 +1148,7 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
         false,
         identity_prefix,
         None,
+        None,
     )
 }
 
@@ -1059,7 +1170,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
 ) -> Round1AbInner {
     precompute_round1_ab_inner_packed_padded_body(
         a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true, identity_prefix,
-        None,
+        None, None,
     )
 }
 
@@ -1076,6 +1187,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
     use_provenance: bool,
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
     tail: Option<&(dyn Fn() + Sync)>,
+    producer: Option<Round1AbProducer<'_>>,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -1193,6 +1305,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     n_chunks,
                     out_bytes,
                     tail,
+                    producer,
                 );
             } else {
                 precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
@@ -1209,6 +1322,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     n_chunks,
                     out_bytes,
                     tail,
+                    producer,
                 );
             }
         } else {
@@ -1226,6 +1340,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                 n_chunks,
                 out_bytes,
                 tail,
+                producer,
             );
         }
         return Round1AbInner {
@@ -1234,6 +1349,10 @@ fn precompute_round1_ab_inner_packed_padded_body(
         };
     }
 
+    assert!(
+        producer.is_none(),
+        "a deferred A/B producer requires the two-pool precompute queue"
+    );
     out_bytes
         .par_chunks_mut(OUTER_BYTES)
         .enumerate()
@@ -1252,6 +1371,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     compact,
                     representation,
                     x_outer,
+                    x_outer * OUTER_BYTES,
                     out_outer,
                     a_col,
                     b_col,
@@ -1344,6 +1464,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     n_chunks: usize,
     out_bytes: &mut [u8],
     tail: Option<&(dyn Fn() + Sync)>,
+    producer: Option<Round1AbProducer<'_>>,
 ) {
     // This is a private specialization contract, but keep it checked in
     // release builds so a future caller cannot accidentally select
@@ -1360,8 +1481,69 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // generation and maximizes spatial locality; queue-level heterogeneity still
     // distributes independent slabs dynamically.
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
-    let n_jobs = n_chunks.div_ceil(chunks_per_job);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+    if let Some(producer) = producer {
+        // Deferred A/B rows: each job produces its units one at a time into
+        // a worker-local scratch and transforms them from there, so the
+        // precompute never streams A/B back from DRAM.  Jobs keep the plain
+        // drain's size, rounded down to whole units; every chunk still
+        // writes only its own disjoint 1 KiB of output, so the bytes are
+        // identical to the plain drain's.
+        let unit_bytes = producer.unit_bytes;
+        let unit_chunks = unit_bytes / OUTER_BYTES;
+        assert!(unit_chunks > 0 && unit_bytes.is_multiple_of(OUTER_BYTES));
+        assert!(n_chunks.is_multiple_of(unit_chunks));
+        let n_units = n_chunks / unit_chunks;
+        let units_per_job = (chunks_per_job / unit_chunks).max(1);
+        let n_jobs = n_units.div_ceil(units_per_job);
+        crate::epool::run_hetero_chunks_stateful_with_tail(
+            n_jobs,
+            || {
+                (
+                    [F8::ZERO; ELL],
+                    [F8::ZERO; ELL],
+                    AbUnitScratch::new(unit_bytes),
+                )
+            },
+            |(a_col, b_col, scratch), job| {
+                let unit_start = job * units_per_job;
+                let unit_end = (unit_start + units_per_job).min(n_units);
+                for unit in unit_start..unit_end {
+                    let (a_unit, b_unit) = scratch.fill(|a, b| (producer.produce)(unit, a, b));
+                    for local in 0..unit_chunks {
+                        let x_outer = unit * unit_chunks + local;
+                        // SAFETY: this job owns the output of its units.
+                        let out_outer = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                out_base.ptr().add(x_outer * OUTER_BYTES),
+                                OUTER_BYTES,
+                            )
+                        };
+                        precompute_ab_one_chunk::<FAST_POLICY, FORCE_DIRECT>(
+                            a_unit,
+                            b_unit,
+                            inv_table,
+                            within_outer_mask,
+                            b_med_counts,
+                            blake3_static_layout,
+                            static_b_context,
+                            nt,
+                            compact,
+                            representation,
+                            x_outer,
+                            local * OUTER_BYTES,
+                            out_outer,
+                            a_col,
+                            b_col,
+                        );
+                    }
+                }
+            },
+            tail,
+        );
+        return;
+    }
+    let n_jobs = n_chunks.div_ceil(chunks_per_job);
     crate::epool::run_hetero_chunks_stateful_with_tail(
         n_jobs,
         || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
@@ -1413,6 +1595,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     compact,
                     representation,
                     x_outer,
+                    x_outer * OUTER_BYTES,
                     out_outer,
                     a_col,
                     b_col,
@@ -1421,6 +1604,37 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         },
         tail,
     );
+}
+
+/// Worker-local copy of one deferred A/B unit: `unit_bytes` of A followed by
+/// `unit_bytes` of B, 64-byte aligned.
+struct AbUnitScratch {
+    storage: Vec<u8>,
+    offset: usize,
+    unit_bytes: usize,
+}
+
+impl AbUnitScratch {
+    fn new(unit_bytes: usize) -> Self {
+        let storage = vec![0u8; 2 * unit_bytes + 64];
+        let offset = storage.as_ptr().align_offset(64);
+        assert!(offset < 64);
+        Self {
+            storage,
+            offset,
+            unit_bytes,
+        }
+    }
+
+    /// Run `produce(a_scratch, b_scratch)` and return the two filled halves.
+    #[inline(always)]
+    fn fill(&mut self, produce: impl FnOnce(*mut u8, *mut u8)) -> (&[u8], &[u8]) {
+        let unit_bytes = self.unit_bytes;
+        let both = &mut self.storage[self.offset..self.offset + 2 * unit_bytes];
+        let (a, b) = both.split_at_mut(unit_bytes);
+        produce(a.as_mut_ptr(), b.as_mut_ptr());
+        (a, b)
+    }
 }
 
 /// One `x_outer`'s worth of the challenge-independent AB transform — the
@@ -1440,14 +1654,16 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     compact: bool,
     representation: Round1AbRepresentation,
     x_outer: usize,
+    chunk_byte_base: usize,
     out_outer: &mut [u8],
     a_col: &mut [F8; ELL],
     b_col: &mut [F8; ELL],
 ) {
-    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    // `chunk_byte_base` is where this chunk's 1 KiB of rows starts inside
+    // `a_packed` / `b_packed`: `x_outer * OUTER_BYTES` for the complete
+    // buffers, a unit-local offset for a producer scratch.
     let within_hash_outer = x_outer & within_outer_mask;
     let n_b_med = b_med_counts[within_hash_outer] as usize;
-    let chunk_byte_base = x_outer * OUTER_BYTES;
     let first_b_med = representation.first_materialized_b_med(within_hash_outer);
     // C1b changes only AB's materialized range. Keep n_b_med unchanged for
     // static-B dispatch (especially mixed row 13), C and tail initialization.
@@ -4582,6 +4798,7 @@ mod tests {
             false,
             Round1AbRepresentation::Complete,
             0,
+            0,
             &mut cached,
             &mut cached_a_col,
             &mut cached_b_col,
@@ -4601,6 +4818,7 @@ mod tests {
             true,
             false,
             Round1AbRepresentation::Complete,
+            0,
             0,
             &mut direct,
             &mut direct_a_col,
@@ -4961,6 +5179,261 @@ mod tests {
                 "store flavor changed bytes at m={m}, padded={}",
                 padded.is_some()
             );
+        }
+    }
+
+    /// Deferred A/B producer: for every queue instantiation the ranked path
+    /// can select, every store flavor and both AB representations, the
+    /// produced drain writes exactly the bytes of the plain drain, calls the
+    /// producer exactly once per unit, never reads the (not yet written)
+    /// packed buffers, and leaves them complete.
+    #[test]
+    fn ab_precompute_producer_matches_plain() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        let cases: [(usize, Option<(usize, usize)>); 3] = [
+            (13, None),
+            (14, Some((14, 15_409))), // BLAKE3 block shape
+            (17, Some((14, 15_409))),
+        ];
+        let mut checked = 0usize;
+        for (m, padded) in cases {
+            let mut rng = Rng::new(0xDEF_AB_u64 ^ (m as u64));
+            let total_bits = 1usize << m;
+            let mut a = rng.bits(total_bits);
+            let mut b = rng.bits(total_bits);
+            let padding = match padded {
+                None => PaddingSpec::dense(m),
+                Some((k_log, useful_bits)) => {
+                    let block_size = 1usize << k_log;
+                    for blk in 0..(total_bits / block_size) {
+                        for j in useful_bits..block_size {
+                            let idx = blk * block_size + j;
+                            a[idx] = false;
+                            b[idx] = false;
+                        }
+                    }
+                    PaddingSpec {
+                        k_log,
+                        useful_bits_per_block: useful_bits,
+                    }
+                }
+            };
+            let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
+            let total = a_p.len();
+            let table = make_inv_table();
+            let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+            let blake3_static_layout = padded.is_some();
+            let static_b_context = kernels::prepare_static_b_context(&table, blake3_static_layout);
+            let n_chunks = total / OUTER_BYTES;
+            let mut representations = vec![Round1AbRepresentation::Complete];
+            if padded.is_some() {
+                for output_window in [false, true] {
+                    representations
+                        .push(Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window });
+                }
+            }
+            // (forced fast policy, direct NT stores, NT stores)
+            let arms = [
+                (false, false, false),
+                (false, false, true),
+                (true, false, false),
+                (true, false, true),
+                (true, true, true),
+            ];
+            for &representation in &representations {
+                for (fast, direct, nt) in arms {
+                    let drain = |a_rows: &[u8],
+                                 b_rows: &[u8],
+                                 out: &mut [u8],
+                                 producer: Option<Round1AbProducer<'_>>| {
+                        macro_rules! go {
+                            ($policy:expr, $direct:literal) => {
+                                precompute_ab_hetero::<{ $policy }, $direct>(
+                                    a_rows,
+                                    b_rows,
+                                    &table,
+                                    within_outer_mask,
+                                    &b_med_counts,
+                                    blake3_static_layout,
+                                    static_b_context,
+                                    nt,
+                                    false,
+                                    representation,
+                                    n_chunks,
+                                    out,
+                                    None,
+                                    producer,
+                                )
+                            };
+                        }
+                        match (fast, direct) {
+                            (false, _) => go!(kernels::AB_FAST_POLICY_PROCESS, false),
+                            (true, false) => go!(kernels::AB_FAST_POLICY_FORCE_FAST, false),
+                            (true, true) => go!(kernels::AB_FAST_POLICY_FORCE_FAST, true),
+                        }
+                    };
+                    let mut plain = vec![0u8; total];
+                    drain(&a_p, &b_p, &mut plain, None);
+                    for unit_bytes in [OUTER_BYTES, 2 * OUTER_BYTES, 8 * OUTER_BYTES] {
+                        if !total.is_multiple_of(unit_bytes) {
+                            continue;
+                        }
+                        let n_units = total / unit_bytes;
+                        // The real buffers hold garbage until produced.
+                        let mut a_t = vec![0x5au8; total];
+                        let mut b_t = vec![0xa5u8; total];
+                        let (a_dst, b_dst) = (
+                            crate::epool::SyncPtr(a_t.as_mut_ptr()),
+                            crate::epool::SyncPtr(b_t.as_mut_ptr()),
+                        );
+                        let calls: Vec<AtomicU32> = (0..n_units).map(|_| AtomicU32::new(0)).collect();
+                        let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8| {
+                            calls[unit].fetch_add(1, Ordering::Relaxed);
+                            assert!(!a_scratch.is_null() && !b_scratch.is_null());
+                            let range = unit * unit_bytes..(unit + 1) * unit_bytes;
+                            // SAFETY: unit ranges are disjoint; the scratch is
+                            // `unit_bytes` long by the producer contract.
+                            unsafe {
+                                let (src_a, src_b) = (&a_p[range.clone()], &b_p[range.clone()]);
+                                core::ptr::copy_nonoverlapping(
+                                    src_a.as_ptr(),
+                                    a_dst.ptr().add(range.start),
+                                    unit_bytes,
+                                );
+                                core::ptr::copy_nonoverlapping(
+                                    src_b.as_ptr(),
+                                    b_dst.ptr().add(range.start),
+                                    unit_bytes,
+                                );
+                                core::ptr::copy_nonoverlapping(src_a.as_ptr(), a_scratch, unit_bytes);
+                                core::ptr::copy_nonoverlapping(src_b.as_ptr(), b_scratch, unit_bytes);
+                            }
+                        };
+                        let mut produced = vec![0u8; total];
+                        // Empty packed slices: any read of them would panic.
+                        drain(
+                            &[],
+                            &[],
+                            &mut produced,
+                            Some(Round1AbProducer {
+                                unit_bytes,
+                                produce: &produce,
+                            }),
+                        );
+                        assert_eq!(
+                            produced, plain,
+                            "m={m} repr={representation:?} fast={fast} direct={direct} nt={nt} unit={unit_bytes}"
+                        );
+                        assert!(calls.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+                        assert_eq!(a_t, a_p);
+                        assert_eq!(b_t, b_p);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        // Arms x (representations x unit sizes that divide the buffer).
+        assert_eq!(checked, 5 * (1 + 3 * 2 + 3 * 3));
+    }
+
+    /// Deferred A/B producer through the public entry (fused by default) and
+    /// the up-front production helper: live output rows equal the plain
+    /// precompute's, and the buffers end complete.
+    #[test]
+    fn ab_precompute_produced_entry_matches_plain() {
+        use crate::zerocheck::univariate_skip::pack_bits;
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        let m = 17usize;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let mut rng = Rng::new(0xDEF_AB_E27);
+        let total_bits = 1usize << m;
+        let mut a = rng.bits(total_bits);
+        let mut b = rng.bits(total_bits);
+        for blk in 0..(total_bits >> padding.k_log) {
+            for j in padding.useful_bits_per_block..(1 << padding.k_log) {
+                a[(blk << padding.k_log) + j] = false;
+                b[(blk << padding.k_log) + j] = false;
+            }
+        }
+        let (a_p, b_p) = (pack_bits(&a), pack_bits(&b));
+        let total = a_p.len();
+        let table = make_inv_table();
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+        let plain =
+            precompute_round1_ab_inner_packed_padded(&a_p, &b_p, m, K_SKIP, &table, &padding, None);
+        let unit_bytes = 8 * OUTER_BYTES;
+        for with_scratch_expected in [true, false] {
+            let mut a_t = vec![0x11u8; total];
+            let mut b_t = vec![0x22u8; total];
+            let (a_dst, b_dst) = (
+                crate::epool::SyncPtr(a_t.as_mut_ptr()),
+                crate::epool::SyncPtr(b_t.as_mut_ptr()),
+            );
+            let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8| {
+                let range = unit * unit_bytes..(unit + 1) * unit_bytes;
+                // SAFETY: disjoint unit ranges; scratch per the contract.
+                unsafe {
+                    let (src_a, src_b) = (&a_p[range.clone()], &b_p[range.clone()]);
+                    core::ptr::copy_nonoverlapping(
+                        src_a.as_ptr(),
+                        a_dst.ptr().add(range.start),
+                        unit_bytes,
+                    );
+                    core::ptr::copy_nonoverlapping(
+                        src_b.as_ptr(),
+                        b_dst.ptr().add(range.start),
+                        unit_bytes,
+                    );
+                    if !a_scratch.is_null() {
+                        core::ptr::copy_nonoverlapping(src_a.as_ptr(), a_scratch, unit_bytes);
+                        core::ptr::copy_nonoverlapping(src_b.as_ptr(), b_scratch, unit_bytes);
+                    }
+                }
+            };
+            let producer = Round1AbProducer {
+                unit_bytes,
+                produce: &produce,
+            };
+            let out = if with_scratch_expected {
+                // SAFETY: both buffers are live for `2^m / 8` bytes and are
+                // written only by the producer during the call.
+                unsafe {
+                    precompute_round1_ab_inner_packed_padded_produced(
+                        a_t.as_ptr(),
+                        b_t.as_ptr(),
+                        m,
+                        K_SKIP,
+                        &table,
+                        &padding,
+                        None,
+                        None,
+                        producer,
+                    )
+                }
+            } else {
+                produce_all_ab_units(producer, total / unit_bytes);
+                precompute_round1_ab_inner_packed_padded(
+                    &a_t, &b_t, m, K_SKIP, &table, &padding, None,
+                )
+            };
+            assert_eq!(a_t, a_p);
+            assert_eq!(b_t, b_p);
+            let (want, got) = (plain.as_bytes(), out.as_bytes());
+            assert_eq!(want.len(), got.len());
+            for x_outer in 0..want.len() / OUTER_BYTES {
+                let live = b_med_counts[x_outer & within_outer_mask] as usize * 64;
+                let base = x_outer * OUTER_BYTES;
+                assert_eq!(
+                    want[base..base + live],
+                    got[base..base + live],
+                    "x_outer={x_outer} scratch={with_scratch_expected}"
+                );
+            }
         }
     }
 
@@ -5537,6 +6010,68 @@ mod tests {
             .expect("spawn bstatic oracle")
             .join()
             .expect("bstatic oracle thread");
+    }
+
+    /// Local timing probe for the static-B Horner rows (not a correctness
+    /// test): 64 chunks, both windows, B rows forced to their static masks.
+    /// Run with `cargo test --profile challenge -p flock-core --lib
+    /// bstatic_horner_rows_timing -- --ignored --nocapture`, several times,
+    /// alternating with the build under comparison.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn bstatic_horner_rows_timing() {
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xB57A_71C0_7131_0001);
+        let context =
+            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+                .expect("enabled static-B context");
+        let kernels::aarch64::StaticBContext::Prepared { partials, .. } = context else {
+            unreachable!("prepared static-B context");
+        };
+        const CHUNKS: usize = 64;
+        let a_packed: Vec<u8> =
+            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+        let mut b: Vec<u8> =
+            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() >> 9 & 0xff) as u8).collect();
+        for c in 0..CHUNKS {
+            for w in 0..2usize {
+                let (lo, hi) = kernels::aarch64::BSTATIC_HORNER_WINDOW_ROWS[w];
+                for b_med in lo..hi {
+                    let blk = w * (1 << N_MEDIUM) + b_med;
+                    for k in 0..N_CHUNKS {
+                        let off = c * 2048 + w * 1024 + b_med * N_CHUNKS * 8 + k * N_CHUNKS;
+                        let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
+                        let word = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                        b[off..off + 8].copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                    }
+                }
+            }
+        }
+        let mut out = vec![0u8; 16 * 64];
+        let mut times = Vec::new();
+        let mut sum = 0u64;
+        const REPS: usize = 40;
+        for _trial in 0..25 {
+            let t0 = std::time::Instant::now();
+            for _ in 0..REPS {
+                for c in 0..CHUNKS {
+                    for w in 0..2usize {
+                        kernels::aarch64::bstatic_horner_window_rows(
+                            w, &a_packed, &b, &table, c * 2048 + w * 1024, partials, &mut out, false,
+                        );
+                        sum = sum.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            ^ u64::from_le_bytes(out[5 * 64..5 * 64 + 8].try_into().unwrap());
+                    }
+                }
+            }
+            times.push(t0.elapsed().as_secs_f64() * 1e9 / (REPS * CHUNKS * 26) as f64);
+        }
+        times.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        eprintln!(
+            "[ab-row-timing] static-B Horner rows: min {:.3} p25 {:.3} median {:.3} ns per row, checksum {:016x}",
+            times[0], times[6], times[12], sum
+        );
     }
 
     /// The unrolled window run of the Horner static-B kernel writes exactly the

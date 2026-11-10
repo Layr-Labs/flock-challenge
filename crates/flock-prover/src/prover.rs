@@ -380,6 +380,7 @@ pub(crate) fn prove_fast_ligerito_from_witness_with_identity_prefix<Ch: Challeng
         lincheck_circuit,
         commit_codeword,
         identity_prefix_witness,
+        None,
         challenger,
     )
 }
@@ -410,6 +411,7 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
         lincheck_circuit,
         CommitCodeword::Preinitialized(codeword),
         identity_prefix_witness,
+        None,
         challenger,
     )
 }
@@ -441,6 +443,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
         identity_prefix_witness,
+        None,
         challenger,
     )
 }
@@ -452,6 +455,12 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
 /// lincheck can read the stripe. The caller's exact-shape/helper-availability
 /// gate is deliberately kept in the BLAKE3 witness driver, where omission of
 /// the eager stripe is decided.
+///
+/// `ab_producer` is `Some` when the witness driver deferred the A/B rows:
+/// `a_packed_f128` / `b_packed_f128` then hold only their per-block
+/// constants, and the round-one AB precompute produces every row (see
+/// [`zerocheck::univariate_skip_optimized::Round1AbProducer`]) before any
+/// other reader of A/B runs.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: Challenger>(
     r1cs: &BlockR1cs,
@@ -463,6 +472,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
+    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -475,6 +485,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
         identity_prefix_witness,
+        ab_producer,
         challenger,
     )
 }
@@ -490,6 +501,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
+    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let lig_config = pcs_params
@@ -516,6 +528,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         lincheck_circuit,
         commit_codeword,
         identity_prefix_witness,
+        ab_producer,
         challenger,
     );
 
@@ -1191,6 +1204,7 @@ fn commit_with_round1_ab_precompute(
     tail_fill: Option<CommitTailFillHook<'_>>,
     identity_prefix_contract: Option<Round1PinnedOnePrefixStatement>,
     stripe_help: Option<&(dyn Fn() + Sync)>,
+    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -1210,6 +1224,26 @@ fn commit_with_round1_ab_precompute(
     // efficiency-core pool, so this arm cannot finish before the stripe does;
     // helping moves the stripe's remainder onto otherwise idle P-workers.
     let precompute_ab = || {
+        if let Some(producer) = ab_producer {
+            // Deferred A/B rows: this arm is their only writer, and it has
+            // produced every unit by the time it returns (the replay below
+            // and round two read complete buffers).
+            // SAFETY: both buffers are live, `2^m / 8` bytes long, and
+            // written only by the producer during this call.
+            return unsafe {
+                zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_produced(
+                    a_packed.as_ptr(),
+                    b_packed.as_ptr(),
+                    pcs_params.m,
+                    k_skip,
+                    inv_table,
+                    padding,
+                    identity_prefix_contract,
+                    stripe_help,
+                    producer,
+                )
+            };
+        }
         zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_with_tail(
             a_packed,
             b_packed,
@@ -1325,6 +1359,7 @@ pub fn prove_fast_core<Ch: Challenger>(
         lincheck_circuit,
         CommitCodeword::Allocate,
         None,
+        None,
         challenger,
     )
 }
@@ -1360,6 +1395,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         lincheck_circuit,
         commit_codeword,
         None,
+        None,
         challenger,
     )
 }
@@ -1375,6 +1411,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
+    ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
     challenger: &mut Ch,
 ) -> ProveCore {
     let padding = r1cs.padding_spec();
@@ -1396,6 +1433,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             tail_fill,
             identity_prefix_contract,
             stripe_help,
+            ab_producer,
         );
         if phase_timing {
             let wall = t_commit.elapsed().as_secs_f64() * 1e3;
@@ -1877,6 +1915,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
+        None,
         None,
         None,
         None,

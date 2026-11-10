@@ -207,6 +207,112 @@ impl Blake3IdentityPrefixWitness {
     }
 }
 
+/// Deferred A/B rows of a ranked streamed witness.
+///
+/// The ranked witness window is bound by memory traffic shared with the
+/// streamed Metal first pass, and only z is needed inside it.  When the
+/// driver defers, it writes z alone and returns this handle: `fill_quad`
+/// rebuilds the a and b rows of four consecutive compressions from the same
+/// inputs the driver used and stores them exactly as the eager driver would
+/// have.  The round-one AB precompute calls it once per quad, right before
+/// it transforms those rows (see
+/// `flock_core::zerocheck::univariate_skip_optimized::Round1AbProducer`).
+///
+/// The handle is minted only by the SIMD driver's exact ranked dead-stage
+/// arm (complete shape, all three provenance tokens, live Metal stream),
+/// so every skipped constant chunk of a and b is already in place.
+pub(crate) struct DeferredAb<'a> {
+    blocks: &'a [Compression],
+    spec_init: Option<u64>,
+    gen_ilp: bool,
+    a: *mut u32,
+    b: *mut u32,
+    n_quads: usize,
+}
+
+// SAFETY: `fill_quad` writes only the four blocks of its own quad; distinct
+// quads are disjoint, and the buffers outlive the handle (it borrows the
+// prove call that owns them).
+unsafe impl Send for DeferredAb<'_> {}
+unsafe impl Sync for DeferredAb<'_> {}
+
+impl DeferredAb<'_> {
+    /// Bytes of a (and of b) per quad.
+    pub(crate) const UNIT_BYTES: usize = 4 * (K / 8);
+
+    pub(crate) fn n_quads(&self) -> usize {
+        self.n_quads
+    }
+
+    /// Write the a and b rows of quad `q` (compressions `4q..4q+4`) into
+    /// the witness buffers; with non-null scratch pointers also write the
+    /// quad's complete a and b blocks (`UNIT_BYTES` each) there.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    pub(crate) fn fill_quad(&self, q: usize, a_scratch: *mut u8, b_scratch: *mut u8) {
+        assert!(q < self.n_quads);
+        assert_eq!(a_scratch.is_null(), b_scratch.is_null());
+        #[cfg(target_arch = "aarch64")]
+        {
+            use witgen_simd::QuadInput;
+            let first = 4 * q;
+            let words = Self::UNIT_BYTES / 4;
+            // SAFETY: quad `q` owns words `q * words .. (q + 1) * words` of
+            // both buffers (see the `Sync` impl); the scratch contract is
+            // the caller's.
+            let emit = |input: QuadInput<'_>| unsafe {
+                let a = self.a.add(q * words);
+                let b = self.b.add(q * words);
+                if a_scratch.is_null() {
+                    witgen_simd::build_quad_split_neon::<false, false>(
+                        input,
+                        std::ptr::null_mut(),
+                        a,
+                        b,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                } else {
+                    witgen_simd::build_quad_split_neon::<false, true>(
+                        input,
+                        std::ptr::null_mut(),
+                        a,
+                        b,
+                        a_scratch.cast::<u32>(),
+                        b_scratch.cast::<u32>(),
+                    );
+                }
+            };
+            // Same input selection as the driver's `process_group`.
+            match self.spec_init {
+                Some(init) if self.gen_ilp => {
+                    let seeded = crate::seed_pipe::gen_quad_soa(init, first);
+                    emit(QuadInput::Seeded(&seeded));
+                }
+                Some(init) => {
+                    let synth: [Compression; 4] = std::array::from_fn(|j| {
+                        crate::seed_pipe::gen_block_with(init, first + j, self.gen_ilp)
+                    });
+                    emit(QuadInput::Blocks(std::array::from_fn(|j| &synth[j])));
+                }
+                None => {
+                    emit(QuadInput::Blocks(std::array::from_fn(|j| &self.blocks[first + j])));
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        unreachable!("deferred A/B handles are minted by the aarch64 SIMD driver only");
+    }
+
+    /// Produce every quad now, without scratch copies (any route that does
+    /// not hand the producer to the AB precompute).
+    pub(crate) fn fill_all(&self) {
+        use rayon::prelude::*;
+        (0..self.n_quads).into_par_iter().with_min_len(64).for_each(|q| {
+            self.fill_quad(q, std::ptr::null_mut(), std::ptr::null_mut());
+        });
+    }
+}
+
 pub const SLOT_BITS: usize = 256; // 2^8, one 256-bit chaining value
 pub const CV_BASE: usize = 0; // input region, slot 0: [0, 256)
 pub const OUT_LO_BASE: usize = SLOT_BITS; // output region, slot 1: [256, 512)
@@ -2895,23 +3001,506 @@ pub(crate) mod witgen_simd {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Deferred A/B: split quad kernels.
+    //
+    // The ranked witness window is bound by memory traffic that the CPU
+    // (1.49 GB of non-temporal z/a/b stores) shares with the streamed Metal
+    // first pass.  Only z is needed inside that window: a and b are first
+    // read by the round-one AB precompute, which starts after it.  The two
+    // kernels below split the incumbent quad builder accordingly:
+    //
+    // * the z form packs only the z stream and publishes exactly the z
+    //   bytes of the ranked dead-stage arm;
+    // * the a/b form packs only the a and b streams.  It publishes exactly
+    //   the a and b bytes of the ranked dead-stage arm with non-temporal
+    //   stores and, when given a scratch, also writes the four complete a
+    //   and b blocks there with ordinary stores so that the AB precompute
+    //   can transform them from L1 instead of re-reading DRAM.
+    //
+    // Field for field the streams are the incumbent's; the tests pin both
+    // forms byte for byte against the incumbent full write.
+    // ------------------------------------------------------------------
+
+    /// `(sum, left, right)` of a lane-wise addition.  With
+    /// `cin = sum ^ x ^ y`, `left = x ^ cin = sum ^ y` and
+    /// `right = y ^ cin = sum ^ x`; the carry row is `left & right`.
+    /// Bit 31 of the rows is irrelevant exactly as in
+    /// [`add_carry_parts_v`].
+    #[inline(always)]
+    fn add_parts_v(x: V4, y: V4) -> (V4, V4, V4) {
+        unsafe {
+            let sum = vaddq_u32(x, y);
+            (sum, veorq_u32(sum, y), veorq_u32(sum, x))
+        }
+    }
+
+    /// Paired a/b bit-stream writer: the [`W32::push`] contract applied to
+    /// both streams at once (their field boundaries are identical).
+    struct W32Pair {
+        pa: V4,
+        pb: V4,
+        sa: *mut V4,
+        sb: *mut V4,
+    }
+
+    impl W32Pair {
+        #[inline(always)]
+        unsafe fn push<const USED: i32, const WIDTH: i32, const BACK: i32, const WORD: usize>(
+            &mut self,
+            va: V4,
+            vb: V4,
+        ) {
+            const {
+                assert!(USED >= 0 && USED < 32);
+                assert!(WIDTH == 31 || WIDTH == 32);
+                assert!(BACK >= 1 && BACK < 32);
+                assert!(WORD < U32_PER_BLOCK);
+            }
+            unsafe {
+                if USED == 0 {
+                    if WIDTH == 32 {
+                        vst1q_u32(self.sa.add(WORD) as *mut u32, va);
+                        vst1q_u32(self.sb.add(WORD) as *mut u32, vb);
+                        self.pa = vdupq_n_u32(0);
+                        self.pb = vdupq_n_u32(0);
+                    } else {
+                        self.pa = va;
+                        self.pb = vb;
+                    }
+                } else if USED + WIDTH < 32 {
+                    self.pa = vsliq_n_u32::<USED>(self.pa, va);
+                    self.pb = vsliq_n_u32::<USED>(self.pb, vb);
+                } else {
+                    let oa = vsliq_n_u32::<USED>(self.pa, va);
+                    let ob = vsliq_n_u32::<USED>(self.pb, vb);
+                    vst1q_u32(self.sa.add(WORD) as *mut u32, oa);
+                    vst1q_u32(self.sb.add(WORD) as *mut u32, ob);
+                    if USED + WIDTH == 32 {
+                        self.pa = vdupq_n_u32(0);
+                        self.pb = vdupq_n_u32(0);
+                    } else {
+                        self.pa = vshrq_n_u32::<BACK>(va);
+                        self.pb = vshrq_n_u32::<BACK>(vb);
+                    }
+                }
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn finish(&mut self) {
+            unsafe {
+                vst1q_u32(self.sa.add(LAST_WORD) as *mut u32, self.pa);
+                vst1q_u32(self.sb.add(LAST_WORD) as *mut u32, self.pb);
+            }
+        }
+    }
+
+    /// Non-temporal drain of dump chunks `g0..g1` (even `g0`) in which the
+    /// two 32-byte halves of every 64-byte destination line are stored back
+    /// to back, so no line stays half written while other lines are opened.
+    /// A trailing odd chunk is stored alone.  Same bytes as
+    /// [`dump_range::<true>`].
+    #[inline(always)]
+    unsafe fn dump_range_lines_nt(stage: *const V4, dst: *mut u32, g0: usize, g1: usize) {
+        debug_assert!(g0.is_multiple_of(2));
+        unsafe {
+            let mut g = g0;
+            while g + 2 <= g1 {
+                let w = 8 * g;
+                let x0 = vld4q_u32(stage.add(w) as *const u32);
+                let y0 = vld4q_u32(stage.add(w + 4) as *const u32);
+                let x1 = vld4q_u32(stage.add(w + 8) as *const u32);
+                let y1 = vld4q_u32(stage.add(w + 12) as *const u32);
+                store_nt_pair(x0.0, y0.0, dst.add(w));
+                store_nt_pair(x1.0, y1.0, dst.add(w + 8));
+                store_nt_pair(x0.1, y0.1, dst.add(U32_PER_BLOCK + w));
+                store_nt_pair(x1.1, y1.1, dst.add(U32_PER_BLOCK + w + 8));
+                store_nt_pair(x0.2, y0.2, dst.add(2 * U32_PER_BLOCK + w));
+                store_nt_pair(x1.2, y1.2, dst.add(2 * U32_PER_BLOCK + w + 8));
+                store_nt_pair(x0.3, y0.3, dst.add(3 * U32_PER_BLOCK + w));
+                store_nt_pair(x1.3, y1.3, dst.add(3 * U32_PER_BLOCK + w + 8));
+                g += 2;
+            }
+            if g < g1 {
+                dump_range::<true>(stage, dst, g, g1);
+            }
+        }
+    }
+
+    /// Sparse tail chunk 60 of one buffer: stage words 480..483 followed by
+    /// four zero words (the single-buffer half of
+    /// [`dump_ranked_sparse_za_tail_nt`]).
+    #[inline(always)]
+    unsafe fn dump_ranked_sparse_tail_nt(stage: *const V4, dst: *mut u32) {
+        unsafe {
+            let x = vld4q_u32(stage.add(RANKED_SPARSE_TAIL_WORD) as *const u32);
+            let zero = vdupq_n_u32(0);
+            store_nt_pair(x.0, zero, dst.add(RANKED_SPARSE_TAIL_WORD));
+            store_nt_pair(x.1, zero, dst.add(U32_PER_BLOCK + RANKED_SPARSE_TAIL_WORD));
+            store_nt_pair(x.2, zero, dst.add(2 * U32_PER_BLOCK + RANKED_SPARSE_TAIL_WORD));
+            store_nt_pair(x.3, zero, dst.add(3 * U32_PER_BLOCK + RANKED_SPARSE_TAIL_WORD));
+        }
+    }
+
+    /// Drain one complete 512-word stage twice: every dump chunk goes to
+    /// `scratch` with ordinary stores (the scratch is re-read from L1 at
+    /// once), then the chunks `nt0..nt1` (even `nt0`) plus, when
+    /// `sparse_tail` is set, the sparse tail chunk go to `dst` with
+    /// non-temporal stores.  The two passes stay separate: interleaving
+    /// ordinary and non-temporal stores chunk by chunk measured ~60% slower
+    /// for the whole kernel than two back-to-back passes over the L1 stage.
+    #[inline(always)]
+    unsafe fn dump_dual(
+        stage: *const V4,
+        scratch: *mut u32,
+        dst: *mut u32,
+        nt0: usize,
+        nt1: usize,
+        sparse_tail: bool,
+    ) {
+        unsafe {
+            dump_range::<false>(stage, scratch, 0, DUMP_CHUNKS);
+            dump_range_lines_nt(stage, dst, nt0, nt1);
+            if sparse_tail {
+                dump_ranked_sparse_tail_nt(stage, dst);
+            }
+        }
+    }
+
+    /// Split quad builder.  `WZ = true`: z only, the exact z bytes of the
+    /// ranked dead-stage arm of [`build_quad_witness_ab_stream_neon_elide`]
+    /// (chunks `0..60` plus the sparse tail chunk, non-temporal); `a`, `b`
+    /// and the scratch pointers are unused.  `WZ = false`: a and b only, the
+    /// exact a and b bytes of that arm (a: chunks `0..60` plus the sparse
+    /// tail chunk, b: chunks `4..59`, non-temporal); `z` is unused, and with
+    /// `SCRATCH` the four complete a blocks and b blocks (all 64 chunks,
+    /// constants included) are also written to `sa` / `sb`.
+    ///
+    /// # Safety
+    /// As [`build_quad_witness_ab_stream_neon_elide`] for the buffers the
+    /// selected form writes; the skipped constant chunks of those buffers
+    /// must already hold the per-block constants (token-certified).
+    /// `sa` / `sb` must each be valid for `4 * U32_PER_BLOCK` words when
+    /// `SCRATCH` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn build_quad_split_neon<const WZ: bool, const SCRATCH: bool>(
+        inputs: QuadInput<'_>,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        sa: *mut u32,
+        sb: *mut u32,
+    ) {
+        const {
+            assert!(!(WZ && SCRATCH));
+            assert!(RANKED_SPARSE_TAIL_CHUNK.is_multiple_of(2));
+            assert!(ELIDE_B_PREFIX_CHUNKS.is_multiple_of(2));
+        }
+        unsafe {
+            let (cv_v, m, tlo, thi, blen, flags) = match inputs {
+                QuadInput::Blocks(inputs) => {
+                    let ptrs = [
+                        inputs[0].0.as_ptr(),
+                        inputs[1].0.as_ptr(),
+                        inputs[2].0.as_ptr(),
+                        inputs[3].0.as_ptr(),
+                    ];
+                    let (cv0, cv1, cv2, cv3) = tr4(
+                        vld1q_u32(ptrs[0]),
+                        vld1q_u32(ptrs[1]),
+                        vld1q_u32(ptrs[2]),
+                        vld1q_u32(ptrs[3]),
+                    );
+                    let (cv4, cv5, cv6, cv7) = tr4(
+                        vld1q_u32(ptrs[0].add(4)),
+                        vld1q_u32(ptrs[1].add(4)),
+                        vld1q_u32(ptrs[2].add(4)),
+                        vld1q_u32(ptrs[3].add(4)),
+                    );
+                    let cv_v = [cv0, cv1, cv2, cv3, cv4, cv5, cv6, cv7];
+                    let mptrs = [
+                        inputs[0].1.as_ptr(),
+                        inputs[1].1.as_ptr(),
+                        inputs[2].1.as_ptr(),
+                        inputs[3].1.as_ptr(),
+                    ];
+                    let mut m: [V4; 16] = [cv0; 16];
+                    for wgrp in 0..4 {
+                        let (m0, m1, m2, m3) = tr4(
+                            vld1q_u32(mptrs[0].add(4 * wgrp)),
+                            vld1q_u32(mptrs[1].add(4 * wgrp)),
+                            vld1q_u32(mptrs[2].add(4 * wgrp)),
+                            vld1q_u32(mptrs[3].add(4 * wgrp)),
+                        );
+                        m[4 * wgrp] = m0;
+                        m[4 * wgrp + 1] = m1;
+                        m[4 * wgrp + 2] = m2;
+                        m[4 * wgrp + 3] = m3;
+                    }
+                    let mut tlo_a = [0u32; 4];
+                    let mut thi_a = [0u32; 4];
+                    let mut bl_a = [0u32; 4];
+                    let mut fl_a = [0u32; 4];
+                    for j in 0..4 {
+                        tlo_a[j] = inputs[j].2 as u32;
+                        thi_a[j] = (inputs[j].2 >> 32) as u32;
+                        bl_a[j] = inputs[j].3;
+                        fl_a[j] = inputs[j].4;
+                    }
+                    (
+                        cv_v,
+                        m,
+                        vld1q_u32(tlo_a.as_ptr()),
+                        vld1q_u32(thi_a.as_ptr()),
+                        vld1q_u32(bl_a.as_ptr()),
+                        vld1q_u32(fl_a.as_ptr()),
+                    )
+                }
+                QuadInput::Seeded(inputs) => {
+                    let cv_v = std::array::from_fn(|w| vld1q_u32(inputs.cv[w].as_ptr()));
+                    let m = std::array::from_fn(|w| vld1q_u32(inputs.message[w].as_ptr()));
+                    (
+                        cv_v,
+                        m,
+                        vld1q_u32(inputs.counter_lo.as_ptr()),
+                        vld1q_u32(inputs.counter_hi.as_ptr()),
+                        vld1q_u32(inputs.block_len.as_ptr()),
+                        vld1q_u32(inputs.flags.as_ptr()),
+                    )
+                }
+            };
+
+            let mut state: [V4; 16] = [
+                cv_v[0],
+                cv_v[1],
+                cv_v[2],
+                cv_v[3],
+                cv_v[4],
+                cv_v[5],
+                cv_v[6],
+                cv_v[7],
+                vdupq_n_u32(BLAKE3_IV[0]),
+                vdupq_n_u32(BLAKE3_IV[1]),
+                vdupq_n_u32(BLAKE3_IV[2]),
+                vdupq_n_u32(BLAKE3_IV[3]),
+                tlo,
+                thi,
+                blen,
+                flags,
+            ];
+
+            // L1 stages.  `za` is the z stage in the z form and the a stage
+            // in the a/b form (prefix, message and output words of z and a
+            // are identical); `bs` is used by the a/b form only.  Every
+            // stage word a drain reads is written first.
+            let zero = vdupq_n_u32(0);
+            let maxv = vdupq_n_u32(u32::MAX);
+            let one = vdupq_n_u32(1);
+            let mut za = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let mut bs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let za = za.as_mut_ptr().cast::<V4>();
+            let bs = bs.as_mut_ptr().cast::<V4>();
+
+            // ---- prefix: cv slot words 0..8 (z = a = cv) ----
+            for w in 0..8usize {
+                vst1q_u32(za.add(w) as *mut u32, cv_v[w]);
+            }
+            // b prefix words 0..36 = MAX.  Without a scratch only words
+            // 32..36 are ever read (the drain starts at chunk 4).
+            if !WZ {
+                let b0 = if SCRATCH {
+                    0
+                } else {
+                    8 * ELIDE_B_PREFIX_CHUNKS
+                };
+                for w in b0..36usize {
+                    vst1q_u32(bs.add(w) as *mut u32, maxv);
+                }
+            }
+            // Message region words 16..36 (z = a).
+            let chain: [V4; 20] = [
+                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
+                m[13], m[14], m[15], tlo, thi, blen, flags,
+            ];
+            vst1q_u32(
+                za.add(16) as *mut u32,
+                vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
+            );
+            for k in 1..20usize {
+                let w = vorrq_u32(vshrq_n_u32::<31>(chain[k - 1]), vshlq_n_u32::<1>(chain[k]));
+                vst1q_u32(za.add(16 + k) as *mut u32, w);
+            }
+
+            // ---- G stream ----
+            let pending_bit = vshrq_n_u32::<31>(flags);
+            let mut wz = W32::at(za, pending_bit);
+            let mut wab = W32Pair {
+                pa: pending_bit,
+                pb: one,
+                sa: za,
+                sb: bs,
+            };
+            // One addition: push its carry row (z form) or its left/right
+            // rows (a/b form) and yield the sum.
+            macro_rules! add {
+                ($pos:expr, $x:expr, $y:expr) => {{
+                    let (sum, l, r) = add_parts_v($x, $y);
+                    if WZ {
+                        pushf!(wz, $pos, 31, vandq_u32(l, r));
+                    } else {
+                        wab.push::<{ ($pos % 32) as i32 }, 31, {
+                            let u = ($pos % 32) as i32;
+                            if u == 0 { 1 } else { 32 - u }
+                        }, { $pos / 32 }>(l, r);
+                    }
+                    sum
+                }};
+            }
+            // One full-width identity row: z = a = value, b = MAX.
+            macro_rules! lin {
+                ($pos:expr, $v:expr) => {{
+                    if WZ {
+                        pushf!(wz, $pos, 32, $v);
+                    } else {
+                        wab.push::<{ ($pos % 32) as i32 }, 32, {
+                            let u = ($pos % 32) as i32;
+                            if u == 0 { 1 } else { 32 - u }
+                        }, { $pos / 32 }>($v, maxv);
+                    }
+                }};
+            }
+            macro_rules! g {
+                ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
+                 $mx:literal, $my:literal) => {{
+                    let t0 = add!(GS_BASE + G_STRIDE * $g + REC_C0, state[$la], state[$lb]);
+                    let a1 = add!(GS_BASE + G_STRIDE * $g + REC_C1, t0, m[$mx]);
+                    let d1 = xor_rotr::<16, 16>(state[$ld], a1);
+                    let c1s = add!(GS_BASE + G_STRIDE * $g + REC_C2, state[$lc], d1);
+                    let b1 = xor_rotr::<12, 20>(state[$lb], c1s);
+                    let t1 = add!(GS_BASE + G_STRIDE * $g + REC_C3, a1, b1);
+                    let a2 = add!(GS_BASE + G_STRIDE * $g + REC_C4, t1, m[$my]);
+                    let d2 = xor_rotr::<8, 24>(d1, a2);
+                    let c2s = add!(GS_BASE + G_STRIDE * $g + REC_C5, c1s, d2);
+                    let bn = xor_rotr::<7, 25>(b1, c2s);
+                    lin!(GS_BASE + G_STRIDE * $g + REC_LIN0, bn);
+                    lin!(GS_BASE + G_STRIDE * $g + REC_LIN1, d2);
+                    state[$la] = a2;
+                    state[$lb] = bn;
+                    state[$lc] = c2s;
+                    state[$ld] = d2;
+                }};
+            }
+            macro_rules! round {
+                ($gb:literal, $m0:literal, $m1:literal, $m2:literal, $m3:literal,
+                 $m4:literal, $m5:literal, $m6:literal, $m7:literal,
+                 $m8:literal, $m9:literal, $m10:literal, $m11:literal,
+                 $m12:literal, $m13:literal, $m14:literal, $m15:literal) => {{
+                    g!($gb, 0, 4, 8, 12, $m0, $m1);
+                    g!($gb + 1, 1, 5, 9, 13, $m2, $m3);
+                    g!($gb + 2, 2, 6, 10, 14, $m4, $m5);
+                    g!($gb + 3, 3, 7, 11, 15, $m6, $m7);
+                    g!($gb + 4, 0, 5, 10, 15, $m8, $m9);
+                    g!($gb + 5, 1, 6, 11, 12, $m10, $m11);
+                    g!($gb + 6, 2, 7, 8, 13, $m12, $m13);
+                    g!($gb + 7, 3, 4, 9, 14, $m14, $m15);
+                }};
+            }
+            round!(0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+            round!(8, 2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8);
+            round!(16, 3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1);
+            round!(24, 10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6);
+            round!(32, 12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4);
+            round!(40, 9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7);
+            round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
+
+            // ---- out_hi, stream-sequential (z = a, b = MAX) ----
+            const {
+                assert!(OUT_HI_BASE % 32 == 17);
+            }
+            macro_rules! oh {
+                ($w:literal) => {{
+                    let hv = veorq_u32(state[$w + 8], cv_v[$w]);
+                    lin!(OUT_HI_BASE + 32 * $w, hv);
+                }};
+            }
+            oh!(0);
+            oh!(1);
+            oh!(2);
+            oh!(3);
+            oh!(4);
+            oh!(5);
+            oh!(6);
+            oh!(7);
+            if WZ {
+                wz.finish();
+            } else {
+                wab.finish();
+            }
+
+            // ---- zero fill behind the last useful word ----
+            const {
+                assert!(U32_PER_BLOCK - ZERO_FILL_WORD == 30);
+                assert!(ZERO_FILL_WORD == RANKED_SPARSE_TAIL_WORD + 2);
+            }
+            if SCRATCH {
+                // Complete stages: the scratch receives every chunk.
+                for w in 0..30usize {
+                    vst1q_u32(za.add(ZERO_FILL_WORD + w) as *mut u32, zero);
+                    vst1q_u32(bs.add(ZERO_FILL_WORD + w) as *mut u32, zero);
+                }
+            } else {
+                // The sparse tail publisher reads words 480..483 only.
+                vst1q_u32(za.add(ZERO_FILL_WORD) as *mut u32, zero);
+                vst1q_u32(za.add(ZERO_FILL_WORD + 1) as *mut u32, zero);
+            }
+
+            // ---- out_lo slot, words 8..16 (z = a) ----
+            for w in 0..8usize {
+                let lo = veorq_u32(state[w], state[w + 8]);
+                vst1q_u32(za.add(8 + w) as *mut u32, lo);
+            }
+
+            // ---- drain ----
+            if WZ {
+                dump_range_lines_nt(za, z, 0, RANKED_SPARSE_TAIL_CHUNK);
+                dump_ranked_sparse_tail_nt(za, z);
+            } else if SCRATCH {
+                dump_dual(za, sa, a, 0, RANKED_SPARSE_TAIL_CHUNK, true);
+                dump_dual(bs, sb, b, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK, false);
+            } else {
+                dump_range_lines_nt(za, a, 0, RANKED_SPARSE_TAIL_CHUNK);
+                dump_ranked_sparse_tail_nt(za, a);
+                dump_range_lines_nt(bs, b, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK);
+            }
+        }
+    }
+
     /// SIMD counterpart of `drive_witness_packed_and_lincheck_impl`
     /// (PER_BLOCK_FULLY_WRITES, no rate-2 codeword): same scratch pools, same
     /// process_group shape, same optional Metal band streaming, same stripe
     /// pass; the per-block builder runs as two NEON quads per group and the
     /// a/b/stripe stores are non-temporal (§14; z stays plain, §16).
+    ///
+    /// `allow_defer_ab`: the caller can complete deferred A/B rows.  When
+    /// set and the exact ranked dead-stage arm is selected, only z is
+    /// written here and the returned handle produces a and b later
+    /// ([`super::DeferredAb`]); `FLOCK_NO_WITGEN_DEFER_AB` keeps the
+    /// incumbent three-stream kernel.
     #[allow(clippy::type_complexity)]
-    fn generate_impl(
-        blocks: &[Compression],
+    fn generate_impl<'a>(
+        blocks: &'a [Compression],
         n_blocks_log: usize,
         stream_params: Option<&flock_core::pcs::PcsParams>,
         defer_ranked_stripe: bool,
+        allow_defer_ab: bool,
     ) -> (
         Vec<F128>,
         Vec<F128>,
         Vec<F128>,
         Option<Vec<u8>>,
         Option<flock_core::gpu_commit::FromZFirstPassStream>,
+        Option<super::DeferredAb<'a>>,
     ) {
         let n_total = 1usize << n_blocks_log;
         let n_blocks = blocks.len();
@@ -3029,6 +3618,39 @@ pub(crate) mod witgen_simd {
             elide,
         );
 
+        // Deferred A/B: z only here; a and b are produced by the handle
+        // returned below.  Tied to the ranked dead-stage arm, whose gate
+        // (all tokens, NT stores, live stream, deferred stripe, complete
+        // shape) is exactly what the split kernels assume.
+        let defer_ab = allow_defer_ab && ranked_dead_stage && defer_ab_enabled();
+        debug_assert!(!defer_ab || (stripe_base.is_none() && n_blocks == n_total));
+        // One quad through the selected kernel.
+        let emit_quad = |input: QuadInput<'_>, z: *mut u32, a: *mut u32, b: *mut u32| {
+            // SAFETY: the caller passes its own quad's block slots.
+            unsafe {
+                if defer_ab {
+                    build_quad_split_neon::<true, false>(
+                        input,
+                        z,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                } else {
+                    build_quad_witness_ab_stream_neon_elide(
+                        input,
+                        z,
+                        a,
+                        b,
+                        z_nt,
+                        nt,
+                        elide,
+                        ranked_dead_stage,
+                    );
+                }
+            }
+        };
         let process_group = |g: usize| {
             // SAFETY: each scheduled group index occurs exactly once. Every
             // group owns disjoint z/a/b ranges and one disjoint stripe.
@@ -3055,20 +3677,14 @@ pub(crate) mod witgen_simd {
                 if let Some(init) = spec_init {
                     if gen_ilp && first + 4 <= n_blocks {
                         let seeded = crate::seed_pipe::gen_quad_soa(init, first);
-                        // SAFETY: each quad fully owns its four block slots in
-                        // every buffer; groups are disjoint across workers.
-                        unsafe {
-                            build_quad_witness_ab_stream_neon_elide(
-                                QuadInput::Seeded(&seeded),
-                                z_grp[base..].as_mut_ptr() as *mut u32,
-                                a_grp[base..].as_mut_ptr() as *mut u32,
-                                b_grp[base..].as_mut_ptr() as *mut u32,
-                                z_nt,
-                                nt,
-                                elide,
-                                ranked_dead_stage,
-                            );
-                        }
+                        // Each quad fully owns its four block slots in every
+                        // buffer; groups are disjoint across workers.
+                        emit_quad(
+                            QuadInput::Seeded(&seeded),
+                            z_grp[base..].as_mut_ptr() as *mut u32,
+                            a_grp[base..].as_mut_ptr() as *mut u32,
+                            b_grp[base..].as_mut_ptr() as *mut u32,
+                        );
                         continue;
                     }
                 }
@@ -3097,20 +3713,14 @@ pub(crate) mod witgen_simd {
                         }
                     })
                 };
-                // SAFETY: each quad fully owns its four block slots in every
-                // buffer; groups are disjoint across workers.
-                unsafe {
-                    build_quad_witness_ab_stream_neon_elide(
-                        QuadInput::Blocks(quad),
-                        z_grp[base..].as_mut_ptr() as *mut u32,
-                        a_grp[base..].as_mut_ptr() as *mut u32,
-                        b_grp[base..].as_mut_ptr() as *mut u32,
-                        z_nt,
-                        nt,
-                        elide,
-                        ranked_dead_stage,
-                    );
-                }
+                // Each quad fully owns its four block slots in every buffer;
+                // groups are disjoint across workers.
+                emit_quad(
+                    QuadInput::Blocks(quad),
+                    z_grp[base..].as_mut_ptr() as *mut u32,
+                    a_grp[base..].as_mut_ptr() as *mut u32,
+                    b_grp[base..].as_mut_ptr() as *mut u32,
+                );
             }
             if let Some(stripe_base) = stripe_base {
                 // Bit-transpose 8 z chunks into the lincheck stripe
@@ -3384,7 +3994,26 @@ pub(crate) mod witgen_simd {
             );
         }
 
-        (z, a, b, z_lincheck, stream)
+        // The a/b tokens staged above describe the buffers once the handle
+        // has produced every quad, which the prover guarantees before it
+        // gives them back.
+        let deferred = defer_ab.then(|| super::DeferredAb {
+            blocks,
+            spec_init,
+            gen_ilp,
+            a: a.as_mut_ptr() as *mut u32,
+            b: b.as_mut_ptr() as *mut u32,
+            n_quads: n_total / 4,
+        });
+        (z, a, b, z_lincheck, stream, deferred)
+    }
+
+    /// `FLOCK_NO_WITGEN_DEFER_AB` (any value) keeps a and b in the witness
+    /// window: the exact same-binary control for deferred A/B.
+    fn defer_ab_enabled() -> bool {
+        static ON: LazyLock<bool> =
+            LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_DEFER_AB").is_none());
+        *ON
     }
 
     /// Non-streamed entry (matches `drive_witness_packed_and_lincheck_full_write`).
@@ -3392,8 +4021,9 @@ pub(crate) mod witgen_simd {
         blocks: &[Compression],
         n_blocks_log: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
-        let (z, a, b, stripe, stream) = generate_impl(blocks, n_blocks_log, None, false);
-        debug_assert!(stream.is_none());
+        let (z, a, b, stripe, stream, deferred) =
+            generate_impl(blocks, n_blocks_log, None, false, false);
+        debug_assert!(stream.is_none() && deferred.is_none());
         (
             z,
             a,
@@ -3416,7 +4046,30 @@ pub(crate) mod witgen_simd {
         Option<Vec<u8>>,
         Option<flock_core::gpu_commit::FromZFirstPassStream>,
     ) {
-        generate_impl(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe)
+        let (z, a, b, stripe, stream, deferred) =
+            generate_impl(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe, false);
+        debug_assert!(deferred.is_none());
+        (z, a, b, stripe, stream)
+    }
+
+    /// [`generate_streamed`] for a caller that completes deferred A/B rows:
+    /// when the last value is `Some`, a and b hold only their per-block
+    /// constants until the handle has produced every quad.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn generate_streamed_deferred_ab<'a>(
+        blocks: &'a [Compression],
+        n_blocks_log: usize,
+        pcs_params: &flock_core::pcs::PcsParams,
+        defer_ranked_stripe: bool,
+    ) -> (
+        Vec<F128>,
+        Vec<F128>,
+        Vec<F128>,
+        Option<Vec<u8>>,
+        Option<flock_core::gpu_commit::FromZFirstPassStream>,
+        Option<super::DeferredAb<'a>>,
+    ) {
+        generate_impl(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe, true)
     }
 }
 
@@ -3625,6 +4278,35 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
 #[inline]
 fn should_request_ranked_exact_tune(call: usize, ranked_shape_enabled: bool) -> bool {
     call == 0 && ranked_shape_enabled
+}
+
+/// [`generate_witness_with_ab_packed_and_lincheck_streamed`] for the prover
+/// entry that can complete deferred A/B rows (see [`DeferredAb`]).
+#[allow(clippy::type_complexity)]
+fn generate_witness_with_ab_packed_and_lincheck_streamed_deferred_ab<'a>(
+    blocks: &'a [Compression],
+    n_blocks_log: usize,
+    pcs_params: &PcsParams,
+) -> (
+    Vec<F128>,
+    Vec<F128>,
+    Vec<F128>,
+    Option<Vec<u8>>,
+    Option<flock_core::gpu_commit::FromZFirstPassStream>,
+    Option<DeferredAb<'a>>,
+) {
+    #[cfg(target_arch = "aarch64")]
+    if witgen_simd::enabled() {
+        return witgen_simd::generate_streamed_deferred_ab(
+            blocks,
+            n_blocks_log,
+            pcs_params,
+            use_deferred_ranked_lincheck_stripe(n_blocks_log, pcs_params),
+        );
+    }
+    let (z, a, b, stripe, stream) =
+        generate_witness_with_ab_packed_and_lincheck_streamed(blocks, n_blocks_log, pcs_params);
+    (z, a, b, stripe, stream, None)
 }
 
 fn generate_witness_with_ab_packed_and_lincheck_streamed(
@@ -4049,13 +4731,51 @@ impl Blake3Setup {
                 let cpu_wit = phase_timing.then(crate::prover::process_cpu_ms);
                 let t_wit = std::time::Instant::now();
                 flock_core::tmark::mark("witgen start");
-                let (z_packed, a_packed_f128, b_packed_f128, z_packed_lincheck, gpu_first_pass) =
-                    generate_witness_with_ab_packed_and_lincheck_streamed(
-                        blocks,
-                        self.n_blocks_log(),
-                        &self.pcs_params,
-                    );
+                let (
+                    z_packed,
+                    a_packed_f128,
+                    b_packed_f128,
+                    z_packed_lincheck,
+                    gpu_first_pass,
+                    deferred_ab,
+                ) = generate_witness_with_ab_packed_and_lincheck_streamed_deferred_ab(
+                    blocks,
+                    self.n_blocks_log(),
+                    &self.pcs_params,
+                );
                 flock_core::tmark::mark("witgen end");
+                // Deferred A/B rows are produced inside the round-one AB
+                // precompute of the deferred-stripe route below; every other
+                // route gets complete buffers first.
+                let ab_produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8| {
+                    if let Some(deferred) = &deferred_ab {
+                        deferred.fill_quad(unit, a_scratch, b_scratch);
+                    }
+                };
+                let ab_producer = match &deferred_ab {
+                    Some(deferred) if gpu_first_pass.is_some() && z_packed_lincheck.is_none() => {
+                        debug_assert_eq!(
+                            deferred.n_quads() * DeferredAb::UNIT_BYTES,
+                            a_packed_f128.len() * std::mem::size_of::<F128>()
+                        );
+                        Some(flock_core::zerocheck::univariate_skip_optimized::Round1AbProducer {
+                            unit_bytes: DeferredAb::UNIT_BYTES,
+                            produce: &ab_produce,
+                        })
+                    }
+                    Some(deferred) => {
+                        deferred.fill_all();
+                        None
+                    }
+                    None => None,
+                };
+                if phase_timing {
+                    eprintln!(
+                        "[phase-timing] deferred a/b: handle={} producer={}",
+                        deferred_ab.is_some(),
+                        ab_producer.is_some()
+                    );
+                }
                 // Witness work is all handed out; the hot pool spin (ready→seed
                 // gap + witness phase) ends here.
                 flock_core::cpu_keepalive::pool_spin_release();
@@ -4103,6 +4823,7 @@ impl Blake3Setup {
                             codeword,
                             stream,
                             identity_prefix_witness,
+                            ab_producer,
                             challenger,
                         ),
                     };
@@ -5171,6 +5892,223 @@ mod tests {
             assert_eq!(z, z_ref);
             assert_eq!(a, a_ref);
             assert_eq!(b, b_ref);
+        }
+    }
+
+    /// Deferred A/B: the split quad kernels write exactly the bytes of the
+    /// incumbent builder.  The z form's z, and the a/b form's a and b (with
+    /// and without scratch), equal the ranked dead-stage arm on buffers that
+    /// already hold a previous witness; all equal a full non-elided write;
+    /// and the scratch receives the four complete a and b blocks.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn split_quad_kernels_match_incumbent() {
+        use super::witgen_simd::{self, QuadInput};
+        const U32S: usize = 4 * (K / 32);
+        let full = |input: QuadInput<'_>, z: &mut [u32], a: &mut [u32], b: &mut [u32]| unsafe {
+            witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                input,
+                z.as_mut_ptr(),
+                a.as_mut_ptr(),
+                b.as_mut_ptr(),
+                false,
+                false,
+                [false; 3],
+                false,
+            );
+        };
+        let mut rng = Rng::new(0x5eed_2a4d_0002);
+        let mut checked = 0usize;
+        for case in 0..64usize {
+            // A previous witness of the same layout sits in the buffers: the
+            // token-elided constant chunks are never rewritten.
+            let init_prev = u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32());
+            let prev = crate::seed_pipe::gen_quad_soa(init_prev, 4 * case);
+            let mut pz = vec![0u32; U32S];
+            let mut pa = vec![0u32; U32S];
+            let mut pb = vec![0u32; U32S];
+            full(QuadInput::Seeded(&prev), &mut pz, &mut pa, &mut pb);
+
+            let init = u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32());
+            let seeded = crate::seed_pipe::gen_quad_soa(init, 4 * (case * 977 % 65_536));
+            let mut blocks: [Compression; 4] = std::array::from_fn(|_| {
+                (
+                    std::array::from_fn(|_| rng.next_u32()),
+                    std::array::from_fn(|_| rng.next_u32()),
+                    u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32()),
+                    rng.next_u32(),
+                    rng.next_u32(),
+                )
+            });
+            match case % 4 {
+                1 => blocks[0] = ([u32::MAX; 8], [u32::MAX; 16], u64::MAX, u32::MAX, u32::MAX),
+                2 => blocks[1] = ([0; 8], [0; 16], 0, 0, 0),
+                3 => blocks[2] = ([0x8000_0000; 8], [0x7fff_ffff; 16], 1 << 63, 1 << 31, 1 << 31),
+                _ => {}
+            }
+            let block_refs: [&Compression; 4] = std::array::from_fn(|j| &blocks[j]);
+            for seeded_path in [true, false] {
+                let input = || {
+                    if seeded_path {
+                        QuadInput::Seeded(&seeded)
+                    } else {
+                        QuadInput::Blocks(block_refs)
+                    }
+                };
+                let mut truth = (vec![0u32; U32S], vec![0u32; U32S], vec![0u32; U32S]);
+                full(input(), &mut truth.0, &mut truth.1, &mut truth.2);
+                // The incumbent ranked arm on the pre-filled buffers is the
+                // byte reference for the split forms.
+                let (mut rz, mut ra, mut rb) = (pz.clone(), pa.clone(), pb.clone());
+                unsafe {
+                    witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                        input(),
+                        rz.as_mut_ptr(),
+                        ra.as_mut_ptr(),
+                        rb.as_mut_ptr(),
+                        true,
+                        true,
+                        [true; 3],
+                        true,
+                    );
+                }
+                assert_eq!((&rz, &ra, &rb), (&truth.0, &truth.1, &truth.2));
+
+                // z form: z only; a and b untouched.
+                let (mut z, mut a, mut b) = (pz.clone(), pa.clone(), pb.clone());
+                unsafe {
+                    witgen_simd::build_quad_split_neon::<true, false>(
+                        input(),
+                        z.as_mut_ptr(),
+                        a.as_mut_ptr(),
+                        b.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                }
+                assert_eq!(z, truth.0, "z case={case} seeded={seeded_path}");
+                assert_eq!(a, pa, "z form touched a");
+                assert_eq!(b, pb, "z form touched b");
+
+                // a/b form without scratch: completes the same buffers.
+                unsafe {
+                    witgen_simd::build_quad_split_neon::<false, false>(
+                        input(),
+                        z.as_mut_ptr(),
+                        a.as_mut_ptr(),
+                        b.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                }
+                assert_eq!(z, truth.0, "a/b form touched z");
+                assert_eq!(a, truth.1, "a case={case} seeded={seeded_path}");
+                assert_eq!(b, truth.2, "b case={case} seeded={seeded_path}");
+
+                // a/b form with scratch: same published bytes, and the
+                // scratch (stale garbage before) holds the complete blocks.
+                let (mut a2, mut b2) = (pa.clone(), pb.clone());
+                let mut sa = vec![0xdead_beefu32; U32S];
+                let mut sb = vec![0x0bad_f00du32; U32S];
+                unsafe {
+                    witgen_simd::build_quad_split_neon::<false, true>(
+                        input(),
+                        std::ptr::null_mut(),
+                        a2.as_mut_ptr(),
+                        b2.as_mut_ptr(),
+                        sa.as_mut_ptr(),
+                        sb.as_mut_ptr(),
+                    );
+                }
+                assert_eq!(a2, truth.1, "a (scratch form) case={case} seeded={seeded_path}");
+                assert_eq!(b2, truth.2, "b (scratch form) case={case} seeded={seeded_path}");
+                assert_eq!(sa, truth.1, "a scratch case={case} seeded={seeded_path}");
+                assert_eq!(sb, truth.2, "b scratch case={case} seeded={seeded_path}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 64 * 2);
+    }
+
+    /// Alternating timing probe for the split quad kernels (ignored).
+    /// Modes: 0 = incumbent ranked three-stream kernel, 1 = z form,
+    /// 2 = a/b form without scratch, 3 = a/b form with an L1 scratch.
+    /// Streams the ranked store shape through large buffers.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "timing probe"]
+    fn split_quad_timing() {
+        use super::witgen_simd::{self, QuadInput};
+        const U32S: usize = 4 * (K / 32);
+        const MODES: usize = 4;
+        let init = 0x1234_5678_9abc_def0u64;
+        let run_quad = |mode: usize, first: usize, z: *mut u32, a: *mut u32, b: *mut u32, s: *mut u32| unsafe {
+            let seeded = crate::seed_pipe::gen_quad_soa(init, first);
+            let input = QuadInput::Seeded(&seeded);
+            match mode {
+                0 => witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                    input, z, a, b, true, true, [true; 3], true,
+                ),
+                1 => witgen_simd::build_quad_split_neon::<true, false>(
+                    input, z, a, b, std::ptr::null_mut(), std::ptr::null_mut(),
+                ),
+                2 => witgen_simd::build_quad_split_neon::<false, false>(
+                    input, z, a, b, std::ptr::null_mut(), std::ptr::null_mut(),
+                ),
+                _ => witgen_simd::build_quad_split_neon::<false, true>(input, z, a, b, s, s.add(U32S)),
+            }
+        };
+        let rounds: usize = std::env::var("SPLIT_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(9);
+        let thread_list: Vec<usize> = std::env::var("SPLIT_THREADS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_else(|| vec![1, 2, 4, 10]);
+        let per_thread_quads = 1usize << 12;
+        for threads in thread_list {
+            let n = threads * per_thread_quads;
+            let mut zb = vec![0u32; n * U32S];
+            let mut ab = vec![0u32; n * U32S];
+            let mut bb = vec![0u32; n * U32S];
+            let (zp, ap, bp) = (zb.as_mut_ptr() as usize, ab.as_mut_ptr() as usize, bb.as_mut_ptr() as usize);
+            let mut samples: [Vec<f64>; MODES] = std::array::from_fn(|_| Vec::new());
+            for round in 0..rounds + 1 {
+                for k in 0..MODES {
+                    let mode = (k + round) % MODES;
+                    let t = std::time::Instant::now();
+                    std::thread::scope(|sc| {
+                        for th in 0..threads {
+                            let run_quad = &run_quad;
+                            sc.spawn(move || {
+                                let mut scratch = vec![0u32; 2 * U32S];
+                                for q in th * per_thread_quads..(th + 1) * per_thread_quads {
+                                    run_quad(
+                                        mode,
+                                        4 * q,
+                                        (zp as *mut u32).wrapping_add(q * U32S),
+                                        (ap as *mut u32).wrapping_add(q * U32S),
+                                        (bp as *mut u32).wrapping_add(q * U32S),
+                                        scratch.as_mut_ptr(),
+                                    );
+                                }
+                            });
+                        }
+                    });
+                    let ns = t.elapsed().as_nanos() as f64 / per_thread_quads as f64;
+                    if round > 0 {
+                        samples[mode].push(ns);
+                    }
+                }
+            }
+            for (mode, v) in samples.iter_mut().enumerate() {
+                v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                eprintln!(
+                    "[split-probe] threads={threads} mode={mode}: min {:.1} median {:.1} max {:.1} ns/quad per thread",
+                    v[0],
+                    v[v.len() / 2],
+                    v[v.len() - 1]
+                );
+            }
+            std::hint::black_box((&mut zb, &mut ab, &mut bb));
         }
     }
 
