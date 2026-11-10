@@ -524,8 +524,9 @@ pub(super) fn accumulate_convert_ab(
 /// current chunk's high `x_lo` bits, and `bank` is the accumulator for its low
 /// `x_lo` bits; the caller applies `eq_bot[u]` to each bank once per `x_hi`
 /// band. Same gathers as the incumbent, zero GHASH multiplies.
+///
 #[inline]
-pub(super) fn accumulate_convert_ab_nomul(
+pub(super) fn accumulate_convert_ab_nomul<const STORE: bool>(
     chunk_ab_bytes: &[[u8; 64]; 16],
     first_b_med: usize,
     n_b_med: usize,
@@ -537,7 +538,18 @@ pub(super) fn accumulate_convert_ab_nomul(
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
     // every table-selected load and every bank slot drained.
     unsafe {
-        aarch64::accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+        aarch64::accumulate_convert_ab_nomul::<STORE>(
+            chunk_ab_bytes,
+            first_b_med,
+            n_b_med,
+            convert,
+            bank,
+        );
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    if STORE {
+        bank.fill(super::F128::ZERO);
     }
 
     #[cfg(all(

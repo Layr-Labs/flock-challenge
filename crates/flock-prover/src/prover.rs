@@ -1927,8 +1927,13 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     fixed_root_rows.is_some(),
                     &input_mismatch,
                 );
-                let produce = |unit: usize, a: *mut u8, b: *mut u8| {
-                    (base.produce)(unit, a, b);
+                // `primed` is forwarded unchanged: a primed fill leaves only
+                // the per-block constant scratch chunks (a 61..64, b 0..4 and
+                // 59..64) from this worker's earlier complete fill, so the
+                // scratch the emitter reads below is the complete quad either
+                // way.
+                let produce = |unit: usize, a: *mut u8, b: *mut u8, primed: bool| {
+                    (base.produce)(unit, a, b, primed);
                     emitter.emit(unit, a, b);
                 };
                 let finish = || {
