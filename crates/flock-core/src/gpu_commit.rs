@@ -7980,7 +7980,9 @@ kernel void blake3_pow_scan(
     /// fallback on its own, since it may have measured slowest. The published
     /// share is still byte-checked against the CPU commit.
     fn choose_hybrid_k(candidates: &[usize], best_ms: &[f64], default_k: usize) -> Option<usize> {
-        // Near-tie band: 2.0% (was 1.5%). With graph-arm scoring the band
+        // Near-tie band: 1.0% (was 2.0%, before that 1.5%); with k=1 in the
+        // sweep the candidates are closer together, so a narrower band keeps
+        // the measured minimum. With graph-arm scoring the band
         // adjudicates real k differences rather than AB-dominated join noise,
         // so a slightly wider GPU-ward bias is safe and prefers the smaller
         // CPU share when margins are thin. `FLOCK_HYBRID_TIE_BAND=0.015`
@@ -7989,7 +7991,7 @@ kernel void blake3_pow_scan(
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0 && *v < 0.1)
-            .unwrap_or(0.02);
+            .unwrap_or(0.01);
         let keep_default = std::env::var_os("FLOCK_HYBRID_KEEP_DEFAULT_BAND").is_some();
         choose_hybrid_k_with(candidates, best_ms, default_k, tie, keep_default)
     }
@@ -8043,9 +8045,11 @@ kernel void blake3_pow_scan(
     /// AB-dominated samples — so it re-enters between pure-GPU and k=3.
     /// k=4 fills the gap between k=3 and the default: a GPU-heavy host whose
     /// balanced split sits between the two otherwise rounds to one side.
-    /// Five candidates × 2 reverse-order samples, all in the untimed warmup,
+    /// k=1 (one sixteenth on the CPU) sits between pure-GPU and k=2: on a
+    /// GPU-strong host (M3 Max class) the balanced split falls there.
+    /// Six candidates × 2 reverse-order samples, all in the untimed warmup,
     /// is still well inside the 10-minute job wall at ~120 workers.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 5] = [0, 2, 3, 4, 5];
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 6] = [0, 1, 2, 3, 4, 5];
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
