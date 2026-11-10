@@ -1020,6 +1020,16 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
 /// A witness generator may hand the prover A/B buffers whose rows are not
 /// written yet, together with this producer.  The buffers are cut into
 /// units of `unit_bytes` bytes of A (and the same range of B); a multiple of
+/// the precompute's 1 KiB outer chunk.
+/// `produce(unit, a_scratch, b_scratch, primed)` must materialise unit
+/// `unit` of both buffers (bytes `unit * unit_bytes .. (unit + 1) *
+/// unit_bytes`), exactly as the eager generator would have left them.  When
+/// the scratch pointers are non-null, the scratch pair must also hold those
+/// same `unit_bytes` bytes of A and of B when it returns.  `primed` says the
+/// pair was last filled by this same producer, so bytes that are the same
+/// for every unit may be left in place; with `primed == false` every byte
+/// must be written.  It must be callable concurrently for distinct units
+/// from any thread.
 ///
 /// The precompute calls it exactly once per unit before it returns, so both
 /// buffers are complete for every later reader (zerocheck round two).  On
@@ -1042,6 +1052,13 @@ fn zc_ab_producer_fused_enabled() -> bool {
         std::env::var_os(ENV_NO_ZC_AB_PRODUCER_FUSED).as_deref()
             != Some(std::ffi::OsStr::new("1"))
     })
+}
+
+/// Whether [`precompute_round1_ab_inner_packed_padded_produced`] takes the
+/// fused arm, i.e. calls the producer with worker scratch, one job's units
+/// in ascending order on one thread, every job starting at an even unit.
+pub fn zc_ab_producer_fused_active() -> bool {
+    zc_ab_producer_fused_enabled() && zc_ab_pre_hetero_enabled()
 }
 
 /// [`precompute_round1_ab_inner_packed_padded_with_tail`] for A/B buffers
@@ -1487,11 +1504,19 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         assert!(unit_chunks > 0 && unit_bytes.is_multiple_of(OUTER_BYTES));
         assert!(n_chunks.is_multiple_of(unit_chunks));
         let n_units = n_chunks / unit_chunks;
-        let units_per_job = (chunks_per_job / unit_chunks).max(1);
+        // Even, so unit pairs (2u, 2u + 1) always share a job and a thread
+        // (the producer may pair them; see `zc_ab_producer_fused_active`).
+        // 42 at the ranked shape, unchanged.
+        let units_per_job = match chunks_per_job / unit_chunks {
+            0 | 1 => 1,
+            u => u & !1,
+        };
         let n_jobs = n_units.div_ceil(units_per_job);
         crate::epool::run_hetero_chunks_stateful_with_tail(
             n_jobs,
             || {
+                #[cfg(target_arch = "aarch64")]
+                kernels::aarch64::ab_kara_note_worker();
                 (
                     [F8::ZERO; ELL],
                     [F8::ZERO; ELL],
@@ -1540,7 +1565,11 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     let n_jobs = n_chunks.div_ceil(chunks_per_job);
     crate::epool::run_hetero_chunks_stateful_with_tail(
         n_jobs,
-        || ([F8::ZERO; ELL], [F8::ZERO; ELL]),
+        || {
+            #[cfg(target_arch = "aarch64")]
+            kernels::aarch64::ab_kara_note_worker();
+            ([F8::ZERO; ELL], [F8::ZERO; ELL])
+        },
         |(a_col, b_col), job| {
             let chunk_start = job * chunks_per_job;
             let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
@@ -1703,16 +1732,31 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     let (run_lo, run_hi) = (ab_end, ab_end);
     #[cfg(target_arch = "aarch64")]
     if let Some((_, _, partials)) = static_run {
-        kernels::aarch64::bstatic_horner_window_rows(
-            within_hash_outer,
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            partials,
-            out_outer,
-            direct,
-        );
+        // Same rows, same bytes: the Karatsuba table apply (18 loads per
+        // word) or, with `FLOCK_NO_ZC_AB_KARA=1`, the plain apply (32).
+        if kernels::aarch64::ab_kara_enabled() {
+            kernels::aarch64::bstatic_horner_window_rows::<{ kernels::aarch64::AB_ROWS_VARIANT }>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else {
+            kernels::aarch64::bstatic_horner_window_rows::<0>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        }
     }
     for b_med in (first_b_med..run_lo).chain(run_hi..ab_end) {
         let dst: &mut [u8; 64] = if nt && !direct {
@@ -5295,9 +5339,14 @@ mod tests {
                             crate::epool::SyncPtr(b_t.as_mut_ptr()),
                         );
                         let calls: Vec<AtomicU32> = (0..n_units).map(|_| AtomicU32::new(0)).collect();
-                        let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, _primed: bool| {
+                        // One scratch per worker thread per drain: `primed`
+                        // must be false on that thread's first unit only.
+                        let seen =
+                            std::sync::Mutex::new(std::collections::HashSet::<std::thread::ThreadId>::new());
+                        let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool| {
                             calls[unit].fetch_add(1, Ordering::Relaxed);
                             assert!(!a_scratch.is_null() && !b_scratch.is_null());
+                            assert_eq!(primed, !seen.lock().unwrap().insert(std::thread::current().id()));
                             let range = unit * unit_bytes..(unit + 1) * unit_bytes;
                             // SAFETY: unit ranges are disjoint; the scratch is
                             // `unit_bytes` long by the producer contract.
@@ -6063,7 +6112,7 @@ mod tests {
             for _ in 0..REPS {
                 for c in 0..CHUNKS {
                     for w in 0..2usize {
-                        kernels::aarch64::bstatic_horner_window_rows(
+                        kernels::aarch64::bstatic_horner_window_rows::<0>(
                             w, &a_packed, &b, &table, c * 2048 + w * 1024, partials, &mut out, false,
                         );
                         sum = sum.wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -6078,6 +6127,280 @@ mod tests {
             "[ab-row-timing] static-B Horner rows: min {:.3} p25 {:.3} median {:.3} ns per row, checksum {:016x}",
             times[0], times[6], times[12], sum
         );
+    }
+
+    /// The Karatsuba table apply and the one-function window write the bytes
+    /// the plain forms write. Words: every byte value in every position, the
+    /// complements, random words, both table images, against the plain apply
+    /// and the scalar reference. Rows: random and edge A rows, B rows that
+    /// satisfy the static masks (the straight-line bodies) and B rows that do
+    /// not (the generic fallback), both store flavours.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_kernel_variants_match_baseline() {
+        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_INLINE_WINDOW, ABV_KARA};
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xAB5A_71C0_F457_0003);
+        let mut words: Vec<u64> = vec![0, u64::MAX];
+        for j in 0..8 {
+            for x in 0..256u64 {
+                words.push(x << (8 * j));
+                words.push(!(x << (8 * j)));
+            }
+        }
+        words.extend((0..4096).map(|_| rng.next_u64()));
+        for scaled in [false, true] {
+            for &word in &words {
+                let (plain, kara) = kernels::aarch64::ab_apply_word_forms(&table, scaled, word);
+                assert_eq!(plain, kara, "Karatsuba apply differs (scaled={scaled}, word={word:016x})");
+                let mut want = [F8::ZERO; 64];
+                table.apply(&word.to_le_bytes(), &mut want);
+                let scale = if scaled { F8(1 << 4) } else { F8::ONE };
+                let want: [u8; 64] = core::array::from_fn(|i| (want[i] * scale).0);
+                assert_eq!(plain, want, "table apply differs from the reference (scaled={scaled})");
+            }
+        }
+        let context =
+            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+                .expect("enabled static-B context");
+        let kernels::aarch64::StaticBContext::Prepared { partials, .. } = context else {
+            unreachable!("prepared static-B context");
+        };
+        const N: usize = 1024;
+        let mut cases = 0usize;
+        for case in 0..96usize {
+            let mut a: Vec<u8> = (0..N).map(|_| (rng.next_u64() >> 11 & 0xff) as u8).collect();
+            let mut b: Vec<u8> = (0..N).map(|_| (rng.next_u64() >> 9 & 0xff) as u8).collect();
+            match case % 12 {
+                0 => a.fill(0),
+                1 => a.fill(0xff),
+                2 => b.fill(0xff),
+                3 => {
+                    a.fill(0);
+                    a[(case * 37) % N] = 1 << (case % 8);
+                }
+                4 => {
+                    for (i, x) in a.iter_mut().enumerate() {
+                        *x = if i % 8 == (case / 12) % 8 { 0xff } else { 0 };
+                    }
+                }
+                5 => {
+                    for (i, x) in a.iter_mut().enumerate() {
+                        *x = i as u8;
+                    }
+                }
+                _ => {}
+            }
+            for w in 0..2usize {
+                let (lo, hi) = kernels::aarch64::BSTATIC_HORNER_WINDOW_ROWS[w];
+                for satisfied in [true, false] {
+                    let mut bb = b.clone();
+                    if satisfied {
+                        for b_med in lo..hi {
+                            let blk = w * (1 << N_MEDIUM) + b_med;
+                            for k in 0..N_CHUNKS {
+                                let off = b_med * N_CHUNKS * 8 + k * N_CHUNKS;
+                                let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
+                                let word = u64::from_le_bytes(bb[off..off + 8].try_into().unwrap());
+                                bb[off..off + 8]
+                                    .copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                            }
+                        }
+                    }
+                    for nt in [false, true] {
+                        let mut want = vec![0x5au8; 16 * 64];
+                        kernels::aarch64::bstatic_horner_window_rows::<0>(
+                            w, &a, &bb, &table, 0, partials, &mut want, nt,
+                        );
+                        macro_rules! check {
+                            ($v:expr) => {{
+                                let mut got = vec![0x5au8; 16 * 64];
+                                kernels::aarch64::bstatic_horner_window_rows::<{ $v }>(
+                                    w, &a, &bb, &table, 0, partials, &mut got, nt,
+                                );
+                                assert_eq!(
+                                    got, want,
+                                    "variant {} differs (case={case}, w={w}, satisfied={satisfied}, nt={nt})",
+                                    $v
+                                );
+                                cases += 1;
+                            }};
+                        }
+                        check!(ABV_KARA);
+                        check!(ABV_INLINE_WINDOW);
+                        check!(AB_ROWS_VARIANT);
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 3);
+    }
+
+    /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
+    /// apply on and off (`FLOCK_NO_ZC_AB_KARA`): same output bytes for both
+    /// windows, every representation, three drain instantiations, B rows that
+    /// satisfy the BLAKE3 static masks (the ranked fast paths) and B rows
+    /// that do not.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_kara_chunk_matches_plain() {
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        let table = make_inv_table();
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+        let static_b_context = kernels::prepare_static_b_context(&table, true);
+        let mut rng = Rng::new(0xAB5A_71C0_F457_0004);
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
+        let mut checked = 0usize;
+        for case in 0..24usize {
+            // One compression: two windows of 1 KiB.
+            let mut a: Vec<u8> = (0..2 * OUTER_BYTES).map(|_| (rng.next_u64() >> 13 & 0xff) as u8).collect();
+            let mut b: Vec<u8> = (0..2 * OUTER_BYTES).map(|_| (rng.next_u64() >> 7 & 0xff) as u8).collect();
+            if case % 3 != 2 {
+                for row in 0..31usize {
+                    for k in 0..N_CHUNKS {
+                        let off = row * 64 + k * N_CHUNKS;
+                        let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[row][k];
+                        let word = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                        b[off..off + 8].copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                    }
+                }
+                b[31 * 64..].fill(0);
+            }
+            if case % 3 == 0 {
+                // Ranked shape of window 0, row 2: A K0/K1 top three bytes zero.
+                for k in 0..2 {
+                    a[2 * 64 + k * 8 + 5..2 * 64 + k * 8 + 8].fill(0);
+                }
+            }
+            if case % 6 == 1 {
+                a.fill(0);
+            }
+            for representation in [
+                Round1AbRepresentation::Complete,
+                Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false },
+                Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true },
+            ] {
+                for window in 0..2usize {
+                    for flavor in 0..3usize {
+                        let mut outs: Vec<Vec<u8>> = Vec::new();
+                        for kara in [false, true] {
+                            kernels::aarch64::ab_kara_force(kara);
+                            let mut out = vec![0x3cu8; OUTER_BYTES];
+                            macro_rules! go {
+                                ($policy:expr, $direct:literal, $nt:expr) => {
+                                    precompute_ab_one_chunk::<{ $policy }, $direct>(
+                                        &a, &b, &table, within_outer_mask, &b_med_counts, true,
+                                        static_b_context, $nt, false, representation, window,
+                                        window * OUTER_BYTES, &mut out, &mut a_col, &mut b_col,
+                                    )
+                                };
+                            }
+                            match flavor {
+                                0 => go!(kernels::AB_FAST_POLICY_FORCE_FAST, true, true),
+                                1 => go!(kernels::AB_FAST_POLICY_FORCE_FAST, false, false),
+                                _ => go!(kernels::AB_FAST_POLICY_PROCESS, false, true),
+                            }
+                            outs.push(out);
+                        }
+                        assert_eq!(
+                            outs[0], outs[1],
+                            "chunk differs (case={case}, window={window}, flavor={flavor}, {representation:?})"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        kernels::aarch64::ab_kara_force(true);
+        assert_eq!(checked, 24 * 3 * 2 * 3);
+    }
+
+    /// Local timing probe for the two forms of the static-B Horner rows (not
+    /// a correctness test): 64 chunks, both windows, B rows forced to their
+    /// static masks, the forms alternated in one process. Run with `cargo
+    /// test --profile challenge -p flock-core --lib ab_kara_rows_timing --
+    /// --ignored --nocapture` on a quiet machine.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "timing probe"]
+    fn ab_kara_rows_timing() {
+        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_KARA};
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xB57A_71C0_7131_0005);
+        let context =
+            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+                .expect("enabled static-B context");
+        let kernels::aarch64::StaticBContext::Prepared { partials, .. } = context else {
+            unreachable!("prepared static-B context");
+        };
+        const CHUNKS: usize = 64;
+        let a_packed: Vec<u8> =
+            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+        let mut b: Vec<u8> =
+            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() >> 9 & 0xff) as u8).collect();
+        for c in 0..CHUNKS {
+            for w in 0..2usize {
+                let (lo, hi) = kernels::aarch64::BSTATIC_HORNER_WINDOW_ROWS[w];
+                for b_med in lo..hi {
+                    let blk = w * (1 << N_MEDIUM) + b_med;
+                    for k in 0..N_CHUNKS {
+                        let off = c * 2048 + w * 1024 + b_med * N_CHUNKS * 8 + k * N_CHUNKS;
+                        let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
+                        let word = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                        b[off..off + 8].copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                    }
+                }
+            }
+        }
+        let mut out = vec![0u8; 16 * 64];
+        const REPS: usize = 40;
+        const NAMES: [&str; 3] = ["plain apply", "Karatsuba apply", "Karatsuba apply, one-function window"];
+        let mut times: [Vec<f64>; 3] = Default::default();
+        let mut sums = [0u64; 3];
+        for round in 0..26 {
+            for k in 0..3 {
+                let form = (k + round) % 3;
+                let mut sum = 0u64;
+                let t0 = std::time::Instant::now();
+                for _ in 0..REPS {
+                    for c in 0..CHUNKS {
+                        for w in 0..2usize {
+                            let base = c * 2048 + w * 1024;
+                            match form {
+                                0 => kernels::aarch64::bstatic_horner_window_rows::<0>(
+                                    w, &a_packed, &b, &table, base, partials, &mut out, false,
+                                ),
+                                1 => kernels::aarch64::bstatic_horner_window_rows::<{ ABV_KARA }>(
+                                    w, &a_packed, &b, &table, base, partials, &mut out, false,
+                                ),
+                                _ => kernels::aarch64::bstatic_horner_window_rows::<{ AB_ROWS_VARIANT }>(
+                                    w, &a_packed, &b, &table, base, partials, &mut out, false,
+                                ),
+                            }
+                            sum = sum.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                ^ u64::from_le_bytes(out[5 * 64..5 * 64 + 8].try_into().unwrap());
+                        }
+                    }
+                }
+                if round > 0 {
+                    times[form].push(t0.elapsed().as_secs_f64() * 1e9 / (REPS * CHUNKS * 26) as f64);
+                }
+                sums[form] = sum;
+            }
+        }
+        assert!(sums[0] == sums[1] && sums[0] == sums[2], "forms disagree");
+        for (form, t) in times.iter_mut().enumerate() {
+            t.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            eprintln!(
+                "[ab-kara-timing] {:38} min {:.3} p25 {:.3} median {:.3} ns per row, checksum {:016x}",
+                NAMES[form], t[0], t[6], t[12], sums[form]
+            );
+        }
     }
 
     /// The unrolled window run of the Horner static-B kernel writes exactly the
@@ -6120,7 +6443,7 @@ mod tests {
                     ));
                 }
                 let mut got = vec![0u8; 16 * 64];
-                kernels::aarch64::bstatic_horner_window_rows(
+                kernels::aarch64::bstatic_horner_window_rows::<0>(
                     w, &a_packed, &b, &table, 0, partials, &mut got, true,
                 );
                 assert_eq!(got, want, "window rows differ (w={w}, satisfied={satisfied})");
