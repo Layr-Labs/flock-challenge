@@ -1067,6 +1067,62 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
     }
 }
 
+///
+/// # Safety
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_3layer_rows_odd_tail(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    odd_lanes: usize,
+    row_start: usize,
+    row_end: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+) {
+    use core::arch::aarch64::*;
+    let lanes = |r: usize| if r & 1 == 1 { odd_lanes } else { num_ntts };
+    unsafe {
+        let t: [uint64x2_t; 7] =
+            core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
+        if zero_root {
+            debug_assert_eq!(twiddles[0], F128::ZERO);
+            debug_assert_eq!(twiddles[1], F128::ZERO);
+            debug_assert_eq!(twiddles[3], F128::ZERO);
+            for r in row_start..row_end {
+                butterfly_fused_3layer_zero_root_row_with_q(
+                    ptr,
+                    eighth,
+                    num_ntts,
+                    lanes(r),
+                    r,
+                    t[2],
+                    t[4],
+                    t[5],
+                    t[6],
+                );
+            }
+        } else if use_three_const_fold() {
+            let prepared = core::array::from_fn(|i| three_coeffs(t[i]));
+            for r in row_start..row_end {
+                butterfly_fused_3layer_row_with_const_q(
+                    ptr,
+                    eighth,
+                    num_ntts,
+                    lanes(r),
+                    r,
+                    &prepared,
+                );
+            }
+        } else {
+            for r in row_start..row_end {
+                butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, lanes(r), r, &t);
+            }
+        }
+    }
+}
+
 /// Two low-constant products with everything held in q registers: product
 /// `i` is `v_i · t_i` where `t_i.hi == 0` and `ts_i` holds `t_i.lo` in both
 /// lanes. Same unreduced-word layout and shift-fold reduction as

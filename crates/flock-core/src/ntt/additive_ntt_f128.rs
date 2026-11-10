@@ -2607,57 +2607,42 @@ fn butterfly_interleaved_fused_3layer_range_par_rows(
     debug_assert!(odd_tail == 0 || eighth.is_multiple_of(2));
     // The block-range caller derives eighth from a power-of-two block of at least eight rows.
     debug_assert!(eighth.is_power_of_two());
-    let block_shift = eighth.trailing_zeros();
-    let row_mask = eighth - 1;
     // Every generated tree has zero twiddles at absolute block zero.
     // Other zero twiddles from custom bases use the exact general kernel.
     let zero_root_block = if abs_first == 0 { 0 } else { usize::MAX };
-    let n_jobs = num_blocks * eighth;
+    let n_rows = num_blocks * eighth;
     // Only a nonempty range with at least two rows can select an odd row.
-    let odd_lanes = if n_jobs != 0 && eighth > 1 {
+    let odd_lanes = if n_rows != 0 && eighth > 1 {
         num_ntts - odd_tail
     } else {
         num_ntts
     };
     // Empty ranges do not read or initialize the process row policy.
-    let use_neon = n_jobs != 0 && kernels::vector_resident_rows();
+    let use_neon = n_rows != 0 && kernels::vector_resident_rows();
+    const ROWS_PER_TILE: usize = 16;
+    let rows_per_tile = ROWS_PER_TILE.min(eighth);
+    let tiles_per_block = eighth / rows_per_tile;
+    let n_jobs = num_blocks * tiles_per_block;
     let base = data.as_mut_ptr() as usize;
     let job = move |job: usize| {
-        let block = job >> block_shift;
-        let r = job & row_mask;
-        let lanes = if r & 1 == 1 {
-            odd_lanes
-        } else {
-            num_ntts
-        };
-        // SAFETY: each job owns the disjoint rows `{i·eighth + r}` of one
-        // block, so concurrent jobs never alias.
+        let block = job / tiles_per_block;
+        let row_start = (job % tiles_per_block) * rows_per_tile;
         unsafe {
             let block_base = (base as *mut F128).add(block * block_elems);
-            if block == zero_root_block {
-                kernels::butterfly_fused_3layer_zero_root_row_with_policy(
-                    block_base,
-                    eighth,
-                    num_ntts,
-                    lanes,
-                    r,
-                    &twiddles[block],
-                    use_neon,
-                )
-            } else {
-                kernels::butterfly_fused_3layer_row_with_policy(
-                    block_base,
-                    eighth,
-                    num_ntts,
-                    lanes,
-                    r,
-                    &twiddles[block],
-                    use_neon,
-                )
-            }
+            kernels::butterfly_fused_3layer_rows_odd_tail_with_policy(
+                block_base,
+                eighth,
+                num_ntts,
+                odd_lanes,
+                row_start,
+                row_start + rows_per_tile,
+                &twiddles[block],
+                block == zero_root_block,
+                use_neon,
+            )
         }
     };
-    if n_jobs < PARALLEL_JOB_THRESHOLD {
+    if n_rows < PARALLEL_JOB_THRESHOLD {
         (0..n_jobs).for_each(job);
     } else {
         (0..n_jobs).into_par_iter().for_each(job);

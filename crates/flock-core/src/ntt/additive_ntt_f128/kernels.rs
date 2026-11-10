@@ -487,6 +487,47 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
     }
 }
 
+///
+/// # Safety
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_3layer_rows_odd_tail_with_policy(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    odd_lanes: usize,
+    row_start: usize,
+    row_end: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+    use_neon: bool,
+) {
+    if use_neon {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        // SAFETY: forwarded caller contract; the cfg gate supplies `aes`.
+        unsafe {
+            aarch64::butterfly_fused_3layer_rows_odd_tail(
+                ptr, eighth, num_ntts, odd_lanes, row_start, row_end, twiddles, zero_root,
+            );
+            return;
+        }
+    }
+
+    for r in row_start..row_end {
+        let lanes = if r & 1 == 1 { odd_lanes } else { num_ntts };
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            if zero_root {
+                portable::butterfly_fused_3layer_zero_root_row(
+                    ptr, eighth, num_ntts, lanes, r, twiddles,
+                );
+            } else {
+                portable::butterfly_fused_3layer_row(ptr, eighth, num_ntts, lanes, r, twiddles);
+            }
+        }
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(super) unsafe fn butterfly_neon_block(chunk: &mut [F128], twiddle: F128, half: usize) {
