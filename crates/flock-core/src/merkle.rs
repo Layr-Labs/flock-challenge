@@ -735,11 +735,35 @@ pub(crate) fn merkle_tree_into(
 /// byte-identical. Falls back to [`merkle_tree_into`] for every shape it does
 /// not cover (non-BLAKE3, non-batchable leaf sizes, `sub_log` out of range).
 pub(crate) fn merkle_tree_into_subtrees(
+    tree: Vec<Hash>,
+    data: &[u8],
+    num_leaves: usize,
+    kind: HashKind,
+    sub_log: usize,
+) -> Vec<Hash> {
+    merkle_tree_into_subtrees_impl(tree, data, num_leaves, kind, sub_log, false)
+}
+
+/// [`merkle_tree_into_subtrees`] with the subtree claims run in order on the
+/// calling thread (small trees, where queue wake-up dominates the hashing).
+/// Same kernels per node, byte-identical tree.
+pub(crate) fn merkle_tree_into_subtrees_serial(
+    tree: Vec<Hash>,
+    data: &[u8],
+    num_leaves: usize,
+    kind: HashKind,
+    sub_log: usize,
+) -> Vec<Hash> {
+    merkle_tree_into_subtrees_impl(tree, data, num_leaves, kind, sub_log, true)
+}
+
+fn merkle_tree_into_subtrees_impl(
     mut tree: Vec<Hash>,
     data: &[u8],
     num_leaves: usize,
     kind: HashKind,
     sub_log: usize,
+    serial: bool,
 ) -> Vec<Hash> {
     assert!(num_leaves.is_power_of_two() && num_leaves > 0);
     assert_eq!(data.len() % num_leaves, 0);
@@ -797,7 +821,13 @@ pub(crate) fn merkle_tree_into_subtrees(
     // Same P+E chunk queue as the level-by-level leaf/parent passes: the
     // efficiency cores carry a real share of the hashing (a main-pool-only
     // split measured ~1.7x slower at 2^16 leaves on the M4).
-    crate::epool::run_hetero_chunks(n_sub, build);
+    if serial {
+        for s in 0..n_sub {
+            build(s);
+        }
+    } else {
+        crate::epool::run_hetero_chunks(n_sub, build);
+    }
     merkle_tree_from_prehashed_level(tree, num_leaves, kind, sub_log)
 }
 
@@ -1279,6 +1309,14 @@ mod tests {
                     sub_log,
                 );
                 assert_eq!(got, want, "log_n={log_n} sub_log={sub_log}");
+                let got_serial = merkle_tree_into_subtrees_serial(
+                    crate::alloc_uninit_vec(2 * n - 1),
+                    &data,
+                    n,
+                    HashKind::Blake3,
+                    sub_log,
+                );
+                assert_eq!(got_serial, want, "serial log_n={log_n} sub_log={sub_log}");
             }
         }
         let data = random_data(1024, 64, 9);
