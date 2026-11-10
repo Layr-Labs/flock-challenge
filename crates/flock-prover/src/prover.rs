@@ -827,12 +827,41 @@ const AB_STRIPE_MAX_ROWS: usize = 177;
 /// is never taken for this prove's even quad.
 static AB_STRIPE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Per-thread copy of one stripe group's z words (8 blocks, the packed
-/// layout of `z_packed`), rebuilt as a AND b from the producer's scratch.
+/// Lane stride, in u64 words, of the per-thread row-lane buffer: even (so a
+/// lane is a whole number of F128) and at least [`AB_STRIPE_MAX_ROWS`].
+const AB_STRIPE_ROW_STRIDE: usize = AB_STRIPE_MAX_ROWS + 1;
+const _: () = assert!(AB_STRIPE_ROW_STRIDE.is_multiple_of(2));
+
+/// Row plan of the row-lane buffer itself: row `j` is word `j` of each lane,
+/// all 64 bits (so [`fill_root_lincheck_stripe_group`] takes its full-row
+/// strided-transpose path for every row).
+static AB_STRIPE_IDENTITY_ROWS: [crate::r1cs_hashes::blake3::RootRow; AB_STRIPE_MAX_ROWS] = {
+    let mut rows = [crate::r1cs_hashes::blake3::RootRow {
+        lo_word: 0,
+        lo_mask: u64::MAX,
+        hi_mask: 0,
+    }; AB_STRIPE_MAX_ROWS];
+    let mut j = 0;
+    while j < AB_STRIPE_MAX_ROWS {
+        rows[j].lo_word = j;
+        j += 1;
+    }
+    rows
+};
+
+/// Per-thread root-row lanes of one stripe group: lane `l` (block `l` of the
+/// group's 8) holds, at word `j`, the 64-bit lane word of root row `j`,
+/// i.e. `(z[lo_word] & lo_mask) | (z[lo_word + 1] & hi_mask)` with
+/// `z = a AND b` read straight from the producer's scratch. This is the
+/// array `fill_root_lincheck_stripe_group` would gather per row, built once
+/// per block instead of staging all 236 z words and re-reading them.
+/// `input_bad` accumulates the fixed-input check residue of the lanes
+/// written so far.
 struct AbStripeZGroup {
     epoch: u64,
     group: usize,
-    words: [F128; 8 * AB_STRIPE_WORDS / 2],
+    input_bad: u64,
+    rows: [F128; 8 * AB_STRIPE_ROW_STRIDE / 2],
 }
 
 thread_local! {
@@ -840,7 +869,8 @@ thread_local! {
         std::cell::RefCell::new(AbStripeZGroup {
             epoch: u64::MAX,
             group: usize::MAX,
-            words: [F128::ZERO; 8 * AB_STRIPE_WORDS / 2],
+            input_bad: 0,
+            rows: [F128::ZERO; 8 * AB_STRIPE_ROW_STRIDE / 2],
         })
     };
 }
@@ -865,8 +895,12 @@ struct AbStripeEmitter<'a> {
     mismatch: &'a std::sync::atomic::AtomicBool,
     emitted: Box<[std::sync::atomic::AtomicU64]>,
     epoch: u64,
-    /// Words of a block the rows and the fixed-input checks read.
-    read_words: usize,
+    /// Maximal runs `(first_row, first_word, len)` of full rows (`lo_mask`
+    /// all ones) on consecutive words: row `first_row + k` is word
+    /// `first_word + k`, so each run is one contiguous a AND b.
+    full_runs: Box<[(usize, usize, usize)]>,
+    /// The remaining (masked) rows with their index.
+    partial_rows: Box<[(usize, crate::r1cs_hashes::blake3::RootRow)]>,
 }
 
 impl<'a> AbStripeEmitter<'a> {
@@ -883,7 +917,28 @@ impl<'a> AbStripeEmitter<'a> {
         assert_eq!(group_bytes, 1 << 14);
         assert!(rows.len() <= AB_STRIPE_MAX_ROWS && rows.len() * 64 <= group_bytes);
         assert!(rows.iter().all(|r| r.lo_word + usize::from(r.hi_mask != 0) < AB_STRIPE_WORDS));
+        assert!(
+            crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS
+                .iter()
+                .all(|c| c.0 < AB_STRIPE_WORDS)
+        );
         let n_groups = stripe_len / group_bytes;
+        let mut full_runs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut partial_rows = Vec::new();
+        for (j, row) in rows.iter().enumerate() {
+            // Same split as `fill_root_lincheck_stripe_group`: a full row is
+            // exactly word `lo_word`.
+            if row.lo_mask == u64::MAX {
+                match full_runs.last_mut() {
+                    Some((r0, w0, len)) if *r0 + *len == j && *w0 + *len == row.lo_word => {
+                        *len += 1;
+                    }
+                    _ => full_runs.push((j, row.lo_word, 1)),
+                }
+            } else {
+                partial_rows.push((j, *row));
+            }
+        }
         Self {
             stripe,
             group_bytes,
@@ -895,12 +950,8 @@ impl<'a> AbStripeEmitter<'a> {
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
             epoch: AB_STRIPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            read_words: rows
-                .iter()
-                .map(|r| r.lo_word + 1 + usize::from(r.hi_mask != 0))
-                .chain(crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter().map(|c| c.0 + 1))
-                .max()
-                .unwrap_or(0),
+            full_runs: full_runs.into_boxed_slice(),
+            partial_rows: partial_rows.into_boxed_slice(),
         }
     }
 
@@ -921,27 +972,55 @@ impl<'a> AbStripeEmitter<'a> {
             if half == 1 && (st.epoch != self.epoch || st.group != group) {
                 return;
             }
-            // z = a AND b over the words the rows (and checks) read.
-            // SAFETY: the scratch holds 4 complete blocks of
-            // `AB_STRIPE_WORDS` words; `read_words <= AB_STRIPE_WORDS`.
-            let zw: &mut [u64] = unsafe {
-                std::slice::from_raw_parts_mut(st.words.as_mut_ptr().cast::<u64>(), 8 * AB_STRIPE_WORDS)
+            // Root-row lanes of this quad's 4 blocks, z = a AND b.
+            let lanes: &mut [u64] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    st.rows.as_mut_ptr().cast::<u64>(),
+                    8 * AB_STRIPE_ROW_STRIDE,
+                )
             };
+            let mut input_bad = 0u64;
             for c in 0..4 {
+                // SAFETY: the scratch holds 4 complete blocks of
+                // `AB_STRIPE_WORDS` words; every row word and check word is
+                // below `AB_STRIPE_WORDS` (asserted in `new`).
                 let (a_blk, b_blk) = unsafe {
                     (
-                        std::slice::from_raw_parts(a.add(c * AB_STRIPE_WORDS), self.read_words),
-                        std::slice::from_raw_parts(b.add(c * AB_STRIPE_WORDS), self.read_words),
+                        std::slice::from_raw_parts(a.add(c * AB_STRIPE_WORDS), AB_STRIPE_WORDS),
+                        std::slice::from_raw_parts(b.add(c * AB_STRIPE_WORDS), AB_STRIPE_WORDS),
                     )
                 };
-                let base = (4 * half + c) * AB_STRIPE_WORDS;
-                for ((d, x), y) in zw[base..base + self.read_words].iter_mut().zip(a_blk).zip(b_blk) {
-                    *d = x & y;
+                let base = (4 * half + c) * AB_STRIPE_ROW_STRIDE;
+                let lane = &mut lanes[base..base + AB_STRIPE_ROW_STRIDE];
+                for &(r0, w0, len) in self.full_runs.iter() {
+                    for ((d, x), y) in lane[r0..r0 + len]
+                        .iter_mut()
+                        .zip(&a_blk[w0..w0 + len])
+                        .zip(&b_blk[w0..w0 + len])
+                    {
+                        *d = x & y;
+                    }
+                }
+                for &(j, row) in self.partial_rows.iter() {
+                    let w = row.lo_word;
+                    let hi = if row.hi_mask != 0 {
+                        a_blk[w + 1] & b_blk[w + 1] & row.hi_mask
+                    } else {
+                        0
+                    };
+                    lane[j] = (a_blk[w] & b_blk[w] & row.lo_mask) | hi;
+                }
+                if self.fixed_inputs {
+                    let checks = crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter();
+                    for &(word, mask, want) in checks {
+                        input_bad |= (a_blk[word] & b_blk[word] & mask) ^ want;
+                    }
                 }
             }
             if half == 0 {
                 st.epoch = self.epoch;
                 st.group = group;
+                st.input_bad = input_bad;
                 return;
             }
             st.group = usize::MAX;
@@ -953,9 +1032,18 @@ impl<'a> AbStripeEmitter<'a> {
                     self.group_bytes,
                 )
             };
-            let group_f128 = 8 * AB_STRIPE_WORDS / 2;
-            fill_root_lincheck_stripe_group(&st.words, dst, 0, group_f128, AB_STRIPE_WORDS, self.rows);
-            if self.fixed_inputs && !fixed_inputs_hold(&st.words, 0, group_f128, AB_STRIPE_WORDS) {
+            // The lanes already hold each row's masked word, so every row
+            // is a full row of the identity plan: same transposes, same bytes.
+            fill_root_lincheck_stripe_group(
+                &st.rows,
+                dst,
+                0,
+                8 * AB_STRIPE_ROW_STRIDE / 2,
+                AB_STRIPE_ROW_STRIDE,
+                &AB_STRIPE_IDENTITY_ROWS[..self.rows.len()],
+            );
+            // `fixed_inputs_hold` over the group's 8 blocks, accumulated.
+            if self.fixed_inputs && (st.input_bad | input_bad) != 0 {
                 self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             self.emitted[group / 64].fetch_or(1 << (group % 64), std::sync::atomic::Ordering::Relaxed);
