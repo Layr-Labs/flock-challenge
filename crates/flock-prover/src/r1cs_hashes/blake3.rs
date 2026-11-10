@@ -3958,6 +3958,7 @@ pub(crate) mod witgen_simd {
                     // AcqRel: the zero-observer acquires every worker's
                     // stores for this band before publishing/submitting it.
                     if remaining[band].fetch_sub(1, Ordering::AcqRel) == 1 {
+                        flock_core::tmark::mark("band ready");
                         if timing {
                             done_ns[band].store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }

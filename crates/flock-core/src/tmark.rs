@@ -7,12 +7,13 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-const SLOTS: usize = 64;
+const SLOTS: usize = 512;
 static NS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 static LABELS: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-fn on() -> bool {
+/// True when `FLOCK_TMARK` is set (cached).
+pub fn on() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_TMARK").is_some());
     *ON
@@ -48,6 +49,42 @@ pub fn mark(label: &'static str) {
             l.resize(i + 1, "");
         }
         l[i] = label;
+    }
+}
+
+/// Record `label` at an explicit CLOCK_UPTIME_RAW timestamp (GPU intervals
+/// converted from Metal's host-timebase seconds). No-op unless enabled.
+#[inline]
+pub fn mark_ns(label: &'static str, t: u64) {
+    if !on() {
+        return;
+    }
+    let i = NEXT.fetch_add(1, Ordering::Relaxed);
+    if i < SLOTS {
+        NS[i].store(t, Ordering::Relaxed);
+        let mut l = LABELS.lock().unwrap_or_else(|e| e.into_inner());
+        if l.len() <= i {
+            l.resize(i + 1, "");
+        }
+        l[i] = label;
+    }
+}
+
+/// Record a Metal GPU interval (`GPUStartTime`/`GPUEndTime`, seconds on the
+/// mach host timebase = CLOCK_UPTIME_RAW) as two marks.
+#[inline]
+pub fn mark_gpu(start_label: &'static str, end_label: &'static str, s: f64, e: f64) {
+    if !on() || e <= 0.0 {
+        return;
+    }
+    mark_ns(start_label, (s * 1e9).round() as u64);
+    mark_ns(end_label, (e * 1e9).round() as u64);
+}
+
+/// Drop every mark recorded so far (warm-up noise) — no-op unless enabled.
+pub fn reset() {
+    if on() {
+        NEXT.store(0, Ordering::Relaxed);
     }
 }
 
