@@ -3368,23 +3368,40 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                         // for the existing pair-fold kernels.
                         // Compute `a_state` into an uninitialized buffer first,
                         // then reuse the owned `fold8` allocation for `w_state`.
+                        //
+                        const COL: usize = 1usize << LOG_PACKING;
+                        let a_cols: Vec<[F128; COL]> = (0..64usize)
+                            .into_par_iter()
+                            .map(|e| {
+                                let bank = &fold8[e * n_packed..(e + 1) * n_packed];
+                                let mut transposed = [F128::ZERO; COL];
+                                tensor_algebra_transpose_into(bank, &mut transposed);
+                                transposed
+                            })
+                            .collect();
+                        let w_cols: Vec<[F128; COL]> = (0..64usize)
+                            .into_par_iter()
+                            .map(|d_low| {
+                                let mut col = [F128::ZERO; COL];
+                                let mut basis_product = low_eq[d_low];
+                                col[0] = fold_one_slot(basis_product, &table);
+                                for slot in col.iter_mut().skip(1) {
+                                    basis_product = mul_by_x(basis_product);
+                                    *slot = fold_one_slot(basis_product, &table);
+                                }
+                                col
+                            })
+                            .collect();
                         let mut a_state = crate::alloc_uninit_f128_vec(64 * n_packed);
-                        let mut transposed = [F128::ZERO; 1 << LOG_PACKING];
-                        for e in 0..64 {
-                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-                            tensor_algebra_transpose_into(bank, &mut transposed);
-                            for (bit, &value) in transposed.iter().enumerate() {
+                        for (e, col) in a_cols.iter().enumerate() {
+                            for (bit, &value) in col.iter().enumerate() {
                                 a_state[bit * 64 + e] = value;
                             }
                         }
                         let mut w_state = crate::alloc_uninit_f128_vec(64 * n_packed);
-                        for d_low in 0..64 {
-                            let scale = low_eq[d_low];
-                            let mut basis_product = scale;
-                            w_state[d_low] = fold_one_slot(basis_product, &table);
-                            for bit in 1..n_packed {
-                                basis_product = mul_by_x(basis_product);
-                                w_state[bit * 64 + d_low] = fold_one_slot(basis_product, &table);
+                        for (d_low, col) in w_cols.iter().enumerate() {
+                            for (bit, &value) in col.iter().enumerate() {
+                                w_state[bit * 64 + d_low] = value;
                             }
                         }
                         let round0 = super::round0_deferred(&a_state, &w_state);
