@@ -1705,7 +1705,13 @@ fn prove_padded_inner<Ch: Challenger>(
     //     fold_1b_rows), avoiding a fresh 2^k_log F128 allocation.
     let captured_z_vec: Option<Vec<F128>> = if capture_z_vec && eq_inner.len() == z_vec.len() {
         let mut cap = eq_inner;
-        cap.copy_from_slice(&z_vec);
+        {
+            use rayon::prelude::*;
+            const CAPTURE_CHUNK: usize = 2048;
+            cap.par_chunks_mut(CAPTURE_CHUNK)
+                .zip(z_vec.par_chunks(CAPTURE_CHUNK))
+                .for_each(|(dst, src)| dst.copy_from_slice(src));
+        }
         Some(cap)
     } else {
         crate::scratch::give_lincheck_eq(eq_inner);
