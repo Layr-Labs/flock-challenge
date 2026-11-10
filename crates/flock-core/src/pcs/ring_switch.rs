@@ -294,26 +294,18 @@ fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
     t[0] = F128::ONE;
     // Threshold below which rayon dispatch overhead beats the parallel work.
     const PAR_THRESHOLD: usize = 1 << 12;
-    for i in 0..n {
-        let r_i = r[i];
+    const PAR_CHUNK: usize = 1 << 8;
+    for (i, &r_i) in r.iter().enumerate() {
         let half = 1usize << i;
         let (lo, hi_rest) = t.split_at_mut(half);
         let hi = &mut hi_rest[..half];
         if half < PAR_THRESHOLD {
-            for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
-                let old = *lo_x;
-                let old_r = old * r_i;
-                *hi_x = old_r;
-                *lo_x = old + old_r;
-            }
+            crate::field::f128_slice::expand_eq_table_level(lo, hi, r_i);
         } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_x, hi_x)| {
-                    let old = *lo_x;
-                    let old_r = old * r_i;
-                    *hi_x = old_r;
-                    *lo_x = old + old_r;
+            lo.par_chunks_mut(PAR_CHUNK)
+                .zip(hi.par_chunks_mut(PAR_CHUNK))
+                .for_each(|(lo_chunk, hi_chunk)| {
+                    crate::field::f128_slice::expand_eq_table_level(lo_chunk, hi_chunk, r_i);
                 });
         }
     }

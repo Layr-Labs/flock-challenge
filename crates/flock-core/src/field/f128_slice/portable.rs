@@ -12,6 +12,14 @@ pub(super) fn expand_eq_table_level(lo: &mut [F128], hi: &mut [F128], r: F128) {
 }
 
 #[inline]
+pub(super) fn scale_into(out: &mut [F128], src: &[F128], c: F128) {
+    debug_assert_eq!(out.len(), src.len());
+    for (o, &s) in out.iter_mut().zip(src) {
+        *o = s * c;
+    }
+}
+
+#[inline]
 pub(super) fn round0_factorized_eq(f: &[F128], eq_tail: &[F128]) -> (F128, F128) {
     debug_assert_eq!(f.len(), 2 * eq_tail.len());
     let mut a = F128::ZERO;

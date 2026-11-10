@@ -94,6 +94,25 @@ pub(crate) fn expand_eq_table_level(lo: &mut [F128], hi: &mut [F128], r: F128) {
     portable::expand_eq_table_level(lo, hi, r)
 }
 
+#[inline]
+pub(crate) fn scale_into(out: &mut [F128], src: &[F128], c: F128) {
+    assert_eq!(
+        out.len(),
+        src.len(),
+        "scaled slice must match its source length"
+    );
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies PMULL, and the hard length check above is
+    // the architecture kernel's complete slice-shape contract.
+    unsafe {
+        aarch64::scale_into(out, src, c)
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    portable::scale_into(out, src, c)
+}
+
 /// Fold one banked output slot with deferred reduction:
 /// `Σ_{k<BANKS} weight[k] · input[k]`, reduced once instead of `BANKS` times.
 ///

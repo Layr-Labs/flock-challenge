@@ -883,6 +883,28 @@ pub(super) unsafe fn expand_eq_table_level(lo: &mut [F128], hi: &mut [F128], r: 
     }
 }
 
+///
+/// # Safety
+#[inline]
+pub(super) unsafe fn scale_into(out: &mut [F128], src: &[F128], c: F128) {
+    use crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon;
+
+    debug_assert_eq!(out.len(), src.len());
+    let paired = src.len() & !1;
+    let mut i = 0usize;
+    while i < paired {
+        // SAFETY: the architecture-selecting caller supplies `aes`.
+        let products = unsafe { ghash_mul_const_vec2_neon(c, [src[i], src[i + 1]]) };
+        out[i] = products[0];
+        out[i + 1] = products[1];
+        i += 2;
+    }
+
+    if i < src.len() {
+        out[i] = src[i] * c;
+    }
+}
+
 /// Two-lane pair fold using NEON and PMULL.
 ///
 /// # Safety

@@ -49,26 +49,19 @@ pub fn build_eq_scaled(r: &[F128], root: F128) -> Vec<F128> {
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
     t[0] = root;
     const PAR_THRESHOLD: usize = 1 << 12;
-    for i in 0..n {
-        let r_i = r[i];
+    const PAR_CHUNK: usize = 1 << 8;
+    for (i, &r_i) in r.iter().enumerate() {
         let half = 1usize << i;
         let (lo, rest) = t.split_at_mut(half);
         let hi = &mut rest[..half];
-        let build_pair = |lo_x: &mut F128, hi_x: &mut F128| {
-            let v = *lo_x;
-            let vr = v * r_i;
-            *hi_x = vr;
-            // v * (1 + r_i) = v + v * r_i in characteristic two.
-            *lo_x = v + vr;
-        };
         if half < PAR_THRESHOLD {
-            lo.iter_mut()
-                .zip(hi.iter_mut())
-                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
+            crate::field::f128_slice::expand_eq_table_level(lo, hi, r_i);
         } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
+            lo.par_chunks_mut(PAR_CHUNK)
+                .zip(hi.par_chunks_mut(PAR_CHUNK))
+                .for_each(|(lo_chunk, hi_chunk)| {
+                    crate::field::f128_slice::expand_eq_table_level(lo_chunk, hi_chunk, r_i);
+                });
         }
     }
     t
