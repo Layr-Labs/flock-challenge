@@ -7277,6 +7277,18 @@ kernel void blake3_pow_scan(
                 // the suffix's aligned subtrees. Same leaf bytes, same BLAKE3
                 // tree, same flat-tree slots, so the root is unchanged.
                 if hybrid_gpu_suffix_hash_enabled() {
+                    let cb3 = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb3)?;
+                    let mut sstart = suffix_leaf_start;
+                    while sstart < n_leaves {
+                        let mut size = 1usize << (n_leaves - sstart).ilog2();
+                        while sstart % size != 0 {
+                            size >>= 1;
+                        }
+                        encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size);
+                        sstart += size;
+                    }
+                    gpu.end_encoding(enc);
                     let t_cpu_ntt = std::time::Instant::now();
                     if fine_m == 0 {
                         ntt.forward_transform_interleaved_ranked_block_range_and_then(
@@ -7318,18 +7330,6 @@ kernel void blake3_pow_scan(
                         )?;
                     }
                     let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
-                    let cb3 = gpu.command_buffer()?;
-                    let enc = gpu.compute_encoder(cb3)?;
-                    let mut sstart = suffix_leaf_start;
-                    while sstart < n_leaves {
-                        let mut size = 1usize << (n_leaves - sstart).ilog2();
-                        while sstart % size != 0 {
-                            size >>= 1;
-                        }
-                        encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size);
-                        sstart += size;
-                    }
-                    gpu.end_encoding(enc);
                     gpu.commit_async(cb3);
                     // Same queue: cb3 runs after cb2, so waiting for cb3
                     // also covers cb2; wait for both explicitly anyway.
