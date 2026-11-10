@@ -99,6 +99,31 @@ pub unsafe fn transpose_8_strided_u64s_to_regs(
         unsafe { vreinterpretq_u8_u64(vcombine_u64(vld1_u64(lo), vld1_u64(hi))) }
     }
 
+    // SAFETY: the caller guarantees all eight reads.
+    unsafe {
+        // Rows 0..8 = the eight source words, two per register.
+        transpose_8_u64_rows_to_regs(
+            lane_pair(base, base.add(stride)),
+            lane_pair(base.add(2 * stride), base.add(3 * stride)),
+            lane_pair(base.add(4 * stride), base.add(5 * stride)),
+            lane_pair(base.add(6 * stride), base.add(7 * stride)),
+        )
+    }
+}
+
+/// Register-entry core of [`transpose_8_strided_u64s_to_regs`]: rows 0..8
+/// are the eight source words, two per register (`r01` = words 0 and 1 in
+/// its low and high half). Same output.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn transpose_8_u64_rows_to_regs(
+    r01: core::arch::aarch64::uint8x16_t,
+    r23: core::arch::aarch64::uint8x16_t,
+    r45: core::arch::aarch64::uint8x16_t,
+    r67: core::arch::aarch64::uint8x16_t,
+) -> [core::arch::aarch64::uint8x16_t; 4] {
+    use core::arch::aarch64::*;
+
     // Output byte 8c + t comes from row t (register t / 2, half t % 2), byte c.
     const IDX0: [u8; 16] = [0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57];
     const IDX1: [u8; 16] = [2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59];
@@ -121,14 +146,8 @@ pub unsafe fn transpose_8_strided_u64s_to_regs(
         }
     }
 
-    // SAFETY: the caller guarantees all eight reads.
+    // SAFETY: NEON is baseline on aarch64; the table loads read the local consts.
     unsafe {
-        // Rows 0..8 = the eight source words, two per register.
-        let r01 = lane_pair(base, base.add(stride));
-        let r23 = lane_pair(base.add(2 * stride), base.add(3 * stride));
-        let r45 = lane_pair(base.add(4 * stride), base.add(5 * stride));
-        let r67 = lane_pair(base.add(6 * stride), base.add(7 * stride));
-
         // Distance 4: row r keeps bits 0..4 and takes row r+4's bits 0..4 as
         // its bits 4..8; row r+4 keeps bits 4..8 and takes row r's bits 4..8.
         let a01 = vsliq_n_u8::<4>(r01, r45);

@@ -750,7 +750,7 @@ fn fill_root_lincheck_stripe_group(
         let full = row.lo_mask == u64::MAX;
         // Reads stay inside the group: lo_word (+1 iff hi_mask != 0) < u64_per_block.
         assert!(row.lo_word + usize::from(row.hi_mask != 0) < u64_per_block);
-        let lanes: [u64; 8] = if full {
+        let lanes: [u64; 8] = if full || (cfg!(target_arch = "aarch64") && row.hi_mask != 0) {
             [0; 8]
         } else {
             std::array::from_fn(|lane| {
@@ -779,6 +779,18 @@ fn fill_root_lincheck_stripe_group(
                     z_u64.as_ptr().add(row.lo_word),
                     u64_per_block,
                 )
+            } else if row.hi_mask != 0 {
+                use core::arch::aarch64::*;
+                let (lo_mask, hi_mask) = (vdupq_n_u64(row.lo_mask), vdupq_n_u64(row.hi_mask));
+                // One 16-byte load per lane gets (w[lo], w[lo + 1]); the assert
+                // above bounds lo_word + 1. zip pairs two lanes' lo and hi words.
+                let pair = |l: usize| vld1q_u64(z_u64.as_ptr().add(l * u64_per_block + row.lo_word));
+                let rows2 = |a: usize| {
+                    let (p, q) = (pair(a), pair(a + 1));
+                    let lo = vandq_u64(vzip1q_u64(p, q), lo_mask);
+                    vreinterpretq_u8_u64(vorrq_u64(lo, vandq_u64(vzip2q_u64(p, q), hi_mask)))
+                };
+                flock_core::bits::transpose_8_u64_rows_to_regs(rows2(0), rows2(2), rows2(4), rows2(6))
             } else {
                 flock_core::bits::transpose_8_strided_u64s_to_regs(lanes.as_ptr(), 1)
             };
