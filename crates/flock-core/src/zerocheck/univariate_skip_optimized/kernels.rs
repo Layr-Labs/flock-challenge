@@ -526,7 +526,7 @@ pub(super) fn accumulate_convert_ab(
 /// band. Same gathers as the incumbent, zero GHASH multiplies.
 ///
 #[inline]
-pub(super) fn accumulate_convert_ab_nomul<const STORE: bool>(
+pub(super) fn accumulate_convert_ab_nomul<const STORE: bool, const U: bool>(
     chunk_ab_bytes: &[[u8; 64]; 16],
     first_b_med: usize,
     n_b_med: usize,
@@ -538,7 +538,7 @@ pub(super) fn accumulate_convert_ab_nomul<const STORE: bool>(
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
     // every table-selected load and every bank slot drained.
     unsafe {
-        aarch64::accumulate_convert_ab_nomul::<STORE>(
+        aarch64::accumulate_convert_ab_nomul::<STORE, U>(
             chunk_ab_bytes,
             first_b_med,
             n_b_med,

@@ -2787,6 +2787,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     let n_banks = 1usize << bank_bits;
     let bank_mask = n_banks - 1;
     let store_first = big_lo_size >= n_banks;
+    let unscaled = zc_ab_unscaled_enabled();
     if !store_first {
         banks.fill(F128::ZERO);
     }
@@ -2812,14 +2813,35 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
         let rows = precomputed_ab_rows(ab_inner, chunk_byte_base);
         let end_b_med = representation.materialized_b_med_end(within_hash_outer, n_b_med);
         let table = &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE];
-        if first_touch {
-            kernels::accumulate_convert_ab_nomul::<true>(rows, first_b_med, end_b_med, table, bank);
-        } else {
-            kernels::accumulate_convert_ab_nomul::<false>(rows, first_b_med, end_b_med, table, bank);
+        match (first_touch, unscaled) {
+            (true, true) => {
+                kernels::accumulate_convert_ab_nomul::<true, true>(rows, first_b_med, end_b_med, table, bank)
+            }
+            (false, true) => {
+                kernels::accumulate_convert_ab_nomul::<false, true>(rows, first_b_med, end_b_med, table, bank)
+            }
+            (true, false) => {
+                kernels::accumulate_convert_ab_nomul::<true, false>(rows, first_b_med, end_b_med, table, bank)
+            }
+            (false, false) => {
+                kernels::accumulate_convert_ab_nomul::<false, false>(rows, first_b_med, end_b_med, table, bank)
+            }
         }
     }
 
     finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks, bank_deferred, partial_ab);
+}
+
+/// Kill switch for the unscaled-index table loads of the round-one AB
+/// completion drain: `FLOCK_NO_ZC_AB_UNSCALED=1` restores the plain
+/// scaled-index loads in the same binary. The same table entries are read.
+pub const ENV_NO_ZC_AB_UNSCALED: &str = "FLOCK_NO_ZC_AB_UNSCALED";
+
+fn zc_ab_unscaled_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(ENV_NO_ZC_AB_UNSCALED).is_none_or(|v| v != *"1")
+    });
+    *ON
 }
 
 /// Collapse the bank-major tensor-fold scratch and apply the unchanged high
@@ -5786,7 +5808,7 @@ mod tests {
                     &mut out_incumbent,
                     false,
                 );
-                shift_reduce_inner_ab_fused_neon_h4(
+                shift_reduce_inner_ab_fused_neon_h4::<0>(
                     &a_packed,
                     &b_packed,
                     &table,
@@ -5794,6 +5816,20 @@ mod tests {
                     b_med,
                     &mut out_h4,
                     false,
+                );
+                let mut out_h4_kara = [0u8; 64];
+                shift_reduce_inner_ab_fused_neon_h4::<{ kernels::aarch64::ABV_KARA }>(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_h4_kara,
+                    false,
+                );
+                assert_eq!(
+                    out_h4_kara, out_h4,
+                    "Karatsuba h4 differs from plain h4 at (base={chunk_byte_base}, b_med={b_med})"
                 );
                 assert_eq!(
                     out_incumbent, out_scalar,

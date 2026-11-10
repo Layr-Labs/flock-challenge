@@ -5255,6 +5255,248 @@ mod tests {
         crate::scratch::clear();
     }
 
+    /// The non-temporal delta store of the two compact round-two kernels
+    /// writes the same anchors, the same deltas and the same aggregates as
+    /// the ordinary store, with and without the dead-pair skip; dead slots
+    /// keep their poison.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn r2_delta_nt_store_matches_at_kernel_level() {
+        const LO: usize = 512; // pairs: four 128-pair blocks, 256 groups
+        let mut rng = Rng::new(0xD17A_0001);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let mut a: Vec<u8> = (0..LO * 16).map(|_| rng.f128().lo as u8).collect();
+        let mut b: Vec<u8> = (0..LO * 16).map(|_| rng.f128().lo as u8).collect();
+        // A run of all-ones b rows (the degenerate shortcut) and zeroed padding pairs.
+        b[64 * 16..96 * 16].fill(0xff);
+        for blk in 0..LO / 128 {
+            a[(blk * 128 + 121) * 16..(blk + 1) * 128 * 16].fill(0);
+            b[(blk * 128 + 121) * 16..(blk + 1) * 128 * 16].fill(0);
+        }
+        let eq_lo: Vec<F128> = (0..LO).map(|_| rng.f128()).collect();
+        // kernel: 0 = lookahead FULL, 1 = lookahead GPU-shared, 2 = Horner.
+        let run = |kernel: usize, nt: bool, skip_dead: bool, periodic: bool| {
+            kernels::aarch64::r2_delta_nt_force(Some(nt));
+            let mut anchors = vec![LA_POISON; 2 * LO];
+            let mut deltas = vec![LA_POISON; LO];
+            let mut out = [LA_POISON; 8];
+            unsafe {
+                let (t, ap, bp) = (table.data.as_ptr().cast::<u8>(), a.as_ptr(), b.as_ptr());
+                let (an, de) = (anchors.as_mut_ptr(), deltas.as_mut_ptr().cast::<u8>());
+                match kernel {
+                    0 => fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                        t, ap, bp, an, de, eq_lo.as_ptr(), LO, 0, 127, 121, true, periodic, skip_dead,
+                        out.as_mut_ptr(),
+                    ),
+                    1 => fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
+                        t, ap, bp, an, de, eq_lo.as_ptr(), LO, 0, 127, 121, true, periodic, skip_dead,
+                        out.as_mut_ptr(),
+                    ),
+                    _ => fold_round2_compact_chunk_neon_horner_8::<true>(
+                        t, ap, bp, an, de, eq_lo.as_ptr(), LO, 0, 127, 121, true, skip_dead,
+                        out.as_mut_ptr(),
+                    ),
+                }
+            }
+            (anchors, deltas, out)
+        };
+        for kernel in 0..3 {
+            for skip_dead in [false, true] {
+                for periodic in [true, false] {
+                    let base = run(kernel, false, skip_dead, periodic);
+                    for p in 0..LO {
+                        let dead = (p & 127) >= 121;
+                        let want = if dead && skip_dead { LA_POISON } else if dead { F128::ZERO } else { base.1[p] };
+                        assert!(base.1[p] == want, "ordinary store layout, kernel {kernel} pair {p}");
+                    }
+                    let got = run(kernel, true, skip_dead, periodic);
+                    assert!(got.0 == base.0, "anchors: kernel {kernel} skip {skip_dead} periodic {periodic}");
+                    assert!(got.1 == base.1, "deltas: kernel {kernel} skip {skip_dead} periodic {periodic}");
+                    assert!(got.2 == base.2, "aggregates: kernel {kernel} skip {skip_dead} periodic {periodic}");
+                }
+            }
+        }
+        kernels::aarch64::r2_delta_nt_force(None);
+    }
+
+    /// The same through the production driver (dense and dead-pair-skip
+    /// states, messages and round-three lookahead).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn r2_delta_nt_store_matches_through_the_driver() {
+        let f = la_fixture(25, 0xD17A_0002, true);
+        let deltas_f128 = 1usize << (f.m - 7);
+        let run = |nt: bool, skip: bool| {
+            kernels::aarch64::r2_delta_nt_force(Some(nt));
+            let backing = ScratchBytes::from_initialized_f128(vec![LA_POISON; deltas_f128]);
+            let r = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+                &f.a_packed, &f.b_packed, f.m, 6, &f.table, &f.mlv, &f.padding, Some(backing), skip,
+            );
+            r
+        };
+        for skip in [false, true] {
+            let (base, b1, bi, bla) = run(false, skip);
+            let (got, g1, gi, gla) = run(true, skip);
+            assert_eq!((g1, gi), (b1, bi), "round-two message, skip {skip}");
+            assert_eq!(gla.c, bla.c, "round-three lookahead, skip {skip}");
+            assert_eq!(got.dead_tail, base.dead_tail);
+            // Under the dead-pair skip the padding pairs' anchor slots are
+            // not written and hold whatever the recycled buffer held.
+            for p in 0..base.len() {
+                if !(got.dead_tail && (p & 127) >= 121) {
+                    assert!(got.anchors[2 * p..2 * p + 2] == base.anchors[2 * p..2 * p + 2], "anchors at live pair {p}, skip {skip}");
+                }
+            }
+            assert!(got.deltas[..] == base.deltas[..], "deltas, skip {skip}");
+            got.recycle();
+            base.recycle();
+        }
+        kernels::aarch64::r2_delta_nt_force(None);
+        crate::scratch::clear();
+    }
+
+    /// Ten-thread kernel probe of the round-two delta store kinds on
+    /// real-sized data (ignored; timing). `R2_PROBE_UNITS` = file of 16 KiB
+    /// units (8 KiB of a rows then 8 KiB of b rows of one quad), tiled to the
+    /// ranked size: a and b 512 MiB each, anchors 1 GiB, deltas 512 MiB.
+    /// `R2_PROBE_ROUNDS` (default 6), `R2_PROBE_THREADS` (default 10).
+    /// Every pass runs all 2,048 chunks through `run_hetero_chunks`, as the
+    /// driver does; kernels: lookahead FULL and Horner; mode 0 = ordinary
+    /// store, 1 = non-temporal pair store.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "timing probe"]
+    fn r2_delta_store_probe() {
+        const LO: usize = 1 << 14;
+        const HI: usize = 2048;
+        const ROWS: usize = 1 << 26;
+        let path = std::env::var("R2_PROBE_UNITS").expect("R2_PROBE_UNITS");
+        let units = std::fs::read(&path).expect("units file");
+        let nq = units.len() / 16384;
+        assert!(nq > 0);
+        let rounds: usize = std::env::var("R2_PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+        let threads: usize = std::env::var("R2_PROBE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let mut a = vec![0u8; ROWS * 8];
+        let mut b = vec![0u8; ROWS * 8];
+        for q in 0..ROWS * 8 / 8192 {
+            let u = &units[(q % nq) * 16384..(q % nq + 1) * 16384];
+            a[q * 8192..(q + 1) * 8192].copy_from_slice(&u[..8192]);
+            b[q * 8192..(q + 1) * 8192].copy_from_slice(&u[8192..]);
+        }
+        let mut rng = Rng::new(0xD17A_0003);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let eq_lo: Vec<F128> = (0..LO).map(|_| rng.f128()).collect();
+        let mut anchors = vec![LA_POISON; ROWS];
+        let mut deltas = vec![LA_POISON; ROWS / 2];
+        let anchors_base = crate::epool::SyncPtr(anchors.as_mut_ptr());
+        let deltas_base = crate::epool::SyncPtr(deltas.as_mut_ptr().cast::<u8>());
+        let sink = std::sync::atomic::AtomicU64::new(0);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let pass = |kernel: usize, mode: u8| -> f64 {
+            kernels::aarch64::r2_delta_nt_force(Some(mode == 1));
+            let t0 = std::time::Instant::now();
+            pool.install(|| {
+                crate::epool::run_hetero_chunks(HI, |x_hi| unsafe {
+                    let mut out = [F128::ZERO; 8];
+                    let t = table.data.as_ptr().cast::<u8>();
+                    let ap = a.as_ptr().add(x_hi * LO * 16);
+                    let bp = b.as_ptr().add(x_hi * LO * 16);
+                    let an = anchors_base.ptr().add(x_hi * 2 * LO);
+                    let de = deltas_base.ptr().add(x_hi * 16 * LO);
+                    if kernel == 0 {
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                            t, ap, bp, an, de, eq_lo.as_ptr(), LO, x_hi * LO, 127, 121, true, true, true,
+                            out.as_mut_ptr(),
+                        );
+                    } else {
+                        fold_round2_compact_chunk_neon_horner_8::<true>(
+                            t, ap, bp, an, de, eq_lo.as_ptr(), LO, x_hi * LO, 127, 121, true, true,
+                            out.as_mut_ptr(),
+                        );
+                    }
+                    sink.fetch_xor(out[4].lo ^ out[7].hi, std::sync::atomic::Ordering::Relaxed);
+                })
+            });
+            t0.elapsed().as_secs_f64() * 1e3
+        };
+        // Untimed between passes: a checksum of what the pass wrote (also
+        // leaves both destinations equally cold for the next pass).
+        let checksum = |anchors: &[F128], deltas: &[F128]| -> (u64, u64) {
+            use rayon::prelude::*;
+            // Per-block hash keyed by the block index, combined with a
+            // commutative, associative sum: independent of rayon's split.
+            let f = |v: &[F128]| {
+                v.par_chunks(1 << 16)
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let h = c.iter().fold(i as u64 + 1, |h, x| {
+                            (h ^ x.lo).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ x.hi
+                        });
+                        h.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+                    })
+                    .reduce(|| 0u64, |x, y| x.wrapping_add(y))
+            };
+            (f(anchors), f(deltas))
+        };
+        let configs: [(usize, u8); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
+        let mut walls: Vec<Vec<f64>> = vec![Vec::new(); configs.len()];
+        let mut sums: Vec<Option<(u64, u64)>> = vec![None; configs.len()];
+        for &(kernel, mode) in &configs[..2] {
+            let _ = pass(kernel, mode); // page in and warm, untimed
+        }
+        for round in 0..rounds {
+            for j in 0..configs.len() {
+                let i = (j + round) % configs.len();
+                let (kernel, mode) = configs[i];
+                let ms = pass(kernel, mode);
+                let s = checksum(&anchors, &deltas);
+                // Machine state beside the pass (read outside the timed region).
+                let mut la = [0f64; 3];
+                unsafe extern "C" {
+                    fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
+                }
+                unsafe { getloadavg(la.as_mut_ptr(), 3) };
+                let comp = std::process::Command::new("vm_stat")
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .find(|l| l.contains("Pages stored in compressor"))
+                            .and_then(|l| l.rsplit(':').next().map(|v| v.trim().trim_end_matches('.').to_string()))
+                            .and_then(|v| v.parse::<f64>().ok())
+                    })
+                    .map_or(-1.0, |pages| pages * 16384.0 / (1u64 << 30) as f64);
+                eprintln!(
+                    "[r2-probe] pass round={round} kernel={kernel} mode={mode} ms={ms:.3} load={:.2} compressor_gib={comp:.2}",
+                    la[0]
+                );
+                match sums[i] {
+                    None => sums[i] = Some(s),
+                    Some(prev) => assert_eq!(prev, s, "config {i} not reproducible"),
+                }
+                walls[i].push(ms);
+            }
+        }
+        for kernel in 0..2 {
+            assert_eq!(sums[kernel * 2 + 1].unwrap(), sums[kernel * 2].unwrap(), "kernel {kernel}: bytes differ between the stores");
+        }
+        eprintln!("[r2-probe] units {nq} quads, threads {threads}, rounds {rounds}, same bytes in all modes: true");
+        for (i, &(kernel, mode)) in configs.iter().enumerate() {
+            let mut w = walls[i].clone();
+            w.sort_by(|x, y| x.total_cmp(y));
+            let all: Vec<String> = walls[i].iter().map(|x| format!("{x:.2}")).collect();
+            eprintln!(
+                "[r2-probe] kernel {} mode {mode}: min {:.2} median {:.2} ms | {}",
+                if kernel == 0 { "lookahead-full" } else { "horner" },
+                w[0],
+                w[w.len() / 2],
+                all.join(" ")
+            );
+        }
+        std::hint::black_box(sink.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     /// C1 — the cascade K-pass oracle. Outputs and the round-four message
     /// must match the incumbent K pass **elementwise** (poison-filled
     /// destinations), and the deferred round-five quadratic must evaluate to

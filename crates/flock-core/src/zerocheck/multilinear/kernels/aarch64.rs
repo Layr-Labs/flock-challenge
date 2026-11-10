@@ -1384,6 +1384,65 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
     }
 }
 
+/// Whether the compact round-two producers on the lookahead path store a
+/// live pair's delta with a non-temporal pair store (default) or with the
+/// ordinary 16-byte vector store (`FLOCK_NO_ZC_R2_DELTA_NT=1`, the previous
+/// form). 0 = not resolved yet, 1 = non-temporal, 2 = ordinary.
+static R2_DELTA_NT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Resolved once per process from the environment; one relaxed load per
+/// chunk call afterwards.
+#[inline]
+pub(crate) fn r2_delta_nt() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    match R2_DELTA_NT.load(Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("FLOCK_NO_ZC_R2_DELTA_NT").is_none();
+            R2_DELTA_NT.store(if on { 1 } else { 2 }, Relaxed);
+            on
+        }
+    }
+}
+
+/// Test access: force the store form (`None` returns to the environment).
+#[cfg(test)]
+pub(crate) fn r2_delta_nt_force(v: Option<bool>) {
+    let s = match v {
+        Some(true) => 1,
+        Some(false) => 2,
+        None => 0,
+    };
+    R2_DELTA_NT.store(s, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Store one pair's 16-byte delta `[da, db]` (two native words, the same
+/// bytes either way). The 512 MiB delta buffer is the donated round-one
+/// table: cold in cache when round two writes it and not read again before
+/// the K pass, so an ordinary store first pulls each line in only to
+/// overwrite it. The non-temporal form stores the two general registers
+/// directly with `stnp`, like the anchors beside it, and needs no vector.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_pair(dst: *mut u8, da: u64, db: u64, nt: bool) {
+    use core::arch::aarch64::*;
+    unsafe {
+        if nt {
+            core::arch::asm!(
+                "stnp {a}, {b}, [{dst}]",
+                dst = in(reg) dst,
+                a = in(reg) da,
+                b = in(reg) db,
+                options(nostack, preserves_flags),
+            );
+        } else {
+            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([da, db]);
+            vst1q_u64(dst.cast::<u64>(), delta_pair);
+        }
+    }
+}
+
 /// Fold one round-two pair and emit its compact anchor + delta stores.
 ///
 /// Every store below is the *same expression* the incumbent
@@ -1406,6 +1465,7 @@ unsafe fn r2_pair_fold_and_store(
     degen: bool,
     b_ones: core::arch::aarch64::uint64x2_t,
     skip_dead: bool,
+    delta_nt: bool,
 ) -> (
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
@@ -1458,17 +1518,14 @@ unsafe fn r2_pair_fold_and_store(
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            store_delta_pair(deltas.add(x_lo * 16), a0_code ^ a1_code, 0, delta_nt);
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-        let delta_pair =
-            core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        store_delta_pair(deltas.add(x_lo * 16), a0_code ^ a1_code, b0_code ^ b1_code, delta_nt);
         (a0, a1, b0, b1, false)
     }
 }
@@ -1548,6 +1605,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     }
 
     unsafe {
+        let delta_nt = r2_delta_nt();
         let zero = vdupq_n_u64(0);
         let tri_zero = TriNeon {
             ll: zero,
@@ -1607,11 +1665,11 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 
                 let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
-                    skip_dead,
+                    skip_dead, delta_nt,
                 );
                 let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
-                    skip_dead,
+                    skip_dead, delta_nt,
                 );
 
                 // The odd lane's weight drives the whole group; see the doc above.
@@ -1929,6 +1987,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
     }
 
     unsafe {
+        let delta_nt = r2_delta_nt();
         let zero = vdupq_n_u64(0);
         let mut sum0 = zero;
         let mut sum3 = zero;
@@ -2009,11 +2068,12 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
                                     fold_two_row_codes_q(table_data, a_even, b_even)
                                 };
                                 store_anchor_pair_nt(anchors.add(2 * x_lo), a, b);
-                                let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
+                                store_delta_pair(
+                                    deltas.add(x_lo * 16),
                                     a_even ^ a_odd,
                                     b_even ^ b_odd,
-                                ]);
-                                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+                                    delta_nt,
+                                );
                                 (a, b, a_odd, b_odd, deg)
                             };
                             let (a0, b0, a1c, b1c, deg0) = pair(x_lo0, pad0);

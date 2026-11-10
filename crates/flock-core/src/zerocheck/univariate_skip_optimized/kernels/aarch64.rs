@@ -269,6 +269,51 @@ pub(crate) unsafe fn accumulate_convert_ab(
     }
 }
 
+/// Entry `(w >> SHIFT) & 0xff` of a 256 x 16-byte table. `U = false` is the
+/// plain Rust form (`ubfx` + scaled-index load, three issue slots on Apple
+/// performance cores); `U = true` forms the byte offset in one instruction
+/// (`ubfiz`, or `and` with a shifted register against `0xff0`) and uses the
+/// unscaled register-offset load, one slot less per lookup. Same entry.
+#[inline(always)]
+unsafe fn ab_ld<const U: bool, const SHIFT: u32>(
+    t: *const u8,
+    w: usize,
+) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        if !U {
+            return vld1q_u8(t.add(((w >> SHIFT) & 0xff) * 16));
+        }
+        let out: uint8x16_t;
+        // SAFETY: the offset is a byte value times 16 (at most 4080), inside
+        // the caller's 4 KiB table; the asm only reads that memory.
+        if SHIFT == 0 {
+            core::arch::asm!(
+                "ubfiz {idx}, {w}, #4, #8",
+                "ldr {out:q}, [{t}, {idx}]",
+                w = in(reg) w,
+                t = in(reg) t,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else {
+            core::arch::asm!(
+                "and {idx}, {mask}, {w}, lsr #{shift}",
+                "ldr {out:q}, [{t}, {idx}]",
+                shift = const (SHIFT + 60) % 64,
+                mask = in(reg) 0xff0usize,
+                w = in(reg) w,
+                t = in(reg) t,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+        out
+    }
+}
+
 /// Multiply-free twin of [`accumulate_convert_ab`] for the banked `eq_lo`
 /// tensor fold.
 ///
@@ -286,7 +331,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
 /// terms — no term is added, dropped, or reordered within a lane.
 ///
 #[inline(always)]
-pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool>(
+pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool, const U: bool>(
     chunk_ab_bytes: &[[u8; 64]; 16],
     first_b_med: usize,
     n_b_med: usize,
@@ -327,43 +372,43 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool>(
                     as usize;
                 ab0 = xor3_u8(
                     ab0,
-                    vld1q_u8(t_even.add((we & 0xff) * 16)),
-                    vld1q_u8(t_odd.add((wo & 0xff) * 16)),
+                    ab_ld::<U, 0>(t_even, we),
+                    ab_ld::<U, 0>(t_odd, wo),
                 );
                 ab1 = xor3_u8(
                     ab1,
-                    vld1q_u8(t_even.add(((we >> 8) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 8) & 0xff) * 16)),
+                    ab_ld::<U, 8>(t_even, we),
+                    ab_ld::<U, 8>(t_odd, wo),
                 );
                 ab2 = xor3_u8(
                     ab2,
-                    vld1q_u8(t_even.add(((we >> 16) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 16) & 0xff) * 16)),
+                    ab_ld::<U, 16>(t_even, we),
+                    ab_ld::<U, 16>(t_odd, wo),
                 );
                 ab3 = xor3_u8(
                     ab3,
-                    vld1q_u8(t_even.add(((we >> 24) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 24) & 0xff) * 16)),
+                    ab_ld::<U, 24>(t_even, we),
+                    ab_ld::<U, 24>(t_odd, wo),
                 );
                 ab4 = xor3_u8(
                     ab4,
-                    vld1q_u8(t_even.add(((we >> 32) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 32) & 0xff) * 16)),
+                    ab_ld::<U, 32>(t_even, we),
+                    ab_ld::<U, 32>(t_odd, wo),
                 );
                 ab5 = xor3_u8(
                     ab5,
-                    vld1q_u8(t_even.add(((we >> 40) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 40) & 0xff) * 16)),
+                    ab_ld::<U, 40>(t_even, we),
+                    ab_ld::<U, 40>(t_odd, wo),
                 );
                 ab6 = xor3_u8(
                     ab6,
-                    vld1q_u8(t_even.add(((we >> 48) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 48) & 0xff) * 16)),
+                    ab_ld::<U, 48>(t_even, we),
+                    ab_ld::<U, 48>(t_odd, wo),
                 );
                 ab7 = xor3_u8(
                     ab7,
-                    vld1q_u8(t_even.add((we >> 56) * 16)),
-                    vld1q_u8(t_odd.add((wo >> 56) * 16)),
+                    ab_ld::<U, 56>(t_even, we),
+                    ab_ld::<U, 56>(t_odd, wo),
                 );
             }
 
@@ -373,14 +418,14 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool>(
                 let table = convert_ptr.add(b_med * 256 * 16);
                 let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u64).read_unaligned()
                     as usize;
-                ab0 = veorq_u8(ab0, vld1q_u8(table.add((wa & 0xff) * 16)));
-                ab1 = veorq_u8(ab1, vld1q_u8(table.add(((wa >> 8) & 0xff) * 16)));
-                ab2 = veorq_u8(ab2, vld1q_u8(table.add(((wa >> 16) & 0xff) * 16)));
-                ab3 = veorq_u8(ab3, vld1q_u8(table.add(((wa >> 24) & 0xff) * 16)));
-                ab4 = veorq_u8(ab4, vld1q_u8(table.add(((wa >> 32) & 0xff) * 16)));
-                ab5 = veorq_u8(ab5, vld1q_u8(table.add(((wa >> 40) & 0xff) * 16)));
-                ab6 = veorq_u8(ab6, vld1q_u8(table.add(((wa >> 48) & 0xff) * 16)));
-                ab7 = veorq_u8(ab7, vld1q_u8(table.add((wa >> 56) * 16)));
+                ab0 = veorq_u8(ab0, ab_ld::<U, 0>(table, wa));
+                ab1 = veorq_u8(ab1, ab_ld::<U, 8>(table, wa));
+                ab2 = veorq_u8(ab2, ab_ld::<U, 16>(table, wa));
+                ab3 = veorq_u8(ab3, ab_ld::<U, 24>(table, wa));
+                ab4 = veorq_u8(ab4, ab_ld::<U, 32>(table, wa));
+                ab5 = veorq_u8(ab5, ab_ld::<U, 40>(table, wa));
+                ab6 = veorq_u8(ab6, ab_ld::<U, 48>(table, wa));
+                ab7 = veorq_u8(ab7, ab_ld::<U, 56>(table, wa));
             }
 
             macro_rules! drain_lane {
@@ -1887,7 +1932,7 @@ pub(crate) fn fast_shift_reduce_enabled() -> bool {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
+pub(crate) fn shift_reduce_inner_ab_fused_neon_h4<const V: u8>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -1904,6 +1949,13 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
     let scaled_sw = inv_table.scaled_x4_half_swapped_data_ptr();
+    // Karatsuba images (see `ab_kara_tables`); dangling and unused otherwise.
+    let kplain = if V & ABV_KARA != 0 {
+        ab_kara_tables(inv_table)
+    } else {
+        core::ptr::null()
+    };
+    let kscaled = kplain.wrapping_add(AB_KARA_IMAGE_BYTES);
 
     unsafe {
         let a_base = a_packed.as_ptr().add(byte_base_b);
@@ -1913,15 +1965,15 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
         // the plain image for K < 4 and the `x^4`-scaled image for K ≥ 4; `B`
         // always comes out of the plain image.
         macro_rules! products {
-            ($at:expr, $at_sw:expr, $k:literal) => {{
+            ($at:expr, $at_sw:expr, $kara:expr, $k:literal) => {{
                 let aw = u64::from_le(core::ptr::read_unaligned(
                     a_base.add($k * N_CHUNKS).cast::<u64>(),
                 ));
                 let bw = u64::from_le(core::ptr::read_unaligned(
                     b_base.add($k * N_CHUNKS).cast::<u64>(),
                 ));
-                let (da0, da1, da2, da3) = apply_word_into_4_regs($at, $at_sw, aw);
-                let (db0, db1, db2, db3) = apply_word_into_4_regs(plain, plain_sw, bw);
+                let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V>($at, $at_sw, $kara, aw);
+                let (db0, db1, db2, db3) = apply_word_into_4_regs_v::<V>(plain, plain_sw, kplain, bw);
                 [
                     pmull_lo_u16(da0, db0),
                     pmull_hi_u16(da0, db0),
@@ -1936,8 +1988,8 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
         }
 
         // d_3 seeds the Horner chain; no shift is due before the first row.
-        let lo3 = products!(plain, plain_sw, 3);
-        let hi3 = products!(scaled, scaled_sw, 7);
+        let lo3 = products!(plain, plain_sw, kplain, 3);
+        let hi3 = products!(scaled, scaled_sw, kscaled, 7);
         let mut acc = [
             veorq_u16(lo3[0], hi3[0]),
             veorq_u16(lo3[1], hi3[1]),
@@ -1951,16 +2003,16 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
 
         let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
 
-        let lo2 = products!(plain, plain_sw, 2);
-        let hi2 = products!(scaled, scaled_sw, 6);
+        let lo2 = products!(plain, plain_sw, kplain, 2);
+        let hi2 = products!(scaled, scaled_sw, kscaled, 6);
         horner_absorb_first(&mut acc, &lo2, &hi2);
 
-        let lo1 = products!(plain, plain_sw, 1);
-        let hi1 = products!(scaled, scaled_sw, 5);
+        let lo1 = products!(plain, plain_sw, kplain, 1);
+        let hi1 = products!(scaled, scaled_sw, kscaled, 5);
         horner_absorb(&mut acc, &lo1, &hi1, carry_not);
 
-        let lo0 = products!(plain, plain_sw, 0);
-        let hi0 = products!(scaled, scaled_sw, 4);
+        let lo0 = products!(plain, plain_sw, kplain, 0);
+        let hi0 = products!(scaled, scaled_sw, kscaled, 4);
         horner_absorb(&mut acc, &lo0, &hi0, carry_not);
 
         let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
@@ -2453,7 +2505,7 @@ unsafe fn store_row_64(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn shift_reduce_inner_a_only_const_b(
+fn shift_reduce_inner_a_only_const_b<const V: u8>(
     a_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
     byte_base_b: usize,
@@ -2465,6 +2517,11 @@ fn shift_reduce_inner_a_only_const_b(
 
     let table_base = inv_table.data_ptr();
     let half_swapped_table_base = inv_table.half_swapped_data_ptr();
+    let kplain = if V & ABV_KARA != 0 {
+        ab_kara_tables(inv_table)
+    } else {
+        core::ptr::null()
+    };
     unsafe {
         let mut acc0_lo = vdupq_n_u16(0);
         let mut acc0_hi = vdupq_n_u16(0);
@@ -2482,7 +2539,7 @@ fn shift_reduce_inner_a_only_const_b(
                     a_packed.as_ptr().add(off).cast::<u64>(),
                 ));
                 let (d0, d1, d2, d3) =
-                    apply_word_into_4_regs(table_base, half_swapped_table_base, word);
+                    apply_word_into_4_regs_v::<V>(table_base, half_swapped_table_base, kplain, word);
                 acc0_lo = veorq_u16(acc0_lo, vshll_n_u8::<$k>(vget_low_u8(d0)));
                 acc0_hi = veorq_u16(acc0_hi, vshll_n_u8::<$k>(vget_high_u8(d0)));
                 acc1_lo = veorq_u16(acc1_lo, vshll_n_u8::<$k>(vget_low_u8(d1)));
@@ -3459,7 +3516,17 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
     if check_all_ones {
         let and_all = bw(0) & bw(1) & bw(2) & bw(3) & bw(4) & bw(5) & bw(6) & bw(7);
         if and_all == u64::MAX {
-            shift_reduce_inner_a_only_const_b(a_packed, inv_table, byte_base_b, out, nt_store);
+            if ab_kara_enabled() {
+                shift_reduce_inner_a_only_const_b::<{ ABV_KARA }>(
+                    a_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            } else {
+                shift_reduce_inner_a_only_const_b::<0>(a_packed, inv_table, byte_base_b, out, nt_store);
+            }
             return;
         }
     }
@@ -3677,15 +3744,27 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         }
     }
     if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-        shift_reduce_inner_ab_fused_neon_h4(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med,
-            out,
-            nt_store,
-        );
+        if ab_kara_enabled() {
+            shift_reduce_inner_ab_fused_neon_h4::<{ ABV_KARA }>(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                out,
+                nt_store,
+            );
+        } else {
+            shift_reduce_inner_ab_fused_neon_h4::<0>(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                out,
+                nt_store,
+            );
+        }
     } else {
         shift_reduce_inner_ab_fused_neon(
             a_packed,
