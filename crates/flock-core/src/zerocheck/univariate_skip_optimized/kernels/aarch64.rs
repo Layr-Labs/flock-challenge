@@ -284,8 +284,9 @@ pub(crate) unsafe fn accumulate_convert_ab(
 /// row by `eq_top[w]` before the XOR chain equals scaling the chain's result
 /// after it, and the deferred `eq_bot[u]` fold re-associates the same product
 /// terms — no term is added, dropped, or reordered within a lane.
+///
 #[inline(always)]
-pub(crate) unsafe fn accumulate_convert_ab_nomul(
+pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool>(
     chunk_ab_bytes: &[[u8; 64]; 16],
     first_b_med: usize,
     n_b_med: usize,
@@ -385,7 +386,11 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul(
             macro_rules! drain_lane {
                 ($offset:literal, $ab:ident) => {{
                     let slot = bank.as_mut_ptr().add(lane + $offset) as *mut u8;
-                    vst1q_u8(slot, veorq_u8(vld1q_u8(slot), $ab));
+                    if STORE {
+                        vst1q_u8(slot, $ab);
+                    } else {
+                        vst1q_u8(slot, veorq_u8(vld1q_u8(slot), $ab));
+                    }
                 }};
             }
             drain_lane!(0, ab0);
