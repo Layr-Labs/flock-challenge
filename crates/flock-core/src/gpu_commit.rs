@@ -7358,6 +7358,53 @@ kernel void blake3_pow_scan(
     static FINE_SPLIT_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static FINE_SPLIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    /// Retained lead command buffer of the last fine-split prefix (0 = none):
+    /// the layer-4 pass and the fine-split event signal, committed ahead of
+    /// the rest of the prefix (see [`fine_lead_cb_enabled`]).
+    static FINE_LEAD_CB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Same-binary control for the fine split's lead command buffer: with
+    /// exactly `FLOCK_NO_FINE_LEAD_CB=1` the layer-4 pass, the event signal
+    /// and the remaining prefix passes share one command buffer again.
+    ///
+    /// The event that releases the CPU suffix's boundary sub-blocks is a
+    /// command-buffer-level signal. Encoded between the two encoders of one
+    /// command buffer it reaches the host together with that command
+    /// buffer's completion, so the suffix's layer-10..20 pass for every CPU
+    /// block would wait for the entire GPU prefix. Committing the layer-4
+    /// pass and the signal as their own command buffer, ahead of the rest on
+    /// the same queue, releases the CPU suffix when that pass completes.
+    /// Same kernels, same order, same buffers: the codeword and tree bytes
+    /// are unchanged.
+    pub(crate) const ENV_NO_FINE_LEAD_CB: &str = "FLOCK_NO_FINE_LEAD_CB";
+
+    fn fine_lead_cb_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os(ENV_NO_FINE_LEAD_CB).as_deref() != Some(std::ffi::OsStr::new("1"))
+        })
+    }
+
+    /// Publish a retained lead command buffer, releasing any stale one.
+    unsafe fn fine_lead_cb_store(gpu: &Gpu, cb: Id) {
+        let old = FINE_LEAD_CB.swap(cb as usize, std::sync::atomic::Ordering::AcqRel);
+        if old != 0 {
+            unsafe { gpu.release(old as Id) };
+        }
+    }
+
+    /// Take ownership of the published lead command buffer, if any.
+    fn fine_lead_cb_take() -> Option<Id> {
+        let p = FINE_LEAD_CB.swap(0, std::sync::atomic::Ordering::AcqRel);
+        (p != 0).then_some(p as Id)
+    }
+
+    /// Whether the published lead command buffer (if any) has failed.
+    unsafe fn fine_lead_cb_failed(gpu: &Gpu) -> bool {
+        let p = FINE_LEAD_CB.load(std::sync::atomic::Ordering::Acquire);
+        p != 0 && unsafe { gpu_cb_failed(gpu, p as Id) }
+    }
+
     /// Decode a hybrid split value: `k_split = k_cpu16 + 16 * m`, where the
     /// CPU owns the last `k_cpu16` sixteenths plus the last `m` of the 16
     /// layer-8 sub-blocks (256ths) of the sixteenth just before them.
@@ -7442,13 +7489,24 @@ kernel void blake3_pow_scan(
             }
             let prefix16 = (16 - k_cpu16) as u64;
             let prefix256 = hybrid_prefix256(k_split) as u64;
-            let cb2 = gpu.command_buffer()?;
-            let enc = gpu.compute_encoder(cb2)?;
+            let lead = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(lead)?;
             encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 4, 8, prefix16, 16);
             gpu.end_encoding(enc);
             let v = FINE_SPLIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            gpu.encode_signal_event(cb2, ev, v);
+            gpu.encode_signal_event(lead, ev, v);
             FINE_SPLIT_WAIT.store(v, std::sync::atomic::Ordering::Release);
+            // Lead command buffer: the layer-4 pass and its signal are
+            // committed on their own, ahead of the rest of the prefix on the
+            // same queue (see `fine_lead_cb_enabled`).
+            let cb2 = if fine_lead_cb_enabled() {
+                let lead = gpu.retain(lead);
+                gpu.commit_async(lead);
+                fine_lead_cb_store(gpu, lead);
+                gpu.command_buffer()?
+            } else {
+                lead
+            };
             let enc = gpu.compute_encoder(cb2)?;
             encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 8, log_d, prefix256, 256);
             let prefix_leaves = prefix256 as usize * (n_leaves / 256);
@@ -7556,7 +7614,7 @@ kernel void blake3_pow_scan(
                             || {
                                 let mut spins = 0u32;
                                 while gpu.event_signaled_value(ev) < want {
-                                    if gpu_cb_failed(gpu, cb2) {
+                                    if gpu_cb_failed(gpu, cb2) || fine_lead_cb_failed(gpu) {
                                         return Err("fine split: GPU prefix failed before layer-4 signal".into());
                                     }
                                     spins = spins.wrapping_add(1);
@@ -7604,7 +7662,19 @@ kernel void blake3_pow_scan(
                     // both cb2 and the CPU NTT, so this split's window is
                     // max(cb2, cpu NTT) + cb3: price the GPU arm as cb2's
                     // start to cb3's end and the CPU arm as the NTT wall.
-                    let (cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
+                    let (mut cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
+                    // A fine split's prefix starts with its lead command
+                    // buffer, which completed before `cb2`.
+                    if fine_m > 0
+                        && let Some(lead) = fine_lead_cb_take()
+                    {
+                        let failed = gpu_cb_failed(gpu, lead);
+                        cb2_s = cb_gpu_interval(gpu, lead).0;
+                        gpu.release(lead);
+                        if failed {
+                            return Err("fine split: GPU prefix lead command buffer failed".into());
+                        }
+                    }
                     let (cb3_s, cb3_e) = cb_gpu_interval(gpu, cb3);
                     record_hybrid_arms(k_split, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
                     record_fine_arms(k_split, (cb2_e - cb2_s) * 1e3, cpu_ntt_ms, (cb3_e - cb3_s) * 1e3);
