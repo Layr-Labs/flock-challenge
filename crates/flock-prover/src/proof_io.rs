@@ -774,18 +774,35 @@ impl<'a> GatherBundle<'a> {
                 .sum::<usize>()
     }
 
-    /// The I/O slices, in order (the arena is complete, so its address is
-    /// stable from here on).
+    /// The encoded bytes as their source slices, in order (the arena is
+    /// complete, so its address is stable from here on).
+    fn parts(&self) -> impl Iterator<Item = &[u8]> {
+        std::iter::once(self.prefix.as_slice()).chain(self.segs.iter().map(|s| match s {
+            GatherSeg::Arena(start, len) => &self.arena[*start..*start + *len],
+            GatherSeg::Ext(b) => *b,
+        }))
+    }
+
+    /// The I/O slices, in order.
     pub(crate) fn io_slices(&self) -> Vec<std::io::IoSlice<'_>> {
         let mut out = Vec::with_capacity(self.segs.len() + 1);
-        out.push(std::io::IoSlice::new(&self.prefix));
-        for s in &self.segs {
-            out.push(std::io::IoSlice::new(match s {
-                GatherSeg::Arena(start, len) => &self.arena[*start..*start + *len],
-                GatherSeg::Ext(b) => b,
-            }));
-        }
+        out.extend(self.parts().map(std::io::IoSlice::new));
         out
+    }
+
+    /// Copy every byte, in order: the first `head.len()` into `head`, the rest
+    /// appended to `tail`. [`Self::len`] must be at least `head.len()`. The
+    /// userspace counterpart of [`Self::write_all_to`] for a destination whose
+    /// front is already memory (a mapped publish file).
+    pub(crate) fn copy_split(&self, head: &mut [u8], tail: &mut Vec<u8>) {
+        let mut at = 0;
+        for part in self.parts() {
+            let n = part.len().min(head.len() - at);
+            head[at..at + n].copy_from_slice(&part[..n]);
+            at += n;
+            tail.extend_from_slice(&part[n..]);
+        }
+        assert_eq!(at, head.len(), "gather shorter than its head");
     }
 
     /// Write every byte to `w` with vectored writes (at most 1024 slices per
@@ -1487,5 +1504,42 @@ mod tests {
     fn rejects_truncated() {
         let res = R1csProofBundleLigerito::from_bytes(&[0u8; 3]);
         assert!(matches!(res, Err(DeserializeError::Truncated)));
+    }
+
+    #[test]
+    fn gather_copy_matches_the_vectored_write() {
+        let rows: Vec<Vec<F128>> = (0..37u64)
+            .map(|r| {
+                (0..(r % 5))
+                    .map(|i| F128::new(r * 1_000 + i, !(r + i)))
+                    .collect()
+            })
+            .collect();
+        let hashes: Vec<MerkleHash> = (0..11u8).map(|i| [i.wrapping_mul(29); 32]).collect();
+        let mut gather = GatherBundle {
+            prefix: (0..4_321u32).map(|i| (i * 7 + 3) as u8).collect(),
+            arena: Vec::new(),
+            segs: Vec::new(),
+        };
+        gather.rows(&rows);
+        gather.hashes(&hashes);
+        gather.u64(0xDEAD_BEEF);
+        gather.bytes(&[]);
+        gather.f128s(&rows[4]);
+
+        let mut written = Vec::new();
+        gather.write_all_to(&mut written).expect("vectored write");
+        assert_eq!(written.len(), gather.len());
+        assert_eq!(written, gather.to_vec());
+
+        // Split inside a part, on a part boundary, at both ends.
+        for head_len in [0, 1, 4_320, 4_321, 4_329, 5_000, written.len() - 1, written.len()] {
+            let mut head = vec![0xA5u8; head_len];
+            let mut tail = vec![0x5Au8; 3];
+            gather.copy_split(&mut head, &mut tail);
+            assert_eq!(head, written[..head_len], "head differs at {head_len}");
+            assert_eq!(tail[..3], [0x5A; 3], "tail prefix overwritten at {head_len}");
+            assert_eq!(tail[3..], written[head_len..], "tail differs at {head_len}");
+        }
     }
 }
