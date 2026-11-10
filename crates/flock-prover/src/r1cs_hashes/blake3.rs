@@ -247,8 +247,27 @@ impl DeferredAb<'_> {
     /// Write the a and b rows of quad `q` (compressions `4q..4q+4`) into
     /// the witness buffers; with non-null scratch pointers also write the
     /// quad's complete a and b blocks (`UNIT_BYTES` each) there.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
     pub(crate) fn fill_quad(&self, q: usize, a_scratch: *mut u8, b_scratch: *mut u8) {
+        self.fill_quad_impl::<false>(q, a_scratch, b_scratch);
+    }
+
+    /// [`Self::fill_quad`] into a scratch pair that an earlier scratch
+    /// `fill_quad` / `fill_quad_primed` of this handle already wrote: the
+    /// witness bytes are identical, and the scratch chunks that are the
+    /// same for every quad (the witness drain's own constant chunks) are
+    /// left as they are (see `build_quad_split_neon_primed`).
+    ///
+    /// # Safety
+    /// `a_scratch` / `b_scratch` must be non-null, valid for `UNIT_BYTES`
+    /// each, and hold the output of an earlier scratch fill of this handle.
+    pub(crate) unsafe fn fill_quad_primed(&self, q: usize, a_scratch: *mut u8, b_scratch: *mut u8) {
+        assert!(!a_scratch.is_null() && !b_scratch.is_null());
+        self.fill_quad_impl::<true>(q, a_scratch, b_scratch);
+    }
+
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    #[inline(always)]
+    fn fill_quad_impl<const PRIMED: bool>(&self, q: usize, a_scratch: *mut u8, b_scratch: *mut u8) {
         assert!(q < self.n_quads);
         assert_eq!(a_scratch.is_null(), b_scratch.is_null());
         #[cfg(target_arch = "aarch64")]
@@ -272,7 +291,7 @@ impl DeferredAb<'_> {
                         std::ptr::null_mut(),
                     );
                 } else {
-                    witgen_simd::build_quad_split_neon::<false, true>(
+                    witgen_simd::build_quad_split_neon_primed::<false, true, PRIMED>(
                         input,
                         std::ptr::null_mut(),
                         a,
@@ -3155,12 +3174,13 @@ pub(crate) mod witgen_simd {
         stage: *const V4,
         scratch: *mut u32,
         dst: *mut u32,
+        scratch_chunks: (usize, usize),
         nt0: usize,
         nt1: usize,
         sparse_tail: bool,
     ) {
         unsafe {
-            dump_range::<false>(stage, scratch, 0, DUMP_CHUNKS);
+            dump_range::<false>(stage, scratch, scratch_chunks.0, scratch_chunks.1);
             dump_range_lines_nt(stage, dst, nt0, nt1);
             if sparse_tail {
                 dump_ranked_sparse_tail_nt(stage, dst);
@@ -3184,7 +3204,38 @@ pub(crate) mod witgen_simd {
     /// `sa` / `sb` must each be valid for `4 * U32_PER_BLOCK` words when
     /// `SCRATCH` is set.
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub(crate) unsafe fn build_quad_split_neon<const WZ: bool, const SCRATCH: bool>(
+        inputs: QuadInput<'_>,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        sa: *mut u32,
+        sb: *mut u32,
+    ) {
+        unsafe { build_quad_split_neon_primed::<WZ, SCRATCH, false>(inputs, z, a, b, sa, sb) }
+    }
+
+    /// [`build_quad_split_neon`] with `PRIMED`: the a/b scratch form for a
+    /// scratch pair whose previous contents were written by an earlier
+    /// scratch call of this builder (primed or not).  It writes the same a
+    /// and b witness bytes, and the same scratch bytes except the chunks
+    /// that the witness drain already treats as per-block constants: a
+    /// chunks `61..64` (zero) and b chunks `0..4` (all ones) and `59..64`
+    /// (ones then zero).  Those chunks hold the same bytes for every quad,
+    /// so the earlier call left them exactly as a full write would.  The
+    /// L1-stage stores that only fed those chunks (b prefix words `0..32`
+    /// and the zero fill past a word 487 / b word 471) are skipped too.
+    ///
+    /// # Safety
+    /// As [`build_quad_split_neon`] with `SCRATCH`; additionally `sa` / `sb`
+    /// must hold the output of an earlier scratch call of this builder.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn build_quad_split_neon_primed<
+        const WZ: bool,
+        const SCRATCH: bool,
+        const PRIMED: bool,
+    >(
         inputs: QuadInput<'_>,
         z: *mut u32,
         a: *mut u32,
@@ -3194,6 +3245,10 @@ pub(crate) mod witgen_simd {
     ) {
         const {
             assert!(!(WZ && SCRATCH));
+            assert!(!PRIMED || SCRATCH);
+            assert!(RANKED_SPARSE_TAIL_CHUNK + 1 == ELIDE_ZERO_CHUNK);
+            assert!(ZERO_FILL_WORD + 6 == 8 * ELIDE_ZERO_CHUNK);
+            assert!(ELIDE_B_TAIL_CHUNK < RANKED_SPARSE_TAIL_CHUNK);
             assert!(RANKED_SPARSE_TAIL_CHUNK.is_multiple_of(2));
             assert!(ELIDE_B_PREFIX_CHUNKS.is_multiple_of(2));
         }
@@ -3309,7 +3364,7 @@ pub(crate) mod witgen_simd {
             // b prefix words 0..36 = MAX.  Without a scratch only words
             // 32..36 are ever read (the drain starts at chunk 4).
             if !WZ {
-                let b0 = if SCRATCH {
+                let b0 = if SCRATCH && !PRIMED {
                     0
                 } else {
                     8 * ELIDE_B_PREFIX_CHUNKS
@@ -3443,11 +3498,18 @@ pub(crate) mod witgen_simd {
                 assert!(U32_PER_BLOCK - ZERO_FILL_WORD == 30);
                 assert!(ZERO_FILL_WORD == RANKED_SPARSE_TAIL_WORD + 2);
             }
-            if SCRATCH {
+            if SCRATCH && !PRIMED {
                 // Complete stages: the scratch receives every chunk.
                 for w in 0..30usize {
                     vst1q_u32(za.add(ZERO_FILL_WORD + w) as *mut u32, zero);
                     vst1q_u32(bs.add(ZERO_FILL_WORD + w) as *mut u32, zero);
+                }
+            } else if PRIMED {
+                // Primed scratch: a chunk 60 (words 480..488) is the last
+                // chunk copied, so zero its words 482..488; b is copied
+                // only through chunk 58, which ends before word 472.
+                for w in 0..6usize {
+                    vst1q_u32(za.add(ZERO_FILL_WORD + w) as *mut u32, zero);
                 }
             } else {
                 // The sparse tail publisher reads words 480..483 only.
@@ -3466,8 +3528,29 @@ pub(crate) mod witgen_simd {
                 dump_range_lines_nt(za, z, 0, RANKED_SPARSE_TAIL_CHUNK);
                 dump_ranked_sparse_tail_nt(za, z);
             } else if SCRATCH {
-                dump_dual(za, sa, a, 0, RANKED_SPARSE_TAIL_CHUNK, true);
-                dump_dual(bs, sb, b, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK, false);
+                // Primed: the scratch skips exactly the chunks the witness
+                // drain also skips as per-block constants (a 61..64, b 0..4
+                // and 59..64); they still hold the earlier call's bytes.
+                let a_scratch = if PRIMED {
+                    (0, RANKED_SPARSE_TAIL_CHUNK + 1)
+                } else {
+                    (0, DUMP_CHUNKS)
+                };
+                let b_scratch = if PRIMED {
+                    (ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK)
+                } else {
+                    (0, DUMP_CHUNKS)
+                };
+                dump_dual(za, sa, a, a_scratch, 0, RANKED_SPARSE_TAIL_CHUNK, true);
+                dump_dual(
+                    bs,
+                    sb,
+                    b,
+                    b_scratch,
+                    ELIDE_B_PREFIX_CHUNKS,
+                    ELIDE_B_TAIL_CHUNK,
+                    false,
+                );
             } else {
                 dump_range_lines_nt(za, a, 0, RANKED_SPARSE_TAIL_CHUNK);
                 dump_ranked_sparse_tail_nt(za, a);
@@ -4752,6 +4835,14 @@ impl Blake3Setup {
                         deferred.fill_quad(unit, a_scratch, b_scratch);
                     }
                 };
+                // Primed scratch fill (see `Round1AbProducer::produce_primed`).
+                let ab_produce_primed = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8| {
+                    if let Some(deferred) = &deferred_ab {
+                        // SAFETY: the precompute calls this only for a
+                        // scratch pair it last filled through this producer.
+                        unsafe { deferred.fill_quad_primed(unit, a_scratch, b_scratch) };
+                    }
+                };
                 let ab_producer = match &deferred_ab {
                     Some(deferred) if gpu_first_pass.is_some() && z_packed_lincheck.is_none() => {
                         debug_assert_eq!(
@@ -4761,6 +4852,7 @@ impl Blake3Setup {
                         Some(flock_core::zerocheck::univariate_skip_optimized::Round1AbProducer {
                             unit_bytes: DeferredAb::UNIT_BYTES,
                             produce: &ab_produce,
+                            produce_primed: Some(&ab_produce_primed),
                         })
                     }
                     Some(deferred) => {
