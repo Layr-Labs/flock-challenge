@@ -7863,13 +7863,16 @@ kernel void blake3_pow_scan(
         }
     }
 
-    /// The fine split is on by default again (the tuner measures the fine
-    /// sub-block arms in the untimed warm-up and keeps the coarse split when
-    /// no fine candidate beats it); `FLOCK_NO_HYBRID_FINE` forces it off.
-    /// The split never changes proof bytes. Read once, at tune time.
+    /// The fine split is OPT-IN: `FLOCK_HYBRID_FINE=1` restores it,
+    /// `FLOCK_NO_HYBRID_FINE` still forces it off. Without it the tuner keeps
+    /// the coarse split it chose. The split never changes proof bytes. Read
+    /// once, at tune time.
     fn hybrid_fine_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_FINE").is_none())
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_HYBRID_FINE").is_some()
+                && std::env::var_os("FLOCK_NO_HYBRID_FINE").is_none()
+        })
     }
 
     /// The `(cb2, cpu, cb3)` of split `k`'s cheapest fine sample.
