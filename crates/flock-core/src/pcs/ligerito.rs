@@ -7105,6 +7105,39 @@ fn materialize_direct_fold4(
     )
 }
 
+/// Kill switch for the opening z-fold GPU arm: `FLOCK_NO_GPU_ZFOLD=1`
+/// restores the incumbent CPU-only direct-fold8 materialize exactly.
+const ENV_NO_GPU_ZFOLD: &str = "FLOCK_NO_GPU_ZFOLD";
+
+/// The GPU arm folds a prefix of the witness blocks of the ranked
+/// direct-fold8 materialize on the GPU (reading the commit's cached no-copy
+/// view of z, writing the small folded vector) while the CPU queue steals
+/// from the top; see `gpu_commit::imp::zfold`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zfold_gpu_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_GPU_ZFOLD).is_none() && crate::gpu_commit::gpu_commit_enabled()
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zfold_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_ZF_DEBUG").is_some())
+}
+
+fn zfold_debug_any() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_ZF_DEBUG").is_some())
+}
+
+/// Diagnostic tuning knobs (unset in ranked runs).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zfold_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from the direct
 /// factor state before this function binds the witness and combined basis in
 /// one N→N/64 pass. It emits M6 — the round message of the folded
@@ -7123,6 +7156,20 @@ fn materialize_direct_fold8(
     let has_ordinary = !ordinary_basis.is_empty();
     assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
     assert!(packed_witness.len().is_multiple_of(64));
+
+    let zf_t0 = std::time::Instant::now();
+    // GPU share of the witness fold (ranked hetero shape only, no ordinary
+    // basis). It is launched by the first drain worker to claim a block, so
+    // the Metal encode/commit overlaps the other workers' CPU steals instead
+    // of delaying the drain.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let zf_want = zfold_gpu_enabled()
+        && super::use_open_mat_hetero(
+            packed_witness.len(),
+            claims[0].eq_lo.len(),
+            claims.len(),
+            has_ordinary,
+        );
 
     let fold_weight: [F128; 64] = std::array::from_fn(|bank| {
         let mut weight = F128::ONE;
@@ -7283,6 +7330,35 @@ fn materialize_direct_fold8(
         }
         super::round0_deferred(f_out, b_out)
     };
+    // The same block body when `f_out` already holds the GPU's witness fold
+    // (an exact field sum, bit-identical to the banked CPU fold): only the
+    // direct basis part and the round-0 partial remain. Ranked shape only
+    // (no ordinary basis), where `fold8_block` writes b = direct parts.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let fold8_b_only = |scratch: &mut Vec<F128>,
+                        block: usize,
+                        b_out: &mut [F128],
+                        f_out: &[F128]|
+     -> (F128, F128) {
+        debug_assert!(!has_ordinary);
+        let (first_claim, rest_claims) = claims.split_first().unwrap();
+        let (first_table, rest_tables) = direct_tables.split_first().unwrap();
+        super::ring_switch::compose_fold_byte_table_into(
+            first_claim.eq_hi[block],
+            first_table,
+            scratch,
+        );
+        for (slot, out) in b_out.iter_mut().enumerate() {
+            *out = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+        }
+        for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
+            super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
+            for (slot, out) in b_out.iter_mut().enumerate() {
+                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+            }
+        }
+        super::round0_deferred(f_out, b_out)
+    };
 
     let mut folded_f = crate::scratch::take_f128(out_len);
     let mut folded_b = crate::scratch::take_f128(out_len);
@@ -7305,10 +7381,86 @@ fn materialize_direct_fold8(
         let f_base = crate::epool::SyncPtr(folded_f.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(folded_b.as_mut_ptr());
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        // GPU arm claim state: `(lo, hi, from_gpu)`. Blocks `[lo, hi)` are
+        // unclaimed; a claim takes `lo` when its GPU chunk has completed,
+        // otherwise steals `hi - 1` for a full CPU fold. Each of the queue's
+        // `n_blocks` calls claims exactly one block, so every block is
+        // claimed exactly once, and no CPU worker ever waits on the GPU.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let zf_claims = std::sync::Mutex::new((0usize, n_blocks, 0usize));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let zf_cell: std::sync::OnceLock<Option<crate::gpu_commit::ZFoldJob>> =
+            std::sync::OnceLock::new();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let zf_launch_claimed = std::sync::atomic::AtomicBool::new(!zf_want);
+        let zf_ns_full = std::sync::atomic::AtomicU64::new(0);
+        let zf_ns_bonly = std::sync::atomic::AtomicU64::new(0);
+        let zf_launch_ns = std::sync::atomic::AtomicU64::new(0);
+        let zf_t_drain = std::time::Instant::now();
+        let zf_setup_ms = zf_t0.elapsed().as_secs_f64() * 1e3;
         crate::epool::run_hetero_chunks_stateful(
             n_blocks,
             || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
             |scratch, block| {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                if zf_want {
+                    if !zf_launch_claimed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        let tl = std::time::Instant::now();
+                        let _ = zf_cell.set(crate::gpu_commit::zfold_launch(
+                            &packed_witness,
+                            &challenges,
+                            block_len,
+                            zfold_env_usize("FLOCK_ZF_GPU_BLOCKS", n_blocks),
+                            zfold_env_usize("FLOCK_ZF_CHUNK", 8),
+                        ));
+                        zf_launch_ns.store(
+                            tl.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    let job = zf_cell.get().and_then(|j| j.as_ref());
+                    let (block, from_gpu) = {
+                        let mut g = zf_claims.lock().unwrap_or_else(|e| e.into_inner());
+                        assert!(g.0 < g.1, "z-fold claim queue overrun");
+                        if job.is_some_and(|job| job.block_ready(g.0)) {
+                            g.0 += 1;
+                            g.2 += 1;
+                            (g.0 - 1, true)
+                        } else {
+                            g.1 -= 1;
+                            if let Some(job) = job {
+                                job.set_cut(g.1);
+                            }
+                            (g.1, false)
+                        }
+                    };
+                    // SAFETY: as below — each claimed `block` is unique and
+                    // owns its disjoint output stripes and partial slot.
+                    unsafe {
+                        let f_out = core::slice::from_raw_parts_mut(
+                            f_base.ptr().add(block * block_len),
+                            block_len,
+                        );
+                        let b_out = core::slice::from_raw_parts_mut(
+                            b_base.ptr().add(block * block_len),
+                            block_len,
+                        );
+                        let tb = zfold_debug_any().then(std::time::Instant::now);
+                        let partial = if let (true, Some(job)) = (from_gpu, job) {
+                            f_out.copy_from_slice(job.block_out(block));
+                            fold8_b_only(scratch, block, b_out, f_out)
+                        } else {
+                            fold8_block(scratch, block, b_out, f_out)
+                        };
+                        if let Some(tb) = tb {
+                            let ns = tb.elapsed().as_nanos() as u64;
+                            if from_gpu { &zf_ns_bonly } else { &zf_ns_full }
+                                .fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        partials_base.ptr().add(block).write(partial);
+                    }
+                    return;
+                }
                 // SAFETY: the queue hands out each `block` exactly once; it
                 // owns output range `[block·B, (block+1)·B)` in both arrays
                 // and one partial slot; the two-pool join publishes all
@@ -7322,13 +7474,53 @@ fn materialize_direct_fold8(
                         b_base.ptr().add(block * block_len),
                         block_len,
                     );
+                    let tb = zfold_debug_any().then(std::time::Instant::now);
                     partials_base
                         .ptr()
                         .add(block)
                         .write(fold8_block(scratch, block, b_out, f_out));
+                    if let Some(tb) = tb {
+                        zf_ns_full.fetch_add(
+                            tb.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                 }
             },
         );
+        let zf_drain_ms = zf_t_drain.elapsed().as_secs_f64() * 1e3;
+        let mut zf_used = 0usize;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(job) = zf_cell.into_inner().flatten() {
+            let gpu_blocks = job.gpu_blocks();
+            // Ranked runs park the buffer (its stolen tail skips at the
+            // boundary; the next launch retires it) instead of waiting.
+            let timing = job.finish(zfold_debug());
+            let g = zf_claims.lock().unwrap_or_else(|e| e.into_inner());
+            zf_used = g.2;
+            if zfold_debug() {
+                eprintln!(
+                    "    [zfold] gpu blocks consumed {} / {} offered; gpu start {:?}",
+                    g.2,
+                    gpu_blocks,
+                    timing.map(|(d, b)| format!("delay {d:.3} ms busy {b:.3} ms")),
+                );
+            }
+        }
+        if zfold_debug_any() {
+            let full = n_blocks - zf_used;
+            let nf = zf_ns_full.load(std::sync::atomic::Ordering::Relaxed);
+            let nb = zf_ns_bonly.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "    [zfold] setup {zf_setup_ms:.3} ms launch {:.3} ms drain {zf_drain_ms:.3} ms; cpu full {full} \
+                 blocks {:.1} us/blk, gpu-consumed {zf_used} blocks {:.1} us/blk (cpu-ms {:.2} + {:.2})",
+                zf_launch_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                nf as f64 / 1e3 / full.max(1) as f64,
+                nb as f64 / 1e3 / zf_used.max(1) as f64,
+                nf as f64 / 1e6,
+                nb as f64 / 1e6,
+            );
+        }
         partials
             .into_iter()
             .fold((F128::ZERO, F128::ZERO), |(x0, x2), (y0, y2)| {

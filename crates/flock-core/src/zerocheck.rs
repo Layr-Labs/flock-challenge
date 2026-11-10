@@ -923,6 +923,35 @@ fn prove_packed_padded_inner<C: Challenger>(
     let use_cascade5 =
         use_cascade4 && n_mlv >= 12 && r[k_skip + 9] != F128::ZERO && !cascade5_off();
 
+    // Tri cascade (see `fold_cascade_t_into`): the composed 5+6 pass also
+    // carries round eight's two-challenge deferred message, so every later
+    // pass binds THREE known challenges (2^22 → 2^19 → 2^16 → 2^13 at the
+    // ranked shape) in place of the 7+8, 9+10, 11+12 passes and loop rounds
+    // i = 10..12. The chain is fixed here from values known before round two:
+    // each tri pass with output 2^L needs r[len-L+1], r[len-L+2] ≠ 0 (protocol
+    // constants or sampled; probability 2⁻¹²⁷ otherwise) and the first one
+    // must exist, or the cascade route below runs unchanged.
+    // Kill switch: FLOCK_NO_ZC_TRI=1 (exact '1').
+    let tri_steps = {
+        let r_ok = |l: usize| {
+            l >= 3 && l <= r.len() && r[r.len() - l + 1] != F128::ZERO && r[r.len() - l + 2] != F128::ZERO
+        };
+        let floor = if cfg!(test) { 3 } else { 13 };
+        let mut steps = 0usize;
+        if use_cascade3 && n_mlv >= 8 && multilinear::zc_tri_enabled() {
+            // The composed 5+6 output has n_mlv - 4 variables.
+            let l56 = n_mlv - 4;
+            if r_ok(l56) {
+                let mut l = l56;
+                while l >= floor + 3 && r_ok(l - 3) {
+                    l -= 3;
+                    steps += 1;
+                }
+            }
+        }
+        steps
+    };
+
     // `loop_start` is the first tail iteration this route has not already
     // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
     // indexed by `i`, so starting at 2 (or 4) needs no other change.
@@ -986,7 +1015,83 @@ fn prove_packed_padded_inner<C: Challenger>(
             // Unpinned for the same reason as the K outputs above.
             let mut a2_out = crate::scratch::take_f128_unpinned(quarter);
             let mut b2_out = crate::scratch::take_f128_unpinned(quarter);
-            if use_cascade3 {
+            if tri_steps > 0 {
+                // Composed 5+6 pass carrying round seven's quadratic AND
+                // round eight's biquadratic.
+                let (m6_1, m6_inf, la7, la8) = multilinear::fold_cascade_t_into(
+                    &a_out,
+                    &b_out,
+                    &mut a2_out,
+                    &mut b2_out,
+                    &mlv_rhos[2..4],
+                    &r_next6,
+                );
+                if tail_round_timing {
+                    eprintln!(
+                        "[zc-tail-rounds] composed rounds 5+6 fold (tri +la7 +la8, out n={quarter}): {:.2} ms",
+                        t_c.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                crate::scratch::give_f128(a_out);
+                crate::scratch::give_f128(b_out);
+                multilinear_msgs.push((m6_1, m6_inf));
+                challenger.observe_f128(m6_1);
+                challenger.observe_f128(m6_inf);
+                mlv_rhos.push(challenger.sample_f128());
+                let mut pending = Some((la7, la8));
+                let (mut cur_a, mut cur_b) = (a2_out, b2_out);
+                for step in 0..tri_steps {
+                    // Rounds r+1 and r+2 from the deferred messages: no pass.
+                    let (la, la2) = pending.take().expect("tri chain carries its lookaheads");
+                    let k = mlv_rhos.len();
+                    let (n1, ninf) = eval_round3_lookahead(&la, mlv_rhos[k - 1]);
+                    multilinear_msgs.push((n1, ninf));
+                    challenger.observe_f128(n1);
+                    challenger.observe_f128(ninf);
+                    mlv_rhos.push(challenger.sample_f128());
+                    let (n1, ninf) =
+                        multilinear::eval_lookahead2(&la2, mlv_rhos[k - 1], mlv_rhos[k]);
+                    multilinear_msgs.push((n1, ninf));
+                    challenger.observe_f128(n1);
+                    challenger.observe_f128(ninf);
+                    mlv_rhos.push(challenger.sample_f128());
+
+                    // Bind the three challenges just sampled in one pass.
+                    let t_s = std::time::Instant::now();
+                    let k = mlv_rhos.len();
+                    let out_n = cur_a.len() / 8;
+                    let l = out_n.trailing_zeros() as usize;
+                    let mut r_nx = vec![F128::ONE; l];
+                    r_nx[1..].copy_from_slice(&r[r.len() - l + 1..]);
+                    let mut na = crate::scratch::take_f128_unpinned(out_n);
+                    let mut nb = crate::scratch::take_f128_unpinned(out_n);
+                    let (e1, einf, la, la2) = multilinear::fold_cascade_t_into(
+                        &cur_a,
+                        &cur_b,
+                        &mut na,
+                        &mut nb,
+                        &mlv_rhos[k - 3..k],
+                        &r_nx,
+                    );
+                    if tail_round_timing {
+                        eprintln!(
+                            "[zc-tail-rounds] tri pass {step} (out n={out_n}): {:.2} ms",
+                            t_s.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    crate::scratch::give_f128(cur_a);
+                    crate::scratch::give_f128(cur_b);
+                    multilinear_msgs.push((e1, einf));
+                    challenger.observe_f128(e1);
+                    challenger.observe_f128(einf);
+                    mlv_rhos.push(challenger.sample_f128());
+                    pending = Some((la, la2));
+                    cur_a = na;
+                    cur_b = nb;
+                }
+                let loop_start = mlv_rhos.len() - 1;
+                (cur_a, cur_b, loop_start)
+            } else if use_cascade3 {
                 // Level three: the composed 5+6 pass additionally carries the
                 // deferred round-seven quadratic — zero extra traversals.
                 let (m6_1, m6_inf, la7) = fold2_plain_and_round67_into(

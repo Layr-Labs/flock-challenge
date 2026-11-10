@@ -1282,6 +1282,7 @@ fn speculative_main(
 
     hot_wait_readable(real_stdin);
     let line = read_line_fd(real_stdin);
+    flock_core::tmark::reset();
     flock_core::tmark::mark("seed read");
 
     // The seed's first byte has arrived: this thread is about to forward it and

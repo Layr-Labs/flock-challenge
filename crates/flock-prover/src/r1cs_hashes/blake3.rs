@@ -3878,23 +3878,38 @@ pub(crate) mod witgen_simd {
             // that final slice from 1/8 of the pass to 1/256 of it, pulling
             // the whole downstream GPU chain earlier by the difference. The
             // uniform 8-band control remains selectable for exact same-binary
-            // A/B (`FLOCK_NO_STREAM_TAPER=1`).
+            // A/B (`FLOCK_NO_STREAM_TAPER=1`). Front tapering starts the GPU
+            // sooner; FLOCK_NO_WITGEN_BAND_FRONT_TAPER=1 restores the old head.
             // Tail band of 64 gps keeps 8 hetero slabs (WITGEN_HETERO_SLAB =
             // 64 jobs) so its drain still parallelizes across the pool.
             const UNIFORM_SCHEDULE: &[usize] = &[512; 8];
-            const TAPERED_SCHEDULE: &[usize] = &[512, 512, 512, 512, 512, 512, 512, 448, 64];
+            const TAPERED_SCHEDULE: &[usize] =
+                &[64, 64, 128, 256, 512, 512, 512, 512, 512, 512, 448, 64];
+            const TAIL_TAPERED_SCHEDULE: &[usize] = &[512, 512, 512, 512, 512, 512, 512, 448, 64];
+            const _: () = {
+                let mut i = 0;
+                let mut total = 0;
+                while i < TAPERED_SCHEDULE.len() {
+                    assert!(TAPERED_SCHEDULE[i] > 0 && TAPERED_SCHEDULE[i] % 64 == 0);
+                    total += TAPERED_SCHEDULE[i];
+                    i += 1;
+                }
+                assert!(total == 4096);
+            };
             // A/B-CONTROL: set to `false` for the official-harness control
             // build. The env kill switch exists for same-binary diagnostics.
             const STREAM_TAPER_DEFAULT: bool = true;
             let tapered =
                 STREAM_TAPER_DEFAULT && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
-            let schedule = if tapered {
-                TAPERED_SCHEDULE
-            } else {
+            let schedule = if !tapered {
                 UNIFORM_SCHEDULE
+            } else if std::env::var("FLOCK_NO_WITGEN_BAND_FRONT_TAPER").is_ok_and(|v| v == "1") {
+                TAIL_TAPERED_SCHEDULE
+            } else {
+                TAPERED_SCHEDULE
             };
             debug_assert_eq!(schedule.iter().sum::<usize>(), groups_per_segment);
-            // Item A (continuous claim queue): replace the 8–9 per-band full
+            // Item A (continuous claim queue): replace the per-band full
             // join barriers with ONE queue over all slabs in band order plus
             // per-band atomic remaining-counters. Whoever zeroes a band's
             // counter publishes it and drains the in-order submit sequencer,
@@ -3958,6 +3973,7 @@ pub(crate) mod witgen_simd {
                     // AcqRel: the zero-observer acquires every worker's
                     // stores for this band before publishing/submitting it.
                     if remaining[band].fetch_sub(1, Ordering::AcqRel) == 1 {
+                        flock_core::tmark::mark("band ready");
                         if timing {
                             done_ns[band].store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         }

@@ -4040,6 +4040,235 @@ pub(crate) fn fold2_and_message_lookahead_nt_expanded_aarch64(
     unsafe { acc.reduce() }
 }
 
+/// Number of aggregates of the tri cascade's group-of-eight message sweep
+/// (see `fold_cascade_t_into` in `multilinear.rs` for the slot layout).
+pub(crate) const TRI_SLOTS: usize = 26;
+
+/// Tri cascade pass: bind `DEPTH` (2 or 3) known challenges in one sweep
+/// (`DEPTH = 2`: `rho_a, rho_b`; `DEPTH = 3`: also `rho_c`), store the
+/// composed outputs, and accumulate the 26 aggregates of every group of eight
+/// composed outputs on the group's single weight `eq_lo[4y+3]`: the exact
+/// message of the outputs, the one-challenge deferred message (quadratic in
+/// the next challenge) and the two-challenge deferred message (biquadratic in
+/// the next two). `ABL` is a probe-only ablation mask (bit 0: no message
+/// products, bit 1: no stores); production instantiates `ABL = 0`.
+///
+/// Outputs are the sequential folds' values (exact field arithmetic: the
+/// expanded fold4 and the final `t0 + rho_c·(t0+t1)` are equal elements).
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, const ABL: u32>(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    rho_c: F128,
+    eq_lo: &[F128],
+) -> [F128; TRI_SLOTS] {
+    use core::arch::aarch64::*;
+    assert!(DEPTH == 2 || DEPTH == 3);
+    let n_out = a_out.len();
+    assert_eq!(b_out.len(), n_out);
+    assert_eq!(n_out, 2 * eq_lo.len());
+    assert!(n_out.is_multiple_of(8));
+    assert_eq!(a_in.len(), n_out << DEPTH);
+    assert_eq!(b_in.len(), n_out << DEPTH);
+
+    #[inline(always)]
+    unsafe fn store_pair<const NT: bool>(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            if NT {
+                core::arch::asm!(
+                    "stnp {x:q}, {y:q}, [{dst}]",
+                    dst = in(reg) dst,
+                    x = in(vreg) x,
+                    y = in(vreg) y,
+                    options(nostack, preserves_flags),
+                );
+            } else {
+                vst1q_u64(dst.cast::<u64>(), x);
+                vst1q_u64(dst.add(1).cast::<u64>(), y);
+            }
+        }
+    }
+
+    unsafe {
+        let q = |v: F128| core::mem::transmute::<F128, uint64x2_t>(v);
+        let rho = Fold4RhoQ::new(q(rho_a), q(rho_b), q(rho_a * rho_b));
+        let rc = q(rho_c);
+        let rc_sw = swap_halves_q(rc);
+        let zero = vdupq_n_u64(0);
+        let mut acc = [TriNeon {
+            ll: zero,
+            cross: zero,
+            hh: zero,
+        }; TRI_SLOTS];
+        let mut sink = zero;
+        let a_ip = a_in.as_ptr();
+        let b_ip = b_in.as_ptr();
+        let a_op = a_out.as_mut_ptr();
+        let b_op = b_out.as_mut_ptr();
+
+        #[inline(always)]
+        unsafe fn fold_eight<const DEPTH: usize>(
+            src: *const F128,
+            rho: &Fold4RhoQ,
+            rc: uint64x2_t,
+            rc_sw: uint64x2_t,
+        ) -> [uint64x2_t; 8] {
+            unsafe {
+                let mut v = [vdupq_n_u64(0); 8];
+                if DEPTH == 2 {
+                    for h in 0..4 {
+                        let (x, y) = fold4_pair_expanded_tri_q(src.add(8 * h), rho);
+                        v[2 * h] = x;
+                        v[2 * h + 1] = y;
+                    }
+                } else {
+                    for (h, slot) in v.iter_mut().enumerate() {
+                        let (t0, t1) = fold4_pair_expanded_tri_q(src.add(8 * h), rho);
+                        *slot = veorq_u64(t0, mul_sw_tri_binius_q(rc, rc_sw, veorq_u64(t0, t1)));
+                    }
+                }
+                v
+            }
+        }
+
+        // Tiles of TG groups: the fold sweep parks the weighted a-side and the
+        // b-side of each group in an L1 tile, then four short sweeps over the
+        // tile each keep at most eight accumulators in registers (26 tri
+        // accumulators = 78 vector registers would otherwise spill on every
+        // product).
+        const TG: usize = 16;
+        let ng = n_out / 8;
+        let mut ta = [[zero; 8]; TG];
+        let mut tb = [[zero; 8]; TG];
+        let mut g0 = 0usize;
+        while g0 < ng {
+            let gn = (ng - g0).min(TG);
+            for t in 0..gn {
+                let y = g0 + t;
+                let a = fold_eight::<DEPTH>(a_ip.add((8 * y) << DEPTH), &rho, rc, rc_sw);
+                let b = fold_eight::<DEPTH>(b_ip.add((8 * y) << DEPTH), &rho, rc, rc_sw);
+                if ABL & 2 == 0 {
+                    for h in 0..4 {
+                        store_pair::<NT>(a_op.add(8 * y + 2 * h), a[2 * h], a[2 * h + 1]);
+                        store_pair::<NT>(b_op.add(8 * y + 2 * h), b[2 * h], b[2 * h + 1]);
+                    }
+                } else {
+                    for h in 0..8 {
+                        sink = xor3_u64(sink, a[h], b[h]);
+                    }
+                }
+                if ABL & 1 != 0 {
+                    sink = xor3_u64(sink, a[0], b[7]);
+                    continue;
+                }
+                let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
+                let w_sum = vgetq_lane_u64::<0>(w) ^ vgetq_lane_u64::<1>(w);
+                for i in 0..8 {
+                    ta[t][i] = mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i]);
+                }
+                tb[t] = b;
+            }
+            g0 += gn;
+            if ABL & 1 != 0 {
+                continue;
+            }
+            // Sweep 1: exact message, split by pair class j.
+            {
+                let mut e = [acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7]];
+                for t in 0..gn {
+                    let (aw, b) = (&ta[t], &tb[t]);
+                    for j in 0..4 {
+                        tri_acc_q(&mut e[j], aw[2 * j + 1], b[2 * j + 1]);
+                        tri_acc_q(
+                            &mut e[4 + j],
+                            veorq_u64(aw[2 * j], aw[2 * j + 1]),
+                            veorq_u64(b[2 * j], b[2 * j + 1]),
+                        );
+                    }
+                }
+                acc[..8].copy_from_slice(&e);
+            }
+            // Sweep 2: one-challenge lookahead, split by half k.
+            {
+                let mut l = [
+                    acc[8], acc[9], acc[10], acc[11], acc[12], acc[13], acc[14], acc[15],
+                ];
+                for t in 0..gn {
+                    let (aw, b) = (&ta[t], &tb[t]);
+                    for k in 0..2 {
+                        let o = 4 * k;
+                        tri_acc_q(&mut l[k], aw[o + 2], b[o + 2]);
+                        let (ea, eb) = (veorq_u64(aw[o], aw[o + 2]), veorq_u64(b[o], b[o + 2]));
+                        let (oa, ob) =
+                            (veorq_u64(aw[o + 1], aw[o + 3]), veorq_u64(b[o + 1], b[o + 3]));
+                        tri_acc_q(&mut l[2 + k], ea, eb);
+                        tri_acc_q(&mut l[4 + k], oa, ob);
+                        tri_acc_q(&mut l[6 + k], veorq_u64(ea, oa), veorq_u64(eb, ob));
+                    }
+                }
+                acc[8..16].copy_from_slice(&l);
+            }
+            // Sweep 3: c4² and the v=0 / v=1 rows of the half-sum grid.
+            {
+                let mut g = [acc[16], acc[17], acc[18], acc[20], acc[21]];
+                for t in 0..gn {
+                    let (aw, b) = (&ta[t], &tb[t]);
+                    tri_acc_q(&mut g[0], aw[4], b[4]);
+                    let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
+                    let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
+                    let (s2a, s2b) = (veorq_u64(aw[2], aw[6]), veorq_u64(b[2], b[6]));
+                    let (s3a, s3b) = (veorq_u64(aw[3], aw[7]), veorq_u64(b[3], b[7]));
+                    // grid(iu, iv) at slot 17 + 3*iu + iv; s index = u + 2v.
+                    tri_acc_q(&mut g[1], s0a, s0b); // (0,0)
+                    tri_acc_q(&mut g[2], s2a, s2b); // (0,1)
+                    tri_acc_q(&mut g[3], s1a, s1b); // (1,0)
+                    tri_acc_q(&mut g[4], s3a, s3b); // (1,1)
+                }
+                acc[16] = g[0];
+                acc[17] = g[1];
+                acc[18] = g[2];
+                acc[20] = g[3];
+                acc[21] = g[4];
+            }
+            // Sweep 4: the remaining five grid entries (a ∞ in u or v).
+            {
+                let mut g = [acc[19], acc[22], acc[23], acc[24], acc[25]];
+                for t in 0..gn {
+                    let (aw, b) = (&ta[t], &tb[t]);
+                    let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
+                    let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
+                    let (s2a, s2b) = (veorq_u64(aw[2], aw[6]), veorq_u64(b[2], b[6]));
+                    let (s3a, s3b) = (veorq_u64(aw[3], aw[7]), veorq_u64(b[3], b[7]));
+                    let (s02a, s02b) = (veorq_u64(s0a, s2a), veorq_u64(s0b, s2b));
+                    let (s13a, s13b) = (veorq_u64(s1a, s3a), veorq_u64(s1b, s3b));
+                    let (s01a, s01b) = (veorq_u64(s0a, s1a), veorq_u64(s0b, s1b));
+                    let (s23a, s23b) = (veorq_u64(s2a, s3a), veorq_u64(s2b, s3b));
+                    tri_acc_q(&mut g[0], s02a, s02b); // (0,∞) slot 19
+                    tri_acc_q(&mut g[1], s13a, s13b); // (1,∞) slot 22
+                    tri_acc_q(&mut g[2], s01a, s01b); // (∞,0) slot 23
+                    tri_acc_q(&mut g[3], s23a, s23b); // (∞,1) slot 24
+                    tri_acc_q(&mut g[4], veorq_u64(s01a, s23a), veorq_u64(s01b, s23b)); // (∞,∞) 25
+                }
+                acc[19] = g[0];
+                acc[22] = g[1];
+                acc[23] = g[2];
+                acc[24] = g[3];
+                acc[25] = g[4];
+            }
+        }
+        if ABL != 0 {
+            core::hint::black_box(sink);
+        }
+        acc.map(|t| core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(t)))
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
 mod tests {
     use super::*;

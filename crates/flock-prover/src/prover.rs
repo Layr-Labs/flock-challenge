@@ -1614,8 +1614,10 @@ fn commit_with_round1_ab_precompute(
         ),
     );
 
+    flock_core::tmark::mark("commit join start");
     let result = rayon::join(
         || {
+            flock_core::tmark::mark("commit arm start");
             let pre = match commit_codeword {
                 CommitCodeword::Allocate => pcs::commit(z_packed, pcs_params),
                 CommitCodeword::NeedsReplication(buf) => {
@@ -1631,12 +1633,15 @@ fn commit_with_round1_ab_precompute(
             // Graph complete, root final — the AB arm is (typically) still
             // running. Fire the tail-fill hook here so its staged GPU work
             // executes in the arm-tail idle.
+            flock_core::tmark::mark("commit arm root");
             if let Some(hook) = tail_fill {
                 hook(&pre.0);
             }
+            flock_core::tmark::mark("commit arm end");
             pre
         },
         || {
+            flock_core::tmark::mark("ab arm start");
             let t = std::time::Instant::now();
             let r = precompute_ab();
             // Inside the arm, so its completion is ordered before the
@@ -1648,6 +1653,7 @@ fn commit_with_round1_ab_precompute(
             // The hybrid-commit warmup sweep sizes its contention emulation
             // from this arm's measured wall (an Instant read is free; the
             // store is one relaxed atomic per prove).
+            flock_core::tmark::mark("ab arm end");
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
             if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
@@ -1656,6 +1662,7 @@ fn commit_with_round1_ab_precompute(
         },
     );
 
+    flock_core::tmark::mark("commit join end");
     if run_ranked_exact_tune {
         flock_core::gpu_commit::retune_ranked_hybrid_with_exact_contention(
             pcs_params,
