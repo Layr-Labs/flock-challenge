@@ -478,6 +478,70 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn const_vec2_prepared_matches_scalar() {
+        let mut rng = Rng::new(11);
+        let mut consts = vec![
+            F128::ZERO,
+            F128::ONE,
+            F128::new(0, 1),
+            F128::new(u64::MAX, 0),
+            F128::new(0, u64::MAX),
+            F128::new(u64::MAX, u64::MAX),
+            F128::new(0x87, 1 << 63),
+        ];
+        for _ in 0..256 {
+            consts.push(rng.next_f128());
+        }
+        for c in consts {
+            let b0 = rng.next_f128();
+            let b1 = if c.lo & 1 == 0 { F128::new(u64::MAX, u64::MAX) } else { rng.next_f128() };
+            let prod = unsafe { aarch64::ghash_mul_const_vec2_prepared_for_test(c, [b0, b1]) };
+            assert_eq!(prod[0], software::ghash_mul(c, b0));
+            assert_eq!(prod[1], software::ghash_mul(c, b1));
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    #[ignore]
+    fn const_vec2_timing() {
+        let mut rng = Rng::new(12);
+        const N: usize = 4096;
+        let src: Vec<F128> = (0..N).map(|_| rng.next_f128()).collect();
+        let c = rng.next_f128();
+        let mut dst = vec![F128::ZERO; N];
+        let mut best = [f64::MAX; 2];
+        for _trial in 0..15 {
+            for which in 0..2 {
+                let t0 = std::time::Instant::now();
+                for _ in 0..2000 {
+                    for i in (0..N).step_by(2) {
+                        let p = unsafe {
+                            if which == 0 {
+                                aarch64::ghash_mul_const_vec2_karatsuba_for_test(c, [src[i], src[i + 1]])
+                            } else {
+                                aarch64::ghash_mul_const_vec2_prepared_for_test(c, [src[i], src[i + 1]])
+                            }
+                        };
+                        dst[i] = p[0];
+                        dst[i + 1] = p[1];
+                    }
+                    std::hint::black_box(&mut dst);
+                }
+                let ns = t0.elapsed().as_secs_f64() * 1e9 / (2000 * N) as f64;
+                best[which] = best[which].min(ns);
+            }
+        }
+        eprintln!(
+            "[const-vec2-timing] ns per product (best of 15): karatsuba {:.3}, prepared {:.3} ({:+.1}%)",
+            best[0],
+            best[1],
+            (best[1] / best[0] - 1.0) * 100.0
+        );
+    }
+
     #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
     #[test]
     fn all_x86_variants_agree() {

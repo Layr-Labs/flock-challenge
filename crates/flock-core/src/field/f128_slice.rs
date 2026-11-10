@@ -518,6 +518,23 @@ fn fold_two_and_msg_with_scaled_basis_addend_at(
     }
 }
 
+#[inline]
+pub(crate) fn scale_slice_into(out: &mut [F128], src: &[F128], s: F128) {
+    assert_eq!(out.len(), src.len());
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EQ_OUTER_PREP").is_none());
+        if *ON {
+            unsafe { aarch64::scale_slice_prepared(out, src, s) };
+            return;
+        }
+    }
+    for (o, &l) in out.iter_mut().zip(src) {
+        *o = l * s;
+    }
+}
+
 /// AArch64 fused kernel for two consecutive Ligerito folds plus the direct
 /// and one-round-lookahead messages. The lookahead lets the prover preserve
 /// Fiat-Shamir order without materializing the intermediate half-sized state.

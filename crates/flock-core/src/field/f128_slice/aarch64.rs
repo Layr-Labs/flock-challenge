@@ -1,4 +1,5 @@
 use crate::field::F128;
+use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep, mul_two_const_sum_prep};
 use core::arch::aarch64::*;
 use core::mem::transmute;
 
@@ -35,6 +36,13 @@ unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
     // SAFETY: the caller provides the `aes` target feature; both types are
     // 128-bit bit containers with compatible alignment.
     unsafe { transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
+}
+
+#[inline]
+fn use_fold_const_prep() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD_CONST_PREP").is_none());
+    *ON
 }
 
 /// Multiply two independent values by the same constant and reduce them in
@@ -946,8 +954,28 @@ pub(super) unsafe fn fold_two_and_msg(
     r: F128,
 ) -> (F128, F128) {
     unsafe {
+        if use_fold_const_prep() {
+            fold_two_and_msg_impl::<true>(f, b, base, nf, nb, r)
+        } else {
+            fold_two_and_msg_impl::<false>(f, b, base, nf, nb, r)
+        }
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_two_and_msg_impl<const PREP: bool>(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    nf: &mut [F128],
+    nb: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    unsafe {
         let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
+        let r_prep = const_prep(r_q);
         let mut u0 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut u2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut t = 0;
@@ -962,12 +990,24 @@ pub(super) unsafe fn fold_two_and_msg(
             let b_even1 = vld1q_u64(b.as_ptr().add(source + 2).cast::<u64>());
             let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
 
-            let folded_f =
-                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+            let folded_f = if PREP {
+                [
+                    mul_const_prep(r_prep, veorq_u64(f_even0, f_odd0)),
+                    mul_const_prep(r_prep, veorq_u64(f_even1, f_odd1)),
+                ]
+            } else {
+                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1))
+            };
             let f0 = veorq_u64(f_even0, folded_f[0]);
             let f1 = veorq_u64(f_even1, folded_f[1]);
-            let folded_b =
-                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
+            let folded_b = if PREP {
+                [
+                    mul_const_prep(r_prep, veorq_u64(b_even0, b_odd0)),
+                    mul_const_prep(r_prep, veorq_u64(b_even1, b_odd1)),
+                ]
+            } else {
+                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1))
+            };
             let b0 = veorq_u64(b_even0, folded_b[0]);
             let b1 = veorq_u64(b_even1, folded_b[1]);
 
@@ -1002,11 +1042,28 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
     r: F128,
 ) -> (F128, F128) {
     unsafe {
+        if use_fold_const_prep() {
+            fold_two_and_msg_in_place_impl::<true>(f, b, r)
+        } else {
+            fold_two_and_msg_in_place_impl::<false>(f, b, r)
+        }
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_two_and_msg_in_place_impl<const PREP: bool>(
+    f: &mut [F128],
+    b: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
+    unsafe {
         let f_ptr = f.as_mut_ptr();
         let b_ptr = b.as_mut_ptr();
         let half = f.len() / 2;
         let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
+        let r_prep = const_prep(r_q);
         let mut u0 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut u2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut t = 0;
@@ -1021,12 +1078,24 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
             let b_even1 = vld1q_u64(b_ptr.add(source + 2).cast::<u64>());
             let b_odd1 = vld1q_u64(b_ptr.add(source + 3).cast::<u64>());
 
-            let folded_f =
-                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+            let folded_f = if PREP {
+                [
+                    mul_const_prep(r_prep, veorq_u64(f_even0, f_odd0)),
+                    mul_const_prep(r_prep, veorq_u64(f_even1, f_odd1)),
+                ]
+            } else {
+                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1))
+            };
             let f0 = veorq_u64(f_even0, folded_f[0]);
             let f1 = veorq_u64(f_even1, folded_f[1]);
-            let folded_b =
-                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
+            let folded_b = if PREP {
+                [
+                    mul_const_prep(r_prep, veorq_u64(b_even0, b_odd0)),
+                    mul_const_prep(r_prep, veorq_u64(b_even1, b_odd1)),
+                ]
+            } else {
+                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1))
+            };
             let b0 = veorq_u64(b_even0, folded_b[0]);
             let b1 = veorq_u64(b_even1, folded_b[1]);
 
@@ -1072,9 +1141,32 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
     scale: F128,
 ) -> (F128, F128) {
     unsafe {
+        if use_fold_const_prep() {
+            fold_two_and_msg_with_scaled_basis_addend_impl::<true>(f, b, basis_addend, base, nf, nb, r, scale)
+        } else {
+            fold_two_and_msg_with_scaled_basis_addend_impl::<false>(f, b, basis_addend, base, nf, nb, r, scale)
+        }
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_two_and_msg_with_scaled_basis_addend_impl<const PREP: bool>(
+    f: &[F128],
+    b: &[F128],
+    basis_addend: &[F128],
+    base: usize,
+    nf: &mut [F128],
+    nb: &mut [F128],
+    r: F128,
+    scale: F128,
+) -> (F128, F128) {
+    unsafe {
         let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
+        let r_prep = const_prep(r_q);
         let scale_q = transmute::<F128, uint64x2_t>(scale);
+        let scale_prep = const_prep(scale_q);
         let mut u0 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut u2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut t = 0usize;
@@ -1084,8 +1176,14 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
             let f_odd0 = vld1q_u64(f.as_ptr().add(source + 1).cast::<u64>());
             let f_even1 = vld1q_u64(f.as_ptr().add(source + 2).cast::<u64>());
             let f_odd1 = vld1q_u64(f.as_ptr().add(source + 3).cast::<u64>());
-            let folded_f =
-                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+            let folded_f = if PREP {
+                [
+                    mul_const_prep(r_prep, veorq_u64(f_even0, f_odd0)),
+                    mul_const_prep(r_prep, veorq_u64(f_even1, f_odd1)),
+                ]
+            } else {
+                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1))
+            };
             let f0 = veorq_u64(f_even0, folded_f[0]);
             let f1 = veorq_u64(f_even1, folded_f[1]);
 
@@ -1095,14 +1193,31 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
             let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
             let addend0 = vld1q_u64(basis_addend.as_ptr().add(t).cast::<u64>());
             let addend1 = vld1q_u64(basis_addend.as_ptr().add(t + 1).cast::<u64>());
-            let folded_b_with_addend = mul_two_const_sum_vec2_pmred(
-                r_q,
-                veorq_u64(b_even0, b_odd0),
-                veorq_u64(b_even1, b_odd1),
-                scale_q,
-                addend0,
-                addend1,
-            );
+            let folded_b_with_addend = if PREP {
+                [
+                    mul_two_const_sum_prep(
+                        r_prep,
+                        veorq_u64(b_even0, b_odd0),
+                        scale_prep,
+                        addend0,
+                    ),
+                    mul_two_const_sum_prep(
+                        r_prep,
+                        veorq_u64(b_even1, b_odd1),
+                        scale_prep,
+                        addend1,
+                    ),
+                ]
+            } else {
+                mul_two_const_sum_vec2_pmred(
+                    r_q,
+                    veorq_u64(b_even0, b_odd0),
+                    veorq_u64(b_even1, b_odd1),
+                    scale_q,
+                    addend0,
+                    addend1,
+                )
+            };
             let b0 = veorq_u64(b_even0, folded_b_with_addend[0]);
             let b1 = veorq_u64(b_even1, folded_b_with_addend[1]);
 
@@ -1253,7 +1368,7 @@ pub(super) unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_adden
 /// # Safety
 /// Caller guarantees PMULL and: `f.len() == b.len()`, `wf.len() == wb.len()`,
 /// `wf.len() % 4 == 0`, `base % 4 == 0`, and `4 * (base + wf.len()) <= f.len()`.
-pub(super) unsafe fn fold2_two_and_msgs(
+unsafe fn fold2_two_and_msgs_impl(
     f: &[F128],
     b: &[F128],
     base: usize,
@@ -1262,6 +1377,7 @@ pub(super) unsafe fn fold2_two_and_msgs(
     r_a: F128,
     r_b: F128,
     nt_stores: bool,
+    prep_on: bool,
 ) -> (F128, F128, [F128; 6]) {
     // `nt_stores` is decided once per fold round by the driver (round output
     // past LLC size ⇒ the w arrays are not read until the next fold pair's
@@ -1284,6 +1400,8 @@ pub(super) unsafe fn fold2_two_and_msgs(
         let zero = vdupq_n_u64(0);
         let ra_q = transmute::<F128, uint64x2_t>(r_a);
         let rb_q = transmute::<F128, uint64x2_t>(r_b);
+        let ra_p = const_prep(ra_q);
+        let rb_p = const_prep(rb_q);
         // Accumulators: a_u0a = c0 (also u_0 term 1), a_u0b = u_0 term 2,
         // a_u2a = c2 (also u_2 term 1), a_u2b = u_2 term 2. a_c1/a_c4
         // hold the complementary endpoint products for Karatsuba recovery;
@@ -1313,15 +1431,15 @@ pub(super) unsafe fn fold2_two_and_msgs(
                 let bo1 = vld1q_u64(b.as_ptr().add(src + 3).cast::<u64>());
 
                 // First bind at r_a: v = even ^ r_a*(even^odd), two v per poly.
-                let pf = mul_const_vec2(ra_q, veorq_u64(fe0, fo0), veorq_u64(fe1, fo1));
+                let pf = mul_const_pair_sel(prep_on, ra_q, ra_p, veorq_u64(fe0, fo0), veorq_u64(fe1, fo1));
                 let vf0 = veorq_u64(fe0, pf[0]);
                 let vf1 = veorq_u64(fe1, pf[1]);
-                let pb = mul_const_vec2(ra_q, veorq_u64(be0, bo0), veorq_u64(be1, bo1));
+                let pb = mul_const_pair_sel(prep_on, ra_q, ra_p, veorq_u64(be0, bo0), veorq_u64(be1, bo1));
                 let vb0 = veorq_u64(be0, pb[0]);
                 let vb1 = veorq_u64(be1, pb[1]);
 
                 // Second bind at r_b, both polynomials in one paired multiply.
-                let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
+                let pw = mul_const_pair_sel(prep_on, rb_q, rb_p, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
                 let wq_f = veorq_u64(vf0, pw[0]);
                 let wq_b = veorq_u64(vb0, pw[1]);
                 if !nt_stores {
@@ -1388,7 +1506,7 @@ pub(super) unsafe fn fold2_two_and_msgs(
 /// # Safety
 /// Caller guarantees PMULL and: `f.len() == b.len()`, `wf.len() == wb.len()`,
 /// `wf.len() % 4 == 0`, `base % 4 == 0`, and `4 * (base + wf.len()) <= f.len()`.
-pub(super) unsafe fn fold2_two_and_msg(
+unsafe fn fold2_two_and_msg_impl(
     f: &[F128],
     b: &[F128],
     base: usize,
@@ -1397,6 +1515,7 @@ pub(super) unsafe fn fold2_two_and_msg(
     r_a: F128,
     r_b: F128,
     nt_stores: bool,
+    prep_on: bool,
 ) -> (F128, F128) {
     #[inline(always)]
     unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
@@ -1415,6 +1534,8 @@ pub(super) unsafe fn fold2_two_and_msg(
         let zero = vdupq_n_u64(0);
         let ra_q = transmute::<F128, uint64x2_t>(r_a);
         let rb_q = transmute::<F128, uint64x2_t>(r_b);
+        let ra_p = const_prep(ra_q);
+        let rb_p = const_prep(rb_q);
         let mut a_u0a = WideNeon { lo: zero, hi: zero };
         let mut a_u0b = WideNeon { lo: zero, hi: zero };
         let mut a_u2a = WideNeon { lo: zero, hi: zero };
@@ -1435,14 +1556,14 @@ pub(super) unsafe fn fold2_two_and_msg(
                 let be1 = vld1q_u64(b.as_ptr().add(src + 2).cast::<u64>());
                 let bo1 = vld1q_u64(b.as_ptr().add(src + 3).cast::<u64>());
 
-                let pf = mul_const_vec2(ra_q, veorq_u64(fe0, fo0), veorq_u64(fe1, fo1));
+                let pf = mul_const_pair_sel(prep_on, ra_q, ra_p, veorq_u64(fe0, fo0), veorq_u64(fe1, fo1));
                 let vf0 = veorq_u64(fe0, pf[0]);
                 let vf1 = veorq_u64(fe1, pf[1]);
-                let pb = mul_const_vec2(ra_q, veorq_u64(be0, bo0), veorq_u64(be1, bo1));
+                let pb = mul_const_pair_sel(prep_on, ra_q, ra_p, veorq_u64(be0, bo0), veorq_u64(be1, bo1));
                 let vb0 = veorq_u64(be0, pb[0]);
                 let vb1 = veorq_u64(be1, pb[1]);
 
-                let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
+                let pw = mul_const_pair_sel(prep_on, rb_q, rb_p, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
                 let wq_f = veorq_u64(vf0, pw[0]);
                 let wq_b = veorq_u64(vb0, pw[1]);
                 if !nt_stores {
@@ -1475,9 +1596,197 @@ pub(super) unsafe fn fold2_two_and_msg(
     }
 }
 
+#[inline]
+fn use_fold2_const_prep() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD2_CONST_PREP").is_none());
+    *ON
+}
+
+#[inline(always)]
+unsafe fn mul_const_pair_sel(
+    prep_on: bool,
+    r: uint64x2_t,
+    p: crate::field::gf2_128::aarch64::ConstPrep,
+    x0: uint64x2_t,
+    x1: uint64x2_t,
+) -> [uint64x2_t; 2] {
+    unsafe {
+        if prep_on {
+            [mul_const_prep(p, x0), mul_const_prep(p, x1)]
+        } else {
+            mul_const_vec2(r, x0, x1)
+        }
+    }
+}
+
+///
+/// # Safety
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn fold2_two_and_msgs(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    wf: &mut [F128],
+    wb: &mut [F128],
+    r_a: F128,
+    r_b: F128,
+    nt_stores: bool,
+) -> (F128, F128, [F128; 6]) {
+    unsafe { fold2_two_and_msgs_impl(f, b, base, wf, wb, r_a, r_b, nt_stores, use_fold2_const_prep()) }
+}
+
+///
+/// # Safety
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn fold2_two_and_msg(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    wf: &mut [F128],
+    wb: &mut [F128],
+    r_a: F128,
+    r_b: F128,
+    nt_stores: bool,
+) -> (F128, F128) {
+    unsafe { fold2_two_and_msg_impl(f, b, base, wf, wb, r_a, r_b, nt_stores, use_fold2_const_prep()) }
+}
+
+///
+/// # Safety
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn scale_slice_prepared(out: &mut [F128], src: &[F128], s: F128) {
+    unsafe {
+        let p = const_prep(transmute::<F128, uint64x2_t>(s));
+        let n = out.len().min(src.len());
+        let (po, ps) = (out.as_mut_ptr(), src.as_ptr());
+        for i in 0..n {
+            let v = vld1q_u64(ps.add(i).cast::<u64>());
+            vst1q_u64(po.add(i).cast::<u64>(), mul_const_prep(p, v));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_scale_matches_generic() {
+        let mut state = 0x5343_414C_4553_4C43u64;
+        let consts = test_field_cases(&mut state);
+        for &n in &[1usize, 2, 3, 127, 128, 1000] {
+            for &sc in consts.iter().step_by(3) {
+                let src: Vec<F128> =
+                    (0..n).map(|_| F128::new(test_xorshift(&mut state), test_xorshift(&mut state))).collect();
+                let mut got = vec![F128::ONE; n];
+                unsafe { scale_slice_prepared(&mut got, &src, sc) };
+                let want: Vec<F128> = src.iter().map(|&l| l * sc).collect();
+                assert_eq!(got, want, "n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_fold2_matches_incumbent() {
+        let mut state = 0x464F_4C44_3250_5245u64;
+        let rand = |state: &mut u64| F128::new(test_xorshift(state), test_xorshift(state));
+        for &outputs in &[4usize, 8, 64, 512] {
+            for case in 0..5 {
+                let base = 4 * (case % 2);
+                let f: Vec<F128> = (0..4 * (base + outputs)).map(|_| rand(&mut state)).collect();
+                let b: Vec<F128> = (0..4 * (base + outputs)).map(|_| rand(&mut state)).collect();
+                let (r_a, r_b) = match case {
+                    0 => (F128::ZERO, F128::ONE),
+                    1 => (F128::new(0, u64::MAX), F128::new(u64::MAX, 0)),
+                    _ => (rand(&mut state), rand(&mut state)),
+                };
+                for nt in [false, true] {
+                    unsafe {
+                        let run = |prep: bool| {
+                            let mut wf = vec![F128::ZERO; outputs];
+                            let mut wb = vec![F128::ZERO; outputs];
+                            let msg = fold2_two_and_msgs_impl(&f, &b, base, &mut wf, &mut wb, r_a, r_b, nt, prep);
+                            (wf, wb, msg)
+                        };
+                        assert_eq!(run(true), run(false), "fold2 msgs outputs={outputs} case={case}");
+                        let run = |prep: bool| {
+                            let mut wf = vec![F128::ZERO; outputs];
+                            let mut wb = vec![F128::ZERO; outputs];
+                            let msg = fold2_two_and_msg_impl(&f, &b, base, &mut wf, &mut wb, r_a, r_b, nt, prep);
+                            (wf, wb, msg)
+                        };
+                        assert_eq!(run(true), run(false), "fold2 msg outputs={outputs} case={case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn prepared_scale_fold2_timing() {
+        let mut state = 0x5449_4D45_5343_414Cu64;
+        let rand = |state: &mut u64| F128::new(test_xorshift(state), test_xorshift(state));
+        for &row in &[128usize, 256] {
+            let src: Vec<F128> = (0..row).map(|_| rand(&mut state)).collect();
+            let rows: Vec<F128> = (0..256).map(|_| rand(&mut state)).collect();
+            let mut out = vec![F128::ZERO; row * rows.len()];
+            let mut best = [f64::MAX; 2];
+            for _trial in 0..15 {
+                for which in 0..2 {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..50 {
+                        for (chunk, &sc) in out.chunks_mut(row).zip(rows.iter()) {
+                            if which == 0 {
+                                for (o, &l) in chunk.iter_mut().zip(&src) {
+                                    *o = l * sc;
+                                }
+                            } else {
+                                unsafe { scale_slice_prepared(chunk, &src, sc) };
+                            }
+                        }
+                        std::hint::black_box(&mut out);
+                    }
+                    let ns = t0.elapsed().as_secs_f64() * 1e9 / (50 * out.len()) as f64;
+                    best[which] = best[which].min(ns);
+                }
+            }
+            eprintln!(
+                "[scale-timing] row={row} ns per entry (best of 15): generic {:.3}, prepared {:.3} ({:+.1}%)",
+                best[0], best[1], (best[1] / best[0] - 1.0) * 100.0
+            );
+        }
+        const OUT: usize = 512;
+        let f: Vec<F128> = (0..4 * OUT).map(|_| rand(&mut state)).collect();
+        let b: Vec<F128> = (0..4 * OUT).map(|_| rand(&mut state)).collect();
+        let (r_a, r_b) = (rand(&mut state), rand(&mut state));
+        let mut wf = vec![F128::ZERO; OUT];
+        let mut wb = vec![F128::ZERO; OUT];
+        let mut best = [f64::MAX; 2];
+        for _trial in 0..15 {
+            for which in 0..2 {
+                let t0 = std::time::Instant::now();
+                let mut sink = F128::ZERO;
+                for _ in 0..4000 {
+                    let msg = unsafe {
+                        fold2_two_and_msgs_impl(&f, &b, 0, &mut wf, &mut wb, r_a, r_b, false, which == 1)
+                    };
+                    sink += msg.0;
+                    std::hint::black_box((&mut wf, &mut wb));
+                }
+                std::hint::black_box(sink);
+                let ns = t0.elapsed().as_secs_f64() * 1e9 / (4000 * OUT) as f64;
+                best[which] = best[which].min(ns);
+            }
+        }
+        eprintln!(
+            "[fold2-timing] ns per output pair (best of 15): incumbent {:.3}, prepared {:.3} ({:+.1}%)",
+            best[0], best[1], (best[1] / best[0] - 1.0) * 100.0
+        );
+    }
 
     #[test]
     fn wide_reduction_pair_matches_two_serial_reductions() {
@@ -1541,6 +1850,170 @@ mod tests {
                 assert_pair(first, second, &format!("random case {case}"));
             }
         }
+    }
+
+    fn test_xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn test_field_cases(state: &mut u64) -> Vec<F128> {
+        let mut cases = vec![
+            F128::ZERO,
+            F128::ONE,
+            F128::new(0, 1),
+            F128::new(u64::MAX, 0),
+            F128::new(0, u64::MAX),
+            F128::new(u64::MAX, u64::MAX),
+            F128::new(0x87, 1 << 63),
+            F128::new(1 << 63, 1 << 63),
+        ];
+        cases.extend((0..160).map(|_| F128::new(test_xorshift(state), test_xorshift(state))));
+        cases
+    }
+
+    #[test]
+    fn prepared_const_products_match_reference() {
+        let mut state = 0x5052_4550_434F_4E53u64;
+        let consts = test_field_cases(&mut state);
+        for (case, &c) in consts.iter().enumerate() {
+            let d = consts[(case * 7 + 3) % consts.len()];
+            for &x in consts.iter().step_by(5) {
+                let y = F128::new(test_xorshift(&mut state), test_xorshift(&mut state));
+                unsafe {
+                    let c_q = transmute::<F128, uint64x2_t>(c);
+                    let d_q = transmute::<F128, uint64x2_t>(d);
+                    let x_q = transmute::<F128, uint64x2_t>(x);
+                    let y_q = transmute::<F128, uint64x2_t>(y);
+                    let got = transmute::<uint64x2_t, F128>(mul_const_prep(const_prep(c_q), x_q));
+                    assert_eq!(got, x * c, "single product case={case}");
+                    let karatsuba = mul_const_vec2(c_q, x_q, y_q);
+                    assert_eq!(got, transmute::<uint64x2_t, F128>(karatsuba[0]));
+                    let sum = transmute::<uint64x2_t, F128>(mul_two_const_sum_prep(
+                        const_prep(c_q),
+                        x_q,
+                        const_prep(d_q),
+                        y_q,
+                    ));
+                    assert_eq!(sum, x * c + y * d, "sum of products case={case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_folds_match_incumbent_folds() {
+        let mut state = 0x464F_4C44_5052_4550u64;
+        let rand = |state: &mut u64| F128::new(test_xorshift(state), test_xorshift(state));
+        for &outputs in &[2usize, 4, 6, 64, 2048] {
+            for case in 0..6 {
+                let f: Vec<F128> = (0..2 * outputs + 8).map(|_| rand(&mut state)).collect();
+                let b: Vec<F128> = (0..2 * outputs + 8).map(|_| rand(&mut state)).collect();
+                let addend: Vec<F128> = (0..outputs).map(|_| rand(&mut state)).collect();
+                let (r, scale) = match case {
+                    0 => (F128::ZERO, rand(&mut state)),
+                    1 => (F128::ONE, F128::ZERO),
+                    2 => (F128::new(0, u64::MAX), F128::ONE),
+                    _ => (rand(&mut state), rand(&mut state)),
+                };
+                let base = 2 * (case % 2);
+                unsafe {
+                    let run = |prep: bool| {
+                        let mut nf = vec![F128::ZERO; outputs];
+                        let mut nb = vec![F128::ZERO; outputs];
+                        let msg = if prep {
+                            fold_two_and_msg_impl::<true>(&f, &b, base, &mut nf, &mut nb, r)
+                        } else {
+                            fold_two_and_msg_impl::<false>(&f, &b, base, &mut nf, &mut nb, r)
+                        };
+                        (nf, nb, msg)
+                    };
+                    assert_eq!(run(true), run(false), "fold_two_and_msg outputs={outputs} case={case}");
+
+                    let run = |prep: bool| {
+                        let mut nf = vec![F128::ZERO; outputs];
+                        let mut nb = vec![F128::ZERO; outputs];
+                        let msg = if prep {
+                            fold_two_and_msg_with_scaled_basis_addend_impl::<true>(
+                                &f, &b, &addend, 0, &mut nf, &mut nb, r, scale,
+                            )
+                        } else {
+                            fold_two_and_msg_with_scaled_basis_addend_impl::<false>(
+                                &f, &b, &addend, 0, &mut nf, &mut nb, r, scale,
+                            )
+                        };
+                        (nf, nb, msg)
+                    };
+                    assert_eq!(run(true), run(false), "scaled addend outputs={outputs} case={case}");
+
+                    if outputs.is_multiple_of(2) {
+                        let run = |prep: bool| {
+                            let mut ff = f[..2 * outputs].to_vec();
+                            let mut bb = b[..2 * outputs].to_vec();
+                            let msg = if prep {
+                                fold_two_and_msg_in_place_impl::<true>(&mut ff, &mut bb, r)
+                            } else {
+                                fold_two_and_msg_in_place_impl::<false>(&mut ff, &mut bb, r)
+                            };
+                            (ff[..outputs].to_vec(), bb[..outputs].to_vec(), msg)
+                        };
+                        assert_eq!(run(true), run(false), "in place outputs={outputs} case={case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn prepared_fold_timing() {
+        let mut state = 0x5449_4D45_464F_4C44u64;
+        let rand = |state: &mut u64| F128::new(test_xorshift(state), test_xorshift(state));
+        const OUT: usize = 2048;
+        let f: Vec<F128> = (0..2 * OUT).map(|_| rand(&mut state)).collect();
+        let b: Vec<F128> = (0..2 * OUT).map(|_| rand(&mut state)).collect();
+        let addend: Vec<F128> = (0..OUT).map(|_| rand(&mut state)).collect();
+        let (r, scale) = (rand(&mut state), rand(&mut state));
+        let mut nf = vec![F128::ZERO; OUT];
+        let mut nb = vec![F128::ZERO; OUT];
+        const REPS: usize = 2000;
+        let mut best = [f64::MAX; 4];
+        for _trial in 0..15 {
+            for which in 0..4 {
+                let t0 = std::time::Instant::now();
+                let mut sink = F128::ZERO;
+                for _ in 0..REPS {
+                    let msg = unsafe {
+                        match which {
+                            0 => fold_two_and_msg_impl::<false>(&f, &b, 0, &mut nf, &mut nb, r),
+                            1 => fold_two_and_msg_impl::<true>(&f, &b, 0, &mut nf, &mut nb, r),
+                            2 => fold_two_and_msg_with_scaled_basis_addend_impl::<false>(
+                                &f, &b, &addend, 0, &mut nf, &mut nb, r, scale,
+                            ),
+                            _ => fold_two_and_msg_with_scaled_basis_addend_impl::<true>(
+                                &f, &b, &addend, 0, &mut nf, &mut nb, r, scale,
+                            ),
+                        }
+                    };
+                    sink += msg.0 + msg.1;
+                    std::hint::black_box((&mut nf, &mut nb));
+                }
+                std::hint::black_box(sink);
+                let ns = t0.elapsed().as_secs_f64() * 1e9 / (REPS * OUT) as f64;
+                best[which] = best[which].min(ns);
+            }
+        }
+        eprintln!(
+            "[fold-timing] ns per output pair (best of 15): fold_two_and_msg incumbent {:.3}, prepared {:.3} ({:+.1}%); scaled addend incumbent {:.3}, prepared {:.3} ({:+.1}%)",
+            best[0],
+            best[1],
+            (best[1] / best[0] - 1.0) * 100.0,
+            best[2],
+            best[3],
+            (best[3] / best[2] - 1.0) * 100.0
+        );
     }
 
     #[test]

@@ -3098,11 +3098,28 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     let n_packed = 1usize << crate::pcs::LOG_PACKING;
     let mut quad = vec![F128::ZERO; 4 * n_packed];
     for q in 0..16 {
+        let weight = retained_hi_eq[q];
         for e in 0..4 {
             let src = (e + 4 * q) * n_packed;
             let dst = e * n_packed;
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let mut packed = 0;
+                while packed < n_packed {
+                    let prod = unsafe {
+                        crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                            weight,
+                            [fold8[src + packed], fold8[src + packed + 1]],
+                        )
+                    };
+                    quad[dst + packed] += prod[0];
+                    quad[dst + packed + 1] += prod[1];
+                    packed += 2;
+                }
+            }
+            #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
             for packed in 0..n_packed {
-                quad[dst + packed] += retained_hi_eq[q] * fold8[src + packed];
+                quad[dst + packed] += weight * fold8[src + packed];
             }
         }
     }
@@ -5538,6 +5555,63 @@ mod tests {
             .expect("spawn bstatic oracle")
             .join()
             .expect("bstatic oracle thread");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn bstatic_horner_rows_timing() {
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xB57A_71C0_7131_0001);
+        let context =
+            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+                .expect("enabled static-B context");
+        let kernels::aarch64::StaticBContext::Prepared { partials, .. } = context else {
+            unreachable!("prepared static-B context");
+        };
+        const CHUNKS: usize = 64;
+        let a_packed: Vec<u8> =
+            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+        let mut b: Vec<u8> =
+            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() >> 9 & 0xff) as u8).collect();
+        for c in 0..CHUNKS {
+            for w in 0..2usize {
+                let (lo, hi) = kernels::aarch64::BSTATIC_HORNER_WINDOW_ROWS[w];
+                for b_med in lo..hi {
+                    let blk = w * (1 << N_MEDIUM) + b_med;
+                    for k in 0..N_CHUNKS {
+                        let off = c * 2048 + w * 1024 + b_med * N_CHUNKS * 8 + k * N_CHUNKS;
+                        let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
+                        let word = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                        b[off..off + 8].copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                    }
+                }
+            }
+        }
+        let mut out = vec![0u8; 16 * 64];
+        let mut times = Vec::new();
+        let mut sum = 0u64;
+        const REPS: usize = 40;
+        for _trial in 0..25 {
+            let t0 = std::time::Instant::now();
+            for _ in 0..REPS {
+                for c in 0..CHUNKS {
+                    for w in 0..2usize {
+                        kernels::aarch64::bstatic_horner_window_rows(
+                            w, &a_packed, &b, &table, c * 2048 + w * 1024, partials, &mut out, false,
+                        );
+                        sum = sum.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            ^ u64::from_le_bytes(out[5 * 64..5 * 64 + 8].try_into().unwrap());
+                    }
+                }
+            }
+            times.push(t0.elapsed().as_secs_f64() * 1e9 / (REPS * CHUNKS * 26) as f64);
+        }
+        times.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        eprintln!(
+            "[ab-row-timing] static-B Horner rows: min {:.3} p25 {:.3} median {:.3} ns per row, checksum {:016x}",
+            times[0], times[6], times[12], sum
+        );
     }
 
     /// The unrolled window run of the Horner static-B kernel writes exactly the
