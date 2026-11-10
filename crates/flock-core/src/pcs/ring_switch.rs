@@ -1488,7 +1488,7 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let (z0, z1) = z_vec.split_at(half);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            let mut out = vec![F128::ZERO; half];
+            let mut out = crate::alloc_uninit_f128_vec(half);
             let mut i = 0;
             while i < half {
                 let x0 = z0[i] + z1[i];
