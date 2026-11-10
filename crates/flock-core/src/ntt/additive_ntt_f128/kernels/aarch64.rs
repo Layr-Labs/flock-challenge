@@ -990,21 +990,22 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
+        let ext = use_const_ext();
+        let (p2, p4, p5, p6) = (
+            three_coeffs(t2),
+            three_coeffs(t4),
+            three_coeffs(t5),
+            three_coeffs(t6),
+        );
+        let step = eighth * num_ntts;
         for lane in 0..lanes {
             let base = ptr.add(r * num_ntts + lane);
-            let step = eighth * num_ntts;
 
             let mut v: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
 
-            if use_const_ext() {
-                fused3_zero_root_prepared_q(
-                    &mut v,
-                    three_coeffs(t2),
-                    three_coeffs(t4),
-                    three_coeffs(t5),
-                    three_coeffs(t6),
-                );
+            if ext {
+                fused3_zero_root_prepared_q(&mut v, p2, p4, p5, p6);
             } else {
                 fused3_zero_root_q(&mut v, t2, t4, t5, t6);
             }
