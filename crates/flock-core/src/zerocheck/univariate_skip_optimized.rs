@@ -1032,10 +1032,18 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
 /// buffers are complete for every later reader (zerocheck round two).  On
 /// the fused path the transform of a unit reads the scratch copy, which is
 /// still in L1, instead of streaming the rows back from DRAM.
+///
+/// `produce_primed`, when present, is `produce` with non-null scratch
+/// pointers for a scratch pair whose current contents were written by an
+/// earlier scratch call of this same producer (`produce` or
+/// `produce_primed`, any unit).  It must leave both buffers and the scratch
+/// exactly as `produce` would, except that it may skip writing scratch
+/// bytes whose value is the same for every unit (those already hold it).
 #[derive(Clone, Copy)]
 pub struct Round1AbProducer<'a> {
     pub unit_bytes: usize,
     pub produce: &'a (dyn Fn(usize, *mut u8, *mut u8) + Sync),
+    pub produce_primed: Option<&'a (dyn Fn(usize, *mut u8, *mut u8) + Sync)>,
 }
 
 /// Same-binary control for the fused producer path: with exactly
@@ -1509,7 +1517,14 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 let unit_start = job * units_per_job;
                 let unit_end = (unit_start + units_per_job).min(n_units);
                 for unit in unit_start..unit_end {
-                    let (a_unit, b_unit) = scratch.fill(|a, b| (producer.produce)(unit, a, b));
+                    // After this worker's first unit the scratch holds a
+                    // complete earlier unit, so the producer may skip the
+                    // unit-invariant bytes (`Round1AbProducer::produce_primed`).
+                    let primed = scratch.primed.then_some(producer.produce_primed).flatten();
+                    let (a_unit, b_unit) = match primed {
+                        Some(produce_primed) => scratch.fill(|a, b| produce_primed(unit, a, b)),
+                        None => scratch.fill(|a, b| (producer.produce)(unit, a, b)),
+                    };
                     for local in 0..unit_chunks {
                         let x_outer = unit * unit_chunks + local;
                         // SAFETY: this job owns the output of its units.
@@ -1607,11 +1622,14 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
 }
 
 /// Worker-local copy of one deferred A/B unit: `unit_bytes` of A followed by
-/// `unit_bytes` of B, 64-byte aligned.
+/// `unit_bytes` of B, 64-byte aligned.  `primed` is set once a `fill` has
+/// completed; nothing else writes `storage`, so from then on it holds the
+/// last unit the producer wrote.
 struct AbUnitScratch {
     storage: Vec<u8>,
     offset: usize,
     unit_bytes: usize,
+    primed: bool,
 }
 
 impl AbUnitScratch {
@@ -1623,6 +1641,7 @@ impl AbUnitScratch {
             storage,
             offset,
             unit_bytes,
+            primed: false,
         }
     }
 
@@ -1633,6 +1652,7 @@ impl AbUnitScratch {
         let both = &mut self.storage[self.offset..self.offset + 2 * unit_bytes];
         let (a, b) = both.split_at_mut(unit_bytes);
         produce(a.as_mut_ptr(), b.as_mut_ptr());
+        self.primed = true;
         (a, b)
     }
 }
@@ -5320,6 +5340,7 @@ mod tests {
                             Some(Round1AbProducer {
                                 unit_bytes,
                                 produce: &produce,
+                                produce_primed: None,
                             }),
                         );
                         assert_eq!(
@@ -5367,7 +5388,7 @@ mod tests {
         let plain =
             precompute_round1_ab_inner_packed_padded(&a_p, &b_p, m, K_SKIP, &table, &padding, None);
         let unit_bytes = 8 * OUTER_BYTES;
-        for with_scratch_expected in [true, false] {
+        for (with_scratch_expected, with_primed) in [(true, false), (true, true), (false, false)] {
             let mut a_t = vec![0x11u8; total];
             let mut b_t = vec![0x22u8; total];
             let (a_dst, b_dst) = (
@@ -5395,9 +5416,32 @@ mod tests {
                     }
                 }
             };
+            // Primed fill: the scratch must already hold some complete
+            // earlier unit (the precondition the precompute promises), and
+            // then it rewrites everything, like `produce`.
+            let produce_primed = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8| {
+                assert!(!a_scratch.is_null() && !b_scratch.is_null());
+                // SAFETY: scratch pointers are valid for `unit_bytes` each.
+                let (held_a, held_b) = unsafe {
+                    (
+                        core::slice::from_raw_parts(a_scratch.cast_const(), unit_bytes),
+                        core::slice::from_raw_parts(b_scratch.cast_const(), unit_bytes),
+                    )
+                };
+                assert!(
+                    (0..total / unit_bytes).any(|u| {
+                        let r = u * unit_bytes..(u + 1) * unit_bytes;
+                        held_a == &a_p[r.clone()] && held_b == &b_p[r]
+                    }),
+                    "primed fill of unit {unit} without a previously produced unit in scratch"
+                );
+                produce(unit, a_scratch, b_scratch);
+            };
+            let produce_primed: &(dyn Fn(usize, *mut u8, *mut u8) + Sync) = &produce_primed;
             let producer = Round1AbProducer {
                 unit_bytes,
                 produce: &produce,
+                produce_primed: with_primed.then_some(produce_primed),
             };
             let out = if with_scratch_expected {
                 // SAFETY: both buffers are live for `2^m / 8` bytes and are
@@ -5431,7 +5475,7 @@ mod tests {
                 assert_eq!(
                     want[base..base + live],
                     got[base..base + live],
-                    "x_outer={x_outer} scratch={with_scratch_expected}"
+                    "x_outer={x_outer} scratch={with_scratch_expected} primed={with_primed}"
                 );
             }
         }
