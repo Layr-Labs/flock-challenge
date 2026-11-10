@@ -756,7 +756,10 @@ const GPU_GRIND_BLOCK_OVERDRAW: f64 = 1.581_976_706_869_326_5;
 /// only the 17..19-bit L0 grinds go to Metal, each as one
 /// four-expected-work dispatch.
 const GPU_GRIND_WIDE_MIN_BITS: u32 = 17;
-const GPU_GRIND_WIDE_EXTRA_BITS: u32 = 2;
+// Two expected-work blocks per dispatch (was four): with the CPU race
+// scanning the same range from nonce 0, a GPU miss (e^-2) is covered by the
+// CPU, so the smaller dispatch is cheaper on average.
+const GPU_GRIND_WIDE_EXTRA_BITS: u32 = 1;
 // Two-sample engagement margin for the Metal grind arm. The min-of-two
 // estimator already prices one-sided calibration contention (a draw can only
 // be slowed by contention, never sped up), so a 1.5 ms protected margin
