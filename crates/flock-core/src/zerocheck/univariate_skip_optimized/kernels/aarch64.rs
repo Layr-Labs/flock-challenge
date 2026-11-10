@@ -1887,7 +1887,7 @@ pub(crate) fn fast_shift_reduce_enabled() -> bool {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
+pub(crate) fn shift_reduce_inner_ab_fused_neon_h4<const V: u8>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -1904,6 +1904,13 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
     let scaled_sw = inv_table.scaled_x4_half_swapped_data_ptr();
+    // Karatsuba images (see `ab_kara_tables`); dangling and unused otherwise.
+    let kplain = if V & ABV_KARA != 0 {
+        ab_kara_tables(inv_table)
+    } else {
+        core::ptr::null()
+    };
+    let kscaled = kplain.wrapping_add(AB_KARA_IMAGE_BYTES);
 
     unsafe {
         let a_base = a_packed.as_ptr().add(byte_base_b);
@@ -1913,15 +1920,15 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
         // the plain image for K < 4 and the `x^4`-scaled image for K ≥ 4; `B`
         // always comes out of the plain image.
         macro_rules! products {
-            ($at:expr, $at_sw:expr, $k:literal) => {{
+            ($at:expr, $at_sw:expr, $kara:expr, $k:literal) => {{
                 let aw = u64::from_le(core::ptr::read_unaligned(
                     a_base.add($k * N_CHUNKS).cast::<u64>(),
                 ));
                 let bw = u64::from_le(core::ptr::read_unaligned(
                     b_base.add($k * N_CHUNKS).cast::<u64>(),
                 ));
-                let (da0, da1, da2, da3) = apply_word_into_4_regs($at, $at_sw, aw);
-                let (db0, db1, db2, db3) = apply_word_into_4_regs(plain, plain_sw, bw);
+                let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V>($at, $at_sw, $kara, aw);
+                let (db0, db1, db2, db3) = apply_word_into_4_regs_v::<V>(plain, plain_sw, kplain, bw);
                 [
                     pmull_lo_u16(da0, db0),
                     pmull_hi_u16(da0, db0),
@@ -1936,8 +1943,8 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
         }
 
         // d_3 seeds the Horner chain; no shift is due before the first row.
-        let lo3 = products!(plain, plain_sw, 3);
-        let hi3 = products!(scaled, scaled_sw, 7);
+        let lo3 = products!(plain, plain_sw, kplain, 3);
+        let hi3 = products!(scaled, scaled_sw, kscaled, 7);
         let mut acc = [
             veorq_u16(lo3[0], hi3[0]),
             veorq_u16(lo3[1], hi3[1]),
@@ -1951,16 +1958,16 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
 
         let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
 
-        let lo2 = products!(plain, plain_sw, 2);
-        let hi2 = products!(scaled, scaled_sw, 6);
+        let lo2 = products!(plain, plain_sw, kplain, 2);
+        let hi2 = products!(scaled, scaled_sw, kscaled, 6);
         horner_absorb_first(&mut acc, &lo2, &hi2);
 
-        let lo1 = products!(plain, plain_sw, 1);
-        let hi1 = products!(scaled, scaled_sw, 5);
+        let lo1 = products!(plain, plain_sw, kplain, 1);
+        let hi1 = products!(scaled, scaled_sw, kscaled, 5);
         horner_absorb(&mut acc, &lo1, &hi1, carry_not);
 
-        let lo0 = products!(plain, plain_sw, 0);
-        let hi0 = products!(scaled, scaled_sw, 4);
+        let lo0 = products!(plain, plain_sw, kplain, 0);
+        let hi0 = products!(scaled, scaled_sw, kscaled, 4);
         horner_absorb(&mut acc, &lo0, &hi0, carry_not);
 
         let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
@@ -3677,15 +3684,27 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         }
     }
     if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-        shift_reduce_inner_ab_fused_neon_h4(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med,
-            out,
-            nt_store,
-        );
+        if ab_kara_enabled() {
+            shift_reduce_inner_ab_fused_neon_h4::<{ ABV_KARA }>(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                out,
+                nt_store,
+            );
+        } else {
+            shift_reduce_inner_ab_fused_neon_h4::<0>(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                out,
+                nt_store,
+            );
+        }
     } else {
         shift_reduce_inner_ab_fused_neon(
             a_packed,

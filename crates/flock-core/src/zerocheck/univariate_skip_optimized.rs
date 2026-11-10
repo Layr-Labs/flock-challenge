@@ -5786,7 +5786,7 @@ mod tests {
                     &mut out_incumbent,
                     false,
                 );
-                shift_reduce_inner_ab_fused_neon_h4(
+                shift_reduce_inner_ab_fused_neon_h4::<0>(
                     &a_packed,
                     &b_packed,
                     &table,
@@ -5794,6 +5794,20 @@ mod tests {
                     b_med,
                     &mut out_h4,
                     false,
+                );
+                let mut out_h4_kara = [0u8; 64];
+                shift_reduce_inner_ab_fused_neon_h4::<{ kernels::aarch64::ABV_KARA }>(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_h4_kara,
+                    false,
+                );
+                assert_eq!(
+                    out_h4_kara, out_h4,
+                    "Karatsuba h4 differs from plain h4 at (base={chunk_byte_base}, b_med={b_med})"
                 );
                 assert_eq!(
                     out_incumbent, out_scalar,
