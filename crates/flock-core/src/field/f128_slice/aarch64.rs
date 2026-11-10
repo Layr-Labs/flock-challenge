@@ -1,4 +1,5 @@
 use crate::field::F128;
+use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep, mul_two_const_sum_prep};
 use core::arch::aarch64::*;
 use core::mem::transmute;
 
@@ -35,6 +36,15 @@ unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
     // SAFETY: the caller provides the `aes` target feature; both types are
     // 128-bit bit containers with compatible alignment.
     unsafe { transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
+}
+
+/// Prepared fixed-multiplier products in the fused sumcheck folds;
+/// `FLOCK_NO_FOLD_CONST_PREP=1` restores the Karatsuba constant kernels.
+#[inline]
+fn use_fold_const_prep() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD_CONST_PREP").is_none());
+    *ON
 }
 
 /// Multiply two independent values by the same constant and reduce them in
@@ -945,9 +955,31 @@ pub(super) unsafe fn fold_two_and_msg(
     nb: &mut [F128],
     r: F128,
 ) -> (F128, F128) {
+    // SAFETY: same contract as the caller; the two arms differ only in how
+    // the fixed-multiplier products are formed.
+    unsafe {
+        if use_fold_const_prep() {
+            fold_two_and_msg_impl::<true>(f, b, base, nf, nb, r)
+        } else {
+            fold_two_and_msg_impl::<false>(f, b, base, nf, nb, r)
+        }
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_two_and_msg_impl<const PREP: bool>(
+    f: &[F128],
+    b: &[F128],
+    base: usize,
+    nf: &mut [F128],
+    nb: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
     unsafe {
         let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
+        let r_prep = const_prep(r_q);
         let mut u0 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut u2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut t = 0;
@@ -962,12 +994,24 @@ pub(super) unsafe fn fold_two_and_msg(
             let b_even1 = vld1q_u64(b.as_ptr().add(source + 2).cast::<u64>());
             let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
 
-            let folded_f =
-                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+            let folded_f = if PREP {
+                [
+                    mul_const_prep(r_prep, veorq_u64(f_even0, f_odd0)),
+                    mul_const_prep(r_prep, veorq_u64(f_even1, f_odd1)),
+                ]
+            } else {
+                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1))
+            };
             let f0 = veorq_u64(f_even0, folded_f[0]);
             let f1 = veorq_u64(f_even1, folded_f[1]);
-            let folded_b =
-                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
+            let folded_b = if PREP {
+                [
+                    mul_const_prep(r_prep, veorq_u64(b_even0, b_odd0)),
+                    mul_const_prep(r_prep, veorq_u64(b_even1, b_odd1)),
+                ]
+            } else {
+                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1))
+            };
             let b0 = veorq_u64(b_even0, folded_b[0]);
             let b1 = veorq_u64(b_even1, folded_b[1]);
 
@@ -1001,12 +1045,31 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
     b: &mut [F128],
     r: F128,
 ) -> (F128, F128) {
+    // SAFETY: same contract as the caller; the two arms differ only in how
+    // the fixed-multiplier products are formed.
+    unsafe {
+        if use_fold_const_prep() {
+            fold_two_and_msg_in_place_impl::<true>(f, b, r)
+        } else {
+            fold_two_and_msg_in_place_impl::<false>(f, b, r)
+        }
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_two_and_msg_in_place_impl<const PREP: bool>(
+    f: &mut [F128],
+    b: &mut [F128],
+    r: F128,
+) -> (F128, F128) {
     unsafe {
         let f_ptr = f.as_mut_ptr();
         let b_ptr = b.as_mut_ptr();
         let half = f.len() / 2;
         let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
+        let r_prep = const_prep(r_q);
         let mut u0 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut u2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut t = 0;
@@ -1021,12 +1084,24 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
             let b_even1 = vld1q_u64(b_ptr.add(source + 2).cast::<u64>());
             let b_odd1 = vld1q_u64(b_ptr.add(source + 3).cast::<u64>());
 
-            let folded_f =
-                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+            let folded_f = if PREP {
+                [
+                    mul_const_prep(r_prep, veorq_u64(f_even0, f_odd0)),
+                    mul_const_prep(r_prep, veorq_u64(f_even1, f_odd1)),
+                ]
+            } else {
+                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1))
+            };
             let f0 = veorq_u64(f_even0, folded_f[0]);
             let f1 = veorq_u64(f_even1, folded_f[1]);
-            let folded_b =
-                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
+            let folded_b = if PREP {
+                [
+                    mul_const_prep(r_prep, veorq_u64(b_even0, b_odd0)),
+                    mul_const_prep(r_prep, veorq_u64(b_even1, b_odd1)),
+                ]
+            } else {
+                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1))
+            };
             let b0 = veorq_u64(b_even0, folded_b[0]);
             let b1 = veorq_u64(b_even1, folded_b[1]);
 
@@ -1071,10 +1146,35 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
     r: F128,
     scale: F128,
 ) -> (F128, F128) {
+    // SAFETY: same contract as the caller; the two arms differ only in how
+    // the fixed-multiplier products are formed.
+    unsafe {
+        if use_fold_const_prep() {
+            fold_two_and_msg_with_scaled_basis_addend_impl::<true>(f, b, basis_addend, base, nf, nb, r, scale)
+        } else {
+            fold_two_and_msg_with_scaled_basis_addend_impl::<false>(f, b, basis_addend, base, nf, nb, r, scale)
+        }
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_two_and_msg_with_scaled_basis_addend_impl<const PREP: bool>(
+    f: &[F128],
+    b: &[F128],
+    basis_addend: &[F128],
+    base: usize,
+    nf: &mut [F128],
+    nb: &mut [F128],
+    r: F128,
+    scale: F128,
+) -> (F128, F128) {
     unsafe {
         let zero = vdupq_n_u64(0);
         let r_q = transmute::<F128, uint64x2_t>(r);
+        let r_prep = const_prep(r_q);
         let scale_q = transmute::<F128, uint64x2_t>(scale);
+        let scale_prep = const_prep(scale_q);
         let mut u0 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut u2 = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
         let mut t = 0usize;
@@ -1084,8 +1184,14 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
             let f_odd0 = vld1q_u64(f.as_ptr().add(source + 1).cast::<u64>());
             let f_even1 = vld1q_u64(f.as_ptr().add(source + 2).cast::<u64>());
             let f_odd1 = vld1q_u64(f.as_ptr().add(source + 3).cast::<u64>());
-            let folded_f =
-                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+            let folded_f = if PREP {
+                [
+                    mul_const_prep(r_prep, veorq_u64(f_even0, f_odd0)),
+                    mul_const_prep(r_prep, veorq_u64(f_even1, f_odd1)),
+                ]
+            } else {
+                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1))
+            };
             let f0 = veorq_u64(f_even0, folded_f[0]);
             let f1 = veorq_u64(f_even1, folded_f[1]);
 
@@ -1095,14 +1201,31 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
             let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
             let addend0 = vld1q_u64(basis_addend.as_ptr().add(t).cast::<u64>());
             let addend1 = vld1q_u64(basis_addend.as_ptr().add(t + 1).cast::<u64>());
-            let folded_b_with_addend = mul_two_const_sum_vec2_pmred(
-                r_q,
-                veorq_u64(b_even0, b_odd0),
-                veorq_u64(b_even1, b_odd1),
-                scale_q,
-                addend0,
-                addend1,
-            );
+            let folded_b_with_addend = if PREP {
+                [
+                    mul_two_const_sum_prep(
+                        r_prep,
+                        veorq_u64(b_even0, b_odd0),
+                        scale_prep,
+                        addend0,
+                    ),
+                    mul_two_const_sum_prep(
+                        r_prep,
+                        veorq_u64(b_even1, b_odd1),
+                        scale_prep,
+                        addend1,
+                    ),
+                ]
+            } else {
+                mul_two_const_sum_vec2_pmred(
+                    r_q,
+                    veorq_u64(b_even0, b_odd0),
+                    veorq_u64(b_even1, b_odd1),
+                    scale_q,
+                    addend0,
+                    addend1,
+                )
+            };
             let b0 = veorq_u64(b_even0, folded_b_with_addend[0]);
             let b1 = veorq_u64(b_even1, folded_b_with_addend[1]);
 
@@ -1541,6 +1664,178 @@ mod tests {
                 assert_pair(first, second, &format!("random case {case}"));
             }
         }
+    }
+
+    fn test_xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn test_field_cases(state: &mut u64) -> Vec<F128> {
+        let mut cases = vec![
+            F128::ZERO,
+            F128::ONE,
+            F128::new(0, 1),
+            F128::new(u64::MAX, 0),
+            F128::new(0, u64::MAX),
+            F128::new(u64::MAX, u64::MAX),
+            F128::new(0x87, 1 << 63),
+            F128::new(1 << 63, 1 << 63),
+        ];
+        cases.extend((0..160).map(|_| F128::new(test_xorshift(state), test_xorshift(state))));
+        cases
+    }
+
+    /// The prepared fixed-multiplier products equal the generic field product
+    /// and the Karatsuba constant kernels, bit for bit, including the edge
+    /// multipliers (zero, one, single limbs, all ones, top bits).
+    #[test]
+    fn prepared_const_products_match_reference() {
+        let mut state = 0x5052_4550_434F_4E53u64;
+        let consts = test_field_cases(&mut state);
+        for (case, &c) in consts.iter().enumerate() {
+            let d = consts[(case * 7 + 3) % consts.len()];
+            for &x in consts.iter().step_by(5) {
+                let y = F128::new(test_xorshift(&mut state), test_xorshift(&mut state));
+                unsafe {
+                    let c_q = transmute::<F128, uint64x2_t>(c);
+                    let d_q = transmute::<F128, uint64x2_t>(d);
+                    let x_q = transmute::<F128, uint64x2_t>(x);
+                    let y_q = transmute::<F128, uint64x2_t>(y);
+                    let got = transmute::<uint64x2_t, F128>(mul_const_prep(const_prep(c_q), x_q));
+                    assert_eq!(got, x * c, "single product case={case}");
+                    let karatsuba = mul_const_vec2(c_q, x_q, y_q);
+                    assert_eq!(got, transmute::<uint64x2_t, F128>(karatsuba[0]));
+                    let sum = transmute::<uint64x2_t, F128>(mul_two_const_sum_prep(
+                        const_prep(c_q),
+                        x_q,
+                        const_prep(d_q),
+                        y_q,
+                    ));
+                    assert_eq!(sum, x * c + y * d, "sum of products case={case}");
+                }
+            }
+        }
+    }
+
+    /// Each fused fold kernel returns the same folded slices and the same
+    /// message with the prepared products as with the incumbent ones.
+    #[test]
+    fn prepared_folds_match_incumbent_folds() {
+        let mut state = 0x464F_4C44_5052_4550u64;
+        let rand = |state: &mut u64| F128::new(test_xorshift(state), test_xorshift(state));
+        for &outputs in &[2usize, 4, 6, 64, 2048] {
+            for case in 0..6 {
+                let f: Vec<F128> = (0..2 * outputs + 8).map(|_| rand(&mut state)).collect();
+                let b: Vec<F128> = (0..2 * outputs + 8).map(|_| rand(&mut state)).collect();
+                let addend: Vec<F128> = (0..outputs).map(|_| rand(&mut state)).collect();
+                let (r, scale) = match case {
+                    0 => (F128::ZERO, rand(&mut state)),
+                    1 => (F128::ONE, F128::ZERO),
+                    2 => (F128::new(0, u64::MAX), F128::ONE),
+                    _ => (rand(&mut state), rand(&mut state)),
+                };
+                let base = 2 * (case % 2);
+                unsafe {
+                    let run = |prep: bool| {
+                        let mut nf = vec![F128::ZERO; outputs];
+                        let mut nb = vec![F128::ZERO; outputs];
+                        let msg = if prep {
+                            fold_two_and_msg_impl::<true>(&f, &b, base, &mut nf, &mut nb, r)
+                        } else {
+                            fold_two_and_msg_impl::<false>(&f, &b, base, &mut nf, &mut nb, r)
+                        };
+                        (nf, nb, msg)
+                    };
+                    assert_eq!(run(true), run(false), "fold_two_and_msg outputs={outputs} case={case}");
+
+                    let run = |prep: bool| {
+                        let mut nf = vec![F128::ZERO; outputs];
+                        let mut nb = vec![F128::ZERO; outputs];
+                        let msg = if prep {
+                            fold_two_and_msg_with_scaled_basis_addend_impl::<true>(
+                                &f, &b, &addend, 0, &mut nf, &mut nb, r, scale,
+                            )
+                        } else {
+                            fold_two_and_msg_with_scaled_basis_addend_impl::<false>(
+                                &f, &b, &addend, 0, &mut nf, &mut nb, r, scale,
+                            )
+                        };
+                        (nf, nb, msg)
+                    };
+                    assert_eq!(run(true), run(false), "scaled addend outputs={outputs} case={case}");
+
+                    if outputs.is_multiple_of(2) {
+                        let run = |prep: bool| {
+                            let mut ff = f[..2 * outputs].to_vec();
+                            let mut bb = b[..2 * outputs].to_vec();
+                            let msg = if prep {
+                                fold_two_and_msg_in_place_impl::<true>(&mut ff, &mut bb, r)
+                            } else {
+                                fold_two_and_msg_in_place_impl::<false>(&mut ff, &mut bb, r)
+                            };
+                            (ff[..outputs].to_vec(), bb[..outputs].to_vec(), msg)
+                        };
+                        assert_eq!(run(true), run(false), "in place outputs={outputs} case={case}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Local timing probe (not a correctness test) at the ranked chunk shape:
+    /// 2048 outputs per call. Run with
+    /// `cargo test --profile challenge -p flock-core --lib prepared_fold_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn prepared_fold_timing() {
+        let mut state = 0x5449_4D45_464F_4C44u64;
+        let rand = |state: &mut u64| F128::new(test_xorshift(state), test_xorshift(state));
+        const OUT: usize = 2048;
+        let f: Vec<F128> = (0..2 * OUT).map(|_| rand(&mut state)).collect();
+        let b: Vec<F128> = (0..2 * OUT).map(|_| rand(&mut state)).collect();
+        let addend: Vec<F128> = (0..OUT).map(|_| rand(&mut state)).collect();
+        let (r, scale) = (rand(&mut state), rand(&mut state));
+        let mut nf = vec![F128::ZERO; OUT];
+        let mut nb = vec![F128::ZERO; OUT];
+        const REPS: usize = 2000;
+        let mut best = [f64::MAX; 4];
+        for _trial in 0..15 {
+            for which in 0..4 {
+                let t0 = std::time::Instant::now();
+                let mut sink = F128::ZERO;
+                for _ in 0..REPS {
+                    let msg = unsafe {
+                        match which {
+                            0 => fold_two_and_msg_impl::<false>(&f, &b, 0, &mut nf, &mut nb, r),
+                            1 => fold_two_and_msg_impl::<true>(&f, &b, 0, &mut nf, &mut nb, r),
+                            2 => fold_two_and_msg_with_scaled_basis_addend_impl::<false>(
+                                &f, &b, &addend, 0, &mut nf, &mut nb, r, scale,
+                            ),
+                            _ => fold_two_and_msg_with_scaled_basis_addend_impl::<true>(
+                                &f, &b, &addend, 0, &mut nf, &mut nb, r, scale,
+                            ),
+                        }
+                    };
+                    sink += msg.0 + msg.1;
+                    std::hint::black_box((&mut nf, &mut nb));
+                }
+                std::hint::black_box(sink);
+                let ns = t0.elapsed().as_secs_f64() * 1e9 / (REPS * OUT) as f64;
+                best[which] = best[which].min(ns);
+            }
+        }
+        eprintln!(
+            "[fold-timing] ns per output pair (best of 15): fold_two_and_msg incumbent {:.3}, prepared {:.3} ({:+.1}%); scaled addend incumbent {:.3}, prepared {:.3} ({:+.1}%)",
+            best[0],
+            best[1],
+            (best[1] / best[0] - 1.0) * 100.0,
+            best[2],
+            best[3],
+            (best[3] / best[2] - 1.0) * 100.0
+        );
     }
 
     #[test]
