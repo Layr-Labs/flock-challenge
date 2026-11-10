@@ -120,8 +120,11 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
-    let trace =
-        std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    // Resolved once per process (the env is fixed after start).
+    static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+    });
+    let trace = *TRACE;
     let t_total = std::time::Instant::now();
 
     assert_eq!(

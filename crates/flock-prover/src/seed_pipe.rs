@@ -406,7 +406,11 @@ static SPEC_INIT: AtomicU64 = AtomicU64::new(0);
 
 /// Exact-`1` kill for lazy mode; anything else leaves the new path on.
 fn lazy_blocks_killed() -> bool {
-    std::env::var("FLOCK_NO_SPEC_LAZY_BLOCKS").is_ok_and(|v| v == "1")
+    // Resolved once per process (the env is fixed after start; no test toggles it).
+    static KILLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NO_SPEC_LAZY_BLOCKS").is_ok_and(|v| v == "1")
+    });
+    *KILLED
 }
 
 /// If `blocks` is the live lazy speculative buffer, return the generator

@@ -223,6 +223,20 @@ fn deep_subtree_pairs_enabled() -> bool {
     *ON
 }
 
+// Env switches read on every call of the paths below, resolved once per
+// process. The worker never changes its environment after start (every
+// in-tree `set_var` is in a test and touches other flags), so this is exact.
+static NTT_LOW_TWIDDLE_FINAL_KILLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_some());
+static RECURSIVE_TOP_HETERO_KILLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_some());
+static NTT_PASS_TIMING: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_PASS_TIMING").is_some());
+static NTT_BLOCK_REGIONS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_some());
+static NTT_TOP_EPOOL_KILLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_some());
+
 /// The standard dimension-20 basis has low-limb-only twiddles throughout the
 /// final two layers. This permits a two-PMULL product on AArch64 instead of the
 /// generic six-PMULL field multiply. Keep the dispatch tied to the exact
@@ -236,7 +250,7 @@ fn use_ranked_low_twiddle_final_pair(log_d: usize, num_ntts: usize, n_top: usize
     )) && log_d == 20
         && num_ntts == 64
         && n_top == 10
-        && std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_none()
+        && !*NTT_LOW_TWIDDLE_FINAL_KILLED
 }
 
 /// The zero-root radix-8 kernel is currently scored only for the ranked L0
@@ -384,7 +398,7 @@ fn trace_recursive_ntt_epool() -> bool {
 /// (block, tile) job writes disjoint destination rows.
 #[inline]
 fn recursive_top_hetero_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_none()
+    !*RECURSIVE_TOP_HETERO_KILLED
 }
 
 // ---------------------------------------------------------------------------
@@ -990,7 +1004,7 @@ impl AdditiveNttF128 {
             tw
         };
 
-        let pass_timing = std::env::var_os("FLOCK_NTT_PASS_TIMING").is_some();
+        let pass_timing = *NTT_PASS_TIMING;
         let t_l1 = std::time::Instant::now();
         // Layer-1 fused-3 pass from the message: 2 blocks, identical input.
         {
@@ -1523,10 +1537,10 @@ impl AdditiveNttF128 {
                     }
                     tw
                 };
-                if zero_root_fused3 && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none() {
+                if zero_root_fused3 && !*NTT_BLOCK_REGIONS {
                     let twiddles: Vec<[F128; 7]> = (0..num_blocks).map(block_twiddles).collect();
                     if is_ranked_top_hetero_fused3_pass(log_d, num_ntts, start_layer, n_top, layer)
-                        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+                        && !*NTT_TOP_EPOOL_KILLED
                     {
                         butterfly_interleaved_fused_3layer_all_blocks_hetero(
                             data, &twiddles, eighth, num_ntts,

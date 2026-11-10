@@ -42,13 +42,33 @@ pub const ENV_NO_ZC_AB_IDENTITY_PREFIX_OMIT: &str = "FLOCK_NO_ZC_AB_IDENTITY_PRE
 /// Literal `1` retains C1 while computing window 30 normally.
 pub const ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT: &str = "FLOCK_NO_ZC_AB_OUTPUT_WINDOW_OMIT";
 
+// Env switches read on every call of the paths below, resolved once per
+// process. The worker never changes its environment after start (every
+// in-tree `set_var` is in a test and touches other flags), so this is exact.
+static OPEN_DIRECT_AB_KILLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_some());
+static LIG_FOLD2_KILLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_FOLD2").is_some());
+static ZC_LINCHECK_C_REUSE_KILLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_some());
+static ZC_AB_IDENTITY_PREFIX_OMIT_KILLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var_os(ENV_NO_ZC_AB_IDENTITY_PREFIX_OMIT).as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+});
+static ZC_AB_OUTPUT_WINDOW_OMIT_KILLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var_os(ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT).as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+});
+static PHASE_TIMING: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_PHASE_TIMING").is_some());
+
 #[inline]
 fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && r1cs.m == 32
         && r1cs.k_log >= pcs::LOG_PACKING + 2
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
-        && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
+        && !*OPEN_DIRECT_AB_KILLED
+        && !*LIG_FOLD2_KILLED
 }
 
 /// Whether the c-claim ships its four-bank sufficient statistic instead of the
@@ -91,7 +111,7 @@ fn ranked_lincheck_c_reuse_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.useful_bits == 15_409
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
         && r1cs.c0_is_identity()
-        && std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none()
+        && !*ZC_LINCHECK_C_REUSE_KILLED
 }
 
 /// C1 needs both statement properties and the exact row-major BLAKE3
@@ -106,15 +126,13 @@ fn ranked_identity_prefix_omission_contract(
 ) -> Option<Round1PinnedOnePrefixStatement> {
     let witness = witness?;
     if !ranked_lincheck_c_reuse_enabled(r1cs)
-        || std::env::var_os(ENV_NO_ZC_AB_IDENTITY_PREFIX_OMIT).as_deref()
-            == Some(std::ffi::OsStr::new("1"))
+        || *ZC_AB_IDENTITY_PREFIX_OMIT_KILLED
         || !witness.matches(z, a, b)
         || z.len() != 1usize << (r1cs.m - 7)
     {
         return None;
     }
-    if std::env::var_os(ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT).as_deref()
-        != Some(std::ffi::OsStr::new("1"))
+    if !*ZC_AB_OUTPUT_WINDOW_OMIT_KILLED
         && let Some(statement) = r1cs.round1_pinned_one_prefix_and_output_statement()
     {
         return Some(statement);
@@ -535,7 +553,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = *PHASE_TIMING;
     flock_core::tmark::mark("open start");
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
@@ -1316,7 +1334,7 @@ fn commit_with_round1_ab_precompute(
             // from this arm's measured wall (an Instant read is free; the
             // store is one relaxed atomic per prove).
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
-            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            if *PHASE_TIMING {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
             r
@@ -1418,7 +1436,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let identity_prefix_contract = ranked_identity_prefix_omission_contract(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
     );
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = *PHASE_TIMING;
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>,
                       stripe_help: Option<&(dyn Fn() + Sync)>| {
         let cpu0 = phase_timing.then(process_cpu_ms);

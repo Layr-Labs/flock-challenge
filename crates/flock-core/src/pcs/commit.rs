@@ -1,3 +1,4 @@
+// Env-switch caching on the fb2e0194 record (202611101501); see the submission note for credits.
 //! PCS commit phase: pack → RS encode (additive NTT) → Merkle root.
 //!
 //! Uses [`AdditiveNttF128`], the binius-style LCH NTT with neighbors-last
@@ -323,6 +324,24 @@ pub fn commit_into(
     finalize_commit_impl(z_packed, codeword, params, false)
 }
 
+// Env switches read on every call of the paths below, resolved once per
+// process. The worker never changes its environment after start (every
+// in-tree `set_var` is in a test and touches other flags), so this is exact.
+static NTT_TOP_EPOOL_KILLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_some());
+static NTT_BLOCK_REGIONS: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_some());
+static NTT_FROM_MSG_KILLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_FROM_MSG").is_some());
+static NTT_MERKLE_PIPELINE_KILLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_some());
+static MERKLE_SUBTREE_PARENTS_KILLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_some());
+static COMMIT_TIMING: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_COMMIT_TIMING").is_some());
+static PREFAULT_KILLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_PREFAULT").is_some());
+
 /// Whether the ranked rate-1/2 commit will fuse the replicate-fill into the
 /// first NTT top pass (see
 /// `forward_transform_interleaved_ranked_top_from_message`). Mirrors every
@@ -335,9 +354,9 @@ pub fn use_ranked_from_message_commit(params: &PcsParams) -> bool {
         && crate::epool::epool().is_some()
         && rayon::current_num_threads() > 1
         && params.log_inv_rate == 1
-        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
-        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
-        && std::env::var_os("FLOCK_NO_NTT_FROM_MSG").is_none()
+        && !*NTT_TOP_EPOOL_KILLED
+        && !*NTT_BLOCK_REGIONS
+        && !*NTT_FROM_MSG_KILLED
 }
 
 /// [`use_ranked_from_message_commit`] plus the buffer-geometry check
@@ -494,7 +513,7 @@ fn is_ranked_ntt_merkle_leaf_pipeline_shape(params: &PcsParams) -> bool {
 #[inline]
 fn use_ranked_ntt_merkle_leaf_pipeline(params: &PcsParams) -> bool {
     is_ranked_ntt_merkle_leaf_pipeline_shape(params)
-        && std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none()
+        && !*NTT_MERKLE_PIPELINE_KILLED
 }
 
 #[derive(Clone, Copy)]
@@ -529,7 +548,7 @@ fn ranked_ntt_with_pipelined_leaves(
     // local levels cover 1,020 of each subtree's 1,023 parent nodes while
     // leaving the shared top for the level-wide builder.
     const LOCAL_PARENT_LEVELS: usize = 8;
-    let local_parent_levels = if std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_some() {
+    let local_parent_levels = if *MERKLE_SUBTREE_PARENTS_KILLED {
         0
     } else {
         LOCAL_PARENT_LEVELS
@@ -598,8 +617,8 @@ fn ranked_ntt_with_pipelined_leaves(
     // never begin. The deep transform and callback-driven leaf pipeline below
     // retain their existing overlap and scheduling.
     let split_ranked_top = is_ranked_ntt_merkle_leaf_pipeline_shape(params)
-        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
-        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
+        && !*NTT_TOP_EPOOL_KILLED
+        && !*NTT_BLOCK_REGIONS;
     if split_ranked_top {
         match from_message {
             Some(msg) => ntt.forward_transform_interleaved_ranked_top_from_message(
@@ -746,7 +765,7 @@ pub(crate) fn cpu_transform_and_tree(
         let total_nodes = 2 * params.n_leaves() - 1;
         crate::gpu_commit::take_tree(total_nodes)
     });
-    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    let timing = *COMMIT_TIMING;
     let cpu_ntt0 = timing.then(commit_cpu_ms);
     let t_ntt = std::time::Instant::now();
     let mut prehashed_parent_levels = 0usize;
@@ -851,7 +870,7 @@ pub fn prefault_codeword_during<R>(
     params: &PcsParams,
     generate: impl FnOnce() -> R,
 ) -> (Option<Vec<F128>>, R) {
-    if rayon::current_num_threads() <= 1 || std::env::var_os("FLOCK_NO_PREFAULT").is_some() {
+    if rayon::current_num_threads() <= 1 || *PREFAULT_KILLED {
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
         // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
         // offload and keeps fixed-thread-count sweeps honest.
