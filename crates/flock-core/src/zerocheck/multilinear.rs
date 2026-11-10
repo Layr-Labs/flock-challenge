@@ -132,6 +132,14 @@ fn r2_degen_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
 }
 
+/// Kill switch for the peeled first group of the round-two Horner kernel:
+/// `FLOCK_NO_R2_FIRST_SHIFT_SKIP=1` restores the uniform loop that shifts the
+/// zero accumulators in front of every window's first group. Same outputs.
+#[cfg(target_arch = "aarch64")]
+fn r2_first_shift_skip_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_R2_FIRST_SHIFT_SKIP").is_none_or(|v| v != *"1")
+}
+
 /// Kill switch for the fused cascade K kernel
 /// (`fold2_compact_and_round45_chunk_neon_8_fused`): `FLOCK_NO_ZC_K_FUSED=1`
 /// restores the one-body compact kernel. Same stores and slots either way.
@@ -1893,6 +1901,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         && mlv_challenges[3..7]
             == crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash();
 
+    #[cfg(target_arch = "aarch64")]
+    let horner_skip_first = r2_first_shift_skip_enabled();
+
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
     // the *summed* `(p1, pinf)` for its prefix. The CPU keeps producing the
@@ -1971,21 +1982,39 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu && horner_weights {
-                    fold_round2_compact_chunk_neon_horner_8(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        skip_dead,
-                        out.as_mut_ptr(),
-                    );
+                    if horner_skip_first {
+                        fold_round2_compact_chunk_neon_horner_8::<true>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        );
+                    } else {
+                        fold_round2_compact_chunk_neon_horner_8::<false>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        );
+                    }
                     let eq_h = eq_hi[x_hi];
                     *partials_base.ptr().add(x_hi) = (F128::ZERO, F128::ZERO);
                     *la_base.ptr().add(x_hi) = [
