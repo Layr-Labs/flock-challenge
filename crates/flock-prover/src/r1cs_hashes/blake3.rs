@@ -3156,13 +3156,8 @@ pub(crate) mod witgen_simd {
         }
     }
 
-    /// Drain one complete 512-word stage twice: every dump chunk goes to
-    /// `scratch` with ordinary stores (the scratch is re-read from L1 at
-    /// once), then the chunks `nt0..nt1` (even `nt0`) plus, when
-    /// `sparse_tail` is set, the sparse tail chunk go to `dst` with
-    /// non-temporal stores.  The two passes stay separate: interleaving
     /// ordinary and non-temporal stores chunk by chunk measured ~60% slower
-    /// for the whole kernel than two back-to-back passes over the L1 stage.
+    ///
     #[inline(always)]
     unsafe fn dump_dual(
         stage: *const V4,
@@ -3172,11 +3167,35 @@ pub(crate) mod witgen_simd {
         nt1: usize,
         sparse_tail: bool,
     ) {
+        debug_assert!(!sparse_tail || nt1 == RANKED_SPARSE_TAIL_CHUNK);
         unsafe {
             dump_range::<false>(stage, scratch, 0, DUMP_CHUNKS);
-            dump_range_lines_nt(stage, dst, nt0, nt1);
-            if sparse_tail {
-                dump_ranked_sparse_tail_nt(stage, dst);
+            copy_lines_nt(scratch, dst, nt0, nt1 + usize::from(sparse_tail));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn copy_lines_nt(src: *const u32, dst: *mut u32, g0: usize, g1: usize) {
+        debug_assert!(g0.is_multiple_of(2));
+        unsafe {
+            for j in 0..4 {
+                let s = src.add(j * U32_PER_BLOCK);
+                let d = dst.add(j * U32_PER_BLOCK);
+                let mut g = g0;
+                while g + 2 <= g1 {
+                    let w = 8 * g;
+                    let v0 = vld1q_u32(s.add(w));
+                    let v1 = vld1q_u32(s.add(w + 4));
+                    let v2 = vld1q_u32(s.add(w + 8));
+                    let v3 = vld1q_u32(s.add(w + 12));
+                    store_nt_pair(v0, v1, d.add(w));
+                    store_nt_pair(v2, v3, d.add(w + 8));
+                    g += 2;
+                }
+                if g < g1 {
+                    let w = 8 * g;
+                    store_nt_pair(vld1q_u32(s.add(w)), vld1q_u32(s.add(w + 4)), d.add(w));
+                }
             }
         }
     }
@@ -3493,10 +3512,9 @@ pub(crate) mod witgen_simd {
                 dump_dual(bs, sb, b, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK, false);
             } else if SCRATCH {
                 dump_range::<false>(za, sa, 0, ELIDE_ZERO_CHUNK);
-                dump_range_lines_nt(za, a, 0, RANKED_SPARSE_TAIL_CHUNK);
-                dump_ranked_sparse_tail_nt(za, a);
                 dump_range::<false>(bs, sb, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK);
-                dump_range_lines_nt(bs, b, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK);
+                copy_lines_nt(sa, a, 0, ELIDE_ZERO_CHUNK);
+                copy_lines_nt(sb, b, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK);
             } else {
                 dump_range_lines_nt(za, a, 0, RANKED_SPARSE_TAIL_CHUNK);
                 dump_ranked_sparse_tail_nt(za, a);
