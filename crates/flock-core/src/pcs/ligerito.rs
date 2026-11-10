@@ -6259,7 +6259,7 @@ fn fold2_and_msgs_lsb(
     //     coeff of rc^2: (wf0+wf1)*(wb0+wb1)
     //   u2_D likewise over sums-of-adjacent-x, which reduce to the same three
     //   bilinear forms on (wf0+wf2.., wf1+wf3..) groupings handled below.
-    const CHUNK: usize = 2048; // outputs per chunk; 8 inputs per output pair
+    const CHUNK: usize = 1024;
     // Fold pairs whose w outputs are past LLC size write ping-pong state not
     // read until the next fold pair's barrier; `stnp` elides the
     // write-allocate RFO reads there (same driver-decided policy as the
@@ -6355,7 +6355,7 @@ fn fold2_and_msgs_lsb(
     // Hetero queue over the identical chunk grid: same bases, same kernel,
     // XOR-merged partials — bytes unchanged, only chunk ownership differs.
     let acc =
-        if quarter >= 16 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
+        if quarter >= 32 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
             let n_chunks = quarter / CHUNK;
             let mut partials = vec![(F128::ZERO, F128::ZERO, [F128::ZERO; 6]); n_chunks];
             let f_base = crate::epool::SyncPtr(wf.as_mut_ptr());
