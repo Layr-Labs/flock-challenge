@@ -285,6 +285,10 @@ pub(crate) unsafe fn accumulate_convert_ab(
 /// after it, and the deferred `eq_bot[u]` fold re-associates the same product
 /// terms — no term is added, dropped, or reordered within a lane.
 ///
+/// `STORE` (store-on-first-touch, fkiene 5a29dcd0): every one of the 64 bank
+/// slots is overwritten with the gathered lane instead of XORed into, so the
+/// caller need not zero the bank before its first touch. All eight lane groups
+/// drain unconditionally (even for an empty `b_med` range, which stores zero).
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool>(
     chunk_ab_bytes: &[[u8; 64]; 16],
@@ -401,6 +405,216 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool>(
             drain_lane!(5, ab5);
             drain_lane!(6, ab6);
             drain_lane!(7, ab7);
+        }
+    }
+}
+
+/// `x^8 · v` in GF(2^128) (GHASH polynomial `x^128 + x^7 + x^2 + x + 1`,
+/// bit `i` of the little-endian 128-bit value is the coefficient of `x^i`):
+/// a one-byte shift up, plus the overflow byte `o` folded back as
+/// `o · (x^7 + x^2 + x + 1)` (degree ≤ 14, so no second reduction).
+/// Exactly `mul_by_x` applied eight times.
+#[inline(always)]
+pub(crate) unsafe fn mul_x8_q(v: core::arch::aarch64::uint8x16_t) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        let shifted = vextq_u8(vdupq_n_u8(0), v, 15);
+        // Overflow byte of the high lane, moved into the low lane: [o, 0].
+        let top = vshrq_n_u64(vreinterpretq_u64_u8(v), 56);
+        let o = vreinterpretq_u64_u8(vextq_u8(vreinterpretq_u8_u64(top), vdupq_n_u8(0), 8));
+        // o · 0x87 carry-less = o ^ o<<1 ^ o<<2 ^ o<<7 (o < 256: no overlap past bit 14).
+        let red = veorq_u64(
+            veorq_u64(o, vshlq_n_u64::<1>(o)),
+            veorq_u64(vshlq_n_u64::<2>(o), vshlq_n_u64::<7>(o)),
+        );
+        veorq_u8(shifted, vreinterpretq_u8_u64(red))
+    }
+}
+
+/// [`accumulate_convert_ab_nomul`] reading only the first eight `b_med`
+/// tables (32 KiB instead of 64 KiB of the 4 KiB-per-`b_med` image).
+///
+/// Requires the derived table image, where row `b` is `x^b · row 0`
+/// bit-for-bit (`build_ab_eq_fold_tables` with the factory convert table).
+/// Then for `b ≥ 8`, `T[b][y] = x^8 · T[b-8][y]`, and by distributivity
+/// `Σ_{b≥8} T[b][y_b] = x^8 · Σ_{b≥8} T[b-8][y_b]`: the high `b_med`s gather
+/// from the low tables into the lane accumulators, one [`mul_x8_q`] per lane
+/// lifts them, and the low `b_med`s are added on top. Same field values in
+/// every bank slot, so the bank bytes are identical; the gathers per chunk
+/// are unchanged and the L1 table footprint halves.
+///
+/// `STORE`: as [`accumulate_convert_ab_nomul`] — every bank slot is stored.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_x8<const STORE: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    n_b_med: usize,
+    convert: &[F128],
+    bank: &mut [F128; 64],
+) {
+    unsafe {
+        accumulate_convert_ab_nomul_x8_impl::<true, STORE>(
+            chunk_ab_bytes,
+            first_b_med,
+            n_b_med,
+            convert,
+            bank.as_mut_ptr(),
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+/// [`accumulate_convert_ab_nomul_x8`] without the per-chunk lift: the high
+/// `b_med` half (gathered from the low tables) drains into `bank_hi`, the low
+/// half into `bank_lo`; the caller lifts the folded high half by `x^8` once
+/// per band. `bank_lo + x^8 · bank_hi` equals the incumbent bank.
+///
+/// `STORE`: every slot of BOTH banks is stored — `bank_hi` receives zeros
+/// when the chunk has no high `b_med` (`n_b_med <= 8`), so a first touch
+/// never leaves a stale high slot behind.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_x8_split<const STORE: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    n_b_med: usize,
+    convert: &[F128],
+    bank_lo: &mut [F128; 64],
+    bank_hi: &mut [F128; 64],
+) {
+    unsafe {
+        accumulate_convert_ab_nomul_x8_impl::<false, STORE>(
+            chunk_ab_bytes,
+            first_b_med,
+            n_b_med,
+            convert,
+            bank_lo.as_mut_ptr(),
+            bank_hi.as_mut_ptr(),
+        )
+    }
+}
+
+#[inline(always)]
+unsafe fn accumulate_convert_ab_nomul_x8_impl<const LIFT: bool, const STORE: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    n_b_med: usize,
+    convert: &[F128],
+    bank: *mut F128,
+    bank_hi: *mut F128,
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    debug_assert_eq!(first_b_med & 1, 0, "paired AB drain requires an even start");
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    // SAFETY: as `accumulate_convert_ab_nomul`; every table index is
+    // `(b_med mod 8) * 4096 + 16 * byte`, inside the first 32 KiB.
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        let hi_start = first_b_med.max(8);
+        let lo_end = n_b_med.min(8);
+        for lane in (0..64).step_by(8) {
+            let mut ab0 = vdupq_n_u8(0);
+            let mut ab1 = vdupq_n_u8(0);
+            let mut ab2 = vdupq_n_u8(0);
+            let mut ab3 = vdupq_n_u8(0);
+            let mut ab4 = vdupq_n_u8(0);
+            let mut ab5 = vdupq_n_u8(0);
+            let mut ab6 = vdupq_n_u8(0);
+            let mut ab7 = vdupq_n_u8(0);
+
+            macro_rules! gather_range {
+                ($start:expr, $end:expr, $tsub:expr) => {{
+                    let (start, end): (usize, usize) = ($start, $end);
+                    let mut b = start;
+                    while b + 1 < end {
+                        let t_even = convert_ptr.add((b - $tsub) * 256 * 16);
+                        let t_odd = convert_ptr.add((b + 1 - $tsub) * 256 * 16);
+                        let we = (chunk_ab_bytes[b].as_ptr().add(lane) as *const u64)
+                            .read_unaligned() as usize;
+                        let wo = (chunk_ab_bytes[b + 1].as_ptr().add(lane) as *const u64)
+                            .read_unaligned() as usize;
+                        ab0 = xor3_u8(ab0, vld1q_u8(t_even.add((we & 0xff) * 16)), vld1q_u8(t_odd.add((wo & 0xff) * 16)));
+                        ab1 = xor3_u8(ab1, vld1q_u8(t_even.add(((we >> 8) & 0xff) * 16)), vld1q_u8(t_odd.add(((wo >> 8) & 0xff) * 16)));
+                        ab2 = xor3_u8(ab2, vld1q_u8(t_even.add(((we >> 16) & 0xff) * 16)), vld1q_u8(t_odd.add(((wo >> 16) & 0xff) * 16)));
+                        ab3 = xor3_u8(ab3, vld1q_u8(t_even.add(((we >> 24) & 0xff) * 16)), vld1q_u8(t_odd.add(((wo >> 24) & 0xff) * 16)));
+                        ab4 = xor3_u8(ab4, vld1q_u8(t_even.add(((we >> 32) & 0xff) * 16)), vld1q_u8(t_odd.add(((wo >> 32) & 0xff) * 16)));
+                        ab5 = xor3_u8(ab5, vld1q_u8(t_even.add(((we >> 40) & 0xff) * 16)), vld1q_u8(t_odd.add(((wo >> 40) & 0xff) * 16)));
+                        ab6 = xor3_u8(ab6, vld1q_u8(t_even.add(((we >> 48) & 0xff) * 16)), vld1q_u8(t_odd.add(((wo >> 48) & 0xff) * 16)));
+                        ab7 = xor3_u8(ab7, vld1q_u8(t_even.add((we >> 56) * 16)), vld1q_u8(t_odd.add((wo >> 56) * 16)));
+                        b += 2;
+                    }
+                    if b < end {
+                        let table = convert_ptr.add((b - $tsub) * 256 * 16);
+                        let wa = (chunk_ab_bytes[b].as_ptr().add(lane) as *const u64)
+                            .read_unaligned() as usize;
+                        ab0 = veorq_u8(ab0, vld1q_u8(table.add((wa & 0xff) * 16)));
+                        ab1 = veorq_u8(ab1, vld1q_u8(table.add(((wa >> 8) & 0xff) * 16)));
+                        ab2 = veorq_u8(ab2, vld1q_u8(table.add(((wa >> 16) & 0xff) * 16)));
+                        ab3 = veorq_u8(ab3, vld1q_u8(table.add(((wa >> 24) & 0xff) * 16)));
+                        ab4 = veorq_u8(ab4, vld1q_u8(table.add(((wa >> 32) & 0xff) * 16)));
+                        ab5 = veorq_u8(ab5, vld1q_u8(table.add(((wa >> 40) & 0xff) * 16)));
+                        ab6 = veorq_u8(ab6, vld1q_u8(table.add(((wa >> 48) & 0xff) * 16)));
+                        ab7 = veorq_u8(ab7, vld1q_u8(table.add((wa >> 56) * 16)));
+                    }
+                }};
+            }
+
+            macro_rules! drain_lane {
+                ($dst:expr, $offset:literal, $ab:ident) => {{
+                    let slot = $dst.add(lane + $offset) as *mut u8;
+                    if STORE {
+                        vst1q_u8(slot, $ab);
+                    } else {
+                        vst1q_u8(slot, veorq_u8(vld1q_u8(slot), $ab));
+                    }
+                }};
+            }
+            macro_rules! drain_all {
+                ($dst:expr) => {{
+                    drain_lane!($dst, 0, ab0);
+                    drain_lane!($dst, 1, ab1);
+                    drain_lane!($dst, 2, ab2);
+                    drain_lane!($dst, 3, ab3);
+                    drain_lane!($dst, 4, ab4);
+                    drain_lane!($dst, 5, ab5);
+                    drain_lane!($dst, 6, ab6);
+                    drain_lane!($dst, 7, ab7);
+                }};
+            }
+            // Split banks: the high half drains into `bank_hi`. Under STORE the
+            // drain runs even with no high `b_med` (accumulators still zero),
+            // so the first touch stores every `bank_hi` slot as well.
+            if !LIFT && (STORE || hi_start < n_b_med) {
+                if hi_start < n_b_med {
+                    gather_range!(hi_start, n_b_med, 8);
+                }
+                drain_all!(bank_hi);
+                ab0 = vdupq_n_u8(0);
+                ab1 = vdupq_n_u8(0);
+                ab2 = vdupq_n_u8(0);
+                ab3 = vdupq_n_u8(0);
+                ab4 = vdupq_n_u8(0);
+                ab5 = vdupq_n_u8(0);
+                ab6 = vdupq_n_u8(0);
+                ab7 = vdupq_n_u8(0);
+            }
+            if LIFT && hi_start < n_b_med {
+                gather_range!(hi_start, n_b_med, 8);
+                ab0 = mul_x8_q(ab0);
+                ab1 = mul_x8_q(ab1);
+                ab2 = mul_x8_q(ab2);
+                ab3 = mul_x8_q(ab3);
+                ab4 = mul_x8_q(ab4);
+                ab5 = mul_x8_q(ab5);
+                ab6 = mul_x8_q(ab6);
+                ab7 = mul_x8_q(ab7);
+            }
+            if first_b_med < lo_end {
+                gather_range!(first_b_med, lo_end, 0);
+            }
+            drain_all!(bank);
         }
     }
 }
