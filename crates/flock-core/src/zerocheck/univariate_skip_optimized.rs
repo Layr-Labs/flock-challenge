@@ -3082,44 +3082,51 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
-    let recovered_ab = recover_identity_prefix.then(|| {
-        let mut ab = round1_identity_prefix_ab_recovery(&c_inner, r, k_log, inv_table);
-        if recover_output_window {
-            add_round1_output_window_ab_recovery(&mut ab, &c_inner, r, inv_table);
-        }
-        ab
-    });
-    let inner_tail = &r[k_skip + 1..k_log];
-    let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
-
-    // Fold retained coordinates 2..6 to recover the incumbent four-bank
-    // tensor (coordinates 0 and 1 remain bank selectors).
-    let retained_hi_eq = build_eq(&inner_tail[2..6]);
-    let n_packed = 1usize << crate::pcs::LOG_PACKING;
-    let mut quad = vec![F128::ZERO; 4 * n_packed];
-    for q in 0..16 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            for packed in 0..n_packed {
-                quad[dst + packed] += retained_hi_eq[q] * fold8[src + packed];
+    let recover_ab = || {
+        recover_identity_prefix.then(|| {
+            let mut ab = round1_identity_prefix_ab_recovery(&c_inner, r, k_log, inv_table);
+            if recover_output_window {
+                add_round1_output_window_ab_recovery(&mut ab, &c_inner, r, inv_table);
             }
-        }
-    }
-    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
+            ab
+        })
+    };
+    let derive_c = || {
+        use rayon::prelude::*;
 
-    // RingSwitch leaves global bit k_skip as its 128-way prefix. Fold that
-    // bit at the original C point to recover C's 64 S-domain evaluations.
-    // The optimized round-one convention omits C_s; the common caller restores
-    // it before placing the message on the transcript.
-    let prefix = r[k_skip];
-    let mut res_c_s = [F128::ZERO; ELL];
-    let c_s_inv = c_s_inv_f128();
-    for lane in 0..ELL {
-        let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
-        res_c_s[lane] = c_s_inv * naive;
-    }
-    let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+        let inner_tail = &r[k_skip + 1..k_log];
+        let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
+
+        // Fold retained coordinates 2..6 to recover the incumbent four-bank
+        let retained_hi_eq = build_eq(&inner_tail[2..6]);
+        let n_packed = 1usize << crate::pcs::LOG_PACKING;
+        let mut quad = vec![F128::ZERO; 4 * n_packed];
+        quad.par_chunks_mut(n_packed)
+            .enumerate()
+            .for_each(|(e, dst)| {
+                for q in 0..16 {
+                    let src = (e + 4 * q) * n_packed;
+                    let weight = retained_hi_eq[q];
+                    for (out, value) in dst.iter_mut().zip(&fold8[src..src + n_packed]) {
+                        *out += weight * *value;
+                    }
+                }
+            });
+        let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
+
+        // RingSwitch leaves global bit k_skip as its 128-way prefix. Fold that
+        // bit at the original C point to recover C's 64 S-domain evaluations.
+        let prefix = r[k_skip];
+        let mut res_c_s = [F128::ZERO; ELL];
+        let c_s_inv = c_s_inv_f128();
+        for lane in 0..ELL {
+            let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
+            res_c_s[lane] = c_s_inv * naive;
+        }
+        let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+        (round1_c_opt, s_hat_v_c, quad, fold8)
+    };
+    let (recovered_ab, (round1_c_opt, s_hat_v_c, quad, fold8)) = rayon::join(recover_ab, derive_c);
     (round1_c_opt, s_hat_v_c, quad, fold8, recovered_ab)
 }
 
