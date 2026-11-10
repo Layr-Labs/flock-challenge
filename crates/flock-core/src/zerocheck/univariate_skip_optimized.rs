@@ -1031,6 +1031,99 @@ pub struct Round1AbProducer<'a> {
     pub produce: &'a (dyn Fn(usize, *mut u8, *mut u8, bool) + Sync),
 }
 
+// ---- Diagnostic: CPU accounting of the fused AB arm (`FLOCK_AB_PARTS=1`) ----
+//
+// Per job, the counter ticks spent producing units (the producer call, which
+// on the ranked route includes the stripe emit, reported separately through
+// [`ab_parts_add_stripe`]) and transforming them, split by main pool (P) and
+// helper pool (E). One line per arm on stderr. Off by default: the hot loop
+// then tests one latched bool per unit.
+const AB_PART_PRODUCE: usize = 0;
+const AB_PART_TRANSFORM: usize = 1;
+const AB_PART_JOB: usize = 2;
+const AB_PART_UNITS: usize = 3;
+const AB_PART_LAST_END: usize = 4;
+const AB_PART_STRIPE: usize = 5;
+const AB_PART_E: usize = 6;
+static AB_PARTS: [std::sync::atomic::AtomicU64; 12] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+/// Whether the fused AB arm accounts its parts (`FLOCK_AB_PARTS=1`).
+pub fn ab_parts_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_AB_PARTS").as_deref() == Some(std::ffi::OsStr::new("1")))
+}
+
+/// Counter ticks (`cntvct_el0` on aarch64).
+#[inline(always)]
+pub fn ab_parts_ticks() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let t: u64;
+        core::arch::asm!("mrs {t}, cntvct_el0", t = out(reg) t, options(nomem, nostack, preserves_flags));
+        t
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
+}
+
+fn ab_parts_tick_ns() -> f64 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let f: u64;
+        core::arch::asm!("mrs {f}, cntfrq_el0", f = out(reg) f, options(nomem, nostack, preserves_flags));
+        1e9 / f as f64
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        1.0
+    }
+}
+
+fn ab_parts_on_helper() -> bool {
+    crate::epool::helper_pool().and_then(rayon::ThreadPool::current_thread_index).is_some()
+}
+
+/// Account `ticks` of stripe emission inside the producer call.
+pub fn ab_parts_add_stripe(ticks: u64) {
+    let o = if ab_parts_on_helper() { AB_PART_E } else { 0 };
+    AB_PARTS[o + AB_PART_STRIPE].fetch_add(ticks, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn ab_parts_report(arm_ticks: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let ns = ab_parts_tick_ns();
+    let v: Vec<u64> = AB_PARTS.iter().map(|x| x.swap(0, Relaxed)).collect();
+    let ms = |t: u64| t as f64 * ns / 1e6;
+    let side = |o: usize| {
+        let units = v[o + AB_PART_UNITS].max(1) as f64;
+        let prod = v[o + AB_PART_PRODUCE];
+        let stripe = v[o + AB_PART_STRIPE];
+        format!(
+            "units={} job={:.1}ms produce={:.1}ms ({:.0}ns/q) stripe={:.1}ms ({:.0}ns/q) transform={:.1}ms ({:.0}ns/q) other={:.1}ms last_end={:.2}ms",
+            v[o + AB_PART_UNITS],
+            ms(v[o + AB_PART_JOB]),
+            ms(prod - stripe.min(prod)),
+            (prod - stripe.min(prod)) as f64 * ns / units,
+            ms(stripe),
+            stripe as f64 * ns / units,
+            ms(v[o + AB_PART_TRANSFORM]),
+            v[o + AB_PART_TRANSFORM] as f64 * ns / units,
+            ms(v[o + AB_PART_JOB].saturating_sub(prod + v[o + AB_PART_TRANSFORM])),
+            ms(v[o + AB_PART_LAST_END]),
+        )
+    };
+    eprintln!(
+        "[ab-parts] arm={:.2}ms P: {} | E: {}",
+        ms(arm_ticks),
+        side(0),
+        side(AB_PART_E)
+    );
+}
+
 /// Same-binary control for the fused producer path: with exactly
 /// `FLOCK_NO_ZC_AB_PRODUCER_FUSED=1` every unit is produced up front (no
 /// scratch) and the incumbent precompute then reads the buffers.
@@ -1042,6 +1135,13 @@ fn zc_ab_producer_fused_enabled() -> bool {
         std::env::var_os(ENV_NO_ZC_AB_PRODUCER_FUSED).as_deref()
             != Some(std::ffi::OsStr::new("1"))
     })
+}
+
+/// Whether [`precompute_round1_ab_inner_packed_padded_produced`] takes the
+/// fused arm, i.e. calls the producer with worker scratch, one job's units
+/// in ascending order on one thread, every job starting at an even unit.
+pub fn zc_ab_producer_fused_active() -> bool {
+    zc_ab_producer_fused_enabled() && zc_ab_pre_hetero_enabled()
 }
 
 /// [`precompute_round1_ab_inner_packed_padded_with_tail`] for A/B buffers
@@ -1487,8 +1587,16 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         assert!(unit_chunks > 0 && unit_bytes.is_multiple_of(OUTER_BYTES));
         assert!(n_chunks.is_multiple_of(unit_chunks));
         let n_units = n_chunks / unit_chunks;
-        let units_per_job = (chunks_per_job / unit_chunks).max(1);
+        // Even, so unit pairs (2u, 2u + 1) always share a job and a thread
+        // (the producer may pair them; see `zc_ab_producer_fused_active`).
+        // 42 at the ranked shape, unchanged.
+        let units_per_job = match chunks_per_job / unit_chunks {
+            0 | 1 => 1,
+            u => u & !1,
+        };
         let n_jobs = n_units.div_ceil(units_per_job);
+        let parts = ab_parts_enabled();
+        let arm_t0 = ab_parts_ticks();
         crate::epool::run_hetero_chunks_stateful_with_tail(
             n_jobs,
             || {
@@ -1501,9 +1609,14 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             |(a_col, b_col, scratch), job| {
                 let unit_start = job * units_per_job;
                 let unit_end = (unit_start + units_per_job).min(n_units);
+                let (mut t_prod, mut t_xf) = (0u64, 0u64);
+                let job_t0 = if parts { ab_parts_ticks() } else { 0 };
                 for unit in unit_start..unit_end {
+                    let u_t0 = if parts { ab_parts_ticks() } else { 0 };
                     let (a_unit, b_unit) =
-                        scratch.fill(|a, b, primed| (producer.produce)(unit, a, b, primed));
+                        scratch.fill(unit, |a, b, primed| (producer.produce)(unit, a, b, primed));
+                    let u_t1 = if parts { ab_parts_ticks() } else { 0 };
+                    t_prod += u_t1.wrapping_sub(u_t0);
                     for local in 0..unit_chunks {
                         let x_outer = unit * unit_chunks + local;
                         // SAFETY: this job owns the output of its units.
@@ -1531,10 +1644,26 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                             b_col,
                         );
                     }
+                    if parts {
+                        t_xf += ab_parts_ticks().wrapping_sub(u_t1);
+                    }
+                }
+                if parts {
+                    let end = ab_parts_ticks();
+                    let e = ab_parts_on_helper();
+                    let o = if e { AB_PART_E } else { 0 };
+                    AB_PARTS[o + AB_PART_PRODUCE].fetch_add(t_prod, std::sync::atomic::Ordering::Relaxed);
+                    AB_PARTS[o + AB_PART_TRANSFORM].fetch_add(t_xf, std::sync::atomic::Ordering::Relaxed);
+                    AB_PARTS[o + AB_PART_JOB].fetch_add(end.wrapping_sub(job_t0), std::sync::atomic::Ordering::Relaxed);
+                    AB_PARTS[o + AB_PART_UNITS].fetch_add((unit_end - unit_start) as u64, std::sync::atomic::Ordering::Relaxed);
+                    AB_PARTS[o + AB_PART_LAST_END].fetch_max(end.wrapping_sub(arm_t0), std::sync::atomic::Ordering::Relaxed);
                 }
             },
             tail,
         );
+        if parts {
+            ab_parts_report(ab_parts_ticks().wrapping_sub(arm_t0));
+        }
         return;
     }
     let n_jobs = n_chunks.div_ceil(chunks_per_job);
@@ -1600,36 +1729,88 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     );
 }
 
+/// Paired scratch slots (`FLOCK_NO_AB_PAIR_SCRATCH=1` kills): the fused arm
+/// writes unit `u` to slot `u & 1` of a two-unit scratch laid out as
+/// `[A(2s) A(2s+1) | B(2s) B(2s+1)]`, so right after an odd unit is produced
+/// the A rows (and the B rows) of the unit pair `(u - 1, u)` sit back to back
+/// in the worker's L1. A producer that consumes unit pairs (the root lincheck
+/// stripe: one stripe group = 8 blocks = two quads) can then read both quads
+/// in place instead of keeping its own copy of the even one. The transform
+/// reads the same bytes either way.
+pub const ENV_NO_AB_PAIR_SCRATCH: &str = "FLOCK_NO_AB_PAIR_SCRATCH";
+
+fn ab_pair_scratch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_AB_PAIR_SCRATCH).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Whether the fused arm hands the producer paired scratch slots: for an odd
+/// unit `u` whose even partner `u - 1` was the previous unit produced on the
+/// same worker, `a_scratch - unit_bytes` / `b_scratch - unit_bytes` still
+/// hold unit `u - 1`'s complete A / B rows. A producer must still check that
+/// the partner was produced into exactly those addresses (see
+/// `prover::AbStripeEmitter`); anything else is not guaranteed.
+pub fn zc_ab_pair_scratch_active() -> bool {
+    zc_ab_producer_fused_active() && ab_pair_scratch_enabled()
+}
+
 /// Worker-local copy of one deferred A/B unit: `unit_bytes` of A followed by
-/// `unit_bytes` of B, 64-byte aligned.
+/// `unit_bytes` of B, 64-byte aligned; with paired slots (see
+/// [`ENV_NO_AB_PAIR_SCRATCH`]) two units, `[A0 A1 | B0 B1]`.
 struct AbUnitScratch {
     storage: Vec<u8>,
     offset: usize,
     unit_bytes: usize,
-    primed: bool,
+    paired: bool,
+    /// Per slot: a complete fill of this slot already wrote the per-block
+    /// constant chunks, so the producer may skip them (`primed`). Each of
+    /// the two paired slots is primed by its own first fill.
+    primed: [bool; 2],
 }
 
 impl AbUnitScratch {
     fn new(unit_bytes: usize) -> Self {
-        let storage = vec![0u8; 2 * unit_bytes + 64];
+        Self::with_pairing(unit_bytes, ab_pair_scratch_enabled())
+    }
+
+    fn with_pairing(unit_bytes: usize, paired: bool) -> Self {
+        let slots = if paired { 2 } else { 1 };
+        let storage = vec![0u8; 2 * slots * unit_bytes + 64];
         let offset = storage.as_ptr().align_offset(64);
         assert!(offset < 64);
         Self {
             storage,
             offset,
             unit_bytes,
-            primed: false,
+            paired,
+            primed: [false; 2],
         }
     }
 
+    /// Run `produce(a_scratch, b_scratch, primed)` for unit `unit` and return
+    /// the two filled halves. `primed` is true iff this exact slot was filled
+    /// before (by this worker, this drain).
     #[inline(always)]
-    fn fill(&mut self, produce: impl FnOnce(*mut u8, *mut u8, bool)) -> (&[u8], &[u8]) {
+    fn fill(&mut self, unit: usize, produce: impl FnOnce(*mut u8, *mut u8, bool)) -> (&[u8], &[u8]) {
         let unit_bytes = self.unit_bytes;
-        let primed = self.primed;
+        if self.paired {
+            let slot = unit & 1;
+            let primed = self.primed[slot];
+            let all = &mut self.storage[self.offset..self.offset + 4 * unit_bytes];
+            let (a2, b2) = all.split_at_mut(2 * unit_bytes);
+            let s = slot * unit_bytes;
+            let (a, b) = (&mut a2[s..s + unit_bytes], &mut b2[s..s + unit_bytes]);
+            produce(a.as_mut_ptr(), b.as_mut_ptr(), primed);
+            self.primed[slot] = true;
+            return (a, b);
+        }
+        let primed = self.primed[0];
         let both = &mut self.storage[self.offset..self.offset + 2 * unit_bytes];
         let (a, b) = both.split_at_mut(unit_bytes);
         produce(a.as_mut_ptr(), b.as_mut_ptr(), primed);
-        self.primed = true;
+        self.primed[0] = true;
         (a, b)
     }
 }
@@ -2609,6 +2790,34 @@ fn ab_eq_fold_factors(r_lo: &[F128], bank_bits: usize) -> (Vec<F128>, Vec<F128>)
 /// eq_top_scaled[w]`, built once per prove and shared read-only by every
 /// worker (mirrors [`build_c_mask_tables`]).
 fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128> {
+    build_ab_eq_fold_tables_derived(eq_top_scaled, convert).0
+}
+
+/// Kill switch for the x^8-lifted round-one completion gathers
+/// (`FLOCK_NO_ZC_R1_X8=1`, exact): the incumbent sixteen-table kernel.
+fn zc_r1_x8_enabled() -> bool {
+    !std::env::var("FLOCK_NO_ZC_R1_X8").is_ok_and(|v| v == "1")
+}
+
+/// `FLOCK_ZC_R1_X8_LIFT=1` (exact): lift the high half per chunk instead of
+/// per band (split banks). Same bytes; kept for same-binary A/B.
+fn zc_r1_x8_lift_per_chunk() -> bool {
+    std::env::var("FLOCK_ZC_R1_X8_LIFT").is_ok_and(|v| v == "1")
+}
+
+/// Round-one completion gather form. `Off` is the incumbent sixteen-table
+/// kernel; the other two need the derived table image.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum R1X8 {
+    Off,
+    LiftPerChunk,
+    SplitBanks,
+}
+
+/// [`build_ab_eq_fold_tables`] plus whether the image is the derived one
+/// (row `b` of every table is `x^b · row 0` bit-for-bit), the precondition of
+/// [`kernels::accumulate_convert_ab_nomul_x8`].
+fn build_ab_eq_fold_tables_derived(eq_top_scaled: &[F128], convert: &[F128]) -> (Vec<F128>, bool) {
     use rayon::prelude::*;
 
     debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
@@ -2712,7 +2921,7 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
                 }
             }
         });
-    tables
+    (tables, derive_rows)
 }
 
 /// Folded twin of [`process_one_x_hi_with_precomputed_ab_fold4_ab`]: same
@@ -2733,49 +2942,68 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     tables: &[F128],
     bank_bits: usize,
     bank_deferred: bool,
+    x8: R1X8,
     banks: &mut [F128],
     partial_ab: &mut [F128; ELL],
 ) {
-    debug_assert_eq!(banks.len(), eq_bot.len() * ELL);
+    let bank_len = eq_bot.len() * ELL;
+    let split = x8 == R1X8::SplitBanks;
+    debug_assert_eq!(banks.len(), if split { 2 * bank_len } else { bank_len });
     debug_assert_eq!(eq_bot.len(), 1usize << bank_bits);
+    banks.fill(F128::ZERO);
+    let (banks, banks_hi) = banks.split_at_mut(bank_len);
 
     let n_lo = n_lo_and_inner - N_INNER;
-    let n_banks = 1usize << bank_bits;
-    let bank_mask = n_banks - 1;
-    let store_first = big_lo_size >= n_banks;
-    if !store_first {
-        banks.fill(F128::ZERO);
-    }
+    let bank_mask = (1usize << bank_bits) - 1;
 
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
-        let first_touch = store_first && x_outer_lo < n_banks;
+        if n_b_med == 0 {
+            continue;
+        }
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let first_b_med = representation.first_materialized_b_med(within_hash_outer);
         let w = x_outer_lo >> bank_bits;
         let u = x_outer_lo & bank_mask;
         let bank: &mut [F128; ELL] = (&mut banks[u * ELL..(u + 1) * ELL])
             .try_into()
             .expect("one ELL-lane bank per low x_lo index");
-        if n_b_med == 0 {
-            if first_touch {
-                bank.fill(F128::ZERO);
-            }
-            continue;
-        }
-        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        let first_b_med = representation.first_materialized_b_med(within_hash_outer);
-        let rows = precomputed_ab_rows(ab_inner, chunk_byte_base);
-        let end_b_med = representation.materialized_b_med_end(within_hash_outer, n_b_med);
         let table = &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE];
-        if first_touch {
-            kernels::accumulate_convert_ab_nomul::<true>(rows, first_b_med, end_b_med, table, bank);
-        } else {
-            kernels::accumulate_convert_ab_nomul::<false>(rows, first_b_med, end_b_med, table, bank);
+        let end = representation.materialized_b_med_end(within_hash_outer, n_b_med);
+        let rows = precomputed_ab_rows(ab_inner, chunk_byte_base);
+        match x8 {
+            R1X8::Off => kernels::accumulate_convert_ab_nomul(rows, first_b_med, end, table, bank),
+            R1X8::LiftPerChunk => {
+                kernels::accumulate_convert_ab_nomul_x8(rows, first_b_med, end, table, bank)
+            }
+            R1X8::SplitBanks => {
+                let bank_hi: &mut [F128; ELL] = (&mut banks_hi[u * ELL..(u + 1) * ELL])
+                    .try_into()
+                    .expect("one ELL-lane high bank per low x_lo index");
+                kernels::accumulate_convert_ab_nomul_x8_split(
+                    rows,
+                    first_b_med,
+                    end,
+                    table,
+                    bank,
+                    bank_hi,
+                )
+            }
         }
     }
 
     finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks, bank_deferred, partial_ab);
+    if split {
+        // bank = bank_lo + x^8 · bank_hi, and the band fold is linear: fold
+        // the high banks the same way, lift the 64 folded lanes once.
+        let mut partial_hi = [F128::ZERO; ELL];
+        finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks_hi, bank_deferred, &mut partial_hi);
+        for (out, hi) in partial_ab.iter_mut().zip(partial_hi) {
+            *out += kernels::mul_x8_f128(hi);
+        }
+    }
 }
 
 /// Collapse the bank-major tensor-fold scratch and apply the unchanged high
@@ -2900,8 +3128,16 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
         Some(bank_bits) => {
             let r_lo = &r[k_skip + N_INNER..k_skip + N_INNER + eq.n_lo];
             let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
-            let tables = build_ab_eq_fold_tables(&eq_top_scaled, convert);
+            let (tables, derived) = build_ab_eq_fold_tables_derived(&eq_top_scaled, convert);
+            let x8 = if !(derived && zc_r1_x8_enabled() && cfg!(target_arch = "aarch64")) {
+                R1X8::Off
+            } else if zc_r1_x8_lift_per_chunk() {
+                R1X8::LiftPerChunk
+            } else {
+                R1X8::SplitBanks
+            };
             let bank_len = eq_bot.len() * ELL;
+            let alloc_len = bank_len * if x8 == R1X8::SplitBanks { 2 } else { 1 };
             let bank_deferred = ranked_ab_bank_deferred_shape(
                 m,
                 k_skip,
@@ -2918,9 +3154,9 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                 let mut partial = [F128::ZERO; ELL];
                 AB_EQ_FOLD_BANKS.with(|cell| {
                     let mut banks = cell.borrow_mut();
-                    if banks.len() != bank_len {
+                    if banks.len() != alloc_len {
                         banks.clear();
-                        banks.resize(bank_len, F128::ZERO);
+                        banks.resize(alloc_len, F128::ZERO);
                     }
                     process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
                         x_hi,
@@ -2935,6 +3171,7 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                         &tables,
                         bank_bits,
                         bank_deferred,
+                        x8,
                         &mut banks,
                         &mut partial,
                     );
@@ -5344,6 +5581,47 @@ mod tests {
         assert_eq!(checked, 5 * (1 + 3 * 2 + 3 * 3));
     }
 
+    /// Primed scratch slots: a producer that skips the constant half of a
+    /// unit whenever `primed` is set must still leave every returned slot
+    /// complete, for the single and the paired layout, in any unit order
+    /// (each paired slot is primed by its own first fill).
+    #[test]
+    fn ab_unit_scratch_primes_each_slot_independently() {
+        const UNIT: usize = 4096;
+        let unit_bytes = |u: usize, half_b: bool| -> Vec<u8> {
+            (0..UNIT)
+                .map(|i| if i >= UNIT / 2 { 0xc7 ^ u8::from(half_b) } else { (u * 31 + i * 7) as u8 ^ u8::from(half_b) })
+                .collect()
+        };
+        for paired in [false, true] {
+            for order in [vec![0usize, 1, 2, 3, 4, 5, 6, 7], vec![1, 0, 3, 2, 4, 6, 5, 7], vec![2, 3, 9, 11, 10]] {
+                let mut scratch = AbUnitScratch::with_pairing(UNIT, paired);
+                let mut fills = [0usize; 2];
+                for &u in &order {
+                    let (want_a, want_b) = (unit_bytes(u, false), unit_bytes(u, true));
+                    let (a, b) = scratch.fill(u, |a, b, primed| {
+                        let n = if primed { UNIT / 2 } else { UNIT };
+                        fills[usize::from(primed)] += 1;
+                        // SAFETY: the scratch halves are `UNIT` bytes long.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(want_a.as_ptr(), a, n);
+                            core::ptr::copy_nonoverlapping(want_b.as_ptr(), b, n);
+                        }
+                    });
+                    assert_eq!(a, &want_a[..], "a paired={paired} unit={u}");
+                    assert_eq!(b, &want_b[..], "b paired={paired} unit={u}");
+                }
+                // Full fills: one per slot used.
+                let slots = if paired {
+                    usize::from(order.iter().any(|u| u & 1 == 0)) + usize::from(order.iter().any(|u| u & 1 == 1))
+                } else {
+                    1
+                };
+                assert_eq!(fills[0], slots, "paired={paired} order={order:?}");
+            }
+        }
+    }
+
     /// Deferred A/B producer through the public entry (fused by default) and
     /// the up-front production helper: live output rows equal the plain
     /// precompute's, and the buffers end complete.
@@ -6845,6 +7123,76 @@ mod tests {
             }
         }
         crate::scratch::give_f128(tables);
+    }
+
+    /// The x^8-lifted completion gathers must leave every bank byte equal to
+    /// the incumbent sixteen-table kernel's, on the derived table image, for
+    /// every `(first_b_med, end)` range (even starts, any end), over a bank
+    /// that already holds data.
+    #[test]
+    fn ab_completion_x8_kernel_matches_incumbent() {
+        let mut rng = Rng::new(0x58_C0_4D);
+        let scales = [F128::ONE, rng.f128(), rng.f128()];
+        let (tables, derived) = build_ab_eq_fold_tables_derived(&scales, convert_table());
+        assert!(derived, "factory convert table must give the derived image");
+        let mut chunk = [[0u8; 64]; 16];
+        for case in 0..40 {
+            for row in chunk.iter_mut() {
+                for byte in row.iter_mut() {
+                    *byte = match case % 4 {
+                        0 => rng.next_u64() as u8,
+                        1 => 0xff,
+                        2 => (rng.next_u64() as u8) & 0x81,
+                        _ => {
+                            if rng.next_u64() & 1 == 0 { 0 } else { rng.next_u64() as u8 }
+                        }
+                    };
+                }
+            }
+            let w = case % scales.len();
+            let table = &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE];
+            let init: [F128; 64] = core::array::from_fn(|_| rng.f128());
+            for first in (0..=16).step_by(2) {
+                for end in first..=16 {
+                    let mut plain = init;
+                    let mut lifted = init;
+                    kernels::accumulate_convert_ab_nomul(&chunk, first, end, table, &mut plain);
+                    kernels::accumulate_convert_ab_nomul_x8(&chunk, first, end, table, &mut lifted);
+                    assert_eq!(plain, lifted, "case {case} w {w} range {first}..{end}");
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let mut lo = init;
+                        let mut hi: [F128; 64] = core::array::from_fn(|_| rng.f128());
+                        let hi0 = hi;
+                        kernels::accumulate_convert_ab_nomul_x8_split(
+                            &chunk, first, end, table, &mut lo, &mut hi,
+                        );
+                        for lane in 0..64 {
+                            let lifted_hi = kernels::mul_x8_f128(hi[lane] + hi0[lane]);
+                            assert_eq!(lo[lane] + lifted_hi, plain[lane], "split lane {lane}");
+                        }
+                    }
+                }
+            }
+        }
+        crate::scratch::give_f128(tables);
+    }
+
+    /// `mul_x8_f128` is eight applications of multiplication by `x`.
+    #[test]
+    fn mul_x8_matches_eight_x_products() {
+        let mut rng = Rng::new(0x58_58);
+        let x = F128 { lo: 2, hi: 0 };
+        for _ in 0..256 {
+            let v = rng.f128();
+            let mut want = v;
+            for _ in 0..8 {
+                want = want * x;
+            }
+            assert_eq!(kernels::mul_x8_f128(v), want);
+        }
+        let ones = F128 { lo: u64::MAX, hi: u64::MAX };
+        assert_eq!(kernels::mul_x8_f128(ones), ones * F128 { lo: 256, hi: 0 });
     }
 
     #[test]

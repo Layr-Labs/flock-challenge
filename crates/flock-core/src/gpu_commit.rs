@@ -759,6 +759,80 @@ pub fn commit_tail_fill_enabled() -> bool {
     !std::env::var(ENV_NO_COMMIT_TAIL_FILL).is_ok_and(|v| v == "1")
 }
 
+/// Kill switch for the GPU root lincheck stripe (`FLOCK_NO_GPU_STRIPE`, any
+/// value): on the ranked streamed Metal path the deferred root stripe (the
+/// bit transpose of the packed witness `z` into the root rows of every
+/// 8-block group, challenge-independent, first read at zerocheck entry) is
+/// written by one Metal pass that overlaps the commit graph on a second
+/// queue (`FLOCK_GPU_STRIPE_SERIAL=1`: queued behind the graph instead), into
+/// the stripe allocation itself through the no-copy wrap the zerocheck and
+/// lincheck fold arms already hold. The round-one AB producer then no longer
+/// emits it. Unset = default on; set = the exact base behaviour (stripe
+/// emitted by the AB producer). Any arm/launch/run failure falls back to the
+/// CPU fill after the commit join, never to both.
+pub const ENV_NO_GPU_STRIPE: &str = "FLOCK_NO_GPU_STRIPE";
+
+pub fn gpu_stripe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_STRIPE).is_none())
+}
+
+/// One root row of the GPU stripe: row `j` of a group is, in each of the
+/// eight blocks, `(w[lo_word] & lo_mask) | (w[lo_word + 1] & hi_mask)` of the
+/// block's packed u64 words (see `r1cs_hashes::blake3::RootRow`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuStripeRow {
+    pub lo_mask: u64,
+    pub hi_mask: u64,
+    pub lo_word: u32,
+    pub _pad: u32,
+}
+
+/// One fixed-input check: `(w[word] & mask) == want` in every block.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuStripeCheck {
+    pub mask: u64,
+    pub want: u64,
+    pub word: u32,
+    pub _pad: u32,
+}
+
+/// Geometry of a GPU root stripe: groups of 8 blocks of `u64_per_block`
+/// packed words, each group writing `rows.len()` 64-byte rows at the start
+/// of its `group_bytes` stripe slab.
+pub struct GpuStripeSpec<'a> {
+    pub rows: &'a [GpuStripeRow],
+    pub checks: &'a [GpuStripeCheck],
+    pub group_bytes: usize,
+    pub u64_per_block: usize,
+}
+
+/// Arm the GPU stripe for this prove: the next streamed commit graph queues
+/// the stripe pass behind itself. Returns false (nothing armed) when Metal,
+/// the pipeline or the stripe wrap is unavailable; the caller then keeps the
+/// base path. The caller must keep `stripe` allocated and untouched by the
+/// CPU until [`gpu_stripe_wait`] returns.
+pub fn gpu_stripe_arm(stripe: &mut [u8], spec: &GpuStripeSpec<'_>) -> bool {
+    imp::gpu_stripe_arm(stripe.as_mut_ptr(), stripe.len(), spec)
+}
+
+/// Settle the armed stripe: `Some(mismatch)` when the GPU pass wrote every
+/// row (`mismatch` = some group failed a fixed-input check), `None` when it
+/// was never launched or failed (the caller fills the stripe on the CPU).
+/// Idempotent: clears the request.
+pub fn gpu_stripe_wait() -> Option<bool> {
+    imp::gpu_stripe_wait()
+}
+
+/// Test/diagnostic entry: run the stripe kernel over a page-aligned packed
+/// `z` into a page-aligned `stripe`, synchronously.
+#[doc(hidden)]
+pub fn gpu_stripe_run_for_test(z: &[u64], stripe: &mut [u8], spec: &GpuStripeSpec<'_>) -> Option<bool> {
+    imp::gpu_stripe_run_for_test(z, stripe, spec)
+}
+
 /// Kill switch for the zerocheck first-tail-round (T3 compact reconstruction)
 /// products GPU arm.
 pub const ENV_NO_GPU_ZC_T3: &str = "FLOCK_NO_GPU_ZC_T3";
@@ -7037,6 +7111,38 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// [`run_commit_graph_after_from_z`] that queues the armed GPU stripe
+    /// pass (if any) directly behind the graph's command buffer before
+    /// waiting, so the stripe starts the moment the graph ends with no host
+    /// round trip, and never delays the graph itself.
+    unsafe fn run_commit_graph_after_from_z_then_stripe(
+        gpu: &Gpu,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        z_buf: Id,
+    ) -> Result<(), String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| {
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                encode_ntt_passes(gpu, enc, staging, tw_buf, log_d, 4);
+                encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
+                gpu.end_encoding(enc);
+                gpu.commit_async(cb);
+                launch_armed_gpu_stripe(gpu, z_buf);
+                gpu.wait_cb(cb)?;
+                record_pure_gpu_arm(gpu, cb);
+                Ok(())
+            })();
+            gpu.pool_pop(pool);
+            r
+        }
+    }
+
     /// Suffix-NTT twiddle table for the hybrid CPU share. Deterministic per
     /// `log_d`; built once per process. Exposed so the warmup autotune sweep
     /// can prebuild it untimed instead of charging the build to the first
@@ -9570,6 +9676,9 @@ kernel void blake3_pow_scan(
             Err("streamed GPU latch or z allocation changed before finish".into())
         } else {
             let k_cpu16 = hybrid_cpu_sixteenths();
+            if gpu_stripe_queue2() {
+                launch_armed_gpu_stripe(stream.gpu, stream.z_buf);
+            }
             unsafe {
                 match early {
                     Some((cb2, k_early)) if k_early == k_cpu16 => {
@@ -9618,13 +9727,14 @@ kernel void blake3_pow_scan(
                                     None,
                                 )
                             } else {
-                                run_commit_graph_after_from_z(
+                                run_commit_graph_after_from_z_then_stripe(
                                     stream.gpu,
                                     stream.staging,
                                     stream.tw_buf,
                                     stream.tree_buf,
                                     stream.log_d,
                                     stream.n_leaves,
+                                    stream.z_buf,
                                 )
                             }
                         })
@@ -9644,13 +9754,14 @@ kernel void blake3_pow_scan(
                                 None,
                             )
                         } else {
-                            run_commit_graph_after_from_z(
+                            run_commit_graph_after_from_z_then_stripe(
                                 stream.gpu,
                                 stream.staging,
                                 stream.tw_buf,
                                 stream.tree_buf,
                                 stream.log_d,
                                 stream.n_leaves,
+                                stream.z_buf,
                             )
                         }
                     }
@@ -9658,6 +9769,12 @@ kernel void blake3_pow_scan(
             }
         };
 
+        // Hybrid splits queue the armed stripe here, behind the graph's last
+        // command buffer (k = 0 already queued it behind the graph). On a
+        // graph failure nothing is launched; the prover fills on the CPU.
+        if run.is_ok() {
+            launch_armed_gpu_stripe(stream.gpu, stream.z_buf);
+        }
         if let Err(e) = run {
             eprintln!("[gpu-commit] streamed GPU failed ({e}); falling back to CPU");
             stream.owns_lease = false;
@@ -10281,6 +10398,14 @@ kernel void lc_fold_stripes_factored_b4(
         out_cap: usize,
         /// Cached no-copy wraps of caller stripes: `(ptr, len, buffer)`.
         z_wraps: Vec<(usize, usize, Id)>,
+        /// GPU root-stripe pipeline (`NIL` under `FLOCK_NO_GPU_STRIPE` or
+        /// on any compile failure: the stripe then stays on the CPU) and its
+        /// three small persistent shared buffers (row table, fixed-input
+        /// checks, mismatch flag). Compiled here so the untimed warmup pays it.
+        pso_stripe: Id,
+        stripe_rows_buf: Id,
+        stripe_checks_buf: Id,
+        stripe_flag_buf: Id,
         /// Commit-tail-fill parked prefix (see `ENV_NO_COMMIT_TAIL_FILL`):
         /// a ZC fold dispatch submitted at commit-graph completion, waiting
         /// for the same prove's zerocheck entry to adopt it under an exact
@@ -10504,12 +10629,43 @@ kernel void lc_fold_stripes_factored_b4(
             } else {
                 NIL
             };
+            let (pso_stripe, stripe_rows_buf, stripe_checks_buf, stripe_flag_buf) =
+                if super::gpu_stripe_enabled() {
+                    let pool = gpu.pool_push();
+                    let built = (|| -> Result<(Id, Id, Id, Id), String> {
+                        let pso = compile_supplemental_pipeline(
+                            gpu,
+                            GPU_STRIPE_MSL_SOURCE,
+                            "root_stripe_from_z",
+                        )?;
+                        let rows = gpu.new_buffer(GPU_STRIPE_MAX_ROWS * 24)?;
+                        let checks = gpu.new_buffer(GPU_STRIPE_MAX_CHECKS * 24)?;
+                        let flag = gpu.new_buffer(16)?;
+                        Ok((pso, rows, checks, flag))
+                    })();
+                    gpu.pool_pop(pool);
+                    match built {
+                        Ok(t) => t,
+                        Err(e) => {
+                            if gpu_stripe_debug() {
+                                eprintln!("[gpu-stripe] pipeline unavailable: {e}");
+                            }
+                            (NIL, NIL, NIL, NIL)
+                        }
+                    }
+                } else {
+                    (NIL, NIL, NIL, NIL)
+                };
             Ok(ZcFold {
                 gpu,
                 pso_fold,
                 pso_reduce,
                 pso_lc_fold,
                 pso_lc_factored_b4,
+                pso_stripe,
+                stripe_rows_buf,
+                stripe_checks_buf,
+                stripe_flag_buf,
                 eq_buf: NIL,
                 eq_cap: 0,
                 part_buf: NIL,
@@ -15955,6 +16111,412 @@ kernel void zc_loop_products(
             ZcLoopResult::Calibrated
         }
     }
+
+    // =======================================================================
+    // GPU root lincheck stripe (see `ENV_NO_GPU_STRIPE`).
+    //
+    // One thread per (group, root row): reads the row's word(s) from each of
+    // the group's eight blocks of packed z, bit-transposes the eight lane
+    // words into the row's 64 stripe bytes (output byte p, bit r = bit p of
+    // lane r — `bits::transpose_8_u64s_to_64_bytes`), and the group's row-0
+    // thread checks the fixed-input words. Written straight into the stripe
+    // allocation through the fold arms' cached no-copy wrap.
+    // =======================================================================
+
+    const GPU_STRIPE_MAX_ROWS: usize = 256;
+    const GPU_STRIPE_MAX_CHECKS: usize = 16;
+
+    const GPU_STRIPE_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct StripeRow { ulong lo_mask; ulong hi_mask; uint lo_word; uint pad; };
+struct StripeCheck { ulong mask; ulong want; uint word; uint pad; };
+struct StripeParams {
+    uint n_rows; uint n_groups; uint group_bytes; uint u64_per_block;
+    uint n_checks; uint pad0; uint pad1; uint pad2;
+};
+
+static inline ulong stripe_tr8(ulong x) {
+    ulong t = (x ^ (x >> 7)) & 0x00AA00AA00AA00AAul;
+    x = x ^ t ^ (t << 7);
+    t = (x ^ (x >> 14)) & 0x0000CCCC0000CCCCul;
+    x = x ^ t ^ (t << 14);
+    t = (x ^ (x >> 28)) & 0x00000000F0F0F0F0ul;
+    x = x ^ t ^ (t << 28);
+    return x;
+}
+
+kernel void root_stripe_from_z(
+    device const ulong* z            [[buffer(0)]],
+    device ulong* stripe             [[buffer(1)]],
+    constant StripeRow* rows         [[buffer(2)]],
+    constant StripeCheck* checks     [[buffer(3)]],
+    constant StripeParams& p         [[buffer(4)]],
+    device atomic_uint* flag         [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint g = gid / p.n_rows;
+    if (g >= p.n_groups) return;
+    uint j = gid - g * p.n_rows;
+    StripeRow r = rows[j];
+    device const ulong* zg = z + (ulong)g * 8ul * (ulong)p.u64_per_block;
+    ulong lane[8];
+    for (uint l = 0u; l < 8u; l++) {
+        device const ulong* w = zg + l * p.u64_per_block + r.lo_word;
+        ulong v = w[0] & r.lo_mask;
+        if (r.hi_mask != 0ul) v |= w[1] & r.hi_mask;
+        lane[l] = v;
+    }
+    device ulong* dst = stripe + (((ulong)g * (ulong)p.group_bytes) >> 3) + (ulong)j * 8ul;
+    for (uint c = 0u; c < 8u; c++) {
+        ulong packed = 0ul;
+        for (uint l = 0u; l < 8u; l++) {
+            packed |= ((lane[l] >> (8u * c)) & 0xFFul) << (8u * l);
+        }
+        dst[c] = stripe_tr8(packed);
+    }
+    if (j == 0u && p.n_checks != 0u) {
+        ulong bad = 0ul;
+        for (uint l = 0u; l < 8u; l++) {
+            for (uint k = 0u; k < p.n_checks; k++) {
+                bad |= (zg[l * p.u64_per_block + checks[k].word] & checks[k].mask) ^ checks[k].want;
+            }
+        }
+        if (bad != 0ul) atomic_fetch_or_explicit(flag, 1u, memory_order_relaxed);
+    }
+}
+"#;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct GpuStripeParams {
+        n_rows: u32,
+        n_groups: u32,
+        group_bytes: u32,
+        u64_per_block: u32,
+        n_checks: u32,
+        _pad: [u32; 3],
+    }
+
+    fn gpu_stripe_debug() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_GPU_STRIPE_DEBUG").is_some()
+                || std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+        })
+    }
+
+    /// Everything the launch needs; Ids other than `stripe_buf` and `cb`
+    /// are process-lifetime ZC_FOLD objects.
+    struct GpuStripeJob {
+        gpu: &'static Gpu,
+        pso: Id,
+        /// Retained by the request (the fold arms' wrap cache may evict).
+        stripe_buf: Id,
+        rows_buf: Id,
+        checks_buf: Id,
+        flag_buf: Id,
+        params: GpuStripeParams,
+        armed_at: std::time::Instant,
+    }
+
+    enum GpuStripeReq {
+        Idle,
+        Armed(GpuStripeJob),
+        Launched(GpuStripeJob, Id, std::time::Instant),
+    }
+    // SAFETY: Metal objects are thread-safe; the request is serialized by
+    // its mutex and owned by the one prove in flight.
+    unsafe impl Send for GpuStripeReq {}
+
+    static GPU_STRIPE_REQ: Mutex<GpuStripeReq> = Mutex::new(GpuStripeReq::Idle);
+
+    fn gpu_stripe_req() -> std::sync::MutexGuard<'static, GpuStripeReq> {
+        GPU_STRIPE_REQ.lock().unwrap_or_else(|e| {
+            GPU_STRIPE_REQ.clear_poison();
+            note_poisoned_lock("gpu-stripe", true);
+            e.into_inner()
+        })
+    }
+
+    fn gpu_stripe_params(len: usize, spec: &super::GpuStripeSpec<'_>) -> Option<GpuStripeParams> {
+        let n_rows = spec.rows.len();
+        if n_rows == 0
+            || n_rows > GPU_STRIPE_MAX_ROWS
+            || spec.checks.len() > GPU_STRIPE_MAX_CHECKS
+            || spec.group_bytes == 0
+            || !spec.group_bytes.is_multiple_of(8)
+            || n_rows * 64 > spec.group_bytes
+            || !len.is_multiple_of(spec.group_bytes)
+            || spec.rows.iter().any(|r| {
+                r.lo_word as usize + usize::from(r.hi_mask != 0) >= spec.u64_per_block
+            })
+            || spec.checks.iter().any(|c| c.word as usize >= spec.u64_per_block)
+        {
+            return None;
+        }
+        let n_groups = len / spec.group_bytes;
+        // 32-bit thread ids and byte offsets inside the kernel.
+        if n_groups.checked_mul(n_rows)? > u32::MAX as usize || spec.group_bytes > u32::MAX as usize {
+            return None;
+        }
+        Some(GpuStripeParams {
+            n_rows: n_rows as u32,
+            n_groups: n_groups as u32,
+            group_bytes: spec.group_bytes as u32,
+            u64_per_block: spec.u64_per_block as u32,
+            n_checks: spec.checks.len() as u32,
+            _pad: [0; 3],
+        })
+    }
+
+    /// Release a request's retained objects (waiting out a launched pass).
+    unsafe fn gpu_stripe_retire(req: GpuStripeReq) {
+        unsafe {
+            match req {
+                GpuStripeReq::Idle => {}
+                GpuStripeReq::Armed(job) => job.gpu.release(job.stripe_buf),
+                GpuStripeReq::Launched(job, cb, _) => {
+                    let _ = job.gpu.wait_cb(cb);
+                    job.gpu.release(cb);
+                    job.gpu.release(job.stripe_buf);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn gpu_stripe_arm(ptr: *mut u8, len: usize, spec: &super::GpuStripeSpec<'_>) -> bool {
+        if !super::gpu_stripe_enabled() {
+            return false;
+        }
+        let Some(params) = gpu_stripe_params(len, spec) else {
+            return false;
+        };
+        let Ok(gpu) = gpu() else {
+            return false;
+        };
+        // A request left by an earlier, unwound prove: retire it first.
+        let stale = std::mem::replace(&mut *gpu_stripe_req(), GpuStripeReq::Idle);
+        unsafe { gpu_stripe_retire(stale) };
+        let mut guard = match ZC_FOLD.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                ZC_FOLD.clear_poison();
+                note_poisoned_lock("zc-fold", true);
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
+        if guard.is_none() {
+            *guard = Some(zc_fold_init(gpu));
+        }
+        let Some(Ok(state)) = guard.as_mut() else {
+            return false;
+        };
+        if state.pso_stripe.is_null() {
+            return false;
+        }
+        let t_arm = std::time::Instant::now();
+        let cached = state.z_wraps.iter().any(|&(p, l, _)| p == ptr as usize && l == len);
+        unsafe {
+            // SAFETY: the caller owns `ptr..ptr+len` for the prove; the wrap
+            // is the fold arms' cached one (same pages, no new pin when the
+            // pooled stripe address repeats, which it does after warmup).
+            let wrapped = state.wrap_z(std::slice::from_raw_parts(ptr, len));
+            let stripe_buf = match wrapped {
+                Ok(buf) => gpu.retain(buf),
+                Err(e) => {
+                    if gpu_stripe_debug() {
+                        eprintln!("[gpu-stripe] stripe wrap failed ({e}); CPU stripe");
+                    }
+                    return false;
+                }
+            };
+            std::ptr::copy_nonoverlapping(
+                spec.rows.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.stripe_rows_buf),
+                std::mem::size_of_val(spec.rows),
+            );
+            std::ptr::copy_nonoverlapping(
+                spec.checks.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(state.stripe_checks_buf),
+                std::mem::size_of_val(spec.checks),
+            );
+            *gpu_stripe_req() = GpuStripeReq::Armed(GpuStripeJob {
+                gpu,
+                pso: state.pso_stripe,
+                stripe_buf,
+                rows_buf: state.stripe_rows_buf,
+                checks_buf: state.stripe_checks_buf,
+                flag_buf: state.stripe_flag_buf,
+                params,
+                armed_at: std::time::Instant::now(),
+            });
+        }
+        if gpu_stripe_debug() {
+            eprintln!(
+                "[gpu-stripe] armed in {:.3} ms, stripe wrap cached={cached}",
+                t_arm.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        true
+    }
+
+    /// Default: the stripe pass runs on a second command queue, launched
+    /// when the commit graph starts, so the bandwidth-bound transpose
+    /// overlaps the graph's compute-bound NTT/Merkle passes (measured on the
+    /// M5 Pro hybrid split: window +1.3 ms instead of +2.8 ms queued behind
+    /// the graph; a pure-GPU k = 0 graph already overlaps a same-queue
+    /// buffer). `FLOCK_GPU_STRIPE_SERIAL=1` queues it behind the graph on
+    /// the commit queue instead.
+    pub(crate) fn gpu_stripe_queue2() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_GPU_STRIPE_SERIAL").is_none())
+    }
+
+    unsafe fn gpu_stripe_second_queue(gpu: &Gpu) -> Id {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static Q: AtomicUsize = AtomicUsize::new(0);
+        let p = Q.load(Ordering::Acquire);
+        if p != 0 {
+            return p as Id;
+        }
+        let q: Id = unsafe {
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newCommandQueue")
+        };
+        if q.is_null() {
+            return q;
+        }
+        match Q.compare_exchange(0, q as usize, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => q,
+            Err(other) => other as Id,
+        }
+    }
+
+    /// Encode + commit the stripe pass over `z_buf` (async). Returns the
+    /// retained command buffer.
+    unsafe fn gpu_stripe_encode(job: &GpuStripeJob, z_buf: Id) -> Result<Id, String> {
+        unsafe {
+            let gpu = job.gpu;
+            gpu.buffer_contents(job.flag_buf).cast::<u32>().write_volatile(0);
+            let pool = gpu.pool_push();
+            let r = (|| -> Result<Id, String> {
+                let cb = if gpu_stripe_queue2() {
+                    let q = gpu_stripe_second_queue(gpu);
+                    if q.is_null() {
+                        return Err("second queue unavailable".into());
+                    }
+                    let cb: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, q, c"commandBuffer");
+                    if cb.is_null() {
+                        return Err("commandBuffer (queue 2) failed".into());
+                    }
+                    cb
+                } else {
+                    gpu.command_buffer()?
+                };
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, job.pso);
+                gpu.set_buffer(enc, z_buf, 0, 0);
+                gpu.set_buffer(enc, job.stripe_buf, 0, 1);
+                gpu.set_buffer(enc, job.rows_buf, 0, 2);
+                gpu.set_buffer(enc, job.checks_buf, 0, 3);
+                let pb = std::slice::from_raw_parts(
+                    (&job.params as *const GpuStripeParams).cast::<u8>(),
+                    std::mem::size_of::<GpuStripeParams>(),
+                );
+                gpu.set_bytes(enc, pb, 4);
+                gpu.set_buffer(enc, job.flag_buf, 0, 5);
+                const TG: u64 = 256;
+                let total = u64::from(job.params.n_rows) * u64::from(job.params.n_groups);
+                gpu.dispatch(enc, total.div_ceil(TG), TG);
+                gpu.end_encoding(enc);
+                let cb = gpu.retain(cb);
+                gpu.commit_async(cb);
+                Ok(cb)
+            })();
+            gpu.pool_pop(pool);
+            r
+        }
+    }
+
+    /// Queue the armed stripe pass behind whatever this queue already holds
+    /// (the commit graph). No-op when nothing is armed.
+    pub(crate) fn launch_armed_gpu_stripe(gpu_ref: &Gpu, z_buf: Id) {
+        let mut req = gpu_stripe_req();
+        // Only an armed request is taken: a launched one (k = 0 queues it
+        // behind the graph, then this is called again) must stay in place.
+        if !matches!(*req, GpuStripeReq::Armed(_)) {
+            return;
+        }
+        let GpuStripeReq::Armed(job) = std::mem::replace(&mut *req, GpuStripeReq::Idle) else {
+            unreachable!("checked above");
+        };
+        debug_assert!(std::ptr::eq(gpu_ref, job.gpu));
+        match unsafe { gpu_stripe_encode(&job, z_buf) } {
+            Ok(cb) => *req = GpuStripeReq::Launched(job, cb, std::time::Instant::now()),
+            Err(e) => {
+                if gpu_stripe_debug() {
+                    eprintln!("[gpu-stripe] launch failed ({e}); CPU stripe");
+                }
+                unsafe { gpu_stripe_retire(GpuStripeReq::Armed(job)) };
+            }
+        }
+    }
+
+    pub(crate) fn gpu_stripe_wait() -> Option<bool> {
+        let req = std::mem::replace(&mut *gpu_stripe_req(), GpuStripeReq::Idle);
+        let GpuStripeReq::Launched(job, cb, launched) = req else {
+            if gpu_stripe_debug() && matches!(req, GpuStripeReq::Armed(_)) {
+                eprintln!("[gpu-stripe] armed but never launched; CPU stripe");
+            }
+            unsafe { gpu_stripe_retire(req) };
+            return None;
+        };
+        let t_wait = std::time::Instant::now();
+        let gpu = job.gpu;
+        let done = unsafe {
+            gpu.yield_wait_cb_until(cb, std::time::Instant::now() + std::time::Duration::from_millis(4))
+        };
+        let mismatch = unsafe { gpu.buffer_contents(job.flag_buf).cast::<u32>().read_volatile() } != 0;
+        if gpu_stripe_debug() {
+            let (s, e) = unsafe { cb_gpu_interval(gpu, cb) };
+            eprintln!("[gpu-stripe] gpu start raw {s:.6} end raw {e:.6}");
+            eprintln!(
+                "[gpu-stripe] gpu dur {:.2} ms, launch {:.2} ms after arm, host waited {:.2} ms \
+                 (wait called {:.2} ms after launch), ok={} mismatch={mismatch} rows={} groups={}",
+                (e - s) * 1e3,
+                (launched - job.armed_at).as_secs_f64() * 1e3,
+                t_wait.elapsed().as_secs_f64() * 1e3,
+                (t_wait - launched).as_secs_f64() * 1e3,
+                done.is_ok(),
+                job.params.n_rows,
+                job.params.n_groups,
+            );
+        }
+        unsafe {
+            gpu.release(cb);
+            gpu.release(job.stripe_buf);
+        }
+        done.ok().map(|()| mismatch)
+    }
+
+    pub(crate) fn gpu_stripe_run_for_test(
+        z: &[u64],
+        stripe: &mut [u8],
+        spec: &super::GpuStripeSpec<'_>,
+    ) -> Option<bool> {
+        let gpu = gpu().ok()?;
+        if !gpu_stripe_arm(stripe.as_mut_ptr(), stripe.len(), spec) {
+            return None;
+        }
+        let z_buf = unsafe { gpu.wrap_buffer(z.as_ptr() as *mut u8, std::mem::size_of_val(z)) }.ok()?;
+        launch_armed_gpu_stripe(gpu, z_buf);
+        let out = gpu_stripe_wait();
+        unsafe { gpu.release(z_buf) };
+        out
+    }
 }
 
 // Test-harness entry points (copy-in/copy-out); production goes through
@@ -16049,6 +16611,22 @@ mod imp {
         _z_len: usize,
         _params: &crate::pcs::commit::PcsParams,
     ) -> Option<FromZFirstPassStream> {
+        None
+    }
+
+    pub(crate) fn gpu_stripe_arm(_ptr: *mut u8, _len: usize, _spec: &super::GpuStripeSpec<'_>) -> bool {
+        false
+    }
+
+    pub(crate) fn gpu_stripe_wait() -> Option<bool> {
+        None
+    }
+
+    pub(crate) fn gpu_stripe_run_for_test(
+        _z: &[u64],
+        _stripe: &mut [u8],
+        _spec: &super::GpuStripeSpec<'_>,
+    ) -> Option<bool> {
         None
     }
 

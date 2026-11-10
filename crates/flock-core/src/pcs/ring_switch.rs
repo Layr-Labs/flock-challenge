@@ -2701,6 +2701,16 @@ pub enum RsEqInd {
 /// Whether a caller-proved dead deferred basis may skip its factor build.
 /// Read once per process and outside every fold loop.
 #[inline]
+/// Ring-switch direct-fold8 factor build: the 64 bank transposes and the 64
+/// basis-column table folds run as parallel tasks instead of two serial loops
+/// on the claim's worker. `FLOCK_NO_OP_RS_PAR=1` restores the serial loops.
+/// Exact: every output slot is computed by the same calls from the same inputs.
+fn rs_fold8_par_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("FLOCK_NO_OP_RS_PAR").map_or(true, |v| v != "1"));
+    *ON
+}
+
 fn rs_elide_dead_basis_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_ELIDE_DEAD_BASIS").is_none());
@@ -3369,22 +3379,74 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                         // Compute `a_state` into an uninitialized buffer first,
                         // then reuse the owned `fold8` allocation for `w_state`.
                         let mut a_state = crate::alloc_uninit_f128_vec(64 * n_packed);
-                        let mut transposed = [F128::ZERO; 1 << LOG_PACKING];
-                        for e in 0..64 {
-                            let bank = &fold8[e * n_packed..(e + 1) * n_packed];
-                            tensor_algebra_transpose_into(bank, &mut transposed);
-                            for (bit, &value) in transposed.iter().enumerate() {
-                                a_state[bit * 64 + e] = value;
-                            }
-                        }
                         let mut w_state = crate::alloc_uninit_f128_vec(64 * n_packed);
-                        for d_low in 0..64 {
-                            let scale = low_eq[d_low];
-                            let mut basis_product = scale;
-                            w_state[d_low] = fold_one_slot(basis_product, &table);
-                            for bit in 1..n_packed {
-                                basis_product = mul_by_x(basis_product);
-                                w_state[bit * 64 + d_low] = fold_one_slot(basis_product, &table);
+                        if rs_fold8_par_enabled() {
+                            // Same per-bank transposes and per-column table
+                            // folds as the serial loops below, computed as
+                            // independent bank/column tasks and scattered in
+                            // the same bit-major layout: every output slot
+                            // receives the identical value.
+                            use rayon::prelude::*;
+                            let (banks, cols): (Vec<[F128; 1 << LOG_PACKING]>, Vec<[F128; 1 << LOG_PACKING]>) =
+                                rayon::join(
+                                    || {
+                                        (0..64usize)
+                                            .into_par_iter()
+                                            .with_min_len(8)
+                                            .map(|e| {
+                                                let mut transposed = [F128::ZERO; 1 << LOG_PACKING];
+                                                tensor_algebra_transpose_into(
+                                                    &fold8[e * n_packed..(e + 1) * n_packed],
+                                                    &mut transposed,
+                                                );
+                                                transposed
+                                            })
+                                            .collect()
+                                    },
+                                    || {
+                                        (0..64usize)
+                                            .into_par_iter()
+                                            .with_min_len(8)
+                                            .map(|d_low| {
+                                                let mut col = [F128::ZERO; 1 << LOG_PACKING];
+                                                let mut basis_product = low_eq[d_low];
+                                                col[0] = fold_one_slot(basis_product, &table);
+                                                for bit in 1..n_packed {
+                                                    basis_product = mul_by_x(basis_product);
+                                                    col[bit] = fold_one_slot(basis_product, &table);
+                                                }
+                                                col
+                                            })
+                                            .collect()
+                                    },
+                                );
+                            for (e, transposed) in banks.iter().enumerate() {
+                                for (bit, &value) in transposed.iter().enumerate() {
+                                    a_state[bit * 64 + e] = value;
+                                }
+                            }
+                            for (d_low, col) in cols.iter().enumerate() {
+                                for (bit, &value) in col.iter().enumerate() {
+                                    w_state[bit * 64 + d_low] = value;
+                                }
+                            }
+                        } else {
+                            let mut transposed = [F128::ZERO; 1 << LOG_PACKING];
+                            for e in 0..64 {
+                                let bank = &fold8[e * n_packed..(e + 1) * n_packed];
+                                tensor_algebra_transpose_into(bank, &mut transposed);
+                                for (bit, &value) in transposed.iter().enumerate() {
+                                    a_state[bit * 64 + e] = value;
+                                }
+                            }
+                            for d_low in 0..64 {
+                                let scale = low_eq[d_low];
+                                let mut basis_product = scale;
+                                w_state[d_low] = fold_one_slot(basis_product, &table);
+                                for bit in 1..n_packed {
+                                    basis_product = mul_by_x(basis_product);
+                                    w_state[bit * 64 + d_low] = fold_one_slot(basis_product, &table);
+                                }
                             }
                         }
                         let round0 = super::round0_deferred(&a_state, &w_state);

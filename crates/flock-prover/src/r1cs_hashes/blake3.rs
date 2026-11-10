@@ -3141,6 +3141,45 @@ pub(crate) mod witgen_simd {
         }
     }
 
+    /// `FLOCK_NO_AB_NT_FROM_SCRATCH` (any value): the primed a/b form
+    /// publishes from the L1 stage again (second de-interleaving pass).
+    fn nt_from_scratch_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_AB_NT_FROM_SCRATCH").is_none());
+        *ON
+    }
+
+    /// Non-temporal copy of chunks `g0..g1` (8 words each) of four
+    /// block-major blocks from `src` to `dst` (same layout): whole 64-byte
+    /// lines where both chunks are in range, a 32-byte pair otherwise.
+    #[inline(always)]
+    unsafe fn copy_range_nt_4(src: *const u32, dst: *mut u32, g0: usize, g1: usize) {
+        unsafe {
+            for c in 0..4usize {
+                let s = src.add(c * U32_PER_BLOCK);
+                let d = dst.add(c * U32_PER_BLOCK);
+                let mut g = g0;
+                if g % 2 == 1 && g < g1 {
+                    store_nt_pair(vld1q_u32(s.add(8 * g)), vld1q_u32(s.add(8 * g + 4)), d.add(8 * g));
+                    g += 1;
+                }
+                while g + 2 <= g1 {
+                    let w = 8 * g;
+                    let x0 = vld1q_u32(s.add(w));
+                    let x1 = vld1q_u32(s.add(w + 4));
+                    let x2 = vld1q_u32(s.add(w + 8));
+                    let x3 = vld1q_u32(s.add(w + 12));
+                    store_nt_pair(x0, x1, d.add(w));
+                    store_nt_pair(x2, x3, d.add(w + 8));
+                    g += 2;
+                }
+                if g < g1 {
+                    store_nt_pair(vld1q_u32(s.add(8 * g)), vld1q_u32(s.add(8 * g + 4)), d.add(8 * g));
+                }
+            }
+        }
+    }
+
     /// Sparse tail chunk 60 of one buffer: stage words 480..483 followed by
     /// four zero words (the single-buffer half of
     /// [`dump_ranked_sparse_za_tail_nt`]).
@@ -3491,6 +3530,21 @@ pub(crate) mod witgen_simd {
             } else if full_scratch {
                 dump_dual(za, sa, a, 0, RANKED_SPARSE_TAIL_CHUNK, true);
                 dump_dual(bs, sb, b, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK, false);
+            } else if SCRATCH && nt_from_scratch_enabled() {
+                // Primed: the scratch receives the data chunks block-major
+                // (one de-interleaving pass over the stage); the
+                // non-temporal publication then streams the same chunks
+                // from the scratch with plain loads instead of
+                // de-interleaving the stage a second time. Scratch chunk 60
+                // holds stage words 480..487 with 482..487 zeroed above, i.e.
+                // exactly the sparse tail line.
+                const {
+                    assert!(ELIDE_ZERO_CHUNK == RANKED_SPARSE_TAIL_CHUNK + 1);
+                }
+                dump_range::<false>(za, sa, 0, ELIDE_ZERO_CHUNK);
+                dump_range::<false>(bs, sb, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK);
+                copy_range_nt_4(sa, a, 0, ELIDE_ZERO_CHUNK);
+                copy_range_nt_4(sb, b, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK);
             } else if SCRATCH {
                 dump_range::<false>(za, sa, 0, ELIDE_ZERO_CHUNK);
                 dump_range_lines_nt(za, a, 0, RANKED_SPARSE_TAIL_CHUNK);
@@ -6053,6 +6107,40 @@ mod tests {
                 assert_eq!(b2, truth.2, "b (scratch form) case={case} seeded={seeded_path}");
                 assert_eq!(sa, truth.1, "a scratch case={case} seeded={seeded_path}");
                 assert_eq!(sb, truth.2, "b scratch case={case} seeded={seeded_path}");
+                // The AB-producer stripe (`prover::AbStripeEmitter`) reads z
+                // as a AND b from this scratch: C = I, so it holds word for
+                // word over the complete blocks.
+                let z_from_ab: Vec<u32> = sa.iter().zip(&sb).map(|(x, y)| x & y).collect();
+                assert_eq!(z_from_ab, truth.0, "z = a AND b case={case} seeded={seeded_path}");
+
+                // Primed scratch: a previous quad's complete scratch form
+                // left the constant chunks, the primed form rewrites only
+                // the data chunks. The scratch must again equal the complete
+                // blocks, so z = a AND b holds for the stripe emitter too.
+                let (mut sa3, mut sb3) = (vec![0xdead_beefu32; U32S], vec![0x0bad_f00du32; U32S]);
+                let (mut a3, mut b3) = (pa.clone(), pb.clone());
+                unsafe {
+                    witgen_simd::build_quad_split_neon::<false, true, false>(
+                        QuadInput::Seeded(&prev),
+                        std::ptr::null_mut(),
+                        a3.as_mut_ptr(),
+                        b3.as_mut_ptr(),
+                        sa3.as_mut_ptr(),
+                        sb3.as_mut_ptr(),
+                    );
+                    witgen_simd::build_quad_split_neon::<false, true, true>(
+                        input(),
+                        std::ptr::null_mut(),
+                        a3.as_mut_ptr(),
+                        b3.as_mut_ptr(),
+                        sa3.as_mut_ptr(),
+                        sb3.as_mut_ptr(),
+                    );
+                }
+                assert_eq!(a3, truth.1, "a (primed form) case={case} seeded={seeded_path}");
+                assert_eq!(b3, truth.2, "b (primed form) case={case} seeded={seeded_path}");
+                assert_eq!(sa3, truth.1, "a primed scratch case={case} seeded={seeded_path}");
+                assert_eq!(sb3, truth.2, "b primed scratch case={case} seeded={seeded_path}");
                 checked += 1;
             }
         }
