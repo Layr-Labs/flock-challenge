@@ -8067,6 +8067,31 @@ kernel void blake3_pow_scan(
         Ok(walls)
     }
 
+    /// Leave CPU work on the GPU once the graph fits below the contending AB arm.
+    fn ab_aware_hybrid_k(samples: &[(usize, f64, f64)]) -> Option<usize> {
+        const MARGIN: f64 = 0.03;
+        if samples
+            .iter()
+            .any(|s| !s.1.is_finite() || s.1 <= 0.0 || !s.2.is_finite() || s.2 <= 0.0)
+        {
+            return None;
+        }
+        let mean = |k| {
+            let (mut graph, mut ab, mut n) = (0.0, 0.0, 0usize);
+            for &(_, g, a) in samples.iter().filter(|s| s.0 == k) {
+                graph += g;
+                ab += a;
+                n += 1;
+            }
+            (n > 0).then(|| (graph / n as f64, ab / n as f64))
+        };
+        RANKED_EXACT_TUNE_CANDIDATES.iter().copied().find(|&k| {
+            let Some((graph, ab)) = mean(k) else { return false };
+            graph <= ab * (1.0 - MARGIN)
+                && (k != 0 || mean(DEFAULT_HYBRID_K).is_some_and(|d| graph <= d.0 * 0.96))
+        })
+    }
+
     fn mean_ranked_exact_samples(
         samples: [[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
     ) -> Option<[f64; RANKED_EXACT_TUNE_CANDIDATES.len()]> {
@@ -8482,28 +8507,37 @@ kernel void blake3_pow_scan(
                 }
             }
         };
-        // Score by the graph arm alone under exact AB contention, not by the
-        // join wall. The AB replay is k-independent; when it outlasts the
-        // graph the join wall contains no information about k (wayfinder F2).
-        // Minimising the graph arm is never wrong: where the graph is
-        // critical it minimises the join too; where it is not, a shorter
-        // graph is free. `FLOCK_HYBRID_SCORE_JOIN_WALL=1` restores the
-        // incumbent join-max objective for same-binary comparison.
+        // Keep the graph score for fallback, but measure AB in the same sample:
+        // CPU suffix work can lengthen AB through contention for the same cores.
+        let ab_aware = std::env::var_os("FLOCK_NO_HYBRID_AB_AWARE").is_none();
+        // Diagnostic only: simulate an AB-bound host without adding work.
+        let ab_debug_scale = std::env::var("FLOCK_HYBRID_AB_DEBUG_SCALE")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0);
+        let mut ab_samples = Vec::with_capacity(2 * RANKED_EXACT_TUNE_CANDIDATES.len());
         let sample = |k: usize| -> Result<f64, String> {
             let score_join = std::env::var_os("FLOCK_HYBRID_SCORE_JOIN_WALL").is_some();
             let t0 = std::time::Instant::now();
-            let (graph_arm, ()) = rayon::join(
+            let (graph_arm, ab_ms) = rayon::join(
                 || {
                     let tg = std::time::Instant::now();
                     let r = timed_graph(k);
                     (r, tg.elapsed().as_secs_f64() * 1e3)
                 },
-                || replay_ab(),
+                || {
+                    let ta = std::time::Instant::now();
+                    replay_ab();
+                    ta.elapsed().as_secs_f64() * 1e3
+                },
             );
             let (graph, graph_ms) = graph_arm;
             graph?;
+            let join_ms = t0.elapsed().as_secs_f64() * 1e3;
+            ab_samples.push((k, graph_ms, ab_ms * ab_debug_scale));
             Ok(if score_join {
-                t0.elapsed().as_secs_f64() * 1e3
+                join_ms
             } else {
                 graph_ms
             })
@@ -8556,16 +8590,21 @@ kernel void blake3_pow_scan(
             .lock()
             .map(|v| v.clone())
             .unwrap_or_default();
-        let chosen = match split_from_arms(&arm_samples, swept) {
-            Some(k) => k,
-            None => swept,
-        };
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
-        let chosen = if hybrid_fine_enabled() {
-            fine_split_from_arms(&fine_samples, chosen)
-        } else {
-            chosen
-        };
+        let ab_chosen = ab_aware.then(|| ab_aware_hybrid_k(&ab_samples)).flatten();
+        let chosen = ab_chosen.unwrap_or_else(|| {
+            let coarse = split_from_arms(&arm_samples, swept).unwrap_or(swept);
+            if hybrid_fine_enabled() {
+                fine_split_from_arms(&fine_samples, coarse)
+            } else {
+                coarse
+            }
+        });
+        if dbg {
+            eprintln!(
+                "[gpu-commit] AB-aware split: {ab_chosen:?} over swept k={swept}, scale={ab_debug_scale} | graph/AB {ab_samples:?}"
+            );
+        }
         if dbg {
             let rows: Vec<String> = fine_samples
                 .iter()
@@ -11982,7 +12021,35 @@ kernel void lc_fold_stripes_factored_b4(
 
     #[cfg(test)]
     mod hybrid_balance_tests {
-        use super::{ARM_SPLIT_MARGIN, arm_window_ms, split_from_arms};
+        use super::{ARM_SPLIT_MARGIN, ab_aware_hybrid_k, arm_window_ms, split_from_arms};
+
+        #[test]
+        fn ab_aware_split_falls_back_on_gpu_bound_or_missing_samples() {
+            let s = [(0, 200.0, 80.0), (2, 180.0, 85.0), (5, 150.0, 90.0)];
+            assert_eq!(ab_aware_hybrid_k(&s), None);
+            assert_eq!(ab_aware_hybrid_k(&[]), None);
+            assert_eq!(ab_aware_hybrid_k(&[(2, f64::NAN, 100.0)]), None);
+            assert_eq!(ab_aware_hybrid_k(&[(2, 80.0, 0.0)]), None);
+        }
+
+        #[test]
+        fn ab_aware_split_uses_paired_means_and_smallest_eligible_k() {
+            let s = [
+                (5, 70.0, 110.0), (2, 98.0, 100.0),
+                (2, 94.0, 100.0), (3, 80.0, 105.0),
+            ];
+            assert_eq!(ab_aware_hybrid_k(&s), Some(2));
+            assert_eq!(ab_aware_hybrid_k(&[(2, 97.0, 100.0)]), Some(2));
+            assert_eq!(ab_aware_hybrid_k(&[(2, 97.0001, 100.0)]), None);
+        }
+
+        #[test]
+        fn ab_aware_split_keeps_the_pure_gpu_guard() {
+            let d = super::DEFAULT_HYBRID_K;
+            assert_eq!(ab_aware_hybrid_k(&[(0, 97.0, 110.0), (d, 100.0, 110.0)]), Some(d));
+            assert_eq!(ab_aware_hybrid_k(&[(0, 96.0, 110.0), (d, 100.0, 110.0)]), Some(0));
+            assert_eq!(ab_aware_hybrid_k(&[(0, 80.0, 100.0)]), None);
+        }
 
         // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
         #[test]
