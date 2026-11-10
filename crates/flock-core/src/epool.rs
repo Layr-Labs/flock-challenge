@@ -583,7 +583,6 @@ pub struct HelpQueue<'a> {
     main_ns: AtomicU64,
     main_cnt: AtomicU64,
     guard_on: bool,
-    main_width: u64,
     n_chunks: usize,
     f: &'a (dyn Fn(usize) + Sync),
 }
@@ -598,7 +597,6 @@ impl<'a> HelpQueue<'a> {
             main_ns: AtomicU64::new(0),
             main_cnt: AtomicU64::new(0),
             guard_on: tail_guard_enabled(),
-            main_width: rayon::current_num_threads() as u64,
             n_chunks,
             f,
         }
@@ -655,8 +653,7 @@ impl<'a> HelpQueue<'a> {
         }
         let t_main = self.main_ns.load(Ordering::Relaxed) / cnt;
         let remaining = self.n_chunks.saturating_sub(self.next.load(Ordering::Relaxed)) as u64;
-        let width = active.max(self.main_width);
-        own_ns.saturating_mul(width) <= remaining.saturating_mul(t_main)
+        own_ns.saturating_mul(active) <= remaining.saturating_mul(t_main)
     }
 
     fn drain_helper(&self) -> usize {

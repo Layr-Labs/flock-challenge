@@ -31,40 +31,12 @@ pub(super) fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twiddle: F1
         x86_64::butterfly_row_pair(top, bot, twiddle);
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    {
-        if aarch64::use_row_pair_prepared() {
-            // SAFETY: the cfg gate guarantees PMULL through the aes feature.
-            unsafe { aarch64::butterfly_row_pair(top, bot, twiddle) };
-        } else {
-            portable::butterfly_row_pair(top, bot, twiddle);
-        }
-    }
-
-    #[cfg(not(any(
-        all(
-            target_arch = "x86_64",
-            target_feature = "avx512f",
-            target_feature = "vpclmulqdq"
-        ),
-        all(target_arch = "aarch64", target_feature = "aes")
+    #[cfg(not(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "vpclmulqdq"
     )))]
     portable::butterfly_row_pair(top, bot, twiddle);
-}
-
-/// Whether [`butterfly_row_pair`] is the prepared-twiddle NEON kernel, whose
-/// per-call twiddle preparation makes one call over a whole single-layer block
-/// preferable to one call per row.
-#[inline]
-pub(super) fn row_pair_prepared() -> bool {
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    {
-        aarch64::use_row_pair_prepared()
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
-    {
-        false
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -549,50 +521,6 @@ mod aarch64_row_tests {
             tw[3] = F128::ZERO;
         }
         (buf, tw)
-    }
-
-    /// The prepared-twiddle single-layer row butterfly must be **bit-identical**
-    /// to the portable per-lane chain: random rows from one lane up to 200
-    /// (the ranked recursive-L1 lead layer passes whole 4096-row blocks of 8
-    /// lanes; see `row_pair_probe` for that shape), and the twiddle edge cases
-    /// (zero, one, zero high limb, zero low limb, all ones).
-    #[test]
-    fn neon_row_pair_matches_portable() {
-        let mut state = 0x524F_575F_5041_4952;
-        let mut twiddles = vec![
-            F128::ZERO,
-            F128 { lo: 1, hi: 0 },
-            F128 { lo: 0, hi: 1 },
-            F128 { lo: u64::MAX, hi: 0 },
-            F128 { lo: 0, hi: u64::MAX },
-            F128 { lo: u64::MAX, hi: u64::MAX },
-            F128 { lo: 0x87, hi: 1 << 63 },
-        ];
-        for _ in 0..64 {
-            twiddles.push(rand_f128(&mut state));
-        }
-        for &lanes in &[1usize, 2, 3, 5, 16, 31, 32, 63, 64, 65, 200] {
-            for &twiddle in &twiddles {
-                let top: Vec<F128> = (0..lanes).map(|_| rand_f128(&mut state)).collect();
-                let bot: Vec<F128> = (0..lanes).map(|_| rand_f128(&mut state)).collect();
-
-                let (mut want_top, mut want_bot) = (top.clone(), bot.clone());
-                portable::butterfly_row_pair(&mut want_top, &mut want_bot, twiddle);
-
-                let (mut got_top, mut got_bot) = (top.clone(), bot.clone());
-                // SAFETY: equal-length rows; this module carries `aes` via cfg.
-                unsafe { aarch64::butterfly_row_pair(&mut got_top, &mut got_bot, twiddle) };
-
-                assert_eq!(got_top, want_top, "top row, lanes={lanes}, twiddle={twiddle:?}");
-                assert_eq!(got_bot, want_bot, "bottom row, lanes={lanes}, twiddle={twiddle:?}");
-
-                // The dispatcher must agree with both.
-                let (mut via_top, mut via_bot) = (top, bot);
-                butterfly_row_pair(&mut via_top, &mut via_bot, twiddle);
-                assert_eq!(via_top, want_top);
-                assert_eq!(via_bot, want_bot);
-            }
-        }
     }
 
     /// The vector-resident radix-8 row kernel must be **bit-identical** to the
