@@ -2460,7 +2460,7 @@ unsafe fn store_row_64(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn shift_reduce_inner_a_only_const_b(
+fn shift_reduce_inner_a_only_const_b<const V: u8>(
     a_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
     byte_base_b: usize,
@@ -2472,6 +2472,11 @@ fn shift_reduce_inner_a_only_const_b(
 
     let table_base = inv_table.data_ptr();
     let half_swapped_table_base = inv_table.half_swapped_data_ptr();
+    let kplain = if V & ABV_KARA != 0 {
+        ab_kara_tables(inv_table)
+    } else {
+        core::ptr::null()
+    };
     unsafe {
         let mut acc0_lo = vdupq_n_u16(0);
         let mut acc0_hi = vdupq_n_u16(0);
@@ -2489,7 +2494,7 @@ fn shift_reduce_inner_a_only_const_b(
                     a_packed.as_ptr().add(off).cast::<u64>(),
                 ));
                 let (d0, d1, d2, d3) =
-                    apply_word_into_4_regs(table_base, half_swapped_table_base, word);
+                    apply_word_into_4_regs_v::<V>(table_base, half_swapped_table_base, kplain, word);
                 acc0_lo = veorq_u16(acc0_lo, vshll_n_u8::<$k>(vget_low_u8(d0)));
                 acc0_hi = veorq_u16(acc0_hi, vshll_n_u8::<$k>(vget_high_u8(d0)));
                 acc1_lo = veorq_u16(acc1_lo, vshll_n_u8::<$k>(vget_low_u8(d1)));
@@ -3466,7 +3471,17 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
     if check_all_ones {
         let and_all = bw(0) & bw(1) & bw(2) & bw(3) & bw(4) & bw(5) & bw(6) & bw(7);
         if and_all == u64::MAX {
-            shift_reduce_inner_a_only_const_b(a_packed, inv_table, byte_base_b, out, nt_store);
+            if ab_kara_enabled() {
+                shift_reduce_inner_a_only_const_b::<{ ABV_KARA }>(
+                    a_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            } else {
+                shift_reduce_inner_a_only_const_b::<0>(a_packed, inv_table, byte_base_b, out, nt_store);
+            }
             return;
         }
     }
