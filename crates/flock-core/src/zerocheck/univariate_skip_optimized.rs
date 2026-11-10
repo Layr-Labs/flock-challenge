@@ -2693,7 +2693,43 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                 rayon::current_num_threads(),
                 zc_ab_bank_deferred_enabled(),
             );
-            crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // Round-one AB GPU arm (`FLOCK_NO_R1_GPU_AB=1` kills): ranked
+            // deferred shape only; a self-calibrated x_hi prefix runs on the
+            // GPU and the CPU sweep skips it.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let gpu_job = if bank_deferred {
+                let fe: Vec<u32> = (0..=within_outer_mask)
+                    .map(|within| {
+                        let n = b_med_counts[within] as usize;
+                        if n == 0 {
+                            0
+                        } else {
+                            let rep = ab_inner.representation;
+                            (rep.first_materialized_b_med(within) as u32)
+                                | ((rep.materialized_b_med_end(within, n) as u32) << 8)
+                        }
+                    })
+                    .collect();
+                crate::gpu_commit::launch_zc_r1_ab(
+                    ab_inner_bytes,
+                    &tables,
+                    &eq_bot,
+                    &eq.hi,
+                    hi_size,
+                    eq.n_lo,
+                    bank_bits,
+                    within_outer_mask,
+                    &fe,
+                )
+            } else {
+                None
+            };
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_skip());
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let gpu_prefix = 0usize;
+            let t_sweep = std::time::Instant::now();
+            let chunk_fn = |x_hi: usize| {
                 let mut partial = [F128::ZERO; ELL];
                 AB_EQ_FOLD_BANKS.with(|cell| {
                     let mut banks = cell.borrow_mut();
@@ -2722,7 +2758,33 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                 // the synchronous queue join publishes all writes before
                 // reduction.
                 unsafe { *partials_base.ptr().add(x_hi) = partial };
-            });
+            };
+            crate::epool::run_hetero_chunks(hi_size - gpu_prefix, |i| chunk_fn(gpu_prefix + i));
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if let Some(job) = gpu_job {
+                let cpu_wall_ms = t_sweep.elapsed().as_secs_f64() * 1e3;
+                let calib = job.is_calibration();
+                match crate::gpu_commit::zc_r1_ab_wait(
+                    job,
+                    calib.then_some(partials.as_slice()),
+                    cpu_wall_ms,
+                    hi_size,
+                ) {
+                    crate::gpu_commit::ZcR1AbResult::Calibrated => {}
+                    crate::gpu_commit::ZcR1AbResult::Prefix(vals) => {
+                        for (x_hi, v) in vals.into_iter().enumerate() {
+                            partials[x_hi] = v;
+                        }
+                    }
+                    crate::gpu_commit::ZcR1AbResult::Failed => {
+                        for x_hi in 0..gpu_prefix {
+                            chunk_fn(x_hi);
+                        }
+                    }
+                }
+            }
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let _ = t_sweep;
             crate::scratch::give_f128(tables);
         }
     }

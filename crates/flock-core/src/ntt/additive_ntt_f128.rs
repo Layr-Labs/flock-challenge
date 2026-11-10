@@ -2470,15 +2470,6 @@ fn butterfly_interleaved_block(
 ) {
     let off_bot = block_size_half * num_ntts;
     let (top, bot) = block.split_at_mut(off_bot);
-    if kernels::row_pair_prepared() {
-        // Row `r`, lane `l` of the top half pairs with the same offset of the
-        // bottom half, so the block is one elementwise pass over two equal
-        // contiguous halves. One call visits the same pairs in the same
-        // row-major order as the per-row loop below and prepares the shared
-        // twiddle once per block instead of once per row.
-        kernels::butterfly_row_pair(&mut top[..off_bot], &mut bot[..off_bot], twiddle);
-        return;
-    }
     for r in 0..block_size_half {
         let o = r * num_ntts;
         kernels::butterfly_row_pair(
