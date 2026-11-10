@@ -84,6 +84,7 @@ fn bstatic_horner_blk<const BLK: usize>(
         // Raw 15-bit products of one K row, in the h4 order (a then b).
         macro_rules! prods {
             ($at:expr, $at_sw:expr, $k:literal, $bimg:expr) => {{
+                horner_row_fence();
                 let aw = u64::from_le(core::ptr::read_unaligned(a_base.add($k * N_CHUNKS).cast::<u64>()));
                 let (da0, da1, da2, da3) = apply_word_into_4_regs($at, $at_sw, aw);
                 let (db0, db1, db2, db3) = $bimg;

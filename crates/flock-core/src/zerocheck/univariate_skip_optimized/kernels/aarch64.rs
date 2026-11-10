@@ -1845,6 +1845,12 @@ unsafe fn horner_absorb(
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn horner_row_fence() {
+    unsafe { core::arch::asm!("", options(nostack, preserves_flags)) }
+}
+
 /// Kill switch for the Horner / scaled-table kernel:
 /// `FLOCK_NO_FAST_SHIFT_REDUCE=1` restores [`shift_reduce_inner_ab_fused_neon`].
 /// Output is bit-identical either way.
@@ -1885,6 +1891,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4(
         // always comes out of the plain image.
         macro_rules! products {
             ($at:expr, $at_sw:expr, $k:literal) => {{
+                horner_row_fence();
                 let aw = u64::from_le(core::ptr::read_unaligned(
                     a_base.add($k * N_CHUNKS).cast::<u64>(),
                 ));
@@ -2003,6 +2010,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
 
         macro_rules! products {
             ($at:expr, $at_sw:expr, $k:literal) => {{
+                horner_row_fence();
                 let (da0, da1, da2, da3) = if STATIC_A && $k == 1 {
                     let p = a_k1_partial.unwrap_unchecked().as_ptr();
                     (
@@ -2429,6 +2437,7 @@ fn shift_reduce_inner_a_only_const_b(
 
         macro_rules! do_k {
             ($k:literal) => {{
+                horner_row_fence();
                 let off = byte_base_b + $k * N_CHUNKS;
                 let word = u64::from_le(core::ptr::read_unaligned(
                     a_packed.as_ptr().add(off).cast::<u64>(),
