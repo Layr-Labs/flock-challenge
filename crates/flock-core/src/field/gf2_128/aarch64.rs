@@ -323,6 +323,146 @@ pub unsafe fn ghash_mul_low_constants_vec2_neon(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fixed-multiplier ("prepared") products for the sumcheck folds.
+//
+// The sumcheck folds multiply a whole slice by one challenge `t`. For
+// a fixed `t`, precompute `R = t.hi * 0x87` (so `x^128 * t.hi = R` modulo
+// `x^128 + x^7 + x^2 + x + 1`) and pack two operands:
+//
+//   p.0 = (t.lo, R.lo)          p.1 = (t.hi, t.lo ^ R.hi)
+//
+// Then `v * t = L + x^64 * M` with `L = v.lo*t.lo + v.hi*R.lo` and
+// `M = v.lo*t.hi + v.hi*(t.lo + R.hi)`: four data PMULLs, and one more PMULL
+// folds `x^64 * M`. The value never leaves the vector register file and no
+// Karatsuba middle terms or 256-bit shift reduction are formed. Both `L` and
+// `M` are GF(2)-linear in `v`, so a sum of products by different constants
+// shares the single fold. Same field products, canonical (fully reduced)
+// outputs: bit-identical to the Karatsuba kernels they replace.
+// ---------------------------------------------------------------------------
+
+pub(crate) type ConstPrep = (uint64x2_t, uint64x2_t);
+
+#[inline(always)]
+pub(crate) unsafe fn const_prep(t: uint64x2_t) -> ConstPrep {
+    unsafe {
+        let r = transmute::<u128, uint64x2_t>(vmull_high_p64(
+            vreinterpretq_p64_u64(t),
+            vreinterpretq_p64_u64(vdupq_n_u64(0x87)),
+        ));
+        let lo = vzip1q_u64(t, r);
+        let mid = veorq_u64(vextq_u64::<1>(t, t), vzip2q_u64(vdupq_n_u64(0), r));
+        (lo, mid)
+    }
+}
+
+/// `(x.lo * y.lo) ^ (x.hi * y.hi)`.
+#[inline(always)]
+unsafe fn pmull_pair_sum(x: uint64x2_t, y: uint64x2_t) -> uint64x2_t {
+    let out: uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "pmull {p:v}.1q, {x:v}.1d, {y:v}.1d",
+            "pmull2 {o:v}.1q, {x:v}.2d, {y:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {p:v}.16b",
+            x = in(vreg) x,
+            y = in(vreg) y,
+            p = out(vreg) _,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// `acc ^ (x.lo * y.lo) ^ (x.hi * y.hi)`, each PMULL adjacent to its EOR.
+#[inline(always)]
+unsafe fn pmull_pair_acc(acc: uint64x2_t, x: uint64x2_t, y: uint64x2_t) -> uint64x2_t {
+    let out: uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "pmull {p:v}.1q, {x:v}.1d, {y:v}.1d",
+            "eor {p:v}.16b, {p:v}.16b, {c:v}.16b",
+            "pmull2 {o:v}.1q, {x:v}.2d, {y:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {p:v}.16b",
+            x = in(vreg) x,
+            y = in(vreg) y,
+            c = in(vreg) acc,
+            p = out(vreg) _,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// Reduce `L + x^64 * M`: `M.lo` moves to the high limb and
+/// `M.hi * x^128 = M.hi * 0x87` (at most 71 bits) lands in the low limbs.
+#[inline(always)]
+unsafe fn fold_lm(l: uint64x2_t, m: uint64x2_t) -> uint64x2_t {
+    unsafe {
+        let s = veorq_u64(l, vextq_u64::<1>(vdupq_n_u64(0), m));
+        let out: uint64x2_t;
+        core::arch::asm!(
+            "pmull2 {o:v}.1q, {m:v}.2d, {k:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+            m = in(vreg) m,
+            k = in(vreg) vdupq_n_u64(0x87),
+            s = in(vreg) s,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        out
+    }
+}
+
+/// `x * t` for the prepared constant `p = const_prep(t)`, fully reduced.
+#[inline(always)]
+pub(crate) unsafe fn mul_const_prep(p: ConstPrep, x: uint64x2_t) -> uint64x2_t {
+    unsafe { fold_lm(pmull_pair_sum(x, p.0), pmull_pair_sum(x, p.1)) }
+}
+
+/// `x * c + y * d` for two prepared constants, with one shared fold.
+#[inline(always)]
+pub(crate) unsafe fn mul_two_const_sum_prep(
+    pc: ConstPrep,
+    x: uint64x2_t,
+    pd: ConstPrep,
+    y: uint64x2_t,
+) -> uint64x2_t {
+    unsafe {
+        let l = pmull_pair_acc(pmull_pair_sum(x, pc.0), y, pd.0);
+        let m = pmull_pair_acc(pmull_pair_sum(x, pc.1), y, pd.1);
+        fold_lm(l, m)
+    }
+}
+
+/// Prepared form of the shared-constant product pair;
+/// `FLOCK_NO_CONST_VEC2_PREP=1` restores the Karatsuba kernel.
+#[inline]
+fn use_const_vec2_prep() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_CONST_VEC2_PREP").is_none());
+    *ON
+}
+
+/// [`ghash_mul_const_vec2_neon`] on the prepared fixed-multiplier product:
+/// one PMULL prepares `c`, then each product is four data PMULLs and one
+/// fold, with no lane-paired shift reduction. When the call is inlined into a
+/// loop over a slice the preparation is loop-invariant.
+#[inline(always)]
+unsafe fn ghash_mul_const_vec2_prepared(c: F128, b: [F128; 2]) -> [F128; 2] {
+    // SAFETY: `F128` is `repr(C, align(16))` over `{ lo, hi }`, the
+    // little-endian lane order of `uint64x2_t`; callers supply `aes`.
+    unsafe {
+        let p = const_prep(transmute::<F128, uint64x2_t>(c));
+        [
+            transmute::<uint64x2_t, F128>(mul_const_prep(p, transmute::<F128, uint64x2_t>(b[0]))),
+            transmute::<uint64x2_t, F128>(mul_const_prep(p, transmute::<F128, uint64x2_t>(b[1]))),
+        ]
+    }
+}
+
 /// Batch multiply 2× F128 by a SHARED constant `c`, Karatsuba variant of
 /// [`ghash_mul_vec2_neon`]: 6 PMULL instead of 8 (3 per product), reusing
 /// the same lane-paired vectorised GHASH reduction. PMULL is the scarce
@@ -336,6 +476,30 @@ pub unsafe fn ghash_mul_low_constants_vec2_neon(
 #[inline]
 #[target_feature(enable = "aes")]
 pub unsafe fn ghash_mul_const_vec2_neon(c: F128, b: [F128; 2]) -> [F128; 2] {
+    // SAFETY: the caller supplies `aes`.
+    unsafe {
+        if use_const_vec2_prep() {
+            ghash_mul_const_vec2_prepared(c, b)
+        } else {
+            ghash_mul_const_vec2_karatsuba(c, b)
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn ghash_mul_const_vec2_prepared_for_test(c: F128, b: [F128; 2]) -> [F128; 2] {
+    unsafe { ghash_mul_const_vec2_prepared(c, b) }
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn ghash_mul_const_vec2_karatsuba_for_test(c: F128, b: [F128; 2]) -> [F128; 2] {
+    unsafe { ghash_mul_const_vec2_karatsuba(c, b) }
+}
+
+/// The Karatsuba form of [`ghash_mul_const_vec2_neon`].
+#[inline]
+#[target_feature(enable = "aes")]
+unsafe fn ghash_mul_const_vec2_karatsuba(c: F128, b: [F128; 2]) -> [F128; 2] {
     // SAFETY: function carries the aes target feature; pmull requires it.
     unsafe {
         // Karatsuba per product: ll, hh, and (b_lo ^ b_hi)·(c_lo ^ c_hi);

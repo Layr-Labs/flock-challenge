@@ -5990,6 +5990,20 @@ fn fold_and_msg_lsb_into(
 
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        {
+            if half.is_multiple_of(2) {
+                let (u_0, u_2) = crate::field::f128_slice::fold_two_and_msg(
+                    f,
+                    b,
+                    0,
+                    &mut nf[..],
+                    &mut nb[..],
+                    r,
+                );
+                return SumcheckMessage { u_0, u_2 };
+            }
+        }
         for j in 0..half {
             nf[j] = f[2 * j] * one_plus_r + f[2 * j + 1] * r;
             nb[j] = b[2 * j] * one_plus_r + b[2 * j + 1] * r;
