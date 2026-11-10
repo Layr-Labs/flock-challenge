@@ -269,6 +269,51 @@ pub(crate) unsafe fn accumulate_convert_ab(
     }
 }
 
+/// Entry `(w >> SHIFT) & 0xff` of a 256 x 16-byte table. `U = false` is the
+/// plain Rust form (`ubfx` + scaled-index load, three issue slots on Apple
+/// performance cores); `U = true` forms the byte offset in one instruction
+/// (`ubfiz`, or `and` with a shifted register against `0xff0`) and uses the
+/// unscaled register-offset load, one slot less per lookup. Same entry.
+#[inline(always)]
+unsafe fn ab_ld<const U: bool, const SHIFT: u32>(
+    t: *const u8,
+    w: usize,
+) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        if !U {
+            return vld1q_u8(t.add(((w >> SHIFT) & 0xff) * 16));
+        }
+        let out: uint8x16_t;
+        // SAFETY: the offset is a byte value times 16 (at most 4080), inside
+        // the caller's 4 KiB table; the asm only reads that memory.
+        if SHIFT == 0 {
+            core::arch::asm!(
+                "ubfiz {idx}, {w}, #4, #8",
+                "ldr {out:q}, [{t}, {idx}]",
+                w = in(reg) w,
+                t = in(reg) t,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else {
+            core::arch::asm!(
+                "and {idx}, {mask}, {w}, lsr #{shift}",
+                "ldr {out:q}, [{t}, {idx}]",
+                shift = const (SHIFT + 60) % 64,
+                mask = in(reg) 0xff0usize,
+                w = in(reg) w,
+                t = in(reg) t,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+        out
+    }
+}
+
 /// Multiply-free twin of [`accumulate_convert_ab`] for the banked `eq_lo`
 /// tensor fold.
 ///
@@ -286,7 +331,7 @@ pub(crate) unsafe fn accumulate_convert_ab(
 /// terms — no term is added, dropped, or reordered within a lane.
 ///
 #[inline(always)]
-pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool>(
+pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool, const U: bool>(
     chunk_ab_bytes: &[[u8; 64]; 16],
     first_b_med: usize,
     n_b_med: usize,
@@ -327,43 +372,43 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool>(
                     as usize;
                 ab0 = xor3_u8(
                     ab0,
-                    vld1q_u8(t_even.add((we & 0xff) * 16)),
-                    vld1q_u8(t_odd.add((wo & 0xff) * 16)),
+                    ab_ld::<U, 0>(t_even, we),
+                    ab_ld::<U, 0>(t_odd, wo),
                 );
                 ab1 = xor3_u8(
                     ab1,
-                    vld1q_u8(t_even.add(((we >> 8) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 8) & 0xff) * 16)),
+                    ab_ld::<U, 8>(t_even, we),
+                    ab_ld::<U, 8>(t_odd, wo),
                 );
                 ab2 = xor3_u8(
                     ab2,
-                    vld1q_u8(t_even.add(((we >> 16) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 16) & 0xff) * 16)),
+                    ab_ld::<U, 16>(t_even, we),
+                    ab_ld::<U, 16>(t_odd, wo),
                 );
                 ab3 = xor3_u8(
                     ab3,
-                    vld1q_u8(t_even.add(((we >> 24) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 24) & 0xff) * 16)),
+                    ab_ld::<U, 24>(t_even, we),
+                    ab_ld::<U, 24>(t_odd, wo),
                 );
                 ab4 = xor3_u8(
                     ab4,
-                    vld1q_u8(t_even.add(((we >> 32) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 32) & 0xff) * 16)),
+                    ab_ld::<U, 32>(t_even, we),
+                    ab_ld::<U, 32>(t_odd, wo),
                 );
                 ab5 = xor3_u8(
                     ab5,
-                    vld1q_u8(t_even.add(((we >> 40) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 40) & 0xff) * 16)),
+                    ab_ld::<U, 40>(t_even, we),
+                    ab_ld::<U, 40>(t_odd, wo),
                 );
                 ab6 = xor3_u8(
                     ab6,
-                    vld1q_u8(t_even.add(((we >> 48) & 0xff) * 16)),
-                    vld1q_u8(t_odd.add(((wo >> 48) & 0xff) * 16)),
+                    ab_ld::<U, 48>(t_even, we),
+                    ab_ld::<U, 48>(t_odd, wo),
                 );
                 ab7 = xor3_u8(
                     ab7,
-                    vld1q_u8(t_even.add((we >> 56) * 16)),
-                    vld1q_u8(t_odd.add((wo >> 56) * 16)),
+                    ab_ld::<U, 56>(t_even, we),
+                    ab_ld::<U, 56>(t_odd, wo),
                 );
             }
 
@@ -373,14 +418,14 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool>(
                 let table = convert_ptr.add(b_med * 256 * 16);
                 let wa = (chunk_ab_bytes[b_med].as_ptr().add(lane) as *const u64).read_unaligned()
                     as usize;
-                ab0 = veorq_u8(ab0, vld1q_u8(table.add((wa & 0xff) * 16)));
-                ab1 = veorq_u8(ab1, vld1q_u8(table.add(((wa >> 8) & 0xff) * 16)));
-                ab2 = veorq_u8(ab2, vld1q_u8(table.add(((wa >> 16) & 0xff) * 16)));
-                ab3 = veorq_u8(ab3, vld1q_u8(table.add(((wa >> 24) & 0xff) * 16)));
-                ab4 = veorq_u8(ab4, vld1q_u8(table.add(((wa >> 32) & 0xff) * 16)));
-                ab5 = veorq_u8(ab5, vld1q_u8(table.add(((wa >> 40) & 0xff) * 16)));
-                ab6 = veorq_u8(ab6, vld1q_u8(table.add(((wa >> 48) & 0xff) * 16)));
-                ab7 = veorq_u8(ab7, vld1q_u8(table.add((wa >> 56) * 16)));
+                ab0 = veorq_u8(ab0, ab_ld::<U, 0>(table, wa));
+                ab1 = veorq_u8(ab1, ab_ld::<U, 8>(table, wa));
+                ab2 = veorq_u8(ab2, ab_ld::<U, 16>(table, wa));
+                ab3 = veorq_u8(ab3, ab_ld::<U, 24>(table, wa));
+                ab4 = veorq_u8(ab4, ab_ld::<U, 32>(table, wa));
+                ab5 = veorq_u8(ab5, ab_ld::<U, 40>(table, wa));
+                ab6 = veorq_u8(ab6, ab_ld::<U, 48>(table, wa));
+                ab7 = veorq_u8(ab7, ab_ld::<U, 56>(table, wa));
             }
 
             macro_rules! drain_lane {
