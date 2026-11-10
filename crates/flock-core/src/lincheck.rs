@@ -117,7 +117,7 @@
 //!   per byte.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
@@ -1362,22 +1362,30 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
     let (clo, chi) = c.split_at(half);
     let (zlo, zhi) = z.split_at(half);
     if half < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
+        let mut e1 = F256Unreduced::ZERO;
+        let mut einf = F256Unreduced::ZERO;
         for i in 0..half {
-            e1 += chi[i] * zhi[i];
-            einf += (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
+            e1 ^= chi[i].mul_unreduced(zhi[i]);
+            einf ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
         }
-        return (e1, einf);
+        return (e1.reduce(), einf.reduce());
     }
-    (0..half)
+    let (e1, einf) = (0..half)
         .into_par_iter()
-        .map(|i| {
-            let e1_i = chi[i] * zhi[i];
-            let einf_i = (chi[i] + clo[i]) * (zhi[i] + zlo[i]);
-            (e1_i, einf_i)
-        })
-        .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+        .fold(
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |(e1, einf), i| {
+                (
+                    e1 ^ chi[i].mul_unreduced(zhi[i]),
+                    einf ^ (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]),
+                )
+            },
+        )
+        .reduce(
+            || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+            |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+        );
+    (e1.reduce(), einf.reduce())
 }
 
 /// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
@@ -1447,8 +1455,8 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq2, zq3) = z_hi.split_at(half2);
 
     let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
-        let mut e1 = F128::ZERO;
-        let mut einf = F128::ZERO;
+        let mut e1 = F256Unreduced::ZERO;
+        let mut einf = F256Unreduced::ZERO;
         for i in 0..half2 {
             let lo = cq0[i] + r * (cq2[i] + cq0[i]);
             let hi = cq1[i] + r * (cq3[i] + cq1[i]);
@@ -1458,8 +1466,8 @@ fn sumcheck_bind_both_and_eval_next(
             cq1[i] = hi;
             zq0[i] = zlo;
             zq1[i] = zhi;
-            e1 += hi * zhi;
-            einf += (hi + lo) * (zhi + zlo);
+            e1 ^= hi.mul_unreduced(zhi);
+            einf ^= (hi + lo).mul_unreduced(zhi + zlo);
         }
         (e1, einf)
     } else {
@@ -1471,19 +1479,29 @@ fn sumcheck_bind_both_and_eval_next(
             .zip(zq1.par_iter_mut())
             .zip(zq2.par_iter())
             .zip(zq3.par_iter())
-            .map(|(((((((c0, c1), c2), c3), z0), z1), z2), z3)| {
-                let lo = *c0 + r * (*c2 + *c0);
-                let hi = *c1 + r * (*c3 + *c1);
-                let zlo = *z0 + r * (*z2 + *z0);
-                let zhi = *z1 + r * (*z3 + *z1);
-                *c0 = lo;
-                *c1 = hi;
-                *z0 = zlo;
-                *z1 = zhi;
-                (hi * zhi, (hi + lo) * (zhi + zlo))
-            })
-            .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
+            .fold(
+                || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+                |(e1, einf), (((((((c0, c1), c2), c3), z0), z1), z2), z3)| {
+                    let lo = *c0 + r * (*c2 + *c0);
+                    let hi = *c1 + r * (*c3 + *c1);
+                    let zlo = *z0 + r * (*z2 + *z0);
+                    let zhi = *z1 + r * (*z3 + *z1);
+                    *c0 = lo;
+                    *c1 = hi;
+                    *z0 = zlo;
+                    *z1 = zhi;
+                    (
+                        e1 ^ hi.mul_unreduced(zhi),
+                        einf ^ (hi + lo).mul_unreduced(zhi + zlo),
+                    )
+                },
+            )
+            .reduce(
+                || (F256Unreduced::ZERO, F256Unreduced::ZERO),
+                |a, b| (a.0 ^ b.0, a.1 ^ b.1),
+            )
     };
+    let (e1, einf) = (e1.reduce(), einf.reduce());
 
     comb.truncate(half);
     z.truncate(half);
