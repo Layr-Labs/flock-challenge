@@ -13729,6 +13729,22 @@ kernel void zc_r2_horner_oracle(
         ZC_R2_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Test-only: the next completed drain reports `Failed` (and poisons the
+    /// arm, as a real failure does) so callers' CPU replay can be exercised.
+    #[cfg(test)]
+    static ZC_R2_TEST_FAIL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_gpu_ok() -> bool {
+        gpu().is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_fail_next() {
+        ZC_R2_TEST_FAIL.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Read raw physical groups through the production job and selected PSO.
     #[cfg(test)]
     pub(crate) fn zc_r2_test_physical_partials(
@@ -14426,6 +14442,10 @@ kernel void zc_r2_horner_oracle(
             // bounded spin dodges the ~0.3-0.5 ms `waitUntilCompleted` park
             // once per timed prove.
             if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+                return poison(job.cb);
+            }
+            #[cfg(test)]
+            if ZC_R2_TEST_FAIL.swap(false, Ordering::Relaxed) {
                 return poison(job.cb);
             }
             let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
@@ -15988,6 +16008,11 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{
+    zc_r2_test_fail_next, zc_r2_test_gpu_ok, zc_r2_test_reset, zc_r2_test_set_share,
+    zc_r2_test_state,
+};
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

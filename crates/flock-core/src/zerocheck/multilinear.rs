@@ -899,6 +899,14 @@ pub struct UniSkipCompactFold {
     /// ([`fold2_compact_and_round45_into`]) accepts such a state; it treats
     /// those pairs as the known zeros the dense state stores.
     pub dead_tail: bool,
+    /// C19 group-sum layout (set by the K-pass-only AArch64 producer when the
+    /// caller handed it the K pass's `b_out`). Per K group (pairs 2y, 2y+1)
+    /// the 32 delta bytes are `d0_a | d0_b | G_a` instead of
+    /// `d0_a | d0_b | d1_a | d1_b`, and `b_out[y]` holds `G_b` on entry to
+    /// [`fold2_compact_and_round45_into`], with `G = T(d0) + T(d1)` (padded
+    /// pairs as zeros). Under `dead_tail` the fully dead groups' slots stay
+    /// stale (K writes zeros there) while `G_b` is still written as zero.
+    pub g_layout: bool,
 }
 
 impl UniSkipCompactFold {
@@ -982,6 +990,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
         dead_tail: false,
+        g_layout: false,
     };
 
     let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -1264,6 +1273,7 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
             anchors: crate::scratch::take_f128(2 * n_pairs),
             deltas: ScratchBytes::take_full_overwrite(2 * n_pairs * n_chunks),
             dead_tail: false,
+            g_layout: false,
         };
 
         let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -1379,6 +1389,7 @@ pub fn fold_compact_and_compute_round_pair_stream(
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
     assert!(matches!(lanes_per_pass, 1 | 2 | 4 | 8));
     assert!(!compact.dead_tail, "dead-pair compact state is K-pass only");
+    assert!(!compact.g_layout, "group-sum compact state is K-pass only");
     #[cfg(not(target_arch = "aarch64"))]
     {
         let _ = lanes_per_pass;
@@ -1492,6 +1503,7 @@ pub fn fold_compact_and_compute_round_pair(
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
     let n = compact.len();
     assert!(!compact.dead_tail, "dead-pair compact state is K-pass only");
+    assert!(!compact.g_layout, "group-sum compact state is K-pass only");
     assert!(!compact.is_empty() && n.is_power_of_two() && n >= 4);
     assert_eq!(compact.anchors.len(), 2 * n);
     assert_eq!(compact.deltas.len(), 2 * n * table.n_chunks);
@@ -1795,6 +1807,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         padding,
         deltas_backing,
         false,
+        None,
     )
 }
 
@@ -1814,6 +1827,12 @@ fn cascade_k_pairs_per_chunk(n_pairs: usize) -> usize {
 /// or delta stores and the state is marked [`UniSkipCompactFold::dead_tail`].
 /// The round-two message and lookahead are unchanged; every live slot holds
 /// the same bytes.
+///
+/// `k_b_out` (C19, requires `k_pass_only`): the K pass's `b_out` buffer
+/// (`n_pairs / 2` entries). On AArch64 the producer then switches the state to
+/// [`UniSkipCompactFold::g_layout`]: it stores `G_a` in place of each group's
+/// `d1` delta bytes and `G_b[y]` into `k_b_out[y]` (every group, dead ones as
+/// zero). Elsewhere it is left untouched and the layout stays incumbent.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     a_packed: &[u8],
@@ -1825,6 +1844,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     padding: &PaddingSpec,
     deltas_backing: Option<ScratchBytes>,
     k_pass_only: bool,
+    k_b_out: Option<&mut [F128]>,
 ) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
     assert_eq!(k_skip, 6, "lookahead compact round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
@@ -1848,6 +1868,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
         dead_tail: false,
+        g_layout: false,
     };
 
     let n_vars = mlv_challenges.len() - 1;
@@ -1892,6 +1913,23 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         false
     };
     compact.dead_tail = skip_dead;
+    // C19: G_a goes into the d1 delta bytes, G_b into K's `b_out` (see
+    // `UniSkipCompactFold::g_layout`); a null pointer keeps the incumbent
+    // layout. Raw pointer only: K later reads and overwrites the same buffer.
+    assert!(k_b_out.is_none() || k_pass_only, "G layout is K-pass only");
+    if let Some(gb) = &k_b_out {
+        assert_eq!(gb.len(), n_pairs / 2, "G_b needs one slot per K group");
+    }
+    #[cfg(target_arch = "aarch64")]
+    let gb_base = crate::epool::SyncPtr(match k_b_out {
+        Some(gb) => {
+            compact.g_layout = true;
+            gb.as_mut_ptr()
+        }
+        None => core::ptr::null_mut(),
+    });
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = k_b_out;
     #[cfg(target_arch = "aarch64")]
     let horner_weights = m == 32
         && lo_size == 1 << 14
@@ -1950,6 +1988,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 deltas_base.ptr().add(x_hi * delta_chunk_size),
             )
         };
+        // This chunk's G_b slots: its lo_size/2 groups.
+        #[cfg(target_arch = "aarch64")]
+        let gb = if gb_base.ptr().is_null() {
+            gb_base.ptr()
+        } else {
+            // SAFETY: as above, chunk x_hi exclusively owns this range.
+            unsafe { gb_base.ptr().add(x_hi * lo_size / 2) }
+        };
         let pair_idx_base = x_hi * lo_size;
         let row_base = pair_idx_base * 2;
         let mut out = [F128::ZERO; 8];
@@ -1971,6 +2017,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         bp,
                         anchors,
                         deltas,
+                        gb,
                         eq_lo.as_ptr(),
                         lo_size,
                         pair_idx_base,
@@ -1989,6 +2036,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             bp,
                             anchors,
                             deltas,
+                            gb,
                             eq_lo.as_ptr(),
                             lo_size,
                             pair_idx_base,
@@ -2005,6 +2053,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             bp,
                             anchors,
                             deltas,
+                            gb,
                             eq_lo.as_ptr(),
                             lo_size,
                             pair_idx_base,
@@ -2033,6 +2082,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         bp,
                         anchors,
                         deltas,
+                        gb,
                         eq_lo.as_ptr(),
                         lo_size,
                         pair_idx_base,
@@ -2050,6 +2100,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         bp,
                         anchors,
                         deltas,
+                        gb,
                         eq_lo.as_ptr(),
                         lo_size,
                         pair_idx_base,
@@ -2156,6 +2207,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             b_packed.as_ptr().add(row_base * n_chunks),
                             scr_anchors.as_mut_ptr(),
                             scr_deltas.as_mut_ptr(),
+                            // Incumbent layout into the throwaway scratch: the
+                            // real G_a/G_b were written by the prefix pass.
+                            core::ptr::null_mut(),
                             eq_lo.as_ptr(),
                             lo_size,
                             pair_idx_base,
@@ -2189,6 +2243,28 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // fallback have joined, covering every byte including padding rows.
     unsafe { compact.deltas.mark_fully_initialized() };
 
+    // Untimed diagnostic (`FLOCK_C19_G_CHECK=1`, never set for timing runs):
+    // recheck every G against the input codes, report per-branch shares.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if compact.g_layout && std::env::var_os("FLOCK_C19_G_CHECK").is_some() {
+        c19_check_group_sums(
+            &compact.deltas,
+            // SAFETY: every writer has joined; nothing else aliases G_b now.
+            unsafe { std::slice::from_raw_parts(gb_base.ptr(), n_pairs / 2) },
+            compact.dead_tail,
+            a_packed,
+            b_packed,
+            table,
+            lo_size,
+            gpu_prefix,
+            odd_on_gpu && horner_weights,
+            odd_on_gpu,
+            degen,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+        );
+    }
+
     let (sum1, sum_inf) = partials
         .iter()
         .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
@@ -2214,6 +2290,78 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     };
 
     (compact, mlv_challenges[0] * sum1, sum_inf, la)
+}
+
+/// C19 diagnostic behind `FLOCK_C19_G_CHECK=1`: every group's G_a (delta
+/// bytes 16..32 of the group) and G_b must equal `T(d0) + T(d1)` from the
+/// input codes (padded pairs as zeros; a dead-tail fully dead group's G_a
+/// slot is stale by design and skipped).
+/// Prints the chunk split by kernel and the share of b≡1 groups on Horner
+/// chunks (the only branch that pays extra lookups for G); panics on mismatch.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+fn c19_check_group_sums(
+    deltas: &[u8],
+    gb: &[F128],
+    dead_tail: bool,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    table: &UniSkipFoldTable,
+    lo_size: usize,
+    gpu_prefix: usize,
+    horner: bool,
+    odd_on_gpu: bool,
+    degen: bool,
+    mask: usize,
+    useful: usize,
+) {
+    use rayon::prelude::*;
+    let fold = |code: u64| {
+        (0..8).fold(F128::ZERO, |acc, j| {
+            acc + table.data[j * 256 + ((code >> (8 * j)) & 0xff) as usize]
+        })
+    };
+    let code = |p: &[u8], row: usize| u64::from_le_bytes(p[8 * row..8 * row + 8].try_into().unwrap());
+    let ones_is_one = fold(u64::MAX) == F128::ONE;
+    let groups_per_chunk = lo_size / 2;
+    let n_groups = gb.len();
+    let (bad, horner_degen) = (0..n_groups)
+        .into_par_iter()
+        .map(|grp| {
+            let (mut ga, mut gb_want) = (F128::ZERO, F128::ZERO);
+            let mut all_deg = true;
+            let mut live = false;
+            for p in [2 * grp, 2 * grp + 1] {
+                if (p & mask) < useful {
+                    live = true;
+                    let (b0, b1) = (code(b_packed, 2 * p), code(b_packed, 2 * p + 1));
+                    ga += fold(code(a_packed, 2 * p) ^ code(a_packed, 2 * p + 1));
+                    gb_want += fold(b0 ^ b1);
+                    all_deg &= degen && (b0 & b1) == u64::MAX;
+                } else {
+                    all_deg = false;
+                }
+            }
+            let ga_got = F128::new(code(deltas, 4 * grp + 2), code(deltas, 4 * grp + 3));
+            let bad = ((ga_got != ga && (live || !dead_tail)) || gb[grp] != gb_want) as usize;
+            let on_horner = horner && grp / groups_per_chunk < gpu_prefix;
+            (bad, (on_horner && all_deg && ones_is_one) as usize)
+        })
+        .reduce(|| (0, 0), |x, y| (x.0 + y.0, x.1 + y.1));
+    let n_chunks = n_groups / groups_per_chunk;
+    let kind = if horner {
+        "horner"
+    } else if odd_on_gpu {
+        "la<false,true>"
+    } else {
+        "la<false,false>"
+    };
+    eprintln!(
+        "[c19-g-check] groups={n_groups} mismatches={bad} chunks={n_chunks}: la<true,false>={} prefix {kind}={gpu_prefix}; horner b-degenerate groups={horner_degen} ({:.3}% of all groups)",
+        n_chunks - gpu_prefix,
+        100.0 * horner_degen as f64 / n_groups as f64
+    );
+    assert_eq!(bad, 0, "C19 group sums disagree with T(d0)+T(d1)");
 }
 
 /// Portable reference for one lookahead round-two chunk (non-AArch64 builds).
@@ -2334,6 +2482,7 @@ pub(crate) fn fold2_compact_and_round4_into(
     let n_pairs = compact.len();
     let n_groups = n_pairs / 2;
     assert!(!compact.dead_tail, "dead-pair compact state is K-pass only");
+    assert!(!compact.g_layout, "group-sum compact state is K-pass only");
     assert!(n_groups >= 2 && n_groups.is_power_of_two());
     assert_eq!(compact.anchors.len(), 2 * n_pairs);
     assert_eq!(compact.deltas.len(), 2 * n_pairs * table.n_chunks);
@@ -2489,6 +2638,11 @@ fn cascade_k_pass_n_hi(n_vars: usize) -> usize {
 /// Requires `r_next4[1] ≠ 0`; the caller falls back to the incumbent route
 /// otherwise (probability 2⁻¹²⁸ for a sampled challenge; at the ranked shape
 /// this slot is the protocol constant β₀ ≠ 0).
+///
+/// C19 ([`UniSkipCompactFold::g_layout`]): `b_out` must be the buffer the
+/// producer wrote `G_b` into. Since `λ₁T(d0) + λ₃T(d1) = ρ₁T(d0) + λ₃G`, each
+/// side then costs 8 lookups in one `ρ₁` table plus a `λ₃` multiply (16
+/// lookups before); every output slot reads its `G_b` before overwriting it.
 pub(crate) fn fold2_compact_and_round45_into(
     compact: &UniSkipCompactFold,
     table: &UniSkipFoldTable,
@@ -2511,11 +2665,21 @@ pub(crate) fn fold2_compact_and_round45_into(
     assert_ne!(r_par, F128::ZERO, "cascade requires a non-zero r_next4[1]");
 
     // Same λ composition as the incumbent K pass: the anchors take one
-    // ordinary ρ₂ fold, only the two deltas carry ρ₁.
+    // ordinary ρ₂ fold, only the two deltas carry ρ₁. The G layout needs the
+    // single table T_ρ₁ and λ₃ as a multiplier (`table_l3` stays empty).
     let lambda1 = rho1 * (F128::ONE + rho2);
     let lambda3 = rho1 * rho2;
-    let table_l1 = table.scaled_linear(lambda1);
-    let table_l3 = table.scaled_linear(lambda3);
+    let g_layout = compact.g_layout;
+    assert!(
+        !g_layout || cfg!(target_arch = "aarch64"),
+        "group-sum layout is produced and consumed on AArch64 only"
+    );
+    let table_l1 = table.scaled_linear(if g_layout { rho1 } else { lambda1 });
+    let table_l3 = if g_layout {
+        Vec::new()
+    } else {
+        table.scaled_linear(lambda3)
+    };
 
     let n_vars = r_next4.len() - 1;
     let eq = SplitEqGhash::with_n_hi(&r_next4[1..], cascade_k_pass_n_hi(n_vars));
@@ -2581,21 +2745,29 @@ pub(crate) fn fold2_compact_and_round45_into(
             );
             let eq_ptr = eq_lo.as_ptr();
             let out_ptr = outv.as_mut_ptr();
-            match (fused_k, compact.dead_tail) {
+            macro_rules! k {
+                ($kernel:ident, $dead:literal, $g:literal) => {
+                    $kernel::<$dead, $g>(
+                        t1, t3, rho2, lambda3, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size,
+                        degen, out_ptr,
+                    )
+                };
+            }
+            match (fused_k, compact.dead_tail, g_layout) {
                 #[cfg(target_feature = "sha3")]
-                (true, true) => fold2_compact_and_round45_chunk_neon_8_fused::<true>(
-                    t1, t3, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
-                ),
+                (true, true, true) => k!(fold2_compact_and_round45_chunk_neon_8_fused, true, true),
                 #[cfg(target_feature = "sha3")]
-                (true, false) => fold2_compact_and_round45_chunk_neon_8_fused::<false>(
-                    t1, t3, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
-                ),
-                (_, true) => fold2_compact_and_round45_chunk_neon_8::<true>(
-                    t1, t3, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
-                ),
-                (_, false) => fold2_compact_and_round45_chunk_neon_8::<false>(
-                    t1, t3, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
-                ),
+                (true, true, false) => k!(fold2_compact_and_round45_chunk_neon_8_fused, true, false),
+                #[cfg(target_feature = "sha3")]
+                (true, false, true) => k!(fold2_compact_and_round45_chunk_neon_8_fused, false, true),
+                #[cfg(target_feature = "sha3")]
+                (true, false, false) => {
+                    k!(fold2_compact_and_round45_chunk_neon_8_fused, false, false)
+                }
+                (_, true, true) => k!(fold2_compact_and_round45_chunk_neon_8, true, true),
+                (_, true, false) => k!(fold2_compact_and_round45_chunk_neon_8, true, false),
+                (_, false, true) => k!(fold2_compact_and_round45_chunk_neon_8, false, true),
+                (_, false, false) => k!(fold2_compact_and_round45_chunk_neon_8, false, false),
             }
         }
 
@@ -5188,6 +5360,7 @@ mod tests {
                 &f.padding,
                 Some(backing),
                 true,
+                None,
             );
             let skip_on = std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none();
             assert_eq!(sparse.dead_tail, cfg!(target_arch = "aarch64") && skip_on);
@@ -5248,10 +5421,360 @@ mod tests {
             &f.padding,
             Some(backing),
             true,
+            None,
         );
         unsafe { std::env::remove_var("FLOCK_NO_R2_DEADPAIR_SKIP") };
         assert!(!off.dead_tail, "kill switch keeps the dense state");
         off.recycle();
+        crate::scratch::clear();
+    }
+
+    /// `T(code)` through the unscaled fold table.
+    fn c19_fold(table: &UniSkipFoldTable, code: &[u8]) -> F128 {
+        (0..8).fold(F128::ZERO, |acc, j| acc + table.data[j * 256 + code[j] as usize])
+    }
+
+    fn c19_bytes_f128(bytes: &[u8]) -> F128 {
+        F128::new(
+            u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        )
+    }
+
+    /// Checks a G-layout state against the incumbent dense state `dense`:
+    /// live anchors and d0 bytes equal, `G_a` in delta bytes 16..32 and
+    /// `gb[y]` equal `T(d0)+T(d1)` of the dense deltas. A dead-tail fully
+    /// dead group must still hold the poisoned (never written) bytes.
+    fn c19_assert_layout(dense: &UniSkipCompactFold, g: &UniSkipCompactFold, gb: &[F128], table: &UniSkipFoldTable, ctx: &str) {
+        assert!(g.g_layout && !dense.g_layout, "{ctx}");
+        let poison_bytes = {
+            let v = [LA_POISON];
+            unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), 16) }.to_vec()
+        };
+        assert_eq!(gb.len(), dense.len() / 2);
+        for y in 0..dense.len() / 2 {
+            let dd = &dense.deltas[32 * y..32 * y + 32];
+            let gd = &g.deltas[32 * y..32 * y + 32];
+            let fully_dead = (2 * y & 127) >= 121;
+            let ga = c19_fold(table, &dd[0..8]) + c19_fold(table, &dd[16..24]);
+            let gbw = c19_fold(table, &dd[8..16]) + c19_fold(table, &dd[24..32]);
+            assert_eq!(gb[y], gbw, "G_b group {y}: {ctx}");
+            if g.dead_tail && fully_dead {
+                assert_eq!(&gd[0..16], &poison_bytes[..], "dead d0 written, group {y}: {ctx}");
+                assert_eq!(&gd[16..32], &poison_bytes[..], "dead G_a written, group {y}: {ctx}");
+                continue;
+            }
+            assert_eq!(&gd[0..16], &dd[0..16], "d0 group {y}: {ctx}");
+            assert_eq!(c19_bytes_f128(&gd[16..32]), ga, "G_a group {y}: {ctx}");
+            for p in [2 * y, 2 * y + 1] {
+                if !(g.dead_tail && (p & 127) >= 121) {
+                    assert_eq!(&g.anchors[2 * p..2 * p + 2], &dense.anchors[2 * p..2 * p + 2], "anchors pair {p}: {ctx}");
+                }
+            }
+        }
+    }
+
+    /// Runs the cascade K pass on the incumbent state and on the G state
+    /// (whose `b_out` starts as `gb`) with the fused and the one-body kernel
+    /// and requires identical outputs, round-four message and lookahead.
+    fn c19_assert_k_matches(dense: &UniSkipCompactFold, g: &UniSkipCompactFold, gb: &[F128], table: &UniSkipFoldTable, r_next4: &[F128], rhos: &[(F128, F128)], ctx: &str) {
+        let n_groups = dense.len() / 2;
+        for fused_off in [false, true] {
+            unsafe {
+                if fused_off {
+                    std::env::set_var("FLOCK_NO_ZC_K_FUSED", "1");
+                } else {
+                    std::env::remove_var("FLOCK_NO_ZC_K_FUSED");
+                }
+            }
+            for &(rho1, rho2) in rhos {
+                let mut a_d = vec![LA_POISON; n_groups];
+                let mut b_d = vec![LA_POISON; n_groups];
+                let (m1_d, mi_d, la_d) =
+                    fold2_compact_and_round45_into(dense, table, rho1, rho2, r_next4, &mut a_d, &mut b_d);
+                let mut a_g = vec![LA_POISON; n_groups];
+                // Same mutable buffer goes in as G_b and comes out as B''.
+                let mut b_g = gb.to_vec();
+                let (m1_g, mi_g, la_g) =
+                    fold2_compact_and_round45_into(g, table, rho1, rho2, r_next4, &mut a_g, &mut b_g);
+                let c = format!("{ctx} fused_off={fused_off} rho1={rho1:?} rho2={rho2:?}");
+                assert_eq!((m1_g, mi_g), (m1_d, mi_d), "round-four message: {c}");
+                assert_eq!(la_g.c, la_d.c, "round-five lookahead: {c}");
+                assert!(a_g == a_d, "A'' outputs differ: {c}");
+                assert!(b_g == b_d, "B'' outputs differ: {c}");
+            }
+        }
+        unsafe { std::env::remove_var("FLOCK_NO_ZC_K_FUSED") };
+    }
+
+    /// C19 — synthetic compact states with every K-lane class: random,
+    /// whole b≡1 round-five groups (`b_flat` ones path), `db0 = db1 = 0`
+    /// with differing anchors, `db0 = 0` but `G_b ≠ 0`, `db0 ≠ 0` with
+    /// `G_b = 0`, and (dead tail) the boundary group 60 plus zero groups
+    /// 61–63 whose anchors, delta slots and even `G_b` slots are poison. The
+    /// G-layout K (fused and one-body) must equal the incumbent formula on
+    /// the dense state bit for bit. A `G_b` overwritten before it is read
+    /// would feed a lane its neighbour's output instead and change `B''`.
+    #[test]
+    fn c19_k_group_sum_formula_matches_incumbent_k() {
+        let table = UniSkipFoldTable::new(6, F128::new(0x0C19_0003, 0x5EED));
+        let mut rng = Rng::new(0x0C19_0004);
+        for (log_groups, dead_tail) in [(10usize, false), (17, false), (17, true)] {
+            let n_groups = 1usize << log_groups;
+            let n_pairs = 2 * n_groups;
+            let mut anchors = rng.f128_vec(2 * n_pairs);
+            let mut deltas: Vec<u8> = (0..32 * n_groups).map(|_| rng.next_u64() as u8).collect();
+            for y in 0..n_groups {
+                let d = &mut deltas[32 * y..32 * y + 32];
+                match y % 16 {
+                    // Four consecutive K outputs = one round-five group, b ≡ 1.
+                    0..=3 => {
+                        d[8..16].fill(0);
+                        d[24..32].fill(0);
+                        anchors[4 * y + 1] = F128::ONE;
+                        anchors[4 * y + 3] = F128::ONE;
+                    }
+                    4 => {
+                        d[8..16].fill(0);
+                        d[24..32].fill(0);
+                    }
+                    5 => d[8..16].fill(0),
+                    6 => {
+                        let (lo, hi) = d.split_at_mut(24);
+                        hi.copy_from_slice(&lo[8..16]);
+                    }
+                    7 => {
+                        // b side flat but a side zero.
+                        d[..8].fill(0);
+                        d[16..24].fill(0);
+                        anchors[4 * y] = F128::ZERO;
+                        anchors[4 * y + 2] = F128::ZERO;
+                    }
+                    _ => {}
+                }
+            }
+            // Dense oracle state: dead-tail pairs hold true zeros.
+            if dead_tail {
+                for p in 0..n_pairs {
+                    if (p & 127) >= 121 {
+                        anchors[2 * p] = F128::ZERO;
+                        anchors[2 * p + 1] = F128::ZERO;
+                        deltas[16 * p..16 * p + 16].fill(0);
+                    }
+                }
+            }
+            let to_f128 = |bytes: &[u8]| -> Vec<F128> { bytes.chunks(16).map(c19_bytes_f128).collect() };
+            let dense = UniSkipCompactFold {
+                anchors: anchors.clone(),
+                deltas: ScratchBytes::from_initialized_f128(to_f128(&deltas)),
+                dead_tail: false,
+                g_layout: false,
+            };
+            let mut g_anchors = anchors.clone();
+            let mut g_deltas = deltas.clone();
+            let mut gb = vec![F128::ZERO; n_groups];
+            let poison = to_f128(&[0x5au8; 16])[0] + LA_POISON;
+            for y in 0..n_groups {
+                let d = &deltas[32 * y..32 * y + 32];
+                let ga = c19_fold(&table, &d[0..8]) + c19_fold(&table, &d[16..24]);
+                gb[y] = c19_fold(&table, &d[8..16]) + c19_fold(&table, &d[24..32]);
+                let slot = &mut g_deltas[32 * y + 16..32 * y + 32];
+                slot[..8].copy_from_slice(&ga.lo.to_le_bytes());
+                slot[8..].copy_from_slice(&ga.hi.to_le_bytes());
+            }
+            if dead_tail {
+                for p in 0..n_pairs {
+                    if (p & 127) >= 121 {
+                        g_anchors[2 * p] = poison;
+                        g_anchors[2 * p + 1] = LA_POISON;
+                        // Pair 121's slot is G_a of the live boundary group.
+                        if (p & 127) != 121 {
+                            for (i, byte) in g_deltas[16 * p..16 * p + 16].iter_mut().enumerate() {
+                                *byte = 0xc3 ^ i as u8;
+                            }
+                        }
+                    }
+                }
+                for y in 0..n_groups {
+                    if (2 * y & 127) >= 121 {
+                        gb[y] = LA_POISON;
+                    }
+                }
+            }
+            let g = UniSkipCompactFold {
+                anchors: g_anchors,
+                deltas: ScratchBytes::from_initialized_f128(to_f128(&g_deltas)),
+                dead_tail,
+                g_layout: true,
+            };
+            let mut r_next4 = vec![F128::ONE; log_groups];
+            for slot in r_next4[1..].iter_mut() {
+                *slot = rng.f128();
+            }
+            let rhos = [
+                (rng.f128(), rng.f128()),
+                (F128::ONE, rng.f128()),
+                (rng.f128(), F128::ONE),
+                (F128::ZERO, rng.f128()),
+            ];
+            let ctx = format!("log_groups={log_groups} dead_tail={dead_tail}");
+            for degen_off in [false, true] {
+                unsafe {
+                    if degen_off {
+                        std::env::set_var("FLOCK_NO_R2_DEGEN", "1");
+                    } else {
+                        std::env::remove_var("FLOCK_NO_R2_DEGEN");
+                    }
+                }
+                c19_assert_k_matches(&dense, &g, &gb, &table, &r_next4, &rhos, &format!("{ctx} degen_off={degen_off}"));
+            }
+            unsafe { std::env::remove_var("FLOCK_NO_R2_DEGEN") };
+        }
+    }
+
+    /// C19 — production producer + K end to end: with the K pass's `b_out`
+    /// handed in, round two (incl. its GPU prefix when the arm is up, and
+    /// every R2 setting) writes `G_a` into the odd-pair delta bytes and
+    /// `G_b` into `b_out`, keeps the round-two message and lookahead, and
+    /// the K pass on it equals the incumbent K on the dense state. Poisoned
+    /// pool/backing: dead-tail slots stay stale and are never read. Without
+    /// `b_out` (the `FLOCK_NO_C19_G=1` route) the layout stays incumbent.
+    #[test]
+    fn c19_group_sum_layout_end_to_end_matches_dense() {
+        for (m, ranked) in [(25usize, true), (20, false), (16, true)] {
+            let f = la_fixture(m, 0x0C19_0001 ^ m as u64, ranked);
+            let r_next4 = la_r_next4(&f);
+            let rhos = [(f.rho_grid[3], f.rho_grid[2]), (F128::ONE, f.rho_grid[3])];
+            let deltas_f128 = 1usize << (f.m - 7);
+            with_round2_settings(|| {
+                crate::scratch::clear();
+                let (dense, d1, di, dla) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                    &f.a_packed, &f.b_packed, f.m, 6, &f.table, &f.mlv, &f.padding, None,
+                );
+                let n_pairs = dense.len();
+                // Poisoned anchors (pool) and deltas (initialized donor).
+                crate::scratch::clear();
+                crate::scratch::give_f128(vec![LA_POISON; 2 * n_pairs]);
+                let backing = ScratchBytes::from_initialized_f128(vec![LA_POISON; deltas_f128]);
+                let mut gb = vec![LA_POISON; n_pairs / 2];
+                let (g, g1, gi, gla) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+                    &f.a_packed, &f.b_packed, f.m, 6, &f.table, &f.mlv, &f.padding, Some(backing), true, Some(&mut gb),
+                );
+                assert_eq!((g1, gi), (d1, di), "round-two message m={m}");
+                assert_eq!(gla.c, dla.c, "round-three lookahead m={m}");
+                let ctx = format!("m={m} ranked={ranked} dead_tail={}", g.dead_tail);
+                if cfg!(target_arch = "aarch64") {
+                    c19_assert_layout(&dense, &g, &gb, &f.table, &ctx);
+                    c19_assert_k_matches(&dense, &g, &gb, &f.table, &r_next4, &rhos, &ctx);
+                } else {
+                    assert!(!g.g_layout && gb.iter().all(|x| *x == LA_POISON), "{ctx}");
+                }
+                let (plain, _, _, _) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+                    &f.a_packed, &f.b_packed, f.m, 6, &f.table, &f.mlv, &f.padding, None, true, None,
+                );
+                assert!(!plain.g_layout, "no b_out, incumbent layout");
+                dense.recycle();
+                g.recycle();
+                plain.recycle();
+                crate::scratch::clear();
+            });
+        }
+    }
+
+    /// C19 — the round-two GPU products arm at a forced prefix share: both a
+    /// completed prefix and a failed drain (CPU replay into throwaway
+    /// scratch with a null `G_b`) must leave the real `G_a`/`G_b` exactly as
+    /// the CPU-only layout oracle requires. Process-global arm state: the
+    /// test restores it on exit.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn c19_group_sums_survive_gpu_prefix_and_failed_drain() {
+        if !crate::gpu_commit::zc_r2_test_gpu_ok() {
+            eprintln!("skipping GPU test: no Metal");
+            return;
+        }
+        let f = la_fixture(26, 0x0C19_0005, true);
+        let r_next4 = la_r_next4(&f);
+        let rhos = [(f.rho_grid[3], f.rho_grid[2])];
+        let deltas_f128 = 1usize << (f.m - 7);
+        crate::scratch::clear();
+        let (dense, d1, di, dla) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+            &f.a_packed, &f.b_packed, f.m, 6, &f.table, &f.mlv, &f.padding, None,
+        );
+        let n_pairs = dense.len();
+        // lo = 2^8, hi = 2^11 at m = 26: the arm's fixed-shape gates pass.
+        let hi_size = 1usize << 11;
+        for fail in [false, true] {
+            crate::gpu_commit::zc_r2_test_reset();
+            crate::gpu_commit::zc_r2_test_set_share(hi_size / 2);
+            if fail {
+                crate::gpu_commit::zc_r2_test_fail_next();
+            }
+            let backing = ScratchBytes::from_initialized_f128(vec![LA_POISON; deltas_f128]);
+            let mut gb = vec![LA_POISON; n_pairs / 2];
+            let (g, g1, gi, gla) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+                &f.a_packed, &f.b_packed, f.m, 6, &f.table, &f.mlv, &f.padding, Some(backing), true, Some(&mut gb),
+            );
+            let (tuned, poisoned) = crate::gpu_commit::zc_r2_test_state();
+            eprintln!("[c19-gpu] fail={fail} tuned={tuned} poisoned={poisoned}");
+            assert_eq!(poisoned, fail, "drain outcome as forced (fail={fail})");
+            if !fail {
+                assert_eq!(tuned, hi_size / 2, "prefix share stays published");
+            }
+            assert_eq!((g1, gi), (d1, di), "round-two message fail={fail}");
+            assert_eq!(gla.c, dla.c, "round-three lookahead fail={fail}");
+            let ctx = format!("gpu fail={fail}");
+            c19_assert_layout(&dense, &g, &gb, &f.table, &ctx);
+            c19_assert_k_matches(&dense, &g, &gb, &f.table, &r_next4, &rhos, &ctx);
+            g.recycle();
+        }
+        crate::gpu_commit::zc_r2_test_reset();
+        dense.recycle();
+        crate::scratch::clear();
+    }
+
+    /// C19 — round one's provenance token survives the G layout: a donated
+    /// full-overwrite backing (not yet initialized, so no dead-pair skip and
+    /// every byte written) handed to the K-pass-only producer *with* `b_out`
+    /// still stages its token on recycle, and the next take of that exact
+    /// allocation hits. An initialized backing does take the dead-pair skip.
+    #[test]
+    fn c19_group_sum_layout_keeps_donation_provenance() {
+        const TAG: u64 = 0xA8F1_2002_0000_0C19;
+        // m = 25: K chunks hold whole 128-pair blocks, so the skip can engage.
+        let f = la_fixture(25, 0xF011_C0DE_0C19, true);
+        let deltas_f128 = 1usize << (f.m - 7);
+        crate::scratch::clear();
+        let (dense, _, _, _) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+            &f.a_packed, &f.b_packed, f.m, 6, &f.table, &f.mlv, &f.padding, None,
+        );
+        let n_pairs = dense.len();
+        let donor = ScratchBytes::from_f128_full_overwrite(vec![LA_POISON; deltas_f128], TAG);
+        let mut gb = vec![LA_POISON; n_pairs / 2];
+        let (g, _, _, _) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+            &f.a_packed, &f.b_packed, f.m, 6, &f.table, &f.mlv, &f.padding, Some(donor), true, Some(&mut gb),
+        );
+        assert!(!g.dead_tail, "uninitialized backing must not skip dead pairs");
+        if cfg!(target_arch = "aarch64") {
+            c19_assert_layout(&dense, &g, &gb, &f.table, "donated full-overwrite");
+        }
+        g.recycle();
+        let (mut held, hit) = crate::scratch::take_f128_with_token(deltas_f128, TAG);
+        assert!(hit, "G-layout R2 must stage the completed donor backing");
+        // Initialized backing: the dead-pair skip engages (when enabled);
+        // re-poisoned so a stray dead-slot store would show.
+        held.fill(LA_POISON);
+        let backing = ScratchBytes::from_initialized_f128(held);
+        let (g2, _, _, _) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+            &f.a_packed, &f.b_packed, f.m, 6, &f.table, &f.mlv, &f.padding, Some(backing), true, Some(&mut gb),
+        );
+        let skip_on = std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none();
+        assert_eq!(g2.dead_tail, cfg!(target_arch = "aarch64") && skip_on);
+        if cfg!(target_arch = "aarch64") {
+            c19_assert_layout(&dense, &g2, &gb, &f.table, "initialized backing");
+        }
+        g2.recycle();
+        dense.recycle();
         crate::scratch::clear();
     }
 

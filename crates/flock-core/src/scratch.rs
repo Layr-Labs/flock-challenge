@@ -712,6 +712,13 @@ pub fn clear() {
     STAGED.lock().unwrap().clear();
 }
 
+/// Kill switch for the C19 group-sum layout: `FLOCK_NO_C19_G=1` keeps the
+/// incumbent compact layout (round two stores d1, K reads it). Read once per
+/// prove by the zerocheck driver, never inside a kernel.
+pub(crate) fn r2_group_sums_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_C19_G").is_none_or(|v| v != *"1")
+}
+
 // ---------------------------------------------------------------------------
 // Byte-buffer pool (the lincheck stripe).
 //

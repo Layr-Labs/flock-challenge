@@ -800,6 +800,15 @@ fn prove_packed_padded_inner<C: Challenger>(
     // only the cascade K pass will read may skip its dead padding pairs.
     let use_cascade = use_lookahead && n_mlv >= 7 && r[k_skip + 3] != F128::ZERO && !cascade2_off();
 
+    // C19 group-sum layout: round two writes each K group's G_b straight into
+    // the K pass's `b_out`, which K then reads and overwrites slot by slot, so
+    // the buffer is taken here (inside the round-two timer) instead of in K.
+    // `FLOCK_NO_C19_G=1` keeps the incumbent layout and take point.
+    let mut k_b_out = (cfg!(target_arch = "aarch64")
+        && use_cascade
+        && crate::scratch::r2_group_sums_enabled())
+    .then(|| crate::scratch::take_f128_unpinned(1usize << (m - k_skip - 2)));
+
     let (compact_mlv, msg_1, msg_inf, lookahead) = if use_lookahead {
         let (compact, m1, mi, la) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
             a_packed,
@@ -811,6 +820,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             padding,
             compact_deltas,
             use_cascade,
+            k_b_out.as_deref_mut(),
         );
         (compact, m1, mi, Some(la))
     } else {
@@ -944,7 +954,10 @@ fn prove_packed_padded_inner<C: Challenger>(
         // next round, and the pinned slots already carry process-lifetime
         // Metal views (see `fold_compact_and_compute_round_pair`).
         let mut a_out = crate::scratch::take_f128_unpinned(n_groups);
-        let mut b_out = crate::scratch::take_f128_unpinned(n_groups);
+        // Under the G layout `b_out` already holds G_b (see `k_b_out`).
+        let mut b_out = k_b_out
+            .take()
+            .unwrap_or_else(|| crate::scratch::take_f128_unpinned(n_groups));
         if use_cascade {
             let (m4_1, m4_inf, la5) = fold2_compact_and_round45_into(
                 &compact_mlv,
