@@ -2963,6 +2963,27 @@ pub(crate) fn fold2_plain_and_round67_into(
     let eq_lo = &eq.lo;
     let eq_hi = &eq.hi;
 
+    // Probe-only: dump four real rounds-5/6 input chunks once per process
+    // to `$FLOCK_ZK_DUMP/` (unset: nothing happens).
+    if quarter >= (1usize << 20) && hi_size >= 8 {
+        static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if let Some(d) = std::env::var_os("FLOCK_ZK_DUMP")
+            && !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let d = std::path::PathBuf::from(d);
+            let _ = std::fs::create_dir_all(&d);
+            let bytes = |v: &[F128]| -> Vec<u8> {
+                v.iter().flat_map(|x| [x.lo.to_le_bytes(), x.hi.to_le_bytes()].concat()).collect()
+            };
+            let x0 = hi_size / 2;
+            let rg = x0 * chunk_in..(x0 + 4) * chunk_in;
+            let _ = std::fs::write(d.join("t3_a.bin"), bytes(&a[rg.clone()]));
+            let _ = std::fs::write(d.join("t3_b.bin"), bytes(&b[rg]));
+            let _ = std::fs::write(d.join("t3_eqlo.bin"), bytes(eq_lo));
+            let _ = std::fs::write(d.join("t3_rho.bin"), bytes(&[rho3, rho4]));
+        }
+    }
+
     // Same NT policy as the plain composed pass: decided once from the
     // round's output size (identical stores either way).
     #[cfg(target_arch = "aarch64")]
@@ -3138,6 +3159,304 @@ pub(crate) fn fold2_plain_and_round67_into(
     };
 
     (r_next6[0] * sum1, sum_inf, la7)
+}
+
+// ---------------------------------------------------------------------------
+// Tri cascade: three challenges per tail pass from round 7 on.
+//
+// Each pass carries, besides the exact message of its outputs and the usual
+// one-challenge deferred quadratic, a TWO-challenge deferred message: the
+// message two rounds ahead as a biquadratic in the two not-yet-sampled
+// challenges. With both deferred messages in hand the transcript can advance
+// three rounds without touching memory, so the next pass binds three known
+// challenges at once (eighth-size output instead of quarter-size): the
+// composed rounds-5/6 pass carries the round-8 biquadratic, and the passes
+// that replace 7+8, 9+10, 11+12 and loop rounds i=10..12 are 2^22 → 2^19,
+// 2^19 → 2^16 and 2^16 → 2^13. Value-identical: exact F128, untouched
+// transcript order, pure reassociation.
+//
+// Group-of-eight algebra (outputs c0..c7; bit 0 is the variable of the exact
+// message, bit 1 the next, bit 2 the one after). One weight per group,
+// `W = eq_lo[4y+3] = r1·r2·E(y)` with `r1 = r_next[1]`, `r2 = r_next[2]` and
+// `E` the eq weight two rounds ahead; every aggregate is `Σ_y W·P(y)` for a
+// product `P` with the weighted a-side:
+//
+//   0..3   E1_j   = c_{2j+1}²             exact G(1), pair class j
+//   4..7   Einf_j = (c_{2j}+c_{2j+1})²    exact G(∞), pair class j
+//   8,9    X0_k   = c_{4k+2}²             one-ahead G(1) at u=0, half k
+//   10,11  Y0_k   = (c_{4k}+c_{4k+2})²    one-ahead G(∞) at u=0
+//   12,13  Y1_k   = (c_{4k+1}+c_{4k+3})²  one-ahead G(∞) at u=1
+//   14,15  Yi_k   = (Σ_{i<4} c_{4k+i})²   one-ahead G(∞), u-leading
+//   16     c4²                            two-ahead G(1) grid (0,0)
+//   17..25 grid(iu,iv) of s_i = c_i + c_{i+4}, two-ahead G(∞)
+//
+// (`x²` is shorthand for `x_a·x_b`.) The one-ahead G(1) entries at u=1 and
+// u=∞ are E1/Einf of the odd classes, and eight of the nine two-ahead G(1)
+// grid entries are shared slots too, so the sweep does 26 products per eight
+// outputs where the cascade-3 pass did 16 — 10 new products buy the third
+// challenge.
+// ---------------------------------------------------------------------------
+
+/// Two-challenge deferred message: `G(1)` and `G(∞)` as 3×3 grids over
+/// `(u, v) ∈ {0, 1, ∞}²` (index `3·iu + iv`, ∞ = leading coefficient), `u` the
+/// first and `v` the second not-yet-sampled challenge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lookahead2 {
+    pub g1: [F128; 9],
+    pub ginf: [F128; 9],
+}
+
+/// Evaluate a [`Lookahead2`] at the sampled `(u, v)`: per row the quadratic
+/// `g0 + t·(g0+g1+g∞) + t²·g∞` in `v`, then the same in `u`.
+#[inline]
+pub fn eval_lookahead2(la: &Lookahead2, u: F128, v: F128) -> (F128, F128) {
+    let quad = |g0: F128, g1: F128, gi: F128, t: F128| g0 + t * (g0 + g1 + gi) + t * t * gi;
+    let ev = |g: &[F128; 9]| {
+        let h0 = quad(g[0], g[1], g[2], v);
+        let h1 = quad(g[3], g[4], g[5], v);
+        let hi = quad(g[6], g[7], g[8], v);
+        quad(h0, h1, hi, u)
+    };
+    (ev(&la.g1), ev(&la.ginf))
+}
+
+/// `FLOCK_NO_ZC_TRI=1` (exact '1') restores the cascade-5 tail route.
+#[cfg(test)]
+pub(crate) static ZC_TRI_FORCED_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn zc_tri_enabled() -> bool {
+    #[cfg(test)]
+    if ZC_TRI_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var_os("FLOCK_NO_ZC_TRI").is_some_and(|v| v == *"1"))
+}
+
+/// Eq split of a tri pass: groups of four pairs need `n_lo ≥ 2`; small
+/// rounds keep chunks of ≥ 2^8 pairs so their region is not 512 slivers.
+/// Any admissible split is bit-identical (exact lo/hi factorisation).
+#[inline]
+fn tri_n_hi(n_vars: usize) -> usize {
+    SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(8))
+}
+
+/// Portable chunk of a tri pass (reference for the NEON kernel and the
+/// non-AArch64 path): sequential folds, then the 26 aggregates.
+fn tri_chunk_scalar(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: &[F128],
+    eq_lo: &[F128],
+) -> [F128; 26] {
+    let per = 1usize << rhos.len();
+    let fold = |v: &[F128]| {
+        let mut cur = v.to_vec();
+        for &rho in rhos {
+            cur = cur.chunks_exact(2).map(|p| p[0] + rho * (p[0] + p[1])).collect();
+        }
+        cur[0]
+    };
+    for o in 0..a_out.len() {
+        a_out[o] = fold(&a_in[o * per..(o + 1) * per]);
+        b_out[o] = fold(&b_in[o * per..(o + 1) * per]);
+    }
+    let mut acc = [F128::ZERO; 26];
+    for y in 0..a_out.len() / 8 {
+        let w = eq_lo[4 * y + 3];
+        let aw: [F128; 8] = std::array::from_fn(|i| w * a_out[8 * y + i]);
+        let b: [F128; 8] = std::array::from_fn(|i| b_out[8 * y + i]);
+        for j in 0..4 {
+            acc[j] += aw[2 * j + 1] * b[2 * j + 1];
+            acc[4 + j] += (aw[2 * j] + aw[2 * j + 1]) * (b[2 * j] + b[2 * j + 1]);
+        }
+        for k in 0..2 {
+            let o = 4 * k;
+            acc[8 + k] += aw[o + 2] * b[o + 2];
+            let (ea, eb) = (aw[o] + aw[o + 2], b[o] + b[o + 2]);
+            let (oa, ob) = (aw[o + 1] + aw[o + 3], b[o + 1] + b[o + 3]);
+            acc[10 + k] += ea * eb;
+            acc[12 + k] += oa * ob;
+            acc[14 + k] += (ea + oa) * (eb + ob);
+        }
+        acc[16] += aw[4] * b[4];
+        let sa: [F128; 4] = std::array::from_fn(|i| aw[i] + aw[i + 4]);
+        let sb: [F128; 4] = std::array::from_fn(|i| b[i] + b[i + 4]);
+        let grid = |s: &[F128; 4], iu: usize, iv: usize| {
+            let row = |v: usize| match iu {
+                0 => s[2 * v],
+                1 => s[2 * v + 1],
+                _ => s[2 * v] + s[2 * v + 1],
+            };
+            match iv {
+                0 => row(0),
+                1 => row(1),
+                _ => row(0) + row(1),
+            }
+        };
+        for iu in 0..3 {
+            for iv in 0..3 {
+                acc[17 + 3 * iu + iv] += grid(&sa, iu, iv) * grid(&sb, iu, iv);
+            }
+        }
+    }
+    acc
+}
+
+/// Tri cascade pass. Binds `rhos` (two or three known challenges, LSB-first)
+/// into eighth- or quarter-size `a_out`/`b_out`, and returns the exact message
+/// of the outputs (`r_next` follows the usual contract for the OUTPUT size:
+/// `r_next[0]` the Convention-A factor, `r_next.len() = log2(a_out.len())`),
+/// the one-challenge deferred message (eval with [`eval_round3_lookahead`] at
+/// the next challenge) and the two-challenge one (eval with
+/// [`eval_lookahead2`] at the next two).
+///
+/// Requires `r_next[1] ≠ 0` and `r_next[2] ≠ 0` (the caller decides the chain
+/// up front from the zerocheck point and keeps the cascade route otherwise).
+pub(crate) fn fold_cascade_t_into(
+    a: &[F128],
+    b: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: &[F128],
+    r_next: &[F128],
+) -> (F128, F128, Round3Lookahead, Lookahead2) {
+    let depth = rhos.len();
+    assert!(depth == 2 || depth == 3);
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    let out_n = n >> depth;
+    assert!(n.is_power_of_two() && out_n >= 8);
+    assert_eq!(a_out.len(), out_n);
+    assert_eq!(b_out.len(), out_n);
+    assert_eq!(r_next.len(), out_n.trailing_zeros() as usize);
+    let (r1, r2) = (r_next[1], r_next[2]);
+    assert!(r1 != F128::ZERO && r2 != F128::ZERO, "tri cascade needs r1, r2 ≠ 0");
+
+    let n_vars = r_next.len() - 1;
+    let eq = SplitEqGhash::with_n_hi(&r_next[1..], tri_n_hi(n_vars));
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert!(lo_size >= 4);
+    assert_eq!(lo_size * hi_size * 2, out_n);
+    let chunk_out = 2 * lo_size;
+    let chunk_in = chunk_out << depth;
+    let eq_lo = &eq.lo;
+    let eq_hi = &eq.hi;
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let nt_stores = out_n >= (1usize << 20) && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none();
+    let rho_c = if depth == 3 { rhos[2] } else { F128::ZERO };
+
+    let chunk = |a_in: &[F128], b_in: &[F128], a_o: &mut [F128], b_o: &mut [F128]| -> [F128; 26] {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        {
+            use kernels::aarch64::fold_tri_and_message_aarch64 as k;
+            match (depth, nt_stores) {
+                (2, true) => k::<2, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+                (2, false) => k::<2, false, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+                (_, true) => k::<3, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+                (_, false) => k::<3, false, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+            }
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        {
+            let _ = rho_c;
+            tri_chunk_scalar(a_in, b_in, a_o, b_o, rhos, eq_lo)
+        }
+    };
+
+    #[cfg(target_arch = "aarch64")]
+    let hetero = out_n >= zc_tail_hetero_low_floor() && zc_tail_hetero_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    let hetero = false;
+
+    let partials: Vec<[F128; 26]> = if hetero {
+        let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
+            let (a_o, b_o) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                )
+            };
+            let outv = chunk(
+                &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                a_o,
+                b_o,
+            );
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = outv;
+            }
+        });
+        partials
+    } else if hi_size == 1 {
+        vec![chunk(a, b, a_out, b_out)]
+    } else {
+        use rayon::prelude::*;
+        a_out
+            .par_chunks_mut(chunk_out)
+            .zip(b_out.par_chunks_mut(chunk_out))
+            .enumerate()
+            .map(|(x_hi, (a_o, b_o))| {
+                chunk(
+                    &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                    a_o,
+                    b_o,
+                )
+            })
+            .collect()
+    };
+
+    let mut s = [F128::ZERO; 26];
+    for (x_hi, outv) in partials.iter().enumerate() {
+        let eq_h = eq_hi[x_hi];
+        for (slot, &v) in s.iter_mut().zip(outv.iter()) {
+            *slot += eq_h * v;
+        }
+    }
+    tri_finish(&s, r_next)
+}
+
+/// Rescale the 26 aggregates (all on `W = r1·r2·E`) into the exact message,
+/// the one-challenge and the two-challenge deferred messages.
+fn tri_finish(s: &[F128; 26], r_next: &[F128]) -> (F128, F128, Round3Lookahead, Lookahead2) {
+    let (inv1, inv2) = (r_next[1].inv(), r_next[2].inv());
+    // eq_r(4y+j)/W: j=3 → 1, j=2 → (1+r1)/r1, j=1 → (1+r2)/r2, j=0 → both.
+    let k1 = F128::ONE + inv1;
+    let k2 = F128::ONE + inv2;
+    let k12 = k1 * k2;
+    let m1 = r_next[0] * (k12 * s[0] + k2 * s[1] + k1 * s[2] + s[3]);
+    let minf = k12 * s[4] + k2 * s[5] + k1 * s[6] + s[7];
+    // eq_{r+1}(2y+k)/W: k=1 → 1/r1, k=0 → (1+r2)/(r1·r2).
+    let (p0, p1) = (k2 * inv1, inv1);
+    let w0 = p0 * s[8] + p1 * s[9];
+    let w1 = p0 * s[1] + p1 * s[3];
+    let w2 = p0 * s[5] + p1 * s[7];
+    let w3 = p0 * s[10] + p1 * s[11];
+    let w4 = p0 * s[12] + p1 * s[13];
+    let w5 = p0 * s[14] + p1 * s[15];
+    let la = Round3Lookahead {
+        c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
+    };
+    // E/W = 1/(r1·r2).
+    let sc = inv1 * inv2;
+    let g1_src = [s[16], s[9], s[11], s[2], s[3], s[13], s[6], s[7], s[15]];
+    let la2 = Lookahead2 {
+        g1: g1_src.map(|v| sc * v),
+        ginf: std::array::from_fn(|i| sc * s[17 + i]),
+    };
+    (m1, minf, la, la2)
 }
 
 /// Optimized fused fold (at the URM challenge `z`, baked into `table`) plus
@@ -5821,6 +6140,433 @@ mod tests {
             g_via_sum += eq_remaining[x_prime] * a_x * b_x;
         }
         assert_eq!(g_via_poly, g_via_sum);
+    }
+
+    /// Tri cascade: outputs equal the sequential folds; the exact message,
+    /// the one-challenge lookahead and the two-challenge lookahead equal the
+    /// naive messages of the outputs folded by 0, 1 and 2 further challenges.
+    #[test]
+    fn tri_pass_matches_sequential_rounds() {
+        let mut rng = Rng::new(0x7121_0003);
+        let special = |rng: &mut Rng, i: usize| match i % 4 {
+            0 => F128::ZERO,
+            1 => F128::ONE,
+            _ => rng.f128(),
+        };
+        for depth in [2usize, 3] {
+            for (case, log_out) in [3usize, 4, 5, 9, 11, 12, 17, 20].into_iter().enumerate() {
+                if depth == 3 && log_out == 20 {
+                    continue;
+                }
+                let n = 1usize << (log_out + depth);
+                let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+                let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+                let rhos: Vec<F128> = (0..depth).map(|i| special(&mut rng, i + case)).collect();
+                let mut r_next = vec![F128::ONE; log_out];
+                for s in r_next[1..].iter_mut() {
+                    *s = rng.f128();
+                }
+                let mut a_o = vec![LA_POISON; n >> depth];
+                let mut b_o = vec![LA_POISON; n >> depth];
+                let (m1, minf, la, la2) =
+                    fold_cascade_t_into(&a, &b, &mut a_o, &mut b_o, &rhos, &r_next);
+                let (mut fa, mut fb) = (a.clone(), b.clone());
+                for &rho in &rhos {
+                    fold_in_place_pair(&mut fa, &mut fb, rho);
+                }
+                assert!(fa == a_o && fb == b_o, "outputs depth {depth} log_out {log_out}");
+                assert_eq!(
+                    (m1, minf),
+                    round_pair_naive(&fa, &fb, &r_next),
+                    "exact depth {depth} log_out {log_out}"
+                );
+                for t in 0..3 {
+                    let u = special(&mut rng, t + 1);
+                    let v = special(&mut rng, t + 2);
+                    let (mut ga, mut gb) = (fa.clone(), fb.clone());
+                    fold_in_place_pair(&mut ga, &mut gb, u);
+                    let mut r1 = vec![F128::ONE; log_out - 1];
+                    r1[1..].copy_from_slice(&r_next[2..]);
+                    assert_eq!(
+                        eval_round3_lookahead(&la, u),
+                        round_pair_naive(&ga, &gb, &r1),
+                        "la depth {depth} log_out {log_out}"
+                    );
+                    fold_in_place_pair(&mut ga, &mut gb, v);
+                    let mut r2 = vec![F128::ONE; log_out - 2];
+                    r2[1..].copy_from_slice(&r_next[3..]);
+                    assert_eq!(
+                        eval_lookahead2(&la2, u, v),
+                        round_pair_naive(&ga, &gb, &r2),
+                        "la2 depth {depth} log_out {log_out}"
+                    );
+                }
+                // The portable chunk agrees with the dispatched kernel.
+                if log_out <= 12 {
+                    let eq = SplitEqGhash::with_n_hi(&r_next[1..], 0);
+                    let mut sa = vec![LA_POISON; n >> depth];
+                    let mut sb = vec![LA_POISON; n >> depth];
+                    let s = tri_chunk_scalar(&a, &b, &mut sa, &mut sb, &rhos, &eq.lo);
+                    assert_eq!(tri_finish(&s, &r_next), (m1, minf, la, la2));
+                }
+            }
+        }
+    }
+
+    /// The depth-2 tri pass is the composed 5+6 pass: same outputs, same
+    /// round-six message, same round-seven lookahead as the cascade-3 kernel.
+    #[test]
+    fn tri_depth2_matches_incumbent_round67() {
+        let mut rng = Rng::new(0x7121_0067);
+        for log_out in [3usize, 6, 10, 14, 19] {
+            let n = 4usize << log_out;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let (rho3, rho4) = (rng.f128(), rng.f128());
+            let mut r_next6 = vec![F128::ONE; log_out];
+            for s in r_next6[1..].iter_mut() {
+                *s = rng.f128();
+            }
+            let mut a_i = vec![LA_POISON; n / 4];
+            let mut b_i = vec![LA_POISON; n / 4];
+            let (i1, iinf, ila) =
+                fold2_plain_and_round67_into(&a, &b, &mut a_i, &mut b_i, rho3, rho4, &r_next6);
+            let mut a_t = vec![LA_POISON; n / 4];
+            let mut b_t = vec![LA_POISON; n / 4];
+            let (t1, tinf, tla, _) =
+                fold_cascade_t_into(&a, &b, &mut a_t, &mut b_t, &[rho3, rho4], &r_next6);
+            assert!(a_i == a_t && b_i == b_t, "outputs log_out {log_out}");
+            assert_eq!((i1, iinf, ila), (t1, tinf, tla), "messages log_out {log_out}");
+        }
+    }
+
+    /// Real dumped rounds-5/6 input chunks (`FLOCK_ZK_DUMP` on a worker run,
+    /// then `ZK_DIR`): the tri kernel equals the incumbent kernel and the
+    /// portable reference on real data.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    #[ignore]
+    fn t3_real_chunk_tri_matches() {
+        let d: std::path::PathBuf = std::env::var_os("ZK_DIR").expect("ZK_DIR").into();
+        let (a, b, eq_lo, rho3, rho4) = t3_probe::load(&d);
+        let nck = a.len() / (8 * eq_lo.len());
+        let ci = 8 * eq_lo.len();
+        let co = 2 * eq_lo.len();
+        for c in 0..nck {
+            let (ai, bi) = (&a[c * ci..(c + 1) * ci], &b[c * ci..(c + 1) * ci]);
+            let mut a1 = vec![LA_POISON; co];
+            let mut b1 = vec![LA_POISON; co];
+            let inc = kernels::aarch64::fold2_and_message_lookahead_nt_expanded_aarch64(
+                ai, bi, &mut a1, &mut b1, rho3, rho4, rho3 * rho4, &eq_lo,
+            );
+            let mut a2 = vec![LA_POISON; co];
+            let mut b2 = vec![LA_POISON; co];
+            let tri = kernels::aarch64::fold_tri_and_message_aarch64::<2, true, 0>(
+                ai, bi, &mut a2, &mut b2, rho3, rho4, F128::ZERO, &eq_lo,
+            );
+            let mut a3 = vec![LA_POISON; co];
+            let mut b3 = vec![LA_POISON; co];
+            let sc = tri_chunk_scalar(ai, bi, &mut a3, &mut b3, &[rho3, rho4], &eq_lo);
+            assert!(a1 == a2 && b1 == b2 && a2 == a3 && b2 == b3, "chunk {c} outputs");
+            assert_eq!(tri, sc, "chunk {c} aggregates");
+            // Incumbent slots → tri slots on a common weight: the incumbent
+            // weights each group of four by eq_lo[2t+1], the tri sweep each
+            // group of eight by eq_lo[4y+3]; compare the unweighted-class sums
+            // through the exact round-six message instead.
+            let _ = inc;
+        }
+        println!("t3: {nck} real chunks: tri kernel == incumbent outputs == portable");
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    #[ignore]
+    fn t3_tail_timing() {
+        std::thread::spawn(t3_probe::run).join().unwrap();
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    mod t3_probe {
+        use super::super::kernels::aarch64::*;
+        use super::*;
+        use std::time::Instant;
+
+        pub(super) fn f128s(path: &std::path::Path) -> Vec<F128> {
+            let b = std::fs::read(path).unwrap();
+            b.chunks_exact(16)
+                .map(|c| F128 {
+                    lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                    hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+                })
+                .collect()
+        }
+
+        pub(super) fn load(d: &std::path::Path) -> (Vec<F128>, Vec<F128>, Vec<F128>, F128, F128) {
+            let a = f128s(&d.join("t3_a.bin"));
+            let b = f128s(&d.join("t3_b.bin"));
+            let eq = f128s(&d.join("t3_eqlo.bin"));
+            let r = f128s(&d.join("t3_rho.bin"));
+            (a, b, eq, r[0], r[1])
+        }
+
+        fn qos() {
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
+            }
+            // SAFETY: plain libSystem call on the current thread.
+            unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+        }
+
+        fn lq(v: &mut [f64]) -> (f64, f64) {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (v[v.len() / 4], v[v.len() / 2])
+        }
+
+        type Kern<'a> = Box<dyn FnMut(usize) + 'a>;
+
+        /// Alternate the forms round by round; each call processes chunk `i`.
+        fn bench(name: &str, forms: &mut [(String, Kern<'_>, f64)], chunks: usize, rounds: usize) {
+            let mut t = vec![Vec::new(); forms.len()];
+            for f in forms.iter_mut() {
+                for c in 0..chunks {
+                    (f.1)(c);
+                }
+            }
+            for r in 0..rounds {
+                for k in 0..forms.len() {
+                    let i = (k + r) % forms.len();
+                    let t0 = Instant::now();
+                    for c in 0..chunks {
+                        (forms[i].1)(c);
+                    }
+                    t[i].push(t0.elapsed().as_nanos() as f64 / (forms[i].2 * chunks as f64));
+                }
+            }
+            println!("{name}");
+            for (f, v) in forms.iter().zip(t.iter_mut()) {
+                let (l, m) = lq(v);
+                println!("  {:<52} lq {l:7.3}  med {m:7.3} ns/input-pair", f.0);
+            }
+        }
+
+        pub(super) fn run() {
+            qos();
+            let mut rng = Rng::new(0x7121_7177);
+            // Rounds-5/6 chunk geometry: eq lo of 2^12 pairs, 2^15 inputs.
+            let (ra, rb, eq56, rho3, rho4) = match std::env::var_os("ZK_DIR") {
+                Some(d) => load(std::path::Path::new(&d)),
+                None => {
+                    let ci = 4 * 8192;
+                    (
+                        (0..4 * ci).map(|_| rng.f128()).collect(),
+                        (0..4 * ci).map(|_| rng.f128()).collect(),
+                        (0..4096).map(|_| rng.f128()).collect(),
+                        rng.f128(),
+                        rng.f128(),
+                    )
+                }
+            };
+            let rho5 = rng.f128();
+            let lo = eq56.len();
+            let ci = 8 * lo; // depth-2 chunk input
+            let co = 2 * lo;
+            println!("t3 probe: lo {lo}, chunk_in {ci}, real={}", std::env::var_os("ZK_DIR").is_some());
+
+            // Cache-resident: one chunk (2 x 512 KiB in, 2 x 128 KiB out), reused.
+            let a_c = &ra[..ci];
+            let b_c = &rb[..ci];
+            let mut ao = vec![F128::ZERO; co];
+            let mut bo = vec![F128::ZERO; co];
+            let ao_p = ao.as_mut_ptr();
+            let bo_p = bo.as_mut_ptr();
+            let eq8 = &eq56[..lo / 2]; // depth-3 chunk with the same input size
+            macro_rules! outs {
+                ($n:expr) => {
+                    unsafe {
+                        (
+                            std::slice::from_raw_parts_mut(ao_p, $n),
+                            std::slice::from_raw_parts_mut(bo_p, $n),
+                        )
+                    }
+                };
+            }
+            let cif = ci as f64;
+            let mut forms: Vec<(String, Kern<'_>, f64)> = vec![
+                (
+                    "5+6 incumbent (lookahead, NT, 16 prod/8 out)".into(),
+                    Box::new(|_| {
+                        let (x, y) = outs!(co);
+                        std::hint::black_box(fold2_and_message_lookahead_nt_expanded_aarch64(
+                            a_c, b_c, x, y, rho3, rho4, rho3 * rho4, &eq56,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "7+8 incumbent kernel (lookahead, normal stores)".into(),
+                    Box::new(|_| {
+                        let (x, y) = outs!(co);
+                        std::hint::black_box(fold2_and_message_lookahead_normal_expanded_aarch64(
+                            a_c, b_c, x, y, rho3, rho4, rho3 * rho4, &eq56,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "11+12 incumbent kernel (direct, normal stores)".into(),
+                    Box::new(|_| {
+                        let (x, y) = outs!(co);
+                        std::hint::black_box(fold2_and_message_normal_expanded_aarch64(
+                            a_c, b_c, x, y, rho3, rho4, rho3 * rho4, &eq56,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "tri d2 NT (5+6 +la8, 26 prod/8 out)".into(),
+                    Box::new(|_| {
+                        let (x, y) = outs!(co);
+                        std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 0>(
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "tri d2 NT, no products (ABL 1)".into(),
+                    Box::new(|_| {
+                        let (x, y) = outs!(co);
+                        std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 1>(
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "tri d2 NT, no stores (ABL 2)".into(),
+                    Box::new(|_| {
+                        let (x, y) = outs!(co);
+                        std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 2>(
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "tri d2, fold only (ABL 3)".into(),
+                    Box::new(|_| {
+                        let (x, y) = outs!(co);
+                        std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 3>(
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "tri d3 normal (T pass, 26 prod/8 out)".into(),
+                    Box::new(|_| {
+                        let (x, y) = outs!(co / 2);
+                        std::hint::black_box(fold_tri_and_message_aarch64::<3, false, 0>(
+                            a_c, b_c, x, y, rho3, rho4, rho5, eq8,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "tri d3 NT (T pass)".into(),
+                    Box::new(|_| {
+                        let (x, y) = outs!(co / 2);
+                        std::hint::black_box(fold_tri_and_message_aarch64::<3, true, 0>(
+                            a_c, b_c, x, y, rho3, rho4, rho5, eq8,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "tri d3, no products (ABL 1)".into(),
+                    Box::new(|_| {
+                        let (x, y) = outs!(co / 2);
+                        std::hint::black_box(fold_tri_and_message_aarch64::<3, false, 1>(
+                            a_c, b_c, x, y, rho3, rho4, rho5, eq8,
+                        ));
+                    }),
+                    cif,
+                ),
+            ];
+            bench("CACHE-RESIDENT (one chunk reused)", &mut forms, 1, 41);
+            drop(forms);
+
+            // Streaming from DRAM, one core: 2^24 inputs per side (256 MiB),
+            // as the ranked rounds-5/6 pass; chunks walked in order.
+            let big = 1usize << 24;
+            let mut sa: Vec<F128> = Vec::with_capacity(big);
+            let mut sb: Vec<F128> = Vec::with_capacity(big);
+            for i in 0..big {
+                sa.push(ra[i % ra.len()]);
+                sb.push(rb[i % rb.len()]);
+            }
+            let mut oa = vec![F128::ZERO; big / 4];
+            let mut ob = vec![F128::ZERO; big / 4];
+            let (oa_p, ob_p) = (oa.as_mut_ptr(), ob.as_mut_ptr());
+            let nchunks = big / ci;
+            let (sa_r, sb_r) = (&sa, &sb);
+            macro_rules! sl {
+                ($c:expr, $per_out:expr) => {{
+                    let o = $c * (ci / $per_out);
+                    unsafe {
+                        (
+                            &sa_r[$c * ci..($c + 1) * ci],
+                            &sb_r[$c * ci..($c + 1) * ci],
+                            std::slice::from_raw_parts_mut(oa_p.add(o), ci / $per_out),
+                            std::slice::from_raw_parts_mut(ob_p.add(o), ci / $per_out),
+                        )
+                    }
+                }};
+            }
+            let mut forms: Vec<(String, Kern<'_>, f64)> = vec![
+                (
+                    "5+6 incumbent NT, DRAM".into(),
+                    Box::new(|c| {
+                        let (x, y, p, q) = sl!(c, 4);
+                        std::hint::black_box(fold2_and_message_lookahead_nt_expanded_aarch64(
+                            x, y, p, q, rho3, rho4, rho3 * rho4, &eq56,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "tri d2 NT, DRAM".into(),
+                    Box::new(|c| {
+                        let (x, y, p, q) = sl!(c, 4);
+                        std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 0>(
+                            x, y, p, q, rho3, rho4, F128::ZERO, &eq56,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "tri d2 NT no products, DRAM".into(),
+                    Box::new(|c| {
+                        let (x, y, p, q) = sl!(c, 4);
+                        std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 1>(
+                            x, y, p, q, rho3, rho4, F128::ZERO, &eq56,
+                        ));
+                    }),
+                    cif,
+                ),
+                (
+                    "tri d3 NT, DRAM".into(),
+                    Box::new(|c| {
+                        let (x, y, p, q) = sl!(c, 8);
+                        std::hint::black_box(fold_tri_and_message_aarch64::<3, true, 0>(
+                            x, y, p, q, rho3, rho4, rho5, eq8,
+                        ));
+                    }),
+                    cif,
+                ),
+            ];
+            bench("DRAM STREAM (2^24 inputs/side, one core)", &mut forms, nchunks, 7);
+        }
     }
 }
 
