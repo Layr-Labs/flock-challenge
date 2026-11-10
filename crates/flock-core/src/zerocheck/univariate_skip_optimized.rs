@@ -2741,32 +2741,41 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
 ) {
     debug_assert_eq!(banks.len(), eq_bot.len() * ELL);
     debug_assert_eq!(eq_bot.len(), 1usize << bank_bits);
-    banks.fill(F128::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
-    let bank_mask = (1usize << bank_bits) - 1;
+    let n_banks = 1usize << bank_bits;
+    let bank_mask = n_banks - 1;
+    let store_first = big_lo_size >= n_banks;
+    if !store_first {
+        banks.fill(F128::ZERO);
+    }
 
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
-        if n_b_med == 0 {
-            continue;
-        }
-        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        let first_b_med = representation.first_materialized_b_med(within_hash_outer);
+        let first_touch = store_first && x_outer_lo < n_banks;
         let w = x_outer_lo >> bank_bits;
         let u = x_outer_lo & bank_mask;
         let bank: &mut [F128; ELL] = (&mut banks[u * ELL..(u + 1) * ELL])
             .try_into()
             .expect("one ELL-lane bank per low x_lo index");
-        kernels::accumulate_convert_ab_nomul(
-            precomputed_ab_rows(ab_inner, chunk_byte_base),
-            first_b_med,
-            representation.materialized_b_med_end(within_hash_outer, n_b_med),
-            &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE],
-            bank,
-        );
+        if n_b_med == 0 {
+            if first_touch {
+                bank.fill(F128::ZERO);
+            }
+            continue;
+        }
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let first_b_med = representation.first_materialized_b_med(within_hash_outer);
+        let rows = precomputed_ab_rows(ab_inner, chunk_byte_base);
+        let end_b_med = representation.materialized_b_med_end(within_hash_outer, n_b_med);
+        let table = &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE];
+        if first_touch {
+            kernels::accumulate_convert_ab_nomul::<true>(rows, first_b_med, end_b_med, table, bank);
+        } else {
+            kernels::accumulate_convert_ab_nomul::<false>(rows, first_b_med, end_b_med, table, bank);
+        }
     }
 
     finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks, bank_deferred, partial_ab);
