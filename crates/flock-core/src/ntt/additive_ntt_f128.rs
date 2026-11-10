@@ -2295,6 +2295,17 @@ fn butterfly_interleaved_block_par_rows(
     }
     let half_offset = block_size_half * num_ntts;
     let (top, bot) = block.split_at_mut(half_offset);
+    if kernels::row_pair_prepared() {
+        // Row `r`, lane `l` of the top half pairs with the same offset of the
+        const PREPARED_ROWS_PER_TASK: usize = 16;
+        let chunk = PREPARED_ROWS_PER_TASK * num_ntts;
+        top.par_chunks_mut(chunk)
+            .zip(bot.par_chunks_mut(chunk))
+            .for_each(|(top_rows, bot_rows)| {
+                kernels::butterfly_row_pair(top_rows, bot_rows, twiddle);
+            });
+        return;
+    }
     top.par_chunks_mut(num_ntts)
         .zip(bot.par_chunks_mut(num_ntts))
         .for_each(|(top_row, bot_row)| {

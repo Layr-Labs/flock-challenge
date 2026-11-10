@@ -605,6 +605,35 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
 
     let d = point.len();
     assert_eq!(out.len(), 1usize << d);
+    if d >= EQ_TENSOR_MIN_LOG && *EQ_TENSOR_ON {
+        let (low_point, high_point) = point.split_at(EQ_TENSOR_LOW_LOG);
+        let mut low = [F128::ZERO; 1 << EQ_TENSOR_LOW_LOG];
+        build_eq_table_doubling_into(low_point, &mut low);
+        let high = build_eq_table(high_point);
+        let low = &low;
+        out.par_chunks_mut(1 << EQ_TENSOR_LOW_LOG)
+            .zip(high.par_iter())
+            .for_each(|(chunk, &h)| {
+                for (o, &l) in chunk.iter_mut().zip(low.iter()) {
+                    *o = l * h;
+                }
+            });
+        return;
+    }
+    build_eq_table_doubling_into(point, out);
+}
+
+const EQ_TENSOR_MIN_LOG: usize = 14;
+const EQ_TENSOR_LOW_LOG: usize = 10;
+
+static EQ_TENSOR_ON: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EQ_TENSOR").is_none());
+
+fn build_eq_table_doubling_into(point: &[F128], out: &mut [F128]) {
+    use rayon::prelude::*;
+
+    let d = point.len();
+    debug_assert_eq!(out.len(), 1usize << d);
     out[0] = F128::ONE;
     const PAR_THRESHOLD: usize = 1 << 12;
     for j in 0..d {
