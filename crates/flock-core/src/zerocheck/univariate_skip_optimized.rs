@@ -1020,13 +1020,8 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
 /// A witness generator may hand the prover A/B buffers whose rows are not
 /// written yet, together with this producer.  The buffers are cut into
 /// units of `unit_bytes` bytes of A (and the same range of B); a multiple of
-/// the precompute's 1 KiB outer chunk.  `produce(unit, a_scratch, b_scratch)`
-/// must materialise unit `unit` of both buffers (bytes
 /// `unit * unit_bytes .. (unit + 1) * unit_bytes`), exactly as the eager
 /// generator would have left them, and, when the scratch pointers are
-/// non-null, also write those same `unit_bytes` bytes of A to `a_scratch`
-/// and of B to `b_scratch`.  It must be callable concurrently for distinct
-/// units from any thread.
 ///
 /// The precompute calls it exactly once per unit before it returns, so both
 /// buffers are complete for every later reader (zerocheck round two).  On
@@ -1035,7 +1030,7 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
 #[derive(Clone, Copy)]
 pub struct Round1AbProducer<'a> {
     pub unit_bytes: usize,
-    pub produce: &'a (dyn Fn(usize, *mut u8, *mut u8) + Sync),
+    pub produce: &'a (dyn Fn(usize, *mut u8, *mut u8, bool) + Sync),
 }
 
 /// Same-binary control for the fused producer path: with exactly
@@ -1124,7 +1119,7 @@ fn produce_all_ab_units(producer: Round1AbProducer<'_>, n_units: usize) {
         |_, job| {
             let start = job * UNITS_PER_JOB;
             for unit in start..(start + UNITS_PER_JOB).min(n_units) {
-                (producer.produce)(unit, core::ptr::null_mut(), core::ptr::null_mut());
+                (producer.produce)(unit, core::ptr::null_mut(), core::ptr::null_mut(), false);
             }
         },
         None,
@@ -1522,7 +1517,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 let unit_start = job * units_per_job;
                 let unit_end = (unit_start + units_per_job).min(n_units);
                 for unit in unit_start..unit_end {
-                    let (a_unit, b_unit) = scratch.fill(|a, b| (producer.produce)(unit, a, b));
+                    let (a_unit, b_unit) =
+                        scratch.fill(|a, b, primed| (producer.produce)(unit, a, b, primed));
                     for local in 0..unit_chunks {
                         let x_outer = unit * unit_chunks + local;
                         // SAFETY: this job owns the output of its units.
@@ -1625,6 +1621,7 @@ struct AbUnitScratch {
     storage: Vec<u8>,
     offset: usize,
     unit_bytes: usize,
+    primed: bool,
 }
 
 impl AbUnitScratch {
@@ -1636,16 +1633,18 @@ impl AbUnitScratch {
             storage,
             offset,
             unit_bytes,
+            primed: false,
         }
     }
 
-    /// Run `produce(a_scratch, b_scratch)` and return the two filled halves.
     #[inline(always)]
-    fn fill(&mut self, produce: impl FnOnce(*mut u8, *mut u8)) -> (&[u8], &[u8]) {
+    fn fill(&mut self, produce: impl FnOnce(*mut u8, *mut u8, bool)) -> (&[u8], &[u8]) {
         let unit_bytes = self.unit_bytes;
+        let primed = self.primed;
         let both = &mut self.storage[self.offset..self.offset + 2 * unit_bytes];
         let (a, b) = both.split_at_mut(unit_bytes);
-        produce(a.as_mut_ptr(), b.as_mut_ptr());
+        produce(a.as_mut_ptr(), b.as_mut_ptr(), primed);
+        self.primed = true;
         (a, b)
     }
 }
@@ -5302,7 +5301,7 @@ mod tests {
                             crate::epool::SyncPtr(b_t.as_mut_ptr()),
                         );
                         let calls: Vec<AtomicU32> = (0..n_units).map(|_| AtomicU32::new(0)).collect();
-                        let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8| {
+                        let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, _primed: bool| {
                             calls[unit].fetch_add(1, Ordering::Relaxed);
                             assert!(!a_scratch.is_null() && !b_scratch.is_null());
                             let range = unit * unit_bytes..(unit + 1) * unit_bytes;
@@ -5387,7 +5386,7 @@ mod tests {
                 crate::epool::SyncPtr(a_t.as_mut_ptr()),
                 crate::epool::SyncPtr(b_t.as_mut_ptr()),
             );
-            let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8| {
+            let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, _primed: bool| {
                 let range = unit * unit_bytes..(unit + 1) * unit_bytes;
                 // SAFETY: disjoint unit ranges; scratch per the contract.
                 unsafe {

@@ -1927,8 +1927,8 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     fixed_root_rows.is_some(),
                     &input_mismatch,
                 );
-                let produce = |unit: usize, a: *mut u8, b: *mut u8| {
-                    (base.produce)(unit, a, b);
+                let produce = |unit: usize, a: *mut u8, b: *mut u8, primed: bool| {
+                    (base.produce)(unit, a, b, primed);
                     emitter.emit(unit, a, b);
                 };
                 let finish = || {
