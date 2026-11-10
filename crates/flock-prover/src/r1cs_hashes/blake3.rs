@@ -6053,6 +6053,8 @@ mod tests {
                 assert_eq!(b2, truth.2, "b (scratch form) case={case} seeded={seeded_path}");
                 assert_eq!(sa, truth.1, "a scratch case={case} seeded={seeded_path}");
                 assert_eq!(sb, truth.2, "b scratch case={case} seeded={seeded_path}");
+                let z_from_ab: Vec<u32> = sa.iter().zip(&sb).map(|(x, y)| x & y).collect();
+                assert_eq!(z_from_ab, truth.0, "z = a AND b case={case} seeded={seeded_path}");
                 checked += 1;
             }
         }

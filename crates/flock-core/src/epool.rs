@@ -114,7 +114,10 @@ fn set_utility_qos() {
 fn set_utility_qos() {}
 
 fn build_epool() -> Option<rayon::ThreadPool> {
-    let n = ecore_count();
+    let n = match std::env::var("FLOCK_EPOOL_MAX_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+        Some(cap) => ecore_count().min(cap),
+        None => ecore_count(),
+    };
     if n == 0 {
         return None;
     }
