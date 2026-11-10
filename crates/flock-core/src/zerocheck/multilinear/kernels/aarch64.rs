@@ -880,12 +880,57 @@ unsafe fn fold_row_q(
     }
 }
 
+/// Build-time choice of the instruction pair behind [`bank_load_q`]. Every
+/// form reads the same 16 bytes; only the address arithmetic differs.
+///
+/// * `1` (default): the byte index is produced already multiplied by 16
+///   (`and idx, mask, row, lsr #(SHIFT - 4)` with `mask = 0xff0`, or `ubfiz
+///   idx, row, #4, #8` for byte 0) and the load uses a plain register offset,
+///   `ldr q, [bank, idx]`.
+/// * `0` (`FLOCK_Q_LOAD_FORM=0` in the build environment): the parent's pair,
+///   `ubfx idx, row, #SHIFT, #8` and `ldr q, [bank, idx, lsl #4]`.
+/// * `2` (`FLOCK_Q_LOAD_FORM=2`): an alternative kept for measurement on
+///   other cores. The row is masked once per lane parity (`row &
+///   0x00ff00ff00ff00ff` and `row & 0xff00ff00ff00ff00`), then `ubfx idx,
+///   masked, #(SHIFT - 4), #12` and the plain register-offset load. It
+///   needs no mask register and no two-issue `and`, at two extra
+///   instructions per row. On an M4 it measured slightly behind form 1.
+///
+/// Forms 0 and 1 are two instructions per lookup. The public Firestorm
+/// (Apple M1 performance core) instruction tables list the 128-bit load
+/// with a shifted register offset as two uops (one integer, one load) and
+/// the same load with an unshifted register offset as one, so on such a core
+/// form 0 takes three pipeline slots per lookup and form 1 takes two. An M4
+/// performance core measures the same way (`q_load_form_uop_probe`).
+const Q_LOAD_FORM: u8 = match option_env!("FLOCK_Q_LOAD_FORM") {
+    Some(v) => {
+        let v = v.as_bytes();
+        if v.len() == 1 && v[0] == b'0' {
+            0
+        } else if v.len() == 1 && v[0] == b'2' {
+            2
+        } else {
+            1
+        }
+    }
+    None => 1,
+};
+
+/// `0xff << 4`: selects one table byte index that is already multiplied by
+/// the 16-byte entry size.
+const Q_INDEX_MASK: u64 = 0xff0;
+/// Byte lanes 0, 2, 4, 6 and 1, 3, 5, 7 of a packed row (form 2 only).
+const Q_EVEN_LANES: u64 = 0x00ff_00ff_00ff_00ff;
+const Q_ODD_LANES: u64 = 0xff00_ff00_ff00_ff00;
+
 /// Entry `(row >> SHIFT) & 0xff` of the 256 x 16-byte table bank at `bank`.
 ///
-/// Written as `ubfx` + scaled-index `ldr` (two instructions). From the plain
+/// Two instructions in every form selected by [`Q_LOAD_FORM`]. From the plain
 /// expression LLVM folds the `<< 4` into the mask, `(row >> (SHIFT-4)) &
-/// 0xff0`, which loses the scaled addressing mode and costs a third integer
-/// op per lookup in the issue-bound round-two fold.
+/// 0xff0`, as a separate shift and mask: a third integer op per lookup in the
+/// issue-bound round-two fold. The default form computes that same value in
+/// one instruction (`and` with a shifted register operand against a mask held
+/// in a register) and so keeps the register-offset load unscaled.
 ///
 /// # Safety
 /// `bank` must point to 256 readable 16-byte entries (4 KiB).
@@ -896,19 +941,65 @@ unsafe fn bank_load_q<const SHIFT: u32>(
     row: u64,
 ) -> core::arch::aarch64::uint64x2_t {
     let out: core::arch::aarch64::uint64x2_t;
-    // SAFETY: the byte index is at most 255, so the 16-byte load stays inside
-    // the caller's 4 KiB bank; the asm only reads that memory.
+    // SAFETY: the byte index is at most 255 (as a byte offset: at most 4080,
+    // a multiple of 16), so the 16-byte load stays inside the caller's 4 KiB
+    // bank; the asm only reads that memory.
     unsafe {
-        core::arch::asm!(
-            "ubfx {idx}, {row}, #{shift}, #8",
-            "ldr {out:q}, [{bank}, {idx}, lsl #4]",
-            shift = const SHIFT,
-            row = in(reg) row,
-            bank = in(reg) bank,
-            idx = out(reg) _,
-            out = lateout(vreg) out,
-            options(pure, readonly, nostack, preserves_flags),
-        );
+        if Q_LOAD_FORM == 0 {
+            core::arch::asm!(
+                "ubfx {idx}, {row}, #{shift}, #8",
+                "ldr {out:q}, [{bank}, {idx}, lsl #4]",
+                shift = const SHIFT,
+                row = in(reg) row,
+                bank = in(reg) bank,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else if SHIFT == 0 {
+            // idx = (row & 0xff) << 4
+            core::arch::asm!(
+                "ubfiz {idx}, {row}, #4, #8",
+                "ldr {out:q}, [{bank}, {idx}]",
+                row = in(reg) row,
+                bank = in(reg) bank,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else if Q_LOAD_FORM == 2 {
+            // With the neighbouring byte lanes cleared, the 12-bit field that
+            // starts four bits below the byte is the byte times 16.
+            let lanes = if SHIFT & 8 == 0 {
+                Q_EVEN_LANES
+            } else {
+                Q_ODD_LANES
+            };
+            core::arch::asm!(
+                "ubfx {idx}, {row}, #{shift}, #{width}",
+                "ldr {out:q}, [{bank}, {idx}]",
+                shift = const (SHIFT + 60) % 64,
+                width = const if SHIFT == 0 { 4 } else { 12 },
+                row = in(reg) row & lanes,
+                bank = in(reg) bank,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else {
+            // idx = (row >> (SHIFT - 4)) & 0xff0 = ((row >> SHIFT) & 0xff) << 4
+            core::arch::asm!(
+                "and {idx}, {mask}, {row}, lsr #{shift}",
+                "ldr {out:q}, [{bank}, {idx}]",
+                shift = const (SHIFT + 60) % 64,
+                mask = in(reg) Q_INDEX_MASK,
+                row = in(reg) row,
+                bank = in(reg) bank,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
     }
     out
 }
@@ -1697,30 +1788,87 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
                 ($c0:literal, $c1:literal, $xor0:literal, $xor1:literal) => {
                     // SAFETY: each byte index is at most 255. Both banks have
                     // 256 initialized q entries. Only the accumulators change.
-                    core::arch::asm!(
-                        "ubfx {idx}, {row0}, #{shift0}, #8",
-                        "ldr {tmp0:q}, [{bank0}, {idx}, lsl #4]",
-                        "ubfx {idx}, {row0}, #{shift1}, #8",
-                        "ldr {tmp1:q}, [{bank1}, {idx}, lsl #4]",
-                        $xor0,
-                        "ubfx {idx}, {row1}, #{shift0}, #8",
-                        "ldr {tmp0:q}, [{bank0}, {idx}, lsl #4]",
-                        "ubfx {idx}, {row1}, #{shift1}, #8",
-                        "ldr {tmp1:q}, [{bank1}, {idx}, lsl #4]",
-                        $xor1,
-                        shift0 = const 8 * $c0,
-                        shift1 = const 8 * $c1,
-                        bank0 = in(reg) table_data.add($c0 * STRIDE),
-                        bank1 = in(reg) table_data.add($c1 * STRIDE),
-                        row0 = in(reg) row0,
-                        row1 = in(reg) row1,
-                        acc0 = inout(vreg) acc0,
-                        acc1 = inout(vreg) acc1,
-                        idx = out(reg) _,
-                        tmp0 = out(vreg) _,
-                        tmp1 = out(vreg) _,
-                        options(pure, readonly, nostack, preserves_flags),
-                    );
+                    // The three arms read the same entries (see `Q_LOAD_FORM`).
+                    if Q_LOAD_FORM == 0 {
+                        core::arch::asm!(
+                            "ubfx {idx}, {row0}, #{shift0}, #8",
+                            "ldr {tmp0:q}, [{bank0}, {idx}, lsl #4]",
+                            "ubfx {idx}, {row0}, #{shift1}, #8",
+                            "ldr {tmp1:q}, [{bank1}, {idx}, lsl #4]",
+                            $xor0,
+                            "ubfx {idx}, {row1}, #{shift0}, #8",
+                            "ldr {tmp0:q}, [{bank0}, {idx}, lsl #4]",
+                            "ubfx {idx}, {row1}, #{shift1}, #8",
+                            "ldr {tmp1:q}, [{bank1}, {idx}, lsl #4]",
+                            $xor1,
+                            shift0 = const 8 * $c0,
+                            shift1 = const 8 * $c1,
+                            bank0 = in(reg) table_data.add($c0 * STRIDE),
+                            bank1 = in(reg) table_data.add($c1 * STRIDE),
+                            row0 = in(reg) row0,
+                            row1 = in(reg) row1,
+                            acc0 = inout(vreg) acc0,
+                            acc1 = inout(vreg) acc1,
+                            idx = out(reg) _,
+                            tmp0 = out(vreg) _,
+                            tmp1 = out(vreg) _,
+                            options(pure, readonly, nostack, preserves_flags),
+                        );
+                    } else if Q_LOAD_FORM == 2 {
+                        // `$c0` is an odd byte lane and `$c1` an even one.
+                        core::arch::asm!(
+                            "ubfx {idx}, {row0o}, #{shift0}, #12",
+                            "ldr {tmp0:q}, [{bank0}, {idx}]",
+                            "ubfx {idx}, {row0e}, #{shift1}, #12",
+                            "ldr {tmp1:q}, [{bank1}, {idx}]",
+                            $xor0,
+                            "ubfx {idx}, {row1o}, #{shift0}, #12",
+                            "ldr {tmp0:q}, [{bank0}, {idx}]",
+                            "ubfx {idx}, {row1e}, #{shift1}, #12",
+                            "ldr {tmp1:q}, [{bank1}, {idx}]",
+                            $xor1,
+                            shift0 = const 8 * $c0 - 4,
+                            shift1 = const 8 * $c1 - 4,
+                            bank0 = in(reg) table_data.add($c0 * STRIDE),
+                            bank1 = in(reg) table_data.add($c1 * STRIDE),
+                            row0o = in(reg) row0 & Q_ODD_LANES,
+                            row0e = in(reg) row0 & Q_EVEN_LANES,
+                            row1o = in(reg) row1 & Q_ODD_LANES,
+                            row1e = in(reg) row1 & Q_EVEN_LANES,
+                            acc0 = inout(vreg) acc0,
+                            acc1 = inout(vreg) acc1,
+                            idx = out(reg) _,
+                            tmp0 = out(vreg) _,
+                            tmp1 = out(vreg) _,
+                            options(pure, readonly, nostack, preserves_flags),
+                        );
+                    } else {
+                        core::arch::asm!(
+                            "and {idx}, {mask}, {row0}, lsr #{shift0}",
+                            "ldr {tmp0:q}, [{bank0}, {idx}]",
+                            "and {idx}, {mask}, {row0}, lsr #{shift1}",
+                            "ldr {tmp1:q}, [{bank1}, {idx}]",
+                            $xor0,
+                            "and {idx}, {mask}, {row1}, lsr #{shift0}",
+                            "ldr {tmp0:q}, [{bank0}, {idx}]",
+                            "and {idx}, {mask}, {row1}, lsr #{shift1}",
+                            "ldr {tmp1:q}, [{bank1}, {idx}]",
+                            $xor1,
+                            shift0 = const 8 * $c0 - 4,
+                            shift1 = const 8 * $c1 - 4,
+                            mask = in(reg) Q_INDEX_MASK,
+                            bank0 = in(reg) table_data.add($c0 * STRIDE),
+                            bank1 = in(reg) table_data.add($c1 * STRIDE),
+                            row0 = in(reg) row0,
+                            row1 = in(reg) row1,
+                            acc0 = inout(vreg) acc0,
+                            acc1 = inout(vreg) acc1,
+                            idx = out(reg) _,
+                            tmp0 = out(vreg) _,
+                            tmp1 = out(vreg) _,
+                            options(pure, readonly, nostack, preserves_flags),
+                        );
+                    }
                 };
             }
             macro_rules! step {
@@ -2681,13 +2829,20 @@ unsafe fn lookup_lanes_q<const L: usize>(
         if L == 8 && lane0 == 0 {
             // Every full-width caller passes a literal 0, so after inlining
             // this is the only path: the same eight loads in the same XOR
-            // tree, bytes 1..7 through the two-instruction scaled lookup.
+            // tree through the two-instruction lookup of `bank_load_q`.
             macro_rules! bank {
                 ($lane:literal) => {
                     bank_load_q::<{ 8 * $lane }>(table_data.add($lane * STRIDE), code)
                 };
             }
-            let acc = xor3_u64(load(0), bank!(1), bank!(2));
+            // Byte 0 goes through the same helper unless the parent's load
+            // form is selected, which keeps the parent's plain expression.
+            let first = if Q_LOAD_FORM == 0 {
+                load(0)
+            } else {
+                bank!(0)
+            };
+            let acc = xor3_u64(first, bank!(1), bank!(2));
             let acc = xor3_u64(acc, bank!(3), bank!(4));
             let acc = xor3_u64(acc, bank!(5), bank!(6));
             return veorq_u64(acc, bank!(7));
@@ -3896,6 +4051,629 @@ mod tests {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
+    }
+
+    /// Every byte lane and every byte value: the selected load form returns
+    /// exactly entry `(row >> SHIFT) & 0xff` of the bank, whatever the other
+    /// 56 bits of the row hold.
+    #[test]
+    fn bank_load_q_reads_the_indexed_entry() {
+        // The bank sits between two guard banks with different contents, so a
+        // wrong offset cannot return the right value by accident.
+        let entries: Vec<[u64; 2]> = (0..3 * 256u64)
+            .map(|j| [j.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xa5a5, !j])
+            .collect();
+        let bank = unsafe { entries.as_ptr().add(256).cast::<u8>() };
+        let mut state = 0x4c4f_4144_464f_524d;
+        macro_rules! check_lane {
+            ($lane:literal) => {
+                for byte in 0..256u64 {
+                    let field = 0xffu64 << (8 * $lane);
+                    for case in 0..6 {
+                        let other = match case {
+                            0 => 0,
+                            1 => u64::MAX,
+                            _ => splitmix64(&mut state),
+                        };
+                        let row = (other & !field) | (byte << (8 * $lane));
+                        let got: [u64; 2] = unsafe {
+                            core::mem::transmute(bank_load_q::<{ 8 * $lane }>(bank, row))
+                        };
+                        assert_eq!(
+                            got,
+                            entries[256 + byte as usize],
+                            "lane {} byte {byte} row {row:#018x}",
+                            $lane
+                        );
+                    }
+                }
+            };
+        }
+        check_lane!(0);
+        check_lane!(1);
+        check_lane!(2);
+        check_lane!(3);
+        check_lane!(4);
+        check_lane!(5);
+        check_lane!(6);
+        check_lane!(7);
+    }
+
+    /// The eight-lane lookups built on `bank_load_q` equal the XOR of the
+    /// eight plainly indexed entries.
+    #[test]
+    fn eight_lane_lookups_match_plain_indexing() {
+        let mut state = 0x4c4f_4f4b_5550_3858;
+        let table: Vec<[u64; 2]> = (0..8 * 256)
+            .map(|_| [splitmix64(&mut state), splitmix64(&mut state)])
+            .collect();
+        let ptr = table.as_ptr().cast::<u8>();
+        let plain = |code: u64| -> [u64; 2] {
+            let mut acc = [0u64; 2];
+            for lane in 0..8 {
+                let e = table[lane * 256 + ((code >> (8 * lane)) & 0xff) as usize];
+                acc[0] ^= e[0];
+                acc[1] ^= e[1];
+            }
+            acc
+        };
+        let as_words = |v: uint64x2_t| -> [u64; 2] { unsafe { core::mem::transmute(v) } };
+        for case in 0..4096 {
+            let codes: [u64; 4] = match case {
+                0 => [0; 4],
+                1 => [u64::MAX; 4],
+                _ => core::array::from_fn(|_| splitmix64(&mut state)),
+            };
+            unsafe {
+                assert_eq!(as_words(lookup_lanes_q::<8>(ptr, codes[0], 0)), plain(codes[0]));
+                assert_eq!(as_words(fold_row_code_q(ptr, codes[1])), plain(codes[1]));
+                let (x, y) = fold_two_row_codes_q(ptr, codes[0], codes[1]);
+                assert_eq!([as_words(x), as_words(y)], [plain(codes[0]), plain(codes[1])]);
+                let (w, x, y, z) = fold_four_row_codes_q(ptr, codes[0], codes[1], codes[2], codes[3]);
+                assert_eq!(
+                    [as_words(w), as_words(x), as_words(y), as_words(z)],
+                    [plain(codes[0]), plain(codes[1]), plain(codes[2]), plain(codes[3])]
+                );
+                #[cfg(target_feature = "sha3")]
+                {
+                    assert_eq!(as_words(lookup8_q(ptr, codes[2])), plain(codes[2]));
+                    let init = core::mem::transmute::<[u64; 2], uint64x2_t>([codes[0], codes[1]]);
+                    let want = plain(codes[3]);
+                    assert_eq!(
+                        as_words(lookup8_acc_q(ptr, codes[3], init)),
+                        [want[0] ^ codes[0], want[1] ^ codes[1]]
+                    );
+                }
+            }
+        }
+    }
+
+    /// One pass of the standalone lookup loop for load form `form` over `n`
+    /// eight-byte rows: eight table loads per row, XORed into one sum.
+    ///
+    /// Forms: 0 `ubfx` + scaled-index load (the parent); 1 `and` with a
+    /// shifted register + plain register-offset load (this tree); 2 two lane
+    /// masks per row, then `ubfx` of twelve bits + plain load; 3 `ubfx`,
+    /// `lsl #4`, plain load (three single instructions, the calibration for
+    /// "one more pipeline slot per lookup"). With `filler`, sixteen
+    /// independent non-load instructions per row are added so that the loop
+    /// is bound by pipeline width rather than by the load units.
+    #[inline(never)]
+    unsafe fn q_load_uop_pass(
+        form: u8,
+        table: *const u8,
+        rows: *const u64,
+        n: usize,
+        filler: bool,
+    ) -> [u64; 2] {
+        use core::arch::aarch64::vdupq_n_u64;
+        unsafe {
+            let end = rows.add(n);
+            let acc0 = vdupq_n_u64(0);
+            let mut acc = acc0;
+            // SAFETY: every index is a byte times 16 inside a 4 KiB bank and
+            // `rows..end` is readable; the loop only reads memory.
+            match form {
+                0 => core::arch::asm!(
+                        "2:",
+                        "ldr {row}, [{p}], #8",
+                        "ubfx {i}, {row}, #0, #8",
+                        "ldr q0, [{b0}, {i}, lsl #4]",
+                        "ubfx {i}, {row}, #8, #8",
+                        "ldr q1, [{b1}, {i}, lsl #4]",
+                        "ubfx {i}, {row}, #16, #8",
+                        "ldr q2, [{b2}, {i}, lsl #4]",
+                        "ubfx {i}, {row}, #24, #8",
+                        "ldr q3, [{b3}, {i}, lsl #4]",
+                        "ubfx {i}, {row}, #32, #8",
+                        "ldr q4, [{b4}, {i}, lsl #4]",
+                        "ubfx {i}, {row}, #40, #8",
+                        "ldr q5, [{b5}, {i}, lsl #4]",
+                        "ubfx {i}, {row}, #48, #8",
+                        "ldr q6, [{b6}, {i}, lsl #4]",
+                        "ubfx {i}, {row}, #56, #8",
+                        "ldr q7, [{b7}, {i}, lsl #4]",
+                        "eor v0.16b, v0.16b, v1.16b",
+                        "eor v2.16b, v2.16b, v3.16b",
+                        "eor v4.16b, v4.16b, v5.16b",
+                        "eor v6.16b, v6.16b, v7.16b",
+                        "eor v0.16b, v0.16b, v2.16b",
+                        "eor v4.16b, v4.16b, v6.16b",
+                        "eor v0.16b, v0.16b, v4.16b",
+                        "eor v16.16b, v16.16b, v0.16b",
+                        "cbz {fill}, 3f",
+                        "add {f}, {g}, #1",
+                        "add {f}, {g}, #2",
+                        "add {f}, {g}, #3",
+                        "add {f}, {g}, #4",
+                        "add {f}, {g}, #5",
+                        "add {f}, {g}, #6",
+                        "add {f}, {g}, #7",
+                        "add {f}, {g}, #8",
+                        "add {f}, {g}, #9",
+                        "add {f}, {g}, #10",
+                        "add {f}, {g}, #11",
+                        "add {f}, {g}, #12",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "3:",
+                        "cmp {p}, {end}",
+                        "b.lo 2b",
+                        p = inout(reg) rows => _,
+                        end = in(reg) end,
+                        row = out(reg) _,
+                        i = out(reg) _,
+                        fill = in(reg) filler as u64,
+                        f = out(reg) _,
+                        g = in(reg) 7u64,
+                        b0 = in(reg) table,
+                        b1 = in(reg) table.add(4096),
+                        b2 = in(reg) table.add(2 * 4096),
+                        b3 = in(reg) table.add(3 * 4096),
+                        b4 = in(reg) table.add(4 * 4096),
+                        b5 = in(reg) table.add(5 * 4096),
+                        b6 = in(reg) table.add(6 * 4096),
+                        b7 = in(reg) table.add(7 * 4096),
+                        inout("v16") acc,
+                        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+                        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+                        out("v17") _, in("v18") acc0, in("v19") acc0,
+                        options(readonly, nostack),
+                    ),
+                1 => core::arch::asm!(
+                        "2:",
+                        "ldr {row}, [{p}], #8",
+                        "ubfiz {i}, {row}, #4, #8",
+                        "ldr q0, [{b0}, {i}]",
+                        "and {i}, {mask}, {row}, lsr #4",
+                        "ldr q1, [{b1}, {i}]",
+                        "and {i}, {mask}, {row}, lsr #12",
+                        "ldr q2, [{b2}, {i}]",
+                        "and {i}, {mask}, {row}, lsr #20",
+                        "ldr q3, [{b3}, {i}]",
+                        "and {i}, {mask}, {row}, lsr #28",
+                        "ldr q4, [{b4}, {i}]",
+                        "and {i}, {mask}, {row}, lsr #36",
+                        "ldr q5, [{b5}, {i}]",
+                        "and {i}, {mask}, {row}, lsr #44",
+                        "ldr q6, [{b6}, {i}]",
+                        "and {i}, {mask}, {row}, lsr #52",
+                        "ldr q7, [{b7}, {i}]",
+                        "eor v0.16b, v0.16b, v1.16b",
+                        "eor v2.16b, v2.16b, v3.16b",
+                        "eor v4.16b, v4.16b, v5.16b",
+                        "eor v6.16b, v6.16b, v7.16b",
+                        "eor v0.16b, v0.16b, v2.16b",
+                        "eor v4.16b, v4.16b, v6.16b",
+                        "eor v0.16b, v0.16b, v4.16b",
+                        "eor v16.16b, v16.16b, v0.16b",
+                        "cbz {fill}, 3f",
+                        "add {f}, {g}, #1",
+                        "add {f}, {g}, #2",
+                        "add {f}, {g}, #3",
+                        "add {f}, {g}, #4",
+                        "add {f}, {g}, #5",
+                        "add {f}, {g}, #6",
+                        "add {f}, {g}, #7",
+                        "add {f}, {g}, #8",
+                        "add {f}, {g}, #9",
+                        "add {f}, {g}, #10",
+                        "add {f}, {g}, #11",
+                        "add {f}, {g}, #12",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "3:",
+                        "cmp {p}, {end}",
+                        "b.lo 2b",
+                        mask = in(reg) 0xff0u64,
+                        p = inout(reg) rows => _,
+                        end = in(reg) end,
+                        row = out(reg) _,
+                        i = out(reg) _,
+                        fill = in(reg) filler as u64,
+                        f = out(reg) _,
+                        g = in(reg) 7u64,
+                        b0 = in(reg) table,
+                        b1 = in(reg) table.add(4096),
+                        b2 = in(reg) table.add(2 * 4096),
+                        b3 = in(reg) table.add(3 * 4096),
+                        b4 = in(reg) table.add(4 * 4096),
+                        b5 = in(reg) table.add(5 * 4096),
+                        b6 = in(reg) table.add(6 * 4096),
+                        b7 = in(reg) table.add(7 * 4096),
+                        inout("v16") acc,
+                        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+                        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+                        out("v17") _, in("v18") acc0, in("v19") acc0,
+                        options(readonly, nostack),
+                    ),
+                2 => core::arch::asm!(
+                        "2:",
+                        "ldr {row}, [{p}], #8",
+                        "and {re}, {row}, #0x00ff00ff00ff00ff",
+                        "and {ro}, {row}, #0xff00ff00ff00ff00",
+                        "ubfiz {i}, {row}, #4, #8",
+                        "ldr q0, [{b0}, {i}]",
+                        "ubfx {i}, {ro}, #4, #12",
+                        "ldr q1, [{b1}, {i}]",
+                        "ubfx {i}, {re}, #12, #12",
+                        "ldr q2, [{b2}, {i}]",
+                        "ubfx {i}, {ro}, #20, #12",
+                        "ldr q3, [{b3}, {i}]",
+                        "ubfx {i}, {re}, #28, #12",
+                        "ldr q4, [{b4}, {i}]",
+                        "ubfx {i}, {ro}, #36, #12",
+                        "ldr q5, [{b5}, {i}]",
+                        "ubfx {i}, {re}, #44, #12",
+                        "ldr q6, [{b6}, {i}]",
+                        "ubfx {i}, {ro}, #52, #12",
+                        "ldr q7, [{b7}, {i}]",
+                        "eor v0.16b, v0.16b, v1.16b",
+                        "eor v2.16b, v2.16b, v3.16b",
+                        "eor v4.16b, v4.16b, v5.16b",
+                        "eor v6.16b, v6.16b, v7.16b",
+                        "eor v0.16b, v0.16b, v2.16b",
+                        "eor v4.16b, v4.16b, v6.16b",
+                        "eor v0.16b, v0.16b, v4.16b",
+                        "eor v16.16b, v16.16b, v0.16b",
+                        "cbz {fill}, 3f",
+                        "add {f}, {g}, #1",
+                        "add {f}, {g}, #2",
+                        "add {f}, {g}, #3",
+                        "add {f}, {g}, #4",
+                        "add {f}, {g}, #5",
+                        "add {f}, {g}, #6",
+                        "add {f}, {g}, #7",
+                        "add {f}, {g}, #8",
+                        "add {f}, {g}, #9",
+                        "add {f}, {g}, #10",
+                        "add {f}, {g}, #11",
+                        "add {f}, {g}, #12",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "3:",
+                        "cmp {p}, {end}",
+                        "b.lo 2b",
+                        re = out(reg) _, ro = out(reg) _,
+                        p = inout(reg) rows => _,
+                        end = in(reg) end,
+                        row = out(reg) _,
+                        i = out(reg) _,
+                        fill = in(reg) filler as u64,
+                        f = out(reg) _,
+                        g = in(reg) 7u64,
+                        b0 = in(reg) table,
+                        b1 = in(reg) table.add(4096),
+                        b2 = in(reg) table.add(2 * 4096),
+                        b3 = in(reg) table.add(3 * 4096),
+                        b4 = in(reg) table.add(4 * 4096),
+                        b5 = in(reg) table.add(5 * 4096),
+                        b6 = in(reg) table.add(6 * 4096),
+                        b7 = in(reg) table.add(7 * 4096),
+                        inout("v16") acc,
+                        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+                        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+                        out("v17") _, in("v18") acc0, in("v19") acc0,
+                        options(readonly, nostack),
+                    ),
+                3 => core::arch::asm!(
+                        "2:",
+                        "ldr {row}, [{p}], #8",
+                        "ubfx {i}, {row}, #0, #8",
+                        "lsl {i}, {i}, #4",
+                        "ldr q0, [{b0}, {i}]",
+                        "ubfx {i}, {row}, #8, #8",
+                        "lsl {i}, {i}, #4",
+                        "ldr q1, [{b1}, {i}]",
+                        "ubfx {i}, {row}, #16, #8",
+                        "lsl {i}, {i}, #4",
+                        "ldr q2, [{b2}, {i}]",
+                        "ubfx {i}, {row}, #24, #8",
+                        "lsl {i}, {i}, #4",
+                        "ldr q3, [{b3}, {i}]",
+                        "ubfx {i}, {row}, #32, #8",
+                        "lsl {i}, {i}, #4",
+                        "ldr q4, [{b4}, {i}]",
+                        "ubfx {i}, {row}, #40, #8",
+                        "lsl {i}, {i}, #4",
+                        "ldr q5, [{b5}, {i}]",
+                        "ubfx {i}, {row}, #48, #8",
+                        "lsl {i}, {i}, #4",
+                        "ldr q6, [{b6}, {i}]",
+                        "ubfx {i}, {row}, #56, #8",
+                        "lsl {i}, {i}, #4",
+                        "ldr q7, [{b7}, {i}]",
+                        "eor v0.16b, v0.16b, v1.16b",
+                        "eor v2.16b, v2.16b, v3.16b",
+                        "eor v4.16b, v4.16b, v5.16b",
+                        "eor v6.16b, v6.16b, v7.16b",
+                        "eor v0.16b, v0.16b, v2.16b",
+                        "eor v4.16b, v4.16b, v6.16b",
+                        "eor v0.16b, v0.16b, v4.16b",
+                        "eor v16.16b, v16.16b, v0.16b",
+                        "cbz {fill}, 3f",
+                        "add {f}, {g}, #1",
+                        "add {f}, {g}, #2",
+                        "add {f}, {g}, #3",
+                        "add {f}, {g}, #4",
+                        "add {f}, {g}, #5",
+                        "add {f}, {g}, #6",
+                        "add {f}, {g}, #7",
+                        "add {f}, {g}, #8",
+                        "add {f}, {g}, #9",
+                        "add {f}, {g}, #10",
+                        "add {f}, {g}, #11",
+                        "add {f}, {g}, #12",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "eor v17.16b, v18.16b, v19.16b",
+                        "3:",
+                        "cmp {p}, {end}",
+                        "b.lo 2b",
+                        p = inout(reg) rows => _,
+                        end = in(reg) end,
+                        row = out(reg) _,
+                        i = out(reg) _,
+                        fill = in(reg) filler as u64,
+                        f = out(reg) _,
+                        g = in(reg) 7u64,
+                        b0 = in(reg) table,
+                        b1 = in(reg) table.add(4096),
+                        b2 = in(reg) table.add(2 * 4096),
+                        b3 = in(reg) table.add(3 * 4096),
+                        b4 = in(reg) table.add(4 * 4096),
+                        b5 = in(reg) table.add(5 * 4096),
+                        b6 = in(reg) table.add(6 * 4096),
+                        b7 = in(reg) table.add(7 * 4096),
+                        inout("v16") acc,
+                        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+                        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+                        out("v17") _, in("v18") acc0, in("v19") acc0,
+                        options(readonly, nostack),
+                    ),
+                _ => unreachable!(),
+            }
+            core::mem::transmute(acc)
+        }
+    }
+
+    /// Standalone answer to one question about the core this runs on: does a
+    /// 128-bit load with a shifted register offset cost one more pipeline slot
+    /// than the same load with a plain register offset? Compare form 0 with
+    /// form 1 (same instruction count) and with form 3 (one more instruction
+    /// per lookup) in the `filler` rows. All four forms must return the same
+    /// sum. Single thread, a few hundred milliseconds.
+    #[test]
+    #[ignore = "timing probe"]
+    fn q_load_form_uop_probe() {
+        const ROWS: usize = 2048;
+        const PASSES: usize = 64;
+        const SAMPLES: usize = 31;
+        let mut state = 0x554f_5050_524f_4245;
+        let table: Vec<[u64; 2]> = (0..8 * 256)
+            .map(|_| [splitmix64(&mut state), splitmix64(&mut state)])
+            .collect();
+        let rows: Vec<u64> = (0..ROWS).map(|_| splitmix64(&mut state)).collect();
+        let run = |form: u8, filler: bool| -> (f64, [u64; 2]) {
+            let mut sum = [0u64; 2];
+            let t = std::time::Instant::now();
+            for _ in 0..PASSES {
+                sum = unsafe {
+                    q_load_uop_pass(form, table.as_ptr().cast::<u8>(), rows.as_ptr(), ROWS, filler)
+                };
+            }
+            (t.elapsed().as_nanos() as f64 / (PASSES * ROWS) as f64, sum)
+        };
+        let want = run(0, false).1;
+        for filler in [false, true] {
+            let mut ns: [Vec<f64>; 4] = Default::default();
+            for _ in 0..SAMPLES {
+                for form in 0..4u8 {
+                    let (t, sum) = run(form, filler);
+                    assert_eq!(sum, want, "form {form}");
+                    ns[form as usize].push(t);
+                }
+            }
+            for v in ns.iter_mut() {
+                v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            }
+            let q = |v: &Vec<f64>| (v[0], v[SAMPLES / 4], v[SAMPLES / 2]);
+            for (form, v) in ns.iter().enumerate() {
+                let (min, q1, med) = q(v);
+                println!(
+                    "UOPPROBE filler={} form={form} ns_per_row min {min:.4} q1 {q1:.4} med {med:.4} (min vs form 0: {:+.2}%)",
+                    filler as u8,
+                    (min / ns[0][0] - 1.0) * 100.0,
+                );
+            }
+        }
+    }
+
+    /// Single-thread cost of the two table-lookup kernels of the ranked path
+    /// for the load form this binary was built with (`FLOCK_Q_LOAD_FORM`).
+    /// Build one test binary per form and alternate them; the checksums must
+    /// agree between forms.
+    #[test]
+    #[ignore = "timing probe"]
+    fn table_load_form_timing() {
+        use crate::zerocheck::multilinear::UniSkipFoldTable;
+        use crate::zerocheck::univariate_skip::build_eq;
+        use crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash;
+
+        let mut state = 0x4c4f_4144_5449_4d45;
+        let z = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+        let table = UniSkipFoldTable::new(6, z);
+        let mix = |sum: &mut u64, v: &F128| {
+            let w: [u64; 2] = unsafe { core::mem::transmute(*v) };
+            *sum = (*sum ^ w[0]).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ w[1];
+        };
+
+        // Round two: the Horner kernel as the ranked proof calls it (peeled
+        // first group, 128-pair blocks with 121 live pairs).
+        const LO: usize = 1 << 14;
+        const R2_CHUNKS: usize = 2;
+        const R2_PASSES: usize = 12;
+        let mut r: Vec<F128> = (0..14)
+            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+            .collect();
+        r[2..6].copy_from_slice(&medium_challenges_ghash());
+        let eq_lo = build_eq(&r);
+        let mut a = vec![0u8; 16 * LO * R2_CHUNKS];
+        let mut b = vec![0u8; 16 * LO * R2_CHUNKS];
+        for pair in 0..LO * R2_CHUNKS {
+            if pair & 127 >= 121 {
+                continue;
+            }
+            for byte in a[16 * pair..16 * pair + 16]
+                .iter_mut()
+                .chain(b[16 * pair..16 * pair + 16].iter_mut())
+            {
+                *byte = splitmix64(&mut state) as u8;
+            }
+        }
+        let mut anchors = vec![F128::ZERO; 2 * LO * R2_CHUNKS];
+        let mut deltas = vec![0u8; 16 * LO * R2_CHUNKS];
+        let mut r2_pass = || -> (f64, u64) {
+            let mut sum = 0u64;
+            let t = std::time::Instant::now();
+            for _ in 0..R2_PASSES {
+                for c in 0..R2_CHUNKS {
+                    let mut out = [F128::ZERO; 8];
+                    unsafe {
+                        fold_round2_compact_chunk_neon_horner_8::<true>(
+                            table.data.as_ptr().cast::<u8>(),
+                            a.as_ptr().add(16 * LO * c),
+                            b.as_ptr().add(16 * LO * c),
+                            anchors.as_mut_ptr().add(2 * LO * c),
+                            deltas.as_mut_ptr().add(16 * LO * c),
+                            eq_lo.as_ptr(),
+                            LO,
+                            c * LO,
+                            127,
+                            121,
+                            true,
+                            true,
+                            out.as_mut_ptr(),
+                        );
+                    }
+                    for v in &out[4..] {
+                        mix(&mut sum, v);
+                    }
+                }
+            }
+            let ns = t.elapsed().as_nanos() as f64 / (R2_PASSES * R2_CHUNKS * LO) as f64;
+            for v in anchors.iter().step_by(61) {
+                mix(&mut sum, v);
+            }
+            (ns, sum)
+        };
+
+        // K pass: the fused kernel on 2^12 lanes per call, dense data.
+        #[cfg(target_feature = "sha3")]
+        const K_OUT_PAIRS: usize = 1 << 11;
+        #[cfg(target_feature = "sha3")]
+        const K_PASSES: usize = 96;
+        #[cfg(target_feature = "sha3")]
+        let (k_l1, k_l3, k_rho2, k_anchors, k_deltas, k_eq) = {
+            let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+            let l1 = table.scaled_linear(rho(&mut state));
+            let l3 = table.scaled_linear(rho(&mut state));
+            let rho2 = rho(&mut state);
+            let anchors: Vec<F128> = (0..8 * K_OUT_PAIRS).map(|_| rho(&mut state)).collect();
+            let deltas: Vec<u8> = (0..64 * K_OUT_PAIRS)
+                .map(|_| splitmix64(&mut state) as u8)
+                .collect();
+            let eq: Vec<F128> = (0..K_OUT_PAIRS).map(|_| rho(&mut state)).collect();
+            (l1, l3, rho2, anchors, deltas, eq)
+        };
+        #[cfg(target_feature = "sha3")]
+        let mut k_a = vec![F128::ZERO; 2 * K_OUT_PAIRS];
+        #[cfg(target_feature = "sha3")]
+        let mut k_b = vec![F128::ZERO; 2 * K_OUT_PAIRS];
+        #[cfg(target_feature = "sha3")]
+        let mut k_pass = || -> (f64, u64) {
+            let mut sum = 0u64;
+            let t = std::time::Instant::now();
+            for _ in 0..K_PASSES {
+                let mut out = [F128::ZERO; 8];
+                unsafe {
+                    fold2_compact_and_round45_chunk_neon_8_fused::<false>(
+                        k_l1.as_ptr().cast::<u8>(),
+                        k_l3.as_ptr().cast::<u8>(),
+                        k_rho2,
+                        k_anchors.as_ptr(),
+                        k_deltas.as_ptr(),
+                        k_a.as_mut_ptr(),
+                        k_b.as_mut_ptr(),
+                        k_eq.as_ptr(),
+                        K_OUT_PAIRS,
+                        true,
+                        out.as_mut_ptr(),
+                    );
+                }
+                for v in &out {
+                    mix(&mut sum, v);
+                }
+            }
+            let ns = t.elapsed().as_nanos() as f64 / (K_PASSES * 2 * K_OUT_PAIRS) as f64;
+            for v in k_a.iter().chain(k_b.iter()).step_by(37) {
+                mix(&mut sum, v);
+            }
+            (ns, sum)
+        };
+        #[cfg(not(target_feature = "sha3"))]
+        let k_pass = || -> (f64, u64) { (0.0, 0) };
+
+        r2_pass();
+        k_pass();
+        const SAMPLES: usize = 41;
+        let mut r2_ns = Vec::with_capacity(SAMPLES);
+        let mut k_ns = Vec::with_capacity(SAMPLES);
+        let (mut r2_sum, mut k_sum) = (0u64, 0u64);
+        for _ in 0..SAMPLES {
+            let (ns, sum) = r2_pass();
+            r2_ns.push(ns);
+            r2_sum = sum;
+            let (ns, sum) = k_pass();
+            k_ns.push(ns);
+            k_sum = sum;
+        }
+        r2_ns.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        k_ns.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        println!(
+            "LOADFORM form={} r2_ns_per_pair min {:.4} q1 {:.4} med {:.4} k_ns_per_lane min {:.4} q1 {:.4} med {:.4} sums {:016x} {:016x}",
+            Q_LOAD_FORM,
+            r2_ns[0], r2_ns[SAMPLES / 4], r2_ns[SAMPLES / 2],
+            k_ns[0], k_ns[SAMPLES / 4], k_ns[SAMPLES / 2],
+            r2_sum, k_sum,
+        );
     }
 
     #[test]
