@@ -1374,24 +1374,30 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 let x_outer = chunk_start + offset;
                 // aarch64: this drain walks its slab monotonically, so the
                 // next chunk's packed rows are known. Start their lines while
-                // this chunk is transformed; the hint addresses are inside
-                // the two packed slices because `next + 1 < n_chunks`.
                 #[cfg(target_arch = "aarch64")]
                 if offset + 8 < slab_len {
-                    let next = (x_outer + 8) * OUTER_BYTES;
-                    for line in 0..8 {
-                        // SAFETY: `next + 1023 < a_packed.len()` by the guard.
-                        unsafe {
-                            core::arch::asm!(
-                                "prfm pldl1keep, [{p}]",
-                                p = in(reg) a_packed.as_ptr().add(next + line * 128),
-                                options(nostack, preserves_flags, readonly)
-                            );
-                            core::arch::asm!(
-                                "prfm pldl1keep, [{p}]",
-                                p = in(reg) b_packed.as_ptr().add(next + line * 128),
-                                options(nostack, preserves_flags, readonly)
-                            );
+                    let ahead = x_outer + 8;
+                    let within_ahead = ahead & within_outer_mask;
+                    let n_ahead = b_med_counts[within_ahead] as usize;
+                    if n_ahead != 0 {
+                        let next = ahead * OUTER_BYTES;
+                        let first_line = representation.first_materialized_b_med(within_ahead) / 2;
+                        let end_line = representation
+                            .materialized_b_med_end(within_ahead, n_ahead)
+                            .div_ceil(2);
+                        for line in first_line..end_line {
+                            unsafe {
+                                core::arch::asm!(
+                                    "prfm pldl1keep, [{p}]",
+                                    p = in(reg) a_packed.as_ptr().add(next + line * 128),
+                                    options(nostack, preserves_flags, readonly)
+                                );
+                                core::arch::asm!(
+                                    "prfm pldl1keep, [{p}]",
+                                    p = in(reg) b_packed.as_ptr().add(next + line * 128),
+                                    options(nostack, preserves_flags, readonly)
+                                );
+                            }
                         }
                     }
                 }
