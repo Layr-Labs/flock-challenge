@@ -2334,8 +2334,6 @@ fn butterfly_interleaved_fused_2layer_par_rows(
         kernels::butterfly_fused_2layer(row_a, row_b, row_c, row_d, t_outer, t_inner_a, t_inner_b);
     };
 
-    // Split the block into four quarters, then zip row-wise. Each rayon task
-    // processes one quarter-row index = 4 logical rows of work.
     let (top_half, bot_half) = block.split_at_mut(2 * stride);
     let (q1, q2) = top_half.split_at_mut(stride);
     let (q3, q4) = bot_half.split_at_mut(stride);
@@ -2351,12 +2349,14 @@ fn butterfly_interleaved_fused_2layer_par_rows(
             do_one(q1r, q2r, q3r, q4r);
         }
     } else {
-        q1.par_chunks_mut(num_ntts)
-            .zip(q2.par_chunks_mut(num_ntts))
-            .zip(q3.par_chunks_mut(num_ntts))
-            .zip(q4.par_chunks_mut(num_ntts))
-            .for_each(|(((row_a, row_b), row_c), row_d)| {
-                do_one(row_a, row_b, row_c, row_d);
+        const ROWS_PER_TASK: usize = 8;
+        let chunk = ROWS_PER_TASK * num_ntts;
+        q1.par_chunks_mut(chunk)
+            .zip(q2.par_chunks_mut(chunk))
+            .zip(q3.par_chunks_mut(chunk))
+            .zip(q4.par_chunks_mut(chunk))
+            .for_each(|(((rows_a, rows_b), rows_c), rows_d)| {
+                do_one(rows_a, rows_b, rows_c, rows_d);
             });
     }
 }
