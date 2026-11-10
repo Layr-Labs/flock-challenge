@@ -648,7 +648,7 @@ enum LincheckStripeInput {
     DeferredRanked,
 }
 
-const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 32;
+const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 16;
 
 fn fill_deferred_lincheck_stripe_group(
     z_packed: &[F128],
@@ -828,7 +828,6 @@ fn fixed_inputs_hold(z_packed: &[F128], group: usize, group_f128: usize, u64_per
 /// The deferred stripe fill as a chunk job: returns the job count and the job
 /// closure, so the closure can outlive one dispatch call and be shared by the
 /// helper pool and main-pool help drains. Job `j` writes exactly the stripe
-/// groups `j*64..(j+1)*64` (clamped), each one disjoint `k`-byte range, and
 /// reads only `z_packed`.
 ///
 /// The closure writes through a raw pointer to `z_lincheck`: the caller must
