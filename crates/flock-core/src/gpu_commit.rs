@@ -4269,16 +4269,19 @@ static inline void gf_build_short2_one(
 
 // Build the 64-bit tables of two consecutive twiddles at once (tab2[0..512)
 // and tab2[512..1024)), so sub-layer 2's four tables cost two barrier pairs.
+// The twiddles' low 64 bits come from the group's prefetched copy `tws`.
 static inline void gf_build_short2_pair(
-    threadgroup uint2* tab2, device const uint4* twiddles, uint idx, uint lid)
+    threadgroup uint2* tab2, threadgroup const uint2* tws, uint k, uint lid)
 {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint t  = lid >> 5;
     const uint u  = lid & 31u;
     const uint aa = u & 3u;
     const uint cc = u >> 2;
-    gf_build_short2_one(tab2, u2l(twiddles[idx]), t, aa, cc);
-    gf_build_short2_one(tab2 + 512u, u2l(twiddles[idx + 1u]), t, aa, cc);
+    const uint2 w0 = tws[k];
+    const uint2 w1 = tws[k + 1u];
+    gf_build_short2_one(tab2, ulong(w0.x) | (ulong(w0.y) << 32), t, aa, cc);
+    gf_build_short2_one(tab2 + 512u, ulong(w1.x) | (ulong(w1.y) << 32), t, aa, cc);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
@@ -4310,18 +4313,17 @@ static inline void gf_mul_mid3_x2(uint4 va, uint4 vb,
     rb = b;
 }
 
+// The twiddle (twl[k]) or its x^8 multiple (twl[3 + k]) comes from the
+// group's prefetched copy: the same value, no device load between barriers.
 static inline void gf_build_mid3(
-    threadgroup uint2* t2, threadgroup uint* t1, device const uint4* twiddles, uint idx, uint lid)
+    threadgroup uint2* t2, threadgroup uint* t1, threadgroup const uint4* twl, uint k, uint lid)
 {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint t  = lid >> 5;
     const uint u  = lid & 31u;
     const uint aa = u & 3u;
     const uint cc = u >> 2;
-    uint4 g = twiddles[idx];
-    if (t != 0u) {
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-    }
+    uint4 g = twl[t * 3u + k];
     uint4 e0 = g;
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
     uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
@@ -4349,22 +4351,20 @@ static inline void gf_build_mid3(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// gf_build_byte16 of the main library, unchanged: rebuild the live
-// twiddle's two byte tables (tab[b] = b*tw, tab[256 + b] = (b*x^8)*tw)
+// gf_build_byte16 of the main library, with the twiddle (twl[k]) or its x^8
+// multiple (twl[3 + k]) read from the group's prefetched copy: rebuild the
+// live twiddle's two byte tables (tab[b] = b*tw, tab[256 + b] = (b*x^8)*tw)
 // between a leading barrier (retires the previous table's readers) and a
 // trailing one (publishes the new table). 64 threads.
 static inline void gf_build_byte16(
-    threadgroup uint4* tabB, device const uint4* twiddles, uint idx, uint lid)
+    threadgroup uint4* tabB, threadgroup const uint4* twl, uint k, uint lid)
 {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint t  = lid >> 5;
     const uint u  = lid & 31u;
     const uint aa = u & 3u;
     const uint cc = u >> 2;
-    uint4 g = twiddles[idx];
-    if (t != 0u) {
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-    }
+    uint4 g = twl[t * 3u + k];
     uint4 e0 = g;
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
     uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
@@ -4401,8 +4401,7 @@ static inline void gf_build_byte16(
         constexpr uint c    = (C);                                             \
         constexpr uint bpos = F - 1u - j;                                      \
         constexpr uint BPER = (NF >> 1) >> j;                                  \
-        gf_build_byte16(tabB, twiddles,                                        \
-                        (1u << (P.l + j)) - 1u + (B << j) + c, lid);           \
+        gf_build_byte16(tabB, twl, c, lid);                                    \
         for (uint bb = 0; bb < BPER; bb += 2u) {                               \
             const uint b0  = c * BPER + bb;                                    \
             const uint b1  = b0 + 1u;                                          \
@@ -4430,8 +4429,7 @@ static inline void gf_build_byte16(
         constexpr uint c    = (C);                                             \
         constexpr uint bpos = F - 1u - j;                                      \
         constexpr uint BPER = (NF >> 1) >> j;                                  \
-        gf_build_mid3(tab2, tab1, twiddles,                                   \
-                        (1u << (P.l + j)) - 1u + (B << j) + c, lid);           \
+        gf_build_mid3(tab2, tab1, twl, 1u + c, lid);                           \
         for (uint bb = 0; bb < BPER; bb += 2u) {                               \
             const uint b0  = c * BPER + bb;                                    \
             const uint b1  = b0 + 1u;                                          \
@@ -4458,8 +4456,7 @@ static inline void gf_build_byte16(
         constexpr uint j    = (J);                                             \
         constexpr uint bpos = F - 1u - j;                                      \
         constexpr uint BPER = (NF >> 1) >> j;                                  \
-        gf_build_short2_pair(tab2, twiddles,                                   \
-                        (1u << (P.l + j)) - 1u + (B << j) + (C0), lid);        \
+        gf_build_short2_pair(tab2, tws, (C0), lid);                            \
         {   constexpr uint c = (C0); threadgroup const uint2* tabc = tab2;      \
         for (uint bb = 0; bb < BPER; bb += 2u) {                               \
             const uint b0  = c * BPER + bb;                                    \
@@ -4522,6 +4519,8 @@ kernel void ntt_final_t3(device uint4* data                [[buffer(0)]],
     constexpr uint NNIB = 5u;      // sub-layer 3: twiddle < 2^20
     threadgroup uint4 tabB[512u];  // the live twiddle's two byte tables
     threadgroup uint  nibB[8u * NNIB];
+    threadgroup uint4 twl[6u];     // prefetched twiddles, see below
+    threadgroup uint2 tws[4u];
     // Narrow-entry views of tabB: sub-layer 1 uses tab2[0..512) (bits 0..63)
     // plus tab1[0..512) (bits 64..95); sub-layer 2 uses tab2[0..1024) for
     // two twiddles' 64-bit tables.
@@ -4537,7 +4536,25 @@ kernel void ntt_final_t3(device uint4* data                [[buffer(0)]],
         uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cB];
         nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;
     }
-    // nibB is published by the first table build's barriers.
+    // Twiddle prefetch for the five table builds (sub-layer 0's twiddle and
+    // sub-layer 1's two, each with its x^8 multiple: twl[k], twl[3 + k];
+    // sub-layer 2's four, low 64 bits: tws[k]). Seven otherwise idle lanes
+    // load them once while the group loads its tile, so no build waits on a
+    // dependent device load or an 8-step mulx chain between its barriers.
+    // Same values, same tables: bit-identical. 128 B of threadgroup memory.
+    if (lid >= 40u && lid < 43u) {
+        const uint k = lid - 40u;
+        const uint idx = (k == 0u) ? ((1u << P.l) - 1u + B)
+                                   : ((1u << (P.l + 1u)) - 1u + (B << 1) + (k - 1u));
+        uint4 g = twiddles[idx];
+        twl[k] = g;
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+        twl[3u + k] = g;
+    } else if (lid >= 43u && lid < 47u) {
+        const uint k = lid - 43u;
+        tws[k] = twiddles[(1u << (P.l + 2u)) - 1u + (B << 2) + k].xy;
+    }
+    // nibB, twl and tws are published by the first table build's barriers.
 
     uint4 elems[NF];
     for (uint e = 0; e < NF; e++) {
