@@ -29,7 +29,7 @@ fn bstatic_horner_fallback(
     out: &mut [u8; 64],
     nt_store: bool,
 ) {
-    shift_reduce_inner_ab_fused_neon_h4::<0>(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
+    shift_reduce_inner_ab_fused_neon_h4(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
 }
 
 /// One static-B arm `BLK = w * 16 + b_med` (3..=28) in the h4 Horner layout.
