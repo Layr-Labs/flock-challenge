@@ -1044,6 +1044,13 @@ fn zc_ab_producer_fused_enabled() -> bool {
     })
 }
 
+/// Whether [`precompute_round1_ab_inner_packed_padded_produced`] takes the
+/// fused arm, i.e. calls the producer with worker scratch, one job's units
+/// in ascending order on one thread, every job starting at an even unit.
+pub fn zc_ab_producer_fused_active() -> bool {
+    zc_ab_producer_fused_enabled() && zc_ab_pre_hetero_enabled()
+}
+
 /// [`precompute_round1_ab_inner_packed_padded_with_tail`] for A/B buffers
 /// whose rows are deferred to `producer` (see [`Round1AbProducer`]).  The
 /// output is byte-identical to producing every unit first and then calling
@@ -1487,7 +1494,13 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         assert!(unit_chunks > 0 && unit_bytes.is_multiple_of(OUTER_BYTES));
         assert!(n_chunks.is_multiple_of(unit_chunks));
         let n_units = n_chunks / unit_chunks;
-        let units_per_job = (chunks_per_job / unit_chunks).max(1);
+        // Even, so unit pairs (2u, 2u + 1) always share a job and a thread
+        // (the producer may pair them; see `zc_ab_producer_fused_active`).
+        // 42 at the ranked shape, unchanged.
+        let units_per_job = match chunks_per_job / unit_chunks {
+            0 | 1 => 1,
+            u => u & !1,
+        };
         let n_jobs = n_units.div_ceil(units_per_job);
         crate::epool::run_hetero_chunks_stateful_with_tail(
             n_jobs,
