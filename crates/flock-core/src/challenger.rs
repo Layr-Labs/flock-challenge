@@ -1021,6 +1021,79 @@ fn run_cpu_window_after_persistent_gpu(
     }
 }
 
+fn grind_race_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_RACE").is_none())
+}
+
+/// Ascending CPU scan for the race: blocks of `2^(bits+1)` nonces drained by
+/// the main pool and the E-core helpers from one chunk cursor. Returns the
+/// smallest satisfying nonce once it is definitive (every lower chunk fully
+/// scanned without a match), or `None` if `stop` fired first.
+fn cpu_race_scan(
+    state_digest: &[u8; 32],
+    bits: u32,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Option<u64> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    const CHUNK: u64 = 960;
+    const PENDING: u64 = u64::MAX;
+    const NO_MATCH: u64 = u64::MAX - 1;
+    let block: u64 = 1 << (bits.min(24) + 1);
+    let n_chunks = usize::try_from(block.div_ceil(CHUNK)).ok()?;
+    let mut start = 0u64;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        let results: Vec<AtomicU64> = (0..n_chunks).map(|_| AtomicU64::new(PENDING)).collect();
+        let next = AtomicUsize::new(0);
+        let bound = AtomicUsize::new(n_chunks);
+        let worker = || loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let c = next.fetch_add(1, Ordering::Relaxed);
+            if c >= n_chunks || c >= bound.load(Ordering::Relaxed) {
+                break;
+            }
+            match pow_scan(
+                state_digest,
+                start.saturating_add(c as u64 * CHUNK),
+                CHUNK,
+                bits,
+                HashKind::Blake3,
+            ) {
+                Some(n) => {
+                    results[c].store(n, Ordering::Release);
+                    bound.fetch_min(c, Ordering::Relaxed);
+                }
+                None => results[c].store(NO_MATCH, Ordering::Release),
+            }
+        };
+        let main_threads = rayon::current_num_threads();
+        match crate::epool::epool() {
+            Some(ep) => crate::epool::drain_hetero(
+                main_threads,
+                &worker,
+                ep,
+                &worker,
+                crate::epool::detached_enabled(),
+            ),
+            None => (0..main_threads).into_par_iter().with_max_len(1).for_each(|_| worker()),
+        }
+        for r in &results {
+            match r.load(Ordering::Acquire) {
+                NO_MATCH => continue,
+                PENDING => return None,
+                n => return Some(n),
+            }
+        }
+        start = start.saturating_add(block);
+    }
+}
+
 fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, String> {
     debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
     // Wide policy: one dispatch covers 2^GPU_GRIND_WIDE_EXTRA_BITS expected-
@@ -1036,6 +1109,51 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         1u32 << bits.min(24)
     };
     let hybrid = !wide && grind_hybrid_enabled() && rayon::current_num_threads() > 1;
+    // CPU/GPU race on the same ascending range (`FLOCK_NO_GRIND_RACE=1`
+    // kills): the GPU scans its wide block on the persistent worker while
+    // the CPU (main pool + E-cores) scans ascending chunks from nonce 0. The
+    // CPU answer is taken only when it is definitive (a match in chunk c with
+    // every lower chunk fully scanned), which is the global minimum — the
+    // same nonce the GPU returns — so proofs are identical; otherwise the
+    // GPU result is used. The CPU bails as soon as the GPU reports a hit.
+    if wide && grind_race_enabled() && rayon::current_num_threads() > 1 {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(done_rx) = grind_worker::dispatch_async(
+            state_digest,
+            0,
+            block_len,
+            bits,
+            std::sync::Arc::clone(&stop),
+            true,
+        ) {
+            let t_iter = grind_trace_enabled().then(std::time::Instant::now);
+            if let Some(n) = cpu_race_scan(state_digest, bits, &stop) {
+                if let Some(t) = t_iter {
+                    eprintln!(
+                        "[grind] bits={bits} race: cpu won wall={:.3} ms",
+                        t.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                // The abandoned GPU scan finishes on its worker; its result
+                // goes to the dropped receiver.
+                drop(done_rx);
+                return Ok(n);
+            }
+            let gpu = grind_worker::recv(done_rx)?;
+            if let Some(t) = t_iter {
+                eprintln!(
+                    "[grind] bits={bits} race: gpu won hit={} wall={:.3} ms",
+                    gpu.is_some(),
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            if let Some(n) = gpu {
+                return Ok(n);
+            }
+            // GPU miss with the CPU stopped cannot happen (the CPU only
+            // stops on a GPU hit); fall through to the incumbent walk.
+        }
+    }
     let mut start = 0u64;
     loop {
         if !hybrid {
