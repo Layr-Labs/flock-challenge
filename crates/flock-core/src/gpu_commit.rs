@@ -3557,6 +3557,17 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
     // groups up to 13.5 KiB, five from 13.8 KiB at 25.2 ms, four from
     // 16.8 KiB at 25.5 ms, three at 21.6 KiB at 31.1 ms).
     threadgroup uint4 pad[256u];
+
+    const uint lane = lid & 63u;
+    const uint r_base = tgid << LOG_G;
+    // The first tile's message half is loaded before the table build, so
+    // its device-load latency overlaps the build's two barrier phases
+    // instead of following them. Same values, same butterflies: the output
+    // is bit-identical. Later tiles load at the top of their iteration.
+    uint4 elems[NF];
+    for (uint e = 0u; e < NF / 2u; e++) {
+        elems[e] = z[(((e << P.s) + r_base) << 6) + lane];
+    }
     build_zero_root_tabs(twiddles, bases, tabs, lid);
     if (P.log_d == 77u) {          // unreachable; keeps `pad` allocated
         pad[lid % 256u] = tabs[lid];
@@ -3564,15 +3575,16 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
         tabs[lid] ^= pad[(lid + 1u) % 256u];
     }
 
-    const uint lane = lid & 63u;
-    const uint r_base = tgid << LOG_G;
     for (uint rr = 0u; rr < (1u << LOG_G); rr++) {
         const uint r = r_base + rr;
-        uint4 elems[NF];
 
         // Layer zero has v=0: load the message half once and duplicate it.
+        if (rr != 0u) {
+            for (uint e = 0u; e < NF / 2u; e++) {
+                elems[e] = z[(((e << P.s) + r) << 6) + lane];
+            }
+        }
         for (uint e = 0u; e < NF / 2u; e++) {
-            elems[e] = z[(((e << P.s) + r) << 6) + lane];
             elems[e + NF / 2u] = elems[e];
         }
 
