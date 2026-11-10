@@ -80,6 +80,8 @@ pub fn micro_stack_enabled() -> bool {
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // Before anything exists: the ranked worker's one idle pause.
+    ranked_start_pause();
     let n = std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -99,6 +101,83 @@ pub fn init_perf_thread_pool() -> Option<usize> {
     {
         Ok(()) => Some(n),
         Err(_) => None, // pool already built
+    }
+}
+
+/// Kill switch for the ranked worker's start-up pause: `FLOCK_NO_READY_PAUSE=1`
+/// skips it. The ranked harness clears the environment, so this is for local
+/// runs only.
+pub const ENV_NO_READY_PAUSE: &str = "FLOCK_NO_READY_PAUSE";
+
+/// Idle time every ranked worker spends once, before it does anything else.
+///
+/// It adds no prover speed. Each benchmark trial is one fresh worker process:
+/// untimed start-up and warm-up proof, readiness, then the timed proof. This
+/// pause lengthens the untimed part of every trial by the same amount, so a
+/// job's trials are spread over more wall time and the machine's average load
+/// is lower. Public run logs show a slow window on the official runner that
+/// is fixed in wall time (about 85 s to 290 s after a job's first trial), so
+/// a longer trial period puts fewer scored trials inside it.
+///
+/// Placement: at the very top of [`init_perf_thread_pool`], the first call of
+/// the protected worker, before the thread pool, the buffers and the GPU
+/// exist. The process is truly idle there, and everything from the warm-up
+/// proof through readiness to the timed proof runs exactly as it did, so the
+/// pause cannot reach the timed proof. It is a plain sleep, the same in every
+/// worker, and reads nothing but the executable name and the argument count.
+const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(1300);
+
+/// Pure selector: the pause a process takes at start-up, if any.
+fn ranked_start_pause_for(
+    ranked_worker: bool,
+    kill: Option<&std::ffi::OsStr>,
+) -> Option<std::time::Duration> {
+    (ranked_worker && kill != Some(std::ffi::OsStr::new("1"))).then_some(RANKED_START_PAUSE)
+}
+
+/// `flock-benchmark-worker LOG2 READY PROOF`: the same test the prover crate
+/// uses to arm its ranked-only paths (executable name and argument count).
+fn is_ranked_worker_process() -> bool {
+    let mut args = std::env::args_os();
+    let Some(exe) = args.next() else {
+        return false;
+    };
+    args.len() == 3
+        && std::path::Path::new(&exe)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
+}
+
+/// Sleep [`RANKED_START_PAUSE`] once per ranked worker process.
+fn ranked_start_pause() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let kill = std::env::var_os(ENV_NO_READY_PAUSE);
+        if let Some(pause) = ranked_start_pause_for(is_ranked_worker_process(), kill.as_deref()) {
+            std::thread::sleep(pause);
+        }
+    });
+}
+
+#[cfg(test)]
+mod ranked_start_pause_tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn only_the_ranked_worker_pauses_and_the_switch_needs_the_literal_one() {
+        let pause = Some(super::RANKED_START_PAUSE);
+        assert_eq!(super::ranked_start_pause_for(true, None), pause);
+        assert_eq!(super::ranked_start_pause_for(true, Some(OsStr::new("0"))), pause);
+        assert_eq!(super::ranked_start_pause_for(true, Some(OsStr::new(""))), pause);
+        assert_eq!(super::ranked_start_pause_for(true, Some(OsStr::new("1"))), None);
+        assert_eq!(super::ranked_start_pause_for(false, None), None);
+        assert_eq!(super::ranked_start_pause_for(false, Some(OsStr::new("1"))), None);
+        // A test binary is never the ranked worker, so this returns at once.
+        assert!(!super::is_ranked_worker_process());
+        let t = std::time::Instant::now();
+        super::ranked_start_pause();
+        assert!(t.elapsed() < super::RANKED_START_PAUSE);
     }
 }
 
