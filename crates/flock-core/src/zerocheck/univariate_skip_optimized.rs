@@ -2653,6 +2653,17 @@ fn ab_eq_fold_factors(r_lo: &[F128], bank_bits: usize) -> (Vec<F128>, Vec<F128>)
 /// eq_top_scaled[w]`, built once per prove and shared read-only by every
 /// worker (mirrors [`build_c_mask_tables`]).
 fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128> {
+    build_ab_eq_fold_tables_derived(eq_top_scaled, convert).0
+}
+
+fn zc_r1_x8_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_R1_X8").as_deref() != Some(std::ffi::OsStr::new("1"))
+    });
+    *ON
+}
+
+fn build_ab_eq_fold_tables_derived(eq_top_scaled: &[F128], convert: &[F128]) -> (Vec<F128>, bool) {
     use rayon::prelude::*;
 
     debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
@@ -2756,7 +2767,7 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
                 }
             }
         });
-    tables
+    (tables, derive_rows)
 }
 
 /// Folded twin of [`process_one_x_hi_with_precomputed_ab_fold4_ab`]: same
@@ -2777,10 +2788,12 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     tables: &[F128],
     bank_bits: usize,
     bank_deferred: bool,
+    x8: bool,
     banks: &mut [F128],
     partial_ab: &mut [F128; ELL],
 ) {
-    debug_assert_eq!(banks.len(), eq_bot.len() * ELL);
+    let bank_len = eq_bot.len() * ELL;
+    debug_assert_eq!(banks.len(), if x8 { 2 * bank_len } else { bank_len });
     debug_assert_eq!(eq_bot.len(), 1usize << bank_bits);
 
     let n_lo = n_lo_and_inner - N_INNER;
@@ -2790,6 +2803,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     if !store_first {
         banks.fill(F128::ZERO);
     }
+    let (banks, banks_hi) = banks.split_at_mut(bank_len);
 
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
@@ -2804,6 +2818,9 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
         if n_b_med == 0 {
             if first_touch {
                 bank.fill(F128::ZERO);
+                if x8 {
+                    banks_hi[u * ELL..(u + 1) * ELL].fill(F128::ZERO);
+                }
             }
             continue;
         }
@@ -2812,7 +2829,20 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
         let rows = precomputed_ab_rows(ab_inner, chunk_byte_base);
         let end_b_med = representation.materialized_b_med_end(within_hash_outer, n_b_med);
         let table = &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE];
-        if first_touch {
+        if x8 {
+            let bank_hi: &mut [F128; ELL] = (&mut banks_hi[u * ELL..(u + 1) * ELL])
+                .try_into()
+                .expect("one ELL-lane high bank per low x_lo index");
+            if first_touch {
+                kernels::accumulate_convert_ab_nomul_x8_split::<true>(
+                    rows, first_b_med, end_b_med, table, bank, bank_hi,
+                );
+            } else {
+                kernels::accumulate_convert_ab_nomul_x8_split::<false>(
+                    rows, first_b_med, end_b_med, table, bank, bank_hi,
+                );
+            }
+        } else if first_touch {
             kernels::accumulate_convert_ab_nomul::<true>(rows, first_b_med, end_b_med, table, bank);
         } else {
             kernels::accumulate_convert_ab_nomul::<false>(rows, first_b_med, end_b_med, table, bank);
@@ -2820,6 +2850,13 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     }
 
     finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks, bank_deferred, partial_ab);
+    if x8 {
+        let mut partial_hi = [F128::ZERO; ELL];
+        finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks_hi, bank_deferred, &mut partial_hi);
+        for (out, hi) in partial_ab.iter_mut().zip(partial_hi) {
+            *out += kernels::mul_x8_f128(hi);
+        }
+    }
 }
 
 /// Collapse the bank-major tensor-fold scratch and apply the unchanged high
@@ -2944,8 +2981,10 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
         Some(bank_bits) => {
             let r_lo = &r[k_skip + N_INNER..k_skip + N_INNER + eq.n_lo];
             let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
-            let tables = build_ab_eq_fold_tables(&eq_top_scaled, convert);
+            let (tables, derived) = build_ab_eq_fold_tables_derived(&eq_top_scaled, convert);
+            let x8 = derived && cfg!(target_arch = "aarch64") && zc_r1_x8_enabled();
             let bank_len = eq_bot.len() * ELL;
+            let alloc_len = if x8 { 2 * bank_len } else { bank_len };
             let bank_deferred = ranked_ab_bank_deferred_shape(
                 m,
                 k_skip,
@@ -2962,9 +3001,9 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                 let mut partial = [F128::ZERO; ELL];
                 AB_EQ_FOLD_BANKS.with(|cell| {
                     let mut banks = cell.borrow_mut();
-                    if banks.len() != bank_len {
+                    if banks.len() != alloc_len {
                         banks.clear();
-                        banks.resize(bank_len, F128::ZERO);
+                        banks.resize(alloc_len, F128::ZERO);
                     }
                     process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
                         x_hi,
@@ -2979,6 +3018,7 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                         &tables,
                         bank_bits,
                         bank_deferred,
+                        x8,
                         &mut banks,
                         &mut partial,
                     );
@@ -7131,6 +7171,57 @@ mod tests {
             finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, true, &mut deferred);
             assert_eq!(deferred, scalar, "trial={trial}");
         }
+    }
+
+    #[test]
+    fn ab_completion_x8_split_matches_incumbent() {
+        let mut rng = Rng::new(0x58_C0_4D);
+        let scales = [F128::ONE, rng.f128(), rng.f128()];
+        let (tables, derived) = build_ab_eq_fold_tables_derived(&scales, convert_table());
+        assert!(derived, "factory convert table must give the derived image");
+        let mut x8 = F128 { lo: 1, hi: 0 };
+        for _ in 0..8 {
+            x8 = x8 * F128 { lo: 2, hi: 0 };
+        }
+        let mut chunk = [[0u8; 64]; 16];
+        for case in 0..24 {
+            for row in chunk.iter_mut() {
+                for byte in row.iter_mut() {
+                    *byte = match case % 3 {
+                        0 => rng.next_u64() as u8,
+                        1 => 0xff,
+                        _ => (rng.next_u64() as u8) & 0x81,
+                    };
+                }
+            }
+            let w = case % scales.len();
+            let table = &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE];
+            let init_lo: [F128; 64] = core::array::from_fn(|_| rng.f128());
+            let init_hi: [F128; 64] = core::array::from_fn(|_| rng.f128());
+            for first in (0..=16).step_by(2) {
+                for end in first..=16 {
+                    let mut plain = [F128::ZERO; 64];
+                    kernels::accumulate_convert_ab_nomul::<true>(&chunk, first, end, table, &mut plain);
+                    let (mut lo, mut hi) = (init_lo, init_hi);
+                    kernels::accumulate_convert_ab_nomul_x8_split::<true>(
+                        &chunk, first, end, table, &mut lo, &mut hi,
+                    );
+                    for lane in 0..64 {
+                        assert_eq!(kernels::mul_x8_f128(hi[lane]), hi[lane] * x8);
+                        assert_eq!(lo[lane] + kernels::mul_x8_f128(hi[lane]), plain[lane], "store {first}..{end}");
+                    }
+                    let (mut lo, mut hi) = (init_lo, init_hi);
+                    kernels::accumulate_convert_ab_nomul_x8_split::<false>(
+                        &chunk, first, end, table, &mut lo, &mut hi,
+                    );
+                    for lane in 0..64 {
+                        let got = (lo[lane] + init_lo[lane]) + kernels::mul_x8_f128(hi[lane] + init_hi[lane]);
+                        assert_eq!(got, plain[lane], "xor {first}..{end}");
+                    }
+                }
+            }
+        }
+        crate::scratch::give_f128(tables);
     }
 
     /// The gather is an XOR chain over convert rows, so the pre-scaled table

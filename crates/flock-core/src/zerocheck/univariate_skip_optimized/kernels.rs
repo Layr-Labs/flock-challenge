@@ -574,6 +574,46 @@ pub(super) fn accumulate_convert_ab_nomul<const STORE: bool>(
     portable::accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
 }
 
+#[inline]
+pub(super) fn accumulate_convert_ab_nomul_x8_split<const STORE: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    n_b_med: usize,
+    convert: &[super::F128],
+    bank_lo: &mut [super::F128; 64],
+    bank_hi: &mut [super::F128; 64],
+) {
+    assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        aarch64::accumulate_convert_ab_nomul_x8_split::<STORE>(
+            chunk_ab_bytes,
+            first_b_med,
+            n_b_med,
+            convert,
+            bank_lo,
+            bank_hi,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        if STORE {
+            bank_hi.fill(super::F128::ZERO);
+        }
+        accumulate_convert_ab_nomul::<STORE>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank_lo);
+    }
+}
+
+#[inline]
+pub(super) fn mul_x8_f128(v: super::F128) -> super::F128 {
+    let o = v.hi >> 56;
+    let red = o ^ (o << 1) ^ (o << 2) ^ (o << 7);
+    super::F128 {
+        lo: (v.lo << 8) ^ red,
+        hi: (v.hi << 8) | (v.lo >> 56),
+    }
+}
+
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
 /// kernel is tested against.
 ///
