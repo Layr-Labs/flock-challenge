@@ -2197,6 +2197,17 @@ unsafe fn xor_apply_byte_pair_into_4_regs<
 
 /// Apply the collapsed inverse-NTT table to one packed eight-byte row and
 /// keep the 64 output bytes in four vector registers.
+///
+/// Output vector `lane` is the XOR of eight table loads: byte `j` of `word`
+/// selects row `byte(j) * 64` of the plain table (even `j`) or of the
+/// half-swapped table (odd `j`), at vector `(lane ^ (j / 2)) * 16`. These are
+/// the same eight loads, in the same tables, as the former left-to-right
+/// chain (`t0`, then `xor3` with `t1,t2`, `t3,t4`, `t5,t6`, then `t7`). XOR is
+/// associative and commutative, so evaluating the balanced tree
+/// `xor3(xor3(t0,t1,t2), xor3(t3,t4,t5), t6 ^ t7)` is byte-identical for every
+/// word, while the source dependence chain per lane is two XOR-family
+/// operations instead of four. Each lane is finished before the next starts,
+/// so at most eight loaded vectors per lane need be live at once.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn apply_word_into_4_regs(
@@ -2212,49 +2223,36 @@ unsafe fn apply_word_into_4_regs(
     use core::arch::aarch64::*;
     unsafe {
         let r0 = table_base.add(byte_from_word::<0>(word) * 64);
-        let mut d0 = vld1q_u8(r0);
-        let mut d1 = vld1q_u8(r0.add(16));
-        let mut d2 = vld1q_u8(r0.add(32));
-        let mut d3 = vld1q_u8(r0.add(48));
-        xor_apply_byte_pair_into_4_regs::<0, true, 1, false>(
-            table_base,
-            half_swapped_table_base,
-            byte_from_word::<1>(word),
-            byte_from_word::<2>(word),
-            &mut d0,
-            &mut d1,
-            &mut d2,
-            &mut d3,
-        );
-        xor_apply_byte_pair_into_4_regs::<1, true, 2, false>(
-            table_base,
-            half_swapped_table_base,
-            byte_from_word::<3>(word),
-            byte_from_word::<4>(word),
-            &mut d0,
-            &mut d1,
-            &mut d2,
-            &mut d3,
-        );
-        xor_apply_byte_pair_into_4_regs::<2, true, 3, false>(
-            table_base,
-            half_swapped_table_base,
-            byte_from_word::<5>(word),
-            byte_from_word::<6>(word),
-            &mut d0,
-            &mut d1,
-            &mut d2,
-            &mut d3,
-        );
-        xor_apply_byte_into_4_regs::<3, true>(
-            table_base,
-            half_swapped_table_base,
-            byte_from_word::<7>(word),
-            &mut d0,
-            &mut d1,
-            &mut d2,
-            &mut d3,
-        );
+        let r1 = half_swapped_table_base.add(byte_from_word::<1>(word) * 64);
+        let r2 = table_base.add(byte_from_word::<2>(word) * 64);
+        let r3 = half_swapped_table_base.add(byte_from_word::<3>(word) * 64);
+        let r4 = table_base.add(byte_from_word::<4>(word) * 64);
+        let r5 = half_swapped_table_base.add(byte_from_word::<5>(word) * 64);
+        let r6 = table_base.add(byte_from_word::<6>(word) * 64);
+        let r7 = half_swapped_table_base.add(byte_from_word::<7>(word) * 64);
+        macro_rules! lane {
+            ($lane:literal) => {{
+                let p0 = xor3_u8(
+                    vld1q_u8(r0.add(($lane ^ 0) * 16)),
+                    vld1q_u8(r1.add(($lane ^ 0) * 16)),
+                    vld1q_u8(r2.add(($lane ^ 1) * 16)),
+                );
+                let p1 = xor3_u8(
+                    vld1q_u8(r3.add(($lane ^ 1) * 16)),
+                    vld1q_u8(r4.add(($lane ^ 2) * 16)),
+                    vld1q_u8(r5.add(($lane ^ 2) * 16)),
+                );
+                let p2 = veorq_u8(
+                    vld1q_u8(r6.add(($lane ^ 3) * 16)),
+                    vld1q_u8(r7.add(($lane ^ 3) * 16)),
+                );
+                xor3_u8(p0, p1, p2)
+            }};
+        }
+        let d0 = lane!(0);
+        let d1 = lane!(1);
+        let d2 = lane!(2);
+        let d3 = lane!(3);
         (d0, d1, d2, d3)
     }
 }
