@@ -8043,9 +8043,11 @@ kernel void blake3_pow_scan(
     /// AB-dominated samples — so it re-enters between pure-GPU and k=3.
     /// k=4 fills the gap between k=3 and the default: a GPU-heavy host whose
     /// balanced split sits between the two otherwise rounds to one side.
-    /// Five candidates × 2 reverse-order samples, all in the untimed warmup,
+    /// k=1 (one sixteenth on the CPU) sits between pure-GPU and k=2: on a
+    /// GPU-strong host (M3 Max class) the balanced split falls there.
+    /// Six candidates × 2 reverse-order samples, all in the untimed warmup,
     /// is still well inside the 10-minute job wall at ~120 workers.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 5] = [0, 2, 3, 4, 5];
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 6] = [0, 1, 2, 3, 4, 5];
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
