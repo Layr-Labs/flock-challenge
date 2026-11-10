@@ -1547,15 +1547,8 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                     };
                     macro_rules! acc {
                         ($acc:expr, $a:expr, $b:expr) => {{
-                            // The GPU-shared (`!FULL`) body keeps fewer live
-                            // accumulators and measures faster with them updated
-                            // in place; the full body keeps the all-fused form.
                             #[cfg(target_feature = "sha3")]
-                            if FULL {
-                                tri_acc_q(&mut $acc, $a, $b);
-                            } else {
-                                tri_acc_q_crossfused(&mut $acc, $a, $b);
-                            }
+                            tri_acc_q_crossfused(&mut $acc, $a, $b);
                             #[cfg(not(target_feature = "sha3"))]
                             tri_acc_q(&mut $acc, $a, $b);
                         }};
