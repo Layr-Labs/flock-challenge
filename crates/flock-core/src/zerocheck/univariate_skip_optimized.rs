@@ -1020,13 +1020,6 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
 /// A witness generator may hand the prover A/B buffers whose rows are not
 /// written yet, together with this producer.  The buffers are cut into
 /// units of `unit_bytes` bytes of A (and the same range of B); a multiple of
-/// the precompute's 1 KiB outer chunk.  `produce(unit, a_scratch, b_scratch)`
-/// must materialise unit `unit` of both buffers (bytes
-/// `unit * unit_bytes .. (unit + 1) * unit_bytes`), exactly as the eager
-/// generator would have left them, and, when the scratch pointers are
-/// non-null, also write those same `unit_bytes` bytes of A to `a_scratch`
-/// and of B to `b_scratch`.  It must be callable concurrently for distinct
-/// units from any thread.
 ///
 /// The precompute calls it exactly once per unit before it returns, so both
 /// buffers are complete for every later reader (zerocheck round two).  On
@@ -1035,7 +1028,7 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
 #[derive(Clone, Copy)]
 pub struct Round1AbProducer<'a> {
     pub unit_bytes: usize,
-    pub produce: &'a (dyn Fn(usize, *mut u8, *mut u8) + Sync),
+    pub produce: &'a (dyn Fn(usize, *mut u8, *mut u8, bool) + Sync),
 }
 
 /// Same-binary control for the fused producer path: with exactly
@@ -1049,13 +1042,6 @@ fn zc_ab_producer_fused_enabled() -> bool {
         std::env::var_os(ENV_NO_ZC_AB_PRODUCER_FUSED).as_deref()
             != Some(std::ffi::OsStr::new("1"))
     })
-}
-
-/// Whether [`precompute_round1_ab_inner_packed_padded_produced`] takes the
-/// fused arm, i.e. calls the producer with worker scratch, one job's units
-/// in ascending order on one thread, every job starting at an even unit.
-pub fn zc_ab_producer_fused_active() -> bool {
-    zc_ab_producer_fused_enabled() && zc_ab_pre_hetero_enabled()
 }
 
 /// [`precompute_round1_ab_inner_packed_padded_with_tail`] for A/B buffers
@@ -1124,7 +1110,7 @@ fn produce_all_ab_units(producer: Round1AbProducer<'_>, n_units: usize) {
         |_, job| {
             let start = job * UNITS_PER_JOB;
             for unit in start..(start + UNITS_PER_JOB).min(n_units) {
-                (producer.produce)(unit, core::ptr::null_mut(), core::ptr::null_mut());
+                (producer.produce)(unit, core::ptr::null_mut(), core::ptr::null_mut(), false);
             }
         },
         None,
@@ -1501,13 +1487,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         assert!(unit_chunks > 0 && unit_bytes.is_multiple_of(OUTER_BYTES));
         assert!(n_chunks.is_multiple_of(unit_chunks));
         let n_units = n_chunks / unit_chunks;
-        // Even, so unit pairs (2u, 2u + 1) always share a job and a thread
-        // (the producer may pair them; see `zc_ab_producer_fused_active`).
-        // 42 at the ranked shape, unchanged.
-        let units_per_job = match chunks_per_job / unit_chunks {
-            0 | 1 => 1,
-            u => u & !1,
-        };
+        let units_per_job = (chunks_per_job / unit_chunks).max(1);
         let n_jobs = n_units.div_ceil(units_per_job);
         crate::epool::run_hetero_chunks_stateful_with_tail(
             n_jobs,
@@ -1522,7 +1502,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 let unit_start = job * units_per_job;
                 let unit_end = (unit_start + units_per_job).min(n_units);
                 for unit in unit_start..unit_end {
-                    let (a_unit, b_unit) = scratch.fill(|a, b| (producer.produce)(unit, a, b));
+                    let (a_unit, b_unit) =
+                        scratch.fill(|a, b, primed| (producer.produce)(unit, a, b, primed));
                     for local in 0..unit_chunks {
                         let x_outer = unit * unit_chunks + local;
                         // SAFETY: this job owns the output of its units.
@@ -1625,6 +1606,7 @@ struct AbUnitScratch {
     storage: Vec<u8>,
     offset: usize,
     unit_bytes: usize,
+    primed: bool,
 }
 
 impl AbUnitScratch {
@@ -1636,16 +1618,18 @@ impl AbUnitScratch {
             storage,
             offset,
             unit_bytes,
+            primed: false,
         }
     }
 
-    /// Run `produce(a_scratch, b_scratch)` and return the two filled halves.
     #[inline(always)]
-    fn fill(&mut self, produce: impl FnOnce(*mut u8, *mut u8)) -> (&[u8], &[u8]) {
+    fn fill(&mut self, produce: impl FnOnce(*mut u8, *mut u8, bool)) -> (&[u8], &[u8]) {
         let unit_bytes = self.unit_bytes;
+        let primed = self.primed;
         let both = &mut self.storage[self.offset..self.offset + 2 * unit_bytes];
         let (a, b) = both.split_at_mut(unit_bytes);
-        produce(a.as_mut_ptr(), b.as_mut_ptr());
+        produce(a.as_mut_ptr(), b.as_mut_ptr(), primed);
+        self.primed = true;
         (a, b)
     }
 }
@@ -2754,32 +2738,41 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
 ) {
     debug_assert_eq!(banks.len(), eq_bot.len() * ELL);
     debug_assert_eq!(eq_bot.len(), 1usize << bank_bits);
-    banks.fill(F128::ZERO);
 
     let n_lo = n_lo_and_inner - N_INNER;
-    let bank_mask = (1usize << bank_bits) - 1;
+    let n_banks = 1usize << bank_bits;
+    let bank_mask = n_banks - 1;
+    let store_first = big_lo_size >= n_banks;
+    if !store_first {
+        banks.fill(F128::ZERO);
+    }
 
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
-        if n_b_med == 0 {
-            continue;
-        }
-        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
-        let first_b_med = representation.first_materialized_b_med(within_hash_outer);
+        let first_touch = store_first && x_outer_lo < n_banks;
         let w = x_outer_lo >> bank_bits;
         let u = x_outer_lo & bank_mask;
         let bank: &mut [F128; ELL] = (&mut banks[u * ELL..(u + 1) * ELL])
             .try_into()
             .expect("one ELL-lane bank per low x_lo index");
-        kernels::accumulate_convert_ab_nomul(
-            precomputed_ab_rows(ab_inner, chunk_byte_base),
-            first_b_med,
-            representation.materialized_b_med_end(within_hash_outer, n_b_med),
-            &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE],
-            bank,
-        );
+        if n_b_med == 0 {
+            if first_touch {
+                bank.fill(F128::ZERO);
+            }
+            continue;
+        }
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let first_b_med = representation.first_materialized_b_med(within_hash_outer);
+        let rows = precomputed_ab_rows(ab_inner, chunk_byte_base);
+        let end_b_med = representation.materialized_b_med_end(within_hash_outer, n_b_med);
+        let table = &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE];
+        if first_touch {
+            kernels::accumulate_convert_ab_nomul::<true>(rows, first_b_med, end_b_med, table, bank);
+        } else {
+            kernels::accumulate_convert_ab_nomul::<false>(rows, first_b_med, end_b_med, table, bank);
+        }
     }
 
     finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks, bank_deferred, partial_ab);
@@ -5302,7 +5295,7 @@ mod tests {
                             crate::epool::SyncPtr(b_t.as_mut_ptr()),
                         );
                         let calls: Vec<AtomicU32> = (0..n_units).map(|_| AtomicU32::new(0)).collect();
-                        let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8| {
+                        let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, _primed: bool| {
                             calls[unit].fetch_add(1, Ordering::Relaxed);
                             assert!(!a_scratch.is_null() && !b_scratch.is_null());
                             let range = unit * unit_bytes..(unit + 1) * unit_bytes;
@@ -5387,7 +5380,7 @@ mod tests {
                 crate::epool::SyncPtr(a_t.as_mut_ptr()),
                 crate::epool::SyncPtr(b_t.as_mut_ptr()),
             );
-            let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8| {
+            let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, _primed: bool| {
                 let range = unit * unit_bytes..(unit + 1) * unit_bytes;
                 // SAFETY: disjoint unit ranges; scratch per the contract.
                 unsafe {

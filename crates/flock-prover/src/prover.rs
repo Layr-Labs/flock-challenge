@@ -820,173 +820,6 @@ fn fill_root_lincheck_stripe_group(
     }
 }
 
-/// Most root rows any stripe uses (`N_ROOT_COLS.div_ceil(64)`).
-const AB_STRIPE_MAX_ROWS: usize = 177;
-
-/// Distinguishes emitters, so a thread-local group left by an earlier prove
-/// is never taken for this prove's even quad.
-static AB_STRIPE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Per-thread copy of one stripe group's z words (8 blocks, the packed
-/// layout of `z_packed`), rebuilt as a AND b from the producer's scratch.
-struct AbStripeZGroup {
-    epoch: u64,
-    group: usize,
-    words: [F128; 8 * AB_STRIPE_WORDS / 2],
-}
-
-thread_local! {
-    static AB_STRIPE_ZGROUP: std::cell::RefCell<AbStripeZGroup> = const {
-        std::cell::RefCell::new(AbStripeZGroup {
-            epoch: u64::MAX,
-            group: usize::MAX,
-            words: [F128::ZERO; 8 * AB_STRIPE_WORDS / 2],
-        })
-    };
-}
-
-/// Emits the root lincheck stripe from the deferred A/B producer's scratch.
-///
-/// A stripe group is 8 consecutive blocks = quads `2g` and `2g + 1`. The
-/// fused AB queue hands each job a run of whole, even-aligned units in
-/// ascending order on one thread, so the even quad's words are stashed
-/// thread-locally and the group is transposed and stored when the odd quad
-/// arrives. Any group whose two quads did not meet on one thread (none on
-/// the ranked queue; every group when the producer runs without scratch) is
-/// left to [`AbStripeEmitter::finish`], which fills it from `z` exactly as
-/// the E-core stripe arm does. Every group is written by exactly one path,
-/// and both write the bytes of [`fill_root_lincheck_stripe_group`].
-struct AbStripeEmitter<'a> {
-    stripe: flock_core::epool::SyncPtr<u8>,
-    group_bytes: usize,
-    n_groups: usize,
-    rows: &'static [crate::r1cs_hashes::blake3::RootRow],
-    fixed_inputs: bool,
-    mismatch: &'a std::sync::atomic::AtomicBool,
-    emitted: Box<[std::sync::atomic::AtomicU64]>,
-    epoch: u64,
-    /// Words of a block the rows and the fixed-input checks read.
-    read_words: usize,
-}
-
-impl<'a> AbStripeEmitter<'a> {
-    fn new(
-        stripe: flock_core::epool::SyncPtr<u8>,
-        stripe_len: usize,
-        group_bytes: usize,
-        rows: &'static [crate::r1cs_hashes::blake3::RootRow],
-        fixed_inputs: bool,
-        mismatch: &'a std::sync::atomic::AtomicBool,
-    ) -> Self {
-        // One group is 8 blocks of `group_bytes / 8` bytes = 2 KiB of packed
-        // u64 words per block (the producer's quad layout).
-        assert_eq!(group_bytes, 1 << 14);
-        assert!(rows.len() <= AB_STRIPE_MAX_ROWS && rows.len() * 64 <= group_bytes);
-        assert!(rows.iter().all(|r| r.lo_word + usize::from(r.hi_mask != 0) < AB_STRIPE_WORDS));
-        let n_groups = stripe_len / group_bytes;
-        Self {
-            stripe,
-            group_bytes,
-            n_groups,
-            rows,
-            fixed_inputs,
-            mismatch,
-            emitted: (0..n_groups.div_ceil(64))
-                .map(|_| std::sync::atomic::AtomicU64::new(0))
-                .collect(),
-            epoch: AB_STRIPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            read_words: rows
-                .iter()
-                .map(|r| r.lo_word + 1 + usize::from(r.hi_mask != 0))
-                .chain(crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter().map(|c| c.0 + 1))
-                .max()
-                .unwrap_or(0),
-        }
-    }
-
-    /// Called right after the producer wrote quad `unit`'s complete a and b
-    /// blocks to the two scratch buffers (null: no scratch, nothing to do).
-    fn emit(&self, unit: usize, a_scratch: *mut u8, b_scratch: *mut u8) {
-        if a_scratch.is_null() || b_scratch.is_null() {
-            return;
-        }
-        let group = unit / 2;
-        let half = unit % 2;
-        if group >= self.n_groups {
-            return;
-        }
-        let a = a_scratch.cast_const().cast::<u64>();
-        let b = b_scratch.cast_const().cast::<u64>();
-        AB_STRIPE_ZGROUP.with_borrow_mut(|st| {
-            if half == 1 && (st.epoch != self.epoch || st.group != group) {
-                return;
-            }
-            // z = a AND b over the words the rows (and checks) read.
-            // SAFETY: the scratch holds 4 complete blocks of
-            // `AB_STRIPE_WORDS` words; `read_words <= AB_STRIPE_WORDS`.
-            let zw: &mut [u64] = unsafe {
-                std::slice::from_raw_parts_mut(st.words.as_mut_ptr().cast::<u64>(), 8 * AB_STRIPE_WORDS)
-            };
-            for c in 0..4 {
-                let (a_blk, b_blk) = unsafe {
-                    (
-                        std::slice::from_raw_parts(a.add(c * AB_STRIPE_WORDS), self.read_words),
-                        std::slice::from_raw_parts(b.add(c * AB_STRIPE_WORDS), self.read_words),
-                    )
-                };
-                let base = (4 * half + c) * AB_STRIPE_WORDS;
-                for ((d, x), y) in zw[base..base + self.read_words].iter_mut().zip(a_blk).zip(b_blk) {
-                    *d = x & y;
-                }
-            }
-            if half == 0 {
-                st.epoch = self.epoch;
-                st.group = group;
-                return;
-            }
-            st.group = usize::MAX;
-            // SAFETY: group `group` owns its `group_bytes` of the stripe;
-            // only this call writes them.
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(
-                    self.stripe.ptr().add(group * self.group_bytes),
-                    self.group_bytes,
-                )
-            };
-            let group_f128 = 8 * AB_STRIPE_WORDS / 2;
-            fill_root_lincheck_stripe_group(&st.words, dst, 0, group_f128, AB_STRIPE_WORDS, self.rows);
-            if self.fixed_inputs && !fixed_inputs_hold(&st.words, 0, group_f128, AB_STRIPE_WORDS) {
-                self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            self.emitted[group / 64].fetch_or(1 << (group % 64), std::sync::atomic::Ordering::Relaxed);
-        });
-    }
-
-    /// After every unit was produced (the AB arm has joined its workers):
-    /// fill the groups no thread emitted with the incumbent fill job (one
-    /// job = `DEFERRED_STRIPE_GROUPS_PER_JOB` groups; jobs with no missing
-    /// group are skipped, partially missing ones are refilled whole, which
-    /// rewrites identical bytes). Returns the number of missing groups.
-    fn finish(&self, _z_packed: &[F128], job: &(dyn Fn(usize) + Sync)) -> usize {
-        use rayon::prelude::*;
-        let per_job = DEFERRED_STRIPE_GROUPS_PER_JOB;
-        let missing = |g: usize| {
-            self.emitted[g / 64].load(std::sync::atomic::Ordering::Relaxed) & (1 << (g % 64)) == 0
-        };
-        let n_missing = (0..self.n_groups).filter(|&g| missing(g)).count();
-        if n_missing > 0 {
-            let jobs: Vec<usize> = (0..self.n_groups.div_ceil(per_job))
-                .filter(|&j| (j * per_job..((j + 1) * per_job).min(self.n_groups)).any(missing))
-                .collect();
-            jobs.par_iter().for_each(|&j| job(j));
-        }
-        n_missing
-    }
-}
-
-/// Packed u64 words per block at the ranked shape (`2^14 / 64`).
-const AB_STRIPE_WORDS: usize = 256;
-
 /// Whether all eight instances of stripe group `group` carry the ranked
 /// `block_len`/`flags` (`r1cs_hashes::blake3::FIXED_INPUT_CHECKS`). Reads the
 /// two packed words the root rows of this group already loaded.
@@ -1215,166 +1048,6 @@ mod deferred_stripe_tests {
         }
     }
 
-    /// AB-producer stripe: units produced in queue order (pairs on one
-    /// thread), out of order (every group falls back to the fill job), and
-    /// on a 4-thread pool with even-aligned jobs, for both root-row sets; the
-    /// bytes equal the incumbent fill from z = a AND b and the fixed-input
-    /// mismatch flag agrees with the incumbent fill's.
-    #[test]
-    fn ab_stripe_emitter_matches_incumbent_fill() {
-        use crate::r1cs_hashes::blake3 as b3;
-        const K_LOG: usize = 14;
-        const M: usize = K_LOG + 3 + 3; // eight groups, sixteen quads
-        const UNIT_U64: usize = 4 * AB_STRIPE_WORDS;
-        let n_units = 1usize << (M - K_LOG - 2);
-        let mut x = 0x1234_5678_9abc_def1u64;
-        let mut next = || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
-        let a: Vec<u64> = (0..n_units * UNIT_U64).map(|_| next()).collect();
-        let mut b: Vec<u64> = (0..n_units * UNIT_U64).map(|_| next() | next()).collect();
-        // Make every instance of the first four quads carry the ranked
-        // block_len/flags (b = all ones, a = z there), the rest random.
-        let mut a = a;
-        for unit in 0..4 {
-            for c in 0..4 {
-                for &(word, mask, want) in b3::FIXED_INPUT_CHECKS.iter() {
-                    let i = unit * UNIT_U64 + c * AB_STRIPE_WORDS + word;
-                    a[i] = (a[i] & !mask) | want;
-                    b[i] |= mask;
-                }
-            }
-        }
-        let z_u64: Vec<u64> = a.iter().zip(&b).map(|(x, y)| x & y).collect();
-        let z: Vec<F128> = z_u64.chunks(2).map(|w| F128::new(w[0], w[1])).collect();
-        for rows in [
-            b3::root_stripe_rows().expect("root stripe on by default"),
-            b3::fixed_input_root_stripe_rows().expect("fixed-input stripe on by default"),
-        ] {
-            let fixed = rows.len() == 176;
-            let ref_flag = std::sync::atomic::AtomicBool::new(false);
-            let mut expected = vec![0xa5u8; 1 << (M - 3)];
-            {
-                let (n_jobs, job) = deferred_lincheck_stripe_job(
-                    &z, &mut expected, M, K_LOG, 15_409, Some(rows), fixed.then_some(&ref_flag),
-                );
-                (0..n_jobs).for_each(&job);
-            }
-            let orders: [Vec<usize>; 3] = [
-                (0..n_units).collect(),
-                (0..n_units).map(|u| u ^ 1).collect(),
-                vec![],
-            ];
-            for (case, order) in orders.iter().enumerate() {
-                let flag = std::sync::atomic::AtomicBool::new(false);
-                let mut stripe = vec![0xa5u8; 1 << (M - 3)];
-                let (stripe_ptr, stripe_len) = (stripe.as_mut_ptr(), stripe.len());
-                let (n_jobs, job) = deferred_lincheck_stripe_job(
-                    &z, &mut stripe, M, K_LOG, 15_409, Some(rows), fixed.then_some(&flag),
-                );
-                let emitter = AbStripeEmitter::new(
-                    flock_core::epool::SyncPtr(stripe_ptr),
-                    stripe_len,
-                    1 << K_LOG,
-                    rows,
-                    fixed,
-                    &flag,
-                );
-                let produce = |unit: usize| {
-                    let mut sa = a[unit * UNIT_U64..(unit + 1) * UNIT_U64].to_vec();
-                    let mut sb = b[unit * UNIT_U64..(unit + 1) * UNIT_U64].to_vec();
-                    emitter.emit(unit, sa.as_mut_ptr().cast(), sb.as_mut_ptr().cast());
-                };
-                if case < 2 {
-                    order.iter().for_each(|&u| produce(u));
-                } else {
-                    // Two-unit jobs on a 4-thread pool, as the fused queue.
-                    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
-                    pool.install(|| {
-                        use rayon::prelude::*;
-                        (0..n_units / 2).into_par_iter().for_each(|j| {
-                            produce(2 * j);
-                            produce(2 * j + 1);
-                        })
-                    });
-                }
-                let missing = emitter.finish(&z, &job);
-                assert_eq!(missing, if case == 1 { n_units / 2 } else { 0 }, "case {case}");
-                let _ = n_jobs;
-                assert_eq!(stripe, expected, "rows={} case {case}", rows.len());
-                assert_eq!(
-                    flag.load(std::sync::atomic::Ordering::Relaxed),
-                    ref_flag.load(std::sync::atomic::Ordering::Relaxed),
-                    "mismatch flag rows={} case {case}",
-                    rows.len()
-                );
-            }
-            if fixed {
-                assert!(ref_flag.load(std::sync::atomic::Ordering::Relaxed), "random tail must mismatch");
-            }
-        }
-    }
-
-    /// Single-thread cost of the AB stripe emitter (scratch in L1) and
-    /// of the incumbent fill from a large z (ignored timing probe).
-    #[test]
-    #[ignore = "timing probe"]
-    fn ab_stripe_emit_timing() {
-        use crate::r1cs_hashes::blake3 as b3;
-        const K_LOG: usize = 14;
-        const G: usize = 4096;
-        const UNIT_U64: usize = 4 * AB_STRIPE_WORDS;
-        let rows = b3::fixed_input_root_stripe_rows().unwrap();
-        let mut x = 0x1234_5678_9abc_def1u64;
-        let mut next = || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
-        let mut sa: Vec<u64> = (0..2 * UNIT_U64).map(|_| next()).collect();
-        let mut sb: Vec<u64> = (0..2 * UNIT_U64).map(|_| next()).collect();
-        let z: Vec<F128> = (0..G * 1024).map(|_| F128::new(next(), next())).collect();
-        let mut stripe = vec![0u8; G << K_LOG];
-        let flag = std::sync::atomic::AtomicBool::new(false);
-        for round in 0..5 {
-            {
-                let e = AbStripeEmitter::new(
-                    flock_core::epool::SyncPtr(stripe.as_mut_ptr()),
-                    stripe.len(),
-                    1 << K_LOG,
-                    rows,
-                    true,
-                    &flag,
-                );
-                let t = std::time::Instant::now();
-                for g in 0..G {
-                    e.emit(2 * g, sa.as_mut_ptr().cast(), sb.as_mut_ptr().cast());
-                    e.emit(2 * g + 1, sa[UNIT_U64..].as_mut_ptr().cast(), sb[UNIT_U64..].as_mut_ptr().cast());
-                }
-                let ns = t.elapsed().as_nanos() as f64 / G as f64;
-                eprintln!("round {round} emit: {ns:.0} ns/group");
-            }
-            let t = std::time::Instant::now();
-            for g in 0..G {
-                let dst = &mut stripe[g << K_LOG..(g + 1) << K_LOG];
-                fill_root_lincheck_stripe_group(&z, dst, g, 1024, AB_STRIPE_WORDS, rows);
-            }
-            let ns = t.elapsed().as_nanos() as f64 / G as f64;
-            eprintln!("round {round} incumbent fill from DRAM z: {ns:.0} ns/group");
-            let t = std::time::Instant::now();
-            for g in 0..G {
-                let dst = &mut stripe[g << K_LOG..(g + 1) << K_LOG];
-                fill_root_lincheck_stripe_group(&z[..1024], dst, 0, 1024, AB_STRIPE_WORDS, rows);
-            }
-            let ns = t.elapsed().as_nanos() as f64 / G as f64;
-            eprintln!("round {round} incumbent fill from L1 z: {ns:.0} ns/group");
-        }
-    }
-
     /// Slow efficiency cores: the helper-only broadcast runs on a pool whose
     /// workers sleep before every chunk (a test-side delay, only in this test),
     /// while main-pool workers help drain the same queue as the AB arm does in
@@ -1532,7 +1205,6 @@ fn commit_with_round1_ab_precompute(
     identity_prefix_contract: Option<Round1PinnedOnePrefixStatement>,
     stripe_help: Option<&(dyn Fn() + Sync)>,
     ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
-    after_ab: Option<&(dyn Fn() + Sync)>,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -1639,11 +1311,6 @@ fn commit_with_round1_ab_precompute(
         || {
             let t = std::time::Instant::now();
             let r = precompute_ab();
-            // Inside the arm, so its completion is ordered before the
-            // tail-fill hook can observe a published stripe.
-            if let Some(after_ab) = after_ab {
-                after_ab();
-            }
             let wall_ms = t.elapsed().as_secs_f64() * 1e3;
             // The hybrid-commit warmup sweep sizes its contention emulation
             // from this arm's measured wall (an Instant read is free; the
@@ -1753,11 +1420,8 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     );
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>,
-                      stripe_help: Option<&(dyn Fn() + Sync)>,
-                      producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
-                      after_ab: Option<&(dyn Fn() + Sync)>| {
+                      stripe_help: Option<&(dyn Fn() + Sync)>| {
         let cpu0 = phase_timing.then(process_cpu_ms);
-        let helper0 = flock_core::epool::helper_chunks_claimed();
         let t_commit = std::time::Instant::now();
         let ((commitment, prover_data), ab_inner) = commit_with_round1_ab_precompute(
             &z_packed,
@@ -1769,8 +1433,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             tail_fill,
             identity_prefix_contract,
             stripe_help,
-            producer,
-            after_ab,
+            ab_producer,
         );
         if phase_timing {
             let wall = t_commit.elapsed().as_secs_f64() * 1e3;
@@ -1778,10 +1441,6 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             eprintln!(
                 "[phase-timing] commit+ab-precompute: {wall:.2} ms cpu={cpu:.1} util={:.1}",
                 cpu / wall
-            );
-            eprintln!(
-                "[phase-timing] epool helper chunks in commit: {}",
-                flock_core::epool::helper_chunks_claimed() - helper0
             );
         }
         (commitment, prover_data, ab_inner)
@@ -1811,7 +1470,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 stripe.as_ptr() as usize,
                 stripe.len(),
             );
-            (run_commit(hook, None, ab_producer, None), stripe)
+            (run_commit(hook, None), stripe)
         }
         LincheckStripeInput::DeferredRanked => {
             assert_eq!(r1cs.m, 32);
@@ -1907,38 +1566,29 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             });
             let stripe_queue = flock_core::epool::HelpQueue::new(n_stripe_jobs, &stripe_job_fn);
             let stripe_help = || stripe_queue.help();
-            // Stripe from the AB producer (`FLOCK_NO_STRIPE_IN_AB` kills): the
-            // fused round-one AB queue holds each quad's complete a and b
-            // blocks in L1, and z = a AND b word for word (C = I), so the
-            // queue emits the root stripe of every 8-block group from the
-            // two quads it produces back to back. No E-core stripe arm and no
-            // 512 MiB re-read of z inside the commit window.
-            let stripe_in_ab = root_rows.is_some()
-                && ab_producer.is_some()
-                && zerocheck::univariate_skip_optimized::zc_ab_producer_fused_active()
-                && std::env::var_os("FLOCK_NO_STRIPE_IN_AB").is_none();
-            let pre = if stripe_in_ab {
-                let base = ab_producer.expect("checked above");
-                let emitter = AbStripeEmitter::new(
-                    flock_core::epool::SyncPtr(stripe_ptr as *mut u8),
-                    stripe_len,
-                    1usize << k_log,
-                    root_rows.expect("checked above"),
-                    fixed_root_rows.is_some(),
-                    &input_mismatch,
-                );
-                let produce = |unit: usize, a: *mut u8, b: *mut u8| {
-                    (base.produce)(unit, a, b);
-                    emitter.emit(unit, a, b);
-                };
-                let finish = || {
-                    let t = std::time::Instant::now();
-                    let missing = emitter.finish(&z_packed, &stripe_job_fn);
-                    let mismatch = input_mismatch.load(std::sync::atomic::Ordering::Acquire);
-                    if mismatch {
-                        if let Some((n_jobs, job)) = &fallback_job {
-                            use rayon::prelude::*;
-                            (0..*n_jobs).into_par_iter().for_each(|j| job(j));
+            let pre = std::thread::scope(|scope| {
+                let stripe_ready = &stripe_ready;
+                let stripe_queue = &stripe_queue;
+                let input_mismatch = &input_mismatch;
+                let fallback_job = &fallback_job;
+                let stripe_job = scope.spawn(move || {
+                    let started = std::time::Instant::now();
+                    let filled_on_epool =
+                        flock_core::epool::run_helper_only_queue(stripe_queue, epool_workers);
+                    if !filled_on_epool {
+                        // No helper pool: drain the same queue here (main-pool
+                        // help may already own some chunks).
+                        stripe_queue.drain_inline();
+                    }
+                    // Chunks claimed by main-pool helpers may still be running
+                    // after the broadcast returns; wait for every completion
+                    // (Release per chunk, Acquire here) before publishing.
+                    stripe_queue.wait_done();
+                    if input_mismatch.load(std::sync::atomic::Ordering::Acquire) {
+                        if let Some((n_jobs, job)) = fallback_job {
+                            for j in 0..*n_jobs {
+                                job(j);
+                            }
                             let replaced = flock_core::lincheck::replace_root_stripe(
                                 stripe_ptr,
                                 stripe_len,
@@ -1950,104 +1600,54 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     stripe_ready.store(true, std::sync::atomic::Ordering::Release);
                     if phase_timing {
                         eprintln!(
-                            "[phase-timing] ab-stripe finish: {:.2} ms fallback_groups={missing} mismatch={mismatch}",
-                            t.elapsed().as_secs_f64() * 1e3
+                            "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={} main_help_jobs={}",
+                            started.elapsed().as_secs_f64() * 1e3,
+                            if filled_on_epool {
+                                "epool"
+                            } else {
+                                "sequential"
+                            },
+                            if filled_on_epool { epool_workers } else { 0 },
+                            stripe_queue.main_claims(),
                         );
                     }
-                };
-                run_commit(
-                    tail_fill_hook,
-                    None,
-                    Some(zerocheck::univariate_skip_optimized::Round1AbProducer {
-                        unit_bytes: base.unit_bytes,
-                        produce: &produce,
-                    }),
-                    Some(&finish),
-                )
-            } else {
-                std::thread::scope(|scope| {
-                    let stripe_ready = &stripe_ready;
-                    let stripe_queue = &stripe_queue;
-                    let input_mismatch = &input_mismatch;
-                    let fallback_job = &fallback_job;
-                    let stripe_job = scope.spawn(move || {
-                        let started = std::time::Instant::now();
-                        let filled_on_epool =
-                            flock_core::epool::run_helper_only_queue(stripe_queue, epool_workers);
-                        if !filled_on_epool {
-                            // No helper pool: drain the same queue here (main-pool
-                            // help may already own some chunks).
-                            stripe_queue.drain_inline();
-                        }
-                        // Chunks claimed by main-pool helpers may still be running
-                        // after the broadcast returns; wait for every completion
-                        // (Release per chunk, Acquire here) before publishing.
-                        stripe_queue.wait_done();
-                        if input_mismatch.load(std::sync::atomic::Ordering::Acquire) {
-                            if let Some((n_jobs, job)) = fallback_job {
-                                for j in 0..*n_jobs {
-                                    job(j);
-                                }
-                                let replaced = flock_core::lincheck::replace_root_stripe(
-                                    stripe_ptr,
-                                    stripe_len,
-                                    crate::r1cs_hashes::blake3::root_stripe_descriptor(),
-                                );
-                                assert!(replaced, "root stripe registration vanished");
-                            }
-                        }
-                        stripe_ready.store(true, std::sync::atomic::Ordering::Release);
-                        if phase_timing {
-                            eprintln!(
-                                "[phase-timing] deferred lincheck stripe: {:.2} ms mode={} workers={} main_help_jobs={}",
-                                started.elapsed().as_secs_f64() * 1e3,
-                                if filled_on_epool {
-                                    "epool"
-                                } else {
-                                    "sequential"
-                                },
-                                if filled_on_epool { epool_workers } else { 0 },
-                                stripe_queue.main_claims(),
-                            );
-                        }
-                    });
-                    let pre = run_commit(tail_fill_hook, Some(&stripe_help), ab_producer, None);
-                    // The calling thread is idle until the join; help first (one
-                    // relaxed load when the queue is already exhausted).
-                    stripe_queue.help();
-                    let join_started = std::time::Instant::now();
-                    // Spin-family completion, prover side: this is the last timed
-                    // production join in the prove path (the gpu_commit.rs joins
-                    // already poll command-buffer status). The deferred fill is
-                    // scheduled to finish before commit+AB at the target shape,
-                    // so the worker is usually ALREADY complete when this join
-                    // runs — yet a blocking scoped-thread join still pays the
-                    // park + completion-wake tail whenever the worker races the
-                    // join call. Poll `is_finished` first (zero cost when done),
-                    // then yield for a bounded budget (yield, not spin: the
-                    // worker is a sibling CPU thread and must keep its core —
-                    // same rationale as the warmup AB-wait), then degrade to the
-                    // exact incumbent blocking join. Byte-identical either way:
-                    // the join consumes the same completed thread.
-                    if !stripe_job.is_finished() {
-                        let spin_deadline =
-                            std::time::Instant::now() + std::time::Duration::from_millis(2);
-                        while !stripe_job.is_finished() && std::time::Instant::now() < spin_deadline {
-                            std::thread::yield_now();
-                        }
+                });
+                let pre = run_commit(tail_fill_hook, Some(&stripe_help));
+                // The calling thread is idle until the join; help first (one
+                // relaxed load when the queue is already exhausted).
+                stripe_queue.help();
+                let join_started = std::time::Instant::now();
+                // Spin-family completion, prover side: this is the last timed
+                // production join in the prove path (the gpu_commit.rs joins
+                // already poll command-buffer status). The deferred fill is
+                // scheduled to finish before commit+AB at the target shape,
+                // so the worker is usually ALREADY complete when this join
+                // runs — yet a blocking scoped-thread join still pays the
+                // park + completion-wake tail whenever the worker races the
+                // join call. Poll `is_finished` first (zero cost when done),
+                // then yield for a bounded budget (yield, not spin: the
+                // worker is a sibling CPU thread and must keep its core —
+                // same rationale as the warmup AB-wait), then degrade to the
+                // exact incumbent blocking join. Byte-identical either way:
+                // the join consumes the same completed thread.
+                if !stripe_job.is_finished() {
+                    let spin_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(2);
+                    while !stripe_job.is_finished() && std::time::Instant::now() < spin_deadline {
+                        std::thread::yield_now();
                     }
-                    stripe_job
-                        .join()
-                        .expect("deferred ranked lincheck stripe worker panicked");
-                    if phase_timing {
-                        eprintln!(
-                            "[phase-timing] deferred lincheck stripe join tail: {:.2} ms",
-                            join_started.elapsed().as_secs_f64() * 1e3
-                        );
-                    }
-                    pre
-                })
-            };
+                }
+                stripe_job
+                    .join()
+                    .expect("deferred ranked lincheck stripe worker panicked");
+                if phase_timing {
+                    eprintln!(
+                        "[phase-timing] deferred lincheck stripe join tail: {:.2} ms",
+                        join_started.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                pre
+            });
             (pre, stripe)
         }
     };
@@ -2315,7 +1915,6 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
-        None,
         None,
         None,
         None,

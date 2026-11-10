@@ -114,13 +114,7 @@ fn set_utility_qos() {
 fn set_utility_qos() {}
 
 fn build_epool() -> Option<rayon::ThreadPool> {
-    // Diagnostic: `FLOCK_EPOOL_MAX_THREADS=<n>` caps the helper pool, e.g. at
-    // the official M3 Max's 4 E-cores on a host with more (an M5 Pro reports
-    // 12 `perflevel1` cores). Scheduling only; unset = the detected count.
-    let n = match std::env::var("FLOCK_EPOOL_MAX_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
-        Some(cap) => ecore_count().min(cap),
-        None => ecore_count(),
-    };
+    let n = ecore_count();
     if n == 0 {
         return None;
     }
