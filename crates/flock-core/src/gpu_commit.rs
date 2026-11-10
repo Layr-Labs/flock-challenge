@@ -8035,49 +8035,106 @@ kernel void blake3_pow_scan(
         Some(candidates[first_i])
     }
 
-    /// Candidate set inside the historical flat basin [0..5]. Trimmed from
-    /// the older [0,2,3,4,5,6,7,8] after the broad-set justification (one
-    /// calibration process publishing through the warmup cache) died on the
-    /// ranked runner. With F2 graph-arm scoring the mid-basin point k=2 is
-    /// informative again — it was invisible when join-max scoring collapsed
-    /// AB-dominated samples — so it re-enters between pure-GPU and k=3.
-    /// k=4 fills the gap between k=3 and the default: a GPU-heavy host whose
-    /// balanced split sits between the two otherwise rounds to one side.
-    /// Five candidates × 2 reverse-order samples, all in the untimed warmup,
-    /// is still well inside the 10-minute job wall at ~120 workers.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 5] = [0, 2, 3, 4, 5];
+    /// Initial candidates cover the historical basin [0..5]. Add k=6,7
+    /// only when the measured minimum remains at the upper boundary, so
+    /// balanced hosts do not pay for a broader warmup search.
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 7] = [0, 2, 3, 4, 5, 6, 7];
+    const RANKED_EXACT_INITIAL_CANDIDATES: usize = 5;
 
-    /// Two samples per candidate, with the second pass in reverse order so
-    /// thermal drift, queue warmup, and A/B replay cache state do not favor
-    /// either end of the search range. Selection consumes the mean rather
-    /// than a noise-sensitive minimum.
-    fn collect_ranked_exact_samples<E>(
-        mut reprime: impl FnMut() -> Result<(), E>,
-        mut sample: impl FnMut(usize) -> Result<f64, E>,
-    ) -> Result<[[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()], E> {
-        let mut walls = [[0.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
-        for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES.iter().enumerate() {
+    fn hybrid_tune_lead_phi(value: Option<&str>) -> f64 {
+        value
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.5)
+    }
+
+    fn hybrid_tune_sampling() -> (bool, bool, f64) {
+        (
+            std::env::var_os("FLOCK_NO_HYBRID_TUNE_LEAD").is_none(),
+            std::env::var_os("FLOCK_NO_HYBRID_TUNE_EXTEND").is_none(),
+            hybrid_tune_lead_phi(std::env::var("FLOCK_HYBRID_TUNE_LEAD_PHI").ok().as_deref()),
+        )
+    }
+
+    /// Reprime is outside the score, but overlaps the replay just as the
+    /// timed proof's first-pass wait does. None preserves simultaneous start.
+    fn sample_ranked_exact_graph<E: Send>(
+        reprime: impl Fn() -> Result<(), E> + Sync,
+        graph: impl FnOnce() -> Result<(), E> + Send,
+        replay: impl FnOnce() + Send,
+        delay: Option<std::time::Duration>,
+        score_join: bool,
+    ) -> Result<(f64, f64), E> {
+        let tp = std::time::Instant::now();
+        if delay.is_none() {
             reprime()?;
+        }
+        let outer_fp_ms = tp.elapsed().as_secs_f64() * 1e3;
+        let t0 = std::time::Instant::now();
+        let (graph_arm, ()) = rayon::join(
+            || {
+                let tp = std::time::Instant::now();
+                if delay.is_some() {
+                    reprime()?;
+                }
+                let fp_ms = if delay.is_some() {
+                    tp.elapsed().as_secs_f64() * 1e3
+                } else {
+                    outer_fp_ms
+                };
+                let tg = std::time::Instant::now();
+                graph()?;
+                Ok((tg, tg.elapsed().as_secs_f64() * 1e3, fp_ms))
+            },
+            || {
+                if let Some(d) = delay {
+                    std::thread::sleep(d);
+                }
+                replay();
+            },
+        );
+        let (tg, graph_ms, fp_ms) = graph_arm?;
+        let score = if score_join {
+            if delay.is_some() { tg } else { t0 }.elapsed().as_secs_f64() * 1e3
+        } else {
+            graph_ms
+        };
+        Ok((score, fp_ms))
+    }
+
+    /// Two reverse-order samples per initial candidate; extend only while
+    /// the boundary has the strictly smallest mean, stopping at k=7.
+    fn collect_ranked_exact_samples<E>(
+        extend: bool,
+        mut sample: impl FnMut(usize) -> Result<f64, E>,
+    ) -> Result<Vec<[f64; 2]>, E> {
+        let mut walls = vec![[0.0; 2]; RANKED_EXACT_INITIAL_CANDIDATES];
+        for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES[..walls.len()].iter().enumerate() {
             walls[i][0] = sample(k)?;
         }
-        for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES.iter().enumerate().rev() {
-            reprime()?;
+        for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES[..walls.len()].iter().enumerate().rev() {
             walls[i][1] = sample(k)?;
+        }
+        while extend && walls.len() < RANKED_EXACT_TUNE_CANDIDATES.len() {
+            let Some(means) = mean_ranked_exact_samples(&walls) else { break };
+            let boundary = means[means.len() - 1];
+            if !means[..means.len() - 1].iter().all(|&m| boundary < m) {
+                break;
+            }
+            let k = RANKED_EXACT_TUNE_CANDIDATES[walls.len()];
+            walls.push([sample(k)?, sample(k)?]);
         }
         Ok(walls)
     }
 
-    fn mean_ranked_exact_samples(
-        samples: [[f64; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()],
-    ) -> Option<[f64; RANKED_EXACT_TUNE_CANDIDATES.len()]> {
-        let mut means = [0.0; RANKED_EXACT_TUNE_CANDIDATES.len()];
-        for (mean, [a, b]) in means.iter_mut().zip(samples) {
+    fn mean_ranked_exact_samples(samples: &[[f64; 2]]) -> Option<Vec<f64>> {
+        samples.iter().map(|&[a, b]| {
             if !a.is_finite() || !b.is_finite() || a < 0.0 || b < 0.0 {
-                return None;
+                None
+            } else {
+                Some((a + b) * 0.5)
             }
-            *mean = (a + b) * 0.5;
-        }
-        Some(means)
+        }).collect()
     }
 
     #[inline]
@@ -8489,27 +8546,43 @@ kernel void blake3_pow_scan(
         // critical it minimises the join too; where it is not, a shorter
         // graph is free. `FLOCK_HYBRID_SCORE_JOIN_WALL=1` restores the
         // incumbent join-max objective for same-binary comparison.
-        let sample = |k: usize| -> Result<f64, String> {
-            let score_join = std::env::var_os("FLOCK_HYBRID_SCORE_JOIN_WALL").is_some();
-            let t0 = std::time::Instant::now();
-            let (graph_arm, ()) = rayon::join(
-                || {
-                    let tg = std::time::Instant::now();
-                    let r = timed_graph(k);
-                    (r, tg.elapsed().as_secs_f64() * 1e3)
-                },
-                || replay_ab(),
-            );
-            let (graph, graph_ms) = graph_arm;
-            graph?;
-            Ok(if score_join {
-                t0.elapsed().as_secs_f64() * 1e3
-            } else {
-                graph_ms
-            })
+        let reprime = || {
+            let c = &ctx;
+            unsafe {
+                run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, params.k_code())
+            }
         };
-        let reprime = || unsafe {
-            run_from_z_first_pass(ctx.gpu, ctx.z_buf, ctx.staging, ctx.tw_buf, params.k_code())
+        let (lead, extend, phi) = hybrid_tune_sampling();
+        let mut first_pass_ms = None;
+        let sample = |k: usize| -> Result<f64, String> {
+            let delay = if lead {
+                let fp_ms = match first_pass_ms {
+                    Some(ms) => ms,
+                    None => {
+                        let tp = std::time::Instant::now();
+                        reprime()?;
+                        tp.elapsed().as_secs_f64() * 1e3
+                    }
+                };
+                Some(std::time::Duration::from_secs_f64(phi * fp_ms * 1e-3))
+            } else {
+                None
+            };
+            let (score, fp_ms) = sample_ranked_exact_graph(
+                &reprime,
+                || timed_graph(k),
+                &replay_ab,
+                delay,
+                std::env::var_os("FLOCK_HYBRID_SCORE_JOIN_WALL").is_some(),
+            )?;
+            first_pass_ms = Some(fp_ms);
+            if dbg {
+                eprintln!(
+                    "[gpu-commit] exact-AB lead k={k}: enabled={lead} phi={phi} first pass {fp_ms:.3} ms, delay {:.3} ms",
+                    delay.map_or(0.0, |d| d.as_secs_f64() * 1e3),
+                );
+            }
+            Ok(score)
         };
         let samples = {
             // Only the sweep's own samples price a split: they are the only
@@ -8522,7 +8595,7 @@ kernel void blake3_pow_scan(
                 v.clear();
             }
             let _recording = ArmRecordScope::enter();
-            match collect_ranked_exact_samples(reprime, sample) {
+            match collect_ranked_exact_samples(extend, sample) {
                 Ok(samples) => samples,
                 Err(e) => {
                     if dbg {
@@ -8535,11 +8608,12 @@ kernel void blake3_pow_scan(
                 }
             }
         };
-        let Some(means) = mean_ranked_exact_samples(samples) else {
+        let candidates = &RANKED_EXACT_TUNE_CANDIDATES[..samples.len()];
+        let Some(means) = mean_ranked_exact_samples(&samples) else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
-        let Some(swept) = choose_hybrid_k(&RANKED_EXACT_TUNE_CANDIDATES, &means, DEFAULT_HYBRID_K)
+        let Some(swept) = choose_hybrid_k(candidates, &means, DEFAULT_HYBRID_K)
         else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
@@ -8574,7 +8648,7 @@ kernel void blake3_pow_scan(
             eprintln!("[gpu-commit] fine split: chosen {chosen} | cb2/cpu/cb3 {}", rows.join(" "));
         }
         if dbg {
-            let arms: Vec<String> = RANKED_EXACT_TUNE_CANDIDATES
+            let arms: Vec<String> = candidates
                 .iter()
                 .map(|k| format!("k={k}:{:.1}ms", arm_window_ms(&arm_samples, *k)))
                 .collect();
@@ -8631,7 +8705,7 @@ kernel void blake3_pow_scan(
             };
 
         if dbg {
-            let table: Vec<String> = RANKED_EXACT_TUNE_CANDIDATES
+            let table: Vec<String> = candidates
                 .iter()
                 .enumerate()
                 .map(|(i, k)| {
@@ -8816,11 +8890,18 @@ kernel void blake3_pow_scan(
         key
     }
 
+    fn warmup_cache_sampling_key(key: u64, lead: bool, extend: bool, phi: f64) -> u64 {
+        key ^ 0x5455_4E45_4C45_4144 // "TUNELEAD": excludes pre-change samples.
+            ^ (u64::from(lead) | (u64::from(extend) << 1)).rotate_left(17)
+            ^ phi.to_bits().rotate_left(7)
+    }
+
     fn warmup_cache_msl_fnv() -> u64 {
-        let key = warmup_cache_msl_fnv_for(
+        let (lead, extend, phi) = hybrid_tune_sampling();
+        let key = warmup_cache_sampling_key(warmup_cache_msl_fnv_for(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
-        );
+        ), lead, extend, phi);
         if super::gpu_g4x2_enabled() {
             key ^ fnv1a64(NTT_G4X2_MSL_SOURCE).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
         } else {
@@ -8973,7 +9054,7 @@ kernel void blake3_pow_scan(
         cpu_tree: &[Hash],
         k: usize,
     ) {
-        debug_assert!(RANKED_EXACT_TUNE_CANDIDATES.contains(&k));
+        debug_assert!(hybrid_split_valid(k));
         TUNED_HYBRID_K.store(k, std::sync::atomic::Ordering::Release);
         if super::warmup_latch_cache_enabled() {
             let cpu_wall_ms = f64::from_bits(
@@ -12109,46 +12190,119 @@ kernel void lc_fold_stripes_factored_b4(
     mod split_select_tests {
         use super::{
             DEFAULT_HYBRID_K, RANKED_EXACT_TUNE_CANDIDATES, choose_hybrid_k, choose_hybrid_k_with,
-            collect_ranked_exact_samples, mean_ranked_exact_samples,
+            collect_ranked_exact_samples, mean_ranked_exact_samples, sample_ranked_exact_graph,
         };
         const C: [usize; 4] = [0, 2, 3, 5];
 
         #[test]
-        fn trimmed_candidate_set_is_stable() {
-            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, [0, 2, 3, 4, 5]);
+        fn initial_candidates_and_extension_limit_are_stable() {
+            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, [0, 2, 3, 4, 5, 6, 7]);
+            assert_eq!(super::RANKED_EXACT_INITIAL_CANDIDATES, 5);
         }
 
         #[test]
-        fn exact_samples_are_balanced_and_each_reprimed() {
-            let events = std::cell::RefCell::new(Vec::new());
+        fn disabled_sampling_keeps_the_reprime_then_forward_reverse_sequence() {
+            let events = std::sync::Mutex::new(Vec::new());
             let samples = collect_ranked_exact_samples(
-                || {
-                    events.borrow_mut().push(-1);
-                    Ok::<(), ()>(())
-                },
+                false,
                 |k| {
-                    events.borrow_mut().push(k as i32);
+                    sample_ranked_exact_graph(
+                        || {
+                            events.lock().unwrap().push(-1);
+                            Ok::<(), ()>(())
+                        },
+                        || {
+                            events.lock().unwrap().push(k as i32);
+                            Ok(())
+                        },
+                        || {},
+                        None,
+                        false,
+                    )?;
                     Ok::<f64, ()>(k as f64)
                 },
-            )
-            .unwrap();
-            // Forward 0,2,3,4,5 then reverse 5,4,3,2,0 — each preceded by reprime.
+            ).unwrap();
             assert_eq!(
-                *events.borrow(),
+                *events.lock().unwrap(),
                 [-1, 0, -1, 2, -1, 3, -1, 4, -1, 5, -1, 5, -1, 4, -1, 3, -1, 2, -1, 0]
             );
+            assert_eq!(samples.len(), 5);
             assert_eq!(samples[0], [0.0, 0.0]);
             assert_eq!(samples[3], [4.0, 4.0]);
             assert_eq!(samples[4], [5.0, 5.0]);
         }
 
         #[test]
+        fn lead_replay_overlaps_reprime_and_errors_join_before_returning() {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let rx = std::sync::Mutex::new(rx);
+            let replay_done = std::sync::atomic::AtomicBool::new(false);
+            let result = pool.install(|| sample_ranked_exact_graph(
+                || {
+                    rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                    Err("reprime failed")
+                },
+                || panic!("a failed first pass must not run the graph"),
+                || {
+                    replay_done.store(true, std::sync::atomic::Ordering::Release);
+                    tx.send(()).unwrap();
+                },
+                Some(std::time::Duration::ZERO),
+                false,
+            ));
+            assert_eq!(result, Err("reprime failed"));
+            assert!(replay_done.load(std::sync::atomic::Ordering::Acquire));
+        }
+
+        #[test]
+        fn extension_is_conditional_two_samples_each_and_bounded() {
+            for (costs, extend, expected) in [
+                ([200., 150., 100., 110., 120., 90., 80.], true, vec![0,2,3,4,5,5,4,3,2,0]),
+                ([200., 150., 130., 120., 100., 110., 90.], true, vec![0,2,3,4,5,5,4,3,2,0,6,6]),
+                ([200., 150., 130., 120., 100., 90., 80.], true, vec![0,2,3,4,5,5,4,3,2,0,6,6,7,7]),
+                ([200., 150., 130., 120., 100., 90., 80.], false, vec![0,2,3,4,5,5,4,3,2,0]),
+                ([200., 150., 130., 100., 100., 90., 80.], true, vec![0,2,3,4,5,5,4,3,2,0]),
+            ] {
+                let mut visited = Vec::new();
+                let samples = collect_ranked_exact_samples(extend, |k| {
+                    visited.push(k);
+                    let i = RANKED_EXACT_TUNE_CANDIDATES.iter().position(|&c| c == k).unwrap();
+                    Ok::<f64, ()>(costs[i])
+                }).unwrap();
+                assert_eq!(visited, expected);
+                assert_eq!(samples.len() * 2, visited.len());
+            }
+            assert_eq!(collect_ranked_exact_samples(true, |_| Err::<f64, _>("graph failed")), Err("graph failed"));
+        }
+
+        #[test]
+        fn sampling_config_validates_phi_and_separates_cache_entries() {
+            for invalid in [None, Some("nan"), Some("inf"), Some("-0.1"), Some("1.1"), Some("bad")] {
+                assert_eq!(super::hybrid_tune_lead_phi(invalid), 0.5);
+            }
+            for v in ["0", "0.25", "0.5", "1"] {
+                assert_eq!(super::hybrid_tune_lead_phi(Some(v)), v.parse::<f64>().unwrap());
+            }
+            let mut keys = std::collections::HashSet::new();
+            for lead in [false, true] {
+                for extend in [false, true] {
+                    for phi in [0.0, 0.25, 0.5, 1.0] {
+                        let key = super::warmup_cache_sampling_key(123, lead, extend, phi);
+                        assert_ne!(key, 123);
+                        assert!(keys.insert(key));
+                    }
+                }
+            }
+        }
+
+        #[test]
         fn exact_selection_uses_valid_balanced_means() {
-            let mut samples = [[100.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
+            let mut samples = vec![[100.0; 2]; RANKED_EXACT_TUNE_CANDIDATES.len()];
             samples[1] = [90.0, 110.0];
-            assert_eq!(mean_ranked_exact_samples(samples).unwrap()[1], 100.0);
+            assert_eq!(mean_ranked_exact_samples(&samples).unwrap()[1], 100.0);
             samples[1][1] = f64::NAN;
-            assert!(mean_ranked_exact_samples(samples).is_none());
+            assert!(mean_ranked_exact_samples(&samples).is_none());
         }
 
         #[test]
