@@ -605,6 +605,22 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
 
     let d = point.len();
     assert_eq!(out.len(), 1usize << d);
+    if d >= 14 {
+        let a = d / 2;
+        let mut lo = vec![F128::ZERO; 1usize << a];
+        let mut hi = vec![F128::ZERO; 1usize << (d - a)];
+        build_eq_table_into(&point[..a], &mut lo);
+        build_eq_table_into(&point[a..], &mut hi);
+        let lo = &lo;
+        out.par_chunks_mut(1usize << a)
+            .zip(hi.par_iter())
+            .for_each(|(chunk, &s)| {
+                for (o, &l) in chunk.iter_mut().zip(lo) {
+                    *o = l * s;
+                }
+            });
+        return;
+    }
     out[0] = F128::ONE;
     const PAR_THRESHOLD: usize = 1 << 12;
     for j in 0..d {
@@ -649,6 +665,23 @@ pub(crate) fn build_eq_table_optimized_into(point: &[F128], out: &mut [F128]) {
     use rayon::prelude::*;
 
     assert_eq!(out.len(), 1usize << point.len());
+    let d = point.len();
+    if d >= 14 {
+        let a = d / 2;
+        let mut lo = vec![F128::ZERO; 1usize << a];
+        let mut hi = vec![F128::ZERO; 1usize << (d - a)];
+        build_eq_table_optimized_into(&point[..a], &mut lo);
+        build_eq_table_optimized_into(&point[a..], &mut hi);
+        let lo = &lo;
+        out.par_chunks_mut(1usize << a)
+            .zip(hi.par_iter())
+            .for_each(|(chunk, &s)| {
+                for (o, &l) in chunk.iter_mut().zip(lo) {
+                    *o = l * s;
+                }
+            });
+        return;
+    }
     out[0] = F128::ONE;
     // The two-lane PMULL kernel makes the smaller expansion levels too short
     // to amortize a Rayon fork/join. Production-geometry crossover sweeps put
