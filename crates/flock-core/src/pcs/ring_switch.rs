@@ -1488,25 +1488,32 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let (z0, z1) = z_vec.split_at(half);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
+            use rayon::prelude::*;
+            const FOLD8_CHUNK: usize = 1024;
             let mut out = vec![F128::ZERO; half];
-            let mut i = 0;
-            while i < half {
-                let x0 = z0[i] + z1[i];
-                let x1 = z0[i + 1] + z1[i + 1];
-                let x2 = z0[i + 2] + z1[i + 2];
-                let x3 = z0[i + 3] + z1[i + 3];
-                let prod0 = unsafe {
-                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, [x0, x1])
-                };
-                let prod1 = unsafe {
-                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, [x2, x3])
-                };
-                out[i] = z0[i] + prod0[0];
-                out[i + 1] = z0[i + 1] + prod0[1];
-                out[i + 2] = z0[i + 2] + prod1[0];
-                out[i + 3] = z0[i + 3] + prod1[1];
-                i += 4;
-            }
+            out.par_chunks_mut(FOLD8_CHUNK)
+                .zip(z0.par_chunks(FOLD8_CHUNK))
+                .zip(z1.par_chunks(FOLD8_CHUNK))
+                .for_each(|((out, z0), z1)| {
+                    let mut i = 0;
+                    while i < out.len() {
+                        let x0 = z0[i] + z1[i];
+                        let x1 = z0[i + 1] + z1[i + 1];
+                        let x2 = z0[i + 2] + z1[i + 2];
+                        let x3 = z0[i + 3] + z1[i + 3];
+                        let prod0 = unsafe {
+                            crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, [x0, x1])
+                        };
+                        let prod1 = unsafe {
+                            crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, [x2, x3])
+                        };
+                        out[i] = z0[i] + prod0[0];
+                        out[i + 1] = z0[i + 1] + prod0[1];
+                        out[i + 2] = z0[i + 2] + prod1[0];
+                        out[i + 3] = z0[i + 3] + prod1[1];
+                        i += 4;
+                    }
+                });
             return out;
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
