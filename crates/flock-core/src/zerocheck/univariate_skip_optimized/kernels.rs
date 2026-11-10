@@ -574,6 +574,56 @@ pub(super) fn accumulate_convert_ab_nomul<const STORE: bool>(
     portable::accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
 }
 
+/// Half-table split form of [`accumulate_convert_ab_nomul`] (AArch64 only;
+/// the caller selects it only there, over the derived table image whose row
+/// `b` is `x^b · row 0`). The low `b_med` half drains into `bank_lo`, the
+/// high half, gathered from the low eight tables, un-lifted into `bank_hi`;
+/// `bank_lo + x^8 · bank_hi` is the [`accumulate_convert_ab_nomul`] bank.
+/// `STORE` initialises both banks (first touch).
+#[inline]
+pub(super) fn accumulate_convert_ab_nomul_x8_split<const STORE: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    n_b_med: usize,
+    convert: &[super::F128],
+    bank_lo: &mut [super::F128; 64],
+    bank_hi: &mut [super::F128; 64],
+) {
+    assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; the fixed arrays cover
+    // every drained slot and every table index stays in the first 32 KiB.
+    unsafe {
+        aarch64::accumulate_convert_ab_nomul_x8_split::<STORE>(
+            chunk_ab_bytes,
+            first_b_med,
+            n_b_med,
+            convert,
+            bank_lo,
+            bank_hi,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (chunk_ab_bytes, convert, bank_lo, bank_hi);
+        unreachable!("split x8 completion is AArch64-only");
+    }
+}
+
+/// `x^8 · v` in GF(2^128) (`x^128 + x^7 + x^2 + x + 1`, bit `i` of the
+/// little-endian value is the coefficient of `x^i`): a one-byte shift plus
+/// the overflow byte `o` folded back as `o · 0x87` (degree <= 14, so no second
+/// reduction). Exactly `mul_by_x` applied eight times.
+#[inline]
+pub(super) fn mul_x8_f128(v: super::F128) -> super::F128 {
+    let o = v.hi >> 56;
+    let red = o ^ (o << 1) ^ (o << 2) ^ (o << 7);
+    super::F128 {
+        lo: (v.lo << 8) ^ red,
+        hi: (v.hi << 8) | (v.lo >> 56),
+    }
+}
+
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
 /// kernel is tested against.
 ///

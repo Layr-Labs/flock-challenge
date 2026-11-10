@@ -2653,6 +2653,22 @@ fn ab_eq_fold_factors(r_lo: &[F128], bank_bits: usize) -> (Vec<F128>, Vec<F128>)
 /// eq_top_scaled[w]`, built once per prove and shared read-only by every
 /// worker (mirrors [`build_c_mask_tables`]).
 fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128> {
+    build_ab_eq_fold_tables_derived(eq_top_scaled, convert).0
+}
+
+/// Kill switch for the half-table round-one completion
+/// (`FLOCK_NO_ZC_R1_X8=1`, exact): the sixteen-table kernel throughout.
+fn zc_r1_x8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_ZC_R1_X8").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// [`build_ab_eq_fold_tables`] plus whether the image is the derived one:
+/// every table's row `b` is `mul_by_x` applied `b` times to row 0, bit for
+/// bit (the precondition of [`kernels::accumulate_convert_ab_nomul_x8_split`]).
+fn build_ab_eq_fold_tables_derived(eq_top_scaled: &[F128], convert: &[F128]) -> (Vec<F128>, bool) {
     use rayon::prelude::*;
 
     debug_assert_eq!(convert.len(), CONVERT_TABLE_SIZE);
@@ -2756,7 +2772,7 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
                 }
             }
         });
-    tables
+    (tables, derive_rows)
 }
 
 /// Folded twin of [`process_one_x_hi_with_precomputed_ab_fold4_ab`]: same
@@ -2777,10 +2793,14 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     tables: &[F128],
     bank_bits: usize,
     bank_deferred: bool,
+    x8_split: bool,
     banks: &mut [F128],
     partial_ab: &mut [F128; ELL],
 ) {
-    debug_assert_eq!(banks.len(), eq_bot.len() * ELL);
+    // Half-table split: `banks` is the low bank set followed by an equal
+    // high bank set (`bank = bank_lo + x^8 · bank_hi`).
+    let bank_len = eq_bot.len() * ELL;
+    debug_assert_eq!(banks.len(), if x8_split { 2 * bank_len } else { bank_len });
     debug_assert_eq!(eq_bot.len(), 1usize << bank_bits);
 
     let n_lo = n_lo_and_inner - N_INNER;
@@ -2788,8 +2808,10 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     let bank_mask = n_banks - 1;
     let store_first = big_lo_size >= n_banks;
     if !store_first {
+        // Short band: some banks are never touched, so clear both sets.
         banks.fill(F128::ZERO);
     }
+    let (banks, banks_hi) = banks.split_at_mut(bank_len);
 
     for x_outer_lo in 0..big_lo_size {
         let x_outer = x_outer_lo | (x_hi << n_lo);
@@ -2804,6 +2826,9 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
         if n_b_med == 0 {
             if first_touch {
                 bank.fill(F128::ZERO);
+                if x8_split {
+                    banks_hi[u * ELL..(u + 1) * ELL].fill(F128::ZERO);
+                }
             }
             continue;
         }
@@ -2812,7 +2837,30 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
         let rows = precomputed_ab_rows(ab_inner, chunk_byte_base);
         let end_b_med = representation.materialized_b_med_end(within_hash_outer, n_b_med);
         let table = &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE];
-        if first_touch {
+        if x8_split {
+            let bank_hi: &mut [F128; ELL] = (&mut banks_hi[u * ELL..(u + 1) * ELL])
+                .try_into()
+                .expect("one ELL-lane high bank per low x_lo index");
+            if first_touch {
+                kernels::accumulate_convert_ab_nomul_x8_split::<true>(
+                    rows,
+                    first_b_med,
+                    end_b_med,
+                    table,
+                    bank,
+                    bank_hi,
+                );
+            } else {
+                kernels::accumulate_convert_ab_nomul_x8_split::<false>(
+                    rows,
+                    first_b_med,
+                    end_b_med,
+                    table,
+                    bank,
+                    bank_hi,
+                );
+            }
+        } else if first_touch {
             kernels::accumulate_convert_ab_nomul::<true>(rows, first_b_med, end_b_med, table, bank);
         } else {
             kernels::accumulate_convert_ab_nomul::<false>(rows, first_b_med, end_b_med, table, bank);
@@ -2820,6 +2868,15 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     }
 
     finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks, bank_deferred, partial_ab);
+    if x8_split {
+        // The band fold is F128-linear, so fold the high banks the same way
+        // and lift the 64 folded lanes by x^8 once.
+        let mut partial_hi = [F128::ZERO; ELL];
+        finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks_hi, bank_deferred, &mut partial_hi);
+        for (out, hi) in partial_ab.iter_mut().zip(partial_hi) {
+            *out += kernels::mul_x8_f128(hi);
+        }
+    }
 }
 
 /// Collapse the bank-major tensor-fold scratch and apply the unchanged high
@@ -2944,8 +3001,11 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
         Some(bank_bits) => {
             let r_lo = &r[k_skip + N_INNER..k_skip + N_INNER + eq.n_lo];
             let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
-            let tables = build_ab_eq_fold_tables(&eq_top_scaled, convert);
+            let (tables, derived) = build_ab_eq_fold_tables_derived(&eq_top_scaled, convert);
+            // Half-table completion: AArch64, derived image, kill switch off.
+            let x8_split = derived && cfg!(target_arch = "aarch64") && zc_r1_x8_enabled();
             let bank_len = eq_bot.len() * ELL;
+            let alloc_len = if x8_split { 2 * bank_len } else { bank_len };
             let bank_deferred = ranked_ab_bank_deferred_shape(
                 m,
                 k_skip,
@@ -2962,9 +3022,9 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                 let mut partial = [F128::ZERO; ELL];
                 AB_EQ_FOLD_BANKS.with(|cell| {
                     let mut banks = cell.borrow_mut();
-                    if banks.len() != bank_len {
+                    if banks.len() != alloc_len {
                         banks.clear();
-                        banks.resize(bank_len, F128::ZERO);
+                        banks.resize(alloc_len, F128::ZERO);
                     }
                     process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
                         x_hi,
@@ -2979,6 +3039,7 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                         &tables,
                         bank_bits,
                         bank_deferred,
+                        x8_split,
                         &mut banks,
                         &mut partial,
                     );
