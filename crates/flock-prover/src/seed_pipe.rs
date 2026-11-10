@@ -551,6 +551,8 @@ unsafe extern "C" {
     fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
     fn write(fd: i32, buf: *const u8, count: usize) -> isize;
     fn poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
 }
 
 #[repr(C)]
@@ -802,12 +804,96 @@ fn late_close_enabled() -> bool {
 /// scale while the parked fd still ends up empty for the publication write.
 const PREOPEN_WARM_BYTES: usize = 458_752; // 448 KiB
 
+const PUBLISH_MAP_BYTES: usize = 26 * 16_384;
+
+const MAX_PROOF_BYTES: usize = 500_000;
+
+fn mapped_publish_enabled() -> bool {
+    mapped_publish_enabled_for(std::env::var_os("FLOCK_NO_MMAP_PUBLISH").as_deref())
+}
+
+fn mapped_publish_enabled_for(kill: Option<&OsStr>) -> bool {
+    kill != Some(OsStr::new("1"))
+}
+
+struct PublishMap {
+    ptr: *mut u8,
+    len: usize,
+    tail: Vec<u8>,
+}
+
+impl PublishMap {
+    fn new(file: &std::fs::File, len: usize) -> Option<Self> {
+        use std::os::fd::AsRawFd;
+        const PROT_READ_WRITE: i32 = 0x1 | 0x2;
+        const MAP_SHARED: i32 = 0x1;
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ_WRITE,
+                MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr as isize == -1 {
+            return None;
+        }
+        let mut tail = vec![0u8; MAX_PROOF_BYTES.saturating_sub(len)];
+        tail.clear();
+        let map = Self { ptr, len, tail };
+        unsafe { std::ptr::write_bytes(map.ptr, 0, len) };
+        Some(map)
+    }
+}
+
+impl Drop for PublishMap {
+    fn drop(&mut self) {
+        unsafe { munmap(self.ptr, self.len) };
+    }
+}
+
 /// The speculative publish target, opened during the untimed ready→seed gap
 /// and held until publication. `file` is an `Option` so publication can take
 /// the descriptor out while [`Drop`] keeps every exit path tidy.
+///
 struct PreopenedPublish {
     file: Option<std::fs::File>,
+    map: Option<PublishMap>,
     temporary: PathBuf,
+}
+
+enum PublishBytes<'a> {
+    Slice(&'a [u8]),
+    Gather(&'a crate::proof_io::GatherBundle<'a>),
+}
+
+impl PublishBytes<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Slice(bytes) => bytes.len(),
+            Self::Gather(gather) => gather.len(),
+        }
+    }
+
+    fn copy_split(&self, head: &mut [u8], tail: &mut Vec<u8>) {
+        match self {
+            Self::Slice(bytes) => {
+                let (first, rest) = bytes.split_at(head.len());
+                head.copy_from_slice(first);
+                tail.extend_from_slice(rest);
+            }
+            Self::Gather(gather) => gather.copy_split(head, tail),
+        }
+    }
+
+    fn write_all_to(&self, file: &mut std::fs::File) -> io::Result<()> {
+        match self {
+            Self::Slice(bytes) => file.write_all(bytes),
+            Self::Gather(gather) => gather.write_all_to(file),
+        }
+    }
 }
 
 impl Drop for PreopenedPublish {
@@ -826,22 +912,26 @@ impl Drop for PreopenedPublish {
 /// before the wrapper even publishes its ready file) and drive the full
 /// create/write/truncate cycle once so the open, vnode, name-cache, and
 /// first-touch write costs land in the gap instead of on the publication
-/// critical path. The fd is then parked exactly as a fresh `File::create`
-/// would leave it: empty file, offset 0.
 ///
 /// Content is irrelevant to the harness — it opens only the final path, and
-/// only after the rename — so the warm pattern is truncated away before the
-/// fd is parked and the published bytes are byte-identical to the incumbent
 /// path's. Any I/O failure returns `None` after removing the temporary, and
 /// the caller keeps the incumbent create-at-publish ordering.
 fn preopen_publish_file(proof_path: &Path) -> Option<PreopenedPublish> {
     if !preopen_publish_enabled() {
         return None;
     }
+    preopen_publish_file_with(proof_path, mapped_publish_enabled())
+}
+
+fn preopen_publish_file_with(proof_path: &Path, mapped: bool) -> Option<PreopenedPublish> {
     let temporary = speculative_temporary_path(proof_path);
     let attempt = || -> io::Result<PreopenedPublish> {
-        // Same create the incumbent publish performs — just earlier.
-        let mut file = std::fs::File::create(&temporary)?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(mapped)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
         let pattern = [0u8; 8192];
         let mut remaining = PREOPEN_WARM_BYTES;
         while remaining > 0 {
@@ -849,12 +939,19 @@ fn preopen_publish_file(proof_path: &Path) -> Option<PreopenedPublish> {
             file.write_all(&pattern[..n])?;
             remaining -= n;
         }
-        // Park the fd as a fresh create would: empty, offset 0. Publication
-        // then pays only write + close + rename.
-        file.set_len(0)?;
+        let map = if mapped {
+            file.set_len(PUBLISH_MAP_BYTES as u64)?;
+            PublishMap::new(&file, PUBLISH_MAP_BYTES)
+        } else {
+            None
+        };
+        if map.is_none() {
+            file.set_len(0)?;
+        }
         file.seek(io::SeekFrom::Start(0))?;
         Ok(PreopenedPublish {
             file: Some(file),
+            map,
             temporary: temporary.clone(),
         })
     };
@@ -878,29 +975,43 @@ fn publish_bytes_through_preopened(
     bytes: &[u8],
     preopened: PreopenedPublish,
 ) -> io::Result<()> {
-    publish_through_preopened_with(proof_path, preopened, |file| file.write_all(bytes))
+    publish_through_preopened(proof_path, preopened, PublishBytes::Slice(bytes))
 }
 
-/// [`publish_bytes_through_preopened`] with the content written by `fill`
-/// (the plain byte slice, or the zero-copy gather list).
-fn publish_through_preopened_with<F>(
+fn fill_parked_file(
+    file: &mut std::fs::File,
+    map: &mut Option<PublishMap>,
+    bytes: &PublishBytes<'_>,
+) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    match map {
+        Some(mapping) if bytes.len() >= mapping.len => {
+            let head = unsafe { std::slice::from_raw_parts_mut(mapping.ptr, mapping.len) };
+            mapping.tail.clear();
+            bytes.copy_split(head, &mut mapping.tail);
+            file.write_all_at(&mapping.tail, mapping.len as u64)
+        }
+        _ => {
+            if map.take().is_some() {
+                file.set_len(0)?;
+            }
+            bytes.write_all_to(file)
+        }
+    }
+}
+
+fn publish_through_preopened(
     proof_path: &Path,
     mut preopened: PreopenedPublish,
-    fill: F,
-) -> io::Result<()>
-where
-    F: FnOnce(&mut std::fs::File) -> io::Result<()>,
-{
+    bytes: PublishBytes<'_>,
+) -> io::Result<()> {
     let file = preopened
         .file
         .take()
         .ok_or_else(|| io::Error::other("pre-opened publish fd already consumed"));
     let result = match file {
-        Ok(mut file) => fill(&mut file).and_then(|()| {
+        Ok(mut file) => fill_parked_file(&mut file, &mut preopened.map, &bytes).and_then(|()| {
             flock_core::tmark::mark("written");
-            // Every byte is in the file (and the shared buffer cache) once
-            // `write_all` returns, at its final length, so the rename alone
-            // makes the complete proof visible. Closing the descriptor is
             // bookkeeping that nothing reading the final path waits on: do it
             // after the rename, off the published-proof critical path.
             // `FLOCK_NO_LATE_CLOSE=1` restores close-then-rename.
@@ -940,8 +1051,7 @@ fn publish_speculative_result(out: &ProveOut, preopened: Option<PreopenedPublish
         if let Some(gather) = crate::proof_io::r1cs_parts_gather(&out.1, &out.0) {
             flock_core::tmark::mark("encoded");
             let pre = preopened.take().expect("checked above");
-            if publish_through_preopened_with(&proof_path, pre, |file| gather.write_all_to(file))
-                .is_ok()
+            if publish_through_preopened(&proof_path, pre, PublishBytes::Gather(&gather)).is_ok()
             {
                 return Ok(true);
             }
@@ -1687,10 +1797,96 @@ mod tests {
     }
 
     #[test]
+    fn mapped_publish_kill_is_literal_one() {
+        assert!(mapped_publish_enabled_for(None));
+        assert!(!mapped_publish_enabled_for(Some(OsStr::new("1"))));
+        for value in ["", "0", "01", "true", " 1", "1 "] {
+            assert!(
+                mapped_publish_enabled_for(Some(OsStr::new(value))),
+                "unexpected kill for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mapped_publish_leaves_exactly_the_proof_bytes() {
+        let dir = publication_test_dir("mapped-publish");
+        for len in [
+            1,
+            PUBLISH_MAP_BYTES - 1,
+            PUBLISH_MAP_BYTES,
+            PUBLISH_MAP_BYTES + 1,
+            435_151,
+            440_079,
+            MAX_PROOF_BYTES,
+            1 << 20,
+        ] {
+            let proof_path = dir.join(format!("proof-{len}.bin"));
+            let expected: Vec<u8> = (0..len).map(|i| (i * 131 + 17) as u8).collect();
+            let pre = preopen_publish_file_with(&proof_path, true)
+                .expect("pre-open in a writable scratch");
+            assert!(pre.map.is_some(), "the scratch file must map");
+            publish_bytes_through_preopened(&proof_path, &expected, pre)
+                .expect("publication through the mapped file");
+            assert_eq!(
+                std::fs::read(&proof_path).expect("published proof"),
+                expected,
+                "published bytes differ at length {len}"
+            );
+            assert!(!speculative_temporary_path(&proof_path).exists());
+        }
+        std::fs::remove_dir_all(&dir).expect("remove publication test directory");
+    }
+
+    #[test]
+    fn mapped_publish_never_exposes_another_length() {
+        let dir = publication_test_dir("mapped-atomic");
+        let proof_path = dir.join("proof.bin");
+        let expected: Vec<u8> = (0..437_000).map(|i| (i * 131 + 17) as u8).collect();
+        let reader_path = proof_path.clone();
+        let reader = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match std::fs::read(&reader_path) {
+                    Ok(bytes) => return bytes,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::NotFound
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("mapped publication reader failed: {error}"),
+                }
+            }
+        });
+
+        let pre =
+            preopen_publish_file_with(&proof_path, true).expect("pre-open in a writable scratch");
+        publish_bytes_through_preopened(&proof_path, &expected, pre)
+            .expect("publication through the mapped file");
+        assert_eq!(reader.join().expect("reader thread"), expected);
+        std::fs::remove_dir_all(&dir).expect("remove publication test directory");
+    }
+
+    #[test]
+    fn mapped_preopen_cleans_up_without_publication() {
+        let dir = publication_test_dir("mapped-parked");
+        let proof_path = dir.join("proof.bin");
+        let pre =
+            preopen_publish_file_with(&proof_path, true).expect("pre-open in a writable scratch");
+        assert!(speculative_temporary_path(&proof_path).exists());
+        drop(pre);
+        assert!(!speculative_temporary_path(&proof_path).exists());
+        assert!(!proof_path.exists());
+        std::fs::remove_dir_all(&dir).expect("remove publication test directory");
+    }
+
+    #[test]
     fn preopen_parks_the_fd_as_a_fresh_create_would() {
         let dir = publication_test_dir("preopen-parked");
         let proof_path = dir.join("proof.bin");
-        let mut pre = preopen_publish_file(&proof_path).expect("pre-open in a writable scratch");
+        let mut pre = preopen_publish_file_with(&proof_path, false)
+            .expect("pre-open in a writable scratch");
         // The parked state: temp exists but is empty...
         assert!(speculative_temporary_path(&proof_path).exists());
         assert_eq!(
