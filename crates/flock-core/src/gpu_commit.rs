@@ -7670,7 +7670,7 @@ kernel void blake3_pow_scan(
     /// Largest split this selection will publish. The hybrid graph needs `k`
     /// in `1..16`; past this plateau the CPU suffix is so long that the
     /// GPU-only graph (`k = 0`) is the answer, and `k = 0` is sampled too.
-    const ARM_SPLIT_MAX_K: usize = 8;
+    const ARM_SPLIT_MAX_K: usize = 15;
 
     /// How much the arms' winner must beat the sweep's own split's arm window
     /// before it replaces it: 3% of the commit window. Comfortably above the
@@ -8046,6 +8046,18 @@ kernel void blake3_pow_scan(
     /// Five candidates × 2 reverse-order samples, all in the untimed warmup,
     /// is still well inside the 10-minute job wall at ~120 workers.
     const RANKED_EXACT_TUNE_CANDIDATES: [usize; 5] = [0, 2, 3, 4, 5];
+
+    /// Largest split the edge extension may climb to (the hybrid graph needs
+    /// `k < 16`), and the improvement over the edge it requires.
+    const HYBRID_EDGE_EXT_MAX_K: usize = 11;
+    const HYBRID_EDGE_EXT_MARGIN: f64 = 0.01;
+
+    /// `FLOCK_NO_HYBRID_EDGE_EXT=1` keeps the sweep's edge pick unextended.
+    fn hybrid_edge_ext_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_EDGE_EXT").is_none())
+    }
 
     /// Two samples per candidate, with the second pass in reverse order so
     /// thermal drift, queue warmup, and A/B replay cache state do not favor
@@ -8522,7 +8534,7 @@ kernel void blake3_pow_scan(
                 v.clear();
             }
             let _recording = ArmRecordScope::enter();
-            match collect_ranked_exact_samples(reprime, sample) {
+            match collect_ranked_exact_samples(&reprime, &sample) {
                 Ok(samples) => samples,
                 Err(e) => {
                     if dbg {
@@ -8544,6 +8556,45 @@ kernel void blake3_pow_scan(
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
+        // Edge extension: a sweep that picks its largest CPU share says the
+        // balance point lies beyond the candidate set (a host whose GPU is
+        // small relative to its CPU). Scan every share above it up to
+        // HYBRID_EDGE_EXT_MAX_K with the sweep's own two-sample scoring and
+        // arm recording (a full scan: a greedy climb stopped early on one
+        // noisy step), and move only if the best beats the edge's mean by
+        // HYBRID_EDGE_EXT_MARGIN. Hosts whose pick is interior never run it.
+        // The final split is byte verified below exactly like a swept one.
+        let top_i = RANKED_EXACT_TUNE_CANDIDATES.len() - 1;
+        let mut ext_rows: Vec<(usize, f64)> = Vec::new();
+        let swept = if swept == RANKED_EXACT_TUNE_CANDIDATES[top_i] && hybrid_edge_ext_enabled() {
+            let _recording = ArmRecordScope::enter();
+            let mut best = (swept, means[top_i]);
+            for k in swept + 1..=HYBRID_EDGE_EXT_MAX_K {
+                let mean = (|| -> Result<f64, String> {
+                    reprime()?;
+                    let a = sample(k)?;
+                    reprime()?;
+                    let b = sample(k)?;
+                    Ok((a + b) * 0.5)
+                })();
+                let Ok(mean) = mean else { break };
+                if !mean.is_finite() || mean < 0.0 {
+                    break;
+                }
+                ext_rows.push((k, mean));
+                if mean < best.1 {
+                    best = (k, mean);
+                }
+            }
+            if best.1 < means[top_i] * (1.0 - HYBRID_EDGE_EXT_MARGIN) { best.0 } else { swept }
+        } else {
+            swept
+        };
+        if dbg && !ext_rows.is_empty() {
+            let rows: Vec<String> =
+                ext_rows.iter().map(|(k, m)| format!("k={k}:{m:.1}ms")).collect();
+            eprintln!("[gpu-commit] edge extension -> k={swept} | {}", rows.join(" "));
+        }
         // Re-price the sweep's candidates from the two arms each one measured,
         // keeping the sweep's pick unless the arms clearly beat it. The arms
         // are the commit window's own `max(gpu, cpu)`; the sweep ranks the
@@ -8973,7 +9024,7 @@ kernel void blake3_pow_scan(
         cpu_tree: &[Hash],
         k: usize,
     ) {
-        debug_assert!(RANKED_EXACT_TUNE_CANDIDATES.contains(&k));
+        debug_assert!(hybrid_split_valid(k));
         TUNED_HYBRID_K.store(k, std::sync::atomic::Ordering::Release);
         if super::warmup_latch_cache_enabled() {
             let cpu_wall_ms = f64::from_bits(
