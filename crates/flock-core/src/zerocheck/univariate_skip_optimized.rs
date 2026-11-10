@@ -2503,6 +2503,9 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
     tables
 }
 
+#[cfg(target_arch = "aarch64")]
+const AB_COMPLETION_PREFETCH_CHUNKS: usize = 8;
+
 /// Folded twin of [`process_one_x_hi_with_precomputed_ab_fold4_ab`]: same
 /// chunk sweep and same gathers, but the per-chunk `eq_lo` multiply is gone —
 /// the table carries `eq_top[w]` and the band-end fold carries `eq_bot[u]`.
@@ -2532,6 +2535,30 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     let bank_mask = (1usize << bank_bits) - 1;
 
     for x_outer_lo in 0..big_lo_size {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let ahead = x_outer_lo + AB_COMPLETION_PREFETCH_CHUNKS;
+            if ahead < big_lo_size {
+                let within_ahead = (ahead | (x_hi << n_lo)) & within_outer_mask;
+                let n_ahead = b_med_counts[within_ahead] as usize;
+                if n_ahead != 0 {
+                    let base = ((ahead << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+                    let first_line = representation.first_materialized_b_med(within_ahead) / 2;
+                    let end_line = representation
+                        .materialized_b_med_end(within_ahead, n_ahead)
+                        .div_ceil(2);
+                    for line in first_line..end_line {
+                        unsafe {
+                            core::arch::asm!(
+                                "prfm pldl1keep, [{p}]",
+                                p = in(reg) ab_inner.as_ptr().add(base + line * 128),
+                                options(nostack, preserves_flags, readonly)
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
