@@ -5267,6 +5267,13 @@ fn ligero_commit_select(
 
 /// Kill switch for the subtree-parallel recursive Merkle builder
 /// (`FLOCK_NO_PCS_SUBTREE=1`, exact).
+fn op_small_merkle_serial_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NO_OP_SMALL_MERKLE").map_or(true, |v| v != "1")
+    });
+    *ON
+}
+
 fn recursive_subtree_merkle_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("FLOCK_NO_PCS_SUBTREE").map_or(true, |v| v != "1")
@@ -5487,7 +5494,15 @@ fn ligero_commit_impl_view(
             } else {
                 0
             };
-            if sub_log > 0 {
+            if sub_log > 0 && lb <= 10 && op_small_merkle_serial_enabled() {
+                merkle::merkle_tree_into_subtrees_serial(
+                    crate::scratch::take_hash_tree(2 * block_len - 1),
+                    data_bytes,
+                    block_len,
+                    kind,
+                    sub_log,
+                )
+            } else if sub_log > 0 {
                 merkle::merkle_tree_into_subtrees(
                     crate::scratch::take_hash_tree(2 * block_len - 1),
                     data_bytes,
@@ -8309,6 +8324,13 @@ fn sample_distinct_queries<Ch: Challenger>(
 }
 
 /// Build a single octopus multi-proof for all `queries` against `tree`.
+fn op_serial_opens_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NO_OP_SERIAL_OPENS").map_or(true, |v| v != "1")
+    });
+    *ON
+}
+
 fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) -> Vec<Hash> {
     merkle::merkle_multi_proof(tree, block_len, queries)
 }
@@ -9273,7 +9295,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             let queries_last =
                 sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_last);
             let _t = std::time::Instant::now();
-            let (merkle_proof_last, opened_rows_last): (Vec<Hash>, Vec<Vec<F128>>) = {
+            let (merkle_proof_last, opened_rows_last): (Vec<Hash>, Vec<Vec<F128>>) = if op_serial_opens_enabled() {
+                (
+                    merkle_multi_proof_for(wtns_prev.nodes(), wtns_prev.block_len, &queries_last),
+                    queries_last.iter().map(|&q| wtns_prev.row(q).to_vec()).collect(),
+                )
+            } else {
                 use rayon::prelude::*;
                 rayon::join(
                     || merkle_multi_proof_for(wtns_prev.nodes(), wtns_prev.block_len, &queries_last),
@@ -9466,6 +9493,12 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             && n_next > 3;
         let open_i = || {
             use rayon::prelude::*;
+            if op_serial_opens_enabled() {
+                return (
+                    merkle_multi_proof_for(wtns_prev.nodes(), wtns_prev.block_len, &queries_i),
+                    queries_i.iter().map(|&q| wtns_prev.row(q).to_vec()).collect::<Vec<Vec<F128>>>(),
+                );
+            }
             rayon::join(
                 || merkle_multi_proof_for(wtns_prev.nodes(), wtns_prev.block_len, &queries_i),
                 || {

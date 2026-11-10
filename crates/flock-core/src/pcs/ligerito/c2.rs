@@ -208,7 +208,12 @@ impl Dual {
         let mut scales = crate::alloc_uninit_vec::<[F128; 4]>(n_queries);
         let mut positions = crate::alloc_uninit_vec::<usize>(n_queries);
         let mut w2_pows = crate::alloc_uninit_vec::<F128>(n_queries);
-        let enforced = if n_queries * lane_weights.len() >= 1024 {
+        let par_floor = if std::env::var("FLOCK_NO_OP_DUAL_PAR").map_or(true, |v| v != "1") {
+            256
+        } else {
+            1024
+        };
+        let enforced = if n_queries * lane_weights.len() >= par_floor {
             use rayon::prelude::*;
             queries
                 .par_iter()
