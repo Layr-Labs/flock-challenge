@@ -29,7 +29,7 @@ pub mod univariate_skip_optimized;
 use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into,
     fold_compact_and_compute_round_pair, fold_in_place_pair, fold2_compact_and_round4_into,
-    fold2_compact_and_round45_into, fold2_plain_and_round6_into, fold2_plain_and_round67_into,
+    fold2_plain_and_round6_into, fold2_plain_and_round67_into,
     interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_lookahead_for,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
@@ -965,7 +965,9 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut a_out = crate::scratch::take_f128_unpinned(n_groups);
         let mut b_out = crate::scratch::take_f128_unpinned(n_groups);
         if use_cascade {
-            let (m4_1, m4_inf, la5) = fold2_compact_and_round45_into(
+            // Dead-tail-packed K output only when the tri pass, the one
+            // reader of that layout, comes next.
+            let (m4_1, m4_inf, la5, packed) = multilinear::fold2_compact_and_round45_into_packed(
                 &compact_mlv,
                 &fold_table,
                 mlv_rhos[0],
@@ -973,10 +975,11 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &r_next4,
                 &mut a_out,
                 &mut b_out,
+                tri_steps > 0 && multilinear::zc_k_dead_pack_enabled(),
             );
             if tail_round_timing {
                 eprintln!(
-                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, dead_tail={}): {:.2} ms",
+                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, dead_tail={}, packed={packed}): {:.2} ms",
                     compact_mlv.dead_tail,
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
@@ -1006,9 +1009,11 @@ fn prove_packed_padded_inner<C: Challenger>(
             let mut a2_out = crate::scratch::take_f128_unpinned(quarter);
             let mut b2_out = crate::scratch::take_f128_unpinned(quarter);
             if tri_steps > 0 {
-                let (m6_1, m6_inf, la7, la8) = multilinear::fold_cascade_t_into(
-                    &a_out,
-                    &b_out,
+                let main = if packed { n_groups / 256 * 244 } else { n_groups };
+                let (m6_1, m6_inf, la7, la8) = multilinear::fold_cascade_t_into_packed(
+                    &a_out[..main],
+                    &b_out[..main],
+                    packed,
                     &mut a2_out,
                     &mut b2_out,
                     &mlv_rhos[2..4],

@@ -1800,6 +1800,15 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
     }
 }
 
+/// Kill switch for the unreduced window sums of the pre-scaled round-two W
+/// kernel: `FLOCK_NO_R2_WINDOW_TRI` (any value) restores one reduced product
+/// per window. Same four sums either way; read once per process.
+#[cfg(target_arch = "aarch64")]
+fn r2_window_tri_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_WINDOW_TRI").is_none())
+}
+
 #[cfg(target_arch = "aarch64")]
 fn r2_gpr_delta_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2425,10 +2434,14 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
             cross: zero,
             hh: zero,
         };
-        let mut sum0 = zero;
-        let mut sum3 = zero;
-        let mut sum4 = zero;
-        let mut sum5 = zero;
+        // Window sums: with `r2_window_tri_enabled` each window's weighted
+        // value is accumulated unreduced (three-limb form) and the four sums
+        // are reduced once per chunk; otherwise one reduced product per window.
+        let window_tri = r2_window_tri_enabled();
+        let mut sum0 = tri_zero;
+        let mut sum3 = tri_zero;
+        let mut sum4 = tri_zero;
+        let mut sum5 = tri_zero;
         let b_ones = fold_row_q(table_data, [0xffu8; 8].as_ptr());
         let ones_is_one = is_zero_q(veorq_u64(
             b_ones,
@@ -2561,19 +2574,26 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                     }
                 }
                 let lambda = vld1q_u64(eq_lo.add(2 * (first + t) + 1).cast::<u64>());
-                sum0 = veorq_u64(sum0, mul_q(lambda, reduce_tri_q(w0)));
-                sum3 = veorq_u64(sum3, mul_q(lambda, reduce_tri_q(w3)));
-                sum4 = veorq_u64(sum4, mul_q(lambda, reduce_tri_q(w4)));
-                sum5 = veorq_u64(sum5, mul_q(lambda, reduce_tri_q(w5)));
+                if window_tri {
+                    tri_acc_q_crossfused(&mut sum0, lambda, reduce_tri_binius_xor_q(w0.ll, w0.cross, w0.hh, zero));
+                    tri_acc_q_crossfused(&mut sum3, lambda, reduce_tri_binius_xor_q(w3.ll, w3.cross, w3.hh, zero));
+                    tri_acc_q_crossfused(&mut sum4, lambda, reduce_tri_binius_xor_q(w4.ll, w4.cross, w4.hh, zero));
+                    tri_acc_q_crossfused(&mut sum5, lambda, reduce_tri_binius_xor_q(w5.ll, w5.cross, w5.hh, zero));
+                } else {
+                    sum0.ll = veorq_u64(sum0.ll, mul_q(lambda, reduce_tri_q(w0)));
+                    sum3.ll = veorq_u64(sum3.ll, mul_q(lambda, reduce_tri_q(w3)));
+                    sum4.ll = veorq_u64(sum4.ll, mul_q(lambda, reduce_tri_q(w4)));
+                    sum5.ll = veorq_u64(sum5.ll, mul_q(lambda, reduce_tri_q(w5)));
+                }
             }
         }
         for i in 0..4 {
             *out.add(i) = F128::ZERO;
         }
-        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(sum0);
-        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(sum3);
-        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(sum4);
-        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(sum5);
+        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(sum0));
+        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(sum3));
+        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(sum4));
+        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(sum5));
     }
 }
 
@@ -3306,6 +3326,17 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused<const DEAD_TAI
     }
 }
 
+/// Blocks of 64 K outputs per superblock of the dead-tail-packed layout.
+pub(crate) const PACK_BLOCKS: usize = 4;
+/// Entries per superblock of the dead-tail-packed layout: four blocks'
+/// outputs 0..60 (block `w` at `60 * w`), then their four outputs 60 (at
+/// `240 + w`); outputs 61..63, which are zero, have no entry. 244 entries
+/// are 61 cache lines, so every superblock starts on a line.
+pub(crate) const PACK_SUPER: usize = 61 * PACK_BLOCKS;
+
+/// `a*b + e1` in the field: [`mul_sw_fused_xor3_q`] with one addend (`eor`
+/// in place of the `eor3`). Same four schoolbook `PMULL`s, same two-step
+/// reduction, same field value; 13 instructions.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[inline(always)]
 unsafe fn mul_sw_fused_xor1_q(
@@ -3348,10 +3379,33 @@ unsafe fn mul_sw_fused_xor1_q(
 }
 
 ///
+/// The incumbent lane value is `anc0 + ρ₂(anc0+anc1) + T_λ₁(δ0) + T_λ₃(δ1)`
+/// with `λ₁ = ρ₁(1+ρ₂)`, `λ₃ = ρ₁ρ₂`. With `x0 = anc0 + T_ρ₁(δ0)` and
+/// `x1 = anc1 + T_ρ₁(δ1)` (the two round-three values, `T_ρ₁ = ρ₁·T`, `T`
+/// GF(2)-linear per byte) this is the sequential fold `x0 + ρ₂(x0 + x1)`:
+/// `x0 + ρ₂(x0+x1) = anc0 + ρ₂(anc0+anc1) + ρ₁(1+ρ₂)T(δ0) + ρ₁ρ₂T(δ1)`.
+/// Same field element, so every store and every product below is the
+/// incumbent's. Per lane side: the same 16 lookups (two `lookup8_acc_q`
+/// trees of four `EOR3` each instead of one `lookup8_acc_q` plus one
+/// `lookup8_q`), one `EOR` (`x0^x1` instead of `anc0^anc1`), one fused
+/// multiply with one addend (13 instructions, the incumbent's has two
+/// addends in its `EOR3`). The table set shrinks from 16 to 8 bank bases
+/// (64 → 32 KiB), which is what frees the general registers the incumbent
+/// spills (`ldr x?, [sp, ..]` per lane side for one λ₃ bank base), and the
+/// stores use immediate offsets (two address `ADD`s per group instead of
+/// six). The message half is unchanged.
+///
+/// `PACK` (with `DEAD_TAIL` only): the outputs are written in the
+/// dead-tail-packed layout ([`PACK_SUPER`]): outputs 61..63 of every block of
+/// 64, which are zero, are not written. Same values, same slots. The chunk
+/// must hold a whole number of four-block superblocks.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<const DEAD_TAIL: bool>(
+pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
+    const DEAD_TAIL: bool,
+    const PACK: bool,
+>(
     table_r1: *const u8,
     rho2: F128,
     anchors: *const F128,
@@ -3363,6 +3417,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<const DEAD_
     degen: bool,
     out: *mut F128,
 ) {
+    const { assert!(DEAD_TAIL || !PACK) };
     use core::arch::aarch64::*;
 
     #[inline(always)]
@@ -3426,12 +3481,13 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<const DEAD_
             }};
         }
 
+        // `$o`: the index of the group's first output in `a_out` / `b_out`.
         macro_rules! k_group {
-            ($t:expr) => {{
+            ($t:expr, $o:expr) => {{
                 let t = $t;
                 let mut b_flat = true;
-                let ao = a_out.add(4 * t);
-                let bo = b_out.add(4 * t);
+                let ao = a_out.add($o);
+                let bo = b_out.add($o);
                 let (a0, b0) = fold_lane!(4 * t, b_flat);
                 let (a1, b1) = fold_lane!(4 * t + 1, b_flat);
                 store_pair_nt_off::<0>(ao, a0, a1);
@@ -3471,12 +3527,24 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<const DEAD_
             }};
         }
 
+        // Packed: output 60 of each block is staged here until the
+        // superblock's four are written as one 64-byte line.
+        let mut stage_a = [zero; 4];
+        let mut stage_b = [zero; 4];
         if DEAD_TAIL {
             debug_assert!(n5.is_multiple_of(16));
+            debug_assert!(!PACK || (n5 / 16).is_multiple_of(PACK_BLOCKS));
             for blk in 0..n5 / 16 {
                 let t0 = 16 * blk;
+                // Packed: block `blk` starts at
+                // `PACK_SUPER * (blk / 4) + 60 * (blk % 4)`.
+                let o0 = if PACK {
+                    PACK_SUPER * (blk / PACK_BLOCKS) + 60 * (blk % PACK_BLOCKS)
+                } else {
+                    4 * t0
+                };
                 for t in t0..t0 + 15 {
-                    k_group!(t);
+                    k_group!(t, o0 + 4 * (t - t0));
                 }
                 let t = t0 + 15;
                 let g = 4 * t;
@@ -3490,12 +3558,26 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<const DEAD_
                 let xb0 = lookup8_acc_q(table_r1, db0, anc_b0);
                 let av0 = mul_sw_fused_xor1_q(rho2_q, rho2_sw, xa0, k87, xa0);
                 let bv0 = mul_sw_fused_xor1_q(rho2_q, rho2_sw, xb0, k87, xb0);
-                let ao = a_out.add(4 * t);
-                let bo = b_out.add(4 * t);
-                store_pair_nt_off::<0>(ao, av0, zero);
-                store_pair_nt_off::<32>(ao, zero, zero);
-                store_pair_nt_off::<0>(bo, bv0, zero);
-                store_pair_nt_off::<32>(bo, zero, zero);
+                if PACK {
+                    let slot = blk % PACK_BLOCKS;
+                    stage_a[slot] = av0;
+                    stage_b[slot] = bv0;
+                    if slot == PACK_BLOCKS - 1 {
+                        let line = PACK_SUPER * (blk / PACK_BLOCKS) + 60 * PACK_BLOCKS;
+                        let (sa, sb) = (a_out.add(line), b_out.add(line));
+                        store_pair_nt_off::<0>(sa, stage_a[0], stage_a[1]);
+                        store_pair_nt_off::<32>(sa, stage_a[2], stage_a[3]);
+                        store_pair_nt_off::<0>(sb, stage_b[0], stage_b[1]);
+                        store_pair_nt_off::<32>(sb, stage_b[2], stage_b[3]);
+                    }
+                } else {
+                    let ao = a_out.add(4 * t);
+                    let bo = b_out.add(4 * t);
+                    store_pair_nt_off::<0>(ao, av0, zero);
+                    store_pair_nt_off::<32>(ao, zero, zero);
+                    store_pair_nt_off::<0>(bo, bv0, zero);
+                    store_pair_nt_off::<32>(bo, zero, zero);
+                }
                 let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
                 let a0w = mul_sw_fused_q(w, swap_halves_q(w), av0, k87);
                 let (ll, cross, hh) = clmul_products_q(a0w, bv0);
@@ -3508,7 +3590,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<const DEAD_
             }
         } else {
             for t in 0..n5 {
-                k_group!(t);
+                k_group!(t, 4 * t);
             }
         }
 
@@ -4771,14 +4853,62 @@ pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, c
     rho_c: F128,
     eq_lo: &[F128],
 ) -> [F128; TRI_SLOTS] {
+    fold_tri_and_message_impl::<DEPTH, NT, ABL, false>(
+        a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
+    )
+}
+
+/// [`fold_tri_and_message_aarch64`] (depth two, no probes) over an input in
+/// the dead-tail-packed layout ([`PACK_SUPER`]): logical inputs 61..63 of
+/// every block of 64 have no entry and enter the same fold as zero
+/// registers, so every output and slot is the one the full input (with its
+/// zeros) gives.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_tri_and_message_packed_aarch64<const NT: bool>(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    eq_lo: &[F128],
+) -> [F128; TRI_SLOTS] {
+    fold_tri_and_message_impl::<2, NT, 0, true>(
+        a_in, b_in, a_out, b_out, rho_a, rho_b, F128::ZERO, eq_lo,
+    )
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn fold_tri_and_message_impl<const DEPTH: usize, const NT: bool, const ABL: u32, const PACK: bool>(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    rho_c: F128,
+    eq_lo: &[F128],
+) -> [F128; TRI_SLOTS] {
     use core::arch::aarch64::*;
     assert!(DEPTH == 2 || DEPTH == 3);
+    assert!(!PACK || (DEPTH == 2 && ABL == 0));
     let n_out = a_out.len();
     assert_eq!(b_out.len(), n_out);
     assert_eq!(n_out, 2 * eq_lo.len());
     assert!(n_out.is_multiple_of(8));
-    assert_eq!(a_in.len(), n_out << DEPTH);
-    assert_eq!(b_in.len(), n_out << DEPTH);
+    if PACK {
+        let n_in = n_out << DEPTH;
+        assert!(n_in.is_multiple_of(64 * PACK_BLOCKS));
+        assert_eq!(a_in.len(), n_in / (64 * PACK_BLOCKS) * PACK_SUPER);
+        assert_eq!(b_in.len(), n_in / (64 * PACK_BLOCKS) * PACK_SUPER);
+    } else {
+        assert_eq!(a_in.len(), n_out << DEPTH);
+        assert_eq!(b_in.len(), n_out << DEPTH);
+    }
 
     #[inline(always)]
     unsafe fn store_pair<const NT: bool>(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
@@ -4840,6 +4970,53 @@ pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, c
             }
         }
 
+        /// [`fold_eight`] (depth two) of a packed block's second half:
+        /// logical inputs 32..60 at `src`, input 60 = `*side`, inputs
+        /// 61..63 zero.
+        #[inline(always)]
+        unsafe fn fold_eight_packed_tail(
+            src: *const F128,
+            side: *const F128,
+            rho: &Fold4RhoQ,
+        ) -> [uint64x2_t; 8] {
+            unsafe {
+                let mut v = [vdupq_n_u64(0); 8];
+                for h in 0..3 {
+                    let (x, y) = fold4_pair_expanded_tri_q(src.add(8 * h), rho);
+                    v[2 * h] = x;
+                    v[2 * h + 1] = y;
+                }
+                let ld = |p: *const F128| vld1q_u64(p.cast::<u64>());
+                let zero = vdupq_n_u64(0);
+                v[6] = fold4_expanded_tri_one_q(
+                    ld(src.add(24)),
+                    ld(src.add(25)),
+                    ld(src.add(26)),
+                    ld(src.add(27)),
+                    rho,
+                );
+                v[7] = fold4_expanded_tri_one_q(ld(side), zero, zero, zero, rho);
+                v
+            }
+        }
+        // Group `y` (32 logical inputs): packed, block `y / 2` of superblock
+        // `y / 8`, first half from its main entries, second half through the
+        // tail with the block's output-60 entry.
+        let fold_group = |ip: *const F128, y: usize| -> [uint64x2_t; 8] {
+            if PACK {
+                let (blk, w) = (y / 2, (y / 2) % PACK_BLOCKS);
+                let sup = ip.add(PACK_SUPER * (blk / PACK_BLOCKS));
+                let main = sup.add(60 * w);
+                if y % 2 == 0 {
+                    fold_eight::<2>(main, &rho, rc, rc_sw)
+                } else {
+                    fold_eight_packed_tail(main.add(32), sup.add(60 * PACK_BLOCKS + w), &rho)
+                }
+            } else {
+                fold_eight::<DEPTH>(ip.add((8 * y) << DEPTH), &rho, rc, rc_sw)
+            }
+        };
+
         const TG: usize = 16;
         let ng = n_out / 8;
         let mut ta = [[zero; 8]; TG];
@@ -4849,8 +5026,8 @@ pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, c
             let gn = (ng - g0).min(TG);
             for t in 0..gn {
                 let y = g0 + t;
-                let a = fold_eight::<DEPTH>(a_ip.add((8 * y) << DEPTH), &rho, rc, rc_sw);
-                let b = fold_eight::<DEPTH>(b_ip.add((8 * y) << DEPTH), &rho, rc, rc_sw);
+                let a = fold_group(a_ip, y);
+                let b = fold_group(b_ip, y);
                 if ABL & 2 == 0 {
                     for h in 0..4 {
                         store_pair::<NT>(a_op.add(8 * y + 2 * h), a[2 * h], a[2 * h + 1]);
@@ -6960,12 +7137,12 @@ mod tests {
                                 deltas.as_ptr(), a.as_mut_ptr(), b.as_mut_ptr(), eq.as_ptr(),
                                 OUT_PAIRS, true, out.as_mut_ptr(),
                             ),
-                            (false, false) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false>(
+                            (false, false) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
                                 r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq.as_ptr(), OUT_PAIRS, true,
                                 out.as_mut_ptr(),
                             ),
-                            (false, true) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true>(
+                            (false, true) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
                                 r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq.as_ptr(), OUT_PAIRS, true,
                                 out.as_mut_ptr(),
@@ -6979,6 +7156,150 @@ mod tests {
                 assert_eq!(a1, a2, "a outputs, case {case}, dead_tail {dead_tail}");
                 assert_eq!(b1, b2, "b outputs, case {case}, dead_tail {dead_tail}");
                 assert_eq!(o1, o2, "slots, case {case}, dead_tail {dead_tail}");
+            }
+        }
+    }
+
+    /// Logical input `i` of a dead-tail-packed array (`PACK_SUPER` layout),
+    /// or `None` for the unstored zeros (outputs 61..63 of a block).
+    fn packed_index(i: usize) -> Option<usize> {
+        let (blk, j) = (i / 64, i % 64);
+        let (sup, w) = (blk / PACK_BLOCKS, blk % PACK_BLOCKS);
+        match j {
+            0..60 => Some(PACK_SUPER * sup + 60 * w + j),
+            60 => Some(PACK_SUPER * sup + 60 * PACK_BLOCKS + w),
+            _ => None,
+        }
+    }
+
+    /// The dead-tail-packed K output (`PACK`) holds exactly the incumbent's
+    /// outputs (and the incumbent's outputs 61..63 of every block are zero);
+    /// the eight slots are identical; entries past the packed length are not
+    /// written.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn k_dead_pack_matches_full_output() {
+        use crate::zerocheck::multilinear::UniSkipFoldTable;
+        let mut state = 0x4b31_5041_434b_3631;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let table = UniSkipFoldTable::new(6, rho(&mut state));
+        for case in 0..12 {
+            // Two and one superblocks of four 64-output blocks.
+            let out_pairs = if case % 2 == 0 { 2 * 16 * 8 } else { 2 * 16 * 4 };
+            let n_out = 2 * out_pairs;
+            let (rho1, rho2) = match case / 2 {
+                0 => (F128::ONE, F128::ONE),
+                1 => (rho(&mut state), F128::ZERO),
+                _ => (rho(&mut state), rho(&mut state)),
+            };
+            let r1 = table.scaled_linear(rho1);
+            let mut anchors: Vec<F128> = (0..8 * out_pairs).map(|_| rho(&mut state)).collect();
+            let mut deltas: Vec<u8> =
+                (0..64 * out_pairs).map(|_| splitmix64(&mut state) as u8).collect();
+            let eq: Vec<F128> = (0..out_pairs).map(|_| rho(&mut state)).collect();
+            for g in 0..4 * out_pairs / 2 {
+                let class = if (g / 4) % 7 == 3 { 1 } else { splitmix64(&mut state) % 5 };
+                match class {
+                    0 => {
+                        anchors[4 * g + 3] = anchors[4 * g + 1];
+                        deltas[32 * g + 8..32 * g + 16].fill(0);
+                        deltas[32 * g + 24..32 * g + 32].fill(0);
+                    }
+                    1 => {
+                        anchors[4 * g + 1] = F128::ONE;
+                        anchors[4 * g + 3] = F128::ONE;
+                        deltas[32 * g + 8..32 * g + 16].fill(0);
+                        deltas[32 * g + 24..32 * g + 32].fill(0);
+                    }
+                    2 => {
+                        deltas[32 * g + 8..32 * g + 16].fill(0);
+                        deltas[32 * g + 24..32 * g + 32].fill(0);
+                    }
+                    _ => {}
+                }
+            }
+            for degen in [false, true] {
+                let poison = F128::new(0xdead, 0xbeef);
+                let (mut a, mut b) = (vec![poison; n_out], vec![poison; n_out]);
+                let (mut ap, mut bp) = (vec![poison; n_out], vec![poison; n_out]);
+                let (mut o_full, mut o_pack) = ([F128::ZERO; 8], [F128::ZERO; 8]);
+                unsafe {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                        r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                        a.as_mut_ptr(), b.as_mut_ptr(), eq.as_ptr(), out_pairs, degen,
+                        o_full.as_mut_ptr(),
+                    );
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
+                        r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                        ap.as_mut_ptr(), bp.as_mut_ptr(), eq.as_ptr(), out_pairs, degen,
+                        o_pack.as_mut_ptr(),
+                    );
+                }
+                assert_eq!(o_pack, o_full, "slots, case {case}, degen {degen}");
+                for i in 0..n_out {
+                    match packed_index(i) {
+                        Some(k) => {
+                            assert_eq!(ap[k], a[i], "a output {i}, case {case}");
+                            assert_eq!(bp[k], b[i], "b output {i}, case {case}");
+                        }
+                        None => {
+                            assert_eq!(a[i], F128::ZERO, "a output {i} not zero");
+                            assert_eq!(b[i], F128::ZERO, "b output {i} not zero");
+                        }
+                    }
+                }
+                let packed_len = n_out / 256 * PACK_SUPER;
+                assert!(ap[packed_len..].iter().all(|&v| v == poison));
+                assert!(bp[packed_len..].iter().all(|&v| v == poison));
+            }
+        }
+    }
+
+    /// The tri pass over a dead-tail-packed input equals the tri pass over
+    /// the full input with zeros at logical inputs 61..63 of every block:
+    /// every output and all 26 slots, both store flavours.
+    #[test]
+    fn tri_packed_input_matches_full_input() {
+        let mut state = 0x7472_6970_6163_6b31;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        for case in 0..4 {
+            let n_out = 64 << case;
+            let n_in = 4 * n_out;
+            let mut a: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+            let mut b: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+            for blk in 0..n_in / 64 {
+                a[64 * blk + 61..64 * blk + 64].fill(F128::ZERO);
+                b[64 * blk + 61..64 * blk + 64].fill(F128::ZERO);
+            }
+            let pack = |v: &[F128]| -> Vec<F128> {
+                let mut p = vec![F128::new(1, 2); n_in / 256 * PACK_SUPER];
+                for (i, &x) in v.iter().enumerate() {
+                    if let Some(k) = packed_index(i) {
+                        p[k] = x;
+                    }
+                }
+                p
+            };
+            let (ap_in, bp_in) = (pack(&a), pack(&b));
+            let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
+            let (ra, rb) = (rho(&mut state), rho(&mut state));
+            for nt in [false, true] {
+                let (mut ao, mut bo) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+                let (mut ap, mut bp) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+                let (full, packed) = if nt {
+                    (
+                        fold_tri_and_message_aarch64::<2, true, 0>(&a, &b, &mut ao, &mut bo, ra, rb, F128::ZERO, &eq),
+                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bp_in, &mut ap, &mut bp, ra, rb, &eq),
+                    )
+                } else {
+                    (
+                        fold_tri_and_message_aarch64::<2, false, 0>(&a, &b, &mut ao, &mut bo, ra, rb, F128::ZERO, &eq),
+                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bp_in, &mut ap, &mut bp, ra, rb, &eq),
+                    )
+                };
+                assert_eq!(packed, full, "slots, case {case}, nt {nt}");
+                assert_eq!(ap, ao, "a outputs, case {case}, nt {nt}");
+                assert_eq!(bp, bo, "b outputs, case {case}, nt {nt}");
             }
         }
     }
