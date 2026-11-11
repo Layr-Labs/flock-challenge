@@ -3858,7 +3858,17 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         }
     }
     if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-        if ab_kara_enabled() {
+        if ab_kara_enabled() && ab_kara_unscaled_enabled() {
+            shift_reduce_inner_ab_fused_neon_h4::<{ ABV_KARA | ABV_KARA_UNSCALED }>(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                out,
+                nt_store,
+            );
+        } else if ab_kara_enabled() {
             shift_reduce_inner_ab_fused_neon_h4::<{ ABV_KARA }>(
                 a_packed,
                 b_packed,
