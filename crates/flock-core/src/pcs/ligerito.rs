@@ -9913,7 +9913,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     let eq_z = if crate::micro_stack_enabled() {
                         crate::lincheck::build_eq_table_optimized(&z)
                     } else {
-                        build_eq_table(&z)
+                        crate::lincheck::build_eq_table_scalar(&z)
                     };
                     let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
                     (intro, y, false)

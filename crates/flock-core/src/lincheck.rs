@@ -587,9 +587,16 @@ pub enum VerifyError {
 ///
 /// Standard "doubling-in-half" construction: `O(2^d)` F128 muls, no
 /// inversions. Indexing is LSB-first — `bit_j(i)` is the `j`-th LSB of `i`.
+///
 pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
     // Every slot is written by the level that first exposes it before it can
     // be read at a later level.
+    let mut out = crate::alloc_uninit_f128_vec(1usize << point.len());
+    build_eq_table_optimized_into(point, &mut out);
+    out
+}
+
+pub(crate) fn build_eq_table_scalar(point: &[F128]) -> Vec<F128> {
     let mut out = crate::alloc_uninit_f128_vec(1usize << point.len());
     build_eq_table_into(point, &mut out);
     out
@@ -1017,7 +1024,7 @@ fn build_z_fold_eq_table(
     } else if pair_products {
         crate::gpu_commit::FoldEqTable::Owned(build_eq_table_optimized(x_outer))
     } else {
-        crate::gpu_commit::FoldEqTable::Owned(build_eq_table(x_outer))
+        crate::gpu_commit::FoldEqTable::Owned(build_eq_table_scalar(x_outer))
     }
 }
 
@@ -2160,7 +2167,7 @@ mod tests {
         for &d in &[0usize, 1, 2, 3, 5, 7, 8, 10, 12, 13, 16] {
             let mut rng = Rng::new(0x4551_4f50 + d as u64);
             let point = rng.f128_vec(d);
-            let generic = build_eq_table(&point);
+            let generic = build_eq_table_scalar(&point);
             let optimized = build_eq_table_optimized(&point);
             assert_eq!(optimized, generic, "dimension={d}");
         }

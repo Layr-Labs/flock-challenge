@@ -12320,7 +12320,7 @@ kernel void lc_fold_stripes_factored_b4(
         if pair_products {
             crate::lincheck::build_eq_table_optimized(point)
         } else {
-            crate::lincheck::build_eq_table(point)
+            crate::lincheck::build_eq_table_scalar(point)
         }
     }
 
@@ -12358,7 +12358,7 @@ kernel void lc_fold_stripes_factored_b4(
                     hi: 0xbf58_476d_1ce4_e5b9u64.wrapping_mul(i as u64 + 3),
                 })
                 .collect();
-            let generic = crate::lincheck::build_eq_table(&point);
+            let generic = crate::lincheck::build_eq_table_scalar(&point);
             let mut staged = vec![
                 F128 {
                     lo: u64::MAX,
