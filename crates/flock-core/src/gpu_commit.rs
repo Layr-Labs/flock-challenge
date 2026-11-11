@@ -1308,6 +1308,15 @@ pub(crate) fn gpu_tw_prefetch_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_TW_PREFETCH").is_none())
 }
 
+/// Kill switch for the word-step (x^32) Horner multiply in the g4x2 pass
+/// (`GF_MUL_W32_MSL_DEFS`): `FLOCK_NO_GPU_MUL_W32` (any value) keeps the
+/// halfword Horner of `gf_mul_byte16_x2`. Both compute the exact field
+/// product from the same byte tables, so both write the same bytes.
+pub(crate) fn gpu_mul_w32_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_MUL_W32").is_none())
+}
+
 /// Kill switch for the two-tiles-per-thread g4 NTT pass
 /// (`ntt_fused_reg4g4x2`): `FLOCK_NO_GPU_G4X2` (any value) keeps
 /// `ntt_fused_reg4g4`. Both kernels write the same bytes.
@@ -3446,7 +3455,7 @@ kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
     /// reuse the rejected device-table preload design: every group constructs
     /// its own compact 11-table image directly from the existing raw twiddle
     /// buffer, then executes explicit zero/nonzero butterflies.
-    const FROM_Z_ZERO_ROOT_MSL_SOURCE: &str = r#"
+    pub(crate) const FROM_Z_ZERO_ROOT_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
@@ -3649,6 +3658,57 @@ kernel void export_from_z_zero_root_tabs(
 }
 "#;
 
+    /// Word-step (x^32) form of `gf_mul_tab4_zero_root` over the same four
+    /// nibble tables (tab[16k + n] = (n*x^(4k))*tw): T(halfword) is four
+    /// lookups, and each 32-bit word of v is one `gf_w32_step`-style step.
+    const GF_MUL_TAB4_W32_ZERO_ROOT: &str = r#"static inline uint4 gf_tab4_t16_zero_root(uint h, threadgroup const uint4* tab) {
+    return (tab[h & 15u] ^ tab[16u + ((h >> 4) & 15u)])
+         ^ (tab[32u + ((h >> 8) & 15u)] ^ tab[48u + ((h >> 12) & 15u)]);
+}
+
+static inline uint4 gf_mul_tab4_zero_root(
+    uint4 v,
+    threadgroup const uint4* tab)
+{
+    uint4 a = uint4(0u);
+    for (int i = 3; i >= 0; i--) {
+        const uint w = v[i];
+        const uint4 tl = gf_tab4_t16_zero_root(w, tab);
+        const uint4 th = gf_tab4_t16_zero_root(w >> 16, tab);
+        const uint o = a.w ^ (th.w >> 16);
+        const uint r0 = o ^ (o << 1) ^ (o << 2) ^ (o << 7);
+        const uint r1 = (o >> 31) ^ (o >> 30) ^ (o >> 25);
+        uint4 n;
+        n.x = tl.x ^ (th.x << 16) ^ r0;
+        n.y = a.x ^ tl.y ^ ((th.y << 16) | (th.x >> 16)) ^ r1;
+        n.z = a.y ^ tl.z ^ ((th.z << 16) | (th.y >> 16));
+        n.w = a.z ^ tl.w ^ ((th.w << 16) | (th.z >> 16));
+        a = n;
+    }
+    return a;
+}
+
+static inline uint4 gf_mul_tab4_zero_root_h16("#;
+
+    /// `src` with `gf_mul_tab4_zero_root` renamed `..._h16` and the
+    /// word-step form defined under the original name just before it.
+    pub(crate) fn with_mul_tab4_w32(src: &str) -> String {
+        const DEF: &str = "static inline uint4 gf_mul_tab4_zero_root(";
+        assert_eq!(src.matches(DEF).count(), 1, "with_mul_tab4_w32: one gf_mul_tab4_zero_root");
+        src.replacen(DEF, GF_MUL_TAB4_W32_ZERO_ROOT, 1)
+    }
+
+    /// The from-z zero-root library source, with `gf_mul_tab4_zero_root` in
+    /// the word-step form unless `FLOCK_NO_GPU_MUL_W32`.
+    pub(crate) fn from_z_zero_root_msl_source() -> &'static str {
+        if super::gpu_mul_w32_enabled() {
+            static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            SRC.get_or_init(|| with_mul_tab4_w32(FROM_Z_ZERO_ROOT_MSL_SOURCE)).as_str()
+        } else {
+            FROM_Z_ZERO_ROOT_MSL_SOURCE
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn zero_root_pair_test_source() -> String {
         let mut source = FROM_Z_ZERO_ROOT_MSL_SOURCE.to_owned();
@@ -3724,12 +3784,69 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// failure leaves `ntt_fused_reg4g4` in place.
     /// The g4x2 library source in use: the twiddle-prefetch form unless
     /// `FLOCK_NO_GPU_TW_PREFETCH` is set.
+    /// With the word-step multiply on (`FLOCK_NO_GPU_MUL_W32` unset), the
+    /// twiddle-prefetch source with `gf_mul_byte16_x2` replaced by
+    /// `GF_MUL_W32_MSL_DEFS`'s form (`with_mul_w32`).
     fn g4x2_msl_source() -> &'static str {
         if super::gpu_tw_prefetch_enabled() {
-            NTT_G4X2_TWL_MSL_SOURCE
+            if super::gpu_mul_w32_enabled() {
+                static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                SRC.get_or_init(|| with_mul_w32(NTT_G4X2_TWL_MSL_SOURCE)).as_str()
+            } else {
+                NTT_G4X2_TWL_MSL_SOURCE
+            }
         } else {
             NTT_G4X2_MSL_SOURCE
         }
+    }
+
+    /// GF(2^128) v * tw over the byte tables tab[b] = b*tw,
+    /// tab[256 + b] = (b*x^8)*tw (the tables of `gf_mul_byte16_x2`), Horner
+    /// over the four 32-bit words of v instead of its eight halfwords. One
+    /// step: acc*x^32 is a word rename with one 32-bit overflow word;
+    /// T(h_hi)*x^16 is one funnel shift whose 16-bit overflow joins that
+    /// word; the overflow o (degrees 128..159) folds once as
+    /// o*(x^7+x^2+x+1) (degree < 39). Same 16 table loads, about a third
+    /// less ALU; the exact field product, so the same bytes.
+    pub(crate) const GF_MUL_W32_MSL_DEFS: &str = r#"
+static inline uint4 gf_w32_step(uint4 a, uint w, threadgroup const uint4* tab) {
+    const uint4 tl = tab[w & 255u] ^ tab[256u + ((w >> 8) & 255u)];
+    const uint4 th = tab[(w >> 16) & 255u] ^ tab[256u + (w >> 24)];
+    const uint o = a.w ^ (th.w >> 16);
+    const uint r0 = o ^ (o << 1) ^ (o << 2) ^ (o << 7);
+    const uint r1 = (o >> 31) ^ (o >> 30) ^ (o >> 25);
+    uint4 n;
+    n.x = tl.x ^ (th.x << 16) ^ r0;
+    n.y = a.x ^ tl.y ^ ((th.y << 16) | (th.x >> 16)) ^ r1;
+    n.z = a.y ^ tl.z ^ ((th.z << 16) | (th.y >> 16));
+    n.w = a.z ^ tl.w ^ ((th.w << 16) | (th.z >> 16));
+    return n;
+}
+static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,
+                                    threadgroup const uint4* tab,
+                                    thread uint4& ra, thread uint4& rb)
+{
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 3; i >= 0; i--) {
+        a = gf_w32_step(a, va[i], tab);
+        b = gf_w32_step(b, vb[i], tab);
+    }
+    ra = a;
+    rb = b;
+}
+"#;
+
+    /// `src` with its `gf_mul_byte16_x2` renamed `gf_mul_byte16_x2_h16` and
+    /// the word-step form defined under the original name just before it.
+    pub(crate) fn with_mul_w32(src: &str) -> String {
+        const DEF: &str = "static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,";
+        assert_eq!(src.matches(DEF).count(), 1, "with_mul_w32: one gf_mul_byte16_x2");
+        src.replacen(
+            DEF,
+            &format!("{GF_MUL_W32_MSL_DEFS}\nstatic inline void gf_mul_byte16_x2_h16(uint4 va, uint4 vb,"),
+            1,
+        )
     }
 
     const NTT_G4X2_MSL_SOURCE: &str = r#"
@@ -3915,7 +4032,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     /// Same tables, same butterflies in the same order: bit-identical. The
     /// 512-byte twiddle array is taken from the never-read residency pad, so
     /// the group still allocates 12,736 B of threadgroup memory.
-    const NTT_G4X2_TWL_MSL_SOURCE: &str = r#"
+    pub(crate) const NTT_G4X2_TWL_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
@@ -4156,7 +4273,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     /// order and its exact field product are unchanged, so the output is
     /// bit-identical. Its own library: a compile failure keeps
     /// `ntt_pass5_mixed`.
-    const NTT_FINAL_T3_MSL_SOURCE: &str = r#"
+    pub(crate) const NTT_FINAL_T3_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
@@ -4751,7 +4868,18 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
 "#;
 
     pub(crate) fn final_leaf_msl_source() -> String {
-        format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}")
+        format!("{}{NTT_FINAL_LEAF_EXTRA_MSL}", final_t3_msl_source())
+    }
+
+    /// The final t3 library source: its byte-table sub-layer's
+    /// `gf_mul_byte16_x2` in the word-step form unless `FLOCK_NO_GPU_MUL_W32`.
+    pub(crate) fn final_t3_msl_source() -> &'static str {
+        if super::gpu_mul_w32_enabled() {
+            static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            SRC.get_or_init(|| with_mul_w32(NTT_FINAL_T3_MSL_SOURCE)).as_str()
+        } else {
+            NTT_FINAL_T3_MSL_SOURCE
+        }
     }
 
     pub(crate) fn final_leaf_selected(gpu: &Gpu, log_d: usize, n_leaves: usize) -> bool {
@@ -5803,7 +5931,7 @@ kernel void blake3_pow_scan(
                 // selects the incumbent pso_ntt4zg4 below.
                 let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) =
                     if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
-                        let src = api.nsstring(FROM_Z_ZERO_ROOT_MSL_SOURCE)?;
+                        let src = api.nsstring(from_z_zero_root_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -6214,7 +6342,7 @@ kernel void blake3_pow_scan(
                 // leaves NIL and the encoders keep `ntt_pass5_mixed`.
                 let pso_ntt5t3 = if super::gpu_final_t3_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(NTT_FINAL_T3_MSL_SOURCE)?;
+                        let src = api.nsstring(final_t3_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -10172,7 +10300,7 @@ kernel void blake3_pow_scan(
     fn warmup_cache_msl_fnv_for(zero_root: bool, leaf_vec4: bool) -> u64 {
         let mut key = fnv1a64(MSL_SOURCE);
         if zero_root {
-            key ^= fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1) ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
+            key ^= fnv1a64(from_z_zero_root_msl_source()).rotate_left(1) ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
         }
         if leaf_vec4 {
             key ^= fnv1a64(LEAF_VEC4_MSL_SOURCE).rotate_left(2) ^ 0x4C45_4146_5F56_3431; // "LEAF_V41"
@@ -10215,7 +10343,7 @@ kernel void blake3_pow_scan(
             assert_eq!(
                 candidate,
                 incumbent
-                    ^ super::fnv1a64(super::FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
+                    ^ super::fnv1a64(super::from_z_zero_root_msl_source()).rotate_left(1)
                     ^ 0x5A52_4F4F_545F_3131
             );
             // The leaf-vec4 dimension is independent and non-degenerate:
@@ -18847,6 +18975,424 @@ mod tests {
             let _ = job.finish(wait);
         }
         unsafe { gpu.release(zbuf) };
+    }
+
+    const GM_DEFS: &str = r#"
+// gm: word-step (x^32) Horner over the same two byte tables. One step:
+// acc*x^32 is a word rename plus one 32-bit overflow word; T(h_hi)*x^16 is
+// a single funnel shift whose 16-bit overflow joins that word; the
+// overflow o (degrees 128..159) folds once as o*(x^7+x^2+x+1) (< x^39).
+static inline uint4 gm_w32_step(uint4 a, uint w, threadgroup const uint4* tab) {
+    const uint4 tl = tab[w & 255u] ^ tab[256u + ((w >> 8) & 255u)];
+    const uint4 th = tab[(w >> 16) & 255u] ^ tab[256u + (w >> 24)];
+    const uint o = a.w ^ (th.w >> 16);
+    const uint r0 = o ^ (o << 1) ^ (o << 2) ^ (o << 7);
+    const uint r1 = (o >> 31) ^ (o >> 30) ^ (o >> 25);
+    uint4 n;
+    n.x = tl.x ^ (th.x << 16) ^ r0;
+    n.y = a.x ^ tl.y ^ ((th.y << 16) | (th.x >> 16)) ^ r1;
+    n.z = a.y ^ tl.z ^ ((th.z << 16) | (th.y >> 16));
+    n.w = a.z ^ tl.w ^ ((th.w << 16) | (th.z >> 16));
+    return n;
+}
+static inline void gm_mul_w32_x2(uint4 va, uint4 vb, threadgroup const uint4* tab,
+                                 thread uint4& ra, thread uint4& rb) {
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 3; i >= 0; i--) {
+        a = gm_w32_step(a, va[i], tab);
+        b = gm_w32_step(b, vb[i], tab);
+    }
+    ra = a;
+    rb = b;
+}
+// gm: four byte tables (tw, tw x^8, tw x^16, tw x^24): word-step Horner with
+// no funnel at all.
+static inline uint4 gm_t4_step(uint4 a, uint w, threadgroup const uint4* tab) {
+    const uint4 t = (tab[w & 255u] ^ tab[256u + ((w >> 8) & 255u)])
+                  ^ (tab[512u + ((w >> 16) & 255u)] ^ tab[768u + (w >> 24)]);
+    const uint o = a.w;
+    uint4 n;
+    n.x = t.x ^ (o ^ (o << 1) ^ (o << 2) ^ (o << 7));
+    n.y = a.x ^ t.y ^ ((o >> 31) ^ (o >> 30) ^ (o >> 25));
+    n.z = a.y ^ t.z;
+    n.w = a.z ^ t.w;
+    return n;
+}
+static inline void gm_mul_t4_x2(uint4 va, uint4 vb, threadgroup const uint4* tab,
+                                thread uint4& ra, thread uint4& rb) {
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 3; i >= 0; i--) {
+        a = gm_t4_step(a, va[i], tab);
+        b = gm_t4_step(b, vb[i], tab);
+    }
+    ra = a;
+    rb = b;
+}
+static inline void gf_build_byte16_twl4(
+    threadgroup uint4* tabB, threadgroup const uint4* twl, uint k, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;
+    const uint cc = u >> 2;
+    for (uint q = 0; q < 2u; q++) {
+        const uint tt = t + (q << 1);
+        uint4 e0 = twl[(tt << 4) + k];
+        uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+        uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+        uint4 A = uint4(0u);
+        if (aa & 1u) { A ^= e2; }
+        if (aa & 2u) { A ^= e3; }
+        const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+        uint4 C = uint4(0u);
+        if (cc & 1u) { C ^= f1; }
+        if (cc & 2u) { C ^= f2; }
+        if (cc & 4u) { C ^= f3; }
+        const uint4 H0 = C, H1 = C ^ f0;
+        threadgroup uint4* dst = &tabB[tt << 8];
+        const uint o0 = (cc << 5) + (aa << 2);
+        const uint o1 = o0 + 16u;
+        dst[o0 + 0u] = L0 ^ H0;
+        dst[o0 + 1u] = L1 ^ H0;
+        dst[o0 + 2u] = L2 ^ H0;
+        dst[o0 + 3u] = L3 ^ H0;
+        dst[o1 + 0u] = L0 ^ H1;
+        dst[o1 + 1u] = L1 ^ H1;
+        dst[o1 + 2u] = L2 ^ H1;
+        dst[o1 + 3u] = L3 ^ H1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// timing-only shapes (wrong products): 16 loads with no Horner ALU, and the
+// w32 ALU with the loads replaced by a register value.
+static inline void gm_loads_x2(uint4 va, uint4 vb, threadgroup const uint4* tab,
+                               thread uint4& ra, thread uint4& rb) {
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 3; i >= 0; i--) {
+        const uint w = va[i], x = vb[i];
+        a ^= (tab[w & 255u] ^ tab[256u + ((w >> 8) & 255u)]) ^ (tab[(w >> 16) & 255u] ^ tab[256u + (w >> 24)]);
+        b ^= (tab[x & 255u] ^ tab[256u + ((x >> 8) & 255u)]) ^ (tab[(x >> 16) & 255u] ^ tab[256u + (x >> 24)]);
+    }
+    ra = a;
+    rb = b;
+}
+// TG cost model shapes: N loads of uint2 (8 B) or uint4, byte-indexed.
+template <int N>
+static inline void gm_ld2_x2(uint4 va, uint4 vb, threadgroup const uint4* tab4,
+                             thread uint4& ra, thread uint4& rb) {
+    threadgroup const uint2* tab = (threadgroup const uint2*)tab4;
+    uint2 a = uint2(0u), b = uint2(0u);
+    for (int i = 0; i < N; i++) {
+        const uint w = va[i & 3] >> ((i >> 2) & 3) * 8;
+        const uint x = vb[i & 3] >> ((i >> 2) & 3) * 8;
+        a ^= tab[((i & 1) << 9) + (w & 255u)];
+        b ^= tab[((i & 1) << 9) + (x & 255u)];
+    }
+    ra = uint4(a, a ^ va.zw);
+    rb = uint4(b, b ^ vb.zw);
+}
+template <int N>
+static inline void gm_ld4_x2(uint4 va, uint4 vb, threadgroup const uint4* tab,
+                             thread uint4& ra, thread uint4& rb) {
+    uint4 a = uint4(0u), b = uint4(0u);
+    for (int i = 0; i < N; i++) {
+        const uint w = va[i & 3] >> ((i >> 2) & 3) * 8;
+        const uint x = vb[i & 3] >> ((i >> 2) & 3) * 8;
+        a ^= tab[((i & 1) << 8) + (w & 255u)];
+        b ^= tab[((i & 1) << 8) + (x & 255u)];
+    }
+    ra = a;
+    rb = b;
+}
+// Device-memory (L1) lookups mixed with threadgroup lookups: ND of the 16.
+template <int ND>
+static inline void gm_mix_x2(uint4 va, uint4 vb, threadgroup const uint4* tab,
+                             device const uint4* dt,
+                             thread uint4& ra, thread uint4& rb) {
+    uint4 a = uint4(0u), b = uint4(0u);
+    for (int i = 0; i < 16; i++) {
+        const uint w = va[i & 3] >> ((i >> 2) & 3) * 8;
+        const uint x = vb[i & 3] >> ((i >> 2) & 3) * 8;
+        if (i < ND) {
+            a ^= dt[((i & 1) << 8) + (w & 255u)];
+            b ^= dt[((i & 1) << 8) + (x & 255u)];
+        } else {
+            a ^= tab[((i & 1) << 8) + (w & 255u)];
+            b ^= tab[((i & 1) << 8) + (x & 255u)];
+        }
+    }
+    ra = a;
+    rb = b;
+}
+static inline uint4 gm_alu_step(uint4 a, uint w) {
+    const uint4 tl = uint4(w, w ^ 0x55u, w + 3u, w * 5u);
+    const uint4 th = uint4(w >> 3, w ^ 0xa5u, w + 7u, w * 9u);
+    const uint o = a.w ^ (th.w >> 16);
+    const uint r0 = o ^ (o << 1) ^ (o << 2) ^ (o << 7);
+    const uint r1 = (o >> 31) ^ (o >> 30) ^ (o >> 25);
+    uint4 n;
+    n.x = tl.x ^ (th.x << 16) ^ r0;
+    n.y = a.x ^ tl.y ^ ((th.y << 16) | (th.x >> 16)) ^ r1;
+    n.z = a.y ^ tl.z ^ ((th.z << 16) | (th.y >> 16));
+    n.w = a.z ^ tl.w ^ ((th.w << 16) | (th.z >> 16));
+    return n;
+}
+static inline void gm_alu_x2(uint4 va, uint4 vb, threadgroup const uint4* tab,
+                             thread uint4& ra, thread uint4& rb) {
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 3; i >= 0; i--) {
+        a = gm_alu_step(a, va[i]);
+        b = gm_alu_step(b, vb[i]);
+    }
+    ra = a ^ tab[0];
+    rb = b ^ tab[1];
+}
+
+// One f=4 sub-layer over both"#;
+
+    /// gm: GF(2^128) multiply-by-constant variants of the g4x2 pass, one
+    /// 1 GiB pass at l = 4, 8, 12; exactness by a multiplying hash of the
+    /// whole output against production. Ignored; --ignored --nocapture.
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gm_mul_probe() {
+        use super::imp;
+        let log_d = 20usize;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let prod = imp::NTT_G4X2_TWL_MSL_SOURCE;
+        let mark = "// One f=4 sub-layer over both";
+        assert!(prod.contains(mark));
+        let with_defs = prod.replacen(mark, GM_DEFS, 1);
+        let mul_call = "gf_mul_byte16_x2(ea[ev], eb[ev], &tabB[0], pa, pb);";
+        assert!(with_defs.contains(mul_call));
+        let v_w32 = with_defs.replace(mul_call, "gm_mul_w32_x2(ea[ev], eb[ev], &tabB[0], pa, pb);");
+        let fill_old = "        twl[16u + lid] = g;\n";
+        assert!(with_defs.contains(fill_old));
+        let t4_base = with_defs
+            .replace(
+                "gf_build_byte16_twl(tabB, twl, (1u << j) - 1u + c, lid);",
+                "gf_build_byte16_twl4(tabB, twl, (1u << j) - 1u + c, lid);",
+            )
+            .replace(mul_call, "gm_mul_t4_x2(ea[ev], eb[ev], &tabB[0], pa, pb);")
+            .replace("threadgroup uint4 tabB[512u];", "threadgroup uint4 tabB[1024u];")
+            .replace("threadgroup uint4 twl[32u];", "threadgroup uint4 twl[64u];")
+            .replace(
+                fill_old,
+                "        twl[16u + lid] = g;\n        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }\n        twl[32u + lid] = g;\n        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }\n        twl[48u + lid] = g;\n",
+            );
+        let v_t4 = t4_base.replace("pad[252u]", "pad[1u]").replace("% 252u", "% 1u");
+        let v_nomul = with_defs.replace(mul_call, "{ pa = ea[ev] ^ tabB[lid]; pb = eb[ev] ^ tabB[lid + 64u]; }");
+        let v_loads = with_defs.replace(mul_call, "gm_loads_x2(ea[ev], eb[ev], &tabB[0], pa, pb);");
+        let v_alu = with_defs.replace(mul_call, "gm_alu_x2(ea[ev], eb[ev], &tabB[0], pa, pb);");
+        let v_w32p = v_w32.replace("pad[252u]", "pad[1u]").replace("% 252u", "% 1u");
+        let sh = |f: &str| with_defs.replace(mul_call, &format!("{f}(ea[ev], eb[ev], &tabB[0], pa, pb);"));
+        let mx = |n: u32| with_defs.replace(mul_call, &format!("gm_mix_x2<{n}>(ea[ev], eb[ev], &tabB[0], twiddles + ((tgid & 63u) << 9), pa, pb);"));
+        let names = ["prod", "w32", "w32lib", "nomul", "loads", "u4x16", "u4x8", "mix0", "mix4", "mix8", "mix16"];
+        let n_exact = 3usize;
+        let _ = v_w32p;
+        let srcs = [prod.to_string(), v_w32, imp::with_mul_w32(prod), v_nomul, v_loads,
+            sh("gm_ld4_x2<16>"), sh("gm_ld4_x2<8>"), mx(0), mx(4), mx(8), mx(16)];
+        let _ = (v_t4, v_alu);
+        unsafe {
+            let _pool = gpu.pool_push();
+            let data_bytes = (64usize << log_d) * 16;
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let tw_bytes = core::mem::size_of_val(twiddles.as_slice());
+            let tw_buf = gpu.new_buffer(tw_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                tw_bytes,
+            );
+            let psos: Vec<imp::Id> = srcs
+                .iter()
+                .map(|s| imp::compile_supplemental_pipeline(gpu, s, "ntt_fused_reg4g4x2").unwrap())
+                .collect();
+            let run = |pso: imp::Id, l: usize| -> f64 {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, data_buf, 0, 0);
+                gpu.set_buffer(enc, tw_buf, 0, 1);
+                let p = imp::NttParams {
+                    log_d: log_d as u32,
+                    l: l as u32,
+                    f: 4,
+                    s: (log_d - l - 4) as u32,
+                };
+                let bytes = core::slice::from_raw_parts(
+                    (&p as *const imp::NttParams).cast::<u8>(),
+                    core::mem::size_of::<imp::NttParams>(),
+                );
+                gpu.set_bytes(enc, bytes, 2);
+                gpu.dispatch(enc, 1u64 << (log_d - 4 - 2), 64);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            };
+            let fill = || {
+                let w = core::slice::from_raw_parts_mut(
+                    gpu.buffer_contents(data_buf).cast::<u64>(),
+                    data_bytes / 8,
+                );
+                let mut x = 0x1234_5678_9ABC_DEF1u64;
+                for v in w.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *v = x;
+                }
+            };
+            // Multiplying (non-linear) hash: a wrong product cannot cancel.
+            let digest = || {
+                let w = core::slice::from_raw_parts(
+                    gpu.buffer_contents(data_buf).cast::<u64>(),
+                    data_bytes / 8,
+                );
+                w.iter().fold(0x9E37_79B9_7F4A_7C15u64, |a, &v| {
+                    (a ^ v).wrapping_mul(0xD6E8_FEB8_6659_FD93).rotate_left(29)
+                })
+            };
+            for l in [4usize, 8, 12] {
+                let mut ds = Vec::new();
+                for &pso in &psos[..n_exact] {
+                    fill();
+                    run(pso, l);
+                    ds.push(digest());
+                }
+                for (i, d) in ds.iter().enumerate() {
+                    eprintln!("gm exact {} l={l}: {}", names[i], *d == ds[0]);
+                }
+                assert!(ds.iter().all(|d| *d == ds[0]), "gm digest mismatch l={l}");
+            }
+            let rounds: usize = std::env::var("GM_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(9);
+            let mut t: Vec<Vec<Vec<f64>>> = vec![vec![Vec::new(); 3]; psos.len()];
+            for r in 0..rounds {
+                for (li, l) in [4usize, 8, 12].into_iter().enumerate() {
+                    for k in 0..psos.len() {
+                        let i = (k + r) % psos.len();
+                        t[i][li].push(run(psos[i], l));
+                    }
+                }
+            }
+            for (i, ti) in t.iter_mut().enumerate() {
+                let mut line = format!("gm {:5}", names[i]);
+                let mut sum = 0.0;
+                for (li, v) in ti.iter_mut().enumerate() {
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let m = v[v.len() / 2];
+                    sum += m;
+                    line += &format!("  l{}: med {:.2} min {:.2}", [4, 8, 12][li], m, v[0]);
+                }
+                eprintln!("{line}  sum-med {sum:.2} ms");
+            }
+            for p in psos {
+                gpu.release(p);
+            }
+            // Whole graph in one command buffer: from-z (l=0), g4x2 l=4,8,12,
+            // final t3 (l=16); old libraries vs the w32 libraries.
+            let z_bytes = data_bytes / 2;
+            let z_buf = gpu.new_buffer(z_bytes).unwrap();
+            {
+                let w = core::slice::from_raw_parts_mut(gpu.buffer_contents(z_buf).cast::<u64>(), z_bytes / 8);
+                let mut x = 0x0F1E_2D3C_4B5A_6978u64;
+                for v in w.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *v = x;
+                }
+            }
+            let mk = |src: &str, name: &str| imp::compile_supplemental_pipeline(gpu, src, name).unwrap();
+            let sets = [
+                [
+                    mk(imp::FROM_Z_ZERO_ROOT_MSL_SOURCE, "ntt_fused_reg4_from_zg4_zero_root"),
+                    mk(prod, "ntt_fused_reg4g4x2"),
+                    mk(imp::NTT_FINAL_T3_MSL_SOURCE, "ntt_final_t3"),
+                ],
+                [
+                    mk(&imp::with_mul_tab4_w32(imp::FROM_Z_ZERO_ROOT_MSL_SOURCE), "ntt_fused_reg4_from_zg4_zero_root"),
+                    mk(&imp::with_mul_w32(prod), "ntt_fused_reg4g4x2"),
+                    mk(&imp::with_mul_w32(imp::NTT_FINAL_T3_MSL_SOURCE), "ntt_final_t3"),
+                ],
+            ];
+            // stages: 0 = from-z only, 1 = t3 only (on current data), 2 = all.
+            let graph = |set: &[imp::Id; 3], stage: u32| -> f64 {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_buffer(enc, data_buf, 0, 0);
+                gpu.set_buffer(enc, tw_buf, 0, 1);
+                let setp = |l: usize, s: usize| {
+                    let p = imp::NttParams { log_d: log_d as u32, l: l as u32, f: 4, s: s as u32 };
+                    let bytes = core::slice::from_raw_parts(
+                        (&p as *const imp::NttParams).cast::<u8>(),
+                        core::mem::size_of::<imp::NttParams>(),
+                    );
+                    gpu.set_bytes(enc, bytes, 2);
+                };
+                if stage != 1 {
+                    gpu.set_pipeline(enc, set[0]);
+                    gpu.set_buffer(enc, z_buf, 0, 3);
+                    setp(0, log_d - 4);
+                    gpu.dispatch(enc, 1u64 << (log_d - 4 - 2), 64);
+                }
+                if stage == 2 {
+                    gpu.set_pipeline(enc, set[1]);
+                    for l in [4usize, 8, 12] {
+                        setp(l, log_d - l - 4);
+                        gpu.dispatch(enc, 1u64 << (log_d - 4 - 2), 64);
+                    }
+                }
+                if stage != 0 {
+                    gpu.set_pipeline(enc, set[2]);
+                    setp(log_d - 4, 0);
+                    gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+                }
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            };
+            for stage in [0u32, 1, 2] {
+                let mut ds = Vec::new();
+                for set in &sets {
+                    fill();
+                    graph(set, stage);
+                    ds.push(digest());
+                }
+                eprintln!("gm exact graph stage {stage} (0 from-z, 1 t3, 2 all): {}", ds[0] == ds[1]);
+                assert_eq!(ds[0], ds[1], "gm graph stage {stage}");
+            }
+            for stage in [0u32, 1, 2] {
+                let mut t: Vec<Vec<f64>> = vec![Vec::new(); 2];
+                for r in 0..rounds.max(9) {
+                    for k in 0..2 {
+                        let i = (k + r) % 2;
+                        t[i].push(graph(&sets[i], stage));
+                    }
+                }
+                for v in t.iter_mut() {
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                }
+                eprintln!(
+                    "gm graph stage {stage}: old med {:.2} min {:.2}  w32 med {:.2} min {:.2} ms",
+                    t[0][t[0].len() / 2], t[0][0], t[1][t[1].len() / 2], t[1][0]
+                );
+            }
+        }
     }
 
     /// Skip (with a note) when Metal is unavailable; fail on real GPU errors.
