@@ -104,8 +104,13 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
                 let mut db3 = vld1q_u8(pp.add(48));
                 #[allow(unused_variables)]
                 let b_word = bw!($k);
-                $(xor_vary_pair::<$j0, $j1>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
-                $(xor_vary_single::<$js>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                if V & ABV_NOSW != 0 {
+                    $(xor_vary_ext::<$j0, $j1>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
+                    $(xor_vary_ext::<$js, 8>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
+                } else {
+                    $(xor_vary_pair::<$j0, $j1>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                    $(xor_vary_single::<$js>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                }
                 (db0, db1, db2, db3)
             }};
         }
@@ -116,7 +121,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
         macro_rules! bimg_sk {
             ($blk:literal, $k:literal, $pairs:tt, $singles:tt) => {{
                 if V & ABV_KARA != 0 {
-                    apply_word_kara::<V, false>(kplain, bw!($k))
+                    apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, bw!($k))
                 } else {
                     bimg_s!($blk, $k, $pairs, $singles)
                 }
