@@ -1249,6 +1249,17 @@ fn gpu_leaf_parent3_enabled() -> bool {
     })
 }
 
+pub const ENV_NO_GPU_B3_UNROLL: &str = "FLOCK_B3_SCHED_LOOP";
+
+fn gpu_b3_unroll_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+pub(crate) fn gpu_b3_unroll_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpu_b3_unroll_value_enabled(std::env::var_os(ENV_NO_GPU_B3_UNROLL).as_deref()))
+}
+
 fn select_gpu_leaf_parent3(pso_ok: bool) -> bool {
     // Ranked-tree-only is enforced by the caller: production only sets
     // `parent3=true` when `select_gpu_parent3` passes (n_leaves == 2^20).
@@ -3273,6 +3284,189 @@ kernel void leaf_parent3(device const uint* codeword [[buffer(0)]],
 }
 "#;
 
+    const B3_COMPRESS_UNROLLED_MSL: &str = r#"static void b3_compress(thread uint* cv, thread const uint* m,
+                        uint block_len, uint flags) {
+    uint v[16];
+    for (int i = 0; i < 8; i++) v[i] = cv[i];
+    for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
+    v[12] = 0u; v[13] = 0u; v[14] = block_len; v[15] = flags;
+    #define G(a,b,c,d,x,y) \
+        v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
+        v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
+        v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
+        v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
+    // round 0
+    G(0,4,8,12, m[0], m[1]); G(1,5,9,13, m[2], m[3]); G(2,6,10,14, m[4], m[5]); G(3,7,11,15, m[6], m[7]);
+    G(0,5,10,15, m[8], m[9]); G(1,6,11,12, m[10], m[11]); G(2,7,8,13, m[12], m[13]); G(3,4,9,14, m[14], m[15]);
+    // round 1
+    G(0,4,8,12, m[2], m[6]); G(1,5,9,13, m[3], m[10]); G(2,6,10,14, m[7], m[0]); G(3,7,11,15, m[4], m[13]);
+    G(0,5,10,15, m[1], m[11]); G(1,6,11,12, m[12], m[5]); G(2,7,8,13, m[9], m[14]); G(3,4,9,14, m[15], m[8]);
+    // round 2
+    G(0,4,8,12, m[3], m[4]); G(1,5,9,13, m[10], m[12]); G(2,6,10,14, m[13], m[2]); G(3,7,11,15, m[7], m[14]);
+    G(0,5,10,15, m[6], m[5]); G(1,6,11,12, m[9], m[0]); G(2,7,8,13, m[11], m[15]); G(3,4,9,14, m[8], m[1]);
+    // round 3
+    G(0,4,8,12, m[10], m[7]); G(1,5,9,13, m[12], m[9]); G(2,6,10,14, m[14], m[3]); G(3,7,11,15, m[13], m[15]);
+    G(0,5,10,15, m[4], m[0]); G(1,6,11,12, m[11], m[2]); G(2,7,8,13, m[5], m[8]); G(3,4,9,14, m[1], m[6]);
+    // round 4
+    G(0,4,8,12, m[12], m[13]); G(1,5,9,13, m[9], m[11]); G(2,6,10,14, m[15], m[10]); G(3,7,11,15, m[14], m[8]);
+    G(0,5,10,15, m[7], m[2]); G(1,6,11,12, m[5], m[3]); G(2,7,8,13, m[0], m[1]); G(3,4,9,14, m[6], m[4]);
+    // round 5
+    G(0,4,8,12, m[9], m[14]); G(1,5,9,13, m[11], m[5]); G(2,6,10,14, m[8], m[12]); G(3,7,11,15, m[15], m[1]);
+    G(0,5,10,15, m[13], m[3]); G(1,6,11,12, m[0], m[10]); G(2,7,8,13, m[2], m[6]); G(3,4,9,14, m[4], m[7]);
+    // round 6
+    G(0,4,8,12, m[11], m[15]); G(1,5,9,13, m[5], m[0]); G(2,6,10,14, m[1], m[9]); G(3,7,11,15, m[8], m[6]);
+    G(0,5,10,15, m[14], m[10]); G(1,6,11,12, m[2], m[12]); G(2,7,8,13, m[3], m[4]); G(3,4,9,14, m[7], m[13]);
+    #undef G
+    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
+}
+"#;
+
+    const B3_COMPRESS_HEAD: &str =
+        "static void b3_compress(thread uint* cv, thread const uint* m_in,";
+    const B3_COMPRESS_TAIL: &str = "    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];\n}\n";
+
+    fn with_unrolled_b3_compress(src: &str) -> Option<String> {
+        if src.matches(B3_COMPRESS_HEAD).count() != 1 {
+            return None;
+        }
+        let start = src.find(B3_COMPRESS_HEAD)?;
+        let end = start + src[start..].find(B3_COMPRESS_TAIL)? + B3_COMPRESS_TAIL.len();
+        Some(format!("{}{}{}", &src[..start], B3_COMPRESS_UNROLLED_MSL, &src[end..]))
+    }
+
+    fn merkle_msl_source(src: &'static str) -> std::borrow::Cow<'static, str> {
+        if super::gpu_b3_unroll_enabled() {
+            if let Some(s) = with_unrolled_b3_compress(src) {
+                return std::borrow::Cow::Owned(s);
+            }
+        }
+        std::borrow::Cow::Borrowed(src)
+    }
+
+    #[cfg(test)]
+    mod b3_unroll_tests {
+        use super::*;
+
+        #[test]
+        fn b3_unrolled_schedule_is_perm_powers() {
+            const PERM: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+            const IDX: [(usize, usize, usize, usize); 8] = [
+                (0, 4, 8, 12),
+                (1, 5, 9, 13),
+                (2, 6, 10, 14),
+                (3, 7, 11, 15),
+                (0, 5, 10, 15),
+                (1, 6, 11, 12),
+                (2, 7, 8, 13),
+                (3, 4, 9, 14),
+            ];
+            for src in [LEAF_PARENT3_MSL_SOURCE, REC_MERKLE_MSL_SOURCE] {
+                let perm: String = PERM.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+                let compact: String = src.chars().filter(|c| !c.is_whitespace() && *c != 'u').collect();
+                assert!(compact.contains(&format!("B3_PERM[16]={{{perm}}}")), "B3_PERM table changed");
+            }
+            let mut sched: [usize; 16] = core::array::from_fn(|i| i);
+            let mut calls = Vec::new();
+            for _ in 0..7 {
+                for (j, &(a, b, c, d)) in IDX.iter().enumerate() {
+                    calls.push(format!("G({a},{b},{c},{d}, m[{}], m[{}]);", sched[2 * j], sched[2 * j + 1]));
+                }
+                let t = sched;
+                for i in 0..16 {
+                    sched[i] = t[PERM[i]];
+                }
+            }
+            let joined = B3_COMPRESS_UNROLLED_MSL.split_whitespace().collect::<Vec<_>>().join(" ");
+            let found: Vec<&str> = joined
+                .split(" G(")
+                .filter(|f| f.starts_with(|c: char| c.is_ascii_digit()))
+                .collect();
+            assert_eq!(found.len(), 56);
+            for (k, f) in found.iter().enumerate() {
+                let f = format!("G({}", f.split(';').next().unwrap()) + ";";
+                assert_eq!(f.replace(' ', ""), calls[k].replace(' ', ""), "G call {k}");
+            }
+        }
+
+        #[test]
+        fn b3_unrolled_splice_applies_to_both_sources() {
+            for src in [LEAF_PARENT3_MSL_SOURCE, REC_MERKLE_MSL_SOURCE] {
+                let out = with_unrolled_b3_compress(src).expect("incumbent b3_compress not found");
+                assert!(out.contains(B3_COMPRESS_UNROLLED_MSL));
+                assert!(!out.contains("t[i] = m[B3_PERM[i]]"));
+                let start = src.find(B3_COMPRESS_HEAD).unwrap();
+                assert_eq!(&out[..start], &src[..start]);
+                let end = src.find(B3_COMPRESS_TAIL).unwrap() + B3_COMPRESS_TAIL.len();
+                assert!(out.ends_with(&src[end..]));
+            }
+        }
+
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn b3_unrolled_kernels_match_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                let n = 1usize << 12;
+                let staging = gpu.new_buffer(n * 1024).unwrap();
+                let tree = gpu.new_buffer(2 * n * 32).unwrap();
+                let words = gpu.buffer_contents(staging).cast::<u64>();
+                let mut x = 0x0123_4567_89AB_CDEFu64;
+                for i in 0..n * 128 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *words.add(i) = x;
+                }
+                let lp3 = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "leaf_parent3").unwrap();
+                    std::ptr::write_bytes(gpu.buffer_contents(tree), 0, 2 * n * 32);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, staging, 0, 0);
+                    gpu.set_buffer(enc, tree, 0, 1);
+                    gpu.set_buffer(enc, tree, n * 32, 2);
+                    gpu.set_buffer(enc, tree, (n + n / 2) * 32, 3);
+                    gpu.set_buffer(enc, tree, (n + n / 2 + n / 4) * 32, 4);
+                    gpu.dispatch(enc, (n / 256) as u64, 256);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(tree), (n + n / 2 + n / 4 + n / 8) * 32).to_vec()
+                };
+                let inc = lp3(LEAF_PARENT3_MSL_SOURCE);
+                let unr = lp3(&with_unrolled_b3_compress(LEAF_PARENT3_MSL_SOURCE).unwrap());
+                assert!(inc == unr, "leaf_parent3: unrolled schedule changed the tree bytes");
+                let data = std::slice::from_raw_parts(gpu.buffer_contents(staging), n * 1024);
+                let cpu = crate::merkle::merkle_tree(data, n, crate::merkle::HashKind::Blake3);
+                let cpu_leaves: Vec<u8> = cpu.iter().take(n).flat_map(|d| d.iter().copied()).collect();
+                assert!(cpu_leaves.as_slice() == &unr[..n * 32], "leaf_parent3 leaves differ from the CPU Merkle");
+                let l128 = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "leaf_hash128").unwrap();
+                    std::ptr::write_bytes(gpu.buffer_contents(tree), 0, n * 32);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, staging, 0, 0);
+                    gpu.set_buffer(enc, tree, 0, 1);
+                    gpu.dispatch(enc, (n / 256) as u64, 256);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(tree), n * 32).to_vec()
+                };
+                let inc = l128(REC_MERKLE_MSL_SOURCE);
+                let unr = l128(&with_unrolled_b3_compress(REC_MERKLE_MSL_SOURCE).unwrap());
+                assert!(inc == unr, "leaf_hash128: unrolled schedule changed the leaf bytes");
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
     /// Vectorized-load Merkle tree kernels, compiled as a supplemental
     /// library so the embedded incumbent metallib stays byte-for-byte intact
     /// (editing `MSL_SOURCE` would trip its FNV staleness guard and force a
@@ -4751,7 +4945,7 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
 "#;
 
     pub(crate) fn final_leaf_msl_source() -> String {
-        format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}")
+        format!("{NTT_FINAL_T3_MSL_SOURCE}{}", merkle_msl_source(NTT_FINAL_LEAF_EXTRA_MSL))
     }
 
     pub(crate) fn final_leaf_selected(gpu: &Gpu, log_d: usize, n_leaves: usize) -> bool {
@@ -5873,7 +6067,7 @@ kernel void blake3_pow_scan(
                 // gate is open so non-ranked processes skip the MSL frontend.
                 let pso_leaf_parent3 = if super::gpu_leaf_parent3_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(LEAF_PARENT3_MSL_SOURCE)?;
+                        let src = api.nsstring(&merkle_msl_source(LEAF_PARENT3_MSL_SOURCE))?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -10192,6 +10386,11 @@ kernel void blake3_pow_scan(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
         ), lead, extend, phi);
+        let key = if super::gpu_b3_unroll_enabled() {
+            key ^ fnv1a64(B3_COMPRESS_UNROLLED_MSL).rotate_left(6) ^ 0x4233_554E_524F_4C4C
+        } else {
+            key
+        };
         let key = if super::gpu_g4x2_enabled() {
             key ^ fnv1a64(g4x2_msl_source()).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
         } else {
