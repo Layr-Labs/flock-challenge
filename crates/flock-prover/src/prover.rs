@@ -745,6 +745,25 @@ fn fill_root_lincheck_stripe_group(
     u64_per_block: usize,
     rows: &[crate::r1cs_hashes::blake3::RootRow],
 ) {
+    // Interleaved-row transpose by default; `FLOCK_NO_STRIPE_ZIP_TRANSPOSE=1`
+    // selects the half-register form. Same bytes; chosen once per group.
+    if flock_core::bits::stripe_zip_transpose_enabled() {
+        fill_root_lincheck_stripe_group_form::<true>(z_packed, stripe, group, group_f128, u64_per_block, rows)
+    } else {
+        fill_root_lincheck_stripe_group_form::<false>(z_packed, stripe, group, group_f128, u64_per_block, rows)
+    }
+}
+
+#[inline(always)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(clippy::extra_unused_type_parameters))]
+fn fill_root_lincheck_stripe_group_form<const ZIP: bool>(
+    z_packed: &[F128],
+    stripe: &mut [u8],
+    group: usize,
+    group_f128: usize,
+    u64_per_block: usize,
+    rows: &[crate::r1cs_hashes::blake3::RootRow],
+) {
     let group_start = group * group_f128;
     let z_group = &z_packed[group_start..group_start + group_f128];
     // SAFETY: F128 is repr(C) as two little-endian u64 halves.
@@ -787,13 +806,17 @@ fn fill_root_lincheck_stripe_group(
                     core::arch::asm!("prfm pldl1keep, [{p}]", p=in(reg) address, options(nostack, readonly, preserves_flags));
                 }
             }
-            let [y0, y1, y2, y3] = if full {
-                flock_core::bits::transpose_8_strided_u64s_to_regs(
+            let [y0, y1, y2, y3] = match (full, ZIP) {
+                (true, true) => flock_core::bits::transpose_8_strided_u64s_to_regs_zip(
                     z_u64.as_ptr().add(row.lo_word),
                     u64_per_block,
-                )
-            } else {
-                flock_core::bits::transpose_8_strided_u64s_to_regs(lanes.as_ptr(), 1)
+                ),
+                (true, false) => flock_core::bits::transpose_8_strided_u64s_to_regs(
+                    z_u64.as_ptr().add(row.lo_word),
+                    u64_per_block,
+                ),
+                (false, true) => flock_core::bits::transpose_8_strided_u64s_to_regs_zip(lanes.as_ptr(), 1),
+                (false, false) => flock_core::bits::transpose_8_strided_u64s_to_regs(lanes.as_ptr(), 1),
             };
             core::arch::asm!(
                 "stnp {y0:q}, {y1:q}, [{dst}]",
@@ -834,62 +857,257 @@ unsafe fn fill_root_lincheck_stripe_group_ab(
     u64_per_block: usize,
     rows: &[crate::r1cs_hashes::blake3::RootRow],
 ) {
+    // As in `fill_root_lincheck_stripe_group`: one choice per group.
+    // SAFETY: the caller's contract, passed through.
+    unsafe {
+        if flock_core::bits::stripe_zip_transpose_enabled() {
+            fill_root_lincheck_stripe_group_ab_form::<true>(a, b, stripe, u64_per_block, rows)
+        } else {
+            fill_root_lincheck_stripe_group_ab_form::<false>(a, b, stripe, u64_per_block, rows)
+        }
+    }
+}
+
+/// # Safety
+/// As [`fill_root_lincheck_stripe_group_ab`].
+#[inline(always)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(clippy::extra_unused_type_parameters))]
+unsafe fn fill_root_lincheck_stripe_group_ab_form<const ZIP: bool>(
+    a: *const u64,
+    b: *const u64,
+    stripe: &mut [u8],
+    u64_per_block: usize,
+    rows: &[crate::r1cs_hashes::blake3::RootRow],
+) {
     assert!(rows.len() * 64 <= stripe.len());
     for (j, row) in rows.iter().enumerate() {
-        // Reads stay inside each block: lo_word (+1 iff hi_mask != 0) < u64_per_block.
-        assert!(row.lo_word + usize::from(row.hi_mask != 0) < u64_per_block);
-        let dst = &mut stripe[j * 64..j * 64 + 64];
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: every read is inside the eight blocks (assert above and the
-        // caller's contract); `dst` is 64 writable bytes.
+        // SAFETY: the caller's contract, passed through.
         unsafe {
-            let [y0, y1, y2, y3] = if row.lo_mask == u64::MAX {
-                flock_core::bits::transpose_8_strided_and_u64s_to_regs(
+            fill_root_lincheck_stripe_row_ab::<ZIP>(a, b, &mut stripe[j * 64..j * 64 + 64], u64_per_block, row);
+        }
+    }
+}
+
+/// One row of [`fill_root_lincheck_stripe_group_ab`]: `dst` receives the 64
+/// bytes of `row`.
+///
+/// # Safety
+/// As [`fill_root_lincheck_stripe_group_ab`]; `dst` is 64 bytes.
+#[inline(always)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(clippy::extra_unused_type_parameters))]
+unsafe fn fill_root_lincheck_stripe_row_ab<const ZIP: bool>(
+    a: *const u64,
+    b: *const u64,
+    dst: &mut [u8],
+    u64_per_block: usize,
+    row: &crate::r1cs_hashes::blake3::RootRow,
+) {
+    // Reads stay inside each block: lo_word (+1 iff hi_mask != 0) < u64_per_block.
+    assert!(row.lo_word + usize::from(row.hi_mask != 0) < u64_per_block);
+    assert!(dst.len() == 64);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: every read is inside the eight blocks (assert above and the
+    // caller's contract); `dst` is 64 writable bytes.
+    unsafe {
+        let [y0, y1, y2, y3] = if row.lo_mask == u64::MAX {
+            if ZIP {
+                flock_core::bits::transpose_8_strided_and_u64s_to_regs_zip(
                     a.add(row.lo_word),
                     b.add(row.lo_word),
                     u64_per_block,
                 )
             } else {
-                let lanes: [u64; 8] = std::array::from_fn(|lane| {
-                    let base = lane * u64_per_block + row.lo_word;
-                    let hi = if row.hi_mask != 0 {
-                        *a.add(base + 1) & *b.add(base + 1) & row.hi_mask
-                    } else {
-                        0
-                    };
-                    (*a.add(base) & *b.add(base) & row.lo_mask) | hi
-                });
-                flock_core::bits::transpose_8_strided_u64s_to_regs(lanes.as_ptr(), 1)
-            };
-            core::arch::asm!(
-                "stnp {y0:q}, {y1:q}, [{dst}]",
-                "stnp {y2:q}, {y3:q}, [{dst}, #32]",
-                dst = in(reg) dst.as_mut_ptr(),
-                y0 = in(vreg) y0,
-                y1 = in(vreg) y1,
-                y2 = in(vreg) y2,
-                y3 = in(vreg) y3,
-                options(nostack, preserves_flags)
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
+                flock_core::bits::transpose_8_strided_and_u64s_to_regs(
+                    a.add(row.lo_word),
+                    b.add(row.lo_word),
+                    u64_per_block,
+                )
+            }
+        } else {
             let lanes: [u64; 8] = std::array::from_fn(|lane| {
                 let base = lane * u64_per_block + row.lo_word;
-                // SAFETY: as above.
-                unsafe {
-                    let hi = if row.hi_mask != 0 {
-                        *a.add(base + 1) & *b.add(base + 1) & row.hi_mask
-                    } else {
-                        0
-                    };
-                    (*a.add(base) & *b.add(base) & row.lo_mask) | hi
-                }
+                let hi = if row.hi_mask != 0 {
+                    *a.add(base + 1) & *b.add(base + 1) & row.hi_mask
+                } else {
+                    0
+                };
+                (*a.add(base) & *b.add(base) & row.lo_mask) | hi
             });
-            let mut transposed = [0u8; 64];
-            flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
-            dst.copy_from_slice(&transposed);
+            if ZIP {
+                flock_core::bits::transpose_8_strided_u64s_to_regs_zip(lanes.as_ptr(), 1)
+            } else {
+                flock_core::bits::transpose_8_strided_u64s_to_regs(lanes.as_ptr(), 1)
+            }
+        };
+        core::arch::asm!(
+            "stnp {y0:q}, {y1:q}, [{dst}]",
+            "stnp {y2:q}, {y3:q}, [{dst}, #32]",
+            dst = in(reg) dst.as_mut_ptr(),
+            y0 = in(vreg) y0,
+            y1 = in(vreg) y1,
+            y2 = in(vreg) y2,
+            y3 = in(vreg) y3,
+            options(nostack, preserves_flags)
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let lanes: [u64; 8] = std::array::from_fn(|lane| {
+            let base = lane * u64_per_block + row.lo_word;
+            // SAFETY: as above.
+            unsafe {
+                let hi = if row.hi_mask != 0 {
+                    *a.add(base + 1) & *b.add(base + 1) & row.hi_mask
+                } else {
+                    0
+                };
+                (*a.add(base) & *b.add(base) & row.lo_mask) | hi
+            }
+        });
+        let mut transposed = [0u8; 64];
+        flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
+        dst.copy_from_slice(&transposed);
+    }
+}
+
+/// One pass of the two-rows-per-pass stripe group fill
+/// ([`fill_root_lincheck_stripe_group_ab_passes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripePass {
+    /// Row `row` alone, through the per-row path.
+    Single { row: usize },
+    /// Whole-word rows `row` and `row + 1` on the adjacent words `word` and
+    /// `word + 1` of every block.
+    Pair { row: usize, word: usize },
+    /// Rows `row` and `row + 1`, one of them split over two words: with
+    /// `z = a AND b`, row `row` is `(z[word] & mask[0]) | (z[word + 1] & !mask[0])`
+    /// and row `row + 1` is `(z[word + 1] & mask[1]) | (z[word + 2] & !mask[1])`.
+    Select { row: usize, word: usize, mask: [u64; 2] },
+}
+
+/// Groups `rows` into passes: consecutive rows are taken two at a time when
+/// both are whole words on adjacent words, or when one is a whole word and
+/// the other a two-word row whose masks are complementary and the three
+/// words involved are adjacent; any other row goes alone. Every row is in
+/// exactly one pass, in order.
+fn stripe_passes(rows: &[crate::r1cs_hashes::blake3::RootRow], u64_per_block: usize) -> Box<[StripePass]> {
+    let whole = |r: &crate::r1cs_hashes::blake3::RootRow| r.lo_mask == u64::MAX && r.hi_mask == 0;
+    let split = |r: &crate::r1cs_hashes::blake3::RootRow| r.hi_mask != 0 && r.hi_mask == !r.lo_mask;
+    let mut passes = Vec::with_capacity(rows.len());
+    let mut j = 0;
+    while j < rows.len() {
+        let r0 = &rows[j];
+        assert!(r0.lo_word + usize::from(r0.hi_mask != 0) < u64_per_block);
+        let pass = match rows.get(j + 1) {
+            Some(r1) if whole(r0) && whole(r1) && r1.lo_word == r0.lo_word + 1 && r1.lo_word < u64_per_block => {
+                StripePass::Pair { row: j, word: r0.lo_word }
+            }
+            // Split row, then the whole word after its second word.
+            Some(r1) if split(r0) && whole(r1) && r1.lo_word == r0.lo_word + 2 && r1.lo_word < u64_per_block => {
+                StripePass::Select { row: j, word: r0.lo_word, mask: [r0.lo_mask, 0] }
+            }
+            // Whole word, then a split row starting on the next word.
+            Some(r1) if whole(r0) && split(r1) && r1.lo_word == r0.lo_word + 1 && r1.lo_word + 1 < u64_per_block => {
+                StripePass::Select { row: j, word: r0.lo_word, mask: [u64::MAX, r1.lo_mask] }
+            }
+            _ => StripePass::Single { row: j },
+        };
+        j += if matches!(pass, StripePass::Single { .. }) { 1 } else { 2 };
+        passes.push(pass);
+    }
+    passes.into_boxed_slice()
+}
+
+/// [`fill_root_lincheck_stripe_group_ab`] with the rows taken two per pass
+/// where `passes` (from [`stripe_passes`] of the same `rows` and
+/// `u64_per_block`) pairs them. Same bytes.
+///
+/// # Safety
+/// As [`fill_root_lincheck_stripe_group_ab`]; `passes` must come from
+/// [`stripe_passes`]`(rows, u64_per_block)`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn fill_root_lincheck_stripe_group_ab_passes(
+    a: *const u64,
+    b: *const u64,
+    stripe: &mut [u8],
+    u64_per_block: usize,
+    rows: &[crate::r1cs_hashes::blake3::RootRow],
+    passes: &[StripePass],
+) {
+    assert!(rows.len() * 64 <= stripe.len());
+    for pass in passes {
+        match *pass {
+            StripePass::Single { row } => {
+                // SAFETY: the caller's contract, passed through.
+                unsafe {
+                    fill_root_lincheck_stripe_row_ab::<true>(
+                        a,
+                        b,
+                        &mut stripe[row * 64..row * 64 + 64],
+                        u64_per_block,
+                        &rows[row],
+                    );
+                }
+            }
+            StripePass::Pair { row, word } => {
+                let dst = &mut stripe[row * 64..row * 64 + 128];
+                assert!(word + 1 < u64_per_block);
+                // SAFETY: words `word` and `word + 1` are inside each of the
+                // eight blocks; `dst` is 128 writable bytes.
+                unsafe {
+                    let y = flock_core::bits::transpose_8_strided_and_u64_pairs_to_regs(
+                        a.add(word),
+                        b.add(word),
+                        u64_per_block,
+                    );
+                    stripe_store_two_rows(dst.as_mut_ptr(), y);
+                }
+            }
+            StripePass::Select { row, word, ref mask } => {
+                let dst = &mut stripe[row * 64..row * 64 + 128];
+                assert!(word + 2 < u64_per_block);
+                // SAFETY: words `word..word + 3` are inside each of the eight
+                // blocks; `dst` is 128 writable bytes.
+                unsafe {
+                    let y = flock_core::bits::transpose_8_strided_and_u64_pairs_select_to_regs(
+                        a.add(word),
+                        b.add(word),
+                        u64_per_block,
+                        mask.as_ptr(),
+                    );
+                    stripe_store_two_rows(dst.as_mut_ptr(), y);
+                }
+            }
         }
+    }
+}
+
+/// Non-temporal store of two stripe rows (128 bytes) from eight registers.
+///
+/// # Safety
+/// `dst` must be valid for 128 bytes of writes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn stripe_store_two_rows(dst: *mut u8, y: [core::arch::aarch64::uint8x16_t; 8]) {
+    let [y0, y1, y2, y3, y4, y5, y6, y7] = y;
+    // SAFETY: the caller's contract.
+    unsafe {
+        core::arch::asm!(
+            "stnp {y0:q}, {y1:q}, [{dst}]",
+            "stnp {y2:q}, {y3:q}, [{dst}, #32]",
+            "stnp {y4:q}, {y5:q}, [{dst}, #64]",
+            "stnp {y6:q}, {y7:q}, [{dst}, #96]",
+            dst = in(reg) dst,
+            y0 = in(vreg) y0,
+            y1 = in(vreg) y1,
+            y2 = in(vreg) y2,
+            y3 = in(vreg) y3,
+            y4 = in(vreg) y4,
+            y5 = in(vreg) y5,
+            y6 = in(vreg) y6,
+            y7 = in(vreg) y7,
+            options(nostack, preserves_flags)
+        );
     }
 }
 
@@ -976,6 +1194,9 @@ struct AbStripeEmitter<'a> {
     /// Paired-scratch mode (see `zc_ab_pair_scratch_active`): the odd quad
     /// reads the even quad's rows in place; nothing is copied.
     direct: bool,
+    /// Two-rows-per-pass plan of `rows` for the direct fill; `None` under
+    /// `FLOCK_NO_STRIPE_ZIP_TRANSPOSE=1` (row-by-row, half-register form).
+    passes: Option<Box<[StripePass]>>,
 }
 
 impl<'a> AbStripeEmitter<'a> {
@@ -1011,6 +1232,8 @@ impl<'a> AbStripeEmitter<'a> {
                 .max()
                 .unwrap_or(0),
             direct: zerocheck::univariate_skip_optimized::zc_ab_pair_scratch_active(),
+            passes: (cfg!(target_arch = "aarch64") && flock_core::bits::stripe_zip_transpose_enabled())
+                .then(|| stripe_passes(rows, AB_STRIPE_WORDS)),
         }
     }
 
@@ -1116,7 +1339,13 @@ impl<'a> AbStripeEmitter<'a> {
         // blocks follow at `a + unit_bytes` / `b + unit_bytes`: 8 complete
         // blocks of `AB_STRIPE_WORDS` words each.
         unsafe {
-            fill_root_lincheck_stripe_group_ab(a, b, dst, AB_STRIPE_WORDS, self.rows);
+            match &self.passes {
+                #[cfg(target_arch = "aarch64")]
+                Some(passes) => {
+                    fill_root_lincheck_stripe_group_ab_passes(a, b, dst, AB_STRIPE_WORDS, self.rows, passes)
+                }
+                _ => fill_root_lincheck_stripe_group_ab_form::<false>(a, b, dst, AB_STRIPE_WORDS, self.rows),
+            }
             if self.fixed_inputs && !fixed_inputs_hold_ab(a, b, AB_STRIPE_WORDS) {
                 self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1484,6 +1713,74 @@ mod deferred_stripe_tests {
             }
             if fixed {
                 assert!(ref_flag.load(std::sync::atomic::Ordering::Relaxed), "random tail must mismatch");
+            }
+        }
+    }
+
+    /// The stripe group fills write the same bytes in both transpose forms
+    /// (interleaved rows with two rows per pass, and the half-register form
+    /// that `FLOCK_NO_STRIPE_ZIP_TRANSPOSE=1` selects), from a/b in place and
+    /// from z = a AND b, for both root-row sets; and most rows take the
+    /// two-row pass.
+    #[test]
+    fn stripe_group_fill_forms_write_the_same_bytes() {
+        use crate::r1cs_hashes::blake3 as b3;
+        let mut x = 0x0bad_5eed_1234_5678u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for rows in [b3::root_stripe_rows().unwrap(), b3::fixed_input_root_stripe_rows().unwrap()] {
+            let passes = stripe_passes(rows, AB_STRIPE_WORDS);
+            // Every row is in exactly one pass, in order; nearly all rows are paired.
+            let mut next_row = 0;
+            let mut singles = 0;
+            for pass in passes.iter() {
+                let (row, n) = match *pass {
+                    StripePass::Single { row } => (row, 1),
+                    StripePass::Pair { row, .. } | StripePass::Select { row, .. } => (row, 2),
+                };
+                assert_eq!(row, next_row);
+                next_row += n;
+                singles += usize::from(n == 1);
+            }
+            assert_eq!(next_row, rows.len());
+            assert!(singles <= 3, "{singles} unpaired rows of {}", rows.len());
+            for _ in 0..8 {
+                let a: Vec<u64> = (0..8 * AB_STRIPE_WORDS).map(|_| next()).collect();
+                let b: Vec<u64> = (0..8 * AB_STRIPE_WORDS).map(|_| next()).collect();
+                let z: Vec<F128> = (0..4 * AB_STRIPE_WORDS)
+                    .map(|i| F128::new(a[2 * i] & b[2 * i], a[2 * i + 1] & b[2 * i + 1]))
+                    .collect();
+                let len = rows.len() * 64;
+                let mut out = [vec![0x5au8; len], vec![0xa5u8; len], vec![0x33u8; len], vec![0xccu8; len]];
+                let mut by_passes = vec![0x0fu8; len];
+                // SAFETY: as below; `passes` is the plan of `rows`.
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    fill_root_lincheck_stripe_group_ab_passes(
+                        a.as_ptr(),
+                        b.as_ptr(),
+                        &mut by_passes,
+                        AB_STRIPE_WORDS,
+                        rows,
+                        &passes,
+                    );
+                }
+                // SAFETY: `a` and `b` hold eight blocks of `AB_STRIPE_WORDS` words.
+                unsafe {
+                    fill_root_lincheck_stripe_group_ab_form::<true>(a.as_ptr(), b.as_ptr(), &mut out[0], AB_STRIPE_WORDS, rows);
+                    fill_root_lincheck_stripe_group_ab_form::<false>(a.as_ptr(), b.as_ptr(), &mut out[1], AB_STRIPE_WORDS, rows);
+                }
+                fill_root_lincheck_stripe_group_form::<true>(&z, &mut out[2], 0, z.len(), AB_STRIPE_WORDS, rows);
+                fill_root_lincheck_stripe_group_form::<false>(&z, &mut out[3], 0, z.len(), AB_STRIPE_WORDS, rows);
+                assert!(out[0] == out[1], "a/b fill: interleaved form differs from the half-register form");
+                assert!(out[2] == out[3], "z fill: interleaved form differs from the half-register form");
+                assert!(out[0] == out[3], "a/b fill differs from the z fill");
+                #[cfg(target_arch = "aarch64")]
+                assert!(by_passes == out[1], "two-rows-per-pass fill differs from the half-register form");
             }
         }
     }

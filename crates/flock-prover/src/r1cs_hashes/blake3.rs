@@ -236,6 +236,11 @@ pub(crate) struct DeferredAb<'a> {
     /// (default) instead of de-interleaving the L1 stage a second time;
     /// `FLOCK_NO_WITGEN_AB_COPY_DRAIN` (any value) restores the latter.
     copy_drain: bool,
+    /// Read the message and chaining-value words from the quad's input
+    /// block where they are used instead of holding them in registers for
+    /// the whole kernel (default); `FLOCK_NO_WITGEN_AB_INPUT_MEM=1` restores
+    /// the register form.  Copy-drain forms only.
+    input_mem: bool,
 }
 
 // SAFETY: `fill_quad` writes only the four blocks of its own quad; distinct
@@ -283,6 +288,12 @@ impl DeferredAb<'_> {
                     );
                 } else {
                     match (primed, self.copy_drain) {
+                        (true, true) if self.input_mem => {
+                            witgen_simd::build_quad_split_neon_mem::<true>(input, a, b, sa, sb)
+                        }
+                        (false, true) if self.input_mem => {
+                            witgen_simd::build_quad_split_neon_mem::<false>(input, a, b, sa, sb)
+                        }
                         (true, true) => witgen_simd::build_quad_split_neon::<false, true, true, true>(
                             input, none, a, b, sa, sb,
                         ),
@@ -3262,7 +3273,82 @@ pub(crate) mod witgen_simd {
         sa: *mut u32,
         sb: *mut u32,
     ) {
+        unsafe {
+            build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false>(inputs, z, a, b, sa, sb)
+        }
+    }
+
+    /// The copy-drain a/b form of [`build_quad_split_neon`]
+    /// (`<false, true, PRIMED, true>`: same arguments, same bytes) with the
+    /// message and chaining-value words read from memory where they are
+    /// used.  The register form keeps 16 message words and 8 chaining
+    /// words live across the whole G stream beside the 16 state words and
+    /// the two pending stream words, more values than there are vector
+    /// registers, so nearly every state word makes a round trip through
+    /// the stack.  Here those 24 words stay in the input block (word-major
+    /// input) or in one local copy of it (block input) and each use is one
+    /// load; the state words then fit in registers.
+    ///
+    /// # Safety
+    /// As [`build_quad_split_neon`] for the `<false, true, PRIMED, true>`
+    /// form.
+    pub(crate) unsafe fn build_quad_split_neon_mem<const PRIMED: bool>(
+        inputs: QuadInput<'_>,
+        a: *mut u32,
+        b: *mut u32,
+        sa: *mut u32,
+        sb: *mut u32,
+    ) {
+        unsafe {
+            build_quad_split_neon_impl::<false, true, PRIMED, true, true>(
+                inputs,
+                core::ptr::null_mut(),
+                a,
+                b,
+                sa,
+                sb,
+            )
+        }
+    }
+
+    /// One 16-byte load at a constant byte offset that the optimizer cannot
+    /// merge with other loads of the same word (a merged load would be held
+    /// in a register, which is what the memory form avoids).
+    #[inline(always)]
+    unsafe fn load_word_opaque<const BYTE_OFFSET: usize>(base: *const u32) -> V4 {
+        unsafe {
+            let v: V4;
+            core::arch::asm!(
+                "ldr {v:q}, [{p}, #{off}]",
+                v = lateout(vreg) v,
+                p = in(reg) base,
+                off = const BYTE_OFFSET,
+                options(nostack, readonly, preserves_flags)
+            );
+            v
+        }
+    }
+
+    /// Body of [`build_quad_split_neon`] (`MEM = false`, the code as it
+    /// was) and [`build_quad_split_neon_mem`] (`MEM = true`).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn build_quad_split_neon_impl<
+        const WZ: bool,
+        const SCRATCH: bool,
+        const PRIMED: bool,
+        const COPY: bool,
+        const MEM: bool,
+    >(
+        inputs: QuadInput<'_>,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        sa: *mut u32,
+        sb: *mut u32,
+    ) {
         const {
+            assert!(!MEM || (!WZ && SCRATCH && COPY));
             assert!(!(WZ && SCRATCH));
             assert!(SCRATCH || !PRIMED);
             assert!(SCRATCH || !COPY);
@@ -3272,6 +3358,15 @@ pub(crate) mod witgen_simd {
         }
         let full_scratch = SCRATCH && !PRIMED;
         unsafe {
+            // Memory form: where the 8 chaining words and the 16 message
+            // words can be re-read (word-major, 16 bytes per word).
+            let mut local_words = core::mem::MaybeUninit::<[V4; 24]>::uninit();
+            let seeded_words: Option<(*const u32, *const u32)> = match &inputs {
+                QuadInput::Seeded(q) => {
+                    Some((q.cv.as_ptr().cast::<u32>(), q.message.as_ptr().cast::<u32>()))
+                }
+                QuadInput::Blocks(_) => None,
+            };
             let (cv_v, m, tlo, thi, blen, flags) = match inputs {
                 QuadInput::Blocks(inputs) => {
                     let ptrs = [
@@ -3364,6 +3459,40 @@ pub(crate) mod witgen_simd {
                 flags,
             ];
 
+            let (cv_mem, m_mem): (*const u32, *const u32) = if !MEM {
+                (core::ptr::null(), core::ptr::null())
+            } else if let Some(pointers) = seeded_words {
+                pointers
+            } else {
+                let base = local_words.as_mut_ptr().cast::<V4>();
+                for w in 0..8usize {
+                    vst1q_u32(base.add(w) as *mut u32, cv_v[w]);
+                }
+                for w in 0..16usize {
+                    vst1q_u32(base.add(8 + w) as *mut u32, m[w]);
+                }
+                (base as *const u32, base.add(8) as *const u32)
+            };
+            // Message word `$i` as an addend, chaining word `$w` at the end.
+            macro_rules! msg {
+                ($i:literal) => {{
+                    if MEM {
+                        load_word_opaque::<{ 16 * $i }>(m_mem)
+                    } else {
+                        m[$i]
+                    }
+                }};
+            }
+            macro_rules! cvw {
+                ($w:literal) => {{
+                    if MEM {
+                        load_word_opaque::<{ 16 * $w }>(cv_mem)
+                    } else {
+                        cv_v[$w]
+                    }
+                }};
+            }
+
             // L1 stages.  `za` is the z stage in the z form and the a stage
             // in the a/b form (prefix, message and output words of z and a
             // are identical); `bs` is used by the a/b form only.  Every
@@ -3447,12 +3576,12 @@ pub(crate) mod witgen_simd {
                 ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
                  $mx:literal, $my:literal) => {{
                     let t0 = add!(GS_BASE + G_STRIDE * $g + REC_C0, state[$la], state[$lb]);
-                    let a1 = add!(GS_BASE + G_STRIDE * $g + REC_C1, t0, m[$mx]);
+                    let a1 = add!(GS_BASE + G_STRIDE * $g + REC_C1, t0, msg!($mx));
                     let d1 = xor_rotr::<16, 16>(state[$ld], a1);
                     let c1s = add!(GS_BASE + G_STRIDE * $g + REC_C2, state[$lc], d1);
                     let b1 = xor_rotr::<12, 20>(state[$lb], c1s);
                     let t1 = add!(GS_BASE + G_STRIDE * $g + REC_C3, a1, b1);
-                    let a2 = add!(GS_BASE + G_STRIDE * $g + REC_C4, t1, m[$my]);
+                    let a2 = add!(GS_BASE + G_STRIDE * $g + REC_C4, t1, msg!($my));
                     let d2 = xor_rotr::<8, 24>(d1, a2);
                     let c2s = add!(GS_BASE + G_STRIDE * $g + REC_C5, c1s, d2);
                     let bn = xor_rotr::<7, 25>(b1, c2s);
@@ -3493,7 +3622,7 @@ pub(crate) mod witgen_simd {
             }
             macro_rules! oh {
                 ($w:literal) => {{
-                    let hv = veorq_u32(state[$w + 8], cv_v[$w]);
+                    let hv = veorq_u32(state[$w + 8], cvw!($w));
                     lin!(OUT_HI_BASE + 32 * $w, hv);
                 }};
             }
@@ -4111,12 +4240,23 @@ pub(crate) mod witgen_simd {
             n_quads: n_total / 4,
             primed_scratch: ab_primed_scratch_enabled(),
             copy_drain: ab_copy_drain_enabled(),
+            input_mem: ab_input_mem_enabled(),
         });
         (z, a, b, z_lincheck, stream, deferred)
     }
 
     /// `FLOCK_NO_WITGEN_AB_COPY_DRAIN` (any value) restores the two-pass
     /// drain of the a/b scratch form.  Resolved once per process.
+    /// `FLOCK_NO_WITGEN_AB_INPUT_MEM=1` restores the a/b kernel that keeps
+    /// the message and chaining-value words in registers.  Read once.
+    fn ab_input_mem_enabled() -> bool {
+        static ON: LazyLock<bool> = LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_WITGEN_AB_INPUT_MEM").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+        });
+        *ON
+    }
+
     fn ab_copy_drain_enabled() -> bool {
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("FLOCK_NO_WITGEN_AB_COPY_DRAIN").is_none());
@@ -6244,6 +6384,228 @@ mod tests {
             }
         }
         assert_eq!(checked, 64 * 2);
+    }
+
+    /// The input-in-memory a/b kernel (`build_quad_split_neon_mem`) against
+    /// the register form it replaces, on ranked-shape inputs: word-major
+    /// seeded quads and block inputs (including all-ones, all-zero and
+    /// carry-heavy blocks), cold and primed scratch.  Published a and b
+    /// bytes, the scratch blocks, and the words a primed fill must leave
+    /// alone are compared word for word.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn split_quad_input_mem_form_matches_register_form() {
+        use super::witgen_simd::{self, QuadInput};
+        const U32S: usize = 4 * (K / 32);
+        let mut rng = Rng::new(0x5eed_a2b2_0003);
+        let mut checked = 0usize;
+        for case in 0..96usize {
+            let init = u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32());
+            let seeded = crate::seed_pipe::gen_quad_soa(init, 4 * (case * 977 % 65_536));
+            let mut blocks: [Compression; 4] = std::array::from_fn(|_| {
+                (
+                    std::array::from_fn(|_| rng.next_u32()),
+                    std::array::from_fn(|_| rng.next_u32()),
+                    u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32()),
+                    rng.next_u32(),
+                    rng.next_u32(),
+                )
+            });
+            match case % 4 {
+                1 => blocks[0] = ([u32::MAX; 8], [u32::MAX; 16], u64::MAX, u32::MAX, u32::MAX),
+                2 => blocks[1] = ([0; 8], [0; 16], 0, 0, 0),
+                3 => blocks[2] = ([0x8000_0000; 8], [0x7fff_ffff; 16], 1 << 63, 1 << 31, 1 << 31),
+                _ => {}
+            }
+            let block_refs: [&Compression; 4] = std::array::from_fn(|j| &blocks[j]);
+            // What an earlier quad left in the destination and in the scratch.
+            let stale_a: Vec<u32> = (0..U32S).map(|_| rng.next_u32()).collect();
+            let stale_b: Vec<u32> = (0..U32S).map(|_| rng.next_u32()).collect();
+            for seeded_path in [true, false] {
+                let input = || {
+                    if seeded_path {
+                        QuadInput::Seeded(&seeded)
+                    } else {
+                        QuadInput::Blocks(block_refs)
+                    }
+                };
+                for primed in [false, true] {
+                    let run = |mem: bool| {
+                        let (mut a, mut b) = (stale_a.clone(), stale_b.clone());
+                        let (mut sa, mut sb) = (stale_b.clone(), stale_a.clone());
+                        unsafe {
+                            match (mem, primed) {
+                                (true, true) => witgen_simd::build_quad_split_neon_mem::<true>(
+                                    input(),
+                                    a.as_mut_ptr(),
+                                    b.as_mut_ptr(),
+                                    sa.as_mut_ptr(),
+                                    sb.as_mut_ptr(),
+                                ),
+                                (true, false) => witgen_simd::build_quad_split_neon_mem::<false>(
+                                    input(),
+                                    a.as_mut_ptr(),
+                                    b.as_mut_ptr(),
+                                    sa.as_mut_ptr(),
+                                    sb.as_mut_ptr(),
+                                ),
+                                (false, true) => {
+                                    witgen_simd::build_quad_split_neon::<false, true, true, true>(
+                                        input(),
+                                        std::ptr::null_mut(),
+                                        a.as_mut_ptr(),
+                                        b.as_mut_ptr(),
+                                        sa.as_mut_ptr(),
+                                        sb.as_mut_ptr(),
+                                    )
+                                }
+                                (false, false) => {
+                                    witgen_simd::build_quad_split_neon::<false, true, false, true>(
+                                        input(),
+                                        std::ptr::null_mut(),
+                                        a.as_mut_ptr(),
+                                        b.as_mut_ptr(),
+                                        sa.as_mut_ptr(),
+                                        sb.as_mut_ptr(),
+                                    )
+                                }
+                            }
+                        }
+                        (a, b, sa, sb)
+                    };
+                    let old = run(false);
+                    let new = run(true);
+                    assert_eq!(new.0, old.0, "a case={case} seeded={seeded_path} primed={primed}");
+                    assert_eq!(new.1, old.1, "b case={case} seeded={seeded_path} primed={primed}");
+                    assert_eq!(new.2, old.2, "a scratch case={case} seeded={seeded_path} primed={primed}");
+                    assert_eq!(new.3, old.3, "b scratch case={case} seeded={seeded_path} primed={primed}");
+                    // Not vacuous: the kernel did overwrite the stale words.
+                    assert_ne!(new.0, stale_a);
+                    assert_ne!(new.2, stale_b);
+                    checked += 1;
+                }
+            }
+            // The inputs are read, never written.
+            let again = crate::seed_pipe::gen_quad_soa(init, 4 * (case * 977 % 65_536));
+            assert_eq!((seeded.cv, seeded.message), (again.cv, again.message));
+        }
+        assert_eq!(checked, 96 * 4);
+    }
+
+    /// `DeferredAb::fill_quad` with the input-in-memory kernel on and off
+    /// (`FLOCK_NO_WITGEN_AB_INPUT_MEM`): same a, b and scratch bytes for
+    /// every quad of a small witness, cold and primed scratch.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn deferred_ab_fill_quad_input_mem_switch_is_byte_neutral() {
+        const U32S: usize = 4 * (K / 32);
+        let mut rng = Rng::new(0x5eed_a2b2_0004);
+        let blocks: Vec<Compression> = (0..32)
+            .map(|_| {
+                (
+                    std::array::from_fn(|_| rng.next_u32()),
+                    std::array::from_fn(|_| rng.next_u32()),
+                    u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32()),
+                    rng.next_u32(),
+                    rng.next_u32(),
+                )
+            })
+            .collect();
+        let n_quads = blocks.len() / 4;
+        let fill_all = |input_mem: bool, spec_init: Option<u64>| {
+            let mut a = vec![0x1111_1111u32; n_quads * U32S];
+            let mut b = vec![0x2222_2222u32; n_quads * U32S];
+            let mut scratch = vec![0x3333_3333u32; 2 * U32S];
+            let mut scratches = Vec::new();
+            let handle = super::DeferredAb {
+                blocks: &blocks,
+                spec_init,
+                gen_ilp: true,
+                a: a.as_mut_ptr(),
+                b: b.as_mut_ptr(),
+                n_quads,
+                primed_scratch: true,
+                copy_drain: true,
+                input_mem,
+            };
+            for q in 0..n_quads {
+                let sa = scratch.as_mut_ptr().cast::<u8>();
+                let sb = unsafe { scratch.as_mut_ptr().add(U32S) }.cast::<u8>();
+                handle.fill_quad(q, sa, sb, q > 0);
+                scratches.push(scratch.clone());
+            }
+            (a, b, scratches)
+        };
+        for spec_init in [None, Some(0x0123_4567_89ab_cdefu64)] {
+            let on = fill_all(true, spec_init);
+            let off = fill_all(false, spec_init);
+            assert!(on == off, "input-mem switch changed bytes (spec_init {spec_init:?})");
+            assert!(on.0.iter().any(|&w| w != 0x1111_1111));
+        }
+    }
+
+    /// Paired timing probe (ignored): the a/b copy-drain kernel, register
+    /// form against input-in-memory form, primed scratch, one thread,
+    /// seeded inputs generated right before each quad as in the prover.
+    /// `PROBE_ROUNDS` rounds of 4096 quads each, order alternating.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "timing probe"]
+    fn ab_input_mem_timing() {
+        use super::witgen_simd::{self, QuadInput};
+        const U32S: usize = 4 * (K / 32);
+        const QUADS: usize = 4096;
+        let rounds: usize = std::env::var("PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(31);
+        let init = 0x1234_5678_9abc_def0u64;
+        let mut a = vec![0u32; QUADS * U32S];
+        let mut b = vec![0u32; QUADS * U32S];
+        let mut scratch = vec![0u32; 2 * U32S];
+        let mut times: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        for round in 0..rounds + 1 {
+            for k in 0..2usize {
+                let form = (k + round) % 2;
+                let t0 = std::time::Instant::now();
+                for q in 0..QUADS {
+                    let seeded = crate::seed_pipe::gen_quad_soa(init, 4 * q);
+                    let input = QuadInput::Seeded(&seeded);
+                    unsafe {
+                        let (pa, pb) = (a.as_mut_ptr().add(q * U32S), b.as_mut_ptr().add(q * U32S));
+                        let (sa, sb) = (scratch.as_mut_ptr(), scratch.as_mut_ptr().add(U32S));
+                        if form == 0 {
+                            witgen_simd::build_quad_split_neon::<false, true, true, true>(
+                                input,
+                                std::ptr::null_mut(),
+                                pa,
+                                pb,
+                                sa,
+                                sb,
+                            );
+                        } else {
+                            witgen_simd::build_quad_split_neon_mem::<true>(input, pa, pb, sa, sb);
+                        }
+                    }
+                }
+                let ns = t0.elapsed().as_nanos() as f64 / QUADS as f64;
+                if round > 0 {
+                    times[form].push(ns);
+                }
+            }
+        }
+        std::hint::black_box((&a, &b));
+        let med = |v: &[f64]| {
+            let mut s = v.to_vec();
+            s.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            s[s.len() / 2]
+        };
+        let diffs: Vec<f64> = times[0].iter().zip(&times[1]).map(|(o, n)| n - o).collect();
+        let lower = diffs.iter().filter(|d| **d < 0.0).count();
+        eprintln!(
+            "[ab-input-mem-timing] register form median {:.1} ns per quad, memory form {:.1}; paired median {:+.1} ns, memory form lower in {lower} of {}",
+            med(&times[0]),
+            med(&times[1]),
+            med(&diffs),
+            diffs.len()
+        );
     }
 
     /// Alternating timing probe for the split quad kernels (ignored).
