@@ -614,6 +614,30 @@ pub fn partial_fold_packed_z_neon_oblock16_padded(
         0,
         usize::MAX,
         true,
+        false,
+    )
+}
+
+/// As [`partial_fold_packed_z_neon_oblock16_padded`], with the row copy of
+/// the ranked schedule (see `lincheck_row_copy_enabled`) forced on.
+#[cfg(target_arch = "aarch64")]
+pub fn partial_fold_packed_z_neon_oblock16_row_copy_padded(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    eq_outer: &[F128],
+) -> Vec<F128> {
+    oblock_padded_tiled_impl::<NEON_TILE_T>(
+        z_packed,
+        m,
+        k_log,
+        useful_bits,
+        eq_outer,
+        0,
+        usize::MAX,
+        true,
+        true,
     )
 }
 
@@ -708,6 +732,7 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
         claim_lo,
         claim_hi,
         block16,
+        block16 && lincheck_row_copy_enabled(),
     )
 }
 
@@ -721,6 +746,7 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     claim_lo: usize,
     claim_hi: usize,
     block16: bool,
+    row_copy: bool,
 ) -> Vec<F128> {
     use rayon::prelude::*;
 
@@ -772,6 +798,8 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     // Fold tiles `[tile_lo, tile_hi)` into the length-k accumulator at
     // `partial` (only `[0..useful)` is read or written; the caller zeroed it).
     // Shared by both claim schedules below, so they cannot drift apart.
+    // Row copy rides on the block16 schedule (eight stripes per tile).
+    let row_copy = row_copy && block16 && TILE_T == 8;
     let fold_tiles = |partial: *mut F128, tile_lo: usize, tile_hi: usize| {
         // TILE_T × 256 F128 tables, L1-resident on stack, built once per tile.
         let mut tables_uninit = core::mem::MaybeUninit::<[[F128; 256]; TILE_T]>::uninit();
@@ -792,6 +820,42 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
             let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
             let mut bs = 0usize;
             #[cfg(target_feature = "sha3")]
+            if row_copy {
+                // 64 columns at a time: the tile's eight row segments (one
+                // cache line each, all in the same first-level cache set
+                // because the rows are 16 KiB apart) are copied into eight
+                // consecutive lines, and the block16 kernel reads the copy.
+                // Same bytes, same tables, same accumulators.
+                #[repr(align(64))]
+                struct RowLines([u8; 64 * 8]);
+                let mut lines = RowLines([0u8; 64 * 8]);
+                while bs + 64 <= useful {
+                    for t in 0..8 {
+                        // SAFETY: `bs + 64 <= useful <= k`, so the 64 source
+                        // bytes lie inside stripe `stripe_base + t`.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                z_base.add(t * k + bs),
+                                lines.0.as_mut_ptr().add(64 * t),
+                                64,
+                            );
+                        }
+                    }
+                    for quarter in 0..4 {
+                        unsafe {
+                            process_block16_neon_single_sha3(
+                                lines.0.as_ptr(),
+                                64,
+                                16 * quarter,
+                                tables_ptr,
+                                partial.add(bs + 16 * quarter),
+                            );
+                        }
+                    }
+                    bs += 64;
+                }
+            }
+            #[cfg(target_feature = "sha3")]
             if block16 {
                 while bs + 16 <= useful {
                     unsafe {
@@ -801,7 +865,7 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
                 }
             }
             #[cfg(not(target_feature = "sha3"))]
-            let _ = block16;
+            let _ = (block16, row_copy);
             while bs < useful {
                 unsafe {
                     process_block_neon_single::<TILE_T>(z_base, k, bs, tables_ptr, partial.add(bs));
@@ -930,6 +994,18 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     drop(parts);
     crate::scratch::give_f128(partials);
     out
+}
+
+/// Row copy in the ranked block16 oblock fold (default on;
+/// `FLOCK_NO_LINCHECK_ROW_COPY=1` restores reading the stripe rows in place).
+/// The eight stripe rows of a tile lie 16 KiB apart, so the eight lines the
+/// kernel reads together share one first-level cache set with two lines of
+/// the tile's lookup tables; copying 64 columns of the eight rows into eight
+/// consecutive lines first takes them out of that set for the lookups.
+/// Read once per process.
+fn lincheck_row_copy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LINCHECK_ROW_COPY").is_none())
 }
 
 /// Worker-owned partials over quarter-claims in the oblock fold (default on;

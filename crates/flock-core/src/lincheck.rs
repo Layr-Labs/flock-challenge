@@ -219,8 +219,8 @@ pub(crate) use kernels::{
 #[cfg(target_arch = "aarch64")]
 pub use kernels::{
     partial_fold_packed_z_neon_iblock_padded, partial_fold_packed_z_neon_oblock_padded,
-    partial_fold_packed_z_neon_oblock16_padded, partial_fold_packed_z_neon_single,
-    partial_fold_packed_z_neon_single_padded,
+    partial_fold_packed_z_neon_oblock16_padded, partial_fold_packed_z_neon_oblock16_row_copy_padded,
+    partial_fold_packed_z_neon_single, partial_fold_packed_z_neon_single_padded,
 };
 
 /// Bench-only A/B toggle: when set, [`partial_fold_packed_z_best`] uses the legacy
@@ -2300,6 +2300,51 @@ mod tests {
                 block8, block16,
                 "m={m}, k_log={k_log}, useful={useful_bits}"
             );
+        }
+    }
+
+    /// The row-copy form of the block16 schedule (eight row segments copied
+    /// into consecutive lines, 64 columns at a time) folds to the same vector
+    /// as the in-place block16 schedule and the block8 kernel, at shapes that
+    /// exercise the 64-column body, the 16-column tail and the 8-column tail,
+    /// including the ranked stripe widths.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    #[test]
+    fn partial_fold_neon_block16_row_copy_matches_in_place() {
+        let cases = [
+            (14usize, 4usize, 13usize), // k = 16: no 64-column body at all
+            (20, 10, 597),              // body + 16-column tail + 8-column tail
+            (20, 10, 1 << 10),          // dense, body only
+            (22, 14, 15_409),           // ranked full stripe width
+            (22, 14, 11_313),           // ranked root stripe width
+            (22, 14, 11_249),           // ranked fixed-input root stripe width
+            (24, 8, 253),
+        ];
+        for &(m, k_log, useful_bits) in &cases {
+            let k = 1usize << k_log;
+            let n_log = m - k_log;
+            let mut rng = Rng::new(9_410 + m as u64 + useful_bits as u64);
+            let mut z = rng.bits(1 << m);
+            for block in 0..(1usize << n_log) {
+                for i in useful_bits..k {
+                    z[block * k + i] = false;
+                }
+            }
+            let z_packed = pack_z_lincheck(&z, m, k_log);
+            let eq = build_eq_table(&rng.f128_vec(n_log));
+            let block8 =
+                partial_fold_packed_z_neon_oblock_padded(&z_packed, m, k_log, useful_bits, &eq);
+            let in_place =
+                partial_fold_packed_z_neon_oblock16_padded(&z_packed, m, k_log, useful_bits, &eq);
+            let row_copy = partial_fold_packed_z_neon_oblock16_row_copy_padded(
+                &z_packed,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+            );
+            assert_eq!(in_place, row_copy, "m={m}, k_log={k_log}, useful={useful_bits}");
+            assert_eq!(block8, row_copy, "m={m}, k_log={k_log}, useful={useful_bits} vs block8");
         }
     }
 
