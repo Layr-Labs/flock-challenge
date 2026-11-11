@@ -156,6 +156,26 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 ]
             }};
         }
+        // Raw 15-bit products of one K row with the A word applied through
+        // the plain image for every K (K4..7 take their `x^4` from
+        // [`x4_products`]).
+        macro_rules! prods1 {
+            ($k:literal, $bimg:expr) => {{
+                let aw = u64::from_le(core::ptr::read_unaligned(a_base.add($k * N_CHUNKS).cast::<u64>()));
+                let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, aw);
+                let (db0, db1, db2, db3) = $bimg;
+                [
+                    pmull_lo_u16(da0, db0),
+                    pmull_hi_u16(da0, db0),
+                    pmull_lo_u16(da1, db1),
+                    pmull_hi_u16(da1, db1),
+                    pmull_lo_u16(da2, db2),
+                    pmull_hi_u16(da2, db2),
+                    pmull_lo_u16(da3, db3),
+                    pmull_hi_u16(da3, db3),
+                ]
+            }};
+        }
         macro_rules! seed {
             ($lo:ident, $hi:ident) => {
                 [
@@ -177,494 +197,988 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(3, 1, [(6, 7)], []));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(3, 5, [(5, 6)], [7]));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(3, 4, [(0, 1), (2, 3), (4, 5)], []));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_s!(3, 5, [(5, 6)], [7])));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_s!(3, 1, [(6, 7)], []));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_sk!(3, 4, [(0, 1), (2, 3), (4, 5)], [])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(3, 1, [(6, 7)], []));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(3, 5, [(5, 6)], [7]));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(3, 4, [(0, 1), (2, 3), (4, 5)], []));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             4 => {
                 if ((!bw!(0) & 0xffff000000000000) | (!bw!(1) & 0x000000ffffffffff) | (!bw!(4) & 0xffffff0000000000) | (!bw!(5) & 0x00000000ffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(4, 1, [(5, 6)], [7]));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(4, 5, [(4, 5), (6, 7)], []));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(4, 0, [(0, 1), (2, 3), (4, 5)], []));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(4, 4, [(0, 1), (2, 3)], [4]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_sk!(4, 5, [(4, 5), (6, 7)], [])));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_s!(4, 1, [(5, 6)], [7]));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_sk!(4, 4, [(0, 1), (2, 3)], [4])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_sk!(4, 0, [(0, 1), (2, 3), (4, 5)], []));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(4, 1, [(5, 6)], [7]));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(4, 5, [(4, 5), (6, 7)], []));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(4, 0, [(0, 1), (2, 3), (4, 5)], []));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(4, 4, [(0, 1), (2, 3)], [4]));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             5 => {
                 if ((!bw!(0) & 0xffffffff00000000) | (!bw!(1) & 0x0000000000ffffff) | (!bw!(4) & 0xffffffffff000000) | (!bw!(5) & 0x000000000000ffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(5, 1, [(3, 4), (5, 6)], [7]));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(5, 5, [(2, 3), (4, 5), (6, 7)], []));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(5, 0, [(0, 1), (2, 3)], []));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(5, 4, [(0, 1)], [2]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_sk!(5, 5, [(2, 3), (4, 5), (6, 7)], [])));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_sk!(5, 1, [(3, 4), (5, 6)], [7]));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_s!(5, 4, [(0, 1)], [2])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_sk!(5, 0, [(0, 1), (2, 3)], []));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(5, 1, [(3, 4), (5, 6)], [7]));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(5, 5, [(2, 3), (4, 5), (6, 7)], []));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(5, 0, [(0, 1), (2, 3)], []));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(5, 4, [(0, 1)], [2]));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             6 => {
                 if ((!bw!(0) & 0xffffffffff000000) | (!bw!(1) & 0x000000000000ffff) | (!bw!(4) & 0xffffffffffff0000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(6, 1, [(2, 3), (4, 5), (6, 7)], []));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(6, 0, [(0, 1)], [2]));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(6, 4, [(0, 1)], []));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_sk!(6, 1, [(2, 3), (4, 5), (6, 7)], []));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_s!(6, 4, [(0, 1)], [])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_s!(6, 0, [(0, 1)], [2]));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(6, 1, [(2, 3), (4, 5), (6, 7)], []));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(6, 0, [(0, 1)], [2]));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(6, 4, [(0, 1)], []));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             7 => {
                 if ((!bw!(0) & 0xffffffffffffff00) | (!bw!(4) & 0x00ffffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(7, 0, [], [0]));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(7, 4, [], [7]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_s!(7, 4, [], [7])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_s!(7, 0, [], [0]));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(7, 0, [], [0]));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(7, 4, [], [7]));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             8 => {
                 if ((!bw!(0) & 0x00ffffffffffffff) | (!bw!(4) & 0x0000ffffffffffff) | (!bw!(7) & 0xffff000000000000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(8, 7, [(0, 1), (2, 3), (4, 5)], []));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(8, 0, [], [7]));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(8, 4, [(6, 7)], []));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_sk!(8, 7, [(0, 1), (2, 3), (4, 5)], [])));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_s!(8, 4, [(6, 7)], [])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_s!(8, 0, [], [7]));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(8, 7, [(0, 1), (2, 3), (4, 5)], []));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(8, 0, [], [7]));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(8, 4, [(6, 7)], []));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             9 => {
                 if ((!bw!(0) & 0x000000ffffffffff) | (!bw!(3) & 0xffffff0000000000) | (!bw!(4) & 0x00000000ffffffff) | (!bw!(7) & 0xffffff0000000000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(9, 3, [(0, 1), (2, 3)], [4]));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(9, 7, [(0, 1), (2, 3)], [4]));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(9, 0, [(5, 6)], [7]));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(9, 4, [(4, 5), (6, 7)], []));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_sk!(9, 7, [(0, 1), (2, 3)], [4])));
+                    let lo3 = prods1!(3, bimg_sk!(9, 3, [(0, 1), (2, 3)], [4]));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_sk!(9, 4, [(4, 5), (6, 7)], [])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_s!(9, 0, [(5, 6)], [7]));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(9, 3, [(0, 1), (2, 3)], [4]));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(9, 7, [(0, 1), (2, 3)], [4]));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(9, 0, [(5, 6)], [7]));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(9, 4, [(4, 5), (6, 7)], []));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             10 => {
                 if ((!bw!(0) & 0x00000000ffffffff) | (!bw!(3) & 0xffffffff00000000) | (!bw!(4) & 0x0000000000ffffff) | (!bw!(7) & 0xffffffffff000000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(10, 3, [(0, 1), (2, 3)], []));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_s!(10, 7, [(0, 1)], [2]));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(10, 0, [(4, 5), (6, 7)], []));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(10, 4, [(3, 4), (5, 6)], [7]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_s!(10, 7, [(0, 1)], [2])));
+                    let lo3 = prods1!(3, bimg_sk!(10, 3, [(0, 1), (2, 3)], []));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_sk!(10, 4, [(3, 4), (5, 6)], [7])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_sk!(10, 0, [(4, 5), (6, 7)], []));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(10, 3, [(0, 1), (2, 3)], []));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_s!(10, 7, [(0, 1)], [2]));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(10, 0, [(4, 5), (6, 7)], []));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(10, 4, [(3, 4), (5, 6)], [7]));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             11 => {
                 if ((!bw!(0) & 0x000000000000ffff) | (!bw!(3) & 0xffffffffffff0000) | (!bw!(7) & 0xffffffffffff0000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_s!(11, 3, [(0, 1)], []));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_s!(11, 7, [(0, 1)], []));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(11, 0, [(2, 3), (4, 5), (6, 7)], []));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_s!(11, 7, [(0, 1)], [])));
+                    let lo3 = prods1!(3, bimg_s!(11, 3, [(0, 1)], []));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_sk!(11, 0, [(2, 3), (4, 5), (6, 7)], []));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_s!(11, 3, [(0, 1)], []));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_s!(11, 7, [(0, 1)], []));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(11, 0, [(2, 3), (4, 5), (6, 7)], []));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             12 => {
                 if ((!bw!(3) & 0xffffffffffffff00) | (!bw!(7) & 0x00ffffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_s!(12, 3, [], [0]));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_s!(12, 7, [], [7]));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_s!(12, 7, [], [7])));
+                    let lo3 = prods1!(3, bimg_s!(12, 3, [], [0]));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_s!(12, 3, [], [0]));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_s!(12, 7, [], [7]));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             13 => {
                 if ((!bw!(3) & 0x0000ffffffffffff) | (!bw!(7) & 0x0000ffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_s!(13, 3, [(6, 7)], []));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_s!(13, 7, [(6, 7)], []));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_s!(13, 7, [(6, 7)], [])));
+                    let lo3 = prods1!(3, bimg_s!(13, 3, [(6, 7)], []));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_s!(13, 3, [(6, 7)], []));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_s!(13, 7, [(6, 7)], []));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             14 => {
                 if ((!bw!(2) & 0xffff000000000000) | (!bw!(3) & 0x000000ffffffffff) | (!bw!(6) & 0xffffff0000000000) | (!bw!(7) & 0x00000000ffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_s!(14, 3, [(5, 6)], [7]));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(14, 7, [(4, 5), (6, 7)], []));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(14, 2, [(0, 1), (2, 3), (4, 5)], []));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(14, 6, [(0, 1), (2, 3)], [4]));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_sk!(14, 7, [(4, 5), (6, 7)], [])));
+                    let lo3 = prods1!(3, bimg_s!(14, 3, [(5, 6)], [7]));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_sk!(14, 6, [(0, 1), (2, 3)], [4])));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_sk!(14, 2, [(0, 1), (2, 3), (4, 5)], []));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_s!(14, 3, [(5, 6)], [7]));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(14, 7, [(4, 5), (6, 7)], []));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(14, 2, [(0, 1), (2, 3), (4, 5)], []));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(14, 6, [(0, 1), (2, 3)], [4]));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             15 => {
                 if ((!bw!(2) & 0xffffffff00000000) | (!bw!(3) & 0x0000000000ffffff) | (!bw!(6) & 0xffffffff00000000) | (!bw!(7) & 0x0000000000ffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(15, 3, [(3, 4), (5, 6)], [7]));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(15, 7, [(3, 4), (5, 6)], [7]));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(15, 2, [(0, 1), (2, 3)], []));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(15, 6, [(0, 1), (2, 3)], []));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_sk!(15, 7, [(3, 4), (5, 6)], [7])));
+                    let lo3 = prods1!(3, bimg_sk!(15, 3, [(3, 4), (5, 6)], [7]));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_sk!(15, 6, [(0, 1), (2, 3)], [])));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_sk!(15, 2, [(0, 1), (2, 3)], []));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(15, 3, [(3, 4), (5, 6)], [7]));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(15, 7, [(3, 4), (5, 6)], [7]));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(15, 2, [(0, 1), (2, 3)], []));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(15, 6, [(0, 1), (2, 3)], []));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             16 => {
                 if ((!bw!(2) & 0xffffffffff000000) | (!bw!(3) & 0x000000000000ffff) | (!bw!(6) & 0xffffffffffff0000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(16, 3, [(2, 3), (4, 5), (6, 7)], []));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_s!(16, 2, [(0, 1)], [2]));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_s!(16, 6, [(0, 1)], []));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_sk!(16, 3, [(2, 3), (4, 5), (6, 7)], []));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_s!(16, 6, [(0, 1)], [])));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_s!(16, 2, [(0, 1)], [2]));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(16, 3, [(2, 3), (4, 5), (6, 7)], []));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_s!(16, 2, [(0, 1)], [2]));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_s!(16, 6, [(0, 1)], []));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             17 => {
                 if ((!bw!(2) & 0xffffffffffffff00) | (!bw!(6) & 0xffffffffffffff00)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_s!(17, 2, [], [0]));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_s!(17, 6, [], [0]));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_s!(17, 6, [], [0])));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_s!(17, 2, [], [0]));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_s!(17, 2, [], [0]));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_s!(17, 6, [], [0]));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             18 => {
                 if ((!bw!(2) & 0x00ffffffffffffff) | (!bw!(6) & 0x0000ffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_s!(18, 2, [], [7]));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_s!(18, 6, [(6, 7)], []));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_s!(18, 6, [(6, 7)], [])));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_s!(18, 2, [], [7]));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_s!(18, 2, [], [7]));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_s!(18, 6, [(6, 7)], []));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             19 => {
                 if ((!bw!(1) & 0xffff000000000000) | (!bw!(2) & 0x000000ffffffffff) | (!bw!(5) & 0xffff000000000000) | (!bw!(6) & 0x000000ffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_s!(19, 2, [(5, 6)], [7]));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_s!(19, 6, [(5, 6)], [7]));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(19, 1, [(0, 1), (2, 3), (4, 5)], []));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(19, 5, [(0, 1), (2, 3), (4, 5)], []));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_s!(19, 6, [(5, 6)], [7])));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_s!(19, 2, [(5, 6)], [7]));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_sk!(19, 5, [(0, 1), (2, 3), (4, 5)], [])));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_sk!(19, 1, [(0, 1), (2, 3), (4, 5)], []));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_s!(19, 2, [(5, 6)], [7]));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_s!(19, 6, [(5, 6)], [7]));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(19, 1, [(0, 1), (2, 3), (4, 5)], []));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(19, 5, [(0, 1), (2, 3), (4, 5)], []));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             20 => {
                 if ((!bw!(1) & 0xffffff0000000000) | (!bw!(2) & 0x00000000ffffffff) | (!bw!(5) & 0xffffffff00000000) | (!bw!(6) & 0x0000000000ffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(20, 2, [(4, 5), (6, 7)], []));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(20, 6, [(3, 4), (5, 6)], [7]));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(20, 1, [(0, 1), (2, 3)], [4]));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(20, 5, [(0, 1), (2, 3)], []));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_sk!(20, 6, [(3, 4), (5, 6)], [7])));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_sk!(20, 2, [(4, 5), (6, 7)], []));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_sk!(20, 5, [(0, 1), (2, 3)], [])));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_sk!(20, 1, [(0, 1), (2, 3)], [4]));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(20, 2, [(4, 5), (6, 7)], []));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(20, 6, [(3, 4), (5, 6)], [7]));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(20, 1, [(0, 1), (2, 3)], [4]));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(20, 5, [(0, 1), (2, 3)], []));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             21 => {
                 if ((!bw!(1) & 0xffffffffff000000) | (!bw!(2) & 0x000000000000ffff) | (!bw!(5) & 0xffffffffff000000) | (!bw!(6) & 0x000000000000ffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(21, 2, [(2, 3), (4, 5), (6, 7)], []));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(21, 6, [(2, 3), (4, 5), (6, 7)], []));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(21, 1, [(0, 1)], [2]));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(21, 5, [(0, 1)], [2]));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_sk!(21, 6, [(2, 3), (4, 5), (6, 7)], [])));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_sk!(21, 2, [(2, 3), (4, 5), (6, 7)], []));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_s!(21, 5, [(0, 1)], [2])));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_s!(21, 1, [(0, 1)], [2]));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(21, 2, [(2, 3), (4, 5), (6, 7)], []));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(21, 6, [(2, 3), (4, 5), (6, 7)], []));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(21, 1, [(0, 1)], [2]));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(21, 5, [(0, 1)], [2]));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             22 => {
                 if ((!bw!(1) & 0xffffffffffff0000) | (!bw!(5) & 0xffffffffffffff00)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(22, 1, [(0, 1)], []));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(22, 5, [], [0]));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_s!(22, 5, [], [0])));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_s!(22, 1, [(0, 1)], []));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(22, 1, [(0, 1)], []));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(22, 5, [], [0]));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             23 => {
                 if ((!bw!(1) & 0x00ffffffffffffff) | (!bw!(5) & 0x00ffffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(23, 1, [], [7]));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(23, 5, [], [7]));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_s!(23, 5, [], [7])));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_s!(23, 1, [], [7]));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_g!(4)));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(23, 1, [], [7]));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(23, 5, [], [7]));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             24 => {
                 if ((!bw!(1) & 0x0000ffffffffffff) | (!bw!(4) & 0xffff000000000000) | (!bw!(5) & 0x000000ffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(24, 1, [(6, 7)], []));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(24, 5, [(5, 6)], [7]));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(24, 4, [(0, 1), (2, 3), (4, 5)], []));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_s!(24, 5, [(5, 6)], [7])));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_s!(24, 1, [(6, 7)], []));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_sk!(24, 4, [(0, 1), (2, 3), (4, 5)], [])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_g!(0));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(24, 1, [(6, 7)], []));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(24, 5, [(5, 6)], [7]));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(24, 4, [(0, 1), (2, 3), (4, 5)], []));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             25 => {
                 if ((!bw!(0) & 0xffffff0000000000) | (!bw!(1) & 0x00000000ffffffff) | (!bw!(4) & 0xffffff0000000000) | (!bw!(5) & 0x00000000ffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(25, 1, [(4, 5), (6, 7)], []));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(25, 5, [(4, 5), (6, 7)], []));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(25, 0, [(0, 1), (2, 3)], [4]));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(25, 4, [(0, 1), (2, 3)], [4]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_sk!(25, 5, [(4, 5), (6, 7)], [])));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_sk!(25, 1, [(4, 5), (6, 7)], []));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_sk!(25, 4, [(0, 1), (2, 3)], [4])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_sk!(25, 0, [(0, 1), (2, 3)], [4]));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(25, 1, [(4, 5), (6, 7)], []));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(25, 5, [(4, 5), (6, 7)], []));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(25, 0, [(0, 1), (2, 3)], [4]));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(25, 4, [(0, 1), (2, 3)], [4]));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             26 => {
                 if ((!bw!(0) & 0xffffffff00000000) | (!bw!(1) & 0x0000000000ffffff) | (!bw!(4) & 0xffffffffff000000) | (!bw!(5) & 0x000000000000ffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(26, 1, [(3, 4), (5, 6)], [7]));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(26, 5, [(2, 3), (4, 5), (6, 7)], []));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(26, 0, [(0, 1), (2, 3)], []));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(26, 4, [(0, 1)], [2]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_sk!(26, 5, [(2, 3), (4, 5), (6, 7)], [])));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_sk!(26, 1, [(3, 4), (5, 6)], [7]));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_s!(26, 4, [(0, 1)], [2])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_sk!(26, 0, [(0, 1), (2, 3)], []));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(26, 1, [(3, 4), (5, 6)], [7]));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(26, 5, [(2, 3), (4, 5), (6, 7)], []));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(26, 0, [(0, 1), (2, 3)], []));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(26, 4, [(0, 1)], [2]));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             27 => {
                 if ((!bw!(0) & 0xffffffffffff0000) | (!bw!(4) & 0xffffffffffff0000)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(27, 0, [(0, 1)], []));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(27, 4, [(0, 1)], []));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_s!(27, 4, [(0, 1)], [])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_s!(27, 0, [(0, 1)], []));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(27, 0, [(0, 1)], []));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(27, 4, [(0, 1)], []));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             28 => {
                 if ((!bw!(0) & 0xffffffffffffff00) | (!bw!(4) & 0x00ffffffffffffff)) != 0 {
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
-                let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
-                horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(28, 0, [], [0]));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(28, 4, [], [7]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
-                acc
+                if V & ABV_SINGLE_IMAGE != 0 {
+                    let mut acc = x4_products(&prods1!(7, bimg_g!(7)));
+                    let lo3 = prods1!(3, bimg_g!(3));
+                    xor_into_acc(&mut acc, &lo3);
+                    let hi2 = x4_products(&prods1!(6, bimg_g!(6)));
+                    horner_absorb_one(&mut acc, &hi2, carry_not);
+                    let lo2 = prods1!(2, bimg_g!(2));
+                    xor_into_acc(&mut acc, &lo2);
+                    let hi1 = x4_products(&prods1!(5, bimg_g!(5)));
+                    horner_absorb_one(&mut acc, &hi1, carry_not);
+                    let lo1 = prods1!(1, bimg_g!(1));
+                    xor_into_acc(&mut acc, &lo1);
+                    let hi0 = x4_products(&prods1!(4, bimg_s!(28, 4, [], [7])));
+                    horner_absorb_one(&mut acc, &hi0, carry_not);
+                    let lo0 = prods1!(0, bimg_s!(28, 0, [], [0]));
+                    xor_into_acc(&mut acc, &lo0);
+                    acc
+                } else {
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
+                    let mut acc = seed!(lo3, hi3);
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
+                    horner_absorb_first(&mut acc, &lo2, &hi2);
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
+                    horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(28, 0, [], [0]));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(28, 4, [], [7]));
+                    horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                    acc
+                }
             }
             _ => unreachable!("no static-B Horner plan for this arm"),
         };

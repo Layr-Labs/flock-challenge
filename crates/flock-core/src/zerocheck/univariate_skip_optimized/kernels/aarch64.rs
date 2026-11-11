@@ -2163,9 +2163,12 @@ fn shift_reduce_inner_mixed_const_b_h4<
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
     let scaled_sw = inv_table.scaled_x4_half_swapped_data_ptr();
-    // Karatsuba images (see `ab_kara_tables`); dangling and unused otherwise.
+    // Karatsuba images (see `ab_kara_tables`), or under `ABV_HZ` the sigma
+    // tables (see `ab_hz_tables`); dangling and unused otherwise.
     let kplain = if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
+    } else if V & ABV_HZ != 0 {
+        ab_hz_tables(inv_table)
     } else {
         core::ptr::null()
     };
@@ -2185,7 +2188,10 @@ fn shift_reduce_inner_mixed_const_b_h4<
         let b_base = b_packed.as_ptr().add(byte_base_b);
 
         macro_rules! products {
-            ($at:expr, $at_sw:expr, $kara:expr, $k:literal) => {{
+            ($at:expr, $at_sw:expr, $kara:expr, $k:literal) => {
+                products!($at, $at_sw, $kara, $k, { $k >= 4 })
+            };
+            ($at:expr, $at_sw:expr, $kara:expr, $k:literal, $sc:expr) => {{
                 let (da0, da1, da2, da3) = if STATIC_A && $k == 1 {
                     let p = a_k1_partial.unwrap_unchecked().as_ptr();
                     (
@@ -2197,7 +2203,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
                 } else if STATIC_A && $k == 0 {
                     let aw = u64::from_le(core::ptr::read_unaligned(a_base.cast::<u64>()));
                     if V & ABV_KARA != 0 {
-                        apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw)
+                        apply_word_into_4_regs_v::<V, { $sc }>($at, $at_sw, $kara, aw)
                     } else {
                         apply_word_low5_into_4_regs($at, $at_sw, aw)
                     }
@@ -2220,7 +2226,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
                     // whole-word Karatsuba apply (18 loads) is this row's
                     // five-byte apply (20 loads).
                     if V & ABV_KARA != 0 {
-                        apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw)
+                        apply_word_into_4_regs_v::<V, { $sc }>($at, $at_sw, $kara, aw)
                     } else {
                         apply_word_low5_into_4_regs($at, $at_sw, aw)
                     }
@@ -2228,7 +2234,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
                     let aw = u64::from_le(core::ptr::read_unaligned(
                         a_base.add($k * N_CHUNKS).cast::<u64>(),
                     ));
-                    apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw)
+                    apply_word_into_4_regs_v::<V, { $sc }>($at, $at_sw, $kara, aw)
                 };
                 if ONE_MASK & (1 << $k) != 0 {
                     [
@@ -2260,6 +2266,35 @@ fn shift_reduce_inner_mixed_const_b_h4<
             }};
         }
 
+        let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
+        if V & ABV_SINGLE_IMAGE != 0 {
+            // Every A word through the plain image; K4..7's products take
+            // their `x^4` from `x4_products`. Each Horner step absorbs the
+            // K+4 products, then XORs in the K products, so one product set
+            // is live at a time.
+            let mut acc = x4_products(&products!(plain, plain_sw, kplain, 7, false));
+            let lo3 = products!(plain, plain_sw, kplain, 3, false);
+            xor_into_acc(&mut acc, &lo3);
+            let hi2 = x4_products(&products!(plain, plain_sw, kplain, 6, false));
+            horner_absorb_one(&mut acc, &hi2, carry_not);
+            let lo2 = products!(plain, plain_sw, kplain, 2, false);
+            xor_into_acc(&mut acc, &lo2);
+            let hi1 = x4_products(&products!(plain, plain_sw, kplain, 5, false));
+            horner_absorb_one(&mut acc, &hi1, carry_not);
+            let lo1 = products!(plain, plain_sw, kplain, 1, false);
+            xor_into_acc(&mut acc, &lo1);
+            let hi0 = x4_products(&products!(plain, plain_sw, kplain, 4, false));
+            horner_absorb_one(&mut acc, &hi0, carry_not);
+            let lo0 = products!(plain, plain_sw, kplain, 0, false);
+            xor_into_acc(&mut acc, &lo0);
+            let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
+            let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
+            let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[5]));
+            let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
+            store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
+            return;
+        }
+
         let lo3 = products!(plain, plain_sw, kplain, 3);
         let hi3 = products!(scaled, scaled_sw, kscaled, 7);
         let mut acc = [
@@ -2273,16 +2308,34 @@ fn shift_reduce_inner_mixed_const_b_h4<
             veorq_u16(lo3[7], hi3[7]),
         ];
 
-        let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
-        let lo2 = products!(plain, plain_sw, kplain, 2);
-        let hi2 = products!(scaled, scaled_sw, kscaled, 6);
-        horner_absorb_first(&mut acc, &lo2, &hi2);
-        let lo1 = products!(plain, plain_sw, kplain, 1);
-        let hi1 = products!(scaled, scaled_sw, kscaled, 5);
-        horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-        let lo0 = products!(plain, plain_sw, kplain, 0);
-        let hi0 = products!(scaled, scaled_sw, kscaled, 4);
-        horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+        if V & ABV_HZ != 0 {
+            // Same terms, absorbed one image at a time: the `x^4` image's
+            // products are formed after the plain image's are already in
+            // `acc`, so only one set of eight products is live at a time.
+            let zero = [vdupq_n_u16(0); 8];
+            let lo2 = products!(plain, plain_sw, kplain, 2);
+            horner_absorb_first(&mut acc, &lo2, &zero);
+            let hi2 = products!(scaled, scaled_sw, kscaled, 6);
+            xor_into_acc(&mut acc, &hi2);
+            let lo1 = products!(plain, plain_sw, kplain, 1);
+            horner_absorb_one(&mut acc, &lo1, carry_not);
+            let hi1 = products!(scaled, scaled_sw, kscaled, 5);
+            xor_into_acc(&mut acc, &hi1);
+            let lo0 = products!(plain, plain_sw, kplain, 0);
+            horner_absorb_one(&mut acc, &lo0, carry_not);
+            let hi0 = products!(scaled, scaled_sw, kscaled, 4);
+            xor_into_acc(&mut acc, &hi0);
+        } else {
+            let lo2 = products!(plain, plain_sw, kplain, 2);
+            let hi2 = products!(scaled, scaled_sw, kscaled, 6);
+            horner_absorb_first(&mut acc, &lo2, &hi2);
+            let lo1 = products!(plain, plain_sw, kplain, 1);
+            let hi1 = products!(scaled, scaled_sw, kscaled, 5);
+            horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+            let lo0 = products!(plain, plain_sw, kplain, 0);
+            let hi0 = products!(scaled, scaled_sw, kscaled, 4);
+            horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+        }
 
         let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
         let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
@@ -2290,6 +2343,84 @@ fn shift_reduce_inner_mixed_const_b_h4<
         let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
 
         store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
+    }
+}
+
+/// [`horner_absorb`] with a single product set: `acc = acc·x ⊕ lo`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn horner_absorb_one(
+    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
+    lo: &[core::arch::aarch64::uint16x8_t; 8],
+    carry_not: core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        for i in 0..8 {
+            let cur = acc[i];
+            let shifted = vreinterpretq_u8_u16(vshlq_n_u16::<1>(cur));
+            let msb = vreinterpretq_u8_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(cur)));
+            let folded = bcax_u8(shifted, msb, carry_not);
+            acc[i] = vreinterpretq_u16_u8(veorq_u8(folded, vreinterpretq_u8_u16(lo[i])));
+        }
+    }
+}
+
+/// `p·x^4` lane-wise in the 16-bit unreduced domain: the four bits leaving
+/// lane bits 12..15 re-enter as their carry-less product with
+/// `x^16 mod p` ([`HORNER_CARRY_X16`]). Equal to four [`horner_absorb`]
+/// steps with zero products, so congruent to `p·x^4` mod `p(x)`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn x4_products(p: &[core::arch::aarch64::uint16x8_t; 8]) -> [core::arch::aarch64::uint16x8_t; 8] {
+    use core::arch::aarch64::*;
+    unsafe {
+        let c = vdupq_n_u8(HORNER_CARRY_X16 as u8);
+        let pair = |lo: uint16x8_t, hi: uint16x8_t| {
+            let top = vshrq_n_u8::<4>(vshrn_high_n_u16::<8>(vshrn_n_u16::<8>(lo), hi));
+            (
+                veorq_u16(vshlq_n_u16::<4>(lo), pmull_lo_u16(top, c)),
+                veorq_u16(vshlq_n_u16::<4>(hi), pmull_hi_u16(top, c)),
+            )
+        };
+        let (o0, o1) = pair(p[0], p[1]);
+        let (o2, o3) = pair(p[2], p[3]);
+        let (o4, o5) = pair(p[4], p[5]);
+        let (o6, o7) = pair(p[6], p[7]);
+        [o0, o1, o2, o3, o4, o5, o6, o7]
+    }
+}
+
+/// Test access: [`x4_products`] on one lane value, and the same value
+/// through four [`horner_absorb`] steps with zero products.
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) fn ab_x4_products_forms(v: u16) -> (u16, u16) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let a = x4_products(&[vdupq_n_u16(v); 8]);
+        let mut b = [vdupq_n_u16(v); 8];
+        let zero = [vdupq_n_u16(0); 8];
+        let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
+        for _ in 0..4 {
+            horner_absorb(&mut b, &zero, &zero, carry_not);
+        }
+        for i in 0..8 {
+            assert_eq!(vgetq_lane_u16::<0>(a[i]), vgetq_lane_u16::<7>(a[i]));
+            assert_eq!(vgetq_lane_u16::<0>(a[i]), vgetq_lane_u16::<0>(a[0]));
+        }
+        (vgetq_lane_u16::<3>(a[5]), vgetq_lane_u16::<3>(b[5]))
+    }
+}
+
+/// `acc ⊕= p`, lane by lane.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn xor_into_acc(acc: &mut [core::arch::aarch64::uint16x8_t; 8], p: &[core::arch::aarch64::uint16x8_t; 8]) {
+    use core::arch::aarch64::*;
+    unsafe {
+        for i in 0..8 {
+            acc[i] = veorq_u16(acc[i], p[i]);
+        }
     }
 }
 
@@ -3606,6 +3737,24 @@ pub(crate) fn ab_kara_xor16_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_KARA_XOR16").is_none())
 }
 
+/// Row-body variant bit: every A word is applied through the plain image
+/// (the `x^4`-scaled image is not read); the products of K4..7 are
+/// multiplied by `x^4` lane-wise ([`x4_products`]) and absorbed with those
+/// of K0..3 in the same Horner chain as the two-image form. Same output
+/// bytes. Taken by the static-B window rows and the mask-`0x03` mixed row;
+/// the mask-`0xf0` mixed row keeps the two-image form.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_SINGLE_IMAGE: u16 = 2048;
+
+/// Kill switch for [`ABV_SINGLE_IMAGE`]: any value of
+/// `FLOCK_NO_ZC_AB_SINGLE_IMAGE` keeps the two-image rows. Read once per
+/// process. The rows written are byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_single_image_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_SINGLE_IMAGE").is_none())
+}
+
 /// Row-body variant bit (with [`ABV_Z`]): the `x^4` image uses it too.
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_Z_SCALED: u16 = 16;
@@ -3854,6 +4003,71 @@ pub(crate) fn ab_hz_helper_enabled() -> bool {
         std::env::var_os(ENV_NO_ZC_AB_HZ).is_none_or(|v| v != *"1")
     });
     *ON && !ab_kara_enabled()
+}
+
+/// Kill switch for [`ab_mixed_hz_enabled`]: any value of
+/// `FLOCK_NO_ZC_AB_MIXED_HZ` keeps the plain apply in the two mixed
+/// const-one rows of a thread that keeps the plain apply. Read once per
+/// process. The rows written are byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ENV_NO_ZC_AB_MIXED_HZ: &str = "FLOCK_NO_ZC_AB_MIXED_HZ";
+
+/// Whether this thread's mixed const-one rows apply the table in the
+/// half-pair z form (24 loads per word instead of 32): a thread that keeps
+/// the plain apply and runs its static-B rows in [`AB_HZ_VARIANT`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn ab_mixed_hz_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_MIXED_HZ).is_none()) && ab_hz_helper_enabled()
+}
+
+/// Test access: one mixed const-one row (`window 0, b_med 2` mask `0x03`
+/// when `w0`, else `window 1, b_med 13` mask `0xf0`) through the plain apply
+/// and through the half-pair z apply.
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) fn ab_mixed_row_plain_and_hz(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    w0: bool,
+) -> ([u8; 64], [u8; 64]) {
+    let mut out = ([0u8; 64], [0u8; 64]);
+    if w0 {
+        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, 0>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.0, false);
+        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { ABV_HZ }>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.1, false);
+    } else {
+        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, 0>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.0, false);
+        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_HZ }>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.1, false);
+    }
+    out
+}
+
+/// Test access: one mixed const-one row (as in
+/// [`ab_mixed_row_plain_and_hz`]) through the two-image performance-core
+/// form, the single-image form and the plain form.
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) fn ab_mixed_row_p_forms(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    w0: bool,
+) -> ([u8; 64], [u8; 64], [u8; 64]) {
+    const TWO: u16 = AB_Z_VARIANT | ABV_KARA_XOR16;
+    const ONE: u16 = AB_Z_VARIANT | ABV_KARA_XOR16 | ABV_SINGLE_IMAGE;
+    let mut out = ([0u8; 64], [0u8; 64], [0u8; 64]);
+    if w0 {
+        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, TWO>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.0, false);
+        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, ONE>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.1, false);
+        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, 0>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.2, false);
+    } else {
+        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, TWO>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.0, false);
+        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, ONE>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.1, false);
+        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, 0>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.2, false);
+    }
+    out
 }
 
 /// Bytes of one image's sigma table (256 x 32).
@@ -4292,7 +4506,17 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     )
                 });
                 if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
-                    if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
+                    if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() && ab_single_image_enabled() {
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { AB_Z_VARIANT | ABV_KARA_XOR16 | ABV_SINGLE_IMAGE }>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            byte_base_b,
+                            None,
+                            out,
+                            nt_store,
+                        );
+                    } else if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { AB_Z_VARIANT | ABV_KARA_XOR16 }>(
                             a_packed,
                             b_packed,
@@ -4324,6 +4548,16 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                         );
                     } else if ab_kara_enabled() {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { ABV_KARA }>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            byte_base_b,
+                            None,
+                            out,
+                            nt_store,
+                        );
+                    } else if ab_mixed_hz_enabled() {
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { ABV_HZ }>(
                             a_packed,
                             b_packed,
                             inv_table,
@@ -4420,6 +4654,16 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     );
                 } else if ab_kara_enabled() {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_KARA }>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base_b,
+                        None,
+                        out,
+                        nt_store,
+                    );
+                } else if ab_mixed_hz_enabled() {
+                    shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_HZ }>(
                         a_packed,
                         b_packed,
                         inv_table,

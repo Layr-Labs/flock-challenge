@@ -1792,6 +1792,27 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             && kernels::aarch64::ab_kara_unscaled_enabled()
             && kernels::aarch64::ab_z_enabled()
             && kernels::aarch64::ab_kara_xor16_enabled()
+            && kernels::aarch64::ab_single_image_enabled()
+        {
+            kernels::aarch64::bstatic_horner_window_rows::<{
+                kernels::aarch64::AB_Z_VARIANT
+                    | kernels::aarch64::ABV_INLINE_WINDOW
+                    | kernels::aarch64::ABV_KARA_XOR16
+                    | kernels::aarch64::ABV_SINGLE_IMAGE
+            }>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else if kernels::aarch64::ab_kara_enabled()
+            && kernels::aarch64::ab_kara_unscaled_enabled()
+            && kernels::aarch64::ab_z_enabled()
+            && kernels::aarch64::ab_kara_xor16_enabled()
         {
             kernels::aarch64::bstatic_horner_window_rows::<{
                 kernels::aarch64::AB_Z_VARIANT | kernels::aarch64::ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16
@@ -6404,12 +6425,13 @@ mod tests {
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED);
                         check!(AB_Z_VARIANT | ABV_INLINE_WINDOW);
                         check!(AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16);
+                        check!(AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16 | kernels::aarch64::ABV_SINGLE_IMAGE);
                         check!(AB_HZ_VARIANT);
                     }
                 }
             }
         }
-        assert_eq!(cases, 32 * 2 * 2 * 2 * 5);
+        assert_eq!(cases, 32 * 2 * 2 * 2 * 6);
     }
 
     /// The hoisted window check rejects slices that do not hold the
@@ -6441,6 +6463,88 @@ mod tests {
     /// and the scalar reference. Rows: random and edge A rows, B rows that
     /// satisfy the static masks (the straight-line bodies) and B rows that do
     /// not (the generic fallback), both store flavours.
+    /// `x^4` on a 16-bit product lane equals four Horner steps with zero
+    /// products, for every lane value.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_x4_products_match_four_steps() {
+        for v in 0..=u16::MAX {
+            let (got, want) = kernels::aarch64::ab_x4_products_forms(v);
+            assert_eq!(got, want, "lane value {v:04x}");
+        }
+    }
+
+    /// The single-image mixed const-one rows write the two-image rows' bytes
+    /// (the performance-core form, and the plain form where the A K0/K1 top
+    /// bytes are zero).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_mixed_rows_single_image_match_two_image() {
+        let table = make_inv_table();
+        let mut rng = Rng::new(0x51_6E_1A_6E);
+        let len = 4 * N_CHUNKS * 64;
+        for trial in 0..512 {
+            let mut a = vec![0u8; len];
+            let mut b = vec![0u8; len];
+            for (i, byte) in a.iter_mut().enumerate() {
+                *byte = match trial % 4 {
+                    0 => rng.next_u64() as u8,
+                    1 if i % 8 >= 5 => 0,
+                    2 => 0xff,
+                    _ => rng.next_u64() as u8 & 0x0f,
+                };
+            }
+            for byte in b.iter_mut() {
+                *byte = match trial % 8 {
+                    2 => 0,
+                    6 => 0xff,
+                    _ => rng.next_u64() as u8,
+                };
+            }
+            for base in [0, 64, 7 * 64, 2 * N_CHUNKS * 64] {
+                for w0 in [true, false] {
+                    let (two, single, plain) = kernels::aarch64::ab_mixed_row_p_forms(&a, &b, &table, base, w0);
+                    assert_eq!(single, two, "trial={trial} base={base} w0={w0}");
+                    if trial % 4 == 1 || !w0 {
+                        assert_eq!(single, plain, "plain trial={trial} base={base} w0={w0}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The mixed const-one rows in the half-pair z form write the plain
+    /// form's bytes: random rows, rows whose A K0/K1 top bytes are zero (the
+    /// ranked shape) and all-ones / zero words, at several chunk bases.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_mixed_rows_hz_match_plain() {
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xAB_313E_D0_42);
+        let len = 4 * N_CHUNKS * 64;
+        for trial in 0..512 {
+            let mut a = vec![0u8; len];
+            let mut b = vec![0u8; len];
+            for (i, byte) in a.iter_mut().enumerate() {
+                *byte = match trial % 4 {
+                    0 => rng.next_u64() as u8,
+                    1 if i % 8 >= 5 => 0,
+                    2 => 0xff,
+                    _ => rng.next_u64() as u8 & 0x0f,
+                };
+            }
+            for byte in b.iter_mut() {
+                *byte = if trial % 8 == 2 { 0 } else { rng.next_u64() as u8 };
+            }
+            for base in [0, 64, 7 * 64, 2 * N_CHUNKS * 64] {
+                for w0 in [true, false] {
+                    let (plain, hz) = kernels::aarch64::ab_mixed_row_plain_and_hz(&a, &b, &table, base, w0);
+                    assert_eq!(hz, plain, "trial={trial} base={base} w0={w0}");
+                }
+            }
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn ab_kernel_variants_match_baseline() {
@@ -6551,6 +6655,8 @@ mod tests {
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_SCALED | kernels::aarch64::ABV_NOSW);
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_KARA_XOR16);
                         check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16);
+                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_SINGLE_IMAGE);
+                        check!(kernels::aarch64::AB_Z_VARIANT | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_SINGLE_IMAGE);
                         check!(kernels::aarch64::ABV_HZ);
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW);
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW | ABV_INLINE_WINDOW);
@@ -6558,7 +6664,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 18);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 20);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
