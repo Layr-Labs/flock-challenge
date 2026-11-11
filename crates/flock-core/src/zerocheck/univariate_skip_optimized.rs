@@ -4229,7 +4229,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     // A fixed per-index partial keeps the nondeterministic claim order out of
     // the output; the final operation is XOR, so serial reduction is exact.
     let mut partials: Vec<([F128; ELL], [[F128; ELL]; N_C_BANKS])> =
-        vec![([F128::ZERO; ELL], [[F128::ZERO; ELL]; N_C_BANKS]); hi_size];
+        crate::alloc_uninit_vec(hi_size);
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         let mut state = WorkerStateWithSHatV::new();
