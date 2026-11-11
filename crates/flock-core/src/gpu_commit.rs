@@ -17579,11 +17579,14 @@ static inline void zf_mul_x2(uint4 va, uint4 vb,
     rb = b;
 }
 
+// Local level J >= 1 on the compact eight-entry arrays: entry k holds the
+// level-0 result of original element 2k, so original stride 2^J becomes
+// compact stride 2^(J-1). Same challenge, same products, same order.
 #define ZF_LEVEL(J)                                                    \
     {                                                                  \
-        constexpr uint st = 1u << (J);                                 \
+        constexpr uint st = 1u << ((J) - 1u);                          \
         zf_build(tabB, consts[2u + (J)], consts[8u + (J)], lid);       \
-        for (uint e = 0u; e < 16u; e += 2u * st) {                     \
+        for (uint e = 0u; e < 8u; e += 2u * st) {                      \
             uint4 pa;                                                  \
             uint4 pb;                                                  \
             zf_mul_x2(ea[e] ^ ea[e + st], eb[e] ^ eb[e + st],          \
@@ -17613,13 +17616,23 @@ kernel void zf_fold8(device const uint4* z      [[buffer(0)]],
     const uint ob = oa + 16u;
     const uint ba = (oa << 6) + q;
     const uint bb = (ob << 6) + q;
-    uint4 ea[16];
-    uint4 eb[16];
-    for (uint e = 0u; e < 16u; e++) {
-        ea[e] = z[ba + (e << 2)];
-        eb[e] = z[bb + (e << 2)];
+    // Level 0 fused into the load: build the c2 table first, then load each
+    // adjacent element pair (original 2k, 2k + 1 at ba + 8k, ba + 8k + 4)
+    // and keep only a ^ (a ^ b) * c2, so eight values per tile stay live.
+    uint4 ea[8];
+    uint4 eb[8];
+    zf_build(tabB, consts[2u + (0u)], consts[8u + (0u)], lid);
+    for (uint e = 0u; e < 8u; e++) {
+        const uint4 a0 = z[ba + (e << 3)];
+        const uint4 a1 = z[ba + (e << 3) + 4u];
+        const uint4 b0 = z[bb + (e << 3)];
+        const uint4 b1 = z[bb + (e << 3) + 4u];
+        uint4 pa;
+        uint4 pb;
+        zf_mul_x2(a0 ^ a1, b0 ^ b1, &tabB[0], pa, pb);
+        ea[e] = a0 ^ pa;
+        eb[e] = b0 ^ pb;
     }
-    ZF_LEVEL(0u)
     ZF_LEVEL(1u)
     ZF_LEVEL(2u)
     ZF_LEVEL(3u)
@@ -18666,14 +18679,20 @@ mod tests {
             .replace("zf_build(tabB, consts[0], consts[6], lid);", "")
             .replace("zf_build(tabB, consts[1], consts[7], lid);", "")
             .replace(
-                "    uint4 eb[16];\n",
-                "    uint4 eb[16];\n    zf_build(tabB, consts[0], consts[6], lid);\n",
+                "zf_build(tabB, consts[2u + (0u)], consts[8u + (0u)], lid);",
+                "zf_build(tabB, consts[0], consts[6], lid);",
             );
         let contig = base
             .replace("const uint ba = (oa << 6) + q;", "const uint ba = (oa << 6) + (q << 4);")
             .replace("const uint bb = (ob << 6) + q;", "const uint bb = (ob << 6) + (q << 4);")
-            .replace("ea[e] = z[ba + (e << 2)];", "ea[e] = z[ba + e];")
-            .replace("eb[e] = z[bb + (e << 2)];", "eb[e] = z[bb + e];")
+            .replace("z[ba + (e << 3)];", "z[ba + (e << 1)];")
+            .replace("z[ba + (e << 3) + 4u];", "z[ba + (e << 1) + 1u];")
+            .replace("z[bb + (e << 3)];", "z[bb + (e << 1)];")
+            .replace("z[bb + (e << 3) + 4u];", "z[bb + (e << 1) + 1u];")
+            .replace(
+                "consts[2u + (0u)], consts[8u + (0u)]",
+                "consts[(0u)], consts[6u + (0u)]",
+            )
             .replace(
                 "zf_build(tabB, consts[0], consts[6], lid);",
                 "zf_build(tabB, consts[4], consts[10], lid);",
