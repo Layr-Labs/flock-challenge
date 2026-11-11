@@ -3773,6 +3773,18 @@ static inline uint4 gf_shl16(uint4 a) {
     return r;
 }
 
+// a * x^8 mod P in one step: the 8 bits shifted out fold back as h * 0x87
+// (<= bit 14, low word only). Equal to eight gf_mulx steps.
+static inline uint4 gf_shl8(uint4 a) {
+    uint h = a.w >> 24;
+    uint4 r;
+    r.w = (a.w << 8) | (a.z >> 24);
+    r.z = (a.z << 8) | (a.y >> 24);
+    r.y = (a.y << 8) | (a.x >> 24);
+    r.x = (a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
 // gf_mul_byte16 of two values by the same table, the two Horner chains
 // interleaved step by step. Each chain is gf_mul_byte16's own sequence.
 static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,
@@ -3803,9 +3815,7 @@ static inline void gf_build_byte16(
     const uint aa = u & 3u;          // owns entry bits 2..3
     const uint cc = u >> 2;          // owns entry bits 5..7
     uint4 g = twiddles[idx];
-    if (t != 0u) {
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-    }
+    if (t != 0u) { g = gf_shl8(g); }
     uint4 e0 = g;
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
     uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
@@ -3956,6 +3966,18 @@ static inline uint4 gf_shl16(uint4 a) {
     return r;
 }
 
+// a * x^8 mod P in one step: the 8 bits shifted out fold back as h * 0x87
+// (<= bit 14, low word only). Equal to eight gf_mulx steps.
+static inline uint4 gf_shl8(uint4 a) {
+    uint h = a.w >> 24;
+    uint4 r;
+    r.w = (a.w << 8) | (a.z >> 24);
+    r.z = (a.z << 8) | (a.y >> 24);
+    r.y = (a.y << 8) | (a.x >> 24);
+    r.x = (a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
 // gf_mul_byte16 of two values by the same table, the two Horner chains
 // interleaved step by step. Each chain is gf_mul_byte16's own sequence.
 static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,
@@ -3986,9 +4008,7 @@ static inline void gf_build_byte16(
     const uint aa = u & 3u;          // owns entry bits 2..3
     const uint cc = u >> 2;          // owns entry bits 5..7
     uint4 g = twiddles[idx];
-    if (t != 0u) {
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-    }
+    if (t != 0u) { g = gf_shl8(g); }
     uint4 e0 = g;
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
     uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
@@ -4123,8 +4143,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
         const uint cj = q - (1u << jj);
         uint4 g = twiddles[(1u << (P.l + jj)) - 1u + (B << jj) + cj];
         twl[lid] = g;
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-        twl[16u + lid] = g;
+        twl[16u + lid] = gf_shl8(g);
     }
 
     for (uint it = 0; it < 2u; it++) {
@@ -4204,6 +4223,18 @@ static inline uint4 gf_shl16(uint4 a) {
     r.z = (a.z << 16) | (a.y >> 16);
     r.y = (a.y << 16) | (a.x >> 16);
     r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// a * x^8 mod P in one step: the 8 bits shifted out fold back as h * 0x87
+// (<= bit 14, low word only). Equal to eight gf_mulx steps.
+static inline uint4 gf_shl8(uint4 a) {
+    uint h = a.w >> 24;
+    uint4 r;
+    r.w = (a.w << 8) | (a.z >> 24);
+    r.z = (a.z << 8) | (a.y >> 24);
+    r.y = (a.y << 8) | (a.x >> 24);
+    r.x = (a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
     return r;
 }
 
@@ -4334,9 +4365,7 @@ static inline void gf_build_mid3(
     const uint aa = u & 3u;
     const uint cc = u >> 2;
     uint4 g = twiddles[idx];
-    if (t != 0u) {
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-    }
+    if (t != 0u) { g = gf_shl8(g); }
     uint4 e0 = g;
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
     uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
@@ -4377,9 +4406,7 @@ static inline void gf_build_byte16(
     const uint aa = u & 3u;
     const uint cc = u >> 2;
     uint4 g = twiddles[idx];
-    if (t != 0u) {
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-    }
+    if (t != 0u) { g = gf_shl8(g); }
     uint4 e0 = g;
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
     uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
@@ -5110,6 +5137,18 @@ static inline uint4 gf_shl16(uint4 a) {
     return r;
 }
 
+// a * x^8 mod P in one step: the 8 bits shifted out fold back as h * 0x87
+// (<= bit 14, low word only). Equal to eight gf_mulx steps.
+static inline uint4 gf_shl8(uint4 a) {
+    uint h = a.w >> 24;
+    uint4 r;
+    r.w = (a.w << 8) | (a.z >> 24);
+    r.z = (a.z << 8) | (a.y >> 24);
+    r.y = (a.y << 8) | (a.x >> 24);
+    r.x = (a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
 static inline uint4 gf_mul_byte16(uint4 v, threadgroup const uint4* tab) {
 #ifdef GR_NOMUL
     return v ^ tab[v.x & 255u];
@@ -5460,8 +5499,7 @@ kernel void ntt_g5(device uint4* data                [[buffer(0)]],
         const uint cj = q - (1u << jj);
         uint4 g = twiddles[(1u << (P.l + jj)) - 1u + (B << jj) + cj];
         twl[lid] = g;
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-        twl[32u + lid] = g;
+        twl[32u + lid] = gf_shl8(g);
     }
 #if NIB4
     for (uint i = lid; i < 80u; i += NTHR) {
