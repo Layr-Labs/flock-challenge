@@ -1329,6 +1329,16 @@ pub(crate) fn gpu_final_leaf_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_LEAF").is_none())
 }
 
+/// Hybrid-split GPU prefix uses the fused final NTT pass + Merkle leaf kernel
+/// (`ntt_final_t3_leaf`) over its own leaves instead of the final pass
+/// followed by a separate leaf pass that re-reads the prefix codeword from
+/// device memory. Same kernels' bytes, same flat-tree slots.
+/// `FLOCK_NO_HYBRID_FINAL_LEAF` (any value) restores the incumbent prefix.
+pub(crate) fn gpu_hybrid_final_leaf_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_FINAL_LEAF").is_none())
+}
+
 #[cfg(test)]
 mod leaf_vec4_gate_tests {
     use std::ffi::OsStr;
@@ -4817,6 +4827,178 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
             gpu.dispatch(enc, (n_leaves / (16 * leaf_tiles)) as u64, 64);
             if upper {
                 encode_merkle_upper(gpu, enc, tree_buf, w3, n_leaves / 8);
+            }
+        }
+    }
+
+    /// Hybrid prefix selection for the fused final pass + leaf kernel.
+    pub(crate) fn hybrid_final_leaf_selected(gpu: &Gpu, log_d: usize, n_leaves: usize) -> bool {
+        super::gpu_hybrid_final_leaf_enabled() && final_leaf_selected(gpu, log_d, n_leaves)
+    }
+
+    /// Fused final NTT pass + leaf hash + three parent levels over the first
+    /// `prefix_leaves` positions only (a multiple of 64 = 16 * LEAF_TILES).
+    /// The kernel indexes every output from `tgid`, so a shortened grid
+    /// writes exactly the prefix's codeword rows, leaves and level-1..3
+    /// parents at their global flat-tree slots.
+    pub(crate) unsafe fn encode_final_leaf_prefix(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        prefix_leaves: usize,
+    ) {
+        unsafe {
+            let n_leaves = 1usize << log_d;
+            debug_assert!(prefix_leaves <= n_leaves && prefix_leaves.is_multiple_of(64));
+            let l = log_d - 4;
+            gpu.set_pipeline(enc, gpu.pso_final_leaf);
+            gpu.set_buffer(enc, data_buf, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            let p = NttParams { log_d: log_d as u32, l: l as u32, f: 4, s: 0 };
+            let bytes = core::slice::from_raw_parts(
+                (&p as *const NttParams).cast::<u8>(),
+                core::mem::size_of::<NttParams>(),
+            );
+            gpu.set_bytes(enc, bytes, 2);
+            let w1 = n_leaves;
+            let w2 = w1 + n_leaves / 2;
+            let w3 = w2 + n_leaves / 4;
+            gpu.set_buffer(enc, tree_buf, 0, 3);
+            gpu.set_buffer(enc, tree_buf, w1 * 32, 4);
+            gpu.set_buffer(enc, tree_buf, w2 * 32, 5);
+            gpu.set_buffer(enc, tree_buf, w3 * 32, 6);
+            gpu.dispatch(enc, (prefix_leaves / 64) as u64, 64);
+        }
+    }
+
+    /// The parent levels of ONE aligned subtree above its level 3 (levels
+    /// 0..3 already written, e.g. by [`encode_final_leaf_prefix`]): the same
+    /// parent3 ladder and single-level tail [`encode_merkle_subtree_impl`]
+    /// runs after its fused leaf + parent3 dispatch, same slots.
+    pub(crate) unsafe fn encode_merkle_subtree_above3(
+        gpu: &Gpu,
+        enc: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        leaf_start: usize,
+        subtree_leaves: usize,
+    ) {
+        debug_assert!(subtree_leaves.is_power_of_two() && subtree_leaves >= 256);
+        debug_assert_eq!(leaf_start % subtree_leaves, 0);
+        unsafe {
+            let pso_parent3 = if gpu.pso_parent3_v4.is_null() {
+                gpu.pso_parent3
+            } else {
+                gpu.pso_parent3_v4
+            };
+            let mut level_start = n_leaves_total + n_leaves_total / 2 + n_leaves_total / 4;
+            let mut level_len = n_leaves_total / 8;
+            let mut local_start = leaf_start / 8;
+            let mut local_len = subtree_leaves / 8;
+            gpu.set_pipeline(enc, pso_parent3);
+            while local_len >= 256 {
+                let level1_start = level_start + level_len;
+                let level1_len = level_len / 2;
+                let local1_start = local_start / 2;
+                let level2_start = level1_start + level1_len;
+                let level2_len = level1_len / 2;
+                let local2_start = local1_start / 2;
+                let level3_start = level2_start + level2_len;
+                let level3_len = level2_len / 2;
+                let local3_start = local2_start / 2;
+                gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
+                gpu.set_buffer(enc, tree_buf, (level1_start + local1_start) * 32, 1);
+                gpu.set_buffer(enc, tree_buf, (level2_start + local2_start) * 32, 2);
+                gpu.set_buffer(enc, tree_buf, (level3_start + local3_start) * 32, 3);
+                gpu.dispatch(enc, (local_len / 256) as u64, 128);
+                level_start = level3_start;
+                level_len = level3_len;
+                local_start = local3_start;
+                local_len /= 8;
+            }
+            gpu.set_pipeline(enc, gpu.pso_parent);
+            while local_len > 1 {
+                let write_level_start = level_start + level_len;
+                let n_out = local_len / 2;
+                gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
+                gpu.set_buffer(enc, tree_buf, (write_level_start + local_start / 2) * 32, 1);
+                let tpg = 256u64.min(n_out as u64);
+                gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                level_start = write_level_start;
+                level_len /= 2;
+                local_start /= 2;
+                local_len = n_out;
+            }
+        }
+    }
+
+    /// GPU-prefix NTT passes from layer `l_from` over `num / den` of the
+    /// positions plus the prefix's aligned Merkle subtrees. With the hybrid
+    /// fused final leaf selected, the final pass and leaf/level-1..3 hashing
+    /// run as one fused dispatch over the prefix and only the levels above 3
+    /// are encoded per subtree; otherwise the incumbent split sequence.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn encode_hybrid_prefix_tail(
+        gpu: &Gpu,
+        enc: Id,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        l_from: usize,
+        num: u64,
+        den: u64,
+    ) {
+        unsafe {
+            let fused = hybrid_final_leaf_selected(gpu, log_d, n_leaves);
+            encode_hybrid_prefix_tail_with(
+                gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves, l_from, num, den, fused,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn encode_hybrid_prefix_tail_with(
+        gpu: &Gpu,
+        enc: Id,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        l_from: usize,
+        num: u64,
+        den: u64,
+        fused: bool,
+    ) {
+        unsafe {
+            let prefix_leaves = (n_leaves / den as usize) * num as usize;
+            let fused = fused
+                && !gpu.pso_final_leaf.is_null()
+                && n_leaves / den as usize >= 256
+                && l_from < log_d - 4;
+            if fused {
+                encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, l_from, log_d - 4, num, den);
+                encode_final_leaf_prefix(gpu, enc, staging, tw_buf, tree_buf, log_d, prefix_leaves);
+            } else {
+                encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, l_from, log_d, num, den);
+            }
+            let mut start = 0usize;
+            while start < prefix_leaves {
+                let mut size = 1usize << (prefix_leaves - start).ilog2();
+                while start % size != 0 {
+                    size >>= 1;
+                }
+                if fused {
+                    encode_merkle_subtree_above3(gpu, enc, tree_buf, n_leaves, start, size);
+                } else {
+                    encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                }
+                start += size;
             }
         }
     }
@@ -8423,6 +8605,11 @@ kernel void blake3_pow_scan(
             let prefix16 = (16 - k_cpu16) as u64;
             let cb2 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb2)?;
+            if hybrid_final_leaf_selected(gpu, log_d, n_leaves) {
+                encode_hybrid_prefix_tail(gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves, 4, prefix16, 16);
+                gpu.end_encoding(enc);
+                return Ok(cb2);
+            }
             encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
             // Greedy aligned power-of-two subtree decomposition of the
             // leaf prefix.
@@ -8480,6 +8667,11 @@ kernel void blake3_pow_scan(
             gpu.encode_signal_event(cb2, ev, v);
             FINE_SPLIT_WAIT.store(v, std::sync::atomic::Ordering::Release);
             let enc = gpu.compute_encoder(cb2)?;
+            if hybrid_final_leaf_selected(gpu, log_d, n_leaves) {
+                encode_hybrid_prefix_tail(gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves, 8, prefix256, 256);
+                gpu.end_encoding(enc);
+                return Ok(cb2);
+            }
             encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 8, log_d, prefix256, 256);
             let prefix_leaves = prefix256 as usize * (n_leaves / 256);
             let mut start = 0usize;
@@ -10197,8 +10389,15 @@ kernel void blake3_pow_scan(
         } else {
             key
         };
-        if super::gpu_final_leaf_enabled() {
+        let key = if super::gpu_final_leaf_enabled() {
             key ^ fnv1a64(&final_leaf_msl_source()).rotate_left(5) ^ 0x464C_4541_465F_3431
+        } else {
+            key
+        };
+        // The hybrid prefix's fused final leaf changes the GPU arm's cost, so
+        // its tuned split must not be shared with the incumbent prefix.
+        if super::gpu_final_leaf_enabled() && super::gpu_hybrid_final_leaf_enabled() {
+            key ^ 0x4859_4246_4C45_4146 // "HYBFLEAF"
         } else {
             key
         }
@@ -22129,6 +22328,68 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         }
     }
 
+    /// Hybrid GPU prefix: fused final pass + leaf + level-1..3 dispatch over
+    /// the prefix, then the per-subtree levels above 3, must write exactly the
+    /// incumbent prefix's codeword rows and tree nodes (and nothing else).
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn hybrid_prefix_final_leaf_matches_incumbent() {
+        use super::imp;
+        let log_d = 16usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        if gpu.pso_final_leaf.is_null() {
+            eprintln!("skipping: fused final-leaf PSO unavailable");
+            return;
+        }
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let input = Rng::new(0x48594246).vec(64 << log_d);
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = (64usize << log_d) * 16;
+            let tree_bytes = (2 * n_leaves - 1) * 32;
+            let tw_buf = gpu.new_buffer(core::mem::size_of_val(twiddles.as_slice())).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            for &(l_from, num, den) in &[(4usize, 11u64, 16u64), (8, 166, 256), (8, 255, 256), (8, 1, 256), (4, 15, 16)] {
+                let mut outs = Vec::new();
+                for fused in [false, true] {
+                    let data_buf = gpu.new_buffer(data_bytes).unwrap();
+                    let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), gpu.buffer_contents(data_buf), data_bytes);
+                    std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0x3C, tree_bytes);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    imp::encode_hybrid_prefix_tail_with(
+                        gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves, l_from, num, den, fused,
+                    );
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let d = core::slice::from_raw_parts(gpu.buffer_contents(data_buf).cast::<u8>(), data_bytes).to_vec();
+                    let t = core::slice::from_raw_parts(gpu.buffer_contents(tree_buf).cast::<u8>(), tree_bytes).to_vec();
+                    outs.push((d, t));
+                    gpu.release(data_buf);
+                    gpu.release(tree_buf);
+                }
+                assert!(outs[0].0 == outs[1].0, "codeword differs at ({l_from},{num},{den})");
+                assert!(outs[0].1 == outs[1].1, "Merkle tree differs at ({l_from},{num},{den})");
+                // The prefix's subtree roots really were written (not the fill).
+                let prefix_leaves = (n_leaves / den as usize) * num as usize;
+                assert_ne!(&outs[1].1[..32], &[0x3Cu8; 32][..]);
+                assert_eq!(&outs[1].1[prefix_leaves * 32..prefix_leaves * 32 + 32], &[0x3Cu8; 32][..]);
+            }
+            gpu.release(tw_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
     #[test]
     #[ignore]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -22249,6 +22510,241 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             gpu.release(tw_buf);
             gpu.pool_pop(pool);
             assert!(exact);
+        }
+    }
+
+    /// GL2 lane: per-stage GPU anatomy of the commit graph at log_d = 20
+    /// (1 GiB codeword) next to streaming bandwidth floors.
+    /// Run with `--ignored --nocapture gl2_anatomy`.
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gl2_anatomy() {
+        use super::imp;
+        let log_d = 20usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x6172);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let bw_src = r#"#include <metal_stdlib>
+using namespace metal;
+kernel void gl2_rw(device uint4* d [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
+    d[gid] = d[gid] ^ uint4(0x9E3779B9u);
+}
+kernel void gl2_rw4(device uint4* d [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
+    uint4 a[4];
+    for (uint i = 0; i < 4u; i++) a[i] = d[gid * 4u + i];
+    for (uint i = 0; i < 4u; i++) d[gid * 4u + i] = a[i] ^ uint4(0x9E3779B9u);
+}
+kernel void gl2_read(device const uint4* d [[buffer(0)]], device uint* out [[buffer(1)]],
+                     uint gid [[thread_position_in_grid]]) {
+    uint4 a = d[gid * 4u] ^ d[gid * 4u + 1u] ^ d[gid * 4u + 2u] ^ d[gid * 4u + 3u];
+    if (a.x == 0x12345678u && a.y == 0x9abcdef0u) out[0] = a.z;
+}
+kernel void gl2_write(device uint4* d [[buffer(0)]], uint gid [[thread_position_in_grid]]) {
+    d[gid] = uint4(gid);
+}
+"#;
+        let pso_rw = unsafe { imp::compile_supplemental_pipeline(gpu, bw_src, "gl2_rw").unwrap() };
+        let pso_rw4 = unsafe { imp::compile_supplemental_pipeline(gpu, bw_src, "gl2_rw4").unwrap() };
+        let pso_rd = unsafe { imp::compile_supplemental_pipeline(gpu, bw_src, "gl2_read").unwrap() };
+        let pso_wr = unsafe { imp::compile_supplemental_pipeline(gpu, bw_src, "gl2_write").unwrap() };
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = (64usize << log_d) * 16;
+            let tree_bytes = (2 * n_leaves - 1) * 32;
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let z_buf = gpu.new_buffer(data_bytes / 2).unwrap();
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            let out_buf = gpu.new_buffer(4096).unwrap();
+            let tw_buf = gpu.new_buffer(core::mem::size_of_val(twiddles.as_slice())).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            let zin = rng.vec(32 << log_d);
+            std::ptr::copy_nonoverlapping(zin.as_ptr().cast::<u8>(), gpu.buffer_contents(z_buf), data_bytes / 2);
+            drop(zin);
+            let run = |f: &dyn Fn(imp::Id)| -> f64 {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                f(enc);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            };
+            let n16 = (data_bytes / 16) as u64;
+            let fz = |enc: imp::Id| {
+                imp::FromZFirstPassPlan::new(log_d).encode_range(
+                    gpu, enc, data_buf, tw_buf, z_buf, log_d, 0, 1usize << (log_d - 4),
+                )
+            };
+            let pass = |enc: imp::Id, l: usize| {
+                imp::encode_ntt_passes_prefix_frac(gpu, enc, data_buf, tw_buf, log_d, 4, l, l + 1, 16, 16)
+            };
+            let fused_ok = !gpu.pso_final_leaf.is_null();
+            let names = [
+                "fz(0-3)", "p4", "p8", "p12", "p16final", "merkle(leaf3+up)", "fused16+leaf+up",
+                "upper", "WHOLE_split", "WHOLE_fused", "bw_rw", "bw_rw4", "bw_read", "bw_write",
+            ];
+            let reps: usize = std::env::var("GL2_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(9);
+            let mut rows: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
+            for _ in 0..reps {
+                rows[0].push(run(&|enc| fz(enc)));
+                for (i, l) in [4usize, 8, 12, 16].iter().enumerate() {
+                    rows[1 + i].push(run(&|enc| pass(enc, *l)));
+                }
+                rows[5].push(run(&|enc| imp::encode_merkle(gpu, enc, data_buf, tree_buf, n_leaves)));
+                rows[6].push(if fused_ok {
+                    run(&|enc| {
+                        imp::encode_final_leaf_and_upper(gpu, enc, gpu.pso_final_leaf, data_buf, tw_buf, tree_buf, log_d, 4, true)
+                    })
+                } else {
+                    0.0
+                });
+                rows[7].push(run(&|enc| {
+                    imp::encode_merkle_upper(gpu, enc, tree_buf, n_leaves + n_leaves / 2 + n_leaves / 4, n_leaves / 8)
+                }));
+                rows[8].push(run(&|enc| {
+                    fz(enc);
+                    imp::encode_ntt_passes(gpu, enc, data_buf, tw_buf, log_d, 4);
+                    imp::encode_merkle(gpu, enc, data_buf, tree_buf, n_leaves);
+                }));
+                rows[9].push(run(&|enc| {
+                    fz(enc);
+                    imp::encode_ntt_and_merkle(gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves);
+                }));
+                rows[10].push(run(&|enc| {
+                    gpu.set_pipeline(enc, pso_rw);
+                    gpu.set_buffer(enc, data_buf, 0, 0);
+                    gpu.dispatch(enc, n16 / 256, 256);
+                }));
+                rows[11].push(run(&|enc| {
+                    gpu.set_pipeline(enc, pso_rw4);
+                    gpu.set_buffer(enc, data_buf, 0, 0);
+                    gpu.dispatch(enc, n16 / 4 / 256, 256);
+                }));
+                rows[12].push(run(&|enc| {
+                    gpu.set_pipeline(enc, pso_rd);
+                    gpu.set_buffer(enc, data_buf, 0, 0);
+                    gpu.set_buffer(enc, out_buf, 0, 1);
+                    gpu.dispatch(enc, n16 / 4 / 256, 256);
+                }));
+                rows[13].push(run(&|enc| {
+                    gpu.set_pipeline(enc, pso_wr);
+                    gpu.set_buffer(enc, data_buf, 0, 0);
+                    gpu.dispatch(enc, n16 / 256, 256);
+                }));
+            }
+            let mut line = String::new();
+            for (i, n) in names.iter().enumerate() {
+                let mut v: Vec<f64> = rows[i].iter().skip(1).copied().collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                line += &format!("\n  {n:>18} med {:7.3} min {:7.3}", v[v.len() / 2], v[0]);
+            }
+            eprintln!("gl2 anatomy GPU ms (1 GiB codeword, log_d {log_d}):{line}");
+            // Write-ablation of the fused final pass (timing only): the
+            // codeword store is made conditional on an impossible value.
+            let wr = "            data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];\n";
+            let base = imp::final_leaf_msl_source();
+            let i = base.rfind(wr).unwrap();
+            let nowrite = format!(
+                "{}{}{}",
+                &base[..i],
+                "            if (elems[e].x == 0x9E3779B9u && P.s == 77u) data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];\n",
+                &base[i + wr.len()..]
+            );
+            let pso_fp = imp::compile_supplemental_pipeline(gpu, &base, "ntt_final_t3_leaf").unwrap();
+            let pso_fnw = imp::compile_supplemental_pipeline(gpu, &nowrite, "ntt_final_t3_leaf").unwrap();
+            let fl = |enc: imp::Id, pso: imp::Id| {
+                imp::encode_final_leaf_and_upper(gpu, enc, pso, data_buf, tw_buf, tree_buf, log_d, 4, false)
+            };
+            // Background CPU load: 0 = none, 1 = memory streaming threads,
+            // 2 = ALU-only threads (GL2_LOAD_THREADS, default 8).
+            for load in [0u32, 1, 2] {
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let nthr: usize = std::env::var("GL2_LOAD_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+                let mut hs = Vec::new();
+                if load > 0 {
+                    for t in 0..nthr {
+                        let stop = stop.clone();
+                        hs.push(std::thread::spawn(move || {
+                            if load == 1 {
+                                let n = 32usize << 20; // 32 Mi u64 = 256 MiB per thread pair
+                                let src = vec![t as u64 + 1; n / 2];
+                                let mut dst = vec![0u64; n / 2];
+                                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                    dst.copy_from_slice(&src);
+                                    std::hint::black_box(&mut dst);
+                                }
+                            } else {
+                                let mut x = t as u64 | 1;
+                                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                    for _ in 0..100_000 {
+                                        x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(7) ^ 0x1234;
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                            }
+                        }));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                let names = ["fused", "fused_nowrite", "p8", "merkle", "bw_rw4", "bw_read", "pfx166_inc", "pfx166_fused"];
+                let mut rr: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
+                for _ in 0..reps {
+                    for (slot, fz) in [(6usize, false), (7, true)] {
+                        rr[slot].push(run(&|enc| {
+                            imp::encode_hybrid_prefix_tail_with(
+                                gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves, 8, 166, 256, fz,
+                            )
+                        }));
+                    }
+                    rr[0].push(run(&|enc| fl(enc, pso_fp)));
+                    rr[1].push(run(&|enc| fl(enc, pso_fnw)));
+                    rr[2].push(run(&|enc| pass(enc, 8)));
+                    rr[3].push(run(&|enc| imp::encode_merkle(gpu, enc, data_buf, tree_buf, n_leaves)));
+                    rr[4].push(run(&|enc| {
+                        gpu.set_pipeline(enc, pso_rw4);
+                        gpu.set_buffer(enc, data_buf, 0, 0);
+                        gpu.dispatch(enc, n16 / 4 / 256, 256);
+                    }));
+                    rr[5].push(run(&|enc| {
+                        gpu.set_pipeline(enc, pso_rd);
+                        gpu.set_buffer(enc, data_buf, 0, 0);
+                        gpu.set_buffer(enc, out_buf, 0, 1);
+                        gpu.dispatch(enc, n16 / 4 / 256, 256);
+                    }));
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                for h in hs {
+                    h.join().unwrap();
+                }
+                let mut line = String::new();
+                for (i, n) in names.iter().enumerate() {
+                    let mut v = rr[i].clone();
+                    v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                    line += &format!(" {n}={:.3}", v[v.len() / 2]);
+                }
+                eprintln!("gl2 load={load} (0 none,1 mem,2 alu; {nthr} thr):{line}");
+            }
+            gpu.release(pso_fp);
+            gpu.release(pso_fnw);
+            for p in [pso_rw, pso_rw4, pso_rd, pso_wr] {
+                gpu.release(p);
+            }
+            gpu.release(data_buf);
+            gpu.release(z_buf);
+            gpu.release(tree_buf);
+            gpu.release(out_buf);
+            gpu.release(tw_buf);
+            gpu.pool_pop(pool);
         }
     }
 }

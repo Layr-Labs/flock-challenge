@@ -36,7 +36,7 @@ fn bstatic_horner_fallback(
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn bstatic_horner_blk<const BLK: usize, const V: u8>(
+fn bstatic_horner_blk<const BLK: usize, const V: u16>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -54,7 +54,7 @@ fn bstatic_horner_blk<const BLK: usize, const V: u8>(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
+fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -104,8 +104,13 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
                 let mut db3 = vld1q_u8(pp.add(48));
                 #[allow(unused_variables)]
                 let b_word = bw!($k);
-                $(xor_vary_pair::<$j0, $j1>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
-                $(xor_vary_single::<$js>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                if V & ABV_NOSW != 0 {
+                    $(xor_vary_ext::<$j0, $j1>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
+                    $(xor_vary_ext::<$js, 8>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
+                } else {
+                    $(xor_vary_pair::<$j0, $j1>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                    $(xor_vary_single::<$js>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                }
                 (db0, db1, db2, db3)
             }};
         }
@@ -116,7 +121,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
         macro_rules! bimg_sk {
             ($blk:literal, $k:literal, $pairs:tt, $singles:tt) => {{
                 if V & ABV_KARA != 0 {
-                    apply_word_kara::<V, false>(kplain, bw!($k))
+                    apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, bw!($k))
                 } else {
                     bimg_s!($blk, $k, $pairs, $singles)
                 }
@@ -721,7 +726,7 @@ pub(crate) const BSTATIC_HORNER_WINDOW_ROWS: [(usize, usize); 2] = [(3, 16), (0,
 /// row `b_med` to `out_outer[b_med * 64..][..64]`.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bstatic_horner_window_rows<const V: u8>(
+pub(crate) fn bstatic_horner_window_rows<const V: u16>(
     w: usize,
     a_packed: &[u8],
     b_packed: &[u8],
@@ -735,6 +740,8 @@ pub(crate) fn bstatic_horner_window_rows<const V: u8>(
     let out = out_outer.as_mut_ptr();
     let kara = if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
+    } else if V & ABV_HZ != 0 {
+        ab_hz_tables(inv_table)
     } else {
         core::ptr::null()
     };
