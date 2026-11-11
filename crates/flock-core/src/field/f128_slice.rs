@@ -178,6 +178,34 @@ pub(crate) fn fold_banked_slots4<const BANKS: usize>(
     }
 }
 
+/// [`fold_banked_slots4`] written to `out[0..4]`, with every input element
+/// read by one whole 16-byte load on AArch64 (even `BANKS` only there; see
+/// `aarch64::fold_banked_slots4_whole_into`).
+///
+/// `odd_live` is the caller's promise about the second and fourth slot:
+/// their banks `odd_live..BANKS` are zero (pass `BANKS` to promise nothing).
+/// Under that promise the result is bit-identical to [`fold_banked_slots4`]
+/// on every target; AArch64 skips the promised-zero bank pairs.
+#[inline]
+pub(crate) fn fold_banked_slots4_whole_into<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    input: &[F128],
+    out: &mut [F128],
+    odd_live: usize,
+) {
+    assert!(input.len() >= 4 * BANKS && out.len() >= 4);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    if BANKS % 2 == 0 {
+        // SAFETY: the cfg gate supplies PMULL through `aes`; the assertion
+        // above establishes four complete banked slots and four outputs.
+        unsafe { aarch64::fold_banked_slots4_whole_into::<BANKS>(weight, input, out, odd_live) }
+        return;
+    }
+    let _ = odd_live;
+    out[..4].copy_from_slice(&fold_banked_slots4::<BANKS>(weight, input));
+}
+
+
 /// Fold the ranked zerocheck AB bank matrix, laid out bank-major, into its
 /// 64 lane sums. Two adjacent lanes share each of the 128 weight loads, and
 /// each lane's complete product sum is reduced only once.
@@ -1132,6 +1160,78 @@ mod tests {
 
     /// Fixed ranked bank-major geometry: cover structured edge cases and
     /// random matrices against an independent fully-reduced scalar oracle.
+
+    #[test]
+    fn banked_slots4_whole_load_form_matches_incumbent_and_oracle() {
+        // Real-shaped inputs: the ranked fold-8 materialise folds 64 banks of
+        // packed witness words (dense bit patterns, the all-zero padding words
+        // of each block, all-ones) with 64 tensor weights.
+        fn oracle<const BANKS: usize>(weight: &[F128; BANKS], input: &[F128]) -> F128 {
+            weight.iter().zip(input).fold(F128::ZERO, |a, (w, x)| a + *w * *x)
+        }
+        fn check<const BANKS: usize>(seed: u64) {
+            let mut state = seed;
+            let mut next = || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state ^ (state >> 29)
+            };
+            let weight: [F128; BANKS] = std::array::from_fn(|_| F128::new(next(), next()));
+            for case in 0..48 {
+                // Guard elements on both sides: the kernel must read exactly
+                // `4 * BANKS` elements and write exactly four.
+                let mut input: Vec<F128> = (0..4 * BANKS + 2).map(|_| F128::new(next(), next())).collect();
+                match case % 6 {
+                    1 => input[1..=4 * BANKS].iter_mut().for_each(|x| *x = F128::ZERO),
+                    2 => input[1..=4 * BANKS].iter_mut().for_each(|x| *x = F128::new(u64::MAX, u64::MAX)),
+                    // Witness-like: the last 7 of every 128 words are padding zeros.
+                    3 => input[1..=4 * BANKS].iter_mut().enumerate().for_each(|(i, x)| {
+                        if i % 128 >= 121 {
+                            *x = F128::ZERO
+                        }
+                    }),
+                    4 => input[1..=4 * BANKS].iter_mut().for_each(|x| x.hi = 0),
+                    5 => input[1..=4 * BANKS].iter_mut().for_each(|x| x.lo = 0),
+                    _ => {}
+                }
+                let body = &input[1..=4 * BANKS];
+                let sentinel = F128::new(0xA5A5_A5A5_5A5A_5A5A, 0x0123_4567_89AB_CDEF);
+                let mut out = [sentinel; 6];
+                fold_banked_slots4_whole_into::<BANKS>(&weight, body, &mut out[1..5], BANKS);
+                let incumbent = fold_banked_slots4::<BANKS>(&weight, body);
+                // Zero-tail promise: with the second and fourth slot zero from
+                // bank `live` on, every promise value down to `live` must give
+                // the incumbent's result on that input.
+                for live in [BANKS - BANKS / 8, BANKS / 2 + 1, 1, 0] {
+                    let mut tail = body.to_vec();
+                    for slot in [1usize, 3] {
+                        tail[slot * BANKS + live..(slot + 1) * BANKS].fill(F128::ZERO);
+                    }
+                    let want = fold_banked_slots4::<BANKS>(&weight, &tail);
+                    for promise in [live, (live + 1).min(BANKS), BANKS] {
+                        let mut got = [sentinel; 4];
+                        fold_banked_slots4_whole_into::<BANKS>(&weight, &tail, &mut got, promise);
+                        assert_eq!(got, want, "BANKS={BANKS} case {case} live {live} promise {promise}");
+                    }
+                }
+                assert_eq!(out[0], sentinel, "BANKS={BANKS} case {case}: wrote before out");
+                assert_eq!(out[5], sentinel, "BANKS={BANKS} case {case}: wrote past out");
+                for slot in 0..4 {
+                    assert_eq!(out[1 + slot], incumbent[slot], "BANKS={BANKS} case {case} slot {slot} vs incumbent");
+                    assert_eq!(
+                        out[1 + slot],
+                        oracle::<BANKS>(&weight, &body[slot * BANKS..(slot + 1) * BANKS]),
+                        "BANKS={BANKS} case {case} slot {slot} vs oracle"
+                    );
+                }
+            }
+        }
+        check::<64>(0x0F8_0001);
+        check::<16>(0x0F8_0002);
+        check::<2>(0x0F8_0003);
+        // Odd bank counts take the incumbent kernel.
+        check::<3>(0x0F8_0004);
+    }
+
     #[test]
     fn bank_major_128x64_rows2_matches_fully_reduced_oracle() {
         fn oracle(weight: &[F128; 128], input: &[F128]) -> [F128; 64] {

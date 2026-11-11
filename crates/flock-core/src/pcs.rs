@@ -148,17 +148,20 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
 
     let t = std::time::Instant::now();
     let ligerito_proof = if let Some(direct) = combined.direct_fold8 {
-        ligerito::recursive_prover_with_basis_direct_fold8(
-            lig_config,
-            packed_witness,
-            combined.b_combined,
-            direct,
-            combined.target_combined,
-            &prover_data.codeword,
-            &*prover_data.merkle_tree,
-            combined.round0_prime,
-            challenger,
-        )
+        // The materializer may skip the witness words `padding` declares zero.
+        ligerito::with_witness_padding(padding, || {
+            ligerito::recursive_prover_with_basis_direct_fold8(
+                lig_config,
+                packed_witness,
+                combined.b_combined,
+                direct,
+                combined.target_combined,
+                &prover_data.codeword,
+                &*prover_data.merkle_tree,
+                combined.round0_prime,
+                challenger,
+            )
+        })
     } else if let Some(direct) = combined.direct_fold4 {
         ligerito::recursive_prover_with_basis_direct_fold4(
             lig_config,

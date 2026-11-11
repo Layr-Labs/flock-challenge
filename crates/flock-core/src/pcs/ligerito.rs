@@ -7138,6 +7138,71 @@ fn zfold_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// Whole-element loads in the four-slot witness fold of the direct-fold8
+/// materializer (default on). `FLOCK_NO_DIRECT_FOLD8_WHOLE_LOAD=1` restores
+/// the incumbent kernel. Read once per process.
+fn direct_fold8_whole_load_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DIRECT_FOLD8_WHOLE_LOAD").is_none())
+}
+
+/// Skip the witness words that the padding descriptor declares zero in the
+/// four-slot witness fold of the direct-fold8 materializer (default on, only
+/// with the whole-load kernel). `FLOCK_NO_DIRECT_FOLD8_ZERO_TAIL=1` restores
+/// the full bank scan. Read once per process.
+fn direct_fold8_zero_tail_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DIRECT_FOLD8_ZERO_TAIL").is_none())
+}
+
+thread_local! {
+    /// `(k_log, useful_bits_per_block)` of the witness being opened on this
+    /// thread, while [`with_witness_padding`] is active.
+    static WITNESS_PADDING: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with the opened witness's padding descriptor visible to the
+/// direct-fold8 materializer on this thread (the materializer runs on the
+/// calling thread of the recursive prover). The descriptor is the one the
+/// ring switch already uses to skip all-zero chunks; it is cleared again when
+/// `f` returns or unwinds.
+pub(crate) fn with_witness_padding<T>(
+    padding: &crate::zerocheck::PaddingSpec,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<(usize, usize)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            WITNESS_PADDING.with(|cell| cell.set(self.0));
+        }
+    }
+    let _reset = Reset(WITNESS_PADDING.with(|cell| {
+        cell.replace(Some((padding.k_log, padding.useful_bits_per_block)))
+    }));
+    f()
+}
+
+/// Leading banks that can be nonzero in the odd 64-word slots of the packed
+/// witness, from a padding descriptor: when one block of the descriptor is
+/// exactly two slots (`k_log = 14`) and its useful prefix ends inside the
+/// second slot, the odd slots' banks from `useful_words - 64` on are padding
+/// zeros. Every other shape reports 64 (nothing known).
+fn direct_fold8_odd_slot_live_banks(padding: Option<(usize, usize)>) -> usize {
+    const SLOT: usize = 64;
+    match padding {
+        Some((k_log, useful_bits)) if k_log == super::LOG_PACKING + 7 => {
+            let useful_words = useful_bits.div_ceil(1usize << super::LOG_PACKING);
+            if useful_words > SLOT && useful_words < 2 * SLOT {
+                useful_words - SLOT
+            } else {
+                SLOT
+            }
+        }
+        _ => SLOT,
+    }
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from the direct
 /// factor state before this function binds the witness and combined basis in
 /// one N→N/64 pass. It emits M6 — the round message of the folded
@@ -7206,6 +7271,20 @@ fn materialize_direct_fold8(
         && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none();
     let quad_fold64 =
         pair_fold64 && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_QUAD").is_none();
+    // Whole-element loads in the four-slot fold (same products, same sums;
+    // see `f128_slice::fold_banked_slots4_whole_into`). The rollback runs
+    // the incumbent block body.
+    let whole_fold64 = quad_fold64 && direct_fold8_whole_load_enabled();
+    // Odd slots are the second halves of the padding descriptor's blocks:
+    // every block starts on a 128-word boundary (`64 * block * block_len`
+    // with an even `block_len`) and the four-slot loop starts on even slots.
+    // Only the ranked padding (57 live banks) has a compiled block form;
+    // any other value runs the full bank scan.
+    let odd_slot_live = if whole_fold64 && direct_fold8_zero_tail_enabled() && block_len.is_multiple_of(4) {
+        direct_fold8_odd_slot_live_banks(WITNESS_PADDING.with(|cell| cell.get()))
+    } else {
+        64
+    };
 
     // One shared per-block body for both drains below, so the scheduling
     // choice cannot drift from the value computation. For block `i` it fully
@@ -7213,7 +7292,14 @@ fn materialize_direct_fold8(
     // disjoint witness stripe `[64·i·B, 64·(i+1)·B)` and returns the block's
     // round-0 partial. Which worker (or pool) runs a block cannot change a
     // single bit of it.
-    let fold8_block = |scratch: &mut Vec<F128>,
+    //
+    // The body is instantiated once per four-slot kernel form (`$whole` and
+    // `$odd_live` are literals), so the rollback form is the incumbent
+    // closure, token for token, and each form is compiled without the
+    // others' code and with its bank split as a constant.
+    macro_rules! fold8_block_body {
+        ($whole:literal, $odd_live:literal) => {
+    |scratch: &mut Vec<F128>,
                        block: usize,
                        b_out: &mut [F128],
                        f_out: &mut [F128]|
@@ -7251,14 +7337,23 @@ fn materialize_direct_fold8(
         if quad_fold64 {
             while slot + 3 < block_len {
                 let base = 64 * slot;
-                let folded_f = crate::field::f128_slice::fold_banked_slots4::<64>(
-                    &fold_weight,
-                    &f_in[base..base + 256],
-                );
-                f_out[slot] = folded_f[0];
-                f_out[slot + 1] = folded_f[1];
-                f_out[slot + 2] = folded_f[2];
-                f_out[slot + 3] = folded_f[3];
+                if $whole {
+                    crate::field::f128_slice::fold_banked_slots4_whole_into::<64>(
+                        &fold_weight,
+                        &f_in[base..base + 256],
+                        &mut f_out[slot..slot + 4],
+                        $odd_live,
+                    );
+                } else {
+                    let folded_f = crate::field::f128_slice::fold_banked_slots4::<64>(
+                        &fold_weight,
+                        &f_in[base..base + 256],
+                    );
+                    f_out[slot] = folded_f[0];
+                    f_out[slot + 1] = folded_f[1];
+                    f_out[slot + 2] = folded_f[2];
+                    f_out[slot + 3] = folded_f[3];
+                }
 
                 let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
                 let direct1 =
@@ -7329,6 +7424,24 @@ fn materialize_direct_fold8(
             }
         }
         super::round0_deferred(f_out, b_out)
+    }
+        };
+    }
+    let fold8_block_incumbent = fold8_block_body!(false, 64);
+    let fold8_block_whole = fold8_block_body!(true, 64);
+    let fold8_block_whole_tail = fold8_block_body!(true, 57);
+    let fold8_block = |scratch: &mut Vec<F128>,
+                       block: usize,
+                       b_out: &mut [F128],
+                       f_out: &mut [F128]|
+     -> (F128, F128) {
+        if whole_fold64 && odd_slot_live == 57 {
+            fold8_block_whole_tail(scratch, block, b_out, f_out)
+        } else if whole_fold64 {
+            fold8_block_whole(scratch, block, b_out, f_out)
+        } else {
+            fold8_block_incumbent(scratch, block, b_out, f_out)
+        }
     };
     // The same block body when `f_out` already holds the GPU's witness fold
     // (an exact field sum, bit-identical to the banked CPU fold): only the
