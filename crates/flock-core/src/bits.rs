@@ -207,6 +207,79 @@ pub unsafe fn transpose_8_row_pairs_to_regs(
     }
 }
 
+/// Transpose eight 128-bit blocks into two consecutive 64-byte bit rows.
+/// Each input register holds two adjacent words of one block. Keeping
+/// that layout through the bit swaps avoids the eight input lane-pair
+/// transposes and the packed-half distance-one variable shifts.
+///
+/// # Safety
+/// AArch64 register operations and reads of constant lookup tables only.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn transpose_8_two_word_blocks_to_regs(
+    rows: [core::arch::aarch64::uint8x16_t; 8],
+) -> [core::arch::aarch64::uint8x16_t; 8] {
+    use core::arch::aarch64::*;
+    const IDX0: [u8; 16] = [0, 16, 32, 48, 1, 17, 33, 49, 2, 18, 34, 50, 3, 19, 35, 51];
+    const IDX1: [u8; 16] = [4, 20, 36, 52, 5, 21, 37, 53, 6, 22, 38, 54, 7, 23, 39, 55];
+    const IDX2: [u8; 16] = [8, 24, 40, 56, 9, 25, 41, 57, 10, 26, 42, 58, 11, 27, 43, 59];
+    const IDX3: [u8; 16] = [12, 28, 44, 60, 13, 29, 45, 61, 14, 30, 46, 62, 15, 31, 47, 63];
+    unsafe {
+        let [r0, r1, r2, r3, r4, r5, r6, r7] = rows;
+        let a0 = vsliq_n_u8::<4>(r0, r4);
+        let a4 = vsriq_n_u8::<4>(r4, r0);
+        let a1 = vsliq_n_u8::<4>(r1, r5);
+        let a5 = vsriq_n_u8::<4>(r5, r1);
+        let a2 = vsliq_n_u8::<4>(r2, r6);
+        let a6 = vsriq_n_u8::<4>(r6, r2);
+        let a3 = vsliq_n_u8::<4>(r3, r7);
+        let a7 = vsriq_n_u8::<4>(r7, r3);
+        let keep2 = vdupq_n_u8(0x33);
+        let b0 = vbslq_u8(keep2, a0, vshlq_n_u8::<2>(a2));
+        let b2 = vbslq_u8(keep2, vshrq_n_u8::<2>(a0), a2);
+        let b1 = vbslq_u8(keep2, a1, vshlq_n_u8::<2>(a3));
+        let b3 = vbslq_u8(keep2, vshrq_n_u8::<2>(a1), a3);
+        let b4 = vbslq_u8(keep2, a4, vshlq_n_u8::<2>(a6));
+        let b6 = vbslq_u8(keep2, vshrq_n_u8::<2>(a4), a6);
+        let b5 = vbslq_u8(keep2, a5, vshlq_n_u8::<2>(a7));
+        let b7 = vbslq_u8(keep2, vshrq_n_u8::<2>(a5), a7);
+        let keep1 = vdupq_n_u8(0x55);
+        let c0 = vbslq_u8(keep1, b0, vshlq_n_u8::<1>(b1));
+        let c1 = vbslq_u8(keep1, vshrq_n_u8::<1>(b0), b1);
+        let c2 = vbslq_u8(keep1, b2, vshlq_n_u8::<1>(b3));
+        let c3 = vbslq_u8(keep1, vshrq_n_u8::<1>(b2), b3);
+        let c4 = vbslq_u8(keep1, b4, vshlq_n_u8::<1>(b5));
+        let c5 = vbslq_u8(keep1, vshrq_n_u8::<1>(b4), b5);
+        let c6 = vbslq_u8(keep1, b6, vshlq_n_u8::<1>(b7));
+        let c7 = vbslq_u8(keep1, vshrq_n_u8::<1>(b6), b7);
+        let tab_lo = uint8x16x4_t(c0, c1, c2, c3);
+        let tab_hi = uint8x16x4_t(c4, c5, c6, c7);
+        let idx0 = vld1q_u8(IDX0.as_ptr());
+        let l0 = vreinterpretq_u32_u8(vqtbl4q_u8(tab_lo, idx0));
+        let h0 = vreinterpretq_u32_u8(vqtbl4q_u8(tab_hi, idx0));
+        let idx1 = vld1q_u8(IDX1.as_ptr());
+        let l1 = vreinterpretq_u32_u8(vqtbl4q_u8(tab_lo, idx1));
+        let h1 = vreinterpretq_u32_u8(vqtbl4q_u8(tab_hi, idx1));
+        let idx2 = vld1q_u8(IDX2.as_ptr());
+        let l2 = vreinterpretq_u32_u8(vqtbl4q_u8(tab_lo, idx2));
+        let h2 = vreinterpretq_u32_u8(vqtbl4q_u8(tab_hi, idx2));
+        let idx3 = vld1q_u8(IDX3.as_ptr());
+        let l3 = vreinterpretq_u32_u8(vqtbl4q_u8(tab_lo, idx3));
+        let h3 = vreinterpretq_u32_u8(vqtbl4q_u8(tab_hi, idx3));
+        // Result register order: four registers per word, low word first.
+        [
+            vreinterpretq_u8_u32(vzip1q_u32(l0, h0)),
+            vreinterpretq_u8_u32(vzip2q_u32(l0, h0)),
+            vreinterpretq_u8_u32(vzip1q_u32(l1, h1)),
+            vreinterpretq_u8_u32(vzip2q_u32(l1, h1)),
+            vreinterpretq_u8_u32(vzip1q_u32(l2, h2)),
+            vreinterpretq_u8_u32(vzip2q_u32(l2, h2)),
+            vreinterpretq_u8_u32(vzip1q_u32(l3, h3)),
+            vreinterpretq_u8_u32(vzip2q_u32(l3, h3)),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +431,54 @@ mod tests {
         }
         check(&[0u64; 8], 1, 0);
         check(&[u64::MAX; 8], 1, 0);
+    }
+
+    /// The pair helper must preserve every bit, lane and word position.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn two_word_block_transpose_matches_naive() {
+        use core::arch::aarch64::*;
+        fn check(input: &[[u8; 16]; 8]) {
+            let mut expected = [0u8; 128];
+            for byte in 0..16 {
+                for bit in 0..8 {
+                    for lane in 0..8 {
+                        expected[byte * 8 + bit] |= ((input[lane][byte] >> bit) & 1) << lane;
+                    }
+                }
+            }
+            let mut got = [0u8; 128];
+            unsafe {
+                let rows = input.map(|row| vld1q_u8(row.as_ptr()));
+                let output = super::transpose_8_two_word_blocks_to_regs(rows);
+                for (i, register) in output.into_iter().enumerate() {
+                    vst1q_u8(got.as_mut_ptr().add(i * 16), register);
+                }
+            }
+            assert_eq!(got, expected);
+        }
+        for bit in 0..1024 {
+            let mut input = [[0u8; 16]; 8];
+            input[bit / 128][bit % 128 / 8] = 1 << (bit % 8);
+            check(&input);
+            for row in &mut input {
+                for byte in row { *byte = !*byte; }
+            }
+            check(&input);
+        }
+        check(&[[0u8; 16]; 8]);
+        check(&[[255u8; 16]; 8]);
+        let mut state = 0x47f73ab9128u64;
+        for _ in 0..64 {
+            let mut input = [[0u8; 16]; 8];
+            for row in &mut input {
+                for byte in row {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    *byte = (state >> 32) as u8;
+                }
+            }
+            check(&input);
+        }
     }
 
     /// Transposing twice is the identity.

@@ -1278,6 +1278,35 @@ unsafe fn emit_root_rows_ab_s256(a: *const u8, b: *const u8, dst: *mut u8, ops: 
         }
     }
 
+    #[inline(always)]
+    unsafe fn put_two(dst: *mut u8, r: [uint64x2_t; 8]) {
+        unsafe {
+            let [y0, y1, y2, y3, y4, y5, y6, y7] =
+                flock_core::bits::transpose_8_two_word_blocks_to_regs([
+                    vreinterpretq_u8_u64(r[0]), vreinterpretq_u8_u64(r[1]),
+                    vreinterpretq_u8_u64(r[2]), vreinterpretq_u8_u64(r[3]),
+                    vreinterpretq_u8_u64(r[4]), vreinterpretq_u8_u64(r[5]),
+                    vreinterpretq_u8_u64(r[6]), vreinterpretq_u8_u64(r[7]),
+                ]);
+            core::arch::asm!(
+                "stnp {y0:q}, {y1:q}, [{dst}]",
+                "stnp {y2:q}, {y3:q}, [{dst}, #32]",
+                "stnp {y4:q}, {y5:q}, [{dst}, #64]",
+                "stnp {y6:q}, {y7:q}, [{dst}, #96]",
+                dst = in(reg) dst,
+                y0 = in(vreg) y0, y1 = in(vreg) y1,
+                y2 = in(vreg) y2, y3 = in(vreg) y3,
+                y4 = in(vreg) y4, y5 = in(vreg) y5,
+                y6 = in(vreg) y6, y7 = in(vreg) y7,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    // One cached switch check per group; any value restores the accepted pair path.
+    static PAIRED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let paired = *PAIRED.get_or_init(|| std::env::var_os("FLOCK_NO_AB_PAIR_TRANSPOSE").is_none());
+
     let mut out = dst;
     for op in ops {
         unsafe {
@@ -1286,6 +1315,11 @@ unsafe fn emit_root_rows_ab_s256(a: *const u8, b: *const u8, dst: *mut u8, ops: 
                 StripeRowKind::Pair | StripeRowKind::Split => {
                     let (z0, z1, z2, z3) = (q(pa, pb, 0), q(pa, pb, 1), q(pa, pb, 2), q(pa, pb, 3));
                     let (z4, z5, z6, z7) = (q(pa, pb, 4), q(pa, pb, 5), q(pa, pb, 6), q(pa, pb, 7));
+                    if op.kind == StripeRowKind::Pair && paired {
+                        put_two(out, [z0, z1, z2, z3, z4, z5, z6, z7]);
+                        out = out.add(128);
+                        continue;
+                    }
                     let lo = [vtrn1q_u64(z0, z1), vtrn1q_u64(z2, z3), vtrn1q_u64(z4, z5), vtrn1q_u64(z6, z7)];
                     let hi = [vtrn2q_u64(z0, z1), vtrn2q_u64(z2, z3), vtrn2q_u64(z4, z5), vtrn2q_u64(z6, z7)];
                     if op.kind == StripeRowKind::Pair {
