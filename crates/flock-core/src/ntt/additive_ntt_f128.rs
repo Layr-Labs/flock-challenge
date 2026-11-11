@@ -520,6 +520,30 @@ pub struct AdditiveNttF128 {
     precomputed_twiddles: Option<Arc<[F128]>>,
 }
 
+static DEEP_PASS_ORDERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn deep_pass_ordered() -> bool {
+    DEEP_PASS_ORDERED.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// While alive, the cache-local deep pass hands out its sub-NTTs in index
+/// order (scheduling only; every value is unchanged).
+#[must_use]
+pub(crate) struct DeepPassOrdered(());
+
+impl DeepPassOrdered {
+    pub(crate) fn scope() -> Self {
+        DEEP_PASS_ORDERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Drop for DeepPassOrdered {
+    fn drop(&mut self) {
+        DEEP_PASS_ORDERED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl AdditiveNttF128 {
     /// Construct an NTT from an explicit F_2-basis.
     pub fn new(basis: &[F128]) -> Self {
@@ -1965,10 +1989,7 @@ impl AdditiveNttF128 {
         let range_start = sub_start * sub_elems;
         let range_end = sub_end * sub_elems;
 
-        data[range_start..range_end]
-            .par_chunks_mut(sub_elems)
-            .enumerate()
-            .for_each(|(local_sub_idx, sub_data)| {
+        let body = |local_sub_idx: usize, sub_data: &mut [F128]| {
                 let sub_idx = sub_start + local_sub_idx;
                 let mut layer = n_top;
                 while layer + 1 < log_d {
@@ -2042,7 +2063,31 @@ impl AdditiveNttF128 {
                     }
                 }
                 finish_chunk(sub_idx * sub_elems, sub_data);
+            };
+        if deep_pass_ordered() {
+            // Same tasks, same per-chunk work; each task takes the next
+            // sub-NTT in index order, so chunks finish roughly in order
+            // (a consumer of `finish_chunk` can act on finished ranges while
+            // the pass is still running). The chunks are disjoint.
+            struct Base(*mut F128);
+            unsafe impl Sync for Base {}
+            unsafe impl Send for Base {}
+            let base = Base(data[range_start..range_end].as_mut_ptr());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            (0..sub_end - sub_start).into_par_iter().for_each(|_| {
+                let local = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let b = &base;
+                // SAFETY: `local` is handed out once; chunk `local` is
+                // `sub_elems` elements inside the borrowed range.
+                let sub_data = unsafe { core::slice::from_raw_parts_mut(b.0.add(local * sub_elems), sub_elems) };
+                body(local, sub_data);
             });
+        } else {
+            data[range_start..range_end]
+                .par_chunks_mut(sub_elems)
+                .enumerate()
+                .for_each(|(local_sub_idx, sub_data)| body(local_sub_idx, sub_data));
+        }
     }
 
     /// Scalar reference implementation. Used as the test oracle and on
