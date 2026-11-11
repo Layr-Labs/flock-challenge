@@ -17719,16 +17719,23 @@ static inline uint4 gf_shl32(uint4 a) {
     return r;
 }
 
+// Generator c_i x^(8k) of table k for challenge i: the challenge itself
+// (consts[i]) for k = 0, the host-computed multiple consts[6k + i]
+// for k = 1..3 (see `zf_consts`).
+static inline uint4 zf_gen(device const uint4* consts, uint i, uint k)
+{
+    return k == 0u ? consts[i] : consts[6u * k + i];
+}
+
 // tab[256 k + b] = b * c * x^(8k), k < 4. Thread (k = lid / 16, u = lid % 16)
-// writes entries (u << 4) | j, j < 16, of table k.
-static inline void zf_build4(threadgroup uint4* tab, uint4 c, uint lid)
+// writes entries (u << 4) | j, j < 16, of table k. Its generator c x^(8k) is
+// read precomputed instead of running an 8k-step gf_mulx chain per group.
+static inline void zf_build4(threadgroup uint4* tab, device const uint4* consts, uint i, uint lid)
 {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint k = lid >> 4;
     const uint u = lid & 15u;
-    uint4 g = c;
-    for (uint m = 0; m < 8u * k; m++) { g = gf_mulx(g); }
-    uint4 e0 = g;
+    uint4 e0 = zf_gen(consts, i, k);
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
     uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
     uint4 H = uint4(0u);
@@ -17769,7 +17776,7 @@ static inline void zf_mul4_x2(uint4 va, uint4 vb,
 #define ZF_LEVEL(J)                                                    \
     {                                                                  \
         constexpr uint st = 1u << (J);                                 \
-        zf_build4(tab, consts[2u + (J)], lid);                         \
+        zf_build4(tab, consts, 2u + (J), lid);                         \
         for (uint e = 0u; e < 16u; e += 2u * st) {                     \
             uint4 pa;                                                  \
             uint4 pb;                                                  \
@@ -17809,7 +17816,7 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
     ZF_LEVEL(3u)
     uint4 ra = ea[0];
     uint4 rb = eb[0];
-    zf_build4(tab, consts[0], lid);
+    zf_build4(tab, consts, 0u, lid);
     {
         uint4 sa = simd_shuffle_xor(ra, ushort(1));
         uint4 sb = simd_shuffle_xor(rb, ushort(1));
@@ -17821,7 +17828,7 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
         ra = la ^ pa;
         rb = lb ^ pb;
     }
-    zf_build4(tab, consts[1], lid);
+    zf_build4(tab, consts, 1u, lid);
     {
         uint4 sa = simd_shuffle_xor(ra, ushort(2));
         uint4 sb = simd_shuffle_xor(rb, ushort(2));
@@ -17843,18 +17850,35 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
         /// Outputs folded by one 64-thread group.
         pub(crate) const ZF_OUTS_PER_TG: usize = 32;
 
-        pub(crate) const ZF_CONSTS_BYTES: usize = 12 * 16;
+        /// Entries of the z-fold constant buffer: the six challenges `c_i`
+        /// (`consts[i]`), then six entries per exponent `c_i x^(8k)` for
+        /// k = 1..3 at `consts[6k + i]` (the W32 table generators).
+        /// The first 12 entries retain the accepted 16-bit x8 fallback layout.
+        pub(crate) const ZF_CONSTS_LEN: usize = 6 + 6 * 3;
+        pub(crate) const ZF_CONSTS_BYTES: usize = ZF_CONSTS_LEN * 16;
 
-        pub(crate) fn zf_consts(challenges: &[F128; 6]) -> [F128; 12] {
-            std::array::from_fn(|i| {
-                let mut v = challenges[i % 6];
-                if i >= 6 {
+        /// The z-fold constant buffer for `challenges`, built once per launch
+        /// on the host; each challenge's multiples are one `mul_by_x` run.
+        pub(crate) fn zf_consts(challenges: &[F128; 6]) -> [F128; ZF_CONSTS_LEN] {
+            let mut out = [F128::ZERO; ZF_CONSTS_LEN];
+            out[..6].copy_from_slice(challenges);
+            for (i, &c) in challenges.iter().enumerate() {
+                let mut v = c;
+                for k in 1..4 {
                     for _ in 0..8 {
                         v = crate::field::mul_by_x(v);
                     }
+                    out[6 * k + i] = v;
                 }
-                v
-            })
+            }
+            out
+        }
+
+        /// Kill switch for the word-Horner z-fold (`FLOCK_NO_GPU_ZF_W32`, any
+        /// value): the 16-bit `zf_fold8` kernel. Both write the same bytes.
+        fn zf_w32_enabled() -> bool {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_ZF_W32").is_none())
         }
 
         #[repr(C)]
@@ -17925,7 +17949,15 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
             unsafe {
                 let pool = gpu.pool_push();
                 let r = (|| -> Result<ZfState, String> {
-                    let pso = compile_supplemental_pipeline(gpu, ZF_MSL_SOURCE, "zf_fold8")?;
+                    // Word-Horner kernel by default; a compile failure (or
+                    // the kill switch) keeps the 16-bit kernel. Both bind the
+                    // same buffers; the first 12 constants preserve the accepted x8 fallback.
+                    let pso = match zf_w32_enabled().then(|| {
+                        compile_supplemental_pipeline(gpu, ZF_MSL_SOURCE_W32, "zf_fold8_w32")
+                    }) {
+                        Some(Ok(pso)) => pso,
+                        _ => compile_supplemental_pipeline(gpu, ZF_MSL_SOURCE, "zf_fold8")?,
+                    };
                     let consts = gpu.new_buffer(ZF_CONSTS_BYTES)?;
                     let cut = gpu.new_buffer(16)?;
                     let ev: Id = send!(
@@ -18767,6 +18799,43 @@ mod tests {
             for i in 0..6 {
                 assert_eq!(k[i], ch[i], "round {round} challenge {i}");
                 assert_eq!(k[6 + i], ch[i] * x8, "round {round} x^8 multiple {i}");
+            }
+        }
+    }
+
+    /// Host constant buffer of the z fold: the six challenges, then each
+    /// challenge's W32 table generators `c x^8, c x^16, c x^24` (full field
+    /// products as the reference).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zf_consts_hold_challenges_then_w32_generators() {
+        use imp::zfold;
+        let mut rng = Rng::new(0x2F32);
+        for round in 0..4 {
+            let ch: [F128; 6] = match round {
+                0 => [F128::ZERO; 6],
+                1 => [F128::ONE; 6],
+                2 => std::array::from_fn(|i| F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX >> i,
+                }),
+                _ => std::array::from_fn(|_| rng.f128()),
+            };
+            let k = zfold::zf_consts(&ch);
+            assert_eq!(core::mem::size_of_val(&k), zfold::ZF_CONSTS_BYTES);
+            for i in 0..6 {
+                assert_eq!(k[i], ch[i], "round {round} challenge {i}");
+                for g in 1..4 {
+                    let x8g = F128 {
+                        lo: 1 << (8 * g),
+                        hi: 0,
+                    };
+                    assert_eq!(
+                        k[6 * g + i],
+                        ch[i] * x8g,
+                        "round {round} gen {i}.{g}"
+                    );
+                }
             }
         }
     }
