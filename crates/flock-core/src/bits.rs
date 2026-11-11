@@ -130,6 +130,30 @@ pub unsafe fn transpose_8_strided_and_u64s_to_regs(
     }
 }
 
+///
+/// # Safety
+/// read for every `l < 8`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn transpose_8_strided_and_u64_pairs_to_regs(
+    a: *const u64,
+    b: *const u64,
+    stride: usize,
+) -> [[core::arch::aarch64::uint8x16_t; 4]; 2] {
+    use core::arch::aarch64::*;
+    unsafe {
+        let z = |l: usize| vandq_u64(vld1q_u64(a.add(l * stride)), vld1q_u64(b.add(l * stride)));
+        let (z0, z1, z2, z3) = (z(0), z(1), z(2), z(3));
+        let (z4, z5, z6, z7) = (z(4), z(5), z(6), z(7));
+        let w0 = |x, y| vreinterpretq_u8_u64(vzip1q_u64(x, y));
+        let w1 = |x, y| vreinterpretq_u8_u64(vzip2q_u64(x, y));
+        [
+            transpose_8_row_pairs_to_regs(w0(z0, z1), w0(z2, z3), w0(z4, z5), w0(z6, z7)),
+            transpose_8_row_pairs_to_regs(w1(z0, z1), w1(z2, z3), w1(z4, z5), w1(z6, z7)),
+        ]
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn lane_pair(lo: *const u64, hi: *const u64) -> core::arch::aarch64::uint8x16_t {

@@ -835,9 +835,44 @@ unsafe fn fill_root_lincheck_stripe_group_ab(
     rows: &[crate::r1cs_hashes::blake3::RootRow],
 ) {
     assert!(rows.len() * 64 <= stripe.len());
-    for (j, row) in rows.iter().enumerate() {
+    let mut j = 0;
+    while j < rows.len() {
+        let row = rows[j];
         // Reads stay inside each block: lo_word (+1 iff hi_mask != 0) < u64_per_block.
         assert!(row.lo_word + usize::from(row.hi_mask != 0) < u64_per_block);
+        #[cfg(target_arch = "aarch64")]
+        if let Some(next) = rows.get(j + 1) {
+            if row.lo_mask == u64::MAX && next.lo_mask == u64::MAX && next.lo_word == row.lo_word + 1 {
+                assert!(next.lo_word < u64_per_block);
+                let dst = &mut stripe[j * 64..j * 64 + 128];
+                unsafe {
+                    let [[y0, y1, y2, y3], [y4, y5, y6, y7]] =
+                        flock_core::bits::transpose_8_strided_and_u64_pairs_to_regs(
+                            a.add(row.lo_word),
+                            b.add(row.lo_word),
+                            u64_per_block,
+                        );
+                    core::arch::asm!(
+                        "stnp {y0:q}, {y1:q}, [{dst}]",
+                        "stnp {y2:q}, {y3:q}, [{dst}, #32]",
+                        "stnp {y4:q}, {y5:q}, [{dst}, #64]",
+                        "stnp {y6:q}, {y7:q}, [{dst}, #96]",
+                        dst = in(reg) dst.as_mut_ptr(),
+                        y0 = in(vreg) y0,
+                        y1 = in(vreg) y1,
+                        y2 = in(vreg) y2,
+                        y3 = in(vreg) y3,
+                        y4 = in(vreg) y4,
+                        y5 = in(vreg) y5,
+                        y6 = in(vreg) y6,
+                        y7 = in(vreg) y7,
+                        options(nostack, preserves_flags)
+                    );
+                }
+                j += 2;
+                continue;
+            }
+        }
         let dst = &mut stripe[j * 64..j * 64 + 64];
         #[cfg(target_arch = "aarch64")]
         // SAFETY: every read is inside the eight blocks (assert above and the
@@ -890,6 +925,7 @@ unsafe fn fill_root_lincheck_stripe_group_ab(
             flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
             dst.copy_from_slice(&transposed);
         }
+        j += 1;
     }
 }
 
