@@ -2505,7 +2505,7 @@ unsafe fn store_row_64(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn shift_reduce_inner_a_only_const_b(
+fn shift_reduce_inner_a_only_const_b<const V: u8>(
     a_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
     byte_base_b: usize,
@@ -2517,6 +2517,11 @@ fn shift_reduce_inner_a_only_const_b(
 
     let table_base = inv_table.data_ptr();
     let half_swapped_table_base = inv_table.half_swapped_data_ptr();
+    let kplain = if V & ABV_KARA != 0 {
+        ab_kara_tables(inv_table)
+    } else {
+        core::ptr::null()
+    };
     unsafe {
         let mut acc0_lo = vdupq_n_u16(0);
         let mut acc0_hi = vdupq_n_u16(0);
@@ -2534,7 +2539,7 @@ fn shift_reduce_inner_a_only_const_b(
                     a_packed.as_ptr().add(off).cast::<u64>(),
                 ));
                 let (d0, d1, d2, d3) =
-                    apply_word_into_4_regs(table_base, half_swapped_table_base, word);
+                    apply_word_into_4_regs_v::<V, false>(table_base, half_swapped_table_base, kplain, word);
                 acc0_lo = veorq_u16(acc0_lo, vshll_n_u8::<$k>(vget_low_u8(d0)));
                 acc0_hi = veorq_u16(acc0_hi, vshll_n_u8::<$k>(vget_high_u8(d0)));
                 acc1_lo = veorq_u16(acc1_lo, vshll_n_u8::<$k>(vget_low_u8(d1)));
@@ -3105,6 +3110,16 @@ pub(crate) const ABV_INLINE_WINDOW: u8 = 2;
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_KARA_UNSCALED: u8 = 4;
 
+/// Kill switch for the unscaled Karatsuba loads in the generic h4 rows only:
+/// `FLOCK_NO_ZC_AB_H4_UNSCALED=1` keeps those rows on the scaled-index form.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_h4_unscaled_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_AB_H4_UNSCALED").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn ab_kara_unscaled_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -3620,7 +3635,25 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
     if check_all_ones {
         let and_all = bw(0) & bw(1) & bw(2) & bw(3) & bw(4) & bw(5) & bw(6) & bw(7);
         if and_all == u64::MAX {
-            shift_reduce_inner_a_only_const_b(a_packed, inv_table, byte_base_b, out, nt_store);
+            if ab_kara_enabled() && ab_kara_unscaled_enabled() {
+                shift_reduce_inner_a_only_const_b::<{ ABV_KARA | ABV_KARA_UNSCALED }>(
+                    a_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            } else if ab_kara_enabled() {
+                shift_reduce_inner_a_only_const_b::<{ ABV_KARA }>(
+                    a_packed,
+                    inv_table,
+                    byte_base_b,
+                    out,
+                    nt_store,
+                );
+            } else {
+                shift_reduce_inner_a_only_const_b::<0>(a_packed, inv_table, byte_base_b, out, nt_store);
+            }
             return;
         }
     }
@@ -3858,7 +3891,21 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         }
     }
     if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-        if ab_kara_enabled() {
+        // The generic h4 rows take the same unscaled byte-offset loads as the
+        // static-B and mixed rows when that form is on (013d25df's switch
+        // `FLOCK_NO_ZC_AB_KARA_UNSCALED=1` restores the scaled-index form
+        // here as well); same table entries, same XOR order, same bytes.
+        if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_h4_unscaled_enabled() {
+            shift_reduce_inner_ab_fused_neon_h4::<{ ABV_KARA | ABV_KARA_UNSCALED }>(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                out,
+                nt_store,
+            );
+        } else if ab_kara_enabled() {
             shift_reduce_inner_ab_fused_neon_h4::<{ ABV_KARA }>(
                 a_packed,
                 b_packed,
