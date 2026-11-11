@@ -92,8 +92,8 @@ use kernels::aarch64::fold_round2_compact_chunk_neon_anchors_only_8;
 #[cfg(target_arch = "aarch64")]
 use kernels::aarch64::{
     fold_and_message_aarch64, fold_compact_chunk_neon_unchecked_8, fold_compact_stream_chunk_neon,
-    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_horner_8,
-    fold_round2_compact_chunk_neon_lookahead_8, fold_round2_compact_chunk_neon_unchecked_8,
+    fold_round2_chunk_neon_unchecked_8, fold_round2_compact_chunk_neon_horner_8g, fold_round2_compact_chunk_neon_lookahead_8,
+    fold_round2_compact_chunk_neon_lookahead_8g, fold_round2_compact_chunk_neon_unchecked_8,
     fold_round2_compact_stream_chunk_neon, fold2_and_message_aarch64,
     fold2_and_message_lookahead_aarch64, fold2_compact_and_round4_chunk_neon_8,
     fold2_compact_and_round45_chunk_neon_8,
@@ -130,6 +130,28 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 #[cfg(target_arch = "aarch64")]
 fn r2_degen_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
+}
+
+/// Kill switch for the general-register delta-pair store in the round-two
+/// kernels (`store_delta_pair_gpr`): `FLOCK_NO_R2_GPR_DELTA=1` restores the
+/// q-register form. Same bytes stored either way.
+#[cfg(target_arch = "aarch64")]
+fn r2_gpr_delta_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_R2_GPR_DELTA").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
+/// Kill switch for the aligned-padding specialisation of the round-two Horner
+/// kernel's shifted groups: `FLOCK_NO_R2_HORNER_AL=1` restores the per-group
+/// pad predicates and per-pair degenerate-flag test. Same outputs.
+#[cfg(target_arch = "aarch64")]
+fn r2_horner_aligned_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_R2_HORNER_AL").is_none_or(|v| v != *"1")
+    });
+    *ON
 }
 
 /// Kill switch for the peeled first group of the round-two Horner kernel:
@@ -1941,6 +1963,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
+    #[cfg(target_arch = "aarch64")]
+    let r2_dg = r2_gpr_delta_enabled();
+    #[cfg(target_arch = "aarch64")]
+    let r2_al = r2_horner_aligned_enabled();
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and both partial slots.
@@ -1965,7 +1991,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
                 if full {
-                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                    if r2_dg {
+                    fold_round2_compact_chunk_neon_lookahead_8g::<true, false, true>(
                         t,
                         ap,
                         bp,
@@ -1981,9 +2008,29 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         skip_dead,
                         out.as_mut_ptr(),
                     );
+                    } else {
+                    fold_round2_compact_chunk_neon_lookahead_8g::<true, false, false>(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        skip_dead,
+                        out.as_mut_ptr(),
+                    );
+                    }
                 } else if odd_on_gpu && horner_weights {
                     if horner_skip_first {
-                        fold_round2_compact_chunk_neon_horner_8::<true>(
+                        if r2_dg {
+                        if r2_al {
+                        fold_round2_compact_chunk_neon_horner_8g::<true, true, true>(
                             t,
                             ap,
                             bp,
@@ -1998,8 +2045,62 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             skip_dead,
                             out.as_mut_ptr(),
                         );
+                        } else {
+                        fold_round2_compact_chunk_neon_horner_8g::<true, true, false>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        );
+                        }
+                        } else {
+                        if r2_al {
+                        fold_round2_compact_chunk_neon_horner_8g::<true, false, true>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        );
+                        } else {
+                        fold_round2_compact_chunk_neon_horner_8g::<true, false, false>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        );
+                        }
+                        }
                     } else {
-                        fold_round2_compact_chunk_neon_horner_8::<false>(
+                        if r2_dg {
+                        if r2_al {
+                        fold_round2_compact_chunk_neon_horner_8g::<false, true, true>(
                             t,
                             ap,
                             bp,
@@ -2014,6 +2115,58 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             skip_dead,
                             out.as_mut_ptr(),
                         );
+                        } else {
+                        fold_round2_compact_chunk_neon_horner_8g::<false, true, false>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        );
+                        }
+                        } else {
+                        if r2_al {
+                        fold_round2_compact_chunk_neon_horner_8g::<false, false, true>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        );
+                        } else {
+                        fold_round2_compact_chunk_neon_horner_8g::<false, false, false>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        );
+                        }
+                        }
                     }
                     let eq_h = eq_hi[x_hi];
                     *partials_base.ptr().add(x_hi) = (F128::ZERO, F128::ZERO);
@@ -2027,7 +2180,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                     ];
                     return;
                 } else if odd_on_gpu {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
+                    if r2_dg {
+                    fold_round2_compact_chunk_neon_lookahead_8g::<false, true, true>(
                         t,
                         ap,
                         bp,
@@ -2043,8 +2197,27 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         skip_dead,
                         out.as_mut_ptr(),
                     );
+                    } else {
+                    fold_round2_compact_chunk_neon_lookahead_8g::<false, true, false>(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        skip_dead,
+                        out.as_mut_ptr(),
+                    );
+                    }
                 } else {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
+                    if r2_dg {
+                    fold_round2_compact_chunk_neon_lookahead_8g::<false, false, true>(
                         t,
                         ap,
                         bp,
@@ -2060,6 +2233,24 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         skip_dead,
                         out.as_mut_ptr(),
                     );
+                    } else {
+                    fold_round2_compact_chunk_neon_lookahead_8g::<false, false, false>(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        skip_dead,
+                        out.as_mut_ptr(),
+                    );
+                    }
                 }
             }
         }
@@ -6502,3 +6693,145 @@ mod tests {
 // r581: source-distinct cadence marker; no semantic effect.
 
 // r584: source-distinct cadence marker
+
+/// Lane az: single-core exactness + timing probes of the round-two kernel
+/// forms on real dumped inputs (`AZ_DIR` = a `FLOCK_ZK_DUMP` directory from
+/// the fb-zk probe tree: r2_a.bin, r2_b.bin, r2_table.bin, r2_eqlo.bin,
+/// r2_meta.txt). Run with `--ignored`.
+#[cfg(all(test, target_arch = "aarch64", target_feature = "sha3"))]
+mod az_probe {
+    use super::*;
+    use std::time::Instant;
+
+    fn f128s(b: &[u8]) -> Vec<F128> {
+        b.chunks_exact(16)
+            .map(|c| F128 {
+                lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+            })
+            .collect()
+    }
+
+    fn lq(v: &mut [f64]) -> (f64, f64) {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (v[v.len() / 4], v[v.len() / 2])
+    }
+
+    type R2Fn = unsafe fn(
+        *const u8, *const u8, *const u8, *mut F128, *mut u8, *const F128, usize, usize, usize,
+        usize, bool, bool, bool, *mut F128,
+    );
+
+    #[test]
+    #[ignore]
+    fn az_r2_forms() {
+        std::thread::spawn(|| {
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
+            }
+            // SAFETY: plain libSystem call on this thread (P-core QoS).
+            unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+            let d: std::path::PathBuf = std::env::var_os("AZ_DIR").expect("AZ_DIR").into();
+            let meta: std::collections::HashMap<String, String> =
+                std::fs::read_to_string(d.join("r2_meta.txt"))
+                    .unwrap()
+                    .lines()
+                    .filter_map(|l| l.split_once('=').map(|(k, v)| (k.into(), v.into())))
+                    .collect();
+            let g = |k: &str| meta[k].parse::<usize>().unwrap();
+            let (lo_size, x0, nck) = (g("lo_size"), g("x0"), g("nck"));
+            let degen = meta["degen"] == "true";
+            let a = std::fs::read(d.join("r2_a.bin")).unwrap();
+            let b = std::fs::read(d.join("r2_b.bin")).unwrap();
+            let table = f128s(&std::fs::read(d.join("r2_table.bin")).unwrap());
+            let eq_lo = f128s(&std::fs::read(d.join("r2_eqlo.bin")).unwrap());
+            let tp = table.as_ptr().cast::<u8>();
+            let row_bytes = lo_size * 2 * 8;
+            let anc_len = 2 * lo_size;
+            let del_len = 16 * lo_size;
+            let forms: Vec<(&str, R2Fn)> = vec![
+                ("lookahead<T,F> incumbent", fold_round2_compact_chunk_neon_lookahead_8g::<true, false, false>),
+                ("lookahead<T,F> gpr delta", fold_round2_compact_chunk_neon_lookahead_8g::<true, false, true>),
+            ];
+            type HFn = unsafe fn(
+                *const u8, *const u8, *const u8, *mut F128, *mut u8, *const F128, usize, usize,
+                usize, usize, bool, bool, *mut F128,
+            );
+            let hforms: Vec<(&str, HFn)> = vec![
+                ("horner<T> incumbent", fold_round2_compact_chunk_neon_horner_8g::<true, false, false>),
+                ("horner<T> gpr delta", fold_round2_compact_chunk_neon_horner_8g::<true, true, false>),
+                ("horner<T> gpr delta + AL", fold_round2_compact_chunk_neon_horner_8g::<true, true, true>),
+            ];
+            // Run one form over all dumped chunks; returns (anchors, deltas, outs).
+            let run_l = |f: R2Fn, skip_dead: bool| {
+                let mut anc = vec![F128::ZERO; anc_len * nck];
+                let mut del = vec![0u8; del_len * nck];
+                let mut outs = vec![F128::ZERO; 8 * nck];
+                for c in 0..nck {
+                    unsafe {
+                        f(tp, a.as_ptr().add(c * row_bytes), b.as_ptr().add(c * row_bytes),
+                          anc.as_mut_ptr().add(c * anc_len), del.as_mut_ptr().add(c * del_len),
+                          eq_lo.as_ptr(), lo_size, (x0 + c) * lo_size, 127, 121, degen, true,
+                          skip_dead, outs.as_mut_ptr().add(8 * c));
+                    }
+                }
+                (anc, del, outs)
+            };
+            let run_h = |f: HFn, skip_dead: bool| {
+                let mut anc = vec![F128::ZERO; anc_len * nck];
+                let mut del = vec![0u8; del_len * nck];
+                let mut outs = vec![F128::ZERO; 8 * nck];
+                for c in 0..nck {
+                    unsafe {
+                        f(tp, a.as_ptr().add(c * row_bytes), b.as_ptr().add(c * row_bytes),
+                          anc.as_mut_ptr().add(c * anc_len), del.as_mut_ptr().add(c * del_len),
+                          eq_lo.as_ptr(), lo_size, (x0 + c) * lo_size, 127, 121, degen,
+                          skip_dead, outs.as_mut_ptr().add(8 * c));
+                    }
+                }
+                (anc, del, outs)
+            };
+            for sd in [false, true] {
+                let w = run_l(forms[0].1, sd);
+                for (n, f) in &forms[1..] {
+                    let got = run_l(*f, sd);
+                    assert!(w.0 == got.0 && w.1 == got.1 && w.2 == got.2, "{n} differs (skip_dead {sd})");
+                }
+                let w = run_h(hforms[0].1, sd);
+                for (n, f) in &hforms[1..] {
+                    let got = run_h(*f, sd);
+                    assert!(w.0 == got.0 && w.1 == got.1 && w.2 == got.2, "{n} differs (skip_dead {sd})");
+                }
+            }
+            println!("az r2: all forms byte-identical on {nck} real chunks (lo_size {lo_size}, degen {degen})");
+            let rounds: usize = std::env::var("AZ_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(31);
+            let groups = (nck * lo_size / 2) as f64;
+            let mut tl = vec![Vec::new(); forms.len()];
+            let mut th = vec![Vec::new(); hforms.len()];
+            for r in 0..rounds + 1 {
+                for k in 0..forms.len() {
+                    let i = (k + r) % forms.len();
+                    let t0 = Instant::now();
+                    std::hint::black_box(run_l(forms[i].1, true));
+                    if r > 0 { tl[i].push(t0.elapsed().as_nanos() as f64 / groups); }
+                }
+                for k in 0..hforms.len() {
+                    let i = (k + r) % hforms.len();
+                    let t0 = Instant::now();
+                    std::hint::black_box(run_h(hforms[i].1, true));
+                    if r > 0 { th[i].push(t0.elapsed().as_nanos() as f64 / groups); }
+                }
+            }
+            for (i, (n, _)) in forms.iter().enumerate() {
+                let (q, m) = lq(&mut tl[i]);
+                println!("  {n:<30} lq {q:7.3} med {m:7.3} ns/group");
+            }
+            for (i, (n, _)) in hforms.iter().enumerate() {
+                let (q, m) = lq(&mut th[i]);
+                println!("  {n:<30} lq {q:7.3} med {m:7.3} ns/group");
+            }
+        })
+        .join()
+        .unwrap();
+    }
+}
