@@ -1488,25 +1488,30 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let (z0, z1) = z_vec.split_at(half);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            let mut out = vec![F128::ZERO; half];
-            let mut i = 0;
-            while i < half {
-                let x0 = z0[i] + z1[i];
-                let x1 = z0[i + 1] + z1[i + 1];
-                let x2 = z0[i + 2] + z1[i + 2];
-                let x3 = z0[i + 3] + z1[i + 3];
+            let mut out = Vec::with_capacity(half);
+            for (a, b) in z0.chunks_exact(4).zip(z1.chunks_exact(4)) {
+                let (a, b): (&[F128; 4], &[F128; 4]) =
+                    (a.try_into().unwrap(), b.try_into().unwrap());
                 let prod0 = unsafe {
-                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, [x0, x1])
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                        r,
+                        [a[0] + b[0], a[1] + b[1]],
+                    )
                 };
                 let prod1 = unsafe {
-                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, [x2, x3])
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
+                        r,
+                        [a[2] + b[2], a[3] + b[3]],
+                    )
                 };
-                out[i] = z0[i] + prod0[0];
-                out[i + 1] = z0[i + 1] + prod0[1];
-                out[i + 2] = z0[i + 2] + prod1[0];
-                out[i + 3] = z0[i + 3] + prod1[1];
-                i += 4;
+                out.extend_from_slice(&[
+                    a[0] + prod0[0],
+                    a[1] + prod0[1],
+                    a[2] + prod1[0],
+                    a[3] + prod1[1],
+                ]);
             }
+            debug_assert_eq!(out.len(), half);
             return out;
         }
         #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
