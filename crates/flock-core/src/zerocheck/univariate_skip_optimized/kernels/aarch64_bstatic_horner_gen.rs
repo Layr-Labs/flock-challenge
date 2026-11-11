@@ -46,22 +46,15 @@ fn bstatic_horner_blk<const BLK: usize, const V: u16>(
     out: &mut [u8; 64],
     nt_store: bool,
 ) {
-    bstatic_horner_blk_body::<BLK, V, false>(
-        a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, out, nt_store,
-    );
+    bstatic_horner_blk_body::<BLK, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, out, nt_store);
 }
 
 /// Body of [`bstatic_horner_blk`]. `kara` is [`ab_kara_tables`] when `V`
 /// has `ABV_KARA` and is not dereferenced otherwise.
-///
-/// `HOIST = true` (window rows only, see [`bstatic_horner_window_rows`]):
-/// the caller has already checked that the row's eight K words lie inside
-/// both slices (one check for the window's largest `b_med`), so the row
-/// does not repeat it. `HOIST = false`: the row checks its own bounds.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
+fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -75,11 +68,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
     use core::arch::aarch64::*;
     let b_med = BLK % 16;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-    if HOIST {
-        debug_assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
-    } else {
-        assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
-    }
+    assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
     let plain = inv_table.data_ptr();
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
@@ -732,22 +721,11 @@ pub(crate) fn shift_reduce_inner_ab_bstatic_horner(
 #[cfg(target_arch = "aarch64")]
 pub(crate) const BSTATIC_HORNER_WINDOW_ROWS: [(usize, usize); 2] = [(3, 16), (0, 13)];
 
-/// Kill switch for the hoisted bounds check of the inlined static-B window
-/// rows: any value of `FLOCK_NO_ZC_AB_ROW_SETUP_HOIST` restores one bounds
-/// check per row. Read once per process. The rows written are
-/// byte-identical.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn ab_row_setup_hoist_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_ROW_SETUP_HOIST").is_none())
-}
-
 /// All static-B Horner rows of window `w` (see [`BSTATIC_HORNER_WINDOW_ROWS`])
 /// as one unrolled sequence of direct calls into the per-arm bodies, writing
 /// row `b_med` to `out_outer[b_med * 64..][..64]`.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
-#[inline]
 pub(crate) fn bstatic_horner_window_rows<const V: u16>(
     w: usize,
     a_packed: &[u8],
@@ -758,40 +736,7 @@ pub(crate) fn bstatic_horner_window_rows<const V: u16>(
     out_outer: &mut [u8],
     nt_store: bool,
 ) {
-    if V & ABV_INLINE_WINDOW != 0 && ab_row_setup_hoist_enabled() {
-        bstatic_horner_window_rows_impl::<V, true>(
-            w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store,
-        );
-    } else {
-        bstatic_horner_window_rows_impl::<V, false>(
-            w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store,
-        );
-    }
-}
-
-/// [`bstatic_horner_window_rows`] with the per-row bounds check hoisted to
-/// one check per window (`HOIST = true`, inlined bodies only) or not.
-#[cfg(target_arch = "aarch64")]
-#[allow(clippy::too_many_arguments)]
-#[inline(never)]
-pub(crate) fn bstatic_horner_window_rows_impl<const V: u16, const HOIST: bool>(
-    w: usize,
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    chunk_byte_base: usize,
-    partials: &'static [[u8; 64]; 248],
-    out_outer: &mut [u8],
-    nt_store: bool,
-) {
     assert!(w <= 1 && out_outer.len() >= 16 * 64);
-    // Every row of window `w` has `b_med < hi` and reads bytes up to
-    // `chunk_byte_base + (b_med + 1) * 8 * N_CHUNKS`; this one check is the
-    // last row's own check, so it covers every row's and is never stricter.
-    if HOIST {
-        let end = chunk_byte_base + BSTATIC_HORNER_WINDOW_ROWS[w].1 * N_CHUNKS * 8;
-        assert!(end <= a_packed.len() && end <= b_packed.len());
-    }
     let out = out_outer.as_mut_ptr();
     let kara = if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
@@ -806,9 +751,7 @@ pub(crate) fn bstatic_horner_window_rows_impl<const V: u16, const HOIST: bool>(
                 // SAFETY: `$blk % 16 < 16` and `out_outer` holds 16 rows of 64 bytes.
                 let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
                 if V & ABV_INLINE_WINDOW != 0 {
-                    bstatic_horner_blk_body::<$blk, V, HOIST>(
-                        a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store,
-                    );
+                    bstatic_horner_blk_body::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store);
                 } else {
                     bstatic_horner_blk::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store);
                 }

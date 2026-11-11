@@ -141,17 +141,13 @@ fn r2_degen_enabled() -> bool {
 /// zero accumulators in front of every window's first group. Same outputs.
 #[cfg(target_arch = "aarch64")]
 fn r2_first_shift_skip_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_R2_FIRST_SHIFT_SKIP").is_none_or(|v| v != *"1")
+    std::env::var_os("FLOCK_OFF_R2_FIRST_SHIFT_SKIP").is_none_or(|v| v != *"1")
 }
 
-/// Kill switch for the pre-scaled round-two W kernel on GPU-covered chunks
-/// (`fold_round2_compact_chunk_neon_prescaled_8`): `FLOCK_NO_R2_PRESCALE`
-/// (any value) restores the Horner-shift kernel. Same anchor and delta stores,
-/// same four W slots, bit for bit. Read once per process.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 fn r2_prescale_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_PRESCALE").is_none())
+    *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_R2_PRESCALE").is_none())
 }
 
 /// Kill switch for the fused cascade K kernel
@@ -159,18 +155,13 @@ fn r2_prescale_enabled() -> bool {
 /// restores the one-body compact kernel. Same stores and slots either way.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 fn cascade_k_fused_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_ZC_K_FUSED").is_none_or(|v| v != *"1")
+    std::env::var_os("FLOCK_OFF_ZC_K_FUSED").is_none_or(|v| v != *"1")
 }
 
-/// Kill switch for the one-table fused cascade K kernel
-/// (`fold2_compact_and_round45_chunk_neon_8_fused_r1`): `FLOCK_NO_ZC_K_ONE_TABLE`
-/// (any value) restores the λ₁/λ₃ table pair. Same stores and slots either
-/// way: `x0 + ρ₂(x0+x1)` with `x_i = anc_i + T_ρ₁(δ_i)` is the incumbent's
-/// `anc0 + ρ₂(anc0+anc1) + T_λ₁(δ0) + T_λ₃(δ1)` as a field element.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 fn zc_k_one_table_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_ONE_TABLE").is_none())
+    *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_ZC_K_ONE_TABLE").is_none())
 }
 
 /// Kill switch for the ranked BLAKE3 periodic-padding schedule in round two:
@@ -2560,16 +2551,10 @@ pub(crate) fn fold2_compact_and_round45_into(
     let fused_k = cascade_k_fused_enabled();
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
     let fused_k = false;
-    // The fused kernel can read ONE ρ₁-scaled table (the round-three values
-    // `x_i = anc_i + T_ρ₁(δ_i)`, then `x0 + ρ₂(x0+x1)`): same lookups and
-    // products, half the bank bases and table bytes, one table build fewer.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let one_table = fused_k && zc_k_one_table_enabled();
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let one_table = false;
-    // Otherwise the incumbent λ composition: the anchors take one ordinary
-    // ρ₂ fold, only the two deltas carry ρ₁. With `one_table`, `table_l1`
-    // holds T_ρ₁ and `table_l3` is empty (never read).
     let (table_l1, table_l3) = if one_table {
         (table.scaled_linear(rho1), Vec::new())
     } else {

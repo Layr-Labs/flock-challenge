@@ -1327,21 +1327,8 @@ unsafe fn butterfly_fused_2layer_low_lazy(
     }
 }
 
-/// Fused two-layer block whose inner (layer L+1) twiddles have zero high
-/// limbs while the outer (layer L) twiddle is general — the third-deepest
-/// layer of every standard recursive basis. The outer pair is exactly the
-/// prepared constant-fold pair of [`butterfly_fused_2layer_row_with_const_q`]
-/// (row a's x^64 half `p` stays pending, row c inherits it); the two inner
-/// products use the low-constant split of [`butterfly_low_fold_q`], which
-/// consumes the same pending half. With `t.hi == 0`, `const_coeffs(t)` is
-/// `((t.lo, 0), (0, t.lo))`, so `const_fold` and `butterfly_low_fold_q`
-/// form the same `L` and `M` words and the same fold: bit-identical outputs
-/// with 3 instead of 5 PMULLs per inner product (15 instead of 19 per lane
-/// group).
 ///
 /// # Safety
-/// Requires the `aes` target feature; `block` holds four `quarter * num_ntts`
-/// quarters and both inner twiddles have zero high limbs.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn butterfly_fused_2layer_low_inner_rows(
     block: &mut [F128],
@@ -1375,7 +1362,6 @@ pub(super) unsafe fn butterfly_fused_2layer_low_inner_rows(
             let xb = vld1q_u64((&raw const *b).cast::<u64>());
             let xc = vld1q_u64((&raw const *c).cast::<u64>());
             let xd = vld1q_u64((&raw const *d).cast::<u64>());
-            // Layer L: (a,c) and (b,d) share the general outer twiddle.
             let (na, nc, p) = const_lazy(xa, xc, to, zero);
             let (nb, nd) = const_fold(xb, xd, to, zero);
             // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.

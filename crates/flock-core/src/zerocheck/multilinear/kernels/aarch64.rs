@@ -1723,13 +1723,10 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     }
 }
 
-/// Kill switch for the constant padding flags of the round-two W kernels on
-/// the aligned ranked geometry: `FLOCK_NO_R2_FIXED_PADS` (any value) restores
-/// the per-group padding tests. Same flags either way; read once per process.
 #[cfg(target_arch = "aarch64")]
 fn r2_fixed_pads_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_FIXED_PADS").is_none())
+    *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_R2_FIXED_PADS").is_none())
 }
 
 /// GPU-covered round-two lookahead with the four fixed medium weights
@@ -1766,7 +1763,6 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
     skip_dead: bool,
     out: *mut F128,
 ) {
-    // `FLOCK_NO_R2_GPR_DELTA` (any value) keeps the incumbent vector delta.
     unsafe {
         if r2_gpr_delta_enabled() {
             fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, true>(
@@ -1804,33 +1800,16 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
     }
 }
 
-/// Kill switch for the unreduced window sums of the pre-scaled round-two W
-/// kernel: `FLOCK_NO_R2_WINDOW_TRI` (any value) restores one reduced product
-/// per window. Same four sums either way; read once per process.
-#[cfg(target_arch = "aarch64")]
-fn r2_window_tri_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_WINDOW_TRI").is_none())
-}
-
-/// Kill switch for the general-register delta path of the round-two Horner
-/// kernel: `FLOCK_NO_R2_GPR_DELTA` (any value) restores the incumbent vector
-/// form. Read once per process.
 #[cfg(target_arch = "aarch64")]
 fn r2_gpr_delta_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_GPR_DELTA").is_none())
+    *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_R2_GPR_DELTA").is_none())
 }
 
-/// Both 8-byte row codes of one pair (`[row0, row1]`, adjacent) in two
-/// general registers through one `LDP`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn load_code_pair_gpr(p: *const u64) -> (u64, u64) {
     let (lo, hi): (u64, u64);
-    // SAFETY: the caller passes 16 readable bytes; read-only, no flags. The
-    // two outputs are distinct registers; a non-writeback LDP may overwrite
-    // its own base.
     unsafe {
         core::arch::asm!(
             "ldp {lo}, {hi}, [{p}]",
@@ -1843,16 +1822,9 @@ unsafe fn load_code_pair_gpr(p: *const u64) -> (u64, u64) {
     (lo, hi)
 }
 
-/// `[a0 ^ a1, b0 ^ b1]` stored to `dst` from general registers: two `EOR` and
-/// one `STP`, the same sixteen little-endian bytes (and the same ordinary,
-/// cached store class) as the vector form, which LLVM builds by re-loading
-/// both code pairs as q registers and zipping them (two loads, `ZIP1`, `ZIP2`,
-/// `EOR`).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn store_delta_pair_gpr(dst: *mut u8, a0: u64, a1: u64, b0: u64, b1: u64) {
-    // SAFETY: the caller owns the sixteen destination bytes; `ta`/`tb` are
-    // early clobbers, so no input is overwritten before it is read.
     unsafe {
         core::arch::asm!(
             "eor {ta}, {a0}, {a1}",
@@ -1870,10 +1842,6 @@ unsafe fn store_delta_pair_gpr(dst: *mut u8, a0: u64, a1: u64, b0: u64, b1: u64)
     }
 }
 
-/// Body of [`fold_round2_compact_chunk_neon_horner_8`]. With `GPR_DELTA` each
-/// pair's two row codes per side come in through one `LDP` and its delta goes
-/// out through [`store_delta_pair_gpr`]; otherwise the incumbent expressions.
-/// Same loads' values, same stores' bytes and addresses either way.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
@@ -2109,8 +2077,6 @@ unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
                 // One group at Horner position `$b`. `$shift` is false only
                 // for the peeled first group of a window, whose accumulators
                 // are all zero.
-                // `$pads` maps the group's two pair indices to their padding
-                // flags (see `fixed_pads` below).
                 macro_rules! horner_group {
                     ($b:expr, $shift:expr, $pads:expr) => {
                         'group: {
@@ -2209,12 +2175,6 @@ unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
                 if SKIP_FIRST_SHIFT {
                     // `b_end` is at least 14, so the peeled group exists.
                     if fixed_pads {
-                        // Aligned ranked geometry: below `b_end` the only
-                        // padded pair is the odd pair of the boundary window's
-                        // peeled group (`b_end == 15`, t = 0, b = 14: block
-                        // group 60, pairs 120/121). Every other group gets
-                        // constant flags, so its two padding tests and their
-                        // branches compile away. Same flags, same stores.
                         let boundary = b_end == 15;
                         horner_group!(b_end - 1, false, |_: usize, _: usize| (false, boundary));
                         for b in (0..b_end - 1).rev() {
@@ -2250,14 +2210,7 @@ unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
     }
 }
 
-/// `x^b * v` in the field for `xb = [x^b, x^b]` with `b <= 15` and `k` = 0x87
-/// in both lanes.
 ///
-/// `v.lo * x^b` and `v.hi * x^b` are two PMULLs of at most 79 bits each. The
-/// high one sits at `x^64`, so only its top limb (`< 2^15`) crosses `x^128`,
-/// and it folds once through `x^128 = x^7 + x^2 + x + 1` with a third PMULL
-/// (`< 2^22`, no second carry). The result is the canonical reduced value:
-/// the same bits as `b` applications of `crate::field::mul_by_x`.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[inline(always)]
 unsafe fn mul_xb_q(
@@ -2266,10 +2219,6 @@ unsafe fn mul_xb_q(
     k: core::arch::aarch64::uint64x2_t,
 ) -> core::arch::aarch64::uint64x2_t {
     let out: core::arch::aarch64::uint64x2_t;
-    // SAFETY: register-only carry-less multiplies, one lane zip and one XOR.
-    // `u` and `r` are early clobbers; `o` is first written by the fourth
-    // instruction, which itself reads `v` and `xb`, after the last read of
-    // `k`. The trailing PMULL+EOR pair is adjacent (one fused issue slot).
     unsafe {
         core::arch::asm!(
             "pmull2 {u:v}.1q, {v:v}.2d, {xb:v}.2d",
@@ -2289,11 +2238,6 @@ unsafe fn mul_xb_q(
     out
 }
 
-/// Module-level twin of the Horner kernel's nested `fold_odd_codes` (default
-/// [`Q_LOAD_FORM`]): two rows folded with each pair of loads kept next to its
-/// accumulator update, so the sixteen table values are never live at once.
-/// Other load forms use [`fold_two_row_codes_q`]; every form reads the same
-/// entries and XORs the same values.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[inline(always)]
 unsafe fn fold_two_codes_paired_q(
@@ -2314,8 +2258,6 @@ unsafe fn fold_two_codes_paired_q(
         let mut acc1 = bank_load_q::<0>(table_data, row1);
         macro_rules! step {
             ($c0:literal, $c1:literal) => {
-                // SAFETY: each byte index is at most 255 and both banks hold
-                // 256 initialized q entries; only the accumulators change.
                 core::arch::asm!(
                     "and {idx}, {mask}, {row0}, lsr #{shift0}",
                     "ldr {tmp0:q}, [{bank0}, {idx}]",
@@ -2352,33 +2294,9 @@ unsafe fn fold_two_codes_paired_q(
     }
 }
 
-/// [`fold_round2_compact_chunk_neon_horner_8`] with the Horner recurrence
-/// replaced by operand pre-scaling. `FLOCK_NO_R2_PRESCALE` (any value)
-/// restores the Horner kernel at the call site.
 ///
-/// The Horner kernel multiplies four 270-bit accumulators (eight q values plus
-/// two packed top-limb lanes) by `x` in front of every group: 30 SIMD
-/// instructions per group, and every product must be widened from its three
-/// partial products to `(lo, hi)` form (two `EXT`, two `EOR3`) so it can be
-/// shifted. Here the group at Horner position `b` instead scales the three
-/// independent A operands it multiplies (`a2`, `e_a`, `o_a`) by `x^b` in
-/// reduced form ([`mul_xb_q`], five instructions, one fused pair), and the
-/// four products accumulate unreduced and in place in [`TriNeon`] form
-/// ([`tri_acc_q_crossfused`], as the GPU-shared lookahead body does), which is
-/// never shifted. Per ordinary group the scalings, products and operand XORs
-/// take 56 instructions (45 SIMD issue slots) instead of the Horner kernel's
-/// 78 (70), and no top limbs or `(lo, hi)` widening remain.
 ///
-/// Exactness: `(x^b·A mod P)·B ≡ x^b·(A·B) (mod P)`, and every window sum is
-/// fully reduced before its `lambda` multiply, so each window yields the same
-/// canonical field element as the Horner sum; `out` is bit-identical. The
-/// anchor/delta stores, the padding cut, the window order and the all-ones-B
-/// shortcut are the Horner kernel's expressions verbatim (the shortcut adds
-/// `x^b·a2` where the Horner kernel adds `a2` before its remaining `b` shifts).
 ///
-/// Same contract as the Horner kernel: the caller checks the fixed medium
-/// weights (`eq_lo[2*(first+2b+t)+1] = eq_lo[2*(first+t)+1]·x^b`) and that
-/// the table is GF(2)-linear per byte bank.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
@@ -2397,8 +2315,6 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
     skip_dead: bool,
     out: *mut F128,
 ) {
-    // `FLOCK_NO_R2_GPR_DELTA` / `FLOCK_NO_R2_FIXED_PADS` (any value) keep the
-    // incumbent delta form / per-group padding tests inside this kernel.
     unsafe {
         match (r2_gpr_delta_enabled(), r2_fixed_pads_enabled()) {
             (true, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true>(
@@ -2465,12 +2381,6 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
     }
 }
 
-/// Body of [`fold_round2_compact_chunk_neon_prescaled_8`]: `GPR_DELTA` takes
-/// each pair's codes through one `LDP` per side and stores its delta from
-/// general registers ([`store_delta_pair_gpr`]); `FIXED_PADS` gives every
-/// group of the aligned ranked geometry constant padding flags (only the
-/// boundary window's first position, block group 60, has a padded odd pair).
-/// Same loads' values, same stores, same slots for all four variants.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
@@ -2515,14 +2425,10 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
             cross: zero,
             hh: zero,
         };
-        // Window sums: with `r2_window_tri_enabled` each window's weighted
-        // value is accumulated unreduced (three-limb form) and the four sums
-        // are reduced once per chunk; otherwise one reduced product per window.
-        let window_tri = r2_window_tri_enabled();
-        let mut sum0 = tri_zero;
-        let mut sum3 = tri_zero;
-        let mut sum4 = tri_zero;
-        let mut sum5 = tri_zero;
+        let mut sum0 = zero;
+        let mut sum3 = zero;
+        let mut sum4 = zero;
+        let mut sum5 = zero;
         let b_ones = fold_row_q(table_data, [0xffu8; 8].as_ptr());
         let ones_is_one = is_zero_q(veorq_u64(
             b_ones,
@@ -2540,8 +2446,6 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                 let mut w3 = tri_zero;
                 let mut w4 = tri_zero;
                 let mut w5 = tri_zero;
-                // Groups 61..64 of an aligned 64-group block hold only padded
-                // pairs (the Horner kernel's leading zero coefficients).
                 let b_end = if aligned_padding && (first & 63) == 32 {
                     15 - t
                 } else {
@@ -2556,11 +2460,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                         vst1q_u64(deltas.add((x_lo + 1) * 16).cast::<u64>(), zero);
                     }
                 }
-                // `[x^b, x^b]` for the current position; positions are walked
-                // in the Horner kernel's descending order.
                 let mut xb = vdupq_n_u64(1u64 << (b_end - 1));
-                // One position: `$pads` maps the group's two pair indices to
-                // their padding flags.
                 macro_rules! group {
                     ($pos:expr, $pads:expr) => {
                         'group: {
@@ -2568,8 +2468,6 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                             let x_lo0 = 2 * u;
                             let x_lo1 = x_lo0 + 1;
                             let (pad0, pad1): (bool, bool) = ($pads)(x_lo0, x_lo1);
-                            // One pair: fold and store its even rows, hand back
-                            // its odd row codes (the Horner kernel's closure).
                             let pair = |x_lo: usize, pad: bool| {
                                 if pad {
                                     if !skip_dead {
@@ -2622,8 +2520,6 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                 break 'group;
                             }
                             if deg0 & deg1 & ones_is_one {
-                                // b == 1 on all four rows: only `x^b·a2·b2 =
-                                // x^b·a2` survives; it adds into the low word.
                                 w0.ll = veorq_u64(w0.ll, mul_xb_q(a2, xb, k87));
                             } else {
                                 let e_a = veorq_u64(a0, a2);
@@ -2633,8 +2529,6 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                 }
                                 let e_s = mul_xb_q(e_a, xb, k87);
                                 tri_acc_q_crossfused(&mut w3, e_s, e_b);
-                                // Consume the even rows before the odd lookup
-                                // chains need their registers.
                                 let (o_a, o_b) =
                                     fold_two_codes_paired_q(table_data, a1c ^ a3c, b1c ^ b3c);
                                 let o_s = mul_xb_q(o_a, xb, k87);
@@ -2656,9 +2550,6 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                     )
                 };
                 if fixed_pads {
-                    // Below `b_end` the only padded pair is the odd pair of
-                    // the boundary window's first position (`b_end == 15`,
-                    // t = 0, position 14: block group 60, pairs 120/121).
                     let boundary = b_end == 15;
                     group!(b_end - 1, |_: usize, _: usize| (false, boundary));
                     for pos in (0..b_end - 1).rev() {
@@ -2670,26 +2561,19 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                     }
                 }
                 let lambda = vld1q_u64(eq_lo.add(2 * (first + t) + 1).cast::<u64>());
-                if window_tri {
-                    tri_acc_q_crossfused(&mut sum0, lambda, reduce_tri_binius_xor_q(w0.ll, w0.cross, w0.hh, zero));
-                    tri_acc_q_crossfused(&mut sum3, lambda, reduce_tri_binius_xor_q(w3.ll, w3.cross, w3.hh, zero));
-                    tri_acc_q_crossfused(&mut sum4, lambda, reduce_tri_binius_xor_q(w4.ll, w4.cross, w4.hh, zero));
-                    tri_acc_q_crossfused(&mut sum5, lambda, reduce_tri_binius_xor_q(w5.ll, w5.cross, w5.hh, zero));
-                } else {
-                    sum0.ll = veorq_u64(sum0.ll, mul_q(lambda, reduce_tri_q(w0)));
-                    sum3.ll = veorq_u64(sum3.ll, mul_q(lambda, reduce_tri_q(w3)));
-                    sum4.ll = veorq_u64(sum4.ll, mul_q(lambda, reduce_tri_q(w4)));
-                    sum5.ll = veorq_u64(sum5.ll, mul_q(lambda, reduce_tri_q(w5)));
-                }
+                sum0 = veorq_u64(sum0, mul_q(lambda, reduce_tri_q(w0)));
+                sum3 = veorq_u64(sum3, mul_q(lambda, reduce_tri_q(w3)));
+                sum4 = veorq_u64(sum4, mul_q(lambda, reduce_tri_q(w4)));
+                sum5 = veorq_u64(sum5, mul_q(lambda, reduce_tri_q(w5)));
             }
         }
         for i in 0..4 {
             *out.add(i) = F128::ZERO;
         }
-        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(sum0));
-        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(sum3));
-        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(sum4));
-        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(sum5));
+        *out.add(4) = core::mem::transmute::<uint64x2_t, F128>(sum0);
+        *out.add(5) = core::mem::transmute::<uint64x2_t, F128>(sum3);
+        *out.add(6) = core::mem::transmute::<uint64x2_t, F128>(sum4);
+        *out.add(7) = core::mem::transmute::<uint64x2_t, F128>(sum5);
     }
 }
 
@@ -3422,9 +3306,6 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused<const DEAD_TAI
     }
 }
 
-/// `a*b + e1` in the field: [`mul_sw_fused_xor3_q`] with one addend (`eor`
-/// in place of the `eor3`). Same four schoolbook `PMULL`s, same two-step
-/// reduction, same field value; 13 instructions.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[inline(always)]
 unsafe fn mul_sw_fused_xor1_q(
@@ -3466,24 +3347,7 @@ unsafe fn mul_sw_fused_xor1_q(
     out
 }
 
-/// [`fold2_compact_and_round45_chunk_neon_8_fused`] reading ONE byte table,
-/// `table_r1 = scaled_linear(rho1)`, instead of the two λ tables.
 ///
-/// The incumbent lane value is `anc0 + ρ₂(anc0+anc1) + T_λ₁(δ0) + T_λ₃(δ1)`
-/// with `λ₁ = ρ₁(1+ρ₂)`, `λ₃ = ρ₁ρ₂`. With `x0 = anc0 + T_ρ₁(δ0)` and
-/// `x1 = anc1 + T_ρ₁(δ1)` (the two round-three values, `T_ρ₁ = ρ₁·T`, `T`
-/// GF(2)-linear per byte) this is the sequential fold `x0 + ρ₂(x0 + x1)`:
-/// `x0 + ρ₂(x0+x1) = anc0 + ρ₂(anc0+anc1) + ρ₁(1+ρ₂)T(δ0) + ρ₁ρ₂T(δ1)`.
-/// Same field element, so every store and every product below is the
-/// incumbent's. Per lane side: the same 16 lookups (two `lookup8_acc_q`
-/// trees of four `EOR3` each instead of one `lookup8_acc_q` plus one
-/// `lookup8_q`), one `EOR` (`x0^x1` instead of `anc0^anc1`), one fused
-/// multiply with one addend (13 instructions, the incumbent's has two
-/// addends in its `EOR3`). The table set shrinks from 16 to 8 bank bases
-/// (64 → 32 KiB), which is what frees the general registers the incumbent
-/// spills (`ldr x?, [sp, ..]` per lane side for one λ₃ bank base), and the
-/// stores use immediate offsets (two address `ADD`s per group instead of
-/// six). The message half is unchanged.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
@@ -3501,7 +3365,6 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<const DEAD_
 ) {
     use core::arch::aarch64::*;
 
-    /// `stnp x, y, [dst, #OFF]`: one base per array per group.
     #[inline(always)]
     unsafe fn store_pair_nt_off<const OFF: usize>(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
         unsafe {
@@ -3542,13 +3405,10 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<const DEAD_
                 let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
                 let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
 
-                // x0 + rho2*(x0 + x1), x_i = anc_i + T_rho1(delta_i).
                 let xa0 = lookup8_acc_q(table_r1, da0, anc_a0);
                 let xa1 = lookup8_acc_q(table_r1, da1, anc_a1);
                 let av = mul_sw_fused_xor1_q(rho2_q, rho2_sw, veorq_u64(xa0, xa1), k87, xa0);
                 let bv = if degen && (db0 | db1) == 0 {
-                    // Zero deltas: x_i = anc_i (table entry 0 is zero), the
-                    // incumbent's degenerate branch verbatim.
                     let bd = veorq_u64(anc_b0, anc_b1);
                     if is_zero_q(bd) {
                         anc_b0
@@ -3580,7 +3440,6 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<const DEAD_
                 let (a3, b3) = fold_lane!(4 * t + 3, b_flat);
                 store_pair_nt_off::<32>(ao, a2, a3);
                 store_pair_nt_off::<32>(bo, b2, b3);
-                // Message half: byte-for-byte the incumbent fused kernel's.
                 let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
                 let acc = &mut acc.0;
                 if b_flat
@@ -3627,8 +3486,6 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<const DEAD_
                 let dp = deltas.add(32 * g);
                 let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
                 let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                // Dense lane 0 with anc1 = 0, delta1 = 0: x1 = 0, so the lane
-                // is x0 + rho2*x0 = anc0 + rho2*anc0 + T_lambda1(delta0).
                 let xa0 = lookup8_acc_q(table_r1, da0, anc_a0);
                 let xb0 = lookup8_acc_q(table_r1, db0, anc_b0);
                 let av0 = mul_sw_fused_xor1_q(rho2_q, rho2_sw, xa0, k87, xa0);
@@ -5870,9 +5727,6 @@ mod tests {
         }
     }
 
-    /// The general-register delta path of the Horner kernel against the
-    /// incumbent vector path: same anchors, deltas and slots, both peel
-    /// variants, aligned and unaligned bases, both padding shapes.
     #[test]
     fn round2_horner_gpr_delta_matches_vector_delta() {
         use crate::field::PHI_8_TABLE;
@@ -5946,8 +5800,6 @@ mod tests {
         }
     }
 
-    /// `mul_xb_q` against the `mul_by_x` ladder for every Horner position,
-    /// with the top bit forced so each `x^b` carry crosses `x^128`.
     #[cfg(target_feature = "sha3")]
     #[test]
     fn mul_xb_matches_mul_by_x_ladder() {
@@ -5972,10 +5824,6 @@ mod tests {
         }
     }
 
-    /// The pre-scaled W kernel against the Horner kernel: same anchors, same
-    /// deltas, same eight output slots, over aligned and unaligned bases,
-    /// both padding shapes, the degenerate shortcut, dead-pair skipping and a
-    /// fold table whose all-ones fold is and is not `ONE`.
     #[cfg(target_feature = "sha3")]
     #[test]
     fn round2_prescaled_matches_horner() {
@@ -5991,8 +5839,6 @@ mod tests {
         for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
             *byte = splitmix64(&mut state) as u8;
         }
-        // All-ones B groups (both pairs degenerate), including window-first
-        // and boundary groups, plus one mixed group.
         for group in [0usize, 15, 16, 31, 47, 59, 60, 64, 127, 200] {
             b_packed[group * 32..(group + 1) * 32].fill(0xff);
         }
@@ -6003,7 +5849,6 @@ mod tests {
             .enumerate()
         {
             let mut table = UniSkipFoldTable::new(6, z);
-            // A random linear table: fold(all-ones) != ONE, wide top bits.
             if z_case == 3 {
                 for bank in table.data.chunks_mut(256) {
                     for bit in 0..8 {
@@ -6034,8 +5879,6 @@ mod tests {
                         [(false, false), (true, false), (false, true), (true, true)]
                     {
                         for base in [0usize, 64, 121, 3 * LO_SIZE] {
-                            // 0: incumbent Horner body; 1..=4: the four
-                            // pre-scaled variants (GPR delta, fixed pads).
                             let run = |variant: usize| {
                                 let poison = F128::new(u64::MAX, u64::MAX);
                                 let mut anchors = vec![poison; 2 * LO_SIZE];
@@ -7058,10 +6901,6 @@ mod tests {
         }
     }
 
-    /// The one-table K kernel equals the incumbent fused kernel elementwise:
-    /// every a/b output and all eight slots, dense and dead-tail, with zero
-    /// b deltas (degenerate branch), b ≡ 1 groups (b_flat branch) and
-    /// poisoned dead slots in the dead-tail case.
     #[cfg(target_feature = "sha3")]
     #[test]
     fn k_fused_one_table_matches_two_tables() {
@@ -7069,7 +6908,7 @@ mod tests {
         let mut state = 0x4b31_5441_424c_4521;
         let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
         let table = UniSkipFoldTable::new(6, rho(&mut state));
-        const OUT_PAIRS: usize = 2 * 16 * 3; // three 128-pair blocks
+        const OUT_PAIRS: usize = 2 * 16 * 3;
         for case in 0..6 {
             let (rho1, rho2) = match case {
                 0 => (F128::ONE, F128::ONE),
@@ -7084,24 +6923,19 @@ mod tests {
                 (0..64 * OUT_PAIRS).map(|_| splitmix64(&mut state) as u8).collect();
             let eq: Vec<F128> = (0..OUT_PAIRS).map(|_| rho(&mut state)).collect();
             for g in 0..4 * OUT_PAIRS / 2 {
-                // Every seventh round-five group is b ≡ 1 on all four lanes
-                // (the b_flat branch); the rest draw a lane class at random.
                 let class = if (g / 4) % 7 == 3 { 1 } else { splitmix64(&mut state) % 5 };
                 match class {
-                    // b constant across the group: degenerate branch, bd == 0.
                     0 => {
                         anchors[4 * g + 3] = anchors[4 * g + 1];
                         deltas[32 * g + 8..32 * g + 16].fill(0);
                         deltas[32 * g + 24..32 * g + 32].fill(0);
                     }
-                    // b ≡ 1 lane.
                     1 => {
                         anchors[4 * g + 1] = F128::ONE;
                         anchors[4 * g + 3] = F128::ONE;
                         deltas[32 * g + 8..32 * g + 16].fill(0);
                         deltas[32 * g + 24..32 * g + 32].fill(0);
                     }
-                    // zero b deltas, distinct anchors: degenerate, bd != 0.
                     2 => {
                         deltas[32 * g + 8..32 * g + 16].fill(0);
                         deltas[32 * g + 24..32 * g + 32].fill(0);

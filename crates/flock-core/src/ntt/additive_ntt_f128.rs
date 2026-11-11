@@ -223,24 +223,16 @@ fn deep_subtree_pairs_enabled() -> bool {
     *ON
 }
 
-/// Below-parallel-floor interleaved transforms (`n_top == 0`, log_d 8..11;
-/// ranked: the L5 recursive commit) run the fused-pair subtree loop instead
-/// of the scalar reference. `FLOCK_NO_SMALL_NTT_PAIRS=1` (any value)
-/// restores the scalar loop. Read once per process.
 #[inline]
 fn small_transform_pairs_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_SMALL_NTT_PAIRS").is_none())
+    *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_SMALL_NTT_PAIRS").is_none())
 }
 
-/// Fused deep pairs whose two inner twiddles have zero high limbs but whose
-/// outer twiddle does not take the low-limb split for the inner products.
-/// `FLOCK_NO_LOW_INNER_PAIRS=1` (any value) restores the general kernel.
-/// Read once per process.
 #[inline]
 fn low_inner_pairs_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LOW_INNER_PAIRS").is_none())
+    *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_LOW_INNER_PAIRS").is_none())
 }
 
 /// The standard dimension-20 basis has low-limb-only twiddles throughout the
@@ -1476,14 +1468,6 @@ impl AdditiveNttF128 {
         let n_top = fusion_aware_interleaved_n_top(log_d, num_ntts, start_layer, n_top);
         if n_top == 0 || log_d < 8 {
             debug_assert_eq!(PHASE, INTERLEAVED_PHASE_ALL);
-            // A transform below the parallel floor (ranked: the L5 commit,
-            // log_d 10, 8 lanes) is one cache-resident sub-transform. Run it
-            // through the vector-resident fused-pair subtree loop (sub 0 of
-            // n_top 0: global block = block) instead of the scalar reference,
-            // whose every butterfly is a GPR-repacked six-PMULL product. Same
-            // butterflies, twiddles and layer order; pairs whose three
-            // twiddles have zero high limbs (all of them at log_d 10) take
-            // the three-PMULL low-limb kernel.
             if cfg!(all(target_arch = "aarch64", target_feature = "aes"))
                 && n_top == 0
                 && log_d >= 8
@@ -1895,9 +1879,6 @@ impl AdditiveNttF128 {
                         block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
                     )
                 {
-                    // Outer twiddle general, both inner twiddles low-limb
-                    // (the third-deepest layer of every standard recursive
-                    // basis: 61/53/45/37 bits at log_d 18/16/14/12).
                 } else {
                     butterfly_interleaved_fused_2layer_rows_seq(
                         block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts, 0,
@@ -3443,10 +3424,6 @@ mod tests {
         }
     }
 
-    /// The low-inner fused pair (general outer, low-limb inner twiddles) is
-    /// exercised at L1/L2 by `recursive_deep_subtree_pairs_match_scalar_oracle`;
-    /// this covers the L3/L4 commit shapes (pairs (10,11) and (8,9)) through
-    /// the ordinary from-layer entry, against the scalar reference.
     #[cfg(any(
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq")
@@ -3889,9 +3866,6 @@ mod tests {
         }
     }
 
-    /// Below-floor transforms (`n_top == 0`) from a rate layer, including the
-    /// ranked L5 commit shape (log_d 10, 8 lanes, start layer 6), match the
-    /// scalar reference through the public from-layer entry point.
     #[cfg(any(
         all(target_arch = "aarch64", target_feature = "aes"),
         all(target_arch = "x86_64", target_feature = "pclmulqdq")

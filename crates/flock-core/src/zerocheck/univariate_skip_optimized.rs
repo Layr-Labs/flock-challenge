@@ -1786,26 +1786,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     if let Some((_, _, partials)) = static_run {
         // Same rows, same bytes: the Karatsuba table apply (18 loads per
         // word) or, with `FLOCK_NO_ZC_AB_KARA=1`, the plain apply (32).
-        // `FLOCK_NO_ZC_AB_KARA_XOR16` (any value) keeps the incumbent
-        // recombination of the Karatsuba words' eighteen lookups.
         if kernels::aarch64::ab_kara_enabled()
-            && kernels::aarch64::ab_kara_unscaled_enabled()
-            && kernels::aarch64::ab_z_enabled()
-            && kernels::aarch64::ab_kara_xor16_enabled()
-        {
-            kernels::aarch64::bstatic_horner_window_rows::<{
-                kernels::aarch64::AB_Z_VARIANT | kernels::aarch64::ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16
-            }>(
-                within_hash_outer,
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                partials,
-                out_outer,
-                direct,
-            );
-        } else if kernels::aarch64::ab_kara_enabled()
             && kernels::aarch64::ab_kara_unscaled_enabled()
             && kernels::aarch64::ab_z_enabled()
         {
@@ -2960,11 +2941,7 @@ fn zc_ab_unscaled_enabled() -> bool {
     *ON
 }
 
-/// Kill switch for the seeded XOR drain of the round-one AB completion
-/// (`kernels::accumulate_convert_ab_nomul_seeded`): `FLOCK_NO_ZC_AB_SEEDED`
-/// (any value) restores the zero-seeded kernel in the same binary. Same bank
-/// bits either way. Read once per process.
-pub const ENV_NO_ZC_AB_SEEDED: &str = "FLOCK_NO_ZC_AB_SEEDED";
+pub const ENV_NO_ZC_AB_SEEDED: &str = "FLOCK_OFF_ZC_AB_SEEDED";
 
 fn zc_ab_seeded_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -6340,101 +6317,6 @@ mod tests {
         );
     }
 
-    /// The static-B window rows with the bounds check hoisted to one per
-    /// window (`FLOCK_NO_ZC_AB_ROW_SETUP_HOIST` off) against the per-row form
-    /// of the same variant: random A rows, B rows that satisfy the static
-    /// masks and rows that do not (fallback), both windows, both store
-    /// flavours.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn ab_window_row_setup_hoist_matches() {
-        use kernels::aarch64::{
-            AB_HZ_VARIANT, AB_ROWS_VARIANT, AB_Z_VARIANT, ABV_INLINE_WINDOW, ABV_KARA_UNSCALED,
-            ABV_KARA_XOR16,
-        };
-        let table = make_inv_table();
-        let mut rng = Rng::new(0xAB5A_71C0_F457_0077);
-        let context =
-            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
-                .expect("enabled static-B context");
-        let kernels::aarch64::StaticBContext::Prepared { partials, .. } = context else {
-            unreachable!("prepared static-B context");
-        };
-        const N: usize = 1024;
-        let mut cases = 0usize;
-        for case in 0..32usize {
-            let a: Vec<u8> = (0..N).map(|_| (rng.next_u64() >> 11 & 0xff) as u8).collect();
-            let b: Vec<u8> = (0..N).map(|_| (rng.next_u64() >> 9 & 0xff) as u8).collect();
-            for w in 0..2usize {
-                let (lo, hi) = kernels::aarch64::BSTATIC_HORNER_WINDOW_ROWS[w];
-                for satisfied in [true, false] {
-                    let mut bb = b.clone();
-                    if satisfied {
-                        for b_med in lo..hi {
-                            let blk = w * (1 << N_MEDIUM) + b_med;
-                            for k in 0..N_CHUNKS {
-                                let off = b_med * N_CHUNKS * 8 + k * N_CHUNKS;
-                                let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
-                                let word = u64::from_le_bytes(bb[off..off + 8].try_into().unwrap());
-                                bb[off..off + 8]
-                                    .copy_from_slice(&((word & !mask) | expected).to_le_bytes());
-                            }
-                        }
-                    }
-                    for nt in [false, true] {
-                        macro_rules! check {
-                            ($v:expr) => {{
-                                let mut want = vec![0x5au8; 16 * 64];
-                                kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, false>(
-                                    w, &a, &bb, &table, 0, partials, &mut want, nt,
-                                );
-                                let mut got = vec![0x5au8; 16 * 64];
-                                kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, true>(
-                                    w, &a, &bb, &table, 0, partials, &mut got, nt,
-                                );
-                                assert_eq!(
-                                    got, want,
-                                    "hoisted variant {} differs (case={case}, w={w}, satisfied={satisfied}, nt={nt})",
-                                    $v
-                                );
-                                cases += 1;
-                            }};
-                        }
-                        check!(AB_ROWS_VARIANT);
-                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED);
-                        check!(AB_Z_VARIANT | ABV_INLINE_WINDOW);
-                        check!(AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16);
-                        check!(AB_HZ_VARIANT);
-                    }
-                }
-            }
-        }
-        assert_eq!(cases, 32 * 2 * 2 * 2 * 5);
-    }
-
-    /// The hoisted window check rejects slices that do not hold the
-    /// window's largest row (the per-row checks it replaces would have).
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    #[should_panic]
-    fn ab_window_row_setup_hoist_checks_bounds() {
-        use kernels::aarch64::{AB_Z_VARIANT, ABV_INLINE_WINDOW, ABV_KARA_XOR16};
-        let table = make_inv_table();
-        let context =
-            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
-                .expect("enabled static-B context");
-        let kernels::aarch64::StaticBContext::Prepared { partials, .. } = context else {
-            unreachable!("prepared static-B context");
-        };
-        // Window 0's last row (b_med 15) needs 1,024 bytes.
-        let (a, b) = (vec![0u8; 1016], vec![0u8; 1024]);
-        let mut out = vec![0u8; 16 * 64];
-        kernels::aarch64::bstatic_horner_window_rows_impl::<
-            { AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16 },
-            true,
-        >(0, &a, &b, &table, 0, partials, &mut out, true);
-    }
-
     /// The Karatsuba table apply and the one-function window write the bytes
     /// the plain forms write. Words: every byte value in every position, the
     /// complements, random words, both table images, against the plain apply
@@ -6444,7 +6326,9 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn ab_kernel_variants_match_baseline() {
-        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_INLINE_WINDOW, ABV_KARA, ABV_KARA_UNSCALED};
+        use kernels::aarch64::{
+            AB_ROWS_VARIANT, ABV_INLINE_WINDOW, ABV_KARA, ABV_KARA_UNSCALED,
+        };
         let table = make_inv_table();
         let mut rng = Rng::new(0xAB5A_71C0_F457_0003);
         let mut words: Vec<u64> = vec![0, u64::MAX];
@@ -6549,8 +6433,6 @@ mod tests {
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_SCALED | kernels::aarch64::ABV_KARA_SCALED_UNSCALED | kernels::aarch64::ABV_NOSW);
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_KARA_SCALED_UNSCALED | kernels::aarch64::ABV_NOSW);
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_SCALED | kernels::aarch64::ABV_NOSW);
-                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_KARA_XOR16);
-                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16);
                         check!(kernels::aarch64::ABV_HZ);
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW);
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW | ABV_INLINE_WINDOW);
@@ -6558,7 +6440,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 18);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 16);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
@@ -7469,9 +7351,6 @@ mod tests {
         }
     }
 
-    /// The seeded XOR-drain completion kernel leaves every bank slot exactly
-    /// where the zero-seeded kernel does: every even start, every end, both
-    /// table-load forms, random and all-ones rows over pre-filled banks.
     #[test]
     fn ab_completion_seeded_kernel_matches_incumbent() {
         let mut rng = Rng::new(0x5EED_AB01);

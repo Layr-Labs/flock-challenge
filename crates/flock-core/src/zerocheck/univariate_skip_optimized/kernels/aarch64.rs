@@ -450,21 +450,8 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool, const U: boo
     }
 }
 
-/// XOR-drain form of [`accumulate_convert_ab_nomul`] (`STORE = false`) whose
-/// eight lane accumulators start as the bank's current eight slots.
 ///
-/// Same rows, same `b_med` pairing, same table entries, same XOR terms per
-/// lane. Only the instruction stream changes:
-/// - each 8-lane group loads its 8 bank slots as the seed (4 `ldp`) and
-///   stores the result (4 `stp`), instead of 8 `movi` zero-seeds, 4 `ldp`,
-///   8 drain `eor` and 4 `stp`;
-/// - rows and tables are walked by raw pointers bounded by the wrapper's
-///   `first_b_med <= n_b_med <= 16` assert, so the compiler's per-pair
-///   bounds counter and panic-index register (`cbz`, `sub`, `add` per pair
-///   in the incumbent) do not exist.
 ///
-/// Bit-exactness: GF(2^128) addition is XOR; `bank ^ (t_0 ^ t_1 ^ ...)` and
-/// `((bank ^ t_0) ^ t_1) ^ ...` are the same bits.
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded<const U: bool>(
     chunk_ab_bytes: &[[u8; 64]; 16],
@@ -479,10 +466,6 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded<const U: bool>(
     debug_assert_eq!(first_b_med & 1, 0, "paired AB drain requires an even start");
     debug_assert_eq!(convert.len(), 16 * 256);
 
-    // SAFETY: caller guarantees `first_b_med <= n_b_med <= 16`, so every row
-    // read (`b_med < n_b_med`, 8 bytes at `lane < 64`) is inside the 1 KiB
-    // chunk and every table pointer is inside the 64 KiB image; the bank
-    // slots are the fixed array's.
     unsafe {
         let convert_ptr = convert.as_ptr() as *const u8;
         let rows = chunk_ab_bytes.as_ptr() as *const u8;
@@ -3489,40 +3472,6 @@ unsafe fn apply_word_kara<const V: u16, const SCALED: bool>(
         let (e0b, o0b) = (ld!(word, 2, 1), ld!(word, 3, 1));
         let (e1a, o1a) = (ld!(word, 4, 2), ld!(word, 5, 2));
         let (e1b, o1b) = (ld!(word, 6, 3), ld!(word, 7, 3));
-        if V & ABV_KARA_XOR16 != 0 {
-            // The same eighteen lookups, recombined. The form below returns
-            // `out_q = e_q ^ sw(o_q)` with `sw` the 8-byte half exchange
-            // (`ext #8`), a fixed byte permutation and therefore GF(2)-linear:
-            // `sw(a ^ b) = sw(a) ^ sw(b)`. Expanding its `e_q` / `o_q` chains:
-            //   out0 = (e0a^e0b^e1a^e1b) ^ sw(o0a^o0b^o1a^o1b)
-            //   out1 = out0 ^ e0s ^ e1s ^ sw(o0s ^ o1s)
-            //   out2 = out0 ^ d2,  d2 = esa ^ esb ^ sw(osa ^ osb)
-            //   out3 = out1 ^ d2 ^ ess ^ sw(oss)
-            // Every output is the same XOR of the same table bytes: twelve
-            // XORs and four `ext` instead of fifteen XORs and four `ext`.
-            let o0 = veorq_u8(xor3_u8(o0a, o0b, o1a), o1b);
-            let out0 = xor3_u8(xor3_u8(e0a, e0b, e1a), e1b, vextq_u8::<8>(o0, o0));
-            let (e0s, o0s) = (ld!(u, 0, 4), ld!(u, 1, 4));
-            let (e1s, o1s) = (ld!(u, 4, 5), ld!(u, 5, 5));
-            let t1 = veorq_u8(o0s, o1s);
-            let out1 = veorq_u8(xor3_u8(out0, e0s, e1s), vextq_u8::<8>(t1, t1));
-            let (esa, osa) = (ld!(s, 0, 6), ld!(s, 1, 6));
-            let (esb, osb) = (ld!(s, 2, 7), ld!(s, 3, 7));
-            let t2 = veorq_u8(osa, osb);
-            let d2 = xor3_u8(esa, esb, vextq_u8::<8>(t2, t2));
-            let out2 = veorq_u8(out0, d2);
-            let ninth = kara.add(AB_KARA_NINTH);
-            let (ess, oss) = if (!SCALED || V & ABV_KARA_SCALED_UNSCALED != 0) && V & ABV_KARA_UNSCALED != 0 {
-                (ab_ld::<true, 0>(ninth, v as usize), ab_ld::<true, 8>(ninth, v as usize))
-            } else {
-                (
-                    vld1q_u8(ninth.add(byte_from_word::<0>(v) * 16)),
-                    vld1q_u8(ninth.add(byte_from_word::<1>(v) * 16)),
-                )
-            };
-            let out3 = veorq_u8(xor3_u8(out1, d2, ess), vextq_u8::<8>(oss, oss));
-            return (out0, out1, out2, out3);
-        }
         let e0 = veorq_u8(xor3_u8(e0a, e0b, e1a), e1b);
         let o0 = veorq_u8(xor3_u8(o0a, o0b, o1a), o1b);
         let (e0s, o0s) = (ld!(u, 0, 4), ld!(u, 1, 4));
@@ -3590,22 +3539,6 @@ pub(crate) fn ab_z_enabled() -> bool {
 /// Row-body variant bit: the plain image uses the z-basis apply.
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_Z: u16 = 8;
-/// Row-body variant bit: a word that keeps the Karatsuba apply (the `x^4`
-/// image under [`ABV_Z`]) recombines its eighteen lookups with twelve XORs
-/// and four `ext` instead of fifteen XORs and four `ext` (see
-/// [`apply_word_kara`]). Same lookups, same output bytes.
-#[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_KARA_XOR16: u16 = 512;
-
-/// Kill switch for [`ABV_KARA_XOR16`]: any value of
-/// `FLOCK_NO_ZC_AB_KARA_XOR16` restores the incumbent recombination in the
-/// same binary. Read once per process. The rows written are byte-identical.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn ab_kara_xor16_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_KARA_XOR16").is_none())
-}
-
 /// Row-body variant bit (with [`ABV_Z`]): the `x^4` image uses it too.
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_Z_SCALED: u16 = 16;
@@ -4292,17 +4225,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     )
                 });
                 if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
-                    if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
-                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { AB_Z_VARIANT | ABV_KARA_XOR16 }>(
-                            a_packed,
-                            b_packed,
-                            inv_table,
-                            byte_base_b,
-                            None,
-                            out,
-                            nt_store,
-                        );
-                    } else if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() {
+                    if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { AB_Z_VARIANT }>(
                             a_packed,
                             b_packed,
@@ -4388,17 +4311,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         }
         0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
             if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
-                    shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { AB_Z_VARIANT | ABV_KARA_XOR16 }>(
-                        a_packed,
-                        b_packed,
-                        inv_table,
-                        byte_base_b,
-                        None,
-                        out,
-                        nt_store,
-                    );
-                } else if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() {
+                if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { AB_Z_VARIANT }>(
                         a_packed,
                         b_packed,

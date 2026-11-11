@@ -139,12 +139,8 @@ unsafe fn lane_pair(lo: *const u64, hi: *const u64) -> core::arch::aarch64::uint
 }
 
 /// The bit transpose of [`transpose_8_strided_u64s_to_regs`] on its four row
-/// registers (rows `2i` and `2i + 1` in the halves of register `i`). Public
-/// so a caller that forms the same four registers another way (the AB
-/// stripe emitter's row program) shares this exact core.
 ///
 /// # Safety
-/// Register arithmetic and loads of the constant tables only.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub unsafe fn transpose_8_row_pairs_to_regs(

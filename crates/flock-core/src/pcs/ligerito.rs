@@ -5052,38 +5052,14 @@ fn transpose_forward_ntt_sparse_impl(
     (data, intro_msg)
 }
 
-/// Kill switch for the retained-prefix C2 materialization:
-/// `FLOCK_NO_C2_RETAINED_TRANSPOSE=1` (any value) restores the incumbent full
-/// transpose followed by `truncate`. Read once per process.
 pub(super) fn c2_retained_transpose_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_RETAINED_TRANSPOSE").is_none())
+    *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_C2_RETAINED_TRANSPOSE").is_none())
 }
 
-/// Retained-prefix form of [`transpose_forward_ntt_sparse_impl`] for a caller
-/// that keeps only the first `2^(log_d - drop_log)` outputs (the C2 dual keeps
-/// `2^(reduced_log_d - log_inv_rate)` basis coefficients and truncates the
-/// rest).
 ///
-/// A reverse butterfly is `top = a + b`, `bottom = t·(a + b) + b`. Every
-/// retained output takes the top branch at reverse layers `drop_log - 1 ..= 0`,
-/// so retained output `j` is exactly the XOR of the `2^drop_log` cosets
-/// `j + c·2^(log_d - drop_log)` of the state after reverse layer `drop_log`.
-/// None of those layers' field products or bottom stores is needed. Layers
-/// `log_d - 1 ..= drop_log` run the incumbent sparse-window prefix, densify and
-/// fused-three / single-layer kernels with the same twiddles in the same
-/// descending layer order, so every retained value is the same XOR of the same
-/// field products: bit-identical to the full transform followed by
-/// `truncate`.
 ///
-/// `drop_log == 1` with a dense suffix that is a whole number of fused-three
-/// groups (the L0 dual, reduced log_d 17) finishes with the five-product
-/// factored low-half row [`l0_factored_final3_retained_row`]; its identities
-/// (`twiddle(1, 0) = twiddle(2, 0) = 0`, `twiddle(2, 3) = twiddle(2, 1) +
-/// twiddle(2, 2)`) hold for every standard-basis table and are asserted.
 ///
-/// Returns `None` (the caller runs the incumbent) for unsorted positions or a
-/// geometry whose sparse prefix would reach a dropped layer.
 pub(super) fn transpose_forward_ntt_sparse_retained(
     ntt: &AdditiveNttF128,
     positions: &[usize],
@@ -5099,7 +5075,6 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
         return None;
     }
     let n = 1usize << log_d;
-    // Same prefix width as `transpose_forward_ntt_sparse_impl`.
     let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
     if log_d - k < drop_log {
         return None;
@@ -5138,10 +5113,6 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
     Some(retained)
 }
 
-/// Five-product factored form of
-/// [`transpose_forward_ntt_fused_final_3layer_low_half`] (same retained low
-/// half, same row ownership): the row algebra of
-/// [`l0_factored_final3_retained_row`] without the fused round message.
 fn transpose_forward_ntt_factored_final_3layer_low_half(
     ntt: &AdditiveNttF128,
     data: &mut [F128],
@@ -5171,9 +5142,6 @@ fn transpose_forward_ntt_factored_final_3layer_low_half(
         .into_par_iter()
         .with_min_len(small_ntt_min_jobs(8))
         .for_each(|row| {
-            // SAFETY: each row owns the eight positions `row + i*eighth`;
-            // different rows never overlap and only i = 0..4 (the retained
-            // low half) are written.
             unsafe {
                 let ptr = data_ptr as *mut F128;
                 let retained = l0_factored_final3_retained_row(
@@ -5187,9 +5155,6 @@ fn transpose_forward_ntt_factored_final_3layer_low_half(
         });
 }
 
-/// `out[j] = Σ_c data[j + c·2^keep_log]` over all `data.len() >> keep_log`
-/// cosets: the top-only tail of a retained-prefix transpose. Exact-size
-/// output so the result does not pin the full-domain capacity.
 fn xor_collapse_cosets(data: &[F128], keep_log: usize) -> Vec<F128> {
     use rayon::prelude::*;
 
@@ -6125,16 +6090,13 @@ fn lig_fold_hetero_enabled() -> bool {
 /// main-pool-only per-worker query split.
 fn lig_induce_hetero_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("FLOCK_NO_LIG_INDUCE_HETERO").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| !std::env::var("FLOCK_OFF_LIG_INDUCE_HETERO").is_ok_and(|v| v == "1"))
 }
 
-/// Serial sumcheck folds (`half < 4096`) use the NEON fold-and-message kernel
-/// of the parallel chunks. `FLOCK_NO_SMALL_FOLD_NEON=1` (any value) restores
-/// the scalar two-product loop. Read once per process.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 fn small_fold_neon_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_SMALL_FOLD_NEON").is_none())
+    *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_SMALL_FOLD_NEON").is_none())
 }
 
 /// Fused fold + next-round message in a SINGLE parallel pass.
@@ -6178,12 +6140,6 @@ fn fold_and_msg_lsb_into(
 
     const PAR_THRESHOLD: usize = 4096;
     if half < PAR_THRESHOLD {
-        // Serial small rounds (ranked: halves 2048..16 on the L3-L5 spine)
-        // take the same NEON kernel every parallel chunk below already runs:
-        // `f0 + r·(f0 + f1)` is one prepared-constant product instead of two
-        // full ones (`f0·(1+r) + f1·r` is the same field element), and the
-        // message products are reduced once per call. Bit-identical outputs
-        // and message. `FLOCK_NO_SMALL_FOLD_NEON=1` keeps the scalar loop.
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         if half >= 2 && half.is_multiple_of(2) && small_fold_neon_enabled() {
             let (u_0, u_2) = crate::field::f128_slice::fold_two_and_msg(
@@ -11860,8 +11816,6 @@ mod tests {
         }
     }
 
-    /// Serial-size folds (`half < 4096`, every ranked L3-L5 round) match the
-    /// scalar two-product fold and fully reduced message bit for bit.
     #[test]
     fn small_fold_and_msg_matches_scalar_oracle() {
         let mut st = 0x5EF0_1D00u64;
@@ -15708,11 +15662,6 @@ mod tests {
         }
     }
 
-    /// The C2 dual's retained-prefix transpose equals the incumbent full
-    /// transform followed by `truncate`, at the five ranked dual shapes
-    /// (reduced log_d, log_inv_rate, queries) and on small extra shapes.
-    /// Positions are `q >> 3` of sorted distinct queries, so duplicates occur
-    /// exactly as in `Dual::new_sync`; the NTT is the dual's full-domain table.
     #[test]
     fn c2_retained_transpose_matches_full_then_truncate() {
         use crate::challenger::Challenger;
