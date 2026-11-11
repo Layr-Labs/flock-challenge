@@ -5052,6 +5052,170 @@ fn transpose_forward_ntt_sparse_impl(
     (data, intro_msg)
 }
 
+/// Kill switch for the retained-prefix C2 materialization:
+/// `FLOCK_NO_C2_RETAINED_TRANSPOSE=1` (any value) restores the incumbent full
+/// transpose followed by `truncate`. Read once per process.
+pub(super) fn c2_retained_transpose_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_RETAINED_TRANSPOSE").is_none())
+}
+
+/// Retained-prefix form of [`transpose_forward_ntt_sparse_impl`] for a caller
+/// that keeps only the first `2^(log_d - drop_log)` outputs (the C2 dual keeps
+/// `2^(reduced_log_d - log_inv_rate)` basis coefficients and truncates the
+/// rest).
+///
+/// A reverse butterfly is `top = a + b`, `bottom = t·(a + b) + b`. Every
+/// retained output takes the top branch at reverse layers `drop_log - 1 ..= 0`,
+/// so retained output `j` is exactly the XOR of the `2^drop_log` cosets
+/// `j + c·2^(log_d - drop_log)` of the state after reverse layer `drop_log`.
+/// None of those layers' field products or bottom stores is needed. Layers
+/// `log_d - 1 ..= drop_log` run the incumbent sparse-window prefix, densify and
+/// fused-three / single-layer kernels with the same twiddles in the same
+/// descending layer order, so every retained value is the same XOR of the same
+/// field products: bit-identical to the full transform followed by
+/// `truncate`.
+///
+/// `drop_log == 1` with a dense suffix that is a whole number of fused-three
+/// groups (the L0 dual, reduced log_d 17) finishes with the five-product
+/// factored low-half row [`l0_factored_final3_retained_row`]; its identities
+/// (`twiddle(1, 0) = twiddle(2, 0) = 0`, `twiddle(2, 3) = twiddle(2, 1) +
+/// twiddle(2, 2)`) hold for every standard-basis table and are asserted.
+///
+/// Returns `None` (the caller runs the incumbent) for unsorted positions or a
+/// geometry whose sparse prefix would reach a dropped layer.
+pub(super) fn transpose_forward_ntt_sparse_retained(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    drop_log: usize,
+) -> Option<Vec<F128>> {
+    if drop_log == 0
+        || drop_log >= log_d
+        || positions.len() != values.len()
+        || !positions_are_sorted(positions)
+    {
+        return None;
+    }
+    let n = 1usize << log_d;
+    // Same prefix width as `transpose_forward_ntt_sparse_impl`.
+    let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
+    if log_d - k < drop_log {
+        return None;
+    }
+    let mut data: Vec<F128> = if k == 0 {
+        let mut data = vec![F128::ZERO; n];
+        for (&p, &v) in positions.iter().zip(values) {
+            data[p] += v;
+        }
+        data
+    } else {
+        let groups = group_sorted_positions(positions, k);
+        let mut arena = scatter_active_windows(&groups, positions, values, k);
+        transform_active_windows(ntt, &mut arena, &groups, positions, values, k, log_d);
+        densify_active_windows(&arena, &groups, log_d, k)
+    };
+    let mut remaining = log_d - k;
+    if drop_log == 1 && remaining >= 3 && remaining.is_multiple_of(3) {
+        while remaining > 3 {
+            remaining -= 3;
+            transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, remaining);
+        }
+        transpose_forward_ntt_factored_final_3layer_low_half(ntt, &mut data, log_d);
+        data.truncate(n >> 1);
+        return Some(data);
+    }
+    while remaining >= drop_log + 3 {
+        remaining -= 3;
+        transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, remaining);
+    }
+    for layer in (drop_log..remaining).rev() {
+        transpose_forward_ntt_single_layer_flat(ntt, &mut data, log_d, layer);
+    }
+    let retained = xor_collapse_cosets(&data, log_d - drop_log);
+    crate::scratch::give_sparse_ntt_data(data);
+    Some(retained)
+}
+
+/// Five-product factored form of
+/// [`transpose_forward_ntt_fused_final_3layer_low_half`] (same retained low
+/// half, same row ownership): the row algebra of
+/// [`l0_factored_final3_retained_row`] without the fused round message.
+fn transpose_forward_ntt_factored_final_3layer_low_half(
+    ntt: &AdditiveNttF128,
+    data: &mut [F128],
+    log_d: usize,
+) {
+    use rayon::prelude::*;
+
+    assert!(log_d >= 3);
+    assert_eq!(data.len(), 1usize << log_d);
+    let eighth = data.len() >> 3;
+    let layer_1_twiddles = [ntt.twiddle(1, 0), ntt.twiddle(1, 1)];
+    let layer_2_twiddles: [F128; 4] = core::array::from_fn(|block| ntt.twiddle(2, block));
+    assert_eq!(layer_1_twiddles[0], F128::ZERO);
+    assert_eq!(layer_2_twiddles[0], F128::ZERO);
+    assert_eq!(
+        layer_2_twiddles[3],
+        layer_2_twiddles[1] + layer_2_twiddles[2]
+    );
+    let constants = L0FactoredFinal3Constants {
+        a: layer_2_twiddles[1],
+        d: layer_2_twiddles[2],
+        a_plus_d: layer_2_twiddles[3],
+        b: layer_1_twiddles[1],
+    };
+    let data_ptr = data.as_mut_ptr() as usize;
+    (0..eighth)
+        .into_par_iter()
+        .with_min_len(small_ntt_min_jobs(8))
+        .for_each(|row| {
+            // SAFETY: each row owns the eight positions `row + i*eighth`;
+            // different rows never overlap and only i = 0..4 (the retained
+            // low half) are written.
+            unsafe {
+                let ptr = data_ptr as *mut F128;
+                let retained = l0_factored_final3_retained_row(
+                    core::array::from_fn(|i| *ptr.add(row + i * eighth)),
+                    constants,
+                );
+                for (i, value) in retained.into_iter().enumerate() {
+                    *ptr.add(row + i * eighth) = value;
+                }
+            }
+        });
+}
+
+/// `out[j] = Σ_c data[j + c·2^keep_log]` over all `data.len() >> keep_log`
+/// cosets: the top-only tail of a retained-prefix transpose. Exact-size
+/// output so the result does not pin the full-domain capacity.
+fn xor_collapse_cosets(data: &[F128], keep_log: usize) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let keep = 1usize << keep_log;
+    assert!(data.len().is_power_of_two() && data.len() >= keep);
+    let cosets = data.len() >> keep_log;
+    let mut out = data[..keep].to_vec();
+    let add_cosets = |base: usize, chunk: &mut [F128]| {
+        let len = chunk.len();
+        for coset in 1..cosets {
+            let start = coset * keep + base;
+            for (o, &s) in chunk.iter_mut().zip(&data[start..start + len]) {
+                *o += s;
+            }
+        }
+    };
+    if keep >= 2 * SMALL_NTT_MIN_ELEMS {
+        out.par_chunks_mut(SMALL_NTT_MIN_ELEMS)
+            .enumerate()
+            .for_each(|(ci, chunk)| add_cosets(ci * SMALL_NTT_MIN_ELEMS, chunk));
+    } else {
+        add_cosets(0, out.as_mut_slice());
+    }
+    out
+}
+
 #[cfg(test)]
 fn transpose_forward_ntt_sparse_hashmap(
     ntt: &AdditiveNttF128,
@@ -15471,6 +15635,51 @@ mod tests {
                 let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
+        }
+    }
+
+    /// The C2 dual's retained-prefix transpose equals the incumbent full
+    /// transform followed by `truncate`, at the five ranked dual shapes
+    /// (reduced log_d, log_inv_rate, queries) and on small extra shapes.
+    /// Positions are `q >> 3` of sorted distinct queries, so duplicates occur
+    /// exactly as in `Dual::new_sync`; the NTT is the dual's full-domain table.
+    #[test]
+    fn c2_retained_transpose_matches_full_then_truncate() {
+        use crate::challenger::Challenger;
+        for &(log_d, drop_log, nq) in &[
+            (17usize, 1usize, 218usize),
+            (15, 2, 106),
+            (13, 3, 71),
+            (11, 4, 53),
+            (9, 5, 43),
+            (12, 1, 40),
+            (14, 4, 64),
+            (8, 2, 9),
+        ] {
+            let mut ch = crate::challenger::RandomChallenger::new(
+                0xC2_7E7A_1E5u64 ^ ((log_d * 977 + drop_log * 31 + nq) as u64),
+            );
+            let full_log = log_d + 3;
+            let ntt = AdditiveNttF128::standard(full_log);
+            let mut queries: Vec<usize> = Vec::new();
+            while queries.len() < nq {
+                let q = (ch.sample_f128().lo as usize) % (1usize << full_log);
+                if !queries.contains(&q) {
+                    queries.push(q);
+                }
+            }
+            queries.sort_unstable();
+            let positions: Vec<usize> = queries.iter().map(|&q| q >> 3).collect();
+            let values: Vec<F128> = (0..nq).map(|_| ch.sample_f128()).collect();
+
+            let (mut expected, _) = transpose_forward_ntt_sparse_impl(
+                &ntt, &positions, &values, log_d, false, None, false,
+            );
+            expected.truncate(1usize << (log_d - drop_log));
+            let actual =
+                transpose_forward_ntt_sparse_retained(&ntt, &positions, &values, log_d, drop_log)
+                    .expect("supported retained geometry");
+            assert_eq!(actual, expected, "log_d={log_d} drop={drop_log} nq={nq}");
         }
     }
 
