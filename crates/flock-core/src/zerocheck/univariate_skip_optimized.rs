@@ -5840,6 +5840,22 @@ mod tests {
                     &mut out_h4_kara,
                     false,
                 );
+                let mut out_h4_kara_unscaled = [0u8; 64];
+                shift_reduce_inner_ab_fused_neon_h4::<{
+                    kernels::aarch64::ABV_KARA | kernels::aarch64::ABV_KARA_UNSCALED
+                }>(
+                    &a_packed,
+                    &b_packed,
+                    &table,
+                    chunk_byte_base,
+                    b_med,
+                    &mut out_h4_kara_unscaled,
+                    false,
+                );
+                assert_eq!(
+                    out_h4_kara_unscaled, out_h4,
+                    "unscaled Karatsuba h4 differs from plain h4 at (base={chunk_byte_base}, b_med={b_med})"
+                );
                 assert_eq!(
                     out_h4_kara, out_h4,
                     "Karatsuba h4 differs from plain h4 at (base={chunk_byte_base}, b_med={b_med})"
@@ -6370,6 +6386,61 @@ mod tests {
         }
         kernels::aarch64::ab_kara_force(true);
         assert_eq!(checked, 24 * 3 * 2 * 3);
+    }
+
+    /// Local timing probe for the generic h4 rows (not a correctness test):
+    /// the Karatsuba apply with scaled-index and with unscaled byte-offset
+    /// loads, alternated in one process on random rows; outputs asserted equal.
+    /// `cargo test --profile challenge -p flock-core --lib ab_h4_unscaled_timing
+    /// -- --ignored --nocapture`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "timing probe"]
+    fn ab_h4_unscaled_timing() {
+        use kernels::aarch64::{ABV_KARA, ABV_KARA_UNSCALED};
+        let table = make_inv_table();
+        let mut rng = Rng::new(0x4A11_5CA1_ED00_0001);
+        const CHUNKS: usize = 64;
+        let a_packed: Vec<u8> = (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+        let b_packed: Vec<u8> = (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() >> 9 & 0xff) as u8).collect();
+        let mut out = [0u8; 64];
+        const REPS: usize = 20;
+        let mut times: [Vec<f64>; 2] = Default::default();
+        let mut sums = [0u64; 2];
+        for round in 0..31 {
+            for k in 0..2 {
+                let form = (k + round) % 2;
+                let mut sum = 0u64;
+                let t0 = std::time::Instant::now();
+                for _ in 0..REPS {
+                    for c in 0..CHUNKS {
+                        for b_med in 0..16usize {
+                            let base = c * 2048 + (b_med & 1) * 1024;
+                            if form == 0 {
+                                kernels::aarch64::shift_reduce_inner_ab_fused_neon_h4::<{ ABV_KARA }>(&a_packed, &b_packed, &table, base, b_med, &mut out, false);
+                            } else {
+                                kernels::aarch64::shift_reduce_inner_ab_fused_neon_h4::<{ ABV_KARA | ABV_KARA_UNSCALED }>(&a_packed, &b_packed, &table, base, b_med, &mut out, false);
+                            }
+                            sum = sum.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from_le_bytes(out[8..16].try_into().unwrap());
+                        }
+                    }
+                }
+                if round > 0 {
+                    times[form].push(t0.elapsed().as_secs_f64() * 1e9 / (REPS * CHUNKS * 16) as f64);
+                }
+                sums[form] = sum;
+            }
+        }
+        assert_eq!(sums[0], sums[1], "forms disagree");
+        let mut d: Vec<f64> = times[1].iter().zip(&times[0]).map(|(u, s)| u - s).collect();
+        d.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let lower = times[1].iter().zip(&times[0]).filter(|(u, s)| u < s).count();
+        for (form, name) in ["scaled-index loads", "unscaled byte-offset loads"].iter().enumerate() {
+            let mut t = times[form].clone();
+            t.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            eprintln!("[ab-h4-timing] {name:28} min {:.3} median {:.3} ns per row", t[0], t[t.len() / 2]);
+        }
+        eprintln!("[ab-h4-timing] paired median {:+.3} ns per row, unscaled lower in {lower} of {}", d[d.len() / 2], d.len());
     }
 
     /// Local timing probe for the two forms of the static-B Horner rows (not
