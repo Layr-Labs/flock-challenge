@@ -186,6 +186,17 @@ pub fn helper_chunks_claimed() -> usize {
     EPOOL_HELPER_CHUNKS.load(Ordering::Relaxed)
 }
 
+#[repr(align(128))]
+struct Line<T>(T);
+
+impl<T> std::ops::Deref for Line<T> {
+    type Target = T;
+    #[inline(always)]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 /// Helper broadcasts issued by the two hetero drains across all of this
 /// process (diagnostic only; relaxed ordering). One increment per *engaged*
 /// drain, i.e. exactly the kickoffs [`drain_hetero`] carries. Drains that skip
@@ -438,6 +449,7 @@ pub(crate) fn drain_hetero<H>(
 /// same atomic cursor (the main workers drain to the end), and `f(i)` does not
 /// depend on which thread runs it, so outputs are byte-identical.
 /// `FLOCK_NO_EPOOL_TAIL_GUARD=1` restores unconditional helper claims.
+#[repr(align(128))]
 struct TailGuard {
     on: bool,
     main_threads: u64,
@@ -551,19 +563,21 @@ where
         return true;
     }
 
-    let next = AtomicUsize::new(0);
+    let next = Line(AtomicUsize::new(0));
     ep.broadcast(|context| {
         if context.index() >= max_workers {
             return;
         }
+        let mut claimed = 0usize;
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n_chunks {
                 break;
             }
-            EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+            claimed += 1;
             f(i);
         }
+        EPOOL_HELPER_CHUNKS.fetch_add(claimed, Ordering::Relaxed);
     });
     true
 }
@@ -582,8 +596,8 @@ where
 /// sees `done == n_chunks` therefore happens after every chunk's writes.
 ///
 pub struct HelpQueue<'a> {
-    next: AtomicUsize,
-    done: AtomicUsize,
+    next: Line<AtomicUsize>,
+    done: Line<AtomicUsize>,
     main_claims: AtomicUsize,
     main_active: AtomicUsize,
     main_ns: AtomicU64,
@@ -597,8 +611,8 @@ pub struct HelpQueue<'a> {
 impl<'a> HelpQueue<'a> {
     pub fn new(n_chunks: usize, f: &'a (dyn Fn(usize) + Sync)) -> Self {
         Self {
-            next: AtomicUsize::new(0),
-            done: AtomicUsize::new(0),
+            next: Line(AtomicUsize::new(0)),
+            done: Line(AtomicUsize::new(0)),
             main_claims: AtomicUsize::new(0),
             main_active: AtomicUsize::new(0),
             main_ns: AtomicU64::new(0),
@@ -836,7 +850,7 @@ fn run_chunks_with_helper_arm<F>(
         }
         return;
     }
-    let next = AtomicUsize::new(0);
+    let next = Line(AtomicUsize::new(0));
     let guard = TailGuard::new(main_threads);
     let worker = || {
         loop {
@@ -861,6 +875,7 @@ fn run_chunks_with_helper_arm<F>(
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
             let helper_body = || {
                 let mut own_ns = 0u64;
+                let mut claimed = 0usize;
                 loop {
                     if !guard.helper_may_claim(own_ns, next.load(Ordering::Relaxed), n_chunks) {
                         break;
@@ -869,9 +884,10 @@ fn run_chunks_with_helper_arm<F>(
                     if i >= n_chunks {
                         break;
                     }
-                    EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+                    claimed += 1;
                     guard.helper_run(&mut own_ns, || f(i));
                 }
+                EPOOL_HELPER_CHUNKS.fetch_add(claimed, Ordering::Relaxed);
             };
             drain_hetero(main_threads, &worker, ep, &helper_body, detached);
         }
@@ -938,7 +954,7 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
         }
         return;
     }
-    let next = AtomicUsize::new(0);
+    let next = Line(AtomicUsize::new(0));
     let guard = TailGuard::new(main_threads);
     let worker = || {
         let mut state = init();
@@ -965,6 +981,7 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
             let helper_body = || {
                 let mut state = init();
                 let mut own_ns = 0u64;
+                let mut claimed = 0usize;
                 loop {
                     if !guard.helper_may_claim(own_ns, next.load(Ordering::Relaxed), n_chunks) {
                         break;
@@ -973,9 +990,10 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
                     if i >= n_chunks {
                         break;
                     }
-                    EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+                    claimed += 1;
                     guard.helper_run(&mut own_ns, || f(&mut state, i));
                 }
+                EPOOL_HELPER_CHUNKS.fetch_add(claimed, Ordering::Relaxed);
             };
             drain_hetero(main_threads, &worker, ep, &helper_body, detached);
         }
