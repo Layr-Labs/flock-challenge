@@ -88,7 +88,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
         }
         macro_rules! bimg_g {
             ($k:literal) => {
-                apply_word_into_4_regs_v::<V>(plain, plain_sw, kplain, bw!($k))
+                apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, bw!($k))
             };
         }
         macro_rules! bimg_s {
@@ -116,7 +116,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
         macro_rules! bimg_sk {
             ($blk:literal, $k:literal, $pairs:tt, $singles:tt) => {{
                 if V & ABV_KARA != 0 {
-                    apply_word_kara(kplain, bw!($k))
+                    apply_word_kara::<V, false>(kplain, bw!($k))
                 } else {
                     bimg_s!($blk, $k, $pairs, $singles)
                 }
@@ -126,7 +126,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
         macro_rules! prods {
             ($at:expr, $at_sw:expr, $kara:expr, $k:literal, $bimg:expr) => {{
                 let aw = u64::from_le(core::ptr::read_unaligned(a_base.add($k * N_CHUNKS).cast::<u64>()));
-                let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V>($at, $at_sw, $kara, aw);
+                let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw);
                 let (db0, db1, db2, db3) = $bimg;
                 [
                     pmull_lo_u16(da0, db0),

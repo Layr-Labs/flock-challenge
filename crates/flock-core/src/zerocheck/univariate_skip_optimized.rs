@@ -1734,7 +1734,20 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     if let Some((_, _, partials)) = static_run {
         // Same rows, same bytes: the Karatsuba table apply (18 loads per
         // word) or, with `FLOCK_NO_ZC_AB_KARA=1`, the plain apply (32).
-        if kernels::aarch64::ab_kara_enabled() {
+        if kernels::aarch64::ab_kara_enabled() && kernels::aarch64::ab_kara_unscaled_enabled() {
+            kernels::aarch64::bstatic_horner_window_rows::<{
+                kernels::aarch64::AB_ROWS_VARIANT | kernels::aarch64::ABV_KARA_UNSCALED
+            }>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else if kernels::aarch64::ab_kara_enabled() {
             kernels::aarch64::bstatic_horner_window_rows::<{ kernels::aarch64::AB_ROWS_VARIANT }>(
                 within_hash_outer,
                 a_packed,
@@ -6174,7 +6187,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn ab_kernel_variants_match_baseline() {
-        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_INLINE_WINDOW, ABV_KARA};
+        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_INLINE_WINDOW, ABV_KARA, ABV_KARA_UNSCALED};
         let table = make_inv_table();
         let mut rng = Rng::new(0xAB5A_71C0_F457_0003);
         let mut words: Vec<u64> = vec![0, u64::MAX];
@@ -6187,7 +6200,9 @@ mod tests {
         words.extend((0..4096).map(|_| rng.next_u64()));
         for scaled in [false, true] {
             for &word in &words {
-                let (plain, kara) = kernels::aarch64::ab_apply_word_forms(&table, scaled, word);
+                let (plain, kara) = kernels::aarch64::ab_apply_word_forms::<ABV_KARA>(&table, scaled, word);
+                let (_, unscaled) = kernels::aarch64::ab_apply_word_forms::<{ ABV_KARA | ABV_KARA_UNSCALED }>(&table, scaled, word);
+                assert_eq!(kara, unscaled, "unscaled Karatsuba apply differs (scaled={scaled}, word={word:016x})");
                 assert_eq!(plain, kara, "Karatsuba apply differs (scaled={scaled}, word={word:016x})");
                 let mut want = [F8::ZERO; 64];
                 table.apply(&word.to_le_bytes(), &mut want);
@@ -6265,11 +6280,12 @@ mod tests {
                         check!(ABV_KARA);
                         check!(ABV_INLINE_WINDOW);
                         check!(AB_ROWS_VARIANT);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED);
                     }
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 3);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 4);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba

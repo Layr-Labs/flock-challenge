@@ -1972,8 +1972,8 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_h4<const V: u8>(
                 let bw = u64::from_le(core::ptr::read_unaligned(
                     b_base.add($k * N_CHUNKS).cast::<u64>(),
                 ));
-                let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V>($at, $at_sw, $kara, aw);
-                let (db0, db1, db2, db3) = apply_word_into_4_regs_v::<V>(plain, plain_sw, kplain, bw);
+                let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw);
+                let (db0, db1, db2, db3) = apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, bw);
                 [
                     pmull_lo_u16(da0, db0),
                     pmull_hi_u16(da0, db0),
@@ -2103,7 +2103,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
                 } else if STATIC_A && $k == 0 {
                     let aw = u64::from_le(core::ptr::read_unaligned(a_base.cast::<u64>()));
                     if V & ABV_KARA != 0 {
-                        apply_word_kara($kara, aw)
+                        apply_word_kara::<V, { $k >= 4 }>($kara, aw)
                     } else {
                         apply_word_low5_into_4_regs($at, $at_sw, aw)
                     }
@@ -2126,7 +2126,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
                     // whole-word Karatsuba apply (18 loads) is this row's
                     // five-byte apply (20 loads).
                     if V & ABV_KARA != 0 {
-                        apply_word_kara($kara, aw)
+                        apply_word_kara::<V, { $k >= 4 }>($kara, aw)
                     } else {
                         apply_word_low5_into_4_regs($at, $at_sw, aw)
                     }
@@ -2134,7 +2134,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
                     let aw = u64::from_le(core::ptr::read_unaligned(
                         a_base.add($k * N_CHUNKS).cast::<u64>(),
                     ));
-                    apply_word_into_4_regs_v::<V>($at, $at_sw, $kara, aw)
+                    apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw)
                 };
                 if ONE_MASK & (1 << $k) != 0 {
                     [
@@ -2151,7 +2151,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
                     let bw = u64::from_le(core::ptr::read_unaligned(
                         b_base.add($k * N_CHUNKS).cast::<u64>(),
                     ));
-                    let (db0, db1, db2, db3) = apply_word_into_4_regs_v::<V>(plain, plain_sw, kplain, bw);
+                    let (db0, db1, db2, db3) = apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, bw);
                     [
                         pmull_lo_u16(da0, db0),
                         pmull_hi_u16(da0, db0),
@@ -3101,6 +3101,17 @@ pub(crate) const ABV_KARA: u8 = 1;
 /// function body (no per-row call, saved registers or constant reloads).
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_INLINE_WINDOW: u8 = 2;
+/// Row-body variant bit: form Karatsuba byte offsets before unscaled loads.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_KARA_UNSCALED: u8 = 4;
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_kara_unscaled_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_AB_KARA_UNSCALED").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
 /// The form of the static-B Horner rows when [`ab_kara_enabled`].
 #[cfg(target_arch = "aarch64")]
 pub(crate) const AB_ROWS_VARIANT: u8 = ABV_KARA | ABV_INLINE_WINDOW;
@@ -3227,11 +3238,98 @@ pub(crate) fn ab_kara_tables(inv_table: &InvNttTableByteSingleGf8) -> *const u8 
     unsafe { tables.storage.as_ptr().add(tables.offset) }
 }
 
+/// One slot of a Karatsuba table, with the byte offset formed in one instruction.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ab_kara_ld<const V: u8, const J: u32, const SLOT: usize>(
+    kara: *const u8,
+    word: u64,
+) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        if V & ABV_KARA_UNSCALED == 0 {
+            return vld1q_u8(kara.add(byte_from_word::<J>(word) * 128 + SLOT * 16));
+        }
+        let out: uint8x16_t;
+        // Each slot base is invariant across words; the maximum offset is 255 * 128.
+        if J == 0 {
+            core::arch::asm!(
+                "ubfiz {idx}, {word}, #7, #8",
+                "ldr {out:q}, [{base}, {idx}]",
+                word = in(reg) word,
+                base = in(reg) kara.add(SLOT * 16),
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else {
+            core::arch::asm!(
+                "and {idx}, {mask}, {word}, lsr #{shift}",
+                "ldr {out:q}, [{base}, {idx}]",
+                shift = const (J * 8 + 57) % 64,
+                mask = in(reg) 0x7f80usize,
+                word = in(reg) word,
+                base = in(reg) kara.add(SLOT * 16),
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+        out
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_kara_unscaled_addresses_match() {
+    let data: Vec<u8> = (0..2 * AB_KARA_IMAGE_BYTES)
+        .map(|i| ((i * 17) ^ (i >> 7) ^ (i >> 15)) as u8)
+        .collect();
+    unsafe fn check<const J: u32, const SHIFT: u32>(kara: *const u8, word: u64) {
+        unsafe {
+            macro_rules! slot {
+                ($s:literal) => {
+                    assert_eq!(
+                        core::mem::transmute::<_, [u8; 16]>(ab_kara_ld::<0, J, $s>(kara, word)),
+                        core::mem::transmute::<_, [u8; 16]>(ab_kara_ld::<ABV_KARA_UNSCALED, J, $s>(kara, word)),
+                        "byte={J}, slot={}, word={word:016x}", $s,
+                    );
+                };
+            }
+            slot!(0); slot!(1); slot!(2); slot!(3);
+            slot!(4); slot!(5); slot!(6); slot!(7);
+            let ninth = kara.add(AB_KARA_NINTH);
+            assert_eq!(
+                core::mem::transmute::<_, [u8; 16]>(ab_ld::<false, SHIFT>(ninth, word as usize)),
+                core::mem::transmute::<_, [u8; 16]>(ab_ld::<true, SHIFT>(ninth, word as usize)),
+            );
+        }
+    }
+    for image in 0..2 {
+        for x in 0..256u64 {
+            for background in [0, u64::MAX] {
+                macro_rules! byte {
+                    ($j:literal) => {
+                        unsafe {
+                            check::<$j, { $j * 8 }>(
+                                data.as_ptr().add(image * AB_KARA_IMAGE_BYTES),
+                                (background & !(0xff << ($j * 8))) | (x << ($j * 8)),
+                            );
+                        }
+                    };
+                }
+                byte!(0); byte!(1); byte!(2); byte!(3);
+                byte!(4); byte!(5); byte!(6); byte!(7);
+            }
+        }
+    }
+}
+
 /// [`apply_word_into_4_regs`] out of one image of [`ab_kara_tables`]
 /// (`kara` points at the image's first entry).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn apply_word_kara(
+unsafe fn apply_word_kara<const V: u8, const SCALED: bool>(
     kara: *const u8,
     word: u64,
 ) -> (
@@ -3249,7 +3347,12 @@ unsafe fn apply_word_kara(
         let v = s ^ (s >> 16);
         macro_rules! ld {
             ($src:expr, $j:literal, $slot:literal) => {
-                vld1q_u8(kara.add(byte_from_word::<$j>($src) * 128 + $slot * 16))
+                // Two images' slot bases spill; keep only the plain image unscaled.
+                if SCALED {
+                    ab_kara_ld::<0, $j, $slot>(kara, $src)
+                } else {
+                    ab_kara_ld::<V, $j, $slot>(kara, $src)
+                }
             };
         }
         // First ("even") and second ("odd") byte of every unit product.
@@ -3270,8 +3373,14 @@ unsafe fn apply_word_kara(
         let e2 = veorq_u8(e0, te);
         let o2 = veorq_u8(o0, to);
         let ninth = kara.add(AB_KARA_NINTH);
-        let ess = vld1q_u8(ninth.add(byte_from_word::<0>(v) * 16));
-        let oss = vld1q_u8(ninth.add(byte_from_word::<1>(v) * 16));
+        let (ess, oss) = if !SCALED && V & ABV_KARA_UNSCALED != 0 {
+            (ab_ld::<true, 0>(ninth, v as usize), ab_ld::<true, 8>(ninth, v as usize))
+        } else {
+            (
+                vld1q_u8(ninth.add(byte_from_word::<0>(v) * 16)),
+                vld1q_u8(ninth.add(byte_from_word::<1>(v) * 16)),
+            )
+        };
         let e3 = xor3_u8(e1, te, ess);
         let o3 = xor3_u8(o1, to, oss);
         (
@@ -3286,7 +3395,7 @@ unsafe fn apply_word_kara(
 /// [`apply_word_into_4_regs`] in the form selected by `V`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn apply_word_into_4_regs_v<const V: u8>(
+unsafe fn apply_word_into_4_regs_v<const V: u8, const SCALED: bool>(
     table_base: *const u8,
     half_swapped_table_base: *const u8,
     kara: *const u8,
@@ -3299,7 +3408,7 @@ unsafe fn apply_word_into_4_regs_v<const V: u8>(
 ) {
     unsafe {
         if V & ABV_KARA != 0 {
-            apply_word_kara(kara, word)
+            apply_word_kara::<V, SCALED>(kara, word)
         } else {
             apply_word_into_4_regs(table_base, half_swapped_table_base, word)
         }
@@ -3309,7 +3418,7 @@ unsafe fn apply_word_into_4_regs_v<const V: u8>(
 /// Test access: one word through the plain apply and through the Karatsuba
 /// apply of the plain (`scaled = false`) or `x^4`-scaled image.
 #[cfg(all(test, target_arch = "aarch64"))]
-pub(crate) fn ab_apply_word_forms(
+pub(crate) fn ab_apply_word_forms<const V: u8>(
     inv_table: &InvNttTableByteSingleGf8,
     scaled: bool,
     word: u64,
@@ -3329,7 +3438,7 @@ pub(crate) fn ab_apply_word_forms(
     // SAFETY: both applies read inside their table images only.
     unsafe {
         let p = apply_word_into_4_regs(t, s, word);
-        let q = apply_word_kara(k, word);
+        let q = if scaled { apply_word_kara::<V, true>(k, word) } else { apply_word_kara::<V, false>(k, word) };
         for (dst, v) in [(&mut out.0, p), (&mut out.1, q)] {
             vst1q_u8(dst.as_mut_ptr(), v.0);
             vst1q_u8(dst.as_mut_ptr().add(16), v.1);
@@ -3578,7 +3687,17 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     )
                 });
                 if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
-                    if ab_kara_enabled() {
+                    if ab_kara_enabled() && ab_kara_unscaled_enabled() {
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { ABV_KARA | ABV_KARA_UNSCALED }>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            byte_base_b,
+                            None,
+                            out,
+                            nt_store,
+                        );
+                    } else if ab_kara_enabled() {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { ABV_KARA }>(
                             a_packed,
                             b_packed,
@@ -3644,7 +3763,17 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         }
         0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
             if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                if ab_kara_enabled() {
+                if ab_kara_enabled() && ab_kara_unscaled_enabled() {
+                    shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_KARA | ABV_KARA_UNSCALED }>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base_b,
+                        None,
+                        out,
+                        nt_store,
+                    );
+                } else if ab_kara_enabled() {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_KARA }>(
                         a_packed,
                         b_packed,
