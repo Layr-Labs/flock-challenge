@@ -795,6 +795,12 @@ pub fn ab_compact_backing_token_counts() -> (usize, usize) {
 pub struct Round1AbInner {
     storage: Vec<F128>,
     representation: Round1AbRepresentation,
+    /// The backing is the exact allocation the previous prove parked through
+    /// its provenance token (a token hit: the Vec never left scratch custody
+    /// in between, so its address names the same pages). Read only by the
+    /// round-one GPU arm's cached-view check.
+    #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+    reused_backing: bool,
 }
 
 /// Representation carried with the large round-one AB transform backing.
@@ -1356,6 +1362,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         return Round1AbInner {
             storage,
             representation,
+            reused_backing: token_hit,
         };
     }
 
@@ -1392,6 +1399,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
     Round1AbInner {
         storage,
         representation,
+        reused_backing: token_hit,
     }
 }
 
@@ -2979,7 +2987,6 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
         Some(bank_bits) => {
             let r_lo = &r[k_skip + N_INNER..k_skip + N_INNER + eq.n_lo];
             let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
-            let tables = build_ab_eq_fold_tables(&eq_top_scaled, convert);
             let bank_len = eq_bot.len() * ELL;
             let bank_deferred = ranked_ab_bank_deferred_shape(
                 m,
@@ -2993,7 +3000,52 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                 rayon::current_num_threads(),
                 zc_ab_bank_deferred_enabled(),
             );
-            crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+            // Round-one AB completion GPU arm (`FLOCK_NO_ZC_R1_GPU=1` kills):
+            // ranked deferred shape only. Submitted before the CPU table
+            // build: the GPU derives its own nibble tables from the 32 eq_top
+            // factors, so its start delay overlaps the CPU's build.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let gpu_job = if bank_deferred
+                && crate::gpu_commit::zc_r1_gpu_enabled()
+                && within_outer_mask <= 3
+                && b_med_counts.len() > within_outer_mask
+            {
+                let rep = ab_inner.representation;
+                let mut fe = [0u32; 4];
+                for (within, slot) in fe.iter_mut().enumerate().take(within_outer_mask + 1) {
+                    let n = b_med_counts[within] as usize;
+                    if n != 0 {
+                        *slot = (rep.first_materialized_b_med(within) as u32)
+                            | ((rep.materialized_b_med_end(within, n) as u32) << 8);
+                    }
+                }
+                crate::gpu_commit::zc_r1_gpu_launch(
+                    ab_inner_bytes,
+                    ab_inner.reused_backing,
+                    convert,
+                    &eq_top_scaled,
+                    &eq_bot,
+                    &eq.hi,
+                    fe,
+                    within_outer_mask as u32,
+                )
+            } else {
+                None
+            };
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if let Some(job) = gpu_job.as_ref()
+                && crate::gpu_commit::zc_r1_gpu_probe()
+            {
+                let (delay, busy) = job.wait_now();
+                eprintln!(
+                    "[zc-r1-gpu] probe: isolated full pass {busy:.3} ms ({:.1} GB/s), start delay {delay:.3} ms",
+                    ab_inner_bytes.len() as f64 / (busy * 1e-3) / 1e9
+                );
+            }
+            let tables = build_ab_eq_fold_tables(&eq_top_scaled, convert);
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let t_sweep = std::time::Instant::now();
+            let chunk_fn = |x_hi: usize| {
                 let mut partial = [F128::ZERO; ELL];
                 AB_EQ_FOLD_BANKS.with(|cell| {
                     let mut banks = cell.borrow_mut();
@@ -3022,7 +3074,33 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                 // the synchronous queue join publishes all writes before
                 // reduction.
                 unsafe { *partials_base.ptr().add(x_hi) = partial };
-            });
+            };
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            match gpu_job {
+                Some(job) if !job.is_verify() => {
+                    // Two-ended claims: GPU-delivered chunks from the bottom
+                    // (adopt the GPU partial), CPU steals from the top.
+                    crate::epool::run_hetero_chunks(hi_size, |_| match job.claim() {
+                        Some(crate::gpu_commit::Zr1Claim::Covered(c)) => {
+                            let partial = job.chunk_partial(c);
+                            // SAFETY: each chunk is claimed exactly once.
+                            unsafe { *partials_base.ptr().add(c) = partial };
+                        }
+                        Some(crate::gpu_commit::Zr1Claim::Full(c)) => chunk_fn(c),
+                        None => unreachable!("one claim per queue index"),
+                    });
+                    job.finish(t_sweep.elapsed().as_secs_f64() * 1e3);
+                }
+                Some(job) => {
+                    // Verification prove: the incumbent sweep, then every GPU
+                    // chunk partial compared with the CPU's.
+                    crate::epool::run_hetero_chunks(hi_size, chunk_fn);
+                    job.finish_verify(&partials);
+                }
+                None => crate::epool::run_hetero_chunks(hi_size, chunk_fn),
+            }
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            crate::epool::run_hetero_chunks(hi_size, chunk_fn);
             crate::scratch::give_f128(tables);
         }
     }
@@ -6959,6 +7037,145 @@ mod tests {
 
             assert_eq!(got, expected, "split round-1 mismatch at m={m}");
         }
+    }
+
+    /// Round-one AB completion GPU arm (`FLOCK_NO_ZC_R1_GPU`): at the ranked
+    /// shape (128 chunks x 4 MiB, n_lo = 12, 128 banks) every GPU chunk
+    /// partial equals the CPU's banked fold VALUE BY VALUE — through the
+    /// verification retire, and through the two-ended claim protocol with
+    /// the GPU taking none, all, and part of the chunks. The claims must
+    /// partition the chunks with the covered ones a prefix. A transform at a
+    /// different allocation (or not token-reused) keeps the arm off.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_r1_gpu_arm_matches_cpu_partials_all_claim_modes() {
+        use crate::gpu_commit::Zr1Claim;
+        use rayon::prelude::*;
+        const HI: usize = 128;
+        const N_LO: usize = 12;
+        const BANK_BITS: usize = 7;
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let (mask, counts) = build_b_med_counts(&padding);
+        assert!(mask <= 3);
+        let total_bytes = 1usize << 29;
+        let mut storage = crate::scratch::take_f128(total_bytes / 16);
+        let mut rng = Rng::new(0x51EA_1A11);
+        for v in storage.iter_mut() {
+            *v = rng.f128();
+        }
+        let bytes = unsafe {
+            core::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), total_bytes)
+        };
+        let r_lo = rng.f128_vec(N_LO);
+        let eq_hi = rng.f128_vec(HI);
+        let (eq_bot, eq_top) = ab_eq_fold_factors(&r_lo, BANK_BITS);
+        let convert = convert_table();
+        let tables = build_ab_eq_fold_tables(&eq_top, convert);
+        for rep in [
+            Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true },
+            Round1AbRepresentation::Complete,
+        ] {
+            let cpu: Vec<[F128; ELL]> = (0..HI)
+                .into_par_iter()
+                .map(|x_hi| {
+                    let mut banks = vec![F128::ZERO; (1 << BANK_BITS) * ELL];
+                    let mut partial = [F128::ZERO; ELL];
+                    process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
+                        x_hi,
+                        1 << N_LO,
+                        N_LO + N_INNER,
+                        mask,
+                        &counts,
+                        bytes,
+                        rep,
+                        &eq_bot,
+                        eq_hi[x_hi],
+                        &tables,
+                        BANK_BITS,
+                        true,
+                        &mut banks,
+                        &mut partial,
+                    );
+                    partial
+                })
+                .collect();
+            let mut fe = [0u32; 4];
+            for (within, slot) in fe.iter_mut().enumerate().take(mask + 1) {
+                let n = counts[within] as usize;
+                if n != 0 {
+                    *slot = (rep.first_materialized_b_med(within) as u32)
+                        | ((rep.materialized_b_med_end(within, n) as u32) << 8);
+                }
+            }
+            let launch = |reused: bool| {
+                crate::gpu_commit::zc_r1_gpu_launch(
+                    bytes, reused, convert, &eq_top, &eq_bot, &eq_hi, fe, mask as u32,
+                )
+            };
+            // Verification retire: full GPU pass, all 8192 values compared.
+            crate::gpu_commit::zc_r1_gpu_test_set_verified(false);
+            let job = launch(false).expect("arm launches on the ranked shape");
+            assert!(job.is_verify());
+            assert!(job.finish_verify(&cpu), "verification must match the CPU");
+            // A verified arm refuses a transform that is not token-reused.
+            assert!(launch(false).is_none(), "non-reused transform keeps the arm off");
+            for mode in 0..3 {
+                let job = launch(true).expect("timed launch");
+                assert!(!job.is_verify());
+                match mode {
+                    // GPU none: claims race ahead of the start delay.
+                    0 => {}
+                    // GPU all.
+                    1 => while !job.delivered(HI - 1) {
+                        std::hint::spin_loop();
+                    },
+                    // GPU part: its first batch at least.
+                    _ => while !job.delivered(0) {
+                        std::hint::spin_loop();
+                    },
+                }
+                let mut seen = [false; HI];
+                let mut n = 0;
+                while let Some(c) = job.claim() {
+                    let (i, cov) = match c {
+                        Zr1Claim::Covered(i) => (i, true),
+                        Zr1Claim::Full(i) => (i, false),
+                    };
+                    assert!(!seen[i], "chunk {i} claimed twice");
+                    seen[i] = true;
+                    n += 1;
+                    if cov {
+                        assert_eq!(job.chunk_partial(i), cpu[i], "GPU partial chunk {i} mode {mode}");
+                    }
+                }
+                assert_eq!(n, HI, "one claim per chunk");
+                let covered = job.covered();
+                match mode {
+                    1 => assert_eq!(covered, HI, "GPU takes all"),
+                    2 => assert!(covered >= 1, "first batch delivered"),
+                    _ => {}
+                }
+                eprintln!("[zc-r1-gpu-test] {rep:?} mode {mode}: covered {covered}/{HI}");
+                job.finish(0.0);
+            }
+        }
+        // A different allocation never gets a view.
+        let other = crate::scratch::take_f128(total_bytes / 16);
+        let obytes =
+            unsafe { core::slice::from_raw_parts(other.as_ptr().cast::<u8>(), total_bytes) };
+        assert!(
+            crate::gpu_commit::zc_r1_gpu_launch(
+                obytes, true, convert, &eq_top, &eq_bot, &eq_hi, [0; 4], 0
+            )
+            .is_none(),
+            "a second allocation is never wrapped"
+        );
+        crate::scratch::give_f128(tables);
+        // The arm's process-lifetime view names `storage`: keep it mapped.
+        std::mem::forget(storage);
     }
 
     /// The eq_lo fold's whole premise. At the ranked split shape the weight
