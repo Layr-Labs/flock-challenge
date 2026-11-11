@@ -687,6 +687,88 @@ unsafe fn fold_banked_slots4_schoolbook<const BANKS: usize>(
     }
 }
 
+/// One whole 16-byte load of an input element that the optimizer may not
+/// narrow or split. With an ordinary load the compiler serves the
+/// matching-lane PMULL of [`tri_acc_two_banks`] from an 8-byte load of the
+/// low half and the PMULL2 from a second, broadcasting 8-byte load of the
+/// high half (`ld1r`, which also needs its own address instruction): two
+/// loads, one address add and one broadcast per element. A volatile load is
+/// kept as written, so each element is one `ldr q` feeding PMULL (low lanes)
+/// and PMULL2 (high lanes) directly.
+#[inline(always)]
+unsafe fn load_whole(p: *const F128) -> uint64x2_t {
+    // SAFETY (caller): `p` is valid for a 16-byte read; `F128` is
+    // `repr(C, align(16))`, the alignment of `uint64x2_t`.
+    unsafe { core::ptr::read_volatile(p.cast::<uint64x2_t>()) }
+}
+
+/// [`fold_banked_slots4`] for an even bank count with whole-element loads
+/// ([`load_whole`]), writing the four folded slots to `out[0..4]`.
+///
+/// Same products, same accumulators and the same reduction as
+/// [`fold_banked_slots4_schoolbook`]: the four outputs are bit-identical.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `BANKS` must be even, `input`
+/// must hold at least `4 * BANKS` elements and `out` at least four.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    input: &[F128],
+    out: &mut [F128],
+) {
+    unsafe {
+        debug_assert!(BANKS % 2 == 0);
+        debug_assert!(input.len() >= 4 * BANKS);
+        debug_assert!(out.len() >= 4);
+        let zero = vdupq_n_u64(0);
+        let mut ll = [zero; 4];
+        let mut cross = [zero; 4];
+        let mut hh = [zero; 4];
+
+        let w = weight.as_ptr();
+        let x = input.as_ptr();
+        let mut bank = 0usize;
+        while bank < BANKS {
+            let w0 = vld1q_u64(w.add(bank).cast::<u64>());
+            let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
+            let w0_sw = swap_halves(w0);
+            let w1_sw = swap_halves(w1);
+            for slot in 0..4 {
+                let row = x.add(slot * BANKS + bank);
+                let x0 = load_whole(row);
+                let x1 = load_whole(row.add(1));
+                tri_acc_two_banks(
+                    &mut ll[slot],
+                    &mut cross[slot],
+                    &mut hh[slot],
+                    x0,
+                    w0,
+                    w0_sw,
+                    x1,
+                    w1,
+                    w1_sw,
+                );
+            }
+            bank += 2;
+        }
+
+        let wide = |slot: usize| WideNeon {
+            lo: veorq_u64(ll[slot], vextq_u64::<1>(zero, cross[slot])),
+            hi: veorq_u64(hh[slot], vextq_u64::<1>(cross[slot], zero)),
+        };
+        let low = reduce_wide_pair(wide(0), wide(1));
+        let high = reduce_wide_pair(wide(2), wide(3));
+        let o = out.as_mut_ptr().cast::<u64>();
+        vst1q_u64(o, low[0]);
+        vst1q_u64(o.add(2), low[1]);
+        vst1q_u64(o.add(4), high[0]);
+        vst1q_u64(o.add(6), high[1]);
+    }
+}
+
+
 /// Fixed 128-bank by 64-lane bank-major fold for the ranked zerocheck AB
 /// completion. Adjacent lanes share a weight load; six raw Karatsuba
 /// components stay live across the complete bank scan, followed by one

@@ -2853,6 +2853,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     let bank_mask = n_banks - 1;
     let store_first = big_lo_size >= n_banks;
     let unscaled = zc_ab_unscaled_enabled();
+    let wide_rows = unscaled && zc_ab_wide_rows_enabled();
     if !store_first {
         banks.fill(F128::ZERO);
     }
@@ -2878,6 +2879,19 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
         let rows = precomputed_ab_rows(ab_inner, chunk_byte_base);
         let end_b_med = representation.materialized_b_med_end(within_hash_outer, n_b_med);
         let table = &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE];
+        // Ranked shape: every materialized block is exactly seven row pairs
+        // (rows 2..16 after the omitted identity prefix, rows 0..14 before the
+        // omitted output window). Those take the written-out wide kernel.
+        if wide_rows && end_b_med == first_b_med + 14 && first_b_med <= 2 {
+            let done = if first_touch {
+                kernels::accumulate_convert_ab_nomul_wide7::<true>(rows, first_b_med, table, bank)
+            } else {
+                kernels::accumulate_convert_ab_nomul_wide7::<false>(rows, first_b_med, table, bank)
+            };
+            if done {
+                continue;
+            }
+        }
         match (first_touch, unscaled) {
             (true, true) => {
                 kernels::accumulate_convert_ab_nomul::<true, true>(rows, first_b_med, end_b_med, table, bank)
@@ -2906,6 +2920,27 @@ fn zc_ab_unscaled_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os(ENV_NO_ZC_AB_UNSCALED).is_none_or(|v| v != *"1")
     });
+    *ON
+}
+
+/// Kill switch for the written-out seven-pair form of the round-one AB
+/// completion drain (two lane groups per pass, one 16-byte load per row):
+/// `FLOCK_NO_ZC_AB_WIDE_ROWS=1` (read once) sends every block back through
+/// the general pair loop in the same binary. The same table entries are read
+/// and the same sums stored.
+pub const ENV_NO_ZC_AB_WIDE_ROWS: &str = "FLOCK_NO_ZC_AB_WIDE_ROWS";
+
+#[cfg(test)]
+static ZC_AB_WIDE_ROWS_TEST_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn zc_ab_wide_rows_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(ENV_NO_ZC_AB_WIDE_ROWS).is_none_or(|v| v != *"1")
+    });
+    #[cfg(test)]
+    if ZC_AB_WIDE_ROWS_TEST_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     *ON
 }
 
@@ -7346,6 +7381,119 @@ mod tests {
                 }
             }
             crate::scratch::give_f128(tables);
+        }
+    }
+
+    /// The written-out seven-pair drain against the general pair loop (both
+    /// load forms) on the two row windows of the ranked shape, storing and
+    /// accumulating, over random rows, a random table and a stale bank.
+    #[test]
+    fn ab_wide_seven_pair_kernel_matches_general_drain() {
+        let mut rng = Rng::new(0x7A_1B_5E7E);
+        for case in 0..48usize {
+            let table = rng.f128_vec(CONVERT_TABLE_SIZE);
+            let mut rows = [[0u8; 64]; 1 << N_MEDIUM];
+            for (b, row) in rows.iter_mut().enumerate() {
+                for (i, byte) in row.iter_mut().enumerate() {
+                    *byte = match case % 4 {
+                        0 => rng.next_u64() as u8,
+                        1 => 0xff,
+                        2 => 0,
+                        _ => (b * 64 + i + case) as u8,
+                    };
+                }
+            }
+            let stale: [F128; ELL] = rng.f128_vec(ELL).try_into().unwrap();
+            for first in [0usize, 2] {
+                let (mut want_store, mut want_xor) = (stale, stale);
+                kernels::accumulate_convert_ab_nomul::<true, false>(&rows, first, first + 14, &table, &mut want_store);
+                kernels::accumulate_convert_ab_nomul::<false, false>(&rows, first, first + 14, &table, &mut want_xor);
+                let (mut unscaled_store, mut unscaled_xor) = (stale, stale);
+                kernels::accumulate_convert_ab_nomul::<true, true>(&rows, first, first + 14, &table, &mut unscaled_store);
+                kernels::accumulate_convert_ab_nomul::<false, true>(&rows, first, first + 14, &table, &mut unscaled_xor);
+                assert_eq!(unscaled_store, want_store, "case {case} first {first}");
+                assert_eq!(unscaled_xor, want_xor, "case {case} first {first}");
+                let (mut got_store, mut got_xor) = (stale, stale);
+                let ran = kernels::accumulate_convert_ab_nomul_wide7::<true>(&rows, first, &table, &mut got_store)
+                    && kernels::accumulate_convert_ab_nomul_wide7::<false>(&rows, first, &table, &mut got_xor);
+                if !ran {
+                    assert_eq!(got_store, stale, "no kernel: bank untouched");
+                    return;
+                }
+                assert_eq!(got_store, want_store, "store, case {case} first {first}");
+                assert_eq!(got_xor, want_xor, "accumulate, case {case} first {first}");
+                // Independent oracle for every lane: plain sums.
+                for lane in 0..ELL {
+                    let mut sum = F128::ZERO;
+                    for b in first..first + 14 {
+                        sum += table[b * 256 + rows[b][lane] as usize];
+                    }
+                    assert_eq!(got_store[lane], sum, "oracle, case {case} first {first} lane {lane}");
+                }
+            }
+        }
+    }
+
+    /// One `x_hi` band of the folded completion at the ranked row geometry
+    /// (identity prefix and output window omitted: rows 2..16, then rows
+    /// 0..14), with the wide seven-pair kernel on and off: same banks, same
+    /// partial, for the generic fold and for the 128-bank deferred fold.
+    #[test]
+    fn ab_wide_rows_switch_is_value_neutral_in_the_folded_band() {
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+        assert_eq!((within_outer_mask, b_med_counts.as_slice()), (1, &[16u8, 15][..]));
+        let mut rng = Rng::new(0x7A_1B_BA4D);
+        for (n_lo, bank_bits, deferred) in [(6usize, 3usize, false), (8, 7, true), (8, 7, false), (5, 5, false)] {
+            let big_lo_size = 1usize << n_lo;
+            let n_hi_bands = 2usize;
+            let mut ab_inner = vec![0u8; n_hi_bands * big_lo_size * (1 << N_MEDIUM) * 64];
+            for byte in ab_inner.iter_mut() {
+                *byte = rng.next_u64() as u8;
+            }
+            let eq_bot = rng.f128_vec(1 << bank_bits);
+            let n_tables = 1usize << (n_lo - bank_bits);
+            let tables = rng.f128_vec(n_tables * CONVERT_TABLE_SIZE);
+            let eq_hi_val = rng.f128();
+            for representation in [
+                Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true },
+                Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false },
+                Round1AbRepresentation::Complete,
+            ] {
+                for x_hi in 0..n_hi_bands {
+                    let mut run = |off: bool| {
+                        ZC_AB_WIDE_ROWS_TEST_OFF.store(off, std::sync::atomic::Ordering::Relaxed);
+                        let mut banks = rng.f128_vec(eq_bot.len() * ELL);
+                        let mut partial = [F128::ONE; ELL];
+                        process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
+                            x_hi,
+                            big_lo_size,
+                            n_lo + N_INNER,
+                            within_outer_mask,
+                            &b_med_counts,
+                            &ab_inner,
+                            representation,
+                            &eq_bot,
+                            eq_hi_val,
+                            &tables,
+                            bank_bits,
+                            deferred,
+                            &mut banks,
+                            &mut partial,
+                        );
+                        ZC_AB_WIDE_ROWS_TEST_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+                        (banks, partial)
+                    };
+                    let (banks_off, partial_off) = run(true);
+                    let (banks_on, partial_on) = run(false);
+                    assert_eq!(banks_on, banks_off, "banks n_lo={n_lo} s={bank_bits} {representation:?} x_hi={x_hi}");
+                    assert_eq!(partial_on, partial_off, "partial n_lo={n_lo} s={bank_bits} {representation:?} x_hi={x_hi}");
+                    assert!(partial_on.iter().any(|v| *v != F128::ZERO));
+                }
+            }
         }
     }
 

@@ -7138,6 +7138,14 @@ fn zfold_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// Whole-element loads in the four-slot witness fold of the direct-fold8
+/// materializer (default on). `FLOCK_NO_DIRECT_FOLD8_WHOLE_LOAD=1` restores
+/// the incumbent kernel. Read once per process.
+fn direct_fold8_whole_load_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DIRECT_FOLD8_WHOLE_LOAD").is_none())
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from the direct
 /// factor state before this function binds the witness and combined basis in
 /// one N→N/64 pass. It emits M6 — the round message of the folded
@@ -7206,6 +7214,10 @@ fn materialize_direct_fold8(
         && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none();
     let quad_fold64 =
         pair_fold64 && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_QUAD").is_none();
+    // Whole-element loads in the four-slot fold (same products, same sums;
+    // see `f128_slice::fold_banked_slots4_whole_into`). The rollback runs
+    // the incumbent block body.
+    let whole_fold64 = quad_fold64 && direct_fold8_whole_load_enabled();
 
     // One shared per-block body for both drains below, so the scheduling
     // choice cannot drift from the value computation. For block `i` it fully
@@ -7213,7 +7225,13 @@ fn materialize_direct_fold8(
     // disjoint witness stripe `[64·i·B, 64·(i+1)·B)` and returns the block's
     // round-0 partial. Which worker (or pool) runs a block cannot change a
     // single bit of it.
-    let fold8_block = |scratch: &mut Vec<F128>,
+    //
+    // The body is instantiated once per four-slot kernel form (`$whole` is a
+    // literal), so the rollback form is the incumbent closure, token for
+    // token, and each form is compiled without the other's code.
+    macro_rules! fold8_block_body {
+        ($whole:literal) => {
+    |scratch: &mut Vec<F128>,
                        block: usize,
                        b_out: &mut [F128],
                        f_out: &mut [F128]|
@@ -7251,14 +7269,22 @@ fn materialize_direct_fold8(
         if quad_fold64 {
             while slot + 3 < block_len {
                 let base = 64 * slot;
-                let folded_f = crate::field::f128_slice::fold_banked_slots4::<64>(
-                    &fold_weight,
-                    &f_in[base..base + 256],
-                );
-                f_out[slot] = folded_f[0];
-                f_out[slot + 1] = folded_f[1];
-                f_out[slot + 2] = folded_f[2];
-                f_out[slot + 3] = folded_f[3];
+                if $whole {
+                    crate::field::f128_slice::fold_banked_slots4_whole_into::<64>(
+                        &fold_weight,
+                        &f_in[base..base + 256],
+                        &mut f_out[slot..slot + 4],
+                    );
+                } else {
+                    let folded_f = crate::field::f128_slice::fold_banked_slots4::<64>(
+                        &fold_weight,
+                        &f_in[base..base + 256],
+                    );
+                    f_out[slot] = folded_f[0];
+                    f_out[slot + 1] = folded_f[1];
+                    f_out[slot + 2] = folded_f[2];
+                    f_out[slot + 3] = folded_f[3];
+                }
 
                 let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
                 let direct1 =
@@ -7329,6 +7355,21 @@ fn materialize_direct_fold8(
             }
         }
         super::round0_deferred(f_out, b_out)
+    }
+        };
+    }
+    let fold8_block_incumbent = fold8_block_body!(false);
+    let fold8_block_whole = fold8_block_body!(true);
+    let fold8_block = |scratch: &mut Vec<F128>,
+                       block: usize,
+                       b_out: &mut [F128],
+                       f_out: &mut [F128]|
+     -> (F128, F128) {
+        if whole_fold64 {
+            fold8_block_whole(scratch, block, b_out, f_out)
+        } else {
+            fold8_block_incumbent(scratch, block, b_out, f_out)
+        }
     };
     // The same block body when `f_out` already holds the GPU's witness fold
     // (an exact field sum, bit-identical to the banked CPU fold): only the

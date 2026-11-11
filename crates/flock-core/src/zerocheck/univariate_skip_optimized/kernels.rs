@@ -574,6 +574,32 @@ pub(super) fn accumulate_convert_ab_nomul<const STORE: bool, const U: bool>(
     portable::accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
 }
 
+/// Fixed seven-pair form of [`accumulate_convert_ab_nomul`] with the unscaled
+/// loads: rows `first_b_med .. first_b_med + 14`, two lane groups per pass.
+/// Returns `false` without touching `bank` when the target has no such
+/// kernel; the caller then runs the general form.
+#[inline]
+pub(super) fn accumulate_convert_ab_nomul_wide7<const STORE: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    convert: &[super::F128],
+    bank: &mut [super::F128; 64],
+) -> bool {
+    assert!(first_b_med & 1 == 0 && first_b_med <= 2 && convert.len() == 16 * 256);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: aarch64 statically guarantees NEON; the asserts above keep the
+    // fourteen rows and their table images inside the fixed arrays.
+    unsafe {
+        aarch64::accumulate_convert_ab_nomul_wide7::<STORE>(chunk_ab_bytes, first_b_med, convert, bank);
+        true
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (chunk_ab_bytes, bank);
+        false
+    }
+}
+
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
 /// kernel is tested against.
 ///
