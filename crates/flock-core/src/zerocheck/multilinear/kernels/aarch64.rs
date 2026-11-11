@@ -1384,7 +1384,29 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
     }
 }
 
+/// Store the compact delta pair `[x, y]` (`x = a0 ^ a1`, `y = b0 ^ b1`, both
+/// formed from row codes already in general registers) with one `stp`.
+/// Without the asm boundary LLVM reloads both 16-byte row pairs into q
+/// registers and forms the pair with `zip1`/`zip2`/`eor`: two loads and three
+/// vector instructions more per pair. Same 16 bytes at the same address.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_pair_gpr(dst: *mut u8, x: u64, y: u64) {
+    // SAFETY: the caller owns the writable 16-byte delta slot at `dst`.
+    unsafe {
+        core::arch::asm!(
+            "stp {x}, {y}, [{dst}]",
+            dst = in(reg) dst,
+            x = in(reg) x,
+            y = in(reg) y,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Fold one round-two pair and emit its compact anchor + delta stores.
+///
+/// `DG`: store the delta pair with [`store_delta_pair_gpr`] (same bytes).
 ///
 /// Every store below is the *same expression* the incumbent
 /// [`fold_round2_compact_chunk_neon_unchecked_8`] emits for the same pair
@@ -1395,7 +1417,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
 /// Returns the four folded rows plus whether the b≡1 shortcut was taken.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn r2_pair_fold_and_store(
+unsafe fn r2_pair_fold_and_store<const DG: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -1458,17 +1480,28 @@ unsafe fn r2_pair_fold_and_store(
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            if DG {
+                store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code ^ a1_code, 0);
+            } else {
+                let delta_pair =
+                    core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            }
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-        let delta_pair =
-            core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        if DG {
+            store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code ^ a1_code, b0_code ^ b1_code);
+        } else {
+            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
+                a0_code ^ a1_code,
+                b0_code ^ b1_code,
+            ]);
+            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        }
         (a0, a1, b0, b1, false)
     }
 }
@@ -1513,9 +1546,56 @@ unsafe fn r2_pair_fold_and_store(
 /// need all four scaled rows.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const FULL: bool,
     const ODD_ON_GPU: bool,
+>(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    periodic_padding: bool,
+    skip_dead: bool,
+    out: *mut F128,
+) {
+    unsafe {
+        fold_round2_compact_chunk_neon_lookahead_8g::<FULL, ODD_ON_GPU, false>(
+            table_data,
+            a_packed,
+            b_packed,
+            anchors,
+            deltas,
+            eq_lo,
+            lo_size,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            degen,
+            periodic_padding,
+            skip_dead,
+            out,
+        )
+    }
+}
+
+/// [`fold_round2_compact_chunk_neon_lookahead_8`] with the delta-pair store
+/// form chosen by `DG` (see [`store_delta_pair_gpr`]); outputs and stores are
+/// byte-identical for both values.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8g<
+    const FULL: bool,
+    const ODD_ON_GPU: bool,
+    const DG: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -1605,11 +1685,11 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 let pad0 = $pad0;
                 let pad1 = $pad1;
 
-                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store(
+                let (a0, a1, b0, b1, deg0) = r2_pair_fold_and_store::<DG>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
                     skip_dead,
                 );
-                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store(
+                let (a2, a3, b2, b3, deg1) = r2_pair_fold_and_store::<DG>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
                     skip_dead,
                 );
@@ -1742,7 +1822,50 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 /// later group is unchanged. Outputs are bit-identical for both values.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SHIFT: bool>(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    skip_dead: bool,
+    out: *mut F128,
+) {
+    unsafe {
+        fold_round2_compact_chunk_neon_horner_8g::<SKIP_FIRST_SHIFT, false>(
+            table_data,
+            a_packed,
+            b_packed,
+            anchors,
+            deltas,
+            eq_lo,
+            lo_size,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            degen,
+            skip_dead,
+            out,
+        )
+    }
+}
+
+/// [`fold_round2_compact_chunk_neon_horner_8`] with the delta-pair store form
+/// chosen by `DG` (see [`store_delta_pair_gpr`]); byte-identical outputs.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8g<
+    const SKIP_FIRST_SHIFT: bool,
+    const DG: bool,
+>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -2009,11 +2132,20 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
                                     fold_two_row_codes_q(table_data, a_even, b_even)
                                 };
                                 store_anchor_pair_nt(anchors.add(2 * x_lo), a, b);
-                                let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
-                                    a_even ^ a_odd,
-                                    b_even ^ b_odd,
-                                ]);
-                                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+                                if DG {
+                                    store_delta_pair_gpr(
+                                        deltas.add(x_lo * 16),
+                                        a_even ^ a_odd,
+                                        b_even ^ b_odd,
+                                    );
+                                } else {
+                                    let delta_pair =
+                                        core::mem::transmute::<[u64; 2], uint64x2_t>([
+                                            a_even ^ a_odd,
+                                            b_even ^ b_odd,
+                                        ]);
+                                    vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+                                }
                                 (a, b, a_odd, b_odd, deg)
                             };
                             let (a0, b0, a1c, b1c, deg0) = pair(x_lo0, pad0);

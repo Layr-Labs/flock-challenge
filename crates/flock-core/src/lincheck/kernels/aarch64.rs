@@ -437,6 +437,188 @@ unsafe fn process_block16_neon_single_sha3(
     );
 }
 
+/// [`process_block16_neon_single_sha3`] with the byte offsets formed in one
+/// instruction (`ubfiz`, or `and` against `0xff0` with a shifted register)
+/// and unscaled register-offset table loads: the scaled 128-bit load is two
+/// uops on Apple performance cores, the unscaled one is one. Same table
+/// entries in the same order, same accumulation, same bytes.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(never)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn process_block16_neon_single_sha3_unscaled(
+    row_ptr: *const u8,
+    row_stride: usize,
+    bs: usize,
+    tables_ptr: *const u8,
+    out_ptr: *mut F128,
+) {
+    use std::arch::asm;
+
+    asm!(
+        "ldp q0, q1, [{dst}]",
+        "ldp q2, q3, [{dst}, #32]",
+        "ldp q4, q5, [{dst}, #64]",
+        "ldp q6, q7, [{dst}, #96]",
+        "ldp q16, q17, [{dst}, #128]",
+        "ldp q18, q19, [{dst}, #160]",
+        "ldp q20, q21, [{dst}, #192]",
+        "ldp q22, q23, [{dst}, #224]",
+        "add x8, {row}, {block_start}",
+        "lsl x9, {stride}, #1",
+        "mov x10, #4",
+        "2:",
+        "ldp x11, x12, [x8]",
+        "add x15, x8, {stride}",
+        "ldp x13, x14, [x15]",
+        "add x15, {table}, #4096",
+
+        "ubfiz x16, x11, #4, #8",
+        "ubfiz x17, x13, #4, #8",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v0, v0, v24, v25",
+
+        "and x16, {mask}, x11, lsr #4",
+        "and x17, {mask}, x13, lsr #4",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v1, v1, v24, v25",
+
+        "and x16, {mask}, x11, lsr #12",
+        "and x17, {mask}, x13, lsr #12",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v2, v2, v24, v25",
+
+        "and x16, {mask}, x11, lsr #20",
+        "and x17, {mask}, x13, lsr #20",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v3, v3, v24, v25",
+
+        "and x16, {mask}, x11, lsr #28",
+        "and x17, {mask}, x13, lsr #28",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v4, v4, v24, v25",
+
+        "and x16, {mask}, x11, lsr #36",
+        "and x17, {mask}, x13, lsr #36",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v5, v5, v24, v25",
+
+        "and x16, {mask}, x11, lsr #44",
+        "and x17, {mask}, x13, lsr #44",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v6, v6, v24, v25",
+
+        "and x16, {mask}, x11, lsr #52",
+        "and x17, {mask}, x13, lsr #52",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v7, v7, v24, v25",
+
+        "ubfiz x16, x12, #4, #8",
+        "ubfiz x17, x14, #4, #8",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v16, v16, v24, v25",
+
+        "and x16, {mask}, x12, lsr #4",
+        "and x17, {mask}, x14, lsr #4",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v17, v17, v24, v25",
+
+        "and x16, {mask}, x12, lsr #12",
+        "and x17, {mask}, x14, lsr #12",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v18, v18, v24, v25",
+
+        "and x16, {mask}, x12, lsr #20",
+        "and x17, {mask}, x14, lsr #20",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v19, v19, v24, v25",
+
+        "and x16, {mask}, x12, lsr #28",
+        "and x17, {mask}, x14, lsr #28",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v20, v20, v24, v25",
+
+        "and x16, {mask}, x12, lsr #36",
+        "and x17, {mask}, x14, lsr #36",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v21, v21, v24, v25",
+
+        "and x16, {mask}, x12, lsr #44",
+        "and x17, {mask}, x14, lsr #44",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v22, v22, v24, v25",
+
+        "and x16, {mask}, x12, lsr #52",
+        "and x17, {mask}, x14, lsr #52",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v23, v23, v24, v25",
+
+        "add x8, x8, x9",
+        "add {table}, {table}, #8192",
+        "subs x10, x10, #1",
+        "b.ne 2b",
+
+        "stp q0, q1, [{dst}]",
+        "stp q2, q3, [{dst}, #32]",
+        "stp q4, q5, [{dst}, #64]",
+        "stp q6, q7, [{dst}, #96]",
+        "stp q16, q17, [{dst}, #128]",
+        "stp q18, q19, [{dst}, #160]",
+        "stp q20, q21, [{dst}, #192]",
+        "stp q22, q23, [{dst}, #224]",
+        row = in(reg) row_ptr,
+        stride = in(reg) row_stride,
+        block_start = in(reg) bs,
+        table = inout(reg) tables_ptr => _,
+        dst = in(reg) out_ptr,
+        mask = in(reg) 0xff0usize,
+        out("x8") _,
+        out("x9") _,
+        out("x10") _,
+        out("x11") _,
+        out("x12") _,
+        out("x13") _,
+        out("x14") _,
+        out("x15") _,
+        out("x16") _,
+        out("x17") _,
+        out("v0") _,
+        out("v1") _,
+        out("v2") _,
+        out("v3") _,
+        out("v4") _,
+        out("v5") _,
+        out("v6") _,
+        out("v7") _,
+        out("v16") _,
+        out("v17") _,
+        out("v18") _,
+        out("v19") _,
+        out("v20") _,
+        out("v21") _,
+        out("v22") _,
+        out("v23") _,
+        out("v24") _,
+        out("v25") _,
+        options(nostack),
+    );
+}
+
 /// **i_inner-partitioned** NEON partial fold. Same result as
 /// [`partial_fold_packed_z_neon_single_padded`] but parallelizes over the
 /// **output** (`i_inner`) instead of over z stripes.
@@ -711,6 +893,16 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
     )
 }
 
+/// Kill switch for [`process_block16_neon_single_sha3_unscaled`]: exactly
+/// `FLOCK_NO_LINCHECK_BLOCK16_UNSCALED=1` keeps the scaled-index loads.
+#[cfg(target_arch = "aarch64")]
+fn lincheck_block16_unscaled_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16_UNSCALED").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
 #[cfg(target_arch = "aarch64")]
 fn oblock_padded_tiled_impl<const TILE_T: usize>(
     z_packed: &[u8],
@@ -793,11 +985,20 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
             let mut bs = 0usize;
             #[cfg(target_feature = "sha3")]
             if block16 {
-                while bs + 16 <= useful {
-                    unsafe {
-                        process_block16_neon_single_sha3(z_base, k, bs, tables_ptr, partial.add(bs));
+                if lincheck_block16_unscaled_enabled() {
+                    while bs + 16 <= useful {
+                        unsafe {
+                            process_block16_neon_single_sha3_unscaled(z_base, k, bs, tables_ptr, partial.add(bs));
+                        }
+                        bs += 16;
                     }
-                    bs += 16;
+                } else {
+                    while bs + 16 <= useful {
+                        unsafe {
+                            process_block16_neon_single_sha3(z_base, k, bs, tables_ptr, partial.add(bs));
+                        }
+                        bs += 16;
+                    }
                 }
             }
             #[cfg(not(target_feature = "sha3"))]
@@ -940,4 +1141,105 @@ fn lincheck_worker_partials_enabled() -> bool {
     *ON.get_or_init(|| {
         std::env::var("FLOCK_NO_LINCHECK_WORKER_PARTIALS").ok().as_deref() != Some("1")
     })
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_feature = "sha3"))]
+mod block16_unscaled_tests {
+    use super::*;
+
+    fn rng_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// Shape of the ranked lincheck drain: k = 2^14 row stride, 4 stripe pairs
+    /// of 4 KiB tables (8 x 256 F128 = 32 KiB), one 16-byte column block.
+    fn setup(seed: u64) -> (Vec<u8>, Vec<F128>, Vec<F128>) {
+        let k = 1usize << 14;
+        let rows = rng_bytes(seed, 8 * k + 64);
+        let tb = rng_bytes(seed ^ 0x5555, 8 * 256 * 16);
+        let tables: Vec<F128> = tb
+            .chunks_exact(16)
+            .map(|c| unsafe { core::ptr::read_unaligned(c.as_ptr().cast::<F128>()) })
+            .collect();
+        let acc0: Vec<F128> = rng_bytes(seed ^ 0xaaaa, 16 * 16)
+            .chunks_exact(16)
+            .map(|c| unsafe { core::ptr::read_unaligned(c.as_ptr().cast::<F128>()) })
+            .collect();
+        (rows, tables, acc0)
+    }
+
+    #[test]
+    fn block16_unscaled_matches_scaled() {
+        let k = 1usize << 14;
+        for seed in 1..40u64 {
+            let (mut rows, tables, acc0) = setup(seed);
+            if seed % 5 == 0 {
+                rows.iter_mut().for_each(|b| *b = 0xff);
+            }
+            for bs in [0usize, 16, 1408, k - 16] {
+                let mut a = acc0.clone();
+                let mut b = acc0.clone();
+                unsafe {
+                    process_block16_neon_single_sha3(rows.as_ptr(), k, bs, tables.as_ptr().cast(), a.as_mut_ptr());
+                    process_block16_neon_single_sha3_unscaled(rows.as_ptr(), k, bs, tables.as_ptr().cast(), b.as_mut_ptr());
+                }
+                let (ab, bb): (Vec<u8>, Vec<u8>) = (
+                    a.iter().flat_map(|v| unsafe { core::mem::transmute::<F128, [u8; 16]>(*v) }).collect(),
+                    b.iter().flat_map(|v| unsafe { core::mem::transmute::<F128, [u8; 16]>(*v) }).collect(),
+                );
+                assert_eq!(ab, bb, "seed={seed} bs={bs}");
+                assert_ne!(ab, acc0.iter().flat_map(|v| unsafe { core::mem::transmute::<F128, [u8; 16]>(*v) }).collect::<Vec<u8>>());
+            }
+        }
+    }
+
+    /// Single-core timing probe, the two forms alternated (not a correctness
+    /// test): `cargo test --profile challenge -p flock-core --lib
+    /// block16_unscaled_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing probe"]
+    fn block16_unscaled_timing() {
+        let k = 1usize << 14;
+        let (rows, tables, acc0) = setup(7);
+        let mut acc = acc0.clone();
+        const BLOCKS: usize = 704; // 11_264 useful columns
+        const REPS: usize = 40;
+        let mut times: [Vec<f64>; 2] = Default::default();
+        for round in 0..33 {
+            for j in 0..2 {
+                let form = (j + round) % 2;
+                let t0 = std::time::Instant::now();
+                for _ in 0..REPS {
+                    for blk in 0..BLOCKS {
+                        unsafe {
+                            if form == 0 {
+                                process_block16_neon_single_sha3(rows.as_ptr(), k, blk * 16, tables.as_ptr().cast(), acc.as_mut_ptr());
+                            } else {
+                                process_block16_neon_single_sha3_unscaled(rows.as_ptr(), k, blk * 16, tables.as_ptr().cast(), acc.as_mut_ptr());
+                            }
+                        }
+                    }
+                }
+                if round > 0 {
+                    times[form].push(t0.elapsed().as_secs_f64() * 1e9 / (REPS * BLOCKS) as f64);
+                }
+            }
+        }
+        std::hint::black_box(&acc);
+        for (form, t) in times.iter_mut().enumerate() {
+            t.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            eprintln!(
+                "[block16-timing] {:9} min {:.3} p25 {:.3} median {:.3} ns per block16 call ({} rounds)",
+                ["scaled", "unscaled"][form], t[0], t[t.len() / 4], t[t.len() / 2], t.len()
+            );
+        }
+    }
 }
