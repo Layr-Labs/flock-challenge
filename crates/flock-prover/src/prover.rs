@@ -850,16 +850,13 @@ unsafe fn fill_root_lincheck_stripe_group_ab(
                     u64_per_block,
                 )
             } else {
-                let lanes: [u64; 8] = std::array::from_fn(|lane| {
-                    let base = lane * u64_per_block + row.lo_word;
-                    let hi = if row.hi_mask != 0 {
-                        *a.add(base + 1) & *b.add(base + 1) & row.hi_mask
-                    } else {
-                        0
-                    };
-                    (*a.add(base) & *b.add(base) & row.lo_mask) | hi
-                });
-                flock_core::bits::transpose_8_strided_u64s_to_regs(lanes.as_ptr(), 1)
+                flock_core::bits::transpose_8_strided_masked_and_u64s_to_regs(
+                    a.add(row.lo_word),
+                    b.add(row.lo_word),
+                    u64_per_block,
+                    row.lo_mask,
+                    row.hi_mask,
+                )
             };
             core::arch::asm!(
                 "stnp {y0:q}, {y1:q}, [{dst}]",

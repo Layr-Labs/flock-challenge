@@ -130,6 +130,55 @@ pub unsafe fn transpose_8_strided_and_u64s_to_regs(
     }
 }
 
+/// Transpose eight masked AND rows directly from paired A/B scratch.
+/// Each row is `(a[lo] & b[lo] & lo_mask) | (a[lo+1] & b[lo+1] & hi_mask)`.
+/// The masks are duplicated across each two-row register. No temporary
+/// eight-word row array is materialized before the register transpose.
+///
+/// # Safety
+/// `a.add(l * stride)` and `b.add(l * stride)` must be readable for each
+/// `l < 8`. The following word must also be readable when `hi_mask != 0`.
+/// With a zero high mask no following-word read is performed.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn transpose_8_strided_masked_and_u64s_to_regs(
+    a: *const u64,
+    b: *const u64,
+    stride: usize,
+    lo_mask: u64,
+    hi_mask: u64,
+) -> [core::arch::aarch64::uint8x16_t; 4] {
+    use core::arch::aarch64::*;
+    // SAFETY: the caller covers the low reads and, only in the nonzero
+    // high-mask branch, the adjacent-word reads. Other operations use registers.
+    unsafe {
+        let lo = vreinterpretq_u8_u64(vdupq_n_u64(lo_mask));
+        let hi = vreinterpretq_u8_u64(vdupq_n_u64(hi_mask));
+        let pair = |l: usize| {
+            let low = vandq_u8(
+                vandq_u8(
+                    lane_pair(a.add(l * stride), a.add((l + 1) * stride)),
+                    lane_pair(b.add(l * stride), b.add((l + 1) * stride)),
+                ),
+                lo,
+            );
+            if hi_mask == 0 {
+                low
+            } else {
+                let high = vandq_u8(
+                    vandq_u8(
+                        lane_pair(a.add(l * stride + 1), a.add((l + 1) * stride + 1)),
+                        lane_pair(b.add(l * stride + 1), b.add((l + 1) * stride + 1)),
+                    ),
+                    hi,
+                );
+                vorrq_u8(low, high)
+            }
+        };
+        transpose_8_row_pairs_to_regs(pair(0), pair(2), pair(4), pair(6))
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn lane_pair(lo: *const u64, hi: *const u64) -> core::arch::aarch64::uint8x16_t {
@@ -284,6 +333,52 @@ mod tests {
                     transpose_8_strided_u64s_to_64_bytes(words.as_ptr().add(word), stride, &mut actual)
                 };
                 assert_eq!(actual, expected, "stride={stride} word={word}");
+            }
+        }
+    }
+
+    /// Masked register formation agrees with an independently formed scalar
+    /// row array, including overlapping masks and a last-word low-only read.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn masked_and_register_transpose_matches_scalar_rows() {
+        let masks = [
+            (0, 0),
+            (u64::MAX, 0),
+            (0, u64::MAX),
+            (u64::MAX, u64::MAX),
+            (0x00ff_00ff_00ff_00ff, 0xf0f0_f0f0_f0f0_f0f0),
+            (0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555),
+        ];
+        for stride in [1usize, 2, 3, 7, 64, 256] {
+            for &(lo_mask, hi_mask) in &masks {
+                // End immediately after the last required word: the zero
+                // high-mask case must not read an adjacent word.
+                let len = 7 * stride + 1 + usize::from(hi_mask != 0);
+                let a: Vec<u64> = (0..len)
+                    .map(|i| (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17))
+                    .collect();
+                let b: Vec<u64> = (0..len)
+                    .map(|i| !(i as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9).rotate_left(31))
+                    .collect();
+                let rows: [u64; 8] = std::array::from_fn(|l| {
+                    let at = l * stride;
+                    let high = if hi_mask != 0 { a[at + 1] & b[at + 1] & hi_mask } else { 0 };
+                    (a[at] & b[at] & lo_mask) | high
+                });
+                let mut want = [0u8; 64];
+                transpose_8_u64s_to_64_bytes_scalar(&rows, &mut want);
+                let mut got = [0u8; 64];
+                // SAFETY: the vectors contain exactly all required reads.
+                unsafe {
+                    let regs = transpose_8_strided_masked_and_u64s_to_regs(
+                        a.as_ptr(), b.as_ptr(), stride, lo_mask, hi_mask,
+                    );
+                    for (k, reg) in regs.into_iter().enumerate() {
+                        core::arch::aarch64::vst1q_u8(got.as_mut_ptr().add(16 * k), reg);
+                    }
+                }
+                assert_eq!(got, want, "stride={stride} masks=({lo_mask:x},{hi_mask:x})");
             }
         }
     }
