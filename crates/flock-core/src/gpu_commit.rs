@@ -8753,6 +8753,16 @@ kernel void blake3_pow_scan(
                 // `encode_merkle_subtree` kernels the GPU prefix uses over
                 // the suffix's aligned subtrees. Same leaf bytes, same BLAKE3
                 // tree, same flat-tree slots, so the root is unchanged.
+                if hybrid_gpu_suffix_hash_enabled() && hybrid_suffix_stream_enabled() {
+                    if let Some((group, n_groups)) =
+                        suffix_stream_groups(suffix_leaf_start, n_leaves, hybrid_suffix_group_leaves())
+                    {
+                        return run_hybrid_suffix_streamed(
+                            gpu, staging, tree_buf, ntt, data, tree_base, log_d, n_leaves, k_split,
+                            cb2, suffix_leaf_start, group, n_groups,
+                        );
+                    }
+                }
                 if hybrid_gpu_suffix_hash_enabled() {
                     let t_cpu_ntt = std::time::Instant::now();
                     if fine_m == 0 {
@@ -8845,54 +8855,7 @@ kernel void blake3_pow_scan(
                             (cb3_e - cb2_s) * 1e3
                         );
                     }
-                    if fine_m > 0 {
-                        // The boundary sixteenth is split between the GPU's
-                        // and the suffix's aligned subtrees, so no subtree
-                        // spans it: rebuild its four levels above the
-                        // 256th-level roots (16 -> 8 -> 4 -> 2 -> 1 node).
-                        let b = 16 - k_cpu16 - 1;
-                        let mut ls = 0usize;
-                        let mut ll = n_leaves;
-                        while ll > 256 {
-                            ls += ll;
-                            ll /= 2;
-                        }
-                        let mut lo = b * 16;
-                        let mut cnt = 16usize;
-                        while ll > 16 {
-                            let ws = ls + ll;
-                            let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + lo), cnt);
-                            let write = core::slice::from_raw_parts_mut(
-                                tree_base.ptr().add(ws + lo / 2),
-                                cnt / 2,
-                            );
-                            crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                            ls = ws;
-                            ll /= 2;
-                            lo /= 2;
-                            cnt /= 2;
-                        }
-                    }
-                    let mut level_start = 0usize;
-                    let mut level_len = n_leaves;
-                    while level_len > 16 {
-                        level_start += level_len;
-                        level_len /= 2;
-                    }
-                    while level_len > 1 {
-                        let write_start = level_start + level_len;
-                        let read = core::slice::from_raw_parts(
-                            tree_base.ptr().add(level_start),
-                            level_len,
-                        );
-                        let write = core::slice::from_raw_parts_mut(
-                            tree_base.ptr().add(write_start),
-                            level_len / 2,
-                        );
-                        crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                        level_start = write_start;
-                        level_len /= 2;
-                    }
+                    join_hybrid_s1_top(tree_base, n_leaves, k_cpu16, fine_m);
                     return Ok(());
                 }
                 let deep_pipeline = hybrid_cpu_suffix_deep_pipeline_enabled();
@@ -9089,6 +9052,353 @@ kernel void blake3_pow_scan(
             })();
             gpu.pool_pop(pool);
             r
+        }
+    }
+
+    /// S1 join after both arms' subtrees are in the flat tree: for a fine
+    /// split rebuild the boundary sixteenth above its 256th-level roots, then
+    /// (re)compute the 15 nodes above the 16-node level.
+    ///
+    /// # Safety
+    /// `tree_base` points to `2 * n_leaves - 1` hashes with every node at the
+    /// 16-node level (and, for `fine_m > 0`, the boundary sixteenth's
+    /// 256th-level nodes) already written; no concurrent writers.
+    pub(crate) unsafe fn join_hybrid_s1_top(
+        tree_base: crate::epool::SyncPtr<Hash>,
+        n_leaves: usize,
+        k_cpu16: usize,
+        fine_m: usize,
+    ) {
+        unsafe {
+            if fine_m > 0 {
+                // The boundary sixteenth is split between the GPU's
+                // and the suffix's aligned subtrees, so no subtree
+                // spans it: rebuild its four levels above the
+                // 256th-level roots (16 -> 8 -> 4 -> 2 -> 1 node).
+                let b = 16 - k_cpu16 - 1;
+                let mut ls = 0usize;
+                let mut ll = n_leaves;
+                while ll > 256 {
+                    ls += ll;
+                    ll /= 2;
+                }
+                let mut lo = b * 16;
+                let mut cnt = 16usize;
+                while ll > 16 {
+                    let ws = ls + ll;
+                    let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + lo), cnt);
+                    let write =
+                        core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + lo / 2), cnt / 2);
+                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                    ls = ws;
+                    ll /= 2;
+                    lo /= 2;
+                    cnt /= 2;
+                }
+            }
+            let mut level_start = 0usize;
+            let mut level_len = n_leaves;
+            while level_len > 16 {
+                level_start += level_len;
+                level_len /= 2;
+            }
+            while level_len > 1 {
+                let write_start = level_start + level_len;
+                let read = core::slice::from_raw_parts(tree_base.ptr().add(level_start), level_len);
+                let write =
+                    core::slice::from_raw_parts_mut(tree_base.ptr().add(write_start), level_len / 2);
+                crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                level_start = write_start;
+                level_len /= 2;
+            }
+        }
+    }
+
+    /// Streamed S1 suffix hash (see [`hybrid_suffix_stream_enabled`]).
+    ///
+    /// The CPU completes the suffix NTT exactly as the serial S1 path does;
+    /// its per-chunk callback counts finished leaves per aligned `group`-leaf
+    /// subtree. A finished group is held while cb2 (the GPU prefix) is still
+    /// running - a buffer committed then could only run after cb2 anyway, and
+    /// many small ones cost more GPU time than one cb3 - and once cb2 has
+    /// completed, held groups are committed in coalesced batches of
+    /// `batch_min`, so the GPU hashes the suffix while the CPU still works.
+    /// Whatever is still held when the NTT returns goes in one final buffer
+    /// (for a GPU-bound split: all of it, i.e. exactly cb3). Each buffer
+    /// reads only finished codeword rows and writes only its groups' tree
+    /// slots. After the NTT the host joins cb2 and every buffer, builds the
+    /// few suffix nodes above the group roots up to the 16-node level, and
+    /// runs the unchanged S1 top join. Every tree node equals the serial
+    /// path's.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_hybrid_suffix_streamed(
+        gpu: &Gpu,
+        staging: Id,
+        tree_buf: Id,
+        ntt: &AdditiveNttF128,
+        data: &mut [F128],
+        tree_base: crate::epool::SyncPtr<Hash>,
+        log_d: usize,
+        n_leaves: usize,
+        k_split: usize,
+        cb2: Id,
+        suffix_leaf_start: usize,
+        group: usize,
+        n_groups: usize,
+    ) -> Result<(), String> {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let (k_cpu16, fine_m) = decode_hybrid_split(k_split);
+        debug_assert!(group >= 1024 && group.is_power_of_two());
+        // Leaves still unfinished per group; each chunk callback subtracts
+        // its own leaf count.
+        let remaining: Vec<AtomicU32> =
+            (0..n_groups).map(|_| AtomicU32::new(group as u32)).collect();
+        // (groups hashed, retained command buffer)
+        let submitted: std::sync::Mutex<Vec<(Vec<usize>, usize)>> =
+            std::sync::Mutex::new(Vec::with_capacity(n_groups));
+        // Finished groups not yet committed. While cb2 is still running a
+        // buffer could only queue behind it, so groups are held and
+        // committed together once cb2 is done, then in batches of
+        // `batch_min`; the rest at the end.
+        let pending: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::with_capacity(n_groups));
+        let cb2_done = AtomicBool::new(false);
+        let batch_min = hybrid_suffix_batch_groups();
+        let cb2_u = cb2 as usize;
+        let failed = AtomicBool::new(false);
+        let (staging_u, tree_u) = (staging as usize, tree_buf as usize);
+        let submit_batch = |groups: Vec<usize>| unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| -> Result<Id, String> {
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                encode_suffix_groups(
+                    gpu,
+                    enc,
+                    staging_u as Id,
+                    tree_u as Id,
+                    n_leaves,
+                    suffix_leaf_start,
+                    group,
+                    &groups,
+                );
+                gpu.end_encoding(enc);
+                gpu.retain(cb);
+                gpu.commit_async(cb);
+                Ok(cb)
+            })();
+            gpu.pool_pop(pool);
+            match r {
+                Ok(cb) => {
+                    if let Ok(mut v) = submitted.lock() {
+                        v.push((groups, cb as usize));
+                    } else {
+                        // Poisoned: keep the buffer alive (leak) and let the
+                        // fallback re-hash these groups on the main queue.
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                }
+                Err(_) => failed.store(true, Ordering::Relaxed),
+            }
+        };
+        let finish_chunk = |elem_offset: usize, chunk: &[F128]| {
+            let leaf_start = elem_offset / 64;
+            let leaf_len = (chunk.len() / 64) as u32;
+            debug_assert!(leaf_start >= suffix_leaf_start);
+            let gi = (leaf_start - suffix_leaf_start) / group;
+            debug_assert!(gi < n_groups);
+            // AcqRel: the thread that drops the count to zero observes every
+            // other chunk's codeword writes before it commits the group.
+            if remaining[gi].fetch_sub(leaf_len, Ordering::AcqRel) != leaf_len {
+                return;
+            }
+            let batch = match pending.lock() {
+                Ok(mut p) => {
+                    p.push(gi);
+                    let done = cb2_done.load(Ordering::Relaxed)
+                        || (unsafe { gpu.cb_status(cb2_u as Id) } >= 4 && {
+                            cb2_done.store(true, Ordering::Relaxed);
+                            true
+                        });
+                    if done && p.len() >= batch_min { core::mem::take(&mut *p) } else { Vec::new() }
+                }
+                Err(_) => {
+                    failed.store(true, Ordering::Relaxed);
+                    Vec::new()
+                }
+            };
+            if !batch.is_empty() {
+                submit_batch(batch);
+            }
+        };
+
+        unsafe {
+            let t_cpu_ntt = std::time::Instant::now();
+            if fine_m == 0 {
+                ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                    data,
+                    64,
+                    4,
+                    log_d,
+                    16 - k_cpu16,
+                    16,
+                    finish_chunk,
+                );
+            } else {
+                let ev = gpu.fine_split_event();
+                let want = FINE_SPLIT_WAIT.load(Ordering::Acquire);
+                ntt.forward_transform_interleaved_ranked_fine_range_and_then(
+                    data,
+                    64,
+                    16 - k_cpu16,
+                    fine_m,
+                    || {
+                        let mut spins = 0u32;
+                        while gpu.event_signaled_value(ev) < want {
+                            if gpu_cb_failed(gpu, cb2) {
+                                return Err("fine split: GPU prefix failed before layer-4 signal".into());
+                            }
+                            spins = spins.wrapping_add(1);
+                            if spins % 64 == 0 {
+                                std::thread::yield_now();
+                            } else {
+                                core::hint::spin_loop();
+                            }
+                        }
+                        Ok(())
+                    },
+                    finish_chunk,
+                )?;
+            }
+            let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
+            crate::tmark::mark("hybrid cpu ntt done");
+
+            // Final flush: every group still held (all of them when the CPU
+            // finished first) goes in one buffer - the serial cb3 shape.
+            let rest = match pending.into_inner() {
+                Ok(v) => v,
+                Err(_) => {
+                    failed.store(true, Ordering::Relaxed);
+                    Vec::new()
+                }
+            };
+            if !rest.is_empty() {
+                submit_batch(rest);
+            }
+            let subs: Vec<(Vec<usize>, usize)> = submitted.into_inner().unwrap_or_default();
+            // Any group whose submit failed (or never reached zero, which
+            // the NTT's full coverage rules out) is hashed by a main-queue
+            // fallback buffer behind cb2 - the serial S1 shape.
+            let mut fallback: Id = NIL;
+            let n_hashed: usize = subs.iter().map(|s| s.0.len()).sum();
+            if failed.load(Ordering::Relaxed) || n_hashed != n_groups {
+                let mut have = vec![false; n_groups];
+                for (gs, _) in &subs {
+                    for &gi in gs {
+                        have[gi] = true;
+                    }
+                }
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                for (gi, h) in have.iter().enumerate() {
+                    if !*h {
+                        encode_merkle_subtree(
+                            gpu,
+                            enc,
+                            staging,
+                            tree_buf,
+                            n_leaves,
+                            suffix_leaf_start + gi * group,
+                            group,
+                        );
+                    }
+                }
+                gpu.end_encoding(enc);
+                gpu.commit_async(cb);
+                fallback = cb;
+            }
+            crate::tmark::mark("suffix stream joined");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4);
+            let mut res: Result<(), String> = Ok(());
+            let spin = super::hybrid_cb2_spin_enabled();
+            let wait = |cb: Id| -> Result<(), String> {
+                if spin { gpu.yield_wait_cb_until(cb, deadline) } else { gpu.wait_cb(cb) }
+            };
+            if let Err(e) = wait(cb2) {
+                res = Err(e);
+            }
+            for &(_, cb) in &subs {
+                if let Err(e) = wait(cb as Id) {
+                    res = res.and(Err(e));
+                }
+            }
+            if !fallback.is_null() {
+                if let Err(e) = wait(fallback) {
+                    res = res.and(Err(e));
+                }
+            }
+            crate::tmark::mark("suffix stream host woke");
+            let (cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
+            let mut aux_s = f64::INFINITY;
+            let mut aux_e = 0.0f64;
+            let mut last_dur = 0.0f64;
+            let mut hash_total = 0.0f64;
+            let mut add = |cb: Id| {
+                let (s, e) = cb_gpu_interval(gpu, cb);
+                hash_total += e - s;
+                aux_s = aux_s.min(s);
+                if e >= aux_e {
+                    aux_e = e;
+                    last_dur = e - s;
+                }
+            };
+            for &(_, cb) in &subs {
+                add(cb as Id);
+            }
+            if !fallback.is_null() {
+                add(fallback);
+            }
+            for &(_, cb) in &subs {
+                gpu.release(cb as Id);
+            }
+            res?;
+            let gpu_end = cb2_e.max(aux_e);
+            crate::tmark::mark_gpu("cb2 gpu start", "cb2 gpu end", cb2_s, cb2_e);
+            crate::tmark::mark_gpu("aux first gpu start", "aux last gpu end", aux_s, aux_e);
+            // Arms for the sweep: the GPU arm runs from cb2's start to the
+            // last GPU hash. The suffix hashing never overlaps cb2, so this
+            // split's window is ~max(cb2 + H, cpu + h) with H all hash
+            // buffers' GPU time and h the last one's; the fine interpolator
+            // prices max(g, c) + h, hence g = cb2 + H - h.
+            record_hybrid_arms(k_split, (gpu_end - cb2_s) * 1e3, cpu_ntt_ms);
+            record_fine_arms(
+                k_split,
+                (cb2_e - cb2_s + hash_total - last_dur) * 1e3,
+                cpu_ntt_ms,
+                last_dur * 1e3,
+            );
+            if window_trace_enabled() {
+                eprintln!(
+                    "[gpu-window] suffix stream (k={k_cpu16}, m={fine_m}, group={group}, aux cbs={}, fallback={}): \
+                     cb2 gpu dur {:.2} ms, cpu ntt {cpu_ntt_ms:.2} ms, aux first start {:+.2} ms / last end {:+.2} ms \
+                     rel cb2 end, last aux dur {:.3} ms, cb2 start to gpu end {:.2} ms",
+                    subs.len(),
+                    !fallback.is_null(),
+                    (cb2_e - cb2_s) * 1e3,
+                    (aux_s - cb2_e) * 1e3,
+                    (aux_e - cb2_e) * 1e3,
+                    last_dur * 1e3,
+                    (gpu_end - cb2_s) * 1e3,
+                );
+            }
+            fill_suffix_levels_above_groups(
+                tree_base,
+                n_leaves,
+                suffix_leaf_start,
+                group,
+                n_leaves.ilog2() as usize - 4,
+            );
+            join_hybrid_s1_top(tree_base, n_leaves, k_cpu16, fine_m);
+            Ok(())
         }
     }
 
@@ -10216,6 +10526,151 @@ kernel void blake3_pow_scan(
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_GPU_SUFFIX_HASH").is_none())
+    }
+
+    /// Stream the S1 suffix hashing: once cb2 has completed, aligned groups
+    /// of finished CPU suffix chunks are leaf/subtree-hashed while the CPU
+    /// NTT still runs, instead of one serial cb3 over the whole suffix after
+    /// it. Same kernels, same tree slots. `FLOCK_NO_HYBRID_SUFFIX_STREAM=1`
+    /// restores the serial cb3.
+    fn hybrid_suffix_stream_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_SUFFIX_STREAM").is_none())
+    }
+
+    /// Finished groups per command buffer once cb2 is done
+    /// (`FLOCK_HYBRID_SUFFIX_BATCH`, default 4 = 16 MiB of codeword).
+    fn hybrid_suffix_batch_groups() -> usize {
+        use std::sync::OnceLock;
+        static B: OnceLock<usize> = OnceLock::new();
+        *B.get_or_init(|| {
+            std::env::var("FLOCK_HYBRID_SUFFIX_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|b| *b >= 1)
+                .unwrap_or(4)
+        })
+    }
+
+    /// Leaves per streamed suffix-hash group (power of two, >= 1,024 = one
+    /// NTT chunk). `FLOCK_HYBRID_SUFFIX_GROUP=<leaves>` overrides (tuning).
+    fn hybrid_suffix_group_leaves() -> usize {
+        use std::sync::OnceLock;
+        static G: OnceLock<usize> = OnceLock::new();
+        *G.get_or_init(|| {
+            std::env::var("FLOCK_HYBRID_SUFFIX_GROUP")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|g| g.is_power_of_two() && *g >= 1024)
+                .unwrap_or(4096)
+        })
+    }
+
+    /// Uniform group geometry for the streamed suffix hash: the largest
+    /// power-of-two group `<= want` (and `>= 1,024`) that divides both the
+    /// suffix start and the suffix length. `None` when no such group exists.
+    pub(crate) fn suffix_stream_groups(
+        suffix_leaf_start: usize,
+        n_leaves: usize,
+        want: usize,
+    ) -> Option<(usize, usize)> {
+        if suffix_leaf_start >= n_leaves || !want.is_power_of_two() || want < 1024 {
+            return None;
+        }
+        let len = n_leaves - suffix_leaf_start;
+        let mut g = want;
+        while g >= 1024 {
+            if suffix_leaf_start % g == 0 && len % g == 0 {
+                return Some((g, len / g));
+            }
+            g >>= 1;
+        }
+        None
+    }
+
+    /// Encode the leaf/subtree hashing of the given suffix groups, coalescing
+    /// runs of adjacent groups into maximal aligned subtrees (so a flush of
+    /// the whole suffix is exactly cb3's greedy decomposition).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn encode_suffix_groups(
+        gpu: &Gpu,
+        enc: Id,
+        staging: Id,
+        tree_buf: Id,
+        n_leaves: usize,
+        suffix_leaf_start: usize,
+        group: usize,
+        groups: &[usize],
+    ) {
+        let mut sorted = groups.to_vec();
+        sorted.sort_unstable();
+        let mut i = 0usize;
+        while i < sorted.len() {
+            let mut j = i + 1;
+            while j < sorted.len() && sorted[j] == sorted[j - 1] + 1 {
+                j += 1;
+            }
+            let mut st = suffix_leaf_start + sorted[i] * group;
+            let end = suffix_leaf_start + (sorted[j - 1] + 1) * group;
+            while st < end {
+                let mut size = 1usize << (end - st).ilog2();
+                while st % size != 0 {
+                    size >>= 1;
+                }
+                unsafe { encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, st, size) };
+                st += size;
+            }
+            i = j;
+        }
+    }
+
+    /// Flat-tree offset of level `level` (0 = leaves) for `n_leaves` leaves.
+    #[inline]
+    pub(crate) fn flat_level_start(n_leaves: usize, level: usize) -> usize {
+        let mut s = 0usize;
+        for j in 0..level {
+            s += n_leaves >> j;
+        }
+        s
+    }
+
+    /// After every streamed group (aligned subtree of `group` leaves) of the
+    /// suffix `[suffix_leaf_start, n_leaves)` has been hashed up to its root,
+    /// fill every flat-tree node at levels `log2(group)+1 ..= top_level`
+    /// whose leaf span lies entirely inside the suffix. Nodes straddling the
+    /// suffix start are left to the caller (prefix/boundary join).
+    ///
+    /// # Safety
+    /// `tree_base` points to `2 * n_leaves - 1` hashes; the caller owns the
+    /// written nodes exclusively.
+    pub(crate) unsafe fn fill_suffix_levels_above_groups(
+        tree_base: crate::epool::SyncPtr<Hash>,
+        n_leaves: usize,
+        suffix_leaf_start: usize,
+        group: usize,
+        top_level: usize,
+    ) {
+        let g_level = group.ilog2() as usize;
+        for level in g_level + 1..=top_level {
+            let lo = suffix_leaf_start.div_ceil(1usize << level);
+            let hi = n_leaves >> level;
+            if lo >= hi {
+                continue;
+            }
+            let rs = flat_level_start(n_leaves, level - 1);
+            let ws = flat_level_start(n_leaves, level);
+            let mut o = lo;
+            while o < hi {
+                let len = 1024.min(hi - o);
+                unsafe {
+                    let read = core::slice::from_raw_parts(tree_base.ptr().add(rs + 2 * o), 2 * len);
+                    let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + o), len);
+                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                }
+                o += len;
+            }
+        }
     }
 
     fn hybrid_cpu_suffix_deep_pipeline_enabled() -> bool {
@@ -22388,6 +22843,128 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             gpu.release(tw_buf);
             gpu.pool_pop(pool);
         }
+    }
+
+    /// Streamed S1 suffix hash: prefix subtrees, then per-group suffix
+    /// subtrees in separate command buffers (out of order), the CPU fill above the group
+    /// roots and the S1 top join must reproduce the single-subtree tree
+    /// byte for byte, for coarse and fine splits and several group sizes.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn hybrid_suffix_stream_tree_matches_full_tree() {
+        use super::imp;
+        let log_n = 18usize;
+        let n_leaves = 1usize << log_n;
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let data_bytes = n_leaves * 1024;
+        let tree_nodes = 2 * n_leaves - 1;
+        let tree_bytes = tree_nodes * 32;
+        let input = Rng::new(0x5EC3B3).vec(data_bytes / 16);
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), gpu.buffer_contents(data_buf), data_bytes);
+            let ref_tree = gpu.new_buffer(tree_bytes).unwrap();
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            imp::encode_merkle_subtree(gpu, enc, data_buf, ref_tree, n_leaves, 0, n_leaves);
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+            let want = core::slice::from_raw_parts(gpu.buffer_contents(ref_tree), tree_bytes).to_vec();
+            gpu.release(ref_tree);
+
+            // (k_cpu16, fine_m, group leaves)
+            for &(k, m, g) in &[
+                (6usize, 0usize, 4096usize),
+                (6, 0, 1024),
+                (6, 0, 1 << 14),
+                (5, 3, 1024),
+                (1, 15, 1024),
+                (8, 1, 4096),
+                (15, 0, 2048),
+            ] {
+                let k_split = k + 16 * m;
+                let prefix_leaves = imp::hybrid_prefix256(k_split) * (n_leaves / 256);
+                let Some((group, n_groups)) = imp::suffix_stream_groups(prefix_leaves, n_leaves, g) else {
+                    panic!("no group geometry for k={k} m={m} g={g}");
+                };
+                let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+                std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0x3C, tree_bytes);
+                // Main queue: greedy aligned prefix subtrees (cb2's Merkle part).
+                let cb2 = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb2).unwrap();
+                let mut s = 0usize;
+                while s < prefix_leaves {
+                    let mut size = 1usize << (prefix_leaves - s).ilog2();
+                    while s % size != 0 {
+                        size >>= 1;
+                    }
+                    imp::encode_merkle_subtree(gpu, enc, data_buf, tree_buf, n_leaves, s, size);
+                    s += size;
+                }
+                gpu.end_encoding(enc);
+                gpu.commit_async(cb2);
+                // Batches of scrambled, partly adjacent groups (coalesced by
+                // encode_suffix_groups), submitted in reverse order.
+                let mut order: Vec<usize> = (0..n_groups).collect();
+                let mut x = 0x9E37_79B9u64 ^ (k_split as u64);
+                for i in (1..order.len()).rev() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    if x % 3 != 0 {
+                        order.swap(i, (x as usize) % (i + 1));
+                    }
+                }
+                let mut auxs = Vec::new();
+                let mut rest = &order[..];
+                let mut bsz = 1usize;
+                while !rest.is_empty() {
+                    let (b, r) = rest.split_at(bsz.min(rest.len()));
+                    rest = r;
+                    bsz = bsz % 7 + 1;
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    imp::encode_suffix_groups(gpu, enc, data_buf, tree_buf, n_leaves, prefix_leaves, group, b);
+                    gpu.end_encoding(enc);
+                    gpu.commit_async(cb);
+                    auxs.push(cb);
+                }
+                gpu.wait_cb(cb2).unwrap();
+                for cb in auxs {
+                    gpu.wait_cb(cb).unwrap();
+                }
+                let base = crate::epool::SyncPtr(gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>());
+                imp::fill_suffix_levels_above_groups(base, n_leaves, prefix_leaves, group, log_n - 4);
+                imp::join_hybrid_s1_top(base, n_leaves, k, m);
+                let got = core::slice::from_raw_parts(gpu.buffer_contents(tree_buf), tree_bytes);
+                // Nodes the S1 path never needs (inside-prefix levels above the
+                // 16-node level are recomputed by the top join) all match too.
+                assert!(got == &want[..], "tree differs for k={k} m={m} group={group}");
+                gpu.release(tree_buf);
+            }
+            gpu.release(data_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn suffix_stream_group_geometry() {
+        use super::imp;
+        let n = 1usize << 20;
+        // k=6 coarse: suffix starts at 10/16.
+        assert_eq!(imp::suffix_stream_groups(10 * n / 16, n, 4096), Some((4096, 96)));
+        // Fine split boundary at a 256th: 4,096-leaf alignment only.
+        assert_eq!(imp::suffix_stream_groups(157 * n / 256, n, 1 << 14), Some((4096, 99)));
+        assert_eq!(imp::suffix_stream_groups(n, n, 4096), None);
+        assert_eq!(imp::suffix_stream_groups(512, n, 4096), None);
+        assert_eq!(imp::flat_level_start(8, 0), 0);
+        assert_eq!(imp::flat_level_start(8, 1), 8);
+        assert_eq!(imp::flat_level_start(8, 3), 14);
     }
 
     #[test]
