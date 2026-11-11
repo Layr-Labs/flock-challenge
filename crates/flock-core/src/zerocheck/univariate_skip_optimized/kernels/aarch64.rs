@@ -3373,7 +3373,7 @@ unsafe fn apply_word_kara<const V: u8, const SCALED: bool>(
         let e2 = veorq_u8(e0, te);
         let o2 = veorq_u8(o0, to);
         let ninth = kara.add(AB_KARA_NINTH);
-        let (ess, oss) = if !SCALED && V & ABV_KARA_UNSCALED != 0 {
+        let (ess, oss) = if V & ABV_KARA_UNSCALED != 0 {
             (ab_ld::<true, 0>(ninth, v as usize), ab_ld::<true, 8>(ninth, v as usize))
         } else {
             (
