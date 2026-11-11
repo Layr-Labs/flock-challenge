@@ -17525,19 +17525,17 @@ static inline uint4 gf_shl16(uint4 a) {
 }
 
 // The commit NTT's 64-thread byte-table build (gf_build_byte16) for one
-// constant `c`: tab[b] = b * c, tab[256 + b] = b * (c x^8).
-static inline void zf_build(threadgroup uint4* tabB, uint4 c, uint lid)
+// constant `c`: tab[b] = b * c, tab[256 + b] = b * (c x^8). `c8` is the
+// host-computed `c x^8` (consts[6 + i] for consts[i]), so the upper half no
+// longer runs an 8-step gf_mulx chain inside every group's barrier pair.
+static inline void zf_build(threadgroup uint4* tabB, uint4 c, uint4 c8, uint lid)
 {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint t  = lid >> 5;
     const uint u  = lid & 31u;
     const uint aa = u & 3u;
     const uint cc = u >> 2;
-    uint4 g = c;
-    if (t != 0u) {
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-    }
-    uint4 e0 = g;
+    uint4 e0 = (t != 0u) ? c8 : c;
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
     uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
     uint4 A = uint4(0u);
@@ -17584,7 +17582,7 @@ static inline void zf_mul_x2(uint4 va, uint4 vb,
 #define ZF_LEVEL(J)                                                    \
     {                                                                  \
         constexpr uint st = 1u << (J);                                 \
-        zf_build(tabB, consts[2u + (J)], lid);                         \
+        zf_build(tabB, consts[2u + (J)], consts[8u + (J)], lid);       \
         for (uint e = 0u; e < 16u; e += 2u * st) {                     \
             uint4 pa;                                                  \
             uint4 pb;                                                  \
@@ -17627,7 +17625,7 @@ kernel void zf_fold8(device const uint4* z      [[buffer(0)]],
     ZF_LEVEL(3u)
     uint4 ra = ea[0];
     uint4 rb = eb[0];
-    zf_build(tabB, consts[0], lid);
+    zf_build(tabB, consts[0], consts[6], lid);
     {
         uint4 sa = simd_shuffle_xor(ra, ushort(1));
         uint4 sb = simd_shuffle_xor(rb, ushort(1));
@@ -17639,7 +17637,7 @@ kernel void zf_fold8(device const uint4* z      [[buffer(0)]],
         ra = la ^ pa;
         rb = lb ^ pb;
     }
-    zf_build(tabB, consts[1], lid);
+    zf_build(tabB, consts[1], consts[7], lid);
     {
         uint4 sa = simd_shuffle_xor(ra, ushort(2));
         uint4 sb = simd_shuffle_xor(rb, ushort(2));
@@ -17845,6 +17843,20 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
         /// Outputs folded by one 64-thread group.
         pub(crate) const ZF_OUTS_PER_TG: usize = 32;
 
+        pub(crate) const ZF_CONSTS_BYTES: usize = 12 * 16;
+
+        pub(crate) fn zf_consts(challenges: &[F128; 6]) -> [F128; 12] {
+            std::array::from_fn(|i| {
+                let mut v = challenges[i % 6];
+                if i >= 6 {
+                    for _ in 0..8 {
+                        v = crate::field::mul_by_x(v);
+                    }
+                }
+                v
+            })
+        }
+
         #[repr(C)]
         pub(crate) struct ZfParams {
             pub(crate) out_lo: u32,
@@ -17888,7 +17900,6 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
             }
         }
 
-        /// Process-lifetime Metal state of the arm: one PSO, the 96-byte
         /// constant buffer, the 8 MiB output (absolute output indexing), the
         /// 16-byte steal-boundary word and one shared event whose value grows
         /// monotonically across proves (one step per completed chunk).
@@ -17915,7 +17926,7 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
                 let pool = gpu.pool_push();
                 let r = (|| -> Result<ZfState, String> {
                     let pso = compile_supplemental_pipeline(gpu, ZF_MSL_SOURCE, "zf_fold8")?;
-                    let consts = gpu.new_buffer(6 * 16)?;
+                    let consts = gpu.new_buffer(ZF_CONSTS_BYTES)?;
                     let cut = gpu.new_buffer(16)?;
                     let ev: Id = send!(
                         gpu.api,
@@ -18093,10 +18104,11 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
                     st.out = fresh;
                     st.out_cap = out_need;
                 }
+                let consts = zf_consts(challenges);
                 std::ptr::copy_nonoverlapping(
-                    challenges.as_ptr().cast::<u8>(),
+                    consts.as_ptr().cast::<u8>(),
                     st.gpu.buffer_contents(st.consts),
-                    96,
+                    ZF_CONSTS_BYTES,
                 );
                 let cut = st.gpu.buffer_contents(st.cut).cast::<u32>();
                 cut.write_volatile(n_blocks as u32);
@@ -18540,8 +18552,12 @@ mod tests {
                     b
                 }
             };
-            let cbuf = gpu.new_buffer(6 * 16).unwrap();
-            std::ptr::copy_nonoverlapping(ch.as_ptr().cast::<u8>(), gpu.buffer_contents(cbuf), 96);
+            let cbuf = gpu.new_buffer(zfold::ZF_CONSTS_BYTES).unwrap();
+            std::ptr::copy_nonoverlapping(
+                zfold::zf_consts(&ch).as_ptr().cast::<u8>(),
+                gpu.buffer_contents(cbuf),
+                zfold::ZF_CONSTS_BYTES,
+            );
             let obuf = gpu.new_buffer(n_out * 16).unwrap();
             let cutbuf = gpu.new_buffer(16).unwrap();
             *gpu.buffer_contents(cutbuf).cast::<u32>() = u32::MAX;
@@ -18643,23 +18659,42 @@ mod tests {
             .collect();
         let base = zfold::ZF_MSL_SOURCE.to_string();
         let nobuild = base
-            .replace("zf_build(tabB, consts[2u + (J)], lid);", "")
-            .replace("zf_build(tabB, consts[0], lid);", "")
-            .replace("zf_build(tabB, consts[1], lid);", "")
-            .replace("    uint4 eb[16];\n", "    uint4 eb[16];\n    zf_build(tabB, consts[0], lid);\n");
+            .replace(
+                "zf_build(tabB, consts[2u + (J)], consts[8u + (J)], lid);",
+                "",
+            )
+            .replace("zf_build(tabB, consts[0], consts[6], lid);", "")
+            .replace("zf_build(tabB, consts[1], consts[7], lid);", "")
+            .replace(
+                "    uint4 eb[16];\n",
+                "    uint4 eb[16];\n    zf_build(tabB, consts[0], consts[6], lid);\n",
+            );
         let contig = base
             .replace("const uint ba = (oa << 6) + q;", "const uint ba = (oa << 6) + (q << 4);")
             .replace("const uint bb = (ob << 6) + q;", "const uint bb = (ob << 6) + (q << 4);")
             .replace("ea[e] = z[ba + (e << 2)];", "ea[e] = z[ba + e];")
             .replace("eb[e] = z[bb + (e << 2)];", "eb[e] = z[bb + e];")
-            .replace("zf_build(tabB, consts[0], lid);", "zf_build(tabB, consts[4], lid);")
-            .replace("zf_build(tabB, consts[1], lid);", "zf_build(tabB, consts[5], lid);")
-            .replace("consts[2u + (J)]", "consts[(J)]");
+            .replace(
+                "zf_build(tabB, consts[0], consts[6], lid);",
+                "zf_build(tabB, consts[4], consts[10], lid);",
+            )
+            .replace(
+                "zf_build(tabB, consts[1], consts[7], lid);",
+                "zf_build(tabB, consts[5], consts[11], lid);",
+            )
+            .replace(
+                "consts[2u + (J)], consts[8u + (J)]",
+                "consts[(J)], consts[6u + (J)]",
+            );
         unsafe {
             let pool = gpu.pool_push();
             let zbuf = gpu.wrap_buffer(z.as_mut_ptr().cast::<u8>(), n * 16).unwrap();
-            let cbuf = gpu.new_buffer(96).unwrap();
-            std::ptr::copy_nonoverlapping(ch.as_ptr().cast::<u8>(), gpu.buffer_contents(cbuf), 96);
+            let cbuf = gpu.new_buffer(zfold::ZF_CONSTS_BYTES).unwrap();
+            std::ptr::copy_nonoverlapping(
+                zfold::zf_consts(&ch).as_ptr().cast::<u8>(),
+                gpu.buffer_contents(cbuf),
+                zfold::ZF_CONSTS_BYTES,
+            );
             let obuf = gpu.new_buffer(n_out * 16).unwrap();
             let cutbuf = gpu.new_buffer(16).unwrap();
             *gpu.buffer_contents(cutbuf).cast::<u32>() = u32::MAX;
@@ -18708,6 +18743,31 @@ mod tests {
             gpu.release(cutbuf);
             gpu.release(zbuf);
             gpu.pool_pop(pool);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zf_consts_hold_challenges_then_x8_multiples() {
+        use imp::zfold;
+        let x8 = F128 { lo: 1 << 8, hi: 0 };
+        let mut rng = Rng::new(0x2F08);
+        for round in 0..4 {
+            let ch: [F128; 6] = match round {
+                0 => [F128::ZERO; 6],
+                1 => [F128::ONE; 6],
+                2 => std::array::from_fn(|i| F128 {
+                    lo: u64::MAX,
+                    hi: u64::MAX >> i,
+                }),
+                _ => std::array::from_fn(|_| rng.f128()),
+            };
+            let k = zfold::zf_consts(&ch);
+            assert_eq!(core::mem::size_of_val(&k), zfold::ZF_CONSTS_BYTES);
+            for i in 0..6 {
+                assert_eq!(k[i], ch[i], "round {round} challenge {i}");
+                assert_eq!(k[6 + i], ch[i] * x8, "round {round} x^8 multiple {i}");
+            }
         }
     }
 
@@ -22192,3 +22252,5 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         }
     }
 }
+#[allow(dead_code)]
+const GAUNTLET_REDRAW_359349b9_20261111T014954Z: u8 = 0;
