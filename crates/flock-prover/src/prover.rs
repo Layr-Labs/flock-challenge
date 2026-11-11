@@ -826,7 +826,6 @@ fn fill_root_lincheck_stripe_group(
 /// producer's paired scratch, with no copy of z. Same bytes.
 ///
 /// # Safety
-/// `a` and `b` must each be valid for `8 * u64_per_block` u64 reads.
 unsafe fn fill_root_lincheck_stripe_group_ab(
     a: *const u64,
     b: *const u64,
@@ -834,11 +833,12 @@ unsafe fn fill_root_lincheck_stripe_group_ab(
     u64_per_block: usize,
     rows: &[crate::r1cs_hashes::blake3::RootRow],
 ) {
-    assert!(rows.len() * 64 <= stripe.len());
+    debug_assert!(rows.len() * 64 <= stripe.len());
+    let stripe_ptr = stripe.as_mut_ptr();
     for (j, row) in rows.iter().enumerate() {
         // Reads stay inside each block: lo_word (+1 iff hi_mask != 0) < u64_per_block.
-        assert!(row.lo_word + usize::from(row.hi_mask != 0) < u64_per_block);
-        let dst = &mut stripe[j * 64..j * 64 + 64];
+        debug_assert!(row.lo_word + usize::from(row.hi_mask != 0) < u64_per_block);
+        let dst = unsafe { std::slice::from_raw_parts_mut(stripe_ptr.add(j * 64), 64) };
         #[cfg(target_arch = "aarch64")]
         // SAFETY: every read is inside the eight blocks (assert above and the
         // caller's contract); `dst` is 64 writable bytes.
@@ -897,15 +897,14 @@ unsafe fn fill_root_lincheck_stripe_group_ab(
 /// of [`fill_root_lincheck_stripe_group_ab`]).
 ///
 /// # Safety
-/// As [`fill_root_lincheck_stripe_group_ab`].
 unsafe fn fixed_inputs_hold_ab(a: *const u64, b: *const u64, u64_per_block: usize) -> bool {
+    let checks: &[(usize, u64, u64)] = &crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS;
     let mut bad = 0u64;
     for lane in 0..8 {
-        for &(word, mask, want) in crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter() {
-            assert!(word < u64_per_block);
-            let i = lane * u64_per_block + word;
-            // SAFETY: `i < 8 * u64_per_block`.
-            bad |= (unsafe { *a.add(i) & *b.add(i) } & mask) ^ want;
+        let (a_lane, b_lane) = unsafe { (a.add(lane * u64_per_block), b.add(lane * u64_per_block)) };
+        for &(word, mask, want) in checks {
+            debug_assert!(word < u64_per_block);
+            bad |= (unsafe { *a_lane.add(word) & *b_lane.add(word) } & mask) ^ want;
         }
     }
     bad == 0
@@ -995,6 +994,7 @@ impl<'a> AbStripeEmitter<'a> {
         assert_eq!(group_bytes, 1 << 14);
         assert!(rows.len() <= AB_STRIPE_MAX_ROWS && rows.len() * 64 <= group_bytes);
         assert!(rows.iter().all(|r| r.lo_word + usize::from(r.hi_mask != 0) < AB_STRIPE_WORDS));
+        assert!(crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter().all(|c| c.0 < AB_STRIPE_WORDS));
         let n_groups = stripe_len / group_bytes;
         Self {
             stripe,
