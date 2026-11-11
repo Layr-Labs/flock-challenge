@@ -3407,12 +3407,349 @@ unsafe fn apply_word_into_4_regs_v<const V: u8, const SCALED: bool>(
     core::arch::aarch64::uint8x16_t,
 ) {
     unsafe {
-        if V & ABV_KARA != 0 {
+        if V & ABV_KARA != 0 && V & ABV_KARA_SWAP != 0 && V & ABV_KARA_X4REG != 0 && SCALED {
+            // `kara` is the swapped plain image here (see the row bodies).
+            let hi = core::arch::aarch64::vld1q_u8(MUL_X4_HI.as_ptr());
+            let (d0, d1, d2, d3) = apply_word_kara_swap(kara, word);
+            (
+                gf8_mul_x4_vec16(hi, d0),
+                gf8_mul_x4_vec16(hi, d1),
+                gf8_mul_x4_vec16(hi, d2),
+                gf8_mul_x4_vec16(hi, d3),
+            )
+        } else if V & ABV_KARA != 0 && V & ABV_KARA_SWAP != 0 && !SCALED {
+            apply_word_kara_swap(kara, word)
+        } else if V & ABV_KARA != 0 {
             apply_word_kara::<V, SCALED>(kara, word)
         } else {
             apply_word_into_4_regs(table_base, half_swapped_table_base, word)
         }
     }
+}
+
+/// Row-body variant bit: the plain image's Karatsuba lookups read the
+/// half-swapped twin of each entry for the odd byte of every pair (see
+/// [`ab_kara_swap_tables`]), so the even and odd trees merge and the four
+/// `ext` + `eor` half-swaps per word disappear. Requires `ABV_KARA`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_KARA_SWAP: u8 = 8;
+
+/// Kill switch: exactly `FLOCK_NO_ZC_AB_KARA_SWAP=1` keeps the incumbent
+/// Karatsuba apply (with the in-register half-swap). Same bytes either way.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_kara_swap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_AB_KARA_SWAP").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
+/// Bytes of the swapped plain image: 256 entries of 256 bytes (the eight
+/// lanes of [`ab_kara_tables`], then the same eight lanes with their two
+/// 8-byte halves exchanged), then 256 entries of 32 bytes (ninth lane,
+/// natural then half-swapped).
+#[cfg(target_arch = "aarch64")]
+pub(crate) const AB_KARA_SWAP_IMAGE_BYTES: usize = 256 * 256 + 256 * 32;
+#[cfg(target_arch = "aarch64")]
+const AB_KARA_SWAP_NINTH: usize = 256 * 256;
+
+/// The swapped plain image (layout above) followed by the `x^4`-scaled image
+/// of [`ab_kara_tables`] unchanged, 128-byte aligned, built once per process.
+/// Entry `x` lane `q` (natural) sits at `x * 256 + 16 q`; its half-swapped
+/// twin at `x * 256 + 128 + 16 q`, so the odd byte of a pair selects the
+/// twin through bit 7 of its index (see [`ab_kswap_ld`]). The natural lanes
+/// 0..3 of entry `x` are also row `x` of the plain table, and the swapped
+/// lanes 0..3 row `x` of the half-swapped plain table.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_kara_swap_tables(inv_table: &InvNttTableByteSingleGf8) -> *const u8 {
+    struct Tables {
+        storage: Vec<u8>,
+        offset: usize,
+    }
+    static TABLES: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        let kara = ab_kara_tables(inv_table);
+        // SAFETY: `ab_kara_tables` holds two images of `AB_KARA_IMAGE_BYTES`.
+        let src = unsafe { core::slice::from_raw_parts(kara, 2 * AB_KARA_IMAGE_BYTES) };
+        let total = AB_KARA_SWAP_IMAGE_BYTES + AB_KARA_IMAGE_BYTES;
+        let mut storage = vec![0u8; total + 127];
+        let offset = storage.as_ptr().align_offset(128);
+        assert!(offset < 128);
+        let dst = &mut storage[offset..offset + total];
+        let swap16 = |s: &[u8], d: &mut [u8]| {
+            d[..8].copy_from_slice(&s[8..16]);
+            d[8..16].copy_from_slice(&s[..8]);
+        };
+        for x in 0..256 {
+            for lane in 0..8 {
+                let s = &src[x * 128 + lane * 16..][..16];
+                dst[x * 256 + lane * 16..][..16].copy_from_slice(s);
+                swap16(s, &mut dst[x * 256 + 128 + lane * 16..][..16]);
+            }
+            let s = &src[AB_KARA_NINTH + x * 16..][..16];
+            dst[AB_KARA_SWAP_NINTH + x * 32..][..16].copy_from_slice(s);
+            swap16(s, &mut dst[AB_KARA_SWAP_NINTH + x * 32 + 16..][..16]);
+        }
+        dst[AB_KARA_SWAP_IMAGE_BYTES..].copy_from_slice(&src[AB_KARA_IMAGE_BYTES..]);
+        Tables { storage, offset }
+    });
+    // SAFETY: `offset < 128` and the allocation holds `offset + total`.
+    unsafe { tables.storage.as_ptr().add(tables.offset) }
+}
+
+/// One 16-byte lane of the swapped image for byte `J` of `src`, lane base
+/// `base` (`table + 16 q`, or the ninth-lane block). `ODD` reads the
+/// half-swapped twin: the caller passes `src | 0x0080_0080_0080_0080`, so bit
+/// `8J - 1` (the top bit of the byte below, which this lookup does not read)
+/// lands on bit 7 of the index (bit 4 for the ninth lane). One index
+/// instruction and one unscaled register-offset load per lookup.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ab_kswap_ld<const J: u32, const ODD: bool, const NINTH: bool>(
+    base: *const u8,
+    src: u64,
+) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::*;
+    let out: uint8x16_t;
+    unsafe {
+        if NINTH {
+            // Entry stride 32: even J = 0 -> x * 32; odd J = 1 -> x * 32 + 16.
+            if !ODD {
+                debug_assert!(J == 0);
+                core::arch::asm!(
+                    "ubfiz {idx}, {w}, #5, #8",
+                    "ldr {out:q}, [{t}, {idx}]",
+                    w = in(reg) src, t = in(reg) base, idx = out(reg) _, out = lateout(vreg) out,
+                    options(pure, readonly, nostack, preserves_flags),
+                );
+            } else {
+                debug_assert!(J == 1);
+                core::arch::asm!(
+                    "and {idx}, {mask}, {w}, lsr #3",
+                    "ldr {out:q}, [{t}, {idx}]",
+                    mask = in(reg) 0x1ff0usize,
+                    w = in(reg) src, t = in(reg) base, idx = out(reg) _, out = lateout(vreg) out,
+                    options(pure, readonly, nostack, preserves_flags),
+                );
+            }
+        } else if J == 0 {
+            core::arch::asm!(
+                "ubfiz {idx}, {w}, #8, #8",
+                "ldr {out:q}, [{t}, {idx}]",
+                w = in(reg) src, t = in(reg) base, idx = out(reg) _, out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else if J == 1 {
+            // No shift: the plain (unshifted) register form, one ALU slot.
+            core::arch::asm!(
+                "and {idx}, {mask}, {w}",
+                "ldr {out:q}, [{t}, {idx}]",
+                mask = in(reg) if ODD { 0xff80usize } else { 0xff00usize },
+                w = in(reg) src, t = in(reg) base, idx = out(reg) _, out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else {
+            // Bits 8J..8J+7 to 8..15 (and, when odd, bit 8J-1 to 7).
+            core::arch::asm!(
+                "and {idx}, {mask}, {w}, lsr #{shift}",
+                "ldr {out:q}, [{t}, {idx}]",
+                shift = const (J * 8 + 56) % 64,
+                mask = in(reg) if ODD { 0xff80usize } else { 0xff00usize },
+                w = in(reg) src, t = in(reg) base, idx = out(reg) _, out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+    }
+    out
+}
+
+/// [`apply_word_kara`] of the plain image out of [`ab_kara_swap_tables`]:
+/// every odd byte reads its half-swapped twin, so each output lane is one
+/// XOR tree (11 vector XORs per word instead of 14 XORs, 4 `ext` and 4 more
+/// XORs). Same 64 bytes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_kara_swap(
+    kara: *const u8,
+    word: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    // Top bit of every even byte only: the odd lookup of byte J reads bit 8J-1.
+    const SEL: u64 = 0x0080_0080_0080_0080;
+    unsafe {
+        let u = word ^ (word >> 16);
+        let s = word ^ (word >> 32);
+        let v = s ^ (s >> 16);
+        let (wo, uo, so, vo) = (word | SEL, u | SEL, s | SEL, v | SEL);
+        macro_rules! ld {
+            ($src:expr, $j:literal, $odd:literal, $lane:literal) => {
+                ab_kswap_ld::<$j, $odd, false>(kara.add($lane * 16), $src)
+            };
+        }
+        // Lane 0: the four byte pairs of the word on lanes C0..C3.
+        let d0 = veorq_u8(
+            xor3_u8(
+                xor3_u8(ld!(word, 0, false, 0), ld!(wo, 1, true, 0), ld!(word, 2, false, 1)),
+                ld!(wo, 3, true, 1),
+                ld!(word, 4, false, 2),
+            ),
+            xor3_u8(ld!(wo, 5, true, 2), ld!(word, 6, false, 3), ld!(wo, 7, true, 3)),
+        );
+        let d1 = xor3_u8(
+            xor3_u8(d0, ld!(u, 0, false, 4), ld!(uo, 1, true, 4)),
+            ld!(u, 4, false, 5),
+            ld!(uo, 5, true, 5),
+        );
+        let t = xor3_u8(
+            ld!(s, 0, false, 6),
+            ld!(so, 1, true, 6),
+            veorq_u8(ld!(s, 2, false, 7), ld!(so, 3, true, 7)),
+        );
+        let ninth = kara.add(AB_KARA_SWAP_NINTH);
+        let n = veorq_u8(
+            ab_kswap_ld::<0, false, true>(ninth, v),
+            ab_kswap_ld::<1, true, true>(ninth, vo),
+        );
+        (d0, d1, veorq_u8(d0, t), xor3_u8(d1, t, n))
+    }
+}
+
+/// [`xor_vary_pair`] / [`xor_vary_single`] out of the swapped image: byte
+/// `J`'s plain-table row is the natural lanes 0..3 of entry `x` (even `J`)
+/// or the swapped lanes (odd `J`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn kswap_row<const J: u32>(kara: *const u8, b_word: u64) -> *const u8 {
+    unsafe { kara.add(byte_from_word::<J>(b_word) * 256 + if J % 2 == 1 { 128 } else { 0 }) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn xor_vary_single_kswap<const J: u32>(
+    kara: *const u8,
+    b_word: u64,
+    db0: &mut core::arch::aarch64::uint8x16_t,
+    db1: &mut core::arch::aarch64::uint8x16_t,
+    db2: &mut core::arch::aarch64::uint8x16_t,
+    db3: &mut core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let bh = (J as usize) / 2;
+        let r = kswap_row::<J>(kara, b_word);
+        *db0 = veorq_u8(*db0, vld1q_u8(r.add(bh * 16)));
+        *db1 = veorq_u8(*db1, vld1q_u8(r.add((1 ^ bh) * 16)));
+        *db2 = veorq_u8(*db2, vld1q_u8(r.add((2 ^ bh) * 16)));
+        *db3 = veorq_u8(*db3, vld1q_u8(r.add((3 ^ bh) * 16)));
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn xor_vary_pair_kswap<const J0: u32, const J1: u32>(
+    kara: *const u8,
+    b_word: u64,
+    db0: &mut core::arch::aarch64::uint8x16_t,
+    db1: &mut core::arch::aarch64::uint8x16_t,
+    db2: &mut core::arch::aarch64::uint8x16_t,
+    db3: &mut core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let bh0 = (J0 as usize) / 2;
+        let bh1 = (J1 as usize) / 2;
+        let r0 = kswap_row::<J0>(kara, b_word);
+        let r1 = kswap_row::<J1>(kara, b_word);
+        *db0 = xor3_u8(*db0, vld1q_u8(r0.add(bh0 * 16)), vld1q_u8(r1.add(bh1 * 16)));
+        *db1 = xor3_u8(*db1, vld1q_u8(r0.add((1 ^ bh0) * 16)), vld1q_u8(r1.add((1 ^ bh1) * 16)));
+        *db2 = xor3_u8(*db2, vld1q_u8(r0.add((2 ^ bh0) * 16)), vld1q_u8(r1.add((2 ^ bh1) * 16)));
+        *db3 = xor3_u8(*db3, vld1q_u8(r0.add((3 ^ bh0) * 16)), vld1q_u8(r1.add((3 ^ bh1) * 16)));
+    }
+}
+
+/// Row-body variant bit (with `ABV_KARA_SWAP`): the `x^4`-scaled words go
+/// through the swapped plain image and are multiplied by `x^4` in registers
+/// (4 vector ops per lane) instead of reading the scaled image. The scaled
+/// image (36 KiB) leaves the working set and its lookups take the
+/// one-instruction index.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_KARA_X4REG: u8 = 16;
+
+/// Row-body variant bit: the window run checks bounds once and fixes the
+/// store flavour per copy of the window body (no per-row length/flag reloads).
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_HOIST: u8 = 32;
+
+/// Kill switch: exactly `FLOCK_NO_ZC_AB_ROW_HOIST=1` keeps per-row checks.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_row_hoist_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_AB_ROW_HOIST").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
+/// Kill switch: exactly `FLOCK_NO_ZC_AB_KARA_X4REG=1` keeps the scaled image.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_kara_x4reg_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_AB_KARA_X4REG").is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
+/// `HI[v] = (v << 4) · x^4` in GF(2^8) mod `x^8 + x^4 + x^3 + x + 1`; the low
+/// nibble times `x^4` is a plain shift (`v << 4`, no reduction).
+#[cfg(target_arch = "aarch64")]
+pub(crate) const MUL_X4_HI: [u8; 16] = [
+    0x00, 0x1b, 0x36, 0x2d, 0x6c, 0x77, 0x5a, 0x41, 0xd8, 0xc3, 0xee, 0xf5, 0xb4, 0xaf, 0x82, 0x99,
+];
+
+/// Multiply 16 GF(2^8) values by `x^4`: `(a << 4) ^ HI[a >> 4]`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn gf8_mul_x4_vec16(
+    hi: core::arch::aarch64::uint8x16_t,
+    a: core::arch::aarch64::uint8x16_t,
+) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::*;
+    unsafe { veorq_u8(vshlq_n_u8::<4>(a), vqtbl1q_u8(hi, vshrq_n_u8::<4>(a))) }
+}
+
+/// Test access: the `x^4`-scaled apply through the swapped plain image.
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) fn ab_apply_word_kswap_x4(inv_table: &InvNttTableByteSingleGf8, word: u64) -> [u8; 64] {
+    use core::arch::aarch64::*;
+    let mut out = [0u8; 64];
+    unsafe {
+        let k = ab_kara_swap_tables(inv_table);
+        let v = apply_word_into_4_regs_v::<{ ABV_KARA | ABV_KARA_SWAP | ABV_KARA_X4REG }, true>(k, k, k, word);
+        vst1q_u8(out.as_mut_ptr(), v.0);
+        vst1q_u8(out.as_mut_ptr().add(16), v.1);
+        vst1q_u8(out.as_mut_ptr().add(32), v.2);
+        vst1q_u8(out.as_mut_ptr().add(48), v.3);
+    }
+    out
+}
+
+/// Test access: the plain image's word apply through [`apply_word_kara_swap`].
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) fn ab_apply_word_kswap(inv_table: &InvNttTableByteSingleGf8, word: u64) -> [u8; 64] {
+    use core::arch::aarch64::*;
+    let mut out = [0u8; 64];
+    unsafe {
+        let v = apply_word_kara_swap(ab_kara_swap_tables(inv_table), word);
+        vst1q_u8(out.as_mut_ptr(), v.0);
+        vst1q_u8(out.as_mut_ptr().add(16), v.1);
+        vst1q_u8(out.as_mut_ptr().add(32), v.2);
+        vst1q_u8(out.as_mut_ptr().add(48), v.3);
+    }
+    out
 }
 
 /// Test access: one word through the plain apply and through the Karatsuba

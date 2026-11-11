@@ -1786,7 +1786,67 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     if let Some((_, _, partials)) = static_run {
         // Same rows, same bytes: the Karatsuba table apply (18 loads per
         // word) or, with `FLOCK_NO_ZC_AB_KARA=1`, the plain apply (32).
-        if kernels::aarch64::ab_kara_enabled() && kernels::aarch64::ab_kara_unscaled_enabled() {
+        if kernels::aarch64::ab_kara_enabled()
+            && kernels::aarch64::ab_kara_unscaled_enabled()
+            && kernels::aarch64::ab_kara_swap_enabled()
+            && kernels::aarch64::ab_kara_x4reg_enabled()
+            && kernels::aarch64::ab_row_hoist_enabled()
+        {
+            kernels::aarch64::bstatic_horner_window_rows::<{
+                kernels::aarch64::AB_ROWS_VARIANT
+                    | kernels::aarch64::ABV_KARA_UNSCALED
+                    | kernels::aarch64::ABV_KARA_SWAP
+                    | kernels::aarch64::ABV_KARA_X4REG
+                    | kernels::aarch64::ABV_HOIST
+            }>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else if kernels::aarch64::ab_kara_enabled()
+            && kernels::aarch64::ab_kara_unscaled_enabled()
+            && kernels::aarch64::ab_kara_swap_enabled()
+            && kernels::aarch64::ab_kara_x4reg_enabled()
+        {
+            kernels::aarch64::bstatic_horner_window_rows::<{
+                kernels::aarch64::AB_ROWS_VARIANT
+                    | kernels::aarch64::ABV_KARA_UNSCALED
+                    | kernels::aarch64::ABV_KARA_SWAP
+                    | kernels::aarch64::ABV_KARA_X4REG
+            }>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else if kernels::aarch64::ab_kara_enabled()
+            && kernels::aarch64::ab_kara_unscaled_enabled()
+            && kernels::aarch64::ab_kara_swap_enabled()
+        {
+            kernels::aarch64::bstatic_horner_window_rows::<{
+                kernels::aarch64::AB_ROWS_VARIANT
+                    | kernels::aarch64::ABV_KARA_UNSCALED
+                    | kernels::aarch64::ABV_KARA_SWAP
+            }>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else if kernels::aarch64::ab_kara_enabled() && kernels::aarch64::ab_kara_unscaled_enabled() {
             kernels::aarch64::bstatic_horner_window_rows::<{
                 kernels::aarch64::AB_ROWS_VARIANT | kernels::aarch64::ABV_KARA_UNSCALED
             }>(
@@ -6255,7 +6315,7 @@ mod tests {
         let mut out = vec![0u8; 16 * 64];
         let mut times = Vec::new();
         let mut sum = 0u64;
-        const REPS: usize = 40;
+        const REPS: usize = 160;
         for _trial in 0..25 {
             let t0 = std::time::Instant::now();
             for _ in 0..REPS {
@@ -6287,7 +6347,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn ab_kernel_variants_match_baseline() {
-        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_INLINE_WINDOW, ABV_KARA, ABV_KARA_UNSCALED};
+        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_INLINE_WINDOW, ABV_KARA, ABV_KARA_SWAP, ABV_KARA_UNSCALED, ABV_KARA_X4REG, ABV_HOIST};
         let table = make_inv_table();
         let mut rng = Rng::new(0xAB5A_71C0_F457_0003);
         let mut words: Vec<u64> = vec![0, u64::MAX];
@@ -6304,6 +6364,13 @@ mod tests {
                 let (_, unscaled) = kernels::aarch64::ab_apply_word_forms::<{ ABV_KARA | ABV_KARA_UNSCALED }>(&table, scaled, word);
                 assert_eq!(kara, unscaled, "unscaled Karatsuba apply differs (scaled={scaled}, word={word:016x})");
                 assert_eq!(plain, kara, "Karatsuba apply differs (scaled={scaled}, word={word:016x})");
+                if !scaled {
+                    let swapped = kernels::aarch64::ab_apply_word_kswap(&table, word);
+                    assert_eq!(swapped, plain, "swapped Karatsuba apply differs (word={word:016x})");
+                } else {
+                    let x4 = kernels::aarch64::ab_apply_word_kswap_x4(&table, word);
+                    assert_eq!(x4, plain, "x^4-in-register apply differs (word={word:016x})");
+                }
                 let mut want = [F8::ZERO; 64];
                 table.apply(&word.to_le_bytes(), &mut want);
                 let scale = if scaled { F8(1 << 4) } else { F8::ONE };
@@ -6381,11 +6448,14 @@ mod tests {
                         check!(ABV_INLINE_WINDOW);
                         check!(AB_ROWS_VARIANT);
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | ABV_KARA_SWAP);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | ABV_KARA_SWAP | ABV_KARA_X4REG);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | ABV_KARA_SWAP | ABV_KARA_X4REG | ABV_HOIST);
                     }
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 4);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 7);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
@@ -6481,7 +6551,7 @@ mod tests {
     #[test]
     #[ignore = "timing probe"]
     fn ab_kara_rows_timing() {
-        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_KARA};
+        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_HOIST, ABV_KARA_SWAP, ABV_KARA_UNSCALED, ABV_KARA_X4REG};
         let table = make_inv_table();
         let mut rng = Rng::new(0xB57A_71C0_7131_0005);
         let context =
@@ -6491,10 +6561,16 @@ mod tests {
             unreachable!("prepared static-B context");
         };
         const CHUNKS: usize = 64;
+        // Probe knob: FLOCK_AA_PROBE_BYTE_MASK=3f limits the byte values
+        // (and so the table footprint) of the synthetic rows.
+        let bm: u8 = std::env::var("FLOCK_AA_PROBE_BYTE_MASK")
+            .ok()
+            .and_then(|v| u8::from_str_radix(&v, 16).ok())
+            .unwrap_or(0xff);
         let a_packed: Vec<u8> =
-            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() & 0xff) as u8 & bm).collect();
         let mut b: Vec<u8> =
-            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() >> 9 & 0xff) as u8).collect();
+            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() >> 9 & 0xff) as u8 & bm).collect();
         for c in 0..CHUNKS {
             for w in 0..2usize {
                 let (lo, hi) = kernels::aarch64::BSTATIC_HORNER_WINDOW_ROWS[w];
@@ -6510,8 +6586,8 @@ mod tests {
             }
         }
         let mut out = vec![0u8; 16 * 64];
-        const REPS: usize = 40;
-        const NAMES: [&str; 3] = ["plain apply", "Karatsuba apply", "Karatsuba apply, one-function window"];
+        const REPS: usize = 160;
+        const NAMES: [&str; 3] = ["swap + x^4 in registers", "incumbent (kara+window+unscaled)", "swap + x^4 + row hoist"];
         let mut times: [Vec<f64>; 3] = Default::default();
         let mut sums = [0u64; 3];
         for round in 0..26 {
@@ -6524,13 +6600,13 @@ mod tests {
                         for w in 0..2usize {
                             let base = c * 2048 + w * 1024;
                             match form {
-                                0 => kernels::aarch64::bstatic_horner_window_rows::<0>(
+                                0 => kernels::aarch64::bstatic_horner_window_rows::<{ AB_ROWS_VARIANT | ABV_KARA_UNSCALED | ABV_KARA_SWAP | ABV_KARA_X4REG }>(
                                     w, &a_packed, &b, &table, base, partials, &mut out, false,
                                 ),
-                                1 => kernels::aarch64::bstatic_horner_window_rows::<{ ABV_KARA }>(
+                                1 => kernels::aarch64::bstatic_horner_window_rows::<{ AB_ROWS_VARIANT | ABV_KARA_UNSCALED }>(
                                     w, &a_packed, &b, &table, base, partials, &mut out, false,
                                 ),
-                                _ => kernels::aarch64::bstatic_horner_window_rows::<{ AB_ROWS_VARIANT }>(
+                                _ => kernels::aarch64::bstatic_horner_window_rows::<{ AB_ROWS_VARIANT | ABV_KARA_UNSCALED | ABV_KARA_SWAP | ABV_KARA_X4REG | ABV_HOIST }>(
                                     w, &a_packed, &b, &table, base, partials, &mut out, false,
                                 ),
                             }

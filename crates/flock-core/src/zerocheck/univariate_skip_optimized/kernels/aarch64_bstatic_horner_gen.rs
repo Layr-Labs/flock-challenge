@@ -68,7 +68,12 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
     use core::arch::aarch64::*;
     let b_med = BLK % 16;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-    assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
+    if V & ABV_HOIST != 0 {
+        // [`bstatic_horner_window_rows`] checked the window's last row once.
+        debug_assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
+    } else {
+        assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
+    }
     let plain = inv_table.data_ptr();
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
@@ -76,7 +81,15 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
     // Karatsuba images of the plain and the scaled table (dangling and
     // unused unless `V` applies the table in that form).
     let kplain = kara;
-    let kscaled = kara.wrapping_add(AB_KARA_IMAGE_BYTES);
+    // With `ABV_KARA_SWAP`, `kara` is [`ab_kara_swap_tables`]: the swapped
+    // plain image, then the scaled image.
+    // With `ABV_KARA_X4REG` the scaled words read the swapped plain image too
+    // and are multiplied by `x^4` in registers.
+    let kscaled = if V & ABV_KARA_SWAP != 0 && V & ABV_KARA_X4REG != 0 {
+        kara
+    } else {
+        kara.wrapping_add(if V & ABV_KARA_SWAP != 0 { AB_KARA_SWAP_IMAGE_BYTES } else { AB_KARA_IMAGE_BYTES })
+    };
     unsafe {
         let a_base = a_packed.as_ptr().add(byte_base_b);
         let b_base = b_packed.as_ptr().add(byte_base_b);
@@ -104,8 +117,14 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
                 let mut db3 = vld1q_u8(pp.add(48));
                 #[allow(unused_variables)]
                 let b_word = bw!($k);
-                $(xor_vary_pair::<$j0, $j1>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
-                $(xor_vary_single::<$js>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                if V & ABV_KARA_SWAP != 0 {
+                    // The plain rows are lanes 0..3 of the swapped image.
+                    $(xor_vary_pair_kswap::<$j0, $j1>(kplain, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                    $(xor_vary_single_kswap::<$js>(kplain, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                } else {
+                    $(xor_vary_pair::<$j0, $j1>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                    $(xor_vary_single::<$js>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                }
                 (db0, db1, db2, db3)
             }};
         }
@@ -116,7 +135,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
         macro_rules! bimg_sk {
             ($blk:literal, $k:literal, $pairs:tt, $singles:tt) => {{
                 if V & ABV_KARA != 0 {
-                    apply_word_kara::<V, false>(kplain, bw!($k))
+                    apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, bw!($k))
                 } else {
                     bimg_s!($blk, $k, $pairs, $singles)
                 }
@@ -733,27 +752,41 @@ pub(crate) fn bstatic_horner_window_rows<const V: u8>(
 ) {
     assert!(w <= 1 && out_outer.len() >= 16 * 64);
     let out = out_outer.as_mut_ptr();
-    let kara = if V & ABV_KARA != 0 {
+    let kara = if V & ABV_KARA != 0 && V & ABV_KARA_SWAP != 0 {
+        ab_kara_swap_tables(inv_table)
+    } else if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
     } else {
         core::ptr::null()
     };
     macro_rules! rows {
-        ($($blk:literal),*) => {{
+        ($nt:expr; $($blk:literal),*) => {{
             $(
                 // SAFETY: `$blk % 16 < 16` and `out_outer` holds 16 rows of 64 bytes.
                 let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
                 if V & ABV_INLINE_WINDOW != 0 {
-                    bstatic_horner_blk_body::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store);
+                    bstatic_horner_blk_body::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, $nt);
                 } else {
-                    bstatic_horner_blk::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store);
+                    bstatic_horner_blk::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, $nt);
                 }
             )*
         }};
     }
-    if w == 0 {
-        rows!(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    if V & ABV_HOIST != 0 {
+        // One bounds check for the window (its rows are `b_med < 16`), and
+        // the store flavour as a constant in each copy of the window body:
+        // no per-row reload of the lengths or of the flag.
+        let last = chunk_byte_base + 15 * N_CHUNKS * 8 + 8 * N_CHUNKS;
+        assert!(last <= a_packed.len() && last <= b_packed.len());
+        match (w == 0, nt_store) {
+            (true, true) => rows!(true; 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+            (true, false) => rows!(false; 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+            (false, true) => rows!(true; 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28),
+            (false, false) => rows!(false; 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28),
+        }
+    } else if w == 0 {
+        rows!(nt_store; 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
     } else {
-        rows!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
+        rows!(nt_store; 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
     }
 }
