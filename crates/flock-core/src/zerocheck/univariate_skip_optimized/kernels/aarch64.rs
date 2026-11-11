@@ -3279,6 +3279,73 @@ unsafe fn ab_kara_ld<const V: u8, const J: u32, const SLOT: usize>(
     }
 }
 
+/// The even/odd pair of one slot of the unscaled Karatsuba image: bytes `J`
+/// and `J + 1` of `word`, both from slot `SLOT` (entry `byte * 128 +
+/// SLOT * 16`). Same loads as two [`ab_kara_ld`] calls, but the slot base is
+/// formed inside the asm block from the one image pointer, so the callers'
+/// inlined loops keep `kara` live instead of eight distinct slot pointers.
+/// The maximum address is `kara + 255 * 128 + 7 * 16`, inside the image.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ab_kara_ld_pair<const J: u32, const SLOT: usize>(
+    kara: *const u8,
+    word: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    // Callers pass an even `J <= 6`; the bounds below keep every
+    // instantiation (including dead test branches) well-formed.
+    const { assert!(J < 8 && SLOT < 8) };
+    let even: uint8x16_t;
+    let odd: uint8x16_t;
+    unsafe {
+        // `base`, `i0`, `i1` are early-clobber scratch (`out`), so none of
+        // them can alias `kara`, `word` or `mask` while those are still read.
+        if J == 0 {
+            core::arch::asm!(
+                "add {base}, {kara}, #{off}",
+                "ubfiz {i0}, {word}, #7, #8",
+                "and {i1}, {mask}, {word}, lsr #1",
+                "ldr {even:q}, [{base}, {i0}]",
+                "ldr {odd:q}, [{base}, {i1}]",
+                off = const SLOT * 16,
+                kara = in(reg) kara,
+                word = in(reg) word,
+                mask = in(reg) 0x7f80usize,
+                base = out(reg) _,
+                i0 = out(reg) _,
+                i1 = out(reg) _,
+                even = lateout(vreg) even,
+                odd = lateout(vreg) odd,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else {
+            core::arch::asm!(
+                "add {base}, {kara}, #{off}",
+                "and {i0}, {mask}, {word}, lsr #{s0}",
+                "and {i1}, {mask}, {word}, lsr #{s1}",
+                "ldr {even:q}, [{base}, {i0}]",
+                "ldr {odd:q}, [{base}, {i1}]",
+                off = const SLOT * 16,
+                s0 = const (J * 8 + 57) % 64,
+                s1 = const (J * 8 + 65) % 64,
+                kara = in(reg) kara,
+                word = in(reg) word,
+                mask = in(reg) 0x7f80usize,
+                base = out(reg) _,
+                i0 = out(reg) _,
+                i1 = out(reg) _,
+                even = lateout(vreg) even,
+                odd = lateout(vreg) odd,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+    }
+    (even, odd)
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 #[test]
 fn ab_kara_unscaled_addresses_match() {
@@ -3298,6 +3365,28 @@ fn ab_kara_unscaled_addresses_match() {
             }
             slot!(0); slot!(1); slot!(2); slot!(3);
             slot!(4); slot!(5); slot!(6); slot!(7);
+            // Paired form at every even byte position the apply uses.
+            if J % 2 == 0 && J < 7 {
+                macro_rules! pair {
+                    ($s:literal) => {
+                        let (e, o) = ab_kara_ld_pair::<J, $s>(kara, word);
+                        assert_eq!(
+                            core::mem::transmute::<_, [u8; 16]>(e),
+                            core::mem::transmute::<_, [u8; 16]>(ab_kara_ld::<0, J, $s>(kara, word)),
+                            "pair even byte={J}, slot={}, word={word:016x}", $s,
+                        );
+                        assert_eq!(
+                            core::mem::transmute::<_, [u8; 16]>(o),
+                            core::mem::transmute::<_, [u8; 16]>(core::arch::aarch64::vld1q_u8(
+                                kara.add(((word >> ((J + 1) * 8)) & 0xff) as usize * 128 + $s * 16),
+                            )),
+                            "pair odd byte={}, slot={}, word={word:016x}", J + 1, $s,
+                        );
+                    };
+                }
+                pair!(0); pair!(1); pair!(2); pair!(3);
+                pair!(4); pair!(5); pair!(6); pair!(7);
+            }
             let ninth = kara.add(AB_KARA_NINTH);
             assert_eq!(
                 core::mem::transmute::<_, [u8; 16]>(ab_ld::<false, SHIFT>(ninth, word as usize)),
@@ -3355,19 +3444,31 @@ unsafe fn apply_word_kara<const V: u8, const SCALED: bool>(
                 }
             };
         }
+        // Even/odd byte pair `j, j + 1` of one slot. The plain unscaled
+        // image forms each slot base inside one asm block per pair
+        // (`ab_kara_ld_pair`), so only `kara` stays live across the loop.
+        macro_rules! ldp {
+            ($src:expr, $j:literal, $j1:literal, $slot:literal) => {
+                if !SCALED && V & ABV_KARA_UNSCALED != 0 {
+                    ab_kara_ld_pair::<$j, $slot>(kara, $src)
+                } else {
+                    (ld!($src, $j, $slot), ld!($src, $j1, $slot))
+                }
+            };
+        }
         // First ("even") and second ("odd") byte of every unit product.
-        let (e0a, o0a) = (ld!(word, 0, 0), ld!(word, 1, 0));
-        let (e0b, o0b) = (ld!(word, 2, 1), ld!(word, 3, 1));
-        let (e1a, o1a) = (ld!(word, 4, 2), ld!(word, 5, 2));
-        let (e1b, o1b) = (ld!(word, 6, 3), ld!(word, 7, 3));
+        let (e0a, o0a) = ldp!(word, 0, 1, 0);
+        let (e0b, o0b) = ldp!(word, 2, 3, 1);
+        let (e1a, o1a) = ldp!(word, 4, 5, 2);
+        let (e1b, o1b) = ldp!(word, 6, 7, 3);
         let e0 = veorq_u8(xor3_u8(e0a, e0b, e1a), e1b);
         let o0 = veorq_u8(xor3_u8(o0a, o0b, o1a), o1b);
-        let (e0s, o0s) = (ld!(u, 0, 4), ld!(u, 1, 4));
-        let (e1s, o1s) = (ld!(u, 4, 5), ld!(u, 5, 5));
+        let (e0s, o0s) = ldp!(u, 0, 1, 4);
+        let (e1s, o1s) = ldp!(u, 4, 5, 5);
         let e1 = xor3_u8(e0, e0s, e1s);
         let o1 = xor3_u8(o0, o0s, o1s);
-        let (esa, osa) = (ld!(s, 0, 6), ld!(s, 1, 6));
-        let (esb, osb) = (ld!(s, 2, 7), ld!(s, 3, 7));
+        let (esa, osa) = ldp!(s, 0, 1, 6);
+        let (esb, osb) = ldp!(s, 2, 3, 7);
         let te = veorq_u8(esa, esb);
         let to = veorq_u8(osa, osb);
         let e2 = veorq_u8(e0, te);
