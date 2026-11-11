@@ -820,6 +820,112 @@ fn fill_root_lincheck_stripe_group(
     }
 }
 
+/// [`fill_root_lincheck_stripe_group`] of the group whose z words are
+/// `a[i] & b[i]`, read in place from the eight blocks at `a` / `b` (packed
+/// u64 words, `u64_per_block` per block, blocks back to back): the AB
+/// producer's paired scratch, with no copy of z. Same bytes.
+///
+/// # Safety
+/// `a` and `b` must each be valid for `8 * u64_per_block` u64 reads.
+unsafe fn fill_root_lincheck_stripe_group_ab(
+    a: *const u64,
+    b: *const u64,
+    stripe: &mut [u8],
+    u64_per_block: usize,
+    rows: &[crate::r1cs_hashes::blake3::RootRow],
+) {
+    assert!(rows.len() * 64 <= stripe.len());
+    for (j, row) in rows.iter().enumerate() {
+        // Reads stay inside each block: lo_word (+1 iff hi_mask != 0) < u64_per_block.
+        assert!(row.lo_word + usize::from(row.hi_mask != 0) < u64_per_block);
+        let dst = &mut stripe[j * 64..j * 64 + 64];
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: every read is inside the eight blocks (assert above and the
+        // caller's contract); `dst` is 64 writable bytes.
+        unsafe {
+            let [y0, y1, y2, y3] = if row.lo_mask == u64::MAX {
+                flock_core::bits::transpose_8_strided_and_u64s_to_regs(
+                    a.add(row.lo_word),
+                    b.add(row.lo_word),
+                    u64_per_block,
+                )
+            } else {
+                let lanes: [u64; 8] = std::array::from_fn(|lane| {
+                    let base = lane * u64_per_block + row.lo_word;
+                    let hi = if row.hi_mask != 0 {
+                        *a.add(base + 1) & *b.add(base + 1) & row.hi_mask
+                    } else {
+                        0
+                    };
+                    (*a.add(base) & *b.add(base) & row.lo_mask) | hi
+                });
+                flock_core::bits::transpose_8_strided_u64s_to_regs(lanes.as_ptr(), 1)
+            };
+            core::arch::asm!(
+                "stnp {y0:q}, {y1:q}, [{dst}]",
+                "stnp {y2:q}, {y3:q}, [{dst}, #32]",
+                dst = in(reg) dst.as_mut_ptr(),
+                y0 = in(vreg) y0,
+                y1 = in(vreg) y1,
+                y2 = in(vreg) y2,
+                y3 = in(vreg) y3,
+                options(nostack, preserves_flags)
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let lanes: [u64; 8] = std::array::from_fn(|lane| {
+                let base = lane * u64_per_block + row.lo_word;
+                // SAFETY: as above.
+                unsafe {
+                    let hi = if row.hi_mask != 0 {
+                        *a.add(base + 1) & *b.add(base + 1) & row.hi_mask
+                    } else {
+                        0
+                    };
+                    (*a.add(base) & *b.add(base) & row.lo_mask) | hi
+                }
+            });
+            let mut transposed = [0u8; 64];
+            flock_core::bits::transpose_8_u64s_to_64_bytes(&lanes, &mut transposed);
+            dst.copy_from_slice(&transposed);
+        }
+    }
+}
+
+/// [`fixed_inputs_hold`] of the group whose z words are `a[i] & b[i]` (layout
+/// of [`fill_root_lincheck_stripe_group_ab`]).
+///
+/// # Safety
+/// As [`fill_root_lincheck_stripe_group_ab`].
+unsafe fn fixed_inputs_hold_ab(a: *const u64, b: *const u64, u64_per_block: usize) -> bool {
+    let mut bad = 0u64;
+    for lane in 0..8 {
+        for &(word, mask, want) in crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter() {
+            assert!(word < u64_per_block);
+            let i = lane * u64_per_block + word;
+            // SAFETY: `i < 8 * u64_per_block`.
+            bad |= (unsafe { *a.add(i) & *b.add(i) } & mask) ^ want;
+        }
+    }
+    bad == 0
+}
+
+/// Per-thread record of the even quad of a stripe group whose a/b rows sit
+/// in the AB producer's paired scratch: `(epoch, group, a, b)`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AbStripePairRecord {
+    epoch: u64,
+    group: usize,
+    a: usize,
+    b: usize,
+}
+
+thread_local! {
+    static AB_STRIPE_PAIR: std::cell::Cell<Option<AbStripePairRecord>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Most root rows any stripe uses (`N_ROOT_COLS.div_ceil(64)`).
 const AB_STRIPE_MAX_ROWS: usize = 177;
 
@@ -867,6 +973,9 @@ struct AbStripeEmitter<'a> {
     epoch: u64,
     /// Words of a block the rows and the fixed-input checks read.
     read_words: usize,
+    /// Paired-scratch mode (see `zc_ab_pair_scratch_active`): the odd quad
+    /// reads the even quad's rows in place; nothing is copied.
+    direct: bool,
 }
 
 impl<'a> AbStripeEmitter<'a> {
@@ -901,6 +1010,7 @@ impl<'a> AbStripeEmitter<'a> {
                 .chain(crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter().map(|c| c.0 + 1))
                 .max()
                 .unwrap_or(0),
+            direct: zerocheck::univariate_skip_optimized::zc_ab_pair_scratch_active(),
         }
     }
 
@@ -913,6 +1023,10 @@ impl<'a> AbStripeEmitter<'a> {
         let group = unit / 2;
         let half = unit % 2;
         if group >= self.n_groups {
+            return;
+        }
+        if self.direct {
+            self.emit_direct(group, half, a_scratch, b_scratch);
             return;
         }
         let a = a_scratch.cast_const().cast::<u64>();
@@ -960,6 +1074,54 @@ impl<'a> AbStripeEmitter<'a> {
             }
             self.emitted[group / 64].fetch_or(1 << (group % 64), std::sync::atomic::Ordering::Relaxed);
         });
+    }
+
+    /// Paired-scratch emit: the even quad only records where its rows are;
+    /// the odd quad, when its rows sit right behind the even quad's (one
+    /// unit = 4 blocks = `group_bytes / 2` bytes further, on this thread,
+    /// with no other unit produced here in between), transposes the group
+    /// straight from the two scratch slots with `z = a AND b` formed in
+    /// registers. Any other order leaves the group to [`Self::finish`].
+    fn emit_direct(&self, group: usize, half: usize, a_scratch: *mut u8, b_scratch: *mut u8) {
+        let unit_bytes = self.group_bytes / 2;
+        let rec = AB_STRIPE_PAIR.with(|r| r.take());
+        if half == 0 {
+            AB_STRIPE_PAIR.with(|r| {
+                r.set(Some(AbStripePairRecord {
+                    epoch: self.epoch,
+                    group,
+                    a: a_scratch as usize,
+                    b: b_scratch as usize,
+                }))
+            });
+            return;
+        }
+        let want = AbStripePairRecord {
+            epoch: self.epoch,
+            group,
+            a: (a_scratch as usize).wrapping_sub(unit_bytes),
+            b: (b_scratch as usize).wrapping_sub(unit_bytes),
+        };
+        if rec != Some(want) {
+            return;
+        }
+        let (a, b) = (want.a as *const u64, want.b as *const u64);
+        // SAFETY: group `group` owns its `group_bytes` of the stripe; only
+        // this call writes them.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(self.stripe.ptr().add(group * self.group_bytes), self.group_bytes)
+        };
+        // SAFETY: the even quad's 4 blocks were produced at `a` / `b` (record)
+        // and nothing was produced on this thread since; the odd quad's 4
+        // blocks follow at `a + unit_bytes` / `b + unit_bytes`: 8 complete
+        // blocks of `AB_STRIPE_WORDS` words each.
+        unsafe {
+            fill_root_lincheck_stripe_group_ab(a, b, dst, AB_STRIPE_WORDS, self.rows);
+            if self.fixed_inputs && !fixed_inputs_hold_ab(a, b, AB_STRIPE_WORDS) {
+                self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        self.emitted[group / 64].fetch_or(1 << (group % 64), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// After every unit was produced (the AB arm has joined its workers):
@@ -1268,14 +1430,14 @@ mod deferred_stripe_tests {
                 (0..n_units).map(|u| u ^ 1).collect(),
                 vec![],
             ];
-            for (case, order) in orders.iter().enumerate() {
+            for ((case, order), direct) in orders.iter().enumerate().flat_map(|c| [(c, false), (c, true)]) {
                 let flag = std::sync::atomic::AtomicBool::new(false);
                 let mut stripe = vec![0xa5u8; 1 << (M - 3)];
                 let (stripe_ptr, stripe_len) = (stripe.as_mut_ptr(), stripe.len());
                 let (n_jobs, job) = deferred_lincheck_stripe_job(
                     &z, &mut stripe, M, K_LOG, 15_409, Some(rows), fixed.then_some(&flag),
                 );
-                let emitter = AbStripeEmitter::new(
+                let mut emitter = AbStripeEmitter::new(
                     flock_core::epool::SyncPtr(stripe_ptr),
                     stripe_len,
                     1 << K_LOG,
@@ -1283,28 +1445,36 @@ mod deferred_stripe_tests {
                     fixed,
                     &flag,
                 );
-                let produce = |unit: usize| {
-                    let mut sa = a[unit * UNIT_U64..(unit + 1) * UNIT_U64].to_vec();
-                    let mut sb = b[unit * UNIT_U64..(unit + 1) * UNIT_U64].to_vec();
-                    emitter.emit(unit, sa.as_mut_ptr().cast(), sb.as_mut_ptr().cast());
+                emitter.direct = direct;
+                let emitter = emitter;
+                // Paired scratch as the fused queue lays it out: [A0 A1 | B0 B1],
+                // unit `u` in slot `u & 1`.
+                let produce = |pair: &mut [u64], unit: usize| {
+                    let (sa, sb) = pair.split_at_mut(2 * UNIT_U64);
+                    let s = (unit & 1) * UNIT_U64;
+                    sa[s..s + UNIT_U64].copy_from_slice(&a[unit * UNIT_U64..(unit + 1) * UNIT_U64]);
+                    sb[s..s + UNIT_U64].copy_from_slice(&b[unit * UNIT_U64..(unit + 1) * UNIT_U64]);
+                    emitter.emit(unit, sa[s..].as_mut_ptr().cast(), sb[s..].as_mut_ptr().cast());
                 };
                 if case < 2 {
-                    order.iter().for_each(|&u| produce(u));
+                    let mut pair = vec![0u64; 4 * UNIT_U64];
+                    order.iter().for_each(|&u| produce(&mut pair, u));
                 } else {
                     // Two-unit jobs on a 4-thread pool, as the fused queue.
                     let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
                     pool.install(|| {
                         use rayon::prelude::*;
                         (0..n_units / 2).into_par_iter().for_each(|j| {
-                            produce(2 * j);
-                            produce(2 * j + 1);
+                            let mut pair = vec![0u64; 4 * UNIT_U64];
+                            produce(&mut pair, 2 * j);
+                            produce(&mut pair, 2 * j + 1);
                         })
                     });
                 }
                 let missing = emitter.finish(&z, &job);
-                assert_eq!(missing, if case == 1 { n_units / 2 } else { 0 }, "case {case}");
+                assert_eq!(missing, if case == 1 { n_units / 2 } else { 0 }, "case {case} direct {direct}");
                 let _ = n_jobs;
-                assert_eq!(stripe, expected, "rows={} case {case}", rows.len());
+                assert_eq!(stripe, expected, "rows={} case {case} direct {direct}", rows.len());
                 assert_eq!(
                     flag.load(std::sync::atomic::Ordering::Relaxed),
                     ref_flag.load(std::sync::atomic::Ordering::Relaxed),
@@ -1341,8 +1511,8 @@ mod deferred_stripe_tests {
         let mut stripe = vec![0u8; G << K_LOG];
         let flag = std::sync::atomic::AtomicBool::new(false);
         for round in 0..5 {
-            {
-                let e = AbStripeEmitter::new(
+            for direct in [false, true] {
+                let mut e = AbStripeEmitter::new(
                     flock_core::epool::SyncPtr(stripe.as_mut_ptr()),
                     stripe.len(),
                     1 << K_LOG,
@@ -1350,13 +1520,17 @@ mod deferred_stripe_tests {
                     true,
                     &flag,
                 );
+                e.direct = direct;
+                // `sa` / `sb` are paired slots: unit 2g at 0, 2g + 1 at UNIT_U64.
                 let t = std::time::Instant::now();
                 for g in 0..G {
                     e.emit(2 * g, sa.as_mut_ptr().cast(), sb.as_mut_ptr().cast());
                     e.emit(2 * g + 1, sa[UNIT_U64..].as_mut_ptr().cast(), sb[UNIT_U64..].as_mut_ptr().cast());
                 }
                 let ns = t.elapsed().as_nanos() as f64 / G as f64;
-                eprintln!("round {round} emit: {ns:.0} ns/group");
+                let missing = e.finish(&z, &|_: usize| ());
+                assert_eq!(missing, 0);
+                eprintln!("round {round} emit direct={direct}: {ns:.0} ns/group");
             }
             let t = std::time::Instant::now();
             for g in 0..G {
