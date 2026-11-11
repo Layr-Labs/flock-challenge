@@ -1798,6 +1798,25 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
     )
 }
 
+/// Debug-only per-chunk CPU timer for the round-two map
+/// (`FLOCK_ZC_R2_GPU_DEBUG`): adds its elapsed ns and a count on drop.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct R2DbgChunk<'a> {
+    t0: u64,
+    slot: usize,
+    cost: &'a [std::sync::atomic::AtomicU64; 4],
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for R2DbgChunk<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dt = crate::tmark::now_ns().saturating_sub(self.t0);
+        self.cost[self.slot].fetch_add(dt, Relaxed);
+        self.cost[self.slot + 1].fetch_add(1, Relaxed);
+    }
+}
+
 /// Pair count per cascade K-pass output chunk for a compact state of
 /// `n_pairs` pairs (the split [`fold2_compact_and_round45_into`] uses).
 fn cascade_k_pairs_per_chunk(n_pairs: usize) -> usize {
@@ -1827,6 +1846,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     k_pass_only: bool,
 ) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
     assert_eq!(k_skip, 6, "lookahead compact round two is k_skip=6 only");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let r2dbg = crate::gpu_commit::gpu_zc_r2_debug();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_fn_ns = if r2dbg { crate::tmark::now_ns() } else { 0 };
     assert_eq!(table.n_chunks, 8);
     let n_chunks = table.n_chunks;
     let n_out = 1usize << (m - k_skip);
@@ -1910,7 +1933,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // odd-parity halves on those chunks (the GPU's sums are not parity-split),
     // which is what makes `W1`/`W2` recoverable everywhere.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
+    let gpu_job = crate::gpu_commit::launch_zc_r2_products_steal(
         a_packed,
         b_packed,
         &table.data,
@@ -1933,6 +1956,12 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let odd_on_gpu = false;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_sweep_ns = if r2dbg { crate::tmark::now_ns() } else { 0 };
+    // Debug-only per-chunk CPU cost split: [covered ns, covered n, full ns, full n].
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let dbg_cost: [std::sync::atomic::AtomicU64; 4] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
     let mut partials: Vec<(F128, F128)> = crate::alloc_uninit_vec(hi_size);
     // [p1_odd, pinf_odd, W0, W3, W4, W5], eq_hi-weighted, one slot per chunk.
@@ -1941,7 +1970,23 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    // Two-ended claim protocol (`FLOCK_NO_ZC_R2_STEAL`): each call claims
+    // its own chunk — GPU-delivered ones from the bottom, fused steals from
+    // the top — instead of taking the queue index.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let steal = gpu_job.as_ref().and_then(|j| j.steal());
+    crate::epool::run_hetero_chunks(hi_size, |claim_idx| {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let (x_hi, covered) = match steal {
+            Some(st) => match st.claim() {
+                Some(crate::gpu_commit::ZcR2Claim::Covered(c)) => (c, true),
+                Some(crate::gpu_commit::ZcR2Claim::Full(c)) => (c, false),
+                None => unreachable!("one claim per queue index"),
+            },
+            None => (claim_idx, claim_idx < gpu_prefix),
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let x_hi = claim_idx;
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and both partial slots.
         let (anchors, deltas) = unsafe {
@@ -1953,11 +1998,17 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         let pair_idx_base = x_hi * lo_size;
         let row_base = pair_idx_base * 2;
         let mut out = [F128::ZERO; 8];
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let _dbg_chunk = r2dbg.then(|| R2DbgChunk {
+            t0: crate::tmark::now_ns(),
+            slot: if covered { 0 } else { 2 },
+            cost: &dbg_cost,
+        });
 
         #[cfg(target_arch = "aarch64")]
         {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let full = x_hi >= gpu_prefix;
+            let full = !covered;
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let full = true;
             unsafe {
@@ -2107,10 +2158,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // adopted as the lookahead's `W1`/`W2` state exactly when the CPU was told
     // to skip it.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_sweep_end_ns = if r2dbg { crate::tmark::now_ns() } else { 0 };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let dbg_calib = gpu_job.as_ref().is_some_and(|j| j.is_calibration());
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(job) = gpu_job {
         let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
         let calib = job.is_calibration();
-        let prefix = job.cpu_split();
+        let prefix = job.steal().map_or(job.cpu_split(), |st| st.covered());
         let res = crate::gpu_commit::zc_r2_wait(
             job,
             if calib {
@@ -2187,6 +2242,36 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // SAFETY: the lookahead writer has the same complete delta-store contract
     // as the standard writer. All hetero workers and the optional GPU-prefix
     // fallback have joined, covering every byte including padding rows.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if r2dbg && !dbg_calib {
+        use std::sync::atomic::Ordering::Relaxed;
+        let t_drain_ns = crate::tmark::now_ns();
+        let ms = |a: u64, b: u64| (b as f64 - a as f64) / 1e6;
+        let commit = crate::gpu_commit::ZC_R2_DBG_COMMIT_NS.load(Relaxed);
+        let gs = f64::from_bits(crate::gpu_commit::ZC_R2_DBG_GPU_START.load(Relaxed));
+        let ge = f64::from_bits(crate::gpu_commit::ZC_R2_DBG_GPU_END.load(Relaxed));
+        let gs_ns = (gs * 1e9) as u64;
+        let ge_ns = (ge * 1e9) as u64;
+        let c = |i: usize| dbg_cost[i].load(Relaxed) as f64;
+        eprintln!(
+            "[zc-r2-map] prefix={gpu_prefix}/{hi_size} fn->commit={:.3} commit->gpu_start={:.3} \
+             fn->sweep={:.3} gpu_busy={:.3} fn->gpu_end={:.3} fn->sweep_end={:.3} \
+             fn->drain={:.3} gpu_idle_tail={:.3} cov_us/chunk={:.2} (n={}) full_us/chunk={:.2} (n={})",
+            ms(t_fn_ns, commit),
+            ms(commit, gs_ns),
+            ms(t_fn_ns, t_sweep_ns),
+            ms(gs_ns, ge_ns),
+            ms(t_fn_ns, ge_ns),
+            ms(t_fn_ns, t_sweep_end_ns),
+            ms(t_fn_ns, t_drain_ns),
+            ms(ge_ns, t_sweep_end_ns),
+            c(0) / c(1).max(1.0) / 1e3,
+            c(1),
+            c(2) / c(3).max(1.0) / 1e3,
+            c(3),
+        );
+    }
+
     unsafe { compact.deltas.mark_fully_initialized() };
 
     let (sum1, sum_inf) = partials

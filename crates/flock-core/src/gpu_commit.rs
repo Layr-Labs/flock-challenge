@@ -522,6 +522,25 @@ fn gpu_zc_r2_karatsuba_enabled() -> bool {
     })
 }
 
+/// Kill switch for the round-two two-ended claim protocol:
+/// `FLOCK_NO_ZC_R2_STEAL=1` restores the incumbent arm exactly (one GPU
+/// dispatch over the calibrated prefix, CPU sweep in ascending order).
+/// Default on (timed proves on the Horner route): the GPU walks the chunks
+/// upward from 0 in batches that each signal a shared event; the CPU claims
+/// from both ends — the lowest unclaimed chunk when the GPU has already
+/// delivered its products (cheap Horner kernel), otherwise the highest
+/// unclaimed chunk with the fused kernel, publishing that steal so the GPU
+/// skips it. Coverage self-corrects inside the timed prove whatever the
+/// warm-up calibration measured; neither side waits for the other.
+pub const ENV_NO_ZC_R2_STEAL: &str = "FLOCK_NO_ZC_R2_STEAL";
+
+pub(crate) fn zc_r2_steal_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(ENV_NO_ZC_R2_STEAL).is_none_or(|v| v != *"1")
+    });
+    *ON
+}
+
 /// Exact-`1` control for the fixed-medium-weight round-two GPU kernel.
 pub const ENV_NO_GPU_ZC_R2_HORNER: &str = "FLOCK_NO_GPU_ZC_R2_HORNER";
 
@@ -15170,6 +15189,99 @@ kernel void zc_r2_products_horner(
     zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid);
 }
 
+
+// Two-ended claim variant of `zc_r2_products_horner` (see
+// `ENV_NO_ZC_R2_STEAL`): identical per-group arithmetic and outputs.
+kernel void zc_r2_products_horner_steal(
+    device const uint4* a_in  [[buffer(0)]],
+    device const uint4* b_in  [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       partials    [[buffer(5)]],
+    constant ZcR2Params& p          [[buffer(6)]],
+    volatile device const uint* cut [[buffer(7)]],
+    constant uint& base             [[buffer(8)]],
+    uint tgid_in [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup ulong4 red[256];
+    threadgroup uint skip;
+    threadgroup uint4* nib = reinterpret_cast<threadgroup uint4*>(red);
+    // This batch starts at chunk `base`. Chunks at or above the CPU's steal
+    // boundary are the CPU's: one read per group so the exit is uniform.
+    uint tgid = tgid_in + (base << 2);
+    if (lid == 0u) { skip = (tgid >> 2) >= cut[0] ? 1u : 0u; }
+    nib[lid] = nib_tab_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (skip != 0u) { return; }
+
+    uint hi_chunk = tgid >> 2;
+    // xpt bit 31 marks this PSO's width-32 map; low bits keep the step count.
+    bool handoff = (p.xpt & 0x80000000u) != 0u
+        && (p.xpt & 0x7fffffffu) == 16u && p.mask == 127u && p.useful == 121u;
+    uint rid = handoff
+        ? 8u * (lid & 31u) + 4u * ((lid >> 5u) & 1u) + (lid >> 6u)
+        : lid;
+    uint window = ((tgid & 3u) << 6) | (rid >> 2);
+    uint small_class = rid & 3u;
+    U320k h1 = {0ul, 0ul, 0ul, 0ul, 0ul};
+    U320k hi = {0ul, 0ul, 0ul, 0ul, 0ul};
+    for (uint step = 0u; step < (p.xpt & 0x7fffffffu); step++) {
+        if (handoff && step == 2u) {
+            // The lower 4 KiB remains the live nibble table.
+            threadgroup uint4* handoff_slots = nib + 256u;
+            U256k p1 = {h1.r0, h1.r1, h1.r2, h1.r3};
+            U256k pi = {hi.r0, hi.r1, hi.r2, hi.r3};
+            uint4 v1 = gf_reduce(p1);
+            uint4 vi = gf_reduce(pi);
+            uint store_slot = rid ^ (rid >> 3u);
+            uint read_slot = lid ^ (lid >> 3u);
+            handoff_slots[store_slot] = v1;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            v1 = handoff_slots[read_slot];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            handoff_slots[store_slot] = vi;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            vi = handoff_slots[read_slot];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            h1.r0 = (ulong(v1.y) << 32) | v1.x;
+            h1.r1 = (ulong(v1.w) << 32) | v1.z;
+            h1.r2 = 0ul; h1.r3 = 0ul; h1.r4 = 0ul;
+            hi.r0 = (ulong(vi.y) << 32) | vi.x;
+            hi.r1 = (ulong(vi.w) << 32) | vi.z;
+            hi.r2 = 0ul; hi.r3 = 0ul; hi.r4 = 0ul;
+            window = ((tgid & 3u) << 6) | (lid >> 2);
+            small_class = lid & 3u;
+        }
+        if (step != 0u) {
+            zc_r2_horner_shift(h1);
+            zc_r2_horner_shift(hi);
+        }
+        uint medium = 15u - step;
+        uint x_lo = (window << 6) | (medium << 2) | small_class;
+        uint pair_idx = hi_chunk * p.lo_size + x_lo;
+        // A padded term is zero, but the Horner shifts must still occur.
+        if ((pair_idx & p.mask) >= p.useful) { continue; }
+        uint4 ar = a_in[pair_idx];
+        uint4 br = b_in[pair_idx];
+        uint4 a0 = zc_r2_fold8(ar.x, ar.y, nib);
+        uint4 a1 = zc_r2_fold8(ar.z, ar.w, nib);
+        uint4 b0 = zc_r2_fold8(br.x, br.y, nib);
+        uint4 b1 = zc_r2_fold8(br.z, br.w, nib);
+        zc_r2_horner_add(h1, clmul128(a1, b1));
+        zc_r2_horner_add(hi, clmul128(a0 ^ a1, b0 ^ b1));
+    }
+    uint4 e = eq_lo[window * 4u + small_class];
+    U256k m1 = clmul128(e, zc_r2_horner_reduce(h1));
+    U256k mi = clmul128(e, zc_r2_horner_reduce(hi));
+    ulong4 acc1 = ulong4(m1.r0, m1.r1, m1.r2, m1.r3);
+    ulong4 acci = ulong4(mi.r0, mi.r1, mi.r2, mi.r3);
+    // Retire every table reader before the reducer reuses the same storage.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid);
+}
+
 "#;
 
     fn zc_r2_msl_source(incumbent: bool) -> std::borrow::Cow<'static, str> {
@@ -15249,6 +15361,12 @@ kernel void zc_r2_horner_oracle(
         eq_hi_cap: usize,
         part_buf: Id,
         part_cap: usize,
+        /// Two-ended claim protocol: its PSO (`NIL` = unavailable), the
+        /// shared steal-boundary word and the batch-progress shared event.
+        steal_pso: Id,
+        cut_buf: Id,
+        steal_ev: Id,
+        steal_ev_next: u64,
         /// Cached no-copy wraps of the packed witness inputs `(ptr, len, buf)`.
         wraps: Vec<(usize, usize, Id)>,
         /// In-flight ZC-idle-fill primer command buffer (see
@@ -15270,6 +15388,14 @@ kernel void zc_r2_horner_oracle(
         std::sync::atomic::AtomicUsize::new(usize::MAX);
     static ZC_R2_POISONED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    /// Debug-only (`FLOCK_ZC_R2_GPU_DEBUG`): host commit time (ns, uptime raw)
+    /// and GPU start/end (s, same timebase) of the last round-two job.
+    pub(crate) static ZC_R2_DBG_COMMIT_NS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static ZC_R2_DBG_GPU_START: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static ZC_R2_DBG_GPU_END: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
 
     #[cfg(test)]
     pub(crate) fn zc_r2_test_reset() {
@@ -15447,8 +15573,29 @@ kernel void zc_r2_horner_oracle(
                 gpu.release(library);
                 built
             })();
+            let (pso, horner_pso) = match built {
+                Ok(v) => v,
+                Err(e) => {
+                    gpu.pool_pop(pool);
+                    return Err(e);
+                }
+            };
+            // The claim-protocol PSO, word and event are optional: without
+            // them every prove runs the incumbent prefix.
+            let (steal_pso, cut_buf, steal_ev) = if super::zc_r2_steal_enabled() {
+                match zc_r2_steal_init(gpu) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!("[zc-r2] steal protocol unavailable: {e}");
+                        }
+                        (NIL, NIL, NIL)
+                    }
+                }
+            } else {
+                (NIL, NIL, NIL)
+            };
             gpu.pool_pop(pool);
-            let (pso, horner_pso) = built?;
             let horner_resources = (
                 send!(
                     gpu.api,
@@ -15486,9 +15633,88 @@ kernel void zc_r2_horner_oracle(
                 eq_hi_cap: 0,
                 part_buf: NIL,
                 part_cap: 0,
+                steal_pso,
+                cut_buf,
+                steal_ev,
+                steal_ev_next: 0,
                 wraps: Vec::new(),
                 prefetch_cb: NIL,
             })
+        }
+    }
+
+    /// Compile the claim-protocol kernel and create its word and event.
+    fn zc_r2_steal_init(gpu: &Gpu) -> Result<(Id, Id, Id), String> {
+        unsafe {
+            let source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled());
+            let src = gpu.api.nsstring(&source)?;
+            let mut err: Id = NIL;
+            let library: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newLibraryWithSource:options:error:",
+                src,
+                NIL,
+                &mut err
+            );
+            if library.is_null() {
+                return Err(format!("zc-r2 steal compile failed: {}", gpu.api.error_string(err)));
+            }
+            let ns = gpu.api.nsstring("zc_r2_products_horner_steal")?;
+            let f: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                library,
+                c"newFunctionWithName:",
+                ns
+            );
+            gpu.release(library);
+            if f.is_null() {
+                return Err("zc_r2_products_horner_steal not found".into());
+            }
+            let mut perr: Id = NIL;
+            let pso: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newComputePipelineStateWithFunction:error:",
+                f,
+                &mut perr
+            );
+            gpu.release(f);
+            if pso.is_null() {
+                return Err(format!("steal pipeline: {}", gpu.api.error_string(perr)));
+            }
+            let max_threads: u64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> u64,
+                pso,
+                c"maxTotalThreadsPerThreadgroup"
+            );
+            if max_threads < 256 {
+                gpu.release(pso);
+                return Err("steal PSO cannot run 256 threads".into());
+            }
+            let cut_buf = match gpu.new_buffer(16) {
+                Ok(b) => b,
+                Err(e) => {
+                    gpu.release(pso);
+                    return Err(e);
+                }
+            };
+            let ev: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> Id,
+                gpu.device,
+                c"newSharedEvent"
+            );
+            if ev.is_null() {
+                gpu.release(cut_buf);
+                gpu.release(pso);
+                return Err("newSharedEvent failed".into());
+            }
+            Ok((pso, cut_buf, ev))
         }
     }
 
@@ -15516,6 +15742,8 @@ kernel void zc_r2_horner_oracle(
         pub chunks: usize,
         calibration: bool,
         horner: bool,
+        /// Two-ended claim job (`None` = incumbent prefix job).
+        steal: Option<ZcR2Steal>,
         lo_size: usize,
         mask: u32,
         useful: u32,
@@ -15525,6 +15753,103 @@ kernel void zc_r2_horner_oracle(
     // SAFETY: the command buffer handle is only waited/released from the
     // launching thread; Metal command buffers are themselves thread-safe.
     unsafe impl Send for ZcR2Job {}
+
+    /// Claim-protocol state of a timed round-two job: chunk batches of
+    /// `batch` chunks, batch `j` complete once `ev` reaches `ev_base + j + 1`;
+    /// `cut` is the shared word the GPU groups compare their chunk against.
+    /// `claims` packs the CPU's two cursors: low 32 bits the next bottom chunk
+    /// (taken only when GPU-delivered), high 32 bits one past the next top
+    /// chunk (taken with the fused kernel).
+    pub(crate) struct ZcR2Steal {
+        ev: Id,
+        ev_base: u64,
+        batch: usize,
+        cut: *const std::sync::atomic::AtomicU32,
+        claims: std::sync::atomic::AtomicU64,
+        /// Diagnostic: GPU deliveries delayed by this many leading batches
+        /// of skipped work (`FLOCK_ZC_R2_STEAL_DELAY_BATCHES`).
+        delay_batches: usize,
+        /// Diagnostic: the CPU waits for every bottom chunk instead of
+        /// stealing, i.e. the GPU takes all (`FLOCK_ZC_R2_STEAL_WAIT=1`).
+        wait_all: bool,
+    }
+
+    // SAFETY: `ev` is a thread-safe Metal shared event; `cut` points into a
+    // process-lifetime shared buffer only accessed through atomics.
+    unsafe impl Send for ZcR2Steal {}
+    unsafe impl Sync for ZcR2Steal {}
+
+    /// One CPU claim of the two-ended protocol.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ZcR2Claim {
+        /// The GPU has delivered this chunk's products: CPU skips them.
+        Covered(usize),
+        /// CPU computes this chunk fused; the GPU will skip it.
+        Full(usize),
+    }
+
+    impl ZcR2Steal {
+        pub(crate) fn delivered(&self, chunk: usize) -> bool {
+            let need = self.ev_base + (chunk / self.batch + self.delay_batches) as u64 + 1;
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return false,
+            };
+            unsafe { gpu.event_signaled_value(self.ev) >= need }
+        }
+
+        /// Claim the next chunk. Exactly `hi_size` calls succeed in total;
+        /// never waits. A bottom chunk is taken only once its batch has
+        /// signalled; otherwise the top chunk is stolen and published.
+        pub(crate) fn claim(&self) -> Option<ZcR2Claim> {
+            use std::sync::atomic::Ordering;
+            let mut cur = self.claims.load(Ordering::Acquire);
+            loop {
+                let (bot, top) = ((cur & 0xffff_ffff) as usize, (cur >> 32) as usize);
+                if bot >= top {
+                    return None;
+                }
+                if self.wait_all {
+                    while !self.delivered(bot) {
+                        std::hint::spin_loop();
+                    }
+                }
+                if self.delivered(bot) {
+                    let next = cur + 1;
+                    match self.claims.compare_exchange_weak(
+                        cur,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return Some(ZcR2Claim::Covered(bot)),
+                        Err(v) => cur = v,
+                    }
+                } else {
+                    let next = cur - (1u64 << 32);
+                    match self.claims.compare_exchange_weak(
+                        cur,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            let c = top - 1;
+                            // SAFETY: `cut` is a live shared-buffer word.
+                            unsafe { (*self.cut).fetch_min(c as u32, Ordering::AcqRel) };
+                            return Some(ZcR2Claim::Full(c));
+                        }
+                        Err(v) => cur = v,
+                    }
+                }
+            }
+        }
+
+        /// Chunks `[0, covered)` are GPU-delivered once all claims are done.
+        pub(crate) fn covered(&self) -> usize {
+            (self.claims.load(std::sync::atomic::Ordering::Acquire) & 0xffff_ffff) as usize
+        }
+    }
 
     impl ZcR2Job {
         /// How many leading chunks the CPU should run anchors-only. Zero
@@ -15536,6 +15861,11 @@ kernel void zc_r2_horner_oracle(
 
         pub(crate) fn is_calibration(&self) -> bool {
             self.calibration
+        }
+
+        /// The claim protocol of a timed two-ended job, if this is one.
+        pub(crate) fn steal(&self) -> Option<&ZcR2Steal> {
+            self.steal.as_ref()
         }
 
         #[cfg(test)]
@@ -15839,6 +16169,159 @@ kernel void zc_r2_horner_oracle(
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
     ) -> Option<ZcR2Job> {
+        launch_zc_r2_products_with(
+            a_packed,
+            b_packed,
+            table_data,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            false,
+        )
+    }
+
+    /// [`launch_zc_r2_products`] for a caller that drives the two-ended claim
+    /// protocol ([`ZcR2Job::steal`]) on timed proves (`ENV_NO_ZC_R2_STEAL`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_r2_products_steal(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_data: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+    ) -> Option<ZcR2Job> {
+        launch_zc_r2_products_with(
+            a_packed,
+            b_packed,
+            table_data,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            true,
+        )
+    }
+
+    /// Chunks per claim-protocol batch: one shared-event signal each
+    /// (diagnostic override `FLOCK_ZC_R2_STEAL_BATCH`).
+    #[cfg(test)]
+    static ZC_R2_STEAL_BATCH_TEST: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(test)]
+    pub(crate) fn zc_r2_test_set_steal_batch(n: usize) {
+        ZC_R2_STEAL_BATCH_TEST.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn zc_r2_steal_batch() -> usize {
+        #[cfg(test)]
+        {
+            let t = ZC_R2_STEAL_BATCH_TEST.load(std::sync::atomic::Ordering::Relaxed);
+            if t > 0 {
+                return t;
+            }
+        }
+        static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            match zc_r2_steal_diag("FLOCK_ZC_R2_STEAL_BATCH") {
+                0 => 128,
+                n => n,
+            }
+        });
+        *V
+    }
+
+    fn zc_r2_steal_diag(name: &str) -> usize {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    }
+
+    /// Encode the claim-protocol job: batches of [`zc_r2_steal_batch()`]
+    /// chunks over the whole range, each followed by an event signal. The
+    /// steal word starts at `hi_size` (nothing stolen).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn zc_r2_submit_steal(
+        gpu: &Gpu,
+        state: &mut ZcR2,
+        a_buf: Id,
+        b_buf: Id,
+        hi_size: usize,
+        lo_size: usize,
+        mask: u32,
+        useful: u32,
+    ) -> Result<(Id, u64), String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                lo_size: u32,
+                xpt: u32,
+                mask: u32,
+                useful: u32,
+            }
+            let params = P {
+                lo_size: lo_size as u32,
+                xpt: 16 | if state.horner_resources.1 == 32 { 0x8000_0000 } else { 0 },
+                mask,
+                useful,
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            let cut = gpu.buffer_contents(state.cut_buf).cast::<std::sync::atomic::AtomicU32>();
+            (*cut).store(hi_size as u32, std::sync::atomic::Ordering::SeqCst);
+            let n_batches = hi_size.div_ceil(zc_r2_steal_batch());
+            let ev_base = state.steal_ev_next;
+            let cb = gpu.command_buffer()?;
+            for j in 0..n_batches {
+                let base = (j * zc_r2_steal_batch()) as u32;
+                let n = zc_r2_steal_batch().min(hi_size - j * zc_r2_steal_batch());
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, state.steal_pso);
+                gpu.set_buffer(enc, a_buf, 0, 0);
+                gpu.set_buffer(enc, b_buf, 0, 1);
+                gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
+                gpu.set_buffer(enc, state.eq_hi_buf, 0, 3);
+                gpu.set_buffer(enc, state.nib_buf, 0, 4);
+                gpu.set_buffer(enc, state.part_buf, 0, 5);
+                gpu.set_bytes(enc, pb, 6);
+                gpu.set_buffer(enc, state.cut_buf, 0, 7);
+                gpu.set_bytes(
+                    enc,
+                    std::slice::from_raw_parts((&raw const base).cast::<u8>(), 4),
+                    8,
+                );
+                gpu.dispatch(enc, (n * 4) as u64, 256);
+                gpu.end_encoding(enc);
+                gpu.encode_signal_event(cb, state.steal_ev, ev_base + j as u64 + 1);
+            }
+            state.steal_ev_next = ev_base + n_batches as u64 + 1;
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok((cb, ev_base))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_zc_r2_products_with(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_data: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+        allow_steal: bool,
+    ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
             return None;
@@ -15931,18 +16414,54 @@ kernel void zc_r2_horner_oracle(
             }
             let a_buf = zc_r2_wrap(&mut state, gpu, a_packed).ok()?;
             let b_buf = zc_r2_wrap(&mut state, gpu, b_packed).ok()?;
-            let cb = zc_r2_submit(
-                gpu,
-                &state,
-                a_buf,
-                b_buf,
-                chunks,
-                lo_size,
-                pair_in_block_mask as u32,
-                useful_pairs_inclusive as u32,
-                horner,
-            )
-            .ok()?;
+            // Timed prove on the Horner route: the calibrated share only
+            // decides that the arm runs; the claim protocol decides coverage.
+            let steal_on = allow_steal
+                && !calibration
+                && horner
+                && !state.steal_pso.is_null()
+                && super::zc_r2_steal_enabled()
+                && hi_size <= u32::MAX as usize / 2;
+            let (cb, chunks, steal) = if steal_on {
+                let (cb, ev_base) = zc_r2_submit_steal(
+                    gpu,
+                    &mut state,
+                    a_buf,
+                    b_buf,
+                    hi_size,
+                    lo_size,
+                    pair_in_block_mask as u32,
+                    useful_pairs_inclusive as u32,
+                )
+                .ok()?;
+                let steal = ZcR2Steal {
+                    ev: state.steal_ev,
+                    ev_base,
+                    batch: zc_r2_steal_batch(),
+                    cut: gpu
+                        .buffer_contents(state.cut_buf)
+                        .cast::<std::sync::atomic::AtomicU32>()
+                        .cast_const(),
+                    claims: std::sync::atomic::AtomicU64::new((hi_size as u64) << 32),
+                    delay_batches: zc_r2_steal_diag("FLOCK_ZC_R2_STEAL_DELAY_BATCHES"),
+                    wait_all: zc_r2_steal_diag("FLOCK_ZC_R2_STEAL_WAIT") != 0,
+                };
+                (cb, hi_size, Some(steal))
+            } else {
+                let cb = zc_r2_submit(
+                    gpu,
+                    &state,
+                    a_buf,
+                    b_buf,
+                    chunks,
+                    lo_size,
+                    pair_in_block_mask as u32,
+                    useful_pairs_inclusive as u32,
+                    horner,
+                )
+                .ok()?;
+                (cb, chunks, None)
+            };
             Some(ZcR2Job {
                 cb,
                 a_buf,
@@ -15950,10 +16469,17 @@ kernel void zc_r2_horner_oracle(
                 chunks,
                 calibration,
                 horner,
+                steal,
                 lo_size,
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
                 submitted: super::gpu_zc_r2_debug().then(std::time::Instant::now),
+            })
+            .inspect(|_| {
+                if super::gpu_zc_r2_debug() {
+                    ZC_R2_DBG_COMMIT_NS
+                        .store(crate::tmark::now_ns(), std::sync::atomic::Ordering::Relaxed);
+                }
             })
         }
     }
@@ -15988,10 +16514,20 @@ kernel void zc_r2_horner_oracle(
             // (first status poll, zero cost) or within a hair of it — a
             // bounded spin dodges the ~0.3-0.5 ms `waitUntilCompleted` park
             // once per timed prove.
+            if let Some(st) = job.steal.as_ref() {
+                // Every claim is done: the GPU's remaining groups are the
+                // CPU's. Lower the word so they exit at once, then retire.
+                (*st.cut).store(0, Ordering::SeqCst);
+            }
             if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
                 return poison(job.cb);
             }
             let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+            if super::gpu_zc_r2_debug() {
+                let (s0, e0) = cb_gpu_interval(gpu, job.cb);
+                ZC_R2_DBG_GPU_START.store(s0.to_bits(), Ordering::Relaxed);
+                ZC_R2_DBG_GPU_END.store(e0.to_bits(), Ordering::Relaxed);
+            }
             let state_mutex = match zc_r2_state() {
                 Some(s) => s,
                 None => return poison(job.cb),
@@ -16007,9 +16543,10 @@ kernel void zc_r2_horner_oracle(
                 }
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
-            let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
+            let n_out = job.steal.as_ref().map_or(job.chunks, |st| st.covered());
+            let mut out: Vec<[F128; 4]> = Vec::with_capacity(n_out);
             let groups = if job.horner { 4 } else { 1 };
-            for c in 0..job.chunks {
+            for c in 0..n_out {
                 let base = c * groups * 4;
                 let mut merged = [
                     *parts.add(base),
@@ -16028,10 +16565,11 @@ kernel void zc_r2_horner_oracle(
                 gpu.release(job.cb);
                 if let Some(submitted) = job.submitted {
                     eprintln!(
-                        "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
+                        "[zc-r2] timed prefix {}/{} chunks (steal={}): gpu={first_wall:.2}ms \
                          cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms horner={}",
-                        job.chunks,
+                        n_out,
                         hi_size,
+                        job.steal.is_some(),
                         submitted.elapsed().as_secs_f64() * 1e3,
                         job.horner,
                     );
@@ -18230,6 +18768,10 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{ZcR2Claim, launch_zc_r2_products_steal};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{ZC_R2_DBG_COMMIT_NS, ZC_R2_DBG_GPU_END, ZC_R2_DBG_GPU_START};
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -21418,6 +21960,74 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 }
             }
             _ => panic!("timed drain must return prefix partials"),
+        }
+        // Two-ended claim protocol (`FLOCK_NO_ZC_R2_STEAL`): whatever the
+        // CPU/GPU race does, the claims partition the chunks exactly, the
+        // GPU-covered chunks are a prefix, and every delivered partial equals
+        // the CPU oracle (values compared).
+        if fixed_weights && gpu_zc_r2_horner_enabled() && zc_r2_steal_enabled() {
+            imp::zc_r2_test_set_steal_batch(2);
+            for mode in 0..3 {
+                imp::zc_r2_test_set_share(hi_size / 2);
+                let job = imp::launch_zc_r2_products_steal(
+                    &a_packed,
+                    &b_packed,
+                    &table_data,
+                    &eq_lo,
+                    &eq_hi,
+                    lo_size,
+                    hi_size,
+                    mask,
+                    useful,
+                )
+                .expect("steal launch must succeed");
+                let (claims, covered) = {
+                    let st = job.steal().expect("timed Horner launch must use the claim protocol");
+                    match mode {
+                        // GPU takes none (claims race ahead of its start delay).
+                        0 => {}
+                        // GPU takes all.
+                        1 => while !st.delivered(hi_size - 1) {
+                            std::hint::spin_loop();
+                        },
+                        // GPU takes its first batch at least.
+                        _ => while !st.delivered(0) {
+                            std::hint::spin_loop();
+                        },
+                    }
+                    let mut claims = Vec::new();
+                    while let Some(c) = st.claim() {
+                        claims.push(c);
+                    }
+                    (claims, st.covered())
+                };
+                assert_eq!(claims.len(), hi_size, "one claim per chunk");
+                let mut seen = vec![false; hi_size];
+                for c in &claims {
+                    let (i, cov) = match *c {
+                        imp::ZcR2Claim::Covered(i) => (i, true),
+                        imp::ZcR2Claim::Full(i) => (i, false),
+                    };
+                    assert!(!seen[i], "chunk {i} claimed twice");
+                    seen[i] = true;
+                    assert_eq!(cov, i < covered, "covered chunks form the prefix");
+                }
+                match mode {
+                    1 => assert_eq!(covered, hi_size, "GPU takes all"),
+                    2 => assert!(covered >= 2, "first batch delivered"),
+                    _ => {}
+                }
+                match imp::zc_r2_wait(job, None, None, 0.0, hi_size) {
+                    imp::ZcR2Result::Prefix(vals) => {
+                        assert_eq!(vals.len(), covered);
+                        assert_eq!(&vals[..], &cpu_split[..covered], "steal partials bit-exact");
+                    }
+                    _ => panic!("steal drain must return the covered partials"),
+                }
+                eprintln!("[zc-r2-steal-test] mode {mode}: covered {covered}/{hi_size}");
+            }
+            imp::zc_r2_test_set_steal_batch(0);
+            imp::zc_r2_test_set_share(hi_size / 2);
         }
         // Change every bound input in place after a completed prefix. The next
         // job must read new bytes through the same cached buffers and addresses.
