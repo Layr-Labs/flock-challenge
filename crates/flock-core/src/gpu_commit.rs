@@ -18193,7 +18193,846 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Zerocheck round-one AB completion GPU arm, safe-memory form
+    // (`FLOCK_NO_ZC_R1_GPU=1` kills; see `ENV_NO_ZC_R1_GPU`).
+    //
+    // Memory contract (the reason this arm exists in this form):
+    //  * the GPU only READS the 512 MiB round-one AB transform, through ONE
+    //    no-copy view created in the process's first (untimed warm-up) prove
+    //    and cached for the process. A later prove uses the view only when
+    //    its transform is the very same allocation (address + length, and
+    //    the scratch provenance token proves the Vec never left custody);
+    //    otherwise the arm stays off for that prove. Nothing large is ever
+    //    wrapped, allocated or retained inside a timed prove.
+    //  * the GPU WRITES only small private buffers: its 256 KiB of
+    //    eq-scaled nibble tables, and the per-group partials
+    //    (128 chunks x groups-per-chunk x 1 KiB, 2-4 MiB).
+    //  * no residency set; no warm-up gates; one correctness check of the
+    //    GPU partials against the CPU's, value by value, inside the warm-up's
+    //    own zerocheck.
+    //  * coverage is decided inside the timed prove by a two-ended claim
+    //    protocol (GPU walks chunks upward in batches that signal a shared
+    //    event; the CPU takes a delivered bottom chunk, else steals the top
+    //    chunk and lowers the cut word the GPU groups test). Nobody waits.
+    // -----------------------------------------------------------------------
+    pub(crate) mod zr1 {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+        pub(crate) const HI: usize = 128;
+        pub(crate) const N_W: usize = 32;
+        pub(crate) const N_U: usize = 128;
+        pub(crate) const CHUNK_BYTES: usize = 4096 * 1024;
+        const ELL: usize = 64;
+
+        const ZR1_MSL_BODY: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline ulong clmul32(uint a, uint b) {
+    const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
+                M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
+    ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
+          a2 = a & 0x44444444u, a3 = a & 0x88888888u;
+    ulong b0 = b & 0x11111111u, b1 = b & 0x22222222u,
+          b2 = b & 0x44444444u, b3 = b & 0x88888888u;
+    ulong r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
+    ulong r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
+    ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
+    ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
+    return r0 | r1 | r2 | r3;
 }
+
+struct U128k { ulong lo; ulong hi; };
+struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+
+static inline U128k clmul64(ulong a, ulong b) {
+    uint al = uint(a), ah = uint(a >> 32);
+    uint bl = uint(b), bh = uint(b >> 32);
+    ulong p_lo = clmul32(al, bl);
+    ulong p_hi = clmul32(ah, bh);
+    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
+    U128k r;
+    r.lo = p_lo ^ (p_mid << 32);
+    r.hi = p_hi ^ (p_mid >> 32);
+    return r;
+}
+
+static inline U256k clmul128(uint4 a, uint4 b) {
+    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
+    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
+    U128k p0 = clmul64(al, bl);
+    U128k p2 = clmul64(ah, bh);
+    U128k pm = clmul64(al ^ ah, bl ^ bh);
+    pm.lo ^= p0.lo ^ p2.lo;
+    pm.hi ^= p0.hi ^ p2.hi;
+    U256k r;
+    r.r0 = p0.lo;
+    r.r1 = p0.hi ^ pm.lo;
+    r.r2 = p2.lo ^ pm.hi;
+    r.r3 = p2.hi;
+    return r;
+}
+
+static inline uint4 gf_reduce(U256k p) {
+    ulong h0 = p.r2, h1 = p.r3;
+    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
+    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+}
+
+static inline uint4 gf_mul(uint4 a, uint4 b) { return gf_reduce(clmul128(a, b)); }
+
+// eqb layout: [0, 32) eq_top (d_inv-scaled), [32, 160) eq_bot, [160, 288) eq_hi.
+// nib[b*32 + n] = convert[b][n], nib[b*32 + 16 + n] = convert[b][n << 4].
+// tabs[w*512 + e] = nib[e] * eq_top[w]  (the CPU table's nibble images).
+kernel void zr1_tabs(device const uint4* nib [[buffer(0)]],
+                     device const uint4* eqb [[buffer(1)]],
+                     device uint4* tabs      [[buffer(2)]],
+                     uint gid [[thread_position_in_grid]])
+{
+    tabs[gid] = gf_mul(nib[gid & 511u], eqb[gid >> 9u]);
+}
+
+struct Zr1Params { uint fe0; uint fe1; uint fe2; uint fe3; uint within_mask; uint pad0; uint pad1; uint pad2; };
+
+#define ZR1_NUB (8u / ZR1_UPT)
+#define ZR1_WPG (32u / ZR1_NWG)
+#define ZR1_TPC (ZR1_NUB * ZR1_NWG)
+
+// One group = (chunk, 16*UPT consecutive u, 32/NWG consecutive w).
+// Thread = (lane quad lq: lanes 4lq..4lq+3, u slot us: UPT u's).
+// Writes eq_hi[chunk] * sum_{u in group} eq_bot[u] * bank_group[u][lane],
+// where bank_group[u] = XOR over the group's w and the row's b of
+// T_w[b][byte] — the CPU's banked fold restricted to the group (F2-linear
+// in the tables, F128-linear in the banks: the per-chunk sum of the group
+// outputs is the CPU's chunk partial exactly).
+kernel void zr1_main(device const uint* ab      [[buffer(0)]],
+                     device const uint4* tabs   [[buffer(1)]],
+                     device const uint4* eqb    [[buffer(2)]],
+                     device uint4* out          [[buffer(3)]],
+                     constant Zr1Params& p      [[buffer(4)]],
+                     volatile device const uint* cut [[buffer(5)]],
+                     constant uint& base        [[buffer(6)]],
+                     uint tgid_in [[threadgroup_position_in_grid]],
+                     uint lid  [[thread_index_in_threadgroup]],
+                     uint sl   [[thread_index_in_simdgroup]],
+                     uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint4 T[512];
+    threadgroup uint skip;
+    const uint tgid = tgid_in + base * ZR1_TPC;
+    const uint chunk = tgid / ZR1_TPC;
+    const uint rem = tgid - chunk * ZR1_TPC;
+    const uint ub = rem / ZR1_NWG;
+    const uint wg = rem - ub * ZR1_NWG;
+    if (lid == 0u) { skip = chunk >= cut[0] ? 1u : 0u; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (skip != 0u) { return; }
+    const uint lq = lid & 15u;
+    const uint us = lid >> 4u;
+    const uint fe[4] = { p.fe0, p.fe1, p.fe2, p.fe3 };
+    const uint4 z = uint4(0u);
+    uint4 acc[ZR1_UPT][4];
+    for (uint j = 0u; j < ZR1_UPT; j++) {
+        acc[j][0] = z; acc[j][1] = z; acc[j][2] = z; acc[j][3] = z;
+    }
+    for (uint wi = 0u; wi < ZR1_WPG; wi++) {
+        const uint w = wg * ZR1_WPG + wi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        T[lid] = tabs[w * 512u + lid];
+        T[lid + 256u] = tabs[w * 512u + 256u + lid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0u; j < ZR1_UPT; j++) {
+            const uint u = ub * (16u * ZR1_UPT) + us * ZR1_UPT + j;
+            const uint f = fe[u & p.within_mask];
+            const uint first = f & 255u;
+            const uint end = f >> 8u;
+            device const uint* row = ab + ((((chunk << 12u) | (w << 7u) | u)) << 8u) + lq;
+            for (uint b = first; b < end; b++) {
+                const uint v = row[b << 4u];
+                threadgroup const uint4* tb = T + (b << 5u);
+                acc[j][0] ^= tb[v & 15u] ^ tb[16u + ((v >> 4u) & 15u)];
+                acc[j][1] ^= tb[(v >> 8u) & 15u] ^ tb[16u + ((v >> 12u) & 15u)];
+                acc[j][2] ^= tb[(v >> 16u) & 15u] ^ tb[16u + ((v >> 20u) & 15u)];
+                acc[j][3] ^= tb[(v >> 24u) & 15u] ^ tb[16u + (v >> 28u)];
+            }
+        }
+    }
+    uint4 part[4] = { z, z, z, z };
+    for (uint j = 0u; j < ZR1_UPT; j++) {
+        const uint u = ub * (16u * ZR1_UPT) + us * ZR1_UPT + j;
+        const uint4 e = eqb[32u + u];
+        for (uint k = 0u; k < 4u; k++) { part[k] ^= gf_mul(e, acc[j][k]); }
+    }
+    // Two u slots per simdgroup (lanes 0-15 / 16-31 share lq).
+    for (uint k = 0u; k < 4u; k++) { part[k] ^= simd_shuffle_xor(part[k], ushort(16)); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sl < 16u) {
+        for (uint k = 0u; k < 4u; k++) { T[sg * 64u + 4u * lq + k] = part[k]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 64u) {
+        uint4 s = z;
+        for (uint g = 0u; g < 8u; g++) { s ^= T[g * 64u + lid]; }
+        out[tgid * 64u + lid] = gf_mul(eqb[160u + chunk], s);
+    }
+}
+
+static inline uint4 gf_mul_x(uint4 v) {
+    uint top = v.w >> 31u;
+    return uint4((v.x << 1u) ^ (top * 0x87u),
+                 (v.y << 1u) | (v.x >> 31u),
+                 (v.z << 1u) | (v.y >> 31u),
+                 (v.w << 1u) | (v.z >> 31u));
+}
+
+// Horner form (FLOCK_ZC_R1_GPU_KERNEL default): T_w[b][v] = x^b * PHI8[v] *
+// eq_top[w] = x^(b&7) * P_(b>>3)[v] with P_0 = eq_top[w]*PHI8 and
+// P_1 = x^8 * P_0 (8 KiB per w in threadgroup memory). One lookup per byte
+// into eight per-(b&7) accumulators; S = sum_j x^j acc_j once per (u, lane).
+// Group = (chunk, 4*UPT consecutive u, 32/NWG consecutive w);
+// thread = (lane, u slot of UPT u's).
+#define ZR1H_UPB (4u * ZR1_UPT)
+#define ZR1H_TPC ((128u / ZR1H_UPB) * ZR1_NWG)
+kernel void zr1_main_h(device const uchar* ab    [[buffer(0)]],
+                       device const uint4* tabs  [[buffer(1)]],
+                       device const uint4* eqb   [[buffer(2)]],
+                       device uint4* out         [[buffer(3)]],
+                       constant Zr1Params& p     [[buffer(4)]],
+                       volatile device const uint* cut [[buffer(5)]],
+                       constant uint& base       [[buffer(6)]],
+                       uint tgid_in [[threadgroup_position_in_grid]],
+                       uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 T[512];
+    threadgroup uint skip;
+    const uint tgid = tgid_in + base * ZR1H_TPC;
+    const uint chunk = tgid / ZR1H_TPC;
+    const uint rem = tgid - chunk * ZR1H_TPC;
+    const uint ub = rem / ZR1_NWG;
+    const uint wg = rem - ub * ZR1_NWG;
+    if (lid == 0u) { skip = chunk >= cut[0] ? 1u : 0u; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (skip != 0u) { return; }
+    const uint lane = lid & 63u;
+    const uint us = lid >> 6u;
+    const uint fe[4] = { p.fe0, p.fe1, p.fe2, p.fe3 };
+    const uint4 z = uint4(0u);
+    uint4 acc[ZR1_UPT][8];
+    for (uint j = 0u; j < ZR1_UPT; j++) {
+        for (uint q = 0u; q < 8u; q++) { acc[j][q] = z; }
+    }
+    for (uint wi = 0u; wi < ZR1_WPG; wi++) {
+        const uint w = wg * ZR1_WPG + wi;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        T[lid] = tabs[w * 512u + lid];
+        T[lid + 256u] = tabs[w * 512u + 256u + lid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0u; j < ZR1_UPT; j++) {
+            const uint u = ub * ZR1H_UPB + us * ZR1_UPT + j;
+            const uint f = fe[u & p.within_mask];
+            const uint first = f & 255u;
+            const uint end = f >> 8u;
+            device const uchar* row = ab + (ulong(((chunk << 12u) | (w << 7u) | u)) << 10u) + lane;
+#pragma clang loop unroll(full)
+            for (uint b = 0u; b < 16u; b++) {
+                if (b >= first && b < end) {
+                    acc[j][b & 7u] ^= T[((b >> 3u) << 8u) + uint(row[b << 6u])];
+                }
+            }
+        }
+    }
+    uint4 part = z;
+    for (uint j = 0u; j < ZR1_UPT; j++) {
+        const uint u = ub * ZR1H_UPB + us * ZR1_UPT + j;
+        uint4 sacc = acc[j][7];
+        for (int q = 6; q >= 0; q--) { sacc = gf_mul_x(sacc) ^ acc[j][q]; }
+        part ^= gf_mul(eqb[32u + u], sacc);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    T[lid] = part;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 64u) {
+        uint4 s = T[lid] ^ T[64u + lid] ^ T[128u + lid] ^ T[192u + lid];
+        out[tgid * 64u + lid] = gf_mul(eqb[160u + chunk], s);
+    }
+}
+"#;
+
+        fn env_usize(name: &str) -> usize {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        }
+
+        /// u's per thread (1 or 2; `FLOCK_ZC_R1_GPU_UPT`).
+        fn upt() -> usize {
+            static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+                match env_usize("FLOCK_ZC_R1_GPU_UPT") {
+                    2 => 2,
+                    4 => 4,
+                    _ => 1,
+                }
+            });
+            *V
+        }
+
+        /// w groups per (chunk, u block) (`FLOCK_ZC_R1_GPU_NWG`).
+        fn nwg() -> usize {
+            static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+                match env_usize("FLOCK_ZC_R1_GPU_NWG") {
+                    n @ (2 | 4 | 8) => n,
+                    _ => 1,
+                }
+            });
+            *V
+        }
+
+        /// Chunks per claim batch (`FLOCK_ZC_R1_GPU_BATCH`).
+        fn batch() -> usize {
+            static V: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+                match env_usize("FLOCK_ZC_R1_GPU_BATCH") {
+                    0 => 4,
+                    n => n.min(HI),
+                }
+            });
+            *V
+        }
+
+        pub(crate) fn debug() -> bool {
+            static V: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_R1_GPU_DEBUG").is_some());
+            *V
+        }
+
+        /// Isolated probe (`FLOCK_ZC_R1_GPU_PROBE=1`): every prove runs the GPU
+        /// over all chunks, waits for it BEFORE the CPU sweep, reports its
+        /// time, and compares all partials with the CPU's afterwards.
+        pub(crate) fn probe() -> bool {
+            static V: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_R1_GPU_PROBE").is_some());
+            *V
+        }
+
+        /// Kernel form (`FLOCK_ZC_R1_GPU_KERNEL=nib` selects the nibble form;
+        /// default the Horner form).
+        fn horner() -> bool {
+            static V: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var("FLOCK_ZC_R1_GPU_KERNEL").map_or(true, |v| v != "nib")
+            });
+            *V
+        }
+
+        fn tpc() -> usize {
+            if horner() { (32 / upt()) * nwg() } else { (8 / upt()) * nwg() }
+        }
+
+        struct Zr1State {
+            gpu: &'static Gpu,
+            queue: Id,
+            pso_tabs: Id,
+            pso_main: Id,
+            nib: Id,
+            eqb: Id,
+            tabs: Id,
+            out: Id,
+            cut: Id,
+            ev: Id,
+            next_value: u64,
+            inflight: Option<Id>,
+            /// The one cached view: (address, length, buffer).
+            wrap: Option<(usize, usize, Id)>,
+            verified: bool,
+        }
+        // SAFETY: Metal objects are thread-safe; access serialized by ZR1.
+        unsafe impl Send for Zr1State {}
+
+        static ZR1: Mutex<Option<Result<Zr1State, String>>> = Mutex::new(None);
+        static POISONED: AtomicBool = AtomicBool::new(false);
+
+        fn zr1_init(gpu: &'static Gpu) -> Result<Zr1State, String> {
+            unsafe {
+                let pool = gpu.pool_push();
+                let r = (|| -> Result<Zr1State, String> {
+                    let src = format!(
+                        "#define ZR1_UPT {}u\n#define ZR1_NWG {}u\n{}",
+                        upt(),
+                        nwg(),
+                        ZR1_MSL_BODY
+                    );
+                    let pso_tabs = compile_supplemental_pipeline(gpu, &src, "zr1_tabs")?;
+                    let pso_main = compile_supplemental_pipeline(
+                        gpu,
+                        &src,
+                        if horner() { "zr1_main_h" } else { "zr1_main" },
+                    )?;
+                    let mt: u64 = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        pso_main,
+                        c"maxTotalThreadsPerThreadgroup"
+                    );
+                    if mt < 256 {
+                        return Err(format!("zr1_main max threads {mt}"));
+                    }
+                    let queue = if std::env::var_os("FLOCK_ZC_R1_GPU_QUEUE2").is_some() {
+                        let q: Id = send!(
+                            gpu.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            gpu.device,
+                            c"newCommandQueue"
+                        );
+                        if q.is_null() {
+                            return Err("newCommandQueue failed".into());
+                        }
+                        q
+                    } else {
+                        NIL
+                    };
+                    let ev: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel) -> Id,
+                        gpu.device,
+                        c"newSharedEvent"
+                    );
+                    if ev.is_null() {
+                        return Err("newSharedEvent failed".into());
+                    }
+                    Ok(Zr1State {
+                        gpu,
+                        queue,
+                        pso_tabs,
+                        pso_main,
+                        nib: gpu.new_buffer(512 * 16)?,
+                        eqb: gpu.new_buffer((N_W + N_U + HI) * 16)?,
+                        tabs: gpu.new_buffer(N_W * 512 * 16)?,
+                        out: gpu.new_buffer(HI * tpc() * ELL * 16)?,
+                        cut: gpu.new_buffer(16)?,
+                        ev,
+                        next_value: 0,
+                        inflight: None,
+                        wrap: None,
+                        verified: false,
+                    })
+                })();
+                gpu.pool_pop(pool);
+                r
+            }
+        }
+
+        /// One CPU claim of the two-ended protocol.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum Zr1Claim {
+            /// GPU-delivered chunk: adopt [`Zr1Job::chunk_partial`].
+            Covered(usize),
+            /// CPU computes this chunk; the GPU skips it.
+            Full(usize),
+        }
+
+        pub(crate) struct Zr1Job {
+            gpu: &'static Gpu,
+            cb: Id,
+            ev: Id,
+            base: u64,
+            batch: usize,
+            tpc: usize,
+            out: *const F128,
+            cut: *const AtomicU32,
+            claims: AtomicU64,
+            /// First prove of the process: the CPU computes every chunk and
+            /// the GPU's complete output is compared with it.
+            verify: bool,
+            delay_batches: usize,
+            wait_all: bool,
+            none: bool,
+            submit_s: f64,
+        }
+        // SAFETY: `ev`/`cb` are thread-safe Metal objects; `out`/`cut` point
+        // into process-lifetime shared buffers (cut only through atomics).
+        unsafe impl Send for Zr1Job {}
+        unsafe impl Sync for Zr1Job {}
+
+        impl Zr1Job {
+            pub(crate) fn is_verify(&self) -> bool {
+                self.verify
+            }
+
+            pub(crate) fn delivered(&self, chunk: usize) -> bool {
+                if self.none {
+                    return false;
+                }
+                let need = self.base + (chunk / self.batch + self.delay_batches) as u64 + 1;
+                unsafe { self.gpu.event_signaled_value(self.ev) >= need }
+            }
+
+            /// Exactly `HI` calls succeed in total; never waits (except in
+            /// the forced GPU-all diagnostic).
+            pub(crate) fn claim(&self) -> Option<Zr1Claim> {
+                let mut cur = self.claims.load(Ordering::Acquire);
+                loop {
+                    let (bot, top) = ((cur & 0xffff_ffff) as usize, (cur >> 32) as usize);
+                    if bot >= top {
+                        return None;
+                    }
+                    if self.wait_all {
+                        while !self.delivered(bot) {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    if self.delivered(bot) {
+                        match self.claims.compare_exchange_weak(
+                            cur,
+                            cur + 1,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => return Some(Zr1Claim::Covered(bot)),
+                            Err(v) => cur = v,
+                        }
+                    } else {
+                        match self.claims.compare_exchange_weak(
+                            cur,
+                            cur - (1u64 << 32),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => {
+                                let c = top - 1;
+                                // SAFETY: live shared-buffer word.
+                                unsafe { (*self.cut).fetch_min(c as u32, Ordering::AcqRel) };
+                                return Some(Zr1Claim::Full(c));
+                            }
+                            Err(v) => cur = v,
+                        }
+                    }
+                }
+            }
+
+            /// Chunks `[0, covered)` are GPU-delivered once claims are done.
+            pub(crate) fn covered(&self) -> usize {
+                (self.claims.load(Ordering::Acquire) & 0xffff_ffff) as usize
+            }
+
+            /// The GPU's partial of a delivered chunk (sum of its groups).
+            pub(crate) fn chunk_partial(&self, chunk: usize) -> [F128; ELL] {
+                let mut acc = [F128::ZERO; ELL];
+                unsafe {
+                    let o = self.out.add(chunk * self.tpc * ELL);
+                    for g in 0..self.tpc {
+                        let row = o.add(g * ELL);
+                        for (lane, a) in acc.iter_mut().enumerate() {
+                            *a += *row.add(lane);
+                        }
+                    }
+                }
+                acc
+            }
+
+            /// Isolated probe: wait for the full GPU pass now; returns
+            /// (start delay ms, GPU busy ms).
+            pub(crate) fn wait_now(&self) -> (f64, f64) {
+                unsafe {
+                    let _ = self.gpu.wait_cb(self.cb);
+                    let (s, e) = cb_gpu_interval(self.gpu, self.cb);
+                    ((s - self.submit_s) * 1e3, (e - s) * 1e3)
+                }
+            }
+
+            /// Verification retire (first prove of the process, or the probe):
+            /// wait for the full GPU pass and compare every chunk partial
+            /// with the CPU's, value by value. A mismatch poisons the arm.
+            pub(crate) fn finish_verify(self, cpu: &[[F128; ELL]]) -> bool {
+                let (delay, busy) = self.wait_now();
+                let mut bad = None;
+                let mut n_vals = 0usize;
+                for (c, want) in cpu.iter().enumerate().take(HI) {
+                    let got = self.chunk_partial(c);
+                    for lane in 0..ELL {
+                        n_vals += 1;
+                        if got[lane] != want[lane] && bad.is_none() {
+                            bad = Some((c, lane));
+                        }
+                    }
+                }
+                let ok = bad.is_none() && cpu.len() == HI;
+                if debug() || probe() {
+                    eprintln!(
+                        "[zc-r1-gpu] verify: {} ({} chunks x {} lanes = {} values compared{}); \
+                         gpu start delay {:.3} ms, busy {:.3} ms ({:.1} GB/s), horner={} upt={} nwg={} batch={}",
+                        if ok { "MATCH" } else { "MISMATCH" },
+                        cpu.len(),
+                        ELL,
+                        n_vals,
+                        bad.map_or(String::new(), |(c, l)| format!(", first bad chunk {c} lane {l}")),
+                        delay,
+                        busy,
+                        (HI * CHUNK_BYTES) as f64 / (busy * 1e-3) / 1e9,
+                        horner(),
+                        upt(),
+                        nwg(),
+                        self.batch,
+                    );
+                }
+                unsafe { self.gpu.release(self.cb) };
+                let mut g = ZR1.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(Ok(st)) = g.as_mut() {
+                    if ok {
+                        st.verified = true;
+                    }
+                }
+                if !ok {
+                    POISONED.store(true, Ordering::Relaxed);
+                }
+                ok
+            }
+
+            /// Timed retire: lower the cut so the remaining groups exit, park
+            /// the command buffer (retired by the next launch). Never waits.
+            pub(crate) fn finish(self, sweep_ms: f64) {
+                unsafe {
+                    (*self.cut).store(0, Ordering::SeqCst);
+                    let covered = self.covered();
+                    if debug() {
+                        let end_s = super::zfold::host_media_seconds();
+                        let cb = self.gpu.retain(self.cb);
+                        let submit_s = self.submit_s;
+                        let cb_addr = cb as usize;
+                        std::thread::spawn(move || {
+                            let cb = cb_addr as Id;
+                            let Ok(gpu) = super::gpu() else { return };
+                            let _ = gpu.wait_cb(cb);
+                            let (s, e) = cb_gpu_interval(gpu, cb);
+                            eprintln!(
+                                "[zc-r1-gpu] timed: covered {covered}/{HI} chunks; submit->gpu_start {:.3} ms, \
+                                 gpu busy {:.3} ms, gpu_end-cpu_end {:+.3} ms, cpu sweep {:.3} ms",
+                                (s - submit_s) * 1e3,
+                                (e - s) * 1e3,
+                                (e - end_s) * 1e3,
+                                sweep_ms,
+                            );
+                            gpu.release(cb);
+                        });
+                    }
+                    let mut g = ZR1.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(Ok(st)) = g.as_mut() {
+                        if let Some(old) = st.inflight.replace(self.cb) {
+                            let _ = self.gpu.wait_cb(old);
+                            self.gpu.release(old);
+                        }
+                    } else {
+                        self.gpu.release(self.cb);
+                    }
+                }
+            }
+        }
+
+        /// Launch the arm over the round-one AB transform `ab` (`HI` chunks
+        /// of [`CHUNK_BYTES`]). `reused` must be true only when `ab` is the
+        /// allocation the previous prove parked through its provenance token
+        /// (never freed in between). `None` = the incumbent CPU path.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn launch(
+            ab: &[u8],
+            reused: bool,
+            convert: &[F128],
+            eq_top: &[F128],
+            eq_bot: &[F128],
+            eq_hi: &[F128],
+            fe: [u32; 4],
+            within_mask: u32,
+        ) -> Option<Zr1Job> {
+            if POISONED.load(Ordering::Relaxed)
+                || ab.len() != HI * CHUNK_BYTES
+                || convert.len() != 16 * 256
+                || eq_top.len() != N_W
+                || eq_bot.len() != N_U
+                || eq_hi.len() != HI
+                || within_mask > 3
+            {
+                return None;
+            }
+            let gpu = gpu().ok()?;
+            let mut guard = ZR1.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                *guard = Some(zr1_init(gpu));
+                if let Some(Err(e)) = guard.as_ref() {
+                    if debug() {
+                        eprintln!("[zc-r1-gpu] init failed: {e}");
+                    }
+                }
+            }
+            let st = match guard.as_mut() {
+                Some(Ok(st)) => st,
+                _ => return None,
+            };
+            let addr = ab.as_ptr() as usize;
+            let len = ab.len();
+            let verify = !st.verified || probe();
+            let ab_buf = match st.wrap {
+                Some((a, l, b)) => {
+                    if a != addr || l != len || !(reused || verify) {
+                        if debug() {
+                            eprintln!(
+                                "[zc-r1-gpu] off this prove: transform {addr:#x}+{len} reused={reused} \
+                                 != cached view {a:#x}+{l}"
+                            );
+                        }
+                        return None;
+                    }
+                    if debug() {
+                        eprintln!("[zc-r1-gpu] cached view hit {addr:#x}+{len} reused={reused} verify={verify}");
+                    }
+                    b
+                }
+                None => {
+                    if !verify || crate::scratch::f128_range_overlaps_pin(addr, len) {
+                        return None;
+                    }
+                    // The process's first prove (the untimed warm-up): the
+                    // one and only view this arm ever creates.
+                    let b = unsafe { gpu.wrap_buffer(ab.as_ptr().cast_mut(), len) }.ok()?;
+                    if debug() {
+                        eprintln!("[zc-r1-gpu] view created once: {addr:#x}+{} MiB", len >> 20);
+                    }
+                    st.wrap = Some((addr, len, b));
+                    b
+                }
+            };
+            unsafe {
+                if let Some(old) = st.inflight.take() {
+                    let _ = st.gpu.wait_cb(old);
+                    st.gpu.release(old);
+                }
+                // Small uploads: 8 KiB nibble images, 4.5 KiB of eq factors.
+                let nib = st.gpu.buffer_contents(st.nib).cast::<F128>();
+                if horner() {
+                    // P_0 = PHI8 (convert row 0), P_1 = x^8 PHI8 (row 8).
+                    std::ptr::copy_nonoverlapping(convert.as_ptr(), nib, 256);
+                    std::ptr::copy_nonoverlapping(convert.as_ptr().add(8 * 256), nib.add(256), 256);
+                } else {
+                    for b in 0..16 {
+                        for n in 0..16 {
+                            *nib.add(b * 32 + n) = convert[b * 256 + n];
+                            *nib.add(b * 32 + 16 + n) = convert[b * 256 + (n << 4)];
+                        }
+                    }
+                }
+                let eqb = st.gpu.buffer_contents(st.eqb).cast::<F128>();
+                std::ptr::copy_nonoverlapping(eq_top.as_ptr(), eqb, N_W);
+                std::ptr::copy_nonoverlapping(eq_bot.as_ptr(), eqb.add(N_W), N_U);
+                std::ptr::copy_nonoverlapping(eq_hi.as_ptr(), eqb.add(N_W + N_U), HI);
+                let cut = st.gpu.buffer_contents(st.cut).cast::<AtomicU32>();
+                (*cut).store(HI as u32, Ordering::SeqCst);
+                let params: [u32; 8] = [fe[0], fe[1], fe[2], fe[3], within_mask, 0, 0, 0];
+                let pool = st.gpu.pool_push();
+                let r = (|| -> Option<Zr1Job> {
+                    let cb: Id = if st.queue.is_null() {
+                        st.gpu.command_buffer().ok()?
+                    } else {
+                        let cb: Id = send!(
+                            st.gpu.api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            st.queue,
+                            c"commandBuffer"
+                        );
+                        if cb.is_null() {
+                            return None;
+                        }
+                        cb
+                    };
+                    let enc = st.gpu.compute_encoder(cb).ok()?;
+                    st.gpu.set_pipeline(enc, st.pso_tabs);
+                    st.gpu.set_buffer(enc, st.nib, 0, 0);
+                    st.gpu.set_buffer(enc, st.eqb, 0, 1);
+                    st.gpu.set_buffer(enc, st.tabs, 0, 2);
+                    st.gpu.dispatch(enc, (N_W * 512 / 256) as u64, 256);
+                    st.gpu.end_encoding(enc);
+                    let base = st.next_value;
+                    let bsz = batch();
+                    let n_batches = HI.div_ceil(bsz);
+                    let tpc = tpc();
+                    let pb = std::slice::from_raw_parts(params.as_ptr().cast::<u8>(), 32);
+                    for j in 0..n_batches {
+                        let c0 = j * bsz;
+                        let n = bsz.min(HI - c0);
+                        let c0u = c0 as u32;
+                        let enc = st.gpu.compute_encoder(cb).ok()?;
+                        st.gpu.set_pipeline(enc, st.pso_main);
+                        st.gpu.set_buffer(enc, ab_buf, 0, 0);
+                        st.gpu.set_buffer(enc, st.tabs, 0, 1);
+                        st.gpu.set_buffer(enc, st.eqb, 0, 2);
+                        st.gpu.set_buffer(enc, st.out, 0, 3);
+                        st.gpu.set_bytes(enc, pb, 4);
+                        st.gpu.set_buffer(enc, st.cut, 0, 5);
+                        // `base` is in chunk units; the kernel scales by tpc.
+                        st.gpu.set_bytes(
+                            enc,
+                            std::slice::from_raw_parts((&raw const c0u).cast::<u8>(), 4),
+                            6,
+                        );
+                        st.gpu.dispatch(enc, (n * tpc) as u64, 256);
+                        st.gpu.end_encoding(enc);
+                        st.gpu.encode_signal_event(cb, st.ev, base + j as u64 + 1);
+                    }
+                    st.next_value = base + n_batches as u64;
+                    let retained = st.gpu.retain(cb);
+                    let submit_s = super::zfold::host_media_seconds();
+                    st.gpu.commit_async(cb);
+                    Some(Zr1Job {
+                        gpu: st.gpu,
+                        cb: retained,
+                        ev: st.ev,
+                        base,
+                        batch: bsz,
+                        tpc,
+                        out: st.gpu.buffer_contents(st.out).cast::<F128>(),
+                        cut: cut.cast_const(),
+                        claims: AtomicU64::new((HI as u64) << 32),
+                        verify,
+                        delay_batches: env_usize("FLOCK_ZC_R1_GPU_DELAY_BATCHES"),
+                        wait_all: env_usize("FLOCK_ZC_R1_GPU_WAIT") != 0,
+                        none: env_usize("FLOCK_ZC_R1_GPU_NONE") != 0,
+                        submit_s,
+                    })
+                })();
+                st.gpu.pool_pop(pool);
+                r
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn test_set_verified(v: bool) {
+            let mut g = ZR1.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(Ok(st)) = g.as_mut() {
+                st.verified = v;
+            }
+        }
+    }
+}
+
+/// Kill switch for the round-one AB completion GPU arm (safe-memory form,
+/// see `imp::zr1`): `FLOCK_NO_ZC_R1_GPU=1` restores the incumbent CPU-only
+/// completion exactly. Default on, ranked Metal shape only.
+pub const ENV_NO_ZC_R1_GPU: &str = "FLOCK_NO_ZC_R1_GPU";
+
+#[allow(dead_code)]
+pub(crate) fn zc_r1_gpu_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(ENV_NO_ZC_R1_GPU).is_none_or(|v| v != *"1")
+            && gpu_zerocheck_enabled()
+    });
+    *ON
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::zr1::{Zr1Claim, launch as zc_r1_gpu_launch, probe as zc_r1_gpu_probe};
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::zr1::test_set_verified as zc_r1_gpu_test_set_verified;
 
 // Test-harness entry points (copy-in/copy-out); production goes through
 // `commit_l0_or_fallback` above.
