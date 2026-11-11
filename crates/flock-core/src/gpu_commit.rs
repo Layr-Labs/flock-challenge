@@ -1339,6 +1339,14 @@ pub(crate) fn gpu_hybrid_final_leaf_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_FINAL_LEAF").is_none())
 }
 
+/// Kill switch for the range-wide Merkle ladders of the hybrid commit split:
+/// `FLOCK_NO_GPU_RANGE_LADDER` (any value) restores the per-subtree
+/// decomposition (one serial dispatch chain per aligned power-of-two subtree).
+pub(crate) fn gpu_range_ladder_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_RANGE_LADDER").is_none())
+}
+
 #[cfg(test)]
 mod leaf_vec4_gate_tests {
     use std::ffi::OsStr;
@@ -4826,7 +4834,11 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
             gpu.set_buffer(enc, tree_buf, w3 * 32, 6);
             gpu.dispatch(enc, (n_leaves / (16 * leaf_tiles)) as u64, 64);
             if upper {
-                encode_merkle_upper(gpu, enc, tree_buf, w3, n_leaves / 8);
+                if super::gpu_range_ladder_enabled() {
+                    encode_merkle_range_ladder(gpu, enc, tree_buf, n_leaves, 3, 0, n_leaves / 8);
+                } else {
+                    encode_merkle_upper(gpu, enc, tree_buf, w3, n_leaves / 8);
+                }
             }
         }
     }
@@ -4987,6 +4999,15 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
             } else {
                 encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, l_from, log_d, num, den);
             }
+            if super::gpu_range_ladder_enabled() {
+                if fused {
+                    encode_merkle_range_ladder(gpu, enc, tree_buf, n_leaves, 3, 0, prefix_leaves / 8);
+                    return;
+                }
+                if encode_merkle_leaf_range(gpu, enc, staging, tree_buf, n_leaves, 0, prefix_leaves) {
+                    return;
+                }
+            }
             let mut start = 0usize;
             while start < prefix_leaves {
                 let mut size = 1usize << (prefix_leaves - start).ilog2();
@@ -5001,6 +5022,198 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
                 start += size;
             }
         }
+    }
+
+    /// One-threadgroup parent ladder: up to 16 levels of a node range in a
+    /// single dispatch, a device-memory barrier between levels (the group is
+    /// one core's, so its own writes are visible to it after the barrier).
+    /// The levels it runs are the small top of a range ladder, which would
+    /// otherwise be one serial dispatch per level.
+    pub(crate) fn ladder_tail_msl_source() -> Option<String> {
+        let end = "    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];\n}\n";
+        let i = LEAF_PARENT3_MSL_SOURCE.find(end)? + end.len();
+        Some(format!(
+            "{}{}",
+            &LEAF_PARENT3_MSL_SOURCE[..i],
+            r#"
+struct LadderLevel { uint read_node; uint write_node; uint n_out; uint pad; };
+
+kernel void parent_ladder_tail(device uint* tree               [[buffer(0)]],
+                               constant LadderLevel* lv         [[buffer(1)]],
+                               constant uint& n_levels          [[buffer(2)]],
+                               uint lid [[thread_index_in_threadgroup]],
+                               uint tpg [[threads_per_threadgroup]])
+{
+    for (uint k = 0u; k < n_levels; k++) {
+        const uint rd = lv[k].read_node, wr = lv[k].write_node, n_out = lv[k].n_out;
+        for (uint n = lid; n < n_out; n += tpg) {
+            uint block[16];
+            for (uint i = 0u; i < 16u; i++) block[i] = tree[(rd + 2u * n) * 8u + i];
+            uint cv[8];
+            for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+            b3_compress(cv, block, 64u, B3_PARENT);
+            for (int i = 0; i < 8; i++) tree[(wr + n) * 8u + i] = cv[i];
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+}
+"#
+        ))
+    }
+
+    /// The ladder-tail pipeline, compiled once on first use (warmup); NIL if
+    /// it cannot be built (the range ladder then dispatches every level).
+    pub(crate) fn ladder_tail_pso(gpu: &Gpu) -> Id {
+        static PSO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *PSO.get_or_init(|| {
+            ladder_tail_msl_source()
+                .and_then(|src| unsafe { compile_supplemental_pipeline(gpu, &src, "parent_ladder_tail").ok() })
+                .map(|p| p as usize)
+                .unwrap_or(0)
+        }) as Id
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct LadderLevel {
+        read_node: u32,
+        write_node: u32,
+        n_out: u32,
+        pad: u32,
+    }
+
+    /// Flat-tree index of level `level`'s first node (leaves are level 0).
+    #[inline]
+    fn tree_level_start(n_leaves_total: usize, level: usize) -> usize {
+        (0..level).map(|i| n_leaves_total >> i).sum()
+    }
+
+    /// Every parent level above `level` whose two children lie in the node
+    /// range `[a, b)` of `level` (all written), up to the root of each
+    /// maximal aligned subtree inside the range: exactly the nodes the
+    /// per-subtree decomposition computes, by the same kernels' hash, with
+    /// one dispatch per level for the whole range instead of one per subtree
+    /// and level. Three levels per dispatch while the range is 256-aligned
+    /// (`parent_hash3`), then single levels, then one dispatch for the small
+    /// top (`parent_ladder_tail`).
+    pub(crate) unsafe fn encode_merkle_range_ladder(
+        gpu: &Gpu,
+        enc: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        mut level: usize,
+        mut a: usize,
+        mut b: usize,
+    ) {
+        const TAIL_MAX_NODES: usize = 4096;
+        unsafe {
+            let pso_parent3 = if gpu.pso_parent3_v4.is_null() {
+                gpu.pso_parent3
+            } else {
+                gpu.pso_parent3_v4
+            };
+            let tail = ladder_tail_pso(gpu);
+            while b > a + 1 {
+                let ls = tree_level_start(n_leaves_total, level);
+                if a % 256 == 0 && (b - a) % 256 == 0 && b - a > TAIL_MAX_NODES {
+                    let l1 = tree_level_start(n_leaves_total, level + 1);
+                    let l2 = tree_level_start(n_leaves_total, level + 2);
+                    let l3 = tree_level_start(n_leaves_total, level + 3);
+                    gpu.set_pipeline(enc, pso_parent3);
+                    gpu.set_buffer(enc, tree_buf, (ls + a) * 32, 0);
+                    gpu.set_buffer(enc, tree_buf, (l1 + a / 2) * 32, 1);
+                    gpu.set_buffer(enc, tree_buf, (l2 + a / 4) * 32, 2);
+                    gpu.set_buffer(enc, tree_buf, (l3 + a / 8) * 32, 3);
+                    gpu.dispatch(enc, ((b - a) / 256) as u64, 128);
+                    level += 3;
+                    a /= 8;
+                    b /= 8;
+                    continue;
+                }
+                if b - a <= TAIL_MAX_NODES && !tail.is_null() {
+                    let mut lv = [LadderLevel::default(); 16];
+                    let mut n = 0usize;
+                    let (mut l, mut x, mut y) = (level, a, b);
+                    while y > x + 1 && n < 16 {
+                        let (x2, y2) = (x.div_ceil(2), y / 2);
+                        lv[n] = LadderLevel {
+                            read_node: (tree_level_start(n_leaves_total, l) + 2 * x2) as u32,
+                            write_node: (tree_level_start(n_leaves_total, l + 1) + x2) as u32,
+                            n_out: (y2 - x2) as u32,
+                            pad: 0,
+                        };
+                        n += 1;
+                        l += 1;
+                        x = x2;
+                        y = y2;
+                    }
+                    let n32 = n as u32;
+                    gpu.set_pipeline(enc, tail);
+                    gpu.set_buffer(enc, tree_buf, 0, 0);
+                    gpu.set_bytes(
+                        enc,
+                        core::slice::from_raw_parts(lv.as_ptr().cast::<u8>(), core::mem::size_of_val(&lv)),
+                        1,
+                    );
+                    gpu.set_bytes(enc, core::slice::from_raw_parts((&n32 as *const u32).cast::<u8>(), 4), 2);
+                    gpu.dispatch(enc, 1, 256);
+                    level = l;
+                    a = x;
+                    b = y;
+                    continue;
+                }
+                // One level over the whole range.
+                let (a2, b2) = (a.div_ceil(2), b / 2);
+                let n_out = b2 - a2;
+                let tpg = (1usize << n_out.trailing_zeros()).min(256);
+                let l1 = tree_level_start(n_leaves_total, level + 1);
+                gpu.set_pipeline(enc, gpu.pso_parent);
+                gpu.set_buffer(enc, tree_buf, (ls + 2 * a2) * 32, 0);
+                gpu.set_buffer(enc, tree_buf, (l1 + a2) * 32, 1);
+                gpu.dispatch(enc, (n_out / tpg) as u64, tpg as u64);
+                level += 1;
+                a = a2;
+                b = b2;
+            }
+        }
+    }
+
+    /// Leaves and every parent level of the leaf range `[a, b)` (256-aligned):
+    /// one `leaf_parent3` dispatch over the whole range, then the range
+    /// ladder. Returns false (nothing encoded) when the fused leaf kernel is
+    /// unavailable or the range is not 256-aligned; callers then keep the
+    /// per-subtree decomposition.
+    pub(crate) unsafe fn encode_merkle_leaf_range(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        a: usize,
+        b: usize,
+    ) -> bool {
+        if gpu.pso_leaf_parent3.is_null()
+            || !super::select_gpu_leaf_parent3(true)
+            || a % 256 != 0
+            || b % 256 != 0
+            || b <= a
+        {
+            return false;
+        }
+        unsafe {
+            let l1 = tree_level_start(n_leaves_total, 1);
+            let l2 = tree_level_start(n_leaves_total, 2);
+            let l3 = tree_level_start(n_leaves_total, 3);
+            gpu.set_pipeline(enc, gpu.pso_leaf_parent3);
+            gpu.set_buffer(enc, codeword_buf, a * 1024, 0);
+            gpu.set_buffer(enc, tree_buf, a * 32, 1);
+            gpu.set_buffer(enc, tree_buf, (l1 + a / 2) * 32, 2);
+            gpu.set_buffer(enc, tree_buf, (l2 + a / 4) * 32, 3);
+            gpu.set_buffer(enc, tree_buf, (l3 + a / 8) * 32, 4);
+            gpu.dispatch(enc, ((b - a) / 256) as u64, 256);
+            encode_merkle_range_ladder(gpu, enc, tree_buf, n_leaves_total, 3, a / 8, b / 8);
+        }
+        true
     }
 
     pub(crate) unsafe fn encode_merkle_upper(
@@ -8798,7 +9011,13 @@ kernel void blake3_pow_scan(
                     crate::tmark::mark("hybrid cpu ntt done");
                     let cb3 = gpu.command_buffer()?;
                     let enc = gpu.compute_encoder(cb3)?;
-                    let mut sstart = suffix_leaf_start;
+                    let mut sstart = if super::gpu_range_ladder_enabled()
+                        && encode_merkle_leaf_range(gpu, enc, staging, tree_buf, n_leaves, suffix_leaf_start, n_leaves)
+                    {
+                        n_leaves
+                    } else {
+                        suffix_leaf_start
+                    };
                     while sstart < n_leaves {
                         let mut size = 1usize << (n_leaves - sstart).ilog2();
                         while sstart % size != 0 {
@@ -14431,6 +14650,14 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 gpu.set_buffer(enc, tree_buf, 0, 1);
                 let tpg = 256u64.min(num_leaves as u64);
                 gpu.dispatch(enc, num_leaves as u64 / tpg, tpg);
+                if super::gpu_range_ladder_enabled()
+                    && !(gpu.pso_parent3.is_null() && gpu.pso_parent3_v4.is_null())
+                {
+                    // Same parent hash, three levels per dispatch, then the
+                    // whole small top in one dispatch: 4 serial dispatches
+                    // instead of one per level (19 at 2^18 leaves).
+                    encode_merkle_range_ladder(gpu, enc, tree_buf, num_leaves, 0, 0, num_leaves);
+                } else {
                 gpu.set_pipeline(enc, state.pso_parent);
                 let mut read_start = 0usize;
                 let mut read_len = num_leaves;
@@ -14443,6 +14670,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     gpu.dispatch(enc, n_out as u64 / tpg, tpg);
                     read_start = write_start;
                     read_len = n_out;
+                }
                 }
                 gpu.end_encoding(enc);
                 // This dispatch sits on the opening's FS-serial spine with
@@ -22744,6 +22972,212 @@ kernel void gl2_write(device uint4* d [[buffer(0)]], uint gid [[thread_position_
             gpu.release(tree_buf);
             gpu.release(out_buf);
             gpu.release(tw_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    /// Range-wide Merkle ladders write exactly the tree bytes of the
+    /// per-subtree decomposition, for coarse and fine prefixes, their
+    /// suffixes, and the fused final-leaf prefix's levels above 3.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn range_ladder_matches_per_subtree() {
+        let log_d = 16usize;
+        let n_leaves = 1usize << log_d;
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        if gpu.pso_leaf_parent3.is_null() || imp::ladder_tail_pso(gpu).is_null() {
+            eprintln!("skipping: leaf_parent3 or ladder tail PSO unavailable");
+            return;
+        }
+        let input = Rng::new(0x4C414444).vec(64 << log_d);
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = (64usize << log_d) * 16;
+            let tree_bytes = (2 * n_leaves - 1) * 32;
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), gpu.buffer_contents(data_buf), data_bytes);
+            let u = n_leaves / 256;
+            let mut ranges = Vec::new();
+            for p256 in [176usize, 175, 255, 1, 128, 240, 17] {
+                ranges.push((0, p256 * u));
+                ranges.push((p256 * u, n_leaves));
+            }
+            for &(a, b) in &ranges {
+                let mut outs = Vec::new();
+                for v in 0..2 {
+                    let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+                    std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0x3C, tree_bytes);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    if v == 0 {
+                        let mut start = a;
+                        while start < b {
+                            let mut size = 1usize << (b - start).ilog2();
+                            while start % size != 0 {
+                                size >>= 1;
+                            }
+                            imp::encode_merkle_subtree_impl(gpu, enc, data_buf, tree_buf, n_leaves, start, size, true);
+                            start += size;
+                        }
+                    } else {
+                        assert!(imp::encode_merkle_leaf_range(gpu, enc, data_buf, tree_buf, n_leaves, a, b));
+                    }
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    outs.push(core::slice::from_raw_parts(gpu.buffer_contents(tree_buf).cast::<u8>(), tree_bytes).to_vec());
+                    gpu.release(tree_buf);
+                }
+                assert!(outs[0] == outs[1], "range [{a},{b}) tree differs");
+            }
+            // Levels above 3 only (the fused prefix's ladder), from leaf+parent3 output.
+            for p256 in [176usize, 175, 255, 1] {
+                let pl = p256 * u;
+                let mut outs = Vec::new();
+                for v in 0..2 {
+                    let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+                    std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0x3C, tree_bytes);
+                    // Levels 0..3 of [0, pl) per subtree, then the two ladders.
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    let mut start = 0usize;
+                    while start < pl {
+                        let mut size = 1usize << (pl - start).ilog2();
+                        while start % size != 0 {
+                            size >>= 1;
+                        }
+                        // leaf + three parent levels of this subtree only
+                        gpu.set_pipeline(enc, gpu.pso_leaf_parent3);
+                        let l1 = n_leaves;
+                        let l2 = l1 + n_leaves / 2;
+                        let l3 = l2 + n_leaves / 4;
+                        gpu.set_buffer(enc, data_buf, start * 1024, 0);
+                        gpu.set_buffer(enc, tree_buf, start * 32, 1);
+                        gpu.set_buffer(enc, tree_buf, (l1 + start / 2) * 32, 2);
+                        gpu.set_buffer(enc, tree_buf, (l2 + start / 4) * 32, 3);
+                        gpu.set_buffer(enc, tree_buf, (l3 + start / 8) * 32, 4);
+                        gpu.dispatch(enc, (size / 256) as u64, 256);
+                        start += size;
+                    }
+                    if v == 0 {
+                        let mut start = 0usize;
+                        while start < pl {
+                            let mut size = 1usize << (pl - start).ilog2();
+                            while start % size != 0 {
+                                size >>= 1;
+                            }
+                            imp::encode_merkle_subtree_above3(gpu, enc, tree_buf, n_leaves, start, size);
+                            start += size;
+                        }
+                    } else {
+                        imp::encode_merkle_range_ladder(gpu, enc, tree_buf, n_leaves, 3, 0, pl / 8);
+                    }
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    outs.push(core::slice::from_raw_parts(gpu.buffer_contents(tree_buf).cast::<u8>(), tree_bytes).to_vec());
+                    gpu.release(tree_buf);
+                }
+                assert!(outs[0] == outs[1], "above-3 ladder of [0,{pl}) differs");
+            }
+            gpu.release(data_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    /// GPU probe: wall of the per-subtree parent levels above level 3 (the
+    /// serial parent3 ladder and single-level tail) the hybrid prefix encodes
+    /// after its fused final pass, per subtree size, alone in a command buffer,
+    /// and the empty-command-buffer floor. Run with --ignored --nocapture above3_probe.
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn above3_probe() {
+        let log_d = 20usize;
+        let n_leaves = 1usize << log_d;
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let reps = 15usize;
+        unsafe {
+            let pool = gpu.pool_push();
+            let tree_bytes = (2 * n_leaves - 1) * 32;
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0x3C, tree_bytes);
+            let run = |f: &dyn Fn(imp::Id)| -> f64 {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                f(enc);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            };
+            let med = |mut v: Vec<f64>| {
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let mut line = String::from("above3 GPU ms:");
+            let empty = med((0..reps).map(|_| run(&|_enc| {})).collect());
+            line += &format!(" empty-cb {empty:.3}");
+            for lg in [16usize, 17, 18, 19] {
+                let sz = 1usize << lg;
+                let t = med((0..reps).map(|_| run(&|enc| imp::encode_merkle_subtree_above3(gpu, enc, tree_buf, n_leaves, 0, sz))).collect());
+                line += &format!(" | 2^{lg} {t:.3}");
+            }
+            // The three subtrees of an 11/16 prefix (1/2 + 1/8 + 1/16), as cb2 encodes them.
+            let t3 = med((0..reps).map(|_| run(&|enc| {
+                let mut start = 0usize;
+                for sz in [n_leaves / 2, n_leaves / 8, n_leaves / 16] {
+                    imp::encode_merkle_subtree_above3(gpu, enc, tree_buf, n_leaves, start, sz);
+                    start += sz;
+                }
+            })).collect());
+            line += &format!(" | 11/16 prefix (3 subtrees) {t3:.3}");
+            for p256 in [176usize, 175] {
+                let pl = p256 * (n_leaves / 256);
+                let tr = med((0..reps).map(|_| run(&|enc| imp::encode_merkle_range_ladder(gpu, enc, tree_buf, n_leaves, 3, 0, pl / 8))).collect());
+                let ts = med((0..reps).map(|_| run(&|enc| {
+                    let mut start = 0usize;
+                    while start < pl {
+                        let mut size = 1usize << (pl - start).ilog2();
+                        while start % size != 0 {
+                            size >>= 1;
+                        }
+                        imp::encode_merkle_subtree_above3(gpu, enc, tree_buf, n_leaves, start, size);
+                        start += size;
+                    }
+                })).collect());
+                line += &format!(" | {p256}/256 per-subtree {ts:.3} range {tr:.3}");
+            }
+            // The L1 recursive tree's parent levels (2^18 leaves, flat layout):
+            // one dispatch per level (incumbent) against the range ladder.
+            {
+                let n = 1usize << 18;
+                let rb = gpu.new_buffer((2 * n - 1) * 32).unwrap();
+                std::ptr::write_bytes(gpu.buffer_contents(rb), 0x5A, (2 * n - 1) * 32);
+                let per_level = med((0..reps).map(|_| run(&|enc| {
+                    gpu.set_pipeline(enc, gpu.pso_parent);
+                    let (mut rs, mut rl) = (0usize, n);
+                    while rl > 1 {
+                        let ws = rs + rl;
+                        let n_out = rl / 2;
+                        gpu.set_buffer(enc, rb, rs * 32, 0);
+                        gpu.set_buffer(enc, rb, ws * 32, 1);
+                        let tpg = 256u64.min(n_out as u64);
+                        gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                        rs = ws;
+                        rl = n_out;
+                    }
+                })).collect());
+                let ranged = med((0..reps).map(|_| run(&|enc| imp::encode_merkle_range_ladder(gpu, enc, rb, n, 0, 0, n))).collect());
+                line += &format!(" | L1 2^18 parents per-level {per_level:.3} range {ranged:.3}");
+                gpu.release(rb);
+            }
+            eprintln!("{line}");
+            gpu.release(tree_buf);
             gpu.pool_pop(pool);
         }
     }
