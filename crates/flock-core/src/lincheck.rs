@@ -666,10 +666,12 @@ pub(crate) fn build_eq_table_optimized_into(point: &[F128], out: &mut [F128]) {
     let d = point.len();
     if d >= 14 {
         let a = d / 2;
-        let mut lo = vec![F128::ZERO; 1usize << a];
-        let mut hi = vec![F128::ZERO; 1usize << (d - a)];
-        build_eq_table_optimized_into(&point[..a], &mut lo);
-        build_eq_table_optimized_into(&point[a..], &mut hi);
+        let mut lo = crate::alloc_uninit_f128_vec(1usize << a);
+        let mut hi = crate::alloc_uninit_f128_vec(1usize << (d - a));
+        rayon::join(
+            || build_eq_table_optimized_into(&point[..a], &mut lo),
+            || build_eq_table_optimized_into(&point[a..], &mut hi),
+        );
         let lo = &lo;
         out.par_chunks_mut(1usize << a)
             .zip(hi.par_iter())

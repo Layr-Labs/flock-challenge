@@ -12299,9 +12299,8 @@ kernel void lc_fold_stripes_factored_b4(
     }
 
     /// Build eq(point, ·) for the zerocheck C-fold window — in place in the
-    /// arm's upload buffer when the arm and staging are both available.
     pub(crate) fn zc_fold_eq_table(point: &[F128]) -> FoldEqTable {
-        fold_eq_table(super::gpu_zerocheck_enabled(), point, false)
+        fold_eq_table(super::gpu_zerocheck_enabled(), point, true)
     }
 
     /// Same for the lincheck gather-fold window.
