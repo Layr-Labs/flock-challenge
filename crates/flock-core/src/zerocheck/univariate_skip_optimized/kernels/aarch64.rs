@@ -450,6 +450,152 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul<const STORE: bool, const U: boo
     }
 }
 
+/// Sixteen consecutive row bytes as two little-endian words, read with ONE
+/// 16-byte load and moved to general registers. The load is an opaque
+/// instruction so the optimizer cannot narrow it back into two 8-byte loads.
+#[inline(always)]
+unsafe fn row_words16(p: *const u8) -> (usize, usize) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let v: uint64x2_t;
+        core::arch::asm!(
+            "ldr {v:q}, [{p}]",
+            p = in(reg) p,
+            v = lateout(vreg) v,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+        (vgetq_lane_u64::<0>(v) as usize, vgetq_lane_u64::<1>(v) as usize)
+    }
+}
+
+/// Fixed-shape twin of [`accumulate_convert_ab_nomul`] (`U = true` loads) for
+/// the one shape the ranked prover drains: exactly seven `b_med` pairs,
+/// `first_b_med .. first_b_med + 14`.
+///
+/// Same table entries, same pairing, same XOR chain per lane, same drain.
+/// What changes is how the work is laid out:
+///
+/// - two lane groups (sixteen lanes) per pass, so each row contributes one
+///   16-byte load per pass instead of two 8-byte loads: the kernel is bound
+///   by the number of load operations per cycle, and the row words were one
+///   load in nine;
+/// - the seven pairs are written out, so the pair loop's counter, its two
+///   table-pointer bumps, its bounds check and the odd-row test disappear,
+///   and the fourteen table bases are loop-invariant registers;
+/// - the first pair starts each lane's chain with a two-input XOR instead of
+///   a three-input one against a zeroed register.
+///
+/// XOR of 128-bit values is associative and commutative, so every lane's sum
+/// is the same.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_wide7<const STORE: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    convert: &[F128],
+    bank: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(first_b_med + 14 <= 16);
+    debug_assert_eq!(first_b_med & 1, 0, "paired AB drain requires an even start");
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
+    // Rows `first_b_med..first_b_med + 14` lie inside the 16-row block and
+    // each 16-byte row load covers lanes `lane..lane + 16` of one 64-byte
+    // row. Each table base is one of the sixteen 4 KiB images of the
+    // debug-asserted table, offsets are `u8` indices scaled by the 16-byte
+    // row size, and every drain address is one 16-byte `F128` slot of the
+    // fixed-size bank.
+    unsafe {
+        let rows = chunk_ab_bytes.as_ptr().add(first_b_med) as *const u8;
+        let t = (convert.as_ptr() as *const u8).add(first_b_med * 256 * 16);
+        let bank = bank.as_mut_ptr() as *mut u8;
+        for lane in (0..64).step_by(16) {
+            macro_rules! tab {
+                ($b:literal) => {
+                    t.add($b * 256 * 16)
+                };
+            }
+            let (we0, we1) = row_words16(rows.add(lane));
+            let (wo0, wo1) = row_words16(rows.add(64 + lane));
+            let (te, to) = (tab!(0), tab!(1));
+            let mut a0 = veorq_u8(ab_ld::<true, 0>(te, we0), ab_ld::<true, 0>(to, wo0));
+            let mut a1 = veorq_u8(ab_ld::<true, 8>(te, we0), ab_ld::<true, 8>(to, wo0));
+            let mut a2 = veorq_u8(ab_ld::<true, 16>(te, we0), ab_ld::<true, 16>(to, wo0));
+            let mut a3 = veorq_u8(ab_ld::<true, 24>(te, we0), ab_ld::<true, 24>(to, wo0));
+            let mut a4 = veorq_u8(ab_ld::<true, 32>(te, we0), ab_ld::<true, 32>(to, wo0));
+            let mut a5 = veorq_u8(ab_ld::<true, 40>(te, we0), ab_ld::<true, 40>(to, wo0));
+            let mut a6 = veorq_u8(ab_ld::<true, 48>(te, we0), ab_ld::<true, 48>(to, wo0));
+            let mut a7 = veorq_u8(ab_ld::<true, 56>(te, we0), ab_ld::<true, 56>(to, wo0));
+            let mut b0 = veorq_u8(ab_ld::<true, 0>(te, we1), ab_ld::<true, 0>(to, wo1));
+            let mut b1 = veorq_u8(ab_ld::<true, 8>(te, we1), ab_ld::<true, 8>(to, wo1));
+            let mut b2 = veorq_u8(ab_ld::<true, 16>(te, we1), ab_ld::<true, 16>(to, wo1));
+            let mut b3 = veorq_u8(ab_ld::<true, 24>(te, we1), ab_ld::<true, 24>(to, wo1));
+            let mut b4 = veorq_u8(ab_ld::<true, 32>(te, we1), ab_ld::<true, 32>(to, wo1));
+            let mut b5 = veorq_u8(ab_ld::<true, 40>(te, we1), ab_ld::<true, 40>(to, wo1));
+            let mut b6 = veorq_u8(ab_ld::<true, 48>(te, we1), ab_ld::<true, 48>(to, wo1));
+            let mut b7 = veorq_u8(ab_ld::<true, 56>(te, we1), ab_ld::<true, 56>(to, wo1));
+            macro_rules! pair {
+                ($be:literal, $bo:literal) => {{
+                    let (we0, we1) = row_words16(rows.add($be * 64 + lane));
+                    let (wo0, wo1) = row_words16(rows.add($bo * 64 + lane));
+                    let (te, to) = (tab!($be), tab!($bo));
+                    a0 = xor3_u8(a0, ab_ld::<true, 0>(te, we0), ab_ld::<true, 0>(to, wo0));
+                    a1 = xor3_u8(a1, ab_ld::<true, 8>(te, we0), ab_ld::<true, 8>(to, wo0));
+                    a2 = xor3_u8(a2, ab_ld::<true, 16>(te, we0), ab_ld::<true, 16>(to, wo0));
+                    a3 = xor3_u8(a3, ab_ld::<true, 24>(te, we0), ab_ld::<true, 24>(to, wo0));
+                    a4 = xor3_u8(a4, ab_ld::<true, 32>(te, we0), ab_ld::<true, 32>(to, wo0));
+                    a5 = xor3_u8(a5, ab_ld::<true, 40>(te, we0), ab_ld::<true, 40>(to, wo0));
+                    a6 = xor3_u8(a6, ab_ld::<true, 48>(te, we0), ab_ld::<true, 48>(to, wo0));
+                    a7 = xor3_u8(a7, ab_ld::<true, 56>(te, we0), ab_ld::<true, 56>(to, wo0));
+                    b0 = xor3_u8(b0, ab_ld::<true, 0>(te, we1), ab_ld::<true, 0>(to, wo1));
+                    b1 = xor3_u8(b1, ab_ld::<true, 8>(te, we1), ab_ld::<true, 8>(to, wo1));
+                    b2 = xor3_u8(b2, ab_ld::<true, 16>(te, we1), ab_ld::<true, 16>(to, wo1));
+                    b3 = xor3_u8(b3, ab_ld::<true, 24>(te, we1), ab_ld::<true, 24>(to, wo1));
+                    b4 = xor3_u8(b4, ab_ld::<true, 32>(te, we1), ab_ld::<true, 32>(to, wo1));
+                    b5 = xor3_u8(b5, ab_ld::<true, 40>(te, we1), ab_ld::<true, 40>(to, wo1));
+                    b6 = xor3_u8(b6, ab_ld::<true, 48>(te, we1), ab_ld::<true, 48>(to, wo1));
+                    b7 = xor3_u8(b7, ab_ld::<true, 56>(te, we1), ab_ld::<true, 56>(to, wo1));
+                }};
+            }
+            pair!(2, 3);
+            pair!(4, 5);
+            pair!(6, 7);
+            pair!(8, 9);
+            pair!(10, 11);
+            pair!(12, 13);
+
+            macro_rules! drain_lane {
+                ($offset:literal, $ab:ident) => {{
+                    let slot = bank.add((lane + $offset) * 16);
+                    if STORE {
+                        vst1q_u8(slot, $ab);
+                    } else {
+                        vst1q_u8(slot, veorq_u8(vld1q_u8(slot), $ab));
+                    }
+                }};
+            }
+            drain_lane!(0, a0);
+            drain_lane!(1, a1);
+            drain_lane!(2, a2);
+            drain_lane!(3, a3);
+            drain_lane!(4, a4);
+            drain_lane!(5, a5);
+            drain_lane!(6, a6);
+            drain_lane!(7, a7);
+            drain_lane!(8, b0);
+            drain_lane!(9, b1);
+            drain_lane!(10, b2);
+            drain_lane!(11, b3);
+            drain_lane!(12, b4);
+            drain_lane!(13, b5);
+            drain_lane!(14, b6);
+            drain_lane!(15, b7);
+        }
+    }
+}
+
 /// Eight α-free single-bit-`K` C banks, NEON — straight off the packed witness.
 ///
 /// Three phases, no multiplies, no convert-table gathers, and **no per-`b_med`
