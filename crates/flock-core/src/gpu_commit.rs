@@ -1249,6 +1249,17 @@ fn gpu_leaf_parent3_enabled() -> bool {
     })
 }
 
+pub const ENV_NO_GPU_B3_UNROLL: &str = "FLOCK_B3_SCHED_LOOP";
+
+fn gpu_b3_unroll_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+pub(crate) fn gpu_b3_unroll_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpu_b3_unroll_value_enabled(std::env::var_os(ENV_NO_GPU_B3_UNROLL).as_deref()))
+}
+
 fn select_gpu_leaf_parent3(pso_ok: bool) -> bool {
     // Ranked-tree-only is enforced by the caller: production only sets
     // `parent3=true` when `select_gpu_parent3` passes (n_leaves == 2^20).
@@ -1327,6 +1338,16 @@ pub(crate) fn gpu_final_t3_enabled() -> bool {
 pub(crate) fn gpu_final_leaf_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_LEAF").is_none())
+}
+
+pub(crate) fn gpu_t3_bytetab2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB2").is_none())
+}
+
+pub(crate) fn gpu_t3_bytetab_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB").is_none())
 }
 
 #[cfg(test)]
@@ -3273,6 +3294,189 @@ kernel void leaf_parent3(device const uint* codeword [[buffer(0)]],
 }
 "#;
 
+    const B3_COMPRESS_UNROLLED_MSL: &str = r#"static void b3_compress(thread uint* cv, thread const uint* m,
+                        uint block_len, uint flags) {
+    uint v[16];
+    for (int i = 0; i < 8; i++) v[i] = cv[i];
+    for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
+    v[12] = 0u; v[13] = 0u; v[14] = block_len; v[15] = flags;
+    #define G(a,b,c,d,x,y) \
+        v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
+        v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
+        v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
+        v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
+    // round 0
+    G(0,4,8,12, m[0], m[1]); G(1,5,9,13, m[2], m[3]); G(2,6,10,14, m[4], m[5]); G(3,7,11,15, m[6], m[7]);
+    G(0,5,10,15, m[8], m[9]); G(1,6,11,12, m[10], m[11]); G(2,7,8,13, m[12], m[13]); G(3,4,9,14, m[14], m[15]);
+    // round 1
+    G(0,4,8,12, m[2], m[6]); G(1,5,9,13, m[3], m[10]); G(2,6,10,14, m[7], m[0]); G(3,7,11,15, m[4], m[13]);
+    G(0,5,10,15, m[1], m[11]); G(1,6,11,12, m[12], m[5]); G(2,7,8,13, m[9], m[14]); G(3,4,9,14, m[15], m[8]);
+    // round 2
+    G(0,4,8,12, m[3], m[4]); G(1,5,9,13, m[10], m[12]); G(2,6,10,14, m[13], m[2]); G(3,7,11,15, m[7], m[14]);
+    G(0,5,10,15, m[6], m[5]); G(1,6,11,12, m[9], m[0]); G(2,7,8,13, m[11], m[15]); G(3,4,9,14, m[8], m[1]);
+    // round 3
+    G(0,4,8,12, m[10], m[7]); G(1,5,9,13, m[12], m[9]); G(2,6,10,14, m[14], m[3]); G(3,7,11,15, m[13], m[15]);
+    G(0,5,10,15, m[4], m[0]); G(1,6,11,12, m[11], m[2]); G(2,7,8,13, m[5], m[8]); G(3,4,9,14, m[1], m[6]);
+    // round 4
+    G(0,4,8,12, m[12], m[13]); G(1,5,9,13, m[9], m[11]); G(2,6,10,14, m[15], m[10]); G(3,7,11,15, m[14], m[8]);
+    G(0,5,10,15, m[7], m[2]); G(1,6,11,12, m[5], m[3]); G(2,7,8,13, m[0], m[1]); G(3,4,9,14, m[6], m[4]);
+    // round 5
+    G(0,4,8,12, m[9], m[14]); G(1,5,9,13, m[11], m[5]); G(2,6,10,14, m[8], m[12]); G(3,7,11,15, m[15], m[1]);
+    G(0,5,10,15, m[13], m[3]); G(1,6,11,12, m[0], m[10]); G(2,7,8,13, m[2], m[6]); G(3,4,9,14, m[4], m[7]);
+    // round 6
+    G(0,4,8,12, m[11], m[15]); G(1,5,9,13, m[5], m[0]); G(2,6,10,14, m[1], m[9]); G(3,7,11,15, m[8], m[6]);
+    G(0,5,10,15, m[14], m[10]); G(1,6,11,12, m[2], m[12]); G(2,7,8,13, m[3], m[4]); G(3,4,9,14, m[7], m[13]);
+    #undef G
+    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
+}
+"#;
+
+    const B3_COMPRESS_HEAD: &str =
+        "static void b3_compress(thread uint* cv, thread const uint* m_in,";
+    const B3_COMPRESS_TAIL: &str = "    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];\n}\n";
+
+    fn with_unrolled_b3_compress(src: &str) -> Option<String> {
+        if src.matches(B3_COMPRESS_HEAD).count() != 1 {
+            return None;
+        }
+        let start = src.find(B3_COMPRESS_HEAD)?;
+        let end = start + src[start..].find(B3_COMPRESS_TAIL)? + B3_COMPRESS_TAIL.len();
+        Some(format!("{}{}{}", &src[..start], B3_COMPRESS_UNROLLED_MSL, &src[end..]))
+    }
+
+    fn merkle_msl_source(src: &'static str) -> std::borrow::Cow<'static, str> {
+        if super::gpu_b3_unroll_enabled() {
+            if let Some(s) = with_unrolled_b3_compress(src) {
+                return std::borrow::Cow::Owned(s);
+            }
+        }
+        std::borrow::Cow::Borrowed(src)
+    }
+
+    #[cfg(test)]
+    mod b3_unroll_tests {
+        use super::*;
+
+        #[test]
+        fn b3_unrolled_schedule_is_perm_powers() {
+            const PERM: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+            const IDX: [(usize, usize, usize, usize); 8] = [
+                (0, 4, 8, 12),
+                (1, 5, 9, 13),
+                (2, 6, 10, 14),
+                (3, 7, 11, 15),
+                (0, 5, 10, 15),
+                (1, 6, 11, 12),
+                (2, 7, 8, 13),
+                (3, 4, 9, 14),
+            ];
+            for src in [LEAF_PARENT3_MSL_SOURCE, REC_MERKLE_MSL_SOURCE] {
+                let perm: String = PERM.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",");
+                let compact: String = src.chars().filter(|c| !c.is_whitespace() && *c != 'u').collect();
+                assert!(compact.contains(&format!("B3_PERM[16]={{{perm}}}")), "B3_PERM table changed");
+            }
+            let mut sched: [usize; 16] = core::array::from_fn(|i| i);
+            let mut calls = Vec::new();
+            for _ in 0..7 {
+                for (j, &(a, b, c, d)) in IDX.iter().enumerate() {
+                    calls.push(format!("G({a},{b},{c},{d}, m[{}], m[{}]);", sched[2 * j], sched[2 * j + 1]));
+                }
+                let t = sched;
+                for i in 0..16 {
+                    sched[i] = t[PERM[i]];
+                }
+            }
+            let joined = B3_COMPRESS_UNROLLED_MSL.split_whitespace().collect::<Vec<_>>().join(" ");
+            let found: Vec<&str> = joined
+                .split(" G(")
+                .filter(|f| f.starts_with(|c: char| c.is_ascii_digit()))
+                .collect();
+            assert_eq!(found.len(), 56);
+            for (k, f) in found.iter().enumerate() {
+                let f = format!("G({}", f.split(';').next().unwrap()) + ";";
+                assert_eq!(f.replace(' ', ""), calls[k].replace(' ', ""), "G call {k}");
+            }
+        }
+
+        #[test]
+        fn b3_unrolled_splice_applies_to_both_sources() {
+            for src in [LEAF_PARENT3_MSL_SOURCE, REC_MERKLE_MSL_SOURCE] {
+                let out = with_unrolled_b3_compress(src).expect("incumbent b3_compress not found");
+                assert!(out.contains(B3_COMPRESS_UNROLLED_MSL));
+                assert!(!out.contains("t[i] = m[B3_PERM[i]]"));
+                let start = src.find(B3_COMPRESS_HEAD).unwrap();
+                assert_eq!(&out[..start], &src[..start]);
+                let end = src.find(B3_COMPRESS_TAIL).unwrap() + B3_COMPRESS_TAIL.len();
+                assert!(out.ends_with(&src[end..]));
+            }
+        }
+
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn b3_unrolled_kernels_match_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                let n = 1usize << 12;
+                let staging = gpu.new_buffer(n * 1024).unwrap();
+                let tree = gpu.new_buffer(2 * n * 32).unwrap();
+                let words = gpu.buffer_contents(staging).cast::<u64>();
+                let mut x = 0x0123_4567_89AB_CDEFu64;
+                for i in 0..n * 128 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *words.add(i) = x;
+                }
+                let lp3 = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "leaf_parent3").unwrap();
+                    std::ptr::write_bytes(gpu.buffer_contents(tree), 0, 2 * n * 32);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, staging, 0, 0);
+                    gpu.set_buffer(enc, tree, 0, 1);
+                    gpu.set_buffer(enc, tree, n * 32, 2);
+                    gpu.set_buffer(enc, tree, (n + n / 2) * 32, 3);
+                    gpu.set_buffer(enc, tree, (n + n / 2 + n / 4) * 32, 4);
+                    gpu.dispatch(enc, (n / 256) as u64, 256);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(tree), (n + n / 2 + n / 4 + n / 8) * 32).to_vec()
+                };
+                let inc = lp3(LEAF_PARENT3_MSL_SOURCE);
+                let unr = lp3(&with_unrolled_b3_compress(LEAF_PARENT3_MSL_SOURCE).unwrap());
+                assert!(inc == unr, "leaf_parent3: unrolled schedule changed the tree bytes");
+                let data = std::slice::from_raw_parts(gpu.buffer_contents(staging), n * 1024);
+                let cpu = crate::merkle::merkle_tree(data, n, crate::merkle::HashKind::Blake3);
+                let cpu_leaves: Vec<u8> = cpu.iter().take(n).flat_map(|d| d.iter().copied()).collect();
+                assert!(cpu_leaves.as_slice() == &unr[..n * 32], "leaf_parent3 leaves differ from the CPU Merkle");
+                let l128 = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "leaf_hash128").unwrap();
+                    std::ptr::write_bytes(gpu.buffer_contents(tree), 0, n * 32);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, staging, 0, 0);
+                    gpu.set_buffer(enc, tree, 0, 1);
+                    gpu.dispatch(enc, (n / 256) as u64, 256);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(tree), n * 32).to_vec()
+                };
+                let inc = l128(REC_MERKLE_MSL_SOURCE);
+                let unr = l128(&with_unrolled_b3_compress(REC_MERKLE_MSL_SOURCE).unwrap());
+                assert!(inc == unr, "leaf_hash128: unrolled schedule changed the leaf bytes");
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
     /// Vectorized-load Merkle tree kernels, compiled as a supplemental
     /// library so the embedded incumbent metallib stays byte-for-byte intact
     /// (editing `MSL_SOURCE` would trip its FNV staleness guard and force a
@@ -4156,6 +4360,384 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     /// order and its exact field product are unchanged, so the output is
     /// bit-identical. Its own library: a compile failure keeps
     /// `ntt_pass5_mixed`.
+    const T3_BYTETAB3_BUILD: &str = "    threadgroup uint* tab3 = (threadgroup uint*)tabB;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    const uint cc = lid >> 3;
+    const uint base = (lid & 7u) * 32u;
+    const uint tw3 = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cc].x;
+    uint hb = 0u;
+    for (uint k = 5u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= tw3 << k; } }
+    for (uint i = 0u; i < 32u; i++) {
+        uint v = hb;
+        for (uint k = 0u; k < 5u; k++) { if ((i >> k) & 1u) { v ^= tw3 << k; } }
+        tab3[cc * 256u + base + i] = v;
+    }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    constexpr uint j = 3u;
+";
+    const T3_BYTETAB3_MUL: &str = "            const uint cb = c * 256u;
+        const uint4 V = elems[ev];
+        uint q0 = 0u, q1 = 0u, q2 = 0u, q3 = 0u, q4 = 0u;
+        #define T3B(W, LO, HI) { \\
+            const uint t0 = tab3[cb + ((W) & 255u)]; LO ^= t0; \\
+            const uint t1 = tab3[cb + extract_bits((W), 8, 8)]; LO ^= t1 << 8; HI ^= t1 >> 24; \\
+            const uint t2 = tab3[cb + extract_bits((W), 16, 8)]; LO ^= t2 << 16; HI ^= t2 >> 16; \\
+            const uint t4 = tab3[cb + ((W) >> 24)]; LO ^= t4 << 24; HI ^= t4 >> 8; }
+        T3B(V.x, q0, q1) T3B(V.y, q1, q2) T3B(V.z, q2, q3) T3B(V.w, q3, q4)
+        #undef T3B
+        q0 ^= q4 ^ (q4 << 1) ^ (q4 << 2) ^ (q4 << 7);
+        uint4 acc = uint4(q0, q1, q2, q3);
+";
+
+    const T3_SUB3_HORNER: &str = "            threadgroup const uint* nb = &nibB[c * NNIB];
+            uint4 V0 = elems[ev];
+            uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+            uint4 acc = uint4(0u);
+            for (int q = (int)NNIB - 1; q >= 0; q--) {
+                acc = gf_shl4(acc);
+                uint n = nb[q];
+                if (n & 1u) acc ^= V0;
+                if (n & 2u) acc ^= V1;
+                if (n & 4u) acc ^= V2;
+                if (n & 8u) acc ^= V3;
+            }
+";
+
+    fn with_fused_bytetab3(src: &str) -> Option<String> {
+        let indent = |t: &str| t.lines().map(|l| if l.is_empty() { String::new() } else { format!("    {l}") }).collect::<Vec<_>>().join("\\n") + "\\n";
+        let pre = "        {\\n            constexpr uint j = 3u;\\n";
+        let sub3 = indent(T3_SUB3_HORNER);
+        if src.matches(pre).count() != 1 || src.matches(sub3.as_str()).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(sub3.as_str(), T3_BYTETAB3_MUL, 1))
+    }
+
+    fn with_t3_bytetab3(src: &str) -> Option<String> {
+        let pre = "    {\n        constexpr uint j = 3u;\n";
+        if src.matches(pre).count() != 1 || src.matches(T3_SUB3_HORNER).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(T3_SUB3_HORNER, T3_BYTETAB3_MUL, 1))
+    }
+
+    const T3_BYTETAB2: &str = "    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        threadgroup ulong* tab64 = (threadgroup ulong*)tabB;
+        const uint cc = lid >> 4;
+        const uint base = (lid & 15u) * 16u;
+        const uint4 tw4 = twiddles[(1u << (P.l + 2u)) - 1u + (B << 2) + cc];
+        const ulong t = ulong(tw4.x) | (ulong(tw4.y) << 32);
+        ulong hb = 0ul;
+        for (uint k = 4u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= t << k; } }
+        for (uint i = 0u; i < 16u; i++) {
+            ulong v = hb;
+            for (uint k = 0u; k < 4u; k++) { if ((i >> k) & 1u) { v ^= t << k; } }
+            tab64[cc * 256u + base + i] = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        threadgroup const ulong* tab64 = (threadgroup const ulong*)tabB;
+        for (uint b = 0; b < 8u; b++) {
+            const uint eu = ((b >> 1) << 2) | (b & 1u);
+            const uint ev = eu | 2u;
+            threadgroup const ulong* T = tab64 + (b >> 1) * 256u;
+            const uint4 V = elems[ev];
+            ulong a0 = 0ul, a1 = 0ul, a2 = 0ul;
+            #define BT2(W, SH, LO, HI) { \\
+                const ulong e = T[extract_bits((W), (SH) & 31u, 8)]; \\
+                LO ^= e << (SH); if ((SH) != 0u) { HI ^= e >> (64u - (SH)); } }
+            BT2(V.x, 0u, a0, a1) BT2(V.x, 8u, a0, a1) BT2(V.x, 16u, a0, a1) BT2(V.x, 24u, a0, a1)
+            BT2(V.y, 32u, a0, a1) BT2(V.y, 40u, a0, a1) BT2(V.y, 48u, a0, a1) BT2(V.y, 56u, a0, a1)
+            BT2(V.z, 0u, a1, a2) BT2(V.z, 8u, a1, a2) BT2(V.z, 16u, a1, a2) BT2(V.z, 24u, a1, a2)
+            BT2(V.w, 32u, a1, a2) BT2(V.w, 40u, a1, a2) BT2(V.w, 48u, a1, a2) BT2(V.w, 56u, a1, a2)
+            #undef BT2
+            a0 ^= a2 ^ (a2 << 1) ^ (a2 << 2) ^ (a2 << 7);
+            const uint4 pr = uint4(uint(a0), uint(a0 >> 32), uint(a1), uint(a1 >> 32));
+            const uint4 nu = elems[eu] ^ pr;
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+";
+
+    fn with_t3_bytetab2(src: &str) -> Option<String> {
+        let old = "    NTT_T3_SHORT_PAIR(2u, 0u)\n    NTT_T3_SHORT_PAIR(2u, 2u)\n";
+        if src.matches(old).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(old, T3_BYTETAB2, 1))
+    }
+
+    fn final_t3_msl_source() -> std::borrow::Cow<'static, str> {
+        let mut s = std::borrow::Cow::Borrowed(NTT_FINAL_T3_MSL_SOURCE);
+        if super::gpu_t3_bytetab_enabled() {
+            if let Some(x) = with_t3_bytetab3(&s) {
+                s = std::borrow::Cow::Owned(x);
+            }
+        }
+        if super::gpu_t3_bytetab2_enabled() {
+            if let Some(x) = with_t3_bytetab2(&s) {
+                s = std::borrow::Cow::Owned(x);
+            }
+        }
+        s
+    }
+
+    #[cfg(test)]
+    mod t3_bytetab2_tests {
+        use super::*;
+
+        #[test]
+        fn t3_bytetab2_splice_applies_alone_and_after_sub3() {
+            let a = with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).expect("sub-layer 2 not found");
+            assert!(a.contains("tab64[cc * 256u + base + i] = v;") && !a.contains("NTT_T3_SHORT_PAIR(2u, 0u)"));
+            let b = with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).expect("not after sub-layer 3");
+            assert!(b.contains("tab64[cc * 256u + base + i] = v;") && b.contains("tab3[cc * 256u + base + i] = v;"));
+        }
+
+        #[test]
+        fn t3_bytetab2_twiddle_bound_holds() {
+            assert!(super::super::max_twiddle_bits(20, 18) <= 40);
+        }
+
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_bytetab2_matches_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let log_d = 20usize;
+            let groups = 256usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = groups * 16 * 64 * 16;
+                let input: Vec<u8> = {
+                    let mut x = 0x0123_4567_89AB_CDEFu64;
+                    (0..len / 8)
+                        .flat_map(|_| {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            x.to_le_bytes()
+                        })
+                        .collect()
+                };
+                let data = gpu.new_buffer(len).unwrap();
+                let run = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3").unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, groups as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec()
+                };
+                let inc = run(NTT_FINAL_T3_MSL_SOURCE);
+                let two = run(&with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).unwrap());
+                let both = run(&with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).unwrap());
+                assert!(inc != input, "the pass did not run");
+                assert!(inc == two, "byte-table sub-layer 2 changed the final pass's output");
+                assert!(inc == both, "both byte-table sub-layers changed the final pass's output");
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod t3_bytetab_tests {
+        use super::*;
+
+        #[test]
+        fn t3_bytetab_splice_applies() {
+            let out = with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).expect("incumbent sub-layer 3 not found");
+            assert!(out.contains("tab3[cc * 256u + base + i] = v;"));
+            assert!(!out.contains("acc = gf_shl4(acc);"));
+            assert!(out.contains("kernel void ntt_final_t3("));
+        }
+
+        #[test]
+        fn t3_bytetab_twiddle_bound_holds() {
+            assert!(super::super::pass5_mixed_ok(20, 16, 4));
+            assert!(super::super::max_twiddle_bits(20, 19) <= 20);
+        }
+
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_bytetab_matches_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let log_d = 20usize;
+            let groups = 256usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = groups * 16 * 64 * 16;
+                let input: Vec<u8> = {
+                    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+                    (0..len / 8)
+                        .flat_map(|_| {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            x.to_le_bytes()
+                        })
+                        .collect()
+                };
+                let data = gpu.new_buffer(len).unwrap();
+                let run = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3").unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, groups as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec()
+                };
+                let inc = run(NTT_FINAL_T3_MSL_SOURCE);
+                let new = run(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap());
+                assert!(inc != input, "the pass did not run");
+                assert!(inc == new, "byte-table sub-layer 3 changed the final pass's output");
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod t3_form_probe {
+        use super::*;
+
+        fn variant(name: &str) -> String {
+            match name {
+                "incumbent" => NTT_FINAL_T3_MSL_SOURCE.to_owned(),
+                "bytetab3" => with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap(),
+                "bytetab2" => with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).unwrap(),
+                "both" => with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).unwrap(),
+                _ => panic!("unknown variant {name}"),
+            }
+        }
+
+        #[test]
+        #[ignore]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_form_probe() {
+            let names: Vec<String> = std::env::var("T3_PROBE_VARIANTS")
+                .unwrap_or_else(|_| "incumbent,bytetab3,bytetab2,both".into())
+                .split(',')
+                .map(|s| s.to_owned())
+                .collect();
+            let rounds: usize = std::env::var("T3_PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            let gpu = gpu().expect("gpu");
+            let log_d = 20usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let mut psos = Vec::new();
+                for n in &names {
+                    let pso = compile_supplemental_pipeline(gpu, &variant(n), "ntt_final_t3")
+                        .unwrap_or_else(|e| panic!("{n}: {e}"));
+                    let (tg, w, maxt) = gpu.pipeline_resources(pso);
+                    println!("variant {n}: threadgroup mem {tg} B, simd {w}, max threads {maxt}");
+                    psos.push(pso);
+                }
+                let data_len = (1usize << log_d) * 64 * 16;
+                let input = gpu.new_buffer(data_len).unwrap();
+                let data = gpu.new_buffer(data_len).unwrap();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let w = gpu.buffer_contents(input).cast::<u64>();
+                let mut x = 0x2545_F491_4F6C_DD1Du64;
+                for i in 0..data_len / 8 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *w.add(i) = x;
+                }
+                let run = |pso: Id| -> (f64, u64) {
+                    std::ptr::copy_nonoverlapping(gpu.buffer_contents(input), gpu.buffer_contents(data), data_len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let (s, e) = cb_gpu_interval(gpu, cb);
+                    let words = std::slice::from_raw_parts(gpu.buffer_contents(data).cast::<u64>(), data_len / 8);
+                    let mut h = 0xcbf2_9ce4_8422_2325u64;
+                    for &w in words.iter().step_by(7) {
+                        h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+                    }
+                    ((e - s) * 1e3, h)
+                };
+                let (_, h_ref) = run(psos[0]);
+                let mut times: Vec<Vec<f64>> = vec![Vec::new(); psos.len()];
+                for r in 0..rounds {
+                    let k = psos.len();
+                    for j in 0..k {
+                        let i = (r + j) % k;
+                        let (ms, h) = run(psos[i]);
+                        if !names[i].starts_with("x_") {
+                            assert_eq!(h, h_ref, "variant {} output differs", names[i]);
+                        }
+                        times[i].push(ms);
+                    }
+                }
+                for (i, n) in names.iter().enumerate() {
+                    let mut t = times[i].clone();
+                    t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let mut d: Vec<f64> = times[i].iter().zip(&times[0]).map(|(a, b)| a - b).collect();
+                    d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let lower = times[i].iter().zip(&times[0]).filter(|(a, b)| a < b).count();
+                    println!(
+                        "summary {n}: median {:.2} ms, min {:.2} ms, paired median vs incumbent {:+.2} ms, lower in {lower} of {}",
+                        t[t.len() / 2], t[0], d[d.len() / 2], t.len()
+                    );
+                }
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
     const NTT_FINAL_T3_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -4751,7 +5333,19 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
 "#;
 
     pub(crate) fn final_leaf_msl_source() -> String {
-        format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}")
+        let extra: std::borrow::Cow<'static, str> = merkle_msl_source(NTT_FINAL_LEAF_EXTRA_MSL);
+        let extra = if super::gpu_t3_bytetab_enabled() {
+            with_fused_bytetab3(&extra).unwrap_or(extra.into_owned()).into()
+        } else {
+            extra
+        };
+        let extra: std::borrow::Cow<'static, str> = if super::gpu_t3_bytetab2_enabled() {
+            let old = "        NTT_T3_SHORT_PAIR(2u, 0u)\n        NTT_T3_SHORT_PAIR(2u, 2u)\n";
+            if extra.matches(old).count() == 1 { extra.replacen(old, T3_BYTETAB2, 1).into() } else { extra }
+        } else {
+            extra
+        };
+        format!("{}{extra}", final_t3_msl_source())
     }
 
     pub(crate) fn final_leaf_selected(gpu: &Gpu, log_d: usize, n_leaves: usize) -> bool {
@@ -5873,7 +6467,7 @@ kernel void blake3_pow_scan(
                 // gate is open so non-ranked processes skip the MSL frontend.
                 let pso_leaf_parent3 = if super::gpu_leaf_parent3_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(LEAF_PARENT3_MSL_SOURCE)?;
+                        let src = api.nsstring(&merkle_msl_source(LEAF_PARENT3_MSL_SOURCE))?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -6214,7 +6808,7 @@ kernel void blake3_pow_scan(
                 // leaves NIL and the encoders keep `ntt_pass5_mixed`.
                 let pso_ntt5t3 = if super::gpu_final_t3_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(NTT_FINAL_T3_MSL_SOURCE)?;
+                        let src = api.nsstring(&final_t3_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -10192,6 +10786,21 @@ kernel void blake3_pow_scan(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
         ), lead, extend, phi);
+        let key = if super::gpu_b3_unroll_enabled() {
+            key ^ fnv1a64(B3_COMPRESS_UNROLLED_MSL).rotate_left(6) ^ 0x4233_554E_524F_4C4C
+        } else {
+            key
+        };
+        let key = if super::gpu_t3_bytetab2_enabled() {
+            key ^ fnv1a64(T3_BYTETAB2).rotate_left(10) ^ 0x5433_4259_5445_3242
+        } else {
+            key
+        };
+        let key = if super::gpu_t3_bytetab_enabled() {
+            key ^ fnv1a64(T3_BYTETAB3_MUL).rotate_left(8) ^ 0x5433_4259_5445_5442
+        } else {
+            key
+        };
         let key = if super::gpu_g4x2_enabled() {
             key ^ fnv1a64(g4x2_msl_source()).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
         } else {
