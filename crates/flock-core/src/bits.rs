@@ -206,6 +206,314 @@ unsafe fn transpose_8_row_pairs_to_regs(
     }
 }
 
+/// Kill switch for the interleaved-row stripe transpose
+/// ([`transpose_8_strided_u64s_to_regs_zip`]): `FLOCK_NO_STRIPE_ZIP_TRANSPOSE=1`
+/// restores the half-register form with its four four-register table lookups.
+pub const ENV_NO_STRIPE_ZIP_TRANSPOSE: &str = "FLOCK_NO_STRIPE_ZIP_TRANSPOSE";
+
+/// Whether the stripe fills use the interleaved-row transpose (default on).
+pub fn stripe_zip_transpose_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(ENV_NO_STRIPE_ZIP_TRANSPOSE).is_none_or(|v| v != "1")
+    });
+    *ON
+}
+
+/// Rows `lo` and `hi` byte-interleaved in one register: byte `2c` is byte `c`
+/// of `*lo`, byte `2c + 1` is byte `c` of `*hi`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn lane_zip(lo: *const u64, hi: *const u64) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::*;
+    // SAFETY: the caller's contract covers both 8-byte reads.
+    unsafe {
+        let zero = vdup_n_u64(0);
+        vzip1q_u8(
+            vreinterpretq_u8_u64(vcombine_u64(vld1_u64(lo), zero)),
+            vreinterpretq_u8_u64(vcombine_u64(vld1_u64(hi), zero)),
+        )
+    }
+}
+
+/// [`transpose_8_strided_u64s_to_regs`] with the row pairs held
+/// byte-interleaved, so the final byte placement is eight two-register zips
+/// instead of four four-register table lookups. Same bytes.
+///
+/// # Safety
+/// As [`transpose_8_strided_u64s_to_regs`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn transpose_8_strided_u64s_to_regs_zip(
+    base: *const u64,
+    stride: usize,
+) -> [core::arch::aarch64::uint8x16_t; 4] {
+    // SAFETY: the caller guarantees all eight reads.
+    unsafe {
+        transpose_8_zipped_rows_to_regs(
+            lane_zip(base, base.add(stride)),
+            lane_zip(base.add(2 * stride), base.add(3 * stride)),
+            lane_zip(base.add(4 * stride), base.add(5 * stride)),
+            lane_zip(base.add(6 * stride), base.add(7 * stride)),
+        )
+    }
+}
+
+/// [`transpose_8_strided_and_u64s_to_regs`] in the interleaved-row form of
+/// [`transpose_8_strided_u64s_to_regs_zip`]. Same bytes.
+///
+/// # Safety
+/// As [`transpose_8_strided_and_u64s_to_regs`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn transpose_8_strided_and_u64s_to_regs_zip(
+    a: *const u64,
+    b: *const u64,
+    stride: usize,
+) -> [core::arch::aarch64::uint8x16_t; 4] {
+    use core::arch::aarch64::*;
+    // SAFETY: the caller guarantees all sixteen reads.
+    unsafe {
+        let zero = vdup_n_u64(0);
+        let row = |l: usize| {
+            vreinterpretq_u8_u64(vcombine_u64(
+                vand_u64(vld1_u64(a.add(l * stride)), vld1_u64(b.add(l * stride))),
+                zero,
+            ))
+        };
+        let pair = |l: usize| vzip1q_u8(row(l), row(l + 1));
+        transpose_8_zipped_rows_to_regs(pair(0), pair(2), pair(4), pair(6))
+    }
+}
+
+/// The bit transpose of [`transpose_8_row_pairs_to_regs`] on byte-interleaved
+/// row pairs (register `i`: byte `2c` = row `2i` byte `c`, byte `2c + 1` =
+/// row `2i + 1` byte `c`). The distance-4 and distance-2 swaps pair bytes at
+/// equal positions of two registers, exactly as in the half-register form;
+/// the distance-1 swap pairs the two bytes of each 16-bit lane. The result
+/// rows are already interleaved in pairs, so two rounds of zips (16-bit, then
+/// 32-bit lanes) put row `t` of matrix `c` at output byte `8c + t`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn transpose_8_zipped_rows_to_regs(
+    i01: core::arch::aarch64::uint8x16_t,
+    i23: core::arch::aarch64::uint8x16_t,
+    i45: core::arch::aarch64::uint8x16_t,
+    i67: core::arch::aarch64::uint8x16_t,
+) -> [core::arch::aarch64::uint8x16_t; 4] {
+    use core::arch::aarch64::*;
+
+    // SAFETY: register arithmetic only.
+    unsafe {
+        // Distance 4.
+        let a01 = vsliq_n_u8::<4>(i01, i45);
+        let a45 = vsriq_n_u8::<4>(i45, i01);
+        let a23 = vsliq_n_u8::<4>(i23, i67);
+        let a67 = vsriq_n_u8::<4>(i67, i23);
+
+        // Distance 2.
+        let keep2 = vdupq_n_u8(0x33);
+        let b01 = vbslq_u8(keep2, a01, vshlq_n_u8::<2>(a23));
+        let b23 = vbslq_u8(keep2, vshrq_n_u8::<2>(a01), a23);
+        let b45 = vbslq_u8(keep2, a45, vshlq_n_u8::<2>(a67));
+        let b67 = vbslq_u8(keep2, vshrq_n_u8::<2>(a45), a67);
+
+        // Distance 1: even bytes (row 2i) keep 0x55 and take the odd byte's
+        // bits shifted up one; odd bytes (row 2i + 1) keep 0xAA and take the
+        // even byte's bits shifted down one.
+        let keep1 = vreinterpretq_u8_u16(vdupq_n_u16(0xAA55));
+        let shift1 = vreinterpretq_s8_u16(vdupq_n_u16(0xFF01));
+        let swap1 = |v: uint8x16_t| vbslq_u8(keep1, v, vshlq_u8(vrev16q_u8(v), shift1));
+        let c01 = vreinterpretq_u16_u8(swap1(b01));
+        let c23 = vreinterpretq_u16_u8(swap1(b23));
+        let c45 = vreinterpretq_u16_u8(swap1(b45));
+        let c67 = vreinterpretq_u16_u8(swap1(b67));
+
+        // Rows 0..4 and rows 4..8 of matrices 0..4 (lo) and 4..8 (hi).
+        let q_lo = vreinterpretq_u32_u16(vzip1q_u16(c01, c23));
+        let q_hi = vreinterpretq_u32_u16(vzip2q_u16(c01, c23));
+        let p_lo = vreinterpretq_u32_u16(vzip1q_u16(c45, c67));
+        let p_hi = vreinterpretq_u32_u16(vzip2q_u16(c45, c67));
+        [
+            vreinterpretq_u8_u32(vzip1q_u32(q_lo, p_lo)),
+            vreinterpretq_u8_u32(vzip2q_u32(q_lo, p_lo)),
+            vreinterpretq_u8_u32(vzip1q_u32(q_hi, p_hi)),
+            vreinterpretq_u8_u32(vzip2q_u32(q_hi, p_hi)),
+        ]
+    }
+}
+
+/// Two adjacent stripe rows at once: the transposes of the eight words
+/// `a[l * stride] & b[l * stride]` (registers 0..4 of the result) and of the
+/// eight words `a[l * stride + 1] & b[l * stride + 1]` (registers 4..8), each
+/// exactly the bytes of [`transpose_8_strided_and_u64s_to_regs`].
+///
+/// # Safety
+/// `a.add(l * stride)` and `b.add(l * stride)` must be valid for a 16-byte
+/// read for every `l < 8`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn transpose_8_strided_and_u64_pairs_to_regs(
+    a: *const u64,
+    b: *const u64,
+    stride: usize,
+) -> [core::arch::aarch64::uint8x16_t; 8] {
+    use core::arch::aarch64::*;
+    // SAFETY: the caller guarantees all sixteen 16-byte reads.
+    unsafe {
+        let row = |l: usize| {
+            vandq_u8(
+                vld1q_u8(a.add(l * stride).cast::<u8>()),
+                vld1q_u8(b.add(l * stride).cast::<u8>()),
+            )
+        };
+        transpose_8_word_pair_rows_to_regs([
+            row(0),
+            row(1),
+            row(2),
+            row(3),
+            row(4),
+            row(5),
+            row(6),
+            row(7),
+        ])
+    }
+}
+
+/// [`transpose_8_strided_and_u64_pairs_to_regs`] for two rows that are not
+/// both whole words. With `z[i] = a[i] & b[i]` and `mask = [m0, m1]`, block
+/// `l` contributes `(z[l * stride] & m0) | (z[l * stride + 1] & !m0)` to the
+/// first row (registers 0..4) and
+/// `(z[l * stride + 1] & m1) | (z[l * stride + 2] & !m1)` to the second
+/// (registers 4..8): one bit select between the block's two overlapping
+/// 16-byte word pairs, then the same transpose.
+///
+/// # Safety
+/// `a.add(l * stride)` and `b.add(l * stride)` must be valid for a 24-byte
+/// read for every `l < 8`; `mask` for a 16-byte read.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn transpose_8_strided_and_u64_pairs_select_to_regs(
+    a: *const u64,
+    b: *const u64,
+    stride: usize,
+    mask: *const u64,
+) -> [core::arch::aarch64::uint8x16_t; 8] {
+    use core::arch::aarch64::*;
+    // SAFETY: the caller guarantees all thirty-two 16-byte reads and the mask.
+    unsafe {
+        let m = vld1q_u8(mask.cast::<u8>());
+        let row = |l: usize| {
+            let first = vandq_u8(
+                vld1q_u8(a.add(l * stride).cast::<u8>()),
+                vld1q_u8(b.add(l * stride).cast::<u8>()),
+            );
+            let second = vandq_u8(
+                vld1q_u8(a.add(l * stride + 1).cast::<u8>()),
+                vld1q_u8(b.add(l * stride + 1).cast::<u8>()),
+            );
+            vbslq_u8(m, first, second)
+        };
+        transpose_8_word_pair_rows_to_regs([
+            row(0),
+            row(1),
+            row(2),
+            row(3),
+            row(4),
+            row(5),
+            row(6),
+            row(7),
+        ])
+    }
+}
+
+/// The bit transposes of two stripe rows held as eight registers, register
+/// `l` carrying block `l`'s word of the first row in its low half and of the
+/// second row in its high half. Result registers 0..4 are the first row's 64
+/// bytes, 4..8 the second row's, in the byte order of
+/// [`transpose_8_u64s_to_64_bytes`].
+///
+/// Every block is a whole register, so all three block swaps pair whole
+/// registers: distance 4 is one shift-insert per register, distances 2 and 1
+/// a shift plus a bit select. Three rounds of zips (bytes, 16-bit, 32-bit
+/// lanes) then place row `t` of matrix `c` at output byte `8c + t` of its
+/// word.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn transpose_8_word_pair_rows_to_regs(
+    v: [core::arch::aarch64::uint8x16_t; 8],
+) -> [core::arch::aarch64::uint8x16_t; 8] {
+    use core::arch::aarch64::*;
+    // SAFETY: register arithmetic only.
+    unsafe {
+        let [v0, v1, v2, v3, v4, v5, v6, v7] = v;
+
+        // Distance 4: row r keeps bits 0..4 and takes row r+4's bits 0..4 as
+        // its bits 4..8; row r+4 keeps bits 4..8 and takes row r's bits 4..8.
+        let x0 = vsliq_n_u8::<4>(v0, v4);
+        let x4 = vsriq_n_u8::<4>(v4, v0);
+        let x1 = vsliq_n_u8::<4>(v1, v5);
+        let x5 = vsriq_n_u8::<4>(v5, v1);
+        let x2 = vsliq_n_u8::<4>(v2, v6);
+        let x6 = vsriq_n_u8::<4>(v6, v2);
+        let x3 = vsliq_n_u8::<4>(v3, v7);
+        let x7 = vsriq_n_u8::<4>(v7, v3);
+
+        // Distance 2: row r keeps 0x33 and takes row r+2's 0x33 bits shifted
+        // up two; row r+2 keeps 0xCC and takes row r's 0xCC bits shifted down.
+        let keep2 = vdupq_n_u8(0x33);
+        let y0 = vbslq_u8(keep2, x0, vshlq_n_u8::<2>(x2));
+        let y2 = vbslq_u8(keep2, vshrq_n_u8::<2>(x0), x2);
+        let y1 = vbslq_u8(keep2, x1, vshlq_n_u8::<2>(x3));
+        let y3 = vbslq_u8(keep2, vshrq_n_u8::<2>(x1), x3);
+        let y4 = vbslq_u8(keep2, x4, vshlq_n_u8::<2>(x6));
+        let y6 = vbslq_u8(keep2, vshrq_n_u8::<2>(x4), x6);
+        let y5 = vbslq_u8(keep2, x5, vshlq_n_u8::<2>(x7));
+        let y7 = vbslq_u8(keep2, vshrq_n_u8::<2>(x5), x7);
+
+        // Distance 1: row r keeps 0x55 and takes row r+1's 0x55 bits shifted
+        // up one; row r+1 keeps 0xAA and takes row r's 0xAA bits shifted down.
+        let keep1 = vdupq_n_u8(0x55);
+        let z0 = vbslq_u8(keep1, y0, vshlq_n_u8::<1>(y1));
+        let z1 = vbslq_u8(keep1, vshrq_n_u8::<1>(y0), y1);
+        let z2 = vbslq_u8(keep1, y2, vshlq_n_u8::<1>(y3));
+        let z3 = vbslq_u8(keep1, vshrq_n_u8::<1>(y2), y3);
+        let z4 = vbslq_u8(keep1, y4, vshlq_n_u8::<1>(y5));
+        let z5 = vbslq_u8(keep1, vshrq_n_u8::<1>(y4), y5);
+        let z6 = vbslq_u8(keep1, y6, vshlq_n_u8::<1>(y7));
+        let z7 = vbslq_u8(keep1, vshrq_n_u8::<1>(y6), y7);
+
+        // Bytes: rows (2i, 2i + 1) interleaved, first row's word (zip1) and
+        // second row's word (zip2).
+        let p = |lo: uint8x16_t, hi: uint8x16_t| {
+            (
+                vreinterpretq_u16_u8(vzip1q_u8(lo, hi)),
+                vreinterpretq_u16_u8(vzip2q_u8(lo, hi)),
+            )
+        };
+        let (p0, s0) = p(z0, z1);
+        let (p1, s1) = p(z2, z3);
+        let (p2, s2) = p(z4, z5);
+        let (p3, s3) = p(z6, z7);
+        // 16-bit lanes: rows 0..4 and rows 4..8 of matrices 0..4 / 4..8;
+        // 32-bit lanes: all eight rows.
+        let word = |p0: uint16x8_t, p1: uint16x8_t, p2: uint16x8_t, p3: uint16x8_t| {
+            let q_lo = vreinterpretq_u32_u16(vzip1q_u16(p0, p1));
+            let q_hi = vreinterpretq_u32_u16(vzip2q_u16(p0, p1));
+            let r_lo = vreinterpretq_u32_u16(vzip1q_u16(p2, p3));
+            let r_hi = vreinterpretq_u32_u16(vzip2q_u16(p2, p3));
+            [
+                vreinterpretq_u8_u32(vzip1q_u32(q_lo, r_lo)),
+                vreinterpretq_u8_u32(vzip2q_u32(q_lo, r_lo)),
+                vreinterpretq_u8_u32(vzip1q_u32(q_hi, r_hi)),
+                vreinterpretq_u8_u32(vzip2q_u32(q_hi, r_hi)),
+            ]
+        };
+        let [o0, o1, o2, o3] = word(p0, p1, p2, p3);
+        let [o4, o5, o6, o7] = word(s0, s1, s2, s3);
+        [o0, o1, o2, o3, o4, o5, o6, o7]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +640,78 @@ mod tests {
                 }
             }
             assert_eq!(anded, oracle, "and form stride={stride} word={word}");
+            // Interleaved-row (zip) forms: the same 64 bytes.
+            let mut zip = [0u8; 64];
+            let mut zip_and = [0u8; 64];
+            // SAFETY: as above.
+            unsafe {
+                let out = transpose_8_strided_u64s_to_regs_zip(words.as_ptr().add(word), stride);
+                for (k, v) in out.iter().enumerate() {
+                    core::arch::aarch64::vst1q_u8(zip.as_mut_ptr().add(16 * k), *v);
+                }
+                let out =
+                    transpose_8_strided_and_u64s_to_regs_zip(a.as_ptr().add(word), b.as_ptr().add(word), stride);
+                for (k, v) in out.iter().enumerate() {
+                    core::arch::aarch64::vst1q_u8(zip_and.as_mut_ptr().add(16 * k), *v);
+                }
+            }
+            // Pair form: this word and the next one of every block (only when
+            // the next word of the last block exists).
+            if 7 * stride + word + 1 < words.len() {
+                let lanes1: [u64; 8] = std::array::from_fn(|l| words[l * stride + word + 1]);
+                let mut oracle1 = [0u8; 64];
+                transpose_8_u64s_to_64_bytes_scalar(&lanes1, &mut oracle1);
+                let mut pair = [0u8; 128];
+                // SAFETY: the highest read ends at word 7 * stride + word + 1.
+                unsafe {
+                    let out = transpose_8_strided_and_u64_pairs_to_regs(
+                        a.as_ptr().add(word),
+                        b.as_ptr().add(word),
+                        stride,
+                    );
+                    for (k, v) in out.iter().enumerate() {
+                        core::arch::aarch64::vst1q_u8(pair.as_mut_ptr().add(16 * k), *v);
+                    }
+                }
+                assert_eq!(pair[..64], oracle, "pair form, first word, stride={stride} word={word}");
+                assert_eq!(pair[64..], oracle1, "pair form, second word, stride={stride} word={word}");
+            }
+            // Select form: two rows cut from three adjacent words by masks.
+            if 7 * stride + word + 2 < words.len() {
+                for (m0, m1) in [
+                    (u64::MAX, u64::MAX),
+                    (0, 0),
+                    (0x0000_0000_03ff_ffff, 0),
+                    (u64::MAX, 0x0000_1fff_ffff_ffff),
+                    (0x1, 0x7fff_ffff_ffff_ffff),
+                    (words[0], !words[0].rotate_left(9)),
+                ] {
+                    let z = |l: usize, k: usize| words[l * stride + word + k];
+                    let r0: [u64; 8] = std::array::from_fn(|l| (z(l, 0) & m0) | (z(l, 1) & !m0));
+                    let r1: [u64; 8] = std::array::from_fn(|l| (z(l, 1) & m1) | (z(l, 2) & !m1));
+                    let (mut o0, mut o1) = ([0u8; 64], [0u8; 64]);
+                    transpose_8_u64s_to_64_bytes_scalar(&r0, &mut o0);
+                    transpose_8_u64s_to_64_bytes_scalar(&r1, &mut o1);
+                    let mask = [m0, m1];
+                    let mut got = [0u8; 128];
+                    // SAFETY: the highest read ends at word 7 * stride + word + 2.
+                    unsafe {
+                        let out = transpose_8_strided_and_u64_pairs_select_to_regs(
+                            a.as_ptr().add(word),
+                            b.as_ptr().add(word),
+                            stride,
+                            mask.as_ptr(),
+                        );
+                        for (k, v) in out.iter().enumerate() {
+                            core::arch::aarch64::vst1q_u8(got.as_mut_ptr().add(16 * k), *v);
+                        }
+                    }
+                    assert_eq!(got[..64], o0, "select form, first row, stride={stride} word={word} m0={m0:#x}");
+                    assert_eq!(got[64..], o1, "select form, second row, stride={stride} word={word} m1={m1:#x}");
+                }
+            }
+            assert_eq!(zip, oracle, "zip form stride={stride} word={word}");
+            assert_eq!(zip_and, oracle, "zip and form stride={stride} word={word}");
         };
         for stride in [1usize, 2, 3, 7, 64, 256] {
             let words: Vec<u64> = (0..8 * stride + 5).map(|_| next()).collect();
@@ -386,5 +766,103 @@ mod tests {
             }
             assert_eq!(got, want, "input={state:016x}");
         }
+    }
+    /// One P-core, L1-resident: the AND-form stripe transpose over one group
+    /// (eight 256-word blocks of a and of b, 176 rows, 64 output bytes each),
+    /// half-register form against interleaved-row form, alternated in one
+    /// process (ignored timing probe). Outputs are compared.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "timing probe"]
+    fn stripe_transpose_zip_timing() {
+        use core::arch::aarch64::*;
+        const STRIDE: usize = 256;
+        const ROWS: usize = 176;
+        let rounds: usize = std::env::var("PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(101);
+        let mut x = 0x1234_5678_9abc_def1u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let a: Vec<u64> = (0..8 * STRIDE).map(|_| next()).collect();
+        let b: Vec<u64> = (0..8 * STRIDE).map(|_| next()).collect();
+        let mut out_old = vec![0u8; ROWS * 64];
+        let mut out_new = vec![0u8; ROWS * 64];
+        let mut out_pair = vec![0u8; ROWS * 64];
+        let mut pair_ns: Vec<f64> = Vec::new();
+        #[inline(never)]
+        fn run_pairs(a: &[u64], b: &[u64], out: &mut [u8], reps: usize) {
+            for _ in 0..reps {
+                for j in (0..ROWS).step_by(2) {
+                    // SAFETY: words j, j + 1 of all eight blocks; 128 bytes of `out` per pair.
+                    unsafe {
+                        let y = transpose_8_strided_and_u64_pairs_to_regs(a.as_ptr().add(j), b.as_ptr().add(j), STRIDE);
+                        let d = out.as_mut_ptr().add(64 * j);
+                        for (k, v) in y.iter().enumerate() {
+                            vst1q_u8(d.add(16 * k), *v);
+                        }
+                    }
+                }
+                std::hint::black_box(&mut *out);
+            }
+        }
+        #[inline(never)]
+        fn run<const ZIP: bool>(a: &[u64], b: &[u64], out: &mut [u8], reps: usize) {
+            for _ in 0..reps {
+                for j in 0..ROWS {
+                    // SAFETY: word j + 7 * STRIDE < 8 * STRIDE; 64 bytes of `out` per row.
+                    unsafe {
+                        let [y0, y1, y2, y3] = if ZIP {
+                            transpose_8_strided_and_u64s_to_regs_zip(a.as_ptr().add(j), b.as_ptr().add(j), STRIDE)
+                        } else {
+                            transpose_8_strided_and_u64s_to_regs(a.as_ptr().add(j), b.as_ptr().add(j), STRIDE)
+                        };
+                        let d = out.as_mut_ptr().add(64 * j);
+                        vst1q_u8(d, y0);
+                        vst1q_u8(d.add(16), y1);
+                        vst1q_u8(d.add(32), y2);
+                        vst1q_u8(d.add(48), y3);
+                    }
+                }
+                std::hint::black_box(&mut *out);
+            }
+        }
+        const REPS: usize = 2000;
+        let (mut old_ns, mut new_ns, mut lower) = (Vec::new(), Vec::new(), 0usize);
+        for round in 0..rounds {
+            let mut t = [0f64; 2];
+            for k in 0..2 {
+                let zip = (k == 1) ^ (round % 2 == 1);
+                let t0 = std::time::Instant::now();
+                if zip {
+                    run::<true>(&a, &b, &mut out_new, REPS);
+                } else {
+                    run::<false>(&a, &b, &mut out_old, REPS);
+                }
+                t[usize::from(zip)] = t0.elapsed().as_nanos() as f64 / (REPS * ROWS) as f64;
+            }
+            assert_eq!(out_old, out_new);
+            let t0 = std::time::Instant::now();
+            run_pairs(&a, &b, &mut out_pair, REPS);
+            pair_ns.push(t0.elapsed().as_nanos() as f64 / (REPS * ROWS) as f64);
+            assert_eq!(out_old, out_pair);
+            old_ns.push(t[0]);
+            new_ns.push(t[1]);
+            lower += usize::from(t[1] < t[0]);
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|p, q| p.partial_cmp(q).unwrap());
+            (v[v.len() / 4], v[v.len() / 2])
+        };
+        let (oq, om) = med(&mut old_ns);
+        let (nq, nm) = med(&mut new_ns);
+        let (pq, pm) = med(&mut pair_ns);
+        eprintln!(
+            "stripe transpose probe: half-register {om:.3} ns/row (q25 {oq:.3}), interleaved {nm:.3} ns/row (q25 {nq:.3}), {:+.1}% at the median, lower in {lower} of {rounds}; two rows per pass {pm:.3} ns/row (q25 {pq:.3}), {:+.1}%",
+            (nm / om - 1.0) * 100.0,
+            (pm / om - 1.0) * 100.0
+        );
     }
 }
