@@ -1528,7 +1528,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 let unit_end = (unit_start + units_per_job).min(n_units);
                 for unit in unit_start..unit_end {
                     let (a_unit, b_unit) =
-                        scratch.fill(|a, b, primed| (producer.produce)(unit, a, b, primed));
+                        scratch.fill(unit, |a, b, primed| (producer.produce)(unit, a, b, primed));
                     for local in 0..unit_chunks {
                         let x_outer = unit * unit_chunks + local;
                         // SAFETY: this job owns the output of its units.
@@ -1629,36 +1629,66 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     );
 }
 
+pub const ENV_NO_AB_PAIR_SCRATCH: &str = "FLOCK_NO_AB_PAIR_SCRATCH";
+
+fn ab_pair_scratch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_AB_PAIR_SCRATCH).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+pub fn zc_ab_pair_scratch_active() -> bool {
+    zc_ab_producer_fused_active() && ab_pair_scratch_enabled()
+}
+
 /// Worker-local copy of one deferred A/B unit: `unit_bytes` of A followed by
-/// `unit_bytes` of B, 64-byte aligned.
 struct AbUnitScratch {
     storage: Vec<u8>,
     offset: usize,
     unit_bytes: usize,
-    primed: bool,
+    paired: bool,
+    primed: [bool; 2],
 }
 
 impl AbUnitScratch {
     fn new(unit_bytes: usize) -> Self {
-        let storage = vec![0u8; 2 * unit_bytes + 64];
+        Self::with_pairing(unit_bytes, ab_pair_scratch_enabled())
+    }
+
+    fn with_pairing(unit_bytes: usize, paired: bool) -> Self {
+        let slots = if paired { 2 } else { 1 };
+        let storage = vec![0u8; 2 * slots * unit_bytes + 64];
         let offset = storage.as_ptr().align_offset(64);
         assert!(offset < 64);
         Self {
             storage,
             offset,
             unit_bytes,
-            primed: false,
+            paired,
+            primed: [false; 2],
         }
     }
 
     #[inline(always)]
-    fn fill(&mut self, produce: impl FnOnce(*mut u8, *mut u8, bool)) -> (&[u8], &[u8]) {
+    fn fill(&mut self, unit: usize, produce: impl FnOnce(*mut u8, *mut u8, bool)) -> (&[u8], &[u8]) {
         let unit_bytes = self.unit_bytes;
-        let primed = self.primed;
+        if self.paired {
+            let slot = unit & 1;
+            let primed = self.primed[slot];
+            let all = &mut self.storage[self.offset..self.offset + 4 * unit_bytes];
+            let (a2, b2) = all.split_at_mut(2 * unit_bytes);
+            let s = slot * unit_bytes;
+            let (a, b) = (&mut a2[s..s + unit_bytes], &mut b2[s..s + unit_bytes]);
+            produce(a.as_mut_ptr(), b.as_mut_ptr(), primed);
+            self.primed[slot] = true;
+            return (a, b);
+        }
+        let primed = self.primed[0];
         let both = &mut self.storage[self.offset..self.offset + 2 * unit_bytes];
         let (a, b) = both.split_at_mut(unit_bytes);
         produce(a.as_mut_ptr(), b.as_mut_ptr(), primed);
-        self.primed = true;
+        self.primed[0] = true;
         (a, b)
     }
 }
@@ -5375,13 +5405,18 @@ mod tests {
                         );
                         let calls: Vec<AtomicU32> = (0..n_units).map(|_| AtomicU32::new(0)).collect();
                         // One scratch per worker thread per drain: `primed`
-                        // must be false on that thread's first unit only.
-                        let seen =
-                            std::sync::Mutex::new(std::collections::HashSet::<std::thread::ThreadId>::new());
+                        let paired = ab_pair_scratch_enabled();
+                        let seen = std::sync::Mutex::new(
+                            std::collections::HashSet::<(std::thread::ThreadId, usize)>::new(),
+                        );
                         let produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool| {
                             calls[unit].fetch_add(1, Ordering::Relaxed);
                             assert!(!a_scratch.is_null() && !b_scratch.is_null());
-                            assert_eq!(primed, !seen.lock().unwrap().insert(std::thread::current().id()));
+                            let slot = if paired { unit & 1 } else { 0 };
+                            assert_eq!(
+                                primed,
+                                !seen.lock().unwrap().insert((std::thread::current().id(), slot))
+                            );
                             let range = unit * unit_bytes..(unit + 1) * unit_bytes;
                             // SAFETY: unit ranges are disjoint; the scratch is
                             // `unit_bytes` long by the producer contract.
@@ -5426,6 +5461,41 @@ mod tests {
         }
         // Arms x (representations x unit sizes that divide the buffer).
         assert_eq!(checked, 5 * (1 + 3 * 2 + 3 * 3));
+    }
+
+    #[test]
+    fn ab_unit_scratch_primes_each_slot_independently() {
+        const UNIT: usize = 4096;
+        let unit_bytes = |u: usize, half_b: bool| -> Vec<u8> {
+            (0..UNIT)
+                .map(|i| if i >= UNIT / 2 { 0xc7 ^ u8::from(half_b) } else { (u * 31 + i * 7) as u8 ^ u8::from(half_b) })
+                .collect()
+        };
+        for paired in [false, true] {
+            for order in [vec![0usize, 1, 2, 3, 4, 5, 6, 7], vec![1, 0, 3, 2, 4, 6, 5, 7], vec![2, 3, 9, 11, 10]] {
+                let mut scratch = AbUnitScratch::with_pairing(UNIT, paired);
+                let mut fills = [0usize; 2];
+                for &u in &order {
+                    let (want_a, want_b) = (unit_bytes(u, false), unit_bytes(u, true));
+                    let (a, b) = scratch.fill(u, |a, b, primed| {
+                        let n = if primed { UNIT / 2 } else { UNIT };
+                        fills[usize::from(primed)] += 1;
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(want_a.as_ptr(), a, n);
+                            core::ptr::copy_nonoverlapping(want_b.as_ptr(), b, n);
+                        }
+                    });
+                    assert_eq!(a, &want_a[..], "a paired={paired} unit={u}");
+                    assert_eq!(b, &want_b[..], "b paired={paired} unit={u}");
+                }
+                let slots = if paired {
+                    usize::from(order.iter().any(|u| u & 1 == 0)) + usize::from(order.iter().any(|u| u & 1 == 1))
+                } else {
+                    1
+                };
+                assert_eq!(fills[0], slots, "paired={paired} order={order:?}");
+            }
+        }
     }
 
     /// Deferred A/B producer through the public entry (fused by default) and

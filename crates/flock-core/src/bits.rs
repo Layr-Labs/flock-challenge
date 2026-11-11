@@ -91,13 +91,55 @@ pub unsafe fn transpose_8_strided_u64s_to_regs(
     base: *const u64,
     stride: usize,
 ) -> [core::arch::aarch64::uint8x16_t; 4] {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn lane_pair(lo: *const u64, hi: *const u64) -> uint8x16_t {
-        // SAFETY: the caller's contract covers both 8-byte reads.
-        unsafe { vreinterpretq_u8_u64(vcombine_u64(vld1_u64(lo), vld1_u64(hi))) }
+    // SAFETY: the caller guarantees all eight reads.
+    unsafe {
+        transpose_8_row_pairs_to_regs(
+            lane_pair(base, base.add(stride)),
+            lane_pair(base.add(2 * stride), base.add(3 * stride)),
+            lane_pair(base.add(4 * stride), base.add(5 * stride)),
+            lane_pair(base.add(6 * stride), base.add(7 * stride)),
+        )
     }
+}
+
+///
+/// # Safety
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn transpose_8_strided_and_u64s_to_regs(
+    a: *const u64,
+    b: *const u64,
+    stride: usize,
+) -> [core::arch::aarch64::uint8x16_t; 4] {
+    use core::arch::aarch64::vandq_u8;
+    unsafe {
+        let pair = |l: usize| {
+            vandq_u8(
+                lane_pair(a.add(l * stride), a.add((l + 1) * stride)),
+                lane_pair(b.add(l * stride), b.add((l + 1) * stride)),
+            )
+        };
+        transpose_8_row_pairs_to_regs(pair(0), pair(2), pair(4), pair(6))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn lane_pair(lo: *const u64, hi: *const u64) -> core::arch::aarch64::uint8x16_t {
+    use core::arch::aarch64::*;
+    // SAFETY: the caller's contract covers both 8-byte reads.
+    unsafe { vreinterpretq_u8_u64(vcombine_u64(vld1_u64(lo), vld1_u64(hi))) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn transpose_8_row_pairs_to_regs(
+    r01: core::arch::aarch64::uint8x16_t,
+    r23: core::arch::aarch64::uint8x16_t,
+    r45: core::arch::aarch64::uint8x16_t,
+    r67: core::arch::aarch64::uint8x16_t,
+) -> [core::arch::aarch64::uint8x16_t; 4] {
+    use core::arch::aarch64::*;
 
     // Output byte 8c + t comes from row t (register t / 2, half t % 2), byte c.
     const IDX0: [u8; 16] = [0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57];
@@ -121,14 +163,7 @@ pub unsafe fn transpose_8_strided_u64s_to_regs(
         }
     }
 
-    // SAFETY: the caller guarantees all eight reads.
     unsafe {
-        // Rows 0..8 = the eight source words, two per register.
-        let r01 = lane_pair(base, base.add(stride));
-        let r23 = lane_pair(base.add(2 * stride), base.add(3 * stride));
-        let r45 = lane_pair(base.add(4 * stride), base.add(5 * stride));
-        let r67 = lane_pair(base.add(6 * stride), base.add(7 * stride));
-
         // Distance 4: row r keeps bits 0..4 and takes row r+4's bits 0..4 as
         // its bits 4..8; row r+4 keeps bits 4..8 and takes row r's bits 4..8.
         let a01 = vsliq_n_u8::<4>(r01, r45);
@@ -273,6 +308,17 @@ mod tests {
             }
             assert_eq!(regs, oracle, "stride={stride} word={word}");
             assert_eq!(regs, strided, "stride={stride} word={word}");
+            let m: Vec<u64> = words.iter().map(|w| w.rotate_left(17) ^ 0xA5A5_5A5A_0FF0_F00F).collect();
+            let a: Vec<u64> = words.iter().zip(&m).map(|(w, m)| w | m).collect();
+            let b: Vec<u64> = words.iter().zip(&m).map(|(w, m)| w | !m).collect();
+            let mut anded = [0u8; 64];
+            unsafe {
+                let out = transpose_8_strided_and_u64s_to_regs(a.as_ptr().add(word), b.as_ptr().add(word), stride);
+                for (k, v) in out.iter().enumerate() {
+                    core::arch::aarch64::vst1q_u8(anded.as_mut_ptr().add(16 * k), *v);
+                }
+            }
+            assert_eq!(anded, oracle, "and form stride={stride} word={word}");
         };
         for stride in [1usize, 2, 3, 7, 64, 256] {
             let words: Vec<u64> = (0..8 * stride + 5).map(|_| next()).collect();
