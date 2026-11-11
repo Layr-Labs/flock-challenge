@@ -3146,9 +3146,6 @@ constant uint B3_IV[8] = {
     0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
     0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
 };
-constant uint B3_PERM[16] = {
-    2u,6u,3u,10u,7u,0u,4u,13u,1u,11u,12u,5u,9u,14u,15u,8u
-};
 #define B3_CHUNK_START 1u
 #define B3_CHUNK_END   2u
 #define B3_PARENT      4u
@@ -3156,28 +3153,94 @@ constant uint B3_PERM[16] = {
 static void b3_compress(thread uint* cv, thread const uint* m_in,
                         uint block_len, uint flags) {
     uint v[16];
-    uint m[16];
     for (int i = 0; i < 8; i++) v[i] = cv[i];
     for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
     v[12] = 0u; v[13] = 0u; v[14] = block_len; v[15] = flags;
-    for (int i = 0; i < 16; i++) m[i] = m_in[i];
-    for (int r = 0; r < 7; r++) {
-        #define G(a,b,c,d,x,y) \
-            v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
-            v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
-        G(0,4,8,12,  m[0], m[1]);  G(1,5,9,13,  m[2], m[3]);
-        G(2,6,10,14, m[4], m[5]);  G(3,7,11,15, m[6], m[7]);
-        G(0,5,10,15, m[8], m[9]);  G(1,6,11,12, m[10],m[11]);
-        G(2,7,8,13,  m[12],m[13]); G(3,4,9,14,  m[14],m[15]);
-        #undef G
-        if (r < 6) {
-            uint t[16];
-            for (int i = 0; i < 16; i++) t[i] = m[B3_PERM[i]];
-            for (int i = 0; i < 16; i++) m[i] = t[i];
-        }
-    }
+    const uint m0 = m_in[0];
+    const uint m1 = m_in[1];
+    const uint m2 = m_in[2];
+    const uint m3 = m_in[3];
+    const uint m4 = m_in[4];
+    const uint m5 = m_in[5];
+    const uint m6 = m_in[6];
+    const uint m7 = m_in[7];
+    const uint m8 = m_in[8];
+    const uint m9 = m_in[9];
+    const uint m10 = m_in[10];
+    const uint m11 = m_in[11];
+    const uint m12 = m_in[12];
+    const uint m13 = m_in[13];
+    const uint m14 = m_in[14];
+    const uint m15 = m_in[15];
+    #define G(a,b,c,d,x,y) \
+        v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
+        v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
+        v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
+        v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
+    // Round 0: fixed message positions, no permutation array.
+    G(0,4,8,12, m0, m1);
+    G(1,5,9,13, m2, m3);
+    G(2,6,10,14, m4, m5);
+    G(3,7,11,15, m6, m7);
+    G(0,5,10,15, m8, m9);
+    G(1,6,11,12, m10, m11);
+    G(2,7,8,13, m12, m13);
+    G(3,4,9,14, m14, m15);
+    // Round 1: fixed message positions, no permutation array.
+    G(0,4,8,12, m2, m6);
+    G(1,5,9,13, m3, m10);
+    G(2,6,10,14, m7, m0);
+    G(3,7,11,15, m4, m13);
+    G(0,5,10,15, m1, m11);
+    G(1,6,11,12, m12, m5);
+    G(2,7,8,13, m9, m14);
+    G(3,4,9,14, m15, m8);
+    // Round 2: fixed message positions, no permutation array.
+    G(0,4,8,12, m3, m4);
+    G(1,5,9,13, m10, m12);
+    G(2,6,10,14, m13, m2);
+    G(3,7,11,15, m7, m14);
+    G(0,5,10,15, m6, m5);
+    G(1,6,11,12, m9, m0);
+    G(2,7,8,13, m11, m15);
+    G(3,4,9,14, m8, m1);
+    // Round 3: fixed message positions, no permutation array.
+    G(0,4,8,12, m10, m7);
+    G(1,5,9,13, m12, m9);
+    G(2,6,10,14, m14, m3);
+    G(3,7,11,15, m13, m15);
+    G(0,5,10,15, m4, m0);
+    G(1,6,11,12, m11, m2);
+    G(2,7,8,13, m5, m8);
+    G(3,4,9,14, m1, m6);
+    // Round 4: fixed message positions, no permutation array.
+    G(0,4,8,12, m12, m13);
+    G(1,5,9,13, m9, m11);
+    G(2,6,10,14, m15, m10);
+    G(3,7,11,15, m14, m8);
+    G(0,5,10,15, m7, m2);
+    G(1,6,11,12, m5, m3);
+    G(2,7,8,13, m0, m1);
+    G(3,4,9,14, m6, m4);
+    // Round 5: fixed message positions, no permutation array.
+    G(0,4,8,12, m9, m14);
+    G(1,5,9,13, m11, m5);
+    G(2,6,10,14, m8, m12);
+    G(3,7,11,15, m15, m1);
+    G(0,5,10,15, m13, m3);
+    G(1,6,11,12, m0, m10);
+    G(2,7,8,13, m2, m6);
+    G(3,4,9,14, m4, m7);
+    // Round 6: fixed message positions, no permutation array.
+    G(0,4,8,12, m11, m15);
+    G(1,5,9,13, m5, m0);
+    G(2,6,10,14, m1, m9);
+    G(3,7,11,15, m8, m6);
+    G(0,5,10,15, m14, m10);
+    G(1,6,11,12, m2, m12);
+    G(2,7,8,13, m3, m4);
+    G(3,4,9,14, m7, m13);
+    #undef G
     for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
 }
 
@@ -10186,6 +10249,14 @@ kernel void blake3_pow_scan(
             ^ phi.to_bits().rotate_left(7)
     }
 
+    fn warmup_cache_leaf_parent3_key(key: u64, enabled: bool) -> u64 {
+        if enabled {
+            key ^ fnv1a64(LEAF_PARENT3_MSL_SOURCE).rotate_left(6) ^ 0x4C50_335F_4D53_4C31
+        } else {
+            key
+        }
+    }
+
     fn warmup_cache_msl_fnv() -> u64 {
         let (lead, extend, phi) = hybrid_tune_sampling();
         let key = warmup_cache_sampling_key(warmup_cache_msl_fnv_for(
@@ -10197,6 +10268,8 @@ kernel void blake3_pow_scan(
         } else {
             key
         };
+        // Keep a tuned split/latch tied to the supplemental kernel it measured.
+        let key = warmup_cache_leaf_parent3_key(key, super::gpu_leaf_parent3_enabled());
         if super::gpu_final_leaf_enabled() {
             key ^ fnv1a64(&final_leaf_msl_source()).rotate_left(5) ^ 0x464C_4541_465F_3431
         } else {
