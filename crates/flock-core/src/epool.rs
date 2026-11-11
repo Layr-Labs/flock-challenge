@@ -422,6 +422,8 @@ pub(crate) fn drain_hetero<H>(
     });
 }
 
+const TAIL_GUARD_SAMPLES: u64 = 64;
+
 /// Self-calibrating tail guard for the shared P+E chunk queue.
 ///
 /// A helper (efficiency-core) worker that claims one of the last chunks can
@@ -462,10 +464,9 @@ impl TailGuard {
         }
     }
 
-    /// Run main-pool chunk `i`, publishing its duration.
     #[inline]
     fn main_run(&self, run: impl FnOnce()) {
-        if !self.on {
+        if !self.on || self.main_cnt.load(Ordering::Relaxed) >= TAIL_GUARD_SAMPLES {
             run();
             return;
         }
@@ -634,6 +635,12 @@ impl<'a> HelpQueue<'a> {
             let i = self.next.fetch_add(1, Ordering::Relaxed);
             if i >= self.n_chunks {
                 return ran;
+            }
+            if self.main_cnt.load(Ordering::Relaxed) >= TAIL_GUARD_SAMPLES {
+                (self.f)(i);
+                self.done.fetch_add(1, Ordering::Release);
+                ran += 1;
+                continue;
             }
             let started = std::time::Instant::now();
             (self.f)(i);
