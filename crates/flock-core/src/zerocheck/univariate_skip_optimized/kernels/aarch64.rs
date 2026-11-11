@@ -3695,19 +3695,20 @@ pub(crate) const ABV_HZ: u16 = 256;
 #[cfg(target_arch = "aarch64")]
 pub(crate) const AB_HZ_VARIANT: u16 = ABV_HZ | ABV_NOSW | ABV_INLINE_WINDOW;
 
-/// Kill switch: exactly `FLOCK_NO_ZC_AB_HZ=1` keeps the plain apply on the
-/// helper threads. Same bytes either way.
+/// Opt-in switch: exactly `FLOCK_ZC_AB_HZ=1` puts the half-pair form on the
+/// helper threads; by default they keep the record's plain apply. Same bytes
+/// either way.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ENV_NO_ZC_AB_HZ: &str = "FLOCK_NO_ZC_AB_HZ";
+pub(crate) const ENV_ZC_AB_HZ: &str = "FLOCK_ZC_AB_HZ";
 
 /// Whether this thread's static-B rows take [`AB_HZ_VARIANT`]: a thread that
 /// keeps the plain apply (helper pool or `FLOCK_NO_ZC_AB_KARA=1`), with the
-/// half-pair form not switched off.
+/// half-pair form switched on.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn ab_hz_helper_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os(ENV_NO_ZC_AB_HZ).is_none_or(|v| v != *"1")
+        std::env::var_os(ENV_ZC_AB_HZ).is_some_and(|v| v == *"1")
     });
     *ON && !ab_kara_enabled()
 }
