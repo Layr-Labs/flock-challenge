@@ -600,6 +600,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             "[phase-timing] pcs-open: {wall:.2} ms cpu={cpu:.1} util={:.1}",
             cpu / wall
         );
+        eprintln!("[minflt] at open end: {}", flock_core::pcs::commit::process_minflt());
     }
 
     let proof = R1csProofLigerito {
