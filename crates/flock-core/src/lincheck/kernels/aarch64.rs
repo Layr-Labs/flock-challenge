@@ -264,16 +264,19 @@ unsafe fn process_block_neon_single<const TILE_T: usize>(
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[inline(never)]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn process_block16_neon_single_sha3(
+unsafe fn process_blocks16_neon_single_sha3(
     row_ptr: *const u8,
     row_stride: usize,
-    bs: usize,
+    blocks: usize,
     tables_ptr: *const u8,
     out_ptr: *mut F128,
 ) {
     use std::arch::asm;
 
     asm!(
+        "lsl x9, {stride}, #1",
+        "3:",
+        "mov {table}, {table_base}",
         "ldp q0, q1, [{dst}]",
         "ldp q2, q3, [{dst}, #32]",
         "ldp q4, q5, [{dst}, #64]",
@@ -282,8 +285,7 @@ unsafe fn process_block16_neon_single_sha3(
         "ldp q18, q19, [{dst}, #160]",
         "ldp q20, q21, [{dst}, #192]",
         "ldp q22, q23, [{dst}, #224]",
-        "add x8, {row}, {block_start}",
-        "lsl x9, {stride}, #1",
+        "mov x8, {row}",
         "mov x10, #4",
         "2:",
         "ldp x11, x12, [x8]",
@@ -400,11 +402,16 @@ unsafe fn process_block16_neon_single_sha3(
         "stp q18, q19, [{dst}, #160]",
         "stp q20, q21, [{dst}, #192]",
         "stp q22, q23, [{dst}, #224]",
-        row = in(reg) row_ptr,
+        "add {row}, {row}, #16",
+        "add {dst}, {dst}, #256",
+        "subs {blocks}, {blocks}, #1",
+        "b.ne 3b",
+        row = inout(reg) row_ptr => _,
         stride = in(reg) row_stride,
-        block_start = in(reg) bs,
-        table = inout(reg) tables_ptr => _,
-        dst = in(reg) out_ptr,
+        blocks = inout(reg) blocks => _,
+        table_base = in(reg) tables_ptr,
+        table = out(reg) _,
+        dst = inout(reg) out_ptr => _,
         out("x8") _,
         out("x9") _,
         out("x10") _,
@@ -793,11 +800,12 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
             let mut bs = 0usize;
             #[cfg(target_feature = "sha3")]
             if block16 {
-                while bs + 16 <= useful {
+                let blocks = useful / 16;
+                if blocks != 0 {
                     unsafe {
-                        process_block16_neon_single_sha3(z_base, k, bs, tables_ptr, partial.add(bs));
+                        process_blocks16_neon_single_sha3(z_base, k, blocks, tables_ptr, partial);
                     }
-                    bs += 16;
+                    bs = blocks * 16;
                 }
             }
             #[cfg(not(target_feature = "sha3"))]

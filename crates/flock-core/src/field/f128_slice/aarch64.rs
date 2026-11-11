@@ -630,6 +630,27 @@ unsafe fn tri_acc_two_banks(
     }
 }
 
+#[inline(always)]
+unsafe fn tri_acc_one_bank(
+    ll: &mut uint64x2_t,
+    cross: &mut uint64x2_t,
+    hh: &mut uint64x2_t,
+    x: uint64x2_t,
+    w: uint64x2_t,
+    w_sw: uint64x2_t,
+) {
+    unsafe {
+        let xp = vreinterpretq_p64_u64(x);
+        let lo = |a: uint64x2_t, b: uint64x2_t| pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+        let hi = |a: poly64x2_t, b: uint64x2_t| {
+            transmute::<u128, uint64x2_t>(vmull_high_p64(a, vreinterpretq_p64_u64(b)))
+        };
+        *ll = veorq_u64(*ll, lo(x, w));
+        *hh = veorq_u64(*hh, hi(xp, w));
+        *cross = xor3_u64(*cross, lo(x, w_sw), hi(xp, w_sw));
+    }
+}
+
 /// [`fold_banked_slots4`] for an even bank count: schoolbook products with
 /// one swapped copy per weight shared by the four slots, two banks per step
 /// so each accumulator update is one EOR3 of two products. The four outputs
@@ -707,8 +728,6 @@ unsafe fn load_whole(p: *const F128) -> uint64x2_t {
 ///
 /// `odd_live` is the number of leading banks that can be nonzero in the
 /// second and fourth slot (`BANKS` when nothing is known). Banks at and above
-/// it, rounded up to a bank pair, are neither loaded nor multiplied for those
-/// two slots: the caller promises they are zero, and a zero input adds
 /// nothing to any of the three product sums.
 ///
 /// Same products (less the promised-zero ones), same accumulators and the
@@ -737,7 +756,8 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
 
         let w = weight.as_ptr();
         let x = input.as_ptr();
-        let split = if odd_live >= BANKS { BANKS } else { (odd_live + 1) & !1 };
+        let live = odd_live.min(BANKS);
+        let split = live & !1;
         let mut bank = 0usize;
         while bank < split {
             let w0 = vld1q_u64(w.add(bank).cast::<u64>());
@@ -758,6 +778,38 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
                     x1,
                     w1,
                     w1_sw,
+                );
+            }
+            bank += 2;
+        }
+        if bank < live {
+            let w0 = vld1q_u64(w.add(bank).cast::<u64>());
+            let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
+            let w0_sw = swap_halves(w0);
+            let w1_sw = swap_halves(w1);
+            for slot in [0usize, 2] {
+                let row = x.add(slot * BANKS + bank);
+                tri_acc_two_banks(
+                    &mut ll[slot],
+                    &mut cross[slot],
+                    &mut hh[slot],
+                    load_whole(row),
+                    w0,
+                    w0_sw,
+                    load_whole(row.add(1)),
+                    w1,
+                    w1_sw,
+                );
+            }
+            for slot in [1usize, 3] {
+                let row = x.add(slot * BANKS + bank);
+                tri_acc_one_bank(
+                    &mut ll[slot],
+                    &mut cross[slot],
+                    &mut hh[slot],
+                    load_whole(row),
+                    w0,
+                    w0_sw,
                 );
             }
             bank += 2;
