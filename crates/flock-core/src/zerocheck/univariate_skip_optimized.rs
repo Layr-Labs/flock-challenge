@@ -6433,6 +6433,11 @@ mod tests {
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_SCALED | kernels::aarch64::ABV_KARA_SCALED_UNSCALED | kernels::aarch64::ABV_NOSW);
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_KARA_SCALED_UNSCALED | kernels::aarch64::ABV_NOSW);
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_SCALED | kernels::aarch64::ABV_NOSW);
+                        check!(kernels::aarch64::AB_Z_VARIANT);
+                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW);
+                        check!((kernels::aarch64::AB_Z_VARIANT & !kernels::aarch64::ABV_Z_MOB) | ABV_INLINE_WINDOW);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_MOB);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_SCALED | kernels::aarch64::ABV_Z_REC | kernels::aarch64::ABV_NOSW | kernels::aarch64::ABV_Z_MOB);
                         check!(kernels::aarch64::ABV_HZ);
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW);
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW | ABV_INLINE_WINDOW);
@@ -6440,7 +6445,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 16);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 21);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
@@ -6570,6 +6575,7 @@ mod tests {
         use kernels::aarch64::{bstatic_horner_window_rows as bw, ABV_INLINE_WINDOW as IW, ABV_KARA as KA};
         let all: Vec<(&str, RowsFn)> = vec![
             ("k3 default (z plain, x4 Kara)", bw::<{ kernels::aarch64::AB_Z_VARIANT | IW }>),
+            ("k3, 7-op z indices (pre-MOB)", bw::<{ (kernels::aarch64::AB_Z_VARIANT & !kernels::aarch64::ABV_Z_MOB) | IW }>),
             ("z both rec nosw", bw::<{ AB_ROWS_VARIANT | ABV_KARA_UNSCALED | ABV_Z | ABV_Z_SCALED | ABV_Z_REC | ABV_NOSW }>),
             ("z plain, x4 Kara unscaled", bw::<{ AB_ROWS_VARIANT | ABV_KARA_UNSCALED | ABV_Z | ABV_Z_REC | ABV_NOSW | ABV_KARA_SCALED_UNSCALED }>),
             ("V=0 plain (helper form)", bw::<0>),

@@ -3523,8 +3523,9 @@ unsafe fn apply_word_kara<const V: u16, const SCALED: bool>(
 /// in Karatsuba form, and the static-B partial path without the half-swapped
 /// image. Measured on an M5 Pro P-core (synthetic static-B rows, 25
 /// alternated rounds): 27.36 against 29.87 ns per row at the lower quartile.
+/// The z indices come from one superset-sum word ([`ABV_Z_MOB`]).
 #[cfg(target_arch = "aarch64")]
-pub(crate) const AB_Z_VARIANT: u16 = ABV_KARA | ABV_KARA_UNSCALED | ABV_Z | ABV_Z_REC | ABV_NOSW;
+pub(crate) const AB_Z_VARIANT: u16 = ABV_KARA | ABV_KARA_UNSCALED | ABV_Z | ABV_Z_REC | ABV_NOSW | ABV_Z_MOB;
 
 /// Kill switch: exactly `FLOCK_NO_ZC_AB_Z=1` keeps the record's Karatsuba
 /// form for the plain image. Same bytes either way.
@@ -3649,11 +3650,53 @@ fn ab_z_idx<const J: u32, const LOG: u32>(word: u64) -> usize {
     idx
 }
 
-/// [`apply_word_into_4_regs`] in the z-basis form. `t0` is the table image
-/// (64-byte rows), `z` its [`AB_Z_IMAGE_BYTES`] of z-basis tables.
+/// Row-body variant bit (with [`ABV_Z`]): the eight z-basis indices of a
+/// word come out of one register, the superset-sum (Moebius) transform of
+/// the word over its three byte-position bits done in place with two masked
+/// shift-XOR stages and one plain one: 5 integer ops (two `and` with a
+/// shifted operand, three `eor`) instead of the 7 shift-XORs that build
+/// seven separate partial sums. Same table loads (15 per word), same tables,
+/// same bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_Z_MOB: u16 = 512;
+
+/// All eight z-basis bytes of `w` in one word: byte `T` of the result is
+/// `w_T`, the XOR of the bytes `W_b` with `b` a superset of `T` (bits of
+/// `T` index byte positions: 1 = s, 2 = l1, 4 = l2). Stage `i` adds byte
+/// `j + 2^i` into byte `j` for every `j` with bit `i` clear; the last stage
+/// needs no mask because the shift by 32 brings in zeros above byte 3.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn apply_word_z<const PACK: bool, const REC: bool>(
+fn ab_z_mobius(w: u64) -> u64 {
+    // `mask & (x >> SHIFT)` as one `and` with a shifted register operand
+    // (left to itself the compiler emits `lsr` + `and #imm`, which gives the
+    // saving back). The two masks are loop-invariant registers.
+    #[inline(always)]
+    fn and_lsr<const SHIFT: u32>(mask: u64, x: u64) -> u64 {
+        let r: u64;
+        unsafe {
+            core::arch::asm!(
+                "and {r}, {mask}, {x}, lsr #{shift}",
+                shift = const SHIFT,
+                mask = in(reg) mask,
+                x = in(reg) x,
+                r = lateout(reg) r,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        r
+    }
+    let z1 = w ^ and_lsr::<8>(0x00ff_00ff_00ff_00ff, w);
+    let z2 = z1 ^ and_lsr::<16>(0x0000_ffff_0000_ffff, z1);
+    z2 ^ (z2 >> 32)
+}
+
+/// [`apply_word_into_4_regs`] in the z-basis form. `t0` is the table image
+/// (64-byte rows), `z` its [`AB_Z_IMAGE_BYTES`] of z-basis tables. `MOB`
+/// takes the eight indices out of [`ab_z_mobius`] (same loads, same bytes).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_z<const PACK: bool, const REC: bool, const MOB: bool>(
     t0: *const u8,
     z: *const u8,
     w: u64,
@@ -3665,13 +3708,22 @@ unsafe fn apply_word_z<const PACK: bool, const REC: bool>(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let ys = w ^ (w >> 8);
-        let yl1 = w ^ (w >> 16);
-        let yl2 = w ^ (w >> 32);
-        let ysl1 = ys ^ (ys >> 16);
-        let ysl2 = ys ^ (ys >> 32);
-        let yl12 = yl1 ^ (yl1 >> 32);
-        let yall = ysl1 ^ (ysl1 >> 32);
+        // Byte T of the word each z table is indexed by (only that byte of
+        // each is read): T = 0 yall, 1 yl12, 2 ysl2, 3 yl2, 4 ysl1, 5 yl1,
+        // 6 ys, 7 w. With `MOB` all eight are bytes of one word.
+        let (ys, yl1, yl2, ysl1, ysl2, yl12, yall);
+        if MOB {
+            let m = ab_z_mobius(w);
+            (ys, yl1, yl2, ysl1, ysl2, yl12, yall) = (m, m, m, m, m, m, m);
+        } else {
+            ys = w ^ (w >> 8);
+            yl1 = w ^ (w >> 16);
+            yl2 = w ^ (w >> 32);
+            ysl1 = ys ^ (ys >> 16);
+            ysl2 = ys ^ (ys >> 32);
+            yl12 = yl1 ^ (yl1 >> 32);
+            yall = ysl1 ^ (ysl1 >> 32);
+        }
         let ld = |base: *const u8, idx: usize| vld1q_u8(base.add(idx));
         // T = {}: the plain row.
         let i0 = ab_z_idx::<0, 6>(yall);
@@ -3738,6 +3790,84 @@ unsafe fn apply_word_z<const PACK: bool, const REC: bool>(
             veorq_u8(xor3_u8(l2, mk2, n0), b2),
             veorq_u8(xor3_u8(l3, mk2, n1), b3),
         )
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_z_mobius_matches_partial_sums_and_apply() {
+    use core::arch::aarch64::*;
+    let partial = |w: u64| -> [u64; 8] {
+        let ys = w ^ (w >> 8);
+        let yl1 = w ^ (w >> 16);
+        let yl2 = w ^ (w >> 32);
+        let ysl1 = ys ^ (ys >> 16);
+        let ysl2 = ys ^ (ys >> 32);
+        let yl12 = yl1 ^ (yl1 >> 32);
+        let yall = ysl1 ^ (ysl1 >> 32);
+        [yall, yl12, ysl2, yl2, ysl1, yl1, ys, w]
+    };
+    let table = InvNttTableByteSingleGf8::cached_standard_k6();
+    let kara = ab_kara_tables(table);
+    let images = [
+        (table.data_ptr(), table.half_swapped_data_ptr(), kara.wrapping_add(2 * AB_KARA_IMAGE_BYTES)),
+        (
+            table.scaled_x4_data_ptr(),
+            table.scaled_x4_half_swapped_data_ptr(),
+            kara.wrapping_add(2 * AB_KARA_IMAGE_BYTES + AB_Z_IMAGE_BYTES),
+        ),
+    ];
+    let dump = |v: (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t)| -> [u8; 64] {
+        let mut out = [0u8; 64];
+        // SAFETY: four 16-byte stores into a 64-byte array.
+        unsafe {
+            vst1q_u8(out.as_mut_ptr(), v.0);
+            vst1q_u8(out.as_mut_ptr().add(16), v.1);
+            vst1q_u8(out.as_mut_ptr().add(32), v.2);
+            vst1q_u8(out.as_mut_ptr().add(48), v.3);
+        }
+        out
+    };
+    let mut words = Vec::new();
+    for j in 0..8 {
+        for x in 0..256u64 {
+            for background in [0, u64::MAX, 0x0123_4567_89ab_cdef] {
+                words.push((background & !(0xff << (j * 8))) | (x << (j * 8)));
+            }
+        }
+    }
+    let mut r = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..20000 {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        words.push(r);
+    }
+    for &w in &words {
+        let m = ab_z_mobius(w);
+        for (t, y) in partial(w).into_iter().enumerate() {
+            assert_eq!((m >> (8 * t)) & 0xff, (y >> (8 * t)) & 0xff, "z byte {t} of {w:016x}");
+        }
+        for (t0, sw, z) in images {
+            // SAFETY: both forms read inside the table image and its z tables.
+            unsafe {
+                assert_eq!(
+                    dump(apply_word_z::<false, true, true>(t0, z, w)),
+                    dump(apply_word_z::<false, true, false>(t0, z, w)),
+                    "rec form, word {w:016x}"
+                );
+                assert_eq!(
+                    dump(apply_word_z::<false, false, true>(t0, z, w)),
+                    dump(apply_word_z::<false, false, false>(t0, z, w)),
+                    "split form, word {w:016x}"
+                );
+                assert_eq!(
+                    dump(apply_word_z::<false, true, true>(t0, z, w)),
+                    dump(apply_word_into_4_regs(t0, sw, w)),
+                    "rec form against the plain apply, word {w:016x}"
+                );
+            }
+        }
     }
 }
 
@@ -3905,14 +4035,16 @@ unsafe fn apply_word_into_4_regs_v<const V: u16, const SCALED: bool>(
             } else {
                 kara.add(2 * AB_KARA_IMAGE_BYTES)
             };
-            if V & ABV_Z_REC != 0 && V & ABV_Z_PACK != 0 {
-                apply_word_z::<true, true>(table_base, z, word)
-            } else if V & ABV_Z_REC != 0 {
-                apply_word_z::<false, true>(table_base, z, word)
-            } else if V & ABV_Z_PACK != 0 {
-                apply_word_z::<true, false>(table_base, z, word)
-            } else {
-                apply_word_z::<false, false>(table_base, z, word)
+            let mob = V & ABV_Z_MOB != 0;
+            match (V & ABV_Z_REC != 0, V & ABV_Z_PACK != 0, mob) {
+                (true, true, false) => apply_word_z::<true, true, false>(table_base, z, word),
+                (true, false, false) => apply_word_z::<false, true, false>(table_base, z, word),
+                (false, true, false) => apply_word_z::<true, false, false>(table_base, z, word),
+                (false, false, false) => apply_word_z::<false, false, false>(table_base, z, word),
+                (true, true, true) => apply_word_z::<true, true, true>(table_base, z, word),
+                (true, false, true) => apply_word_z::<false, true, true>(table_base, z, word),
+                (false, true, true) => apply_word_z::<true, false, true>(table_base, z, word),
+                (false, false, true) => apply_word_z::<false, false, true>(table_base, z, word),
             }
         } else if V & ABV_KARA != 0 {
             apply_word_kara::<V, SCALED>(kara, word)
