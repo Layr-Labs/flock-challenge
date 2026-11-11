@@ -979,6 +979,14 @@ struct AbStripeEmitter<'a> {
     /// Paired-scratch mode (see `zc_ab_pair_scratch_active`): the odd quad
     /// reads the even quad's rows in place; nothing is copied.
     direct: bool,
+    /// The rows compiled for the fixed block stride
+    /// ([`build_stripe_row_program`]); `None` keeps
+    /// [`fill_root_lincheck_stripe_group_ab`] in `emit_direct`.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    program: Option<Box<[StripeRowOp]>>,
+    /// `FIXED_INPUT_CHECKS`, resolved once (see [`fixed_inputs_hold_ab_resolved`]).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    checks: Box<[(usize, u64, u64)]>,
 }
 
 impl<'a> AbStripeEmitter<'a> {
@@ -1014,6 +1022,12 @@ impl<'a> AbStripeEmitter<'a> {
                 .max()
                 .unwrap_or(0),
             direct: zerocheck::univariate_skip_optimized::zc_ab_pair_scratch_active(),
+            program: if cfg!(target_arch = "aarch64") && ab_stripe_row_program_enabled() {
+                build_stripe_row_program(rows)
+            } else {
+                None
+            },
+            checks: crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter().copied().collect(),
         }
     }
 
@@ -1118,10 +1132,32 @@ impl<'a> AbStripeEmitter<'a> {
         // and nothing was produced on this thread since; the odd quad's 4
         // blocks follow at `a + unit_bytes` / `b + unit_bytes`: 8 complete
         // blocks of `AB_STRIPE_WORDS` words each.
-        unsafe {
-            fill_root_lincheck_stripe_group_ab(a, b, dst, AB_STRIPE_WORDS, self.rows);
-            if self.fixed_inputs && !fixed_inputs_hold_ab(a, b, AB_STRIPE_WORDS) {
-                self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The compiled row program writes the same rows as the generic
+        // filler; either path marks the group through the line below.
+        #[cfg(target_arch = "aarch64")]
+        let programmed = if let Some(program) = self.program.as_deref() {
+            // SAFETY: as above; every op reads words `w`, `w + 1 <
+            // AB_STRIPE_WORDS` of each of the 8 blocks, `dst` is
+            // `group_bytes >= 64 * rows.len()` (asserted in `new`), and the
+            // program was compiled from `self.rows`.
+            unsafe {
+                emit_root_rows_ab_s256(a.cast(), b.cast(), dst.as_mut_ptr(), program);
+                if self.fixed_inputs && !fixed_inputs_hold_ab_resolved(a, b, &self.checks) {
+                    self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            true
+        } else {
+            false
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let programmed = false;
+        if !programmed {
+            unsafe {
+                fill_root_lincheck_stripe_group_ab(a, b, dst, AB_STRIPE_WORDS, self.rows);
+                if self.fixed_inputs && !fixed_inputs_hold_ab(a, b, AB_STRIPE_WORDS) {
+                    self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
@@ -1151,6 +1187,216 @@ impl<'a> AbStripeEmitter<'a> {
 
 /// Packed u64 words per block at the ranked shape (`2^14 / 64`).
 const AB_STRIPE_WORDS: usize = 256;
+
+/// Kill switch for the AB emitter's row program
+/// (`FLOCK_NO_AB_STRIPE_ROW_PROGRAM`, any value): `emit_direct` calls
+/// [`fill_root_lincheck_stripe_group_ab`] and [`fixed_inputs_hold_ab`].
+/// Same stripe bytes and mismatch flag either way. Read once per process.
+fn ab_stripe_row_program_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_AB_STRIPE_ROW_PROGRAM").is_none())
+}
+
+/// What one op of the AB emitter's row program writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+enum StripeRowKind {
+    /// Two full rows on consecutive words `w`, `w + 1`.
+    Pair,
+    /// One full row on word `w`.
+    Full,
+    /// `(w & mask) | (w' & !mask)`, `w' = w + 1`: a two-word row whose
+    /// `hi_mask` is exactly `!lo_mask` (every bit lane once).
+    Split,
+    /// `w & mask`: a one-word partial row (`hi_mask == 0`).
+    Masked,
+}
+
+/// One op of the AB emitter's row program (see [`build_stripe_row_program`]).
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+struct StripeRowOp {
+    /// Byte offset of word `w` inside a block (`lo_word * 8`).
+    off: usize,
+    kind: StripeRowKind,
+    /// `lo_mask` of `Split` / `Masked` rows.
+    mask: u64,
+}
+
+/// Compiles root rows for the emitter's fixed block stride: consecutive full
+/// rows on consecutive words become one `Pair` (both words from one 16-byte
+/// load per block and operand), complementary two-word rows a `Split` (one
+/// 16-byte load per block and operand, then a bit select), the rest `Full` /
+/// `Masked`. Ops are in row order and write 64 bytes per row, so row `j`
+/// lands at byte `64 j` exactly as in [`fill_root_lincheck_stripe_group_ab`].
+/// An op reads word `w + 1` only when a row reads it (the next row of a
+/// `Pair`, the high word of a `Split`). `None` (a row form the program does
+/// not cover) keeps the incumbent fill.
+fn build_stripe_row_program(
+    rows: &[crate::r1cs_hashes::blake3::RootRow],
+) -> Option<Box<[StripeRowOp]>> {
+    let full = |r: &crate::r1cs_hashes::blake3::RootRow| r.lo_mask == u64::MAX && r.hi_mask == 0;
+    let mut ops = Vec::with_capacity(rows.len());
+    let mut j = 0;
+    while j < rows.len() {
+        let row = rows[j];
+        if row.lo_word + 1 >= AB_STRIPE_WORDS {
+            return None;
+        }
+        let off = row.lo_word * 8;
+        if full(&row) {
+            if rows.get(j + 1).is_some_and(|next| full(next) && next.lo_word == row.lo_word + 1) {
+                ops.push(StripeRowOp { off, kind: StripeRowKind::Pair, mask: 0 });
+                j += 2;
+                continue;
+            }
+            ops.push(StripeRowOp { off, kind: StripeRowKind::Full, mask: 0 });
+        } else if row.hi_mask != 0 && row.hi_mask == !row.lo_mask {
+            ops.push(StripeRowOp { off, kind: StripeRowKind::Split, mask: row.lo_mask });
+        } else if row.hi_mask == 0 {
+            ops.push(StripeRowOp { off, kind: StripeRowKind::Masked, mask: row.lo_mask });
+        } else {
+            return None;
+        }
+        j += 1;
+    }
+    Some(ops.into_boxed_slice())
+}
+
+/// Runs the row program over a paired scratch: `a` and `b` each point at
+/// eight blocks of `AB_STRIPE_WORDS` u64 words back to back (block `l` at
+/// byte `l * 2048`, lane `l` of the transpose), and `z = a AND b` is formed in
+/// registers. Each row's eight lane words are the ones
+/// [`fill_root_lincheck_stripe_group_ab`] forms for it, in the same lane-pair
+/// registers, through the same core
+/// ([`flock_core::bits::transpose_8_row_pairs_to_regs`]), with the same
+/// non-temporal stores: same bytes. The fixed stride makes every lane offset
+/// an immediate; the asserted program needs no per-row checks; two full
+/// rows on consecutive words share one 16-byte load per block and operand;
+/// two-word rows are a vector bit select instead of 32 scalar loads.
+///
+/// # Safety
+/// `a` and `b` must each be readable for `8 * AB_STRIPE_WORDS` u64 words,
+/// `dst` writable for 64 bytes per row, and `ops` must come from
+/// [`build_stripe_row_program`].
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+unsafe fn emit_root_rows_ab_s256(a: *const u8, b: *const u8, dst: *mut u8, ops: &[StripeRowOp]) {
+    use core::arch::aarch64::*;
+    /// Bytes from word `w` of block `l` to word `w` of block `l + 1`.
+    const LANE: usize = AB_STRIPE_WORDS * 8;
+
+    /// Words `w`, `w + 1` of block `l` of `a AND b`.
+    #[inline(always)]
+    unsafe fn q(a: *const u8, b: *const u8, l: usize) -> uint64x2_t {
+        unsafe { vandq_u64(vld1q_u64(a.add(l * LANE).cast()), vld1q_u64(b.add(l * LANE).cast())) }
+    }
+    /// Word `w` of blocks `l`, `l + 1` of `a AND b` (the incumbent's AND lane pair).
+    #[inline(always)]
+    unsafe fn pair(a: *const u8, b: *const u8, l: usize) -> uint64x2_t {
+        unsafe {
+            vandq_u64(
+                vcombine_u64(vld1_u64(a.add(l * LANE).cast()), vld1_u64(a.add((l + 1) * LANE).cast())),
+                vcombine_u64(vld1_u64(b.add(l * LANE).cast()), vld1_u64(b.add((l + 1) * LANE).cast())),
+            )
+        }
+    }
+    /// `(x & m) | (y & !m)` per bit.
+    #[inline(always)]
+    unsafe fn sel(m: uint8x16_t, x: uint64x2_t, y: uint64x2_t) -> uint64x2_t {
+        unsafe { vreinterpretq_u64_u8(vbslq_u8(m, vreinterpretq_u8_u64(x), vreinterpretq_u8_u64(y))) }
+    }
+    #[inline(always)]
+    unsafe fn put(dst: *mut u8, r: [uint64x2_t; 4]) {
+        unsafe {
+            let [y0, y1, y2, y3] = flock_core::bits::transpose_8_row_pairs_to_regs(
+                vreinterpretq_u8_u64(r[0]),
+                vreinterpretq_u8_u64(r[1]),
+                vreinterpretq_u8_u64(r[2]),
+                vreinterpretq_u8_u64(r[3]),
+            );
+            core::arch::asm!(
+                "stnp {y0:q}, {y1:q}, [{dst}]",
+                "stnp {y2:q}, {y3:q}, [{dst}, #32]",
+                dst = in(reg) dst,
+                y0 = in(vreg) y0,
+                y1 = in(vreg) y1,
+                y2 = in(vreg) y2,
+                y3 = in(vreg) y3,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    let mut out = dst;
+    for op in ops {
+        // SAFETY: the caller's contract; each op reads words `w` (and
+        // `w + 1`) of each block and writes its rows' 64-byte slots in order.
+        unsafe {
+            let (pa, pb) = (a.add(op.off), b.add(op.off));
+            match op.kind {
+                StripeRowKind::Pair | StripeRowKind::Split => {
+                    let (z0, z1, z2, z3) = (q(pa, pb, 0), q(pa, pb, 1), q(pa, pb, 2), q(pa, pb, 3));
+                    let (z4, z5, z6, z7) = (q(pa, pb, 4), q(pa, pb, 5), q(pa, pb, 6), q(pa, pb, 7));
+                    // Word w of blocks (0,1), (2,3), (4,5), (6,7); then w + 1.
+                    let lo = [vtrn1q_u64(z0, z1), vtrn1q_u64(z2, z3), vtrn1q_u64(z4, z5), vtrn1q_u64(z6, z7)];
+                    let hi = [vtrn2q_u64(z0, z1), vtrn2q_u64(z2, z3), vtrn2q_u64(z4, z5), vtrn2q_u64(z6, z7)];
+                    if op.kind == StripeRowKind::Pair {
+                        put(out, lo);
+                        put(out.add(64), hi);
+                        out = out.add(128);
+                    } else {
+                        // (lo & mask) | (hi & !mask) == (lo & lo_mask) | (hi & hi_mask).
+                        let m = vreinterpretq_u8_u64(vdupq_n_u64(op.mask));
+                        put(
+                            out,
+                            [sel(m, lo[0], hi[0]), sel(m, lo[1], hi[1]), sel(m, lo[2], hi[2]), sel(m, lo[3], hi[3])],
+                        );
+                        out = out.add(64);
+                    }
+                }
+                StripeRowKind::Full => {
+                    put(out, [pair(pa, pb, 0), pair(pa, pb, 2), pair(pa, pb, 4), pair(pa, pb, 6)]);
+                    out = out.add(64);
+                }
+                StripeRowKind::Masked => {
+                    let m = vdupq_n_u64(op.mask);
+                    put(
+                        out,
+                        [
+                            vandq_u64(pair(pa, pb, 0), m),
+                            vandq_u64(pair(pa, pb, 2), m),
+                            vandq_u64(pair(pa, pb, 4), m),
+                            vandq_u64(pair(pa, pb, 6), m),
+                        ],
+                    );
+                    out = out.add(64);
+                }
+            }
+        }
+    }
+}
+
+/// [`fixed_inputs_hold_ab`] with `checks` resolved once in `new` (no
+/// `LazyLock` deref and assert per lane). Same predicate over the same words.
+///
+/// # Safety
+/// As [`fixed_inputs_hold_ab`] with `u64_per_block = AB_STRIPE_WORDS`; every
+/// check word must be `< AB_STRIPE_WORDS` (true of `FIXED_INPUT_CHECKS`,
+/// whose words are below the rows' `read_words`).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+unsafe fn fixed_inputs_hold_ab_resolved(a: *const u64, b: *const u64, checks: &[(usize, u64, u64)]) -> bool {
+    let mut bad = 0u64;
+    for lane in 0..8 {
+        for &(word, mask, want) in checks {
+            debug_assert!(word < AB_STRIPE_WORDS);
+            let i = lane * AB_STRIPE_WORDS + word;
+            // SAFETY: `i < 8 * AB_STRIPE_WORDS` (caller's contract).
+            bad |= (unsafe { *a.add(i) & *b.add(i) } & mask) ^ want;
+        }
+    }
+    bad == 0
+}
 
 /// Whether all eight instances of stripe group `group` carry the ranked
 /// `block_len`/`flags` (`r1cs_hashes::blake3::FIXED_INPUT_CHECKS`). Reads the
@@ -1487,6 +1733,72 @@ mod deferred_stripe_tests {
             }
             if fixed {
                 assert!(ref_flag.load(std::sync::atomic::Ordering::Relaxed), "random tail must mismatch");
+            }
+        }
+    }
+
+    /// The AB emitter's row program compiles both root-row sets (every row
+    /// once, in order) and writes the bytes of
+    /// `fill_root_lincheck_stripe_group_ab` over random, all-zero, all-one
+    /// and fixed-input-satisfying paired scratch; its fixed-input check
+    /// agrees with `fixed_inputs_hold_ab`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_stripe_row_program_matches_incumbent_fill() {
+        use crate::r1cs_hashes::blake3 as b3;
+        let mut x = 0x0f1e_2d3c_4b5a_6978u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let checks: Vec<(usize, u64, u64)> = b3::FIXED_INPUT_CHECKS.iter().copied().collect();
+        for rows in [
+            b3::root_stripe_rows().expect("root stripe on by default"),
+            b3::fixed_input_root_stripe_rows().expect("fixed-input stripe on by default"),
+        ] {
+            let program = build_stripe_row_program(rows).expect("ranked rows compile");
+            let covered: usize = program
+                .iter()
+                .map(|op| if op.kind == StripeRowKind::Pair { 2 } else { 1 })
+                .sum();
+            assert_eq!(covered, rows.len());
+            for case in 0..8 {
+                let mut word = |_: usize| match case {
+                    0 => 0,
+                    1 => u64::MAX,
+                    _ => next(),
+                };
+                let mut a: Vec<u64> = (0..8 * AB_STRIPE_WORDS).map(&mut word).collect();
+                let mut b: Vec<u64> = (0..8 * AB_STRIPE_WORDS).map(&mut word).collect();
+                if case >= 5 {
+                    for (ab, bb) in a.chunks_exact_mut(AB_STRIPE_WORDS).zip(b.chunks_exact_mut(AB_STRIPE_WORDS)) {
+                        for &(w, m, want) in &checks {
+                            ab[w] = (ab[w] & !m) | want;
+                            bb[w] |= m;
+                        }
+                    }
+                }
+                let mut expected = vec![0xa5u8; 1 << 14];
+                let mut actual = vec![0xa5u8; 1 << 14];
+                // SAFETY: 8 blocks of AB_STRIPE_WORDS words each; 16 KiB >= 64 * rows.
+                unsafe {
+                    fill_root_lincheck_stripe_group_ab(a.as_ptr(), b.as_ptr(), &mut expected, AB_STRIPE_WORDS, rows);
+                    emit_root_rows_ab_s256(a.as_ptr().cast(), b.as_ptr().cast(), actual.as_mut_ptr(), &program);
+                }
+                assert_eq!(actual, expected, "rows={} case={case}", rows.len());
+                // SAFETY: as above.
+                let (got, want) = unsafe {
+                    (
+                        fixed_inputs_hold_ab_resolved(a.as_ptr(), b.as_ptr(), &checks),
+                        fixed_inputs_hold_ab(a.as_ptr(), b.as_ptr(), AB_STRIPE_WORDS),
+                    )
+                };
+                assert_eq!(got, want, "rows={} case={case}", rows.len());
+                if case >= 5 {
+                    assert!(got, "rows={} case={case}", rows.len());
+                }
             }
         }
     }

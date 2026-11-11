@@ -400,6 +400,26 @@ impl Dual {
             }
         }
         let reduced_log_d = self.log_d - d;
+        // Only the first 2^(reduced_log_d - log_inv_rate) coefficients of the
+        // transpose are kept (the truncate below). The retained-prefix form
+        // skips the dead outputs of the last `log_inv_rate` reverse layers;
+        // `None` (unsupported geometry) or the kill switch keeps the
+        // incumbent full transform + truncate.
+        if c2_retained_transpose_enabled() {
+            if let Some(basis) = transpose_forward_ntt_sparse_retained(
+                &self.ntt,
+                &self.positions,
+                &self.w0_pows,
+                reduced_log_d,
+                self.log_inv_rate,
+            ) {
+                debug_assert_eq!(
+                    basis.len(),
+                    1usize << (reduced_log_d - self.log_inv_rate)
+                );
+                return basis;
+            }
+        }
         let (mut basis, _) = transpose_forward_ntt_sparse_impl(
             &self.ntt,
             &self.positions,
