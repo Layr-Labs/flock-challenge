@@ -1786,7 +1786,21 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     if let Some((_, _, partials)) = static_run {
         // Same rows, same bytes: the Karatsuba table apply (18 loads per
         // word) or, with `FLOCK_NO_ZC_AB_KARA=1`, the plain apply (32).
-        if kernels::aarch64::ab_kara_enabled() && kernels::aarch64::ab_kara_unscaled_enabled() {
+        if kernels::aarch64::ab_kara_enabled()
+            && kernels::aarch64::ab_kara_unscaled_enabled()
+            && kernels::aarch64::ab_z_enabled()
+        {
+            kernels::aarch64::bstatic_horner_window_rows::<{ kernels::aarch64::AB_Z_VARIANT | kernels::aarch64::ABV_INLINE_WINDOW }>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else if kernels::aarch64::ab_kara_enabled() && kernels::aarch64::ab_kara_unscaled_enabled() {
             kernels::aarch64::bstatic_horner_window_rows::<{
                 kernels::aarch64::AB_ROWS_VARIANT | kernels::aarch64::ABV_KARA_UNSCALED
             }>(
@@ -1801,6 +1815,17 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             );
         } else if kernels::aarch64::ab_kara_enabled() {
             kernels::aarch64::bstatic_horner_window_rows::<{ kernels::aarch64::AB_ROWS_VARIANT }>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else if kernels::aarch64::ab_hz_helper_enabled() {
+            kernels::aarch64::bstatic_horner_window_rows::<{ kernels::aarch64::AB_HZ_VARIANT }>(
                 within_hash_outer,
                 a_packed,
                 b_packed,
@@ -6309,6 +6334,8 @@ mod tests {
                 let scale = if scaled { F8(1 << 4) } else { F8::ONE };
                 let want: [u8; 64] = core::array::from_fn(|i| (want[i] * scale).0);
                 assert_eq!(plain, want, "table apply differs from the reference (scaled={scaled})");
+                let hz = kernels::aarch64::ab_apply_word_hz_form(&table, scaled, word);
+                assert_eq!(hz, want, "half-pair z apply differs (scaled={scaled}, word={word:016x})");
             }
         }
         let context =
@@ -6381,11 +6408,23 @@ mod tests {
                         check!(ABV_INLINE_WINDOW);
                         check!(AB_ROWS_VARIANT);
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_SCALED);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_NOSW);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_REC);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_SCALED | kernels::aarch64::ABV_Z_REC);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_SCALED | kernels::aarch64::ABV_Z_REC | kernels::aarch64::ABV_NOSW);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_SCALED | kernels::aarch64::ABV_KARA_SCALED_UNSCALED | kernels::aarch64::ABV_NOSW);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_KARA_SCALED_UNSCALED | kernels::aarch64::ABV_NOSW);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | kernels::aarch64::ABV_Z | kernels::aarch64::ABV_Z_SCALED | kernels::aarch64::ABV_NOSW);
+                        check!(kernels::aarch64::ABV_HZ);
+                        check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW);
+                        check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW | ABV_INLINE_WINDOW);
                     }
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 4);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 16);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
@@ -6481,7 +6520,7 @@ mod tests {
     #[test]
     #[ignore = "timing probe"]
     fn ab_kara_rows_timing() {
-        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_KARA};
+        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_KARA_UNSCALED, ABV_NOSW, ABV_Z, ABV_KARA_SCALED_UNSCALED, ABV_Z_REC, ABV_Z_SCALED};
         let table = make_inv_table();
         let mut rng = Rng::new(0xB57A_71C0_7131_0005);
         let context =
@@ -6511,29 +6550,40 @@ mod tests {
         }
         let mut out = vec![0u8; 16 * 64];
         const REPS: usize = 40;
-        const NAMES: [&str; 3] = ["plain apply", "Karatsuba apply", "Karatsuba apply, one-function window"];
-        let mut times: [Vec<f64>; 3] = Default::default();
-        let mut sums = [0u64; 3];
+        type RowsFn = fn(usize, &[u8], &[u8], &InvNttTableByteSingleGf8, usize, &'static [[u8; 64]; 248], &mut [u8], bool);
+        use kernels::aarch64::{bstatic_horner_window_rows as bw, ABV_INLINE_WINDOW as IW, ABV_KARA as KA};
+        let all: Vec<(&str, RowsFn)> = vec![
+            ("k3 default (z plain, x4 Kara)", bw::<{ kernels::aarch64::AB_Z_VARIANT | IW }>),
+            ("z both rec nosw", bw::<{ AB_ROWS_VARIANT | ABV_KARA_UNSCALED | ABV_Z | ABV_Z_SCALED | ABV_Z_REC | ABV_NOSW }>),
+            ("z plain, x4 Kara unscaled", bw::<{ AB_ROWS_VARIANT | ABV_KARA_UNSCALED | ABV_Z | ABV_Z_REC | ABV_NOSW | ABV_KARA_SCALED_UNSCALED }>),
+            ("V=0 plain (helper form)", bw::<0>),
+            ("V=0 plain inline", bw::<{ IW }>),
+            ("Kara unscaled (pre-k3)", bw::<{ AB_ROWS_VARIANT | ABV_KARA_UNSCALED }>),
+            ("z both rec, sw partials", bw::<{ KA | IW | ABV_KARA_UNSCALED | ABV_Z | ABV_Z_SCALED | ABV_Z_REC }>),
+            ("z both, split tables nosw", bw::<{ KA | IW | ABV_KARA_UNSCALED | ABV_Z | ABV_Z_SCALED | ABV_NOSW }>),
+            ("HZ nosw (per-row calls)", bw::<{ kernels::aarch64::ABV_HZ | ABV_NOSW }>),
+            ("HZ nosw inline", bw::<{ kernels::aarch64::ABV_HZ | ABV_NOSW | IW }>),
+            ("HZ, sw partials", bw::<{ kernels::aarch64::ABV_HZ }>),
+            ("V=0 nosw partials", bw::<{ ABV_NOSW }>),
+        ];
+        let pick: Vec<usize> = std::env::var("FLOCK_PROBE_FORMS")
+            .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+            .unwrap_or_else(|_| (0..all.len()).collect());
+        let forms: Vec<(&str, RowsFn)> = pick.iter().map(|&i| all[i]).collect();
+        let f = forms.len();
+        let mut times: Vec<Vec<f64>> = vec![Vec::new(); f];
+        let mut sums = vec![0u64; f];
         for round in 0..26 {
-            for k in 0..3 {
-                let form = (k + round) % 3;
+            for k in 0..f {
+                let form = (k + round) % f;
+                let run = forms[form].1;
                 let mut sum = 0u64;
                 let t0 = std::time::Instant::now();
                 for _ in 0..REPS {
                     for c in 0..CHUNKS {
                         for w in 0..2usize {
                             let base = c * 2048 + w * 1024;
-                            match form {
-                                0 => kernels::aarch64::bstatic_horner_window_rows::<0>(
-                                    w, &a_packed, &b, &table, base, partials, &mut out, false,
-                                ),
-                                1 => kernels::aarch64::bstatic_horner_window_rows::<{ ABV_KARA }>(
-                                    w, &a_packed, &b, &table, base, partials, &mut out, false,
-                                ),
-                                _ => kernels::aarch64::bstatic_horner_window_rows::<{ AB_ROWS_VARIANT }>(
-                                    w, &a_packed, &b, &table, base, partials, &mut out, false,
-                                ),
-                            }
+                            run(w, &a_packed, &b, &table, base, partials, &mut out, false);
                             sum = sum.wrapping_mul(0x9E37_79B9_7F4A_7C15)
                                 ^ u64::from_le_bytes(out[5 * 64..5 * 64 + 8].try_into().unwrap());
                         }
@@ -6545,12 +6595,12 @@ mod tests {
                 sums[form] = sum;
             }
         }
-        assert!(sums[0] == sums[1] && sums[0] == sums[2], "forms disagree");
+        assert!(sums.iter().all(|&x| x == sums[0]), "forms disagree");
         for (form, t) in times.iter_mut().enumerate() {
             t.sort_by(|x, y| x.partial_cmp(y).unwrap());
             eprintln!(
-                "[ab-kara-timing] {:38} min {:.3} p25 {:.3} median {:.3} ns per row, checksum {:016x}",
-                NAMES[form], t[0], t[6], t[12], sums[form]
+                "[ab-kara-timing] {:2} {:32} min {:.3} p25 {:.3} median {:.3} ns per row, checksum {:016x}",
+                pick[form], forms[form].0, t[0], t[6], t[12], sums[form]
             );
         }
     }
