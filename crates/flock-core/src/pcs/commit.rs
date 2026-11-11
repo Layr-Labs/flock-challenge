@@ -416,6 +416,37 @@ pub fn commit_from_streamed_first_pass(
     )
 }
 
+/// Process minor page faults so far (`getrusage` `ru_minflt`), for
+/// `FLOCK_PHASE_TIMING` diagnostics; 0 off macOS.
+pub fn process_minflt() -> i64 {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct Timeval {
+            sec: i64,
+            usec: i32,
+        }
+        #[repr(C)]
+        struct Rusage {
+            utime: Timeval,
+            stime: Timeval,
+            other: [i64; 14],
+        }
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+        }
+        let mut ru = Rusage {
+            utime: Timeval { sec: 0, usec: 0 },
+            stime: Timeval { sec: 0, usec: 0 },
+            other: [0; 14],
+        };
+        if unsafe { getrusage(0, &mut ru) } == 0 {
+            return ru.other[4];
+        }
+    }
+    0
+}
+
 /// Process CPU (user+system) in ms for `FLOCK_COMMIT_TIMING` diagnostics.
 /// Direct `getrusage(RUSAGE_SELF)`; diagnostics-only, 0.0 off macOS.
 pub(crate) fn commit_cpu_ms() -> f64 {
