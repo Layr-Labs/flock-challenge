@@ -4804,6 +4804,8 @@ pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, c
         let rc = q(rho_c);
         let rc_sw = swap_halves_q(rc);
         let zero = vdupq_n_u64(0);
+        #[cfg(target_feature = "sha3")]
+        let k87 = vdupq_n_u64(0x87);
         let mut acc = [TriNeon {
             ll: zero,
             cross: zero,
@@ -4866,9 +4868,23 @@ pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, c
                     continue;
                 }
                 let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
-                let w_sum = vgetq_lane_u64::<0>(w) ^ vgetq_lane_u64::<1>(w);
-                for i in 0..8 {
-                    ta[t][i] = mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i]);
+                // The eight `w`-scaled rows as fused schoolbook products (the
+                // cascade K pass's form): one swap of `w` per group and the
+                // hoisted `0x87`, no GPR round trip for Karatsuba lane sums.
+                // Same reduced field products, so the same bytes.
+                #[cfg(target_feature = "sha3")]
+                {
+                    let w_sw = swap_halves_q(w);
+                    for i in 0..8 {
+                        ta[t][i] = mul_sw_fused_q(w, w_sw, a[i], k87);
+                    }
+                }
+                #[cfg(not(target_feature = "sha3"))]
+                {
+                    let w_sum = vgetq_lane_u64::<0>(w) ^ vgetq_lane_u64::<1>(w);
+                    for i in 0..8 {
+                        ta[t][i] = mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i]);
+                    }
                 }
                 tb[t] = b;
             }
