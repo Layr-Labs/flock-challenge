@@ -78,6 +78,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
     let kplain = kara;
     let kscaled = kara.wrapping_add(AB_KARA_IMAGE_BYTES);
     unsafe {
+        let red_x4 = vld1q_u8(AB_X4_RED.as_ptr());
         let a_base = a_packed.as_ptr().add(byte_base_b);
         let b_base = b_packed.as_ptr().add(byte_base_b);
         let pbase = partials.as_ptr().cast::<u8>();
@@ -126,7 +127,11 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u8>(
         macro_rules! prods {
             ($at:expr, $at_sw:expr, $kara:expr, $k:literal, $bimg:expr) => {{
                 let aw = u64::from_le(core::ptr::read_unaligned(a_base.add($k * N_CHUNKS).cast::<u64>()));
-                let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw);
+                let (da0, da1, da2, da3) = if $k >= 4 && V & ABV_KARA_X4_FROM_PLAIN != 0 {
+                    apply_word_kara_x4::<V>(kplain, aw, red_x4)
+                } else {
+                    apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw)
+                };
                 let (db0, db1, db2, db3) = $bimg;
                 [
                     pmull_lo_u16(da0, db0),

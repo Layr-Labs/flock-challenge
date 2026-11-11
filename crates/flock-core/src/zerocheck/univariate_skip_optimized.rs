@@ -1734,7 +1734,24 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     if let Some((_, _, partials)) = static_run {
         // Same rows, same bytes: the Karatsuba table apply (18 loads per
         // word) or, with `FLOCK_NO_ZC_AB_KARA=1`, the plain apply (32).
-        if kernels::aarch64::ab_kara_enabled() && kernels::aarch64::ab_kara_unscaled_enabled() {
+        if kernels::aarch64::ab_kara_enabled()
+            && kernels::aarch64::ab_kara_unscaled_enabled()
+            && kernels::aarch64::ab_kara_x4_from_plain_enabled()
+        {
+            kernels::aarch64::bstatic_horner_window_rows::<{
+                kernels::aarch64::AB_ROWS_VARIANT | kernels::aarch64::ABV_KARA_UNSCALED
+                    | kernels::aarch64::ABV_KARA_X4_FROM_PLAIN
+            }>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else if kernels::aarch64::ab_kara_enabled() && kernels::aarch64::ab_kara_unscaled_enabled() {
             kernels::aarch64::bstatic_horner_window_rows::<{
                 kernels::aarch64::AB_ROWS_VARIANT | kernels::aarch64::ABV_KARA_UNSCALED
             }>(
@@ -6186,8 +6203,30 @@ mod tests {
     /// not (the generic fallback), both store flavours.
     #[cfg(target_arch = "aarch64")]
     #[test]
+    fn ab_kara_x4_identity() {
+        use kernels::aarch64::{ab_kara_tables, AB_KARA_IMAGE_BYTES, ABV_KARA};
+        let table = make_inv_table();
+        let kara = ab_kara_tables(&table);
+        // Each byte value has eight 16-byte slots, followed by the ninth subtable.
+        let plain = unsafe { core::slice::from_raw_parts(kara, AB_KARA_IMAGE_BYTES) };
+        let scaled = unsafe {
+            core::slice::from_raw_parts(kara.add(AB_KARA_IMAGE_BYTES), AB_KARA_IMAGE_BYTES)
+        };
+        for (i, (&p, &s)) in plain.iter().zip(scaled).enumerate() {
+            assert_eq!(s, (F8(p) * F8(0x10)).0, "table byte {i}");
+        }
+        let mut rng = Rng::new(0xE110_1234_5678_0001);
+        for word in [0, u64::MAX].into_iter().chain((0..4096).map(|_| rng.next_u64())) {
+            let (_, p) = kernels::aarch64::ab_apply_word_forms::<ABV_KARA>(&table, false, word);
+            let (_, s) = kernels::aarch64::ab_apply_word_forms::<ABV_KARA>(&table, true, word);
+            assert_eq!(s, p.map(|x| (F8(x) * F8(0x10)).0), "word {word:016x}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
     fn ab_kernel_variants_match_baseline() {
-        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_INLINE_WINDOW, ABV_KARA, ABV_KARA_UNSCALED};
+        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_INLINE_WINDOW, ABV_KARA, ABV_KARA_UNSCALED, ABV_KARA_X4_FROM_PLAIN};
         let table = make_inv_table();
         let mut rng = Rng::new(0xAB5A_71C0_F457_0003);
         let mut words: Vec<u64> = vec![0, u64::MAX];
@@ -6203,6 +6242,8 @@ mod tests {
                 let (plain, kara) = kernels::aarch64::ab_apply_word_forms::<ABV_KARA>(&table, scaled, word);
                 let (_, unscaled) = kernels::aarch64::ab_apply_word_forms::<{ ABV_KARA | ABV_KARA_UNSCALED }>(&table, scaled, word);
                 assert_eq!(kara, unscaled, "unscaled Karatsuba apply differs (scaled={scaled}, word={word:016x})");
+                let (_, x4) = kernels::aarch64::ab_apply_word_forms::<{ ABV_KARA | ABV_KARA_UNSCALED | ABV_KARA_X4_FROM_PLAIN }>(&table, scaled, word);
+                assert_eq!(kara, x4, "x4 Karatsuba apply differs (scaled={scaled}, word={word:016x})");
                 assert_eq!(plain, kara, "Karatsuba apply differs (scaled={scaled}, word={word:016x})");
                 let mut want = [F8::ZERO; 64];
                 table.apply(&word.to_le_bytes(), &mut want);
@@ -6281,11 +6322,12 @@ mod tests {
                         check!(ABV_INLINE_WINDOW);
                         check!(AB_ROWS_VARIANT);
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | ABV_KARA_X4_FROM_PLAIN);
                     }
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 4);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 5);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
