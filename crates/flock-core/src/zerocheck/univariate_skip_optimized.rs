@@ -1398,7 +1398,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
 /// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
 #[inline]
 fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
-    n_chunks.div_ceil(2048).max(1)
+    n_chunks.div_ceil(4096).max(1)
 }
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
@@ -1506,7 +1506,6 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         let n_units = n_chunks / unit_chunks;
         // Even, so unit pairs (2u, 2u + 1) always share a job and a thread
         // (the producer may pair them; see `zc_ab_producer_fused_active`).
-        // 42 at the ranked shape, unchanged.
         let units_per_job = match chunks_per_job / unit_chunks {
             0 | 1 => 1,
             u => u & !1,
