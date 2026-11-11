@@ -1398,7 +1398,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
 /// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
 #[inline]
 fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
-    n_chunks.div_ceil(1536).max(1)
+    n_chunks.div_ceil(2048).max(1)
 }
 
 /// Ranked-shape selector for resolving the process-wide Horner policy once
