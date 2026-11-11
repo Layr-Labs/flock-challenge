@@ -969,7 +969,10 @@ struct AbStripeEmitter<'a> {
     rows: &'static [crate::r1cs_hashes::blake3::RootRow],
     fixed_inputs: bool,
     mismatch: &'a std::sync::atomic::AtomicBool,
-    emitted: Box<[std::sync::atomic::AtomicU64]>,
+    /// Completion is monotone and independent for each group. A separate
+    /// byte lets producers publish with a store rather than an RMW shared
+    /// by 64 groups. `finish` reads these marks after AB production completes.
+    emitted: Box<[std::sync::atomic::AtomicU8]>,
     epoch: u64,
     /// Words of a block the rows and the fixed-input checks read.
     read_words: usize,
@@ -1000,8 +1003,8 @@ impl<'a> AbStripeEmitter<'a> {
             rows,
             fixed_inputs,
             mismatch,
-            emitted: (0..n_groups.div_ceil(64))
-                .map(|_| std::sync::atomic::AtomicU64::new(0))
+            emitted: (0..n_groups)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
             epoch: AB_STRIPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             read_words: rows
@@ -1072,7 +1075,7 @@ impl<'a> AbStripeEmitter<'a> {
             if self.fixed_inputs && !fixed_inputs_hold(&st.words, 0, group_f128, AB_STRIPE_WORDS) {
                 self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            self.emitted[group / 64].fetch_or(1 << (group % 64), std::sync::atomic::Ordering::Relaxed);
+            self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
 
@@ -1121,7 +1124,7 @@ impl<'a> AbStripeEmitter<'a> {
                 self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        self.emitted[group / 64].fetch_or(1 << (group % 64), std::sync::atomic::Ordering::Relaxed);
+        self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// After every unit was produced (the AB arm has joined its workers):
@@ -1133,7 +1136,7 @@ impl<'a> AbStripeEmitter<'a> {
         use rayon::prelude::*;
         let per_job = DEFERRED_STRIPE_GROUPS_PER_JOB;
         let missing = |g: usize| {
-            self.emitted[g / 64].load(std::sync::atomic::Ordering::Relaxed) & (1 << (g % 64)) == 0
+            self.emitted[g].load(std::sync::atomic::Ordering::Relaxed) == 0
         };
         let n_missing = (0..self.n_groups).filter(|&g| missing(g)).count();
         if n_missing > 0 {
