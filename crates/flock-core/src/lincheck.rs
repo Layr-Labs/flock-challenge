@@ -606,17 +606,7 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
     let d = point.len();
     assert_eq!(out.len(), 1usize << d);
     if d >= 14 {
-        let a = d / 2;
-        let mut lo = vec![F128::ZERO; 1usize << a];
-        let mut hi = vec![F128::ZERO; 1usize << (d - a)];
-        build_eq_table_into(&point[..a], &mut lo);
-        build_eq_table_into(&point[a..], &mut hi);
-        let lo = &lo;
-        out.par_chunks_mut(1usize << a)
-            .zip(hi.par_iter())
-            .for_each(|(chunk, &s)| {
-                crate::field::f128_slice::scale_slice_into(chunk, lo, s);
-            });
+        build_eq_table_optimized_into(point, out);
         return;
     }
     out[0] = F128::ONE;
