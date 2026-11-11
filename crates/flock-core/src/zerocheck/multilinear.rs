@@ -99,7 +99,11 @@ use kernels::aarch64::{
     fold2_compact_and_round45_chunk_neon_8,
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-use kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused;
+use kernels::aarch64::{
+    fold2_compact_and_round45_chunk_neon_8_fused, fold2_compact_and_round45_chunk_neon_8_fused_r1,
+};
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+use kernels::aarch64::fold_round2_compact_chunk_neon_prescaled_8;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::{
     fold2_and_message_lookahead_normal_expanded_aarch64,
@@ -140,12 +144,33 @@ fn r2_first_shift_skip_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_FIRST_SHIFT_SKIP").is_none_or(|v| v != *"1")
 }
 
+/// Kill switch for the pre-scaled round-two W kernel on GPU-covered chunks
+/// (`fold_round2_compact_chunk_neon_prescaled_8`): `FLOCK_NO_R2_PRESCALE`
+/// (any value) restores the Horner-shift kernel. Same anchor and delta stores,
+/// same four W slots, bit for bit. Read once per process.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn r2_prescale_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_PRESCALE").is_none())
+}
+
 /// Kill switch for the fused cascade K kernel
 /// (`fold2_compact_and_round45_chunk_neon_8_fused`): `FLOCK_NO_ZC_K_FUSED=1`
 /// restores the one-body compact kernel. Same stores and slots either way.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 fn cascade_k_fused_enabled() -> bool {
     std::env::var_os("FLOCK_NO_ZC_K_FUSED").is_none_or(|v| v != *"1")
+}
+
+/// Kill switch for the one-table fused cascade K kernel
+/// (`fold2_compact_and_round45_chunk_neon_8_fused_r1`): `FLOCK_NO_ZC_K_ONE_TABLE`
+/// (any value) restores the λ₁/λ₃ table pair. Same stores and slots either
+/// way: `x0 + ρ₂(x0+x1)` with `x_i = anc_i + T_ρ₁(δ_i)` is the incumbent's
+/// `anc0 + ρ₂(anc0+anc1) + T_λ₁(δ0) + T_λ₃(δ1)` as a field element.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn zc_k_one_table_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_ONE_TABLE").is_none())
 }
 
 /// Kill switch for the ranked BLAKE3 periodic-padding schedule in round two:
@@ -1903,6 +1928,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
 
     #[cfg(target_arch = "aarch64")]
     let horner_skip_first = r2_first_shift_skip_enabled();
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let horner_prescale = r2_prescale_enabled();
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
+    let horner_prescale = false;
 
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
@@ -1982,7 +2011,24 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu && horner_weights {
-                    if horner_skip_first {
+                    if horner_prescale {
+                        #[cfg(target_feature = "sha3")]
+                        fold_round2_compact_chunk_neon_prescaled_8(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        );
+                    } else if horner_skip_first {
                         fold_round2_compact_chunk_neon_horner_8::<true>(
                             t,
                             ap,
@@ -2510,12 +2556,27 @@ pub(crate) fn fold2_compact_and_round45_into(
     let r_par = r_next4[1];
     assert_ne!(r_par, F128::ZERO, "cascade requires a non-zero r_next4[1]");
 
-    // Same λ composition as the incumbent K pass: the anchors take one
-    // ordinary ρ₂ fold, only the two deltas carry ρ₁.
-    let lambda1 = rho1 * (F128::ONE + rho2);
-    let lambda3 = rho1 * rho2;
-    let table_l1 = table.scaled_linear(lambda1);
-    let table_l3 = table.scaled_linear(lambda3);
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let fused_k = cascade_k_fused_enabled();
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
+    let fused_k = false;
+    // The fused kernel can read ONE ρ₁-scaled table (the round-three values
+    // `x_i = anc_i + T_ρ₁(δ_i)`, then `x0 + ρ₂(x0+x1)`): same lookups and
+    // products, half the bank bases and table bytes, one table build fewer.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let one_table = fused_k && zc_k_one_table_enabled();
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
+    let one_table = false;
+    // Otherwise the incumbent λ composition: the anchors take one ordinary
+    // ρ₂ fold, only the two deltas carry ρ₁. With `one_table`, `table_l1`
+    // holds T_ρ₁ and `table_l3` is empty (never read).
+    let (table_l1, table_l3) = if one_table {
+        (table.scaled_linear(rho1), Vec::new())
+    } else {
+        let lambda1 = rho1 * (F128::ONE + rho2);
+        let lambda3 = rho1 * rho2;
+        (table.scaled_linear(lambda1), table.scaled_linear(lambda3))
+    };
 
     let n_vars = r_next4.len() - 1;
     let eq = SplitEqGhash::with_n_hi(&r_next4[1..], cascade_k_pass_n_hi(n_vars));
@@ -2546,10 +2607,6 @@ pub(crate) fn fold2_compact_and_round45_into(
     );
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let fused_k = cascade_k_fused_enabled();
-    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
-    let fused_k = false;
 
     // Weight each kernel output once. The odd-lane terms are shared by the
     // round-4 result and round-5 lookahead; kappa is common to all chunks and
@@ -2582,6 +2639,14 @@ pub(crate) fn fold2_compact_and_round45_into(
             let eq_ptr = eq_lo.as_ptr();
             let out_ptr = outv.as_mut_ptr();
             match (fused_k, compact.dead_tail) {
+                #[cfg(target_feature = "sha3")]
+                (true, true) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true>(
+                    t1, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                ),
+                #[cfg(target_feature = "sha3")]
+                (true, false) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false>(
+                    t1, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                ),
                 #[cfg(target_feature = "sha3")]
                 (true, true) => fold2_compact_and_round45_chunk_neon_8_fused::<true>(
                     t1, t3, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,

@@ -574,6 +574,29 @@ pub(super) fn accumulate_convert_ab_nomul<const STORE: bool, const U: bool>(
     portable::accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
 }
 
+/// [`accumulate_convert_ab_nomul`]`::<false, U>` with the bank slots as the
+/// accumulators' seed (aarch64; other targets run that function). Same bank
+/// bits.
+#[inline]
+pub(super) fn accumulate_convert_ab_nomul_seeded<const U: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    n_b_med: usize,
+    convert: &[super::F128],
+    bank: &mut [super::F128; 64],
+) {
+    assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    assert_eq!(convert.len(), 16 * 256);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: the asserts above bound every row and table access; aarch64
+    // statically guarantees NEON.
+    unsafe {
+        aarch64::accumulate_convert_ab_nomul_seeded::<U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    accumulate_convert_ab_nomul::<false, U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+}
+
 /// Portable reference for [`accumulate_c_banks`], and the shape the aarch64
 /// kernel is tested against.
 ///

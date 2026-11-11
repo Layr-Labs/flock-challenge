@@ -2878,6 +2878,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     let bank_mask = n_banks - 1;
     let store_first = big_lo_size >= n_banks;
     let unscaled = zc_ab_unscaled_enabled();
+    let seeded = zc_ab_seeded_enabled();
     if !store_first {
         banks.fill(F128::ZERO);
     }
@@ -2907,6 +2908,12 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
             (true, true) => {
                 kernels::accumulate_convert_ab_nomul::<true, true>(rows, first_b_med, end_b_med, table, bank)
             }
+            (false, true) if seeded => {
+                kernels::accumulate_convert_ab_nomul_seeded::<true>(rows, first_b_med, end_b_med, table, bank)
+            }
+            (false, false) if seeded => {
+                kernels::accumulate_convert_ab_nomul_seeded::<false>(rows, first_b_med, end_b_med, table, bank)
+            }
             (false, true) => {
                 kernels::accumulate_convert_ab_nomul::<false, true>(rows, first_b_med, end_b_med, table, bank)
             }
@@ -2932,6 +2939,17 @@ fn zc_ab_unscaled_enabled() -> bool {
         std::env::var_os(ENV_NO_ZC_AB_UNSCALED).is_none_or(|v| v != *"1")
     });
     *ON
+}
+
+/// Kill switch for the seeded XOR drain of the round-one AB completion
+/// (`kernels::accumulate_convert_ab_nomul_seeded`): `FLOCK_NO_ZC_AB_SEEDED`
+/// (any value) restores the zero-seeded kernel in the same binary. Same bank
+/// bits either way. Read once per process.
+pub const ENV_NO_ZC_AB_SEEDED: &str = "FLOCK_NO_ZC_AB_SEEDED";
+
+fn zc_ab_seeded_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_SEEDED).is_none())
 }
 
 /// Collapse the bank-major tensor-fold scratch and apply the unchanged high
@@ -7332,6 +7350,38 @@ mod tests {
             finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, false, &mut scalar);
             finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, true, &mut deferred);
             assert_eq!(deferred, scalar, "trial={trial}");
+        }
+    }
+
+    /// The seeded XOR-drain completion kernel leaves every bank slot exactly
+    /// where the zero-seeded kernel does: every even start, every end, both
+    /// table-load forms, random and all-ones rows over pre-filled banks.
+    #[test]
+    fn ab_completion_seeded_kernel_matches_incumbent() {
+        let mut rng = Rng::new(0x5EED_AB01);
+        let table = rng.f128_vec(CONVERT_TABLE_SIZE);
+        for trial in 0..4 {
+            let mut rows = [[0u8; 64]; 16];
+            for row in rows.iter_mut() {
+                for byte in row.iter_mut() {
+                    *byte = if trial == 0 { 0xff } else { rng.next_u64() as u8 };
+                }
+            }
+            let start: [F128; ELL] = core::array::from_fn(|_| rng.f128());
+            for first in (0..=16).step_by(2) {
+                for end in first..=16 {
+                    let mut want = start;
+                    let mut got = start;
+                    kernels::accumulate_convert_ab_nomul::<false, true>(&rows, first, end, &table, &mut want);
+                    kernels::accumulate_convert_ab_nomul_seeded::<true>(&rows, first, end, &table, &mut got);
+                    assert_eq!(got, want, "unscaled trial={trial} first={first} end={end}");
+                    let mut want = start;
+                    let mut got = start;
+                    kernels::accumulate_convert_ab_nomul::<false, false>(&rows, first, end, &table, &mut want);
+                    kernels::accumulate_convert_ab_nomul_seeded::<false>(&rows, first, end, &table, &mut got);
+                    assert_eq!(got, want, "scaled trial={trial} first={first} end={end}");
+                }
+            }
         }
     }
 
