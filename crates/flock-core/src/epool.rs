@@ -44,6 +44,24 @@ use std::sync::{Arc, OnceLock};
 
 use rayon::prelude::*;
 
+// Keep the same lazy initializer, including its cached failure. Membership
+// queries below must not initialize a pool or create worker threads.
+static EPOOL_INSTANCE: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
+#[cfg(any(test, all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3")))]
+fn current_thread_is_in_pool(pool: Option<&rayon::ThreadPool>) -> bool {
+    pool.is_some_and(|pool| pool.current_thread_index().is_some())
+}
+
+/// Query the actual registered helper pool, without constructing it. Worker
+/// indices are pool-local, so a main worker numbered zero is not helper zero.
+/// This is pool membership, not a claim about physical-core placement.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3"))]
+pub(crate) fn current_thread_is_helper() -> bool {
+    current_thread_is_in_pool(EPOOL_INSTANCE.get().and_then(Option::as_ref))
+}
+
+
 /// Logical efficiency-core count on Apple Silicon macOS, else 0.
 ///
 /// Queries `hw.perflevel1.logicalcpu` through the `sysctlbyname` *syscall* —
@@ -137,8 +155,7 @@ fn build_epool() -> Option<rayon::ThreadPool> {
 /// First use happens during the worker's fixed-seed warm-up proof, so the
 /// (one-time) thread spawns are outside every measured interval.
 pub(crate) fn epool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    POOL.get_or_init(build_epool).as_ref()
+    EPOOL_INSTANCE.get_or_init(build_epool).as_ref()
 }
 
 /// Whether this host has a live efficiency-core helper pool.
@@ -1011,6 +1028,26 @@ unsafe impl<T> Sync for SyncPtr<T> {}
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn helper_membership_uses_registry_not_worker_index() {
+        let helper = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let main = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        assert!(!current_thread_is_in_pool(None));
+        assert!(!current_thread_is_in_pool(Some(&helper)));
+        helper.install(|| {
+            assert_eq!(helper.current_thread_index(), Some(0));
+            assert!(current_thread_is_in_pool(Some(&helper)));
+            assert!(!current_thread_is_in_pool(Some(&main)));
+        });
+        main.install(|| {
+            assert_eq!(main.current_thread_index(), Some(0));
+            assert!(current_thread_is_in_pool(Some(&main)));
+            assert!(!current_thread_is_in_pool(Some(&helper)));
+        });
+        assert!(!current_thread_is_in_pool(Some(&helper)));
+    }
+
     use super::*;
 
     /// Every chunk index is executed exactly once when both pools drain the
