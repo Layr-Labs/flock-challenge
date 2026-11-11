@@ -223,6 +223,26 @@ fn deep_subtree_pairs_enabled() -> bool {
     *ON
 }
 
+/// Below-parallel-floor interleaved transforms (`n_top == 0`, log_d 8..11;
+/// ranked: the L5 recursive commit) run the fused-pair subtree loop instead
+/// of the scalar reference. `FLOCK_NO_SMALL_NTT_PAIRS=1` (any value)
+/// restores the scalar loop. Read once per process.
+#[inline]
+fn small_transform_pairs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_SMALL_NTT_PAIRS").is_none())
+}
+
+/// Fused deep pairs whose two inner twiddles have zero high limbs but whose
+/// outer twiddle does not take the low-limb split for the inner products.
+/// `FLOCK_NO_LOW_INNER_PAIRS=1` (any value) restores the general kernel.
+/// Read once per process.
+#[inline]
+fn low_inner_pairs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LOW_INNER_PAIRS").is_none())
+}
+
 /// The standard dimension-20 basis has low-limb-only twiddles throughout the
 /// final two layers. This permits a two-PMULL product on AArch64 instead of the
 /// generic six-PMULL field multiply. Keep the dispatch tied to the exact
@@ -1456,6 +1476,31 @@ impl AdditiveNttF128 {
         let n_top = fusion_aware_interleaved_n_top(log_d, num_ntts, start_layer, n_top);
         if n_top == 0 || log_d < 8 {
             debug_assert_eq!(PHASE, INTERLEAVED_PHASE_ALL);
+            // A transform below the parallel floor (ranked: the L5 commit,
+            // log_d 10, 8 lanes) is one cache-resident sub-transform. Run it
+            // through the vector-resident fused-pair subtree loop (sub 0 of
+            // n_top 0: global block = block) instead of the scalar reference,
+            // whose every butterfly is a GPR-repacked six-PMULL product. Same
+            // butterflies, twiddles and layer order; pairs whose three
+            // twiddles have zero high limbs (all of them at log_d 10) take
+            // the three-PMULL low-limb kernel.
+            if cfg!(all(target_arch = "aarch64", target_feature = "aes"))
+                && n_top == 0
+                && log_d >= 8
+                && small_transform_pairs_enabled()
+                && deep_subtree_pairs_enabled()
+            {
+                self.forward_transform_interleaved_deep_subtree_pairs(
+                    data,
+                    num_ntts,
+                    start_layer,
+                    0,
+                    log_d,
+                    0,
+                );
+                finish_chunk(0, data);
+                return;
+            }
             self.forward_transform_interleaved_scalar_from_layer(data, num_ntts, start_layer);
             finish_chunk(0, data);
             return;
@@ -1843,6 +1888,16 @@ impl AdditiveNttF128 {
                     butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
                         block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
                     );
+                } else if t_inner_a.hi == 0
+                    && t_inner_b.hi == 0
+                    && low_inner_pairs_enabled()
+                    && kernels::try_butterfly_fused_2layer_low_inner_rows(
+                        block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+                    )
+                {
+                    // Outer twiddle general, both inner twiddles low-limb
+                    // (the third-deepest layer of every standard recursive
+                    // basis: 61/53/45/37 bits at log_d 18/16/14/12).
                 } else {
                     butterfly_interleaved_fused_2layer_rows_seq(
                         block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts, 0,
@@ -3388,6 +3443,33 @@ mod tests {
         }
     }
 
+    /// The low-inner fused pair (general outer, low-limb inner twiddles) is
+    /// exercised at L1/L2 by `recursive_deep_subtree_pairs_match_scalar_oracle`;
+    /// this covers the L3/L4 commit shapes (pairs (10,11) and (8,9)) through
+    /// the ordinary from-layer entry, against the scalar reference.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    ))]
+    #[test]
+    fn low_inner_pairs_match_scalar_at_recursive_l3_l4_shapes() {
+        const NUM_NTTS: usize = 8;
+        let mut rng = Rng::new(0x10E1_77E2_0003);
+        for (log_d, start_layer) in [(14usize, 4usize), (12, 5)] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let msg_len = (1usize << (log_d - start_layer)) * NUM_NTTS;
+            let msg = rand_vec(&mut rng, msg_len);
+            let mut want = vec![F128::ZERO; msg_len << start_layer];
+            for replica in want.chunks_mut(msg_len) {
+                replica.copy_from_slice(&msg);
+            }
+            let mut got = want.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut want, NUM_NTTS, start_layer);
+            ntt.forward_transform_interleaved_from_layer(&mut got, NUM_NTTS, start_layer);
+            assert!(got == want, "log_d={log_d} start={start_layer}");
+        }
+    }
+
     #[test]
     fn recursive_l1_ntt_epool_gate_and_rollback_are_exact() {
         let enabled_here = cfg!(all(
@@ -3804,6 +3886,33 @@ mod tests {
                     "interleaved parallel mismatch at log_d={log_d}, num_ntts={num_ntts}"
                 );
             }
+        }
+    }
+
+    /// Below-floor transforms (`n_top == 0`) from a rate layer, including the
+    /// ranked L5 commit shape (log_d 10, 8 lanes, start layer 6), match the
+    /// scalar reference through the public from-layer entry point.
+    #[cfg(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq")
+    ))]
+    #[test]
+    fn small_from_layer_pairs_match_scalar() {
+        let mut rng = Rng::new(0x5A11);
+        for &(log_d, num_ntts, start) in &[
+            (10usize, 8usize, 6usize),
+            (10, 8, 0),
+            (11, 8, 5),
+            (9, 8, 4),
+            (8, 4, 1),
+        ] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let original = rand_vec(&mut rng, (1 << log_d) * num_ntts);
+            let mut expected = original.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut expected, num_ntts, start);
+            let mut actual = original;
+            ntt.forward_transform_interleaved_from_layer(&mut actual, num_ntts, start);
+            assert_eq!(actual, expected, "log_d={log_d} num_ntts={num_ntts} start={start}");
         }
     }
 

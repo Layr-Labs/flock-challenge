@@ -1786,7 +1786,27 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     if let Some((_, _, partials)) = static_run {
         // Same rows, same bytes: the Karatsuba table apply (18 loads per
         // word) or, with `FLOCK_NO_ZC_AB_KARA=1`, the plain apply (32).
-        if kernels::aarch64::ab_kara_enabled() && kernels::aarch64::ab_kara_unscaled_enabled() {
+        // `FLOCK_NO_ZC_AB_KARA_XOR16` (any value) keeps the incumbent
+        // recombination of the eighteen lookups.
+        if kernels::aarch64::ab_kara_enabled()
+            && kernels::aarch64::ab_kara_unscaled_enabled()
+            && kernels::aarch64::ab_kara_xor16_enabled()
+        {
+            kernels::aarch64::bstatic_horner_window_rows::<{
+                kernels::aarch64::AB_ROWS_VARIANT
+                    | kernels::aarch64::ABV_KARA_UNSCALED
+                    | kernels::aarch64::ABV_KARA_XOR16
+            }>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else if kernels::aarch64::ab_kara_enabled() && kernels::aarch64::ab_kara_unscaled_enabled() {
             kernels::aarch64::bstatic_horner_window_rows::<{
                 kernels::aarch64::AB_ROWS_VARIANT | kernels::aarch64::ABV_KARA_UNSCALED
             }>(
@@ -2853,6 +2873,7 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     let bank_mask = n_banks - 1;
     let store_first = big_lo_size >= n_banks;
     let unscaled = zc_ab_unscaled_enabled();
+    let seeded = zc_ab_seeded_enabled();
     if !store_first {
         banks.fill(F128::ZERO);
     }
@@ -2882,6 +2903,12 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
             (true, true) => {
                 kernels::accumulate_convert_ab_nomul::<true, true>(rows, first_b_med, end_b_med, table, bank)
             }
+            (false, true) if seeded => {
+                kernels::accumulate_convert_ab_nomul_seeded::<true>(rows, first_b_med, end_b_med, table, bank)
+            }
+            (false, false) if seeded => {
+                kernels::accumulate_convert_ab_nomul_seeded::<false>(rows, first_b_med, end_b_med, table, bank)
+            }
             (false, true) => {
                 kernels::accumulate_convert_ab_nomul::<false, true>(rows, first_b_med, end_b_med, table, bank)
             }
@@ -2907,6 +2934,17 @@ fn zc_ab_unscaled_enabled() -> bool {
         std::env::var_os(ENV_NO_ZC_AB_UNSCALED).is_none_or(|v| v != *"1")
     });
     *ON
+}
+
+/// Kill switch for the seeded XOR drain of the round-one AB completion
+/// (`kernels::accumulate_convert_ab_nomul_seeded`): `FLOCK_NO_ZC_AB_SEEDED`
+/// (any value) restores the zero-seeded kernel in the same binary. Same bank
+/// bits either way. Read once per process.
+pub const ENV_NO_ZC_AB_SEEDED: &str = "FLOCK_NO_ZC_AB_SEEDED";
+
+fn zc_ab_seeded_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_SEEDED).is_none())
 }
 
 /// Collapse the bank-major tensor-fold scratch and apply the unchanged high
@@ -6287,7 +6325,9 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn ab_kernel_variants_match_baseline() {
-        use kernels::aarch64::{AB_ROWS_VARIANT, ABV_INLINE_WINDOW, ABV_KARA, ABV_KARA_UNSCALED};
+        use kernels::aarch64::{
+            AB_ROWS_VARIANT, ABV_INLINE_WINDOW, ABV_KARA, ABV_KARA_UNSCALED, ABV_KARA_XOR16,
+        };
         let table = make_inv_table();
         let mut rng = Rng::new(0xAB5A_71C0_F457_0003);
         let mut words: Vec<u64> = vec![0, u64::MAX];
@@ -6303,6 +6343,10 @@ mod tests {
                 let (plain, kara) = kernels::aarch64::ab_apply_word_forms::<ABV_KARA>(&table, scaled, word);
                 let (_, unscaled) = kernels::aarch64::ab_apply_word_forms::<{ ABV_KARA | ABV_KARA_UNSCALED }>(&table, scaled, word);
                 assert_eq!(kara, unscaled, "unscaled Karatsuba apply differs (scaled={scaled}, word={word:016x})");
+                let (_, xor16) = kernels::aarch64::ab_apply_word_forms::<{ ABV_KARA | ABV_KARA_XOR16 }>(&table, scaled, word);
+                assert_eq!(kara, xor16, "XOR16 Karatsuba apply differs (scaled={scaled}, word={word:016x})");
+                let (_, xor16u) = kernels::aarch64::ab_apply_word_forms::<{ ABV_KARA | ABV_KARA_UNSCALED | ABV_KARA_XOR16 }>(&table, scaled, word);
+                assert_eq!(kara, xor16u, "unscaled XOR16 Karatsuba apply differs (scaled={scaled}, word={word:016x})");
                 assert_eq!(plain, kara, "Karatsuba apply differs (scaled={scaled}, word={word:016x})");
                 let mut want = [F8::ZERO; 64];
                 table.apply(&word.to_le_bytes(), &mut want);
@@ -6381,11 +6425,12 @@ mod tests {
                         check!(ABV_INLINE_WINDOW);
                         check!(AB_ROWS_VARIANT);
                         check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED);
+                        check!(AB_ROWS_VARIANT | ABV_KARA_UNSCALED | ABV_KARA_XOR16);
                     }
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 4);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 5);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
@@ -7282,6 +7327,38 @@ mod tests {
             finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, false, &mut scalar);
             finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, true, &mut deferred);
             assert_eq!(deferred, scalar, "trial={trial}");
+        }
+    }
+
+    /// The seeded XOR-drain completion kernel leaves every bank slot exactly
+    /// where the zero-seeded kernel does: every even start, every end, both
+    /// table-load forms, random and all-ones rows over pre-filled banks.
+    #[test]
+    fn ab_completion_seeded_kernel_matches_incumbent() {
+        let mut rng = Rng::new(0x5EED_AB01);
+        let table = rng.f128_vec(CONVERT_TABLE_SIZE);
+        for trial in 0..4 {
+            let mut rows = [[0u8; 64]; 16];
+            for row in rows.iter_mut() {
+                for byte in row.iter_mut() {
+                    *byte = if trial == 0 { 0xff } else { rng.next_u64() as u8 };
+                }
+            }
+            let start: [F128; ELL] = core::array::from_fn(|_| rng.f128());
+            for first in (0..=16).step_by(2) {
+                for end in first..=16 {
+                    let mut want = start;
+                    let mut got = start;
+                    kernels::accumulate_convert_ab_nomul::<false, true>(&rows, first, end, &table, &mut want);
+                    kernels::accumulate_convert_ab_nomul_seeded::<true>(&rows, first, end, &table, &mut got);
+                    assert_eq!(got, want, "unscaled trial={trial} first={first} end={end}");
+                    let mut want = start;
+                    let mut got = start;
+                    kernels::accumulate_convert_ab_nomul::<false, false>(&rows, first, end, &table, &mut want);
+                    kernels::accumulate_convert_ab_nomul_seeded::<false>(&rows, first, end, &table, &mut got);
+                    assert_eq!(got, want, "scaled trial={trial} first={first} end={end}");
+                }
+            }
         }
     }
 

@@ -144,6 +144,42 @@ pub(super) fn try_butterfly_fused_2layer_rows(
     false
 }
 
+/// AArch64 block form for a fused pair whose two inner twiddles have zero
+/// high limbs while the outer twiddle is general. Returns `false` (caller
+/// runs the incumbent general kernel) off AArch64 or when the
+/// vector-resident row kernels are disabled.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn try_butterfly_fused_2layer_low_inner_rows(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+) -> bool {
+    debug_assert_eq!(t_inner_a.hi, 0);
+    debug_assert_eq!(t_inner_b.hi, 0);
+    debug_assert!(quarter > 0 && num_ntts > 0);
+    debug_assert_eq!(block.len(), 4 * quarter * num_ntts);
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies `aes`; the four-quarter geometry and the
+    // zero inner high limbs are established by the caller and asserted above.
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_2layer_low_inner_rows(
+                block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts,
+            );
+            return true;
+        }
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    let _ = (block, t_outer, t_inner_a, t_inner_b, quarter, num_ntts);
+    false
+}
+
 /// AArch64 specialization for a fused pair whose three twiddles all have a
 /// zero high limb. Other targets retain the ordinary field-multiply kernel.
 #[allow(clippy::too_many_arguments)]
