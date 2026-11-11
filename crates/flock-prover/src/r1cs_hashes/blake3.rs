@@ -4008,8 +4008,6 @@ pub(crate) mod witgen_simd {
             // the whole downstream GPU chain earlier by the difference. The
             // uniform 8-band control remains selectable for exact same-binary
             // A/B (`FLOCK_NO_STREAM_TAPER=1`).
-            // Tail band of 64 gps keeps 8 hetero slabs (WITGEN_HETERO_SLAB =
-            // 64 jobs) so its drain still parallelizes across the pool.
             const UNIFORM_SCHEDULE: &[usize] = &[512; 8];
             const TAPERED_SCHEDULE: &[usize] = &[512, 512, 512, 512, 512, 512, 512, 448, 64];
             // A/B-CONTROL: set to `false` for the official-harness control
@@ -4038,7 +4036,7 @@ pub(crate) mod witgen_simd {
             let cont_queue = !std::env::var("FLOCK_NO_WITGEN_CONT_QUEUE").is_ok_and(|v| v == "1");
             if cont_queue {
                 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-                const SLAB: usize = super::super::common::WITGEN_HETERO_SLAB;
+                const SLAB: usize = super::super::common::WITGEN_HETERO_SLAB / 2;
                 let n_bands = schedule.len();
                 let band_offset: Vec<usize> = schedule
                     .iter()
@@ -4051,7 +4049,6 @@ pub(crate) mod witgen_simd {
                 // Slab table in band-major order (band, then segment, then
                 // local) — the incumbent's claim order, minus its joins. A
                 // slab never straddles a segment or a band: every schedule
-                // entry is a multiple of the 64-group slab.
                 let mut slab_band: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
                 let mut slab_g0: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
                 for (i, &gps) in schedule.iter().enumerate() {
