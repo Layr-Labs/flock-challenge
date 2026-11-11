@@ -4247,6 +4247,339 @@ pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, c
     }
 }
 
+/// One expanded fold4 output, `v0 + ra*(v0+v1) + rb*(v0+v2) + rab*(v0+v1+v2+v3)`,
+/// with the same twelve constant products and the same two-step reduction as
+/// [`fold4_expanded_tri_one_q`] (so the same field value and the same bytes),
+/// issued so that every `PMULL` whose result feeds an XOR is an adjacent
+/// PMULL+EOR fused pair: the three partial sums are chains instead of `EOR3`
+/// trees, `v0` enters the low chain (`reduce(lo + v0) = reduce(lo) + v0` for a
+/// 128-bit addend), the middle-word swap enters the cross chain, and `k` =
+/// `0x87` in both lanes is a hoisted register. 19 SIMD issue slots per output
+/// instead of 27 and a `DUP` per pair.
+///
+/// # Safety
+/// `values` must point to four initialized, readable `F128` values.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn fold4_fused_one_q(
+    values: *const F128,
+    rho: &Fold4RhoQ,
+    k: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    let out: uint64x2_t;
+    // SAFETY: the caller guarantees four readable values; the asm is
+    // register-only (AES and SHA3 are enabled for this build) and every
+    // scratch is an early clobber, so no input is overwritten before its last
+    // read (`v1..v3` are replaced by the three deltas in place).
+    unsafe {
+        let v0 = vld1q_u64(values.cast::<u64>());
+        let v1 = vld1q_u64(values.add(1).cast::<u64>());
+        let v2 = vld1q_u64(values.add(2).cast::<u64>());
+        let v3 = vld1q_u64(values.add(3).cast::<u64>());
+        core::arch::asm!(
+            "eor {v1:v}.16b, {v0:v}.16b, {v1:v}.16b",
+            "eor3 {v3:v}.16b, {v1:v}.16b, {v2:v}.16b, {v3:v}.16b",
+            "eor {v2:v}.16b, {v0:v}.16b, {v2:v}.16b",
+            "pmull {ll:v}.1q, {ra:v}.1d, {v1:v}.1d",
+            "eor {ll:v}.16b, {ll:v}.16b, {v0:v}.16b",
+            "pmull {t:v}.1q, {rb:v}.1d, {v2:v}.1d",
+            "eor {t:v}.16b, {t:v}.16b, {ll:v}.16b",
+            "pmull {ll:v}.1q, {rab:v}.1d, {v3:v}.1d",
+            "eor {ll:v}.16b, {ll:v}.16b, {t:v}.16b",
+            "pmull2 {hh:v}.1q, {ra:v}.2d, {v1:v}.2d",
+            "pmull2 {t:v}.1q, {rb:v}.2d, {v2:v}.2d",
+            "eor {t:v}.16b, {t:v}.16b, {hh:v}.16b",
+            "pmull2 {hh:v}.1q, {rab:v}.2d, {v3:v}.2d",
+            "eor {hh:v}.16b, {hh:v}.16b, {t:v}.16b",
+            "ext {x:v}.16b, {ll:v}.16b, {hh:v}.16b, #8",
+            "pmull {c:v}.1q, {ras:v}.1d, {v1:v}.1d",
+            "eor {c:v}.16b, {c:v}.16b, {x:v}.16b",
+            "pmull2 {t:v}.1q, {ras:v}.2d, {v1:v}.2d",
+            "eor {t:v}.16b, {t:v}.16b, {c:v}.16b",
+            "pmull {c:v}.1q, {rbs:v}.1d, {v2:v}.1d",
+            "eor {c:v}.16b, {c:v}.16b, {t:v}.16b",
+            "pmull2 {t:v}.1q, {rbs:v}.2d, {v2:v}.2d",
+            "eor {t:v}.16b, {t:v}.16b, {c:v}.16b",
+            "pmull {c:v}.1q, {rabs:v}.1d, {v3:v}.1d",
+            "eor {c:v}.16b, {c:v}.16b, {t:v}.16b",
+            "pmull2 {t:v}.1q, {rabs:v}.2d, {v3:v}.2d",
+            "eor {t:v}.16b, {t:v}.16b, {c:v}.16b",
+            "pmull2 {c:v}.1q, {hh:v}.2d, {k:v}.2d",
+            "eor {c:v}.16b, {c:v}.16b, {t:v}.16b",
+            "zip1 {x:v}.2d, {ll:v}.2d, {c:v}.2d",
+            "pmull2 {hh:v}.1q, {c:v}.2d, {k:v}.2d",
+            "eor {hh:v}.16b, {hh:v}.16b, {x:v}.16b",
+            v0 = in(vreg) v0,
+            v1 = inout(vreg) v1 => _,
+            v2 = inout(vreg) v2 => _,
+            v3 = inout(vreg) v3 => _,
+            ra = in(vreg) rho.a,
+            ras = in(vreg) rho.a_sw,
+            rb = in(vreg) rho.b,
+            rbs = in(vreg) rho.b_sw,
+            rab = in(vreg) rho.ab,
+            rabs = in(vreg) rho.ab_sw,
+            k = in(vreg) k,
+            ll = out(vreg) _,
+            hh = out(vreg) out,
+            t = out(vreg) _,
+            c = out(vreg) _,
+            x = out(vreg) _,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// `a*b + e` in the field: [`mul_sw_fused_q`] with the 128-bit addend `e`
+/// entering the low partial product (`reduce(lo + e) = reduce(lo) + e`), so it
+/// costs no issue slot of its own: 8 slots.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn mul_sw_fused_add_q(
+    a: core::arch::aarch64::uint64x2_t,
+    a_sw: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+    k: core::arch::aarch64::uint64x2_t,
+    e: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    let out: core::arch::aarch64::uint64x2_t;
+    // SAFETY: as `mul_sw_fused_q`.
+    unsafe {
+        core::arch::asm!(
+            "pmull {ll:v}.1q, {a:v}.1d, {b:v}.1d",
+            "eor {ll:v}.16b, {ll:v}.16b, {e:v}.16b",
+            "pmull2 {hh:v}.1q, {a:v}.2d, {b:v}.2d",
+            "ext {x:v}.16b, {ll:v}.16b, {hh:v}.16b, #8",
+            "pmull {p:v}.1q, {s:v}.1d, {b:v}.1d",
+            "eor {p:v}.16b, {p:v}.16b, {x:v}.16b",
+            "pmull2 {x:v}.1q, {s:v}.2d, {b:v}.2d",
+            "eor {x:v}.16b, {x:v}.16b, {p:v}.16b",
+            "pmull2 {p:v}.1q, {hh:v}.2d, {k:v}.2d",
+            "eor {p:v}.16b, {p:v}.16b, {x:v}.16b",
+            "zip1 {x:v}.2d, {ll:v}.2d, {p:v}.2d",
+            "pmull2 {hh:v}.1q, {p:v}.2d, {k:v}.2d",
+            "eor {hh:v}.16b, {hh:v}.16b, {x:v}.16b",
+            a = in(vreg) a,
+            s = in(vreg) a_sw,
+            b = in(vreg) b,
+            k = in(vreg) k,
+            e = in(vreg) e,
+            ll = out(vreg) _,
+            hh = out(vreg) out,
+            x = out(vreg) _,
+            p = out(vreg) _,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// [`fold_tri_and_message_aarch64`] with the same stores and the same 26
+/// reduced slots, rebuilt around the fused PMULL+EOR forms:
+///
+/// - every folded output is [`fold4_fused_one_q`] (depth three:
+///   two of them and one [`mul_sw_fused_add_q`] by `rho_c`);
+/// - the eight weight products of a group are fused schoolbook
+///   [`mul_sw_fused_q`] sharing one swap of the weight, replacing the
+///   Karatsuba middle terms that went through general registers;
+/// - a folded pair goes from its registers straight to the output and to the
+///   16-group staging block; the incumbent builds an eight-entry array per
+///   side on the stack first and reloads it.
+///
+/// The four accumulation passes over the staging block are the incumbent's.
+/// Every product is the incumbent's or a field-equal one and each slot is
+/// reduced once, so the output bytes and the slots are identical.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3"))]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_tri_and_message_fused_aarch64<const DEPTH: usize, const NT: bool>(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    rho_c: F128,
+    eq_lo: &[F128],
+) -> [F128; TRI_SLOTS] {
+    use core::arch::aarch64::*;
+    assert!(DEPTH == 2 || DEPTH == 3);
+    let n_out = a_out.len();
+    assert_eq!(b_out.len(), n_out);
+    assert_eq!(n_out, 2 * eq_lo.len());
+    assert!(n_out.is_multiple_of(8));
+    assert_eq!(a_in.len(), n_out << DEPTH);
+    assert_eq!(b_in.len(), n_out << DEPTH);
+
+    #[inline(always)]
+    unsafe fn store_pair<const NT: bool>(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            if NT {
+                core::arch::asm!(
+                    "stnp {x:q}, {y:q}, [{dst}]",
+                    dst = in(reg) dst,
+                    x = in(vreg) x,
+                    y = in(vreg) y,
+                    options(nostack, preserves_flags),
+                );
+            } else {
+                vst1q_u64(dst.cast::<u64>(), x);
+                vst1q_u64(dst.add(1).cast::<u64>(), y);
+            }
+        }
+    }
+
+    /// Output `i` of a group reads `1 << DEPTH` inputs at `src`.
+    #[inline(always)]
+    unsafe fn fold_one<const DEPTH: usize>(
+        src: *const F128,
+        rho: &Fold4RhoQ,
+        rc: uint64x2_t,
+        rc_sw: uint64x2_t,
+        k: uint64x2_t,
+    ) -> uint64x2_t {
+        unsafe {
+            if DEPTH == 2 {
+                fold4_fused_one_q(src, rho, k)
+            } else {
+                let t0 = fold4_fused_one_q(src, rho, k);
+                let t1 = fold4_fused_one_q(src.add(4), rho, k);
+                mul_sw_fused_add_q(rc, rc_sw, veorq_u64(t0, t1), k, t0)
+            }
+        }
+    }
+
+    unsafe {
+        let q = |v: F128| core::mem::transmute::<F128, uint64x2_t>(v);
+        let rho = Fold4RhoQ::new(q(rho_a), q(rho_b), q(rho_a * rho_b));
+        let rc = q(rho_c);
+        let rc_sw = swap_halves_q(rc);
+        let k = vdupq_n_u64(0x87);
+        let zero = vdupq_n_u64(0);
+        let mut acc = [TriNeon {
+            ll: zero,
+            cross: zero,
+            hh: zero,
+        }; TRI_SLOTS];
+        let a_ip = a_in.as_ptr();
+        let b_ip = b_in.as_ptr();
+        let a_op = a_out.as_mut_ptr();
+        let b_op = b_out.as_mut_ptr();
+
+        const TG: usize = 16;
+        let ng = n_out / 8;
+        let mut ta = [[zero; 8]; TG];
+        let mut tb = [[zero; 8]; TG];
+        let mut g0 = 0usize;
+        while g0 < ng {
+            let gn = (ng - g0).min(TG);
+            for t in 0..gn {
+                let y = g0 + t;
+                let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
+                let w_sw = swap_halves_q(w);
+                let src = a_ip.add((8 * y) << DEPTH);
+                for h in 0..4 {
+                    let x0 = fold_one::<DEPTH>(src.add((2 * h) << DEPTH), &rho, rc, rc_sw, k);
+                    let x1 = fold_one::<DEPTH>(src.add((2 * h + 1) << DEPTH), &rho, rc, rc_sw, k);
+                    store_pair::<NT>(a_op.add(8 * y + 2 * h), x0, x1);
+                    ta[t][2 * h] = mul_sw_fused_q(w, w_sw, x0, k);
+                    ta[t][2 * h + 1] = mul_sw_fused_q(w, w_sw, x1, k);
+                }
+                let src = b_ip.add((8 * y) << DEPTH);
+                for h in 0..4 {
+                    let x0 = fold_one::<DEPTH>(src.add((2 * h) << DEPTH), &rho, rc, rc_sw, k);
+                    let x1 = fold_one::<DEPTH>(src.add((2 * h + 1) << DEPTH), &rho, rc, rc_sw, k);
+                    store_pair::<NT>(b_op.add(8 * y + 2 * h), x0, x1);
+                    tb[t][2 * h] = x0;
+                    tb[t][2 * h + 1] = x1;
+                }
+            }
+            g0 += gn;
+            {
+                let mut e = [acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7]];
+                for t in 0..gn {
+                    let (aw, b) = (&ta[t], &tb[t]);
+                    for j in 0..4 {
+                        tri_acc_q(&mut e[j], aw[2 * j + 1], b[2 * j + 1]);
+                        tri_acc_q(
+                            &mut e[4 + j],
+                            veorq_u64(aw[2 * j], aw[2 * j + 1]),
+                            veorq_u64(b[2 * j], b[2 * j + 1]),
+                        );
+                    }
+                }
+                acc[..8].copy_from_slice(&e);
+            }
+            {
+                let mut l = [
+                    acc[8], acc[9], acc[10], acc[11], acc[12], acc[13], acc[14], acc[15],
+                ];
+                for t in 0..gn {
+                    let (aw, b) = (&ta[t], &tb[t]);
+                    for k2 in 0..2 {
+                        let o = 4 * k2;
+                        tri_acc_q(&mut l[k2], aw[o + 2], b[o + 2]);
+                        let (ea, eb) = (veorq_u64(aw[o], aw[o + 2]), veorq_u64(b[o], b[o + 2]));
+                        let (oa, ob) =
+                            (veorq_u64(aw[o + 1], aw[o + 3]), veorq_u64(b[o + 1], b[o + 3]));
+                        tri_acc_q(&mut l[2 + k2], ea, eb);
+                        tri_acc_q(&mut l[4 + k2], oa, ob);
+                        tri_acc_q(&mut l[6 + k2], veorq_u64(ea, oa), veorq_u64(eb, ob));
+                    }
+                }
+                acc[8..16].copy_from_slice(&l);
+            }
+            {
+                let mut g = [acc[16], acc[17], acc[18], acc[20], acc[21]];
+                for t in 0..gn {
+                    let (aw, b) = (&ta[t], &tb[t]);
+                    tri_acc_q(&mut g[0], aw[4], b[4]);
+                    let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
+                    let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
+                    let (s2a, s2b) = (veorq_u64(aw[2], aw[6]), veorq_u64(b[2], b[6]));
+                    let (s3a, s3b) = (veorq_u64(aw[3], aw[7]), veorq_u64(b[3], b[7]));
+                    tri_acc_q(&mut g[1], s0a, s0b);
+                    tri_acc_q(&mut g[2], s2a, s2b);
+                    tri_acc_q(&mut g[3], s1a, s1b);
+                    tri_acc_q(&mut g[4], s3a, s3b);
+                }
+                acc[16] = g[0];
+                acc[17] = g[1];
+                acc[18] = g[2];
+                acc[20] = g[3];
+                acc[21] = g[4];
+            }
+            {
+                let mut g = [acc[19], acc[22], acc[23], acc[24], acc[25]];
+                for t in 0..gn {
+                    let (aw, b) = (&ta[t], &tb[t]);
+                    let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
+                    let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
+                    let (s2a, s2b) = (veorq_u64(aw[2], aw[6]), veorq_u64(b[2], b[6]));
+                    let (s3a, s3b) = (veorq_u64(aw[3], aw[7]), veorq_u64(b[3], b[7]));
+                    let (s02a, s02b) = (veorq_u64(s0a, s2a), veorq_u64(s0b, s2b));
+                    let (s13a, s13b) = (veorq_u64(s1a, s3a), veorq_u64(s1b, s3b));
+                    let (s01a, s01b) = (veorq_u64(s0a, s1a), veorq_u64(s0b, s1b));
+                    let (s23a, s23b) = (veorq_u64(s2a, s3a), veorq_u64(s2b, s3b));
+                    tri_acc_q(&mut g[0], s02a, s02b);
+                    tri_acc_q(&mut g[1], s13a, s13b);
+                    tri_acc_q(&mut g[2], s01a, s01b);
+                    tri_acc_q(&mut g[3], s23a, s23b);
+                    tri_acc_q(&mut g[4], veorq_u64(s01a, s23a), veorq_u64(s01b, s23b));
+                }
+                acc[19] = g[0];
+                acc[22] = g[1];
+                acc[23] = g[2];
+                acc[24] = g[3];
+                acc[25] = g[4];
+            }
+        }
+        acc.map(|t| core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(t)))
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
 mod tests {
     use super::*;

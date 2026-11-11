@@ -3197,6 +3197,16 @@ pub(crate) fn zc_tri_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var_os("FLOCK_NO_ZC_TRI").is_some_and(|v| v == *"1"))
 }
 
+/// Kill switch for the fused tri kernel
+/// (`fold_tri_and_message_fused_aarch64`): `FLOCK_NO_ZC_TRI_FUSED=1` (exactly
+/// `"1"`, read once) restores `fold_tri_and_message_aarch64`. Same stores and
+/// slots either way.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3"))]
+fn zc_tri_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var_os("FLOCK_NO_ZC_TRI_FUSED").is_some_and(|v| v == *"1"))
+}
+
 #[inline]
 fn tri_n_hi(n_vars: usize) -> usize {
     SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(8))
@@ -3300,9 +3310,28 @@ pub(crate) fn fold_cascade_t_into(
     let nt_stores = out_n >= (1usize << 20) && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none();
     let rho_c = if depth == 3 { rhos[2] } else { F128::ZERO };
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3"))]
+    let tri_fused = zc_tri_fused_enabled();
+
     let chunk = |a_in: &[F128], b_in: &[F128], a_o: &mut [F128], b_o: &mut [F128]| -> [F128; 26] {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
+            #[cfg(target_feature = "sha3")]
+            {
+                // Decide on the executing worker: this closure is shared by
+                // both pools. The published fused kernel helped P cores but
+                // regressed E cores in its author's paired measurements.
+                // Keep the incumbent kernel on the actual helper pool.
+                if tri_fused && !crate::epool::current_thread_is_helper() {
+                    use kernels::aarch64::fold_tri_and_message_fused_aarch64 as f;
+                    return match (depth, nt_stores) {
+                        (2, true) => f::<2, true>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+                        (2, false) => f::<2, false>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+                        (_, true) => f::<3, true>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+                        (_, false) => f::<3, false>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+                    };
+                }
+            }
             use kernels::aarch64::fold_tri_and_message_aarch64 as k;
             match (depth, nt_stores) {
                 (2, true) => k::<2, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
@@ -6176,6 +6205,93 @@ mod tests {
             assert!(a_i == a_t && b_i == b_t, "outputs log_out {log_out}");
             assert_eq!((i1, iinf, ila), (t1, tinf, tla), "messages log_out {log_out}");
         }
+    }
+
+    /// The fused tri kernel against the incumbent kernel and the portable
+    /// chunk: folded outputs and all 26 slots, both depths, both store forms,
+    /// group counts around the 16-group staging block, structured and random
+    /// inputs, guard elements around every output.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3"))]
+    #[test]
+    fn tri_fused_kernel_matches_incumbent_and_portable() {
+        use kernels::aarch64::{fold_tri_and_message_aarch64, fold_tri_and_message_fused_aarch64};
+        const GUARD: usize = 4;
+        let mut rng = Rng::new(0x7121_0f05);
+        let ones = F128 { lo: u64::MAX, hi: u64::MAX };
+        let mut cases = 0usize;
+        for depth in [2usize, 3] {
+            for groups in [1usize, 2, 3, 15, 16, 17, 31, 32, 33, 48, 70] {
+                for kind in 0..6usize {
+                    let n_out = 8 * groups;
+                    let n_in = n_out << depth;
+                    let pick = |rng: &mut Rng, i: usize| match kind {
+                        0 | 1 => rng.f128(),
+                        2 => F128::ZERO,
+                        3 => ones,
+                        4 => {
+                            if i % 3 == 0 { F128::ZERO } else { F128 { lo: rng.f128().lo & 1, hi: 0 } }
+                        }
+                        _ => F128 { lo: 0, hi: rng.f128().hi },
+                    };
+                    let a: Vec<F128> = (0..n_in).map(|i| pick(&mut rng, i)).collect();
+                    let b: Vec<F128> = (0..n_in).map(|i| pick(&mut rng, i + 1)).collect();
+                    let eq_lo: Vec<F128> = (0..n_out / 2)
+                        .map(|i| if kind == 1 && i % 4 == 3 { F128::ONE } else { rng.f128() })
+                        .collect();
+                    let special = |rng: &mut Rng, i: usize| match (kind + i) % 5 {
+                        0 => F128::ZERO,
+                        1 => F128::ONE,
+                        2 => ones,
+                        _ => rng.f128(),
+                    };
+                    let rhos: Vec<F128> = (0..3).map(|i| special(&mut rng, i)).collect();
+                    let rho_c = if depth == 3 { rhos[2] } else { F128::ZERO };
+
+                    let mut a_p = vec![LA_POISON; n_out];
+                    let mut b_p = vec![LA_POISON; n_out];
+                    let portable =
+                        tri_chunk_scalar(&a, &b, &mut a_p, &mut b_p, &rhos[..depth], &eq_lo);
+                    for nt in [false, true] {
+                        let run = |fused: bool| {
+                            let mut a_o = vec![LA_POISON; n_out + 2 * GUARD];
+                            let mut b_o = vec![LA_POISON; n_out + 2 * GUARD];
+                            let (ao, bo) = (
+                                &mut a_o[GUARD..GUARD + n_out],
+                                &mut b_o[GUARD..GUARD + n_out],
+                            );
+                            let (r0, r1) = (rhos[0], rhos[1]);
+                            let slots = match (fused, depth, nt) {
+                                (false, 2, false) => fold_tri_and_message_aarch64::<2, false, 0>(&a, &b, ao, bo, r0, r1, rho_c, &eq_lo),
+                                (false, 2, true) => fold_tri_and_message_aarch64::<2, true, 0>(&a, &b, ao, bo, r0, r1, rho_c, &eq_lo),
+                                (false, _, false) => fold_tri_and_message_aarch64::<3, false, 0>(&a, &b, ao, bo, r0, r1, rho_c, &eq_lo),
+                                (false, _, true) => fold_tri_and_message_aarch64::<3, true, 0>(&a, &b, ao, bo, r0, r1, rho_c, &eq_lo),
+                                (true, 2, false) => fold_tri_and_message_fused_aarch64::<2, false>(&a, &b, ao, bo, r0, r1, rho_c, &eq_lo),
+                                (true, 2, true) => fold_tri_and_message_fused_aarch64::<2, true>(&a, &b, ao, bo, r0, r1, rho_c, &eq_lo),
+                                (true, _, false) => fold_tri_and_message_fused_aarch64::<3, false>(&a, &b, ao, bo, r0, r1, rho_c, &eq_lo),
+                                (true, _, true) => fold_tri_and_message_fused_aarch64::<3, true>(&a, &b, ao, bo, r0, r1, rho_c, &eq_lo),
+                            };
+                            for g in 0..GUARD {
+                                assert!(a_o[g] == LA_POISON && a_o[GUARD + n_out + g] == LA_POISON);
+                                assert!(b_o[g] == LA_POISON && b_o[GUARD + n_out + g] == LA_POISON);
+                            }
+                            (a_o, b_o, slots)
+                        };
+                        let (a_i, b_i, s_i) = run(false);
+                        let (a_f, b_f, s_f) = run(true);
+                        let tag = format!("depth {depth} groups {groups} kind {kind} nt {nt}");
+                        assert!(a_i == a_f && b_i == b_f, "outputs vs incumbent: {tag}");
+                        assert_eq!(s_i, s_f, "slots vs incumbent: {tag}");
+                        assert!(
+                            a_f[GUARD..GUARD + n_out] == a_p[..] && b_f[GUARD..GUARD + n_out] == b_p[..],
+                            "outputs vs portable: {tag}"
+                        );
+                        assert_eq!(s_f, portable, "slots vs portable: {tag}");
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 2 * 11 * 6 * 2);
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
