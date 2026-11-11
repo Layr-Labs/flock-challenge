@@ -1339,6 +1339,18 @@ pub(crate) fn gpu_hybrid_final_leaf_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_FINAL_LEAF").is_none())
 }
 
+/// GL3 four-pass commit graph: the from-z first pass runs layers 0..5
+/// (`ntt_g5` FROMZ build), the GPU prefix runs two five-layer `ntt_g5`
+/// passes (layers 5..10, 10..15) and a fused five-layer final pass + Merkle
+/// leaves (`ntt_final5c_t3_leaf`, layers 15..20); the CPU suffix starts at
+/// layer 5. One full codeword read + write fewer than the five-pass graph
+/// on every GPU-owned row. Same butterflies and twiddles, same bytes.
+/// `FLOCK_NO_GL3_FOUR_PASS` (any value) restores the five-pass graph.
+pub(crate) fn gl3_four_pass_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GL3_FOUR_PASS").is_none())
+}
+
 #[cfg(test)]
 mod leaf_vec4_gate_tests {
     use std::ffi::OsStr;
@@ -4764,6 +4776,748 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
         format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}")
     }
 
+    /// GL3 production kernel: five-layer final pass (layers `log_d - 5 ..
+    /// log_d`) + leaf hash + three parent levels, 128 threads per group.
+    pub(crate) const NTT_FINAL5C_MSL: &str = r#"
+// Butterfly layer between quad members X apart (simd_shuffle_xor mask X):
+// the member with (rho & X) == 0 holds u rows, its partner the v rows of the
+// same 16 row offsets. Row pairs (2i, 2i + 1) split the products: the u
+// member forms row 2i's v * tw, the v member row 2i + 1's; one shuffle swaps
+// them. Same field products, same butterfly: bit-identical.
+#define FIN6Q_CROSS(X, TB)                                                     \
+    {                                                                          \
+        const bool isu = (rho & (X)) == 0u;                                    \
+        for (uint i = 0; i < 16u; i += 4u) {                                   \
+            const uint4 o0 = simd_shuffle_xor(elems[i], (ushort)(X));          \
+            const uint4 o1 = simd_shuffle_xor(elems[i + 1u], (ushort)(X));     \
+            const uint4 o2 = simd_shuffle_xor(elems[i + 2u], (ushort)(X));     \
+            const uint4 o3 = simd_shuffle_xor(elems[i + 3u], (ushort)(X));     \
+            const uint4 u0 = isu ? elems[i] : o0, v0 = isu ? o0 : elems[i];    \
+            const uint4 u1 = isu ? elems[i + 1u] : o1, v1 = isu ? o1 : elems[i + 1u]; \
+            const uint4 u2 = isu ? elems[i + 2u] : o2, v2 = isu ? o2 : elems[i + 2u]; \
+            const uint4 u3 = isu ? elems[i + 3u] : o3, v3 = isu ? o3 : elems[i + 3u]; \
+            uint4 qa;                                                          \
+            uint4 qb;                                                          \
+            gf_mul_byte16_x2(isu ? v0 : v1, isu ? v2 : v3, (TB), qa, qb);      \
+            const uint4 ra = simd_shuffle_xor(qa, (ushort)(X));                \
+            const uint4 rb = simd_shuffle_xor(qb, (ushort)(X));                \
+            const uint4 p0 = isu ? qa : ra, p1 = isu ? ra : qa;                \
+            const uint4 p2 = isu ? qb : rb, p3 = isu ? rb : qb;                \
+            const uint4 n0 = u0 ^ p0, n1 = u1 ^ p1, n2 = u2 ^ p2, n3 = u3 ^ p3; \
+            elems[i]      = isu ? n0 : (v0 ^ n0);                              \
+            elems[i + 1u] = isu ? n1 : (v1 ^ n1);                              \
+            elems[i + 2u] = isu ? n2 : (v2 ^ n2);                              \
+            elems[i + 3u] = isu ? n3 : (v3 ^ n3);                              \
+        }                                                                      \
+    }
+
+// Five-layer final pass + leaf, pair form: 128 threads, 128 rows per group.
+// Two threads per lane (rho = lid & 1, adjacent in the simdgroup); per
+// 32-row half h, thread rho holds tile 2h + rho (16 rows). Layer P.l - 1
+// pairs the two tiles through simd_shuffle_xor (FIN6Q_CROSS: the two
+// threads split the 16 products and swap them), then each thread runs the
+// t3 tile body on its own tile with its own table copy. One codeword read + one write per row, 16 live
+// elements per thread (as ntt_final_t3_leaf).
+[[max_total_threads_per_threadgroup(128)]]
+kernel void ntt_final5c_t3_leaf(device uint4* data                [[buffer(0)]],
+                                device const uint4* twiddles      [[buffer(1)]],
+                                constant NttParams& P             [[buffer(2)]],
+                                device uint* leaves               [[buffer(3)]],
+                                device uint* parents1             [[buffer(4)]],
+                                device uint* parents2             [[buffer(5)]],
+                                device uint* parents3             [[buffer(6)]],
+                                uint tgid [[threadgroup_position_in_grid]],
+                                uint lid_in [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u, NF = 1u << F;
+    constexpr uint NNIB = 5u;
+    threadgroup uint4 tabs[1024u];
+    threadgroup uint  nibs[2u * 8u * NNIB];
+    const uint rho = lid_in & 1u;
+    const uint lane = ((lid_in >> 5) << 4) | ((lid_in & 31u) >> 1);
+    threadgroup uint4* tabB = tabs + (rho << 9);
+    threadgroup uint* nibB = nibs + rho * (8u * NNIB);
+    threadgroup uint2* tab2 = (threadgroup uint2*)tabB;
+    threadgroup uint* tab1 = (threadgroup uint*)(tabB + 256u);
+    const uint gbase = tgid << 7;
+    {
+    const uint lid = lane;   // half-local table-builder index (0..63)
+    for (uint h = 0; h < 4u; h++) {
+        const uint rbase = gbase + (h << 5) + (rho << 4);
+        uint4 elems[NF];
+        for (uint e = 0; e < NF; e++) {
+            elems[e] = data[((rbase + e) << 6) | lane];
+        }
+        gf_build_byte16(tabB, twiddles, (1u << (P.l - 1u)) - 1u + (tgid << 2) + h, lid);
+        FIN6Q_CROSS(1u, &tabB[0])
+        {
+            const uint B = (tgid << 3) + (h << 1) + rho;
+            if (lid < 8u * NNIB) {
+                uint cB = lid / NNIB, qB = lid % NNIB;
+                uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cB];
+                nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;
+            }
+            NTT_T3_SUBLAYER(0u, 0u)
+            NTT_T3_MID(1u, 0u)
+            NTT_T3_MID(1u, 1u)
+            NTT_T3_SHORT_PAIR(2u, 0u)
+            NTT_T3_SHORT_PAIR(2u, 2u)
+            {
+                constexpr uint j = 3u;
+                constexpr uint bpos = F - 1u - j;
+                for (uint b = 0; b < (NF >> 1); b++) {
+                    uint low = b & ((1u << bpos) - 1u);
+                    uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+                    uint ev = eu | (1u << bpos);
+                    uint c = eu >> (F - j);
+                    threadgroup const uint* nb = &nibB[c * NNIB];
+                    uint4 V0 = elems[ev];
+                    uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+                    uint4 acc = uint4(0u);
+                    for (int q = (int)NNIB - 1; q >= 0; q--) {
+                        acc = gf_shl4(acc);
+                        uint n = nb[q];
+                        if (n & 1u) acc ^= V0;
+                        if (n & 2u) acc ^= V1;
+                        if (n & 4u) acc ^= V2;
+                        if (n & 8u) acc ^= V3;
+                    }
+                    uint4 nu = elems[eu] ^ acc;
+                    elems[eu] = nu;
+                    elems[ev] ^= nu;
+                }
+            }
+        }
+        for (uint e = 0; e < NF; e++) {
+            data[((rbase + e) << 6) | lane] = elems[e];
+        }
+    }
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    {
+    const uint lid = lid_in;
+    constexpr uint NL = 128u;
+    threadgroup uint* level0 = (threadgroup uint*)tabs;
+    threadgroup uint* level1 = level0 + NL * 8u;
+    threadgroup uint* level2 = level1 + NL * 4u;
+    for (uint n = lid; n < NL; n += 128u) {
+        const uint id = tgid * NL + n;
+        device const uint4* leaf4 = data + id * 64u;
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        for (uint b = 0u; b < 16u; b++) {
+            uint block[16];
+            for (uint q = 0u; q < 4u; q++) {
+                const uint4 w = leaf4[b * 4u + q];
+                block[q * 4u + 0u] = w.x;
+                block[q * 4u + 1u] = w.y;
+                block[q * 4u + 2u] = w.z;
+                block[q * 4u + 3u] = w.w;
+            }
+            uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
+            b3_compress(cv, block, 64u, flags);
+        }
+        for (uint i = 0u; i < 8u; i++) {
+            leaves[id * 8u + i] = cv[i];
+            level0[n * 8u + i] = cv[i];
+        }
+    }
+#define FIN_PARENT_LEVEL128(SRC, DST, OUT, CNT)                                \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    for (uint n = lid; n < (CNT); n += 128u) {                                 \
+        uint block[16];                                                        \
+        for (uint i = 0u; i < 8u; i++) {                                       \
+            block[i] = SRC[(2u * n) * 8u + i];                                 \
+            block[8u + i] = SRC[(2u * n + 1u) * 8u + i];                       \
+        }                                                                      \
+        uint cv[8];                                                            \
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];                       \
+        b3_compress(cv, block, 64u, B3_PARENT);                                \
+        const uint id = tgid * (CNT) + n;                                      \
+        for (uint i = 0u; i < 8u; i++) {                                       \
+            OUT[id * 8u + i] = cv[i];                                          \
+            DST[n * 8u + i] = cv[i];                                           \
+        }                                                                      \
+    }
+    FIN_PARENT_LEVEL128(level0, level1, parents1, NL / 2u)
+    FIN_PARENT_LEVEL128(level1, level2, parents2, NL / 4u)
+    FIN_PARENT_LEVEL128(level2, level0, parents3, NL / 8u)
+#undef FIN_PARENT_LEVEL128
+    }
+}
+
+"#;
+
+    pub(crate) fn final5c_msl_source() -> String {
+        format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}{NTT_FINAL5C_MSL}")
+    }
+
+    /// GL3: six-layer final pass + Merkle leaves (`ntt_final6_t3_leaf`).
+    /// One 64-thread group owns 64 consecutive positions (= the four 16-row
+    /// tiles `ntt_final_t3_leaf` owns with LEAF_TILES = 4). It runs layers
+    /// `log_d - 6` and `log_d - 5` itself, then the unchanged t3 tile body
+    /// (layers `log_d - 4 .. log_d`) and the unchanged leaf + three parent
+    /// levels. The prior `log_d - 4` pass's 1 GiB read + 1 GiB write is gone:
+    /// the two extra layers' intermediates round-trip through the group's own
+    /// cache lines only (each thread re-reads exactly what it wrote).
+    /// Same butterflies, same twiddles, same order per block: bit-identical.
+    pub(crate) const NTT_FINAL6_LEAF_EXTRA_MSL: &str = r#"
+#define FIN6_T3_TILE(BT, OFF)                                                  \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    {                                                                          \
+        const uint B = (BT);                                                   \
+        if (lid < 8u * NNIB) {                                                 \
+            uint cB = lid / NNIB, qB = lid % NNIB;                             \
+            uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cB];     \
+            nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;              \
+        }                                                                      \
+        thread uint4* elems = &el[(OFF)];                                      \
+        NTT_T3_SUBLAYER(0u, 0u)                                                \
+        NTT_T3_MID(1u, 0u)                                                     \
+        NTT_T3_MID(1u, 1u)                                                     \
+        NTT_T3_SHORT_PAIR(2u, 0u)                                              \
+        NTT_T3_SHORT_PAIR(2u, 2u)                                              \
+        {                                                                      \
+            constexpr uint j = 3u;                                             \
+            constexpr uint bpos = F - 1u - j;                                  \
+            for (uint b = 0; b < (NF >> 1); b++) {                             \
+                uint low = b & ((1u << bpos) - 1u);                            \
+                uint eu = ((b >> bpos) << (bpos + 1u)) | low;                  \
+                uint ev = eu | (1u << bpos);                                   \
+                uint c = eu >> (F - j);                                        \
+                threadgroup const uint* nb = &nibB[c * NNIB];                  \
+                uint4 V0 = elems[ev];                                          \
+                uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);    \
+                uint4 acc = uint4(0u);                                         \
+                for (int q = (int)NNIB - 1; q >= 0; q--) {                     \
+                    acc = gf_shl4(acc);                                        \
+                    uint n = nb[q];                                            \
+                    if (n & 1u) acc ^= V0;                                     \
+                    if (n & 2u) acc ^= V1;                                     \
+                    if (n & 4u) acc ^= V2;                                     \
+                    if (n & 8u) acc ^= V3;                                     \
+                }                                                              \
+                uint4 nu = elems[eu] ^ acc;                                    \
+                elems[eu] = nu;                                                \
+                elems[ev] ^= nu;                                               \
+            }                                                                  \
+        }                                                                      \
+        for (uint e = 0; e < NF; e++) {                                        \
+            data[(((B) << 4) + e) << 6 | lane] = elems[e];                     \
+        }                                                                      \
+    }
+
+#define FIN_LEAF_TAIL                                                          \
+    constexpr uint NL = 64u;                                                   \
+    threadgroup uint* level0 = (threadgroup uint*)tabB;                        \
+    threadgroup uint* level1 = level0 + NL * 8u;                               \
+    threadgroup uint* level2 = level1 + NL * 4u;                               \
+    for (uint n = lid; n < NL; n += 64u) {                                     \
+        const uint id = tgid * NL + n;                                         \
+        device const uint4* leaf4 = data + id * 64u;                           \
+        uint cv[8];                                                            \
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];                       \
+        for (uint b = 0u; b < 16u; b++) {                                      \
+            uint block[16];                                                    \
+            for (uint q = 0u; q < 4u; q++) {                                   \
+                const uint4 w = leaf4[b * 4u + q];                             \
+                block[q * 4u + 0u] = w.x;                                      \
+                block[q * 4u + 1u] = w.y;                                      \
+                block[q * 4u + 2u] = w.z;                                      \
+                block[q * 4u + 3u] = w.w;                                      \
+            }                                                                  \
+            uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u); \
+            b3_compress(cv, block, 64u, flags);                                \
+        }                                                                      \
+        for (uint i = 0u; i < 8u; i++) {                                       \
+            leaves[id * 8u + i] = cv[i];                                       \
+            level0[n * 8u + i] = cv[i];                                        \
+        }                                                                      \
+    }                                                                          \
+    FIN_PARENT_LEVEL(level0, level1, parents1, NL / 2u)                        \
+    FIN_PARENT_LEVEL(level1, level2, parents2, NL / 4u)                        \
+    FIN_PARENT_LEVEL(level2, level0, parents3, NL / 8u)
+
+#define FIN_PARENT_LEVEL(SRC, DST, OUT, CNT)                                   \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    for (uint n = lid; n < (CNT); n += 64u) {                                  \
+        uint block[16];                                                        \
+        for (uint i = 0u; i < 8u; i++) {                                       \
+            block[i] = SRC[(2u * n) * 8u + i];                                 \
+            block[8u + i] = SRC[(2u * n + 1u) * 8u + i];                       \
+        }                                                                      \
+        uint cv[8];                                                            \
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];                       \
+        b3_compress(cv, block, 64u, B3_PARENT);                                \
+        const uint id = tgid * (CNT) + n;                                      \
+        for (uint i = 0u; i < 8u; i++) {                                       \
+            OUT[id * 8u + i] = cv[i];                                          \
+            DST[n * 8u + i] = cv[i];                                           \
+        }                                                                      \
+    }
+
+[[max_total_threads_per_threadgroup(64)]]
+kernel void ntt_final6_t3_leaf(device uint4* data                [[buffer(0)]],
+                               device const uint4* twiddles      [[buffer(1)]],
+                               constant NttParams& P             [[buffer(2)]],
+                               device uint* leaves               [[buffer(3)]],
+                               device uint* parents1             [[buffer(4)]],
+                               device uint* parents2             [[buffer(5)]],
+                               device uint* parents3             [[buffer(6)]],
+                               uint tgid [[threadgroup_position_in_grid]],
+                               uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u, NF = 1u << F;
+    constexpr uint NNIB = 5u;
+    threadgroup uint4 tabB[512u];
+    threadgroup uint  nibB[8u * NNIB];
+    threadgroup uint2* tab2 = (threadgroup uint2*)tabB;
+    threadgroup uint* tab1 = (threadgroup uint*)(tabB + 256u);
+    const uint lane = lid & 63u;
+    const uint gbase = tgid << 6;          // 64 positions per group
+    // P.l = log_d - 4 (the t3 tile layers); this group's layer P.l - 2
+    // block is tgid, its layer P.l - 1 blocks are 2 tgid + {0, 1}.
+    uint4 el[32];
+
+    // Layer P.l - 2: pairs (j, j + 32). Two rounds of 32 rows (tiles r and
+    // r + 2) through one table.
+    gf_build_byte16(tabB, twiddles, (1u << (P.l - 2u)) - 1u + tgid, lid);
+    for (uint r = 0; r < 2u; r++) {
+        for (uint e = 0; e < 16u; e++) {
+            el[e]       = data[((gbase + (r << 4) + e) << 6) | lane];
+            el[16u + e] = data[((gbase + 32u + (r << 4) + e) << 6) | lane];
+        }
+        for (uint e = 0; e < 16u; e += 2u) {
+            uint4 p0;
+            uint4 p1;
+            gf_mul_byte16_x2(el[16u + e], el[17u + e], &tabB[0], p0, p1);
+            const uint4 n0 = el[e] ^ p0;
+            const uint4 n1 = el[e + 1u] ^ p1;
+            el[e] = n0;
+            el[16u + e] ^= n0;
+            el[e + 1u] = n1;
+            el[17u + e] ^= n1;
+        }
+        for (uint e = 0; e < 16u; e++) {
+            data[((gbase + (r << 4) + e) << 6) | lane] = el[e];
+            data[((gbase + 32u + (r << 4) + e) << 6) | lane] = el[16u + e];
+        }
+    }
+    // Layer P.l - 1 on each 32-row half (pairs (j, j + 16)), then the t3
+    // tile body on the half's two tiles. Every thread re-reads only the
+    // lane it wrote, so no device barrier is needed between the phases.
+    for (uint h = 0; h < 2u; h++) {
+        for (uint e = 0; e < 32u; e++) {
+            el[e] = data[((gbase + (h << 5) + e) << 6) | lane];
+        }
+        gf_build_byte16(tabB, twiddles, (1u << (P.l - 1u)) - 1u + (tgid << 1) + h, lid);
+        for (uint e = 0; e < 16u; e += 2u) {
+            uint4 p0;
+            uint4 p1;
+            gf_mul_byte16_x2(el[16u + e], el[17u + e], &tabB[0], p0, p1);
+            const uint4 n0 = el[e] ^ p0;
+            const uint4 n1 = el[e + 1u] ^ p1;
+            el[e] = n0;
+            el[16u + e] ^= n0;
+            el[e + 1u] = n1;
+            el[17u + e] ^= n1;
+        }
+        FIN6_T3_TILE((tgid << 2) + (h << 1), 0u)
+        FIN6_T3_TILE((tgid << 2) + (h << 1) + 1u, 16u)
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    constexpr uint NL = 64u;                              // leaves per group
+    threadgroup uint* level0 = (threadgroup uint*)tabB;  // NL * 8 words
+    threadgroup uint* level1 = level0 + NL * 8u;         // NL * 4 words
+    threadgroup uint* level2 = level1 + NL * 4u;         // NL * 2 words
+    for (uint n = lid; n < NL; n += 64u) {
+        const uint id = tgid * NL + n;
+        device const uint4* leaf4 = data + id * 64u;
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        for (uint b = 0u; b < 16u; b++) {
+            uint block[16];
+            for (uint q = 0u; q < 4u; q++) {
+                const uint4 w = leaf4[b * 4u + q];
+                block[q * 4u + 0u] = w.x;
+                block[q * 4u + 1u] = w.y;
+                block[q * 4u + 2u] = w.z;
+                block[q * 4u + 3u] = w.w;
+            }
+            uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
+            b3_compress(cv, block, 64u, flags);
+        }
+        for (uint i = 0u; i < 8u; i++) {
+            leaves[id * 8u + i] = cv[i];
+            level0[n * 8u + i] = cv[i];
+        }
+    }
+#define LEAF_PARENT_LEVEL(SRC, DST, OUT, CNT)                                  \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    for (uint n = lid; n < (CNT); n += 64u) {                                  \
+        uint block[16];                                                        \
+        for (uint i = 0u; i < 8u; i++) {                                       \
+            block[i] = SRC[(2u * n) * 8u + i];                                 \
+            block[8u + i] = SRC[(2u * n + 1u) * 8u + i];                       \
+        }                                                                      \
+        uint cv[8];                                                            \
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];                       \
+        b3_compress(cv, block, 64u, B3_PARENT);                                \
+        const uint id = tgid * (CNT) + n;                                      \
+        for (uint i = 0u; i < 8u; i++) {                                       \
+            OUT[id * 8u + i] = cv[i];                                          \
+            DST[n * 8u + i] = cv[i];                                           \
+        }                                                                      \
+    }
+    LEAF_PARENT_LEVEL(level0, level1, parents1, NL / 2u)
+    LEAF_PARENT_LEVEL(level1, level2, parents2, NL / 4u)
+    LEAF_PARENT_LEVEL(level2, level0, parents3, NL / 8u)
+#undef LEAF_PARENT_LEVEL
+}
+
+// Five-layer final pass + leaf: layer P.l - 1 (pairs (j, j + 16)) on each
+// 32-row half in registers, then the t3 tile body on its two tiles straight
+// from registers; one codeword read + one write per row.
+[[max_total_threads_per_threadgroup(64)]]
+kernel void ntt_final5_t3_leaf(device uint4* data                [[buffer(0)]],
+                               device const uint4* twiddles      [[buffer(1)]],
+                               constant NttParams& P             [[buffer(2)]],
+                               device uint* leaves               [[buffer(3)]],
+                               device uint* parents1             [[buffer(4)]],
+                               device uint* parents2             [[buffer(5)]],
+                               device uint* parents3             [[buffer(6)]],
+                               uint tgid [[threadgroup_position_in_grid]],
+                               uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u, NF = 1u << F;
+    constexpr uint NNIB = 5u;
+    threadgroup uint4 tabB[512u];
+    threadgroup uint  nibB[8u * NNIB];
+    threadgroup uint2* tab2 = (threadgroup uint2*)tabB;
+    threadgroup uint* tab1 = (threadgroup uint*)(tabB + 256u);
+    const uint lane = lid & 63u;
+    const uint gbase = tgid << 6;
+    uint4 el[32];
+    for (uint h = 0; h < 2u; h++) {
+        for (uint e = 0; e < 32u; e++) {
+            el[e] = data[((gbase + (h << 5) + e) << 6) | lane];
+        }
+        gf_build_byte16(tabB, twiddles, (1u << (P.l - 1u)) - 1u + (tgid << 1) + h, lid);
+        for (uint e = 0; e < 16u; e += 2u) {
+            uint4 p0;
+            uint4 p1;
+            gf_mul_byte16_x2(el[16u + e], el[17u + e], &tabB[0], p0, p1);
+            const uint4 n0 = el[e] ^ p0;
+            const uint4 n1 = el[e + 1u] ^ p1;
+            el[e] = n0;
+            el[16u + e] ^= n0;
+            el[e + 1u] = n1;
+            el[17u + e] ^= n1;
+        }
+        FIN6_T3_TILE((tgid << 2) + (h << 1), 0u)
+        FIN6_T3_TILE((tgid << 2) + (h << 1) + 1u, 16u)
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    FIN_LEAF_TAIL
+}
+
+// Six-layer final pass + leaf, quad form: 256 threads, 256 rows per group
+// (four 64-row blocks h). Four threads per lane (rho = lid & 3, one quad of
+// the simdgroup); thread rho holds tile rho (16 rows) of block h. Layers
+// P.l - 2 (tiles 0,1 | 2,3, xor 2) and P.l - 1 (tiles 0 | 1, 2 | 3, xor 1)
+// cross the quad; the t3 tile body then runs per thread on its own tile
+// with its own table slot (sub-layer 3 reads its short twiddles' nibbles
+// straight from the twiddle buffer). One read + one write per row.
+[[max_total_threads_per_threadgroup(256)]]
+kernel void ntt_final6q_t3_leaf(device uint4* data                [[buffer(0)]],
+                                device const uint4* twiddles      [[buffer(1)]],
+                                constant NttParams& P             [[buffer(2)]],
+                                device uint* leaves               [[buffer(3)]],
+                                device uint* parents1             [[buffer(4)]],
+                                device uint* parents2             [[buffer(5)]],
+                                device uint* parents3             [[buffer(6)]],
+                                uint tgid [[threadgroup_position_in_grid]],
+                                uint lid_in [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u, NF = 1u << F;
+    constexpr uint NNIB = 5u;
+    threadgroup uint4 tabs[2048u];
+    const uint rho = lid_in & 3u;
+    const uint lane = ((lid_in >> 5) << 3) | ((lid_in & 31u) >> 2);
+    threadgroup uint4* tabB = tabs + (rho << 9);
+    threadgroup uint2* tab2 = (threadgroup uint2*)tabB;
+    threadgroup uint* tab1 = (threadgroup uint*)(tabB + 256u);
+    {
+    const uint lid = lane;   // slot-local table-builder index (0..63)
+    for (uint h = 0; h < 4u; h++) {
+        const uint blk = (tgid << 2) + h;               // 64-row block
+        const uint rbase = (blk << 6) + (rho << 4);
+        uint4 elems[NF];
+        for (uint e = 0; e < NF; e++) {
+            elems[e] = data[((rbase + e) << 6) | lane];
+        }
+        gf_build_byte16(tabB, twiddles, (1u << (P.l - 2u)) - 1u + blk, lid);
+        FIN6Q_CROSS(2u, &tabB[0])
+        gf_build_byte16(tabB, twiddles, (1u << (P.l - 1u)) - 1u + (blk << 1) + (rho >> 1), lid);
+        FIN6Q_CROSS(1u, &tabB[0])
+        {
+            const uint B = (blk << 2) + rho;
+            NTT_T3_SUBLAYER(0u, 0u)
+            NTT_T3_MID(1u, 0u)
+            NTT_T3_MID(1u, 1u)
+            NTT_T3_SHORT_PAIR(2u, 0u)
+            NTT_T3_SHORT_PAIR(2u, 2u)
+            {
+                constexpr uint j = 3u;
+                constexpr uint bpos = F - 1u - j;
+                for (uint b = 0; b < (NF >> 1); b++) {
+                    uint low = b & ((1u << bpos) - 1u);
+                    uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+                    uint ev = eu | (1u << bpos);
+                    uint c = eu >> (F - j);
+                    const uint4 twc = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + c];
+                    uint4 V0 = elems[ev];
+                    uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+                    uint4 acc = uint4(0u);
+                    for (int q = (int)NNIB - 1; q >= 0; q--) {
+                        acc = gf_shl4(acc);
+                        uint n = (twc[q >> 3] >> ((q & 7) * 4)) & 15u;
+                        if (n & 1u) acc ^= V0;
+                        if (n & 2u) acc ^= V1;
+                        if (n & 4u) acc ^= V2;
+                        if (n & 8u) acc ^= V3;
+                    }
+                    uint4 nu = elems[eu] ^ acc;
+                    elems[eu] = nu;
+                    elems[ev] ^= nu;
+                }
+            }
+        }
+        for (uint e = 0; e < NF; e++) {
+            data[((rbase + e) << 6) | lane] = elems[e];
+        }
+    }
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    {
+    const uint lid = lid_in;
+    constexpr uint NL = 256u;
+    threadgroup uint* level0 = (threadgroup uint*)tabs;
+    threadgroup uint* level1 = level0 + NL * 8u;
+    threadgroup uint* level2 = level1 + NL * 4u;
+    for (uint n = lid; n < NL; n += 256u) {
+        const uint id = tgid * NL + n;
+        device const uint4* leaf4 = data + id * 64u;
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        for (uint b = 0u; b < 16u; b++) {
+            uint block[16];
+            for (uint q = 0u; q < 4u; q++) {
+                const uint4 w = leaf4[b * 4u + q];
+                block[q * 4u + 0u] = w.x;
+                block[q * 4u + 1u] = w.y;
+                block[q * 4u + 2u] = w.z;
+                block[q * 4u + 3u] = w.w;
+            }
+            uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
+            b3_compress(cv, block, 64u, flags);
+        }
+        for (uint i = 0u; i < 8u; i++) {
+            leaves[id * 8u + i] = cv[i];
+            level0[n * 8u + i] = cv[i];
+        }
+    }
+#define FIN_PARENT_LEVEL256(SRC, DST, OUT, CNT)                                \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    for (uint n = lid; n < (CNT); n += 256u) {                                 \
+        uint block[16];                                                        \
+        for (uint i = 0u; i < 8u; i++) {                                       \
+            block[i] = SRC[(2u * n) * 8u + i];                                 \
+            block[8u + i] = SRC[(2u * n + 1u) * 8u + i];                       \
+        }                                                                      \
+        uint cv[8];                                                            \
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];                       \
+        b3_compress(cv, block, 64u, B3_PARENT);                                \
+        const uint id = tgid * (CNT) + n;                                      \
+        for (uint i = 0u; i < 8u; i++) {                                       \
+            OUT[id * 8u + i] = cv[i];                                          \
+            DST[n * 8u + i] = cv[i];                                           \
+        }                                                                      \
+    }
+    FIN_PARENT_LEVEL256(level0, level1, parents1, NL / 2u)
+    FIN_PARENT_LEVEL256(level1, level2, parents2, NL / 4u)
+    FIN_PARENT_LEVEL256(level2, level0, parents3, NL / 8u)
+#undef FIN_PARENT_LEVEL256
+    }
+}
+
+// Variant B: layers P.l - 2 and P.l - 1 in registers over two 32-row rounds
+// split by position bit 3 (each round is closed under bits 5 and 4), stored
+// back, then the unchanged LEAF_TILES = 4 t3 tile loop + leaf hashing.
+[[max_total_threads_per_threadgroup(64)]]
+kernel void ntt_final6b_t3_leaf(device uint4* data                [[buffer(0)]],
+                                device const uint4* twiddles      [[buffer(1)]],
+                                constant NttParams& P             [[buffer(2)]],
+                                device uint* leaves               [[buffer(3)]],
+                                device uint* parents1             [[buffer(4)]],
+                                device uint* parents2             [[buffer(5)]],
+                                device uint* parents3             [[buffer(6)]],
+                                uint tgid [[threadgroup_position_in_grid]],
+                                uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F = 4u, NF = 1u << F;
+    constexpr uint NNIB = 5u;
+    threadgroup uint4 tabB[512u];
+    threadgroup uint  nibB[8u * NNIB];
+    threadgroup uint2* tab2 = (threadgroup uint2*)tabB;
+    threadgroup uint* tab1 = (threadgroup uint*)(tabB + 256u);
+    const uint lane = lid & 63u;
+    const uint gbase = tgid << 6;
+    for (uint r = 0; r < 2u; r++) {
+        uint4 el[32];
+        // el[(q << 3) + i] = row gbase + (q << 4) + (r << 3) + i, q = (b5 b4).
+        for (uint q = 0; q < 4u; q++) {
+            for (uint i = 0; i < 8u; i++) {
+                el[(q << 3) + i] = data[((gbase + (q << 4) + (r << 3) + i) << 6) | lane];
+            }
+        }
+        gf_build_byte16(tabB, twiddles, (1u << (P.l - 2u)) - 1u + tgid, lid);
+        for (uint e = 0; e < 16u; e += 2u) {
+            uint4 p0;
+            uint4 p1;
+            gf_mul_byte16_x2(el[16u + e], el[17u + e], &tabB[0], p0, p1);
+            const uint4 n0 = el[e] ^ p0;
+            const uint4 n1 = el[e + 1u] ^ p1;
+            el[e] = n0;
+            el[16u + e] ^= n0;
+            el[e + 1u] = n1;
+            el[17u + e] ^= n1;
+        }
+        for (uint h = 0; h < 2u; h++) {
+            gf_build_byte16(tabB, twiddles, (1u << (P.l - 1u)) - 1u + (tgid << 1) + h, lid);
+            for (uint e = 0; e < 8u; e += 2u) {
+                const uint u0 = (h << 4) + e;
+                uint4 p0;
+                uint4 p1;
+                gf_mul_byte16_x2(el[u0 + 8u], el[u0 + 9u], &tabB[0], p0, p1);
+                const uint4 n0 = el[u0] ^ p0;
+                const uint4 n1 = el[u0 + 1u] ^ p1;
+                el[u0] = n0;
+                el[u0 + 8u] ^= n0;
+                el[u0 + 1u] = n1;
+                el[u0 + 9u] ^= n1;
+            }
+        }
+        for (uint q = 0; q < 4u; q++) {
+            for (uint i = 0; i < 8u; i++) {
+                data[((gbase + (q << 4) + (r << 3) + i) << 6) | lane] = el[(q << 3) + i];
+            }
+        }
+    }
+    for (uint tt = 0; tt < 4u; tt++) {
+        const uint B = (tgid << 2) + tt;
+        const uint pos_base = B << 4;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < 8u * NNIB) {
+            uint cB = lid / NNIB, qB = lid % NNIB;
+            uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cB];
+            nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;
+        }
+        uint4 elems[NF];
+        for (uint e = 0; e < NF; e++) {
+            elems[e] = data[((pos_base + e) << 6) + lane];
+        }
+        NTT_T3_SUBLAYER(0u, 0u)
+        NTT_T3_MID(1u, 0u)
+        NTT_T3_MID(1u, 1u)
+        NTT_T3_SHORT_PAIR(2u, 0u)
+        NTT_T3_SHORT_PAIR(2u, 2u)
+        {
+            constexpr uint j = 3u;
+            constexpr uint bpos = F - 1u - j;
+            for (uint b = 0; b < (NF >> 1); b++) {
+                uint low = b & ((1u << bpos) - 1u);
+                uint eu = ((b >> bpos) << (bpos + 1u)) | low;
+                uint ev = eu | (1u << bpos);
+                uint c = eu >> (F - j);
+                threadgroup const uint* nb = &nibB[c * NNIB];
+                uint4 V0 = elems[ev];
+                uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+                uint4 acc = uint4(0u);
+                for (int q = (int)NNIB - 1; q >= 0; q--) {
+                    acc = gf_shl4(acc);
+                    uint n = nb[q];
+                    if (n & 1u) acc ^= V0;
+                    if (n & 2u) acc ^= V1;
+                    if (n & 4u) acc ^= V2;
+                    if (n & 8u) acc ^= V3;
+                }
+                uint4 nu = elems[eu] ^ acc;
+                elems[eu] = nu;
+                elems[ev] ^= nu;
+            }
+        }
+        for (uint e = 0; e < NF; e++) {
+            data[((pos_base + e) << 6) + lane] = elems[e];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+    constexpr uint NL = 64u;
+    threadgroup uint* level0 = (threadgroup uint*)tabB;
+    threadgroup uint* level1 = level0 + NL * 8u;
+    threadgroup uint* level2 = level1 + NL * 4u;
+    for (uint n = lid; n < NL; n += 64u) {
+        const uint id = tgid * NL + n;
+        device const uint4* leaf4 = data + id * 64u;
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        for (uint b = 0u; b < 16u; b++) {
+            uint block[16];
+            for (uint q = 0u; q < 4u; q++) {
+                const uint4 w = leaf4[b * 4u + q];
+                block[q * 4u + 0u] = w.x;
+                block[q * 4u + 1u] = w.y;
+                block[q * 4u + 2u] = w.z;
+                block[q * 4u + 3u] = w.w;
+            }
+            uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
+            b3_compress(cv, block, 64u, flags);
+        }
+        for (uint i = 0u; i < 8u; i++) {
+            leaves[id * 8u + i] = cv[i];
+            level0[n * 8u + i] = cv[i];
+        }
+    }
+#define LEAF_PARENT_LEVEL(SRC, DST, OUT, CNT)                                  \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                           \
+    for (uint n = lid; n < (CNT); n += 64u) {                                  \
+        uint block[16];                                                        \
+        for (uint i = 0u; i < 8u; i++) {                                       \
+            block[i] = SRC[(2u * n) * 8u + i];                                 \
+            block[8u + i] = SRC[(2u * n + 1u) * 8u + i];                       \
+        }                                                                      \
+        uint cv[8];                                                            \
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];                       \
+        b3_compress(cv, block, 64u, B3_PARENT);                                \
+        const uint id = tgid * (CNT) + n;                                      \
+        for (uint i = 0u; i < 8u; i++) {                                       \
+            OUT[id * 8u + i] = cv[i];                                          \
+            DST[n * 8u + i] = cv[i];                                           \
+        }                                                                      \
+    }
+    LEAF_PARENT_LEVEL(level0, level1, parents1, NL / 2u)
+    LEAF_PARENT_LEVEL(level1, level2, parents2, NL / 4u)
+    LEAF_PARENT_LEVEL(level2, level0, parents3, NL / 8u)
+#undef LEAF_PARENT_LEVEL
+}
+"#;
+
+    pub(crate) fn final6_leaf_msl_source() -> String {
+        format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}{NTT_FINAL5C_MSL}{NTT_FINAL6_LEAF_EXTRA_MSL}")
+    }
+
     pub(crate) fn final_leaf_selected(gpu: &Gpu, log_d: usize, n_leaves: usize) -> bool {
         !gpu.pso_final_leaf.is_null()
             && log_d >= 10
@@ -4775,6 +5529,25 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
     }
 
     pub(crate) unsafe fn encode_ntt_and_merkle(
+        gpu: &Gpu,
+        enc: Id,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+    ) {
+        unsafe {
+            if gl3_four_pass_selected(gpu, log_d, n_leaves) {
+                encode_gl3_prefix_tail(gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves, Some((1, 1)), 1, 1);
+                return;
+            }
+            encode_ntt_and_merkle_five(gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves);
+        }
+    }
+
+    /// The incumbent five-pass graph after a four-layer first pass.
+    pub(crate) unsafe fn encode_ntt_and_merkle_five(
         gpu: &Gpu,
         enc: Id,
         staging: Id,
@@ -4871,6 +5644,161 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
             gpu.set_buffer(enc, tree_buf, w2 * 32, 5);
             gpu.set_buffer(enc, tree_buf, w3 * 32, 6);
             gpu.dispatch(enc, (prefix_leaves / 64) as u64, 64);
+        }
+    }
+
+    /// GL3: one five-layer `ntt_g5` (mid build: LOG_T = 1, 128 threads,
+    /// byte tables) pass at layer `l` over the first `num / den` of the
+    /// positions. `den` must not exceed the layer's block count.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn encode_g5_pass_frac(
+        gpu: &Gpu,
+        enc: Id,
+        pso: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        log_d: usize,
+        l: usize,
+        num: u64,
+        den: u64,
+    ) {
+        debug_assert!(l + 5 <= log_d && (1u64 << l) >= den);
+        unsafe {
+            gpu.set_pipeline(enc, pso);
+            gpu.set_buffer(enc, data_buf, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            // buffer(3) is the from-z input, never read by the mid build.
+            gpu.set_buffer(enc, data_buf, 0, 3);
+            let p = NttParams { log_d: log_d as u32, l: l as u32, f: 5, s: (log_d - l - 5) as u32 };
+            let bytes = core::slice::from_raw_parts(
+                (&p as *const NttParams).cast::<u8>(),
+                core::mem::size_of::<NttParams>(),
+            );
+            gpu.set_bytes(enc, bytes, 2);
+            let groups = 1u64 << (log_d - 5 - G5_MID_LOG_T);
+            debug_assert_eq!(groups % den, 0);
+            gpu.dispatch(enc, groups / den * num, 64u64 << G5_MID_LOG_T);
+        }
+    }
+
+    /// GL3: `ntt_final6_t3_leaf` over the first `prefix_leaves` positions (a
+    /// multiple of 64): layers `log_d - 6 .. log_d`, leaves and level-1..3
+    /// parents at their global flat-tree slots.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn encode_final6_leaf_prefix(
+        gpu: &Gpu,
+        enc: Id,
+        pso: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        prefix_leaves: usize,
+        rows: usize,
+    ) {
+        unsafe {
+            let n_leaves = 1usize << log_d;
+            debug_assert!(prefix_leaves <= n_leaves && prefix_leaves.is_multiple_of(rows));
+            let l = log_d - 4;
+            gpu.set_pipeline(enc, pso);
+            gpu.set_buffer(enc, data_buf, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            let p = NttParams { log_d: log_d as u32, l: l as u32, f: 4, s: 0 };
+            let bytes = core::slice::from_raw_parts(
+                (&p as *const NttParams).cast::<u8>(),
+                core::mem::size_of::<NttParams>(),
+            );
+            gpu.set_bytes(enc, bytes, 2);
+            let w1 = n_leaves;
+            let w2 = w1 + n_leaves / 2;
+            let w3 = w2 + n_leaves / 4;
+            gpu.set_buffer(enc, tree_buf, 0, 3);
+            gpu.set_buffer(enc, tree_buf, w1 * 32, 4);
+            gpu.set_buffer(enc, tree_buf, w2 * 32, 5);
+            gpu.set_buffer(enc, tree_buf, w3 * 32, 6);
+            gpu.dispatch(enc, (prefix_leaves / rows) as u64, rows as u64);
+        }
+    }
+
+    /// Rows (= threads) per group of the GL3 final kernel in use: 128 for the
+    /// pair form `ntt_final5c_t3_leaf`, 64 otherwise.
+    #[cfg(test)]
+    pub(crate) fn gl3_fin_rows() -> usize {
+        match std::env::var("GL3_FIN_ROWS").ok().and_then(|v| v.parse().ok()) {
+            Some(r) => r,
+            None => 128,
+        }
+    }
+
+    /// LOG_T of the GL3 mid `ntt_g5` build (two 64-lane tiles per group).
+    pub(crate) const G5_MID_LOG_T: usize = 1;
+    pub(crate) const G5_MID_DEFS: &str = "#define LOG_T 1u\n#define DBUF 1\n#define PADN 1u\n";
+
+    pub(crate) const G5_FZ_DEFS: &str = "#define FROMZ 1\n#define LOG_T 1u\n#define DBUF 1\n#define PADN 1u\n";
+
+    pub(crate) fn g5_fz_msl_source() -> String {
+        NTT_G5_MSL_SOURCE.replacen("using namespace metal;\n", &format!("using namespace metal;\n{G5_FZ_DEFS}"), 1)
+    }
+
+    pub(crate) fn g5_mid_msl_source() -> String {
+        NTT_G5_MSL_SOURCE.replacen("using namespace metal;\n", &format!("using namespace metal;\n{G5_MID_DEFS}"), 1)
+    }
+
+    /// GL3 four-pass graph selected for this shape. Depends only on
+    /// process-constant state (kill switch, compiled pipelines, pass-tune
+    /// and final-leaf gates), so the first pass, the GPU prefix, the
+    /// pure-GPU graph and the CPU suffix always agree on it.
+    pub(crate) fn gl3_four_pass_selected(gpu: &Gpu, log_d: usize, n_leaves: usize) -> bool {
+        !gpu.pso_g5fz.is_null()
+            && !gpu.pso_g5mid.is_null()
+            && !gpu.pso_fin5c.is_null()
+            && log_d == 20
+            && n_leaves == 1usize << log_d
+            && final_leaf_selected(gpu, log_d, n_leaves)
+    }
+
+    /// Rows per `ntt_final5c_t3_leaf` group.
+    pub(crate) const GL3_FIN_ROWS: usize = 128;
+
+    /// GL3 GPU prefix after the five-layer first pass: (optionally) layers
+    /// 5..10 over the first `num5 / den5` of the positions, then layers
+    /// 10..15 and the fused final pass + leaves over the first `num / den`,
+    /// then the levels above 3 of the prefix's aligned subtrees (or the
+    /// whole upper tree when the prefix is everything).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn encode_gl3_prefix_tail(
+        gpu: &Gpu,
+        enc: Id,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        l5: Option<(u64, u64)>,
+        num: u64,
+        den: u64,
+    ) {
+        unsafe {
+            if let Some((num5, den5)) = l5 {
+                encode_g5_pass_frac(gpu, enc, gpu.pso_g5mid, staging, tw_buf, log_d, 5, num5, den5);
+            }
+            encode_g5_pass_frac(gpu, enc, gpu.pso_g5mid, staging, tw_buf, log_d, 10, num, den);
+            let prefix_leaves = (n_leaves / den as usize) * num as usize;
+            encode_final6_leaf_prefix(gpu, enc, gpu.pso_fin5c, staging, tw_buf, tree_buf, log_d, prefix_leaves, GL3_FIN_ROWS);
+            if prefix_leaves == n_leaves {
+                let w3 = n_leaves + n_leaves / 2 + n_leaves / 4;
+                encode_merkle_upper(gpu, enc, tree_buf, w3, n_leaves / 8);
+                return;
+            }
+            let mut start = 0usize;
+            while start < prefix_leaves {
+                let mut size = 1usize << (prefix_leaves - start).ilog2();
+                while start % size != 0 {
+                    size >>= 1;
+                }
+                encode_merkle_subtree_above3(gpu, enc, tree_buf, n_leaves, start, size);
+                start += size;
+            }
         }
     }
 
@@ -5820,6 +6748,12 @@ kernel void blake3_pow_scan(
         /// `pso_ntt5mix`, which writes the same bytes.
         pub(crate) pso_ntt5t3: Id,
         pub(crate) pso_final_leaf: Id,
+        /// GL3 four-pass graph kernels (NIL unless `gl3_four_pass_enabled`
+        /// and all three compile): from-z layers 0..5, mid five-layer pass,
+        /// fused five-layer final pass + leaves.
+        pub(crate) pso_g5fz: Id,
+        pub(crate) pso_g5mid: Id,
+        pub(crate) pso_fin5c: Id,
         /// Supplemental PCS Fiat--Shamir BLAKE3 nonce scanner.  Its single
         /// shared result word is protected because `Gpu` itself is global.
         pub(crate) pso_pow: Id,
@@ -6526,6 +7460,90 @@ kernel void blake3_pow_scan(
                 } else {
                     NIL
                 };
+                let compile_gl3 = |source: &str, name: &str, min_threads: u64| -> Result<Id, String> {
+                    let src = api.nsstring(source)?;
+                    let mut err: Id = NIL;
+                    let library: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                        device,
+                        c"newLibraryWithSource:options:error:",
+                        src,
+                        NIL,
+                        &mut err
+                    );
+                    if library.is_null() {
+                        return Err(format!("gl3 shader compile failed: {}", api.error_string(err)));
+                    }
+                    let ns = api.nsstring(name)?;
+                    let f: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        return Err(format!("gl3 kernel {name} not found"));
+                    }
+                    let mut pso_err: Id = NIL;
+                    let pso: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut pso_err
+                    );
+                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    if pso.is_null() {
+                        return Err(format!("gl3 pipeline {name}: {}", api.error_string(pso_err)));
+                    }
+                    let max_threads: u64 = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        pso,
+                        c"maxTotalThreadsPerThreadgroup"
+                    );
+                    if max_threads < min_threads {
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                        return Err(format!("gl3 pipeline {name} allows {max_threads} threads"));
+                    }
+                    Ok(pso)
+                };
+                let (pso_g5fz, pso_g5mid, pso_fin5c) = if super::gl3_four_pass_enabled()
+                    && !pso_final_leaf.is_null()
+                {
+                    let r = (|| -> Result<(Id, Id, Id), String> {
+                        let fz = compile_gl3(&g5_fz_msl_source(), "ntt_g5", 64 << G5_MID_LOG_T)?;
+                        let mid = match compile_gl3(&g5_mid_msl_source(), "ntt_g5", 64 << G5_MID_LOG_T) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, fz, c"release");
+                                return Err(e);
+                            }
+                        };
+                        let fin = match compile_gl3(&final5c_msl_source(), "ntt_final5c_t3_leaf", 128) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, fz, c"release");
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, mid, c"release");
+                                return Err(e);
+                            }
+                        };
+                        Ok((fz, mid, fin))
+                    })();
+                    r.unwrap_or_else(|e| {
+                        if debug_enabled() {
+                            eprintln!("[gpu-commit] {e}; keeping the five-pass graph");
+                        }
+                        (NIL, NIL, NIL)
+                    })
+                } else {
+                    (NIL, NIL, NIL)
+                };
                 Ok(Gpu {
                     api,
                     device,
@@ -6549,6 +7567,9 @@ kernel void blake3_pow_scan(
                     pso_ntt4g4x2,
                     pso_ntt5t3,
                     pso_final_leaf,
+                    pso_g5fz,
+                    pso_g5mid,
+                    pso_fin5c,
                     pso_pow,
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
@@ -7033,15 +8054,38 @@ kernel void blake3_pow_scan(
     pub(crate) struct FromZFirstPassPlan {
         grouped: bool,
         zero_root: bool,
+        /// GL3: layers 0..5 (`ntt_g5` FROMZ build); `r` counts 2^(log_d-5)
+        /// tiles instead of 2^(log_d-4).
+        four: bool,
     }
 
     impl FromZFirstPassPlan {
         pub(crate) fn new(log_d: usize) -> Self {
             let grouped = super::pass_tune_enabled();
+            let four = gpu().map(|g| gl3_four_pass_selected(g, log_d, 1usize << log_d)).unwrap_or(false);
             Self {
                 grouped,
                 zero_root: grouped && super::gpu_from_z_zero_root_selected(log_d),
+                four,
             }
+        }
+
+        /// The incumbent four-layer first pass regardless of the GL3 mode
+        /// (probes comparing the two graphs).
+        #[cfg(test)]
+        pub(crate) fn incumbent(log_d: usize) -> Self {
+            Self { four: false, ..Self::new(log_d) }
+        }
+
+        /// Whether this plan is the GL3 five-layer first pass.
+        pub(crate) fn is_four_pass(&self) -> bool {
+            self.four
+        }
+
+        /// Tile count of the full first pass (the `r_count` of a full-range
+        /// `encode_range`).
+        pub(crate) fn total_r(&self, log_d: usize) -> usize {
+            1usize << (log_d - if self.four { 5 } else { 4 })
         }
 
         pub(crate) unsafe fn encode_range(
@@ -7057,6 +8101,23 @@ kernel void blake3_pow_scan(
         ) {
             debug_assert!(!self.zero_root || self.grouped);
             debug_assert!(!self.grouped || r_count.is_multiple_of(4));
+            if self.four {
+                unsafe {
+                    gpu.set_pipeline(enc, gpu.pso_g5fz);
+                    gpu.set_buffer(enc, staging, byte_offset, 0);
+                    gpu.set_buffer(enc, tw_buf, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 0, f: 5, s: (log_d - 5) as u32 };
+                    let bytes = core::slice::from_raw_parts(
+                        (&p as *const NttParams).cast::<u8>(),
+                        core::mem::size_of::<NttParams>(),
+                    );
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.set_buffer(enc, z_buf, byte_offset, 3);
+                    debug_assert!(r_count.is_multiple_of(1 << G5_MID_LOG_T));
+                    gpu.dispatch(enc, (r_count >> G5_MID_LOG_T) as u64, 64u64 << G5_MID_LOG_T);
+                }
+                return;
+            }
             unsafe {
                 let pso = if self.zero_root {
                     debug_assert!(!gpu.pso_ntt4zg4_zero_root.is_null());
@@ -7105,6 +8166,7 @@ kernel void blake3_pow_scan(
             FromZFirstPassPlan {
                 grouped: true,
                 zero_root: true,
+                four: false,
             }
             .encode_range(
                 gpu,
@@ -7777,6 +8839,10 @@ kernel void blake3_pow_scan(
         log_d: usize,
         n_leaves: usize,
         next_r: usize,
+        /// GL3 four-pass: five-layer first-pass tiles already dispatched
+        /// (tile r5 needs message rows r5 + e 2^15, e < 16, i.e. streamed
+        /// four-layer tiles r5 and r5 + 2^15).
+        done5: usize,
         pending: Vec<Id>,
         failed: Option<String>,
         owns_lease: bool,
@@ -7826,6 +8892,24 @@ kernel void blake3_pow_scan(
             // A position contains 64 F128 lanes = 1 KiB. Offsetting both the
             // z and staging bindings makes local kernel r map to global
             // r_start+r without modifying the proven full-range kernel.
+            let plan = FromZFirstPassPlan::new(self.log_d);
+            let (r_start, r_count) = if plan.is_four_pass() {
+                // Five-layer tiles become ready once the stream passes their
+                // upper partner: r5 < next_r - 2^15.
+                let ready5 = (self.next_r + r_count).saturating_sub(total_r / 2);
+                let (a, b) = (self.done5, ready5.max(self.done5));
+                if b == a {
+                    self.next_r += r_count;
+                    return;
+                }
+                self.done5 = b;
+                // `next_r` advances below by the dispatched count; pre-add the
+                // remainder so it ends at the streamed four-layer position.
+                self.next_r += r_count - (b - a);
+                (a, b - a)
+            } else {
+                (r_start, r_count)
+            };
             let byte_offset = r_start * 64 * core::mem::size_of::<F128>();
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             let result = unsafe {
@@ -7833,7 +8917,7 @@ kernel void blake3_pow_scan(
                 let result = (|| -> Result<Id, String> {
                     let cb = self.gpu.command_buffer()?;
                     let enc = self.gpu.compute_encoder(cb)?;
-                    FromZFirstPassPlan::new(self.log_d).encode_range(
+                    plan.encode_range(
                         self.gpu,
                         enc,
                         self.staging,
@@ -7928,8 +9012,15 @@ kernel void blake3_pow_scan(
                     let result = (|| -> Result<Id, String> {
                         let cb = self.gpu.command_buffer()?;
                         let enc = self.gpu.compute_encoder(cb)?;
-                        encode_ntt_passes(self.gpu, enc, self.staging, self.tw_buf, self.log_d, 4);
-                        encode_merkle(self.gpu, enc, self.staging, self.tree_buf, self.n_leaves);
+                        if gl3_four_pass_selected(self.gpu, self.log_d, self.n_leaves) {
+                            encode_gl3_prefix_tail(
+                                self.gpu, enc, self.staging, self.tw_buf, self.tree_buf, self.log_d,
+                                self.n_leaves, Some((1, 1)), 1, 1,
+                            );
+                        } else {
+                            encode_ntt_passes(self.gpu, enc, self.staging, self.tw_buf, self.log_d, 4);
+                            encode_merkle(self.gpu, enc, self.staging, self.tree_buf, self.n_leaves);
+                        }
                         self.gpu.end_encoding(enc);
                         let cb = self.gpu.retain(cb);
                         self.gpu.commit_async(cb);
@@ -8100,6 +9191,7 @@ kernel void blake3_pow_scan(
             log_d: params.k_code(),
             n_leaves: params.n_leaves(),
             next_r: 0,
+            done5: 0,
             pending: Vec::with_capacity(8),
             failed: None,
             owns_lease: true,
@@ -8368,16 +9460,8 @@ kernel void blake3_pow_scan(
                 // From-z tiles all live in block B = 0 (l = 0), so the g4
                 // table-reuse idiom applies; the tuned kernel also skips the
                 // zero-region sub-layer (a pure copy).
-                FromZFirstPassPlan::new(log_d).encode_range(
-                    gpu,
-                    enc,
-                    staging,
-                    tw_buf,
-                    z_buf,
-                    log_d,
-                    0,
-                    1usize << (log_d - 4),
-                );
+                let plan = FromZFirstPassPlan::new(log_d);
+                plan.encode_range(gpu, enc, staging, tw_buf, z_buf, log_d, 0, plan.total_r(log_d));
                 // Passes 2..: layers 4..log_d in place over staging.
                 encode_ntt_and_merkle(gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves);
                 gpu.end_encoding(enc);
@@ -8470,7 +9554,7 @@ kernel void blake3_pow_scan(
             let pool = gpu.pool_push();
             let r = (|| {
                 crate::tmark::mark("graph encode start");
-                if gw_split_cb_enabled() {
+                if gw_split_cb_enabled() && !gl3_four_pass_selected(gpu, log_d, n_leaves) {
                     return run_graph_after_from_z_split(gpu, staging, tw_buf, tree_buf, log_d, n_leaves);
                 }
                 let cb = gpu.command_buffer()?;
@@ -8532,16 +9616,8 @@ kernel void blake3_pow_scan(
             // From-z tiles all live in block B = 0 (l = 0), so the g4
             // table-reuse idiom applies; the tuned kernel also skips
             // the zero-region sub-layer (a pure copy).
-            FromZFirstPassPlan::new(log_d).encode_range(
-                gpu,
-                enc,
-                staging,
-                tw_buf,
-                z_buf,
-                log_d,
-                0,
-                1usize << (log_d - 4),
-            );
+            let plan = FromZFirstPassPlan::new(log_d);
+            plan.encode_range(gpu, enc, staging, tw_buf, z_buf, log_d, 0, plan.total_r(log_d));
             gpu.end_encoding(enc);
             gpu.commit_and_wait(cb1)
         }
@@ -8605,6 +9681,13 @@ kernel void blake3_pow_scan(
             let prefix16 = (16 - k_cpu16) as u64;
             let cb2 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb2)?;
+            if gl3_four_pass_selected(gpu, log_d, n_leaves) {
+                encode_gl3_prefix_tail(
+                    gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves, Some((prefix16, 16)), prefix16, 16,
+                );
+                gpu.end_encoding(enc);
+                return Ok(cb2);
+            }
             if hybrid_final_leaf_selected(gpu, log_d, n_leaves) {
                 encode_hybrid_prefix_tail(gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves, 4, prefix16, 16);
                 gpu.end_encoding(enc);
@@ -8661,12 +9744,24 @@ kernel void blake3_pow_scan(
             let prefix256 = hybrid_prefix256(k_split) as u64;
             let cb2 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb2)?;
-            encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 4, 8, prefix16, 16);
+            let four = gl3_four_pass_selected(gpu, log_d, n_leaves);
+            if four {
+                // Layers 5..10 over the GPU's sixteenths INCLUDING the boundary
+                // one: the CPU's boundary sub-blocks resume at layer 10.
+                encode_g5_pass_frac(gpu, enc, gpu.pso_g5mid, staging, tw_buf, log_d, 5, prefix16, 16);
+            } else {
+                encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 4, 8, prefix16, 16);
+            }
             gpu.end_encoding(enc);
             let v = FINE_SPLIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             gpu.encode_signal_event(cb2, ev, v);
             FINE_SPLIT_WAIT.store(v, std::sync::atomic::Ordering::Release);
             let enc = gpu.compute_encoder(cb2)?;
+            if four {
+                encode_gl3_prefix_tail(gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves, None, prefix256, 256);
+                gpu.end_encoding(enc);
+                return Ok(cb2);
+            }
             if hybrid_final_leaf_selected(gpu, log_d, n_leaves) {
                 encode_hybrid_prefix_tail(gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves, 8, prefix256, 256);
                 gpu.end_encoding(enc);
@@ -8746,6 +9841,13 @@ kernel void blake3_pow_scan(
                 let tree_base = crate::epool::SyncPtr(tree.as_mut_ptr());
                 let suffix_leaf_start = prefix_leaves;
                 let suffix_leaves = n_leaves - prefix_leaves;
+                // GL3 four-pass: the first pass already ran layer 4, so the
+                // CPU suffix starts at layer 5 over the same rows (in 32nds).
+                let (cpu_l0, cpu_b0, cpu_bn) = if gl3_four_pass_selected(gpu, log_d, n_leaves) {
+                    (5usize, 2 * (16 - k_cpu16), 32usize)
+                } else {
+                    (4usize, 16 - k_cpu16, 16usize)
+                };
                 // S1: the GPU hashes the CPU suffix's leaves and subtree
                 // parents. The CPU still finishes the suffix NTT (same
                 // kernels, same order, a no-op chunk callback), then queues
@@ -8759,10 +9861,10 @@ kernel void blake3_pow_scan(
                         ntt.forward_transform_interleaved_ranked_block_range_and_then(
                             data,
                             64,
-                            4,
+                            cpu_l0,
                             log_d,
-                            16 - k_cpu16,
-                            16,
+                            cpu_b0,
+                            cpu_bn,
                             |_elem_offset: usize, _chunk: &[F128]| {},
                         );
                     } else {
@@ -8774,6 +9876,7 @@ kernel void blake3_pow_scan(
                         ntt.forward_transform_interleaved_ranked_fine_range_and_then(
                             data,
                             64,
+                            cpu_l0,
                             16 - k_cpu16,
                             fine_m,
                             || {
@@ -8938,10 +10041,10 @@ kernel void blake3_pow_scan(
                     ntt.forward_transform_interleaved_ranked_block_range_and_then(
                         data,
                         64,
-                        4,
+                        cpu_l0,
                         log_d,
-                        16 - k_cpu16,
-                        16,
+                        cpu_b0,
+                        cpu_bn,
                         finish_chunk,
                     );
                 } else {
@@ -8950,10 +10053,10 @@ kernel void blake3_pow_scan(
                     ntt.forward_transform_interleaved_block_range(
                         data,
                         64,
-                        4,
+                        cpu_l0,
                         log_d,
-                        16 - k_cpu16,
-                        16,
+                        cpu_b0,
+                        cpu_bn,
                         crate::ntt::additive_ntt_f128::ranked_zero_odd_tail_lanes(log_d, 64),
                     );
                     let suffix_bytes: &[u8] = core::slice::from_raw_parts(
@@ -10396,8 +11499,16 @@ kernel void blake3_pow_scan(
         };
         // The hybrid prefix's fused final leaf changes the GPU arm's cost, so
         // its tuned split must not be shared with the incumbent prefix.
-        if super::gpu_final_leaf_enabled() && super::gpu_hybrid_final_leaf_enabled() {
+        let key = if super::gpu_final_leaf_enabled() && super::gpu_hybrid_final_leaf_enabled() {
             key ^ 0x4859_4246_4C45_4146 // "HYBFLEAF"
+        } else {
+            key
+        };
+        // GL3 four-pass graph: different GPU and CPU arm costs.
+        if super::gl3_four_pass_enabled() {
+            key ^ fnv1a64(&final5c_msl_source()).rotate_left(6)
+                ^ fnv1a64(&g5_mid_msl_source()).rotate_left(7)
+                ^ 0x474C_335F_3450_4153 // "GL3_4PAS"
         } else {
             key
         }
@@ -22117,7 +23228,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 gpu.dispatch(enc, 1u64 << (log_d - 5 - (log_t + log_r) as usize), 64u64 << log_t);
             };
             let prod_fz = |enc: imp::Id| {
-                imp::FromZFirstPassPlan::new(log_d).encode_range(
+                imp::FromZFirstPassPlan::incumbent(log_d).encode_range(
                     gpu, enc, data_buf, tw_buf, z_buf, log_d, 0, 1usize << (log_d - 4),
                 )
             };
@@ -22148,6 +23259,37 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             let exact = newd[3] == prod;
             eprintln!("gr EXACT four-pass == production five-pass: {exact}");
             let mut rows: Vec<[f64; 11]> = Vec::new();
+            // GL3: optional background CPU load during the timing rows
+            // (GR_LOAD=1 memory streaming, 2 ALU; GL2_LOAD_THREADS, default 8).
+            let load: u32 = std::env::var("GR_LOAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut hs = Vec::new();
+            if load > 0 {
+                let nthr: usize = std::env::var("GL2_LOAD_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+                for t in 0..nthr {
+                    let stop = stop.clone();
+                    hs.push(std::thread::spawn(move || {
+                        if load == 1 {
+                            let n = 32usize << 20;
+                            let src = vec![t as u64 + 1; n / 2];
+                            let mut dst = vec![0u64; n / 2];
+                            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                dst.copy_from_slice(&src);
+                                std::hint::black_box(&mut dst);
+                            }
+                        } else {
+                            let mut x = t as u64 | 1;
+                            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                for _ in 0..100_000 {
+                                    x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(7) ^ 0x1234;
+                                }
+                                std::hint::black_box(x);
+                            }
+                        }
+                    }));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
             for _ in 0..9 {
                 let mut r = [0f64; 11];
                 r[0] = run(&|enc| prod_fz(enc));
@@ -22174,6 +23316,11 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 });
                 rows.push(r);
             }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            for h in hs {
+                h.join().unwrap();
+            }
+            eprintln!("gr timing rows under GR_LOAD={load}");
             if std::env::var_os("GR_CACHE").is_some() {
                 let den = 256u64;
                 let g5p = |enc: imp::Id, pso: imp::Id, l: usize, log_t: u32| {
@@ -22448,7 +23595,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             };
             let prefix = || {
                 run(&|enc| {
-                    imp::FromZFirstPassPlan::new(log_d).encode_range(
+                    imp::FromZFirstPassPlan::incumbent(log_d).encode_range(
                         gpu, enc, data_buf, tw_buf, z_buf, log_d, 0, 1usize << (log_d - 4),
                     );
                     imp::encode_ntt_passes_prefix_frac(gpu, enc, data_buf, tw_buf, log_d, 4, 4, 16, 16, 16);
@@ -22581,7 +23728,7 @@ kernel void gl2_write(device uint4* d [[buffer(0)]], uint gid [[thread_position_
             };
             let n16 = (data_bytes / 16) as u64;
             let fz = |enc: imp::Id| {
-                imp::FromZFirstPassPlan::new(log_d).encode_range(
+                imp::FromZFirstPassPlan::incumbent(log_d).encode_range(
                     gpu, enc, data_buf, tw_buf, z_buf, log_d, 0, 1usize << (log_d - 4),
                 )
             };
@@ -22618,7 +23765,7 @@ kernel void gl2_write(device uint4* d [[buffer(0)]], uint gid [[thread_position_
                 }));
                 rows[9].push(run(&|enc| {
                     fz(enc);
-                    imp::encode_ntt_and_merkle(gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves);
+                    imp::encode_ntt_and_merkle_five(gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves);
                 }));
                 rows[10].push(run(&|enc| {
                     gpu.set_pipeline(enc, pso_rw);
@@ -22745,6 +23892,478 @@ kernel void gl2_write(device uint4* d [[buffer(0)]], uint gid [[thread_position_
             gpu.release(out_buf);
             gpu.release(tw_buf);
             gpu.pool_pop(pool);
+        }
+    }
+
+    /// GL3 lane: four-pass prefix (g5@4, g5@9, fused six-layer final + leaf)
+    /// vs the production five-pass graph: exactness + GPU ms quiet and under
+    /// CPU memory streaming. Run with `--ignored --nocapture gl3_probe`.
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gl3_probe() {
+        use super::imp;
+        let log_d = 20usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x6173);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let pso_mid = unsafe { imp::compile_supplemental_pipeline(gpu, &imp::g5_mid_msl_source(), "ntt_g5").unwrap() };
+        let f6name = std::env::var("GL3_F6").unwrap_or_else(|_| "ntt_final6b_t3_leaf".into());
+        let pso_f6 = unsafe {
+            imp::compile_supplemental_pipeline(gpu, &imp::final6_leaf_msl_source(), &f6name).unwrap()
+        };
+        eprintln!("gl3 f6 kernel {f6name}");
+        for (n, p) in [("mid", pso_mid), ("f6", pso_f6), ("f4leaf", gpu.pso_final_leaf)] {
+            if !p.is_null() {
+                let (a, b, c) = unsafe { gpu.pipeline_resources(p) };
+                eprintln!("gl3 pso {n}: resources {a} {b} {c}");
+            }
+        }
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = (64usize << log_d) * 16;
+            let tree_bytes = (2 * n_leaves - 1) * 32;
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let z_buf = gpu.new_buffer(data_bytes / 2).unwrap();
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            let tw_buf = gpu.new_buffer(core::mem::size_of_val(twiddles.as_slice())).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            let zin = rng.vec(32 << log_d);
+            std::ptr::copy_nonoverlapping(zin.as_ptr().cast::<u8>(), gpu.buffer_contents(z_buf), data_bytes / 2);
+            drop(zin);
+            let run = |f: &dyn Fn(imp::Id)| -> f64 {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                f(enc);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            };
+            let digest = |buf: imp::Id, bytes: usize| {
+                let w = core::slice::from_raw_parts(gpu.buffer_contents(buf).cast::<u64>(), bytes / 8);
+                use rayon::prelude::*;
+                w.par_chunks(1 << 16)
+                    .map(|c| c.iter().fold(0u64, |a, &v| (a ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29)))
+                    .collect::<Vec<u64>>()
+                    .iter()
+                    .fold(0u64, |a, &v| (a ^ v).wrapping_mul(0xD6E8_FEB8_6659_FD93).rotate_left(31))
+            };
+            let fz = |enc: imp::Id| {
+                imp::FromZFirstPassPlan::incumbent(log_d).encode_range(
+                    gpu, enc, data_buf, tw_buf, z_buf, log_d, 0, 1usize << (log_d - 4),
+                )
+            };
+            let w3 = n_leaves + n_leaves / 2 + n_leaves / 4;
+            let prod = |enc: imp::Id| imp::encode_ntt_and_merkle_five(gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves);
+            let newg = |enc: imp::Id| {
+                imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 4, 1, 1);
+                imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 9, 1, 1);
+                imp::encode_final6_leaf_prefix(gpu, enc, pso_f6, data_buf, tw_buf, tree_buf, log_d, n_leaves, imp::gl3_fin_rows());
+                imp::encode_merkle_upper(gpu, enc, tree_buf, w3, n_leaves / 8);
+            };
+            // Exactness: whole codeword and whole tree.
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0, tree_bytes);
+            run(&|enc| { fz(enc); prod(enc); });
+            let (dp, tp) = (digest(data_buf, data_bytes), digest(tree_buf, tree_bytes - 32));
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0, tree_bytes);
+            run(&|enc| { fz(enc); newg(enc); });
+            let (dn, tn) = (digest(data_buf, data_bytes), digest(tree_buf, tree_bytes - 32));
+            eprintln!("gl3 EXACT codeword {} tree {}", dp == dn, tp == tn);
+            // Prefix exactness (10/16 sixteenths): prefix codeword rows and
+            // prefix subtrees vs the production fused prefix.
+            let pfx16 = 10u64;
+            let pfx_leaves = n_leaves / 16 * pfx16 as usize;
+            let prodp = |enc: imp::Id| {
+                imp::encode_hybrid_prefix_tail_with(gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves, 4, pfx16, 16, true)
+            };
+            let newp = |enc: imp::Id| {
+                imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 4, pfx16, 16);
+                imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 9, pfx16, 16);
+                imp::encode_final6_leaf_prefix(gpu, enc, pso_f6, data_buf, tw_buf, tree_buf, log_d, pfx_leaves, imp::gl3_fin_rows());
+                let mut start = 0usize;
+                while start < pfx_leaves {
+                    let mut size = 1usize << (pfx_leaves - start).ilog2();
+                    while start % size != 0 {
+                        size >>= 1;
+                    }
+                    imp::encode_merkle_subtree_above3(gpu, enc, tree_buf, n_leaves, start, size);
+                    start += size;
+                }
+            };
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0, tree_bytes);
+            run(&|enc| { fz(enc); prodp(enc); });
+            let (dp, tp) = (digest(data_buf, pfx_leaves * 1024), digest(tree_buf, tree_bytes - 32));
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0, tree_bytes);
+            run(&|enc| { fz(enc); newp(enc); });
+            let (dn, tn) = (digest(data_buf, pfx_leaves * 1024), digest(tree_buf, tree_bytes - 32));
+            eprintln!("gl3 EXACT prefix10/16 codeword {} tree {}", dp == dn, tp == tn);
+            let exact = dp == dn && tp == tn;
+
+            let reps: usize = std::env::var("GL3_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
+            let nthr: usize = std::env::var("GL2_LOAD_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            let loads: Vec<u32> = std::env::var("GL3_LOADS")
+                .ok()
+                .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+                .unwrap_or(vec![0, 1]);
+            for load in loads {
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut hs = Vec::new();
+                if load > 0 {
+                    for t in 0..nthr {
+                        let stop = stop.clone();
+                        hs.push(std::thread::spawn(move || {
+                            if load == 1 {
+                                let n = 32usize << 20;
+                                let src = vec![t as u64 + 1; n / 2];
+                                let mut dst = vec![0u64; n / 2];
+                                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                    dst.copy_from_slice(&src);
+                                    std::hint::black_box(&mut dst);
+                                }
+                            } else {
+                                let mut x = t as u64 | 1;
+                                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                    for _ in 0..100_000 {
+                                        x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(7) ^ 0x1234;
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                            }
+                        }));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                let names = [
+                    "fz", "p4", "p8", "p12", "fin4leaf", "g5@4", "g5@9", "fin6leaf", "PROD_full", "NEW_full",
+                    "PROD_pfx10", "NEW_pfx10",
+                ];
+                let mut rr: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
+                for _ in 0..reps {
+                    rr[0].push(run(&|enc| fz(enc)));
+                    for (i, l) in [4usize, 8, 12].iter().enumerate() {
+                        rr[1 + i].push(run(&|enc| {
+                            imp::encode_ntt_passes_prefix_frac(gpu, enc, data_buf, tw_buf, log_d, 4, *l, *l + 1, 16, 16)
+                        }));
+                    }
+                    rr[4].push(run(&|enc| {
+                        imp::encode_final_leaf_and_upper(gpu, enc, gpu.pso_final_leaf, data_buf, tw_buf, tree_buf, log_d, 4, false)
+                    }));
+                    rr[5].push(run(&|enc| imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 4, 1, 1)));
+                    rr[6].push(run(&|enc| imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 9, 1, 1)));
+                    rr[7].push(run(&|enc| {
+                        imp::encode_final6_leaf_prefix(gpu, enc, pso_f6, data_buf, tw_buf, tree_buf, log_d, n_leaves, imp::gl3_fin_rows())
+                    }));
+                    rr[8].push(run(&|enc| { fz(enc); prod(enc); }));
+                    rr[9].push(run(&|enc| { fz(enc); newg(enc); }));
+                    rr[10].push(run(&|enc| prodp(enc)));
+                    rr[11].push(run(&|enc| newp(enc)));
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                for h in hs {
+                    h.join().unwrap();
+                }
+                let mut line = String::new();
+                for (i, n) in names.iter().enumerate() {
+                    let mut v = rr[i].clone();
+                    v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                    line += &format!(" {n}={:.2}", v[v.len() / 2]);
+                }
+                eprintln!("gl3 load={load} ({nthr} thr):{line}");
+            }
+            gpu.release(pso_mid);
+            gpu.release(pso_f6);
+            gpu.release(data_buf);
+            gpu.release(z_buf);
+            gpu.release(tree_buf);
+            gpu.release(tw_buf);
+            gpu.pool_pop(pool);
+            assert!(exact);
+        }
+    }
+
+    /// GL3 plan A: from-z five-layer first pass (layers 0..5), g5@5, g5@10,
+    /// fused five-layer final + leaf, vs production. Exactness + GPU ms per
+    /// load mode. `--ignored --nocapture gl3_probe2`.
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gl3_probe2() {
+        use super::imp;
+        let log_d = 20usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut rng = Rng::new(0x6174);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let pso_mid = unsafe { imp::compile_supplemental_pipeline(gpu, &imp::g5_mid_msl_source(), "ntt_g5").unwrap() };
+        let f5name = std::env::var("GL3_F5").unwrap_or_else(|_| "ntt_final5c_t3_leaf".into());
+        let pso_f5 = unsafe {
+            imp::compile_supplemental_pipeline(gpu, &imp::final6_leaf_msl_source(), &f5name).unwrap()
+        };
+        let (a, b, c) = unsafe { gpu.pipeline_resources(pso_f5) };
+        eprintln!("gl3 f5 kernel {f5name}: resources {a} {b} {c}");
+        let fz_sets: Vec<String> = std::env::var("GL3_FZ")
+            .unwrap_or_else(|_| "FROMZ=1 LOG_T=1u DBUF=1 PADN=1u".into())
+            .split(';')
+            .map(|x| x.to_string())
+            .collect();
+        let mut fz5: Vec<(imp::Id, u32, u32)> = Vec::new();
+        for set in &fz_sets {
+            let mut defs = String::new();
+            let (mut log_t, mut log_r) = (1u32, 0u32);
+            for kv in set.split_whitespace() {
+                let (k, v) = kv.split_once('=').unwrap();
+                defs += &format!("#define {k} {v}\n");
+                if k == "LOG_T" {
+                    log_t = v.trim_end_matches('u').parse().unwrap();
+                }
+                if k == "LOG_R" {
+                    log_r = v.trim_end_matches('u').parse().unwrap();
+                }
+            }
+            let src = imp::NTT_G5_MSL_SOURCE.replacen("using namespace metal;\n", &format!("using namespace metal;\n{defs}"), 1);
+            let pso = unsafe { imp::compile_supplemental_pipeline(gpu, &src, "ntt_g5").unwrap() };
+            let (a, b, c) = unsafe { gpu.pipeline_resources(pso) };
+            eprintln!("gl3 fz5[{}] '{set}': resources {a} {b} {c}", fz5.len());
+            fz5.push((pso, log_t, log_r));
+        }
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = (64usize << log_d) * 16;
+            let tree_bytes = (2 * n_leaves - 1) * 32;
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let z_buf = gpu.new_buffer(data_bytes / 2).unwrap();
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            let tw_buf = gpu.new_buffer(core::mem::size_of_val(twiddles.as_slice())).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            let zin = rng.vec(32 << log_d);
+            std::ptr::copy_nonoverlapping(zin.as_ptr().cast::<u8>(), gpu.buffer_contents(z_buf), data_bytes / 2);
+            drop(zin);
+            let run = |f: &dyn Fn(imp::Id)| -> f64 {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                f(enc);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            };
+            let digest = |buf: imp::Id, bytes: usize| {
+                let w = core::slice::from_raw_parts(gpu.buffer_contents(buf).cast::<u64>(), bytes / 8);
+                use rayon::prelude::*;
+                w.par_chunks(1 << 16)
+                    .map(|c| c.iter().fold(0u64, |a, &v| (a ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29)))
+                    .collect::<Vec<u64>>()
+                    .iter()
+                    .fold(0u64, |a, &v| (a ^ v).wrapping_mul(0xD6E8_FEB8_6659_FD93).rotate_left(31))
+            };
+            let fz4 = |enc: imp::Id| {
+                imp::FromZFirstPassPlan::incumbent(log_d).encode_range(
+                    gpu, enc, data_buf, tw_buf, z_buf, log_d, 0, 1usize << (log_d - 4),
+                )
+            };
+            let params = |enc: imp::Id, l: usize, f: usize| {
+                let p = imp::NttParams { log_d: log_d as u32, l: l as u32, f: f as u32, s: (log_d - l - f) as u32 };
+                let bytes = core::slice::from_raw_parts(
+                    (&p as *const imp::NttParams).cast::<u8>(),
+                    core::mem::size_of::<imp::NttParams>(),
+                );
+                gpu.set_bytes(enc, bytes, 2);
+            };
+            let generic = |enc: imp::Id, l: usize, f: usize| {
+                gpu.set_pipeline(enc, gpu.pso_ntt);
+                gpu.set_buffer(enc, data_buf, 0, 0);
+                gpu.set_buffer(enc, tw_buf, 0, 1);
+                params(enc, l, f);
+                gpu.dispatch(enc, 1u64 << (log_d - f), 1u64 << (f + 5));
+            };
+            let fz5r = |enc: imp::Id, v: usize| {
+                let (pso, log_t, log_r) = fz5[v];
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, data_buf, 0, 0);
+                gpu.set_buffer(enc, tw_buf, 0, 1);
+                gpu.set_buffer(enc, z_buf, 0, 3);
+                params(enc, 0, 5);
+                gpu.dispatch(enc, 1u64 << (log_d - 5 - (log_t + log_r) as usize), 64u64 << log_t);
+            };
+            let w3 = n_leaves + n_leaves / 2 + n_leaves / 4;
+            let prod = |enc: imp::Id| imp::encode_ntt_and_merkle_five(gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves);
+            let newa = |enc: imp::Id, num: u64, den: u64| {
+                let pl = n_leaves / den as usize * num as usize;
+                imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 5, num, den);
+                imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 10, num, den);
+                imp::encode_final6_leaf_prefix(gpu, enc, pso_f5, data_buf, tw_buf, tree_buf, log_d, pl, imp::gl3_fin_rows());
+                if num == den {
+                    imp::encode_merkle_upper(gpu, enc, tree_buf, w3, n_leaves / 8);
+                } else {
+                    let mut start = 0usize;
+                    while start < pl {
+                        let mut size = 1usize << (pl - start).ilog2();
+                        while start % size != 0 {
+                            size >>= 1;
+                        }
+                        imp::encode_merkle_subtree_above3(gpu, enc, tree_buf, n_leaves, start, size);
+                        start += size;
+                    }
+                }
+            };
+            let pfx16 = 10u64;
+            let pfx_leaves = n_leaves / 16 * pfx16 as usize;
+            let prodp = |enc: imp::Id| {
+                imp::encode_hybrid_prefix_tail_with(gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves, 4, pfx16, 16, true)
+            };
+            // Exactness.
+            run(&|enc| { fz4(enc); generic(enc, 4, 1); });
+            let d5 = digest(data_buf, data_bytes);
+            let mut exact = true;
+            for v in 0..fz5.len() {
+                run(&|enc| fz5r(enc, v));
+                let ok = digest(data_buf, data_bytes) == d5;
+                eprintln!("gl3 EXACT fz5[{v}] == fz4 + layer 4: {ok}");
+                exact &= ok;
+            }
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0, tree_bytes);
+            run(&|enc| { fz4(enc); prod(enc); });
+            let (dp, tp) = (digest(data_buf, data_bytes), digest(tree_buf, tree_bytes - 32));
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0, tree_bytes);
+            run(&|enc| { fz5r(enc, 0); newa(enc, 1, 1); });
+            let (dn, tn) = (digest(data_buf, data_bytes), digest(tree_buf, tree_bytes - 32));
+            eprintln!("gl3 EXACT planA full codeword {} tree {}", dp == dn, tp == tn);
+            exact &= dp == dn && tp == tn;
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0, tree_bytes);
+            run(&|enc| { fz4(enc); prodp(enc); });
+            let (dp, tp) = (digest(data_buf, pfx_leaves * 1024), digest(tree_buf, tree_bytes - 32));
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0, tree_bytes);
+            run(&|enc| { fz5r(enc, 0); newa(enc, pfx16, 16); });
+            let (dn, tn) = (digest(data_buf, pfx_leaves * 1024), digest(tree_buf, tree_bytes - 32));
+            eprintln!("gl3 EXACT planA prefix10/16 codeword {} tree {}", dp == dn, tp == tn);
+            exact &= dp == dn && tp == tn;
+            // Fine-granularity prefix (166/256) exactness.
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0, tree_bytes);
+            run(&|enc| { fz4(enc); imp::encode_hybrid_prefix_tail_with(gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves, 4, 11, 16, true); });
+            let pl166 = n_leaves / 256 * 166;
+            let (dp, tp) = (digest(data_buf, pl166 * 1024), digest(tree_buf, tree_bytes - 32));
+            std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0, tree_bytes);
+            run(&|enc| {
+                fz5r(enc, 0);
+                imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 5, 11, 16);
+                imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 10, 166, 256);
+                imp::encode_final6_leaf_prefix(gpu, enc, pso_f5, data_buf, tw_buf, tree_buf, log_d, pl166, imp::gl3_fin_rows());
+                let mut start = 0usize;
+                while start < pl166 {
+                    let mut size = 1usize << (pl166 - start).ilog2();
+                    while start % size != 0 {
+                        size >>= 1;
+                    }
+                    imp::encode_merkle_subtree_above3(gpu, enc, tree_buf, n_leaves, start, size);
+                    start += size;
+                }
+            });
+            let (dn, _) = (digest(data_buf, pl166 * 1024), digest(tree_buf, tree_bytes - 32));
+            eprintln!("gl3 EXACT planA prefix166/256 codeword {}", dp == dn);
+            exact &= dp == dn;
+            let _ = tp;
+
+            let reps: usize = std::env::var("GL3_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
+            let nthr: usize = std::env::var("GL2_LOAD_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            let loads: Vec<u32> = std::env::var("GL3_LOADS")
+                .ok()
+                .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+                .unwrap_or(vec![0, 1]);
+            for load in loads {
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut hs = Vec::new();
+                if load > 0 {
+                    for t in 0..nthr {
+                        let stop = stop.clone();
+                        hs.push(std::thread::spawn(move || {
+                            if load == 1 {
+                                let n = 32usize << 20;
+                                let src = vec![t as u64 + 1; n / 2];
+                                let mut dst = vec![0u64; n / 2];
+                                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                    dst.copy_from_slice(&src);
+                                    std::hint::black_box(&mut dst);
+                                }
+                            } else {
+                                let mut x = t as u64 | 1;
+                                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                    for _ in 0..100_000 {
+                                        x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(7) ^ 0x1234;
+                                    }
+                                    std::hint::black_box(x);
+                                }
+                            }
+                        }));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                let mut names: Vec<String> = ["fz4", "g5@5", "g5@10", "fin4leaf", "fin5leaf", "PROD_full", "NEWA_full", "PROD_pfx10", "NEWA_pfx10"]
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect();
+                for v in 0..fz5.len() {
+                    names.push(format!("fz5[{v}]"));
+                }
+                let mut rr: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
+                for _ in 0..reps {
+                    rr[0].push(run(&|enc| fz4(enc)));
+                    rr[1].push(run(&|enc| imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 5, 1, 1)));
+                    rr[2].push(run(&|enc| imp::encode_g5_pass_frac(gpu, enc, pso_mid, data_buf, tw_buf, log_d, 10, 1, 1)));
+                    rr[3].push(run(&|enc| {
+                        imp::encode_final_leaf_and_upper(gpu, enc, gpu.pso_final_leaf, data_buf, tw_buf, tree_buf, log_d, 4, false)
+                    }));
+                    rr[4].push(run(&|enc| {
+                        imp::encode_final6_leaf_prefix(gpu, enc, pso_f5, data_buf, tw_buf, tree_buf, log_d, n_leaves, imp::gl3_fin_rows())
+                    }));
+                    rr[5].push(run(&|enc| { fz4(enc); prod(enc); }));
+                    rr[6].push(run(&|enc| { fz5r(enc, 0); newa(enc, 1, 1); }));
+                    rr[7].push(run(&|enc| { fz4(enc); prodp(enc); }));
+                    rr[8].push(run(&|enc| { fz5r(enc, 0); newa(enc, pfx16, 16); }));
+                    for v in 0..fz5.len() {
+                        rr[9 + v].push(run(&|enc| fz5r(enc, v)));
+                    }
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                for h in hs {
+                    h.join().unwrap();
+                }
+                let mut line = String::new();
+                for (i, n) in names.iter().enumerate() {
+                    let mut v = rr[i].clone();
+                    v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                    line += &format!(" {n}={:.2}", v[v.len() / 2]);
+                }
+                eprintln!("gl3 load={load} ({nthr} thr):{line}");
+            }
+            for (p, _, _) in fz5 {
+                gpu.release(p);
+            }
+            gpu.release(pso_mid);
+            gpu.release(pso_f5);
+            gpu.release(data_buf);
+            gpu.release(z_buf);
+            gpu.release(tree_buf);
+            gpu.release(tw_buf);
+            gpu.pool_pop(pool);
+            assert!(exact);
         }
     }
 }

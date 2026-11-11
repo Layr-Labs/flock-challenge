@@ -1205,7 +1205,11 @@ impl AdditiveNttF128 {
         let log_d = log2_pow2(data.len() / num_ntts);
         assert_eq!(log_d, 20, "ranked hybrid suffix requires log_d=20");
         assert_eq!(num_ntts, 64, "ranked hybrid suffix requires 64 lanes");
-        assert_eq!(start_layer, 4, "ranked hybrid suffix starts at layer 4");
+        // Layer 5 when the GL3 four-pass GPU first pass already ran layer 4.
+        assert!(
+            start_layer == 4 || start_layer == 5,
+            "ranked hybrid suffix starts at layer 4 or 5"
+        );
         assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
         assert!(b_start < b_end && b_end <= (1usize << start_layer));
 
@@ -1253,6 +1257,7 @@ impl AdditiveNttF128 {
         &self,
         data: &mut [F128],
         num_ntts: usize,
+        start_layer: usize,
         b_start: usize,
         fine_m: usize,
         wait_boundary: W,
@@ -1268,6 +1273,28 @@ impl AdditiveNttF128 {
         assert_eq!(num_ntts, 64, "ranked fine split requires 64 lanes");
         assert!((1..16).contains(&b_start) && (1..16).contains(&fine_m));
         let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
+        if start_layer == 5 {
+            // GL3 four-pass: the GPU ran layer 4 everywhere and layers 5..10
+            // over the whole boundary sixteenth, so the boundary's last
+            // `fine_m` layer-8 sub-blocks resume directly at layer 10.
+            self.forward_transform_interleaved_block_range(
+                data, num_ntts, 5, DEEP_LAYER, 2 * b_start, 32, odd_tail,
+            );
+            let sb_start = (b_start << 4) - fine_m;
+            wait_boundary()?;
+            self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                data,
+                num_ntts,
+                DEEP_LAYER,
+                log_d,
+                sb_start << (DEEP_LAYER - 8),
+                16 << (DEEP_LAYER - 4),
+                odd_tail,
+                &finish_chunk,
+            );
+            return Ok(());
+        }
+        assert_eq!(start_layer, 4, "ranked fine split starts at layer 4 or 5");
         self.forward_transform_interleaved_block_range(
             data, num_ntts, 4, DEEP_LAYER, b_start, 16, odd_tail,
         );
