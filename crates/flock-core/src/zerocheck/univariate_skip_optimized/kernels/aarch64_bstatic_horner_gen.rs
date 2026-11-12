@@ -204,10 +204,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(3, 1, [(6, 7)], []));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(3, 5, [(5, 6)], [7]));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(3, 4, [(0, 1), (2, 3), (4, 5)], []));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             4 => {
@@ -223,10 +223,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(4, 1, [(5, 6)], [7]));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(4, 5, [(4, 5), (6, 7)], []));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(4, 0, [(0, 1), (2, 3), (4, 5)], []));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(4, 4, [(0, 1), (2, 3)], [4]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             5 => {
@@ -242,10 +242,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(5, 1, [(3, 4), (5, 6)], [7]));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(5, 5, [(2, 3), (4, 5), (6, 7)], []));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_lz!(5, 0, 4, bimg_sk!(5, 0, [(0, 1), (2, 3)], [])));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_lz!(5, 4, 3, bimg_s!(5, 4, [(0, 1)], [2])));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             6 => {
@@ -261,10 +261,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(6, 1, [(2, 3), (4, 5), (6, 7)], []));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_lz!(6, 0, 3, bimg_s!(6, 0, [(0, 1)], [2])));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_lz!(6, 4, 2, bimg_s!(6, 4, [(0, 1)], [])));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             7 => {
@@ -280,10 +280,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(7, 0, [], [0]));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(7, 4, [], [7]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             8 => {
@@ -299,10 +299,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(8, 0, [], [7]));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(8, 4, [(6, 7)], []));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             9 => {
@@ -318,10 +318,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(9, 0, [(5, 6)], [7]));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(9, 4, [(4, 5), (6, 7)], []));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             10 => {
@@ -337,10 +337,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(10, 0, [(4, 5), (6, 7)], []));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(10, 4, [(3, 4), (5, 6)], [7]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             11 => {
@@ -356,10 +356,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(11, 0, [(2, 3), (4, 5), (6, 7)], []));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             12 => {
@@ -375,10 +375,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             13 => {
@@ -394,10 +394,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             14 => {
@@ -413,10 +413,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             15 => {
@@ -432,10 +432,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             16 => {
@@ -451,10 +451,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             17 => {
@@ -470,10 +470,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             18 => {
@@ -489,10 +489,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             19 => {
@@ -508,10 +508,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(19, 1, [(0, 1), (2, 3), (4, 5)], []));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(19, 5, [(0, 1), (2, 3), (4, 5)], []));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             20 => {
@@ -527,10 +527,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(20, 1, [(0, 1), (2, 3)], [4]));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_lz!(20, 5, 4, bimg_sk!(20, 5, [(0, 1), (2, 3)], [])));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             21 => {
@@ -546,10 +546,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_lz!(21, 1, 3, bimg_s!(21, 1, [(0, 1)], [2])));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_lz!(21, 5, 3, bimg_s!(21, 5, [(0, 1)], [2])));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             22 => {
@@ -565,10 +565,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_lz!(22, 1, 2, bimg_s!(22, 1, [(0, 1)], [])));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(22, 5, [], [0]));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             23 => {
@@ -584,10 +584,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(23, 1, [], [7]));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(23, 5, [], [7]));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             24 => {
@@ -603,10 +603,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(24, 1, [(6, 7)], []));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(24, 5, [(5, 6)], [7]));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(24, 4, [(0, 1), (2, 3), (4, 5)], []));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             25 => {
@@ -622,10 +622,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(25, 1, [(4, 5), (6, 7)], []));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(25, 5, [(4, 5), (6, 7)], []));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(25, 0, [(0, 1), (2, 3)], [4]));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(25, 4, [(0, 1), (2, 3)], [4]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             26 => {
@@ -641,10 +641,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(26, 1, [(3, 4), (5, 6)], [7]));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(26, 5, [(2, 3), (4, 5), (6, 7)], []));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_lz!(26, 0, 4, bimg_sk!(26, 0, [(0, 1), (2, 3)], [])));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_lz!(26, 4, 3, bimg_s!(26, 4, [(0, 1)], [2])));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             27 => {
@@ -660,10 +660,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_lz!(27, 0, 2, bimg_s!(27, 0, [(0, 1)], [])));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_lz!(27, 4, 2, bimg_s!(27, 4, [(0, 1)], [])));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             28 => {
@@ -679,10 +679,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
-                horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+                horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(28, 0, [], [0]));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(28, 4, [], [7]));
-                horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+                horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
             _ => unreachable!("no static-B Horner plan for this arm"),

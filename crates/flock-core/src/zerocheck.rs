@@ -1093,6 +1093,9 @@ fn prove_packed_padded_inner<C: Challenger>(
                     r_nx[1..].copy_from_slice(&r[r.len() - l + 1..]);
                     let mut na = crate::scratch::take_f128_unpinned(out_n);
                     let mut nb = crate::scratch::take_f128_unpinned(out_n);
+                    // ~1.3 ms before the lincheck GPU prefix: wake the idle
+                    // GPU (see `gpu_commit::ENV_NO_LC_GPU_WAKE`).
+                    crate::gpu_commit::lc_gpu_wake_fire(step as u32);
                     let (e1, einf, la, la2) = multilinear::fold_cascade_t_into(
                         &cur_a,
                         &cur_b,
@@ -1117,6 +1120,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     cur_a = na;
                     cur_b = nb;
                 }
+                crate::gpu_commit::lc_gpu_wake_fire(99);
                 let loop_start = mlv_rhos.len() - 1;
                 (cur_a, cur_b, loop_start)
             } else if use_cascade3 {

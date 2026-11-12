@@ -1996,6 +1996,97 @@ unsafe fn horner_absorb_first(
     }
 }
 
+/// Row-body variant bit: the static-B Horner rows fold the bits a Horner
+/// step shifts out of the 16-bit lanes once, two degrees at a time, instead
+/// of once per step. After the seed and the first absorb the accumulator is
+/// `T = x·P3 + P2` (degree at most 15, see [`horner_absorb_first`]); the
+/// K1 step forms `x^2·T + x·P1` as `(T << 2) ^ fold(T >> 14) ^ (P1 << 1)`
+/// with `fold(c) = c0·x^16 + c1·x^17 mod p` (one `tbl`), and the K0 step is
+/// a plain `eor3` with `P0`. Six plus one vector ops per lane instead of
+/// four plus four; every lane stays congruent mod p to the incumbent's, so
+/// `gf8_reduce_vec16` writes the same bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_HORNER2: u16 = 2048;
+
+/// Kill switch for [`ABV_HORNER2`]: any value of `FLOCK_NO_ZC_AB_HORNER2`
+/// keeps the per-step carry fold. Read once per process. Same bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_horner2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_HORNER2").is_none())
+}
+
+/// `tbl` table of [`ABV_HORNER2`]: entry `c` (bit 0 = lane bit 14, bit 1 =
+/// lane bit 15 of `T`) is `c0·x^16 + c1·x^17 mod p`; entries 4..15 unused.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const HORNER2_FOLD: [u8; 16] = {
+    let x17 = (HORNER_CARRY_X16 as u8) << 1; // x^16 mod p < 0x80
+    [0, HORNER_CARRY_X16 as u8, x17, (HORNER_CARRY_X16 as u8) ^ x17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+};
+
+/// The K1 Horner step of the static-B rows in the form `V` selects:
+/// [`horner_absorb`] or, under [`ABV_HORNER2`], `acc = (acc << 2) ^
+/// fold(acc >> 14) ^ ((lo ^ hi) << 1)` (the accumulator then holds
+/// `x^2·T + x·P1`, which [`horner_absorb_k0`] completes).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn horner_absorb_k1<const V: u16>(
+    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
+    lo: &[core::arch::aarch64::uint16x8_t; 8],
+    hi: &[core::arch::aarch64::uint16x8_t; 8],
+    carry_not: core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        if V & ABV_HORNER2 == 0 {
+            horner_absorb(acc, lo, hi, carry_not);
+            return;
+        }
+        let fold = vld1q_u8(HORNER2_FOLD.as_ptr());
+        for i in 0..8 {
+            let t = acc[i];
+            let s2 = vreinterpretq_u8_u16(vshlq_n_u16::<2>(t));
+            let f = vqtbl1q_u8(fold, vreinterpretq_u8_u16(vshrq_n_u16::<14>(t)));
+            let p1 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(veorq_u16(lo[i], hi[i])));
+            acc[i] = vreinterpretq_u16_u8(xor3_u8(s2, f, p1));
+        }
+    }
+}
+
+/// The K0 Horner step of the static-B rows in the form `V` selects:
+/// [`horner_absorb`] or, under [`ABV_HORNER2`], `acc ^= lo ^ hi`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn horner_absorb_k0<const V: u16>(
+    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
+    lo: &[core::arch::aarch64::uint16x8_t; 8],
+    hi: &[core::arch::aarch64::uint16x8_t; 8],
+    carry_not: core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        if V & ABV_HORNER2 == 0 {
+            horner_absorb(acc, lo, hi, carry_not);
+            return;
+        }
+        for i in 0..8 {
+            acc[i] = vreinterpretq_u16_u8(xor3_u8(
+                vreinterpretq_u8_u16(acc[i]),
+                vreinterpretq_u8_u16(lo[i]),
+                vreinterpretq_u8_u16(hi[i]),
+            ));
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn horner2_fold_table_matches_field() {
+    let x16 = (0..16).fold(F8::ONE, |a, _| a * F8(2));
+    let x17 = x16 * F8(2);
+    assert_eq!(HORNER2_FOLD[..4], [0, x16.0, x17.0, x16.0 ^ x17.0]);
+}
+
 /// Kill switch for the Horner / scaled-table kernel:
 /// `FLOCK_NO_FAST_SHIFT_REDUCE=1` restores [`shift_reduce_inner_ab_fused_neon`].
 /// Output is bit-identical either way.
@@ -3491,6 +3582,196 @@ fn ab_kara_unscaled_addresses_match() {
     }
 }
 
+/// Row-body variant bit (with [`ABV_KARA_XOR16`]): the `x^4` Karatsuba
+/// image's lookups form their addresses per slot pair in one asm block
+/// ([`ab_kara_slot_pair`]): one `add` of the slot offset per pair, then an
+/// unscaled register-offset load per byte (`and`/`ubfiz` + `ldr`), instead
+/// of `ubfx` + `add (shifted)` + `ldr` per byte. Same lookups, same bytes;
+/// no extra live base registers (the eight fixed slot bases of
+/// [`ABV_KARA_SCALED_UNSCALED`] spill).
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_KARA_SLOT: u16 = 8192;
+
+/// Kill switch for [`ABV_KARA_SLOT`]: any value of `FLOCK_NO_ZC_AB_KARA_SLOT`
+/// keeps the incumbent address formation. Read once per process. The rows
+/// written are byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_kara_slot_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_KARA_SLOT").is_none())
+}
+
+/// Build-time choice of [`ab_kara_slot_pair`]'s form: `true` = opaque
+/// per-pair `add` of the slot offset + ordinary loads (the scheduler can
+/// interleave them); `false` = the whole pair in one asm block.
+#[cfg(target_arch = "aarch64")]
+const AB_KARA_SLOT_PLAIN_LOADS: bool = true;
+
+/// Slot `SLOT` of the Karatsuba entries of bytes `JA` and `JB` (`JA < JB`)
+/// of `word`: `(kara[byte JA][SLOT], kara[byte JB][SLOT])`, 16 bytes each.
+/// One asm block: `add t, kara, #SLOT*16` (none for slot 0), then per byte
+/// `ubfiz`/`and (shifted)` into a byte offset and `ldr q, [t, off]`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ab_kara_slot_pair<const JA: u32, const JB: u32, const SLOT: usize>(
+    kara: *const u8,
+    word: u64,
+) -> (core::arch::aarch64::uint8x16_t, core::arch::aarch64::uint8x16_t) {
+    use core::arch::aarch64::*;
+    const { assert!(JA < JB && JB < 8 && SLOT < 8) };
+    if AB_KARA_SLOT_PLAIN_LOADS {
+        // SAFETY: as below; the add is opaque and takes `word` as a dummy
+        // input so the slot base is formed once per pair, not hoisted into
+        // eight live registers. The loads are ordinary LLVM loads.
+        unsafe {
+            let t: *const u8 = if SLOT == 0 {
+                kara
+            } else {
+                let a: usize;
+                core::arch::asm!(
+                    "add {a}, {b}, #{off} // {w}",
+                    off = const SLOT * 16,
+                    a = lateout(reg) a,
+                    b = in(reg) kara,
+                    w = in(reg) word,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+                a as *const u8
+            };
+            return (
+                vld1q_u8(t.add(ab_z_idx::<JA, 7>(word))),
+                vld1q_u8(t.add(ab_z_idx::<JB, 7>(word))),
+            );
+        }
+    }
+    let (a, b): (uint8x16_t, uint8x16_t);
+    // SAFETY: each offset is a byte value times 128 plus SLOT * 16, inside
+    // the caller's 32 KiB image of 128-byte entries; the asm only reads it.
+    unsafe {
+        match (SLOT == 0, JA == 0) {
+            (true, true) => core::arch::asm!(
+                "ubfiz {ia}, {w}, #7, #8",
+                "ldr {a:q}, [{base}, {ia}]",
+                "and {ib}, {mask}, {w}, lsr #{sb}",
+                "ldr {b:q}, [{base}, {ib}]",
+                sb = const (JB * 8 + 57) % 64,
+                mask = in(reg) 0x7f80usize,
+                w = in(reg) word,
+                base = in(reg) kara,
+                ia = out(reg) _,
+                ib = out(reg) _,
+                a = lateout(vreg) a,
+                b = lateout(vreg) b,
+                options(pure, readonly, nostack, preserves_flags),
+            ),
+            (true, false) => core::arch::asm!(
+                "and {ia}, {mask}, {w}, lsr #{sa}",
+                "ldr {a:q}, [{base}, {ia}]",
+                "and {ib}, {mask}, {w}, lsr #{sb}",
+                "ldr {b:q}, [{base}, {ib}]",
+                sa = const (JA * 8 + 57) % 64,
+                sb = const (JB * 8 + 57) % 64,
+                mask = in(reg) 0x7f80usize,
+                w = in(reg) word,
+                base = in(reg) kara,
+                ia = out(reg) _,
+                ib = out(reg) _,
+                a = lateout(vreg) a,
+                b = lateout(vreg) b,
+                options(pure, readonly, nostack, preserves_flags),
+            ),
+            (false, true) => core::arch::asm!(
+                "add {t}, {base}, #{off}",
+                "ubfiz {ia}, {w}, #7, #8",
+                "ldr {a:q}, [{t}, {ia}]",
+                "and {ib}, {mask}, {w}, lsr #{sb}",
+                "ldr {b:q}, [{t}, {ib}]",
+                off = const SLOT * 16,
+                sb = const (JB * 8 + 57) % 64,
+                mask = in(reg) 0x7f80usize,
+                w = in(reg) word,
+                base = in(reg) kara,
+                t = out(reg) _,
+                ia = out(reg) _,
+                ib = out(reg) _,
+                a = lateout(vreg) a,
+                b = lateout(vreg) b,
+                options(pure, readonly, nostack, preserves_flags),
+            ),
+            (false, false) => core::arch::asm!(
+                "add {t}, {base}, #{off}",
+                "and {ia}, {mask}, {w}, lsr #{sa}",
+                "ldr {a:q}, [{t}, {ia}]",
+                "and {ib}, {mask}, {w}, lsr #{sb}",
+                "ldr {b:q}, [{t}, {ib}]",
+                off = const SLOT * 16,
+                sa = const (JA * 8 + 57) % 64,
+                sb = const (JB * 8 + 57) % 64,
+                mask = in(reg) 0x7f80usize,
+                w = in(reg) word,
+                base = in(reg) kara,
+                t = out(reg) _,
+                ia = out(reg) _,
+                ib = out(reg) _,
+                a = lateout(vreg) a,
+                b = lateout(vreg) b,
+                options(pure, readonly, nostack, preserves_flags),
+            ),
+        }
+    }
+    (a, b)
+}
+
+/// Entries of bytes 0 and 1 of `v` in the ninth table of a Karatsuba image
+/// (256 x 16 bytes at [`AB_KARA_NINTH`]): one asm block, one `add` of the
+/// table offset, two unscaled loads.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn ab_kara_ninth_pair(
+    kara: *const u8,
+    v: u64,
+) -> (core::arch::aarch64::uint8x16_t, core::arch::aarch64::uint8x16_t) {
+    use core::arch::aarch64::*;
+    const { assert!(AB_KARA_NINTH == 8 << 12) };
+    if AB_KARA_SLOT_PLAIN_LOADS {
+        // SAFETY: as below (opaque per-word add, ordinary loads).
+        unsafe {
+            let a: usize;
+            core::arch::asm!(
+                "add {a}, {b}, #8, lsl #12 // {w}",
+                a = lateout(reg) a,
+                b = in(reg) kara,
+                w = in(reg) v,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            let t = a as *const u8;
+            return (vld1q_u8(t.add(ab_z_idx::<0, 4>(v))), vld1q_u8(t.add(ab_z_idx::<1, 4>(v))));
+        }
+    }
+    let (a, b): (uint8x16_t, uint8x16_t);
+    // SAFETY: the offsets are byte values times 16 inside the 4 KiB ninth
+    // table of the image; the asm only reads that memory.
+    unsafe {
+        core::arch::asm!(
+            "add {t}, {base}, #8, lsl #12",
+            "ubfiz {ia}, {v}, #4, #8",
+            "ldr {a:q}, [{t}, {ia}]",
+            "and {ib}, {mask}, {v}, lsr #4",
+            "ldr {b:q}, [{t}, {ib}]",
+            mask = in(reg) 0xff0usize,
+            v = in(reg) v,
+            base = in(reg) kara,
+            t = out(reg) _,
+            ia = out(reg) _,
+            ib = out(reg) _,
+            a = lateout(vreg) a,
+            b = lateout(vreg) b,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+    }
+    (a, b)
+}
+
 /// [`apply_word_into_4_regs`] out of one image of [`ab_kara_tables`]
 /// (`kara` points at the image's first entry).
 #[cfg(target_arch = "aarch64")]
@@ -3520,6 +3801,29 @@ unsafe fn apply_word_kara<const V: u16, const SCALED: bool>(
                     ab_kara_ld::<V, $j, $slot>(kara, $src)
                 }
             };
+        }
+        if SCALED && V & ABV_KARA_SLOT != 0 && V & ABV_KARA_XOR16 != 0 {
+            // The same eighteen lookups and the same twelve-XOR recombination
+            // as the `ABV_KARA_XOR16` arm below; only the address formation
+            // differs (see [`ab_kara_slot_pair`]).
+            let (e0a, o0a) = ab_kara_slot_pair::<0, 1, 0>(kara, word);
+            let (e0b, o0b) = ab_kara_slot_pair::<2, 3, 1>(kara, word);
+            let (e1a, o1a) = ab_kara_slot_pair::<4, 5, 2>(kara, word);
+            let (e1b, o1b) = ab_kara_slot_pair::<6, 7, 3>(kara, word);
+            let o0 = veorq_u8(xor3_u8(o0a, o0b, o1a), o1b);
+            let out0 = xor3_u8(xor3_u8(e0a, e0b, e1a), e1b, vextq_u8::<8>(o0, o0));
+            let (e0s, o0s) = ab_kara_slot_pair::<0, 1, 4>(kara, u);
+            let (e1s, o1s) = ab_kara_slot_pair::<4, 5, 5>(kara, u);
+            let t1 = veorq_u8(o0s, o1s);
+            let out1 = veorq_u8(xor3_u8(out0, e0s, e1s), vextq_u8::<8>(t1, t1));
+            let (esa, osa) = ab_kara_slot_pair::<0, 1, 6>(kara, s);
+            let (esb, osb) = ab_kara_slot_pair::<2, 3, 7>(kara, s);
+            let t2 = veorq_u8(osa, osb);
+            let d2 = xor3_u8(esa, esb, vextq_u8::<8>(t2, t2));
+            let out2 = veorq_u8(out0, d2);
+            let (ess, oss) = ab_kara_ninth_pair(kara, v);
+            let out3 = veorq_u8(xor3_u8(out1, d2, ess), vextq_u8::<8>(oss, oss));
+            return (out0, out1, out2, out3);
         }
         // First ("even") and second ("odd") byte of every unit product.
         let (e0a, o0a) = (ld!(word, 0, 0), ld!(word, 1, 0));
@@ -3961,6 +4265,130 @@ unsafe fn apply_word_z<const PACK: bool, const REC: bool>(
     }
 }
 
+/// Row-body variant bit (with [`ABV_Z`] and [`ABV_Z_REC`]): the z-basis
+/// apply takes its eight lookup bytes from one word, the superset (Möbius)
+/// transform of `w` (`z[T] = XOR of W_b over b ⊇ T`), formed in three
+/// butterfly steps (five integer instructions, no live mask registers)
+/// instead of the seven partial XOR-shift words. Same lookups, same bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_Z_MT: u16 = 1024;
+
+/// Opt-in for [`ABV_Z_MT`]: off by default (it measured ~1.7% slower on a
+/// single M5 Pro core); `FLOCK_ZC_AB_Z_MT=1` enables it. Read once per
+/// process. Same bytes either way.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_z_mt_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_ZC_AB_Z_MT").is_some())
+}
+
+/// Superset transform of the eight bytes of `w`: byte `T` of the result is
+/// the XOR of the bytes `b` of `w` with `b & T == T`. Three butterflies:
+/// `and` with the odd-byte / high-pair immediate mask and `eor` with the
+/// shifted result, then one `eor` with a shifted register.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn ab_superset_bytes(w: u64) -> u64 {
+    let z: u64;
+    // SAFETY: register arithmetic only.
+    unsafe {
+        // `(w >> 8) & M == (w & (M << 8)) >> 8`: the masks are logical
+        // immediates, so no mask register is live.
+        core::arch::asm!(
+            "and {t}, {w}, #0xff00ff00ff00ff00",
+            "eor {z}, {w}, {t}, lsr #8",
+            "and {t}, {z}, #0xffff0000ffff0000",
+            "eor {z}, {z}, {t}, lsr #16",
+            "eor {z}, {z}, {z}, lsr #32",
+            w = in(reg) w,
+            t = out(reg) _,
+            z = out(reg) z,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    z
+}
+
+/// [`apply_word_z`] (`REC`, not `PACK`) with the lookup bytes taken from
+/// [`ab_superset_bytes`] of `w`: byte 0 indexes the plain row, bytes 2, 4,
+/// 1, 3 the record pairs, bytes 6, 5, 7 the `l1 l2`, `s l2` and `s l1 l2`
+/// tables, exactly the bytes `apply_word_z` extracts from its partial
+/// words.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_z_mt(
+    t0: *const u8,
+    z: *const u8,
+    w: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let y = ab_superset_bytes(w);
+        let ld = |base: *const u8, idx: usize| vld1q_u8(base.add(idx));
+        let r0 = t0.add(ab_z_idx::<0, 6>(y));
+        let (l0, l1, l2, l3) = (ld(r0, 0), ld(r0, 16), ld(r0, 32), ld(r0, 48));
+        let rec = |i: usize| -> *const u8 {
+            let a: usize;
+            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) z.add(AB_Z_REC), i = in(reg) i,
+                options(pure, nomem, nostack, preserves_flags));
+            a as *const u8
+        };
+        let a = rec(ab_z_idx::<2, 7>(y));
+        let (m0, m2) = (ld(a, 0), ld(a, 16));
+        let a = rec(ab_z_idx::<4, 7>(y));
+        let (n0, n1) = (ld(a, 32), ld(a, 48));
+        let a = rec(ab_z_idx::<1, 7>(y));
+        let (d01, d23) = (ld(a, 64), ld(a, 80));
+        let a = rec(ab_z_idx::<3, 7>(y));
+        let (e0, e2) = (ld(a, 96), ld(a, 112));
+        let g = ld(z.add(AB_Z_ALL), ab_z_idx::<7, 4>(y));
+        let k = ld(z.add(AB_Z_L12), ab_z_idx::<6, 4>(y));
+        let f = ld(z.add(AB_Z_SL2), ab_z_idx::<5, 4>(y));
+        let fg = veorq_u8(f, g);
+        let p = vreinterpretq_u64_u8(xor3_u8(d01, e0, fg));
+        let q = vreinterpretq_u64_u8(xor3_u8(d23, e2, fg));
+        let mk0 = veorq_u8(m0, k);
+        let mk2 = veorq_u8(m2, k);
+        let b0 = vreinterpretq_u8_u64(vzip1q_u64(p, p));
+        let b1 = vreinterpretq_u8_u64(vzip2q_u64(p, p));
+        let b2 = vreinterpretq_u8_u64(vzip1q_u64(q, q));
+        let b3 = vreinterpretq_u8_u64(vzip2q_u64(q, q));
+        (
+            veorq_u8(xor3_u8(l0, mk0, n0), b0),
+            veorq_u8(xor3_u8(l1, mk0, n1), b1),
+            veorq_u8(xor3_u8(l2, mk2, n0), b2),
+            veorq_u8(xor3_u8(l3, mk2, n1), b3),
+        )
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_superset_bytes_matches_definition() {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for i in 0..20000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let w = match i {
+            0 => 0,
+            1 => u64::MAX,
+            2..=2049 => (i & 0xff) << (8 * ((i >> 8) & 7)),
+            _ => x,
+        };
+        let b = w.to_le_bytes();
+        let want: [u8; 8] = core::array::from_fn(|t| {
+            (0..8).filter(|&j| j & t == t).fold(0u8, |acc, j| acc ^ b[j])
+        });
+        assert_eq!(ab_superset_bytes(w).to_le_bytes(), want, "w={w:016x}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Half-pair z form ("HZ") of the table apply: 24 loads per word instead of 32,
 // no half-swapped image, for the narrow efficiency cores.
@@ -4044,6 +4472,32 @@ pub(crate) fn ab_mixed_row_plain_and_hz(
     } else {
         shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, 0>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.0, false);
         shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_HZ }>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.1, false);
+    }
+    out
+}
+
+/// Test access: one mixed const-one row (as [`ab_mixed_row_plain_and_hz`])
+/// through the incumbent production z form (`AB_Z_VARIANT | ABV_KARA_XOR16`)
+/// and through the same form with [`ABV_KARA_SLOT`] and [`ABV_Z_MT`]. (The
+/// plain form of window 0's row drops A K0/K1 bytes 5..7, which the z forms
+/// keep, so it is compared only on rows of the ranked shape.)
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) fn ab_mixed_row_incumbent_and_slot_mt(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    w0: bool,
+) -> ([u8; 64], [u8; 64]) {
+    const V0: u16 = AB_Z_VARIANT | ABV_KARA_XOR16;
+    const V: u16 = V0 | ABV_KARA_SLOT | ABV_Z_MT;
+    let mut out = ([0u8; 64], [0u8; 64]);
+    if w0 {
+        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V0>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.0, false);
+        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.1, false);
+    } else {
+        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V0>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.0, false);
+        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.1, false);
     }
     out
 }
@@ -4166,6 +4620,8 @@ unsafe fn apply_word_into_4_regs_v<const V: u16, const SCALED: bool>(
             };
             if V & ABV_Z_REC != 0 && V & ABV_Z_PACK != 0 {
                 apply_word_z::<true, true>(table_base, z, word)
+            } else if V & ABV_Z_REC != 0 && V & ABV_Z_MT != 0 {
+                apply_word_z_mt(table_base, z, word)
             } else if V & ABV_Z_REC != 0 {
                 apply_word_z::<false, true>(table_base, z, word)
             } else if V & ABV_Z_PACK != 0 {
@@ -4484,7 +4940,19 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     )
                 });
                 if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
-                    if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
+                    if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled()
+                        && ab_kara_slot_enabled() && ab_z_mt_enabled()
+                    {
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { AB_Z_VARIANT | ABV_KARA_XOR16 | ABV_KARA_SLOT | ABV_Z_MT }>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            byte_base_b,
+                            None,
+                            out,
+                            nt_store,
+                        );
+                    } else if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { AB_Z_VARIANT | ABV_KARA_XOR16 }>(
                             a_packed,
                             b_packed,
@@ -4590,7 +5058,19 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         }
         0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
             if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
+                if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled()
+                    && ab_kara_slot_enabled() && ab_z_mt_enabled()
+                {
+                    shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { AB_Z_VARIANT | ABV_KARA_XOR16 | ABV_KARA_SLOT | ABV_Z_MT }>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base_b,
+                        None,
+                        out,
+                        nt_store,
+                    );
+                } else if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { AB_Z_VARIANT | ABV_KARA_XOR16 }>(
                         a_packed,
                         b_packed,
